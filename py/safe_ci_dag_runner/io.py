@@ -174,6 +174,10 @@ def dag_from_json(text: str) -> DagConfig:
     except json.JSONDecodeError as exc:
         raise DagJsonError(f"invalid JSON: {exc}") from exc
     doc = _as_obj(raw, "<root>")
+    # The document-level default_step_timeout is the per-step default for any step that omits
+    # its own `timeout` (falling back to the module constant only when the document omits it
+    # too). Parse it BEFORE the step loop so it can be threaded in as each step's default.
+    default_step_timeout = _opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)
     steps_raw = doc.get("steps")
     if not isinstance(steps_raw, list):
         raise DagJsonError("<root>: 'steps' must be a list")
@@ -192,7 +196,7 @@ def dag_from_json(text: str) -> DagConfig:
                 hint=_hint_from(sm.get("hint"), f"{where}.hint"),
                 networkonly=_opt_bool(sm, "networkonly", False),
                 engine_only=_opt_bool(sm, "engine_only", False),
-                timeout=_opt_int(sm, "timeout", DEFAULT_STEP_TIMEOUT),
+                timeout=_opt_int(sm, "timeout", default_step_timeout),
             )
         )
     return DagConfig(
@@ -201,7 +205,7 @@ def dag_from_json(text: str) -> DagConfig:
         mem_cap_factor=_opt_float(doc, "mem_cap_factor", 1.25),
         mem_cap_floor_bytes=_opt_int(doc, "mem_cap_floor_bytes", _DEFAULT_MEM_CAP_FLOOR),
         outer_mem_safety_factor=_opt_float(doc, "outer_mem_safety_factor", 1.0),
-        default_step_timeout=_opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT),
+        default_step_timeout=default_step_timeout,
     )
 
 

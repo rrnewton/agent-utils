@@ -123,10 +123,27 @@ Global: `--version`, `-h/--help`. Running with no command prints help and exits 
 | -------------------- | ---------------------------------------------------------------------------------- |
 | `--dag FILE`         | DAG JSON file (`-` = stdin). Required.                                              |
 | `-j, --jobs N`       | Max concurrent steps. Default: the machine's CPU count.                            |
+| `--max-mem SPEC`     | RAM budget (e.g. `8G`, `4096M`): pick the largest `-j` whose modeled worst-case footprint fits. Ignored when `--jobs` is given (`--jobs` wins, with a note). |
+| `--perf-dir DIR`     | Write per-step and whole-run resource-usage CSVs into `DIR` (uses the `CsvMetricsSink`). Prints the CSV paths at the end. |
 | `-k, --keep-going`   | Run every still-runnable step even after a failure; report all failures at the end. |
 | `--cgroups`          | Best-effort Linux cgroup-v2 per-step boxing (see [Status](#status--limitations)).  |
 | `-v`                 | Verbose: stream each step's child output live as it runs.                          |
 | `-q, --quiet`        | Quieter: suppress the per-step PASS summaries (failures are always shown).         |
+
+Memory-aware sizing example — let the runner choose a RAM-safe `-j` from the graph's per-step
+memory hints instead of hard-coding one:
+
+```sh
+safe-ci-dag-runner run --dag dag.json --max-mem 8G
+```
+
+Record resource usage while running:
+
+```sh
+safe-ci-dag-runner run --dag dag.json --perf-dir ./perf
+# writes ./perf/step_profiles_<machine>_<container>.csv (one row per step)
+#    and ./perf/<machine>.csv                            (one whole-run summary row)
+```
 
 By default (`--keep-going` off), the **first genuine failure stops scheduling** and any in-flight
 steps are cancelled and reported as `ABORTED`; steps whose dependencies failed are reported as
@@ -199,14 +216,17 @@ Stated honestly for the 0.1 release:
   full outer-scope re-exec that sets up the two-level box is available through the Python API
   (`safe_ci_dag_runner.cgroup.reexec_in_scope` + `Cgroups`); wiring it automatically into the CLI is
   still to come.
-- **Memory-aware `-j` is API-only for now.** The CLI runs at `-j`/CPU-count. The memory model and the
-  "largest `-jN` that fits a RAM budget" solver (`jobs_for_budget`, `schedulable_peak_mem_bytes`) are
-  available in the Python API and can be used to choose a RAM-safe `-j` yourself; per-step inner
-  memory caps *are* applied automatically when cgroup boxing is active.
-- **Per-step CSV metrics are baseline / experimental.** A custom `MetricsSink` works today (the
-  default is a no-op that records nothing). The bundled file-backed `CsvMetricsSink` does not yet
-  accept the scheduler's per-step row schema, so prefer `metrics=None` (the default) or your own sink
-  for the 0.1 release. See the troubleshooting section of the user guide.
+- **Memory-aware `-j` is wired into the CLI.** Pass `run --max-mem 8G` to have the runner pick the
+  largest `-j` whose modeled worst-case footprint fits the budget, using the same memory model
+  (`jobs_for_budget`, `schedulable_peak_mem_bytes`) available in the Python API. An explicit `--jobs`
+  always overrides `--max-mem` (a note is printed when both are given). Per-step inner memory caps
+  *are* applied automatically when cgroup boxing is active.
+- **Per-step CSV metrics work.** The bundled file-backed `CsvMetricsSink` records the scheduler's
+  per-step rows (one row per step) plus a whole-run summary row; use it from the CLI with
+  `run --perf-dir DIR`, or pass `metrics=CsvMetricsSink(dir, git_sha=...)` to `run_dag` in the Python
+  API. The header is derived from the actual row keys, so dynamic per-step columns (e.g. `cgroup
+  cpu.*` counters, present only when cgroup boxing is active) are captured without configuration. The
+  default remains a no-op sink that records nothing.
 - **The Rust crate is a stub.** It currently answers only `--version`/`--help`; the runner is being
   ported and kept behaviorally identical to the Python build via differential tests. Use the Python
   package for real work.

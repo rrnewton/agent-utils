@@ -8,9 +8,10 @@ DeepScry/MTG specific. The generic contract:
   (``pct_we`` / ``pct_other`` / ``total_busy_pct``) is derived from ``/proc/stat`` sampled
   at window start and end vs. ``RUSAGE_CHILDREN`` CPU-seconds, so an uncontended run (we
   had the box) is distinguishable from a contended one (other work ate the cores).
-* :func:`append_step_profiles` appends per-step cgroup measurement rows to a
-  machine/container-specific CSV using the self-migrating :data:`STEP_PROFILE_COLUMNS`
-  schema.
+* :func:`append_step_profiles` appends per-step measurement rows to a
+  machine/container-specific CSV. The header is the standard :data:`STEP_PROFILE_COLUMNS`
+  (run context plus the scheduler's per-step keys) widened with any dynamic per-row keys
+  (e.g. ``cpu.*`` counters); it widens across runs without ever dropping a column.
 * :class:`CsvMetricsSink` is a concrete file-backed implementation of the
   :class:`~safe_ci_dag_runner.protocols.MetricsSink` protocol wiring the two together.
 
@@ -79,25 +80,19 @@ CSV_COLUMNS = [
     "jobs",            # effective scheduler fan-out (-j)
 ]
 
-#: Per-step profile columns, keyed by ``machine_id`` + ``container_class``.
+#: Standard per-step profile columns, keyed by ``machine_id`` + ``container_class``. These
+#: match exactly what the scheduler emits: the run context stamped by
+#: :func:`append_step_profiles`, followed by the per-step measurement keys the scheduler
+#: builds in ``scheduler._run_step`` (its ``row`` dict). Dynamic ``cpu.*`` counters vary by
+#: cgroup manager and are appended per run AFTER these standard columns (see
+#: :func:`_step_profile_fieldnames`), so they are captured without being hard-coded here.
 STEP_PROFILE_COLUMNS = [
+    # Run context, stamped onto every row by append_step_profiles().
     "timestamp", "machine_id", "container_class", "git_sha", "outer_jobs",
-    "step", "classification", "inner_jobs", "duration_s", "effective_cores",
-    "quota_utilization_pct", "throttled_s", "memory_peak_bytes", "thread_peak",
-    "load1_start", "load1_end", "load5_start", "load5_end",
-    "external_cpu_s", "external_cores", "co_tenants_start", "co_tenants_end",
-    "ambient_bucket",
-    "host_cpu_psi_avg10_start", "host_cpu_psi_avg10_end",
-    "host_cpu_psi_avg60_start", "host_cpu_psi_avg60_end",
-    "host_memory_psi_avg10_start", "host_memory_psi_avg10_end",
-    "host_memory_psi_avg60_start", "host_memory_psi_avg60_end",
-    "host_io_psi_avg10_start", "host_io_psi_avg10_end",
-    "host_io_psi_avg60_start", "host_io_psi_avg60_end",
-    "step_cpu_psi_avg10_start", "step_cpu_psi_avg10_end",
-    "step_cpu_psi_avg60_start", "step_cpu_psi_avg60_end",
-    "profile_base_sha",
-    "enforcement_kind",
-    "runner_name",
+    "profile_base_sha", "enforcement_kind", "runner_name",
+    # Per-step measurements produced by the scheduler.
+    "step", "classification", "inner_jobs", "elapsed_s", "returncode", "ok",
+    "timed_out", "oom_kills", "peak_bytes", "thread_peak",
 ]
 
 
@@ -188,18 +183,20 @@ def append_step_profiles(
     enforcement_kind: str = "unverified",
     runner_name: str = "local",
 ) -> Path | None:
-    """Append per-step cgroup measurement ``rows`` to a machine/container-specific CSV.
+    """Append per-step measurement ``rows`` to a machine/container-specific CSV.
 
     The file is ``<output_dir>/step_profiles_<machine_id>_<container_class>.csv``. Each row
-    is a heterogeneous column->value mapping owned by the caller; the shared run context
-    (timestamp, machine id, container class, git SHA, outer job count, and the
-    provenance columns) is stamped onto every row here. Writes are serialized with an
-    ``flock`` sidecar so concurrent runs on one machine do not interleave.
+    is a heterogeneous column->value mapping owned by the caller (the scheduler's per-step
+    ``row``); the shared run context (timestamp, machine id, container class, git SHA, outer
+    job count, and the provenance columns) is stamped onto every row here. Writes are
+    serialized with an ``flock`` sidecar so concurrent runs on one machine do not interleave.
 
-    The schema self-migrates: if an existing file's header differs from
-    :data:`STEP_PROFILE_COLUMNS`, it is rewritten to the current column set (dropping
-    unknown columns, filling absent ones blank) before appending. Returns the CSV path, or
-    ``None`` if the output directory could not be created (a visible warning is emitted).
+    The header is derived from the ACTUAL row keys: the standard columns
+    (:data:`STEP_PROFILE_COLUMNS`) come first, then any extra per-row keys (dynamic ``cpu.*``
+    counters) are appended in first-seen order, so no real data is ever dropped. If an
+    existing file has a narrower header it is widened in place (older rows keep their columns)
+    before appending. The file is created on first write. Returns the CSV path, or ``None``
+    if the output directory could not be created (a visible warning is emitted).
 
     ``profile_base_sha`` defaults to ``git_sha``. ``enforcement_kind`` / ``runner_name``
     are recorded verbatim (neutral defaults replace the DeepScry env-var reads)."""
@@ -208,81 +205,88 @@ def append_step_profiles(
         return None
     path = logs_dir / f"step_profiles_{machine_id()}_{container_class()}.csv"
     lock_path = path.with_suffix(path.suffix + ".lock")
+    common: dict[str, object] = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "machine_id": machine_id(),
+        "container_class": container_class(),
+        "git_sha": git_sha,
+        "outer_jobs": outer_jobs,
+        "profile_base_sha": git_sha if profile_base_sha is None else profile_base_sha,
+        "enforcement_kind": enforcement_kind,
+        "runner_name": runner_name,
+    }
+    full_rows = [{**common, **row} for row in rows]
+    fieldnames = _step_profile_fieldnames(full_rows)
     with open(lock_path, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        _migrate_step_profile_schema(path)
-        new = not path.exists() or path.stat().st_size == 0
-        with open(path, "a", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=STEP_PROFILE_COLUMNS)
-            if new:
-                writer.writeheader()
-            common: dict[str, object] = {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                "machine_id": machine_id(),
-                "container_class": container_class(),
-                "git_sha": git_sha,
-                "outer_jobs": outer_jobs,
-                "profile_base_sha": git_sha if profile_base_sha is None else profile_base_sha,
-                "enforcement_kind": enforcement_kind,
-                "runner_name": runner_name,
-            }
-            for row in rows:
-                writer.writerow({**common, **row})
+        _append_rows_merging_header(path, full_rows, fieldnames)
     return path
 
 
-def _migrate_step_profile_schema(path: Path) -> None:
-    """Rewrite ``path`` in place to the exact :data:`STEP_PROFILE_COLUMNS` header when its
-    current header differs (append-column or column-drop drift). No-op when the file is
-    absent, empty, or already current. Caller holds the ``flock``."""
-    if not (path.exists() and path.stat().st_size):
-        return
-    with open(path, newline="") as existing:
-        reader = csv.DictReader(existing)
-        if (reader.fieldnames or []) == STEP_PROFILE_COLUMNS:
-            return
-        old_rows = list(reader)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", newline="") as migrated:
-        writer = csv.DictWriter(migrated, fieldnames=STEP_PROFILE_COLUMNS)
-        writer.writeheader()
-        for old_row in old_rows:
-            old_row.pop(None, None)  # drop csv restkey overflow
-            writer.writerow({name: old_row.get(name, "") for name in STEP_PROFILE_COLUMNS})
-    os.replace(tmp, path)
+def _step_profile_fieldnames(rows: Sequence[Mapping[str, object]]) -> list[str]:
+    """Per-step CSV column order: the standard columns (:data:`STEP_PROFILE_COLUMNS`) first,
+    then any extra per-row keys (dynamic ``cpu.*`` counters) in first-seen order. Always
+    captures the standard keys and never drops real row data (No Silent Failure)."""
+    fields = list(STEP_PROFILE_COLUMNS)
+    seen = set(fields)
+    for row in rows:
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+    return fields
+
+
+def _append_rows_merging_header(
+    csv_path: Path, rows: Sequence[Mapping[str, object]], fieldnames: Sequence[str]
+) -> None:
+    """Append ``rows`` to ``csv_path`` under a header that is the union of any pre-existing
+    header and ``fieldnames`` (existing columns first, then new columns appended).
+
+    Creates the file with ``fieldnames`` when it is absent or empty; when an existing header
+    is narrower, the file is rewritten to the widened header first so older rows keep their
+    columns and no column is ever dropped. Each row is projected onto the final header, so an
+    extra key that somehow escaped ``fieldnames`` is stored under a column (never a raise) as
+    long as it is in the header. The caller holds any needed lock.
+
+    This is the single place first-write file creation is handled: the file is opened for
+    reading ONLY when it already exists, so a brand-new CSV is created cleanly instead of
+    raising ``FileNotFoundError``."""
+    new = not csv_path.exists() or csv_path.stat().st_size == 0
+    if new:
+        header = list(fieldnames)
+    else:
+        with open(csv_path, newline="") as existing:
+            reader = csv.DictReader(existing)
+            header = list(reader.fieldnames or [])
+            old_rows = list(reader)
+        widened = list(header)
+        for col in fieldnames:
+            if col not in widened:
+                widened.append(col)
+        if widened != header:
+            tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+            with open(tmp, "w", newline="") as out:
+                writer = csv.DictWriter(out, fieldnames=widened)
+                writer.writeheader()
+                for old_row in old_rows:
+                    old_row.pop(None, None)  # drop csv restkey overflow
+                    writer.writerow({col: old_row.get(col, "") for col in widened})
+            os.replace(tmp, csv_path)
+            header = widened
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        if new:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({col: row.get(col, "") for col in header})
 
 
 def _append_whole_run_row(csv_path: Path, row: Mapping[str, object]) -> None:
     """Append one whole-run summary ``row`` to ``csv_path`` under the additive
-    :data:`CSV_COLUMNS` schema. Unlike the per-step schema (which is rewritten to the exact
-    column set), the whole-run schema MERGES any pre-existing columns with the current ones
-    so older, wider files keep their extra columns intact."""
-    new = not csv_path.exists()
-    if not new:
-        with open(csv_path, newline="") as f:
-            old_fields = list(csv.DictReader(f).fieldnames or [])
-        if old_fields != CSV_COLUMNS:
-            merged_fields = list(old_fields)
-            for col in CSV_COLUMNS:
-                if col not in merged_fields:
-                    merged_fields.append(col)
-            with open(csv_path, newline="") as f:
-                old_rows = list(csv.DictReader(f))
-            tmp = csv_path.with_suffix(csv_path.suffix + ".tmp")
-            with open(tmp, "w", newline="") as out:
-                w = csv.DictWriter(out, fieldnames=merged_fields)
-                w.writeheader()
-                for old_row in old_rows:
-                    old_row.pop(None, None)
-                    w.writerow({col: old_row.get(col, "") for col in merged_fields})
-            os.replace(tmp, csv_path)
-    with open(csv_path, newline="") as existing:
-        fieldnames = list(csv.DictReader(existing).fieldnames or []) if not new else CSV_COLUMNS
-    with open(csv_path, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if new:
-            w.writeheader()
-        w.writerow({col: row.get(col, "") for col in fieldnames})
+    :data:`CSV_COLUMNS` schema, merging with any pre-existing (possibly wider) header so
+    older files keep their extra columns intact. The file is created on first write."""
+    _append_rows_merging_header(csv_path, [row], CSV_COLUMNS)
 
 
 # ---------------------------------------------------------------------------

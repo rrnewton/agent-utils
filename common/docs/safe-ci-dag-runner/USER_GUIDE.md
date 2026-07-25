@@ -52,8 +52,9 @@ resource gating are enforced independently.
 **Memory-aware `-j`.** Rather than a flat "N GB per job" guess, the memory model enumerates which
 steps could *actually* co-run — no transitive dependency between them, and their summed resource
 demand fits the caps — and takes the worst-case sum of their per-step memory caps. That yields an
-exact "largest `-jN` that fits budget M." (In 0.1 this is a Python-API helper, `jobs_for_budget`; the
-CLI's default `-j` is the CPU count.)
+exact "largest `-jN` that fits budget M." Use it from the CLI with `run --max-mem 8G`, or from the
+Python API with the `jobs_for_budget` helper. The CLI's default `-j` (when neither `--jobs` nor
+`--max-mem` is given) is the CPU count; an explicit `--jobs` always overrides `--max-mem`.
 
 **cgroup boxing.** On a Linux cgroup-v2 host with a *delegated* hierarchy, the runner can put the
 whole run in an outer CPU/memory box and each step in its own nested box. The payoff is twofold:
@@ -265,7 +266,14 @@ outside the subset are dropped from the drawing).
 
 ### Choosing a RAM-safe `-j` (memory-aware sizing)
 
-The CLI defaults `-j` to the CPU count, but you can size it to real memory in the API:
+From the CLI, pass a budget and let the runner size `-j`:
+
+```sh
+safe-ci-dag-runner run --dag dag.json --max-mem 8G
+```
+
+It picks the largest `-j` whose modeled worst-case footprint fits `8G` and prints the decision. An
+explicit `--jobs` overrides `--max-mem` (with a note). The same is available in the API:
 
 ```python
 from safe_ci_dag_runner import jobs_for_budget, mem_available_bytes, run_dag
@@ -305,8 +313,24 @@ class MySink(MetricsSink):
 run_dag(DagConfig(steps=(Step("build", "app", "compile", "echo hi"),)), jobs=2, metrics=MySink())
 ```
 
-A file-backed `CsvMetricsSink` also ships, but it is baseline/experimental in 0.1 — see
-troubleshooting below. The safe default is `metrics=None` (record nothing).
+A file-backed `CsvMetricsSink` also ships and works out of the box. It writes one CSV row per step
+plus a whole-run summary row into a directory you choose:
+
+```python
+from safe_ci_dag_runner import run_dag, CsvMetricsSink
+
+sink = CsvMetricsSink("./perf", git_sha="deadbeef")   # git_sha stamps every row
+run_dag(cfg, jobs=4, metrics=sink)
+# ./perf/step_profiles_<machine>_<container>.csv  (one row per step; columns derived from the
+#                                                  actual row keys, incl. dynamic cgroup cpu.* )
+# ./perf/<machine>.csv                            (one whole-run summary row: wall time, CPU
+#                                                  contention split, cores, result)
+```
+
+The CLI wraps this as `run --perf-dir ./perf`. The safe default remains `metrics=None` (record
+nothing). Note the dynamic `cpu.*` per-step columns only appear when cgroup boxing is active
+(`--cgroups` inside a delegated scope); without it, those measurements are unavailable and the CSV
+simply omits them.
 
 ### Plugging in cgroup containment
 
@@ -370,9 +394,14 @@ auto-disabled whenever stdout is not a terminal.
 step's captured detail go to **stdout**; the final `PASS`/`FAIL` summary line goes to **stderr**. So
 `run ... 2>/dev/null` hides only the summary line.
 
-**`CsvMetricsSink` raises `ValueError: dict contains fields not in fieldnames`.** Known limitation in
-0.1: the bundled file-backed CSV sink does not yet accept the scheduler's per-step row schema. Use
-`metrics=None` (the default) or a custom `MetricsSink` (see above) until it is wired up.
+**`CsvMetricsSink` and the `--perf-dir` CSVs.** The bundled file-backed CSV sink works (this was
+broken before 0.1 and is now fixed): `run_dag(cfg, metrics=CsvMetricsSink(dir, git_sha=...))`, or the
+CLI `run --perf-dir DIR`, writes a per-step CSV and a whole-run CSV, creating the directory and files
+as needed. The per-step CSV's columns are derived from the actual row keys, so it never drops data.
+The dynamic `cpu.*` per-step columns only appear when cgroup boxing is active (see the "containment
+is DEGRADED" note above): the CLI's `--cgroups` only boxes steps when the process is already inside a
+delegated cgroup-v2 scope, so on a plain host those cgroup-derived measurements are simply absent from
+the CSV rather than an error.
 
 **The Rust binary does nothing.** The Rust crate is a stub in 0.1 (only `--version`/`--help`). Use
 the Python package (`pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"`).

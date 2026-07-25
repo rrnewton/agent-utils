@@ -77,6 +77,37 @@ def test_missing_and_malformed_dag_exit_2() -> None:
         assert _capture(["list", "--dag", str(junk)])[0] == 2
 
 
+def test_run_max_mem_exits_0() -> None:
+    # --max-mem picks a memory-aware -j; a passing DAG still exits 0.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["run", "--max-mem", "8G", "--dag", dag, "-q"])
+        assert rc == 0
+        assert "--max-mem 8G" in err  # the sizing decision is surfaced
+
+
+def test_run_jobs_overrides_max_mem() -> None:
+    # When both --jobs and --max-mem are given, --jobs wins with a visible note.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["run", "--jobs", "2", "--max-mem", "8G", "--dag", dag, "-q"])
+        assert rc == 0
+        assert "--jobs=2 wins" in err
+
+
+def test_run_perf_dir_writes_csv() -> None:
+    # --perf-dir writes per-step + whole-run CSVs (the CsvMetricsSink path).
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        perf = Path(tmp) / "perf"
+        rc, _, err = _capture(["run", "--perf-dir", str(perf), "--dag", dag, "-q"])
+        assert rc == 0
+        csvs = list(perf.glob("*.csv"))
+        assert csvs, "expected at least one perf CSV to be written"
+        assert any(p.stat().st_size > 0 for p in csvs)
+        assert "perf CSVs written under" in err
+
+
 def test_version_via_module() -> None:
     # argparse --version exits(0); run as a subprocess so it doesn't kill the test process.
     result = subprocess.run(

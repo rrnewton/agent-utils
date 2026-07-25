@@ -61,6 +61,28 @@ def test_minimal_document_defaults() -> None:
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25
 
 
+def test_default_step_timeout_applied() -> None:
+    # A step that omits `timeout` inherits the document-level default_step_timeout; a step
+    # with its own timeout keeps it; and the config records the document default.
+    doc = (
+        '{"default_step_timeout": 42, "steps": ['
+        '{"group": "g", "job": "a", "cmd": "true"},'
+        '{"group": "g", "job": "b", "cmd": "true", "timeout": 7}]}'
+    )
+    cfg = dag_from_json(doc)
+    by_tag = cfg.by_tag()
+    assert by_tag["g.a"].timeout == 42  # inherited document default
+    assert by_tag["g.b"].timeout == 7  # explicit per-step timeout wins
+    assert cfg.default_step_timeout == 42
+
+
+def test_default_step_timeout_falls_back_to_module_constant() -> None:
+    # Without a document-level default, steps fall back to the module DEFAULT_STEP_TIMEOUT.
+    cfg = dag_from_json('{"steps": [{"group": "g", "job": "a", "cmd": "true"}]}')
+    assert cfg.steps[0].timeout == 1800
+    assert cfg.default_step_timeout == 1800
+
+
 def test_strict_parse_errors() -> None:
     bad_docs = [
         "not json at all",

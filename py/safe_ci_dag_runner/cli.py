@@ -1,20 +1,22 @@
 """Command-line interface for safe-ci-dag-runner.
 
 Subcommands:
-  run FILE        run a DAG (exit 0 iff every step passes)
-  list FILE       list the steps
-  ascii FILE      draw the DAG as ASCII art
-  dot FILE        emit Graphviz DOT (pipe to `dot -Tsvg`)
-  json FILE       re-emit the DAG as canonical JSON
-  quickstart      print a self-contained getting-started guide
+  run --dag FILE    run a DAG (exit 0 iff every step passes)
+  list --dag FILE   list the steps
+  ascii --dag FILE  draw the DAG as ASCII art
+  dot --dag FILE    emit Graphviz DOT (pipe to `dot -Tsvg`)
+  json --dag FILE   re-emit the DAG as canonical JSON
+  quickstart        print a self-contained getting-started guide
 
 A DAG is a JSON file (see `quickstart` for the schema + a runnable example).
+Pass `--dag -` to read the DAG from stdin.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -22,8 +24,9 @@ from pathlib import Path
 from safe_ci_dag_runner import __version__
 from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
 from safe_ci_dag_runner.model import DagConfig, step_classification
-from safe_ci_dag_runner.protocols import CgroupManager
+from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink
 from safe_ci_dag_runner.scheduler import run_dag
+from safe_ci_dag_runner.sizing import jobs_for_budget, parse_size
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
 PROG = "safe-ci-dag-runner"
@@ -118,7 +121,7 @@ def _quickstart(c: Palette) -> str:
           classification("cpu-bound"|"latency-bound"|"light"), preferred_inner_jobs
   top:    resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
           outer_mem_safety_factor, default_step_timeout
-  {c.dim('resource_caps bound concurrent demand - e.g. {{"browser":1}} serializes browser steps.')}
+  {c.dim('resource_caps bound concurrent demand - e.g. {"browser":1} serializes browser steps.')}
 
 {h('What you get')}
   - concurrent scheduling in longest-first order, honoring deps + resource caps
@@ -126,6 +129,9 @@ def _quickstart(c: Palette) -> str:
     ({k('--keep-going')} runs everything runnable and reports all failures)
   - {k('run --cgroups')} adds best-effort Linux cgroup-v2 per-step memory/CPU boxing
     {c.dim('(needs cgroup-v2; without it, steps run un-boxed with a visible warning)')}
+  - {k('run --max-mem 8G')} picks the largest -j whose modeled worst-case RAM fits the budget
+    {c.dim('(--jobs, when given, overrides this)')}
+  - {k('run --perf-dir DIR')} writes per-step + whole-run resource-usage CSVs into DIR
 
 {h('Python API')}  {c.dim('(same engine, in code)')}
   from safe_ci_dag_runner import Step, ResourceHint, DagConfig, run_dag, to_ascii
@@ -169,6 +175,19 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="run a DAG (exit 0 iff every step passes)")
     run_p.add_argument("--dag", required=True, metavar="FILE", help="DAG JSON file ('-' = stdin)")
     run_p.add_argument("-j", "--jobs", type=int, default=None, help="max concurrent steps (default: CPU count)")
+    run_p.add_argument(
+        "--max-mem",
+        metavar="SPEC",
+        default=None,
+        help="RAM budget (e.g. 8G, 4096M); pick the largest -j whose modeled worst-case "
+        "footprint fits (ignored when --jobs is given)",
+    )
+    run_p.add_argument(
+        "--perf-dir",
+        metavar="DIR",
+        default=None,
+        help="write per-step + whole-run resource-usage CSVs into DIR",
+    )
     run_p.add_argument("-k", "--keep-going", action="store_true", help="run all runnable steps even after a failure")
     run_p.add_argument("--cgroups", action="store_true", help="best-effort Linux cgroup-v2 per-step boxing")
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
@@ -192,16 +211,82 @@ def _load(dag_arg: str) -> DagConfig:
     return dag_from_json(text)
 
 
+def _git_sha() -> str:
+    """Best-effort git SHA of the current working directory's repo, or ``"unknown"``.
+
+    Used only to stamp perf-log rows (``--perf-dir``); it must never fail the run, so any
+    error (not a repo, git absent, timeout) degrades to ``"unknown"``."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    return proc.stdout.strip() or "unknown"
+
+
+def _select_jobs(cfg: DagConfig, ns: argparse.Namespace) -> int:
+    """Choose the outer scheduler fan-out (``-j``).
+
+    Precedence: an explicit ``--jobs`` always wins; otherwise ``--max-mem`` picks the largest
+    ``-j`` whose modeled worst-case memory footprint fits the budget; otherwise default to the
+    CPU count. When BOTH ``--jobs`` and ``--max-mem`` are given, ``--jobs`` wins and the
+    memory-aware sizing is skipped with a visible note (No Silent Failure)."""
+    max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
+    if isinstance(ns.jobs, int):
+        if max_mem is not None:
+            print(
+                f"{PROG}: both --jobs and --max-mem given; --jobs={ns.jobs} wins, "
+                "--max-mem sizing skipped",
+                file=sys.stderr,
+            )
+        return ns.jobs
+    if max_mem is not None:
+        budget = parse_size(max_mem)
+        if budget is None:
+            print(
+                f"{PROG}: could not parse --max-mem {max_mem!r}; falling back to CPU count",
+                file=sys.stderr,
+            )
+        else:
+            jobs, footprint = jobs_for_budget(cfg, budget)
+            print(
+                f"{PROG}: --max-mem {max_mem} -> -j{jobs} "
+                f"(modeled worst-case {footprint} bytes fits budget {budget} bytes)",
+                file=sys.stderr,
+            )
+            return jobs
+    return os.cpu_count() or 4
+
+
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
-    jobs = ns.jobs if isinstance(ns.jobs, int) else (os.cpu_count() or 4)
+    jobs = _select_jobs(cfg, ns)
     verbosity = 0 if bool(ns.quiet) else int(ns.verbosity)
     cgroups: CgroupManager | None = None
     if bool(ns.cgroups):
         from safe_ci_dag_runner.cgroup import Cgroups
 
         cgroups = Cgroups()
+
+    perf_dir = ns.perf_dir if isinstance(ns.perf_dir, str) and ns.perf_dir else None
+    metrics: MetricsSink | None = None
+    if perf_dir is not None:
+        from safe_ci_dag_runner.perflog import CsvMetricsSink
+
+        metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
+
     result = run_dag(
-        cfg, jobs=jobs, cgroups=cgroups, keep_going=bool(ns.keep_going), verbosity=verbosity
+        cfg,
+        jobs=jobs,
+        cgroups=cgroups,
+        metrics=metrics,
+        keep_going=bool(ns.keep_going),
+        verbosity=verbosity,
     )
     passed = sum(1 for o in result.outcomes if o.ok)
     failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)
@@ -212,6 +297,17 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         f"{len(result.skipped)} skipped in {result.wall_s:.1f}s",
         file=sys.stderr,
     )
+    if perf_dir is not None:
+        written = sorted(str(p) for p in Path(perf_dir).glob("*.csv"))
+        if written:
+            print(f"{PROG}: perf CSVs written under {perf_dir}:", file=sys.stderr)
+            for path in written:
+                print(f"  {path}", file=sys.stderr)
+        else:
+            print(
+                f"{PROG}: WARNING no perf CSVs were written under {perf_dir}",
+                file=sys.stderr,
+            )
     return 0 if result.ok else 1
 
 
