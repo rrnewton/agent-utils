@@ -135,7 +135,7 @@ def _quickstart(c: Palette) -> str:
 
 {h('Python API')}  {c.dim('(same engine, in code)')}
   from safe_ci_dag_runner import Step, ResourceHint, DagConfig, run_dag, to_ascii
-  cfg = DagConfig(steps=(Step("build","app","compile","make build"),))
+  cfg = DagConfig(steps=(Step("build","app","compile","echo build && sleep 0.1"),))
   print(to_ascii(cfg)); result = run_dag(cfg, jobs=4)   # result.ok, result.outcomes
 
 {h('Exit codes')}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file

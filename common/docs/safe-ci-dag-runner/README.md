@@ -172,10 +172,10 @@ from safe_ci_dag_runner import Step, ResourceHint, DagConfig, run_dag, to_ascii
 
 cfg = DagConfig(
     steps=(
-        Step("build", "app", "compile", "make build",
+        Step("build", "app", "compile", "echo building && sleep 0.1",
              hint=ResourceHint(est_duration_s=90, rss_baseline_bytes=2 * 1024**3)),
-        Step("test", "unit", "unit tests", "make test", deps=["build.app"]),
-        Step("e2e", "smoke", "browser smoke", "make e2e", deps=["build.app"],
+        Step("test", "unit", "unit tests", "echo unit && sleep 0.1", deps=["build.app"]),
+        Step("e2e", "smoke", "browser smoke", "echo e2e && sleep 0.1", deps=["build.app"],
              hint=ResourceHint(resources={"browser": 1})),
     ),
     resource_caps={"browser": 1},   # at most one browser step at a time
