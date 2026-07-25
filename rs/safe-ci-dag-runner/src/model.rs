@@ -376,7 +376,7 @@ impl StepOutcome {
 }
 
 /// Aggregate outcome of a whole DAG run.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunResult {
     /// Overall pass/fail (no genuine, non-aborted failure occurred).
     pub ok: bool,
@@ -386,6 +386,9 @@ pub struct RunResult {
     pub outcomes: Vec<StepOutcome>,
     /// Tags whose dependencies failed so they never ran (sorted).
     pub skipped: Vec<String>,
+    /// Per-step measurement rows (column -> value) to forward to a metrics sink; empty when no
+    /// cgroup manager supplied per-step metrics.
+    pub step_profile_rows: Vec<BTreeMap<String, String>>,
 }
 
 #[cfg(test)]

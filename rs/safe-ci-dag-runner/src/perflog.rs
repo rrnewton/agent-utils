@@ -1,0 +1,537 @@
+//! Always-on perf logging for a DAG run: whole-run window + per-step profile CSVs.
+//!
+//! Rust port of `perflog.py`, matching its on-disk SCHEMA:
+//! * [`CSV_COLUMNS`] — one whole-run summary row per run, in `<output_dir>/<machine_id>.csv`.
+//! * [`STEP_PROFILE_COLUMNS`] — per-step measurement rows, in
+//!   `<output_dir>/step_profiles_<machine_id>_<container_class>.csv`, widened per run with any
+//!   dynamic `cpu.*` keys (existing columns first, new columns appended; no column ever dropped).
+//!
+//! The contention split (`pct_we` / `pct_other` / `total_busy_pct`) is derived from `/proc/stat`
+//! sampled at window start/end vs. this process's accumulated CHILD CPU time (from
+//! `/proc/self/stat` `cutime`/`cstime`, the getrusage(RUSAGE_CHILDREN) analogue — read without
+//! `unsafe`). The output directory is an explicit argument and is created on demand; a failure to
+//! create/write it is a visible warning (No Silent Failure), never a silent skip.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use crate::ambient::host_busy_jiffies;
+
+/// Whole-run summary columns (append-only: never reorder or remove).
+pub const CSV_COLUMNS: [&str; 15] = [
+    "timestamp",
+    "machine_id",
+    "git_sha",
+    "nproc",
+    "wall_s",
+    "user_s",
+    "sys_s",
+    "result",
+    "n_steps",
+    "pct_we",
+    "pct_other",
+    "total_busy_pct",
+    "ipc",
+    "cache_miss_pct",
+    "jobs",
+];
+
+/// Standard per-step profile columns (dynamic `cpu.*` keys are appended per run AFTER these).
+pub const STEP_PROFILE_COLUMNS: [&str; 18] = [
+    "timestamp",
+    "machine_id",
+    "container_class",
+    "git_sha",
+    "outer_jobs",
+    "profile_base_sha",
+    "enforcement_kind",
+    "runner_name",
+    "step",
+    "classification",
+    "inner_jobs",
+    "elapsed_s",
+    "returncode",
+    "ok",
+    "timed_out",
+    "oom_kills",
+    "peak_bytes",
+    "thread_peak",
+];
+
+/// A per-step measurement row (heterogeneous column -> value, matching the CSV).
+pub type ProfileRow = BTreeMap<String, String>;
+
+/// Per-machine identifier from `/proc/cpuinfo` "model name" (spaces -> `_`, then non
+/// `[A-Za-z0-9_-]` stripped). Falls back to the hostname, then `"unknown"`.
+pub fn machine_id() -> String {
+    let sanitize = |name: &str| -> String {
+        name.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            .collect()
+    };
+    if let Ok(text) = fs::read_to_string("/proc/cpuinfo") {
+        for line in text.lines() {
+            if line.starts_with("model name") {
+                if let Some((_, v)) = line.split_once(':') {
+                    let underscored = v.trim().replace(' ', "_");
+                    let cleaned = sanitize(&underscored);
+                    if !cleaned.is_empty() {
+                        return cleaned;
+                    }
+                }
+            }
+        }
+    }
+    let host = fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
+    let cleaned = sanitize(host.trim());
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Cores this run could use (respects CPU affinity), mirroring Python's `nproc()`.
+pub fn nproc() -> i64 {
+    std::thread::available_parallelism()
+        .map(|n| n.get() as i64)
+        .unwrap_or_else(|_| crate::sizing::cpu_count())
+}
+
+/// Stable CPU-container key: affinity width plus the cgroup-v2 CPU quota (`/sys/fs/cgroup/cpu.max`).
+pub fn container_class() -> String {
+    let quota = fs::read_to_string("/sys/fs/cgroup/cpu.max")
+        .map(|s| s.trim().replace(' ', "_"))
+        .unwrap_or_else(|_| "unknown".to_string());
+    format!("affinity{}_cpu-max-{}", nproc(), quota)
+}
+
+/// This process's accumulated CHILD (user, sys) CPU seconds, from `/proc/self/stat`
+/// `cutime`/`cstime` (fields 16/17, in clock ticks). The getrusage(RUSAGE_CHILDREN) analogue.
+fn child_cpu_seconds() -> (f64, f64) {
+    let text = match fs::read_to_string("/proc/self/stat") {
+        Ok(t) => t,
+        Err(_) => return (0.0, 0.0),
+    };
+    // The comm field (2) may contain spaces/parens; fields resume after the LAST ')'.
+    let after = match text.rfind(')') {
+        Some(i) => &text[i + 1..],
+        None => return (0.0, 0.0),
+    };
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    // After ')', token[0] is field 3 (state); field N is token[N-3].
+    let cutime = fields
+        .get(13)
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let cstime = fields
+        .get(14)
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0);
+    let tck = clk_tck() as f64;
+    (cutime / tck, cstime / tck)
+}
+
+fn clk_tck() -> i64 {
+    if let Ok(out) = std::process::Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(n) = String::from_utf8_lossy(&out.stdout).trim().parse::<i64>() {
+                if n > 0 {
+                    return n;
+                }
+            }
+        }
+    }
+    100
+}
+
+/// ISO-8601 UTC timestamp `YYYY-MM-DDTHH:MM:SS` (Python emits local time; the column value is not
+/// cross-compared, only the schema is, so UTC is fine and dependency-free).
+fn timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
+}
+
+/// Howard Hinnant's days-from-civil inverse (days since 1970-01-01 -> (year, month, day)).
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn ensure_dir(output_dir: &Path) -> Option<PathBuf> {
+    match fs::create_dir_all(output_dir) {
+        Ok(()) => Some(output_dir.to_path_buf()),
+        Err(e) => {
+            eprintln!(
+                "[perflog] skipped: cannot create output dir {} ({e})",
+                output_dir.display()
+            );
+            None
+        }
+    }
+}
+
+// --- minimal CSV field escaping (quote when the value has a comma/quote/newline) ---
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if c == '"' {
+            in_quotes = true;
+        } else if c == ',' {
+            out.push(std::mem::take(&mut field));
+        } else {
+            field.push(c);
+        }
+    }
+    out.push(field);
+    out
+}
+
+fn write_row(out: &mut String, header: &[String], row: &BTreeMap<String, String>) {
+    let cells: Vec<String> = header
+        .iter()
+        .map(|col| csv_field(row.get(col).map(String::as_str).unwrap_or("")))
+        .collect();
+    out.push_str(&cells.join(","));
+    out.push('\n');
+}
+
+/// Append `rows` under a header that is the union of any pre-existing header and `fieldnames`
+/// (existing columns first, then new columns appended). Widens an existing narrower file in place.
+fn append_rows_merging_header(
+    csv_path: &Path,
+    rows: &[BTreeMap<String, String>],
+    fieldnames: &[String],
+) -> std::io::Result<()> {
+    let existing = fs::read_to_string(csv_path).ok();
+    let is_new = existing.as_deref().map(str::is_empty).unwrap_or(true);
+    if is_new {
+        let mut out = String::new();
+        let header: Vec<String> = fieldnames.to_vec();
+        out.push_str(
+            &header
+                .iter()
+                .map(|h| csv_field(h))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        out.push('\n');
+        for row in rows {
+            write_row(&mut out, &header, row);
+        }
+        return fs::write(csv_path, out);
+    }
+    let text = existing.unwrap();
+    let mut lines = text.lines();
+    let old_header: Vec<String> = lines.next().map(parse_csv_line).unwrap_or_default();
+    let mut widened = old_header.clone();
+    for col in fieldnames {
+        if !widened.contains(col) {
+            widened.push(col.clone());
+        }
+    }
+    let mut out = String::new();
+    out.push_str(
+        &widened
+            .iter()
+            .map(|h| csv_field(h))
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    out.push('\n');
+    if widened != old_header {
+        // Re-project old rows onto the widened header so older rows keep their columns.
+        for line in lines {
+            if line.is_empty() {
+                continue;
+            }
+            let cells = parse_csv_line(line);
+            let old_row: BTreeMap<String, String> = old_header.iter().cloned().zip(cells).collect();
+            write_row(&mut out, &widened, &old_row);
+        }
+    } else {
+        // Header unchanged: keep the existing body verbatim.
+        for line in lines {
+            if !line.is_empty() {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    for row in rows {
+        write_row(&mut out, &widened, row);
+    }
+    fs::write(csv_path, out)
+}
+
+/// Best-effort per-file advisory lock via a `.lock` sidecar (create_new spin), so concurrent runs
+/// on one machine do not interleave. Falls through (unlocked) after a bounded wait rather than
+/// blocking a run on metrics.
+fn with_file_lock<F: FnOnce()>(csv_path: &Path, f: F) {
+    let lock = PathBuf::from(format!("{}.lock", csv_path.display()));
+    let mut held = false;
+    for _ in 0..200 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(_) => {
+                held = true;
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+    f();
+    if held {
+        let _ = fs::remove_file(&lock);
+    }
+}
+
+/// Append per-step measurement `rows` to a machine/container-specific CSV. Returns the path, or
+/// `None` when the output dir could not be created (a visible warning is emitted).
+#[allow(clippy::too_many_arguments)]
+pub fn append_step_profiles(
+    output_dir: &Path,
+    rows: &[ProfileRow],
+    git_sha: &str,
+    outer_jobs: i64,
+    profile_base_sha: Option<&str>,
+    enforcement_kind: &str,
+    runner_name: &str,
+) -> Option<PathBuf> {
+    let dir = ensure_dir(output_dir)?;
+    let mid = machine_id();
+    let cc = container_class();
+    let path = dir.join(format!("step_profiles_{mid}_{cc}.csv"));
+    let mut common: BTreeMap<String, String> = BTreeMap::new();
+    common.insert("timestamp".into(), timestamp());
+    common.insert("machine_id".into(), mid);
+    common.insert("container_class".into(), cc);
+    common.insert("git_sha".into(), git_sha.into());
+    common.insert("outer_jobs".into(), outer_jobs.to_string());
+    common.insert(
+        "profile_base_sha".into(),
+        profile_base_sha.unwrap_or(git_sha).into(),
+    );
+    common.insert("enforcement_kind".into(), enforcement_kind.into());
+    common.insert("runner_name".into(), runner_name.into());
+
+    let full_rows: Vec<BTreeMap<String, String>> = rows
+        .iter()
+        .map(|row| {
+            let mut r = common.clone();
+            for (k, v) in row {
+                r.insert(k.clone(), v.clone());
+            }
+            r
+        })
+        .collect();
+
+    // Field order: the standard columns first, then any extra per-row keys (cpu.*) in first-seen
+    // order across the rows.
+    let mut fieldnames: Vec<String> = STEP_PROFILE_COLUMNS.iter().map(|s| s.to_string()).collect();
+    let mut seen: std::collections::HashSet<String> = fieldnames.iter().cloned().collect();
+    for row in &full_rows {
+        for key in row.keys() {
+            if seen.insert(key.clone()) {
+                fieldnames.push(key.clone());
+            }
+        }
+    }
+
+    let mut result = Some(path.clone());
+    with_file_lock(&path, || {
+        if let Err(e) = append_rows_merging_header(&path, &full_rows, &fieldnames) {
+            eprintln!("[perflog] step-profile write failed ({e})");
+            result = None;
+        }
+    });
+    result
+}
+
+/// A started whole-run measurement bracket; [`PerfWindow::finish`] appends one summary row.
+pub struct PerfWindow {
+    output_dir: PathBuf,
+    git_sha: String,
+    machine_id: String,
+    wall_start: Instant,
+    user_start: f64,
+    sys_start: f64,
+    busy_start: Option<i64>,
+}
+
+impl PerfWindow {
+    /// Open the window, capturing baseline counters at the current instant.
+    pub fn start(output_dir: &Path, git_sha: &str) -> Self {
+        let (u, s) = child_cpu_seconds();
+        PerfWindow {
+            output_dir: output_dir.to_path_buf(),
+            git_sha: git_sha.to_string(),
+            machine_id: machine_id(),
+            wall_start: Instant::now(),
+            user_start: u,
+            sys_start: s,
+            busy_start: host_busy_jiffies(Path::new("/proc/stat")),
+        }
+    }
+
+    /// Compute window metrics and append the summary row (recorded for pass AND fail).
+    pub fn finish(&self, result: &str, n_steps: usize, jobs: i64) -> Option<PathBuf> {
+        let wall = self.wall_start.elapsed().as_secs_f64().max(0.0);
+        let (u_end, s_end) = child_cpu_seconds();
+        let user_s = (u_end - self.user_start).max(0.0);
+        let sys_s = (s_end - self.sys_start).max(0.0);
+        let ncpu = nproc();
+        let capacity = if wall > 0.0 { ncpu as f64 * wall } else { 0.0 };
+        let our_cpu = user_s + sys_s;
+
+        let pct = |x: f64| -> String {
+            if capacity > 0.0 {
+                format!("{:.2}", 100.0 * x / capacity)
+            } else {
+                String::new()
+            }
+        };
+        let pct_we = pct(our_cpu);
+        let (pct_other, total_busy_pct) =
+            match (self.busy_start, host_busy_jiffies(Path::new("/proc/stat"))) {
+                (Some(a), Some(b)) => {
+                    let total_busy_s = ((b - a).max(0)) as f64 / clk_tck() as f64;
+                    (pct((total_busy_s - our_cpu).max(0.0)), pct(total_busy_s))
+                }
+                _ => (String::new(), String::new()),
+            };
+
+        let mut row: BTreeMap<String, String> = BTreeMap::new();
+        row.insert("timestamp".into(), timestamp());
+        row.insert("machine_id".into(), self.machine_id.clone());
+        row.insert("git_sha".into(), self.git_sha.clone());
+        row.insert("nproc".into(), ncpu.to_string());
+        row.insert("wall_s".into(), format!("{:.1}", wall));
+        row.insert("user_s".into(), format!("{:.1}", user_s));
+        row.insert("sys_s".into(), format!("{:.1}", sys_s));
+        row.insert("result".into(), result.to_string());
+        row.insert("n_steps".into(), n_steps.to_string());
+        row.insert("pct_we".into(), pct_we);
+        row.insert("pct_other".into(), pct_other);
+        row.insert("total_busy_pct".into(), total_busy_pct);
+        row.insert("ipc".into(), String::new());
+        row.insert("cache_miss_pct".into(), String::new());
+        row.insert("jobs".into(), jobs.to_string());
+
+        let dir = ensure_dir(&self.output_dir)?;
+        let path = dir.join(format!("{}.csv", self.machine_id));
+        let fieldnames: Vec<String> = CSV_COLUMNS.iter().map(|s| s.to_string()).collect();
+        let mut result_path = Some(path.clone());
+        with_file_lock(&path, || {
+            if let Err(e) =
+                append_rows_merging_header(&path, std::slice::from_ref(&row), &fieldnames)
+            {
+                eprintln!("[perflog] whole-run row skipped ({e})");
+                result_path = None;
+            }
+        });
+        result_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn civil_from_days_epoch() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(31), (1970, 2, 1));
+    }
+
+    #[test]
+    fn timestamp_shape() {
+        let ts = timestamp();
+        assert_eq!(ts.len(), 19);
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[10..11], "T");
+    }
+
+    #[test]
+    fn append_step_profiles_writes_schema_header() {
+        let dir = std::env::temp_dir().join(format!("scdr_perf_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut row: ProfileRow = BTreeMap::new();
+        row.insert("step".into(), "g.j".into());
+        row.insert("classification".into(), "light".into());
+        row.insert("elapsed_s".into(), "0.1".into());
+        row.insert("ok".into(), "true".into());
+        row.insert("cpu.usage_usec".into(), "1234".into()); // dynamic key appended after standard
+        let path = append_step_profiles(&dir, &[row], "abc123", 4, None, "unverified", "local")
+            .expect("path");
+        let text = fs::read_to_string(&path).unwrap();
+        let header = text.lines().next().unwrap();
+        assert!(header.starts_with("timestamp,machine_id,container_class,git_sha,outer_jobs"));
+        assert!(header.contains("step,classification,inner_jobs"));
+        assert!(header.trim_end().ends_with("cpu.usage_usec"));
+        assert!(text.lines().nth(1).unwrap().contains("g.j"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn perf_window_writes_whole_run_row() {
+        let dir = std::env::temp_dir().join(format!("scdr_perfw_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let w = PerfWindow::start(&dir, "deadbeef");
+        let path = w.finish("pass", 3, 4).expect("path");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with("timestamp,machine_id,git_sha,nproc"));
+        assert!(text.lines().nth(1).unwrap().contains("deadbeef"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

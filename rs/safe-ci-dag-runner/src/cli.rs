@@ -9,19 +9,23 @@
 //!   quickstart        print a self-contained getting-started guide
 //!
 //! `list`, `ascii`, `dot`, and `json` stdout is BYTE-IDENTICAL to the Python build; `--help`
-//! and `quickstart` wording may differ but the structure and exit codes (0 / 1 / 2) match.
+//! and `quickstart` wording may differ but the structure and exit codes (0 / 1 / 2 / 3) match.
 //!
-//! Scope note: per-step Linux cgroup boxing and `--perf-dir` (CSV perf logging) are not yet
-//! available in this Rust build (that port is in progress). It accepts the related flags but
-//! degrades VISIBLY (a stderr warning) and runs unboxed / without perf recording — never a
-//! silent skip.
+//! Cgroup boxing is ON by default (this tool's primary purpose): `run` re-execs inside a
+//! transient `systemd-run --user --scope` and caps each step in its own child cgroup. When
+//! cgroup-v2 + a working systemd `--user` scope are unavailable the run ERRORS (exit 3);
+//! `--allow-cgroup-failure` downgrades to a best-effort UNBOXED run with a visible warning.
+//! `--perf-dir DIR` writes per-step + whole-run resource-usage CSVs.
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
+use std::sync::Arc;
 
+use crate::cgroup::{install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups};
 use crate::io::{dag_from_json, dag_to_json, DagJsonError};
 use crate::model::{step_classification, DagConfig};
-use crate::scheduler::run_dag;
+use crate::perflog::{append_step_profiles, PerfWindow};
+use crate::scheduler::{run_dag_boxed, BoxedCgroups};
 use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
 use crate::viz::{to_ascii, to_dot};
 use crate::{PROG, VERSION};
@@ -126,8 +130,8 @@ jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"
 - concurrent scheduling in longest-first order, honoring deps + resource caps\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
 - {maxmem} picks the largest -j whose modeled worst-case RAM fits the budget\n\n\
-{note}  per-step cgroup boxing and perf logging (--perf-dir) are not yet available in this\n        Rust build (port in progress); it runs steps unboxed with a visible warning.\n\n\
-{exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file\n",
+{note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. {perfdir} writes per-step + whole-run resource-usage CSVs.\n\n\
+{exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = cgroup\n           boxing required but unavailable (use {acf})\n",
         banner = banner(c),
         i1 = h("1. Install"),
         i2 = h("2. Write a DAG (JSON)"),
@@ -141,6 +145,8 @@ jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"
         what = h("What you get"),
         keepgoing = k("--keep-going"),
         maxmem = k("run --max-mem 8G"),
+        acf = k("--allow-cgroup-failure"),
+        perfdir = k("run --perf-dir DIR"),
         note = h("Note"),
         exits = h("Exit codes"),
     )
@@ -312,32 +318,92 @@ add per-step rss_baseline_bytes to enable memory-aware throttling",
     cpu_count()
 }
 
+/// Best-effort git SHA of the current working directory's repo (stamps perf-log rows only).
+fn git_sha() -> String {
+    match std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() {
+                "unknown".to_string()
+            } else {
+                s
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose (mirrors the
+/// Python `_resolve_cgroup_manager`). Returns the manager to use (`None` = intentional UNBOXED
+/// run), or an `Err(exit_code)` the caller must return when boxing is required but unavailable.
+/// May re-exec this process into a systemd scope (never returns on success).
+fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, i32> {
+    if is_in_scope() {
+        let mgr = Cgroups::new();
+        if mgr.enabled() {
+            install_scope_teardown();
+            eprintln!(
+                "{PROG}: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU caps \
+                 + setsid-proof teardown)."
+            );
+            return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
+        }
+        if allow_failure {
+            eprintln!(
+                "{PROG}: warning: inside a scope but per-step cgroup setup failed; running \
+                 best-effort UNBOXED (--allow-cgroup-failure)."
+            );
+            return Ok(None);
+        }
+        eprintln!(
+            "{PROG}: ERROR: inside a managed scope but per-step cgroups could not be set up; \
+             re-run with --allow-cgroup-failure to run UNBOXED."
+        );
+        return Err(3);
+    }
+    if allow_failure {
+        eprintln!(
+            "{PROG}: warning: cgroup boxing not established (--allow-cgroup-failure); running \
+             UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
+        );
+        return Ok(None);
+    }
+    // Default: boxing is required -> re-exec into a transient systemd --user scope (never returns
+    // on success).
+    let reexeced_or_skipped = reexec_in_scope(None, None);
+    let detail = if reexeced_or_skipped {
+        "boxing was skipped (e.g. CI without a systemd --user scope)"
+    } else {
+        "cgroup-v2 + a working systemd --user scope are unavailable"
+    };
+    eprintln!(
+        "{PROG}: ERROR: cgroup boxing could not be established: {detail}. Cgroup resource boxing is \
+         this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
+    );
+    Err(3)
+}
+
 fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
+    // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
+    let cgroups = match resolve_cgroups(a.allow_cgroup_failure) {
+        Ok(cg) => cg,
+        Err(code) => return code,
+    };
+    if a.cgroups {
+        eprintln!("{PROG}: note: --cgroups is a deprecated no-op (boxing is ON by default)");
+    }
+
     let jobs = select_jobs(cfg, a);
     let verbosity = if a.quiet { 0 } else { a.verbosity };
 
-    // Cgroup-v2 boxing is ON by default in the Python build; it is being ported to this Rust
-    // build. Until it lands the Rust `run` executes UNBOXED. Surface that clearly (No Silent
-    // Failure) unless the caller explicitly accepted an un-boxed run with --allow-cgroup-failure
-    // (which is what the differential passes).
-    if !a.allow_cgroup_failure {
-        eprintln!(
-            "{PROG}: warning: per-step cgroup-v2 boxing is not yet available in this Rust build; \
-running UNBOXED (process-group teardown only). Pass --allow-cgroup-failure to accept this."
-        );
-    }
-    if a.cgroups {
-        eprintln!(
-            "{PROG}: note: --cgroups is a no-op here (boxing not yet ported to this Rust build)"
-        );
-    }
-    if a.perf_dir.is_some() {
-        eprintln!(
-            "{PROG}: warning: --perf-dir is not yet available in this Rust build; no perf CSVs written"
-        );
-    }
+    let perf_dir = a.perf_dir.as_deref().filter(|s| !s.is_empty());
+    let git = git_sha();
+    let window = perf_dir.map(|d| PerfWindow::start(Path::new(d), &git));
 
-    let result = run_dag(cfg, jobs, a.keep_going, verbosity);
+    let result = run_dag_boxed(cfg, jobs, a.keep_going, verbosity, cgroups);
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
     let failed = result
         .outcomes
@@ -355,6 +421,30 @@ running UNBOXED (process-group teardown only). Pass --allow-cgroup-failure to ac
         result.skipped.len(),
         result.wall_s
     );
+
+    if let Some(d) = perf_dir {
+        if let Some(w) = &window {
+            w.finish(
+                if result.ok { "pass" } else { "fail" },
+                result.outcomes.len(),
+                jobs,
+            );
+        }
+        let loc = append_step_profiles(
+            Path::new(d),
+            &result.step_profile_rows,
+            &git,
+            jobs,
+            None,
+            "unverified",
+            "local",
+        );
+        match loc {
+            Some(p) => eprintln!("{PROG}: perf CSVs written under {d} (e.g. {})", p.display()),
+            None => eprintln!("{PROG}: WARNING no perf CSVs were written under {d}"),
+        }
+    }
+
     if result.ok {
         0
     } else {

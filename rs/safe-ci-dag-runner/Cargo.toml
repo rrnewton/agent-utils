@@ -17,6 +17,10 @@ authors.workspace = true
 # pulled in: the strict reader replicates Python's exact narrowing (e.g. bool-is-not-int),
 # which derive would not.
 serde_json = "1"
+# Safe (no-`unsafe`) SIGINT/SIGTERM registration for the cgroup scope-teardown handler: on
+# Ctrl-C the whole outer scope is torn down so no setsid-escapee orphans survive. std has no
+# signal API, and this project is safe-rust; signal-hook encapsulates the unsafe internally.
+signal-hook = "0.4.4"
 
 [[bin]]
 name = "safe-ci-dag-runner"
