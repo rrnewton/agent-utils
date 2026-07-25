@@ -235,8 +235,11 @@ def _select_jobs(cfg: DagConfig, ns: argparse.Namespace) -> int:
 
     Precedence: an explicit ``--jobs`` always wins; otherwise ``--max-mem`` picks the largest
     ``-j`` whose modeled worst-case memory footprint fits the budget; otherwise default to the
-    CPU count. When BOTH ``--jobs`` and ``--max-mem`` are given, ``--jobs`` wins and the
-    memory-aware sizing is skipped with a visible note (No Silent Failure)."""
+    CPU count (LOGICAL CPUs, ``os.cpu_count()``). When BOTH ``--jobs`` and ``--max-mem`` are
+    given, ``--jobs`` wins and the memory-aware sizing is skipped with a visible note (No Silent
+    Failure). When ``--max-mem`` picks the full CPU count only because NO step carries an
+    ``rss_baseline_bytes`` (the modeled footprint collapsed to ``mem_cap_floor_bytes``), a note
+    explains why the budget did not throttle, so an un-throttled run is never a silent surprise."""
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
     if isinstance(ns.jobs, int):
         if max_mem is not None:
@@ -260,6 +263,18 @@ def _select_jobs(cfg: DagConfig, ns: argparse.Namespace) -> int:
                 f"(modeled worst-case {footprint} bytes fits budget {budget} bytes)",
                 file=sys.stderr,
             )
+            ncpu = os.cpu_count() or 4
+            modeled = any(
+                s.hint.rss_baseline_bytes is not None and not s.engine_only for s in cfg.steps
+            )
+            if jobs == ncpu and not modeled:
+                print(
+                    f"{PROG}: note: no step carries rss_baseline_bytes, so the modeled footprint "
+                    f"collapsed to the mem_cap_floor_bytes floor ({cfg.mem_cap_floor_bytes} bytes) "
+                    f"and --max-mem did not throttle (-j{jobs} = CPU count); add per-step "
+                    "rss_baseline_bytes to enable memory-aware throttling",
+                    file=sys.stderr,
+                )
             return jobs
     return os.cpu_count() or 4
 

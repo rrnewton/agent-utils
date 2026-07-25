@@ -57,6 +57,16 @@ exact "largest `-jN` that fits budget M." Use it from the CLI with `run --max-me
 Python API with the `jobs_for_budget` helper. The CLI's default `-j` (when neither `--jobs` nor
 `--max-mem` is given) is the CPU count; an explicit `--jobs` always overrides `--max-mem`.
 
+Two facts keep `--max-mem` from being surprising. First, "CPU count" everywhere here means
+**logical** CPUs (`os.cpu_count()` — SMT/hyperthreads included), which is both the plain default `-j`
+and the ceiling `--max-mem` sizing is capped at. Second, memory-aware sizing only bites when steps
+actually carry `rss_baseline_bytes`: a DAG whose steps have **no** memory baselines has a modeled
+footprint of `0`, which is then clamped up to `mem_cap_floor_bytes` (default 8 GiB). So for any budget
+at or above that floor the model concludes every `-j` up to the CPU count fits, `--max-mem` picks the
+full CPU count, and it does **not** throttle. The CLI prints a one-line note whenever this happens
+(chosen `-j` equals the CPU count AND no step has a baseline), so an un-throttled run is never a
+silent surprise; add per-step `rss_baseline_bytes` hints to make the budget actually constrain `-j`.
+
 **cgroup boxing.** On a Linux cgroup-v2 host with a *delegated* hierarchy, the runner can put the
 whole run in an outer CPU/memory box and each step in its own nested box. The payoff is twofold:
 (1) a step that exceeds its memory cap is OOM-killed in isolation instead of taking down the host;

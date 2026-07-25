@@ -137,6 +137,11 @@ memory hints instead of hard-coding one:
 safe-ci-dag-runner run --dag dag.json --max-mem 8G
 ```
 
+`--max-mem` only throttles a DAG whose steps carry per-step `rss_baseline_bytes` memory hints. With
+no baselines, the modeled footprint collapses to `mem_cap_floor_bytes` (default 8 GiB), so any budget
+at or above the floor picks the full `-j` — the **CPU count** — and prints a note saying it did not
+throttle. "CPU count" here means **logical** CPUs (`os.cpu_count()`, i.e. SMT/hyperthreads included).
+
 Record resource usage while running:
 
 ```sh

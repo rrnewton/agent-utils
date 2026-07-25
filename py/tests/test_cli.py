@@ -86,6 +86,33 @@ def test_run_max_mem_exits_0() -> None:
         assert "--max-mem 8G" in err  # the sizing decision is surfaced
 
 
+def test_run_max_mem_no_throttle_note() -> None:
+    # A DAG with no per-step rss_baseline_bytes: the modeled footprint collapses to the
+    # mem_cap_floor_bytes floor, so a budget at/above the floor picks the full -j (CPU count)
+    # and a note explains why --max-mem did not throttle (No Silent Failure).
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["run", "--max-mem", "16G", "--dag", dag, "-q"])
+        assert rc == 0
+        assert "no step carries rss_baseline_bytes" in err
+        assert "did not throttle" in err
+
+
+def test_run_max_mem_with_baseline_no_note() -> None:
+    # A DAG whose step carries an rss_baseline_bytes participates in the memory model, so the
+    # no-throttle note is NOT emitted even when the chosen -j lands at the CPU count.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = Path(tmp) / "dag.json"
+        dag.write_text(
+            '{"steps": [{"group": "g", "job": "j", "cmd": "true",'
+            ' "hint": {"rss_baseline_bytes": 1073741824}}]}',
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(["run", "--max-mem", "64G", "--dag", str(dag), "-q"])
+        assert rc == 0
+        assert "no step carries rss_baseline_bytes" not in err
+
+
 def test_run_jobs_overrides_max_mem() -> None:
     # When both --jobs and --max-mem are given, --jobs wins with a visible note.
     with tempfile.TemporaryDirectory() as tmp:
