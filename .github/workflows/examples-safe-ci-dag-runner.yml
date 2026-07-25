@@ -1,0 +1,67 @@
+name: examples-safe-ci-dag-runner
+
+# Prove every shipped example DAG still runs green under BOTH builds. Runs when the examples
+# change, or when either implementation that executes them changes (so a source regression that
+# breaks a newcomer example is caught here too).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'examples/**'
+      - 'py/pyproject.toml'
+      - 'py/safe_ci_dag_runner/**'
+      - 'rs/Cargo.toml'
+      - 'rs/Cargo.lock'
+      - 'rs/safe-ci-dag-runner/**'
+      - '.github/workflows/examples-safe-ci-dag-runner.yml'
+  pull_request:
+    paths:
+      - 'examples/**'
+      - 'py/pyproject.toml'
+      - 'py/safe_ci_dag_runner/**'
+      - 'rs/Cargo.toml'
+      - 'rs/Cargo.lock'
+      - 'rs/safe-ci-dag-runner/**'
+      - '.github/workflows/examples-safe-ci-dag-runner.yml'
+
+jobs:
+  examples:
+    runs-on: ubuntu-latest
+    env:
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build rust
+        run: cargo build --release --workspace --manifest-path rs/Cargo.toml
+      - name: run every example under the Python build
+        env:
+          PYTHONPATH: py
+        run: |
+          shopt -s nullglob
+          examples=(examples/*.json)
+          if [ ${#examples[@]} -eq 0 ]; then
+            echo "no examples/*.json found" >&2
+            exit 1
+          fi
+          for dag in "${examples[@]}"; do
+            echo "::group::python run $dag"
+            python3 -m safe_ci_dag_runner run --dag "$dag"
+            echo "::endgroup::"
+          done
+      - name: run every example under the Rust build
+        run: |
+          shopt -s nullglob
+          examples=(examples/*.json)
+          if [ ${#examples[@]} -eq 0 ]; then
+            echo "no examples/*.json found" >&2
+            exit 1
+          fi
+          for dag in "${examples[@]}"; do
+            echo "::group::rust run $dag"
+            rs/target/release/safe-ci-dag-runner run --dag "$dag"
+            echo "::endgroup::"
+          done

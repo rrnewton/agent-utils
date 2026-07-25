@@ -1,0 +1,103 @@
+# `examples/` — runnable safe-ci-dag-runner DAGs
+
+Five small, self-contained DAG files you can run immediately, each demonstrating one core idea.
+Every command is `sleep`/`echo` only, so a whole example finishes in a few seconds and needs no build
+tools installed.
+
+Run any of them with either build (they behave identically — that parity is enforced by
+`cross/differential.py`):
+
+```sh
+# Python (no build needed):
+python3 -m safe_ci_dag_runner run --dag examples/01-linear-chain.json
+# or, once installed / built:
+safe-ci-dag-runner run --dag examples/01-linear-chain.json
+```
+
+Before running, it is worth *looking* at each graph — every example works with `list`, `ascii`, `dot`,
+and `json` too:
+
+```sh
+safe-ci-dag-runner list  --dag examples/02-diamond.json   # one line per step, with class + deps
+safe-ci-dag-runner ascii --dag examples/02-diamond.json   # topological-layer view
+safe-ci-dag-runner dot   --dag examples/02-diamond.json | dot -Tsvg -o dag.svg   # a picture
+```
+
+Work through them in order — each adds one concept on top of the previous.
+
+## 1. `01-linear-chain.json` — a trivial linear chain
+
+`build.compile → test.unit → package.tarball`: the simplest possible pipeline, three steps in a
+straight line where each waits for the previous one. Start here to see the basic run output (a
+`▶ START` / `✓ PASS` line per step and the final `PASS` summary). Because each step depends on the one
+before it, nothing runs in parallel and the wall time is the sum of the steps (~6s).
+
+```sh
+safe-ci-dag-runner run --dag examples/01-linear-chain.json
+```
+
+## 2. `02-diamond.json` — a diamond with parallel branches
+
+`build.app` fans out to two independent checks (`test.unit` and `test.lint`) that run **at the same
+time**, and `deploy.staging` waits for **both** to finish. This is the first example where you see
+concurrency: the two middle steps overlap, so the wall time is shorter than their sum. `test.unit`
+carries a larger `est_duration_s`, so when both become ready the runner dispatches it first
+(longest-processing-time ordering). If either check failed, `deploy.staging` would be reported as
+`skipped`.
+
+```sh
+safe-ci-dag-runner run --dag examples/02-diamond.json
+safe-ci-dag-runner ascii --dag examples/02-diamond.json   # shows the 3 topological layers
+```
+
+## 3. `03-scarce-resource-browser.json` — a named scarce resource
+
+Two end-to-end steps (`e2e.login`, `e2e.checkout`) each declare `"resources": {"browser": 1}`, and the
+top-level `"resource_caps": {"browser": 1}` allows only **one** browser step to run at a time. So the
+two e2e steps run one-after-another even though both are ready — while the ordinary `test.unit` step
+(which needs no browser) runs alongside whichever e2e step currently holds the browser.
+
+`browser` here is just a **name you chose** — the caps are arbitrary caller-defined strings, not a
+built-in. It models any scarce thing that cannot be shared concurrently (in DeepScry it serializes
+Playwright/browser end-to-end tests, which grab fixed ports and a display). You could equally cap
+`"gpu"`, `"db"`, or `"licenses"`.
+
+```sh
+safe-ci-dag-runner run --dag examples/03-scarce-resource-browser.json
+```
+
+## 4. `04-memory-aware.json` — memory hints drive a RAM-safe `-j`
+
+Each step carries a memory hint: `build.compile` and `test.integration` set `rss_baseline_bytes`
+(estimated peak RSS), and `test.fuzz` additionally pins a `hard_mem_max_bytes` cap that overrides its
+baseline. With those hints, `--max-mem` picks the largest `-j` whose modeled worst-case footprint fits
+a RAM budget, instead of you hard-coding a number:
+
+```sh
+safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 4G   # -> -j1 (worst case 4 GiB)
+safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 8G   # -> -j2 (worst case 7 GiB)
+```
+
+A 4 GiB budget only fits one step at a time; 8 GiB fits the two largest that can co-run; a large enough
+budget lets all three run at once (up to the CPU count). Run it with no `--max-mem` and it simply uses
+the CPU count as `-j`. (This example sets `mem_cap_factor: 1.0`, `mem_cap_floor_bytes: 0`, and
+`outer_mem_safety_factor: 1.0` so the modeled numbers are exactly the byte values above; the defaults
+add headroom.)
+
+## 5. `05-inner-jobs.json` — a step with internal parallelism
+
+`build.app` runs its *own* parallel build (imagine `make -j8`). Declaring
+`"preferred_inner_jobs": 8` tells the runner how wide the step is internally, so it can set an inner
+CPU cap when cgroup boxing is active and account for the extra memory a wide `cpu-bound` step uses in
+the budget model. It does **not** inject a `-j` flag into your command — the parallelism lives in your
+`cmd`; the hint only describes it.
+
+```sh
+safe-ci-dag-runner run --dag examples/05-inner-jobs.json
+```
+
+## See also
+
+- `common/docs/safe-ci-dag-runner/README.md` — the tool overview and CLI reference.
+- `common/docs/safe-ci-dag-runner/USER_GUIDE.md` — the full concept guide and complete JSON schema.
+- `safe-ci-dag-runner quickstart` — the same getting-started tour from the command line.
