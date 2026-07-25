@@ -126,14 +126,16 @@ def test_cli_run_ok_from_file() -> None:
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "dag.json"
         path.write_text(dag_to_json(diamond(0.05)), encoding="utf-8")
-        assert _run_cli(["run", "--dag", str(path), "-q"]) == 0
+        # --allow-cgroup-failure so the default-on boxing does NOT re-exec into a systemd scope
+        # (which would replace the in-process pytest runner).
+        assert _run_cli(["run", "--dag", str(path), "-q", "--allow-cgroup-failure"]) == 0
 
 
 def test_cli_run_reports_failure_exit_1() -> None:
     with tempfile.TemporaryDirectory() as d:
         path = Path(d) / "dag.json"
         path.write_text('{"steps": [{"group": "g", "job": "x", "cmd": "false"}]}', encoding="utf-8")
-        assert _run_cli(["run", "--dag", str(path), "-q"]) == 1
+        assert _run_cli(["run", "--dag", str(path), "-q", "--allow-cgroup-failure"]) == 1
 
 
 def test_cli_render_commands_exit_0() -> None:

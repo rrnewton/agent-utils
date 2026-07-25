@@ -33,6 +33,11 @@ from dataclasses import dataclass, field
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+#: Passed to every `run` comparison. Cgroup boxing is ON by default in both builds; this flag
+#: downgrades to the deterministic, environment-independent UNBOXED scheduling core so the two
+#: implementations are compared on identical observable behavior (boxing is proven separately).
+ACF = "--allow-cgroup-failure"
+
 _COUNTS_RE = re.compile(
     r"(\d+) passed, (\d+) failed, (\d+) aborted, (\d+) skipped"
 )
@@ -370,8 +375,14 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # deterministic in its EXIT CODE (1 iff any reachable step fails) but NOT in the
         # passed/aborted split, which depends on which in-flight step is cancelled first, so
         # only the exit code is compared here.
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4"))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4"))
+        #
+        # All `run` comparisons pass --allow-cgroup-failure: cgroup-v2 boxing is ON by default in
+        # BOTH builds, but boxing is environment-dependent and cannot be asserted byte-identically
+        # here (see cross/README.md). The flag makes both builds run the SAME observable UNBOXED
+        # scheduling core deterministically, regardless of whether the host can box. Boxing itself
+        # is proven by each build's own tests (Python pytest + the Rust boxing smoke test).
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4", ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4", ACF))
         label = f"{fx.name}/run(default-exit)"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
@@ -383,8 +394,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # passed/failed/aborted/skipped counts are fully reproducible between the two builds.
         # (Note: --keep-going only suppresses the eager-abort of in-flight steps; on any
         # failure BOTH builds set stop and launch no new steps, so counts still race at -j>1.)
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1"))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1"))
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", ACF))
         label = f"{fx.name}/run(serial-counts)"
         pc, rc = _counts(po.stderr), _counts(ro.stderr)
         if po.returncode != ro.returncode:
@@ -398,8 +409,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
 
         # 5) --max-mem sizing decision, when the fixture supplies a budget.
         if fx.max_mem is not None:
-            po = run(py, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem))
-            ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem))
+            po = run(py, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, ACF))
+            ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, ACF))
             label = f"{fx.name}/sizing"
             ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
             if ps is None or rss is None:

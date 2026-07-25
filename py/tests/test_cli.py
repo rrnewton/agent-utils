@@ -59,14 +59,21 @@ def test_dot_and_json() -> None:
         assert rc == 0 and '"steps"' in out
 
 
+# Cgroup boxing is ON by default; the in-process CLI tests use --allow-cgroup-failure so `run`
+# does NOT re-exec into a systemd scope (which would replace the pytest process). The default
+# require-boxing path and the require-but-unavailable error are covered by
+# test_run_default_requires_cgroups_or_flag via a subprocess instead.
+_ACF = "--allow-cgroup-failure"
+
+
 def test_run_exit_codes() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         ok = Path(tmp) / "ok.json"
         ok.write_text('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}', encoding="utf-8")
-        assert _capture(["run", "--dag", str(ok), "-q"])[0] == 0
+        assert _capture(["run", "--dag", str(ok), "-q", _ACF])[0] == 0
         bad = Path(tmp) / "bad.json"
         bad.write_text('{"steps": [{"group": "g", "job": "j", "cmd": "false"}]}', encoding="utf-8")
-        assert _capture(["run", "--dag", str(bad), "-q"])[0] == 1
+        assert _capture(["run", "--dag", str(bad), "-q", _ACF])[0] == 1
 
 
 def test_missing_and_malformed_dag_exit_2() -> None:
@@ -81,7 +88,7 @@ def test_run_max_mem_exits_0() -> None:
     # --max-mem picks a memory-aware -j; a passing DAG still exits 0.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--max-mem", "8G", "--dag", dag, "-q"])
+        rc, _, err = _capture(["run", "--max-mem", "8G", "--dag", dag, "-q", _ACF])
         assert rc == 0
         assert "--max-mem 8G" in err  # the sizing decision is surfaced
 
@@ -92,7 +99,7 @@ def test_run_max_mem_no_throttle_note() -> None:
     # and a note explains why --max-mem did not throttle (No Silent Failure).
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--max-mem", "16G", "--dag", dag, "-q"])
+        rc, _, err = _capture(["run", "--max-mem", "16G", "--dag", dag, "-q", _ACF])
         assert rc == 0
         assert "no step carries rss_baseline_bytes" in err
         assert "did not throttle" in err
@@ -108,7 +115,7 @@ def test_run_max_mem_with_baseline_no_note() -> None:
             ' "hint": {"rss_baseline_bytes": 1073741824}}]}',
             encoding="utf-8",
         )
-        rc, _, err = _capture(["run", "--max-mem", "64G", "--dag", str(dag), "-q"])
+        rc, _, err = _capture(["run", "--max-mem", "64G", "--dag", str(dag), "-q", _ACF])
         assert rc == 0
         assert "no step carries rss_baseline_bytes" not in err
 
@@ -117,7 +124,7 @@ def test_run_jobs_overrides_max_mem() -> None:
     # When both --jobs and --max-mem are given, --jobs wins with a visible note.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--jobs", "2", "--max-mem", "8G", "--dag", dag, "-q"])
+        rc, _, err = _capture(["run", "--jobs", "2", "--max-mem", "8G", "--dag", dag, "-q", _ACF])
         assert rc == 0
         assert "--jobs=2 wins" in err
 
@@ -127,7 +134,7 @@ def test_run_perf_dir_writes_csv() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
         perf = Path(tmp) / "perf"
-        rc, _, err = _capture(["run", "--perf-dir", str(perf), "--dag", dag, "-q"])
+        rc, _, err = _capture(["run", "--perf-dir", str(perf), "--dag", dag, "-q", _ACF])
         assert rc == 0
         csvs = list(perf.glob("*.csv"))
         assert csvs, "expected at least one perf CSV to be written"
@@ -146,3 +153,33 @@ def test_version_via_module() -> None:
         check=True,
     )
     assert result.stdout.strip() == f"{PROG} {__version__}"
+
+
+def test_run_default_requires_cgroups_or_flag() -> None:
+    # Cgroup boxing is ON by default. Run in a SUBPROCESS (so a re-exec cannot replace pytest)
+    # with CI=1 set, which makes the boxing bring-up skip the re-exec -> boxing is "unavailable".
+    # Default (no flag): the run must ERROR with a distinct nonzero exit (3). With
+    # --allow-cgroup-failure it must downgrade to a best-effort UNBOXED run and exit 0.
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        env = dict(os.environ, CI="1")  # force the boxing re-exec to be skipped
+        required = subprocess.run(
+            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert required.returncode == 3, required.stderr
+        assert "cgroup boxing" in required.stderr.lower()
+
+        allowed = subprocess.run(
+            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q",
+             "--allow-cgroup-failure"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert allowed.returncode == 0, allowed.stderr
+        assert "UNBOXED" in allowed.stderr

@@ -35,6 +35,21 @@ python cross/differential.py --tool safe-ci-dag-runner
 python cross/differential.py --random 40 --seed 99   # more fixtures, different seed
 ```
 
-The Linux cgroup boxing (`--cgroups`), perf logging (`--perf-dir`), and ambient-load
-bucketing remain **Python-only** for 0.1; the Rust `run` uses no per-step boxing (matching
-Python's default), so those paths are out of scope for the differential.
+## Cgroup boxing and the differential
+
+Linux cgroup-v2 boxing is **ON by default** in the Python build (it is the tool's primary
+purpose): a bare `run` re-execs inside a transient `systemd-run --user --scope` and caps each
+step in its own child cgroup. When cgroup-v2 + a working systemd `--user` scope are unavailable,
+the default `run` **errors** (exit 3); `--allow-cgroup-failure` downgrades to a best-effort
+UNBOXED run with a visible warning.
+
+Cgroup behavior is environment-dependent (a CI container may have no delegated cgroup or systemd
+`--user` scope), so it **cannot** be asserted byte-identically here. Every `run` comparison in
+`differential.py` therefore passes **`--allow-cgroup-failure`**, which makes both builds execute
+the same deterministic, environment-independent UNBOXED scheduling core — exactly the observable
+behavior this differential is meant to pin. Boxing itself is proven separately: by the Python
+test suite (`pytest`) and by the Rust boxing smoke test (a step allocating past its cap is
+OOM-killed).
+
+The perf logging (`--perf-dir`) and ambient-load bucketing are likewise out of scope for the
+byte-identical differential.

@@ -200,6 +200,7 @@ struct RunArgs {
     perf_dir: Option<String>,
     keep_going: bool,
     cgroups: bool,
+    allow_cgroup_failure: bool,
     verbosity: i64,
     quiet: bool,
 }
@@ -212,6 +213,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         perf_dir: None,
         keep_going: false,
         cgroups: false,
+        allow_cgroup_failure: false,
         verbosity: 1,
         quiet: false,
     };
@@ -246,6 +248,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "-k" | "--keep-going" => a.keep_going = true,
             "--cgroups" => a.cgroups = true,
+            "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
             other => {
@@ -311,15 +314,24 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let jobs = select_jobs(cfg, a);
     let verbosity = if a.quiet { 0 } else { a.verbosity };
 
+    // Cgroup-v2 boxing is ON by default in the Python build; it is being ported to this Rust
+    // build. Until it lands the Rust `run` executes UNBOXED. Surface that clearly (No Silent
+    // Failure) unless the caller explicitly accepted an un-boxed run with --allow-cgroup-failure
+    // (which is what the differential passes).
+    if !a.allow_cgroup_failure {
+        eprintln!(
+            "{PROG}: warning: per-step cgroup-v2 boxing is not yet available in this Rust build; \
+running UNBOXED (process-group teardown only). Pass --allow-cgroup-failure to accept this."
+        );
+    }
     if a.cgroups {
         eprintln!(
-            "{PROG}: warning: --cgroups is Python-only in 0.1; this Rust build runs steps UNBOXED \
-(no per-step memory/CPU cap, process-group teardown only)"
+            "{PROG}: note: --cgroups is a no-op here (boxing not yet ported to this Rust build)"
         );
     }
     if a.perf_dir.is_some() {
         eprintln!(
-            "{PROG}: warning: --perf-dir is Python-only in 0.1; this Rust build records no perf CSVs"
+            "{PROG}: warning: --perf-dir is not yet available in this Rust build; no perf CSVs written"
         );
     }
 

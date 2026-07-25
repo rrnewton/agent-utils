@@ -1,7 +1,8 @@
 """Command-line interface for safe-ci-dag-runner.
 
 Subcommands:
-  run --dag FILE    run a DAG (exit 0 iff every step passes)
+  run --dag FILE    run a DAG under two-level cgroup-v2 boxing (exit 0 iff every step passes;
+                    boxing is ON by default — pass --allow-cgroup-failure to run un-boxed)
   list --dag FILE   list the steps
   ascii --dag FILE  draw the DAG as ASCII art
   dot --dag FILE    emit Graphviz DOT (pipe to `dot -Tsvg`)
@@ -127,8 +128,9 @@ def _quickstart(c: Palette) -> str:
   - concurrent scheduling in longest-first order, honoring deps + resource caps
   - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps
     ({k('--keep-going')} lets already-running steps finish instead; it still stops launching new steps)
-  - {k('run --cgroups')} adds best-effort Linux cgroup-v2 per-step memory/CPU boxing
-    {c.dim('(needs cgroup-v2; without it, steps run un-boxed with a visible warning)')}
+  - Linux cgroup-v2 per-step memory/CPU boxing is ON BY DEFAULT (the tool's primary purpose):
+    {k('run')} re-execs inside a systemd --user scope and caps each step in its own child cgroup
+    {c.dim('(no cgroup-v2 + systemd --user scope? the run errors — pass')} {k('--allow-cgroup-failure')} {c.dim('to run un-boxed)')}
   - {k('run --max-mem 8G')} picks the largest -j whose modeled worst-case RAM fits the budget
     {c.dim('(--jobs, when given, overrides this)')}
   - {k('run --perf-dir DIR')} writes per-step + whole-run resource-usage CSVs into DIR
@@ -139,6 +141,7 @@ def _quickstart(c: Palette) -> str:
   print(to_ascii(cfg)); result = run_dag(cfg, jobs=4)   # result.ok, result.outcomes
 
 {h('Exit codes')}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file
+             | 3 = cgroup boxing required but unavailable (use {k('--allow-cgroup-failure')})
 """
 
 
@@ -194,7 +197,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="on a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps)",
     )
-    run_p.add_argument("--cgroups", action="store_true", help="best-effort Linux cgroup-v2 per-step boxing")
+    run_p.add_argument(
+        "--cgroups",
+        action="store_true",
+        help="(deprecated no-op; cgroup-v2 boxing is now ON by default) accepted for compatibility",
+    )
+    run_p.add_argument(
+        "--allow-cgroup-failure",
+        action="store_true",
+        help="downgrade to a best-effort UNBOXED run (with a visible warning) instead of erroring "
+        "when two-level cgroup-v2 + systemd --user scope boxing cannot be established",
+    )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
 
@@ -284,14 +297,82 @@ def _select_jobs(cfg: DagConfig, ns: argparse.Namespace) -> int:
     return os.cpu_count() or 4
 
 
+def _resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, int]:
+    """Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose.
+
+    Cgroup boxing is ON BY DEFAULT. This returns ``(manager, 0)`` when boxing is active (the
+    caller runs boxed), ``(None, 0)`` for an intentional best-effort UNBOXED run, or
+    ``(None, <nonzero>)`` when boxing is REQUIRED but unavailable and the caller must exit with
+    that code (No Silent Failure: the reason is printed to stderr first).
+
+    Flow (mirrors DeepScry's validate cgroup bring-up):
+
+    * Already inside the managed scope (``SAFE_CI_IN_SCOPE=1``): construct :class:`Cgroups`. If
+      per-step containment came up, install the scope teardown handler and box. If it did not,
+      error (or, with ``allow_failure``, warn and run unboxed).
+    * Not in a scope, ``allow_failure``: skip the re-exec and run unboxed with a visible warning
+      (today's un-boxed behavior).
+    * Not in a scope, default: re-exec this process inside a transient ``systemd-run --user
+      --scope`` (a delegated cgroup) via :func:`reexec_in_scope`; on success ``execvp`` replaces
+      this process and never returns. If it cannot (no cgroup-v2 / no systemd --user scope, or
+      skipped in CI), print a clear error and return a nonzero exit code.
+    """
+    from safe_ci_dag_runner import cgroup as cg
+
+    naming = cg.DEFAULT_NAMING
+    if os.environ.get(naming.env_in_scope) == "1":
+        manager = cg.Cgroups(naming)
+        if manager.enabled:
+            cg.install_scope_teardown(naming=naming)
+            print(
+                f"{PROG}: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU caps"
+                " + setsid-proof teardown).",
+                file=sys.stderr,
+            )
+            return manager, 0
+        if allow_failure:
+            print(
+                f"{PROG}: warning: inside a scope but per-step cgroup setup failed; running "
+                "best-effort UNBOXED (--allow-cgroup-failure).",
+                file=sys.stderr,
+            )
+            return None, 0
+        print(
+            f"{PROG}: ERROR: inside a managed scope but per-step cgroups could not be set up; "
+            "re-run with --allow-cgroup-failure to run UNBOXED.",
+            file=sys.stderr,
+        )
+        return None, 3
+    if allow_failure:
+        print(
+            f"{PROG}: warning: cgroup boxing not established (--allow-cgroup-failure); running "
+            "UNBOXED (process-group teardown only, no per-step memory/CPU caps).",
+            file=sys.stderr,
+        )
+        return None, 0
+    # Default: boxing is required -> re-exec into a transient systemd --user scope.
+    argv = [sys.executable, "-m", "safe_ci_dag_runner", *sys.argv[1:]]
+    reexeced_or_skipped = cg.reexec_in_scope(argv, memory_max=None)
+    # Only reached when NO exec happened (execvp on success never returns).
+    detail = (
+        "boxing was skipped (e.g. CI without a systemd --user scope)"
+        if reexeced_or_skipped
+        else "cgroup-v2 + a working systemd --user scope are unavailable"
+    )
+    print(
+        f"{PROG}: ERROR: cgroup boxing could not be established: {detail}. Cgroup resource boxing "
+        "is this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED.",
+        file=sys.stderr,
+    )
+    return None, 3
+
+
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
+    cgroups, code = _resolve_cgroup_manager(bool(ns.allow_cgroup_failure))
+    if code != 0:
+        return code
     jobs = _select_jobs(cfg, ns)
     verbosity = 0 if bool(ns.quiet) else int(ns.verbosity)
-    cgroups: CgroupManager | None = None
-    if bool(ns.cgroups):
-        from safe_ci_dag_runner.cgroup import Cgroups
-
-        cgroups = Cgroups()
 
     perf_dir = ns.perf_dir if isinstance(ns.perf_dir, str) and ns.perf_dir else None
     metrics: MetricsSink | None = None
