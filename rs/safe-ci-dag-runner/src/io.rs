@@ -17,7 +17,9 @@ use std::fmt;
 
 use serde_json::Value;
 
-use crate::model::{DagConfig, ResourceHint, Step, StepClass, DEFAULT_STEP_TIMEOUT};
+use crate::model::{
+    DagConfig, ResourceHint, Step, StepClass, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+};
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
 
@@ -104,6 +106,17 @@ fn opt_int(
     match m.get(key) {
         None => Ok(default),
         Some(v) => number_as_int(v).ok_or_else(|| err(format!("field '{key}' must be an integer"))),
+    }
+}
+
+fn opt_str_or_none(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<String>, DagJsonError> {
+    match m.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(err(format!("field '{key}' must be a string or null"))),
     }
 }
 
@@ -273,6 +286,7 @@ pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
             networkonly: opt_bool(sm, "networkonly", false)?,
             engine_only: opt_bool(sm, "engine_only", false)?,
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
+            jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
         });
     }
     Ok(DagConfig {
@@ -282,6 +296,7 @@ pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
         mem_cap_floor_bytes: opt_int(doc, "mem_cap_floor_bytes", DEFAULT_MEM_CAP_FLOOR)?,
         outer_mem_safety_factor: opt_float(doc, "outer_mem_safety_factor", 1.0)?,
         default_step_timeout,
+        default_jobs_flag: opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG)?,
     })
 }
 
@@ -327,6 +342,13 @@ fn json_float(f: f64) -> String {
 fn opt_int_json(v: Option<i64>) -> String {
     match v {
         Some(n) => n.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+fn opt_str_json(v: Option<&str>) -> String {
+    match v {
+        Some(s) => json_str(s),
         None => "null".to_string(),
     }
 }
@@ -471,6 +493,11 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&key);
     s.push_str(&format!("\"timeout\": {},\n", step.timeout));
     s.push_str(&key);
+    s.push_str(&format!(
+        "\"jobs_flag\": {},\n",
+        opt_str_json(step.jobs_flag.as_deref())
+    ));
+    s.push_str(&key);
     s.push_str("\"hint\": ");
     emit_hint(s, &step.hint, base + 2);
     s.push('\n');
@@ -502,6 +529,10 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
         "  \"default_step_timeout\": {},\n",
         cfg.default_step_timeout
     ));
+    s.push_str(&format!(
+        "  \"default_jobs_flag\": {},\n",
+        json_str(&cfg.default_jobs_flag)
+    ));
     if cfg.steps.is_empty() {
         s.push_str("  \"steps\": []\n");
     } else {
@@ -524,8 +555,9 @@ mod tests {
     #[test]
     fn roundtrip_is_stable() {
         let doc = r#"{"resource_caps": {"browser": 2}, "mem_cap_factor": 1.25,
-            "outer_mem_safety_factor": 1.1, "steps": [
+            "outer_mem_safety_factor": 1.1, "default_jobs_flag": "--jobs=", "steps": [
             {"group": "build", "job": "app", "desc": "compile", "cmd": "make build",
+             "jobs_flag": "-j%d",
              "hint": {"est_duration_s": 90, "rss_baseline_bytes": 5368709120,
                       "classification": "cpu-bound", "preferred_inner_jobs": 8}},
             {"group": "e2e", "job": "smoke", "desc": "browser", "cmd": "make e2e",
@@ -543,6 +575,9 @@ mod tests {
         assert_eq!(back.resource_caps.get("browser"), Some(&2));
         assert_eq!(back.steps[0].hint.classification, StepClass::CpuBound);
         assert_eq!(back.steps[0].hint.rss_baseline_bytes, Some(5368709120));
+        assert_eq!(back.steps[0].jobs_flag.as_deref(), Some("-j%d"));
+        assert_eq!(back.steps[1].jobs_flag, None);
+        assert_eq!(back.default_jobs_flag, "--jobs=");
         assert_eq!(back.steps[1].hint.resources.get("browser"), Some(&1));
         assert_eq!(back.steps[1].env.get("HEADLESS"), Some(&"1".to_string()));
     }
@@ -558,8 +593,10 @@ mod tests {
         assert!(step.env.is_empty());
         assert_eq!(step.timeout, 1800);
         assert_eq!(step.hint.classification, StepClass::Light);
+        assert_eq!(step.jobs_flag, None);
         assert!(cfg.resource_caps.is_empty());
         assert_eq!(cfg.mem_cap_factor, 1.25);
+        assert_eq!(cfg.default_jobs_flag, "-j");
     }
 
     #[test]

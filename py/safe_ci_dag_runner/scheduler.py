@@ -53,6 +53,7 @@ from collections.abc import Mapping, Sequence
 from safe_ci_dag_runner.model import (
     DagConfig,
     Step,
+    command_with_inner_jobs,
     preferred_inner_jobs,
     step_classification,
 )
@@ -313,12 +314,17 @@ class Runner:
         stream = self.verbosity >= 2
         timed_out = False
 
+        # Append the step's inner-parallelism (concurrency) flag when it declares one, using the
+        # step's jobs_flag template (or the DagConfig default, e.g. "-j"). No-op when the step
+        # declares no preferred_inner_jobs.
+        base_cmd = command_with_inner_jobs(step, self.cfg.default_jobs_flag, inner_jobs)
+
         # When per-step cgroups are enabled, prepare_command wraps the command so the bash
         # leader self-moves into the step's child cgroup BEFORE forking any grandchild (the
         # cgroup-v2 fork-inheritance rule), applying the inner memory/CPU caps. A disabled /
         # noop manager returns the command unchanged.
         run_cmd = self.cgroups.prepare_command(
-            step.tag, step.cmd, mem_max=mem_max, cpu_count=inner_jobs
+            step.tag, base_cmd, mem_max=mem_max, cpu_count=inner_jobs
         )
         # start_new_session=True gives the step its OWN process group/session (pgid == child
         # pid) so teardown can reap the whole tree (bash leader + any server/browser

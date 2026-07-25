@@ -11,6 +11,10 @@ use std::collections::BTreeMap;
 /// Default per-step timeout (seconds); mirrors Python's `DEFAULT_STEP_TIMEOUT`.
 pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
 
+/// Default template for the inner-parallelism (concurrency) flag appended to a step's command
+/// when the step declares `preferred_inner_jobs`. Mirrors Python's `DEFAULT_JOBS_FLAG`.
+pub const DEFAULT_JOBS_FLAG: &str = "-j";
+
 /// How a step uses the machine, used for scheduling decisions.
 ///
 /// The serde/string values (`"cpu-bound"`, `"latency-bound"`, `"light"`) are load-bearing:
@@ -84,12 +88,62 @@ pub struct Step {
     /// Selected only by an engine-only subset preset.
     pub engine_only: bool,
     pub timeout: i64,
+    /// Template for the inner-parallelism flag appended to `cmd` when this step declares
+    /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
+    /// disables appending (the step manages its own concurrency). See [`render_jobs_flag`].
+    pub jobs_flag: Option<String>,
 }
 
 impl Step {
     /// The step's unique tag, `"group.job"`.
     pub fn tag(&self) -> String {
         format!("{}.{}", self.group, self.job)
+    }
+}
+
+/// Render an inner-parallelism (concurrency) flag from a template and a job count.
+///
+/// Byte-for-byte identical to Python's `render_jobs_flag`. Three forms:
+/// * template contains `%d` -> substitute (no auto-space): `"-j%d"` -> `"-j4"`.
+/// * template ends with `=` -> concatenate (no space): `"--jobs="` -> `"--jobs=4"`.
+/// * otherwise -> space-separated: `"--num-threads"` -> `"--num-threads 4"`, default `"-j"` ->
+///   `"-j 4"`.
+pub fn render_jobs_flag(template: &str, inner_jobs: i64) -> String {
+    if template.contains("%d") {
+        return template.replace("%d", &inner_jobs.to_string());
+    }
+    if template.ends_with('=') {
+        return format!("{template}{inner_jobs}");
+    }
+    format!("{template} {inner_jobs}")
+}
+
+/// The jobs-flag template in effect for a step: its own `jobs_flag` overrides the
+/// DagConfig-level default; `None` inherits the default.
+pub fn effective_jobs_flag<'a>(step: &'a Step, default_jobs_flag: &'a str) -> &'a str {
+    step.jobs_flag.as_deref().unwrap_or(default_jobs_flag)
+}
+
+/// The step's shell command with its inner-parallelism flag appended, when applicable.
+///
+/// Appends `<rendered-flag>` (see [`render_jobs_flag`]) when `inner_jobs` is set and the
+/// effective template is non-empty; a `None` `inner_jobs` or an empty template leaves the
+/// command unchanged. Mirrors Python's `command_with_inner_jobs`.
+pub fn command_with_inner_jobs(
+    step: &Step,
+    default_jobs_flag: &str,
+    inner_jobs: Option<i64>,
+) -> String {
+    match inner_jobs {
+        None => step.cmd.clone(),
+        Some(n) => {
+            let template = effective_jobs_flag(step, default_jobs_flag);
+            if template.is_empty() {
+                step.cmd.clone()
+            } else {
+                format!("{} {}", step.cmd, render_jobs_flag(template, n))
+            }
+        }
     }
 }
 
@@ -209,6 +263,8 @@ pub struct DagConfig {
     /// Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.
     pub outer_mem_safety_factor: f64,
     pub default_step_timeout: i64,
+    /// Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
+    pub default_jobs_flag: String,
 }
 
 impl Default for DagConfig {
@@ -220,6 +276,7 @@ impl Default for DagConfig {
             mem_cap_floor_bytes: 8 * 1024i64.pow(3),
             outer_mem_safety_factor: 1.0,
             default_step_timeout: DEFAULT_STEP_TIMEOUT,
+            default_jobs_flag: DEFAULT_JOBS_FLAG.to_string(),
         }
     }
 }
@@ -350,8 +407,52 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: DEFAULT_STEP_TIMEOUT,
+            jobs_flag: None,
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
+    }
+
+    fn bare_step(cmd: &str, jobs_flag: Option<&str>) -> Step {
+        Step {
+            group: "g".into(),
+            job: "j".into(),
+            desc: String::new(),
+            cmd: cmd.into(),
+            deps: vec![],
+            env: BTreeMap::new(),
+            hint: ResourceHint::default(),
+            networkonly: false,
+            engine_only: false,
+            timeout: DEFAULT_STEP_TIMEOUT,
+            jobs_flag: jobs_flag.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn render_jobs_flag_forms() {
+        assert_eq!(render_jobs_flag("-j", 4), "-j 4");
+        assert_eq!(render_jobs_flag("-j%d", 4), "-j4");
+        assert_eq!(render_jobs_flag("--jobs=", 8), "--jobs=8");
+        assert_eq!(render_jobs_flag("--num-threads", 2), "--num-threads 2");
+        assert_eq!(render_jobs_flag("--threads=%d", 3), "--threads=3");
+    }
+
+    #[test]
+    fn command_with_inner_jobs_appends_and_respects_defaults() {
+        // No inner jobs -> unchanged.
+        let s = bare_step("make", None);
+        assert_eq!(command_with_inner_jobs(&s, "-j", None), "make");
+        // Inner jobs + default template.
+        assert_eq!(command_with_inner_jobs(&s, "-j", Some(4)), "make -j 4");
+        // Step-level jobs_flag overrides the default.
+        let s2 = bare_step("cargo build", Some("-j%d"));
+        assert_eq!(
+            command_with_inner_jobs(&s2, "-j", Some(8)),
+            "cargo build -j8"
+        );
+        // Empty template disables appending.
+        let s3 = bare_step("mytool", Some(""));
+        assert_eq!(command_with_inner_jobs(&s3, "-j", Some(4)), "mytool");
     }
 
     #[test]

@@ -29,7 +29,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::model::{DagConfig, RunResult, Step, StepOutcome};
+use crate::model::{
+    command_with_inner_jobs, preferred_inner_jobs, DagConfig, RunResult, Step, StepOutcome,
+};
 
 /// Scheduler idle interval between ready-set sweeps (matches Python's `time.sleep(0.05)`).
 const LOOP_SLEEP: Duration = Duration::from_millis(50);
@@ -105,6 +107,8 @@ struct Runner {
     jobs: i64,
     keep_going: bool,
     verbosity: i64,
+    /// Default inner-parallelism flag template (e.g. "-j") for steps without their own.
+    default_jobs_flag: String,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -130,6 +134,7 @@ impl Runner {
             jobs: jobs.max(1),
             keep_going,
             verbosity,
+            default_jobs_flag: cfg.default_jobs_flag.clone(),
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
                 running: HashSet::new(),
@@ -211,8 +216,9 @@ impl Runner {
                 let shared = Arc::clone(&self.shared);
                 let keep_going = self.keep_going;
                 let verbosity = self.verbosity;
+                let default_jobs_flag = self.default_jobs_flag.clone();
                 handles.push(thread::spawn(move || {
-                    run_step(step, shared, keep_going, verbosity);
+                    run_step(step, shared, keep_going, verbosity, default_jobs_flag);
                 }));
             }
             thread::sleep(LOOP_SLEEP);
@@ -282,12 +288,24 @@ fn last_line(bytes: &[u8]) -> String {
 }
 
 /// Supervise ONE step: launch, pump stdout/stderr, enforce the timeout, reap, classify.
-fn run_step(step: Step, shared: Arc<Mutex<Shared>>, keep_going: bool, verbosity: i64) {
+fn run_step(
+    step: Step,
+    shared: Arc<Mutex<Shared>>,
+    keep_going: bool,
+    verbosity: i64,
+    default_jobs_flag: String,
+) {
     let tag = step.tag();
     emit(&format!("[{tag}] \u{25b6} START  {}", step.desc));
 
+    // Append the step's inner-parallelism (concurrency) flag when it declares one, using the
+    // step's jobs_flag template (or the DagConfig default, e.g. "-j"). No-op when the step has
+    // no preferred_inner_jobs.
+    let inner_jobs = preferred_inner_jobs(&step, None);
+    let run_cmd = command_with_inner_jobs(&step, &default_jobs_flag, inner_jobs);
+
     let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(&step.cmd);
+    cmd.arg("-c").arg(&run_cmd);
     // env = inherited process env + the step's overrides.
     for (k, v) in &step.env {
         cmd.env(k, v);
@@ -514,6 +532,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            jobs_flag: None,
         }
     }
 
@@ -620,5 +639,30 @@ mod tests {
         // A cap of 1 must serialize the two: their run intervals cannot overlap.
         assert!(ends["one"] <= starts["two"] || ends["two"] <= starts["one"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inner_jobs_flag_is_appended_to_command() {
+        // A step with preferred_inner_jobs + a "-j%d" jobs_flag has "-j4" appended; a command
+        // that only succeeds when it receives exactly "-j4" therefore exits 0.
+        let mut s = step(
+            "g",
+            "j",
+            "check() { [ \"$*\" = \"-j4\" ]; }; check",
+            &[],
+            0.0,
+            &[],
+        );
+        s.hint = ResourceHint {
+            preferred_inner_jobs: Some(4),
+            ..Default::default()
+        };
+        s.jobs_flag = Some("-j%d".to_string());
+        let cfg = DagConfig {
+            steps: vec![s],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 1, false, 0);
+        assert!(res.ok, "expected '-j4' to be appended so the check passes");
     }
 }

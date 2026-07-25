@@ -16,6 +16,10 @@ from enum import Enum
 
 DEFAULT_STEP_TIMEOUT = 1800
 
+#: Default template for the inner-parallelism (concurrency) flag appended to a step's command
+#: when the step declares ``preferred_inner_jobs``. See :func:`render_jobs_flag`.
+DEFAULT_JOBS_FLAG = "-j"
+
 
 class StepClass(Enum):
     """How a step uses the machine, used for scheduling decisions."""
@@ -68,10 +72,56 @@ class Step:
     networkonly: bool = False  # skipped when networking is disabled
     engine_only: bool = False  # selected only by an engine-only subset preset
     timeout: int = DEFAULT_STEP_TIMEOUT
+    # Template for the inner-parallelism flag appended to `cmd` when this step declares
+    # `preferred_inner_jobs`. None inherits DagConfig.default_jobs_flag; "" disables appending
+    # (the step manages its own concurrency). See render_jobs_flag for the template forms.
+    jobs_flag: str | None = None
 
     @property
     def tag(self) -> str:
         return f"{self.group}.{self.job}"
+
+
+def render_jobs_flag(template: str, inner_jobs: int) -> str:
+    """Render an inner-parallelism (concurrency) flag from a template and a job count.
+
+    Three forms let a caller match any tool's flag spelling:
+
+    * template contains ``%d`` -> substitute (full control, no auto-space):
+      ``"-j%d"`` -> ``"-j4"``, ``"--num-threads=%d"`` -> ``"--num-threads=4"``.
+    * template ends with ``=`` -> concatenate (no space): ``"--jobs="`` -> ``"--jobs=4"``.
+    * otherwise -> space-separated: ``"--num-threads"`` -> ``"--num-threads 4"``, and the
+      default ``"-j"`` -> ``"-j 4"``.
+    """
+    if "%d" in template:
+        return template.replace("%d", str(inner_jobs))
+    if template.endswith("="):
+        return f"{template}{inner_jobs}"
+    return f"{template} {inner_jobs}"
+
+
+def effective_jobs_flag(step: Step, default_jobs_flag: str) -> str:
+    """The jobs-flag template in effect for a step: its own ``jobs_flag`` overrides the
+    DagConfig-level default; ``None`` inherits the default."""
+    return step.jobs_flag if step.jobs_flag is not None else default_jobs_flag
+
+
+def command_with_inner_jobs(
+    step: Step, default_jobs_flag: str, inner_jobs: int | None
+) -> str:
+    """The step's shell command with its inner-parallelism flag appended, when applicable.
+
+    Appends ``<rendered-flag>`` (see :func:`render_jobs_flag`) to the command when
+    ``inner_jobs`` is set and the effective jobs-flag template is non-empty. A ``None``
+    ``inner_jobs`` or an empty template leaves the command unchanged (the step then declares no
+    inner parallelism, or manages its own).
+    """
+    if inner_jobs is None:
+        return step.cmd
+    template = effective_jobs_flag(step, default_jobs_flag)
+    if not template:
+        return step.cmd
+    return f"{step.cmd} {render_jobs_flag(template, inner_jobs)}"
 
 
 def step_classification(step: Step) -> StepClass:
@@ -150,6 +200,8 @@ class DagConfig:
     # Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.
     outer_mem_safety_factor: float = 1.0
     default_step_timeout: int = DEFAULT_STEP_TIMEOUT
+    # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
+    default_jobs_flag: str = DEFAULT_JOBS_FLAG
 
     def by_tag(self) -> dict[str, Step]:
         return {step.tag: step for step in self.steps}

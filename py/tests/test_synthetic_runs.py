@@ -41,7 +41,12 @@ def sleeper(
     )
     cmd = busy_cmd(seconds) if inner > 1 else f"sleep {seconds:g}"
     env: dict[str, str] = {"INNER": str(inner)} if inner > 1 else {}
-    return Step(group, job, f"{group}.{job}", cmd, deps=list(deps or []), env=env, hint=hint)
+    # busy_cmd drives its inner parallelism via the INNER env var, so the concurrency flag must
+    # NOT be appended to the command (an empty jobs_flag template disables the append).
+    jobs_flag = "" if inner > 1 else None
+    return Step(
+        group, job, f"{group}.{job}", cmd, deps=list(deps or []), env=env, hint=hint, jobs_flag=jobs_flag
+    )
 
 
 def diamond(seconds: float = 0.1) -> DagConfig:

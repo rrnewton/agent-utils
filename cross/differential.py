@@ -247,6 +247,60 @@ def representative_fixtures() -> list[Fixture]:
         )
     )
 
+    # jobs_flag: the inner-parallelism flag appended to a step's command when it declares
+    # preferred_inner_jobs. Each fixture's command PASSES iff exactly the expected appended token(s)
+    # arrive as "$*", so a serial run (-j1) yields 1-passed in BOTH builds only when Python and
+    # Rust render + append the flag identically. The `json` check additionally pins schema parity
+    # for the jobs_flag / default_jobs_flag fields.
+    fixtures.append(
+        Fixture(
+            "jobs_flag_percent",  # "-j%d" -> "-j4" (no space)
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": 'c() { [ "$*" = "-j4" ]; }; c',
+                        "jobs_flag": "-j%d",
+                        "hint": {"preferred_inner_jobs": 4},
+                    }
+                ]
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "jobs_flag_equals",  # "--jobs=" -> "--jobs=8" (concatenated)
+            {
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": 'c() { [ "$*" = "--jobs=8" ]; }; c',
+                        "jobs_flag": "--jobs=",
+                        "hint": {"preferred_inner_jobs": 8},
+                    }
+                ]
+            },
+        )
+    )
+    fixtures.append(
+        Fixture(
+            "jobs_flag_default_inherit",  # step inherits DAG default_jobs_flag "--num-threads" -> "--num-threads 3"
+            {
+                "default_jobs_flag": "--num-threads",
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "j",
+                        "cmd": 'c() { [ "$*" = "--num-threads 3" ]; }; c',
+                        "hint": {"preferred_inner_jobs": 3},
+                    }
+                ],
+            },
+        )
+    )
+
     return fixtures
 
 

@@ -28,12 +28,16 @@ from safe_ci_dag_runner.analyze import summarize
 from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroups
 from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
 from safe_ci_dag_runner.model import (
+    DEFAULT_JOBS_FLAG,
     DEFAULT_STEP_TIMEOUT,
     DagConfig,
     ResourceHint,
     Step,
     StepClass,
+    command_with_inner_jobs,
+    effective_jobs_flag,
     preferred_inner_jobs,
+    render_jobs_flag,
     step_classification,
     step_failure_reason,
 )
@@ -69,9 +73,13 @@ __all__ = [
     "ResourceHint",
     "DagConfig",
     "DEFAULT_STEP_TIMEOUT",
+    "DEFAULT_JOBS_FLAG",
     "step_classification",
     "preferred_inner_jobs",
     "step_failure_reason",
+    "render_jobs_flag",
+    "effective_jobs_flag",
+    "command_with_inner_jobs",
     # running
     "run_dag",
     "Runner",

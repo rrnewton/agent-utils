@@ -19,8 +19,9 @@ pub mod viz;
 
 pub use io::{dag_from_json, dag_to_json, DagJsonError};
 pub use model::{
-    preferred_inner_jobs, step_classification, step_failure_reason, DagConfig, ResourceHint,
-    RunResult, Step, StepClass, StepOutcome, DEFAULT_STEP_TIMEOUT,
+    command_with_inner_jobs, effective_jobs_flag, preferred_inner_jobs, render_jobs_flag,
+    step_classification, step_failure_reason, DagConfig, ResourceHint, RunResult, Step, StepClass,
+    StepOutcome, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
 };
 pub use scheduler::run_dag;
 pub use sizing::{

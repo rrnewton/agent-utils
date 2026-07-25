@@ -25,6 +25,7 @@ import json
 from collections.abc import Mapping
 
 from safe_ci_dag_runner.model import (
+    DEFAULT_JOBS_FLAG,
     DEFAULT_STEP_TIMEOUT,
     DagConfig,
     ResourceHint,
@@ -71,6 +72,15 @@ def _opt_int(m: Mapping[str, object], key: str, default: int) -> int:
     val = m.get(key, default)
     if isinstance(val, bool) or not isinstance(val, int):
         raise DagJsonError(f"field '{key}' must be an integer")
+    return val
+
+
+def _opt_str_or_none(m: Mapping[str, object], key: str) -> str | None:
+    val = m.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise DagJsonError(f"field '{key}' must be a string or null")
     return val
 
 
@@ -197,6 +207,7 @@ def dag_from_json(text: str) -> DagConfig:
                 networkonly=_opt_bool(sm, "networkonly", False),
                 engine_only=_opt_bool(sm, "engine_only", False),
                 timeout=_opt_int(sm, "timeout", default_step_timeout),
+                jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
             )
         )
     return DagConfig(
@@ -206,6 +217,7 @@ def dag_from_json(text: str) -> DagConfig:
         mem_cap_floor_bytes=_opt_int(doc, "mem_cap_floor_bytes", _DEFAULT_MEM_CAP_FLOOR),
         outer_mem_safety_factor=_opt_float(doc, "outer_mem_safety_factor", 1.0),
         default_step_timeout=default_step_timeout,
+        default_jobs_flag=_opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG),
     )
 
 
@@ -233,6 +245,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "networkonly": step.networkonly,
         "engine_only": step.engine_only,
         "timeout": step.timeout,
+        "jobs_flag": step.jobs_flag,
         "hint": _hint_to_json(step.hint),
     }
 
@@ -245,6 +258,7 @@ def dag_to_json(cfg: DagConfig) -> str:
         "mem_cap_floor_bytes": cfg.mem_cap_floor_bytes,
         "outer_mem_safety_factor": cfg.outer_mem_safety_factor,
         "default_step_timeout": cfg.default_step_timeout,
+        "default_jobs_flag": cfg.default_jobs_flag,
         "steps": [_step_to_json(s) for s in cfg.steps],
     }
     return json.dumps(doc, indent=2)

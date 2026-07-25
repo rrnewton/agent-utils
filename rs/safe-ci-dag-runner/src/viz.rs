@@ -214,6 +214,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            jobs_flag: None,
         };
         let mut caps = BTreeMap::new();
         caps.insert("browser".to_string(), 1);

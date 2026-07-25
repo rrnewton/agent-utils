@@ -117,12 +117,14 @@ def _quickstart(c: Palette) -> str:
   {k(f'{PROG} run   --dag dag.json')}        {c.dim('# concurrent, dependency-ordered; exit 0 = all passed')}
 
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
-  step:   group, job, desc, cmd, deps[], env{{}}, timeout, networkonly, engine_only, hint{{}}
+  step:   group, job, desc, cmd, deps[], env{{}}, timeout, jobs_flag, networkonly, engine_only, hint{{}}
   hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,
           classification("cpu-bound"|"latency-bound"|"light"), preferred_inner_jobs
   top:    resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
-          outer_mem_safety_factor, default_step_timeout
+          outer_mem_safety_factor, default_step_timeout, default_jobs_flag
   {c.dim('resource_caps bound concurrent demand - e.g. {"browser":1} serializes browser steps.')}
+  {c.dim('jobs_flag: template appended with a step preferred_inner_jobs, e.g. "-j" -> "-j 4",')}
+  {c.dim('  "-j%d" -> "-j4", "--jobs=" -> "--jobs=4", "--num-threads" -> "--num-threads 4".')}
 
 {h('What you get')}
   - concurrent scheduling in longest-first order, honoring deps + resource caps
