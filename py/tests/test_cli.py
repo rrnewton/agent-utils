@@ -1,19 +1,84 @@
-"""Tests for the safe-ci-dag-runner CLI."""
+"""Tests for the safe-ci-dag-runner CLI surface (in-process, stdlib capture)."""
 
 from __future__ import annotations
 
+import contextlib
+import io
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
 
 from safe_ci_dag_runner import __version__
 from safe_ci_dag_runner.cli import PROG, main
 
+_DEMO = '{"steps": [{"group": "g", "job": "j", "cmd": "true", "deps": []}]}'
 
-def test_main_no_args_returns_zero() -> None:
-    assert main([]) == 0
+
+def _capture(args: list[str]) -> tuple[int, str, str]:
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        rc = main(args)
+    return rc, out.getvalue(), err.getvalue()
+
+
+def _demo_path(tmp: str) -> str:
+    path = Path(tmp) / "dag.json"
+    path.write_text(_DEMO, encoding="utf-8")
+    return str(path)
+
+
+def test_no_args_prints_help() -> None:
+    rc, out, _ = _capture([])
+    assert rc == 0
+    assert PROG in out and "quickstart" in out
+
+
+def test_quickstart_is_self_contained() -> None:
+    rc, out, _ = _capture(["quickstart"])
+    assert rc == 0
+    for marker in ("Install", "Write a DAG", "run", "DAG schema", "Exit codes"):
+        assert marker in out
+
+
+def test_list_and_ascii() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, out, _ = _capture(["list", "--dag", dag])
+        assert rc == 0 and "g.j" in out
+        rc, out, _ = _capture(["ascii", "--dag", dag])
+        assert rc == 0 and "layer 0:" in out and "g.j" in out
+
+
+def test_dot_and_json() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, out, _ = _capture(["dot", "--dag", dag])
+        assert rc == 0 and out.startswith("digraph")
+        rc, out, _ = _capture(["json", "--dag", dag])
+        assert rc == 0 and '"steps"' in out
+
+
+def test_run_exit_codes() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        ok = Path(tmp) / "ok.json"
+        ok.write_text('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}', encoding="utf-8")
+        assert _capture(["run", "--dag", str(ok), "-q"])[0] == 0
+        bad = Path(tmp) / "bad.json"
+        bad.write_text('{"steps": [{"group": "g", "job": "j", "cmd": "false"}]}', encoding="utf-8")
+        assert _capture(["run", "--dag", str(bad), "-q"])[0] == 1
+
+
+def test_missing_and_malformed_dag_exit_2() -> None:
+    assert _capture(["run", "--dag", "/nonexistent/nope.json", "-q"])[0] == 2
+    with tempfile.TemporaryDirectory() as tmp:
+        junk = Path(tmp) / "junk.json"
+        junk.write_text("not json", encoding="utf-8")
+        assert _capture(["list", "--dag", str(junk)])[0] == 2
 
 
 def test_version_via_module() -> None:
+    # argparse --version exits(0); run as a subprocess so it doesn't kill the test process.
     result = subprocess.run(
         [sys.executable, "-m", "safe_ci_dag_runner", "--version"],
         capture_output=True,

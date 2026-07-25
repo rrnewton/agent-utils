@@ -26,6 +26,7 @@ from safe_ci_dag_runner.ambient import (
 )
 from safe_ci_dag_runner.analyze import summarize
 from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroups
+from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
 from safe_ci_dag_runner.model import (
     DEFAULT_STEP_TIMEOUT,
     DagConfig,
@@ -107,4 +108,8 @@ __all__ = [
     "to_ascii",
     # analysis
     "summarize",
+    # serialization
+    "dag_from_json",
+    "dag_to_json",
+    "DagJsonError",
 ]
