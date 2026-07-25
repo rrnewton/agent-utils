@@ -1,0 +1,374 @@
+//! Core DAG vocabulary for safe-ci-dag-runner.
+//!
+//! Pure data + pure helpers, no I/O. A caller describes their build/test graph as a set of
+//! [`Step`] values (each carrying a [`ResourceHint`]) bundled in a [`DagConfig`], then hands
+//! it to the runner. Direct port of `py/safe_ci_dag_runner/model.py`; the enum serde values,
+//! defaults, and the [`step_failure_reason`] precedence + strings are kept identical to the
+//! Python build so the two are cross-differential-testable.
+
+use std::collections::BTreeMap;
+
+/// Default per-step timeout (seconds); mirrors Python's `DEFAULT_STEP_TIMEOUT`.
+pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
+
+/// How a step uses the machine, used for scheduling decisions.
+///
+/// The serde/string values (`"cpu-bound"`, `"latency-bound"`, `"light"`) are load-bearing:
+/// they appear verbatim in JSON, `list`, `ascii`, and `dot` output and must match Python.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepClass {
+    CpuBound,
+    LatencyBound,
+    #[default]
+    Light,
+}
+
+impl StepClass {
+    /// The canonical string form (matches Python's `StepClass.<X>.value`).
+    pub fn value(self) -> &'static str {
+        match self {
+            StepClass::CpuBound => "cpu-bound",
+            StepClass::LatencyBound => "latency-bound",
+            StepClass::Light => "light",
+        }
+    }
+
+    /// Parse the canonical string form, or `None` for an unknown value.
+    pub fn from_value(text: &str) -> Option<StepClass> {
+        match text {
+            "cpu-bound" => Some(StepClass::CpuBound),
+            "latency-bound" => Some(StepClass::LatencyBound),
+            "light" => Some(StepClass::Light),
+            _ => None,
+        }
+    }
+}
+
+/// Per-step scheduling knowledge: scarce-resource demand, cost estimate, memory.
+///
+/// Every field is optional (has a default). With none supplied the runner falls back to a
+/// fixed concurrency with no memory model; supplying them enables memory-aware `-j` sizing and
+/// longest-processing-time dispatch ordering.
+#[derive(Debug, Clone, Default)]
+pub struct ResourceHint {
+    /// Scarce-resource DEMAND for this step, e.g. `{"browser": 1}`. The runner never lets the
+    /// summed demand of concurrently-running steps exceed `DagConfig::resource_caps`.
+    pub resources: BTreeMap<String, i64>,
+    /// Estimated wall-clock seconds; used only to order ready steps (longest first).
+    pub est_duration_s: f64,
+    /// Estimated peak resident memory (bytes). `None` excludes the step from the memory model.
+    pub rss_baseline_bytes: Option<i64>,
+    /// Explicit hard per-step memory cap (bytes); overrides the derived cap when set.
+    pub hard_mem_max_bytes: Option<i64>,
+    pub classification: StepClass,
+    /// Internal parallelism width for the step's own command (e.g. a build's `-j`).
+    pub preferred_inner_jobs: Option<i64>,
+    pub measured_effective_cores: Option<f64>,
+    pub measured_cpu_utilization: Option<f64>,
+}
+
+/// One node in the DAG: a shell command plus its dependencies and resource hint.
+#[derive(Debug, Clone)]
+pub struct Step {
+    pub group: String,
+    pub job: String,
+    pub desc: String,
+    /// Shell command (`bash -c`), run from the run's working directory.
+    pub cmd: String,
+    /// Tags (`"group.job"`) this step depends on.
+    pub deps: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub hint: ResourceHint,
+    /// Skipped when networking is disabled.
+    pub networkonly: bool,
+    /// Selected only by an engine-only subset preset.
+    pub engine_only: bool,
+    pub timeout: i64,
+}
+
+impl Step {
+    /// The step's unique tag, `"group.job"`.
+    pub fn tag(&self) -> String {
+        format!("{}.{}", self.group, self.job)
+    }
+}
+
+/// A step's class: an explicit non-default hint wins; a browser-resource step is
+/// latency-bound; otherwise light. (Mirrors DeepScry's `step_class`.)
+pub fn step_classification(step: &Step) -> StepClass {
+    if step.hint.classification != StepClass::Light {
+        return step.hint.classification;
+    }
+    if step.hint.resources.contains_key("browser") {
+        return StepClass::LatencyBound;
+    }
+    StepClass::Light
+}
+
+/// Internal parallelism width for a step: an explicit override wins, else the hint.
+pub fn preferred_inner_jobs(step: &Step, experiment_override: Option<i64>) -> Option<i64> {
+    experiment_override.or(step.hint.preferred_inner_jobs)
+}
+
+/// Map a Unix signal number to its name (e.g. `9 -> "SIGKILL"`), matching the names Python's
+/// `signal.Signals(n).name` produces for the common signals; unknown numbers fall back to
+/// `"signal N"` exactly like the Python `ValueError` branch.
+fn signal_name(sig: i64) -> String {
+    let name = match sig {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGUSR1",
+        11 => "SIGSEGV",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        17 => "SIGCHLD",
+        18 => "SIGCONT",
+        19 => "SIGSTOP",
+        20 => "SIGTSTP",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        26 => "SIGVTALRM",
+        27 => "SIGPROF",
+        28 => "SIGWINCH",
+        29 => "SIGIO",
+        31 => "SIGSYS",
+        _ => return format!("signal {sig}"),
+    };
+    name.to_string()
+}
+
+/// Describe a failed step without conflating an external signal with an OOM.
+///
+/// Precedence (load-bearing for cross-language parity):
+/// OOM > timeout > pids-guard > detail-capture-failure > signal > exit code.
+///
+/// A negative `returncode` means the child received a Unix signal; that must never be
+/// reported as an OOM.
+#[allow(clippy::too_many_arguments)]
+pub fn step_failure_reason(
+    returncode: Option<i64>,
+    oomed: bool,
+    oom_kills: i64,
+    timed_out: bool,
+    timeout: i64,
+    pids_guard_tripped: bool,
+    pids_guard_reason: Option<&str>,
+    detail_write_failure: &[String],
+) -> String {
+    if oomed {
+        return format!("OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))");
+    }
+    if timed_out {
+        return format!("TIMEOUT >{timeout}s");
+    }
+    if pids_guard_tripped {
+        return format!("PIDS GUARD ({})", pids_guard_reason.unwrap_or(""));
+    }
+    if let Some(first) = detail_write_failure.first() {
+        return format!("DETAIL CAPTURE FAILED ({first})");
+    }
+    if let Some(rc) = returncode {
+        if rc < 0 {
+            let name = signal_name(-rc);
+            return format!(
+                "received {name} with no validate timeout, pids guard, \
+                 or child-cgroup OOM recorded"
+            );
+        }
+    }
+    match returncode {
+        Some(rc) => format!("exit {rc}"),
+        None => "exit None".to_string(),
+    }
+}
+
+/// A whole DAG plus caller policy.
+///
+/// `steps` is the graph; `resource_caps` bounds concurrent scarce-resource demand. The
+/// memory-model tunables mirror DeepScry's outer-cap behavior and can be left at their
+/// defaults.
+#[derive(Debug, Clone)]
+pub struct DagConfig {
+    pub steps: Vec<Step>,
+    pub resource_caps: BTreeMap<String, i64>,
+    /// Multiplier from a step's measured RSS baseline to its inner memory cap (headroom).
+    pub mem_cap_factor: f64,
+    /// Lower bound (bytes) on the modeled worst-case footprint. Default 8 GiB.
+    pub mem_cap_floor_bytes: i64,
+    /// Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.
+    pub outer_mem_safety_factor: f64,
+    pub default_step_timeout: i64,
+}
+
+impl Default for DagConfig {
+    fn default() -> Self {
+        DagConfig {
+            steps: Vec::new(),
+            resource_caps: BTreeMap::new(),
+            mem_cap_factor: 1.25,
+            mem_cap_floor_bytes: 8 * 1024i64.pow(3),
+            outer_mem_safety_factor: 1.0,
+            default_step_timeout: DEFAULT_STEP_TIMEOUT,
+        }
+    }
+}
+
+impl DagConfig {
+    /// Map each step tag to a reference to the step (mirrors Python's `by_tag`).
+    pub fn by_tag(&self) -> BTreeMap<String, &Step> {
+        self.steps.iter().map(|s| (s.tag(), s)).collect()
+    }
+}
+
+/// Terminal result of one scheduled step.
+#[derive(Debug, Clone)]
+pub struct StepOutcome {
+    /// The step's tag (`"group.job"`).
+    pub tag: String,
+    /// Whether the step succeeded (exit 0, not timed out).
+    pub ok: bool,
+    /// Wall-clock seconds the step ran.
+    pub duration_s: f64,
+    /// One-line summary extracted from the step's output (`""` when unavailable).
+    pub summary: String,
+    /// Child process exit code; negative for a Unix signal; `None` if never collected.
+    pub returncode: Option<i64>,
+    /// Human-readable failure reason; `""` when `ok`.
+    pub reason: String,
+    /// True when eager-exit killed this in-flight step after ANOTHER step failed.
+    pub aborted: bool,
+}
+
+impl StepOutcome {
+    /// Build a passing outcome.
+    pub fn passed(tag: String, duration_s: f64, summary: String, returncode: Option<i64>) -> Self {
+        StepOutcome {
+            tag,
+            ok: true,
+            duration_s,
+            summary,
+            returncode,
+            reason: String::new(),
+            aborted: false,
+        }
+    }
+
+    /// Build a failed outcome, deriving `reason` from the shared precedence rule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn failed(
+        tag: String,
+        duration_s: f64,
+        summary: String,
+        returncode: Option<i64>,
+        oomed: bool,
+        oom_kills: i64,
+        timed_out: bool,
+        timeout: i64,
+        aborted: bool,
+    ) -> Self {
+        let reason = step_failure_reason(
+            returncode, oomed, oom_kills, timed_out, timeout, false, None, &[],
+        );
+        StepOutcome {
+            tag,
+            ok: false,
+            duration_s,
+            summary,
+            returncode,
+            reason,
+            aborted,
+        }
+    }
+
+    /// Build an eager-exit ABORTED outcome (a cancellation, not a genuine failure).
+    pub fn aborted_outcome(
+        tag: String,
+        duration_s: f64,
+        summary: String,
+        returncode: Option<i64>,
+    ) -> Self {
+        StepOutcome {
+            tag,
+            ok: false,
+            duration_s,
+            summary,
+            returncode,
+            reason: "ABORTED (eager-exit after another step failed; keep_going to run all)"
+                .to_string(),
+            aborted: true,
+        }
+    }
+}
+
+/// Aggregate outcome of a whole DAG run.
+#[derive(Debug, Clone)]
+pub struct RunResult {
+    /// Overall pass/fail (no genuine, non-aborted failure occurred).
+    pub ok: bool,
+    /// Wall-clock seconds the whole run took.
+    pub wall_s: f64,
+    /// Per-step terminal results, in dispatch (LPT) order.
+    pub outcomes: Vec<StepOutcome>,
+    /// Tags whose dependencies failed so they never ran (sorted).
+    pub skipped: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classification_browser_promotes_to_latency() {
+        let mut hint = ResourceHint::default();
+        hint.resources.insert("browser".to_string(), 1);
+        let step = Step {
+            group: "e2e".into(),
+            job: "smoke".into(),
+            desc: String::new(),
+            cmd: "true".into(),
+            deps: vec![],
+            env: BTreeMap::new(),
+            hint,
+            networkonly: false,
+            engine_only: false,
+            timeout: DEFAULT_STEP_TIMEOUT,
+        };
+        assert_eq!(step_classification(&step), StepClass::LatencyBound);
+    }
+
+    #[test]
+    fn failure_reason_precedence() {
+        // OOM beats a signal.
+        assert_eq!(
+            step_failure_reason(Some(-9), true, 2, false, 10, false, None, &[]),
+            "OOM-KILLED (hit inner MemoryMax; 2 oom_kill event(s))"
+        );
+        // timeout beats a signal.
+        assert_eq!(
+            step_failure_reason(Some(-15), false, 0, true, 30, false, None, &[]),
+            "TIMEOUT >30s"
+        );
+        // negative return code without oom/timeout -> signal name.
+        assert_eq!(
+            step_failure_reason(Some(-9), false, 0, false, 10, false, None, &[]),
+            "received SIGKILL with no validate timeout, pids guard, \
+             or child-cgroup OOM recorded"
+        );
+        // plain non-zero exit.
+        assert_eq!(
+            step_failure_reason(Some(1), false, 0, false, 10, false, None, &[]),
+            "exit 1"
+        );
+    }
+}

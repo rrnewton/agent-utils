@@ -10,6 +10,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[dependencies]
+# JSON parsing only. Serialization is hand-rolled (see io.rs) to reproduce Python's
+# `json.dumps(indent=2)` byte-for-byte (key order, 2-space indent, float formatting) which a
+# derive + default serde_json round-trip cannot guarantee. serde-derive is therefore not
+# pulled in: the strict reader replicates Python's exact narrowing (e.g. bool-is-not-int),
+# which derive would not.
+serde_json = "1"
+
 [[bin]]
 name = "safe-ci-dag-runner"
 path = "src/main.rs"
