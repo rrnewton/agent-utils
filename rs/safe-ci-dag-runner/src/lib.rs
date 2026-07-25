@@ -12,6 +12,7 @@
 
 pub mod model;
 pub mod sizing;
+pub mod viz;
 
 pub use model::{
     preferred_inner_jobs, step_classification, step_failure_reason, DagConfig, ResourceHint,
@@ -21,6 +22,7 @@ pub use sizing::{
     jobs_footprint_bytes, jobs_for_budget, mem_available_bytes, parse_size,
     schedulable_peak_mem_bytes, step_mem_cap_bytes, step_mem_cap_for_inner_jobs, transitive_deps,
 };
+pub use viz::{to_ascii, to_dot};
 
 /// Program name (matches the Python build so `--version` output is byte-identical).
 pub const PROG: &str = "safe-ci-dag-runner";
