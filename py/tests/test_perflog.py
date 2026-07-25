@@ -68,6 +68,9 @@ def test_csv_metrics_sink_writes_per_step_and_whole_run() -> None:
         assert whole_rows[0]["result"] == "pass"
         assert whole_rows[0]["n_steps"] == "3"
 
+        # The flock sidecar must not be left behind as stray output.
+        assert not list(Path(d).glob("*.lock")), "a stray *.lock file was left in --perf-dir"
+
 
 def test_csv_metrics_sink_appends_across_runs() -> None:
     """A second run into the same directory appends (does not clobber): the per-step CSV

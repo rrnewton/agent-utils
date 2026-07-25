@@ -133,6 +133,8 @@ def test_run_perf_dir_writes_csv() -> None:
         assert csvs, "expected at least one perf CSV to be written"
         assert any(p.stat().st_size > 0 for p in csvs)
         assert "perf CSVs written under" in err
+        # No stray flock sidecar left behind in the user's --perf-dir.
+        assert not list(perf.glob("*.lock"))
 
 
 def test_version_via_module() -> None:

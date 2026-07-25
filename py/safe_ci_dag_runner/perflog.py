@@ -189,7 +189,9 @@ def append_step_profiles(
     is a heterogeneous column->value mapping owned by the caller (the scheduler's per-step
     ``row``); the shared run context (timestamp, machine id, container class, git SHA, outer
     job count, and the provenance columns) is stamped onto every row here. Writes are
-    serialized with an ``flock`` sidecar so concurrent runs on one machine do not interleave.
+    serialized with an ``flock`` sidecar so concurrent runs on one machine do not interleave;
+    the sidecar is unlinked while the lock is still held, so a normal run leaves no stray
+    ``*.csv.lock`` file behind without weakening the write serialization.
 
     The header is derived from the ACTUAL row keys: the standard columns
     (:data:`STEP_PROFILE_COLUMNS`) come first, then any extra per-row keys (dynamic ``cpu.*``
@@ -220,6 +222,16 @@ def append_step_profiles(
     with open(lock_path, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         _append_rows_merging_header(path, full_rows, fieldnames)
+        # Remove the 0-byte flock sidecar so a normal run leaves no stray *.csv.lock in the
+        # user's --perf-dir. Unlinking AFTER the write but BEFORE releasing keeps write
+        # serialization intact: a waiter that already opened this same lock inode still blocks
+        # on us, and a racing opener that recreates the path only ever overlaps our post-write
+        # teardown, never another writer's write. Best-effort (cosmetic): a failed unlink never
+        # breaks logging.
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
     return path
 
 
