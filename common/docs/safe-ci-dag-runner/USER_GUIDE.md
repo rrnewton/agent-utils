@@ -7,6 +7,7 @@ start with the README's 60-second quickstart or run `safe-ci-dag-runner quicksta
 ## Contents
 
 - [Concepts](#concepts)
+- [Planning algorithm](#planning-algorithm)
 - [The DAG JSON schema](#the-dag-json-schema)
 - [Worked examples](#worked-examples)
 - [The Python API in depth](#the-python-api-in-depth)
@@ -15,34 +16,61 @@ start with the README's 60-second quickstart or run `safe-ci-dag-runner quicksta
 
 ## Concepts
 
+**The resource model in one glance — three independent parts.** Before the individual concepts, the
+big picture: the runner reasons about three *separate* kinds of resource, and it helps to keep them
+distinct.
+
+1. **Memory (bytes / GB)** — per-step `rss_baseline_bytes` / `hard_mem_max_bytes` hints drive
+   memory-aware `-j` (the largest concurrency whose modeled worst-case RAM fits `--max-mem`) and the
+   per-step inner memory cap under cgroup boxing. Usually the first knob you reach for.
+2. **CPU** — the outer `-j` (how many steps run at once), a step's own `preferred_inner_jobs` width,
+   and (under boxing) CPU caps carved from the delegated cgroup scope.
+3. **Named scarce resources** — arbitrary caller-named semaphores (`hint.resources` bounded by
+   `resource_caps`) for anything memory and CPU do not capture, such as "only one browser at a time".
+
+The concepts below cover each in turn.
+
 **DAG.** Your build/test pipeline is a directed acyclic graph: a set of steps, where an edge means
 "this step depends on that one." The runner executes steps concurrently, only starting a step once
 all of its dependencies have finished successfully.
 
 **Step.** One node in the graph: a shell command (`cmd`, run via `bash -c`) plus its dependencies and
-an optional resource hint. Every step is identified by its **tag**, `group.job` (for example
-`build.app`). Tags must be unique — they are how dependencies, resource accounting, and per-step
-boxing all refer to a step.
+an optional resource hint. Every step is identified by its fully-qualified **tag**, `group.job` (for
+example `build.app`). Tags must be unique — they are how dependencies, resource accounting, and
+per-step boxing all refer to a step. The `group` is simply a **namespace** for organizing and
+referring to related steps (for example every `e2e.*` step); it carries no scheduling meaning of its
+own.
 
 **Dependencies.** A step lists the tags it depends on in `deps`. A step launches only once **every**
 dependency has a *done and successful* outcome. If any dependency **fails**, the step is never run —
 and the failure closes transitively, so everything downstream of a failure is marked `skipped`.
 
+**resource_caps.** A top-level map bounding the total concurrent demand for each named scarce
+resource. The runner never lets the summed `resources` demand of the steps running at one instant
+exceed the cap. The classic use is `{"browser": 1}` to **serialize** browser/e2e steps (only one at a
+time) even while other steps run in parallel. (It is introduced here *before* the per-step
+`ResourceHint` because the caps are what a step's `hint.resources` demand is measured against.)
+
+Resource names are **arbitrary strings you choose — not a built-in list**: `"browser"`, `"db"`,
+`"gpu"`, `"api-tokens"`, anything. The only rule is that every resource a step demands in its hint
+must have a matching key in `resource_caps` with enough capacity; demand an uncapped (or
+insufficiently-capped) resource and that step can never be scheduled, stalling the run. `"browser"`
+is *only a name*: DeepScry uses it to serialize its Playwright/browser end-to-end tests, which each
+grab fixed ports and a display and so cannot run concurrently — but the runner has no built-in notion
+of a browser. (The single place the literal name `browser` is recognized is a *cosmetic display*
+default — a browser-resource step is shown as `latency-bound` unless you set a class; see the
+classification auto-promotion note under the schema below. It changes no scheduling.)
+
 **ResourceHint.** Optional per-step scheduling knowledge attached to a step. Every field is optional;
 supplying them unlocks smarter behavior:
 
-- `resources` — how much of each *scarce named resource* the step needs (e.g. `{"browser": 1}`).
+- `resources` — how much of each *scarce named resource* the step needs (e.g. `{"browser": 1}`),
+  matched against the `resource_caps` above.
 - `est_duration_s` — an estimated runtime, used only to *order* ready steps.
 - `rss_baseline_bytes` / `hard_mem_max_bytes` — memory estimates that feed the memory model and the
   per-step inner memory cap.
 - `classification` — `cpu-bound`, `latency-bound`, or `light`.
 - `preferred_inner_jobs` — the step's own internal parallelism width.
-
-**resource_caps.** A top-level map bounding the total concurrent demand for each named resource. The
-runner never lets the summed `resources` demand of the steps running at one instant exceed the cap.
-The classic use is `{"browser": 1}` to **serialize** browser/e2e steps (only one at a time) even
-while other steps run in parallel. Resource names are arbitrary strings you choose (`browser`, `db`,
-`gpu`, `net`, ...); a step demands them via its hint, and the cap bounds them.
 
 **Longest-first (LPT) scheduling.** When several steps are ready and a slot frees up, the runner
 picks the one with the largest `est_duration_s` first (a stable sort, so steps with equal or no
@@ -81,6 +109,27 @@ load bucket). The default records nothing. Metrics never fail a run.
 **Visualization.** `to_dot` renders Graphviz DOT (one cluster per group, solid dependency edges, and
 a dashed chain across the users of each cap-1 resource to hint that they serialize). `to_ascii`
 renders a compact topological-layer view for the terminal.
+
+## Planning algorithm
+
+The scheduler today is a single **greedy, longest-processing-time-first (LPT)** pass over the ready
+set. On every sweep it launches each step that is *ready* — all dependencies finished successfully,
+its scarce-resource demand fits the remaining `resource_caps`, and the run is under its `-j` fan-out —
+considering ready steps in descending `est_duration_s`, so that when a slot or a scarce resource
+frees, the heaviest ready step claims it. That keeps long steps off the tail of the run and shortens
+overall wall-clock time. Ordering is the *only* thing the estimate affects; dependency and resource
+gating are enforced independently, so a wrong estimate can mildly degrade packing but never breaks
+correctness.
+
+Two planned improvements are worth knowing about:
+
+- **A pluggable planner (`--planner`).** The greedy LPT pass is the only strategy for now; a
+  `--planner` flag that selects a smarter **critical-path / lookahead** planner — one that reasons
+  about the whole remaining graph, not just the current ready set — is planned (ds-afzsqf).
+- **A learned duration profile.** `est_duration_s` is, for now, a static hint you write into the DAG.
+  A separate, auto-updated **profile store** that records real per-step durations from past runs and
+  feeds them back as the estimate is planned (ds-7pzdgm), so the numbers would not have to be
+  hand-maintained.
 
 ## The DAG JSON schema
 
@@ -508,7 +557,7 @@ step's captured detail go to **stdout**; the final `PASS`/`FAIL` summary line go
 `run ... 2>/dev/null` hides only the summary line.
 
 **`CsvMetricsSink` and the `--perf-dir` CSVs.** The bundled file-backed CSV sink works (this was
-broken before 0.1 and is now fixed): `run_dag(cfg, metrics=CsvMetricsSink(dir, git_sha=...))`, or the
+broken previously and is now fixed): `run_dag(cfg, metrics=CsvMetricsSink(dir, git_sha=...))`, or the
 CLI `run --perf-dir DIR`, writes a per-step CSV and a whole-run CSV, creating the directory and files
 as needed. The per-step CSV's columns are derived from the actual row keys, so it never drops data.
 The dynamic `cpu.*` per-step columns only appear when cgroup boxing is active (see the "containment
@@ -516,10 +565,10 @@ is DEGRADED" note above): the CLI's `--cgroups` only boxes steps when the proces
 delegated cgroup-v2 scope, so on a plain host those cgroup-derived measurements are simply absent from
 the CSV rather than an error.
 
-**Python vs Rust.** In 0.1 the Rust binary is at parity for the *core*: `run`, `list`, `ascii`,
+**Python vs Rust.** For now, the Rust binary is at parity for the *core*: `run`, `list`, `ascii`,
 `dot`, `json`, and `quickstart` all work, with `list`/`ascii`/`dot` output byte-identical to the
 Python build, `json` parsed-identical, and `run` exit code + step counts identical (enforced by the
-`cross/differential.py` harness). What is **Python-only** in 0.1 is the Linux cgroup boxing
+`cross/differential.py` harness). What is **Python-only** for now is the Linux cgroup boxing
 (`--cgroups`), the CSV perf logging (`--perf-dir`), and the ambient-load bucketing: the Rust `run`
 uses no per-step boxing (matching Python's default, where boxing is the opt-in `--cgroups` path), and
 the Rust CLI accepts `--cgroups`/`--perf-dir` but prints a visible warning and runs unboxed / without

@@ -24,6 +24,7 @@ agent-utils/
 ├── bin/            ->  rs/bin (or py/bin)   # convenience symlink, created by setup
 ├── common/                   # language-neutral shared material (single source of truth)
 │   └── docs/<tool>/          #   userguide, symlinked into py/ and rs/ for DRY
+├── examples/                 # small, runnable DAG files (one per core idea), run by either build
 ├── py/
 │   ├── bin/<tool>            # command entrypoints (shebang symlinks; no build needed)
 │   ├── <tool_pkg>/           # the Python package (mypy strict, zero `Any`)
@@ -33,7 +34,7 @@ agent-utils/
 │   ├── Cargo.toml            # workspace
 │   └── <tool>/               # the crate
 ├── cross/                    # randomized py-vs-rs differential tests
-└── .github/workflows/        # per-tool py / rs / cross workflows, path-filtered
+└── .github/workflows/        # per-tool py / rs / cross / examples workflows, path-filtered
 ```
 
 `py/bin/<tool>` and `rs/bin/<tool>` expose the **same command names** (no `-py`/`-rs` suffix). The
@@ -43,7 +44,7 @@ top-level `bin/` symlink points at the Rust binaries when Rust is built, otherwi
 
 | Tool | Purpose | Status |
 |------|---------|--------|
-| `safe-ci-dag-runner` | Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on CPU/mem/ambient-load logging. | ✅ core at py↔rs parity (load / model / size / visualize / run — `run`/`list`/`ascii`/`dot`/`json`/`quickstart`), proven by the `cross/` differential. cgroup boxing + perf logging are Python-only in 0.1. |
+| `safe-ci-dag-runner` | Run a DAG (a dependency graph) of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on CPU/mem/ambient-load logging. | ✅ core at py↔rs parity (load / model / size / visualize / run — `run`/`list`/`ascii`/`dot`/`json`/`quickstart`), proven by the `cross/` differential. cgroup boxing + perf logging are Python-only for now. |
 
 ## Building
 

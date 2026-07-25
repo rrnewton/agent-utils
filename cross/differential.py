@@ -310,6 +310,41 @@ def randomized_fixtures(count: int, seed: int) -> list[Fixture]:
     return fixtures
 
 
+def example_fixtures() -> list[Fixture]:
+    """Every DAG shipped under ``examples/`` becomes a fixture, so the runnable newcomer examples
+    are proven to render identically under both builds.
+
+    These are checked STATIC-ONLY (``list``/``ascii``/``dot``/``json`` parity via
+    :func:`compare_example_static`): the examples use real multi-second ``sleep`` commands to make
+    parallelism visible, so folding them into the full run/timing battery would slow the harness for
+    no added coverage — run/exit/counts/sizing parity is already exercised by the fast representative
+    and randomized fixtures.
+    """
+    examples_dir = os.path.join(REPO_ROOT, "examples")
+    if not os.path.isdir(examples_dir):
+        return []
+    fixtures: list[Fixture] = []
+    for name in sorted(os.listdir(examples_dir)):
+        if not name.endswith(".json"):
+            continue
+        with open(os.path.join(examples_dir, name), encoding="utf-8") as fh:
+            loaded: object = json.load(fh)
+        if not isinstance(loaded, dict):
+            raise TypeError(f"examples/{name}: expected a JSON object at the top level")
+        dag: dict[str, object] = {str(key): val for key, val in loaded.items()}
+        fixtures.append(Fixture(f"example:{name[:-len('.json')]}", dag))
+    return fixtures
+
+
+def compare_example_static(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> None:
+    """Static-command parity for a shipped example DAG (see :func:`example_fixtures`)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(fx.dag))
+        _static_parity(py, rs, dag_path, fx.name, rep)
+
+
 # --------------------------------------------------------------------------- comparisons
 
 
@@ -327,44 +362,55 @@ def _sizing(stderr: str) -> tuple[int, int, int] | None:
     return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
 
+def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: Report) -> None:
+    """Assert the static (non-running) commands agree for one DAG file: ``list``/``ascii``/``dot``
+    stdout byte-identical, and ``json`` stdout parsed-equal (byte-identity additionally tracked).
+
+    Shared by the full-battery fixtures (:func:`compare_fixture`) and the shipped-example fixtures
+    (:func:`compare_example_static`), so the two paths cannot drift apart.
+    """
+    # list / ascii / dot: byte-identical stdout.
+    for mode in ("list", "ascii", "dot"):
+        po = run(py, (mode, "--dag", dag_path))
+        ro = run(rs, (mode, "--dag", dag_path))
+        label = f"{name}/{mode}"
+        if po.returncode != ro.returncode:
+            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+        elif po.stdout != ro.stdout:
+            rep.bad(label, f"stdout differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}")
+        else:
+            rep.ok(label)
+
+    # json: parsed-equal (byte-identity additionally tracked).
+    po = run(py, ("json", "--dag", dag_path))
+    ro = run(rs, ("json", "--dag", dag_path))
+    label = f"{name}/json"
+    if po.returncode != ro.returncode:
+        rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+        return
+    try:
+        equal = json.loads(po.stdout) == json.loads(ro.stdout)
+    except json.JSONDecodeError as exc:
+        rep.bad(label, f"unparseable json: {exc}")
+        return
+    if not equal:
+        rep.bad(label, f"parsed json differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}")
+    else:
+        rep.ok(label)
+        if po.stdout == ro.stdout:
+            rep.json_byte_identical += 1
+        else:
+            rep.json_parsed_equal_only += 1
+
+
 def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag_path = os.path.join(tmp, "dag.json")
         with open(dag_path, "w", encoding="utf-8") as fh:
             fh.write(json.dumps(fx.dag))
 
-        # 1) list / ascii / dot: byte-identical stdout.
-        for mode in ("list", "ascii", "dot"):
-            po = run(py, (mode, "--dag", dag_path))
-            ro = run(rs, (mode, "--dag", dag_path))
-            label = f"{fx.name}/{mode}"
-            if po.returncode != ro.returncode:
-                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
-            elif po.stdout != ro.stdout:
-                rep.bad(label, f"stdout differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}")
-            else:
-                rep.ok(label)
-
-        # 2) json: parsed-equal (byte-identity additionally tracked).
-        po = run(py, ("json", "--dag", dag_path))
-        ro = run(rs, ("json", "--dag", dag_path))
-        label = f"{fx.name}/json"
-        if po.returncode != ro.returncode:
-            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
-        else:
-            try:
-                equal = json.loads(po.stdout) == json.loads(ro.stdout)
-            except json.JSONDecodeError as exc:
-                rep.bad(label, f"unparseable json: {exc}")
-            else:
-                if not equal:
-                    rep.bad(label, f"parsed json differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}")
-                else:
-                    rep.ok(label)
-                    if po.stdout == ro.stdout:
-                        rep.json_byte_identical += 1
-                    else:
-                        rep.json_parsed_equal_only += 1
+        # 1-2) static commands: list/ascii/dot byte-identical, json parsed-equal.
+        _static_parity(py, rs, dag_path, fx.name, rep)
 
         # 3) run: default concurrent exit-code parity. The default eager-exit path is
         # deterministic in its EXIT CODE (1 iff any reachable step fails) but NOT in the
@@ -438,19 +484,24 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     fixtures = representative_fixtures() + randomized_fixtures(rand_count, seed)
     for fx in fixtures:
         compare_fixture(py, rs, fx, rep)
+    examples = example_fixtures()
+    for fx in examples:
+        compare_example_static(py, rs, fx, rep)
+    n_fixtures = len(fixtures) + len(examples)
 
     if rep.failures:
         for failure in rep.failures:
             print(f"DIVERGENCE [{failure}")
         print(
             f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks "
-            f"across {len(fixtures)} fixtures"
+            f"across {n_fixtures} fixtures ({len(examples)} shipped examples, static-only)"
         )
         return 1
 
     print(
-        f"cross[{tool}]: OK - {rep.checks} checks across {len(fixtures)} fixtures agree "
-        f"(json byte-identical: {rep.json_byte_identical}, "
+        f"cross[{tool}]: OK - {rep.checks} checks across {n_fixtures} fixtures agree "
+        f"({len(examples)} shipped examples, static-only; "
+        f"json byte-identical: {rep.json_byte_identical}, "
         f"parsed-equal-only: {rep.json_parsed_equal_only})"
     )
     return 0

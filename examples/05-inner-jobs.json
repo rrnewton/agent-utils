@@ -1,0 +1,11 @@
+{
+  "steps": [
+    {"group": "build", "job": "app", "desc": "parallel compile that runs its own make -j8",
+     "cmd": "echo '[build] make -j8 build' && sleep 3",
+     "hint": {"classification": "cpu-bound", "preferred_inner_jobs": 8,
+              "rss_baseline_bytes": 2147483648}},
+    {"group": "test", "job": "unit", "desc": "unit tests once the build is done",
+     "cmd": "echo '[test] unit tests' && sleep 2",
+     "deps": ["build.app"]}
+  ]
+}

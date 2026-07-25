@@ -1,0 +1,12 @@
+{
+  "steps": [
+    {"group": "build", "job": "compile", "desc": "compile the sources",
+     "cmd": "echo '[build] compiling' && sleep 2"},
+    {"group": "test", "job": "unit", "desc": "run the unit tests",
+     "cmd": "echo '[test] running unit tests' && sleep 2",
+     "deps": ["build.compile"]},
+    {"group": "package", "job": "tarball", "desc": "assemble the release tarball",
+     "cmd": "echo '[package] building tarball' && sleep 2",
+     "deps": ["test.unit"]}
+  ]
+}

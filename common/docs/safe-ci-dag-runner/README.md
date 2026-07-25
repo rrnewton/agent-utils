@@ -30,7 +30,7 @@ This is one tool from [`agent-utils`](https://github.com/rrnewton/agent-utils). 
 package and a Rust crate. **The core is now at parity**: both builds load a DAG from JSON, model it,
 size it (memory-aware `-j`), visualize it, and run it, and a randomized differential test asserts the
 two produce identical observable output. The Linux cgroup boxing and perf logging remain Python-only
-in 0.1 — see [Status & limitations](#status--limitations).
+for now — see [Status & limitations](#status--limitations).
 
 ## Install
 
@@ -50,8 +50,10 @@ safe-ci-dag-runner quickstart
 
 ## 60-second quickstart
 
-Save a DAG as `dag.json`. Each step has a `group` and a `job` (its tag is `group.job`), a shell
-`cmd`, and may depend on other steps by tag:
+Save a DAG as `dag.json`. Each step is identified by a fully-qualified `group.job` **tag** (the
+`group` is just a namespace for organizing and referring to steps). A step carries a shell `cmd` and
+may depend on other steps by tag. The top-level `resource_caps` (introduced before the per-step
+`hint` because it bounds them) limits how much of each named scarce resource may run at once:
 
 ```json
 {
@@ -99,6 +101,45 @@ safe-ci-dag-runner: PASS - 3 passed, 0 failed, 0 aborted, 0 skipped in 0.5s
 `build.app` runs first; once it passes, `test.unit` and `e2e.smoke` run concurrently. The exit code
 is `0` because every step passed. (The per-step lines go to stdout; the final `PASS`/`FAIL` summary
 line goes to stderr.)
+
+Ready-to-run examples of each idea (linear chain, diamond, scarce resource, memory-aware sizing,
+inner jobs) live in [`examples/`](https://github.com/rrnewton/agent-utils/tree/main/examples).
+
+## The resource model: memory, CPU, and named resources
+
+The runner reasons about three *independent* kinds of resource; keeping them separate makes the
+knobs easy to place:
+
+1. **Memory (bytes / GB).** Per-step memory hints — `rss_baseline_bytes` (estimated peak resident
+   memory) and `hard_mem_max_bytes` (an explicit cap) — drive **memory-aware `-j`**: `run --max-mem
+   8G` picks the largest concurrency whose modeled worst-case RAM fits your budget, and (under cgroup
+   boxing) caps each step so a runaway is OOM-killed in isolation. This is the knob most users reach
+   for first.
+2. **CPU.** Outer concurrency is `-j` (how many steps run at once); a step's own internal width is
+   `preferred_inner_jobs` (e.g. it runs `make -j8`); and under cgroup boxing the whole run and each
+   step get CPU caps from the delegated scope. CPU governs *how many things run*, not *which are
+   allowed to co-run*.
+3. **Named scarce resources (semaphores).** For constraints that memory and CPU do not capture, a
+   step declares demand in `hint.resources` (e.g. `{"browser": 1}`) and the top-level `resource_caps`
+   bounds the total concurrent demand (e.g. `{"browser": 1}` lets only one browser step run at a
+   time).
+
+**Named resources are just names you choose — not a built-in list.** A resource name is an arbitrary
+caller-defined string; the only rule is that every resource a step demands must have a matching key
+in `resource_caps` with enough capacity, or that step can never be scheduled. `"browser"` is the
+worked example throughout these docs, and it is *only a name*: DeepScry uses it to serialize its
+Playwright/browser end-to-end tests, which each grab fixed ports and a display and so cannot run
+concurrently. You could equally cap `"gpu"`, `"db"`, or `"api-tokens"` — anything scarce.
+
+## Planning algorithm
+
+Scheduling today is a single **greedy, longest-processing-time-first** pass: whenever a worker slot
+frees, the runner starts the ready step (all dependencies done, resource demand fits the caps, under
+`-j`) with the largest `est_duration_s` first, so long steps do not pile up on the tail of the run.
+The `est_duration_s` you attach to a step is, for now, a static hint you supply in the DAG; a
+separate, auto-updated profile store that learns real durations from past runs is planned
+(ds-7pzdgm), as is a `--planner` flag that would select a smarter critical-path / lookahead planner
+in place of today's greedy one (ds-afzsqf).
 
 ## CLI reference
 
@@ -210,7 +251,7 @@ to plug in a real cgroup manager or a metrics sink.
 
 ## Status & limitations
 
-Stated honestly for the 0.1 release:
+Stated honestly:
 
 - **Python CLI + API: ready.** `run`, `list`, `ascii`, `dot`, `json`, and `quickstart` all work, and
   the scheduler (dependency gating, resource caps, longest-first dispatch, fail-fast / keep-going,
@@ -239,13 +280,14 @@ Stated honestly for the 0.1 release:
   the Python build, its `json` parsed-identical, and its `run` exit code + step counts identical —
   proven by the randomized `cross/differential.py` harness in CI. Scope note: the Rust `run` performs
   **no per-step cgroup boxing and no perf logging** (matching Python's default, where boxing is the
-  opt-in `--cgroups` path); those Linux-only modules stay Python-only in 0.1. `--cgroups` /
+  opt-in `--cgroups` path); those Linux-only modules stay Python-only for now. `--cgroups` /
   `--perf-dir` are accepted by the Rust CLI but degrade with a visible warning and run unboxed.
 
 ## See also
 
 - [`USER_GUIDE.md`](https://github.com/rrnewton/agent-utils/blob/main/common/docs/safe-ci-dag-runner/USER_GUIDE.md) — concepts, the complete DAG JSON schema, worked examples, the
   in-depth Python API, and troubleshooting.
+- [`examples/`](https://github.com/rrnewton/agent-utils/tree/main/examples) — five small, runnable DAGs, one per core idea, each ready for `run --dag`.
 - `safe-ci-dag-runner quickstart` — the same tour from the command line.
 
 ## License

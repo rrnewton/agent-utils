@@ -1,0 +1,16 @@
+{
+  "steps": [
+    {"group": "build", "job": "app", "desc": "compile the app (fans out to two checks)",
+     "cmd": "echo '[build] compiling app' && sleep 2",
+     "hint": {"est_duration_s": 2, "classification": "cpu-bound"}},
+    {"group": "test", "job": "unit", "desc": "unit tests (longer branch, dispatched first)",
+     "cmd": "echo '[test] unit tests' && sleep 4",
+     "deps": ["build.app"], "hint": {"est_duration_s": 4}},
+    {"group": "test", "job": "lint", "desc": "lint (shorter branch, runs alongside unit)",
+     "cmd": "echo '[test] lint' && sleep 2",
+     "deps": ["build.app"], "hint": {"est_duration_s": 2}},
+    {"group": "deploy", "job": "staging", "desc": "deploy once BOTH checks pass",
+     "cmd": "echo '[deploy] to staging' && sleep 2",
+     "deps": ["test.unit", "test.lint"]}
+  ]
+}
