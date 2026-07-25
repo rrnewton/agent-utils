@@ -245,7 +245,7 @@ run_dag(
     jobs: int,                       # outer fan-out (-j); clamped to >= 1
     cgroups: CgroupManager | None = None,   # None -> NoopCgroups (no boxing)
     metrics: MetricsSink | None = None,      # None -> record nothing
-    keep_going: bool = False,        # run all runnable steps even after a failure
+    keep_going: bool = False,        # on failure, let running steps finish (still stops launching new)
     verbosity: int = 1,              # 0 quiet(+failures), 1 default(+summaries), >=2 stream child stdout
 ) -> RunResult
 ```

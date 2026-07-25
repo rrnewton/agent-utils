@@ -126,7 +126,7 @@ def _quickstart(c: Palette) -> str:
 {h('What you get')}
   - concurrent scheduling in longest-first order, honoring deps + resource caps
   - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps
-    ({k('--keep-going')} runs everything runnable and reports all failures)
+    ({k('--keep-going')} lets already-running steps finish instead; it still stops launching new steps)
   - {k('run --cgroups')} adds best-effort Linux cgroup-v2 per-step memory/CPU boxing
     {c.dim('(needs cgroup-v2; without it, steps run un-boxed with a visible warning)')}
   - {k('run --max-mem 8G')} picks the largest -j whose modeled worst-case RAM fits the budget
@@ -188,7 +188,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write per-step + whole-run resource-usage CSVs into DIR",
     )
-    run_p.add_argument("-k", "--keep-going", action="store_true", help="run all runnable steps even after a failure")
+    run_p.add_argument(
+        "-k",
+        "--keep-going",
+        action="store_true",
+        help="on a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps)",
+    )
     run_p.add_argument("--cgroups", action="store_true", help="best-effort Linux cgroup-v2 per-step boxing")
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")

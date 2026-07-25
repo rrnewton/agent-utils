@@ -30,8 +30,10 @@ these — see the accompanying report):
   daemon stdout-reader thread so an orphan holding the stdout pipe can never wedge the run;
   the supervisor blocks only on ``proc.wait(timeout=step.timeout)``.
 * **Fail-fast (eager-exit) with ``--keep-going`` override.** The first genuine failure stops
-  scheduling and (unless ``keep_going``) reaps every in-flight step, labelling those as
-  ABORTED (a cancellation) rather than FAILED.
+  the scheduler launching any NEW step. By default it also eager-reaps every in-flight step,
+  labelling those ABORTED (a cancellation) rather than FAILED; ``keep_going`` only suppresses
+  that eager-cancel so already-running steps finish — it does NOT keep launching still-runnable
+  steps.
 * **Failure classification** via :func:`safe_ci_dag_runner.model.step_failure_reason`
   (OOM > timeout > pids-guard > detail-capture > signal > exit precedence).
 
@@ -427,7 +429,7 @@ class Runner:
                     duration_s=elapsed,
                     summary=summary,
                     returncode=returncode,
-                    reason="ABORTED (eager-exit after another step failed; keep_going to run all)",
+                    reason="ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)",
                     aborted=True,
                 )
             elif ok:
@@ -454,9 +456,10 @@ class Runner:
                 )
             self.done[step.tag] = outcome
             if not was_aborted and not ok:
-                # A REAL failure. Mark failed + stop scheduling. EAGER-EXIT (default): reap
-                # every step still running in parallel NOW so a fast failure doesn't wait for a
-                # slow in-flight build. keep_going leaves them running (collect all failures).
+                # A REAL failure. Mark failed + stop launching NEW steps. EAGER-EXIT (default):
+                # reap every step still running in parallel NOW so a fast failure doesn't wait for
+                # a slow in-flight build. keep_going instead lets those in-flight steps finish (so
+                # they report their own pass/fail); it does NOT launch any further steps.
                 self.failed = True
                 self.stop = True
                 if not self.keep_going:
@@ -468,7 +471,7 @@ class Runner:
         if outcome.aborted:
             self._emit(
                 f"[{step.tag}] ⊘ ABORT  {step.desc} "
-                f"({dur}s — eager-exit after another step failed; keep_going to run all)"
+                f"({dur}s — eager-exit after another step failed; keep_going lets in-flight steps finish)"
             )
         elif outcome.ok:
             extra = f"  [{summary}]" if (summary and self.verbosity >= 1) else ""
@@ -527,8 +530,9 @@ def run_dag(
         (a :class:`_NoopCgroupManager` is substituted; teardown falls back to process-group
         kill). A present-but-disabled manager triggers a visible degraded-enforcement warning.
     :param metrics: durable measurement sink, or ``None`` for no recording.
-    :param keep_going: when ``True``, do not eager-exit on the first failure — run every step
-        whose deps still succeed and report all failures in one pass.
+    :param keep_going: on a failure, let already-running steps finish instead of eager-cancelling
+        them; the scheduler still stops launching new steps (it does NOT run every still-runnable
+        step), so in-flight steps report their own pass/fail rather than ABORTED.
     :param verbosity: 0 quiet (+failures), 1 default (+summaries), >=2 stream child stdout.
     """
     sink: MetricsSink = metrics if metrics is not None else _NoopMetricsSink()

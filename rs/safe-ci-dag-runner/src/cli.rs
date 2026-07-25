@@ -122,7 +122,7 @@ hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_
 top:    resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout\n\n\
 {what}\n  \
 - concurrent scheduling in longest-first order, honoring deps + resource caps\n  \
-- a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} runs everything runnable and reports all failures)\n  \
+- a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
 - {maxmem} picks the largest -j whose modeled worst-case RAM fits the budget\n\n\
 {note}  cgroup boxing (--cgroups) and perf logging (--perf-dir) are Python-only in 0.1;\n        this Rust build runs steps unboxed with a visible warning.\n\n\
 {exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file\n",

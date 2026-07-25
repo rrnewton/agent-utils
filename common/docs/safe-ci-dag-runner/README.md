@@ -127,7 +127,7 @@ Global: `--version`, `-h/--help`. Running with no command prints help and exits 
 | `-j, --jobs N`       | Max concurrent steps. Default: the machine's CPU count.                            |
 | `--max-mem SPEC`     | RAM budget (e.g. `8G`, `4096M`): pick the largest `-j` whose modeled worst-case footprint fits. Ignored when `--jobs` is given (`--jobs` wins, with a note). |
 | `--perf-dir DIR`     | Write per-step and whole-run resource-usage CSVs into `DIR` (uses the `CsvMetricsSink`). Prints the CSV paths at the end. |
-| `-k, --keep-going`   | Run every still-runnable step even after a failure; report all failures at the end. |
+| `-k, --keep-going`   | On a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps). |
 | `--cgroups`          | Best-effort Linux cgroup-v2 per-step boxing (see [Status](#status--limitations)).  |
 | `-v`                 | Verbose: stream each step's child output live as it runs.                          |
 | `-q, --quiet`        | Quieter: suppress the per-step PASS summaries (failures are always shown).         |

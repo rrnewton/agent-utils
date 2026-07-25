@@ -311,7 +311,7 @@ impl StepOutcome {
             duration_s,
             summary,
             returncode,
-            reason: "ABORTED (eager-exit after another step failed; keep_going to run all)"
+            reason: "ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)"
                 .to_string(),
             aborted: true,
         }

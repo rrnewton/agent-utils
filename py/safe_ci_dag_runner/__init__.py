@@ -59,7 +59,7 @@ from safe_ci_dag_runner.sizing import (
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
-__version__: str = "0.1.0"
+__version__: str = "0.2.0"
 
 __all__ = [
     "__version__",

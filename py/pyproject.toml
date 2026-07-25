@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safe-ci-dag-runner"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on resource logging."
 readme = "README.md"
 requires-python = ">=3.10"

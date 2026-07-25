@@ -10,8 +10,10 @@
 //! * Named-resource capacity buckets (`hint.resources` vs `cfg.resource_caps`).
 //! * Longest-processing-time (LPT) dispatch order (descending `est_duration_s`, stable).
 //! * Per-step supervision via `bash -c` in its own process group (whole-tree teardown).
-//! * Fail-fast (eager-exit) with a `keep_going` override; eager-cancelled in-flight steps are
-//!   labelled ABORTED, not FAILED.
+//! * Fail-fast (eager-exit): the first genuine failure stops launching NEW steps; by default it
+//!   also eager-cancels in-flight steps (labelled ABORTED, not FAILED). `keep_going` only
+//!   suppresses that eager-cancel so already-running steps finish — it does NOT keep launching
+//!   still-runnable steps.
 //! * Failure classification via [`crate::model::step_failure_reason`].
 //!
 //! Scope note (0.1): this Rust build performs NO per-step cgroup boxing and NO perf logging
@@ -416,8 +418,9 @@ fn run_step(step: Step, shared: Arc<Mutex<Shared>>, keep_going: bool, verbosity:
         let reason = outcome.reason.clone();
         sh.done.insert(tag.clone(), outcome);
         if !was_aborted && !ok {
-            // A REAL failure: mark failed + stop scheduling. Eager-exit (default): reap every
-            // step still running so a fast failure doesn't wait for a slow in-flight build.
+            // A REAL failure: mark failed + stop launching NEW steps. Eager-exit (default): reap
+            // every step still running so a fast failure doesn't wait for a slow in-flight build.
+            // keep_going instead lets those in-flight steps finish; it does NOT launch further steps.
             sh.failed = true;
             sh.stop = true;
             if !keep_going {
@@ -438,7 +441,7 @@ fn run_step(step: Step, shared: Arc<Mutex<Shared>>, keep_going: bool, verbosity:
     // Emit the terminal status OUTSIDE the lock.
     if was_aborted {
         emit(&format!(
-            "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} eager-exit after another step failed; keep_going to run all)",
+            "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} eager-exit after another step failed; keep_going lets in-flight steps finish)",
             step.desc
         ));
     } else if ok {
@@ -468,8 +471,9 @@ fn run_step(step: Step, shared: Arc<Mutex<Shared>>, keep_going: bool, verbosity:
 /// Run a whole DAG and return its [`RunResult`] (no cgroup boxing, no metrics recording).
 ///
 /// * `jobs`: outer scheduler fan-out (`-j`), clamped to at least 1.
-/// * `keep_going`: when true, do not eager-exit on the first failure — run every step whose
-///   deps still succeed and report all failures.
+/// * `keep_going`: on a failure, let already-running steps finish instead of eager-cancelling
+///   them; the scheduler still stops launching new steps (it does NOT run every still-runnable
+///   step), so in-flight steps report their own pass/fail rather than ABORTED.
 /// * `verbosity`: 0 quiet (+failures), 1 default (+summaries), `>=2` stream child stdout.
 pub fn run_dag(cfg: &DagConfig, jobs: i64, keep_going: bool, verbosity: i64) -> RunResult {
     let runner = Runner::new(cfg, jobs, keep_going, verbosity);
