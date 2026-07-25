@@ -195,7 +195,7 @@ for outcome in result.outcomes:
 
 `run_dag` returns a `RunResult` (`.ok`, `.wall_s`, `.outcomes`, `.skipped`, `.step_profile_rows`);
 each `StepOutcome` carries `.tag`, `.ok`, `.duration_s`, `.summary`, `.returncode`, `.reason`, and
-`.aborted`. See [`USER_GUIDE.md`](USER_GUIDE.md) for the full API, the complete JSON schema, and how
+`.aborted`. See [`USER_GUIDE.md`](https://github.com/rrnewton/agent-utils/blob/main/common/docs/safe-ci-dag-runner/USER_GUIDE.md) for the full API, the complete JSON schema, and how
 to plug in a real cgroup manager or a metrics sink.
 
 ## Exit codes
@@ -238,7 +238,7 @@ Stated honestly for the 0.1 release:
 
 ## See also
 
-- [`USER_GUIDE.md`](USER_GUIDE.md) — concepts, the complete DAG JSON schema, worked examples, the
+- [`USER_GUIDE.md`](https://github.com/rrnewton/agent-utils/blob/main/common/docs/safe-ci-dag-runner/USER_GUIDE.md) — concepts, the complete DAG JSON schema, worked examples, the
   in-depth Python API, and troubleshooting.
 - `safe-ci-dag-runner quickstart` — the same tour from the command line.
 
