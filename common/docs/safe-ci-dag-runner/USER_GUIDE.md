@@ -128,6 +128,16 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 | `measured_effective_cores` | number or `null`    | `null`     | Measurement passthrough (recorded in metrics; not used for scheduling).                                       |
 | `measured_cpu_utilization` | number or `null`    | `null`     | Measurement passthrough (recorded in metrics; not used for scheduling).                                       |
 
+> **Classification auto-promotion is a runtime/display derivation, not stored state.** A step that
+> demands the `browser` resource but leaves `classification` unset is *scheduled and shown* as
+> `latency-bound`: `list`, `ascii`, and `dot` render `[latency-bound]` for it. That promotion is
+> computed on the fly (`step_classification`) from the step's resource demand — it is **not** written
+> back onto the step. So the canonical JSON (`safe-ci-dag-runner json`, and any round-trip through
+> `dag_to_json`) re-emits the *stored* value — `"light"` for such a step — not the promoted
+> `"latency-bound"`. This is intentional: the JSON is the exact input you supplied, while the
+> promotion is a scheduling view derived from it. To pin `latency-bound` into the canonical JSON, set
+> `classification` explicitly on the hint.
+
 ## Worked examples
 
 ### A diamond
@@ -212,6 +222,19 @@ from safe_ci_dag_runner import (
     dag_from_json, dag_to_json, DagJsonError,   # (de)serialization
 )
 ```
+
+`StepClass` is the classification enum; set it on a hint to pin how a step is scheduled instead of
+relying on the `light`-or-auto-promoted default:
+
+```python
+from safe_ci_dag_runner import ResourceHint, StepClass
+
+hint = ResourceHint(classification=StepClass.CPU_BOUND)   # or StepClass.LATENCY_BOUND / StepClass.LIGHT
+```
+
+Its three members map one-to-one onto the JSON `classification` strings — `StepClass.CPU_BOUND` ↔
+`"cpu-bound"`, `StepClass.LATENCY_BOUND` ↔ `"latency-bound"`, `StepClass.LIGHT` ↔ `"light"` (each
+`member.value` is exactly that string) — so a Python `DagConfig` and its serialized JSON agree.
 
 ### `run_dag`
 
