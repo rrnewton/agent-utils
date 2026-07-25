@@ -8,8 +8,8 @@ down the run or the host.
 
 ## What you get
 
-- **Two-level cgroup boxing.** The whole run can execute inside an outer CPU/memory box, and each
-  step gets its own nested box. A step that blows its memory budget is OOM-killed *in isolation* at
+- **Two-level cgroup boxing, on by default.** `run` boxes every step: the whole run executes inside
+  an outer CPU/memory box, and each step gets its own nested box. A step that blows its memory budget is OOM-killed *in isolation* at
   its own cap, and when a step finishes, times out, or the run is cancelled, its **entire process
   subtree is torn down immediately** — including `setsid`/double-forked escapees (orphan servers,
   browsers) that a plain process-group kill misses. No orphaned or zombie processes.
@@ -22,15 +22,18 @@ down the run or the host.
 - **DAG visualization.** Render the graph as Graphviz DOT (`dot -Tsvg`) or compact ASCII for a quick
   terminal glance.
 
+Boxing is the tool's primary purpose, so `run` boxes each step **by default**. On a machine without
+cgroup-v2 + a working systemd `--user` scope (many laptops, most CI runners, macOS), a bare `run`
+**errors with exit code 3** instead of silently running unprotected; pass `--allow-cgroup-failure` to
+fall back to the safe no-op stand-in (`NoopCgroups`) and run un-boxed with a visible warning.
 Containment and metrics are **pluggable** (the `CgroupManager` and `MetricsSink` protocols), so the
-scheduler runs anywhere: with real Linux cgroup-v2 boxing where available, or with safe no-op
-stand-ins (`NoopCgroups`, the default) on any other host.
+scheduler runs anywhere.
 
 This is one tool from [`agent-utils`](https://github.com/rrnewton/agent-utils). It ships as a Python
-package and a Rust crate. **The core is now at parity**: both builds load a DAG from JSON, model it,
-size it (memory-aware `-j`), visualize it, and run it, and a randomized differential test asserts the
-two produce identical observable output. The Linux cgroup boxing and perf logging remain Python-only
-for now — see [Status & limitations](#status--limitations).
+package and a Rust crate, **at full parity**: both builds load a DAG from JSON, model it,
+size it (memory-aware `-j`), visualize it, run it under two-level cgroup-v2 boxing, and write per-step
+perf CSVs — and a randomized differential test asserts the two produce identical observable output.
+See [Status & limitations](#status--limitations).
 
 ## Install
 
@@ -88,7 +91,7 @@ layer 1:
   e2e.smoke  [latency-bound] {browser:1}  <- build.app
   test.unit  [light]  <- build.app
 
-$ safe-ci-dag-runner run --dag dag.json
+$ safe-ci-dag-runner run --dag dag.json --allow-cgroup-failure
 [build.app] ▶ START  compile the app
 [build.app] ✓ PASS   compile the app (0s)  [building]
 [test.unit] ▶ START  unit tests
@@ -101,6 +104,13 @@ safe-ci-dag-runner: PASS - 3 passed, 0 failed, 0 aborted, 0 skipped in 0.5s
 `build.app` runs first; once it passes, `test.unit` and `e2e.smoke` run concurrently. The exit code
 is `0` because every step passed. (The per-step lines go to stdout; the final `PASS`/`FAIL` summary
 line goes to stderr.)
+
+**About `--allow-cgroup-failure`.** Boxing each step in its own cgroup-v2 sandbox is this tool's
+primary purpose, so `run` **boxes by default** (it re-execs the run inside a transient `systemd-run
+--user --scope` and caps each step). On a host without cgroup-v2 + a working systemd `--user` scope,
+a bare `run` errors with exit code `3` rather than silently running unprotected; the flag opts out
+and runs the steps un-boxed (with a warning) so the quickstart works on any machine. On a Linux host
+with a systemd user session, drop the flag to get real per-step boxing.
 
 Ready-to-run examples of each idea (linear chain, diamond, scarce resource, memory-aware sizing,
 inner jobs) live in [`examples/`](https://github.com/rrnewton/agent-utils/tree/main/examples).
@@ -169,7 +179,8 @@ Global: `--version`, `-h/--help`. Running with no command prints help and exits 
 | `--max-mem SPEC`     | RAM budget (e.g. `8G`, `4096M`): pick the largest `-j` whose modeled worst-case footprint fits. Ignored when `--jobs` is given (`--jobs` wins, with a note). |
 | `--perf-dir DIR`     | Write per-step and whole-run resource-usage CSVs into `DIR` (uses the `CsvMetricsSink`). Prints the CSV paths at the end. |
 | `-k, --keep-going`   | On a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps). |
-| `--cgroups`          | Best-effort Linux cgroup-v2 per-step boxing (see [Status](#status--limitations)).  |
+| `--allow-cgroup-failure` | Opt out of the on-by-default boxing requirement: instead of erroring (exit `3`) when cgroup-v2 + a systemd `--user` scope are unavailable, run the steps **un-boxed** with a visible warning. Needed on laptops, most CI runners, and non-Linux hosts. |
+| `--cgroups`          | Deprecated no-op, accepted for backward compatibility (cgroup-v2 boxing is now ON by default). |
 | `-v`                 | Verbose: stream each step's child output live as it runs.                          |
 | `-q, --quiet`        | Quieter: suppress the per-step PASS summaries (failures are always shown).         |
 
@@ -177,10 +188,11 @@ Memory-aware sizing example — let the runner choose a RAM-safe `-j` from the g
 memory hints instead of hard-coding one:
 
 ```sh
-safe-ci-dag-runner run --dag dag.json --max-mem 8G
+safe-ci-dag-runner run --dag dag.json --max-mem 8G --allow-cgroup-failure
 ```
 
-`--max-mem` only throttles a DAG whose steps carry per-step `rss_baseline_bytes` memory hints. With
+(As everywhere, drop `--allow-cgroup-failure` on a Linux host with a systemd user session to get
+real per-step boxing; keep it where cgroups are unavailable.) `--max-mem` only throttles a DAG whose steps carry per-step `rss_baseline_bytes` memory hints. With
 no baselines, the modeled footprint collapses to `mem_cap_floor_bytes` (default 8 GiB), so any budget
 at or above the floor picks the full `-j` — the **CPU count** — and prints a note saying it did not
 throttle. "CPU count" here means **logical** CPUs (`os.cpu_count()`, i.e. SMT/hyperthreads included).
@@ -188,7 +200,7 @@ throttle. "CPU count" here means **logical** CPUs (`os.cpu_count()`, i.e. SMT/hy
 Record resource usage while running:
 
 ```sh
-safe-ci-dag-runner run --dag dag.json --perf-dir ./perf
+safe-ci-dag-runner run --dag dag.json --perf-dir ./perf --allow-cgroup-failure
 # writes ./perf/step_profiles_<machine>_<container>.csv (one row per step)
 #    and ./perf/<machine>.csv                            (one whole-run summary row)
 ```
@@ -198,7 +210,7 @@ steps are cancelled and reported as `ABORTED`; steps whose dependencies failed a
 `skipped`. Example:
 
 ```
-$ safe-ci-dag-runner run --dag dag.json -j 4
+$ safe-ci-dag-runner run --dag dag.json -j 4 --allow-cgroup-failure
 ...
 safe-ci-dag-runner: FAIL - 1 passed, 1 failed, 1 aborted, 1 skipped in 0.2s
 ```
@@ -248,6 +260,7 @@ to plug in a real cgroup manager or a metrics sink.
 | `0`  | Every step passed.                                      |
 | `1`  | A step failed (or was aborted/skipped because one did). |
 | `2`  | Bad usage, or a missing / malformed DAG file.           |
+| `3`  | cgroup boxing was required (the default) but could not be established; re-run with `--allow-cgroup-failure` to run un-boxed. |
 
 ## Status & limitations
 
@@ -256,14 +269,16 @@ Stated honestly:
 - **Python CLI + API: ready.** `run`, `list`, `ascii`, `dot`, `json`, and `quickstart` all work, and
   the scheduler (dependency gating, resource caps, longest-first dispatch, fail-fast / keep-going,
   failure classification) is complete.
-- **cgroup boxing is best-effort, and off by default.** The safe default is `NoopCgroups` (no
-  boxing; teardown falls back to a process-group kill). Real two-level cgroup-v2 boxing needs a Linux
-  host with a *delegated* cgroup-v2 hierarchy. From the CLI, `--cgroups` enables per-step boxing only
-  when the runner is **already inside** such a delegated scope; otherwise it prints a visible
-  "containment is DEGRADED" warning and runs the steps un-boxed (it never silently drops a cap). The
-  full outer-scope re-exec that sets up the two-level box is available through the Python API
-  (`safe_ci_dag_runner.cgroup.reexec_in_scope` + `Cgroups`); wiring it automatically into the CLI is
-  still to come.
+- **cgroup boxing is ON by default (both builds).** `run` boxes each step: it re-execs the run inside
+  a transient, delegated `systemd-run --user --scope`, caps each step's memory/CPU in its own child
+  cgroup, and tears the whole subtree down atomically with the step's `cgroup.kill`. Real two-level
+  boxing needs a Linux host with cgroup-v2 and a working systemd `--user` scope; where that is
+  unavailable (laptops, most CI runners, macOS) a bare `run` **errors with exit 3** rather than
+  silently running unprotected, and `--allow-cgroup-failure` downgrades to the safe `NoopCgroups`
+  stand-in (no boxing; teardown falls back to a process-group kill) with a visible warning. The
+  deprecated `--cgroups` flag is now an accepted no-op. (The Python *library* entry point
+  `run_dag(cgroups=None)` still defaults to `NoopCgroups`; it is the *CLI* that boxes by default —
+  see the USER_GUIDE for enabling boxing from the API via `reexec_in_scope` + `Cgroups`.)
 - **Memory-aware `-j` is wired into the CLI.** Pass `run --max-mem 8G` to have the runner pick the
   largest `-j` whose modeled worst-case footprint fits the budget, using the same memory model
   (`jobs_for_budget`, `schedulable_peak_mem_bytes`) available in the Python API. An explicit `--jobs`
@@ -275,13 +290,13 @@ Stated honestly:
   API. The header is derived from the actual row keys, so dynamic per-step columns (e.g. `cgroup
   cpu.*` counters, present only when cgroup boxing is active) are captured without configuration. The
   default remains a no-op sink that records nothing.
-- **The Rust crate is at parity for the core.** `run`, `list`, `ascii`, `dot`, `json`, and
-  `quickstart` all work in the Rust binary, and its `list`/`ascii`/`dot` output is byte-identical to
-  the Python build, its `json` parsed-identical, and its `run` exit code + step counts identical —
-  proven by the randomized `cross/differential.py` harness in CI. Scope note: the Rust `run` performs
-  **no per-step cgroup boxing and no perf logging** (matching Python's default, where boxing is the
-  opt-in `--cgroups` path); those Linux-only modules stay Python-only for now. `--cgroups` /
-  `--perf-dir` are accepted by the Rust CLI but degrade with a visible warning and run unboxed.
+- **The Rust crate is at full parity.** `run`, `list`, `ascii`, `dot`, `json`, and `quickstart` all
+  work in the Rust binary, and its `list`/`ascii`/`dot` output is byte-identical to the Python build,
+  its `json` parsed-identical, and its `run` exit code + step counts identical — proven by the
+  randomized `cross/differential.py` harness in CI. The Rust `run` **also boxes each step in a
+  cgroup-v2 sandbox by default** (identical `--allow-cgroup-failure` opt-out and exit-3 behavior) and
+  **also writes per-step + whole-run perf CSVs via `--perf-dir`**; the earlier Python-only gap for
+  Linux cgroup boxing and perf logging has been closed. `--cgroups` is a deprecated no-op in both.
 
 ## See also
 

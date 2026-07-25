@@ -49,7 +49,9 @@ jobs:
           fi
           for dag in "${examples[@]}"; do
             echo "::group::python run $dag"
-            python3 -m safe_ci_dag_runner run --dag "$dag"
+            # Cgroup boxing is ON by default; CI runners lack a systemd --user scope, so opt out
+            # (a bare `run` would exit 3). This mirrors how the docs tell newcomers to run anywhere.
+            python3 -m safe_ci_dag_runner run --dag "$dag" --allow-cgroup-failure
             echo "::endgroup::"
           done
       - name: run every example under the Rust build
@@ -62,6 +64,8 @@ jobs:
           fi
           for dag in "${examples[@]}"; do
             echo "::group::rust run $dag"
-            rs/target/release/safe-ci-dag-runner run --dag "$dag"
+            # Cgroup boxing is ON by default; CI runners lack a systemd --user scope, so opt out
+            # (a bare `run` would exit 3). This mirrors how the docs tell newcomers to run anywhere.
+            rs/target/release/safe-ci-dag-runner run --dag "$dag" --allow-cgroup-failure
             echo "::endgroup::"
           done

@@ -95,12 +95,15 @@ full CPU count, and it does **not** throttle. The CLI prints a one-line note whe
 (chosen `-j` equals the CPU count AND no step has a baseline), so an un-throttled run is never a
 silent surprise; add per-step `rss_baseline_bytes` hints to make the budget actually constrain `-j`.
 
-**cgroup boxing.** On a Linux cgroup-v2 host with a *delegated* hierarchy, the runner can put the
-whole run in an outer CPU/memory box and each step in its own nested box. The payoff is twofold:
-(1) a step that exceeds its memory cap is OOM-killed in isolation instead of taking down the host;
-(2) teardown writes the step's `cgroup.kill`, an **atomic SIGKILL of the entire subtree** that
-catches `setsid`/double-fork escapees (orphan servers, browsers) a process-group kill misses. When a
-delegated cgroup is unavailable, the runner degrades to a process-group kill and says so out loud.
+**cgroup boxing.** On a Linux cgroup-v2 host with a *delegated* hierarchy, the runner puts the whole
+run in an outer CPU/memory box and each step in its own nested box — and the CLI `run` does this **by
+default** (it re-execs into a transient `systemd-run --user --scope`; see [Enabling real cgroup
+boxing](#enabling-real-cgroup-boxing)). The payoff is twofold: (1) a step that exceeds its memory cap
+is OOM-killed in isolation instead of taking down the host; (2) teardown writes the step's
+`cgroup.kill`, an **atomic SIGKILL of the entire subtree** that catches `setsid`/double-fork escapees
+(orphan servers, browsers) a process-group kill misses. Where a delegated cgroup is unavailable a
+bare `run` **errors with exit 3**; `--allow-cgroup-failure` downgrades to a process-group kill and
+says so out loud.
 
 **Metrics sink.** An optional pluggable destination for durable measurements: one whole-run summary
 row (wall time, CPU contention split, cores) and per-step rows (CPU, memory peak, threads, ambient
@@ -148,6 +151,7 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 | `mem_cap_floor_bytes`    | integer             | `8589934592` (8 GiB) | Lower bound on the modeled worst-case footprint, so `-j` selection never concludes "0 fits."             |
 | `outer_mem_safety_factor`| number              | `1.0`              | Multiplier applied to the modeled peak footprint (`1.0` = no inflation).                                   |
 | `default_step_timeout`   | integer             | `1800`             | Default per-step timeout (seconds) carried as caller policy. Note: the runner enforces each step's own `timeout`. |
+| `default_jobs_flag`      | string              | `"-j"`             | Default inner-jobs flag template for steps that declare `preferred_inner_jobs` but do not set their own `jobs_flag` (see the step `jobs_flag` field). |
 
 ### Step fields
 
@@ -160,6 +164,7 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 | `deps`        | array of string     | `[]`           | Tags this step depends on. All must finish successfully before it launches.                                  |
 | `env`         | object `{str: str}` | `{}`           | Extra environment variables, merged over the runner's environment for this step's command.                  |
 | `hint`        | object              | `{}`           | The resource hint (see below).                                                                               |
+| `jobs_flag`   | string or `null`    | `null` (inherit) | Template for the inner-jobs flag appended to `cmd` when the step declares `preferred_inner_jobs`. `null` inherits the DAG's `default_jobs_flag`; `""` **disables** the append (the command manages its own concurrency). Spellings: `"-j"` → `-j 8`, `"-j%d"` → `-j8`, `"--jobs="` → `--jobs=8`, `"--num-threads"` → `--num-threads 8`. |
 | `networkonly` | boolean             | `false`        | Caller-facing selection flag (a preset can drop these when networking is disabled). Preserved but not acted on by the core scheduler. |
 | `engine_only` | boolean             | `false`        | Caller-facing subset flag. Concretely, `engine_only` steps are **excluded from the memory-budget model**.    |
 | `timeout`     | integer             | `1800`         | Per-step timeout in seconds. On expiry the step's whole process tree is reaped and the step FAILS as TIMEOUT. |
@@ -173,7 +178,7 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 | `rss_baseline_bytes`       | integer or `null`   | `null`     | Estimated peak resident memory. Enables the memory model and (with `mem_cap_factor`) the derived inner cap. `null` excludes the step from the memory model. |
 | `hard_mem_max_bytes`       | integer or `null`   | `null`     | Explicit hard inner memory cap (bytes); overrides the derived (`rss_baseline_bytes` × `mem_cap_factor`) cap.  |
 | `classification`           | `"cpu-bound"` / `"latency-bound"` / `"light"` | `"light"` | How the step uses the machine. Any browser-resource step is treated as `latency-bound` automatically. |
-| `preferred_inner_jobs`     | integer or `null`   | `null`     | The step's own internal parallelism width. Sets the inner CPU cap when boxed and scales the memory-budget model. It does **not** inject a `-j` flag into your command — your `cmd` must use its own parallelism. |
+| `preferred_inner_jobs`     | integer or `null`   | `null`     | The step's own internal parallelism width. Sets the inner CPU cap when boxed, scales the memory-budget model, and — unless suppressed by `jobs_flag` — is rendered into an inner-jobs flag **appended to the step's `cmd`** (see the `jobs_flag` step field). |
 | `measured_effective_cores` | number or `null`    | `null`     | Measurement passthrough (recorded in metrics; not used for scheduling).                                       |
 | `measured_cpu_utilization` | number or `null`    | `null`     | Measurement passthrough (recorded in metrics; not used for scheduling).                                       |
 
@@ -241,23 +246,26 @@ serialize.)
 
 ### A step with internal parallelism
 
-A build that runs its own `-j` internally. Declare the width so the runner can set an inner CPU cap
-(when boxed) and account for the extra memory in the budget model:
+A build that runs its own `-j` internally. Declare the width so the runner can append the inner-jobs
+flag, set an inner CPU cap (when boxed), and account for the extra memory in the budget model:
 
 ```json
 {
   "steps": [
     {"group": "build", "job": "app", "desc": "parallel compile",
-     "cmd": "make -j8 build",
+     "cmd": "make build",
      "hint": {"classification": "cpu-bound", "preferred_inner_jobs": 8,
               "rss_baseline_bytes": 6442450944}}
   ]
 }
 ```
 
-The `-j8` is in *your* command — `preferred_inner_jobs: 8` only tells the runner about it. When cgroup
-boxing is active the step is capped to 8 CPUs; in the memory model a `cpu-bound` step's cap scales
-with its inner width above a width of 4.
+`preferred_inner_jobs: 8` does two things. First, the runner **appends** the inner-jobs flag to your
+command: with the default `-j` template the step actually runs as `make build -j 8`, so you declare
+the width once instead of hardcoding it in `cmd`. (Set `jobs_flag` to change the spelling — e.g.
+`"-j%d"` → `make build -j8` — or `""` to opt out when your command already sets its own `-j`.) Second,
+it feeds scheduling: when cgroup boxing is active the step is capped to 8 CPUs, and in the memory
+model a `cpu-bound` step's cap scales with its inner width above a width of 4.
 
 ## The Python API in depth
 
@@ -299,9 +307,12 @@ run_dag(
 ) -> RunResult
 ```
 
-`jobs` is required and keyword-only. Passing a `cgroups` manager whose `.enabled` is `False` triggers
-a visible "containment is DEGRADED" warning (No Silent Failure) and runs un-boxed. Passing a real
-`metrics` sink but getting nothing recorded also warns.
+`jobs` is required and keyword-only. Note the split between the two entry points: the **library**
+`run_dag(cgroups=None)` defaults to `NoopCgroups` (no boxing), whereas the **CLI** `run` boxes by
+default and only runs un-boxed when you pass `--allow-cgroup-failure` (see [Enabling real cgroup
+boxing](#enabling-real-cgroup-boxing)). Passing a `cgroups` manager whose `.enabled` is `False`
+triggers a visible "containment is DEGRADED" warning (No Silent Failure) and runs un-boxed. Passing a
+real `metrics` sink but getting nothing recorded also warns.
 
 ### `RunResult` and `StepOutcome`
 
@@ -349,10 +360,11 @@ outside the subset are dropped from the drawing).
 
 ### Choosing a RAM-safe `-j` (memory-aware sizing)
 
-From the CLI, pass a budget and let the runner size `-j`:
+From the CLI, pass a budget and let the runner size `-j` (add `--allow-cgroup-failure` on a host
+without cgroups, or drop it on a Linux systemd host for real boxing):
 
 ```sh
-safe-ci-dag-runner run --dag dag.json --max-mem 8G
+safe-ci-dag-runner run --dag dag.json --max-mem 8G --allow-cgroup-failure
 ```
 
 It picks the largest `-j` whose modeled worst-case footprint fits `8G` and prints the decision. An
@@ -410,10 +422,11 @@ run_dag(cfg, jobs=4, metrics=sink)
 #                                                  contention split, cores, result)
 ```
 
-The CLI wraps this as `run --perf-dir ./perf`. The safe default remains `metrics=None` (record
-nothing). Note the dynamic `cpu.*` per-step columns only appear when cgroup boxing is active
-(`--cgroups` inside a delegated scope); without it, those measurements are unavailable and the CSV
-simply omits them.
+The CLI wraps this as `run --perf-dir ./perf` (available in both the Python and Rust builds). The
+`run_dag` library default remains `metrics=None` (record nothing). Note the dynamic `cpu.*` per-step
+columns only appear when cgroup boxing is active — i.e. an actual boxed `run` (the default on a Linux
+systemd host), not an `--allow-cgroup-failure` un-boxed run; without boxing those cgroup-derived
+measurements are unavailable and the CSV simply omits them.
 
 ### Plugging in cgroup containment
 
@@ -430,10 +443,11 @@ When boxing is active, each step's inner memory cap comes from its hint (`hard_m
 
 ## Enabling real cgroup boxing
 
-By default the runner uses `NoopCgroups` (no boxing), and the CLI's `run --cgroups` only boxes steps
-when the process is **already inside** a delegated cgroup-v2 scope — otherwise it prints a visible
-"containment is DEGRADED" warning and runs the steps un-boxed (it never silently drops a cap). This
-section shows how to actually turn boxing on from the Python API.
+The CLI `run` boxes each step **by default**: it performs the `reexec_in_scope` step described below
+for you, and errors with exit 3 where cgroup-v2 + a systemd `--user` scope are unavailable (unless
+you pass `--allow-cgroup-failure` to run un-boxed). The **library** entry point `run_dag(cgroups=None)`
+instead defaults to `NoopCgroups` (no boxing). This section shows how to turn real boxing on from the
+Python API — the same mechanism the CLI uses under the hood.
 
 ### Prerequisites
 
@@ -511,29 +525,34 @@ When boxing is active, each step's inner memory cap comes from its hint (`hard_m
 that exceeds its inner `memory.max` is OOM-killed in isolation, and teardown uses the step cgroup's
 `cgroup.kill` (setsid-proof) instead of a process-group kill.
 
-### The CLI `run --cgroups` caveat
+### The CLI boxes by default
 
-The CLI flag `run --cgroups` constructs `Cgroups()` for you but does **not** perform the outer
-`reexec_in_scope` step. So it enables per-step boxing only when you have *already* entered a delegated
-scope — for example by running the CLI from inside `boxed_run.py`'s scope, or under an external
-`systemd-run --user --scope -p Delegate=yes` wrapper. Otherwise it prints the "containment is
-DEGRADED" warning and runs un-boxed. Wiring the outer re-exec into the CLI automatically is still to
-come; until then, use the Python recipe above for turn-key boxing.
+The CLI `run` performs the outer `reexec_in_scope` step for you: on a Linux host with cgroup-v2 and a
+working systemd `--user` scope, a bare `run` re-execs into a transient delegated scope and boxes every
+step — no wrapper needed. Where that environment is unavailable it **errors with exit 3** rather than
+silently running unprotected; pass `--allow-cgroup-failure` to run un-boxed with a visible warning.
+The old opt-in `--cgroups` flag is now a deprecated no-op (accepted for backward compatibility), and
+the Python and Rust builds behave identically here. Use the `reexec_in_scope` + `Cgroups` recipe above
+when you want the same turn-key boxing from your own Python program rather than the CLI.
 
 ## Troubleshooting
 
-**"containment is DEGRADED" / steps run un-boxed.** You passed `--cgroups` (or a `Cgroups()` whose
-`.enabled` is `False`). The runner prints, then continues un-boxed:
+**"containment is DEGRADED" / steps run un-boxed.** This is a **library**-path signal: you passed
+`run_dag` a `CgroupManager` whose `.enabled` is `False` (e.g. a `Cgroups()` constructed outside a
+delegated scope). The runner prints, then continues un-boxed:
 
 ```
 [scheduler] ⚠ per-step cgroup manager is present but disabled; containment is DEGRADED (falling back to process-group kill for teardown, no inner memory/CPU caps).
 ```
 
-This is expected when the process is **not** inside a delegated cgroup-v2 scope (a non-Linux host, no
-systemd `--user` delegation, or you didn't set up the outer scope). Steps still run correctly;
-teardown just uses a process-group kill instead of `cgroup.kill`, and no inner memory/CPU caps are
-applied. To get real boxing, run inside a delegated scope via `reexec_in_scope` (see above). The
-warning is deliberate — the tool never silently drops a cap you asked for.
+It means the process is **not** inside a delegated cgroup-v2 scope (a non-Linux host, no systemd
+`--user` delegation, or you didn't set up the outer scope). Steps still run correctly; teardown just
+uses a process-group kill instead of `cgroup.kill`, and no inner memory/CPU caps are applied. To get
+real boxing, enter a delegated scope via `reexec_in_scope` (see above). The warning is deliberate —
+the tool never silently drops a cap you asked for. From the **CLI** you won't see this line: a bare
+`run` either boxes successfully or errors with exit 3 where boxing is unavailable, and
+`--allow-cgroup-failure` runs un-boxed with its own `cgroup boxing not established
+(--allow-cgroup-failure); running UNBOXED` warning instead.
 
 **A DAG file is rejected (exit 2).** Parsing is strict and the message names the offending field:
 
@@ -565,12 +584,13 @@ is DEGRADED" note above): the CLI's `--cgroups` only boxes steps when the proces
 delegated cgroup-v2 scope, so on a plain host those cgroup-derived measurements are simply absent from
 the CSV rather than an error.
 
-**Python vs Rust.** For now, the Rust binary is at parity for the *core*: `run`, `list`, `ascii`,
-`dot`, `json`, and `quickstart` all work, with `list`/`ascii`/`dot` output byte-identical to the
-Python build, `json` parsed-identical, and `run` exit code + step counts identical (enforced by the
-`cross/differential.py` harness). What is **Python-only** for now is the Linux cgroup boxing
-(`--cgroups`), the CSV perf logging (`--perf-dir`), and the ambient-load bucketing: the Rust `run`
-uses no per-step boxing (matching Python's default, where boxing is the opt-in `--cgroups` path), and
-the Rust CLI accepts `--cgroups`/`--perf-dir` but prints a visible warning and runs unboxed / without
-perf CSVs rather than silently ignoring them. For real cgroup boxing or perf CSVs, use the Python
-package (`pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"`).
+**Python vs Rust.** The Rust binary is at **full parity** with the Python build: `run`, `list`,
+`ascii`, `dot`, `json`, and `quickstart` all work, with `list`/`ascii`/`dot` output byte-identical to
+the Python build, `json` parsed-identical, and `run` exit code + step counts identical (enforced by the
+`cross/differential.py` harness). The Rust `run` also **boxes each step in a cgroup-v2 sandbox by
+default** (identical `--allow-cgroup-failure` opt-out and exit-3 behavior) and **writes per-step +
+whole-run perf CSVs via `--perf-dir`**; the earlier Python-only gap for Linux cgroup boxing, perf
+logging, and ambient-load bucketing has been closed. `--cgroups` is a deprecated no-op in both builds.
+Either package works — install the Python one with
+`pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"`, or build the Rust crate
+under `rs/`.

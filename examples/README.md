@@ -9,10 +9,19 @@ Run any of them with either build (they behave identically — that parity is en
 
 ```sh
 # Python (no build needed):
-python3 -m safe_ci_dag_runner run --dag examples/01-linear-chain.json
+python3 -m safe_ci_dag_runner run --dag examples/01-linear-chain.json --allow-cgroup-failure
 # or, once installed / built:
-safe-ci-dag-runner run --dag examples/01-linear-chain.json
+safe-ci-dag-runner run --dag examples/01-linear-chain.json --allow-cgroup-failure
 ```
+
+**Why `--allow-cgroup-failure`?** Boxing each step in its own Linux cgroup-v2 sandbox is this
+tool's whole point, so `run` **boxes by default**: it re-execs the run inside a transient
+`systemd-run --user --scope` and caps each step. On a machine without cgroup-v2 + a working systemd
+`--user` scope (many laptops, most CI runners, macOS), a bare `run` would instead **error with exit
+code 3** rather than silently run unprotected. `--allow-cgroup-failure` opts out of the requirement:
+it runs the steps **un-boxed** (with a visible warning) so these demo DAGs work out-of-the-box
+anywhere. Drop the flag on a Linux host with a systemd user session to get the real per-step boxing.
+The commands below include it so they are copy-paste runnable on any machine.
 
 Before running, it is worth *looking* at each graph — every example works with `list`, `ascii`, `dot`,
 and `json` too:
@@ -33,7 +42,7 @@ straight line where each waits for the previous one. Start here to see the basic
 before it, nothing runs in parallel and the wall time is the sum of the steps (~6s).
 
 ```sh
-safe-ci-dag-runner run --dag examples/01-linear-chain.json
+safe-ci-dag-runner run --dag examples/01-linear-chain.json --allow-cgroup-failure
 ```
 
 ## 2. `02-diamond.json` — a diamond with parallel branches
@@ -46,7 +55,7 @@ carries a larger `est_duration_s`, so when both become ready the runner dispatch
 `skipped`.
 
 ```sh
-safe-ci-dag-runner run --dag examples/02-diamond.json
+safe-ci-dag-runner run --dag examples/02-diamond.json --allow-cgroup-failure
 safe-ci-dag-runner ascii --dag examples/02-diamond.json   # shows the 3 topological layers
 ```
 
@@ -63,7 +72,7 @@ Playwright/browser end-to-end tests, which grab fixed ports and a display). You 
 `"gpu"`, `"db"`, or `"licenses"`.
 
 ```sh
-safe-ci-dag-runner run --dag examples/03-scarce-resource-browser.json
+safe-ci-dag-runner run --dag examples/03-scarce-resource-browser.json --allow-cgroup-failure
 ```
 
 ## 4. `04-memory-aware.json` — memory hints drive a RAM-safe `-j`
@@ -74,8 +83,8 @@ baseline. With those hints, `--max-mem` picks the largest `-j` whose modeled wor
 a RAM budget, instead of you hard-coding a number:
 
 ```sh
-safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 4G   # -> -j1 (worst case 4 GiB)
-safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 8G   # -> -j2 (worst case 7 GiB)
+safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 4G --allow-cgroup-failure   # -> -j1 (worst case 4 GiB)
+safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 8G --allow-cgroup-failure   # -> -j2 (worst case 7 GiB)
 ```
 
 A 4 GiB budget only fits one step at a time; 8 GiB fits the two largest that can co-run; a large enough
@@ -89,11 +98,18 @@ add headroom.)
 `build.app` runs its *own* parallel build (imagine `make -j8`). Declaring
 `"preferred_inner_jobs": 8` tells the runner how wide the step is internally, so it can set an inner
 CPU cap when cgroup boxing is active and account for the extra memory a wide `cpu-bound` step uses in
-the budget model. It does **not** inject a `-j` flag into your command — the parallelism lives in your
-`cmd`; the hint only describes it.
+the budget model.
+
+By **default** the runner also *appends* an inner-jobs flag to your command derived from that width —
+the default template is `-j`, so a `cmd` of `make build` would be run as `make build -j 8`. This step,
+though, already hardcodes its own `make -j8`, so it sets `"jobs_flag": ""` to **opt out** of the
+append (otherwise the runner would tack a redundant `-j 8` onto the command — and appending it to this
+example's `sleep`-based simulated command would even make it error). Set `jobs_flag` to a template
+like `"-j%d"`, `"--jobs="`, or `"--num-threads"` to control the flag's spelling, or `""` (as here)
+when your command manages its own concurrency.
 
 ```sh
-safe-ci-dag-runner run --dag examples/05-inner-jobs.json
+safe-ci-dag-runner run --dag examples/05-inner-jobs.json --allow-cgroup-failure
 ```
 
 ## See also
