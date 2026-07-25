@@ -379,7 +379,7 @@ mod tests {
                 step("g", "A", Some(3 * GIB), &[], false),
                 step("g", "B", Some(2 * GIB), &["g.A"], false),
                 step("g", "C", Some(4 * GIB), &[], true),
-                step("g", "D", Some(1 * GIB), &[], true),
+                step("g", "D", Some(GIB), &[], true),
             ],
             resource_caps: caps,
             mem_cap_factor: 1.0,
@@ -444,6 +444,6 @@ mod tests {
         let c = cfg();
         assert_eq!(jobs_footprint_bytes(&c, 1, None), 4 * GIB);
         assert_eq!(jobs_for_budget(&c, 6 * GIB), (1, 4 * GIB));
-        assert_eq!(jobs_for_budget(&c, 1 * GIB).0, 1);
+        assert_eq!(jobs_for_budget(&c, GIB).0, 1);
     }
 }
