@@ -516,5 +516,12 @@ is DEGRADED" note above): the CLI's `--cgroups` only boxes steps when the proces
 delegated cgroup-v2 scope, so on a plain host those cgroup-derived measurements are simply absent from
 the CSV rather than an error.
 
-**The Rust binary does nothing.** The Rust crate is a stub in 0.1 (only `--version`/`--help`). Use
-the Python package (`pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"`).
+**Python vs Rust.** In 0.1 the Rust binary is at parity for the *core*: `run`, `list`, `ascii`,
+`dot`, `json`, and `quickstart` all work, with `list`/`ascii`/`dot` output byte-identical to the
+Python build, `json` parsed-identical, and `run` exit code + step counts identical (enforced by the
+`cross/differential.py` harness). What is **Python-only** in 0.1 is the Linux cgroup boxing
+(`--cgroups`), the CSV perf logging (`--perf-dir`), and the ambient-load bucketing: the Rust `run`
+uses no per-step boxing (matching Python's default, where boxing is the opt-in `--cgroups` path), and
+the Rust CLI accepts `--cgroups`/`--perf-dir` but prints a visible warning and runs unboxed / without
+perf CSVs rather than silently ignoring them. For real cgroup boxing or perf CSVs, use the Python
+package (`pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"`).

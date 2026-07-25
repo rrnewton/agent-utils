@@ -323,7 +323,10 @@ fn run_step(step: Step, shared: Arc<Mutex<Shared>>, keep_going: bool, verbosity:
             sh.failed = true;
             sh.stop = true;
             drop(sh);
-            emit(&format!("[{tag}] \u{2717} FAIL   {} (spawn failed: {e})", step.desc));
+            emit(&format!(
+                "[{tag}] \u{2717} FAIL   {} (spawn failed: {e})",
+                step.desc
+            ));
             return;
         }
     };
@@ -359,7 +362,11 @@ fn run_step(step: Step, shared: Arc<Mutex<Shared>>, keep_going: bool, verbosity:
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(_) => break child.wait().unwrap_or_else(|_| std::process::ExitStatus::from_raw(9)),
+            Err(_) => {
+                break child
+                    .wait()
+                    .unwrap_or_else(|_| std::process::ExitStatus::from_raw(9))
+            }
         }
     };
 
@@ -440,9 +447,15 @@ fn run_step(step: Step, shared: Arc<Mutex<Shared>>, keep_going: bool, verbosity:
         } else {
             String::new()
         };
-        emit(&format!("[{tag}] \u{2713} PASS   {} ({dur}s){extra}", step.desc));
+        emit(&format!(
+            "[{tag}] \u{2713} PASS   {} ({dur}s){extra}",
+            step.desc
+        ));
     } else {
-        emit(&format!("[{tag}] \u{2717} FAIL   {} ({dur}s, {reason})", step.desc));
+        emit(&format!(
+            "[{tag}] \u{2717} FAIL   {} ({dur}s, {reason})",
+            step.desc
+        ));
         emit(&format!("[{tag}] ----- detail -----"));
         let text = String::from_utf8_lossy(&combined);
         for line in text.lines() {
@@ -470,7 +483,14 @@ mod tests {
     use crate::model::ResourceHint;
     use std::collections::BTreeMap;
 
-    fn step(group: &str, job: &str, cmd: &str, deps: &[&str], est: f64, res: &[(&str, i64)]) -> Step {
+    fn step(
+        group: &str,
+        job: &str,
+        cmd: &str,
+        deps: &[&str],
+        est: f64,
+        res: &[(&str, i64)],
+    ) -> Step {
         let mut resources = BTreeMap::new();
         for (k, v) in res {
             resources.insert(k.to_string(), *v);
@@ -525,8 +545,11 @@ mod tests {
         };
         let res = run_dag(&cfg, 2, false, 0);
         assert!(!res.ok);
-        let outcomes: HashMap<String, StepOutcome> =
-            res.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
+        let outcomes: HashMap<String, StepOutcome> = res
+            .outcomes
+            .iter()
+            .map(|o| (o.tag.clone(), o.clone()))
+            .collect();
         assert!(!outcomes["g.A"].ok);
         assert!(res.skipped.contains(&"g.B".to_string()));
         assert!(!outcomes.contains_key("g.B"));
@@ -543,8 +566,11 @@ mod tests {
         };
         let res = run_dag(&cfg, 2, false, 0);
         assert!(!res.ok);
-        let outcomes: HashMap<String, StepOutcome> =
-            res.outcomes.iter().map(|o| (o.tag.clone(), o.clone())).collect();
+        let outcomes: HashMap<String, StepOutcome> = res
+            .outcomes
+            .iter()
+            .map(|o| (o.tag.clone(), o.clone()))
+            .collect();
         assert!(!outcomes["g.fast"].ok);
         assert!(outcomes["g.slow"].aborted);
         assert!(!outcomes["g.slow"].ok);
@@ -557,7 +583,9 @@ mod tests {
         let log = dir.join("intervals");
         let lf = log.to_string_lossy().to_string();
         let cmd = |t: &str| {
-            format!("echo S {t} $(date +%s.%N) >> {lf}; sleep 0.3; echo E {t} $(date +%s.%N) >> {lf}")
+            format!(
+                "echo S {t} $(date +%s.%N) >> {lf}; sleep 0.3; echo E {t} $(date +%s.%N) >> {lf}"
+            )
         };
         let mut caps = BTreeMap::new();
         caps.insert("slot".to_string(), 1);

@@ -278,7 +278,14 @@ impl StepOutcome {
         aborted: bool,
     ) -> Self {
         let reason = step_failure_reason(
-            returncode, oomed, oom_kills, timed_out, timeout, false, None, &[],
+            returncode,
+            oomed,
+            oom_kills,
+            timed_out,
+            timeout,
+            false,
+            None,
+            &[],
         );
         StepOutcome {
             tag,

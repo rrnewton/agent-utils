@@ -39,7 +39,10 @@ fn err(msg: impl Into<String>) -> DagJsonError {
 
 // --- typed narrowing helpers (serde_json::Value; narrow explicitly, mirror Python strictness) ---
 
-fn as_obj<'a>(value: &'a Value, where_: &str) -> Result<&'a serde_json::Map<String, Value>, DagJsonError> {
+fn as_obj<'a>(
+    value: &'a Value,
+    where_: &str,
+) -> Result<&'a serde_json::Map<String, Value>, DagJsonError> {
     match value {
         Value::Object(m) => Ok(m),
         other => Err(err(format!(
@@ -70,14 +73,22 @@ fn number_as_int(v: &Value) -> Option<i64> {
     }
 }
 
-fn req_str(m: &serde_json::Map<String, Value>, key: &str, where_: &str) -> Result<String, DagJsonError> {
+fn req_str(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+    where_: &str,
+) -> Result<String, DagJsonError> {
     match m.get(key) {
         Some(Value::String(s)) => Ok(s.clone()),
         _ => Err(err(format!("{where_}: field '{key}' must be a string"))),
     }
 }
 
-fn opt_str(m: &serde_json::Map<String, Value>, key: &str, default: &str) -> Result<String, DagJsonError> {
+fn opt_str(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+    default: &str,
+) -> Result<String, DagJsonError> {
     match m.get(key) {
         None => Ok(default.to_string()),
         Some(Value::String(s)) => Ok(s.clone()),
@@ -85,14 +96,21 @@ fn opt_str(m: &serde_json::Map<String, Value>, key: &str, default: &str) -> Resu
     }
 }
 
-fn opt_int(m: &serde_json::Map<String, Value>, key: &str, default: i64) -> Result<i64, DagJsonError> {
+fn opt_int(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+    default: i64,
+) -> Result<i64, DagJsonError> {
     match m.get(key) {
         None => Ok(default),
         Some(v) => number_as_int(v).ok_or_else(|| err(format!("field '{key}' must be an integer"))),
     }
 }
 
-fn opt_int_or_none(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option<i64>, DagJsonError> {
+fn opt_int_or_none(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<i64>, DagJsonError> {
     match m.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => number_as_int(v)
@@ -101,7 +119,11 @@ fn opt_int_or_none(m: &serde_json::Map<String, Value>, key: &str) -> Result<Opti
     }
 }
 
-fn opt_float(m: &serde_json::Map<String, Value>, key: &str, default: f64) -> Result<f64, DagJsonError> {
+fn opt_float(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+    default: f64,
+) -> Result<f64, DagJsonError> {
     match m.get(key) {
         None => Ok(default),
         Some(Value::Bool(_)) => Err(err(format!("field '{key}' must be a number"))),
@@ -112,7 +134,10 @@ fn opt_float(m: &serde_json::Map<String, Value>, key: &str, default: f64) -> Res
     }
 }
 
-fn opt_float_or_none(m: &serde_json::Map<String, Value>, key: &str) -> Result<Option<f64>, DagJsonError> {
+fn opt_float_or_none(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<f64>, DagJsonError> {
     match m.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Bool(_)) => Err(err(format!("field '{key}' must be a number or null"))),
@@ -124,7 +149,11 @@ fn opt_float_or_none(m: &serde_json::Map<String, Value>, key: &str) -> Result<Op
     }
 }
 
-fn opt_bool(m: &serde_json::Map<String, Value>, key: &str, default: bool) -> Result<bool, DagJsonError> {
+fn opt_bool(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+    default: bool,
+) -> Result<bool, DagJsonError> {
     match m.get(key) {
         None => Ok(default),
         Some(Value::Bool(b)) => Ok(*b),
@@ -132,7 +161,10 @@ fn opt_bool(m: &serde_json::Map<String, Value>, key: &str, default: bool) -> Res
     }
 }
 
-fn opt_str_list(m: &serde_json::Map<String, Value>, key: &str) -> Result<Vec<String>, DagJsonError> {
+fn opt_str_list(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<String>, DagJsonError> {
     match m.get(key) {
         None | Some(Value::Null) => Ok(Vec::new()),
         Some(Value::Array(items)) => {
@@ -200,7 +232,9 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
     let obj = as_obj(value, where_)?;
     let cls_name = opt_str(obj, "classification", StepClass::Light.value())?;
     let classification = StepClass::from_value(&cls_name).ok_or_else(|| {
-        err(format!("{where_}.classification: unknown value '{cls_name}'"))
+        err(format!(
+            "{where_}.classification: unknown value '{cls_name}'"
+        ))
     })?;
     Ok(ResourceHint {
         resources: opt_str_int_map(obj, "resources", where_)?,
@@ -217,8 +251,7 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
 /// Parse a DAG JSON document into a [`DagConfig`]. Returns [`DagJsonError`] on any malformed
 /// field, mirroring the Python `dag_from_json` strictness.
 pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
-    let raw: Value =
-        serde_json::from_str(text).map_err(|e| err(format!("invalid JSON: {e}")))?;
+    let raw: Value = serde_json::from_str(text).map_err(|e| err(format!("invalid JSON: {e}")))?;
     let doc = as_obj(&raw, "<root>")?;
     let default_step_timeout = opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)?;
     let steps_raw = match doc.get("steps") {
@@ -282,7 +315,11 @@ fn json_float(f: f64) -> String {
         return "NaN".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if f > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     format!("{f:?}")
 }
@@ -368,15 +405,30 @@ fn emit_hint(s: &mut String, hint: &ResourceHint, base: usize) {
     emit_int_map(s, &hint.resources, base + 2);
     s.push_str(",\n");
     s.push_str(&key);
-    s.push_str(&format!("\"est_duration_s\": {},\n", json_float(hint.est_duration_s)));
+    s.push_str(&format!(
+        "\"est_duration_s\": {},\n",
+        json_float(hint.est_duration_s)
+    ));
     s.push_str(&key);
-    s.push_str(&format!("\"rss_baseline_bytes\": {},\n", opt_int_json(hint.rss_baseline_bytes)));
+    s.push_str(&format!(
+        "\"rss_baseline_bytes\": {},\n",
+        opt_int_json(hint.rss_baseline_bytes)
+    ));
     s.push_str(&key);
-    s.push_str(&format!("\"hard_mem_max_bytes\": {},\n", opt_int_json(hint.hard_mem_max_bytes)));
+    s.push_str(&format!(
+        "\"hard_mem_max_bytes\": {},\n",
+        opt_int_json(hint.hard_mem_max_bytes)
+    ));
     s.push_str(&key);
-    s.push_str(&format!("\"classification\": {},\n", json_str(hint.classification.value())));
+    s.push_str(&format!(
+        "\"classification\": {},\n",
+        json_str(hint.classification.value())
+    ));
     s.push_str(&key);
-    s.push_str(&format!("\"preferred_inner_jobs\": {},\n", opt_int_json(hint.preferred_inner_jobs)));
+    s.push_str(&format!(
+        "\"preferred_inner_jobs\": {},\n",
+        opt_int_json(hint.preferred_inner_jobs)
+    ));
     s.push_str(&key);
     s.push_str(&format!(
         "\"measured_effective_cores\": {},\n",
@@ -434,13 +486,22 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
     s.push_str("  \"resource_caps\": ");
     emit_int_map(&mut s, &cfg.resource_caps, 2);
     s.push_str(",\n");
-    s.push_str(&format!("  \"mem_cap_factor\": {},\n", json_float(cfg.mem_cap_factor)));
-    s.push_str(&format!("  \"mem_cap_floor_bytes\": {},\n", cfg.mem_cap_floor_bytes));
+    s.push_str(&format!(
+        "  \"mem_cap_factor\": {},\n",
+        json_float(cfg.mem_cap_factor)
+    ));
+    s.push_str(&format!(
+        "  \"mem_cap_floor_bytes\": {},\n",
+        cfg.mem_cap_floor_bytes
+    ));
     s.push_str(&format!(
         "  \"outer_mem_safety_factor\": {},\n",
         json_float(cfg.outer_mem_safety_factor)
     ));
-    s.push_str(&format!("  \"default_step_timeout\": {},\n", cfg.default_step_timeout));
+    s.push_str(&format!(
+        "  \"default_step_timeout\": {},\n",
+        cfg.default_step_timeout
+    ));
     if cfg.steps.is_empty() {
         s.push_str("  \"steps\": []\n");
     } else {
@@ -488,7 +549,8 @@ mod tests {
 
     #[test]
     fn minimal_document_defaults() {
-        let cfg = dag_from_json(r#"{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}"#).unwrap();
+        let cfg =
+            dag_from_json(r#"{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}"#).unwrap();
         let step = &cfg.steps[0];
         assert_eq!(step.tag(), "g.j");
         assert_eq!(step.desc, "");

@@ -43,7 +43,7 @@ top-level `bin/` symlink points at the Rust binaries when Rust is built, otherwi
 
 | Tool | Purpose | Status |
 |------|---------|--------|
-| `safe-ci-dag-runner` | Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on CPU/mem/ambient-load logging. | 🚧 early |
+| `safe-ci-dag-runner` | Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on CPU/mem/ambient-load logging. | ✅ core at py↔rs parity (load / model / size / visualize / run — `run`/`list`/`ascii`/`dot`/`json`/`quickstart`), proven by the `cross/` differential. cgroup boxing + perf logging are Python-only in 0.1. |
 
 ## Building
 

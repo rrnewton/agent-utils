@@ -27,7 +27,11 @@ pub fn step_mem_cap_bytes(step: &Step, mem_cap_factor: f64) -> Option<i64> {
 ///
 /// Conservative `P x J` model: an explicit hard cap and non-CPU-bound steps keep the base
 /// cap; CPU-bound steps scale linearly above J=4.
-pub fn step_mem_cap_for_inner_jobs(step: &Step, inner_jobs: Option<i64>, mem_cap_factor: f64) -> i64 {
+pub fn step_mem_cap_for_inner_jobs(
+    step: &Step,
+    inner_jobs: Option<i64>,
+    mem_cap_factor: f64,
+) -> i64 {
     let cap = step_mem_cap_bytes(step, mem_cap_factor).unwrap_or(0);
     match inner_jobs {
         Some(jobs)
@@ -56,7 +60,12 @@ pub fn transitive_deps(steps: &[Step]) -> HashMap<String, HashSet<String>> {
         if let Some(cached) = result.get(tag) {
             return cached.clone();
         }
-        let mut deps: HashSet<String> = direct.get(tag).cloned().unwrap_or_default().into_iter().collect();
+        let mut deps: HashSet<String> = direct
+            .get(tag)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let direct_deps: Vec<String> = deps.iter().cloned().collect();
         for dep in direct_deps {
             for t in visit(&dep, direct, result) {
@@ -167,7 +176,9 @@ pub fn schedulable_peak_mem_bytes(
             }
             let total: i64 = combo
                 .iter()
-                .map(|&i| step_mem_cap_for_inner_jobs(participating[i], inner_jobs, cfg.mem_cap_factor))
+                .map(|&i| {
+                    step_mem_cap_for_inner_jobs(participating[i], inner_jobs, cfg.mem_cap_factor)
+                })
                 .sum();
             if total > best_total {
                 best_total = total;

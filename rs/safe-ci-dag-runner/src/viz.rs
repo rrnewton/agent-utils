@@ -27,7 +27,12 @@ fn kept_deps(steps: &[&Step]) -> HashMap<String, Vec<String>> {
     steps
         .iter()
         .map(|s| {
-            let kept: Vec<String> = s.deps.iter().filter(|d| tags.contains(*d)).cloned().collect();
+            let kept: Vec<String> = s
+                .deps
+                .iter()
+                .filter(|d| tags.contains(*d))
+                .cloned()
+                .collect();
             (s.tag(), kept)
         })
         .collect()
@@ -55,7 +60,9 @@ pub fn to_dot(cfg: &DagConfig, name: &str, selected: Option<&HashSet<String>>) -
 
     for (i, (group, group_steps)) in by_group.iter().enumerate() {
         out.push(format!("  subgraph cluster_{i} {{"));
-        out.push(format!("    label=\"{group}\"; style=dashed; color=gray70;"));
+        out.push(format!(
+            "    label=\"{group}\"; style=dashed; color=gray70;"
+        ));
         let mut sorted_steps: Vec<&&Step> = group_steps.iter().collect();
         sorted_steps.sort_by(|a, b| a.job.cmp(&b.job));
         for step in sorted_steps {
@@ -100,7 +107,11 @@ pub fn to_dot(cfg: &DagConfig, name: &str, selected: Option<&HashSet<String>>) -
 fn layers_of(steps: &[&Step], deps: &HashMap<String, Vec<String>>) -> HashMap<String, i64> {
     let mut depth: HashMap<String, i64> = HashMap::new();
 
-    fn visit(tag: &str, deps: &HashMap<String, Vec<String>>, depth: &mut HashMap<String, i64>) -> i64 {
+    fn visit(
+        tag: &str,
+        deps: &HashMap<String, Vec<String>>,
+        depth: &mut HashMap<String, i64>,
+    ) -> i64 {
         if let Some(d) = depth.get(tag) {
             return *d;
         }
@@ -108,7 +119,11 @@ fn layers_of(steps: &[&Step], deps: &HashMap<String, Vec<String>>) -> HashMap<St
         let d = if parents.is_empty() {
             0
         } else {
-            1 + parents.iter().map(|p| visit(p, deps, depth)).max().unwrap_or(0)
+            1 + parents
+                .iter()
+                .map(|p| visit(p, deps, depth))
+                .max()
+                .unwrap_or(0)
         };
         depth.insert(tag.to_string(), d);
         d

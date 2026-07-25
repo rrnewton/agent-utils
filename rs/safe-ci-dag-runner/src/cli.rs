@@ -325,7 +325,11 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
 
     let result = run_dag(cfg, jobs, a.keep_going, verbosity);
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
-    let failed = result.outcomes.iter().filter(|o| !o.ok && !o.aborted).count();
+    let failed = result
+        .outcomes
+        .iter()
+        .filter(|o| !o.ok && !o.aborted)
+        .count();
     let aborted = result.outcomes.iter().filter(|o| o.aborted).count();
     let verdict = if result.ok {
         c.green("PASS")
@@ -401,7 +405,9 @@ pub fn run(argv: &[String]) -> i32 {
             let dag_arg = match parse_simple_dag(rest) {
                 Ok(Some(d)) => d,
                 Ok(None) => {
-                    eprintln!("{PROG} {command}: error: the following arguments are required: --dag");
+                    eprintln!(
+                        "{PROG} {command}: error: the following arguments are required: --dag"
+                    );
                     return 2;
                 }
                 Err(msg) => {

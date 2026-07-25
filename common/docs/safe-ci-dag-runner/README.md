@@ -27,8 +27,10 @@ scheduler runs anywhere: with real Linux cgroup-v2 boxing where available, or wi
 stand-ins (`NoopCgroups`, the default) on any other host.
 
 This is one tool from [`agent-utils`](https://github.com/rrnewton/agent-utils). It ships as a Python
-package and a Rust crate; the two are intended to be behaviorally identical, but **today the Python
-package is the working implementation** — see [Status & limitations](#status--limitations).
+package and a Rust crate. **The core is now at parity**: both builds load a DAG from JSON, model it,
+size it (memory-aware `-j`), visualize it, and run it, and a randomized differential test asserts the
+two produce identical observable output. The Linux cgroup boxing and perf logging remain Python-only
+in 0.1 — see [Status & limitations](#status--limitations).
 
 ## Install
 
@@ -232,9 +234,13 @@ Stated honestly for the 0.1 release:
   API. The header is derived from the actual row keys, so dynamic per-step columns (e.g. `cgroup
   cpu.*` counters, present only when cgroup boxing is active) are captured without configuration. The
   default remains a no-op sink that records nothing.
-- **The Rust crate is a stub.** It currently answers only `--version`/`--help`; the runner is being
-  ported and kept behaviorally identical to the Python build via differential tests. Use the Python
-  package for real work.
+- **The Rust crate is at parity for the core.** `run`, `list`, `ascii`, `dot`, `json`, and
+  `quickstart` all work in the Rust binary, and its `list`/`ascii`/`dot` output is byte-identical to
+  the Python build, its `json` parsed-identical, and its `run` exit code + step counts identical —
+  proven by the randomized `cross/differential.py` harness in CI. Scope note: the Rust `run` performs
+  **no per-step cgroup boxing and no perf logging** (matching Python's default, where boxing is the
+  opt-in `--cgroups` path); those Linux-only modules stay Python-only in 0.1. `--cgroups` /
+  `--perf-dir` are accepted by the Rust CLI but degrade with a visible warning and run unboxed.
 
 ## See also
 
