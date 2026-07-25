@@ -10,6 +10,7 @@ start with the README's 60-second quickstart or run `safe-ci-dag-runner quicksta
 - [The DAG JSON schema](#the-dag-json-schema)
 - [Worked examples](#worked-examples)
 - [The Python API in depth](#the-python-api-in-depth)
+- [Enabling real cgroup boxing](#enabling-real-cgroup-boxing)
 - [Troubleshooting](#troubleshooting)
 
 ## Concepts
@@ -339,24 +340,103 @@ simply omits them.
 - `NoopCgroups` — the safe default (`enabled == False`): no boxing, teardown falls back to a
   process-group kill. Works on any host.
 - `Cgroups` — the real Linux cgroup-v2 manager. It is `enabled` **only** when the process is already
-  inside a delegated cgroup-v2 scope. To set that scope up, use the API in
-  `safe_ci_dag_runner.cgroup`:
+  inside a delegated cgroup-v2 scope. To set that scope up (and turn boxing on), follow the runnable
+  recipe in [Enabling real cgroup boxing](#enabling-real-cgroup-boxing) below.
 
-  ```python
-  import sys
-  from safe_ci_dag_runner.cgroup import reexec_in_scope, Cgroups
-  from safe_ci_dag_runner import run_dag
+When boxing is active, each step's inner memory cap comes from its hint (`hard_mem_max_bytes`, else
+`rss_baseline_bytes` × `mem_cap_factor`) and its inner CPU cap from `preferred_inner_jobs`.
 
-  # Re-exec this process inside a transient, delegated systemd --user scope. On success this
-  # replaces the process and does not return; the re-executed run then boxes each step.
-  if not reexec_in_scope(sys.argv, memory_max=None):
-      sys.exit("refusing to run without cgroup enforcement")
-  cg = Cgroups()          # enabled==True now that we're in the delegated scope
-  run_dag(cfg, jobs=4, cgroups=cg)
-  ```
+## Enabling real cgroup boxing
 
-  When boxing is active, each step's inner memory cap comes from its hint (`hard_mem_max_bytes`, else
-  `rss_baseline_bytes` × `mem_cap_factor`) and its inner CPU cap from `preferred_inner_jobs`.
+By default the runner uses `NoopCgroups` (no boxing), and the CLI's `run --cgroups` only boxes steps
+when the process is **already inside** a delegated cgroup-v2 scope — otherwise it prints a visible
+"containment is DEGRADED" warning and runs the steps un-boxed (it never silently drops a cap). This
+section shows how to actually turn boxing on from the Python API.
+
+### Prerequisites
+
+Real two-level boxing needs all of:
+
+- **Linux with the cgroup-v2 unified hierarchy** mounted at `/sys/fs/cgroup` (not the legacy
+  cgroup-v1 or hybrid layout).
+- **A delegated scope carrying the `cpu` and `memory` controllers.** The normal way to get one is a
+  systemd **user** session where `systemd-run --user --scope` works: the runner launches the outer
+  scope with `-p Delegate=yes` so it can carve per-step child cgroups underneath. (In a systemd-less
+  container whose namespace cgroup root already delegates `cpu`+`memory`, the systemd-free
+  `enter_delegated_scope` fallback reaches the same end state.)
+
+You can check the two ingredients directly:
+
+```sh
+stat -fc %T /sys/fs/cgroup                 # -> cgroup2fs  (the unified v2 hierarchy)
+systemd-run --user --scope --quiet true    # exits 0 iff a --user scope works here
+```
+
+If either is missing, `Cgroups().enabled` is `False` and the runner correctly falls back to a
+process-group kill.
+
+### Recipe: box a run via `reexec_in_scope`
+
+The entry point is `safe_ci_dag_runner.cgroup.reexec_in_scope`. It re-execs the current process
+inside a transient, delegated `systemd-run --user --scope`, so every descendant — including
+`setsid`/double-forked escapees — is contained and reaped atomically. Save this as `boxed_run.py`:
+
+```python
+import sys
+from safe_ci_dag_runner import Step, DagConfig, run_dag
+from safe_ci_dag_runner.cgroup import reexec_in_scope, Cgroups
+
+cfg = DagConfig(steps=(Step("build", "app", "compile", "echo build && sleep 0.1"),))
+
+# Re-exec THIS process inside a transient, delegated systemd --user scope.
+#   - On the FIRST call, on success, execvp REPLACES the process and does NOT return; the
+#     program restarts from the top, now running INSIDE the scope.
+#   - On that second pass the SAFE_CI_IN_SCOPE sentinel is set, so reexec_in_scope() returns
+#     True (anti-recursion) and execution falls through to here.
+#   - It returns False only when a --user scope is unavailable or the exec failed.
+# Pass memory_max=<bytes> and/or cpu_count=<n> to cap the whole run's outer box.
+if not reexec_in_scope(sys.argv, memory_max=None, skip_in_ci=False):
+    sys.exit("refusing to run without cgroup enforcement (no delegated cgroup-v2 scope)")
+
+cg = Cgroups()                          # the real manager; construct it INSIDE the scope
+if not cg.enabled:
+    sys.exit("cgroup boxing did not engage")
+print("Cgroups().enabled ==", cg.enabled)   # -> True
+run_dag(cfg, jobs=4, cgroups=cg)
+```
+
+```sh
+python3 boxed_run.py
+```
+
+`reexec_in_scope` defaults to `skip_in_ci=True`, which returns `True` **without** re-execing when
+`CI` or `GITHUB_ACTIONS` is set (so a plain CI run is not boxed); pass `skip_in_ci=False`, as above,
+to force boxing even under CI. Its other keyword arguments: `memory_max` (outer `MemoryMax` in bytes;
+swap is always disabled regardless), `cpu_count` (outer `CPUQuota`), `naming` (a `ScopeNaming` value
+to brand the scope/slice/log-prefix), and `use_aggregate_slice` (share one CPU cap across concurrent
+runs).
+
+### Verifying it engaged
+
+`Cgroups().enabled is True` is the one-line "boxing is live" signal, and the recipe above prints it.
+For a fuller audit of the outer box after the re-exec, call
+`verify_scope_limits(expected_memory_max, expected_cpu_count)` — it reads back the scope's
+`memory.max`, `memory.swap.max`, and `cpu.max` and prints `bound`/`MISMATCH` evidence, returning
+`True` only when the requested limits actually reached cgroup-v2.
+
+When boxing is active, each step's inner memory cap comes from its hint (`hard_mem_max_bytes`, else
+`rss_baseline_bytes` × `mem_cap_factor`) and its inner CPU cap from `preferred_inner_jobs`; a step
+that exceeds its inner `memory.max` is OOM-killed in isolation, and teardown uses the step cgroup's
+`cgroup.kill` (setsid-proof) instead of a process-group kill.
+
+### The CLI `run --cgroups` caveat
+
+The CLI flag `run --cgroups` constructs `Cgroups()` for you but does **not** perform the outer
+`reexec_in_scope` step. So it enables per-step boxing only when you have *already* entered a delegated
+scope — for example by running the CLI from inside `boxed_run.py`'s scope, or under an external
+`systemd-run --user --scope -p Delegate=yes` wrapper. Otherwise it prints the "containment is
+DEGRADED" warning and runs un-boxed. Wiring the outer re-exec into the CLI automatically is still to
+come; until then, use the Python recipe above for turn-key boxing.
 
 ## Troubleshooting
 
