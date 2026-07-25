@@ -6,9 +6,9 @@
 //!
 //! This Rust build reproduces the OBSERVABLE behavior of the Python reference
 //! (`py/safe_ci_dag_runner`) for that core, proven identical by the randomized differential
-//! test in `cross/differential.py`. Scope note for 0.1: the Rust `run` performs NO per-step
-//! cgroup boxing and NO perf logging (matching Python's DEFAULT, where boxing is the opt-in
-//! `--cgroups` path); those Linux-only modules stay Python-only for now.
+//! test in `cross/differential.py`. Scope note: the Rust `run` does not yet perform per-step
+//! cgroup boxing or perf logging (that port is in progress); those Linux-only modules currently
+//! stay Python-only.
 
 pub mod cli;
 pub mod io;

@@ -16,10 +16,11 @@
 //!   still-runnable steps.
 //! * Failure classification via [`crate::model::step_failure_reason`].
 //!
-//! Scope note (0.1): this Rust build performs NO per-step cgroup boxing and NO perf logging
-//! (Python's `cgroup.py` / `perflog.py` / `teardown.py` / `ambient.py` stay Python-only).
-//! Teardown here is a safe, dependency-free process-group SIGKILL (a negative-pid `kill(1)`),
-//! not a cgroup kill; that matches Python's process-group fallback when cgroups are off.
+//! Scope note: this Rust build does not yet perform per-step cgroup boxing or perf logging
+//! (Python's `cgroup.py` / `perflog.py` / `teardown.py` / `ambient.py` currently stay
+//! Python-only; the port is in progress). Teardown here is a safe, dependency-free process-group
+//! SIGKILL (a negative-pid `kill(1)`), not a cgroup kill; that matches Python's process-group
+//! fallback when cgroups are off.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};

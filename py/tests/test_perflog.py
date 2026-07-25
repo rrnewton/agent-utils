@@ -1,6 +1,6 @@
 """Tests for the CSV-backed metrics sink (perflog.CsvMetricsSink).
 
-Guards the 0.1 fix that made ``run_dag(cfg, metrics=CsvMetricsSink(dir))`` actually write
+Guards the fix that made ``run_dag(cfg, metrics=CsvMetricsSink(dir))`` actually write
 its per-step and whole-run CSVs instead of raising: the scheduler's per-step row keys did
 not match the writer's fieldnames (a ``ValueError``) and the whole-run appender opened a
 not-yet-existent file for reading (a ``FileNotFoundError``).

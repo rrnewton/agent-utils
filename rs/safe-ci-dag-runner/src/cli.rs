@@ -11,9 +11,10 @@
 //! `list`, `ascii`, `dot`, and `json` stdout is BYTE-IDENTICAL to the Python build; `--help`
 //! and `quickstart` wording may differ but the structure and exit codes (0 / 1 / 2) match.
 //!
-//! Scope note (0.1): `--cgroups` (per-step Linux boxing) and `--perf-dir` (CSV perf logging)
-//! are Python-only. This build accepts the flags but degrades VISIBLY (a stderr warning) and
-//! runs unboxed / without perf recording — never a silent skip.
+//! Scope note: per-step Linux cgroup boxing and `--perf-dir` (CSV perf logging) are not yet
+//! available in this Rust build (that port is in progress). It accepts the related flags but
+//! degrades VISIBLY (a stderr warning) and runs unboxed / without perf recording — never a
+//! silent skip.
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
@@ -125,7 +126,7 @@ jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"
 - concurrent scheduling in longest-first order, honoring deps + resource caps\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
 - {maxmem} picks the largest -j whose modeled worst-case RAM fits the budget\n\n\
-{note}  cgroup boxing (--cgroups) and perf logging (--perf-dir) are Python-only in 0.1;\n        this Rust build runs steps unboxed with a visible warning.\n\n\
+{note}  per-step cgroup boxing and perf logging (--perf-dir) are not yet available in this\n        Rust build (port in progress); it runs steps unboxed with a visible warning.\n\n\
 {exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file\n",
         banner = banner(c),
         i1 = h("1. Install"),
