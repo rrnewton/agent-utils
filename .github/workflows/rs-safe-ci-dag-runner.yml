@@ -1,0 +1,41 @@
+name: rs-safe-ci-dag-runner
+
+# Only run when the Rust side of this tool (or its shared docs) changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'rs/Cargo.toml'
+      - 'rs/Cargo.lock'
+      - 'rs/safe-ci-dag-runner/**'
+      - 'common/docs/safe-ci-dag-runner/**'
+      - '.github/workflows/rs-safe-ci-dag-runner.yml'
+  pull_request:
+    paths:
+      - 'rs/Cargo.toml'
+      - 'rs/Cargo.lock'
+      - 'rs/safe-ci-dag-runner/**'
+      - 'common/docs/safe-ci-dag-runner/**'
+      - '.github/workflows/rs-safe-ci-dag-runner.yml'
+
+jobs:
+  rs:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+      - name: build release
+        run: cargo build --release --workspace
+      - name: smoke --version
+        run: ./target/release/safe-ci-dag-runner --version

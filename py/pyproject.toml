@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safe-ci-dag-runner"
+version = "0.1.0"
+description = "Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on resource logging."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Ryan Newton" }]
+keywords = ["ci", "dag", "cgroup", "scheduler"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+
+[project.scripts]
+safe-ci-dag-runner = "safe_ci_dag_runner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["safe_ci_dag_runner*"]
+
+[tool.setuptools.package-data]
+safe_ci_dag_runner = ["py.typed"]
+
+# mypy: strict, and no explicit `Any` allowed in our own annotations.
+# (disallow_any_expr is intentionally NOT enabled yet — it fights stdlib return types;
+#  revisit for absolute zero-Any once the port stabilizes.)
+[tool.mypy]
+python_version = "3.10"
+strict = true
+disallow_any_explicit = true
+disallow_any_decorated = true
+warn_unreachable = true
+show_error_codes = true

@@ -1,0 +1,20 @@
+# --- build outputs (produced by ./setup) ---
+# top-level convenience symlink -> rs/bin or py/bin
+/bin
+/rs/target/
+/rs/bin/*
+!/rs/bin/.gitkeep
+
+# --- python ---
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+
+# --- editor / os ---
+*.swp
+.DS_Store

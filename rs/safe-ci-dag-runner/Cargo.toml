@@ -1,0 +1,19 @@
+[package]
+name = "safe-ci-dag-runner"
+version = "0.1.0"
+description = "Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on resource logging."
+readme = "README.md"
+keywords = ["ci", "dag", "cgroup", "scheduler"]
+categories = ["command-line-utilities", "development-tools"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "safe-ci-dag-runner"
+path = "src/main.rs"
+
+[lib]
+name = "safe_ci_dag_runner"
+path = "src/lib.rs"

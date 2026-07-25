@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# agent-utils build/setup driver.
+#
+# Usage:
+#   ./setup            build BOTH python and rust (default)
+#   ./setup both       same
+#   ./setup py         python only: mypy-strict typecheck + wire py/bin, ./bin -> py/bin
+#   ./setup rs         rust only:   cargo build --release -> rs/bin, ./bin -> rs/bin
+#   ./setup rs --clean rust, then remove rs/target (standalone binaries remain in rs/bin)
+#
+# `make` just calls `./setup`.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+WHAT="both"
+CLEAN=0
+for arg in "$@"; do
+  case "$arg" in
+    py|rs|both) WHAT="$arg" ;;
+    --clean)    CLEAN=1 ;;
+    -h|--help)  sed -n 's/^# \{0,1\}//p;/^set -/q' "$0"; exit 0 ;;
+    *) echo "setup: unknown arg: $arg (want py|rs|both [--clean])" >&2; exit 2 ;;
+  esac
+done
+
+setup_py() {
+  echo "==> [py] mypy strict typecheck + wire bin"
+  command -v python3 >/dev/null || { echo "py: python3 not found" >&2; return 1; }
+  if ! python3 -m mypy --version >/dev/null 2>&1; then
+    echo "py: mypy not installed. Install it (e.g. 'with-proxy pip install mypy')." >&2
+    return 1
+  fi
+  ( cd py && python3 -m mypy . )
+  [ -d py/bin ] && chmod +x py/bin/* 2>/dev/null || true
+  echo "==> [py] ok"
+}
+
+setup_rs() {
+  echo "==> [rs] cargo build --release --workspace"
+  command -v cargo >/dev/null || { echo "rs: cargo not found" >&2; return 1; }
+  cargo build --release --workspace --manifest-path rs/Cargo.toml
+  mkdir -p rs/bin
+  # Copy each workspace bin target into rs/bin so the binaries are standalone and
+  # rs/target can be deleted. Bin names are discovered from cargo metadata.
+  python3 - "$ROOT" <<'PY'
+import json, os, shutil, subprocess, sys
+root = sys.argv[1]
+manifest = os.path.join(root, "rs", "Cargo.toml")
+meta = json.loads(subprocess.check_output(
+    ["cargo", "metadata", "--format-version", "1", "--no-deps", "--manifest-path", manifest]))
+rel = os.path.join(root, "rs", "target", "release")
+binroot = os.path.join(root, "rs", "bin")
+os.makedirs(binroot, exist_ok=True)
+installed = []
+for pkg in meta["packages"]:
+    for tgt in pkg["targets"]:
+        if "bin" in tgt["kind"]:
+            src = os.path.join(rel, tgt["name"])
+            if os.path.exists(src):
+                dst = os.path.join(binroot, tgt["name"])
+                shutil.copy2(src, dst)
+                os.chmod(dst, 0o755)
+                installed.append(tgt["name"])
+print("rs: installed binaries:", ", ".join(sorted(installed)) or "(none)")
+PY
+  if [ "$CLEAN" = 1 ]; then echo "==> [rs] --clean: removing rs/target"; rm -rf rs/target; fi
+  echo "==> [rs] ok"
+}
+
+wire_bin() { rm -f bin; ln -s "$1" bin; echo "==> ./bin -> $1"; }
+
+case "$WHAT" in
+  py)   setup_py; wire_bin "py/bin" ;;
+  rs)   setup_rs; wire_bin "rs/bin" ;;
+  both) setup_py; setup_rs; wire_bin "rs/bin" ;;  # rust preferred when both are present
+esac
+echo "setup: done ($WHAT)"
