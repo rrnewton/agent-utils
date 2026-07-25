@@ -10,10 +10,12 @@
 //! cgroup boxing and NO perf logging (matching Python's DEFAULT, where boxing is the opt-in
 //! `--cgroups` path); those Linux-only modules stay Python-only for now.
 
+pub mod io;
 pub mod model;
 pub mod sizing;
 pub mod viz;
 
+pub use io::{dag_from_json, dag_to_json, DagJsonError};
 pub use model::{
     preferred_inner_jobs, step_classification, step_failure_reason, DagConfig, ResourceHint,
     RunResult, Step, StepClass, StepOutcome, DEFAULT_STEP_TIMEOUT,
