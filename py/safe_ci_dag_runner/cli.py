@@ -7,10 +7,13 @@ Subcommands:
   ascii --dag FILE  draw the DAG as ASCII art
   dot --dag FILE    emit Graphviz DOT (pipe to `dot -Tsvg`)
   json --dag FILE   re-emit the DAG as canonical JSON
+  yaml --dag FILE   re-emit the DAG as YAML
   quickstart        print a self-contained getting-started guide
 
-A DAG is a JSON file (see `quickstart` for the schema + a runnable example).
-Pass `--dag -` to read the DAG from stdin.
+A DAG is a JSON or YAML file (see `quickstart` for the schema + a runnable example). `--dag`
+auto-detects the format by extension: `.yaml`/`.yml` load as YAML (isomorphic to the JSON schema,
+and additionally allow comments + multi-line block-scalar descriptions), everything else as JSON.
+Pass `--dag -` to read a JSON DAG from stdin.
 """
 
 from __future__ import annotations
@@ -23,7 +26,13 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from safe_ci_dag_runner import __version__
-from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
+from safe_ci_dag_runner.io import (
+    DagJsonError,
+    dag_from_json,
+    dag_from_yaml,
+    dag_to_json,
+    dag_to_yaml,
+)
 from safe_ci_dag_runner.model import DagConfig, step_classification
 from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink
 from safe_ci_dag_runner.scheduler import run_dag
@@ -123,6 +132,8 @@ def _quickstart(c: Palette) -> str:
   top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,
           outer_mem_safety_factor, default_step_timeout, default_jobs_flag
   {c.dim('desc = short label; description = long-form docs (often multi-line, great in YAML).')}
+  {c.dim('YAML: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + block-scalar')}
+  {c.dim('  descriptions). The yaml subcommand emits YAML; json emits canonical JSON.')}
   {c.dim('resource_caps bound concurrent demand - e.g. {"browser":1} serializes browser steps.')}
   {c.dim('jobs_flag: template appended with a step preferred_inner_jobs, e.g. "-j" -> "-j 4",')}
   {c.dim('  "-j%d" -> "-j4", "--jobs=" -> "--jobs=4", "--num-threads" -> "--num-threads 4".')}
@@ -179,7 +190,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     run_p = sub.add_parser("run", help="run a DAG (exit 0 iff every step passes)")
-    run_p.add_argument("--dag", required=True, metavar="FILE", help="DAG JSON file ('-' = stdin)")
+    run_p.add_argument(
+        "--dag",
+        required=True,
+        metavar="FILE",
+        help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+    )
     run_p.add_argument("-j", "--jobs", type=int, default=None, help="max concurrent steps (default: CPU count)")
     run_p.add_argument(
         "--max-mem",
@@ -219,16 +235,29 @@ def build_parser() -> argparse.ArgumentParser:
         ("ascii", "draw the DAG as ASCII art"),
         ("dot", "emit Graphviz DOT (pipe to `dot -Tsvg`)"),
         ("json", "re-emit the DAG as canonical JSON"),
+        ("yaml", "re-emit the DAG as YAML"),
     ):
         sp = sub.add_parser(cmd, help=helptext)
-        sp.add_argument("--dag", required=True, metavar="FILE", help="DAG JSON file ('-' = stdin)")
+        sp.add_argument(
+            "--dag",
+            required=True,
+            metavar="FILE",
+            help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+        )
 
     sub.add_parser("quickstart", help="print a self-contained getting-started guide")
     return parser
 
 
 def _load(dag_arg: str) -> DagConfig:
-    text = sys.stdin.read() if dag_arg == "-" else Path(dag_arg).read_text(encoding="utf-8")
+    if dag_arg == "-":
+        # stdin has no filename to auto-detect from: default to JSON.
+        return dag_from_json(sys.stdin.read())
+    path = Path(dag_arg)
+    text = path.read_text(encoding="utf-8")
+    # Auto-detect the interchange format by extension: .yaml/.yml -> YAML, else JSON.
+    if path.suffix.lower() in (".yaml", ".yml"):
+        return dag_from_yaml(text)
     return dag_from_json(text)
 
 
@@ -449,6 +478,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "json":
         print(dag_to_json(cfg))
+        return 0
+    if command == "yaml":
+        # dag_to_yaml already ends with a trailing newline.
+        sys.stdout.write(dag_to_yaml(cfg))
         return 0
     if command == "run":
         return _run(cfg, ns, c)

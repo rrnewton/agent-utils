@@ -27,7 +27,9 @@ pub use ambient::{
     AmbientSnapshot,
 };
 pub use cgroup::{install_scope_teardown, reexec_in_scope, CgroupManager, Cgroups};
-pub use io::{dag_from_json, dag_to_json, DagJsonError};
+pub use io::{
+    dag_from_json, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError,
+};
 pub use model::{
     command_with_inner_jobs, effective_jobs_flag, preferred_inner_jobs, render_jobs_flag,
     step_classification, step_failure_reason, DagConfig, ResourceHint, RunResult, Step, StepClass,

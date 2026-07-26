@@ -17,6 +17,13 @@ authors.workspace = true
 # pulled in: the strict reader replicates Python's exact narrowing (e.g. bool-is-not-int),
 # which derive would not.
 serde_json = "1"
+# YAML interchange (FEATURE: YAML is isomorphic to the JSON schema). serde_yaml is ARCHIVED;
+# serde_norway is its maintained, actively-updated fork keeping the same serde API and YAML 1.2
+# core-schema semantics. We deserialize YAML directly into `serde_json::Value` so the YAML path
+# funnels into the EXACT same strict narrowing (`dag_from_value`) as JSON — identical model
+# construction, one code path. (serde_yml is a deprecated/unmaintained shim; yaml-rust2 is a bare
+# parser with no serde-Value integration.)
+serde_norway = "0.9"
 # Safe (no-`unsafe`) SIGINT/SIGTERM registration for the cgroup scope-teardown handler: on
 # Ctrl-C the whole outer scope is torn down so no setsid-escapee orphans survive. std has no
 # signal API, and this project is safe-rust; signal-hook encapsulates the unsafe internally.

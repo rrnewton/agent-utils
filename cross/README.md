@@ -11,11 +11,24 @@ results:
 | Command | Assertion |
 |---------|-----------|
 | `list`, `ascii`, `dot` | stdout **byte-identical** |
-| `json` | **parsed-equal** (byte-identity is additionally reported when it holds — in practice it always does for ASCII fixtures) |
+| `json` | stdout **byte-identical** (both builds emit `ensure_ascii=False` canonical JSON, so the bytes match for every input — including multi-line / quote / backslash / unicode `description` fields) |
 | `run` (default, `-j4`) | same **exit code** (the eager-exit passed/aborted split races on timing, so only the exit code is compared here) |
 | `run` (serial, `-j1`) | same exit code **and** same `passed / failed / aborted / skipped` counts (serial dispatch is a single deterministic LPT sequence, so the counts are fully reproducible) |
 | `--max-mem` sizing | same chosen `-j` and same modeled worst-case footprint |
+| YAML isomorphism | every `.yaml` fixture (under `examples/` and `cross/yaml_fixtures/`) loads in BOTH builds and re-emits **byte-identical canonical JSON**; and each `examples/NAME.{json,yaml}` pair loads to the same DAG |
 | `--version` / `--help` / no-args | same exit code (and `--version` stdout byte-identical) |
+
+## YAML isomorphism fixtures
+
+`cross/yaml_fixtures/` holds adversarial YAML that never runs but must load identically in both
+builds: literal (`|`) and folded (`>`) block scalars and their strip (`-`) variants, the "Norway
+problem" quoted tokens (`no`/`yes`/`on`/`off` must stay strings, not booleans), a quoted
+number-like string, a literal backslash in a block scalar, and unicode. The shipped `examples/*.yaml`
+are exercised the same way, and additionally checked against their `.json` twins.
+
+The Python CLI imports `pyyaml` to load YAML, and the Rust CLI uses `serde_norway` (the maintained
+fork of the archived `serde_yaml`); both deserialize YAML into the same intermediate their JSON path
+uses, so the model is constructed identically regardless of input syntax.
 
 Randomized fixtures are seeded (`--seed`, default 1234; `--random N` controls how many), so a
 failure is reproducible. The randomized DAGs are acyclic (deps only reference earlier steps),

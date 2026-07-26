@@ -417,6 +417,77 @@ def compare_example_static(py: list[str], rs: list[str], fx: Fixture, rep: Repor
         _static_parity(py, rs, dag_path, fx.name, rep)
 
 
+# --------------------------------------------------------------------------- YAML isomorphism
+
+
+def yaml_fixture_paths() -> list[str]:
+    """Every ``.yaml``/``.yml`` fixture: the shipped ``examples/`` plus the dedicated adversarial
+    torture set under ``cross/yaml_fixtures/`` (block scalars, quoted Norway tokens, unicode)."""
+    paths: list[str] = []
+    for directory in (
+        os.path.join(REPO_ROOT, "examples"),
+        os.path.join(REPO_ROOT, "cross", "yaml_fixtures"),
+    ):
+        if not os.path.isdir(directory):
+            continue
+        for name in sorted(os.listdir(directory)):
+            if name.endswith((".yaml", ".yml")):
+                paths.append(os.path.join(directory, name))
+    return paths
+
+
+def compare_yaml_isomorphism(py: list[str], rs: list[str], rep: Report) -> None:
+    """Assert YAML is ISOMORPHIC to JSON.
+
+    For each YAML fixture: load it in BOTH builds, emit CANONICAL JSON, and assert the two are
+    BYTE-IDENTICAL (so the two parsers agree — including on block scalars, the quoted Norway-problem
+    tokens, and unicode). Additionally, when an ``examples/NAME.json`` pair exists, assert the
+    ``.json`` and ``.yaml`` load to the SAME DAG in each language.
+    """
+    for path in yaml_fixture_paths():
+        rel = os.path.relpath(path, REPO_ROOT)
+        po = run(py, ("json", "--dag", path))
+        ro = run(rs, ("json", "--dag", path))
+        label = f"yaml-iso:{rel}"
+        if po.returncode != 0 or ro.returncode != 0:
+            rep.bad(
+                label,
+                f"YAML load failed: py rc={po.returncode} ({po.stderr!r}); "
+                f"rs rc={ro.returncode} ({ro.stderr!r})",
+            )
+            continue
+        if po.stdout != ro.stdout:
+            rep.bad(
+                label,
+                f"YAML not isomorphic (py vs rs canonical JSON differ)\n"
+                f"--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+            )
+            continue
+        rep.ok(label)
+        rep.yaml_isomorphic += 1
+
+        json_pair = os.path.splitext(path)[0] + ".json"
+        if not os.path.exists(json_pair):
+            continue
+        pj = run(py, ("json", "--dag", json_pair))
+        rj = run(rs, ("json", "--dag", json_pair))
+        plabel = f"yaml-pair:{rel}"
+        if pj.returncode != 0 or rj.returncode != 0:
+            rep.bad(plabel, f"JSON pair load failed: py rc={pj.returncode}; rs rc={rj.returncode}")
+        elif pj.stdout != po.stdout:
+            rep.bad(
+                plabel,
+                f"py: json/yaml pair loads differ\n--- json ---\n{pj.stdout}\n--- yaml ---\n{po.stdout}",
+            )
+        elif rj.stdout != ro.stdout:
+            rep.bad(
+                plabel,
+                f"rs: json/yaml pair loads differ\n--- json ---\n{rj.stdout}\n--- yaml ---\n{ro.stdout}",
+            )
+        else:
+            rep.ok(plabel)
+
+
 # --------------------------------------------------------------------------- comparisons
 
 
@@ -569,21 +640,25 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     examples = example_fixtures()
     for fx in examples:
         compare_example_static(py, rs, fx, rep)
-    n_fixtures = len(fixtures) + len(examples)
+    compare_yaml_isomorphism(py, rs, rep)
+    yaml_paths = yaml_fixture_paths()
+    n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)
 
     if rep.failures:
         for failure in rep.failures:
             print(f"DIVERGENCE [{failure}")
         print(
             f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks "
-            f"across {n_fixtures} fixtures ({len(examples)} shipped examples, static-only)"
+            f"across {n_fixtures} fixtures ({len(examples)} shipped JSON examples static-only; "
+            f"{len(yaml_paths)} YAML fixtures for isomorphism)"
         )
         return 1
 
     print(
         f"cross[{tool}]: OK - {rep.checks} checks across {n_fixtures} fixtures agree "
-        f"({len(examples)} shipped examples, static-only; "
-        f"json byte-identical: {rep.json_byte_identical})"
+        f"({len(examples)} shipped JSON examples static-only; "
+        f"{len(yaml_paths)} YAML fixtures isomorphic to JSON; "
+        f"json byte-identical: {rep.json_byte_identical}, yaml isomorphic: {rep.yaml_isomorphic})"
     )
     return 0
 

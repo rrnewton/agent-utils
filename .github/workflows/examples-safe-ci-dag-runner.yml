@@ -35,6 +35,9 @@ jobs:
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
+      - name: install python deps
+        # pyyaml is a runtime dep: the CLI imports it to load the .yaml examples.
+        run: python -m pip install --upgrade pyyaml
       - name: build rust
         run: cargo build --release --workspace --manifest-path rs/Cargo.toml
       - name: run every example under the Python build
@@ -42,9 +45,9 @@ jobs:
           PYTHONPATH: py
         run: |
           shopt -s nullglob
-          examples=(examples/*.json)
+          examples=(examples/*.json examples/*.yaml)
           if [ ${#examples[@]} -eq 0 ]; then
-            echo "no examples/*.json found" >&2
+            echo "no examples/*.json or examples/*.yaml found" >&2
             exit 1
           fi
           for dag in "${examples[@]}"; do
@@ -57,9 +60,9 @@ jobs:
       - name: run every example under the Rust build
         run: |
           shopt -s nullglob
-          examples=(examples/*.json)
+          examples=(examples/*.json examples/*.yaml)
           if [ ${#examples[@]} -eq 0 ]; then
-            echo "no examples/*.json found" >&2
+            echo "no examples/*.json or examples/*.yaml found" >&2
             exit 1
           fi
           for dag in "${examples[@]}"; do

@@ -1,9 +1,14 @@
-"""Canonical JSON (de)serialization for a :class:`~safe_ci_dag_runner.model.DagConfig`.
+"""Canonical JSON and YAML (de)serialization for a :class:`~safe_ci_dag_runner.model.DagConfig`.
 
 This is the on-disk / interchange form the CLI loads via ``--dag FILE`` and the shared
 fixture format for cross-language (Python vs Rust) tests. The schema mirrors the dataclasses
 field-for-field. Parsing is STRICT and fails loudly on a malformed document
 (:class:`DagJsonError`), never silently defaulting a wrong-typed field.
+
+YAML (:func:`dag_from_yaml` / :func:`dag_to_yaml`) is ISOMORPHIC to the JSON schema: the parsed
+YAML object is funneled through the SAME strict narrowing as JSON, so both syntaxes build an
+identical model. YAML additionally allows comments and multi-line block scalars (handy for
+``description`` fields), which is why "literate" DAGs are written in YAML.
 
 Example document::
 
@@ -33,7 +38,13 @@ from safe_ci_dag_runner.model import (
     StepClass,
 )
 
-__all__ = ["dag_from_json", "dag_to_json", "DagJsonError"]
+__all__ = [
+    "dag_from_json",
+    "dag_from_yaml",
+    "dag_to_json",
+    "dag_to_yaml",
+    "DagJsonError",
+]
 
 _DEFAULT_MEM_CAP_FLOOR = 8 * 1024**3
 
@@ -183,6 +194,31 @@ def dag_from_json(text: str) -> DagConfig:
         raw: object = json.loads(text)
     except json.JSONDecodeError as exc:
         raise DagJsonError(f"invalid JSON: {exc}") from exc
+    return _dag_from_obj(raw)
+
+
+def dag_from_yaml(text: str) -> DagConfig:
+    """Parse a DAG YAML document into a :class:`DagConfig`. Raises :class:`DagJsonError`.
+
+    YAML is ISOMORPHIC to the JSON schema: the parsed object is funneled through the SAME typed
+    narrowing (:func:`_dag_from_obj`) that :func:`dag_from_json` uses, so JSON and YAML construct
+    the model identically — the only difference is the surface syntax (which additionally allows
+    comments and multi-line block scalars).
+    """
+    import yaml
+
+    # yaml.safe_load returns Any; pin it to `object` right at the parse boundary so no Any leaks
+    # past here (the strict narrowing in _dag_from_obj re-validates every field's type anyway).
+    raw: object = yaml.safe_load(text)
+    return _dag_from_obj(raw)
+
+
+def _dag_from_obj(raw: object) -> DagConfig:
+    """Build a :class:`DagConfig` from an already-parsed JSON/YAML object.
+
+    The shared strict narrowing behind both :func:`dag_from_json` and :func:`dag_from_yaml`, so the
+    two syntaxes cannot drift in how they construct the model.
+    """
     doc = _as_obj(raw, "<root>")
     # The document-level default_step_timeout is the per-step default for any step that omits
     # its own `timeout` (falling back to the module constant only when the document omits it
@@ -253,16 +289,12 @@ def _step_to_json(step: Step) -> dict[str, object]:
     }
 
 
-def dag_to_json(cfg: DagConfig) -> str:
-    """Serialize a :class:`DagConfig` to canonical, deterministic JSON (2-space indent).
+def _dag_to_obj(cfg: DagConfig) -> dict[str, object]:
+    """Build the canonical document dict shared by :func:`dag_to_json` and :func:`dag_to_yaml`.
 
-    ``ensure_ascii=False`` emits non-ASCII characters as raw UTF-8 (not ``\\uXXXX`` escapes),
-    which makes this output BYTE-IDENTICAL to the Rust build's hand-rolled serializer for every
-    input — including multi-line, quote/backslash-laden, and unicode descriptions. Both sides
-    still escape the JSON control set (``"``, ``\\``, ``\\n``, ``\\t``, ``\\r``, ``\\b``, ``\\f``,
-    and ``\\u00XX`` for other code points < 0x20) identically.
+    A single source of truth for the field set + key order, so the two output formats cannot drift.
     """
-    doc: dict[str, object] = {
+    return {
         "description": cfg.description,
         "resource_caps": dict(sorted(cfg.resource_caps.items())),
         "mem_cap_factor": cfg.mem_cap_factor,
@@ -272,4 +304,33 @@ def dag_to_json(cfg: DagConfig) -> str:
         "default_jobs_flag": cfg.default_jobs_flag,
         "steps": [_step_to_json(s) for s in cfg.steps],
     }
-    return json.dumps(doc, indent=2, ensure_ascii=False)
+
+
+def dag_to_json(cfg: DagConfig) -> str:
+    """Serialize a :class:`DagConfig` to canonical, deterministic JSON (2-space indent).
+
+    ``ensure_ascii=False`` emits non-ASCII characters as raw UTF-8 (not ``\\uXXXX`` escapes),
+    which makes this output BYTE-IDENTICAL to the Rust build's hand-rolled serializer for every
+    input — including multi-line, quote/backslash-laden, and unicode descriptions. Both sides
+    still escape the JSON control set (``"``, ``\\``, ``\\n``, ``\\t``, ``\\r``, ``\\b``, ``\\f``,
+    and ``\\u00XX`` for other code points < 0x20) identically.
+    """
+    return json.dumps(_dag_to_obj(cfg), indent=2, ensure_ascii=False)
+
+
+def dag_to_yaml(cfg: DagConfig) -> str:
+    """Serialize a :class:`DagConfig` to a YAML document.
+
+    YAML byte-output need NOT match the Rust build (only YAML *loading* is isomorphic across the
+    two languages); the emitted document round-trips back through :func:`dag_from_yaml` to an
+    identical :class:`DagConfig`. Built from the same canonical document dict as
+    :func:`dag_to_json`.
+    """
+    import yaml
+
+    return yaml.safe_dump(
+        _dag_to_obj(cfg),
+        sort_keys=False,  # preserve our deliberate key order
+        allow_unicode=True,  # keep unicode raw rather than \\xNN escapes
+        default_flow_style=False,  # block style, human-readable
+    )

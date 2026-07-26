@@ -44,7 +44,7 @@ top-level `bin/` symlink points at the Rust binaries when Rust is built, otherwi
 
 | Tool | Purpose | Status |
 |------|---------|--------|
-| `safe-ci-dag-runner` | Run a DAG (a dependency graph) of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on CPU/mem/ambient-load logging. | ✅ py↔rs parity across the whole tool (load / model / size / visualize / run — `run`/`list`/`ascii`/`dot`/`json`/`quickstart`), proven by the `cross/` differential. Both builds box each step in a cgroup-v2 sandbox **by default** (pass `--allow-cgroup-failure` to run un-boxed where cgroups are unavailable) and both support `--perf-dir` CPU/mem logging. |
+| `safe-ci-dag-runner` | Run a DAG (a dependency graph) of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on CPU/mem/ambient-load logging. | ✅ py↔rs parity across the whole tool (load / model / size / visualize / run — `run`/`list`/`ascii`/`dot`/`json`/`yaml`/`quickstart`), proven by the `cross/` differential. Loads DAGs from **JSON or YAML** (auto-detected by file extension; YAML is isomorphic to the JSON schema and additionally allows comments + multi-line "literate" descriptions). Both builds box each step in a cgroup-v2 sandbox **by default** (pass `--allow-cgroup-failure` to run un-boxed where cgroups are unavailable) and both support `--perf-dir` CPU/mem logging. |
 
 ## Building
 

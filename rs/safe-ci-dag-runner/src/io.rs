@@ -267,7 +267,23 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
 /// field, mirroring the Python `dag_from_json` strictness.
 pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
     let raw: Value = serde_json::from_str(text).map_err(|e| err(format!("invalid JSON: {e}")))?;
-    let doc = as_obj(&raw, "<root>")?;
+    dag_from_value(&raw)
+}
+
+/// Parse a DAG YAML document into a [`DagConfig`]. YAML is ISOMORPHIC to the JSON schema: it is
+/// deserialized into the same `serde_json::Value` intermediate and funneled through
+/// [`dag_from_value`], so JSON and YAML construct the model identically. Returns [`DagJsonError`]
+/// on any malformed field, mirroring the JSON strictness.
+pub fn dag_from_yaml(text: &str) -> Result<DagConfig, DagJsonError> {
+    let raw: Value = serde_norway::from_str(text).map_err(|e| err(format!("invalid YAML: {e}")))?;
+    dag_from_value(&raw)
+}
+
+/// Construct a [`DagConfig`] from an already-parsed JSON/YAML value tree — the shared strict
+/// narrowing behind both [`dag_from_json`] and [`dag_from_yaml`], so the two syntaxes cannot
+/// drift in how they build the model.
+pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
+    let doc = as_obj(raw, "<root>")?;
     let default_step_timeout = opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)?;
     let steps_raw = match doc.get("steps") {
         Some(Value::Array(items)) => items,
@@ -561,6 +577,21 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
     s
 }
 
+/// Serialize a [`DagConfig`] to a YAML document.
+///
+/// YAML byte-output need NOT match the Python build (only YAML *loading* is isomorphic across the
+/// two languages); the emitted document round-trips back through [`dag_from_yaml`] to an identical
+/// `DagConfig`. Implemented by re-parsing the canonical JSON into a value tree — a single source of
+/// truth for the field set shared with [`dag_to_json`] — and dumping that tree as YAML.
+pub fn dag_to_yaml(cfg: &DagConfig) -> String {
+    let json = dag_to_json(cfg);
+    // Canonical JSON produced by dag_to_json is always valid, and a plain JSON value tree always
+    // serializes to YAML, so neither step can fail in practice; the invariants are asserted here.
+    let value: Value =
+        serde_json::from_str(&json).expect("canonical JSON from dag_to_json must re-parse");
+    serde_norway::to_string(&value).expect("a JSON value tree always serializes to YAML")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,6 +633,69 @@ mod tests {
         assert_eq!(back.default_jobs_flag, "--jobs=");
         assert_eq!(back.steps[1].hint.resources.get("browser"), Some(&1));
         assert_eq!(back.steps[1].env.get("HEADLESS"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn yaml_is_isomorphic_to_json() {
+        // Adversarial YAML: a literal (|-) block scalar with quotes + unicode, and a QUOTED
+        // Norway-problem token ("no"), which must stay the STRING "no" (not the bool false).
+        // The lines start at column 0 so the YAML indentation is exactly two spaces.
+        let yaml = r#"description: the whole pipeline
+resource_caps:
+  browser: 1
+steps:
+  - group: build
+    job: app
+    desc: compile
+    description: |-
+      line 1
+      line 2 with "quotes" and unicode é☃
+    cmd: make build
+    hint:
+      classification: cpu-bound
+      preferred_inner_jobs: 8
+  - group: e2e
+    job: smoke
+    desc: browser
+    description: "no"
+    cmd: make e2e
+    deps: [build.app]
+    hint:
+      resources:
+        browser: 1
+"#;
+        // The JSON document that must load to the SAME DagConfig.
+        let json = r#"{"description": "the whole pipeline", "resource_caps": {"browser": 1},
+            "steps": [
+            {"group": "build", "job": "app", "desc": "compile",
+             "description": "line 1\nline 2 with \"quotes\" and unicode é☃",
+             "cmd": "make build",
+             "hint": {"classification": "cpu-bound", "preferred_inner_jobs": 8}},
+            {"group": "e2e", "job": "smoke", "desc": "browser", "description": "no",
+             "cmd": "make e2e", "deps": ["build.app"],
+             "hint": {"resources": {"browser": 1}}}]}"#;
+        let from_yaml = dag_from_yaml(yaml).unwrap();
+        let from_json = dag_from_json(json).unwrap();
+        // Isomorphism: identical canonical JSON regardless of input syntax.
+        assert_eq!(dag_to_json(&from_yaml), dag_to_json(&from_json));
+        // The quoted Norway token stayed a string; the literal block scalar chomped correctly.
+        assert_eq!(from_yaml.steps[1].description, "no");
+        assert_eq!(
+            from_yaml.steps[0].description,
+            "line 1\nline 2 with \"quotes\" and unicode é☃"
+        );
+    }
+
+    #[test]
+    fn yaml_emit_round_trips() {
+        let cfg = dag_from_json(
+            r#"{"description": "d", "steps": [{"group": "g", "job": "j", "desc": "x",
+                "description": "multi\nline", "cmd": "true"}]}"#,
+        )
+        .unwrap();
+        // dag_to_yaml output need not match Python, but must round-trip back to the same DagConfig.
+        let back = dag_from_yaml(&dag_to_yaml(&cfg)).unwrap();
+        assert_eq!(dag_to_json(&cfg), dag_to_json(&back));
     }
 
     #[test]

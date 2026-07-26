@@ -9,6 +9,7 @@ start with the README's 60-second quickstart or run `safe-ci-dag-runner quicksta
 - [Concepts](#concepts)
 - [Planning algorithm](#planning-algorithm)
 - [The DAG JSON schema](#the-dag-json-schema)
+- [YAML: an isomorphic, literate alternative to JSON](#yaml-an-isomorphic-literate-alternative-to-json)
 - [Worked examples](#worked-examples)
 - [The Python API in depth](#the-python-api-in-depth)
 - [Enabling real cgroup boxing](#enabling-real-cgroup-boxing)
@@ -193,6 +194,75 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 > `"latency-bound"`. This is intentional: the JSON is the exact input you supplied, while the
 > promotion is a scheduling view derived from it. To pin `latency-bound` into the canonical JSON, set
 > `classification` explicitly on the hint.
+
+## YAML: an isomorphic, literate alternative to JSON
+
+A DAG can be written in **YAML** instead of JSON. YAML is **isomorphic** to the JSON schema: every
+field, default, and validation rule is identical — the two formats are parsed into the *same* model
+through the *same* strict narrowing, so anything you can express in a JSON DAG you can express in a
+YAML DAG and vice versa. The only differences are surface syntax and two conveniences YAML adds.
+
+**Auto-detection by extension.** `--dag FILE` chooses the format from the file extension:
+`.yaml`/`.yml` load as YAML, everything else as JSON. Reading from stdin (`--dag -`) always assumes
+JSON. So no flag is needed — `run`, `list`, `ascii`, `dot`, `json`, and `yaml` all accept either
+format transparently:
+
+```sh
+safe-ci-dag-runner run  --dag pipeline.yaml --allow-cgroup-failure
+safe-ci-dag-runner list --dag pipeline.yml
+```
+
+**Two conveniences that make DAGs "literate".** YAML allows:
+
+1. **Comments** (`# ...`) — annotate the pipeline inline, right next to the steps.
+2. **Multi-line block scalars** — write a long `description` across several lines with a literal
+   (`|`) or folded (`>`) block scalar, instead of cramming `\n` escapes into a JSON string.
+
+Together these let a DAG document *why* each step exists, in prose, in the file itself. The
+`description` field (top-level and per-node — see the schema tables above) is the natural home for
+this. For example:
+
+```yaml
+# The whole pipeline, documented inline.
+description: |-
+  Build the app, then run the checks in parallel, then deploy.
+  Deploy waits for every check to pass.
+steps:
+  - group: build
+    job: app
+    desc: compile            # short label shown by `list`/`run`
+    description: |-           # long-form docs: a literal block scalar keeps the line breaks
+      Compile the application once.
+      Both downstream checks depend on this single artifact.
+    cmd: make build
+```
+
+**Emitting YAML.** The `yaml` subcommand re-emits any loaded DAG as YAML (mirroring how `json`
+re-emits canonical JSON):
+
+```sh
+safe-ci-dag-runner yaml --dag pipeline.json    # JSON -> YAML
+safe-ci-dag-runner json --dag pipeline.yaml    # YAML -> canonical JSON
+```
+
+Loading is guaranteed isomorphic across the Python and Rust builds (a YAML file loads to a
+byte-identical canonical JSON under both — enforced by `cross/differential.py`). The *emitted* YAML
+bytes are not guaranteed identical across the two builds; only loading is. A JSON DAG and its YAML
+translation always load to the same DAG.
+
+**Watch the "Norway problem" (quote ambiguous scalars).** In YAML, an *unquoted* `no`, `yes`, `on`,
+or `off` parses as a **boolean**, and an unquoted `true`/`false` or a bare number parses as a
+bool/number — not a string. If you mean the literal *string* `"no"` (or a command like `true`, or a
+numeric-looking id), **quote it**: `desc: "no"`, `cmd: "true"`, `job: "123"`. The strict parser will
+otherwise reject a boolean where it wants a string (e.g. `cmd` must be a string) — loudly, never
+silently. The Python (PyYAML) and Rust (serde_norway) parsers agree on all quoted forms; the
+adversarial fixture in `cross/yaml_fixtures/` pins this.
+
+**The `serde_norway` crate (Rust side).** The Rust build parses YAML with
+[`serde_norway`](https://crates.io/crates/serde_norway) — the maintained fork of the archived
+`serde_yaml`, keeping the same serde API and YAML 1.2 core-schema semantics. It deserializes YAML
+into the same `serde_json::Value` intermediate the JSON path uses, so both syntaxes build the model
+through one code path.
 
 ## Worked examples
 

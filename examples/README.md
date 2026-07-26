@@ -2,7 +2,14 @@
 
 Five small, self-contained DAG files you can run immediately, each demonstrating one core idea.
 Every command is `sleep`/`echo` only, so a whole example finishes in a few seconds and needs no build
-tools installed.
+tools installed. Each example also carries `description` fields (a top-level one for the whole DAG
+and one per node) — free-form documentation that never affects scheduling.
+
+Two of them (`02-diamond` and `04-memory-aware`) additionally ship a **side-by-side YAML edition**
+(`.yaml`) that loads to the *exact same DAG* as its `.json` twin — a "literate" version with inline
+comments and multi-line block-scalar descriptions. `--dag` auto-detects the format by extension
+(`.yaml`/`.yml` → YAML, else JSON), so you can point `run`/`list`/`ascii`/`dot`/`json`/`yaml` at
+either file. See `02-diamond.yaml` for what a literate DAG looks like.
 
 Run any of them with either build (they behave identically — that parity is enforced by
 `cross/differential.py`):
@@ -24,7 +31,7 @@ anywhere. Drop the flag on a Linux host with a systemd user session to get the r
 The commands below include it so they are copy-paste runnable on any machine.
 
 Before running, it is worth *looking* at each graph — every example works with `list`, `ascii`, `dot`,
-and `json` too:
+`json`, and `yaml` too:
 
 ```sh
 safe-ci-dag-runner list  --dag examples/02-diamond.json   # one line per step, with class + deps
@@ -57,6 +64,15 @@ carries a larger `est_duration_s`, so when both become ready the runner dispatch
 ```sh
 safe-ci-dag-runner run --dag examples/02-diamond.json --allow-cgroup-failure
 safe-ci-dag-runner ascii --dag examples/02-diamond.json   # shows the 3 topological layers
+```
+
+This example also ships as **`02-diamond.yaml`** — the same DAG, written literately: inline `#`
+comments and multi-line block-scalar (`|-` / `>-`) descriptions. It loads identically (proven by
+`cross/differential.py`), so you can run the YAML edition anywhere the JSON one runs:
+
+```sh
+safe-ci-dag-runner run  --dag examples/02-diamond.yaml --allow-cgroup-failure
+safe-ci-dag-runner json --dag examples/02-diamond.yaml   # YAML in, canonical JSON out
 ```
 
 ## 3. `03-scarce-resource-browser.json` — a named scarce resource
@@ -93,6 +109,13 @@ the CPU count as `-j`. (This example sets `mem_cap_factor: 1.0`, `mem_cap_floor_
 `outer_mem_safety_factor: 1.0` so the modeled numbers are exactly the byte values above; the defaults
 add headroom.)
 
+This example also ships as **`04-memory-aware.yaml`** — the same DAG in literate YAML (byte-value
+comments on each memory hint), loading identically to the JSON:
+
+```sh
+safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-cgroup-failure
+```
+
 ## 5. `05-inner-jobs.json` — a step with internal parallelism
 
 `build.app` runs its *own* parallel build (imagine `make -j8`). Declaring
@@ -115,5 +138,6 @@ safe-ci-dag-runner run --dag examples/05-inner-jobs.json --allow-cgroup-failure
 ## See also
 
 - `common/docs/safe-ci-dag-runner/README.md` — the tool overview and CLI reference.
-- `common/docs/safe-ci-dag-runner/USER_GUIDE.md` — the full concept guide and complete JSON schema.
+- `common/docs/safe-ci-dag-runner/USER_GUIDE.md` — the full concept guide, the complete JSON/YAML
+  schema, and the YAML isomorphism details.
 - `safe-ci-dag-runner quickstart` — the same getting-started tour from the command line.

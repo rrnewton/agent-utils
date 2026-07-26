@@ -2,9 +2,9 @@
 
 Run a **directed acyclic graph (DAG) of CI / build / test steps** concurrently and *safely*.
 You describe your steps as shell commands with dependencies (and optional resource hints) in a small
-JSON file (or in Python), and the runner schedules them across a worker pool — respecting
-dependencies and scarce-resource limits — while boxing each step so a runaway command cannot take
-down the run or the host.
+JSON **or YAML** file (or in Python), and the runner schedules them across a worker pool —
+respecting dependencies and scarce-resource limits — while boxing each step so a runaway command
+cannot take down the run or the host.
 
 ## What you get
 
@@ -113,7 +113,45 @@ and runs the steps un-boxed (with a warning) so the quickstart works on any mach
 with a systemd user session, drop the flag to get real per-step boxing.
 
 Ready-to-run examples of each idea (linear chain, diamond, scarce resource, memory-aware sizing,
-inner jobs) live in [`examples/`](https://github.com/rrnewton/agent-utils/tree/main/examples).
+inner jobs) live in [`examples/`](https://github.com/rrnewton/agent-utils/tree/main/examples), in
+both JSON and (for a couple) side-by-side YAML.
+
+## The DAG format: JSON or YAML
+
+A DAG file can be written in **JSON or YAML** — two spellings of the *same* schema (same fields,
+same defaults, same strict validation, same model). `--dag FILE` auto-detects the format by
+extension: `.yaml`/`.yml` load as YAML, everything else as JSON; `--dag -` reads a JSON DAG from
+stdin.
+
+YAML additionally allows **comments** and **multi-line block-scalar descriptions**, so a DAG can
+document itself inline ("literate" DAGs). Every node — and the DAG as a whole — takes an optional
+`description` field: free-form long-form documentation, distinct from the short `desc` label, that
+never affects scheduling. The `yaml` subcommand re-emits a DAG as YAML and `json` re-emits canonical
+JSON, so you can convert between them.
+
+```yaml
+# A literate YAML DAG (isomorphic to the equivalent JSON).
+description: |-
+  Build, then test. The test depends on the build artifact.
+steps:
+  - group: build
+    job: app
+    desc: compile                 # short label shown by `list`/`run`
+    description: |-               # long-form docs (a literal block scalar)
+      Compile the app once; the test depends on this artifact.
+    cmd: make build
+  - group: test
+    job: unit
+    cmd: make test
+    deps: [build.app]
+```
+
+Loading is guaranteed **isomorphic** across the Python and Rust builds (a YAML file loads to a
+byte-identical canonical JSON under both — enforced by the cross differential). One YAML gotcha:
+quote scalars that look like booleans or numbers when you mean the string — e.g. `cmd: "true"`,
+`desc: "no"` — since unquoted `true`/`no`/`yes`/`on`/`off` parse as booleans. See the
+[USER_GUIDE](https://github.com/rrnewton/agent-utils/blob/main/common/docs/safe-ci-dag-runner/USER_GUIDE.md#yaml-an-isomorphic-literate-alternative-to-json)
+for the full treatment.
 
 ## The resource model: memory, CPU, and named resources
 
@@ -157,7 +195,9 @@ in place of today's greedy one (ds-afzsqf).
 safe-ci-dag-runner <command> [options]
 ```
 
-Every command except `quickstart` takes `--dag FILE` (use `-` to read the DAG from stdin).
+Every command except `quickstart` takes `--dag FILE`. The format is **auto-detected by extension**:
+`.yaml`/`.yml` load as YAML, everything else as JSON (use `-` to read a JSON DAG from stdin). YAML is
+isomorphic to the JSON schema — see [The DAG format: JSON or YAML](#the-dag-format-json-or-yaml).
 
 | Command      | What it does                                                        |
 | ------------ | ------------------------------------------------------------------- |
@@ -166,6 +206,7 @@ Every command except `quickstart` takes `--dag FILE` (use `-` to read the DAG fr
 | `ascii`      | Draw the DAG as ASCII art, grouped by topological layer.            |
 | `dot`        | Emit Graphviz DOT to stdout (pipe to `dot -Tsvg`).                  |
 | `json`       | Re-emit the DAG as canonical, fully-defaulted JSON.                 |
+| `yaml`       | Re-emit the DAG as YAML.                                            |
 | `quickstart` | Print a self-contained getting-started guide (no `--dag` needed).  |
 
 Global: `--version`, `-h/--help`. Running with no command prints help and exits `0`.

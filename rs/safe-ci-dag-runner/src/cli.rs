@@ -6,10 +6,16 @@
 //!   ascii --dag FILE  draw the DAG as ASCII art
 //!   dot --dag FILE    emit Graphviz DOT
 //!   json --dag FILE   re-emit the DAG as canonical JSON
+//!   yaml --dag FILE   re-emit the DAG as YAML
 //!   quickstart        print a self-contained getting-started guide
 //!
-//! `list`, `ascii`, `dot`, and `json` stdout is BYTE-IDENTICAL to the Python build; `--help`
-//! and `quickstart` wording may differ but the structure and exit codes (0 / 1 / 2 / 3) match.
+//! `--dag FILE` auto-detects the input format by extension: `.yaml`/`.yml` load as YAML (which is
+//! ISOMORPHIC to the JSON schema — same model), everything else as JSON. `--dag -` reads JSON from
+//! stdin.
+//!
+//! `list`, `ascii`, `dot`, and `json` stdout is BYTE-IDENTICAL to the Python build; `--help`,
+//! `quickstart`, and `yaml` wording may differ (YAML byte-output is not cross-identical, only YAML
+//! *loading* is) but the structure and exit codes (0 / 1 / 2 / 3) match.
 //!
 //! Cgroup boxing is ON by default (this tool's primary purpose): `run` re-execs inside a
 //! transient `systemd-run --user --scope` and caps each step in its own child cgroup. When
@@ -22,7 +28,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::cgroup::{install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups};
-use crate::io::{dag_from_json, dag_to_json, DagJsonError};
+use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
 use crate::model::{step_classification, DagConfig};
 use crate::perflog::{append_step_profiles, PerfWindow};
 use crate::scheduler::{run_dag_boxed, BoxedCgroups};
@@ -94,6 +100,7 @@ fn help_text(c: &Palette) -> String {
          \x20 ascii      draw the DAG as ASCII art\n\
          \x20 dot        emit Graphviz DOT (pipe to `dot -Tsvg`)\n\
          \x20 json       re-emit the DAG as canonical JSON\n\
+         \x20 yaml       re-emit the DAG as YAML\n\
          \x20 quickstart print a self-contained getting-started guide\n\n\
          {examples}\n\
          \x20 {e1}\n\
@@ -126,7 +133,8 @@ step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag,
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
 top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
-jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"->\"-j4\", \"--jobs=\"->\"--jobs=4\"\n\n\
+jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"->\"-j4\", \"--jobs=\"->\"--jobs=4\"\n  \
+yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n\n\
 {what}\n  \
 - concurrent scheduling in longest-first order, honoring deps + resource caps\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
@@ -177,19 +185,30 @@ fn render_list(cfg: &DagConfig, c: &Palette) -> String {
 // --------------------------------------------------------------------------- dag loading
 
 fn load(dag_arg: &str) -> Result<DagConfig, LoadError> {
-    let text = if dag_arg == "-" {
+    if dag_arg == "-" {
+        // stdin has no filename to auto-detect from: default to JSON.
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(|e| LoadError(format!("{e}")))?;
-        buf
+        return dag_from_json(&buf).map_err(LoadError::from);
+    }
+    let text = std::fs::read_to_string(Path::new(dag_arg)).map_err(|e| {
+        // Match Python's message shape: "[Errno 2] No such file or directory: 'path'".
+        LoadError(format!("{e}: '{dag_arg}'"))
+    })?;
+    // Auto-detect the interchange format by file extension: .yaml/.yml -> YAML, else JSON.
+    if is_yaml_path(dag_arg) {
+        dag_from_yaml(&text).map_err(LoadError::from)
     } else {
-        std::fs::read_to_string(Path::new(dag_arg)).map_err(|e| {
-            // Match Python's message shape: "[Errno 2] No such file or directory: 'path'".
-            LoadError(format!("{e}: '{dag_arg}'"))
-        })?
-    };
-    dag_from_json(&text).map_err(LoadError::from)
+        dag_from_json(&text).map_err(LoadError::from)
+    }
+}
+
+/// Whether a `--dag` path names a YAML file (case-insensitive `.yaml`/`.yml`).
+fn is_yaml_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".yaml") || lower.ends_with(".yml")
 }
 
 struct LoadError(String);
@@ -506,7 +525,7 @@ pub fn run(argv: &[String]) -> i32 {
             };
             cmd_run(&cfg, &a, &c)
         }
-        "list" | "ascii" | "dot" | "json" => {
+        "list" | "ascii" | "dot" | "json" | "yaml" => {
             let dag_arg = match parse_simple_dag(rest) {
                 Ok(Some(d)) => d,
                 Ok(None) => {
@@ -532,6 +551,8 @@ pub fn run(argv: &[String]) -> i32 {
                 "ascii" => print!("{}", to_ascii(&cfg, None)),
                 "dot" => print!("{}", to_dot(&cfg, "dag", None)),
                 "json" => println!("{}", dag_to_json(&cfg)),
+                // dag_to_yaml already ends with a trailing newline.
+                "yaml" => print!("{}", dag_to_yaml(&cfg)),
                 _ => unreachable!(),
             }
             0
@@ -540,7 +561,7 @@ pub fn run(argv: &[String]) -> i32 {
             eprintln!(
                 "usage: {PROG} [-h] [--version] <command> ...\n\
                  {PROG}: error: argument <command>: invalid choice: '{other}' \
-                 (choose from run, list, ascii, dot, json, quickstart)"
+                 (choose from run, list, ascii, dot, json, yaml, quickstart)"
             );
             2
         }
