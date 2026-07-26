@@ -32,8 +32,9 @@ fn boxing_oom_kills_a_step_past_its_cap() {
 
     // Default `run` = boxing REQUIRED. No --allow-cgroup-failure, so if boxing is unavailable the
     // binary exits 3 and we skip loudly rather than asserting on an environment that cannot box.
+    // --no-profile keeps the default auto-logging profile store from writing into the test CWD.
     let output = Command::new(bin)
-        .args(["run", "--dag", dag.to_str().unwrap(), "-q"])
+        .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
         .output()
         .expect("failed to spawn the built binary");
 

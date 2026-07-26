@@ -22,7 +22,13 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
 * ``run`` agrees on exit code, and on the passed/failed/aborted/skipped counts. Counts are
   compared under ``--keep-going`` so they are deterministic (the default eager-exit path
   races on which in-flight step is cancelled first, so only its exit code is compared).
+* ``--only`` selection (Feature A) agrees: running EXACTLY one named step matches on exit code
+  and counts, and an unknown ``--only`` tag exits 2 on both builds. (The ``sweep`` timing table
+  and the ``--profile`` table are NOT byte-compared — runtimes legitimately differ across the two
+  languages — but their ``--only``/profile-store schema and flag behavior are exercised here.)
 * The memory-aware ``-j`` decision and modeled footprint from ``--max-mem`` match.
+* All ``run`` comparisons pass ``--no-profile`` so the default auto-logging profile store does not
+  write into the harness CWD (profile logging itself is proven by each build's own tests).
 
 It also keeps the bootstrap ``--version`` / ``--help`` / no-args exit-code checks.
 
@@ -48,6 +54,11 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: downgrades to the deterministic, environment-independent UNBOXED scheduling core so the two
 #: implementations are compared on identical observable behavior (boxing is proven separately).
 ACF = "--allow-cgroup-failure"
+
+#: Passed to every `run` comparison so the default auto-logging profile store (Feature D) does not
+#: write CSVs into the harness CWD during the differential; the scheduling behavior under test is
+#: independent of profile logging, which is proven by each build's own tests.
+NOPROF = "--no-profile"
 
 _COUNTS_RE = re.compile(
     r"(\d+) passed, (\d+) failed, (\d+) aborted, (\d+) skipped"
@@ -680,6 +691,39 @@ def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: 
     rep.json_byte_identical += 1
 
 
+def _first_tag(fx: Fixture) -> str | None:
+    """The ``group.job`` tag of the fixture's first step, or ``None`` for an empty/odd DAG.
+
+    Used to exercise ``--only`` selection parity (Feature A) on a concrete, present tag."""
+    steps = fx.dag.get("steps")
+    if not isinstance(steps, list) or not steps:
+        return None
+    first = steps[0]
+    if not isinstance(first, dict):
+        return None
+    group, job = first.get("group"), first.get("job")
+    if isinstance(group, str) and isinstance(job, str):
+        return f"{group}.{job}"
+    return None
+
+
+def compare_only_errors(py: list[str], rs: list[str], rep: Report) -> None:
+    """``--only`` with an unknown tag must exit 2 on BOTH builds (Feature A error parity)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dag.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}')
+        po = run(py, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, ACF))
+        ro = run(rs, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, ACF))
+        label = "only-unknown-tag"
+        if po.returncode != ro.returncode:
+            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+        elif po.returncode != 2:
+            rep.bad(label, f"expected exit 2 for an unknown --only tag; got {po.returncode}")
+        else:
+            rep.ok(label)
+
+
 def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag_path = os.path.join(tmp, "dag.json")
@@ -699,8 +743,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # here (see cross/README.md). The flag makes both builds run the SAME observable UNBOXED
         # scheduling core deterministically, regardless of whether the host can box. Boxing itself
         # is proven by each build's own tests (Python pytest + the Rust boxing smoke test).
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4", ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4", ACF))
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, ACF))
         label = f"{fx.name}/run(default-exit)"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
@@ -712,8 +756,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # passed/failed/aborted/skipped counts are fully reproducible between the two builds.
         # (Note: --keep-going only suppresses the eager-abort of in-flight steps; on any
         # failure BOTH builds set stop and launch no new steps, so counts still race at -j>1.)
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", ACF))
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, ACF))
         label = f"{fx.name}/run(serial-counts)"
         pc, rc = _counts(po.stderr), _counts(ro.stderr)
         if po.returncode != ro.returncode:
@@ -727,14 +771,36 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
 
         # 5) --max-mem sizing decision, when the fixture supplies a budget.
         if fx.max_mem is not None:
-            po = run(py, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, ACF))
-            ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, ACF))
+            po = run(py, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, ACF))
+            ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, ACF))
             label = f"{fx.name}/sizing"
             ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
             if ps is None or rss is None:
                 rep.bad(label, f"missing sizing line py={po.stderr!r} rs={ro.stderr!r}")
             elif ps != rss:
                 rep.bad(label, f"(-j, footprint, budget) py={ps} rs={rss}")
+            else:
+                rep.ok(label)
+
+        # 6) --only selection parity (Feature A): running EXACTLY the named step(s) must agree on
+        # exit code AND the passed/failed/aborted/skipped counts across both builds. Selecting a
+        # single step at -j1 is deterministic (its deps outside the selection are dropped), so the
+        # counts are reproducible even though full-DAG timing is not.
+        tag = _first_tag(fx)
+        if tag is not None:
+            po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, ACF))
+            ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, ACF))
+            label = f"{fx.name}/only({tag})"
+            pc, rc = _counts(po.stderr), _counts(ro.stderr)
+            if po.returncode != ro.returncode:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+            elif pc is None or rc is None:
+                rep.bad(label, f"missing summary counts py={po.stderr!r} rs={ro.stderr!r}")
+            elif pc != rc:
+                rep.bad(label, f"counts py={pc} rs={rc}")
+            elif pc != (1, 0, 0, 0) and pc != (0, 1, 0, 0):
+                # --only <one tag> runs exactly one step: it either passes or fails, nothing else.
+                rep.bad(label, f"--only one step should run exactly one step; got counts {pc}")
             else:
                 rep.ok(label)
 
@@ -772,6 +838,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
         compare_example_static(py, rs, fx, rep)
     compare_yaml_isomorphism(py, rs, rep)
     compare_scalar_parity(py, rs, rep)
+    compare_only_errors(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)
 

@@ -184,10 +184,13 @@ concurrently. You could equally cap `"gpu"`, `"db"`, or `"api-tokens"` — anyth
 Scheduling today is a single **greedy, longest-processing-time-first** pass: whenever a worker slot
 frees, the runner starts the ready step (all dependencies done, resource demand fits the caps, under
 `-j`) with the largest `est_duration_s` first, so long steps do not pile up on the tail of the run.
-The `est_duration_s` you attach to a step is, for now, a static hint you supply in the DAG; a
-separate, auto-updated profile store that learns real durations from past runs is planned
-(ds-7pzdgm), as is a `--planner` flag that would select a smarter critical-path / lookahead planner
-in place of today's greedy one (ds-afzsqf).
+The `est_duration_s` you attach to a step is, for now, a static hint you supply in the DAG. The
+**storage** half of the planned learned-duration profile store (ds-7pzdgm) now ships: every `run` and
+`sweep` auto-logs per-step timings/memory to the profile store described in
+[Where profiling data is stored](#where-profiling-data-is-stored-the-default-profile-store), so the
+data a future planner would learn from is being collected today. Feeding those recorded durations
+back in as the estimate automatically (and a `--planner` flag selecting a smarter critical-path /
+lookahead planner in place of today's greedy one, ds-afzsqf) are still to come.
 
 ## CLI reference
 
@@ -202,6 +205,7 @@ isomorphic to the JSON schema — see [The DAG format: JSON or YAML](#the-dag-fo
 | Command      | What it does                                                        |
 | ------------ | ------------------------------------------------------------------- |
 | `run`        | Run the DAG. Exit `0` iff every step passes.                        |
+| `sweep`      | Parallel-speedup study of ONE step: run it at inner `-j1..-jN` and print a timing/speedup table (see [Profiling & experimenting with individual steps](#profiling--experimenting-with-individual-steps)). |
 | `list`       | List the steps with class and dependencies (registration order).    |
 | `ascii`      | Draw the DAG as ASCII art, grouped by topological layer.            |
 | `dot`        | Emit Graphviz DOT to stdout (pipe to `dot -Tsvg`).                  |
@@ -217,13 +221,90 @@ Global: `--version`, `-h/--help`. Running with no command prints help and exits 
 | -------------------- | ---------------------------------------------------------------------------------- |
 | `--dag FILE`         | DAG JSON file (`-` = stdin). Required.                                              |
 | `-j, --jobs N`       | Max concurrent steps. Default: the machine's CPU count.                            |
+| `--only TAG[,TAG...]`| Run **exactly** the named step(s) and nothing else. Dependency edges to steps *outside* the selection are dropped (their outputs are assumed already present) — it does **not** run the step's dependencies. For profiling/experimenting on a step in isolation. Errors (exit `2`) if a tag does not exist. See [Profiling & experimenting with individual steps](#profiling--experimenting-with-individual-steps). |
 | `--max-mem SPEC`     | RAM budget (e.g. `8G`, `4096M`): pick the largest `-j` whose modeled worst-case footprint fits. Ignored when `--jobs` is given (`--jobs` wins, with a note). |
-| `--perf-dir DIR`     | Write per-step and whole-run resource-usage CSVs into `DIR` (uses the `CsvMetricsSink`). Prints the CSV paths at the end. |
+| `--profile`          | After the run, print a per-step profile table (`step` &#124; `wall_s` &#124; `user_s` &#124; `sys_s` &#124; `rss_hwm` &#124; `oom` &#124; `inner_jobs`) to the terminal. The CPU/memory columns come from the per-step cgroup, so they are populated under boxing and show `-` in an un-boxed run. |
+| `--perf-dir DIR`     | Write per-step and whole-run resource-usage CSVs into `DIR` (uses the `CsvMetricsSink`), **overriding** the default profile store and `$SAFE_CI_DAG_RUNNER_PROFILE_DIR`. Prints the CSV paths at the end. |
+| `--no-profile`       | Disable the default auto-logging profile store (do not append CSVs anywhere). |
 | `-k, --keep-going`   | On a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps). |
 | `--allow-cgroup-failure` | Opt out of the on-by-default boxing requirement: instead of erroring (exit `3`) when cgroup-v2 + a systemd `--user` scope are unavailable, run the steps **un-boxed** with a visible warning. Needed on laptops, most CI runners, and non-Linux hosts. |
 | `--cgroups`          | Deprecated no-op, accepted for backward compatibility (cgroup-v2 boxing is now ON by default). |
 | `-v`                 | Verbose: stream each step's child output live as it runs.                          |
 | `-q, --quiet`        | Quieter: suppress the per-step PASS summaries (failures are always shown).         |
+
+### Profiling & experimenting with individual steps
+
+Beyond running a whole DAG, three tools let an agent (or a person) profile and experiment with
+**individual** steps, and make profiling data land somewhere obvious so it can be browsed:
+
+**`run --only TAG[,TAG...]`** runs *exactly* the named step(s) and nothing else. It does **not** run
+their dependencies — dependency edges to steps outside the selection are dropped, and the step's
+inputs are assumed already present — so you can iterate on one step without re-running the graph:
+
+```sh
+safe-ci-dag-runner run --dag dag.json --only build.app --allow-cgroup-failure
+safe-ci-dag-runner run --dag dag.json --only build.app,test.unit --allow-cgroup-failure
+```
+
+**`run --profile`** prints a per-step profile table after the run so a CI-optimizing agent sees what
+happened without opening a CSV:
+
+```
+$ safe-ci-dag-runner run --dag dag.json --profile
+...
+per-step profile:
+step       wall_s  user_s  sys_s  rss_hwm  oom  inner_jobs
+---------  ------  ------  -----  -------  ---  ----------
+build.app   0.920   3.438  0.004  2.6 MiB    0           4
+test.unit   0.269   0.002  0.016  512.0 KiB  0     ambient
+```
+
+**`sweep`** runs ONE step at inner parallelism `-j1, -j2, … -jN` (passing each width into the step's
+command via its `jobs_flag`) and prints the classic parallel-speedup table:
+
+```
+$ safe-ci-dag-runner sweep --dag dag.json --step build.app --jobs 1..8
+parallel-speedup sweep: build.app
+jobs  wall_s  user_s  sys_s  rss_hwm  speedup(vs j1)
+----  ------  ------  -----  -------  --------------
+1      3.574   3.514  0.007  1.2 MiB           1.00x
+2      1.770   3.432  0.003  1.6 MiB           2.02x
+4      1.457   3.487  0.006  2.6 MiB           2.45x
+8      0.519   3.553  0.020  3.7 MiB           6.89x
+```
+
+`sweep` flags: `--dag FILE`, `--step TAG` (the single `group.job` step to sweep), `--jobs RANGE`
+(`LO..HI`, e.g. `1..8`, or a bare `N` meaning `1..N`), `--repeat K` (run each width K times and keep
+the fastest wall time; default `1`), plus `--perf-dir` / `--no-profile` / `--allow-cgroup-failure` /
+`-v` with the same meaning as `run`. Like `run`, `sweep` boxes each measurement by default so it
+measures under real cgroup limits (`rss_hwm` comes from the step cgroup's `memory.peak`, so it is
+populated under boxing and blank in an un-boxed `--allow-cgroup-failure` run).
+
+### Where profiling data is stored (the default profile store)
+
+Every `run` and `sweep` **auto-logs** resource-usage CSVs — you do **not** need `--perf-dir`. The
+destination is resolved in this order:
+
+1. `--no-profile` — logging is disabled.
+2. `--perf-dir DIR` — an explicit directory (wins over everything below).
+3. `$SAFE_CI_DAG_RUNNER_PROFILE_DIR` — an environment override.
+4. **Default:** `./.safe-ci-dag-runner/profiles/` — repo-local, relative to the current working
+   directory, created on demand.
+
+The tool prints exactly where it appended (never a silent write), e.g.:
+
+```
+safe-ci-dag-runner: profile data appended to the default profile store at .safe-ci-dag-runner/profiles
+  (override with --perf-dir or $SAFE_CI_DAG_RUNNER_PROFILE_DIR; disable with --no-profile):
+  .safe-ci-dag-runner/profiles/<machine>.csv
+  .safe-ci-dag-runner/profiles/step_profiles_<machine>_<container>.csv
+```
+
+The schema and filenames are the same as `--perf-dir` has always produced: a whole-run summary
+`<machine_id>.csv` and a per-step `step_profiles_<machine>_<container>.csv` (one row per step, with
+dynamic cgroup `cpu.*` columns when boxing is active — including the `inner_jobs` width, so a sweep's
+rows are browsable per width). Consider **gitignoring** `./.safe-ci-dag-runner/` (it is machine-local
+perf data, not source) — or check it in to keep a history; that is a project choice.
 
 Memory-aware sizing example — let the runner choose a RAM-safe `-j` from the graph's per-step
 memory hints instead of hard-coding one:

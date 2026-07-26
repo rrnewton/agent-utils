@@ -54,7 +54,9 @@ jobs:
             echo "::group::python run $dag"
             # Cgroup boxing is ON by default; CI runners lack a systemd --user scope, so opt out
             # (a bare `run` would exit 3). This mirrors how the docs tell newcomers to run anywhere.
-            python3 -m safe_ci_dag_runner run --dag "$dag" --allow-cgroup-failure
+            # --no-profile keeps each example from writing a default profile store here (the store
+            # itself is exercised by the dedicated step below).
+            python3 -m safe_ci_dag_runner run --dag "$dag" --allow-cgroup-failure --no-profile
             echo "::endgroup::"
           done
       - name: run every example under the Rust build
@@ -69,6 +71,36 @@ jobs:
             echo "::group::rust run $dag"
             # Cgroup boxing is ON by default; CI runners lack a systemd --user scope, so opt out
             # (a bare `run` would exit 3). This mirrors how the docs tell newcomers to run anywhere.
-            rs/target/release/safe-ci-dag-runner run --dag "$dag" --allow-cgroup-failure
+            rs/target/release/safe-ci-dag-runner run --dag "$dag" --allow-cgroup-failure --no-profile
             echo "::endgroup::"
           done
+      - name: exercise --only, sweep, and the default profile store (both builds)
+        env:
+          PYTHONPATH: py
+        run: |
+          set -euo pipefail
+          ex=examples/06-step-sweep.json
+          # Both builds share the same CLI, so run the identical checks against each.
+          for build in "python3 -m safe_ci_dag_runner" "rs/target/release/safe-ci-dag-runner"; do
+            echo "::group::$build run --only (Feature A: run EXACTLY one step, not its deps)"
+            $build run --dag "$ex" --only build.app --allow-cgroup-failure --no-profile
+            echo "::endgroup::"
+
+            echo "::group::$build run --only unknown tag must exit 2"
+            rc=0
+            $build run --dag "$ex" --only no.pe --allow-cgroup-failure --no-profile || rc=$?
+            if [ "$rc" -ne 2 ]; then
+              echo "expected exit code 2 for an unknown --only tag, got $rc" >&2; exit 1
+            fi
+            echo "::endgroup::"
+
+            echo "::group::$build sweep (Feature B) -> default profile store (Feature D)"
+            rm -rf .safe-ci-dag-runner
+            $build sweep --dag "$ex" --step build.app --jobs 1..3 --allow-cgroup-failure
+            # Feature D: the sweep must have auto-created the repo-local default profile store.
+            if [ -z "$(find .safe-ci-dag-runner/profiles -name '*.csv' 2>/dev/null)" ]; then
+              echo "expected default profile store CSVs after sweep" >&2; exit 1
+            fi
+            echo "::endgroup::"
+          done
+          rm -rf .safe-ci-dag-runner

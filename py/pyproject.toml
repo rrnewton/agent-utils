@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safe-ci-dag-runner"
-version = "0.4.0"
+version = "0.5.0"
 description = "Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on resource logging."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -46,3 +46,12 @@ disallow_any_explicit = true
 disallow_any_decorated = true
 warn_unreachable = true
 show_error_codes = true
+
+# The test suite imports `pytest`, whose `pytest.approx` support pulls in numpy's type stubs
+# transitively. numpy's stubs use 3.12-only `type` statements that error under our
+# python_version=3.10 target. This project never uses numpy, so skip following it (no `Any`
+# leaks into first-party code — numpy is not referenced anywhere here).
+[[tool.mypy.overrides]]
+module = "numpy.*"
+follow_imports = "skip"
+follow_imports_for_stubs = true

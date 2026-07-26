@@ -1,9 +1,9 @@
 # `examples/` — runnable safe-ci-dag-runner DAGs
 
-Five small, self-contained DAG files you can run immediately, each demonstrating one core idea.
-Every command is `sleep`/`echo` only, so a whole example finishes in a few seconds and needs no build
-tools installed. Each example also carries `description` fields (a top-level one for the whole DAG
-and one per node) — free-form documentation that never affects scheduling.
+Six small, self-contained DAG files you can run immediately, each demonstrating one core idea.
+Every command is `sleep`/`echo`/pure-shell only, so a whole example finishes in a few seconds and
+needs no build tools installed. Each example also carries `description` fields (a top-level one for
+the whole DAG and one per node) — free-form documentation that never affects scheduling.
 
 Two of them (`02-diamond` and `04-memory-aware`) additionally ship a **side-by-side YAML edition**
 (`.yaml`) that loads to the *exact same DAG* as its `.json` twin — a "literate" version with inline
@@ -134,6 +134,33 @@ when your command manages its own concurrency.
 ```sh
 safe-ci-dag-runner run --dag examples/05-inner-jobs.json --allow-cgroup-failure
 ```
+
+## 6. `06-step-sweep.json` — profile & experiment with individual steps
+
+This example exists to demonstrate the **per-step profiling tools**. Its `build.app` step is a small
+CPU-bound workload that *actually scales* with its inner parallelism: it splits a fixed amount of
+pure-shell work across N workers, where N is the inner-jobs width the runner passes in via the step's
+`jobs_flag`. So a `sweep` of it produces a real speedup curve. `test.unit` and `package.tarball` are
+quick downstream steps so `--only` is meaningful.
+
+```sh
+# Run EXACTLY one step (its dependency build.app is NOT run — inputs assumed present):
+safe-ci-dag-runner run --dag examples/06-step-sweep.json --only test.unit --allow-cgroup-failure
+
+# Run the whole DAG and print a per-step profile table afterwards:
+safe-ci-dag-runner run --dag examples/06-step-sweep.json --profile --allow-cgroup-failure
+
+# Parallel-speedup study of the build step at inner -j1..-j8:
+safe-ci-dag-runner sweep --dag examples/06-step-sweep.json --step build.app --jobs 1..8 --allow-cgroup-failure
+```
+
+Every `run` and `sweep` above **auto-logs** resource-usage CSVs to the default profile store,
+`./.safe-ci-dag-runner/profiles/` (relative to your current directory) — you do not need
+`--perf-dir`. The tool prints exactly where it appended. Drop `--allow-cgroup-failure` on a Linux
+host with a systemd user session to get real per-step boxing, which also fills in the `rss_hwm`
+(peak memory) column from each step's cgroup. Override the location with `--perf-dir DIR` or
+`$SAFE_CI_DAG_RUNNER_PROFILE_DIR`, or turn logging off with `--no-profile`. Consider gitignoring
+`./.safe-ci-dag-runner/`.
 
 ## See also
 

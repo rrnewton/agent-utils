@@ -15,6 +15,11 @@ build/
 dist/
 .venv/
 
+# --- default profile store (safe-ci-dag-runner Feature D auto-logging) ---
+# Runs and sweeps auto-append resource-usage CSVs here by default; it is machine-local
+# perf data, not source. Delete this line to check the history in instead (project choice).
+.safe-ci-dag-runner/
+
 # --- editor / os ---
 *.swp
 .DS_Store

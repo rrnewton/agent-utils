@@ -110,7 +110,8 @@ pub fn container_class() -> String {
 
 /// This process's accumulated CHILD (user, sys) CPU seconds, from `/proc/self/stat`
 /// `cutime`/`cstime` (fields 16/17, in clock ticks). The getrusage(RUSAGE_CHILDREN) analogue.
-fn child_cpu_seconds() -> (f64, f64) {
+/// Public so the sweep (`cli.rs`) can bracket a single-step run and derive its user/sys CPU.
+pub fn child_cpu_seconds() -> (f64, f64) {
     let text = match fs::read_to_string("/proc/self/stat") {
         Ok(t) => t,
         Err(_) => return (0.0, 0.0),

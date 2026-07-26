@@ -23,18 +23,29 @@
 //! `--allow-cgroup-failure` downgrades to a best-effort UNBOXED run with a visible warning.
 //! `--perf-dir DIR` writes per-step + whole-run resource-usage CSVs.
 
+use std::collections::{BTreeMap, HashSet};
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::cgroup::{install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups};
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
-use crate::model::{step_classification, DagConfig};
-use crate::perflog::{append_step_profiles, PerfWindow};
+use crate::model::{step_classification, DagConfig, Step};
+use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::scheduler::{run_dag_boxed, BoxedCgroups};
 use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
 use crate::viz::{to_ascii, to_dot};
 use crate::{PROG, VERSION};
+
+/// Environment variable overriding the default profile-store location (Feature D). An explicit
+/// `--perf-dir` still wins over this; `--no-profile` disables logging entirely.
+const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
+
+/// Default profile-store directory, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
+/// `--perf-dir` nor `$SAFE_CI_DAG_RUNNER_PROFILE_DIR` is set and `--no-profile` is absent. Created
+/// on demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
+const DEFAULT_PROFILE_DIR: &str = ".safe-ci-dag-runner/profiles";
 
 // --------------------------------------------------------------------------- colors
 
@@ -96,6 +107,7 @@ fn help_text(c: &Palette) -> String {
          {usage}\n  {PROG} <command> [options]\n\n\
          {commands}\n\
          \x20 run        run a DAG (exit 0 iff every step passes)\n\
+         \x20 sweep      parallel-speedup sweep of ONE step (inner -j1..-jN + timing table)\n\
          \x20 list       list the steps\n\
          \x20 ascii      draw the DAG as ASCII art\n\
          \x20 dot        emit Graphviz DOT (pipe to `dot -Tsvg`)\n\
@@ -105,14 +117,23 @@ fn help_text(c: &Palette) -> String {
          {examples}\n\
          \x20 {e1}\n\
          \x20 {e2}\n\
-         \x20 {e3}\n",
+         \x20 {e3}\n\
+         \x20 {e4}\n\
+         \x20 {e5}\n\n\
+         {profiling}\n",
         banner = banner(c),
         usage = c.bold("usage"),
         commands = c.bold("commands"),
         examples = c.bold("examples"),
         e1 = ex(&format!("{PROG} quickstart")),
-        e2 = ex(&format!("{PROG} run --dag dag.json")),
-        e3 = ex(&format!("{PROG} ascii --dag dag.json")),
+        e2 = ex(&format!("{PROG} run --dag dag.json --profile")),
+        e3 = ex(&format!("{PROG} run --dag dag.json --only build.app")),
+        e4 = ex(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8")),
+        e5 = ex(&format!("{PROG} ascii --dag dag.json")),
+        profiling = c.dim(
+            "Profiling data auto-logs to ./.safe-ci-dag-runner/profiles/ by default\n \
+             (override with --perf-dir or $SAFE_CI_DAG_RUNNER_PROFILE_DIR; disable with --no-profile)."
+        ),
     )
 }
 
@@ -128,6 +149,8 @@ fn quickstart(c: &Palette) -> String {
 {{\"group\": \"test\",  \"job\": \"unit\", \"desc\": \"unit tests\", \"cmd\": \"echo test && sleep 0.2\",\n        \"deps\": [\"build.app\"]}},\n      \
 {{\"group\": \"e2e\",   \"job\": \"smoke\", \"desc\": \"browser smoke\", \"cmd\": \"echo e2e && sleep 0.2\",\n        \"deps\": [\"build.app\"], \"hint\": {{\"resources\": {{\"browser\": 1}}}}}}\n    ]\n  }}\n\n\
 {i3}\n  {r1}\n  {r2}\n  {r3}\n\n\
+{studies}\n  {s1}\n  {s2}\n  {s3}\n  {studies_note}\n\n\
+{store}\n  {store_dir}\n  {store_note}\n\n\
 {schema}  {schema_note}\n  \
 step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, networkonly, engine_only, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
@@ -149,6 +172,21 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         r1 = k(&format!("{PROG} list  --dag dag.json")),
         r2 = k(&format!("{PROG} ascii --dag dag.json")),
         r3 = k(&format!("{PROG} run   --dag dag.json")),
+        studies = h("Profile & experiment with individual steps"),
+        s1 = k(&format!("{PROG} run   --dag dag.json --profile        # per-step timing/memory table after the run")),
+        s2 = k(&format!("{PROG} run   --dag dag.json --only test.unit # run EXACTLY that step (NOT its deps)")),
+        s3 = k(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8  # -j1..-j8 speedup table")),
+        studies_note = c.dim(
+            "--only drops dependency edges to steps outside the selection (inputs assumed present); \
+             sweep passes each width into the step via its jobs_flag and reports wall/user/sys/rss + speedup."
+        ),
+        store = h("Where profiling data lands (by default)"),
+        store_dir = k("./.safe-ci-dag-runner/profiles/   (created on demand, relative to CWD)"),
+        store_note = c.dim(
+            "Every run and sweep AUTO-LOGS resource-usage CSVs here; override with --perf-dir or \
+             $SAFE_CI_DAG_RUNNER_PROFILE_DIR, disable with --no-profile. The tool prints where it \
+             appended (never silent). Consider gitignoring ./.safe-ci-dag-runner/."
+        ),
         schema = h("DAG schema"),
         schema_note = c.dim("(only group/job/cmd are required per step; everything else has defaults)"),
         what = h("What you get"),
@@ -225,7 +263,10 @@ struct RunArgs {
     dag: Option<String>,
     jobs: Option<i64>,
     max_mem: Option<String>,
+    only: Option<String>,
     perf_dir: Option<String>,
+    no_profile: bool,
+    profile: bool,
     keep_going: bool,
     cgroups: bool,
     allow_cgroup_failure: bool,
@@ -238,7 +279,10 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         dag: None,
         jobs: None,
         max_mem: None,
+        only: None,
         perf_dir: None,
+        no_profile: false,
+        profile: false,
         keep_going: false,
         cgroups: false,
         allow_cgroup_failure: false,
@@ -273,7 +317,10 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 );
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
+            "--only" => a.only = Some(take_value(inline, &mut i)?),
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
+            "--no-profile" => a.no_profile = true,
+            "--profile" => a.profile = true,
             "-k" | "--keep-going" => a.keep_going = true,
             "--cgroups" => a.cgroups = true,
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
@@ -406,7 +453,541 @@ fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, i32> {
     Err(3)
 }
 
+// --------------------------------------------------------------------------- profile store
+
+/// Resolve the effective profile-store directory and a label for its source (Feature D).
+///
+/// Precedence: `--no-profile` disables logging (returns `(None, "disabled")`); otherwise an
+/// explicit `--perf-dir` wins; otherwise `$SAFE_CI_DAG_RUNNER_PROFILE_DIR`; otherwise the
+/// repo-local default `./.safe-ci-dag-runner/profiles/`. Auto-logging is ON by default.
+fn resolve_profile_dir(perf_dir: Option<&str>, no_profile: bool) -> (Option<String>, &'static str) {
+    if no_profile {
+        return (None, "disabled");
+    }
+    if let Some(d) = perf_dir {
+        if !d.is_empty() {
+            return (Some(d.to_string()), "--perf-dir");
+        }
+    }
+    if let Ok(env) = std::env::var(PROFILE_DIR_ENV) {
+        if !env.is_empty() {
+            return (Some(env), "env");
+        }
+    }
+    (Some(DEFAULT_PROFILE_DIR.to_string()), "default")
+}
+
+/// Print one visible line naming where profile CSVs were appended (No Silent Failure).
+fn report_profile_written(perf_dir: &str, source: &str) {
+    let mut csvs: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(perf_dir) {
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|x| x == "csv") {
+                csvs.push(path.display().to_string());
+            }
+        }
+    }
+    csvs.sort();
+    if csvs.is_empty() {
+        eprintln!("{PROG}: WARNING no profile CSVs were written under {perf_dir}");
+        return;
+    }
+    if source == "--perf-dir" {
+        eprintln!("{PROG}: perf CSVs written under {perf_dir}:");
+    } else {
+        let origin = match source {
+            "default" => "default profile store".to_string(),
+            "env" => format!("profile store (${PROFILE_DIR_ENV})"),
+            other => format!("profile store ({other})"),
+        };
+        eprintln!(
+            "{PROG}: profile data appended to the {origin} at {perf_dir} (override with --perf-dir \
+             or ${PROFILE_DIR_ENV}; disable with --no-profile):"
+        );
+    }
+    for path in csvs {
+        eprintln!("  {path}");
+    }
+}
+
+// --------------------------------------------------------------------------- --only selection
+
+/// Split a comma-separated `group.job` tag list, dropping empty entries.
+fn parse_tag_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Return a DAG containing EXACTLY the named steps (Feature A).
+///
+/// Dependency edges to steps OUTSIDE the selection are dropped (their outputs are assumed
+/// present); edges among selected steps are preserved so a selected sub-graph still runs in the
+/// right order. Registration order is preserved, matching the Python build. `Err` on unknown tag.
+fn filter_only(cfg: &DagConfig, tags: &[String]) -> Result<DagConfig, String> {
+    let by_tag: HashSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
+    let unknown: Vec<String> = tags
+        .iter()
+        .filter(|t| !by_tag.contains(*t))
+        .cloned()
+        .collect();
+    if !unknown.is_empty() {
+        let mut known: Vec<String> = by_tag.into_iter().collect();
+        known.sort();
+        let known_s = if known.is_empty() {
+            "(none)".to_string()
+        } else {
+            known.join(", ")
+        };
+        return Err(format!(
+            "--only: unknown step tag(s): {}. Known tags: {known_s}",
+            unknown.join(", ")
+        ));
+    }
+    let selected: HashSet<String> = tags.iter().cloned().collect();
+    let mut new_cfg = cfg.clone();
+    new_cfg.steps = cfg
+        .steps
+        .iter()
+        .filter(|s| selected.contains(&s.tag()))
+        .map(|s| {
+            let mut step = s.clone();
+            step.deps.retain(|d| selected.contains(d));
+            step
+        })
+        .collect();
+    Ok(new_cfg)
+}
+
+// --------------------------------------------------------------------------- table rendering
+
+/// Human-readable byte count (e.g. `3.5 GiB`); `-` when unknown.
+fn human_bytes(n: Option<i64>) -> String {
+    let mut value = match n {
+        Some(v) => v as f64,
+        None => return "-".to_string(),
+    };
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"] {
+        if value < 1024.0 || unit == "TiB" {
+            return if unit == "B" {
+                format!("{} B", value as i64)
+            } else {
+                format!("{value:.1} {unit}")
+            };
+        }
+        value /= 1024.0;
+    }
+    format!("{} B", n.unwrap_or(0))
+}
+
+/// Render a fixed-width table: the first column left-aligned, the rest right-aligned.
+fn render_table(headers: &[String], rows: &[Vec<String>], c: &Palette) -> String {
+    let cols = headers.len();
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let fmt_row = |cells: &[String]| -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(cols);
+        for (i, cell) in cells.iter().enumerate() {
+            let w = widths[i];
+            if i == 0 {
+                parts.push(format!("{cell:<w$}"));
+            } else {
+                parts.push(format!("{cell:>w$}"));
+            }
+        }
+        parts.join("  ")
+    };
+    let sep: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
+    let mut out = vec![c.bold(&fmt_row(headers)), c.dim(&sep.join("  "))];
+    for row in rows {
+        out.push(fmt_row(row));
+    }
+    out.join("\n")
+}
+
+fn cell_secs(value: Option<&String>) -> String {
+    match value.and_then(|s| s.parse::<f64>().ok()) {
+        Some(v) => format!("{v:.3}"),
+        None => "-".to_string(),
+    }
+}
+
+fn cell_secs_from_usec(value: Option<&String>) -> String {
+    match value.and_then(|s| s.parse::<i64>().ok()) {
+        Some(v) => format!("{:.3}", v as f64 / 1e6),
+        None => "-".to_string(),
+    }
+}
+
+fn cell_bytes(value: Option<&String>) -> String {
+    match value.and_then(|s| s.parse::<i64>().ok()) {
+        Some(v) => human_bytes(Some(v)),
+        None => "-".to_string(),
+    }
+}
+
+/// Print the per-step profile table (Feature C) to stdout.
+///
+/// Columns: step | wall_s | user_s | sys_s | rss_hwm | oom | inner_jobs. `user_s`/`sys_s` come
+/// from the per-step cgroup `cpu.stat` (present only under boxing) and `rss_hwm` from the step
+/// cgroup `memory.peak`; each shows `-` when unavailable (an un-boxed run).
+fn print_profile_table(rows: &[BTreeMap<String, String>], c: &Palette) {
+    if rows.is_empty() {
+        eprintln!("{PROG}: no per-step profile rows to show (nothing ran)");
+        return;
+    }
+    let headers: Vec<String> = [
+        "step",
+        "wall_s",
+        "user_s",
+        "sys_s",
+        "rss_hwm",
+        "oom",
+        "inner_jobs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let mut table: Vec<Vec<String>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        table.push(vec![
+            row.get("step").cloned().unwrap_or_else(|| "?".to_string()),
+            cell_secs(row.get("elapsed_s")),
+            cell_secs_from_usec(row.get("cpu.user_usec")),
+            cell_secs_from_usec(row.get("cpu.system_usec")),
+            cell_bytes(row.get("peak_bytes")),
+            row.get("oom_kills")
+                .cloned()
+                .unwrap_or_else(|| "0".to_string()),
+            row.get("inner_jobs")
+                .cloned()
+                .unwrap_or_else(|| "-".to_string()),
+        ]);
+    }
+    println!("{}", c.bold("per-step profile:"));
+    println!("{}", render_table(&headers, &table, c));
+}
+
+// --------------------------------------------------------------------------- sweep
+
+/// One measured single-step run at a given inner-parallelism width.
+#[derive(Clone, Copy)]
+struct SweepMeasure {
+    wall_s: f64,
+    user_s: f64,
+    sys_s: f64,
+    rss_hwm: Option<i64>,
+    ok: bool,
+}
+
+/// Parse a sweep width range: `"LO..HI"` or a bare `"N"` (meaning `1..N`).
+fn parse_jobs_range(raw: &str) -> Result<(i64, i64), String> {
+    let text = raw.trim();
+    let (lo, hi) = match text.split_once("..") {
+        Some((a, b)) => {
+            let lo = a
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("invalid --jobs range '{raw}': not an integer"))?;
+            let hi = b
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| format!("invalid --jobs range '{raw}': not an integer"))?;
+            (lo, hi)
+        }
+        None => {
+            let n = text
+                .parse::<i64>()
+                .map_err(|_| format!("invalid --jobs '{raw}': not an integer"))?;
+            (1, n)
+        }
+    };
+    if lo < 1 || hi < lo {
+        return Err(format!("invalid --jobs range '{raw}': need 1 <= LO <= HI"));
+    }
+    Ok((lo, hi))
+}
+
+/// Run ONE step at a fixed inner-parallelism width and measure it (see [`cmd_sweep`]).
+#[allow(clippy::too_many_arguments)]
+fn run_single_step(
+    base: &Step,
+    cfg: &DagConfig,
+    inner_jobs: i64,
+    cgroups: &BoxedCgroups,
+    perf_dir: Option<&str>,
+    git: &str,
+    verbosity: i64,
+) -> SweepMeasure {
+    let mut step = base.clone();
+    step.deps.clear();
+    step.hint.preferred_inner_jobs = Some(inner_jobs);
+    let mut one = cfg.clone();
+    one.steps = vec![step];
+
+    let (u0, s0) = child_cpu_seconds();
+    let window = perf_dir.map(|d| PerfWindow::start(Path::new(d), git));
+    let start = Instant::now();
+    let result = run_dag_boxed(&one, 1, false, verbosity, cgroups.clone());
+    let measured = start.elapsed().as_secs_f64();
+    let (u1, s1) = child_cpu_seconds();
+    if let Some(w) = &window {
+        w.finish(
+            if result.ok { "pass" } else { "fail" },
+            result.outcomes.len(),
+            inner_jobs,
+        );
+    }
+    if let Some(d) = perf_dir {
+        append_step_profiles(
+            Path::new(d),
+            &result.step_profile_rows,
+            git,
+            1,
+            None,
+            "unverified",
+            "local",
+        );
+    }
+    let row = result.step_profile_rows.first();
+    let wall_s = row
+        .and_then(|r| r.get("elapsed_s"))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(measured);
+    let rss_hwm = row
+        .and_then(|r| r.get("peak_bytes"))
+        .and_then(|s| s.parse::<i64>().ok());
+    SweepMeasure {
+        wall_s,
+        user_s: (u1 - u0).max(0.0),
+        sys_s: (s1 - s0).max(0.0),
+        rss_hwm,
+        ok: result.ok,
+    }
+}
+
+/// Print the parallel-speedup sweep table (Feature B) to stdout.
+fn print_sweep_table(
+    step: &str,
+    baseline_jobs: i64,
+    measures: &[(i64, SweepMeasure)],
+    c: &Palette,
+) {
+    let baseline_wall = measures.first().map(|(_, m)| m.wall_s).unwrap_or(0.0);
+    let headers: Vec<String> = vec![
+        "jobs".to_string(),
+        "wall_s".to_string(),
+        "user_s".to_string(),
+        "sys_s".to_string(),
+        "rss_hwm".to_string(),
+        format!("speedup(vs j{baseline_jobs})"),
+    ];
+    let mut table: Vec<Vec<String>> = Vec::with_capacity(measures.len());
+    for (jobs, m) in measures {
+        let speedup = if m.wall_s > 0.0 {
+            format!("{:.2}x", baseline_wall / m.wall_s)
+        } else {
+            "-".to_string()
+        };
+        table.push(vec![
+            jobs.to_string(),
+            format!("{:.3}", m.wall_s),
+            format!("{:.3}", m.user_s),
+            format!("{:.3}", m.sys_s),
+            human_bytes(m.rss_hwm),
+            speedup,
+        ]);
+    }
+    println!("{}", c.bold(&format!("parallel-speedup sweep: {step}")));
+    println!("{}", render_table(&headers, &table, c));
+}
+
+struct SweepArgs {
+    dag: Option<String>,
+    step: Option<String>,
+    jobs: Option<String>,
+    repeat: i64,
+    perf_dir: Option<String>,
+    no_profile: bool,
+    allow_cgroup_failure: bool,
+    verbosity: i64,
+}
+
+fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
+    let mut a = SweepArgs {
+        dag: None,
+        step: None,
+        jobs: None,
+        repeat: 1,
+        perf_dir: None,
+        no_profile: false,
+        allow_cgroup_failure: false,
+        verbosity: 0,
+    };
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+        let take_value = |inline: Option<String>, i: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline {
+                Ok(v)
+            } else {
+                *i += 1;
+                rest.get(*i)
+                    .cloned()
+                    .ok_or_else(|| format!("the argument {key} requires a value"))
+            }
+        };
+        match key.as_str() {
+            "--dag" => a.dag = Some(take_value(inline, &mut i)?),
+            "--step" => a.step = Some(take_value(inline, &mut i)?),
+            "--jobs" => a.jobs = Some(take_value(inline, &mut i)?),
+            "--repeat" => {
+                let v = take_value(inline, &mut i)?;
+                a.repeat = v
+                    .parse::<i64>()
+                    .map_err(|_| format!("--repeat: invalid int value: '{v}'"))?;
+            }
+            "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
+            "--no-profile" => a.no_profile = true,
+            "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
+            "-v" => a.verbosity += 1,
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+        i += 1;
+    }
+    Ok(a)
+}
+
+/// Per-step parallel-speedup sweep (Feature B).
+fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
+    let dag_arg = match &a.dag {
+        Some(d) => d.clone(),
+        None => {
+            eprintln!("{PROG} sweep: error: the following arguments are required: --dag");
+            return 2;
+        }
+    };
+    let step_tag = match &a.step {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("{PROG} sweep: error: the following arguments are required: --step");
+            return 2;
+        }
+    };
+    let jobs_spec = match &a.jobs {
+        Some(j) => j.clone(),
+        None => {
+            eprintln!("{PROG} sweep: error: the following arguments are required: --jobs");
+            return 2;
+        }
+    };
+    let cfg = match load(&dag_arg) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{PROG}: {}", e.0);
+            return 2;
+        }
+    };
+    let by_tag: HashSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
+    if !by_tag.contains(&step_tag) {
+        let mut known: Vec<String> = by_tag.into_iter().collect();
+        known.sort();
+        let known_s = if known.is_empty() {
+            "(none)".to_string()
+        } else {
+            known.join(", ")
+        };
+        eprintln!("{PROG}: sweep: unknown --step tag '{step_tag}'. Known tags: {known_s}");
+        return 2;
+    }
+    let (lo, hi) = match parse_jobs_range(&jobs_spec) {
+        Ok(range) => range,
+        Err(e) => {
+            eprintln!("{PROG}: sweep: {e}");
+            return 2;
+        }
+    };
+    let repeat = a.repeat.max(1);
+
+    // Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
+    let cgroups = match resolve_cgroups(a.allow_cgroup_failure) {
+        Ok(cg) => cg,
+        Err(code) => return code,
+    };
+    let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
+    let git = git_sha();
+    let base = cfg
+        .steps
+        .iter()
+        .find(|s| s.tag() == step_tag)
+        .expect("tag presence checked above")
+        .clone();
+
+    let mut measures: Vec<(i64, SweepMeasure)> = Vec::new();
+    for jobs in lo..=hi {
+        let mut best: Option<SweepMeasure> = None;
+        for _ in 0..repeat {
+            let m = run_single_step(
+                &base,
+                &cfg,
+                jobs,
+                &cgroups,
+                perf_dir.as_deref(),
+                &git,
+                a.verbosity,
+            );
+            if !m.ok {
+                eprintln!(
+                    "{PROG}: sweep: step '{step_tag}' FAILED at -j{jobs}; aborting the sweep"
+                );
+                return 1;
+            }
+            best = Some(match best {
+                Some(b) if b.wall_s <= m.wall_s => b,
+                _ => m,
+            });
+        }
+        measures.push((jobs, best.expect("repeat >= 1")));
+    }
+
+    print_sweep_table(&step_tag, lo, &measures, c);
+    if let Some(d) = perf_dir.as_deref() {
+        report_profile_written(d, source);
+    }
+    0
+}
+
 fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
+    // Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so
+    // a bad tag fails fast (exit 2) without needing a systemd scope.
+    let filtered = if let Some(only) = a.only.as_deref() {
+        let tags = parse_tag_list(only);
+        if tags.is_empty() {
+            eprintln!("{PROG}: run: --only requires at least one tag");
+            return 2;
+        }
+        match filter_only(cfg, &tags) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!("{PROG}: {e}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    let cfg: &DagConfig = filtered.as_ref().unwrap_or(cfg);
+
     // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
     let cgroups = match resolve_cgroups(a.allow_cgroup_failure) {
         Ok(cg) => cg,
@@ -419,9 +1000,11 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let jobs = select_jobs(cfg, a);
     let verbosity = if a.quiet { 0 } else { a.verbosity };
 
-    let perf_dir = a.perf_dir.as_deref().filter(|s| !s.is_empty());
+    let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
     let git = git_sha();
-    let window = perf_dir.map(|d| PerfWindow::start(Path::new(d), &git));
+    let window = perf_dir
+        .as_deref()
+        .map(|d| PerfWindow::start(Path::new(d), &git));
 
     let result = run_dag_boxed(cfg, jobs, a.keep_going, verbosity, cgroups);
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
@@ -442,7 +1025,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         result.wall_s
     );
 
-    if let Some(d) = perf_dir {
+    if let Some(d) = perf_dir.as_deref() {
         if let Some(w) = &window {
             w.finish(
                 if result.ok { "pass" } else { "fail" },
@@ -450,7 +1033,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
                 jobs,
             );
         }
-        let loc = append_step_profiles(
+        append_step_profiles(
             Path::new(d),
             &result.step_profile_rows,
             &git,
@@ -459,10 +1042,12 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             "unverified",
             "local",
         );
-        match loc {
-            Some(p) => eprintln!("{PROG}: perf CSVs written under {d} (e.g. {})", p.display()),
-            None => eprintln!("{PROG}: WARNING no perf CSVs were written under {d}"),
-        }
+        report_profile_written(d, source);
+    }
+
+    // Feature C: --profile prints a per-step profile table to stdout.
+    if a.profile {
+        print_profile_table(&result.step_profile_rows, c);
     }
 
     if result.ok {
@@ -525,6 +1110,16 @@ pub fn run(argv: &[String]) -> i32 {
             };
             cmd_run(&cfg, &a, &c)
         }
+        "sweep" => {
+            let a = match parse_sweep_args(rest) {
+                Ok(a) => a,
+                Err(msg) => {
+                    eprintln!("{PROG} sweep: error: {msg}");
+                    return 2;
+                }
+            };
+            cmd_sweep(&a, &c)
+        }
         "list" | "ascii" | "dot" | "json" | "yaml" => {
             let dag_arg = match parse_simple_dag(rest) {
                 Ok(Some(d)) => d,
@@ -561,7 +1156,7 @@ pub fn run(argv: &[String]) -> i32 {
             eprintln!(
                 "usage: {PROG} [-h] [--version] <command> ...\n\
                  {PROG}: error: argument <command>: invalid choice: '{other}' \
-                 (choose from run, list, ascii, dot, json, yaml, quickstart)"
+                 (choose from run, sweep, list, ascii, dot, json, yaml, quickstart)"
             );
             2
         }

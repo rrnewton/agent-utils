@@ -11,6 +11,7 @@ start with the README's 60-second quickstart or run `safe-ci-dag-runner quicksta
 - [The DAG JSON schema](#the-dag-json-schema)
 - [YAML: an isomorphic, literate alternative to JSON](#yaml-an-isomorphic-literate-alternative-to-json)
 - [Worked examples](#worked-examples)
+- [Profiling and experimenting with individual steps](#profiling-and-experimenting-with-individual-steps)
 - [The Python API in depth](#the-python-api-in-depth)
 - [Enabling real cgroup boxing](#enabling-real-cgroup-boxing)
 - [Troubleshooting](#troubleshooting)
@@ -132,8 +133,11 @@ Two planned improvements are worth knowing about:
   about the whole remaining graph, not just the current ready set — is planned (ds-afzsqf).
 - **A learned duration profile.** `est_duration_s` is, for now, a static hint you write into the DAG.
   A separate, auto-updated **profile store** that records real per-step durations from past runs and
-  feeds them back as the estimate is planned (ds-7pzdgm), so the numbers would not have to be
-  hand-maintained.
+  feeds them back as the estimate is planned (ds-7pzdgm). Its **storage** half now ships: every `run`
+  and `sweep` auto-logs per-step timings and memory to a default profile store (see
+  [Profiling and experimenting with individual steps](#profiling-and-experimenting-with-individual-steps)
+  below), so the data a future planner would learn from is already being collected. Feeding those
+  recorded durations back in as the estimate automatically is the remaining step.
 
 ## The DAG JSON schema
 
@@ -338,6 +342,86 @@ the width once instead of hardcoding it in `cmd`. (Set `jobs_flag` to change the
 `"-j%d"` → `make build -j8` — or `""` to opt out when your command already sets its own `-j`.) Second,
 it feeds scheduling: when cgroup boxing is active the step is capped to 8 CPUs, and in the memory
 model a `cpu-bound` step's cap scales with its inner width above a width of 4.
+
+## Profiling and experimenting with individual steps
+
+The whole-DAG `run` is the common path, but three tools let you profile and experiment with a
+**single** step, and make the resulting profiling data land somewhere obvious so it can be browsed
+and (later) feed planning.
+
+### `run --only TAG[,TAG...]` — run exactly the named step(s)
+
+`--only` runs *exactly* the named steps and nothing else. Crucially, it does **not** run their
+dependencies: dependency edges pointing to steps *outside* the selection are dropped, and those
+inputs are assumed to already be present. This is for iterating on or profiling one step without
+paying to rebuild the whole graph.
+
+```sh
+safe-ci-dag-runner run --dag dag.json --only build.app                 # one step
+safe-ci-dag-runner run --dag dag.json --only build.app,test.unit       # several, comma-separated
+```
+
+Edges *among* the selected steps are preserved, so a selected sub-graph still runs in the right
+order. An unknown tag is a hard error (exit `2`) that lists the known tags. Both the Python and Rust
+builds filter identically (enforced by `cross/differential.py`).
+
+### `run --profile` — a per-step profile table after the run
+
+Add `--profile` to print a per-step table once the run finishes, so a CI-optimizing agent sees what
+happened without opening a CSV:
+
+```
+per-step profile:
+step       wall_s  user_s  sys_s  rss_hwm  oom  inner_jobs
+---------  ------  ------  -----  -------  ---  ----------
+build.app   0.920   3.438  0.004  2.6 MiB    0           4
+test.unit   0.269   0.002  0.016  512.0 KiB  0     ambient
+```
+
+`user_s`/`sys_s` come from each step's cgroup `cpu.stat` and `rss_hwm` from its `memory.peak`, so
+they are populated under real boxing and shown as `-` in an un-boxed (`--allow-cgroup-failure`) run.
+
+### `sweep` — a per-step parallel-speedup study
+
+`sweep` runs ONE step at inner parallelism `-j1, -j2, … -jN`, passing each width into the step's
+command through its `jobs_flag` (so, e.g., `jobs_flag: "-j%d"` makes width 4 arrive as `-j4`), and
+prints the classic parallel-speedup table:
+
+```
+$ safe-ci-dag-runner sweep --dag dag.json --step build.app --jobs 1..8
+parallel-speedup sweep: build.app
+jobs  wall_s  user_s  sys_s  rss_hwm  speedup(vs j1)
+----  ------  ------  -----  -------  --------------
+1      3.574   3.514  0.007  1.2 MiB           1.00x
+2      1.770   3.432  0.003  1.6 MiB           2.02x
+8      0.519   3.553  0.020  3.7 MiB           6.89x
+```
+
+Flags: `--step TAG` (required), `--jobs RANGE` (`LO..HI` like `1..8`, or a bare `N` meaning `1..N`),
+`--repeat K` (run each width K times and keep the fastest wall time; default `1`), and the same
+`--perf-dir` / `--no-profile` / `--allow-cgroup-failure` / `-v` as `run`. Like `run`, `sweep` boxes
+each measurement by default, so it measures under real cgroup limits. (Runtimes legitimately differ
+between the Python and Rust builds, so the sweep/`--profile` *table contents* are not byte-compared
+across languages — but the `--only` selection semantics, the profile-store schema, and the
+`json`/`list`/`ascii`/`dot` output all are.)
+
+### The default profile store (auto-logging)
+
+Every `run` and `sweep` **auto-logs** resource-usage CSVs; you do not need `--perf-dir`. The
+destination is resolved in order:
+
+1. `--no-profile` — disable logging.
+2. `--perf-dir DIR` — explicit directory (wins over the rest).
+3. `$SAFE_CI_DAG_RUNNER_PROFILE_DIR` — an environment override.
+4. **Default:** `./.safe-ci-dag-runner/profiles/`, repo-local (relative to the CWD), created on
+   demand.
+
+The tool always prints where it appended (No Silent Failure). The files and schema are exactly what
+`--perf-dir` has always written — `<machine_id>.csv` (one whole-run summary row) and
+`step_profiles_<machine>_<container>.csv` (one row per step, including the `inner_jobs` width and the
+dynamic cgroup `cpu.*` columns under boxing) — so a sweep's rows are browsable per width. Consider
+**gitignoring** `./.safe-ci-dag-runner/` (machine-local perf data, not source), or check it in to
+keep a history — your choice.
 
 ## The Python API in depth
 

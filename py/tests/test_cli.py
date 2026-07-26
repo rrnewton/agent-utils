@@ -9,6 +9,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from safe_ci_dag_runner import __version__
 from safe_ci_dag_runner.cli import PROG, main
 
@@ -142,6 +144,129 @@ def test_run_perf_dir_writes_csv() -> None:
         assert "perf CSVs written under" in err
         # No stray flock sidecar left behind in the user's --perf-dir.
         assert not list(perf.glob("*.lock"))
+
+
+def test_run_only_runs_exactly_selected_step() -> None:
+    # --only runs EXACTLY the named step(s) and nothing else (deps not run). The selected step's
+    # dep (build.app) is NOT executed, so exactly one step passes.
+    dag = (
+        '{"steps": ['
+        '{"group": "build", "job": "app", "cmd": "true"},'
+        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(["run", "--dag", str(path), "--only", "test.unit", "-q", _ACF])
+        assert rc == 0
+        assert "1 passed, 0 failed, 0 aborted, 0 skipped" in err
+
+
+def test_run_only_multiple_steps() -> None:
+    # A comma-separated selection runs exactly those steps.
+    dag = (
+        '{"steps": ['
+        '{"group": "a", "job": "x", "cmd": "true"},'
+        '{"group": "b", "job": "y", "cmd": "true"},'
+        '{"group": "c", "job": "z", "cmd": "true"}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(["run", "--dag", str(path), "--only", "a.x,c.z", "-q", _ACF])
+        assert rc == 0
+        assert "2 passed, 0 failed, 0 aborted, 0 skipped" in err
+
+
+def test_run_only_unknown_tag_exits_2() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, _, err = _capture(["run", "--dag", dag, "--only", "no.pe", "-q", _ACF])
+        assert rc == 2
+        assert "unknown step tag" in err
+
+
+def test_run_profile_prints_table() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        rc, out, _ = _capture(["run", "--dag", dag, "--profile", "-q", _ACF])
+        assert rc == 0
+        assert "per-step profile:" in out
+        for column in ("step", "wall_s", "user_s", "sys_s", "rss_hwm", "oom", "inner_jobs"):
+            assert column in out
+
+
+def test_run_default_profile_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # With NEITHER --perf-dir NOR $SAFE_CI_DAG_RUNNER_PROFILE_DIR set, a run auto-logs to the
+    # repo-local default ./.safe-ci-dag-runner/profiles/ (relative to CWD) and says where.
+    monkeypatch.delenv("SAFE_CI_DAG_RUNNER_PROFILE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    dag = _demo_path(str(tmp_path))
+    rc, _, err = _capture(["run", "--dag", dag, "-q", _ACF])
+    assert rc == 0
+    store = tmp_path / ".safe-ci-dag-runner" / "profiles"
+    csvs = list(store.glob("*.csv"))
+    assert csvs, "expected the default profile store to be created and written"
+    assert "default profile store" in err
+
+
+def test_run_no_profile_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SAFE_CI_DAG_RUNNER_PROFILE_DIR", raising=False)
+    monkeypatch.chdir(tmp_path)
+    dag = _demo_path(str(tmp_path))
+    rc, _, err = _capture(["run", "--dag", dag, "--no-profile", "-q", _ACF])
+    assert rc == 0
+    assert not (tmp_path / ".safe-ci-dag-runner").exists()
+    assert "profile data appended" not in err
+
+
+def test_sweep_prints_table_and_writes_store() -> None:
+    # sweep runs the ONE step at inner -j1..-j2 and prints a speedup table; each run auto-appends
+    # to the profile store (redirected to a temp dir by the autouse conftest fixture).
+    dag = '{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}'
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        store = Path(tmp) / "perf"
+        rc, out, err = _capture(
+            ["sweep", "--dag", str(path), "--step", "g.j", "--jobs", "1..2",
+             "--perf-dir", str(store), _ACF]
+        )
+        assert rc == 0, err
+        assert "parallel-speedup sweep: g.j" in out
+        for column in ("jobs", "wall_s", "user_s", "sys_s", "rss_hwm", "speedup(vs j1)"):
+            assert column in out
+        assert list(store.glob("*.csv")), "sweep should append to the profile store"
+
+
+def test_sweep_unknown_step_exits_2() -> None:
+    dag = '{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}'
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(
+            ["sweep", "--dag", str(path), "--step", "no.pe", "--jobs", "1..2", _ACF]
+        )
+        assert rc == 2
+        assert "unknown --step tag" in err
+
+
+def test_sweep_bad_range_exits_2() -> None:
+    dag = '{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}'
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, _, err = _capture(
+            ["sweep", "--dag", str(path), "--step", "g.j", "--jobs", "5..2", _ACF]
+        )
+        assert rc == 2
+        assert "invalid --jobs range" in err
 
 
 def test_version_via_module() -> None:
