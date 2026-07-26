@@ -8,11 +8,17 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
 
 * ``list``, ``ascii``, ``dot`` stdout are BYTE-IDENTICAL.
 * ``json`` stdout is BYTE-IDENTICAL (both builds emit ``ensure_ascii=False`` canonical JSON, so
-  the bytes match for every input — including multi-line / quote / backslash / unicode
-  ``description`` fields).
+  the bytes match for every input — including multi-line / quote / backslash / control-char /
+  unicode ``description`` fields, and floats in scientific notation).
 * Every ``.yaml`` fixture is ISOMORPHIC to JSON: loaded in BOTH builds and re-emitted as
   canonical JSON, the bytes match; and each ``examples/NAME.{json,yaml}`` pair loads to the same
   DAG.
+* Scalar-resolution PARITY: a battery of adversarial scalars (the YAML "Norway problem",
+  octal/underscore/sexagesimal/timestamp tokens, non-finite and overflow floats, and
+  out-of-i64-range integers) is loaded in BOTH builds and must yield the SAME accept/reject exit
+  code — and byte-identical JSON whenever both accept. This catches PyYAML-1.1-vs-serde_norway-1.2
+  and Python-json-vs-serde_json divergences that the isomorphism check (which only covers
+  documents both builds accept) cannot.
 * ``run`` agrees on exit code, and on the passed/failed/aborted/skipped counts. Counts are
   compared under ``--keep-going`` so they are deterministic (the default eager-exit path
   races on which in-flight step is cancelled first, so only its exit code is compared).
@@ -79,6 +85,7 @@ class Report:
     failures: list[str] = field(default_factory=list)
     json_byte_identical: int = 0
     yaml_isomorphic: int = 0
+    scalar_parity: int = 0
 
     def ok(self, _label: str) -> None:
         self.checks += 1
@@ -210,9 +217,18 @@ def representative_fixtures() -> list[Fixture]:
                         # A multi-line description with quotes, backslashes, a tab, a control
                         # char, and unicode — proves the JSON string escaping is byte-identical
                         # across the two builds (FEATURE 1).
+                        # Adversarial description covering hostile classes across the full escape
+                        # surface: every C0 control (0x00 NUL .. 0x1f), DEL (0x7f), double
+                        # backslashes, leading/trailing spaces, and the sneaky Unicode line/
+                        # paragraph separators (U+2028/U+2029/U+0085) that some serializers escape
+                        # and others pass raw. Both builds must agree byte-for-byte.
                         "description": (
-                            'multi-line\nwith "quotes", \\backslash\\, \ttab, '
-                            "ctrl \x01, unicode é☃\U0001F600"
+                            "  leading+trailing spaces  \n"
+                            'multi-line\nwith "quotes", \\backslash\\, double\\\\backslash, \ttab, '
+                            "all-ctrl "
+                            + "".join(chr(c) for c in range(0x00, 0x20))
+                            + " del\x7f, unicode é☃\U0001F600, "
+                            "line-seps \u2028\u2029\u0085 end"
                         ),
                         "cmd": "true",
                         "env": {"K2": "v2", "K1": "v1"},
@@ -488,6 +504,120 @@ def compare_yaml_isomorphism(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok(plabel)
 
 
+# --------------------------------------------------------------------------- scalar parity
+
+
+def scalar_parity_cases() -> list[tuple[str, str, str]]:
+    """``(name, extension, document)`` triples pinning cross-language AGREEMENT on adversarial
+    scalar resolution, non-finite / overflow floats, and out-of-range integers.
+
+    Unlike :func:`compare_yaml_isomorphism` (which only covers documents BOTH builds accept), each
+    case here asserts the two builds return the SAME exit code — so "both correctly REJECT" is a
+    pass — and, when both accept, byte-identical canonical JSON. This is the regression net for the
+    PyYAML-1.1-vs-serde_norway-1.2 divergences (the "Norway problem", octal/underscore/sexagesimal/
+    timestamp resolution), Python-vs-serde_json non-finite handling, and i64-range integer bounds.
+    """
+    # A single valid step, appended after whichever adversarial top-level/step field is under test.
+    step = "steps:\n  - {group: g, job: j, cmd: make}\n"
+    cases: list[tuple[str, str, str]] = []
+
+    # Norway problem in a STRING field (top-level `description`): plain yes/no/on/off/y/n must stay
+    # strings (accept); true/false resolve to bools (reject as non-string) — the SAME on both sides.
+    for tok in ("no", "yes", "on", "off", "y", "n", "Yes", "No"):
+        cases.append((f"norway_str_{tok}", "yaml", f"description: {tok}\n{step}"))
+    for tok in ("true", "false", "True", "FALSE"):
+        cases.append((f"bool_in_str_{tok}", "yaml", f"description: {tok}\n{step}"))
+
+    # Norway problem in a BOOL field (`networkonly`): only true/false are bools; yes/no/on/off are
+    # strings and must be rejected by the boolean field — identically in both builds.
+    for tok in ("true", "false"):
+        cases.append((f"bool_field_ok_{tok}", "yaml", f"steps:\n  - {{group: g, job: j, cmd: make, networkonly: {tok}}}\n"))
+    for tok in ("no", "yes", "on", "off"):
+        cases.append((f"bool_field_reject_{tok}", "yaml", f"steps:\n  - {{group: g, job: j, cmd: make, networkonly: {tok}}}\n"))
+
+    # Integer resolution in an INT field (`default_step_timeout`).
+    for name, tok in (
+        ("dec", "42"), ("plus", "+5"), ("minus", "-5"), ("zero", "0"),
+        ("octal_prefixed", "0o17"), ("hex", "0x10"), ("binary", "0b101"),
+        ("leading_zero", "0755"), ("leading_zero2", "010"),
+        ("underscore", "1_000"), ("sexagesimal", "1:20"), ("floatish", "1e3"),
+        ("bignum", "99999999999999999999999999"),
+        ("just_over_i64", "9223372036854775808"),
+    ):
+        cases.append((f"int_{name}", "yaml", f"default_step_timeout: {tok}\n{step}"))
+
+    # Float resolution in a FLOAT field (`mem_cap_factor`).
+    for name, tok in (
+        ("sci", "1e3"), ("dot_frac", ".5"), ("trailing_dot", "1."),
+        ("overflow", "1e400"), ("neg_overflow", "-1e400"),
+        ("inf", ".inf"), ("nan", ".nan"), ("leading_zero", "0755"),
+    ):
+        cases.append((f"float_{name}", "yaml", f"mem_cap_factor: {tok}\n{step}"))
+
+    # Non-finite in a NULLABLE float field: serde maps `.inf` to null, so both read null (accept).
+    cases.append(("nullable_inf", "yaml", "steps:\n  - {group: g, job: j, cmd: make, hint: {measured_effective_cores: .inf}}\n"))
+
+    # String field fed YAML null tokens: `description` has default "" but an explicit null value is
+    # not a string and must be rejected by BOTH builds.
+    for name, tok in (("null_word", "null"), ("tilde", "~")):
+        cases.append((f"str_{name}", "yaml", f"description: {tok}\n{step}"))
+
+    # Timestamp / time-like tokens must stay plain strings in a string field (accept on both).
+    for name, tok in (("date", "2024-01-01"), ("time", "12:34:56")):
+        cases.append((f"str_{name}", "yaml", f"description: {tok}\n{step}"))
+
+    # Malformed YAML must be a load error (exit 2), not an uncaught exception, on both builds.
+    cases.append(("malformed_yaml", "yaml", "steps: [ this is : broken : yaml"))
+
+    # JSON non-finite literals: Python's json accepts them by default, serde_json rejects — both
+    # must reject here.
+    for name, tok in (("infinity", "Infinity"), ("neg_infinity", "-Infinity"), ("nan", "NaN")):
+        cases.append((f"json_{name}", "json", f'{{"mem_cap_factor": {tok}, "steps": []}}'))
+    # JSON overflow-to-infinity and out-of-i64-range integer: both reject.
+    cases.append(("json_overflow_float", "json", '{"mem_cap_factor": 1e400, "steps": []}'))
+    cases.append(("json_bignum", "json", '{"mem_cap_floor_bytes": 99999999999999999999999999, "steps": []}'))
+
+    # Scientific-notation float VALUES must serialize byte-identically (the json_float parity fix).
+    for name, tok in (
+        ("e20", "1e20"), ("e_minus7", "1e-7"), ("e16", "1e16"), ("e100", "1e100"),
+        ("big", "1.2345678901234568e17"), ("e_minus5", "1e-5"), ("fixed_e15", "1e15"),
+    ):
+        cases.append((f"sci_{name}", "json", f'{{"mem_cap_factor": {tok}, "steps": []}}'))
+
+    # Duplicate mapping keys: both builds accept last-wins, on both YAML and JSON, byte-identically.
+    cases.append(("dup_key_yaml", "yaml", "steps:\n  - {group: g, job: j, cmd: first, cmd: second}\n"))
+    cases.append(("dup_key_json", "json", '{"steps": [{"group": "g", "job": "j", "cmd": "first", "cmd": "second"}]}'))
+
+    return cases
+
+
+def compare_scalar_parity(py: list[str], rs: list[str], rep: Report) -> None:
+    """Run every :func:`scalar_parity_cases` document through both builds and assert exit-code parity
+    (so "both reject" passes) plus byte-identical canonical JSON whenever both accept."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, (name, ext, doc) in enumerate(scalar_parity_cases()):
+            path = os.path.join(tmp, f"case{i}.{ext}")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(doc)
+            po = run(py, ("json", "--dag", path))
+            ro = run(rs, ("json", "--dag", path))
+            label = f"scalar-parity:{name}"
+            if po.returncode != ro.returncode:
+                rep.bad(
+                    label,
+                    f"exit py={po.returncode} rs={ro.returncode} "
+                    f"(py stderr={po.stderr!r}; rs stderr={ro.stderr!r})",
+                )
+            elif po.returncode == 0 and po.stdout != ro.stdout:
+                rep.bad(
+                    label,
+                    f"both accepted but json differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+                )
+            else:
+                rep.ok(label)
+                rep.scalar_parity += 1
+
+
 # --------------------------------------------------------------------------- comparisons
 
 
@@ -641,6 +771,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     for fx in examples:
         compare_example_static(py, rs, fx, rep)
     compare_yaml_isomorphism(py, rs, rep)
+    compare_scalar_parity(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)
 
@@ -658,7 +789,8 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
         f"cross[{tool}]: OK - {rep.checks} checks across {n_fixtures} fixtures agree "
         f"({len(examples)} shipped JSON examples static-only; "
         f"{len(yaml_paths)} YAML fixtures isomorphic to JSON; "
-        f"json byte-identical: {rep.json_byte_identical}, yaml isomorphic: {rep.yaml_isomorphic})"
+        f"json byte-identical: {rep.json_byte_identical}, yaml isomorphic: {rep.yaml_isomorphic}, "
+        f"scalar-resolution parity cases: {rep.scalar_parity})"
     )
     return 0
 

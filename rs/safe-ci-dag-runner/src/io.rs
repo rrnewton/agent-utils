@@ -7,12 +7,16 @@
 //!
 //! Serialization ([`dag_to_json`]) is hand-rolled to reproduce Python's
 //! `json.dumps(indent=2, ensure_ascii=False)` byte-for-byte: the fixed non-alphabetical key
-//! order, 2-space indent, inline empty `{}` / `[]`, and float formatting (`1.0`, `90.0`,
-//! `1.25`). Non-ASCII characters are emitted as raw UTF-8 on BOTH sides (Python passes
-//! `ensure_ascii=False`), and both escape the same JSON control set (`"`, `\`, `\n`, `\t`,
-//! `\r`, `\b`, `\f`, and `\u00XX` for other code points < 0x20), so the `json` output is
-//! byte-identical for every input — including multi-line / quote / backslash / unicode
-//! descriptions.
+//! order, 2-space indent, inline empty `{}` / `[]`, and float formatting that matches CPython's
+//! `repr(float)` for every finite value — fixed notation (`1.0`, `90.0`, `1.25`, `0.0001`) and
+//! scientific notation alike (`1e+20`, `1e-07`, `1.5e+16`; see [`json_float`], which documents the
+//! single negligible exact-halfway-tie residual). Non-ASCII
+//! characters are emitted as raw UTF-8 on BOTH sides (Python passes `ensure_ascii=False`), and
+//! both escape the same JSON control set (`"`, `\`, `\n`, `\t`, `\r`, `\b`, `\f`, and `\u00XX` for
+//! other code points < 0x20), so the `json` output is byte-identical for every input — including
+//! multi-line / quote / backslash / unicode descriptions. serde_json is built with the
+//! `float_roundtrip` feature so a float literal PARSES to the same `f64` CPython's `json.loads`
+//! produces, which byte-identical re-emission depends on.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -343,8 +347,28 @@ fn json_str(s: &str) -> String {
     out
 }
 
-/// Format a float like Python's `repr` / `json.dumps` (e.g. `1.0`, `90.0`, `1.25`). Rust's
-/// `{:?}` shortest-round-trip formatting matches for all finite non-scientific values.
+/// Format a float exactly like Python's `repr(float)` / `json.dumps` — e.g. `1.0`, `90.0`,
+/// `1.25`, `0.0001`, but also the scientific forms `1e+20`, `1e-07`, `1.5e+16`, `1e+100`.
+///
+/// Rust's default float formatting gives the same shortest round-trip *digits* as CPython, but
+/// `{:?}` formats the exponent differently (`1e20` / `1e-7`, no sign, no zero-pad), which broke
+/// byte-for-byte parity for any float Python renders in scientific notation. This reproduces
+/// CPython's `float_repr`:
+///  * the shortest round-trip digit string (taken from Rust's `{}` / Display, which is shortest and
+///    always fixed-point — `{:e}` is NOT shortest and must not be used),
+///  * fixed vs. scientific chosen by CPython's rule (scientific iff the decimal point position is
+///    `<= -4` or `> 16`),
+///  * a signed, at-least-two-digit exponent (`e+NN` / `e-NN`),
+///  * and a trailing `.0` on any integer-valued float in fixed notation.
+///
+/// This matches CPython for every finite `f64` EXCEPT one negligible residual: when a value is
+/// EXACTLY halfway between two equally-short decimals, CPython rounds the tie to even while Rust's
+/// Display rounds it half-up (e.g. `-887777373534812.25` -> CPython `...812.2`, here `...812.3`).
+/// Detecting an exact tie needs arbitrary-precision arithmetic (a dependency this crate avoids),
+/// and such values are unreachable for realistic config floats; see the pinning unit test.
+///
+/// Non-finite inputs cannot occur (the reader rejects them and the model never holds them); the
+/// guards below are a defensive fallback that never executes on real data.
 fn json_float(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -356,7 +380,87 @@ fn json_float(f: f64) -> String {
             "-Infinity".into()
         };
     }
-    format!("{f:?}")
+    // Rust's Display (`{}`) is the shortest round-trip decimal in PLAIN fixed-point form — never
+    // an exponent — e.g. "100", "1.25", "0.0001", "100000000000000000000". (Rust's `{:e}` is NOT
+    // shortest and can be a ULP off, so it must not be used here.) Decompose Display into a
+    // canonical (sign, significant-digit string, decimal-point position `decpt`) triple: `decpt`
+    // is the count of digits to the left of the point, i.e. value == <digits> with the point after
+    // `decpt` of them. Then re-render with CPython's repr rules.
+    let disp = format!("{f}");
+    let (neg, body) = match disp.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, disp.as_str()),
+    };
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((i, fr)) => (i, fr),
+        None => (body, ""),
+    };
+    let mut all = String::with_capacity(int_part.len() + frac_part.len());
+    all.push_str(int_part);
+    all.push_str(frac_part);
+
+    // Strip leading zeros (shifting decpt) and trailing zeros to get the significant digits.
+    let first_nonzero = all.bytes().position(|b| b != b'0');
+    let (digits, decpt): (&str, i32) = match first_nonzero {
+        // The value is exactly zero: CPython renders it as "0.0" / "-0.0".
+        None => {
+            return if neg {
+                "-0.0".to_string()
+            } else {
+                "0.0".to_string()
+            }
+        }
+        Some(lead) => {
+            let last_nonzero = all.bytes().rposition(|b| b != b'0').unwrap_or(lead);
+            (
+                &all[lead..=last_nonzero],
+                int_part.len() as i32 - lead as i32,
+            )
+        }
+    };
+
+    // CPython uses scientific notation for repr iff decpt <= -4 or decpt > 16.
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    if decpt <= -4 || decpt > 16 {
+        // Scientific: d[.ddd]e{+|-}NN, exponent = decpt - 1, magnitude zero-padded to >= 2 digits.
+        out.push_str(&digits[..1]);
+        if digits.len() > 1 {
+            out.push('.');
+            out.push_str(&digits[1..]);
+        }
+        out.push('e');
+        let exp_val = decpt - 1;
+        if exp_val < 0 {
+            out.push('-');
+        } else {
+            out.push('+');
+        }
+        out.push_str(&format!("{:02}", exp_val.unsigned_abs()));
+    } else if decpt <= 0 {
+        // 0.000ddd
+        out.push_str("0.");
+        for _ in 0..(-decpt) {
+            out.push('0');
+        }
+        out.push_str(digits);
+    } else if (decpt as usize) >= digits.len() {
+        // ddd000.0  (integer-valued: pad with zeros, add the trailing ".0")
+        out.push_str(digits);
+        for _ in 0..(decpt as usize - digits.len()) {
+            out.push('0');
+        }
+        out.push_str(".0");
+    } else {
+        // dd.ddd  (decimal point inside the digit run)
+        let cut = decpt as usize;
+        out.push_str(&digits[..cut]);
+        out.push('.');
+        out.push_str(&digits[cut..]);
+    }
+    out
 }
 
 fn opt_int_json(v: Option<i64>) -> String {
@@ -745,5 +849,55 @@ steps:
         for doc in bad {
             assert!(dag_from_json(doc).is_err(), "expected error for: {doc}");
         }
+    }
+
+    #[test]
+    fn json_float_matches_python_repr() {
+        // (value, exact CPython repr(float) == json.dumps(float) output)
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0.0"),
+            (1.0, "1.0"),
+            (90.0, "90.0"),
+            (1.25, "1.25"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1073741824.0, "1073741824.0"),
+            (100.0, "100.0"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1e20, "1e+20"),
+            (1e100, "1e+100"),
+            (1e-7, "1e-07"),
+            (1.5e16, "1.5e+16"),
+            (1.2345678901234568e17, "1.2345678901234568e+17"),
+            (3.5e-4, "0.00035"),
+            (-3.5e-4, "-0.00035"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(&json_float(*v), want, "json_float({v}) mismatch");
+        }
+        // -0.0 preserves the sign, like CPython's repr(-0.0).
+        assert_eq!(json_float(-0.0), "-0.0");
+    }
+
+    #[test]
+    fn float_literal_round_trips_bit_exactly() {
+        // float_roundtrip: a scientific literal must parse to the exact f64 and re-emit identically.
+        let doc = r#"{"mem_cap_factor": 2.0951218323850843e-171, "steps": []}"#;
+        let cfg = dag_from_json(doc).unwrap();
+        assert_eq!(cfg.mem_cap_factor, 2.0951218323850843e-171);
+        assert!(dag_to_json(&cfg).contains("\"mem_cap_factor\": 2.0951218323850843e-171"));
+    }
+
+    #[test]
+    fn json_float_exact_halfway_tie_is_a_known_residual() {
+        // The ONE documented float parity gap. -887777373534812.25 is EXACTLY halfway between the
+        // two equally-short decimals ...812.2 and ...812.3. CPython's repr rounds such a tie to
+        // EVEN (emits ...812.2); Rust's Display rounds it half-up (...812.3), which json_float
+        // inherits. Correctly detecting an exact tie needs arbitrary-precision arithmetic (a
+        // dependency this crate deliberately avoids), and such a value is essentially unreachable
+        // for real config data (small, few-decimal floats). This test PINS the current behavior so
+        // the residual is visible and any future change is caught.
+        assert_eq!(json_float(-887777373534812.2), "-887777373534812.3");
     }
 }
