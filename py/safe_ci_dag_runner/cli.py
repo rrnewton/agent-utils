@@ -406,8 +406,15 @@ def _resolve_profile_dir(
 
 
 def _report_profile_written(perf_dir: str, source: str) -> None:
-    """Print one visible line naming where profile CSVs were appended (No Silent Failure)."""
-    written = sorted(str(p) for p in Path(perf_dir).glob("*.csv"))
+    """Print one visible line naming where profile CSVs were appended (No Silent Failure).
+
+    Lists EXACTLY the files this run/sweep wrote (the deterministic :func:`store_paths` set,
+    filtered to files that exist), not a glob of the whole store — a persistent store also holds
+    prior runs' other-``container_class`` CSVs for the same machine, and globbing would over-report
+    files this run never touched."""
+    from safe_ci_dag_runner.perflog import store_paths
+
+    written = sorted(str(p) for p in store_paths(perf_dir) if p.exists())
     if not written:
         print(f"{PROG}: WARNING no profile CSVs were written under {perf_dir}", file=sys.stderr)
         return
@@ -548,9 +555,18 @@ def _parse_jobs_range(raw: str) -> tuple[int, int]:
     text = raw.strip()
     if ".." in text:
         lo_s, _, hi_s = text.partition("..")
-        lo, hi = int(lo_s), int(hi_s)
+        try:
+            lo, hi = int(lo_s), int(hi_s)
+        except ValueError:
+            # Clean, user-facing message matching the Rust build (never leak Python's raw
+            # "invalid literal for int() with base 10: '...'").
+            raise ValueError(f"invalid --jobs range {raw!r}: not an integer") from None
     else:
-        lo, hi = 1, int(text)
+        try:
+            hi = int(text)
+        except ValueError:
+            raise ValueError(f"invalid --jobs {raw!r}: not an integer") from None
+        lo = 1
     if lo < 1 or hi < lo:
         raise ValueError(f"invalid --jobs range {raw!r}: need 1 <= LO <= HI")
     return lo, hi

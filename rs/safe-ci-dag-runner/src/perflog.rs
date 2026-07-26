@@ -93,11 +93,35 @@ pub fn machine_id() -> String {
     }
 }
 
-/// Cores this run could use (respects CPU affinity), mirroring Python's `nproc()`.
+/// Cores this run could actually use: the CPU-affinity width, matching Python's
+/// `len(os.sched_getaffinity(0))`. Read from `/proc/self/status` `Cpus_allowed_list` (the same mask
+/// `sched_getaffinity` reports) and DELIBERATELY NOT clamped to the cgroup CPU quota, so the two
+/// builds agree on this value — and hence on the step-profile filename's `container_class` segment
+/// and the whole-run `nproc` column — on every host, including cgroup-boxed CI where the quota is
+/// narrower than the affinity width. (`available_parallelism()` WOULD clamp to the cgroup quota and
+/// so silently diverge from Python on a boxed host; the quota is captured separately by
+/// `container_class()` via `cpu.max`.) Falls back to `available_parallelism`, then the logical CPU
+/// count.
 pub fn nproc() -> i64 {
+    if let Some(n) = affinity_width() {
+        return n;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get() as i64)
         .unwrap_or_else(|_| crate::sizing::cpu_count())
+}
+
+/// CPU-affinity width from `/proc/self/status` `Cpus_allowed_list` (a CPU-range list such as
+/// `0-7,16-23`), matching `len(os.sched_getaffinity(0))`. `None` when the field is absent or
+/// unparsable.
+fn affinity_width() -> Option<i64> {
+    let text = fs::read_to_string("/proc/self/status").ok()?;
+    for line in text.lines() {
+        if let Some(list) = line.strip_prefix("Cpus_allowed_list:") {
+            return crate::sizing::count_cpu_ranges(list.trim());
+        }
+    }
+    None
 }
 
 /// Stable CPU-container key: affinity width plus the cgroup-v2 CPU quota (`/sys/fs/cgroup/cpu.max`).
@@ -106,6 +130,32 @@ pub fn container_class() -> String {
         .map(|s| s.trim().replace(' ', "_"))
         .unwrap_or_else(|_| "unknown".to_string());
     format!("affinity{}_cpu-max-{}", nproc(), quota)
+}
+
+/// The whole-run summary CSV file name for a machine: `<machine_id>.csv`.
+fn whole_run_csv_name(mid: &str) -> String {
+    format!("{mid}.csv")
+}
+
+/// The per-step profile CSV file name for a machine/container:
+/// `step_profiles_<machine_id>_<container_class>.csv`.
+fn step_profiles_csv_name(mid: &str, cc: &str) -> String {
+    format!("step_profiles_{mid}_{cc}.csv")
+}
+
+/// The profile-store file paths a single `run`/`sweep` writes into `output_dir`: the whole-run
+/// summary (`<machine_id>.csv`) and the per-step profile CSV
+/// (`step_profiles_<machine_id>_<container_class>.csv`). The CLI reports EXACTLY these (filtered to
+/// files that exist) rather than globbing the whole store — a persistent store also holds prior
+/// runs' other-`container_class` variants on the same machine, and globbing would over-report files
+/// this run never wrote.
+pub fn store_paths(output_dir: &Path) -> Vec<PathBuf> {
+    let mid = machine_id();
+    let cc = container_class();
+    vec![
+        output_dir.join(whole_run_csv_name(&mid)),
+        output_dir.join(step_profiles_csv_name(&mid, &cc)),
+    ]
 }
 
 /// This process's accumulated CHILD (user, sys) CPU seconds, from `/proc/self/stat`
@@ -348,7 +398,7 @@ pub fn append_step_profiles(
     let dir = ensure_dir(output_dir)?;
     let mid = machine_id();
     let cc = container_class();
-    let path = dir.join(format!("step_profiles_{mid}_{cc}.csv"));
+    let path = dir.join(step_profiles_csv_name(&mid, &cc));
     let mut common: BTreeMap<String, String> = BTreeMap::new();
     common.insert("timestamp".into(), timestamp());
     common.insert("machine_id".into(), mid);
@@ -373,17 +423,22 @@ pub fn append_step_profiles(
         })
         .collect();
 
-    // Field order: the standard columns first, then any extra per-row keys (cpu.*) in first-seen
-    // order across the rows.
-    let mut fieldnames: Vec<String> = STEP_PROFILE_COLUMNS.iter().map(|s| s.to_string()).collect();
-    let mut seen: std::collections::HashSet<String> = fieldnames.iter().cloned().collect();
+    // Field order: the standard columns first, then any extra per-row keys (dynamic cpu.* counters)
+    // SORTED ALPHABETICALLY. Both builds sort this dynamic tail identically (the Python build sorts
+    // the same set in _step_profile_fieldnames), so the CSV header is byte-identical across
+    // languages — asserted by the cross/ differential. A BTreeSet keeps the tail sorted regardless
+    // of row-key iteration order.
+    let standard: std::collections::HashSet<&str> = STEP_PROFILE_COLUMNS.iter().copied().collect();
+    let mut extra: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for row in &full_rows {
         for key in row.keys() {
-            if seen.insert(key.clone()) {
-                fieldnames.push(key.clone());
+            if !standard.contains(key.as_str()) {
+                extra.insert(key.clone());
             }
         }
     }
+    let mut fieldnames: Vec<String> = STEP_PROFILE_COLUMNS.iter().map(|s| s.to_string()).collect();
+    fieldnames.extend(extra);
 
     let mut result = Some(path.clone());
     with_file_lock(&path, || {
@@ -466,7 +521,7 @@ impl PerfWindow {
         row.insert("jobs".into(), jobs.to_string());
 
         let dir = ensure_dir(&self.output_dir)?;
-        let path = dir.join(format!("{}.csv", self.machine_id));
+        let path = dir.join(whole_run_csv_name(&self.machine_id));
         let fieldnames: Vec<String> = CSV_COLUMNS.iter().map(|s| s.to_string()).collect();
         let mut result_path = Some(path.clone());
         with_file_lock(&path, || {
@@ -517,6 +572,51 @@ mod tests {
         assert!(header.contains("step,classification,inner_jobs"));
         assert!(header.trim_end().ends_with("cpu.usage_usec"));
         assert!(text.lines().nth(1).unwrap().contains("g.j"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_step_profiles_sorts_dynamic_cpu_columns() {
+        // Dynamic cpu.* columns must land in ALPHABETICAL order (not row-insertion order), so the
+        // header is byte-identical to the Python build's (which sorts the same set). Insert the keys
+        // in a deliberately scrambled order and assert the header tail comes back sorted.
+        let dir = std::env::temp_dir().join(format!("scdr_perford_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut row: ProfileRow = BTreeMap::new();
+        row.insert("step".into(), "g.j".into());
+        // BTreeMap sorts on insert anyway, but that is exactly the property under test: the WRITER
+        // must project to a sorted tail regardless of collection type.
+        for key in [
+            "cpu.usage_usec",
+            "cpu.user_usec",
+            "cpu.system_usec",
+            "cpu.nice_usec",
+        ] {
+            row.insert(key.into(), "1".into());
+        }
+        let path = append_step_profiles(&dir, &[row], "abc123", 4, None, "unverified", "local")
+            .expect("path");
+        let text = fs::read_to_string(&path).unwrap();
+        let header = text.lines().next().unwrap();
+        let tail: Vec<&str> = header
+            .split(',')
+            .filter(|c| c.starts_with("cpu."))
+            .collect();
+        let mut sorted = tail.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            tail, sorted,
+            "dynamic cpu.* columns must be alphabetically sorted"
+        );
+        assert_eq!(
+            tail,
+            vec![
+                "cpu.nice_usec",
+                "cpu.system_usec",
+                "cpu.usage_usec",
+                "cpu.user_usec"
+            ]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -229,7 +229,10 @@ pub fn cpu_count() -> i64 {
 }
 
 /// Count CPUs from a Linux cpu-range list like `"0-3,5,7-8"`.
-fn count_cpu_ranges(spec: &str) -> Option<i64> {
+///
+/// Shared with `perflog::affinity_width` (which parses `/proc/self/status` `Cpus_allowed_list`),
+/// so both the `-j` sizing default and the perf-log `nproc()` use one CPU-range parser.
+pub(crate) fn count_cpu_ranges(spec: &str) -> Option<i64> {
     if spec.is_empty() {
         return None;
     }

@@ -478,16 +478,17 @@ fn resolve_profile_dir(perf_dir: Option<&str>, no_profile: bool) -> (Option<Stri
 }
 
 /// Print one visible line naming where profile CSVs were appended (No Silent Failure).
+///
+/// Lists EXACTLY the files this run/sweep wrote (the deterministic `store_paths` set, filtered to
+/// files that exist), not a glob of the whole store — a persistent store also holds prior runs'
+/// other-`container_class` CSVs for the same machine, and globbing would over-report files this run
+/// never touched.
 fn report_profile_written(perf_dir: &str, source: &str) {
-    let mut csvs: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(perf_dir) {
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|x| x == "csv") {
-                csvs.push(path.display().to_string());
-            }
-        }
-    }
+    let mut csvs: Vec<String> = crate::perflog::store_paths(Path::new(perf_dir))
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .collect();
     csvs.sort();
     if csvs.is_empty() {
         eprintln!("{PROG}: WARNING no profile CSVs were written under {perf_dir}");

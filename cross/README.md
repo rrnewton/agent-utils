@@ -15,6 +15,9 @@ results:
 | `run` (default, `-j4`) | same **exit code** (the eager-exit passed/aborted split races on timing, so only the exit code is compared here) |
 | `run` (serial, `-j1`) | same exit code **and** same `passed / failed / aborted / skipped` counts (serial dispatch is a single deterministic LPT sequence, so the counts are fully reproducible) |
 | `--max-mem` sizing | same chosen `-j` and same modeled worst-case footprint |
+| `--only` errors | an unknown `--only` tag exits 2 on both builds |
+| profile store (`--perf-dir`) | an unboxed run under each build writes the **same set of CSV filenames** (so `machine_id` + `container_class` + `nproc` agree), **byte-identical header rows**, and the **same line-ending style** (data rows — timestamps/elapsed/git SHA — legitimately differ and are not compared) |
+| `sweep --jobs` errors | malformed range / not-an-integer specs exit 2 with **byte-identical stderr** |
 | YAML isomorphism | every `.yaml` fixture (under `examples/` and `cross/yaml_fixtures/`) loads in BOTH builds and re-emits **byte-identical canonical JSON**; and each `examples/NAME.{json,yaml}` pair loads to the same DAG |
 | `--version` / `--help` / no-args | same exit code (and `--version` stdout byte-identical) |
 
@@ -64,5 +67,9 @@ behavior this differential is meant to pin. Boxing itself is proven separately: 
 test suite (`pytest`) and by the Rust boxing smoke test (a step allocating past its cap is
 OOM-killed).
 
-The perf logging (`--perf-dir`) and ambient-load bucketing are likewise out of scope for the
-byte-identical differential.
+The profile-store **schema** IS cross-checked (see the `profile store` row above): an unboxed run
+under each build writes the same CSV filenames, byte-identical headers, and the same line endings.
+Only the profile-store **data rows** (run-varying timestamps / elapsed / git SHA) and the dynamic
+cgroup `cpu.*` columns (which appear only under boxing) are out of scope for the byte-identical
+differential; the `cpu.*` columns' alphabetical ordering is pinned by each build's own perflog
+tests. Ambient-load bucketing is likewise out of scope.

@@ -74,7 +74,7 @@ jobs:
             rs/target/release/safe-ci-dag-runner run --dag "$dag" --allow-cgroup-failure --no-profile
             echo "::endgroup::"
           done
-      - name: exercise --only, sweep, and the default profile store (both builds)
+      - name: exercise --only, --profile, sweep, and the default profile store (both builds)
         env:
           PYTHONPATH: py
         run: |
@@ -94,12 +94,31 @@ jobs:
             fi
             echo "::endgroup::"
 
+            echo "::group::$build run --profile (Feature C: per-step timing/memory table)"
+            # The table goes to stdout; capture it and assert the header + a real step row appear.
+            table="$($build run --dag "$ex" --only build.app --profile \
+              --allow-cgroup-failure --no-profile)"
+            echo "$table"
+            echo "$table" | grep -q 'per-step profile:' \
+              || { echo "run --profile printed no profile table" >&2; exit 1; }
+            echo "$table" | grep -Eq '^build\.app' \
+              || { echo "run --profile table missing the build.app step row" >&2; exit 1; }
+            echo "::endgroup::"
+
             echo "::group::$build sweep (Feature B) -> default profile store (Feature D)"
             rm -rf .safe-ci-dag-runner
             $build sweep --dag "$ex" --step build.app --jobs 1..3 --allow-cgroup-failure
-            # Feature D: the sweep must have auto-created the repo-local default profile store.
-            if [ -z "$(find .safe-ci-dag-runner/profiles -name '*.csv' 2>/dev/null)" ]; then
-              echo "expected default profile store CSVs after sweep" >&2; exit 1
+            # Feature D: the sweep must have auto-created the repo-local default profile store...
+            csv="$(find .safe-ci-dag-runner/profiles -name 'step_profiles_*.csv' 2>/dev/null | head -n1)"
+            if [ -z "$csv" ]; then
+              echo "expected a step_profiles_*.csv in the default profile store after sweep" >&2; exit 1
+            fi
+            # ...with a real header AND at least one data row (one per swept width, not just a header).
+            head -n1 "$csv" | grep -q 'inner_jobs' \
+              || { echo "profile store CSV header missing the inner_jobs column" >&2; exit 1; }
+            rows="$(($(wc -l < "$csv") - 1))"
+            if [ "$rows" -lt 3 ]; then
+              echo "expected >=3 data rows (one per swept width 1..3) in $csv, got $rows" >&2; exit 1
             fi
             echo "::endgroup::"
           done

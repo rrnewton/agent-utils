@@ -25,10 +25,18 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
 * ``--only`` selection (Feature A) agrees: running EXACTLY one named step matches on exit code
   and counts, and an unknown ``--only`` tag exits 2 on both builds. (The ``sweep`` timing table
   and the ``--profile`` table are NOT byte-compared — runtimes legitimately differ across the two
-  languages — but their ``--only``/profile-store schema and flag behavior are exercised here.)
+  languages.)
 * The memory-aware ``-j`` decision and modeled footprint from ``--max-mem`` match.
-* All ``run`` comparisons pass ``--no-profile`` so the default auto-logging profile store does not
-  write into the harness CWD (profile logging itself is proven by each build's own tests).
+* The auto-logging profile STORE (Feature D) has an identical on-disk schema across builds: an
+  unboxed run under each build (into separate ``--perf-dir`` dirs) writes the SAME set of CSV
+  filenames — so ``machine_id`` + ``container_class`` (and hence ``nproc``) agree — with
+  byte-identical HEADER rows and the SAME line-ending style. Data rows (timestamps, elapsed, git
+  SHA) legitimately differ and are not compared. The dynamic cgroup ``cpu.*`` columns only appear
+  under boxing (out of scope for the unboxed differential); their alphabetical ordering is pinned
+  by each build's own perflog tests.
+* The ``sweep`` ``--jobs`` error text (malformed range / not-an-integer) matches across builds.
+* The remaining ``run`` comparisons pass ``--no-profile`` so the default auto-logging profile store
+  does not write into the harness CWD (its schema is asserted separately, above).
 
 It also keeps the bootstrap ``--version`` / ``--help`` / no-args exit-code checks.
 
@@ -805,6 +813,96 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
                 rep.ok(label)
 
 
+def _store_csv_names(directory: str) -> list[str]:
+    """Sorted basenames of the ``*.csv`` files in a profile-store directory (``[]`` if absent)."""
+    if not os.path.isdir(directory):
+        return []
+    return sorted(name for name in os.listdir(directory) if name.endswith(".csv"))
+
+
+def _header_and_eol(path: str) -> tuple[str, str]:
+    """The first line (header, with any trailing ``\\r`` stripped) and the line-ending STYLE
+    (``"CRLF"`` / ``"LF"`` / ``"none"``) of a CSV file, read as raw bytes so the terminator is
+    observed exactly (never newline-translated)."""
+    with open(path, "rb") as fh:
+        data = fh.read()
+    eol = "CRLF" if b"\r\n" in data else ("LF" if b"\n" in data else "none")
+    header = data.split(b"\n", 1)[0].rstrip(b"\r").decode("utf-8")
+    return header, eol
+
+
+def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
+    """Assert the auto-logging profile STORE (Feature D) has an identical on-disk schema in both
+    builds. Runs the SAME tiny DAG under each build with ``--perf-dir`` into a fresh temp dir
+    (unboxed via ``--allow-cgroup-failure``, so it is environment-independent), then asserts the two
+    stores agree on: (a) the SET of CSV filenames (proving ``machine_id`` + ``container_class``, and
+    hence ``nproc``, agree), (b) each file's HEADER row byte-for-byte, and (c) the line-ending
+    style. Data rows are NOT compared (their timestamps/elapsed/git-SHA legitimately differ)."""
+    dag = (
+        '{"steps": [{"group": "g", "job": "a", "cmd": "true"}, '
+        '{"group": "g", "job": "b", "cmd": "true", "deps": ["g.a"]}]}'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(dag)
+        py_dir = os.path.join(tmp, "py_store")
+        rs_dir = os.path.join(tmp, "rs_store")
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", py_dir, ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", rs_dir, ACF))
+        label = "profile-store"
+        if po.returncode != ro.returncode:
+            rep.bad(label, f"run exit py={po.returncode} rs={ro.returncode}")
+            return
+        py_names = _store_csv_names(py_dir)
+        rs_names = _store_csv_names(rs_dir)
+        if py_names != rs_names:
+            rep.bad(
+                label,
+                f"profile-store filename sets differ (machine_id/container_class/nproc mismatch)\n"
+                f"--- py ---\n{py_names}\n--- rs ---\n{rs_names}",
+            )
+            return
+        if not py_names:
+            rep.bad(label, "no profile CSVs were written by either build")
+            return
+        for name in py_names:
+            py_hdr, py_eol = _header_and_eol(os.path.join(py_dir, name))
+            rs_hdr, rs_eol = _header_and_eol(os.path.join(rs_dir, name))
+            sub = f"{label}:{name}"
+            if py_eol != rs_eol:
+                rep.bad(sub, f"line endings differ py={py_eol} rs={rs_eol}")
+            elif py_hdr != rs_hdr:
+                rep.bad(sub, f"header differs\n--- py ---\n{py_hdr}\n--- rs ---\n{rs_hdr}")
+            else:
+                rep.ok(sub)
+
+
+def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
+    """``sweep --jobs`` malformed inputs must exit 2 with byte-identical stderr in both builds
+    (guards the not-an-integer / malformed-range error-text parity)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dag.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}')
+        bad_jobs = ("abc", "3..1", "0..2", "1..x")
+        for spec in bad_jobs:
+            po = run(py, ("sweep", "--dag", path, "--step", "g.j", "--jobs", spec, ACF))
+            ro = run(rs, ("sweep", "--dag", path, "--step", "g.j", "--jobs", spec, ACF))
+            label = f"sweep-jobs-error:{spec}"
+            if po.returncode != ro.returncode:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != 2:
+                rep.bad(label, f"expected exit 2 for --jobs {spec!r}; got {po.returncode}")
+            elif po.stderr != ro.stderr:
+                rep.bad(
+                    label,
+                    f"stderr differs\n--- py ---\n{po.stderr}\n--- rs ---\n{ro.stderr}",
+                )
+            else:
+                rep.ok(label)
+
+
 INVOCATIONS: tuple[Invocation, ...] = (
     Invocation("version", ("--version",)),
     Invocation("help", ("--help",)),
@@ -839,6 +937,8 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     compare_yaml_isomorphism(py, rs, rep)
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
+    compare_profile_store(py, rs, rep)
+    compare_sweep_errors(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)
 
