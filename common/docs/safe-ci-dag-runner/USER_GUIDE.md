@@ -146,6 +146,7 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 | Field                    | Type                | Default            | Meaning                                                                                                   |
 | ------------------------ | ------------------- | ------------------ | --------------------------------------------------------------------------------------------------------- |
 | `steps`                  | array of step       | — (required)       | The graph's nodes. May be empty (`[]`), which is a valid, no-op DAG.                                       |
+| `description`            | string              | `""`               | Optional long-form documentation for the **whole DAG** (free-form prose, often multi-line). Purely documentary — never affects scheduling. In YAML it is naturally a block scalar (see [YAML](#yaml-an-isomorphic-literate-alternative-to-json)). |
 | `resource_caps`          | object `{str: int}` | `{}`               | Capacity per named scarce resource. Concurrent summed `hint.resources` demand never exceeds this.         |
 | `mem_cap_factor`         | number              | `1.25`             | Multiplier from a step's `rss_baseline_bytes` to its derived inner memory cap (headroom).                  |
 | `mem_cap_floor_bytes`    | integer             | `8589934592` (8 GiB) | Lower bound on the modeled worst-case footprint, so `-j` selection never concludes "0 fits."             |
@@ -160,7 +161,8 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 | `group`       | string              | — (required)   | First half of the tag.                                                                                       |
 | `job`         | string              | — (required)   | Second half of the tag. The full tag `group.job` must be unique across the DAG.                             |
 | `cmd`         | string              | — (required)   | Shell command, run via `bash -c` from the current working directory, in its own session/process group.      |
-| `desc`        | string              | `""`           | Human-readable description shown by `list` and `run`.                                                        |
+| `desc`        | string              | `""`           | Short human-readable label shown by `list` and `run`.                                                        |
+| `description` | string              | `""`           | Optional long-form documentation for this node (free-form prose, often multi-line). Distinct from the short `desc` label; purely documentary and never affects scheduling. Renders naturally as a YAML block scalar. |
 | `deps`        | array of string     | `[]`           | Tags this step depends on. All must finish successfully before it launches.                                  |
 | `env`         | object `{str: str}` | `{}`           | Extra environment variables, merged over the runner's environment for this step's command.                  |
 | `hint`        | object              | `{}`           | The resource hint (see below).                                                                               |

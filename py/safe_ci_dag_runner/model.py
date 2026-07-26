@@ -66,6 +66,10 @@ class Step:
     job: str
     desc: str
     cmd: str  # shell command (bash -c), run from the run's working directory
+    # Optional long-form documentation for this node (default empty). Unlike `desc` — a short
+    # label shown by `list`/`run` — `description` is free-form prose (often multi-line, e.g. a
+    # YAML block scalar) that documents WHY the step exists. It never affects scheduling.
+    description: str = ""
     deps: list[str] = field(default_factory=list)  # tags ("group.job") this step depends on
     env: dict[str, str] = field(default_factory=dict)
     hint: ResourceHint = field(default_factory=ResourceHint)
@@ -191,6 +195,9 @@ class DagConfig:
     """
 
     steps: tuple[Step, ...]
+    # Optional long-form documentation for the WHOLE DAG (default empty). Free-form prose
+    # (often multi-line) describing the pipeline as a whole; never affects scheduling.
+    description: str = ""
     resource_caps: Mapping[str, int] = field(default_factory=dict)
     # Multiplier from a step's measured RSS baseline to its inner memory cap (headroom).
     mem_cap_factor: float = 1.25

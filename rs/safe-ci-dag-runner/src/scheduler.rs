@@ -750,6 +750,7 @@ mod tests {
             group: group.into(),
             job: job.into(),
             desc: String::new(),
+            description: String::new(),
             cmd: cmd.into(),
             deps: deps.iter().map(|s| s.to_string()).collect(),
             env: BTreeMap::new(),

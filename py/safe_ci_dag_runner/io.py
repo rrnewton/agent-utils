@@ -200,6 +200,7 @@ def dag_from_json(text: str) -> DagConfig:
                 group=_req_str(sm, "group", where),
                 job=_req_str(sm, "job", where),
                 desc=_opt_str(sm, "desc", ""),
+                description=_opt_str(sm, "description", ""),
                 cmd=_req_str(sm, "cmd", where),
                 deps=_opt_str_list(sm, "deps"),
                 env=_opt_str_str_map(sm, "env", where),
@@ -212,6 +213,7 @@ def dag_from_json(text: str) -> DagConfig:
         )
     return DagConfig(
         steps=tuple(steps),
+        description=_opt_str(doc, "description", ""),
         resource_caps=_opt_str_int_map(doc, "resource_caps", "<root>"),
         mem_cap_factor=_opt_float(doc, "mem_cap_factor", 1.25),
         mem_cap_floor_bytes=_opt_int(doc, "mem_cap_floor_bytes", _DEFAULT_MEM_CAP_FLOOR),
@@ -239,6 +241,7 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "group": step.group,
         "job": step.job,
         "desc": step.desc,
+        "description": step.description,
         "cmd": step.cmd,
         "deps": list(step.deps),
         "env": dict(sorted(step.env.items())),
@@ -251,8 +254,16 @@ def _step_to_json(step: Step) -> dict[str, object]:
 
 
 def dag_to_json(cfg: DagConfig) -> str:
-    """Serialize a :class:`DagConfig` to canonical, deterministic JSON (2-space indent)."""
+    """Serialize a :class:`DagConfig` to canonical, deterministic JSON (2-space indent).
+
+    ``ensure_ascii=False`` emits non-ASCII characters as raw UTF-8 (not ``\\uXXXX`` escapes),
+    which makes this output BYTE-IDENTICAL to the Rust build's hand-rolled serializer for every
+    input — including multi-line, quote/backslash-laden, and unicode descriptions. Both sides
+    still escape the JSON control set (``"``, ``\\``, ``\\n``, ``\\t``, ``\\r``, ``\\b``, ``\\f``,
+    and ``\\u00XX`` for other code points < 0x20) identically.
+    """
     doc: dict[str, object] = {
+        "description": cfg.description,
         "resource_caps": dict(sorted(cfg.resource_caps.items())),
         "mem_cap_factor": cfg.mem_cap_factor,
         "mem_cap_floor_bytes": cfg.mem_cap_floor_bytes,
@@ -261,4 +272,4 @@ def dag_to_json(cfg: DagConfig) -> str:
         "default_jobs_flag": cfg.default_jobs_flag,
         "steps": [_step_to_json(s) for s in cfg.steps],
     }
-    return json.dumps(doc, indent=2)
+    return json.dumps(doc, indent=2, ensure_ascii=False)

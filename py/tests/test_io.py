@@ -6,6 +6,11 @@ from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
 from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step, StepClass
 
 
+#: Multi-line description with quotes, backslashes, a tab, and unicode — proves the JSON string
+#: escaping survives a round-trip (and, in the cross harness, is byte-identical to Rust).
+_HAIRY_DESC = 'line 1\nline 2 with "quotes" and \\backslash\\ and\ttab and unicode é☃'
+
+
 def _cfg() -> DagConfig:
     return DagConfig(
         steps=(
@@ -14,6 +19,7 @@ def _cfg() -> DagConfig:
                 "app",
                 "compile",
                 "make build",
+                description=_HAIRY_DESC,
                 hint=ResourceHint(
                     est_duration_s=90.0,
                     rss_baseline_bytes=5 * 1024**3,
@@ -31,6 +37,7 @@ def _cfg() -> DagConfig:
                 hint=ResourceHint(resources={"browser": 1}, classification=StepClass.LATENCY_BOUND),
             ),
         ),
+        description="the whole pipeline",
         resource_caps={"browser": 2},
         mem_cap_factor=1.25,
         outer_mem_safety_factor=1.1,
@@ -44,6 +51,9 @@ def test_roundtrip_is_stable() -> None:
     assert once == twice  # canonical JSON is a fixed point
     back = dag_from_json(once)
     assert [s.tag for s in back.steps] == ["build.app", "e2e.smoke"]
+    assert back.description == "the whole pipeline"
+    assert back.steps[0].description == _HAIRY_DESC
+    assert back.steps[1].description == ""  # default empty
     assert back.resource_caps == {"browser": 2}
     assert back.steps[0].hint.classification is StepClass.CPU_BOUND
     assert back.steps[0].hint.rss_baseline_bytes == 5 * 1024**3
@@ -56,6 +66,7 @@ def test_minimal_document_defaults() -> None:
     step = cfg.steps[0]
     assert step.tag == "g.j"
     assert step.desc == "" and step.deps == [] and step.env == {}
+    assert step.description == "" and cfg.description == ""  # default empty
     assert step.timeout == 1800
     assert step.hint.classification is StepClass.LIGHT
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25

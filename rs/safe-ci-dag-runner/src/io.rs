@@ -6,11 +6,13 @@
 //! silently defaulting a wrong-typed field.
 //!
 //! Serialization ([`dag_to_json`]) is hand-rolled to reproduce Python's
-//! `json.dumps(indent=2)` byte-for-byte: the fixed non-alphabetical key order, 2-space indent,
-//! inline empty `{}` / `[]`, and float formatting (`1.0`, `90.0`, `1.25`). One documented
-//! deviation: non-ASCII characters are emitted as raw UTF-8 rather than Python's
-//! `ensure_ascii` `\uXXXX` escapes; fixtures are ASCII so the `json` output stays
-//! byte-identical, and the cross-test compares `json` by parsed-equality regardless.
+//! `json.dumps(indent=2, ensure_ascii=False)` byte-for-byte: the fixed non-alphabetical key
+//! order, 2-space indent, inline empty `{}` / `[]`, and float formatting (`1.0`, `90.0`,
+//! `1.25`). Non-ASCII characters are emitted as raw UTF-8 on BOTH sides (Python passes
+//! `ensure_ascii=False`), and both escape the same JSON control set (`"`, `\`, `\n`, `\t`,
+//! `\r`, `\b`, `\f`, and `\u00XX` for other code points < 0x20), so the `json` output is
+//! byte-identical for every input — including multi-line / quote / backslash / unicode
+//! descriptions.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -279,6 +281,7 @@ pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
             group: req_str(sm, "group", &where_)?,
             job: req_str(sm, "job", &where_)?,
             desc: opt_str(sm, "desc", "")?,
+            description: opt_str(sm, "description", "")?,
             cmd: req_str(sm, "cmd", &where_)?,
             deps: opt_str_list(sm, "deps")?,
             env: opt_str_str_map(sm, "env", &where_)?,
@@ -291,6 +294,7 @@ pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
     }
     Ok(DagConfig {
         steps,
+        description: opt_str(doc, "description", "")?,
         resource_caps: opt_str_int_map(doc, "resource_caps", "<root>")?,
         mem_cap_factor: opt_float(doc, "mem_cap_factor", 1.25)?,
         mem_cap_floor_bytes: opt_int(doc, "mem_cap_floor_bytes", DEFAULT_MEM_CAP_FLOOR)?,
@@ -477,6 +481,11 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&key);
     s.push_str(&format!("\"desc\": {},\n", json_str(&step.desc)));
     s.push_str(&key);
+    s.push_str(&format!(
+        "\"description\": {},\n",
+        json_str(&step.description)
+    ));
+    s.push_str(&key);
     s.push_str(&format!("\"cmd\": {},\n", json_str(&step.cmd)));
     s.push_str(&key);
     s.push_str("\"deps\": ");
@@ -510,6 +519,10 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
 pub fn dag_to_json(cfg: &DagConfig) -> String {
     let mut s = String::new();
     s.push_str("{\n");
+    s.push_str(&format!(
+        "  \"description\": {},\n",
+        json_str(&cfg.description)
+    ));
     s.push_str("  \"resource_caps\": ");
     emit_int_map(&mut s, &cfg.resource_caps, 2);
     s.push_str(",\n");
@@ -554,9 +567,12 @@ mod tests {
 
     #[test]
     fn roundtrip_is_stable() {
-        let doc = r#"{"resource_caps": {"browser": 2}, "mem_cap_factor": 1.25,
+        let doc = r#"{"description": "the whole pipeline", "resource_caps": {"browser": 2},
+            "mem_cap_factor": 1.25,
             "outer_mem_safety_factor": 1.1, "default_jobs_flag": "--jobs=", "steps": [
-            {"group": "build", "job": "app", "desc": "compile", "cmd": "make build",
+            {"group": "build", "job": "app", "desc": "compile",
+             "description": "line 1\nline 2 with \"quotes\" and \\backslash\\ and unicode é☃",
+             "cmd": "make build",
              "jobs_flag": "-j%d",
              "hint": {"est_duration_s": 90, "rss_baseline_bytes": 5368709120,
                       "classification": "cpu-bound", "preferred_inner_jobs": 8}},
@@ -572,6 +588,12 @@ mod tests {
             back.steps.iter().map(|s| s.tag()).collect::<Vec<_>>(),
             vec!["build.app", "e2e.smoke"]
         );
+        assert_eq!(back.description, "the whole pipeline");
+        assert_eq!(
+            back.steps[0].description,
+            "line 1\nline 2 with \"quotes\" and \\backslash\\ and unicode é☃"
+        );
+        assert_eq!(back.steps[1].description, "");
         assert_eq!(back.resource_caps.get("browser"), Some(&2));
         assert_eq!(back.steps[0].hint.classification, StepClass::CpuBound);
         assert_eq!(back.steps[0].hint.rss_baseline_bytes, Some(5368709120));
@@ -589,6 +611,8 @@ mod tests {
         let step = &cfg.steps[0];
         assert_eq!(step.tag(), "g.j");
         assert_eq!(step.desc, "");
+        assert_eq!(step.description, "");
+        assert_eq!(cfg.description, "");
         assert!(step.deps.is_empty());
         assert!(step.env.is_empty());
         assert_eq!(step.timeout, 1800);

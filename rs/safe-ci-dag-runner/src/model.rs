@@ -77,6 +77,10 @@ pub struct Step {
     pub group: String,
     pub job: String,
     pub desc: String,
+    /// Optional long-form documentation for this node (default empty). Unlike `desc` — a short
+    /// label shown by `list`/`run` — `description` is free-form prose (often multi-line, e.g. a
+    /// YAML block scalar) documenting WHY the step exists. It never affects scheduling.
+    pub description: String,
     /// Shell command (`bash -c`), run from the run's working directory.
     pub cmd: String,
     /// Tags (`"group.job"`) this step depends on.
@@ -255,6 +259,9 @@ pub fn step_failure_reason(
 #[derive(Debug, Clone)]
 pub struct DagConfig {
     pub steps: Vec<Step>,
+    /// Optional long-form documentation for the WHOLE DAG (default empty). Free-form prose
+    /// describing the pipeline as a whole; never affects scheduling.
+    pub description: String,
     pub resource_caps: BTreeMap<String, i64>,
     /// Multiplier from a step's measured RSS baseline to its inner memory cap (headroom).
     pub mem_cap_factor: f64,
@@ -271,6 +278,7 @@ impl Default for DagConfig {
     fn default() -> Self {
         DagConfig {
             steps: Vec::new(),
+            description: String::new(),
             resource_caps: BTreeMap::new(),
             mem_cap_factor: 1.25,
             mem_cap_floor_bytes: 8 * 1024i64.pow(3),
@@ -403,6 +411,7 @@ mod tests {
             group: "e2e".into(),
             job: "smoke".into(),
             desc: String::new(),
+            description: String::new(),
             cmd: "true".into(),
             deps: vec![],
             env: BTreeMap::new(),
@@ -420,6 +429,7 @@ mod tests {
             group: "g".into(),
             job: "j".into(),
             desc: String::new(),
+            description: String::new(),
             cmd: cmd.into(),
             deps: vec![],
             env: BTreeMap::new(),

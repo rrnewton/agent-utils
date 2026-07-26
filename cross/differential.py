@@ -7,7 +7,12 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
 ``rs/bin/…``) and asserts:
 
 * ``list``, ``ascii``, ``dot`` stdout are BYTE-IDENTICAL.
-* ``json`` stdout is PARSED-EQUAL (byte-identity is additionally reported when it holds).
+* ``json`` stdout is BYTE-IDENTICAL (both builds emit ``ensure_ascii=False`` canonical JSON, so
+  the bytes match for every input — including multi-line / quote / backslash / unicode
+  ``description`` fields).
+* Every ``.yaml`` fixture is ISOMORPHIC to JSON: loaded in BOTH builds and re-emitted as
+  canonical JSON, the bytes match; and each ``examples/NAME.{json,yaml}`` pair loads to the same
+  DAG.
 * ``run`` agrees on exit code, and on the passed/failed/aborted/skipped counts. Counts are
   compared under ``--keep-going`` so they are deterministic (the default eager-exit path
   races on which in-flight step is cancelled first, so only its exit code is compared).
@@ -73,7 +78,7 @@ class Report:
     checks: int = 0
     failures: list[str] = field(default_factory=list)
     json_byte_identical: int = 0
-    json_parsed_equal_only: int = 0
+    yaml_isomorphic: int = 0
 
     def ok(self, _label: str) -> None:
         self.checks += 1
@@ -196,15 +201,23 @@ def representative_fixtures() -> list[Fixture]:
         Fixture(
             "special_chars",
             {
+                "description": 'top-level: "quotes", \\slash\\, unicode é☃, and a\nnewline',
                 "steps": [
                     {
                         "group": "g",
                         "job": "quote",
                         "desc": 'has "quotes" and \\backslash\\ and\ttab',
+                        # A multi-line description with quotes, backslashes, a tab, a control
+                        # char, and unicode — proves the JSON string escaping is byte-identical
+                        # across the two builds (FEATURE 1).
+                        "description": (
+                            'multi-line\nwith "quotes", \\backslash\\, \ttab, '
+                            "ctrl \x01, unicode é☃\U0001F600"
+                        ),
                         "cmd": "true",
                         "env": {"K2": "v2", "K1": "v1"},
                     }
-                ]
+                ],
             },
         )
     )
@@ -423,7 +436,12 @@ def _sizing(stderr: str) -> tuple[int, int, int] | None:
 
 def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: Report) -> None:
     """Assert the static (non-running) commands agree for one DAG file: ``list``/``ascii``/``dot``
-    stdout byte-identical, and ``json`` stdout parsed-equal (byte-identity additionally tracked).
+    AND ``json`` stdout are all BYTE-IDENTICAL.
+
+    Both builds now emit ``ensure_ascii=False`` canonical JSON, so the ``json`` output must match
+    byte-for-byte for every input, including hairy ``description`` fields (multi-line, quotes,
+    backslashes, control chars, unicode). A parse-only difference is still a failure — the note in
+    the failure message localizes whether it is a formatting-only or a semantic divergence.
 
     Shared by the full-battery fixtures (:func:`compare_fixture`) and the shipped-example fixtures
     (:func:`compare_example_static`), so the two paths cannot drift apart.
@@ -440,26 +458,25 @@ def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: 
         else:
             rep.ok(label)
 
-    # json: parsed-equal (byte-identity additionally tracked).
+    # json: BYTE-identical stdout.
     po = run(py, ("json", "--dag", dag_path))
     ro = run(rs, ("json", "--dag", dag_path))
     label = f"{name}/json"
     if po.returncode != ro.returncode:
         rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
         return
-    try:
-        equal = json.loads(po.stdout) == json.loads(ro.stdout)
-    except json.JSONDecodeError as exc:
-        rep.bad(label, f"unparseable json: {exc}")
+    if po.stdout != ro.stdout:
+        try:
+            note = "parse-equal" if json.loads(po.stdout) == json.loads(ro.stdout) else "parse-DIFFER"
+        except json.JSONDecodeError as exc:
+            note = f"unparseable: {exc}"
+        rep.bad(
+            label,
+            f"json stdout not byte-identical ({note})\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+        )
         return
-    if not equal:
-        rep.bad(label, f"parsed json differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}")
-    else:
-        rep.ok(label)
-        if po.stdout == ro.stdout:
-            rep.json_byte_identical += 1
-        else:
-            rep.json_parsed_equal_only += 1
+    rep.ok(label)
+    rep.json_byte_identical += 1
 
 
 def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> None:
@@ -566,8 +583,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     print(
         f"cross[{tool}]: OK - {rep.checks} checks across {n_fixtures} fixtures agree "
         f"({len(examples)} shipped examples, static-only; "
-        f"json byte-identical: {rep.json_byte_identical}, "
-        f"parsed-equal-only: {rep.json_parsed_equal_only})"
+        f"json byte-identical: {rep.json_byte_identical})"
     )
     return 0
 
