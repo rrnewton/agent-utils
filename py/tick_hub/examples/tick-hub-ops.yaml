@@ -1,13 +1,14 @@
 # tick-hub example reminder set (literate YAML edition)
 #
-# This file is ISOMORPHIC to examples/tick-hub-ops.json: both load to the EXACT same TickConfig.
-# YAML buys two things a JSON config cannot have: (1) comments like this block, and (2) multi-line
-# block-scalar descriptions — so the reminder set documents itself inline.
+# This file is ISOMORPHIC to tick-hub-ops.json (same directory): both load to the EXACT same
+# TickConfig. YAML buys two things a JSON config cannot have: (1) comments like this block, and
+# (2) multi-line block-scalar descriptions — so the reminder set documents itself inline.
 #
 # Run one tick against it (dry-run: prints the lines, persists no state):
-#   tick-hub tick --config examples/tick-hub-ops.yaml
-# Pair it with a per-host runtime state file (examples/tick-hub-state.yaml):
-#   tick-hub tick --config examples/tick-hub-ops.yaml --state examples/tick-hub-state.yaml
+#   tick-hub tick --config py/tick_hub/examples/tick-hub-ops.yaml
+# Pair it with a per-host runtime state file (py/tick_hub/examples/tick-hub-state.yaml):
+#   tick-hub tick --config py/tick_hub/examples/tick-hub-ops.yaml \
+#     --state py/tick_hub/examples/tick-hub-state.yaml
 #
 # The gate commands here are intentionally hermetic (plain `echo`/`exit`), so a tick is fully
 # reproducible with `--now <epoch>` and needs no external services — a caller swaps them for real

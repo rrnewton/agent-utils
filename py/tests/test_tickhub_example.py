@@ -10,7 +10,7 @@ from tick_hub.probes import GlobFileAgeProbe
 from tick_hub.protocols import GateResult
 from tick_hub.state import OpsState
 
-_EXAMPLES = Path(__file__).resolve().parent.parent.parent / "examples"
+_EXAMPLES = Path(__file__).resolve().parent.parent / "tick_hub" / "examples"
 
 
 class _NoGate:

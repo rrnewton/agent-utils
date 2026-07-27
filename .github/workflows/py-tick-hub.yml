@@ -8,7 +8,6 @@ on:
       - 'py/pyproject.toml'
       - 'py/tick_hub/**'
       - 'py/tests/test_tickhub_*.py'
-      - 'examples/tick-hub-*'
       - 'common/docs/tick-hub/**'
       - '.github/workflows/py-tick-hub.yml'
   pull_request:
@@ -16,7 +15,6 @@ on:
       - 'py/pyproject.toml'
       - 'py/tick_hub/**'
       - 'py/tests/test_tickhub_*.py'
-      - 'examples/tick-hub-*'
       - 'common/docs/tick-hub/**'
       - '.github/workflows/py-tick-hub.yml'
 
@@ -42,4 +40,4 @@ jobs:
       - name: smoke --version
         run: python -m tick_hub --version
       - name: smoke example tick (dry-run)
-        run: python -m tick_hub tick --config ../examples/tick-hub-ops.yaml --state ../examples/tick-hub-state.yaml --now 0 --no-header
+        run: python -m tick_hub tick --config tick_hub/examples/tick-hub-ops.yaml --state tick_hub/examples/tick-hub-state.yaml --now 0 --no-header

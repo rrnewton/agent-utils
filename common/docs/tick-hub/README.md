@@ -100,8 +100,8 @@ Each `ACTION:` is one unit of work for a coordinator to dispatch to the named `s
 persist the per-reminder last-fired epochs so cadenced reminders fire on schedule across ticks.
 
 Ready-to-run examples live in
-[`examples/`](https://github.com/rrnewton/agent-utils/tree/main/examples) as a JSON/YAML twin
-(`tick-hub-ops.{yaml,json}`) plus a sample ops-state (`tick-hub-state.yaml`).
+[`py/tick_hub/examples/`](https://github.com/rrnewton/agent-utils/tree/main/py/tick_hub/examples)
+as a JSON/YAML twin (`tick-hub-ops.{yaml,json}`) plus a sample ops-state (`tick-hub-state.yaml`).
 
 ## The output contract
 
