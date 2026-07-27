@@ -35,8 +35,15 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   under boxing (out of scope for the unboxed differential); their alphabetical ordering is pinned
   by each build's own perflog tests.
 * The ``sweep`` ``--jobs`` error text (malformed range / not-an-integer) matches across builds.
-* The remaining ``run`` comparisons pass ``--no-profile`` so the default auto-logging profile store
-  does not write into the harness CWD (its schema is asserted separately, above).
+* The profile-store FEEDBACK loop + ``--planner`` agree (``compare_plan_feedback``): against a FIXED
+  synthetic store, ``plan`` output is byte-identical across builds for BOTH planners and BOTH formats
+  (so the contention-discounted median durations, high-percentile rss estimates, and dispatch order
+  all match); the ``critical-path`` order differs from ``greedy-lpt`` (the planner really reorders);
+  the hint-only ``--no-profile-feedback`` plan is also identical; and the ``--max-mem`` sizing fed by
+  the store's rss estimates matches across builds and throttles below the CPU count.
+* The remaining ``run`` comparisons pass ``--no-profile`` (no store WRITE into the harness CWD) and
+  ``--no-profile-feedback`` (no store READ / hint refinement), so the base scheduling behavior under
+  test stays hermetic and hint-only; feedback parity is asserted separately (above).
 
 It also keeps the bootstrap ``--version`` / ``--help`` / no-args exit-code checks.
 
@@ -53,7 +60,7 @@ import re
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -67,6 +74,18 @@ ACF = "--allow-cgroup-failure"
 #: write CSVs into the harness CWD during the differential; the scheduling behavior under test is
 #: independent of profile logging, which is proven by each build's own tests.
 NOPROF = "--no-profile"
+
+#: Passed to the existing `run` comparisons so plan-time profile-store FEEDBACK (the learned-estimate
+#: reader) does NOT read the repo-local default store and silently refine hints mid-differential —
+#: the base scheduling behavior under test must stay hint-only and hermetic. Feedback parity is
+#: proven separately by :func:`compare_plan_feedback` against a fixed SYNTHETIC store.
+NOFB = "--no-profile-feedback"
+
+#: Feedback identity envs (mirrors safe_ci_dag_runner.estimates): pin the machine id + container
+#: class so the feedback reader loads a fixed synthetic ``step_profiles_<mid>_<cc>.csv`` regardless
+#: of the host, making the plan/sizing feedback checks deterministic everywhere.
+SYNTH_MACHINE = "cross_synth_machine"
+SYNTH_CONTAINER = "cross_synth_container"
 
 _COUNTS_RE = re.compile(
     r"(\d+) passed, (\d+) failed, (\d+) aborted, (\d+) skipped"
@@ -133,20 +152,24 @@ def rs_command(tool: str) -> list[str]:
     )
 
 
-def _env() -> dict[str, str]:
+def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ)
     env["PYTHONPATH"] = os.path.join(REPO_ROOT, "py") + os.pathsep + env.get("PYTHONPATH", "")
     # Deterministic, color-free output regardless of the runner's TTY state.
     env["NO_COLOR"] = "1"
+    if extra:
+        env.update(extra)
     return env
 
 
-def run(cmd: Sequence[str], args: Sequence[str]) -> Outcome:
+def run(
+    cmd: Sequence[str], args: Sequence[str], extra_env: Mapping[str, str] | None = None
+) -> Outcome:
     proc = subprocess.run(
         [*cmd, *args],
         capture_output=True,
         text=True,
-        env=_env(),
+        env=_env(extra_env),
         check=False,
     )
     return Outcome(proc.returncode, proc.stdout, proc.stderr)
@@ -721,8 +744,8 @@ def compare_only_errors(py: list[str], rs: list[str], rep: Report) -> None:
         path = os.path.join(tmp, "dag.json")
         with open(path, "w", encoding="utf-8") as fh:
             fh.write('{"steps": [{"group": "g", "job": "j", "cmd": "true"}]}')
-        po = run(py, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, ACF))
-        ro = run(rs, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, ACF))
+        po = run(py, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, NOFB, ACF))
+        ro = run(rs, ("run", "--dag", path, "-q", "--only", "no.pe", NOPROF, NOFB, ACF))
         label = "only-unknown-tag"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
@@ -751,8 +774,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # here (see cross/README.md). The flag makes both builds run the SAME observable UNBOXED
         # scheduling core deterministically, regardless of whether the host can box. Boxing itself
         # is proven by each build's own tests (Python pytest + the Rust boxing smoke test).
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, ACF))
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, NOFB, ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, NOFB, ACF))
         label = f"{fx.name}/run(default-exit)"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
@@ -764,8 +787,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # passed/failed/aborted/skipped counts are fully reproducible between the two builds.
         # (Note: --keep-going only suppresses the eager-abort of in-flight steps; on any
         # failure BOTH builds set stop and launch no new steps, so counts still race at -j>1.)
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, ACF))
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
         label = f"{fx.name}/run(serial-counts)"
         pc, rc = _counts(po.stderr), _counts(ro.stderr)
         if po.returncode != ro.returncode:
@@ -779,8 +802,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
 
         # 5) --max-mem sizing decision, when the fixture supplies a budget.
         if fx.max_mem is not None:
-            po = run(py, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, ACF))
-            ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, ACF))
+            po = run(py, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, NOFB, ACF))
+            ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, NOFB, ACF))
             label = f"{fx.name}/sizing"
             ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
             if ps is None or rss is None:
@@ -796,8 +819,8 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # counts are reproducible even though full-DAG timing is not.
         tag = _first_tag(fx)
         if tag is not None:
-            po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, ACF))
-            ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, ACF))
+            po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, NOFB, ACF))
+            ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, NOFB, ACF))
             label = f"{fx.name}/only({tag})"
             pc, rc = _counts(po.stderr), _counts(ro.stderr)
             if po.returncode != ro.returncode:
@@ -848,8 +871,8 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
             fh.write(dag)
         py_dir = os.path.join(tmp, "py_store")
         rs_dir = os.path.join(tmp, "rs_store")
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", py_dir, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", rs_dir, ACF))
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", py_dir, NOFB, ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", rs_dir, NOFB, ACF))
         label = "profile-store"
         if po.returncode != ro.returncode:
             rep.bad(label, f"run exit py={po.returncode} rs={ro.returncode}")
@@ -876,6 +899,181 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
                 rep.bad(sub, f"header differs\n--- py ---\n{py_hdr}\n--- rs ---\n{rs_hdr}")
             else:
                 rep.ok(sub)
+
+
+# --------------------------------------------------------------------------- plan feedback
+
+#: A DAG whose steps carry only est_duration HINTS (no rss baselines) so the SYNTHETIC store below
+#: is the sole source of learned durations + memory estimates. Its shape makes the two planners
+#: disagree: g.prep is cheap on its own but heads a long chain (bottom-level 1+8), so critical-path
+#: dispatches it first while greedy-lpt dispatches the individually-largest g.heavy/g.solo first.
+_FEEDBACK_DAG = {
+    "mem_cap_factor": 1.0,
+    "mem_cap_floor_bytes": 0,
+    "outer_mem_safety_factor": 1.0,
+    "steps": [
+        {"group": "g", "job": "prep", "desc": "prep", "cmd": "true",
+         "hint": {"est_duration_s": 1.0}},
+        {"group": "g", "job": "heavy", "desc": "heavy", "cmd": "true", "deps": ["g.prep"],
+         "hint": {"est_duration_s": 10.0}},
+        {"group": "g", "job": "solo", "desc": "solo", "cmd": "true",
+         "hint": {"est_duration_s": 5.0}},
+    ],
+}
+
+#: A fixed synthetic per-step profile store for :data:`_FEEDBACK_DAG`. g.heavy's 20s sample was
+#: taken under 60% other-work contention, so the reader must DISCOUNT it back to ~8s (matching the
+#: uncontended 8s sample) — proving contention-discounted median duration recovery. peak_bytes give
+#: the memory model its rss estimates (6 GiB for heavy/solo => a tight --max-mem budget throttles to
+#: -j1). Written with the pinned SYNTH identity so the file name matches what the reader loads.
+_FEEDBACK_STORE_CSV = (
+    "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
+    "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
+    "peak_bytes,thread_peak,pct_other\n"
+    f"2026-07-26T10:00:00,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "g.prep,light,1,1.000,0,True,False,0,1073741824,,0.0\n"
+    f"2026-07-26T10:00:01,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "g.prep,light,1,1.100,0,True,False,0,1073741824,,0.0\n"
+    f"2026-07-26T10:00:02,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "g.heavy,cpu-bound,1,8.000,0,True,False,0,6442450944,,0.0\n"
+    f"2026-07-26T10:00:03,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "g.heavy,cpu-bound,1,20.000,0,True,False,0,6442450944,,60.0\n"
+    f"2026-07-26T10:00:04,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "g.solo,light,1,5.000,0,True,False,0,6442450944,,0.0\n"
+    f"2026-07-26T10:00:05,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "g.solo,light,1,5.200,0,True,False,0,6442450944,,0.0\n"
+)
+
+
+def _order_from_plan_json(stdout: str) -> list[str] | None:
+    """Extract the scheduled ``order`` list from ``plan --format json`` output (``None`` if
+    unparseable)."""
+    try:
+        obj = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    order = obj.get("order")
+    if not isinstance(order, list) or not all(isinstance(x, str) for x in order):
+        return None
+    return [str(x) for x in order]
+
+
+def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the profile-store FEEDBACK loop + the ``--planner`` choices agree across builds.
+
+    Against a FIXED synthetic store (pinned to a host-independent machine/container identity):
+
+    * ``plan`` output is BYTE-IDENTICAL across the two builds for BOTH planners and BOTH formats —
+      so the derived estimates (contention-discounted median duration, high-percentile rss) and the
+      dispatch order match exactly.
+    * the ``critical-path`` scheduled order DIFFERS from ``greedy-lpt`` (the planner actually
+      reorders), while both remain identical across builds.
+    * ``plan`` with feedback OFF (``--no-profile-feedback``) is also byte-identical (hint-only path).
+    * the memory-aware ``--max-mem`` sizing decision, now fed the store's rss estimates, matches
+      across builds AND throttles below the CPU count (proving the store feeds the memory model).
+    """
+    extra = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+            fh.write(_FEEDBACK_STORE_CSV)
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_FEEDBACK_DAG))
+
+        orders: dict[str, list[str]] = {}
+        for planner in ("greedy-lpt", "critical-path"):
+            for fmt in ("text", "json"):
+                po = run(
+                    py,
+                    ("plan", "--dag", dag_path, "--perf-dir", store, "--planner", planner,
+                     "--format", fmt),
+                    extra,
+                )
+                ro = run(
+                    rs,
+                    ("plan", "--dag", dag_path, "--perf-dir", store, "--planner", planner,
+                     "--format", fmt),
+                    extra,
+                )
+                label = f"plan-feedback:{planner}/{fmt}"
+                if po.returncode != 0 or ro.returncode != 0:
+                    rep.bad(label, f"exit py={po.returncode} rs={ro.returncode} "
+                                   f"(py stderr={po.stderr!r}; rs stderr={ro.stderr!r})")
+                    continue
+                if po.stdout != ro.stdout:
+                    rep.bad(
+                        label,
+                        f"plan output not byte-identical\n--- py ---\n{po.stdout}\n"
+                        f"--- rs ---\n{ro.stdout}",
+                    )
+                    continue
+                rep.ok(label)
+                if fmt == "json":
+                    order = _order_from_plan_json(po.stdout)
+                    if order is None:
+                        rep.bad(f"plan-feedback:{planner}/order", "unparseable order")
+                    else:
+                        orders[planner] = order
+
+        # The two planners must actually produce a DIFFERENT scheduled order (else --planner is a
+        # no-op on this fixture). Both builds already agree per-planner (asserted above).
+        if "greedy-lpt" in orders and "critical-path" in orders:
+            if orders["greedy-lpt"] == orders["critical-path"]:
+                rep.bad(
+                    "plan-feedback:planner-differs",
+                    f"greedy-lpt and critical-path produced the SAME order {orders['greedy-lpt']}",
+                )
+            else:
+                rep.ok("plan-feedback:planner-differs")
+
+        # Feedback OFF: hint-only plan must still be byte-identical across builds.
+        po = run(py, ("plan", "--dag", dag_path, "--no-profile-feedback", "--format", "json"), extra)
+        ro = run(rs, ("plan", "--dag", dag_path, "--no-profile-feedback", "--format", "json"), extra)
+        if po.stdout != ro.stdout:
+            rep.bad(
+                "plan-feedback:no-feedback",
+                f"hint-only plan differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+            )
+        else:
+            rep.ok("plan-feedback:no-feedback")
+
+        # Memory-aware sizing fed by the store's rss estimates: both builds must pick the same -j
+        # and throttle below the CPU count (the 6 GiB heavy+solo pair overflows an 8 GiB budget).
+        po = run(
+            py,
+            ("run", "--dag", dag_path, "-q", "-k", "--max-mem", "8G", "--perf-dir", store,
+             NOPROF, ACF),
+            extra,
+        )
+        ro = run(
+            rs,
+            ("run", "--dag", dag_path, "-q", "-k", "--max-mem", "8G", "--perf-dir", store,
+             NOPROF, ACF),
+            extra,
+        )
+        ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
+        if ps is None or rss is None:
+            rep.bad(
+                "plan-feedback:sizing",
+                f"missing sizing line py={po.stderr!r} rs={ro.stderr!r}",
+            )
+        elif ps != rss:
+            rep.bad("plan-feedback:sizing", f"(-j, footprint, budget) py={ps} rs={rss}")
+        elif ps[0] != 1:
+            rep.bad(
+                "plan-feedback:sizing",
+                f"expected the store's rss estimates to throttle to -j1; got -j{ps[0]}",
+            )
+        else:
+            rep.ok("plan-feedback:sizing")
 
 
 def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
@@ -938,6 +1136,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
     compare_profile_store(py, rs, rep)
+    compare_plan_feedback(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

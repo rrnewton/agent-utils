@@ -29,6 +29,16 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from safe_ci_dag_runner import __version__
+from safe_ci_dag_runner.estimates import (
+    Plan,
+    Planner,
+    apply_plan_to_config,
+    build_plan,
+    feedback_identity,
+    load_step_samples,
+    plan_to_json,
+    plan_to_text,
+)
 from safe_ci_dag_runner.io import (
     DagJsonError,
     dag_from_json,
@@ -108,6 +118,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} run --dag dag.json')}               {c.dim('# run it; exit 0 iff all steps pass')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --profile')}     {c.dim('# ...and print a per-step profile table')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --only build.app')} {c.dim('# run EXACTLY one step (not its deps)')}\n"
+        f"  {ex(f'{PROG} plan --dag dag.json --planner critical-path')} {c.dim('# show learned estimates + the plan')}\n"
         f"  {ex(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')} {c.dim('# parallel-speedup study')}\n"
         f"  {ex(f'{PROG} ascii --dag dag.json')}             {c.dim('# quick ASCII view of the graph')}\n"
         f"  {ex(f'{PROG} dot --dag dag.json | dot -Tsvg -o dag.svg')}\n\n"
@@ -159,6 +170,20 @@ def _quickstart(c: Palette) -> str:
   {c.dim('The tool prints exactly where it appended, so the logging is never silent. Consider')}
   {c.dim('gitignoring ./.safe-ci-dag-runner/ (or check it in to keep a history - project choice).')}
 
+{h('Smarter planning: learned estimates + the critical-path planner')}
+  {c.dim('The runner FEEDS the recorded store back in at plan time: for each step it derives a')}
+  {c.dim('robust est_duration (contention-discounted MEDIAN of past elapsed_s) and an rss estimate')}
+  {c.dim('(a high percentile of past peak_bytes), and USES them in place of the DAG-authored hint')}
+  {c.dim('when the store has enough samples. So est_duration_s no longer has to be hand-authored -')}
+  {c.dim('planning improves automatically as runs accumulate. This also feeds --max-mem sizing.')}
+  {k(f'{PROG} plan  --dag dag.json')}                       {c.dim('# show the plan (est + source, rss, bottom-level, order)')}
+  {k(f'{PROG} plan  --dag dag.json --planner critical-path')} {c.dim('# order by longest remaining path, not just single est')}
+  {k(f'{PROG} plan  --dag dag.json --format json')}          {c.dim('# canonical machine-readable plan (for a CI-optimizing agent)')}
+  {k(f'{PROG} run   --dag dag.json --planner critical-path --show-plan')} {c.dim('# print the plan, then run in that order')}
+  {c.dim('--planner greedy-lpt (default) launches the longest single step first; critical-path')}
+  {c.dim('launches the step with the highest bottom-level (longest remaining est-weighted path).')}
+  {c.dim(f'Use {k("--no-profile-feedback")} to ignore the store and plan from the DAG hints only.')}
+
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
   step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, networkonly, engine_only, hint{{}}
   hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,
@@ -173,7 +198,10 @@ def _quickstart(c: Palette) -> str:
   {c.dim('  "-j%d" -> "-j4", "--jobs=" -> "--jobs=4", "--num-threads" -> "--num-threads 4".')}
 
 {h('What you get')}
-  - concurrent scheduling in longest-first order, honoring deps + resource caps
+  - concurrent scheduling honoring deps + resource caps, ordered by the chosen {k('--planner')}
+    {c.dim('(greedy-lpt = longest single step first; critical-path = longest remaining path first)')}
+  - learned est_duration / rss from the profile store override the DAG hints at plan time
+    {c.dim('(disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)')}
   - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps
     ({k('--keep-going')} lets already-running steps finish instead; it still stops launching new steps)
   - Linux cgroup-v2 per-step memory/CPU boxing is ON BY DEFAULT (the tool's primary purpose):
@@ -266,6 +294,25 @@ def build_parser() -> argparse.ArgumentParser:
         "rss_hwm | oom | inner_jobs) to the terminal",
     )
     run_p.add_argument(
+        "--planner",
+        choices=[p.value for p in Planner],
+        default=Planner.GREEDY_LPT.value,
+        help="dispatch-ordering planner: 'greedy-lpt' (default; longest est_duration first) or "
+        "'critical-path' (longest remaining est-weighted path first, i.e. highest bottom-level)",
+    )
+    run_p.add_argument(
+        "--show-plan",
+        action="store_true",
+        help="before running, print the plan (per-step est_duration + source, rss_estimate, "
+        "bottom_level, the critical path, and the scheduled order)",
+    )
+    run_p.add_argument(
+        "--no-profile-feedback",
+        action="store_true",
+        help="do NOT read the profile store to refine est_duration_s / rss_baseline_bytes at plan "
+        "time; use only the DAG-authored hints (for reproducibility)",
+    )
+    run_p.add_argument(
         "-k",
         "--keep-going",
         action="store_true",
@@ -333,6 +380,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="run UNBOXED (with a warning) instead of erroring when cgroup-v2 boxing is unavailable",
     )
     sweep_p.add_argument("-v", dest="verbosity", action="count", default=0, help="-v: stream child output")
+
+    plan_p = sub.add_parser(
+        "plan",
+        help="show the plan: per-step est_duration (+ source), rss_estimate, bottom-level, the "
+        "critical path, and the scheduled order (does NOT run anything)",
+    )
+    plan_p.add_argument(
+        "--dag",
+        required=True,
+        metavar="FILE",
+        help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+    )
+    plan_p.add_argument(
+        "--planner",
+        choices=[p.value for p in Planner],
+        default=Planner.GREEDY_LPT.value,
+        help="dispatch-ordering planner: 'greedy-lpt' (default) or 'critical-path'",
+    )
+    plan_p.add_argument(
+        "--format",
+        choices=["text", "json"],
+        default="text",
+        help="output format: 'text' (human table, default) or 'json' (canonical machine-readable)",
+    )
+    plan_p.add_argument(
+        "--perf-dir",
+        metavar="DIR",
+        default=None,
+        help="read the profile store from DIR (overrides the default store and "
+        f"${PROFILE_DIR_ENV}) when deriving learned estimates",
+    )
+    plan_p.add_argument(
+        "--no-profile-feedback",
+        action="store_true",
+        help="ignore the profile store; show only the DAG-authored hints",
+    )
 
     for cmd, helptext in (
         ("list", "list the steps"),
@@ -403,6 +486,40 @@ def _resolve_profile_dir(
     if env:
         return env, f"${PROFILE_DIR_ENV}"
     return DEFAULT_PROFILE_DIR, "default"
+
+
+def _resolve_feedback_dir(perf_dir_arg: str | None, no_feedback: bool) -> str | None:
+    """The directory the plan-time FEEDBACK reader loads the profile store from, or ``None`` when
+    feedback is off.
+
+    Independent of ``--no-profile`` (which only governs WRITING): reading the store to refine
+    estimates is a separate concern. Precedence mirrors the write path minus the disable:
+    ``--no-profile-feedback`` turns it off; else ``--perf-dir``; else
+    ``$SAFE_CI_DAG_RUNNER_PROFILE_DIR``; else the repo-local default store."""
+    if no_feedback:
+        return None
+    if perf_dir_arg:
+        return perf_dir_arg
+    env = os.environ.get(PROFILE_DIR_ENV)
+    if env:
+        return env
+    return DEFAULT_PROFILE_DIR
+
+
+def _build_feedback_plan(
+    cfg: DagConfig, feedback_dir: str | None, planner: Planner
+) -> Plan:
+    """Load the profile store (when feedback is on) and build the plan for ``planner``.
+
+    With ``feedback_dir`` set, the store's learned estimates refine each step (store wins when it
+    has enough samples; the DAG hint is the fallback). With ``feedback_dir`` ``None`` the plan
+    reflects the DAG hints only."""
+    samples = (
+        load_step_samples(feedback_dir, *feedback_identity())
+        if feedback_dir is not None
+        else {}
+    )
+    return build_plan(cfg, samples, planner=planner)
 
 
 def _report_profile_written(perf_dir: str, source: str) -> None:
@@ -822,6 +939,28 @@ def _resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, 
     return None, 3
 
 
+def _cmd_plan(ns: argparse.Namespace) -> int:
+    """Show the plan (per-step estimates + sources, critical path, scheduled order) without
+    running anything. Text (human) or canonical JSON (machine-readable, cross-identical)."""
+    dag_arg = ns.dag if isinstance(ns.dag, str) else None
+    if dag_arg is None:
+        print(f"{PROG}: plan: --dag FILE is required", file=sys.stderr)
+        return 2
+    try:
+        cfg = _load(dag_arg)
+    except (OSError, DagJsonError) as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
+    feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
+    plan = _build_feedback_plan(cfg, feedback_dir, planner)
+    if str(ns.format) == "json":
+        print(plan_to_json(plan))
+    else:
+        sys.stdout.write(plan_to_text(plan))
+    return 0
+
+
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so a
     # bad tag fails fast (exit 2) without needing a systemd scope.
@@ -840,6 +979,18 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     cgroups, code = _resolve_cgroup_manager(bool(ns.allow_cgroup_failure))
     if code != 0:
         return code
+
+    # Plan-time profile-store FEEDBACK (ds-7pzdgm / ds-afzsqf): refine each step's est_duration_s
+    # and rss_baseline_bytes from the recorded store, then pick the dispatch order for the chosen
+    # --planner. The applied cfg (with refined hints) is what both the memory-aware -j sizing below
+    # and the scheduler see, so planning improves automatically as runs accumulate.
+    planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
+    feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
+    plan = _build_feedback_plan(cfg, feedback_dir, planner)
+    cfg = apply_plan_to_config(cfg, plan)
+    if bool(ns.show_plan):
+        sys.stdout.write(plan_to_text(plan))
+
     jobs = _select_jobs(cfg, ns)
     verbosity = 0 if bool(ns.quiet) else int(ns.verbosity)
 
@@ -857,6 +1008,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         metrics=metrics,
         keep_going=bool(ns.keep_going),
         verbosity=verbosity,
+        order=list(plan.order),
     )
     passed = sum(1 for o in result.outcomes if o.ok)
     failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)
@@ -889,6 +1041,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "sweep":
         return _cmd_sweep(ns, c)
+    if command == "plan":
+        return _cmd_plan(ns)
 
     dag_arg = ns.dag if isinstance(ns.dag, str) else None
     if dag_arg is None:

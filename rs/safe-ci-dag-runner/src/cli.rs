@@ -30,10 +30,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cgroup::{install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups};
+use crate::estimates::{
+    apply_plan_to_config, build_plan, feedback_identity, load_step_samples, plan_to_json,
+    plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
+};
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
 use crate::model::{step_classification, DagConfig, Step};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
-use crate::scheduler::{run_dag_boxed, BoxedCgroups};
+use crate::scheduler::{run_dag_boxed, run_dag_boxed_ordered, BoxedCgroups};
 use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
 use crate::viz::{to_ascii, to_dot};
 use crate::{PROG, VERSION};
@@ -108,6 +112,7 @@ fn help_text(c: &Palette) -> String {
          {commands}\n\
          \x20 run        run a DAG (exit 0 iff every step passes)\n\
          \x20 sweep      parallel-speedup sweep of ONE step (inner -j1..-jN + timing table)\n\
+         \x20 plan       show learned estimates + the scheduled order (does NOT run anything)\n\
          \x20 list       list the steps\n\
          \x20 ascii      draw the DAG as ASCII art\n\
          \x20 dot        emit Graphviz DOT (pipe to `dot -Tsvg`)\n\
@@ -118,6 +123,7 @@ fn help_text(c: &Palette) -> String {
          \x20 {e1}\n\
          \x20 {e2}\n\
          \x20 {e3}\n\
+         \x20 {e6}\n\
          \x20 {e4}\n\
          \x20 {e5}\n\n\
          {profiling}\n",
@@ -128,6 +134,7 @@ fn help_text(c: &Palette) -> String {
         e1 = ex(&format!("{PROG} quickstart")),
         e2 = ex(&format!("{PROG} run --dag dag.json --profile")),
         e3 = ex(&format!("{PROG} run --dag dag.json --only build.app")),
+        e6 = ex(&format!("{PROG} plan --dag dag.json --planner critical-path")),
         e4 = ex(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8")),
         e5 = ex(&format!("{PROG} ascii --dag dag.json")),
         profiling = c.dim(
@@ -151,6 +158,7 @@ fn quickstart(c: &Palette) -> String {
 {i3}\n  {r1}\n  {r2}\n  {r3}\n\n\
 {studies}\n  {s1}\n  {s2}\n  {s3}\n  {studies_note}\n\n\
 {store}\n  {store_dir}\n  {store_note}\n\n\
+{planning}\n  {pl1}\n  {pl2}\n  {pl3}\n  {plan_note}\n\n\
 {schema}  {schema_note}\n  \
 step:   group, job, desc, description, cmd, deps[], env{{}}, timeout, jobs_flag, networkonly, engine_only, hint{{}}\n  \
 hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_bytes,\n          classification(\"cpu-bound\"|\"latency-bound\"|\"light\"), preferred_inner_jobs\n  \
@@ -159,7 +167,8 @@ desc = short label; description = long-form docs (often multi-line, great in YAM
 jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"->\"-j4\", \"--jobs=\"->\"--jobs=4\"\n  \
 yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n\n\
 {what}\n  \
-- concurrent scheduling in longest-first order, honoring deps + resource caps\n  \
+- concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
+- learned est_duration / rss from the profile store override the DAG hints at plan time\n    (disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
 - {maxmem} picks the largest -j whose modeled worst-case RAM fits the budget\n\n\
 {note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. {perfdir} writes per-step + whole-run resource-usage CSVs.\n\n\
@@ -186,6 +195,25 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
             "Every run and sweep AUTO-LOGS resource-usage CSVs here; override with --perf-dir or \
              $SAFE_CI_DAG_RUNNER_PROFILE_DIR, disable with --no-profile. The tool prints where it \
              appended (never silent). Consider gitignoring ./.safe-ci-dag-runner/."
+        ),
+        planning = h("Smarter planning: learned estimates + the critical-path planner"),
+        pl1 = k(&format!(
+            "{PROG} plan  --dag dag.json                        # show est (+ source), rss, bottom-level, order"
+        )),
+        pl2 = k(&format!(
+            "{PROG} plan  --dag dag.json --planner critical-path # order by longest remaining path"
+        )),
+        pl3 = k(&format!(
+            "{PROG} run   --dag dag.json --planner critical-path --show-plan  # print the plan, then run it"
+        )),
+        plan_note = c.dim(
+            "The runner FEEDS the profile store back at plan time: a robust est_duration \
+             (contention-discounted MEDIAN of past elapsed_s) and an rss estimate (high percentile \
+             of past peak_bytes) OVERRIDE the DAG hint once enough samples exist, so est_duration_s \
+             need not be hand-authored and --max-mem sizing improves automatically. --planner \
+             greedy-lpt (default) launches the longest single step first; critical-path launches \
+             the highest bottom-level (longest remaining est-weighted path) first. \
+             --no-profile-feedback ignores the store (DAG hints only)."
         ),
         schema = h("DAG schema"),
         schema_note = c.dim("(only group/job/cmd are required per step; everything else has defaults)"),
@@ -267,6 +295,9 @@ struct RunArgs {
     perf_dir: Option<String>,
     no_profile: bool,
     profile: bool,
+    planner: String,
+    show_plan: bool,
+    no_profile_feedback: bool,
     keep_going: bool,
     cgroups: bool,
     allow_cgroup_failure: bool,
@@ -283,6 +314,9 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         perf_dir: None,
         no_profile: false,
         profile: false,
+        planner: Planner::GreedyLpt.value().to_string(),
+        show_plan: false,
+        no_profile_feedback: false,
         keep_going: false,
         cgroups: false,
         allow_cgroup_failure: false,
@@ -321,6 +355,9 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile" => a.no_profile = true,
             "--profile" => a.profile = true,
+            "--planner" => a.planner = validate_planner(take_value(inline, &mut i)?)?,
+            "--show-plan" => a.show_plan = true,
+            "--no-profile-feedback" => a.no_profile_feedback = true,
             "-k" | "--keep-going" => a.keep_going = true,
             "--cgroups" => a.cgroups = true,
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
@@ -475,6 +512,54 @@ fn resolve_profile_dir(perf_dir: Option<&str>, no_profile: bool) -> (Option<Stri
         }
     }
     (Some(DEFAULT_PROFILE_DIR.to_string()), "default")
+}
+
+/// Validate a `--planner` value, returning the canonical string or a usage error.
+fn validate_planner(value: String) -> Result<String, String> {
+    match Planner::from_value(&value) {
+        Some(p) => Ok(p.value().to_string()),
+        None => Err(format!(
+            "--planner: invalid choice: '{value}' (choose from greedy-lpt, critical-path)"
+        )),
+    }
+}
+
+/// The directory the plan-time FEEDBACK reader loads the profile store from, or `None` when
+/// feedback is off. Independent of `--no-profile` (which governs WRITING). Mirrors Python's
+/// `_resolve_feedback_dir`.
+fn resolve_feedback_dir(perf_dir: Option<&str>, no_feedback: bool) -> Option<String> {
+    if no_feedback {
+        return None;
+    }
+    if let Some(d) = perf_dir {
+        if !d.is_empty() {
+            return Some(d.to_string());
+        }
+    }
+    if let Ok(env) = std::env::var(PROFILE_DIR_ENV) {
+        if !env.is_empty() {
+            return Some(env);
+        }
+    }
+    Some(DEFAULT_PROFILE_DIR.to_string())
+}
+
+/// Load the profile store (when feedback is on) and build the plan for `planner`. Mirrors Python's
+/// `_build_feedback_plan`.
+fn build_feedback_plan(cfg: &DagConfig, feedback_dir: Option<&str>, planner: Planner) -> Plan {
+    match feedback_dir {
+        Some(dir) => {
+            let (mid, cc) = feedback_identity();
+            let samples = load_step_samples(Path::new(dir), &mid, &cc);
+            build_plan(cfg, &samples, planner, DEFAULT_MIN_SAMPLES)
+        }
+        None => build_plan(
+            cfg,
+            &std::collections::HashMap::new(),
+            planner,
+            DEFAULT_MIN_SAMPLES,
+        ),
+    }
 }
 
 /// Print one visible line naming where profile CSVs were appended (No Silent Failure).
@@ -968,6 +1053,89 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     0
 }
 
+// --------------------------------------------------------------------------- plan subcommand
+
+struct PlanArgs {
+    dag: Option<String>,
+    planner: String,
+    format: String,
+    perf_dir: Option<String>,
+    no_profile_feedback: bool,
+}
+
+fn parse_plan_args(rest: &[String]) -> Result<PlanArgs, String> {
+    let mut a = PlanArgs {
+        dag: None,
+        planner: Planner::GreedyLpt.value().to_string(),
+        format: "text".to_string(),
+        perf_dir: None,
+        no_profile_feedback: false,
+    };
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        let (key, inline) = match arg.split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (arg.clone(), None),
+        };
+        let take_value = |inline: Option<String>, i: &mut usize| -> Result<String, String> {
+            if let Some(v) = inline {
+                Ok(v)
+            } else {
+                *i += 1;
+                rest.get(*i)
+                    .cloned()
+                    .ok_or_else(|| format!("the argument {key} requires a value"))
+            }
+        };
+        match key.as_str() {
+            "--dag" => a.dag = Some(take_value(inline, &mut i)?),
+            "--planner" => a.planner = validate_planner(take_value(inline, &mut i)?)?,
+            "--format" => {
+                let v = take_value(inline, &mut i)?;
+                if v != "text" && v != "json" {
+                    return Err(format!(
+                        "--format: invalid choice: '{v}' (choose from text, json)"
+                    ));
+                }
+                a.format = v;
+            }
+            "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
+            "--no-profile-feedback" => a.no_profile_feedback = true,
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+        i += 1;
+    }
+    Ok(a)
+}
+
+/// Show the plan (per-step estimates + sources, critical path, scheduled order) without running.
+fn cmd_plan(a: &PlanArgs) -> i32 {
+    let dag_arg = match &a.dag {
+        Some(d) => d.clone(),
+        None => {
+            eprintln!("{PROG} plan: error: the following arguments are required: --dag");
+            return 2;
+        }
+    };
+    let cfg = match load(&dag_arg) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{PROG}: {}", e.0);
+            return 2;
+        }
+    };
+    let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
+    let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
+    let plan = build_feedback_plan(&cfg, feedback_dir.as_deref(), planner);
+    if a.format == "json" {
+        println!("{}", plan_to_json(&plan));
+    } else {
+        print!("{}", plan_to_text(&plan));
+    }
+    0
+}
+
 fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so
     // a bad tag fails fast (exit 2) without needing a systemd scope.
@@ -998,6 +1166,18 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         eprintln!("{PROG}: note: --cgroups is a deprecated no-op (boxing is ON by default)");
     }
 
+    // Plan-time profile-store FEEDBACK (ds-7pzdgm / ds-afzsqf): refine each step's est_duration_s
+    // and rss_baseline_bytes from the recorded store, then pick the dispatch order for --planner.
+    // The applied cfg (refined hints) feeds both the memory-aware -j sizing and the scheduler.
+    let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
+    let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
+    let plan = build_feedback_plan(cfg, feedback_dir.as_deref(), planner);
+    let applied = apply_plan_to_config(cfg, &plan);
+    let cfg: &DagConfig = &applied;
+    if a.show_plan {
+        print!("{}", plan_to_text(&plan));
+    }
+
     let jobs = select_jobs(cfg, a);
     let verbosity = if a.quiet { 0 } else { a.verbosity };
 
@@ -1007,7 +1187,14 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         .as_deref()
         .map(|d| PerfWindow::start(Path::new(d), &git));
 
-    let result = run_dag_boxed(cfg, jobs, a.keep_going, verbosity, cgroups);
+    let result = run_dag_boxed_ordered(
+        cfg,
+        jobs,
+        a.keep_going,
+        verbosity,
+        cgroups,
+        Some(plan.order.clone()),
+    );
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
     let failed = result
         .outcomes
@@ -1121,6 +1308,16 @@ pub fn run(argv: &[String]) -> i32 {
             };
             cmd_sweep(&a, &c)
         }
+        "plan" => {
+            let a = match parse_plan_args(rest) {
+                Ok(a) => a,
+                Err(msg) => {
+                    eprintln!("{PROG} plan: error: {msg}");
+                    return 2;
+                }
+            };
+            cmd_plan(&a)
+        }
         "list" | "ascii" | "dot" | "json" | "yaml" => {
             let dag_arg = match parse_simple_dag(rest) {
                 Ok(Some(d)) => d,
@@ -1157,7 +1354,7 @@ pub fn run(argv: &[String]) -> i32 {
             eprintln!(
                 "usage: {PROG} [-h] [--version] <command> ...\n\
                  {PROG}: error: argument <command>: invalid choice: '{other}' \
-                 (choose from run, sweep, list, ascii, dot, json, yaml, quickstart)"
+                 (choose from run, sweep, plan, list, ascii, dot, json, yaml, quickstart)"
             );
             2
         }

@@ -15,6 +15,7 @@
 pub mod ambient;
 pub mod cgroup;
 pub mod cli;
+pub mod estimates;
 pub mod io;
 pub mod model;
 pub mod perflog;
@@ -27,6 +28,10 @@ pub use ambient::{
     AmbientSnapshot,
 };
 pub use cgroup::{install_scope_teardown, reexec_in_scope, CgroupManager, Cgroups};
+pub use estimates::{
+    apply_plan_to_config, build_plan, feedback_identity, load_step_samples, plan_to_json,
+    plan_to_text, Plan, PlanEntry, Planner, StepSamples, DEFAULT_MIN_SAMPLES,
+};
 pub use io::{
     dag_from_json, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError,
 };
@@ -36,7 +41,7 @@ pub use model::{
     StepOutcome, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
 };
 pub use perflog::{append_step_profiles, PerfWindow};
-pub use scheduler::{run_dag, run_dag_boxed};
+pub use scheduler::{run_dag, run_dag_boxed, run_dag_boxed_ordered};
 pub use sizing::{
     jobs_footprint_bytes, jobs_for_budget, mem_available_bytes, parse_size,
     schedulable_peak_mem_bytes, step_mem_cap_bytes, step_mem_cap_for_inner_jobs, transitive_deps,

@@ -139,15 +139,21 @@ impl Runner {
         keep_going: bool,
         verbosity: i64,
         cgroups: BoxedCgroups,
+        order_override: Option<Vec<String>>,
     ) -> Self {
         let steps: HashMap<String, Step> = cfg.steps.iter().map(|s| (s.tag(), s.clone())).collect();
-        // LPT dispatch order: sort tags by est_duration_s DESCENDING; the sort is stable, so
-        // ties keep cfg (registration) order, matching Python's stable reverse sort.
-        let mut order: Vec<String> = cfg.steps.iter().map(|s| s.tag()).collect();
-        order.sort_by(|a, b| {
-            let ea = steps[a].hint.est_duration_s;
-            let eb = steps[b].hint.est_duration_s;
-            eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+        // Dispatch order. When the caller supplies an explicit order (e.g. a critical-path
+        // planner's) use it verbatim; otherwise default to LPT: sort tags by est_duration_s
+        // DESCENDING (stable, so ties keep cfg/registration order, matching Python's stable
+        // reverse sort).
+        let order: Vec<String> = order_override.unwrap_or_else(|| {
+            let mut o: Vec<String> = cfg.steps.iter().map(|s| s.tag()).collect();
+            o.sort_by(|a, b| {
+                let ea = steps[a].hint.est_duration_s;
+                let eb = steps[b].hint.est_duration_s;
+                eb.partial_cmp(&ea).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            o
         });
         let resource_avail: HashMap<String, i64> = cfg
             .resource_caps
@@ -714,6 +720,19 @@ pub fn run_dag_boxed(
     verbosity: i64,
     cgroups: BoxedCgroups,
 ) -> RunResult {
+    run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups, None)
+}
+
+/// Like [`run_dag_boxed`] but with an explicit dispatch `order` (e.g. a critical-path planner's).
+/// `None` uses the built-in longest-processing-time default.
+pub fn run_dag_boxed_ordered(
+    cfg: &DagConfig,
+    jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+) -> RunResult {
     if let Some(cg) = &cgroups {
         if !cg.enabled() {
             // No Silent Failure: a present-but-disabled manager means containment is degraded.
@@ -723,7 +742,7 @@ pub fn run_dag_boxed(
             );
         }
     }
-    let runner = Runner::new(cfg, jobs, keep_going, verbosity, cgroups);
+    let runner = Runner::new(cfg, jobs, keep_going, verbosity, cgroups, order);
     let (_ok, wall) = runner.run();
     runner.result(wall)
 }

@@ -26,6 +26,19 @@ from safe_ci_dag_runner.ambient import (
 )
 from safe_ci_dag_runner.analyze import summarize
 from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroups
+from safe_ci_dag_runner.estimates import (
+    DEFAULT_MIN_SAMPLES,
+    Plan,
+    PlanEntry,
+    Planner,
+    StepSamples,
+    apply_plan_to_config,
+    build_plan,
+    feedback_identity,
+    load_step_samples,
+    plan_to_json,
+    plan_to_text,
+)
 from safe_ci_dag_runner.io import (
     DagJsonError,
     dag_from_json,
@@ -69,7 +82,7 @@ from safe_ci_dag_runner.sizing import (
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
-__version__: str = "0.5.0"
+__version__: str = "0.6.0"
 
 __all__ = [
     "__version__",
@@ -122,6 +135,18 @@ __all__ = [
     "to_ascii",
     # analysis
     "summarize",
+    # profile-store feedback + planner
+    "Planner",
+    "StepSamples",
+    "PlanEntry",
+    "Plan",
+    "DEFAULT_MIN_SAMPLES",
+    "feedback_identity",
+    "load_step_samples",
+    "build_plan",
+    "apply_plan_to_config",
+    "plan_to_json",
+    "plan_to_text",
     # serialization
     "dag_from_json",
     "dag_from_yaml",

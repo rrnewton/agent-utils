@@ -181,16 +181,64 @@ concurrently. You could equally cap `"gpu"`, `"db"`, or `"api-tokens"` — anyth
 
 ## Planning algorithm
 
-Scheduling today is a single **greedy, longest-processing-time-first** pass: whenever a worker slot
-frees, the runner starts the ready step (all dependencies done, resource demand fits the caps, under
-`-j`) with the largest `est_duration_s` first, so long steps do not pile up on the tail of the run.
-The `est_duration_s` you attach to a step is, for now, a static hint you supply in the DAG. The
-**storage** half of the planned learned-duration profile store (ds-7pzdgm) now ships: every `run` and
-`sweep` auto-logs per-step timings/memory to the profile store described in
-[Where profiling data is stored](#where-profiling-data-is-stored-the-default-profile-store), so the
-data a future planner would learn from is being collected today. Feeding those recorded durations
-back in as the estimate automatically (and a `--planner` flag selecting a smarter critical-path /
-lookahead planner in place of today's greedy one, ds-afzsqf) are still to come.
+Two planners are available via `--planner`:
+
+- **`greedy-lpt`** (default) — a greedy, **longest-processing-time-first** pass: whenever a worker
+  slot frees, the runner starts the ready step (all dependencies done, resource demand fits the
+  caps, under `-j`) with the largest `est_duration_s` first, so long steps do not pile up on the
+  tail of the run.
+- **`critical-path`** — critical-path-first list scheduling: it computes each step's **bottom-level**
+  (the longest remaining path to a sink, weighted by `est_duration`) and, among ready steps,
+  launches the one with the highest bottom-level first. This keeps the graph's longest chain moving
+  and shortens the makespan when a cheap step heads a long dependency chain (a case where plain
+  longest-*single*-step ordering picks the wrong step first).
+
+Both orders are **deterministic and identical across the Python and Rust builds** for the same
+profile + DAG (ties broken stably, by tag for critical-path).
+
+**Learned estimates (the feedback loop).** `est_duration_s` no longer has to be a static hint you
+hand-author. The runner now **feeds the recorded profile store back in at plan time** (ds-7pzdgm /
+ds-afzsqf): for the current machine + container class it derives, per step,
+
+- a robust `est_duration_s` — the **contention-discounted MEDIAN** of past `elapsed_s` (a median,
+  not a mean, so one slow sample cannot drag it; discounted by whatever contention signal the store
+  carries — `pct_other` / `external_cores` / a CPU-pressure column / `co_tenants` — to recover the
+  step's *intrinsic*, uncontended duration), and
+- a robust `rss_estimate_bytes` — a **high percentile** of past `peak_bytes`, for the memory model.
+
+These **override the DAG-authored hint** once the store has enough samples (the hint is the
+fallback), so planning improves automatically as runs accumulate, and the same learned `rss` feeds
+the memory-aware `--max-mem` sizing. Pass `--no-profile-feedback` to ignore the store and plan from
+the DAG hints only (for reproducibility). Inspect exactly what the planner decided — and why — with
+the [`plan` command](#the-plan-command-see-the-estimates--the-schedule) or `run --show-plan`.
+
+Not yet built (a clearly-scoped follow-on): full **parallel-speedup-curve modeling** — learning each
+step's speedup as a function of its inner `-j` from multi-level samples, and watching total-CPU-seconds
+growth as a work-conservation signal. The `sweep` command already *collects* the multi-width samples
+this would learn from; turning them into a per-step speedup model is the remaining piece.
+
+### The `plan` command: see the estimates + the schedule
+
+`plan` prints, without running anything, exactly what the planner would do — so a CI-optimizing agent
+(or a person) can see *why* the steps are ordered the way they are:
+
+```
+$ safe-ci-dag-runner plan --dag dag.json --planner critical-path
+plan: critical-path
+per-step estimates (source: store = learned from the profile store; hint = DAG-authored; default = none):
+step       est_duration_s  source  rss_estimate  rss_source  bottom_level_s  samples
+---------  --------------  ------  ------------  ----------  --------------  -------
+build.app           3.000   store       1.1 GiB       store          13.000        4
+test.unit          10.000    hint             -        none          10.000        0
+lint.all            5.000    hint             -        none           5.000        0
+critical path (13.000s): build.app -> test.unit
+scheduled order: build.app, test.unit, lint.all
+```
+
+The **source** column shows where each estimate came from (`store` = learned, `hint` = DAG-authored,
+`default` = none). `plan --format json` emits the same plan as canonical, machine-readable JSON
+(byte-identical across the Python and Rust builds). `run --show-plan` prints this table and then
+runs. All three honor `--planner` and `--no-profile-feedback`.
 
 ## CLI reference
 
@@ -206,6 +254,7 @@ isomorphic to the JSON schema — see [The DAG format: JSON or YAML](#the-dag-fo
 | ------------ | ------------------------------------------------------------------- |
 | `run`        | Run the DAG. Exit `0` iff every step passes.                        |
 | `sweep`      | Parallel-speedup study of ONE step: run it at inner `-j1..-jN` and print a timing/speedup table (see [Profiling & experimenting with individual steps](#profiling--experimenting-with-individual-steps)). |
+| `plan`       | Show the plan — per-step learned/hint estimates, the critical path, and the scheduled order — without running anything (see [The `plan` command](#the-plan-command-see-the-estimates--the-schedule)). |
 | `list`       | List the steps with class and dependencies (registration order).    |
 | `ascii`      | Draw the DAG as ASCII art, grouped by topological layer.            |
 | `dot`        | Emit Graphviz DOT to stdout (pipe to `dot -Tsvg`).                  |
@@ -223,6 +272,9 @@ Global: `--version`, `-h/--help`. Running with no command prints help and exits 
 | `-j, --jobs N`       | Max concurrent steps. Default: the machine's CPU count.                            |
 | `--only TAG[,TAG...]`| Run **exactly** the named step(s) and nothing else. Dependency edges to steps *outside* the selection are dropped (their outputs are assumed already present) — it does **not** run the step's dependencies. For profiling/experimenting on a step in isolation. Errors (exit `2`) if a tag does not exist. See [Profiling & experimenting with individual steps](#profiling--experimenting-with-individual-steps). |
 | `--max-mem SPEC`     | RAM budget (e.g. `8G`, `4096M`): pick the largest `-j` whose modeled worst-case footprint fits. Ignored when `--jobs` is given (`--jobs` wins, with a note). |
+| `--planner NAME`     | Dispatch-ordering planner: `greedy-lpt` (default; longest single step first) or `critical-path` (longest remaining est-weighted path first). See [Planning algorithm](#planning-algorithm). |
+| `--show-plan`        | Before running, print the plan (per-step estimate + source, `rss_estimate`, bottom-level, the critical path, and the scheduled order). |
+| `--no-profile-feedback` | Do **not** read the profile store to refine `est_duration_s` / `rss_baseline_bytes` at plan time; plan from the DAG hints only (for reproducibility). |
 | `--profile`          | After the run, print a per-step profile table (`step` &#124; `wall_s` &#124; `user_s` &#124; `sys_s` &#124; `rss_hwm` &#124; `oom` &#124; `inner_jobs`) to the terminal. The CPU/memory columns come from the per-step cgroup, so they are populated under boxing and show `-` in an un-boxed run. |
 | `--perf-dir DIR`     | Write per-step and whole-run resource-usage CSVs into `DIR` (uses the `CsvMetricsSink`), **overriding** the default profile store and `$SAFE_CI_DAG_RUNNER_PROFILE_DIR`. Prints the CSV paths at the end. |
 | `--no-profile`       | Disable the default auto-logging profile store (do not append CSVs anywhere). |
@@ -388,9 +440,15 @@ to plug in a real cgroup manager or a metrics sink.
 
 Stated honestly:
 
-- **Python CLI + API: ready.** `run`, `list`, `ascii`, `dot`, `json`, and `quickstart` all work, and
-  the scheduler (dependency gating, resource caps, longest-first dispatch, fail-fast / keep-going,
-  failure classification) is complete.
+- **Python CLI + API: ready.** `run`, `sweep`, `plan`, `list`, `ascii`, `dot`, `json`, `yaml`, and
+  `quickstart` all work, and the scheduler (dependency gating, resource caps, `--planner` dispatch
+  ordering, fail-fast / keep-going, failure classification) is complete.
+- **Learned-estimate feedback loop: ready (both builds).** The runner reads the profile store back at
+  plan time to derive a contention-discounted median `est_duration_s` and a high-percentile
+  `rss_estimate_bytes` per step, overriding the DAG hints when enough samples exist; `--planner
+  critical-path` adds bottom-level list scheduling alongside the default `greedy-lpt`; the `plan`
+  command / `run --show-plan` display the estimates + schedule. Still to come: full
+  parallel-speedup-curve modeling from the multi-width `sweep` samples.
 - **cgroup boxing is ON by default (both builds).** `run` boxes each step: it re-execs the run inside
   a transient, delegated `systemd-run --user --scope`, caps each step's memory/CPU in its own child
   cgroup, and tears the whole subtree down atomically with the step's `cgroup.kill`. Real two-level

@@ -117,27 +117,78 @@ renders a compact topological-layer view for the terminal.
 
 ## Planning algorithm
 
-The scheduler today is a single **greedy, longest-processing-time-first (LPT)** pass over the ready
-set. On every sweep it launches each step that is *ready* — all dependencies finished successfully,
-its scarce-resource demand fits the remaining `resource_caps`, and the run is under its `-j` fan-out —
-considering ready steps in descending `est_duration_s`, so that when a slot or a scarce resource
-frees, the heaviest ready step claims it. That keeps long steps off the tail of the run and shortens
-overall wall-clock time. Ordering is the *only* thing the estimate affects; dependency and resource
-gating are enforced independently, so a wrong estimate can mildly degrade packing but never breaks
-correctness.
+On every sweep the scheduler launches each step that is *ready* — all dependencies finished
+successfully, its scarce-resource demand fits the remaining `resource_caps`, and the run is under its
+`-j` fan-out. **Which** ready step is picked first when a slot or scarce resource frees is decided by
+the chosen planner (`--planner`). Ordering is the *only* thing the estimate affects; dependency and
+resource gating are enforced independently, so a wrong estimate can mildly degrade packing but never
+breaks correctness. Both planners' orders are **deterministic and identical across the Python and
+Rust builds** for the same profile + DAG.
 
-Two planned improvements are worth knowing about:
+- **`greedy-lpt`** (default) — **longest-processing-time-first**: consider ready steps in descending
+  `est_duration_s`, so the heaviest ready step claims a freeing slot. Keeps long steps off the tail
+  of the run.
+- **`critical-path`** — **critical-path-first list scheduling**: compute each step's *bottom-level*
+  (the longest remaining path to a sink, weighted by `est_duration`) and, among ready steps, launch
+  the highest bottom-level first. Ties break by tag (ascending). This wins over plain LPT when a
+  *cheap* step heads a *long* dependency chain: LPT would start some other individually-larger step
+  first and leave the long chain to finish late, whereas critical-path starts the chain-head
+  immediately.
 
-- **A pluggable planner (`--planner`).** The greedy LPT pass is the only strategy for now; a
-  `--planner` flag that selects a smarter **critical-path / lookahead** planner — one that reasons
-  about the whole remaining graph, not just the current ready set — is planned (ds-afzsqf).
-- **A learned duration profile.** `est_duration_s` is, for now, a static hint you write into the DAG.
-  A separate, auto-updated **profile store** that records real per-step durations from past runs and
-  feeds them back as the estimate is planned (ds-7pzdgm). Its **storage** half now ships: every `run`
-  and `sweep` auto-logs per-step timings and memory to a default profile store (see
-  [Profiling and experimenting with individual steps](#profiling-and-experimenting-with-individual-steps)
-  below), so the data a future planner would learn from is already being collected. Feeding those
-  recorded durations back in as the estimate automatically is the remaining step.
+### The learned-estimate feedback loop
+
+`est_duration_s` does **not** have to be a static hint you hand-author. At plan time the runner reads
+the auto-logged **profile store** back (for the current machine + container class) and derives, per
+step:
+
+- a robust **`est_duration_s`** — the **contention-discounted median** of that step's past
+  `elapsed_s`. It is a *median* (not a mean) so a single slow sample cannot drag it, and it is
+  *discounted* by whatever contention signal the store carries (`pct_other`, `external_cores`, a
+  CPU-pressure column, or `co_tenants`) to recover the step's *intrinsic*, uncontended duration —
+  correcting a duration that was measured on a loaded box back toward its quiet-box value. Robust
+  stats (median / MAD-trim) keep noise and outliers from dominating.
+- a robust **`rss_estimate_bytes`** — a **high percentile** (90th, nearest-rank) of that step's past
+  `peak_bytes`, so one spurious spike does not inflate the memory model while a genuinely high
+  footprint is still respected.
+
+These **override the DAG-authored hint** whenever the store has enough samples for a step (the hint
+is the fallback; and if the store has no data for a step, its hint — then the built-in default —
+applies). The same learned `rss_estimate_bytes` feeds the memory-aware `--max-mem` sizing, so both
+the schedule *and* the chosen `-j` improve automatically as runs accumulate. Pass
+`--no-profile-feedback` to ignore the store and plan from the DAG hints only (useful for a
+reproducible run).
+
+Today's per-step store rows do not yet carry per-step contention columns, so on real data the
+discount is a no-op (the plain median is used) until a step's rows include one of the contention
+signals above; the reader consumes them "where present", so the discount engages automatically once
+they do. Populating per-step contention, and the full **parallel-speedup-curve modeling** (learning
+each step's speedup vs inner `-j` from the multi-width `sweep` samples, with total-CPU-seconds growth
+as a work-conservation signal), are the clearly-scoped remaining work.
+
+### Seeing the plan: `plan` / `run --show-plan`
+
+`safe-ci-dag-runner plan --dag FILE` prints — without running anything — the per-step estimate and
+**its source** (`store` = learned, `hint` = DAG-authored, `default` = none), the `rss_estimate`, the
+`bottom_level`, the **critical path**, and the **scheduled order**, so a CI-optimizing agent can see
+*why* the planner ordered things:
+
+```
+$ safe-ci-dag-runner plan --dag dag.json --planner critical-path
+plan: critical-path
+per-step estimates (source: store = learned from the profile store; hint = DAG-authored; default = none):
+step       est_duration_s  source  rss_estimate  rss_source  bottom_level_s  samples
+---------  --------------  ------  ------------  ----------  --------------  -------
+build.app           3.000   store       1.1 GiB       store          13.000        4
+test.unit          10.000    hint             -        none          10.000        0
+lint.all            5.000    hint             -        none           5.000        0
+critical path (13.000s): build.app -> test.unit
+scheduled order: build.app, test.unit, lint.all
+```
+
+`plan --format json` emits the same plan as canonical JSON (byte-identical across the Python and Rust
+builds — the estimate strings are fixed-precision so parity does not depend on float `repr`).
+`run --show-plan` prints this table and then runs the DAG in that order. `plan` accepts `--planner`,
+`--perf-dir`, and `--no-profile-feedback`.
 
 ## The DAG JSON schema
 

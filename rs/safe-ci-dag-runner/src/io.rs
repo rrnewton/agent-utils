@@ -327,7 +327,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
 // --------------------------------------------------------------------------- serialization
 
 /// Quote and escape a string the way Python's `json.dumps` does for ASCII input.
-fn json_str(s: &str) -> String {
+pub(crate) fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

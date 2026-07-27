@@ -252,7 +252,7 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-fn parse_csv_line(line: &str) -> Vec<String> {
+pub(crate) fn parse_csv_line(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut field = String::new();
     let mut chars = line.chars().peekable();

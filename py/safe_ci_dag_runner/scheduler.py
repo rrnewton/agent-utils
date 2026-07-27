@@ -175,6 +175,7 @@ class Runner:
         cgroups: CgroupManager,
         keep_going: bool = False,
         verbosity: int = 1,
+        order: Sequence[str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.jobs = max(1, jobs)
@@ -183,15 +184,20 @@ class Runner:
         # verbosity: 0 quiet(+failures), 1 default(+summaries), >=2 stream child stdout.
         self.verbosity = verbosity
         self.steps: dict[str, Step] = cfg.by_tag()
-        # Dispatch order = LONGEST-processing-time first (LPT makespan heuristic): sort by the
-        # static duration hint DESCENDING. The sort is STABLE, so steps with equal/no hint keep
-        # registration order. This only decides which READY step is picked first when a scarce
-        # resource frees; dependency and resource gating are enforced separately in run().
-        self.order: list[str] = sorted(
-            (s.tag for s in cfg.steps),
-            key=lambda tag: self.steps[tag].hint.est_duration_s,
-            reverse=True,
-        )
+        # Dispatch order. When the caller supplies an explicit `order` (e.g. a critical-path
+        # planner's), use it verbatim; otherwise default to LONGEST-processing-time first (LPT
+        # makespan heuristic): sort by the static duration hint DESCENDING. The sort is STABLE, so
+        # steps with equal/no hint keep registration order. Order only decides which READY step is
+        # picked first when a slot/resource frees; dependency and resource gating are enforced
+        # separately in run().
+        if order is not None:
+            self.order = list(order)
+        else:
+            self.order = sorted(
+                (s.tag for s in cfg.steps),
+                key=lambda tag: self.steps[tag].hint.est_duration_s,
+                reverse=True,
+            )
         # Remaining capacity per named scarce resource (mutable copy of the caps).
         self.resource_avail: dict[str, int] = dict(cfg.resource_caps)
         self.lock = threading.Lock()
@@ -522,6 +528,7 @@ def run_dag(
     metrics: MetricsSink | None = None,
     keep_going: bool = False,
     verbosity: int = 1,
+    order: Sequence[str] | None = None,
 ) -> RunResult:
     """Run a whole DAG and return its :class:`RunResult`.
 
@@ -540,6 +547,8 @@ def run_dag(
         them; the scheduler still stops launching new steps (it does NOT run every still-runnable
         step), so in-flight steps report their own pass/fail rather than ABORTED.
     :param verbosity: 0 quiet (+failures), 1 default (+summaries), >=2 stream child stdout.
+    :param order: explicit dispatch order (e.g. a critical-path planner's); ``None`` uses the
+        built-in longest-processing-time default.
     """
     sink: MetricsSink = metrics if metrics is not None else _NoopMetricsSink()
     manager: CgroupManager = cgroups if cgroups is not None else _NoopCgroupManager()
@@ -557,6 +566,7 @@ def run_dag(
         cgroups=manager,
         keep_going=keep_going,
         verbosity=verbosity,
+        order=order,
     )
     window: RunWindow = sink.start_run_window()
     ok = runner.run()
