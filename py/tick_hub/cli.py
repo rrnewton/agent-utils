@@ -1,0 +1,436 @@
+"""Command-line interface for tick-hub.
+
+Subcommands:
+  tick   --config FILE [--state FILE]   run one tick: emit HEALTH/ACTION/NOTE/ERROR lines
+  list   --config FILE                  list the reminders + health checks
+  json   --config FILE                  re-emit the config as canonical JSON
+  yaml   --config FILE                  re-emit the config as YAML
+  state  --state FILE                   validate + show the ops-state's own lines
+  quickstart                            print a self-contained getting-started guide
+
+A config is a JSON or YAML file (see `quickstart` for the schema + a runnable example). `--config`
+auto-detects the format by extension: `.yaml`/`.yml` load as YAML, everything else as JSON.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+from tick_hub import __version__
+from tick_hub.cadence import load_fired_state, persist_fired_state
+from tick_hub.engine import run_tick
+from tick_hub.io import (
+    TickConfigError,
+    config_from_json,
+    config_from_yaml,
+    config_to_json,
+    config_to_yaml,
+)
+from tick_hub.model import EVERY_TICK, TickConfig
+from tick_hub.probes import GlobFileAgeProbe, SubprocessGateRunner, wall_clock_now
+from tick_hub.state import OpsState, StateError, state_lines
+
+PROG = "tick-hub"
+
+#: Environment variable overriding the default fired-state file location.
+STATE_FILE_ENV = "TICK_HUB_STATE"
+
+#: Default fired-state file, RELATIVE TO THE CURRENT WORKING DIRECTORY, used when neither
+#: ``--fired-state`` nor ``$TICK_HUB_STATE`` is set. Created on demand.
+DEFAULT_FIRED_STATE = os.path.join(".tick-hub", "state")
+
+
+# --------------------------------------------------------------------------- colors
+class Palette:
+    """Minimal ANSI colorizer (stdlib only). Disabled for non-ttys and when NO_COLOR is set."""
+
+    def __init__(self, enabled: bool) -> None:
+        self.enabled = enabled
+
+    def _wrap(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.enabled else text
+
+    def bold(self, text: str) -> str:
+        return self._wrap("1", text)
+
+    def dim(self, text: str) -> str:
+        return self._wrap("2", text)
+
+    def green(self, text: str) -> str:
+        return self._wrap("32", text)
+
+    def yellow(self, text: str) -> str:
+        return self._wrap("33", text)
+
+    def cyan(self, text: str) -> str:
+        return self._wrap("36", text)
+
+
+def _color_enabled(stream: object) -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    isatty = getattr(stream, "isatty", None)
+    return bool(callable(isatty) and isatty())
+
+
+def _banner(c: Palette) -> str:
+    return (
+        f"{c.bold(PROG)} {c.dim('v' + __version__)}\n"
+        "A single scheduled tick that funnels many recurring responsibilities, each on its own\n"
+        "cadence, and emits machine-readable HEALTH/ACTION/NOTE/ERROR lines for a coordinator or\n"
+        "automation to dispatch. Reminders, gates, and health checks are all caller config."
+    )
+
+
+def _epilog(c: Palette) -> str:
+    ex = c.cyan
+    return (
+        f"{c.bold('examples')}\n"
+        f"  {ex(f'{PROG} quickstart')}                          {c.dim('# get started (model + runnable demo)')}\n"
+        f"  {ex(f'{PROG} tick --config ops.yaml')}              {c.dim('# one tick (dry-run: no state write)')}\n"
+        f"  {ex(f'{PROG} tick --config ops.yaml --flush')}      {c.dim('# ...and persist the fired-state')}\n"
+        f"  {ex(f'{PROG} list --config ops.yaml')}              {c.dim('# reminders + health checks')}\n"
+        f"  {ex(f'{PROG} state --state host.yaml')}             {c.dim('# validate + show the ops-state lines')}\n\n"
+        f"{c.dim('The fired-state (per-reminder last-fired epochs) lives at ./.tick-hub/state by')}\n"
+        f"{c.dim(f'default (override with --fired-state or ${STATE_FILE_ENV}); it is written only on --flush.')}"
+    )
+
+
+# --------------------------------------------------------------------------- quickstart
+def _quickstart(c: Palette) -> str:
+    h = c.bold
+    k = c.cyan
+    return f"""{_banner(c)}
+
+{h('The idea')}  {c.dim('- one heartbeat, many cadenced reminders, machine-readable output')}
+  A "tick" is one heartbeat (a cron job, a coordinator loop, a systemd timer). On each tick the
+  hub checks every DUE reminder and prints a stable, line-oriented report. A slow reminder (say a
+  6-hourly sync) only appears when its cadence has elapsed; a reminder that is not due prints
+  nothing. This lets ONE loop carry every recurring responsibility instead of N separate timers.
+
+{h('1. Install')}
+  pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"
+
+{h('2. Write a reminder set (YAML)')}  {c.dim('- the caller plug-in; JSON works too')}
+  Save as ops.yaml:
+  reminders:
+    - name: git_sync                 {c.dim('# a plain timed reminder')}
+      cadence_secs: 21600            {c.dim('# ~6h; 0 = every tick')}
+      emit: {{kind: action, skill: git-sync, title: "fetch origin and reconcile"}}
+    - name: backlog                  {c.dim('# a GATED reminder that CAPTURES a live value')}
+      cadence_secs: 0
+      gate: {{cmd: "echo count=42", when: always, capture: true}}
+      emit:
+        kind: action
+        skill: backlog-triage
+        fields: {{threshold: "20"}}
+        title: "backlog has {{count}} ready items (threshold {{threshold}})"
+    - name: benchmark                {c.dim('# only fires when a state flag is truthy')}
+      requires_flags: [benchmark_enabled]
+      emit: {{kind: action, skill: run-benchmark, title: "refresh benchmarks"}}
+  health_checks:
+    - name: db_backup
+      glob: "/var/backups/db-*.sql"
+      threshold_secs: 93600
+      detail: "newest DB snapshot"
+
+{h('3. Run a tick')}
+  {k(f'{PROG} tick --config ops.yaml')}          {c.dim('# dry-run: prints the lines, does NOT persist state')}
+  {k(f'{PROG} tick --config ops.yaml --flush')}  {c.dim('# persist per-reminder last-fired epochs')}
+
+{h('The output contract')}  {c.dim('(parse by the leading token; lines are independent)')}
+  HEALTH: <check> <ok|stale|missing> age_secs=<N|NA> threshold_secs=<N> detail="..."
+  ACTION: <skill> [key=value ...] title="..."
+  NOTE:   <free text>
+  ERROR:  <text>
+  {c.dim('A caller dispatches each ACTION to the named skill/handler; HEALTH is a freshness')}
+  {c.dim('signal to investigate (not a work item); NOTE is informational; ERROR needs attention.')}
+
+{h('Reminders')}  {c.dim('(each: WHEN to check, WHETHER to fire, WHAT to emit)')}
+  cadence_secs    how often to CHECK the reminder (0 = every tick; else seconds since last fire)
+  requires_flags  names of ops-state flags that must ALL be truthy, or the reminder is suppressed
+  gate            optional shell check: {{cmd, when: success|failure|nonempty|always, capture}}
+                  {c.dim('when=success fires on exit 0; failure on non-zero; nonempty on stdout;')}
+                  {c.dim('capture=true parses stdout key=value lines into fields + {{placeholders}}')}
+  emit            action ({{skill, fields, title}}) or note ({{title}})
+
+{h('The ops-state (per-host runtime state)')}  {c.dim('- YAML; strict + typed')}
+  {k(f'{PROG} tick --config ops.yaml --state host.yaml')}
+  enabled: true          {c.dim('# master switch; false => summary + health only, no reminders')}
+  tick_frequency_min: 30 {c.dim('# desired cadence; --current-tick-min N triggers an actualize ACTION')}
+  label: my-host         {c.dim('# optional identity shown in the state summary')}
+  flags:                 {c.dim('# caller-defined toggles read by requires_flags (bool/int/str)')}
+    benchmark_enabled: true
+
+{h('Cadence + state files')}
+  Per-reminder last-fired epochs live in a tiny key=last_fired_epoch file:
+    {k('./.tick-hub/state')}   {c.dim('(created on demand; override with --fired-state or $' + STATE_FILE_ENV + ')')}
+  It is written ONLY on {k('--flush')}; the default dry-run mutates nothing.
+
+{h('Exit codes')}  0 = tick ran | 2 = bad usage / bad config or state file
+"""
+
+
+# --------------------------------------------------------------------------- loading
+def _load_config(config_arg: str) -> TickConfig:
+    path = Path(config_arg)
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in (".yaml", ".yml"):
+        return config_from_yaml(text)
+    return config_from_json(text)
+
+
+def _resolve_fired_path(fired_arg: str | None) -> Path:
+    if fired_arg:
+        return Path(fired_arg)
+    env = os.environ.get(STATE_FILE_ENV)
+    if env:
+        return Path(env)
+    return Path(DEFAULT_FIRED_STATE)
+
+
+# --------------------------------------------------------------------------- rendering
+def _render_list(cfg: TickConfig, c: Palette) -> str:
+    lines: list[str] = []
+    if cfg.reminders:
+        lines.append(c.bold("reminders:"))
+        width = max(len(r.name) for r in cfg.reminders)
+        for rem in cfg.reminders:
+            cadence = "every-tick" if rem.cadence_secs == EVERY_TICK else f"{rem.cadence_secs}s"
+            gate = ""
+            if rem.gate is not None:
+                cap = ",capture" if rem.gate.capture else ""
+                gate = c.dim(f" gate[{rem.gate.when.value}{cap}]")
+            flags = c.dim(f" needs={','.join(rem.requires_flags)}") if rem.requires_flags else ""
+            name = c.bold(f"{rem.name:<{width}}")
+            kind = c.yellow(f"[{rem.emit.kind.value}]")
+            target = rem.emit.skill if rem.emit.skill else rem.emit.title
+            lines.append(f"  {name}  {kind} {c.cyan(cadence)} {target}{gate}{flags}")
+    else:
+        lines.append(c.dim("(no reminders)"))
+    if cfg.health_checks:
+        lines.append(c.bold("health checks:"))
+        for hc in cfg.health_checks:
+            lines.append(
+                f"  {c.bold(hc.name)}  {c.dim(hc.glob)} "
+                f"{c.cyan(f'threshold={hc.threshold_secs}s')}"
+            )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- parser
+class _ColorHelp(argparse.RawDescriptionHelpFormatter):
+    """Raw formatter so our colored description/epilog render verbatim."""
+
+
+def build_parser() -> argparse.ArgumentParser:
+    c = Palette(_color_enabled(sys.stdout))
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        formatter_class=_ColorHelp,
+        description=_banner(c),
+        epilog=_epilog(c),
+    )
+    parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    tick_p = sub.add_parser("tick", help="run one tick (emit HEALTH/ACTION/NOTE/ERROR lines)")
+    tick_p.add_argument(
+        "--config",
+        required=True,
+        metavar="FILE",
+        help="reminder-set config file; .yaml/.yml load as YAML, else JSON",
+    )
+    tick_p.add_argument(
+        "--state",
+        metavar="FILE",
+        default=None,
+        help="per-host ops-state YAML (optional; a sensible enabled default is used when omitted)",
+    )
+    tick_p.add_argument(
+        "--fired-state",
+        metavar="FILE",
+        default=None,
+        help=f"per-reminder last-fired-epoch file (default: ./{DEFAULT_FIRED_STATE} or "
+        f"${STATE_FILE_ENV})",
+    )
+    tick_p.add_argument(
+        "--now",
+        type=int,
+        default=None,
+        metavar="EPOCH",
+        help="override the clock with an explicit epoch (seconds) for deterministic runs",
+    )
+    tick_p.add_argument(
+        "--current-tick-min",
+        type=int,
+        default=None,
+        metavar="N",
+        help="the actually-running tick cadence in minutes; when it differs from the ops-state's "
+        "tick_frequency_min, emit an actualize-tick-frequency ACTION",
+    )
+    tick_p.add_argument(
+        "--flush",
+        action="store_true",
+        help="persist the advanced fired-state (default: dry-run, mutate nothing)",
+    )
+    tick_p.add_argument(
+        "--no-header",
+        action="store_true",
+        help="suppress the explanatory stderr banner (pure machine parsing)",
+    )
+
+    state_p = sub.add_parser("state", help="validate + show the ops-state's own lines")
+    state_p.add_argument("--state", required=True, metavar="FILE", help="ops-state YAML file")
+    state_p.add_argument(
+        "--current-tick-min",
+        type=int,
+        default=None,
+        metavar="N",
+        help="the running tick cadence in minutes (drives the actualize-tick-frequency ACTION)",
+    )
+
+    for cmd, helptext in (
+        ("list", "list the reminders + health checks"),
+        ("json", "re-emit the config as canonical JSON"),
+        ("yaml", "re-emit the config as YAML"),
+    ):
+        sp = sub.add_parser(cmd, help=helptext)
+        sp.add_argument(
+            "--config",
+            required=True,
+            metavar="FILE",
+            help="config file; .yaml/.yml load as YAML, else JSON",
+        )
+
+    sub.add_parser("quickstart", help="print a self-contained getting-started guide")
+    return parser
+
+
+# --------------------------------------------------------------------------- commands
+def _cmd_tick(ns: argparse.Namespace, c: Palette) -> int:
+    config_arg = ns.config if isinstance(ns.config, str) else None
+    if config_arg is None:
+        print(f"{PROG}: tick: --config FILE is required", file=sys.stderr)
+        return 2
+    try:
+        cfg = _load_config(config_arg)
+    except (OSError, TickConfigError) as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+
+    state_arg = ns.state if isinstance(ns.state, str) else None
+    state_note: str | None = None
+    if state_arg is None:
+        state = OpsState.default()
+        state_note = "no --state file given; using the default enabled ops-state"
+    elif not Path(state_arg).is_file():
+        state = OpsState.default()
+        state_note = f"ops-state file {state_arg} not found; using the default enabled ops-state"
+    else:
+        try:
+            state = OpsState.load(state_arg)
+        except (OSError, StateError) as exc:
+            print(f"{PROG}: invalid ops-state {state_arg}: {exc}", file=sys.stderr)
+            return 2
+
+    now = int(ns.now) if isinstance(ns.now, int) else wall_clock_now()
+    current_tick_min = ns.current_tick_min if isinstance(ns.current_tick_min, int) else None
+    fired_path = _resolve_fired_path(ns.fired_state if isinstance(ns.fired_state, str) else None)
+    fired = load_fired_state(fired_path)
+
+    result = run_tick(
+        cfg,
+        state,
+        now=now,
+        fired=fired,
+        gate_runner=SubprocessGateRunner(),
+        age_probe=GlobFileAgeProbe(),
+        current_tick_min=current_tick_min,
+    )
+
+    if not bool(ns.no_header):
+        print(_banner(c), file=sys.stderr)
+        if state_note is not None:
+            print(f"{PROG}: {state_note}", file=sys.stderr)
+
+    for line in result.lines:
+        print(line)
+
+    if bool(ns.flush):
+        persist_fired_state(fired_path, dict(result.fired))
+        print(f"{PROG}: fired-state persisted to {fired_path}", file=sys.stderr)
+    else:
+        print(
+            f"{PROG}: dry-run (fired-state NOT persisted; pass --flush to persist)",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _cmd_state(ns: argparse.Namespace) -> int:
+    state_arg = ns.state if isinstance(ns.state, str) else None
+    if state_arg is None:
+        print(f"{PROG}: state: --state FILE is required", file=sys.stderr)
+        return 2
+    try:
+        state = OpsState.load(state_arg)
+    except (OSError, StateError) as exc:
+        print(f"{PROG}: invalid ops-state {state_arg}: {exc}", file=sys.stderr)
+        return 2
+    current_tick_min = ns.current_tick_min if isinstance(ns.current_tick_min, int) else None
+    for line in state_lines(state, current_tick_min):
+        print(line)
+    return 0
+
+
+def _cmd_config_render(ns: argparse.Namespace, command: str, c: Palette) -> int:
+    config_arg = ns.config if isinstance(ns.config, str) else None
+    if config_arg is None:
+        print(f"{PROG}: {command}: --config FILE is required", file=sys.stderr)
+        return 2
+    try:
+        cfg = _load_config(config_arg)
+    except (OSError, TickConfigError) as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    if command == "list":
+        print(_render_list(cfg, c))
+    elif command == "json":
+        print(config_to_json(cfg))
+    elif command == "yaml":
+        sys.stdout.write(config_to_yaml(cfg))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    ns = parser.parse_args(list(argv) if argv is not None else None)
+    c = Palette(_color_enabled(sys.stdout))
+
+    command = ns.command if isinstance(ns.command, str) else None
+    if command is None:
+        parser.print_help()
+        return 0
+    if command == "quickstart":
+        print(_quickstart(c))
+        return 0
+    if command == "tick":
+        return _cmd_tick(ns, c)
+    if command == "state":
+        return _cmd_state(ns)
+    if command in ("list", "json", "yaml"):
+        return _cmd_config_render(ns, command, c)
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = ["main", "build_parser", "PROG", "STATE_FILE_ENV", "DEFAULT_FIRED_STATE"]

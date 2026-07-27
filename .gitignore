@@ -20,6 +20,11 @@ dist/
 # perf data, not source. Delete this line to check the history in instead (project choice).
 .safe-ci-dag-runner/
 
+# --- default fired-state store (tick-hub) ---
+# `tick-hub tick --flush` writes per-reminder last-fired epochs here by default; it is
+# machine-local runtime state, not source.
+.tick-hub/
+
 # --- editor / os ---
 *.swp
 .DS_Store

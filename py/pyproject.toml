@@ -27,14 +27,20 @@ dev = ["mypy", "pytest", "types-PyYAML"]
 [project.urls]
 Repository = "https://github.com/rrnewton/agent-utils"
 
+# Console scripts for every tool the shared py/ distribution ships. The tools are independent (no
+# shared runtime library); they simply co-habit one py/ tree with one mypy/pytest config. If a truly
+# separate PyPI distribution per tool is wanted later, split py/ into per-tool subdirs — tracked as a
+# follow-up. `cd py && python3 -m mypy .` / `pytest -q` already cover every package here.
 [project.scripts]
 safe-ci-dag-runner = "safe_ci_dag_runner.cli:main"
+tick-hub = "tick_hub.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["safe_ci_dag_runner*"]
+include = ["safe_ci_dag_runner*", "tick_hub*"]
 
 [tool.setuptools.package-data]
 safe_ci_dag_runner = ["py.typed"]
+tick_hub = ["py.typed"]
 
 # mypy: strict, and no explicit `Any` allowed in our own annotations.
 # (disallow_any_expr is intentionally NOT enabled yet — it fights stdlib return types;
