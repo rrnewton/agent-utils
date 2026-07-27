@@ -161,18 +161,27 @@ fn affinity_width(container_class: &str) -> Option<i64> {
     }
 }
 
-fn parse_float(cell: Option<&String>) -> Option<f64> {
-    match cell {
-        Some(s) if !s.is_empty() => s.parse::<f64>().ok(),
-        _ => None,
+/// Trim the surrounding ASCII whitespace that Python's `str.strip` removes over the same
+/// five-character set (tab, newline, form-feed, carriage-return, space) and return the cleaned
+/// token, or `None` when it is empty. Rust's `str::parse` already rejects the non-ASCII characters,
+/// `_` separators, and out-of-`i64` magnitudes that Python's permissive `float()` / `int()` would
+/// otherwise accept, so trimming is all that is needed for the two builds to accept EXACTLY the same
+/// numeric tokens from a store cell (mirrors `_clean_numeric_cell` in the Python port).
+fn clean_numeric_cell(cell: Option<&String>) -> Option<&str> {
+    let token = cell?.trim_matches(|c: char| c.is_ascii_whitespace());
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
     }
 }
 
+fn parse_float(cell: Option<&String>) -> Option<f64> {
+    clean_numeric_cell(cell).and_then(|t| t.parse::<f64>().ok())
+}
+
 fn parse_int(cell: Option<&String>) -> Option<i64> {
-    match cell {
-        Some(s) if !s.is_empty() => s.parse::<i64>().ok(),
-        _ => None,
-    }
+    clean_numeric_cell(cell).and_then(|t| t.parse::<i64>().ok())
 }
 
 /// The fraction of machine capacity taken by OTHER work during a sample, from whichever
@@ -757,6 +766,61 @@ mod tests {
         );
         // n=3, rank = (27+9)/10 = 3 -> the max.
         assert_eq!(high_percentile(&[5, 9, 7]), 9);
+    }
+
+    #[test]
+    fn parse_helpers_trim_and_reject() {
+        // Surrounding ASCII whitespace is trimmed (matches Python's str.strip over the same set).
+        assert_eq!(parse_float(Some(&" 50.0 ".to_string())), Some(50.0));
+        assert_eq!(parse_int(Some(&"  1000\t".to_string())), Some(1000));
+        // PEP-515 underscore separators are rejected in both builds.
+        assert_eq!(parse_float(Some(&"1_0.0".to_string())), None);
+        assert_eq!(parse_int(Some(&"1_000".to_string())), None);
+        // Out-of-i64 magnitudes are rejected (Python's bigint would otherwise keep them).
+        assert_eq!(parse_int(Some(&"9999999999999999999999".to_string())), None);
+        assert_eq!(parse_int(Some(&(i64::MAX).to_string())), Some(i64::MAX));
+        // Empty / whitespace-only / absent cells are None.
+        assert_eq!(parse_float(Some(&"   ".to_string())), None);
+        assert_eq!(parse_float(None), None);
+    }
+
+    #[test]
+    fn affinity_width_is_ascii_digit_only() {
+        assert_eq!(affinity_width("affinity8_cpu-max"), Some(8));
+        assert_eq!(affinity_width("affinity316_x"), Some(316));
+        // A Unicode-digit container_class must NOT be misread (returns None, never panics).
+        assert_eq!(affinity_width("affinity\u{00b2}_cpu"), None); // superscript two
+        assert_eq!(affinity_width("nonaffinity"), None);
+        assert_eq!(affinity_width("affinity_cpu"), None);
+    }
+
+    #[test]
+    fn load_step_samples_trims_and_rejects_hostile_cells() {
+        let dir = std::env::temp_dir().join(format!("scdr_est_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let csv = "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,\
+                   enforcement_kind,runner_name,step,classification,inner_jobs,elapsed_s,returncode,\
+                   ok,timed_out,oom_kills,peak_bytes,thread_peak,pct_other\n\
+                   t,m,c,abc,1,abc,unverified,local,g.a,light,1, 8.0 ,0,True,False,0,1000,,0.0\n\
+                   t,m,c,abc,1,abc,unverified,local,g.a,light,1,4.0,0,True,False,0,2000,,0.0\n\
+                   t,m,c,abc,1,abc,unverified,local,g.a,light,1,10.0,0,True,False,0,3000,, 50.0 \n\
+                   t,m,c,abc,1,abc,unverified,local,g.b,light,1,1_0.0,0,True,False,0,1_000,,0.0\n\
+                   t,m,c,abc,1,abc,unverified,local,g.b,light,1,4.0,0,True,False,0,9999999999999999999999,,0.0\n\
+                   t,m,c,abc,1,abc,unverified,local,g.b,light,1,6.0,0,True,False,0,5000,,0.0\n";
+        let path = dir.join("step_profiles_m_c.csv");
+        std::fs::write(&path, csv).unwrap();
+        let samples = load_step_samples(&dir, "m", "c");
+        // g.a: whitespace elapsed trimmed, padded ' 50.0 '% contention trimmed+applied -> [8,4,5].
+        let a = &samples["g.a"];
+        assert_eq!(a.samples, 3);
+        assert_eq!(a.est_duration_s, Some(5.0));
+        assert_eq!(a.rss_estimate_bytes, Some(3000));
+        // g.b: '1_0.0' rejected -> [4,6] median 5; '1_000' + out-of-i64 peak rejected -> [5000].
+        let b = &samples["g.b"];
+        assert_eq!(b.samples, 3);
+        assert_eq!(b.est_duration_s, Some(5.0));
+        assert_eq!(b.rss_estimate_bytes, Some(5000));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

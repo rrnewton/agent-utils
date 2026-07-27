@@ -945,6 +945,107 @@ _FEEDBACK_STORE_CSV = (
 )
 
 
+#: A DAG whose two steps carry only large est_duration HINTS, so the hostile store below (whose
+#: numeric cells the reader must parse identically in both builds) is the sole source of the learned
+#: durations/rss. If either build failed to parse a hostile cell the way the other does, the store
+#: estimate — and thus the plan JSON — would diverge.
+_HOSTILE_DAG = {
+    "mem_cap_factor": 1.0,
+    "mem_cap_floor_bytes": 0,
+    "outer_mem_safety_factor": 1.0,
+    "steps": [
+        {"group": "h", "job": "ws", "desc": "ws", "cmd": "true",
+         "hint": {"est_duration_s": 99.0}},
+        {"group": "h", "job": "us", "desc": "us", "cmd": "true",
+         "hint": {"est_duration_s": 99.0, "rss_baseline_bytes": 4242}},
+    ],
+}
+
+#: A per-step profile store full of HOSTILE numeric cells that Python's ``float()``/``int()`` accept
+#: but Rust's ``str::parse`` rejects (or vice versa) unless both builds normalize identically:
+#: whitespace-padded ``elapsed_s`` and ``pct_other`` (must TRIM and then apply the discount in both),
+#: PEP-515 underscore separators (must be REJECTED in both), and an out-of-i64 ``peak_bytes`` (must
+#: be REJECTED in both — Python's arbitrary-precision int would otherwise keep it). This is the
+#: adversarial data the earlier clean-only fixture could not exercise; it guards parse-helper
+#: equivalence across the two builds.
+#:
+#: Expected (identical) derivation in BOTH builds:
+#:   h.ws elapsed [' 8.0 '->8, 4.0, '10.0' under ' 50.0 '% -> 5] => robust median 5.000; peaks
+#:        [1000,2000,3000] => p90 3000.
+#:   h.us elapsed ['1_0.0' rejected, 4.0, 6.0] => robust median 5.000; peaks ['1_000' rejected,
+#:        9999999999999999999999 rejected, 5000] => p90 5000.
+_HOSTILE_STORE_CSV = (
+    "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
+    "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
+    "peak_bytes,thread_peak,pct_other\n"
+    f"2026-07-26T10:00:00,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "h.ws,light,1, 8.0 ,0,True,False,0,1000,,0.0\n"
+    f"2026-07-26T10:00:01,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "h.ws,light,1,4.0,0,True,False,0,2000,,0.0\n"
+    f"2026-07-26T10:00:02,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "h.ws,light,1,10.0,0,True,False,0,3000,, 50.0 \n"
+    f"2026-07-26T10:00:03,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "h.us,light,1,1_0.0,0,True,False,0,1_000,,0.0\n"
+    f"2026-07-26T10:00:04,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "h.us,light,1,4.0,0,True,False,0,9999999999999999999999,,0.0\n"
+    f"2026-07-26T10:00:05,{SYNTH_MACHINE},{SYNTH_CONTAINER},abc,1,abc,unverified,local,"
+    "h.us,light,1,6.0,0,True,False,0,5000,,0.0\n"
+)
+
+
+def compare_hostile_numeric_cells(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the profile-store numeric-cell PARSING is equivalent across builds on ADVERSARIAL data.
+
+    Feeds a fixed store whose cells stress the Python-``float()``/``int()`` vs Rust-``str::parse``
+    difference (leading/trailing whitespace, PEP-515 ``_`` separators, out-of-i64 magnitudes) and
+    asserts ``plan --format json`` is BYTE-IDENTICAL across the two builds — plus that the derived
+    values actually reflect the trim/reject rules (so the check proves the normalization happened,
+    not merely that both builds fell back to the hint). This is the regression guard the earlier
+    clean-only feedback fixture could not provide."""
+    extra = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": SYNTH_MACHINE,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": SYNTH_CONTAINER,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{SYNTH_MACHINE}_{SYNTH_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+            fh.write(_HOSTILE_STORE_CSV)
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_HOSTILE_DAG))
+
+        args = ("plan", "--dag", dag_path, "--perf-dir", store, "--format", "json")
+        po = run(py, args, extra)
+        ro = run(rs, args, extra)
+        if po.returncode != 0 or ro.returncode != 0:
+            rep.bad(
+                "hostile-cells",
+                f"exit py={po.returncode} rs={ro.returncode} "
+                f"(py stderr={po.stderr!r}; rs stderr={ro.stderr!r})",
+            )
+            return
+        if po.stdout != ro.stdout:
+            rep.bad(
+                "hostile-cells",
+                f"plan output not byte-identical on hostile numeric cells\n--- py ---\n{po.stdout}\n"
+                f"--- rs ---\n{ro.stdout}",
+            )
+            return
+        rep.ok("hostile-cells")
+        # Positive proof the whitespace-trim + reject rules actually fired (both agree, checked py):
+        #   both hostile steps must derive est_duration 5.000 FROM THE STORE (not the 99.0 hint).
+        if '"est_source": "store"' in po.stdout and po.stdout.count('"est_duration_s": "5.000"') == 2:
+            rep.ok("hostile-cells:trim-applied")
+        else:
+            rep.bad(
+                "hostile-cells:trim-applied",
+                "expected both steps to learn est_duration 5.000 from the trimmed store cells; "
+                f"got\n{po.stdout}",
+            )
+
+
 def _order_from_plan_json(stdout: str) -> list[str] | None:
     """Extract the scheduled ``order`` list from ``plan --format json`` output (``None`` if
     unparseable)."""
@@ -1137,6 +1238,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     compare_only_errors(py, rs, rep)
     compare_profile_store(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
+    compare_hostile_numeric_cells(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

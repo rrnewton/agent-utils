@@ -79,6 +79,20 @@ _RSS_PCTL_DEN = 10
 #: ``pct_other`` of 100) cannot discount a duration all the way to zero.
 _MAX_CONTENTION = 0.95
 
+#: The inclusive range of a signed 64-bit integer. Python's ``int`` is arbitrary-precision, so an
+#: out-of-range value it would happily keep must be REJECTED here to match Rust's
+#: ``str::parse::<i64>()`` (which fails on overflow). Otherwise the two builds would derive different
+#: estimates from the SAME store cell (e.g. a huge ``peak_bytes``), breaking cross-language parity.
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
+
+#: ASCII whitespace trimmed from a numeric cell before parsing — EXACTLY the five characters Rust's
+#: ``char::is_ascii_whitespace`` trims (tab, newline, form-feed, carriage-return, space; note it does
+#: NOT include the vertical tab 0x0b). Trimming the same set in both builds lets a whitespace-padded
+#: cell (a common CSV-producer artifact from spreadsheets/awk/hand-edited fixtures) parse to the same
+#: number in both, instead of Python accepting it while Rust's strict parse silently drops it.
+_ASCII_WS = "\t\n\x0c\r "
+
 
 class Planner(Enum):
     """Which scheduling planner to use for dispatch ordering."""
@@ -186,31 +200,65 @@ def _affinity_width(container_class: str) -> int | None:
     rest = container_class[len("affinity"):]
     digits = ""
     for ch in rest:
-        if ch.isdigit():
+        # ASCII digits ONLY, matching Rust's ``char::is_ascii_digit``. Python's ``str.isdigit()``
+        # also returns True for Unicode digit characters (e.g. the superscript ``²``) that ``int()``
+        # then cannot parse, which would raise here — restricting to ASCII keeps this function total
+        # (the module never raises, per the docstring) and identical to the Rust build.
+        if ch.isascii() and ch.isdigit():
             digits += ch
         else:
             break
     if not digits:
         return None
-    return int(digits)
+    value = int(digits)
+    # Bound to i64 as Rust's ``digits.parse::<i64>().ok()`` does, so an absurdly wide affinity token
+    # is rejected identically in both builds instead of Python keeping an out-of-range int.
+    if value < _I64_MIN or value > _I64_MAX:
+        return None
+    return value
+
+
+def _clean_numeric_cell(cell: str | None) -> str | None:
+    """Trim surrounding ASCII whitespace and reject anything Rust's strict ``str::parse`` would
+    reject anyway (non-ASCII characters and PEP-515 ``_`` separators), returning the cleaned token or
+    ``None``.
+
+    This is the single source of truth that keeps :func:`_parse_float` / :func:`_parse_int` accepting
+    EXACTLY the same set of numeric tokens as the Rust build: Python's ``float()`` / ``int()`` are
+    permissive (they accept leading/trailing whitespace, underscore separators, and — for ``int`` —
+    out-of-``i64`` magnitudes) while Rust's ``parse`` is strict, so without this normalization the
+    two builds would silently derive different estimates from the same store."""
+    if cell is None:
+        return None
+    token = cell.strip(_ASCII_WS)
+    if not token or not token.isascii() or "_" in token:
+        return None
+    return token
 
 
 def _parse_float(cell: str | None) -> float | None:
-    if cell is None or cell == "":
+    token = _clean_numeric_cell(cell)
+    if token is None:
         return None
     try:
-        return float(cell)
+        return float(token)
     except ValueError:
         return None
 
 
 def _parse_int(cell: str | None) -> int | None:
-    if cell is None or cell == "":
+    token = _clean_numeric_cell(cell)
+    if token is None:
         return None
     try:
-        return int(cell)
+        value = int(token)
     except ValueError:
         return None
+    # Reject out-of-i64 magnitudes so a value Python's arbitrary-precision ``int`` would keep is
+    # dropped exactly as Rust's ``str::parse::<i64>()`` drops it (see :data:`_I64_MIN`).
+    if value < _I64_MIN or value > _I64_MAX:
+        return None
+    return value
 
 
 def _contention_fraction(row: Mapping[str, str], affinity_width: int | None) -> float:

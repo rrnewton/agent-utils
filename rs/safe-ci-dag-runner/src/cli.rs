@@ -207,13 +207,16 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
             "{PROG} run   --dag dag.json --planner critical-path --show-plan  # print the plan, then run it"
         )),
         plan_note = c.dim(
-            "The runner FEEDS the profile store back at plan time: a robust est_duration \
-             (contention-discounted MEDIAN of past elapsed_s) and an rss estimate (high percentile \
-             of past peak_bytes) OVERRIDE the DAG hint once enough samples exist, so est_duration_s \
-             need not be hand-authored and --max-mem sizing improves automatically. --planner \
-             greedy-lpt (default) launches the longest single step first; critical-path launches \
-             the highest bottom-level (longest remaining est-weighted path) first. \
-             --no-profile-feedback ignores the store (DAG hints only)."
+            // Hand-wrapped to ~90 columns (matching the Python quickstart) so the note reads
+            // cleanly on a narrow terminal instead of as one long unbroken line. Each `\n  `
+            // starts a new 2-space-indented line; the trailing `\` then eats the source newline.
+            "The runner FEEDS the profile store back at plan time: a robust est_duration\n  \
+             (contention-discounted MEDIAN of past elapsed_s) and an rss estimate (high\n  \
+             percentile of past peak_bytes) OVERRIDE the DAG hint once enough samples exist,\n  \
+             so est_duration_s need not be hand-authored and --max-mem sizing improves\n  \
+             automatically. --planner greedy-lpt (default) launches the longest single step\n  \
+             first; critical-path launches the highest bottom-level (longest remaining\n  \
+             est-weighted path) first. --no-profile-feedback ignores the store (DAG hints only)."
         ),
         schema = h("DAG schema"),
         schema_note = c.dim("(only group/job/cmd are required per step; everything else has defaults)"),

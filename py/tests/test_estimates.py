@@ -14,7 +14,12 @@ from safe_ci_dag_runner import (
     plan_to_json,
     plan_to_text,
 )
-from safe_ci_dag_runner.estimates import Planner
+from safe_ci_dag_runner.estimates import (
+    Planner,
+    _affinity_width,
+    _parse_float,
+    _parse_int,
+)
 
 _HEADER = (
     "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
@@ -88,6 +93,81 @@ def test_missing_columns_degrade_gracefully(tmp_path: Path) -> None:
     samples = load_step_samples(store, "m", "c")
     assert samples["g.a"].est_duration_s == 2.0
     assert samples["g.a"].rss_estimate_bytes is None
+
+
+def test_parse_helpers_match_rust_strict_grammar() -> None:
+    # Surrounding ASCII whitespace is TRIMMED (matching Rust's str::parse after trim), so a padded
+    # cell parses to the same number instead of one build dropping it.
+    assert _parse_float(" 50.0 ") == 50.0
+    assert _parse_int("  1000\t") == 1000
+    # PEP-515 underscore separators are REJECTED (Rust's str::parse rejects them; Python's
+    # float()/int() would otherwise accept them) -> both builds drop the cell.
+    assert _parse_float("1_0.0") is None
+    assert _parse_int("1_000") is None
+    # Out-of-i64 magnitudes are REJECTED (Python's arbitrary-precision int would otherwise keep
+    # them; Rust's parse::<i64>() overflows) -> both builds drop the cell.
+    assert _parse_int("9999999999999999999999") is None
+    assert _parse_int(str(2**63 - 1)) == 2**63 - 1
+    assert _parse_int(str(2**63)) is None
+    # Empty / whitespace-only / non-ASCII cells are None in both builds.
+    assert _parse_float("   ") is None
+    assert _parse_float(None) is None
+    assert _parse_float("１.０") is None  # fullwidth digits are non-ASCII -> rejected like Rust
+
+
+def test_affinity_width_rejects_non_ascii_digits_without_raising() -> None:
+    # ASCII affinity widths parse; a Unicode-digit container_class (e.g. the superscript two) must
+    # NOT raise (Python's str.isdigit() accepts it but int() cannot) -> returns None like Rust.
+    assert _affinity_width("affinity8_cpu-max") == 8
+    assert _affinity_width("affinity316_x") == 316
+    assert _affinity_width("affinity²_cpu") is None  # superscript 2
+    assert _affinity_width("nonaffinity") is None
+    assert _affinity_width("affinity_cpu") is None
+
+
+def test_whitespace_cells_parse_and_discount_after_trim(tmp_path: Path) -> None:
+    # Whitespace-padded elapsed_s AND pct_other must be trimmed, then the discount applies: the 10s
+    # sample under a padded ' 50.0 '% contention becomes intrinsic 5s, matching the clean samples.
+    store = _write_store(
+        tmp_path,
+        [
+            _row("g.a", " 8.0 ", "1000", pct_other="0.0"),
+            _row("g.a", "4.0", "2000", pct_other="0.0"),
+            _row("g.a", "10.0", "3000", pct_other=" 50.0 "),
+        ],
+    )
+    samples = load_step_samples(store, "m", "c")
+    assert samples["g.a"].samples == 3
+    # robust median of [8, 4, 5] == 5.0.
+    assert samples["g.a"].est_duration_s == 5.0
+    # p90 of [1000, 2000, 3000] == 3000.
+    assert samples["g.a"].rss_estimate_bytes == 3000
+
+
+def test_underscore_and_overflow_cells_rejected(tmp_path: Path) -> None:
+    store = _write_store(
+        tmp_path,
+        [
+            _row("g.a", "1_0.0", "1_000"),
+            _row("g.a", "4.0", "9999999999999999999999"),
+            _row("g.a", "6.0", "5000"),
+        ],
+    )
+    samples = load_step_samples(store, "m", "c")
+    assert samples["g.a"].samples == 3
+    # '1_0.0' rejected -> durations [4, 6] -> median 5.0.
+    assert samples["g.a"].est_duration_s == 5.0
+    # '1_000' and the out-of-i64 peak rejected -> peaks [5000] -> p90 5000.
+    assert samples["g.a"].rss_estimate_bytes == 5000
+
+
+def test_non_ascii_container_class_does_not_crash_loader(tmp_path: Path) -> None:
+    store = _write_store(
+        tmp_path, [_row("g.a", "3.0", "1000")], machine="m", container="affinity²_cpu"
+    )
+    samples = load_step_samples(store, "m", "affinity²_cpu")
+    # No affinity width parsed (non-ASCII digit), so no external_cores discount -> plain median.
+    assert samples["g.a"].est_duration_s == 3.0
 
 
 def _dag() -> DagConfig:
