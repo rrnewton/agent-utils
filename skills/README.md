@@ -13,6 +13,8 @@ by `<tool> --userguide`). This keeps exactly one guide and one skill per tool, b
   concurrency and learned-estimate planning.
 - `tick-hub/SKILL.md` — one scheduled tick funnels many cadenced reminders into machine-readable
   HEALTH/ACTION/NOTE/ERROR lines.
+- `pr-landing-planner/SKILL.md` — conflict-graph + CI-aware advisory landing planner: classifies each
+  red CI, partitions PRs into parallel-safe groups, and recommends a per-PR action.
 
 ## Linking a skill into an agent
 

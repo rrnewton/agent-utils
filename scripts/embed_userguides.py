@@ -58,6 +58,11 @@ EMBEDS: tuple[Embed, ...] = (
         source="common/docs/tick-hub/USER_GUIDE.md",
         destinations=("py/tick_hub/USER_GUIDE.md",),
     ),
+    Embed(
+        tool="pr-landing-planner",
+        source="common/docs/pr-landing-planner/USER_GUIDE.md",
+        destinations=("py/pr_landing_planner/USER_GUIDE.md",),
+    ),
 )
 
 _GENERATED_BANNER = (
