@@ -212,10 +212,23 @@ the memory-aware `--max-mem` sizing. Pass `--no-profile-feedback` to ignore the 
 the DAG hints only (for reproducibility). Inspect exactly what the planner decided — and why — with
 the [`plan` command](#the-plan-command-see-the-estimates--the-schedule) or `run --show-plan`.
 
-Not yet built (a clearly-scoped follow-on): full **parallel-speedup-curve modeling** — learning each
-step's speedup as a function of its inner `-j` from multi-level samples, and watching total-CPU-seconds
-growth as a work-conservation signal. The `sweep` command already *collects* the multi-width samples
-this would learn from; turning them into a per-step speedup model is the remaining piece.
+**Parallel-speedup model.** The runner also learns each step's **speedup curve** — `wall` vs. inner
+`-j` — from the samples the store holds across *different* `inner_jobs` widths (the widths a `sweep`,
+or repeated runs at different `preferred_inner_jobs`, records). For every step with at least two
+measured widths it derives a robust, contention-discounted `wall_s` per width, the achieved
+`effective_cores`, and the **work-conservation signal** (total CPU-seconds `user_s`+`sys_s`, and
+`throttled_s`), then exposes the `speedup(inner_jobs)` curve, the `measured_effective_cores`, and a
+**recommended `inner_jobs`** — the best wall time before the knee (a level must be ≥1.15x faster than
+the previous AND not blow total CPU-seconds past 1.5x) and within the machine's core budget. So a
+step whose wall halves `-j1`→`-j2` but barely improves `-j2`→`-j4` while its total CPU-seconds rise
+gets a recommended `inner_jobs` of 2; a near-linear step gets the widest measured width. This is
+surfaced by `plan` / `run --show-plan` (below) and is byte-identical across the two builds.
+
+Not yet built (a deliberately-separate follow-on): a speedup-aware **co-scheduling allocator** that
+*acts* on the model — distributing inner `-j` across concurrently-scheduled steps to minimize
+whole-DAG wall (more threads to critical-path steps that scale, fewer to steps that plateau), under
+the total core + memory + resource caps. The model is *surfaced* today; the allocator is the next
+piece.
 
 ### The `plan` command: see the estimates + the schedule
 
@@ -236,9 +249,20 @@ scheduled order: build.app, test.unit, lint.all
 ```
 
 The **source** column shows where each estimate came from (`store` = learned, `hint` = DAG-authored,
-`default` = none). `plan --format json` emits the same plan as canonical, machine-readable JSON
-(byte-identical across the Python and Rust builds). `run --show-plan` prints this table and then
-runs. All three honor `--planner` and `--no-profile-feedback`.
+`default` = none). When the store holds more than one `inner_jobs` width for a step, `plan` /
+`run --show-plan` append a **parallel-speedup section** with that step's recommended `inner_jobs`,
+achieved `eff_cores`, the speedup at that width, and the full `inner_jobs->speedup` curve:
+
+```
+parallel-speedup model (recommended inner_jobs = best wall within the knee + core budget; speedup@rec = speedup at that width):
+step       rec_inner_jobs  eff_cores  speedup@rec  curve(inner_jobs->speedup)
+---------  --------------  ---------  -----------  --------------------------
+build.app               2      1.980        2.00x     1:1.00x 2:2.00x 4:2.22x
+```
+
+`plan --format json` emits the same plan as canonical, machine-readable JSON (byte-identical across
+the Python and Rust builds), including a per-step `"speedup"` object (or `null`). `run --show-plan`
+prints this table and then runs. All three honor `--planner` and `--no-profile-feedback`.
 
 ## CLI reference
 

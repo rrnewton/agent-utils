@@ -158,12 +158,43 @@ the schedule *and* the chosen `-j` improve automatically as runs accumulate. Pas
 `--no-profile-feedback` to ignore the store and plan from the DAG hints only (useful for a
 reproducible run).
 
-Today's per-step store rows do not yet carry per-step contention columns, so on real data the
-discount is a no-op (the plain median is used) until a step's rows include one of the contention
-signals above; the reader consumes them "where present", so the discount engages automatically once
-they do. Populating per-step contention, and the full **parallel-speedup-curve modeling** (learning
-each step's speedup vs inner `-j` from the multi-width `sweep` samples, with total-CPU-seconds growth
-as a work-conservation signal), are the clearly-scoped remaining work.
+The writer now records the per-step contention columns (see [Rich per-step profile
+columns](#rich-per-step-profile-columns) below), so the discount engages automatically on real
+boxed runs. The reader still consumes them "where present", so an older, narrower store degrades to
+the plain median rather than erroring.
+
+### The parallel-speedup model
+
+Beyond a single learned duration, the runner now learns each step's **speedup curve** —
+`wall` vs. inner `-j` — from the samples the store holds across *different* `inner_jobs` widths
+(the widths a `sweep`, or repeated `run --only`/`run` at different `preferred_inner_jobs`, records).
+For every step with at least two measured widths it derives, per width, a robust
+(contention-discounted MAD-trimmed median) `wall_s`, the achieved `effective_cores`, and the
+**work-conservation signal**: the total CPU-seconds (`user_s` + `sys_s`) and `throttled_s`. It then
+exposes per step:
+
+- a **`speedup(inner_jobs)` curve** — `wall(baseline) / wall(width)` at each measured width;
+- `measured_effective_cores` — the achieved parallelism at the recommended width;
+- a **recommended `inner_jobs`** — the best wall time still *before the knee* and *within the core
+  budget*. The recommendation walks from the smallest width outward and only accepts a wider level
+  while it is materially faster than the previous one (at least a 1.15x marginal gain) AND does not
+  blow up total CPU-seconds (no more than a 1.5x jump between consecutive widths — the
+  work-conservation guard). The moment either test fails, that is the knee and the recommendation
+  stops; it is additionally capped at the machine's core budget (the affinity width from
+  `container_class`).
+
+So a step whose wall halves from `-j1` to `-j2` but barely improves `-j2` -> `-j4` while its total
+CPU-seconds rise (classic diminishing returns) gets a **recommended `inner_jobs` of 2**; a
+near-linear step gets the widest measured width (up to the core budget). The curve, the
+recommendation, and the achieved cores are surfaced by `plan` / `run --show-plan` (below) and are
+byte-identical across the Python and Rust builds for a given store.
+
+**Consuming the recommendation (scoped follow-on).** The model is *surfaced* today; the runner does
+not yet *act* on it. A speedup-aware co-scheduling planner — one that ALLOCATES inner `-j` across
+concurrently-scheduled steps to minimize whole-DAG wall (more threads to critical-path steps that
+scale well, fewer to steps that plateau), subject to the total core budget + memory + resource caps
+— is the next, deliberately separate, piece of work. The current release ships the writer
+enrichment, the per-step model, and the display solidly rather than half-building that allocator.
 
 ### Seeing the plan: `plan` / `run --show-plan`
 
@@ -185,8 +216,22 @@ critical path (13.000s): build.app -> test.unit
 scheduled order: build.app, test.unit, lint.all
 ```
 
+When the store holds samples across more than one `inner_jobs` width for a step, `plan` /
+`run --show-plan` also print a **parallel-speedup section** with, per such step, the recommended
+`inner_jobs`, the achieved `eff_cores` at that width, the `speedup@rec` (the speedup at the
+recommended/knee width), and the full `inner_jobs->speedup` curve:
+
+```
+parallel-speedup model (recommended inner_jobs = best wall within the knee + core budget; speedup@rec = speedup at that width):
+step       rec_inner_jobs  eff_cores  speedup@rec  curve(inner_jobs->speedup)
+---------  --------------  ---------  -----------  --------------------------
+build.app               2      1.980        2.00x     1:1.00x 2:2.00x 4:2.22x
+```
+
 `plan --format json` emits the same plan as canonical JSON (byte-identical across the Python and Rust
-builds — the estimate strings are fixed-precision so parity does not depend on float `repr`).
+builds — the estimate strings are fixed-precision so parity does not depend on float `repr`), with a
+per-step `"speedup"` object (or `null` when the step has fewer than two measured widths) carrying
+`baseline_inner_jobs`, `recommended_inner_jobs`, `measured_effective_cores`, and the `levels` curve.
 `run --show-plan` prints this table and then runs the DAG in that order. `plan` accepts `--planner`,
 `--perf-dir`, and `--no-profile-feedback`.
 
@@ -426,11 +471,35 @@ per-step profile:
 step       wall_s  user_s  sys_s  rss_hwm  oom  inner_jobs
 ---------  ------  ------  -----  -------  ---  ----------
 build.app   0.920   3.438  0.004  2.6 MiB    0           4
-test.unit   0.269   0.002  0.016  512.0 KiB  0     ambient
+test.unit   0.269   0.002  0.016  512.0 KiB  0          16
 ```
 
 `user_s`/`sys_s` come from each step's cgroup `cpu.stat` and `rss_hwm` from its `memory.peak`, so
 they are populated under real boxing and shown as `-` in an un-boxed (`--allow-cgroup-failure`) run.
+`inner_jobs` is always a **number**: a step with an explicit `preferred_inner_jobs` shows that
+width; an "ambient" (un-`-j`-capped) step shows the effective parallelism of the cgroup/container it
+ran in (the resolved core budget), never the old `ambient` string — so the speedup model can group
+samples by a real parallelism level.
+
+### Rich per-step profile columns
+
+Under real cgroup boxing every per-step CSV row is enriched with parallel-speedup and contention
+columns (all blank on an un-boxed run — the schema column is present but empty). The column NAMES
+mirror DeepScry's `validate_perflog` schema so the two can later be unified by a rename:
+
+- `effective_cores` — child CPU-seconds / wall (`cpu.stat usage_usec` / `elapsed_s`), the achieved
+  parallelism; `user_s` / `sys_s` / `throttled_s` from the matching `cpu.stat` counters.
+- `quota_utilization_pct` — `effective_cores` as a fraction of the applied inner `-j` cap (blank for
+  an ambient step, which has no cap to measure against).
+- `external_cpu_s` / `external_cores` — host CPU burned by OTHER tenants during the step window
+  (the `/proc/stat` busy-jiffies delta minus this step's own cgroup usage), and `ambient_bucket`
+  (`quiet` / `moderate` / `busy`) — what the reader uses to contention-discount the sample.
+- `co_tenants_start` / `co_tenants_end`, `load1_*` / `load5_*`, and host + step **PSI**
+  (`host_cpu_psi_*`, `host_memory_psi_*`, `host_io_psi_*`, `step_cpu_psi_*`, each `avg10`/`avg60`
+  at start and end) — the ambient-load context around the window.
+
+The schema is **additive and self-widening**: these columns are appended after the original ones,
+so an older reader (and an older checked-in store) is unaffected.
 
 ### `sweep` — a per-step parallel-speedup study
 

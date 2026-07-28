@@ -39,7 +39,14 @@ pub const CSV_COLUMNS: [&str; 15] = [
 ];
 
 /// Standard per-step profile columns (dynamic `cpu.*` keys are appended per run AFTER these).
-pub const STEP_PROFILE_COLUMNS: [&str; 18] = [
+///
+/// The trailing block (from `effective_cores` on) is the rich PARALLEL-SPEEDUP enrichment,
+/// captured UNDER cgroup boxing and left BLANK when unavailable, exactly like the Python build.
+/// Column NAMES mirror DeepScry's `validate_perflog` `STEP_PROFILE_COLUMNS` so a later schema
+/// unification is a rename, not a redesign. This MUST stay byte-for-byte identical to
+/// `perflog.STEP_PROFILE_COLUMNS` in the Python build (the cross differential compares the CSV
+/// header).
+pub const STEP_PROFILE_COLUMNS: [&str; 48] = [
     "timestamp",
     "machine_id",
     "container_class",
@@ -58,6 +65,37 @@ pub const STEP_PROFILE_COLUMNS: [&str; 18] = [
     "oom_kills",
     "peak_bytes",
     "thread_peak",
+    // --- rich parallel-speedup enrichment (blank when unavailable) ---
+    "effective_cores",
+    "user_s",
+    "sys_s",
+    "throttled_s",
+    "quota_utilization_pct",
+    "external_cpu_s",
+    "external_cores",
+    "co_tenants_start",
+    "co_tenants_end",
+    "ambient_bucket",
+    "load1_start",
+    "load1_end",
+    "load5_start",
+    "load5_end",
+    "host_cpu_psi_avg10_start",
+    "host_cpu_psi_avg10_end",
+    "host_cpu_psi_avg60_start",
+    "host_cpu_psi_avg60_end",
+    "host_memory_psi_avg10_start",
+    "host_memory_psi_avg10_end",
+    "host_memory_psi_avg60_start",
+    "host_memory_psi_avg60_end",
+    "host_io_psi_avg10_start",
+    "host_io_psi_avg10_end",
+    "host_io_psi_avg60_start",
+    "host_io_psi_avg60_end",
+    "step_cpu_psi_avg10_start",
+    "step_cpu_psi_avg10_end",
+    "step_cpu_psi_avg60_start",
+    "step_cpu_psi_avg60_end",
 ];
 
 /// A per-step measurement row (heterogeneous column -> value, matching the CSV).

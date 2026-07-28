@@ -71,6 +71,9 @@ pub trait CgroupManager: Send + Sync {
     fn peak_bytes(&self, tag: &str) -> Option<i64>;
     /// Per-step cgroup-v2 CPU counters from `cpu.stat`.
     fn cpu_stats(&self, tag: &str) -> Option<BTreeMap<String, i64>>;
+    /// Per-step CPU pressure-stall averages (`cpu.pressure` `some` line: `avg10`, `avg60`),
+    /// sampled at step start + end to attribute contention. `None` when disabled/unreadable.
+    fn cpu_pressure(&self, tag: &str) -> Option<BTreeMap<String, f64>>;
     /// Current descendant thread count from the step's `cgroup.threads`.
     fn thread_count(&self, tag: &str) -> Option<i64>;
     /// NORMAL-EXIT backstop: `cgroup.kill` + `rmdir` every remaining step child cgroup.
@@ -522,6 +525,31 @@ impl CgroupManager for Cgroups {
             }
         }
         Some(out)
+    }
+
+    fn cpu_pressure(&self, tag: &str) -> Option<BTreeMap<String, f64>> {
+        let child = self.child(tag)?;
+        if !self.enabled {
+            return None;
+        }
+        let text = read_trim(&child, "cpu.pressure")?;
+        let some = text.lines().find(|l| l.starts_with("some "))?;
+        let mut out = BTreeMap::new();
+        for item in some.split_whitespace().skip(1) {
+            if let Some((k, v)) = item.split_once('=') {
+                if matches!(k, "avg10" | "avg60") {
+                    if let Ok(n) = v.parse::<f64>() {
+                        out.insert(k.to_string(), n);
+                    }
+                }
+            }
+        }
+        // Match the Python reader: both avg10 and avg60 must be present, else None.
+        if out.contains_key("avg10") && out.contains_key("avg60") {
+            Some(out)
+        } else {
+            None
+        }
     }
 
     fn thread_count(&self, tag: &str) -> Option<i64> {

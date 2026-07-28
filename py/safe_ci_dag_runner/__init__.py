@@ -31,11 +31,14 @@ from safe_ci_dag_runner.estimates import (
     Plan,
     PlanEntry,
     Planner,
+    SpeedupLevel,
     StepSamples,
+    StepSpeedup,
     apply_plan_to_config,
     build_plan,
     feedback_identity,
     load_step_samples,
+    load_step_speedups,
     plan_to_json,
     plan_to_text,
 )
@@ -82,7 +85,7 @@ from safe_ci_dag_runner.sizing import (
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
-__version__: str = "0.6.0"
+__version__: str = "0.7.0"
 
 __all__ = [
     "__version__",
@@ -138,11 +141,14 @@ __all__ = [
     # profile-store feedback + planner
     "Planner",
     "StepSamples",
+    "SpeedupLevel",
+    "StepSpeedup",
     "PlanEntry",
     "Plan",
     "DEFAULT_MIN_SAMPLES",
     "feedback_identity",
     "load_step_samples",
+    "load_step_speedups",
     "build_plan",
     "apply_plan_to_config",
     "plan_to_json",

@@ -48,6 +48,7 @@ from safe_ci_dag_runner.protocols import MetricsSink, RunWindow
 __all__ = [
     "CSV_COLUMNS",
     "STEP_PROFILE_COLUMNS",
+    "ENRICHMENT_COLUMNS",
     "machine_id",
     "nproc",
     "container_class",
@@ -92,6 +93,32 @@ CSV_COLUMNS = [
 #: builds in ``scheduler._run_step`` (its ``row`` dict). Dynamic ``cpu.*`` counters vary by
 #: cgroup manager and are appended per run AFTER these standard columns (see
 #: :func:`_step_profile_fieldnames`), so they are captured without being hard-coded here.
+#: Rich parallel-speedup enrichment columns, appended to STEP_PROFILE_COLUMNS. Captured UNDER
+#: cgroup boxing on Linux and left BLANK when unavailable (an un-boxed run / missing /proc file),
+#: exactly like DeepScry's writer. The NAMES mirror DeepScry's ``validate_perflog``
+#: STEP_PROFILE_COLUMNS so a later schema unification is a rename, not a redesign. Produced by
+#: :func:`safe_ci_dag_runner.profile_enrich.step_enrichment_columns`.
+ENRICHMENT_COLUMNS = [
+    "effective_cores",         # child CPU-seconds / wall (cpu.stat usage_usec / elapsed_s)
+    "user_s",                  # cpu.stat user_usec, seconds
+    "sys_s",                   # cpu.stat system_usec, seconds
+    "throttled_s",             # cpu.stat throttled_usec, seconds
+    "quota_utilization_pct",   # effective_cores / applied inner -j cap, percent
+    "external_cpu_s",          # host CPU burned by OTHER tenants during the window, seconds
+    "external_cores",          # ...expressed as cores
+    "co_tenants_start", "co_tenants_end",
+    "ambient_bucket",          # quiet | moderate | busy
+    "load1_start", "load1_end", "load5_start", "load5_end",
+    "host_cpu_psi_avg10_start", "host_cpu_psi_avg10_end",
+    "host_cpu_psi_avg60_start", "host_cpu_psi_avg60_end",
+    "host_memory_psi_avg10_start", "host_memory_psi_avg10_end",
+    "host_memory_psi_avg60_start", "host_memory_psi_avg60_end",
+    "host_io_psi_avg10_start", "host_io_psi_avg10_end",
+    "host_io_psi_avg60_start", "host_io_psi_avg60_end",
+    "step_cpu_psi_avg10_start", "step_cpu_psi_avg10_end",
+    "step_cpu_psi_avg60_start", "step_cpu_psi_avg60_end",
+]
+
 STEP_PROFILE_COLUMNS = [
     # Run context, stamped onto every row by append_step_profiles().
     "timestamp", "machine_id", "container_class", "git_sha", "outer_jobs",
@@ -99,6 +126,8 @@ STEP_PROFILE_COLUMNS = [
     # Per-step measurements produced by the scheduler.
     "step", "classification", "inner_jobs", "elapsed_s", "returncode", "ok",
     "timed_out", "oom_kills", "peak_bytes", "thread_peak",
+    # Rich parallel-speedup enrichment (appended; blank when unavailable).
+    *ENRICHMENT_COLUMNS,
 ]
 
 

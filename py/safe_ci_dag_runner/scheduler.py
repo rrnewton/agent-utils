@@ -50,12 +50,21 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 
+from safe_ci_dag_runner.ambient import (
+    AmbientSnapshot,
+    PsiReading,
+    capture_ambient_snapshot,
+)
 from safe_ci_dag_runner.model import (
     DagConfig,
     Step,
     command_with_inner_jobs,
     preferred_inner_jobs,
     step_classification,
+)
+from safe_ci_dag_runner.profile_enrich import (
+    resolve_effective_inner_jobs,
+    step_enrichment_columns,
 )
 from safe_ci_dag_runner.protocols import (
     CgroupManager,
@@ -87,6 +96,14 @@ _THREAD_JOIN_S = 2.0
 def _warn(message: str) -> None:
     """Emit a visible degraded-behavior warning (No Silent Failure)."""
     print(f"[scheduler] ⚠ {message}", file=sys.stderr)
+
+
+def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
+    """Adapt a cgroup ``cpu.pressure`` ``{avg10, avg60}`` mapping to a typed :class:`PsiReading`
+    for the enrichment builder; ``None`` (unreadable / unboxed) passes straight through."""
+    if pressure is None:
+        return None
+    return PsiReading(avg10=pressure["avg10"], avg60=pressure["avg60"])
 
 
 class _NoopRunWindow:
@@ -332,6 +349,14 @@ class Runner:
         run_cmd = self.cgroups.prepare_command(
             step.tag, base_cmd, mem_max=mem_max, cpu_count=inner_jobs
         )
+        # Parallel-speedup ENRICHMENT capture (only under real cgroup boxing, matching DeepScry).
+        # prepare_command has already created the step's child cgroup, so cpu.pressure is readable;
+        # bracket the step with two host-load snapshots so contention can be attributed later.
+        boxed = self.cgroups.enabled
+        ambient_start: AmbientSnapshot | None = (
+            capture_ambient_snapshot(()) if boxed else None
+        )
+        step_pressure_start = _psi_reading(self.cgroups.cpu_pressure(step.tag)) if boxed else None
         # start_new_session=True gives the step its OWN process group/session (pgid == child
         # pid) so teardown can reap the whole tree (bash leader + any server/browser
         # grandchildren) without ever touching the runner's own group.
@@ -404,6 +429,8 @@ class Runner:
         oom = self.cgroups.oom_kills(step.tag)
         peak = self.cgroups.peak_bytes(step.tag)
         cpu_stats = self.cgroups.cpu_stats(step.tag)
+        step_pressure_end = _psi_reading(self.cgroups.cpu_pressure(step.tag)) if boxed else None
+        ambient_end: AmbientSnapshot | None = capture_ambient_snapshot(()) if boxed else None
         self.cgroups.cleanup(step.tag)
 
         elapsed = time.time() - start
@@ -415,7 +442,9 @@ class Runner:
         row: dict[str, object] = {
             "step": step.tag,
             "classification": step_classification(step).value,
-            "inner_jobs": inner_jobs if inner_jobs is not None else "ambient",
+            # Resolve to a NUMBER (the effective parallelism the step ran in) — never the old
+            # "ambient" string — so the speedup model can group samples by parallelism level.
+            "inner_jobs": resolve_effective_inner_jobs(inner_jobs),
             "elapsed_s": round(elapsed, 3),
             "returncode": returncode,
             "ok": ok,
@@ -427,6 +456,21 @@ class Runner:
         if cpu_stats is not None:
             for key, value in cpu_stats.items():
                 row[f"cpu.{key}"] = value
+        # Rich parallel-speedup enrichment columns (effective_cores, throttled_s, contention, PSI).
+        # Only under real boxing; an un-boxed run leaves them blank (the writer fills them from the
+        # STEP_PROFILE_COLUMNS schema), matching DeepScry's "blank when unavailable" posture.
+        if boxed:
+            row.update(
+                step_enrichment_columns(
+                    elapsed_s=elapsed,
+                    inner_jobs=inner_jobs,
+                    cpu_stats=cpu_stats,
+                    ambient_start=ambient_start,
+                    ambient_end=ambient_end,
+                    step_pressure_start=step_pressure_start,
+                    step_pressure_end=step_pressure_end,
+                )
+            )
 
         with self.lock:
             self.running.discard(step.tag)

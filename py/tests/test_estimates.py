@@ -245,3 +245,133 @@ def test_empty_dag_plan() -> None:
     assert list(plan.order) == []
     assert list(plan.critical_path) == []
     assert plan_to_json(plan).endswith('"steps": []\n}')
+
+
+# --------------------------------------------------------------------------- speedup model
+
+_SPEEDUP_HEADER = (
+    "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
+    "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
+    "peak_bytes,thread_peak,effective_cores,user_s,sys_s,throttled_s\n"
+)
+
+
+def _speedup_row(
+    step: str,
+    inner_jobs: int,
+    elapsed: str,
+    *,
+    effective_cores: str = "",
+    user_s: str = "",
+    sys_s: str = "",
+    throttled_s: str = "",
+) -> str:
+    return (
+        f"t,m,affinity16_cpu-max-max,abc,1,abc,unverified,local,{step},cpu-bound,{inner_jobs},"
+        f"{elapsed},0,True,False,0,1000,,{effective_cores},{user_s},{sys_s},{throttled_s}\n"
+    )
+
+
+def _write_speedup_store(tmp_path: Path, rows: list[str]) -> Path:
+    store = tmp_path / "sstore"
+    store.mkdir()
+    (store / "step_profiles_m_affinity16_cpu-max-max.csv").write_text(_SPEEDUP_HEADER + "".join(rows))
+    return store
+
+
+def test_speedup_knee_stops_at_two_on_rising_cpu(tmp_path: Path) -> None:
+    from safe_ci_dag_runner import load_step_speedups
+
+    # Wall halves 1->2 (10->5) but barely improves 2->4 (5->4.5) while total CPU-s rises
+    # (~10.2 -> ~18): both the marginal-gain and the work-conservation signals say stop at -j2.
+    store = _write_speedup_store(
+        tmp_path,
+        [
+            _speedup_row("build.app", 1, "10.0", effective_cores="1.0", user_s="10.0", sys_s="0.2"),
+            _speedup_row("build.app", 1, "10.1", effective_cores="1.0", user_s="10.1", sys_s="0.2"),
+            _speedup_row("build.app", 2, "5.0", effective_cores="1.98", user_s="10.0", sys_s="0.4"),
+            _speedup_row("build.app", 2, "5.05", effective_cores="1.98", user_s="10.1", sys_s="0.4"),
+            _speedup_row("build.app", 4, "4.5", effective_cores="3.2", user_s="17.5", sys_s="0.8"),
+            _speedup_row("build.app", 4, "4.6", effective_cores="3.2", user_s="17.6", sys_s="0.9"),
+        ],
+    )
+    models = load_step_speedups(store, "m", "affinity16_cpu-max-max")
+    sp = models["build.app"]
+    assert sp.recommended_inner_jobs == 2
+    assert sp.baseline_inner_jobs == 1
+    assert [lvl.inner_jobs for lvl in sp.levels] == [1, 2, 4]
+    # measured_effective_cores is the achieved parallelism at the recommended width.
+    assert sp.measured_effective_cores == 1.98
+    # speedup at -j2 is ~2.0 (10.05 median / 5.025 median).
+    lvl2 = next(lvl for lvl in sp.levels if lvl.inner_jobs == 2)
+    assert abs(lvl2.speedup - 2.0) < 1e-9
+
+
+def test_speedup_linear_recommends_widest_within_budget(tmp_path: Path) -> None:
+    from safe_ci_dag_runner import load_step_speedups
+
+    # Near-linear scaling with flat total CPU-s: the widest measured width (still within the
+    # affinity-16 budget) is recommended.
+    store = _write_speedup_store(
+        tmp_path,
+        [
+            _speedup_row("lin.step", 1, "8.0", user_s="8.0", sys_s="0.0"),
+            _speedup_row("lin.step", 2, "4.0", user_s="8.0", sys_s="0.0"),
+            _speedup_row("lin.step", 4, "2.0", user_s="8.1", sys_s="0.0"),
+        ],
+    )
+    models = load_step_speedups(store, "m", "affinity16_cpu-max-max")
+    assert models["lin.step"].recommended_inner_jobs == 4
+
+
+def test_speedup_single_level_has_no_model(tmp_path: Path) -> None:
+    from safe_ci_dag_runner import load_step_speedups
+
+    # One inner_jobs width is not enough to model a curve.
+    store = _write_speedup_store(
+        tmp_path,
+        [_speedup_row("s.one", 1, "5.0"), _speedup_row("s.one", 1, "5.1")],
+    )
+    assert load_step_speedups(store, "m", "affinity16_cpu-max-max") == {}
+
+
+def test_speedup_core_budget_caps_recommendation(tmp_path: Path) -> None:
+    from safe_ci_dag_runner import load_step_speedups
+
+    # Perfect linear scaling to -j4, but a 2-core container budget caps the recommendation at 2.
+    store = tmp_path / "cbstore"
+    store.mkdir()
+    header = _SPEEDUP_HEADER
+    body = "".join(
+        f"t,m,affinity2_cpu-max-max,abc,1,abc,unverified,local,cb.step,cpu-bound,{j},{w},0,True,"
+        f"False,0,1000,,,8.0,0.0,\n"
+        for j, w in ((1, "8.0"), (2, "4.0"), (4, "2.0"))
+    )
+    (store / "step_profiles_m_affinity2_cpu-max-max.csv").write_text(header + body)
+    models = load_step_speedups(store, "m", "affinity2_cpu-max-max")
+    assert models["cb.step"].recommended_inner_jobs == 2
+
+
+def test_plan_includes_speedup_field(tmp_path: Path) -> None:
+    from safe_ci_dag_runner import load_step_speedups
+
+    store = _write_speedup_store(
+        tmp_path,
+        [
+            _speedup_row("build.app", 1, "10.0", user_s="10.0", sys_s="0.0"),
+            _speedup_row("build.app", 2, "5.0", user_s="10.0", sys_s="0.0"),
+        ],
+    )
+    cfg = DagConfig(steps=(Step("build", "app", "compile", "true"),))
+    speedups = load_step_speedups(store, "m", "affinity16_cpu-max-max")
+    plan = build_plan(cfg, {}, planner=Planner.GREEDY_LPT, speedups=speedups)
+    js = plan_to_json(plan)
+    assert '"speedup": {' in js
+    assert '"recommended_inner_jobs": 2' in js
+    text = plan_to_text(plan)
+    assert "parallel-speedup model" in text
+    assert "curve(inner_jobs->speedup)" in text
+    # A plan with no speedup data has "speedup": null and no model section.
+    bare = build_plan(cfg, {}, planner=Planner.GREEDY_LPT)
+    assert '"speedup": null' in plan_to_json(bare)
+    assert "parallel-speedup model" not in plan_to_text(bare)

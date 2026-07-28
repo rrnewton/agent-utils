@@ -31,8 +31,8 @@ use std::time::Instant;
 
 use crate::cgroup::{install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups};
 use crate::estimates::{
-    apply_plan_to_config, build_plan, feedback_identity, load_step_samples, plan_to_json,
-    plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
+    apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
+    plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
 use crate::model::{step_classification, DagConfig, Step};
@@ -216,7 +216,11 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
              so est_duration_s need not be hand-authored and --max-mem sizing improves\n  \
              automatically. --planner greedy-lpt (default) launches the longest single step\n  \
              first; critical-path launches the highest bottom-level (longest remaining\n  \
-             est-weighted path) first. --no-profile-feedback ignores the store (DAG hints only)."
+             est-weighted path) first. When the store holds multiple inner-jobs widths for a\n  \
+             step, plan/--show-plan also print a parallel-speedup section: the recommended\n  \
+             inner_jobs (best wall before the diminishing-returns knee + within the core\n  \
+             budget), achieved effective_cores, and the speedup curve.\n  \
+             --no-profile-feedback ignores the store (DAG hints only)."
         ),
         schema = h("DAG schema"),
         schema_note = c.dim("(only group/job/cmd are required per step; everything else has defaults)"),
@@ -554,13 +558,15 @@ fn build_feedback_plan(cfg: &DagConfig, feedback_dir: Option<&str>, planner: Pla
         Some(dir) => {
             let (mid, cc) = feedback_identity();
             let samples = load_step_samples(Path::new(dir), &mid, &cc);
-            build_plan(cfg, &samples, planner, DEFAULT_MIN_SAMPLES)
+            let speedups = load_step_speedups(Path::new(dir), &mid, &cc);
+            build_plan(cfg, &samples, planner, DEFAULT_MIN_SAMPLES, &speedups)
         }
         None => build_plan(
             cfg,
             &std::collections::HashMap::new(),
             planner,
             DEFAULT_MIN_SAMPLES,
+            &std::collections::HashMap::new(),
         ),
     }
 }

@@ -32,11 +32,13 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::cgroup::CgroupManager;
 use crate::model::{
     command_with_inner_jobs, preferred_inner_jobs, step_classification, DagConfig, RunResult, Step,
     StepOutcome,
 };
+use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
 type ProfileRow = BTreeMap<String, String>;
@@ -346,6 +348,16 @@ fn last_line(bytes: &[u8]) -> String {
     String::new()
 }
 
+/// Adapt a cgroup `cpu.pressure` `{avg10, avg60}` map to a typed [`PsiReading`] for the enrichment
+/// builder; `None` (unreadable / unboxed) passes straight through.
+fn psi_from(pressure: Option<BTreeMap<String, f64>>) -> Option<PsiReading> {
+    let map = pressure?;
+    Some(PsiReading {
+        avg10: *map.get("avg10")?,
+        avg60: *map.get("avg60")?,
+    })
+}
+
 /// Everything a supervisor thread needs to run ONE step.
 struct StepCtx {
     step: Step,
@@ -423,6 +435,23 @@ fn run_step(ctx: StepCtx) {
         _ => base_cmd,
     };
 
+    // Parallel-speedup ENRICHMENT capture (only under real cgroup boxing, matching the Python
+    // build). prepare_command has created the step's child cgroup, so cpu.pressure is readable;
+    // bracket the step with two host-load snapshots so contention can be attributed later.
+    let boxed = matches!(&cgroups, Some(cg) if cg.enabled());
+    let ambient_start = if boxed {
+        Some(capture_ambient_snapshot(&[], None))
+    } else {
+        None
+    };
+    let step_pressure_start = if boxed {
+        cgroups
+            .as_ref()
+            .and_then(|cg| psi_from(cg.cpu_pressure(&tag)))
+    } else {
+        None
+    };
+
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(&run_cmd);
     for (k, v) in &step.env {
@@ -488,7 +517,6 @@ fn run_step(ctx: StepCtx) {
     // boxing is enabled (thread_count is meaningless otherwise), so the un-boxed path adds no
     // extra thread. The poll is interruptible (checks the stop flag every 50ms and only samples
     // once per MONITOR_INTERVAL), so joining it at step end returns promptly.
-    let boxed = matches!(&cgroups, Some(cg) if cg.enabled());
     let monitor_stop = Arc::new(AtomicBool::new(false));
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
     let monitor: Option<thread::JoinHandle<()>> = if boxed {
@@ -558,6 +586,18 @@ fn run_step(ctx: StepCtx) {
         Some(cg) if cg.enabled() => (cg.oom_kills(&tag), cg.peak_bytes(&tag), cg.cpu_stats(&tag)),
         _ => (0, None, None),
     };
+    let step_pressure_end = if boxed {
+        cgroups
+            .as_ref()
+            .and_then(|cg| psi_from(cg.cpu_pressure(&tag)))
+    } else {
+        None
+    };
+    let ambient_end = if boxed {
+        Some(capture_ambient_snapshot(&[], None))
+    } else {
+        None
+    };
     if let Some(cg) = &cgroups {
         if cg.enabled() {
             cg.cleanup(&tag);
@@ -585,9 +625,11 @@ fn run_step(ctx: StepCtx) {
         "classification".into(),
         step_classification(&step).value().into(),
     );
+    // Resolve to a NUMBER (the effective parallelism the step ran in) — never the old "ambient"
+    // string — so the speedup model can group samples by parallelism level.
     row.insert(
         "inner_jobs".into(),
-        inner_jobs.map_or_else(|| "ambient".into(), |n| n.to_string()),
+        resolve_effective_inner_jobs(inner_jobs).to_string(),
     );
     row.insert("elapsed_s".into(), format!("{elapsed:.3}"));
     row.insert(
@@ -608,6 +650,22 @@ fn run_step(ctx: StepCtx) {
     if let Some(stats) = &cpu_stats {
         for (k, v) in stats {
             row.insert(format!("cpu.{k}"), v.to_string());
+        }
+    }
+    // Rich parallel-speedup enrichment columns (effective_cores, throttled_s, contention, PSI).
+    // Only under real boxing; an un-boxed run leaves them blank (the writer fills them from the
+    // STEP_PROFILE_COLUMNS schema), matching the Python build's "blank when unavailable" posture.
+    if boxed {
+        for (k, v) in step_enrichment_columns(
+            elapsed,
+            inner_jobs,
+            cpu_stats.as_ref(),
+            ambient_start.as_ref(),
+            ambient_end.as_ref(),
+            step_pressure_start.as_ref(),
+            step_pressure_end.as_ref(),
+        ) {
+            row.insert(k, v);
         }
     }
 

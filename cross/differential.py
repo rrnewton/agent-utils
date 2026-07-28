@@ -1177,6 +1177,143 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok("plan-feedback:sizing")
 
 
+# --------------------------------------------------------------------------- speedup model
+
+#: Pinned identity for the speedup fixtures. The container class is an ``affinityN`` form so the
+#: reader parses a core BUDGET (8 cores) from it — exercising the budget cap in the recommendation.
+_SPEEDUP_MACHINE = "cross_speedup_machine"
+_SPEEDUP_CONTAINER = "affinity8_cpu-max-max"
+
+#: A DAG whose steps carry only est_duration HINTS; the synthetic multi-inner_jobs store below is the
+#: sole source of the learned speedup curves. Four steps cover the shapes the model must distinguish.
+_SPEEDUP_DAG = {
+    "mem_cap_factor": 1.0,
+    "mem_cap_floor_bytes": 0,
+    "outer_mem_safety_factor": 1.0,
+    "steps": [
+        {"group": "p", "job": "lin", "desc": "linear", "cmd": "true",
+         "hint": {"est_duration_s": 9.0}},
+        {"group": "p", "job": "knee", "desc": "sub-linear knee", "cmd": "true",
+         "hint": {"est_duration_s": 9.0}},
+        {"group": "p", "job": "plat", "desc": "plateau", "cmd": "true",
+         "hint": {"est_duration_s": 9.0}},
+        {"group": "p", "job": "bud", "desc": "budget-capped", "cmd": "true",
+         "hint": {"est_duration_s": 9.0}},
+    ],
+}
+
+_SPEEDUP_HEADER = (
+    "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
+    "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
+    "peak_bytes,thread_peak,effective_cores,user_s,sys_s,throttled_s\n"
+)
+
+
+def _speedup_row(
+    step: str, inner_jobs: int, elapsed: str, eff: str, user_s: str, sys_s: str, throttled: str
+) -> str:
+    return (
+        f"2026-07-26T10:00:00,{_SPEEDUP_MACHINE},{_SPEEDUP_CONTAINER},abc,1,abc,unverified,local,"
+        f"{step},cpu-bound,{inner_jobs},{elapsed},0,True,False,0,1000,,{eff},{user_s},{sys_s},"
+        f"{throttled}\n"
+    )
+
+
+def _speedup_store_csv() -> str:
+    """A fixed synthetic per-step store spanning LINEAR, SUB-LINEAR (knee), PLATEAU, and
+    BUDGET-CAPPED speedup shapes — the data the py and rs speedup readers must fold IDENTICALLY.
+
+    Expected recommendations (identical in both builds):
+      * p.lin   : wall 8->4->2 with flat CPU-s -> near-linear, recommend the widest measured (-j4).
+      * p.knee  : wall 10->5->4.5 with CPU-s rising 10.2->18 -> sub-linear, recommend -j2 (marginal
+                  gain 2->4 is <1.15 AND total CPU-s more than doubles: the knee is at 2).
+      * p.plat  : wall 6->5.8 -> the -j2 gain (1.03x) is below the threshold, recommend -j1.
+      * p.bud   : wall halves cleanly to -j16, but the affinity-8 core budget caps it at -j8.
+    """
+    rows: list[str] = []
+    # p.lin — near-linear, flat total CPU-seconds (two samples per width).
+    for j, walls in ((1, ("8.0", "8.0")), (2, ("4.0", "4.0")), (4, ("2.0", "2.0"))):
+        for w in walls:
+            rows.append(_speedup_row("p.lin", j, w, "", "8.0", "0.0", "0.0"))
+    # p.knee — halves 1->2 but flattens 2->4 while total CPU-seconds blow up (work-conservation).
+    rows.append(_speedup_row("p.knee", 1, "10.0", "1.0", "10.0", "0.2", "0.0"))
+    rows.append(_speedup_row("p.knee", 1, "10.1", "1.0", "10.1", "0.2", "0.0"))
+    rows.append(_speedup_row("p.knee", 2, "5.0", "1.98", "10.0", "0.4", "0.0"))
+    rows.append(_speedup_row("p.knee", 2, "5.05", "1.98", "10.1", "0.4", "0.0"))
+    rows.append(_speedup_row("p.knee", 4, "4.5", "3.2", "17.5", "0.5", "1.2"))
+    rows.append(_speedup_row("p.knee", 4, "4.6", "3.2", "17.6", "0.5", "1.3"))
+    # p.plat — the second width barely helps.
+    rows.append(_speedup_row("p.plat", 1, "6.0", "", "6.0", "0.0", "0.0"))
+    rows.append(_speedup_row("p.plat", 2, "5.8", "", "6.5", "0.0", "0.0"))
+    # p.bud — perfect halving to -j16, but the core budget (8) caps the recommendation.
+    for j, wall in ((1, "16.0"), (2, "8.0"), (4, "4.0"), (8, "2.0"), (16, "1.0")):
+        rows.append(_speedup_row("p.bud", j, wall, "", "16.0", "0.1", "0.0"))
+    return _SPEEDUP_HEADER + "".join(rows)
+
+
+def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the per-step PARALLEL-SPEEDUP model is byte-identical across builds on a fixed store.
+
+    Against a synthetic store spanning linear / sub-linear / plateau / budget-capped shapes, assert
+    ``plan`` output (BOTH ``text`` and ``json``) is BYTE-IDENTICAL between the Python and Rust
+    builds — so the derived speedup curves AND the recommended inner_jobs match exactly — and that
+    the recommendations are the expected 4 / 2 / 1 / 8 (positive proof the model actually fired,
+    not merely that both builds agree on ``null``)."""
+    extra = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": _SPEEDUP_MACHINE,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _SPEEDUP_CONTAINER,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{_SPEEDUP_MACHINE}_{_SPEEDUP_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+            fh.write(_speedup_store_csv())
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_SPEEDUP_DAG))
+
+        json_out = ""
+        for fmt in ("text", "json"):
+            args = ("plan", "--dag", dag_path, "--perf-dir", store, "--format", fmt)
+            po = run(py, args, extra)
+            ro = run(rs, args, extra)
+            label = f"speedup-model:{fmt}"
+            if po.returncode != 0 or ro.returncode != 0:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode} "
+                               f"(py stderr={po.stderr!r}; rs stderr={ro.stderr!r})")
+                continue
+            if po.stdout != ro.stdout:
+                rep.bad(
+                    label,
+                    f"speedup plan not byte-identical\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+                )
+                continue
+            rep.ok(label)
+            if fmt == "json":
+                json_out = po.stdout
+
+        # Positive proof: the four shapes yield the expected recommended widths in BOTH builds
+        # (already asserted byte-identical above; checked once on the shared output).
+        expected = {"p.lin": 4, "p.knee": 2, "p.plat": 1, "p.bud": 8}
+        try:
+            obj = json.loads(json_out)
+            recs = {
+                step["tag"]: step["speedup"]["recommended_inner_jobs"]
+                for step in obj.get("steps", [])
+                if isinstance(step.get("speedup"), dict)
+            }
+        except (json.JSONDecodeError, KeyError, TypeError):
+            recs = {}
+        if recs == expected:
+            rep.ok("speedup-model:recommendations")
+        else:
+            rep.bad(
+                "speedup-model:recommendations",
+                f"recommended inner_jobs mismatch: expected {expected}, got {recs}",
+            )
+
+
 def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
     """``sweep --jobs`` malformed inputs must exit 2 with byte-identical stderr in both builds
     (guards the not-an-integer / malformed-range error-text parity)."""
@@ -1239,6 +1376,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     compare_profile_store(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)
+    compare_speedup_model(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

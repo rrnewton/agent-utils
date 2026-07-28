@@ -45,10 +45,13 @@ __all__ = [
     "DEFAULT_MIN_SAMPLES",
     "Planner",
     "StepSamples",
+    "SpeedupLevel",
+    "StepSpeedup",
     "PlanEntry",
     "Plan",
     "feedback_identity",
     "load_step_samples",
+    "load_step_speedups",
     "build_plan",
     "apply_plan_to_config",
     "plan_to_json",
@@ -288,6 +291,25 @@ def _contention_fraction(row: Mapping[str, str], affinity_width: int | None) -> 
     return fraction
 
 
+def _load_store(
+    profile_dir: str | Path, machine_id: str, container_class: str
+) -> tuple[list[dict[str, str]], int | None] | None:
+    """Read ``<profile_dir>/step_profiles_<machine_id>_<container_class>.csv`` into a list of
+    column->value row dicts plus the parsed affinity (core) width, or ``None`` when the file is
+    absent. The single CSV-reading path shared by :func:`load_step_samples` and
+    :func:`load_step_speedups`, so both consume the store identically (DRY)."""
+    path = Path(profile_dir) / f"step_profiles_{machine_id}_{container_class}.csv"
+    if not path.is_file():
+        return None
+    rows: list[dict[str, str]] = []
+    with path.open(newline="") as handle:
+        for raw in csv.DictReader(handle):
+            rows.append(
+                {k: (v if isinstance(v, str) else "") for k, v in raw.items() if isinstance(k, str)}
+            )
+    return rows, _affinity_width(container_class)
+
+
 def load_step_samples(
     profile_dir: str | Path, machine_id: str, container_class: str
 ) -> dict[str, StepSamples]:
@@ -300,26 +322,25 @@ def load_step_samples(
     :class:`StepSamples` carries the contention-discounted MAD-trimmed median ``elapsed_s`` and the
     high-percentile ``peak_bytes`` for that step, or ``None`` for a column that no sample supplied.
     """
-    path = Path(profile_dir) / f"step_profiles_{machine_id}_{container_class}.csv"
-    if not path.is_file():
+    loaded = _load_store(profile_dir, machine_id, container_class)
+    if loaded is None:
         return {}
-    affinity_width = _affinity_width(container_class)
+    rows, affinity_width = loaded
     durations: dict[str, list[float]] = {}
     peaks: dict[str, list[int]] = {}
     counts: dict[str, int] = {}
-    with path.open(newline="") as handle:
-        for row in csv.DictReader(handle):
-            step = row.get("step")
-            if not step:
-                continue
-            counts[step] = counts.get(step, 0) + 1
-            elapsed = _parse_float(row.get("elapsed_s"))
-            if elapsed is not None and elapsed >= 0.0:
-                intrinsic = elapsed * (1.0 - _contention_fraction(row, affinity_width))
-                durations.setdefault(step, []).append(intrinsic)
-            peak = _parse_int(row.get("peak_bytes"))
-            if peak is not None and peak >= 0:
-                peaks.setdefault(step, []).append(peak)
+    for row in rows:
+        step = row.get("step")
+        if not step:
+            continue
+        counts[step] = counts.get(step, 0) + 1
+        elapsed = _parse_float(row.get("elapsed_s"))
+        if elapsed is not None and elapsed >= 0.0:
+            intrinsic = elapsed * (1.0 - _contention_fraction(row, affinity_width))
+            durations.setdefault(step, []).append(intrinsic)
+        peak = _parse_int(row.get("peak_bytes"))
+        if peak is not None and peak >= 0:
+            peaks.setdefault(step, []).append(peak)
     result: dict[str, StepSamples] = {}
     for step, n in counts.items():
         step_durations = durations.get(step, [])
@@ -330,6 +351,188 @@ def load_step_samples(
             est_duration_s=_robust_median(step_durations) if step_durations else None,
             rss_estimate_bytes=_high_percentile(step_peaks) if step_peaks else None,
         )
+    return result
+
+
+# --------------------------------------------------------------------------- speedup model
+
+#: A level must be at least this many times faster than the PREVIOUS (fewer-thread) level to make
+#: the extra threads worthwhile; below this the marginal speedup has plateaued (a knee).
+_SPEEDUP_MIN_MARGINAL_GAIN = 1.15
+#: If total CPU-seconds (user+sys) grow by more than this factor between two consecutive levels the
+#: step is doing materially more total work per added thread (sub-linear scaling / contention), a
+#: work-conservation signal to stop adding threads even if the wall still nudged down.
+_SPEEDUP_MAX_WORK_GROWTH = 1.5
+#: A step needs at least this many DISTINCT inner_jobs levels (with wall data) to model a curve;
+#: fewer and there is nothing to say about speedup vs. parallelism.
+_SPEEDUP_MIN_LEVELS = 2
+
+
+@dataclass(frozen=True)
+class SpeedupLevel:
+    """One measured point on a step's speedup curve: its robust wall (and work) at one inner_jobs
+    width, plus the speedup relative to the smallest measured width."""
+
+    inner_jobs: int
+    samples: int
+    #: Contention-discounted MAD-trimmed median ``elapsed_s`` at this width.
+    wall_s: float
+    #: Robust-median total CPU-seconds (``user_s`` + ``sys_s``) — the work-conservation signal.
+    cpu_s: float | None
+    #: Robust-median achieved parallelism (``effective_cores``) at this width.
+    effective_cores: float | None
+    #: Robust-median ``throttled_s`` at this width (rising throttling is a saturation signal).
+    throttled_s: float | None
+    #: ``wall(baseline) / wall(this)`` — the measured speedup vs. the smallest width.
+    speedup: float
+
+
+@dataclass(frozen=True)
+class StepSpeedup:
+    """A step's fitted speedup curve across inner_jobs widths, plus the recommended width.
+
+    ``recommended_inner_jobs`` is the best wall time still within diminishing-returns AND the core
+    budget: the loop advances the recommendation to a wider level only while that level is
+    materially faster than the previous one (:data:`_SPEEDUP_MIN_MARGINAL_GAIN`) and does not blow
+    up total CPU-seconds (:data:`_SPEEDUP_MAX_WORK_GROWTH`), stopping at the knee."""
+
+    step: str
+    baseline_inner_jobs: int
+    recommended_inner_jobs: int
+    #: Achieved parallelism at the recommended width (``None`` if not measured there).
+    measured_effective_cores: float | None
+    levels: tuple[SpeedupLevel, ...]
+
+
+def _build_step_speedup(
+    step: str,
+    raw_levels: Sequence[tuple[int, int, float, float | None, float | None, float | None]],
+    core_budget: int | None,
+) -> StepSpeedup:
+    """Assemble a :class:`StepSpeedup` from per-level ``(inner_jobs, samples, wall, cpu, eff,
+    throttled)`` tuples SORTED ascending by inner_jobs. Deterministic across builds (only compares
+    robust medians of identical inputs)."""
+    baseline_j = raw_levels[0][0]
+    baseline_wall = raw_levels[0][2]
+    levels: list[SpeedupLevel] = []
+    recommended = baseline_j
+    still_scaling = True
+    prev_wall = baseline_wall
+    prev_cpu = raw_levels[0][3]
+    eff_by_j: dict[int, float | None] = {}
+    for idx, (j, n, wall, cpu, eff, throttled) in enumerate(raw_levels):
+        speedup = baseline_wall / wall if wall > 0.0 else 1.0
+        levels.append(
+            SpeedupLevel(
+                inner_jobs=j,
+                samples=n,
+                wall_s=wall,
+                cpu_s=cpu,
+                effective_cores=eff,
+                throttled_s=throttled,
+                speedup=speedup,
+            )
+        )
+        eff_by_j[j] = eff
+        if idx > 0 and still_scaling:
+            gain = prev_wall / wall if wall > 0.0 else 1.0
+            work_growth = (
+                cpu / prev_cpu if (cpu is not None and prev_cpu is not None and prev_cpu > 0.0) else None
+            )
+            within_budget = core_budget is None or j <= core_budget
+            if (
+                gain >= _SPEEDUP_MIN_MARGINAL_GAIN
+                and (work_growth is None or work_growth <= _SPEEDUP_MAX_WORK_GROWTH)
+                and within_budget
+            ):
+                recommended = j
+            else:
+                still_scaling = False
+        prev_wall = wall
+        prev_cpu = cpu
+    return StepSpeedup(
+        step=step,
+        baseline_inner_jobs=baseline_j,
+        recommended_inner_jobs=recommended,
+        measured_effective_cores=eff_by_j.get(recommended),
+        levels=tuple(levels),
+    )
+
+
+def load_step_speedups(
+    profile_dir: str | Path, machine_id: str, container_class: str
+) -> dict[str, StepSpeedup]:
+    """Model each step's PARALLEL-SPEEDUP curve from its samples ACROSS inner_jobs widths.
+
+    Reads the same per-step store as :func:`load_step_samples`, groups samples by
+    ``(step, inner_jobs)``, and for each width derives a robust (MAD-trimmed median),
+    contention-discounted wall time plus the work-conservation signal (median total CPU-seconds
+    ``user_s`` + ``sys_s``), achieved ``effective_cores``, and ``throttled_s``. From those it fits
+    the per-step speedup(inner_jobs) curve and a RECOMMENDED width (best wall within the knee and
+    the machine's core budget, the affinity width parsed from ``container_class``).
+
+    Only steps with at least :data:`_SPEEDUP_MIN_LEVELS` distinct widths (with wall data) get a
+    model; the rest are absent (the caller shows no speedup curve for them). Never raises on a
+    malformed row (an unparseable cell is skipped, matching :func:`load_step_samples`).
+    """
+    loaded = _load_store(profile_dir, machine_id, container_class)
+    if loaded is None:
+        return {}
+    rows, affinity_width = loaded
+    core_budget = affinity_width
+    walls: dict[tuple[str, int], list[float]] = {}
+    cpus: dict[tuple[str, int], list[float]] = {}
+    effs: dict[tuple[str, int], list[float]] = {}
+    thrs: dict[tuple[str, int], list[float]] = {}
+    for row in rows:
+        step = row.get("step")
+        if not step:
+            continue
+        inner = _parse_int(row.get("inner_jobs"))
+        if inner is None or inner <= 0:
+            continue
+        key = (step, inner)
+        elapsed = _parse_float(row.get("elapsed_s"))
+        if elapsed is not None and elapsed >= 0.0:
+            walls.setdefault(key, []).append(
+                elapsed * (1.0 - _contention_fraction(row, affinity_width))
+            )
+        user = _parse_float(row.get("user_s"))
+        system = _parse_float(row.get("sys_s"))
+        if user is not None and system is not None and user >= 0.0 and system >= 0.0:
+            cpus.setdefault(key, []).append(user + system)
+        eff = _parse_float(row.get("effective_cores"))
+        if eff is not None and eff >= 0.0:
+            effs.setdefault(key, []).append(eff)
+        throttled = _parse_float(row.get("throttled_s"))
+        if throttled is not None and throttled >= 0.0:
+            thrs.setdefault(key, []).append(throttled)
+    by_step: dict[str, list[int]] = {}
+    for step, inner in walls:
+        by_step.setdefault(step, []).append(inner)
+    result: dict[str, StepSpeedup] = {}
+    for step, widths in by_step.items():
+        levels_j = sorted(set(widths))
+        if len(levels_j) < _SPEEDUP_MIN_LEVELS:
+            continue
+        raw_levels: list[tuple[int, int, float, float | None, float | None, float | None]] = []
+        for inner in levels_j:
+            key = (step, inner)
+            wall_samples = walls[key]
+            cpu_samples = cpus.get(key)
+            eff_samples = effs.get(key)
+            thr_samples = thrs.get(key)
+            raw_levels.append(
+                (
+                    inner,
+                    len(wall_samples),
+                    _robust_median(wall_samples),
+                    _robust_median(cpu_samples) if cpu_samples else None,
+                    _robust_median(eff_samples) if eff_samples else None,
+                    _robust_median(thr_samples) if thr_samples else None,
+                )
+            )
+        result[step] = _build_step_speedup(step, raw_levels, core_budget)
     return result
 
 
@@ -347,6 +550,9 @@ class PlanEntry:
     rss_source: str  # "store" | "hint" | "none"
     bottom_level_s: float
     samples: int
+    #: The learned parallel-speedup curve for this step, or ``None`` when the store has fewer than
+    #: two inner_jobs widths for it (nothing to model).
+    speedup: "StepSpeedup | None" = None
 
 
 @dataclass(frozen=True)
@@ -489,9 +695,15 @@ def build_plan(
     *,
     planner: Planner = Planner.GREEDY_LPT,
     min_samples: int = DEFAULT_MIN_SAMPLES,
+    speedups: Mapping[str, StepSpeedup] | None = None,
 ) -> Plan:
     """Resolve every step's estimate (store-over-hint-over-default) and build the plan for
-    ``planner``: the per-step resolved estimates, the critical path, and the dispatch order."""
+    ``planner``: the per-step resolved estimates, the critical path, and the dispatch order.
+
+    ``speedups`` (from :func:`load_step_speedups`) attaches each step's learned parallel-speedup
+    curve for the plan display; it does not change the dispatch order (the co-scheduling
+    inner_jobs allocation planner is a scoped follow-on)."""
+    speedups = speedups or {}
     resolved: dict[str, tuple[float, str, int | None, str, int]] = {}
     est: dict[str, float] = {}
     for step in cfg.steps:
@@ -511,6 +723,7 @@ def build_plan(
             rss_source=resolved[step.tag][3],
             bottom_level_s=bottom[step.tag],
             samples=resolved[step.tag][4],
+            speedup=speedups.get(step.tag),
         )
         for step in cfg.steps
     )
@@ -588,6 +801,41 @@ def _fmt_secs(value: float) -> str:
     return f"{value:.3f}"
 
 
+def _opt_secs_json(value: float | None) -> str:
+    """JSON value for an optional fixed-3-decimal number: ``null`` or a quoted string (so parity
+    does not depend on float ``repr``)."""
+    return "null" if value is None else f'"{_fmt_secs(value)}"'
+
+
+def _speedup_level_json(level: SpeedupLevel) -> str:
+    """One speedup-curve level as a single-line JSON object (byte-identical across builds)."""
+    return (
+        f'{{"inner_jobs": {level.inner_jobs}, "wall_s": "{_fmt_secs(level.wall_s)}", '
+        f'"speedup": "{_fmt_secs(level.speedup)}", "cpu_s": {_opt_secs_json(level.cpu_s)}, '
+        f'"effective_cores": {_opt_secs_json(level.effective_cores)}, '
+        f'"throttled_s": {_opt_secs_json(level.throttled_s)}, "samples": {level.samples}}}'
+    )
+
+
+def _speedup_to_json(speedup: "StepSpeedup | None") -> str:
+    """The ``"speedup"`` field value for a step in the plan JSON: ``null`` or a nested object with
+    the recommended width, achieved cores, and the full measured curve. Indented to embed after
+    ``\"speedup\": `` at the step object's 6-space field indent."""
+    if speedup is None:
+        return "null"
+    levels = ",\n".join(f"          {_speedup_level_json(level)}" for level in speedup.levels)
+    return (
+        "{\n"
+        f'        "baseline_inner_jobs": {speedup.baseline_inner_jobs},\n'
+        f'        "recommended_inner_jobs": {speedup.recommended_inner_jobs},\n'
+        f'        "measured_effective_cores": {_opt_secs_json(speedup.measured_effective_cores)},\n'
+        '        "levels": [\n'
+        f"{levels}\n"
+        "        ]\n"
+        "      }"
+    )
+
+
 def plan_to_json(plan: Plan) -> str:
     """Canonical, machine-readable plan JSON (2-space indent), byte-identical across builds.
 
@@ -607,7 +855,8 @@ def plan_to_json(plan: Plan) -> str:
             f'      "rss_estimate_bytes": {rss},\n'
             f'      "rss_source": {_json_str(entry.rss_source)},\n'
             f'      "bottom_level_s": "{_fmt_secs(entry.bottom_level_s)}",\n'
-            f'      "samples": {entry.samples}\n'
+            f'      "samples": {entry.samples},\n'
+            f'      "speedup": {_speedup_to_json(entry.speedup)}\n'
             "    }"
         )
     parts = [
@@ -724,4 +973,53 @@ def plan_to_text(plan: Plan) -> str:
     crit = " -> ".join(plan.critical_path) if plan.critical_path else "(none)"
     lines.append(f"critical path ({_fmt_secs(plan.critical_path_length_s)}s): {crit}")
     lines.append("scheduled order: " + (", ".join(plan.order) if plan.order else "(none)"))
+    lines.extend(_speedup_text_lines(plan))
     return "\n".join(lines) + "\n"
+
+
+def _speedup_text_lines(plan: Plan) -> list[str]:
+    """The optional parallel-speedup section for :func:`plan_to_text`: one row per step that HAS a
+    learned curve (>=2 inner_jobs widths), showing the recommended width, achieved cores, the
+    speedup at that (knee) width, and the full ``inner_jobs->speedup`` curve. Empty (no lines) when
+    no step has a model, so a store without multi-width samples renders exactly as before."""
+    by_tag = plan.by_tag()
+    modeled = [(tag, by_tag[tag].speedup) for tag in plan.order if by_tag[tag].speedup is not None]
+    if not modeled:
+        return []
+    headers = ["step", "rec_inner_jobs", "eff_cores", "speedup@rec", "curve(inner_jobs->speedup)"]
+    rows: list[list[str]] = []
+    for tag, speedup in modeled:
+        assert speedup is not None  # narrowed by the filter above (for the type checker)
+        knee = next(
+            (lvl.speedup for lvl in speedup.levels if lvl.inner_jobs == speedup.recommended_inner_jobs),
+            1.0,
+        )
+        eff = (
+            f"{speedup.measured_effective_cores:.3f}"
+            if speedup.measured_effective_cores is not None
+            else "-"
+        )
+        curve = " ".join(f"{lvl.inner_jobs}:{lvl.speedup:.2f}x" for lvl in speedup.levels)
+        rows.append(
+            [tag, str(speedup.recommended_inner_jobs), eff, f"{knee:.2f}x", curve]
+        )
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(cells: Sequence[str]) -> str:
+        return "  ".join(
+            f"{cells[i]:<{widths[i]}}" if i == 0 else f"{cells[i]:>{widths[i]}}"
+            for i in range(len(headers))
+        )
+
+    out = [
+        "",
+        "parallel-speedup model (recommended inner_jobs = best wall within the knee + core budget; "
+        "speedup@rec = speedup at that width):",
+        fmt(headers),
+        "  ".join("-" * w for w in widths),
+    ]
+    out.extend(fmt(row) for row in rows)
+    return out

@@ -176,6 +176,11 @@ def count_external_build_processes(
     returned.
     """
     names = set(build_process_names)
+    if not names:
+        # No build-process names to match => nothing to count. Return early so a caller that only
+        # wants the load/PSI parts of a snapshot (e.g. the generic runner, which has no project
+        # build-process names) does not pay for a full /proc scan that could only ever return 0.
+        return 0
     marker = scope_marker or ""
     count = 0
     for entry in Path("/proc").iterdir():

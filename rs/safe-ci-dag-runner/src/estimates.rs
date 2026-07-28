@@ -219,6 +219,38 @@ fn contention_fraction(row: &HashMap<String, String>, affinity: Option<i64>) -> 
     }
 }
 
+/// A loaded store: the column->value row maps plus the parsed affinity (core) width.
+type LoadedStore = (Vec<HashMap<String, String>>, Option<i64>);
+
+/// Read `<profile_dir>/step_profiles_<machine_id>_<container_class>.csv` into a list of
+/// column->value row maps plus the parsed affinity (core) width, or `None` when the file is absent.
+/// The single CSV-reading path shared by [`load_step_samples`] and [`load_step_speedups`] (DRY);
+/// mirrors Python's `_load_store`.
+fn load_store(profile_dir: &Path, machine_id: &str, container_class: &str) -> Option<LoadedStore> {
+    let path = profile_dir.join(format!("step_profiles_{machine_id}_{container_class}.csv"));
+    let text = std::fs::read_to_string(&path).ok()?;
+    let affinity = affinity_width(container_class);
+    let mut lines = text.lines();
+    let header: Vec<String> = match lines.next() {
+        Some(h) => parse_csv_line(h),
+        None => return Some((Vec::new(), affinity)),
+    };
+    let mut rows: Vec<HashMap<String, String>> = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let cells = parse_csv_line(line);
+        let row: HashMap<String, String> = header
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), cells.get(i).cloned().unwrap_or_default()))
+            .collect();
+        rows.push(row);
+    }
+    Some((rows, affinity))
+}
+
 /// Read the per-step profile CSV for `(machine_id, container_class)` under `profile_dir` and
 /// aggregate the samples per step into robust estimates. Returns `{}` when the file is absent
 /// (the caller then falls back to DAG hints). Mirrors Python's `load_step_samples`.
@@ -227,37 +259,15 @@ pub fn load_step_samples(
     machine_id: &str,
     container_class: &str,
 ) -> HashMap<String, StepSamples> {
-    let path = profile_dir.join(format!("step_profiles_{machine_id}_{container_class}.csv"));
-    let text = match std::fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(_) => return HashMap::new(),
-    };
-    let affinity = affinity_width(container_class);
-    let mut lines = text.lines();
-    let header: Vec<String> = match lines.next() {
-        Some(h) => parse_csv_line(h),
+    let (rows, affinity) = match load_store(profile_dir, machine_id, container_class) {
+        Some(x) => x,
         None => return HashMap::new(),
     };
-    let index: HashMap<String, usize> = header
-        .iter()
-        .enumerate()
-        .map(|(i, name)| (name.clone(), i))
-        .collect();
-
     let mut durations: HashMap<String, Vec<f64>> = HashMap::new();
     let mut peaks: HashMap<String, Vec<i64>> = HashMap::new();
     let mut counts: HashMap<String, i64> = HashMap::new();
 
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let cells = parse_csv_line(line);
-        // Build a name->value map for the contention lookups (mirrors csv.DictReader).
-        let row: HashMap<String, String> = index
-            .iter()
-            .map(|(name, &i)| (name.clone(), cells.get(i).cloned().unwrap_or_default()))
-            .collect();
+    for row in &rows {
         let step = match row.get("step") {
             Some(s) if !s.is_empty() => s.clone(),
             _ => continue,
@@ -265,7 +275,7 @@ pub fn load_step_samples(
         *counts.entry(step.clone()).or_insert(0) += 1;
         if let Some(elapsed) = parse_float(row.get("elapsed_s")) {
             if elapsed >= 0.0 {
-                let intrinsic = elapsed * (1.0 - contention_fraction(&row, affinity));
+                let intrinsic = elapsed * (1.0 - contention_fraction(row, affinity));
                 durations.entry(step.clone()).or_default().push(intrinsic);
             }
         }
@@ -293,6 +303,194 @@ pub fn load_step_samples(
     result
 }
 
+// --------------------------------------------------------------------------- speedup model
+
+/// A level must be at least this many times faster than the previous (fewer-thread) level to make
+/// the extra threads worthwhile; below this the marginal speedup has plateaued (a knee).
+const SPEEDUP_MIN_MARGINAL_GAIN: f64 = 1.15;
+/// If total CPU-seconds grow by more than this factor between two consecutive levels, the step does
+/// materially more total work per added thread (a work-conservation stop signal).
+const SPEEDUP_MAX_WORK_GROWTH: f64 = 1.5;
+/// A step needs at least this many DISTINCT inner_jobs levels (with wall data) to model a curve.
+const SPEEDUP_MIN_LEVELS: usize = 2;
+
+/// One measured point on a step's speedup curve. Mirrors Python's `SpeedupLevel`.
+#[derive(Debug, Clone)]
+pub struct SpeedupLevel {
+    pub inner_jobs: i64,
+    pub samples: i64,
+    pub wall_s: f64,
+    pub cpu_s: Option<f64>,
+    pub effective_cores: Option<f64>,
+    pub throttled_s: Option<f64>,
+    pub speedup: f64,
+}
+
+/// A step's fitted speedup curve across inner_jobs widths plus the recommended width. Mirrors
+/// Python's `StepSpeedup`.
+#[derive(Debug, Clone)]
+pub struct StepSpeedup {
+    pub step: String,
+    pub baseline_inner_jobs: i64,
+    pub recommended_inner_jobs: i64,
+    pub measured_effective_cores: Option<f64>,
+    pub levels: Vec<SpeedupLevel>,
+}
+
+/// Per-level `(inner_jobs, samples, wall, cpu, effective_cores, throttled)` tuple.
+type RawLevel = (i64, i64, f64, Option<f64>, Option<f64>, Option<f64>);
+
+/// Assemble a [`StepSpeedup`] from per-level tuples SORTED ascending by inner_jobs. Deterministic
+/// across builds (only compares robust medians of identical inputs). Mirrors Python's
+/// `_build_step_speedup`.
+fn build_step_speedup(
+    step: String,
+    raw_levels: &[RawLevel],
+    core_budget: Option<i64>,
+) -> StepSpeedup {
+    let baseline_j = raw_levels[0].0;
+    let baseline_wall = raw_levels[0].2;
+    let mut levels: Vec<SpeedupLevel> = Vec::with_capacity(raw_levels.len());
+    let mut recommended = baseline_j;
+    let mut still_scaling = true;
+    let mut prev_wall = baseline_wall;
+    let mut prev_cpu = raw_levels[0].3;
+    let mut eff_by_j: HashMap<i64, Option<f64>> = HashMap::new();
+    for (idx, &(j, n, wall, cpu, eff, throttled)) in raw_levels.iter().enumerate() {
+        let speedup = if wall > 0.0 {
+            baseline_wall / wall
+        } else {
+            1.0
+        };
+        levels.push(SpeedupLevel {
+            inner_jobs: j,
+            samples: n,
+            wall_s: wall,
+            cpu_s: cpu,
+            effective_cores: eff,
+            throttled_s: throttled,
+            speedup,
+        });
+        eff_by_j.insert(j, eff);
+        if idx > 0 && still_scaling {
+            let gain = if wall > 0.0 { prev_wall / wall } else { 1.0 };
+            let work_growth = match (cpu, prev_cpu) {
+                (Some(c), Some(pc)) if pc > 0.0 => Some(c / pc),
+                _ => None,
+            };
+            let within_budget = core_budget.is_none_or(|b| j <= b);
+            let work_ok = work_growth.is_none_or(|w| w <= SPEEDUP_MAX_WORK_GROWTH);
+            if gain >= SPEEDUP_MIN_MARGINAL_GAIN && work_ok && within_budget {
+                recommended = j;
+            } else {
+                still_scaling = false;
+            }
+        }
+        prev_wall = wall;
+        prev_cpu = cpu;
+    }
+    StepSpeedup {
+        step,
+        baseline_inner_jobs: baseline_j,
+        recommended_inner_jobs: recommended,
+        measured_effective_cores: eff_by_j.get(&recommended).copied().flatten(),
+        levels,
+    }
+}
+
+/// Model each step's PARALLEL-SPEEDUP curve from its samples ACROSS inner_jobs widths. Mirrors
+/// Python's `load_step_speedups`: groups by `(step, inner_jobs)`, derives a robust
+/// contention-discounted wall plus the work-conservation signal (median `user_s`+`sys_s`),
+/// `effective_cores`, and `throttled_s` per width, then fits the curve and a recommended width
+/// (best wall within the knee and the machine's core budget, the affinity width from
+/// `container_class`). Only steps with at least [`SPEEDUP_MIN_LEVELS`] widths get a model.
+pub fn load_step_speedups(
+    profile_dir: &Path,
+    machine_id: &str,
+    container_class: &str,
+) -> HashMap<String, StepSpeedup> {
+    let (rows, affinity) = match load_store(profile_dir, machine_id, container_class) {
+        Some(x) => x,
+        None => return HashMap::new(),
+    };
+    let core_budget = affinity;
+    let mut walls: HashMap<(String, i64), Vec<f64>> = HashMap::new();
+    let mut cpus: HashMap<(String, i64), Vec<f64>> = HashMap::new();
+    let mut effs: HashMap<(String, i64), Vec<f64>> = HashMap::new();
+    let mut thrs: HashMap<(String, i64), Vec<f64>> = HashMap::new();
+    for row in &rows {
+        let step = match row.get("step") {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => continue,
+        };
+        let inner = match parse_int(row.get("inner_jobs")) {
+            Some(j) if j > 0 => j,
+            _ => continue,
+        };
+        let key = (step, inner);
+        if let Some(elapsed) = parse_float(row.get("elapsed_s")) {
+            if elapsed >= 0.0 {
+                walls
+                    .entry(key.clone())
+                    .or_default()
+                    .push(elapsed * (1.0 - contention_fraction(row, affinity)));
+            }
+        }
+        if let (Some(u), Some(s)) = (
+            parse_float(row.get("user_s")),
+            parse_float(row.get("sys_s")),
+        ) {
+            if u >= 0.0 && s >= 0.0 {
+                cpus.entry(key.clone()).or_default().push(u + s);
+            }
+        }
+        if let Some(e) = parse_float(row.get("effective_cores")) {
+            if e >= 0.0 {
+                effs.entry(key.clone()).or_default().push(e);
+            }
+        }
+        if let Some(t) = parse_float(row.get("throttled_s")) {
+            if t >= 0.0 {
+                thrs.entry(key.clone()).or_default().push(t);
+            }
+        }
+    }
+    let mut by_step: HashMap<String, Vec<i64>> = HashMap::new();
+    for (step, inner) in walls.keys() {
+        by_step.entry(step.clone()).or_default().push(*inner);
+    }
+    let mut result: HashMap<String, StepSpeedup> = HashMap::new();
+    for (step, widths) in by_step {
+        let mut levels_j = widths;
+        levels_j.sort_unstable();
+        levels_j.dedup();
+        if levels_j.len() < SPEEDUP_MIN_LEVELS {
+            continue;
+        }
+        let mut raw_levels: Vec<RawLevel> = Vec::with_capacity(levels_j.len());
+        for inner in &levels_j {
+            let key = (step.clone(), *inner);
+            let wall_samples = &walls[&key];
+            let median_of = |m: &HashMap<(String, i64), Vec<f64>>| -> Option<f64> {
+                m.get(&key)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| robust_median(v))
+            };
+            raw_levels.push((
+                *inner,
+                wall_samples.len() as i64,
+                robust_median(wall_samples),
+                median_of(&cpus),
+                median_of(&effs),
+                median_of(&thrs),
+            ));
+        }
+        let model = build_step_speedup(step.clone(), &raw_levels, core_budget);
+        result.insert(step, model);
+    }
+    result
+}
+
 // --------------------------------------------------------------------------- planner
 
 /// The resolved estimate + planner metadata for one step (what the plan display shows).
@@ -305,6 +503,9 @@ pub struct PlanEntry {
     pub rss_source: String,
     pub bottom_level_s: f64,
     pub samples: i64,
+    /// The learned parallel-speedup curve for this step, or `None` when the store has fewer than
+    /// two inner_jobs widths for it.
+    pub speedup: Option<StepSpeedup>,
 }
 
 /// A complete plan: per-step resolved estimates, the dispatch order, and the critical path.
@@ -488,11 +689,16 @@ fn plan_order(
 }
 
 /// Resolve every step's estimate and build the plan for `planner` (mirrors Python's `build_plan`).
+///
+/// `speedups` (from [`load_step_speedups`]) attaches each step's learned parallel-speedup curve for
+/// the plan display; it does not change the dispatch order (the co-scheduling inner_jobs allocation
+/// planner is a scoped follow-on).
 pub fn build_plan(
     cfg: &DagConfig,
     store_samples: &HashMap<String, StepSamples>,
     planner: Planner,
     min_samples: i64,
+    speedups: &HashMap<String, StepSpeedup>,
 ) -> Plan {
     let mut resolved: HashMap<String, Resolved> = HashMap::new();
     let mut est: HashMap<String, f64> = HashMap::new();
@@ -519,6 +725,7 @@ pub fn build_plan(
                 rss_source: r.rss_source.to_string(),
                 bottom_level_s: bottom.get(&tag).copied().unwrap_or(0.0),
                 samples: r.samples,
+                speedup: speedups.get(&tag).cloned(),
             }
         })
         .collect();
@@ -570,6 +777,50 @@ pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
 /// Fixed 3-decimal seconds, byte-identical to the Python `f"{value:.3f}"`.
 fn fmt_secs(value: f64) -> String {
     format!("{value:.3}")
+}
+
+/// JSON value for an optional fixed-3-decimal number: `null` or a quoted string.
+fn opt_secs_json(value: Option<f64>) -> String {
+    match value {
+        None => "null".to_string(),
+        Some(v) => format!("\"{}\"", fmt_secs(v)),
+    }
+}
+
+/// One speedup-curve level as a single-line JSON object (byte-identical to the Python build).
+fn speedup_level_json(level: &SpeedupLevel) -> String {
+    format!(
+        "{{\"inner_jobs\": {}, \"wall_s\": \"{}\", \"speedup\": \"{}\", \"cpu_s\": {}, \"effective_cores\": {}, \"throttled_s\": {}, \"samples\": {}}}",
+        level.inner_jobs,
+        fmt_secs(level.wall_s),
+        fmt_secs(level.speedup),
+        opt_secs_json(level.cpu_s),
+        opt_secs_json(level.effective_cores),
+        opt_secs_json(level.throttled_s),
+        level.samples,
+    )
+}
+
+/// The `"speedup"` field value for a step in the plan JSON: `null` or a nested object with the
+/// recommended width, achieved cores, and the full measured curve. Indented to embed after
+/// `"speedup": ` at the step object's 6-space field indent. Mirrors Python's `_speedup_to_json`.
+fn speedup_to_json(speedup: &Option<StepSpeedup>) -> String {
+    let sp = match speedup {
+        None => return "null".to_string(),
+        Some(s) => s,
+    };
+    let levels: Vec<String> = sp
+        .levels
+        .iter()
+        .map(|l| format!("          {}", speedup_level_json(l)))
+        .collect();
+    format!(
+        "{{\n        \"baseline_inner_jobs\": {},\n        \"recommended_inner_jobs\": {},\n        \"measured_effective_cores\": {},\n        \"levels\": [\n{}\n        ]\n      }}",
+        sp.baseline_inner_jobs,
+        sp.recommended_inner_jobs,
+        opt_secs_json(sp.measured_effective_cores),
+        levels.join(",\n"),
+    )
 }
 
 fn human_bytes(n: Option<i64>) -> String {
@@ -626,7 +877,7 @@ pub fn plan_to_json(plan: &Plan) -> String {
             None => "null".to_string(),
         };
         steps_json.push(format!(
-            "    {{\n      \"tag\": {},\n      \"est_duration_s\": \"{}\",\n      \"est_source\": {},\n      \"rss_estimate_bytes\": {},\n      \"rss_source\": {},\n      \"bottom_level_s\": \"{}\",\n      \"samples\": {}\n    }}",
+            "    {{\n      \"tag\": {},\n      \"est_duration_s\": \"{}\",\n      \"est_source\": {},\n      \"rss_estimate_bytes\": {},\n      \"rss_source\": {},\n      \"bottom_level_s\": \"{}\",\n      \"samples\": {},\n      \"speedup\": {}\n    }}",
             json_str(&entry.tag),
             fmt_secs(entry.est_duration_s),
             json_str(&entry.est_source),
@@ -634,6 +885,7 @@ pub fn plan_to_json(plan: &Plan) -> String {
             json_str(&entry.rss_source),
             fmt_secs(entry.bottom_level_s),
             entry.samples,
+            speedup_to_json(&entry.speedup),
         ));
     }
     if steps_json.is_empty() {
@@ -720,7 +972,93 @@ pub fn plan_to_text(plan: &Plan) -> String {
         plan.order.join(", ")
     };
     lines.push(format!("scheduled order: {order}"));
+    lines.extend(speedup_text_lines(plan));
     lines.join("\n") + "\n"
+}
+
+/// The optional parallel-speedup section for [`plan_to_text`]: one row per step that HAS a learned
+/// curve (>=2 inner_jobs widths). Empty when no step has a model, so a store without multi-width
+/// samples renders exactly as before. Mirrors Python's `_speedup_text_lines`.
+fn speedup_text_lines(plan: &Plan) -> Vec<String> {
+    let by_tag = plan.by_tag();
+    let modeled: Vec<(&String, &StepSpeedup)> = plan
+        .order
+        .iter()
+        .filter_map(|tag| {
+            by_tag
+                .get(tag)
+                .and_then(|e| e.speedup.as_ref().map(|s| (tag, s)))
+        })
+        .collect();
+    if modeled.is_empty() {
+        return Vec::new();
+    }
+    let headers = [
+        "step",
+        "rec_inner_jobs",
+        "eff_cores",
+        "speedup@rec",
+        "curve(inner_jobs->speedup)",
+    ];
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(modeled.len());
+    for (tag, sp) in &modeled {
+        let knee = sp
+            .levels
+            .iter()
+            .find(|l| l.inner_jobs == sp.recommended_inner_jobs)
+            .map(|l| l.speedup)
+            .unwrap_or(1.0);
+        let eff = match sp.measured_effective_cores {
+            Some(e) => format!("{e:.3}"),
+            None => "-".to_string(),
+        };
+        let curve = sp
+            .levels
+            .iter()
+            .map(|l| format!("{}:{:.2}x", l.inner_jobs, l.speedup))
+            .collect::<Vec<_>>()
+            .join(" ");
+        rows.push(vec![
+            (*tag).clone(),
+            sp.recommended_inner_jobs.to_string(),
+            eff,
+            format!("{knee:.2}x"),
+            curve,
+        ]);
+    }
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in &rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.chars().count());
+        }
+    }
+    let fmt_row = |cells: &[String]| -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(headers.len());
+        for (i, cell) in cells.iter().enumerate() {
+            let w = widths[i];
+            if i == 0 {
+                parts.push(format!("{cell:<w$}"));
+            } else {
+                parts.push(format!("{cell:>w$}"));
+            }
+        }
+        parts.join("  ")
+    };
+    let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    let mut out: Vec<String> = vec![
+        String::new(),
+        "parallel-speedup model (recommended inner_jobs = best wall within the knee + core budget; speedup@rec = speedup at that width):".to_string(),
+        fmt_row(&header_cells),
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  "),
+    ];
+    for row in &rows {
+        out.push(fmt_row(row));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -832,6 +1170,42 @@ mod tests {
     }
 
     #[test]
+    fn speedup_model_detects_knee_and_linear() {
+        let dir = std::env::temp_dir().join(format!("scdr_sp_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // b.app: wall halves 1->2 but flattens 2->4 while total CPU-s blows up -> knee at 2.
+        // l.step: near-linear halving with flat CPU-s -> widest measured width (4), under budget 16.
+        let csv = "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,\
+                   enforcement_kind,runner_name,step,classification,inner_jobs,elapsed_s,returncode,\
+                   ok,timed_out,oom_kills,peak_bytes,thread_peak,effective_cores,user_s,sys_s,throttled_s\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,b.app,cpu-bound,1,10.0,0,True,False,0,1000,,1.0,10.0,0.2,0.0\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,b.app,cpu-bound,1,10.1,0,True,False,0,1000,,1.0,10.1,0.2,0.0\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,b.app,cpu-bound,2,5.0,0,True,False,0,1000,,1.98,10.0,0.4,0.0\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,b.app,cpu-bound,2,5.05,0,True,False,0,1000,,1.98,10.1,0.4,0.0\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,b.app,cpu-bound,4,4.5,0,True,False,0,1000,,3.2,17.5,0.8,1.2\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,b.app,cpu-bound,4,4.6,0,True,False,0,1000,,3.2,17.6,0.9,1.3\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,l.step,cpu-bound,1,8.0,0,True,False,0,1000,,,8.0,0.0,0.0\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,l.step,cpu-bound,2,4.0,0,True,False,0,1000,,,8.0,0.0,0.0\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,l.step,cpu-bound,4,2.0,0,True,False,0,1000,,,8.1,0.0,0.0\n\
+                   t,m,affinity16_cpu-max-max,a,1,a,u,l,s.one,cpu-bound,1,5.0,0,True,False,0,1000,,,5.0,0.0,0.0\n";
+        let path = dir.join("step_profiles_m_affinity16_cpu-max-max.csv");
+        std::fs::write(&path, csv).unwrap();
+        let models = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let knee = &models["b.app"];
+        assert_eq!(knee.baseline_inner_jobs, 1);
+        assert_eq!(knee.recommended_inner_jobs, 2);
+        assert_eq!(knee.measured_effective_cores, Some(1.98));
+        assert_eq!(
+            knee.levels.iter().map(|l| l.inner_jobs).collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        assert_eq!(models["l.step"].recommended_inner_jobs, 4);
+        // A single measured width is not enough to model a curve.
+        assert!(!models.contains_key("s.one"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn critical_path_planner_differs_from_lpt() {
         // prep(1) -> heavy(10); solo(5) independent. LPT dispatches heavy/solo/prep by est;
         // critical-path dispatches prep first (bottom_level 11 > solo 5 > heavy 10 order).
@@ -844,8 +1218,21 @@ mod tests {
             ..Default::default()
         };
         let empty: HashMap<String, StepSamples> = HashMap::new();
-        let lpt = build_plan(&cfg, &empty, Planner::GreedyLpt, DEFAULT_MIN_SAMPLES);
-        let cp = build_plan(&cfg, &empty, Planner::CriticalPath, DEFAULT_MIN_SAMPLES);
+        let no_speedups: HashMap<String, StepSpeedup> = HashMap::new();
+        let lpt = build_plan(
+            &cfg,
+            &empty,
+            Planner::GreedyLpt,
+            DEFAULT_MIN_SAMPLES,
+            &no_speedups,
+        );
+        let cp = build_plan(
+            &cfg,
+            &empty,
+            Planner::CriticalPath,
+            DEFAULT_MIN_SAMPLES,
+            &no_speedups,
+        );
         assert_eq!(lpt.order, vec!["g.heavy", "g.solo", "g.prep"]);
         assert_eq!(cp.order, vec!["g.prep", "g.heavy", "g.solo"]);
         assert_eq!(cp.critical_path, vec!["g.prep", "g.heavy"]);

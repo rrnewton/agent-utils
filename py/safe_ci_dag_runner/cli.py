@@ -36,6 +36,7 @@ from safe_ci_dag_runner.estimates import (
     build_plan,
     feedback_identity,
     load_step_samples,
+    load_step_speedups,
     plan_to_json,
     plan_to_text,
 )
@@ -182,6 +183,9 @@ def _quickstart(c: Palette) -> str:
   {k(f'{PROG} run   --dag dag.json --planner critical-path --show-plan')} {c.dim('# print the plan, then run in that order')}
   {c.dim('--planner greedy-lpt (default) launches the longest single step first; critical-path')}
   {c.dim('launches the step with the highest bottom-level (longest remaining est-weighted path).')}
+  {c.dim('When the store holds multiple inner-jobs widths for a step, plan/--show-plan also print a')}
+  {c.dim('parallel-speedup section: the recommended inner_jobs (best wall before the diminishing-')}
+  {c.dim('returns knee + within the core budget), achieved effective_cores, and the speedup curve.')}
   {c.dim(f'Use {k("--no-profile-feedback")} to ignore the store and plan from the DAG hints only.')}
 
 {h('DAG schema')}  {c.dim('(only group/job/cmd are required per step; everything else has defaults)')}
@@ -512,14 +516,17 @@ def _build_feedback_plan(
     """Load the profile store (when feedback is on) and build the plan for ``planner``.
 
     With ``feedback_dir`` set, the store's learned estimates refine each step (store wins when it
-    has enough samples; the DAG hint is the fallback). With ``feedback_dir`` ``None`` the plan
-    reflects the DAG hints only."""
-    samples = (
-        load_step_samples(feedback_dir, *feedback_identity())
-        if feedback_dir is not None
-        else {}
-    )
-    return build_plan(cfg, samples, planner=planner)
+    has enough samples; the DAG hint is the fallback) and the per-step parallel-speedup curves are
+    attached for the plan display. With ``feedback_dir`` ``None`` the plan reflects the DAG hints
+    only."""
+    if feedback_dir is not None:
+        machine_id, container_class = feedback_identity()
+        samples = load_step_samples(feedback_dir, machine_id, container_class)
+        speedups = load_step_speedups(feedback_dir, machine_id, container_class)
+    else:
+        samples = {}
+        speedups = {}
+    return build_plan(cfg, samples, planner=planner, speedups=speedups)
 
 
 def _report_profile_written(perf_dir: str, source: str) -> None:
