@@ -1322,6 +1322,242 @@ def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
             )
 
 
+# --------------------------------------------------------------------------- CPA planner
+
+#: Pinned identity for the CPA fixtures. An ``affinityN`` container so the speedup reader parses a
+#: 16-core knee budget (well above the widths used), keeping the recommended widths curve-limited
+#: rather than budget-limited.
+_CPA_MACHINE = "cross_cpa_machine"
+_CPA_CONTAINER = "affinity16_cpu-max-max"
+
+#: A DAG with a long dependency chain (prep -> build -> test) plus an independent plateau step
+#: (side). All durations come from the synthetic store below. Its shape makes CPA earn its keep: at
+#: inner-jobs=1 the chain critical path is prep(2)+build(40)+test(16) = 58s; the allocator widens the
+#: two SCALING chain steps (build, test) to shrink that path while the plateau step (side) and the
+#: curveless prep stay narrow.
+_CPA_DAG = {
+    "mem_cap_factor": 1.0,
+    "mem_cap_floor_bytes": 0,
+    "outer_mem_safety_factor": 1.0,
+    "steps": [
+        {"group": "c", "job": "prep", "desc": "prep", "cmd": "true",
+         "hint": {"est_duration_s": 2.0}},
+        {"group": "c", "job": "build", "desc": "build", "cmd": "true", "deps": ["c.prep"],
+         "hint": {"est_duration_s": 40.0}},
+        {"group": "c", "job": "test", "desc": "test", "cmd": "true", "deps": ["c.build"],
+         "hint": {"est_duration_s": 16.0}},
+        {"group": "c", "job": "side", "desc": "side", "cmd": "true",
+         "hint": {"est_duration_s": 9.0}},
+    ],
+}
+
+#: The width-1 critical-path length of :data:`_CPA_DAG` (prep 2 + build 40 + test 16). This is the
+#: makespan of the "critical-path with fixed inner-jobs = 1" baseline (side runs in parallel), which
+#: the CPA allocation must BEAT once it can widen the scaling chain steps (any core budget >= 2).
+_CPA_WIDTH1_CRITICAL_PATH_S = 58.0
+
+_CPA_HEADER = (
+    "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
+    "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
+    "peak_bytes,thread_peak,effective_cores,user_s,sys_s,throttled_s\n"
+)
+
+
+def _cpa_row(
+    machine: str, container: str, step: str, inner_jobs: int, elapsed: str, user_s: str,
+    peak_bytes: str = "1000",
+) -> str:
+    return (
+        f"t,{machine},{container},a,1,a,unverified,local,{step},cpu-bound,{inner_jobs},{elapsed},"
+        f"0,True,False,0,{peak_bytes},,,{user_s},0.0,0.0\n"
+    )
+
+
+def _cpa_store_csv() -> str:
+    """A fixed synthetic store for :data:`_CPA_DAG`: build and test scale near-linearly (flat total
+    CPU-seconds, so the work-conservation knee does not truncate them) while side plateaus after
+    inner-jobs=1. So the allocator's admissible widths are build up to 8, test up to 4, side rigid at
+    1 — and CPA widens build+test to collapse the 58s chain."""
+    rows: list[str] = []
+    for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0")):
+        rows.append(_cpa_row(_CPA_MACHINE, _CPA_CONTAINER, "c.build", j, w, "40.0"))
+    for j, w in ((1, "16.0"), (2, "8.0"), (4, "4.0")):
+        rows.append(_cpa_row(_CPA_MACHINE, _CPA_CONTAINER, "c.test", j, w, "16.0"))
+    for j, w in ((1, "9.0"), (2, "8.7")):
+        rows.append(_cpa_row(_CPA_MACHINE, _CPA_CONTAINER, "c.side", j, w, "9.0"))
+    return _CPA_HEADER + "".join(rows)
+
+
+#: A DAG whose one scaling CPU-bound step carries a memory baseline (3 GiB, factor 1.0) so its cap
+#: SCALES with width above inner-jobs=4 (``step_mem_cap_for_inner_jobs``: cap*p/4). Widening it
+#: 4 -> 8 doubles the modeled footprint from 3 GiB to 6 GiB, so a 5G RAM budget must BLOCK that
+#: widening (mem-capped) even though cores are free.
+_CPA_MEM_DAG = {
+    "mem_cap_factor": 1.0,
+    "mem_cap_floor_bytes": 0,
+    "outer_mem_safety_factor": 1.0,
+    "steps": [
+        {"group": "m", "job": "prep", "desc": "prep", "cmd": "true",
+         "hint": {"est_duration_s": 2.0}},
+        {"group": "m", "job": "heavy", "desc": "heavy", "cmd": "true", "deps": ["m.prep"],
+         "hint": {"est_duration_s": 40.0, "rss_baseline_bytes": 3221225472,
+                  "classification": "cpu-bound"}},
+    ],
+}
+
+
+def _cpa_mem_store_csv() -> str:
+    """Store for :data:`_CPA_MEM_DAG`: m.heavy scales near-linearly to inner-jobs=8 (flat CPU-s)."""
+    rows = [
+        _cpa_row(_CPA_MACHINE, _CPA_CONTAINER, "m.heavy", j, w, "40.0")
+        for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0"))
+    ]
+    return _CPA_HEADER + "".join(rows)
+
+
+def _cpa_widths_from_json(stdout: str) -> dict[str, int] | None:
+    """Extract ``{tag: alloc_inner_jobs}`` from ``plan --planner cpa --format json`` output."""
+    try:
+        obj = json.loads(stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    steps = obj.get("steps")
+    if not isinstance(steps, list):
+        return None
+    out: dict[str, int] = {}
+    for s in steps:
+        if not isinstance(s, dict):
+            return None
+        tag, w = s.get("tag"), s.get("alloc_inner_jobs")
+        if isinstance(tag, str) and isinstance(w, int):
+            out[tag] = w
+    return out
+
+
+def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the ``--planner cpa`` moldable allocator agrees across builds AND actually helps.
+
+    Against a fixed synthetic store (host-independent identity), for both output formats:
+
+    * ``plan --planner cpa`` output is BYTE-IDENTICAL py vs rs (so the chosen widths, the dispatch
+      order at the allocated weights, the allocator summary, the makespan lower bound, and the
+      modeled makespan all match exactly).
+    * the allocator FIRED — it widened the scaling chain step (``c.build`` gets inner-jobs > 1) —
+      and the modeled makespan never dips below the ``max(T_CP, area/P)`` lower bound.
+    * CPA BEATS the fixed-inner-jobs=1 baseline: its modeled makespan is below the 58s width-1
+      critical path (whenever the core budget allows any widening, i.e. P >= 2).
+    * the MEMORY cap binds: with a tight ``--max-mem`` the memory-heavy step is widened LESS than
+      with no budget (and the run reports ``mem-capped``) — provided cores were not the limit.
+    """
+    extra = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": _CPA_MACHINE,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _CPA_CONTAINER,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{_CPA_MACHINE}_{_CPA_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as fh:
+            fh.write(_cpa_store_csv())
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_CPA_DAG))
+
+        json_out = ""
+        for fmt in ("text", "json"):
+            args = ("plan", "--dag", dag_path, "--perf-dir", store, "--planner", "cpa",
+                    "--format", fmt)
+            po = run(py, args, extra)
+            ro = run(rs, args, extra)
+            label = f"cpa:{fmt}"
+            if po.returncode != 0 or ro.returncode != 0:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode} "
+                               f"(py stderr={po.stderr!r}; rs stderr={ro.stderr!r})")
+                continue
+            if po.stdout != ro.stdout:
+                rep.bad(label, f"cpa plan not byte-identical\n--- py ---\n{po.stdout}\n"
+                               f"--- rs ---\n{ro.stdout}")
+                continue
+            rep.ok(label)
+            if fmt == "json":
+                json_out = po.stdout
+
+        # Positive proofs on the shared (byte-identical) JSON.
+        try:
+            obj = json.loads(json_out)
+            alloc = obj["allocation"]
+            widths = _cpa_widths_from_json(json_out) or {}
+            core_budget = int(alloc["core_budget"])
+            modeled = float(alloc["modeled_makespan_s"])
+            lower_bound = float(alloc["lower_bound_s"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            rep.bad("cpa:allocation", f"unparseable allocation in\n{json_out}")
+            return
+
+        # The allocator actually allocated: the scaling chain head widened past 1 (needs P >= 2).
+        if core_budget >= 2 and widths.get("c.build", 0) > 1:
+            rep.ok("cpa:widened")
+        elif core_budget < 2:
+            rep.ok("cpa:widened")  # a 1-core box cannot widen; not a divergence
+        else:
+            rep.bad("cpa:widened",
+                    f"expected c.build to be widened past 1 (P={core_budget}); widths={widths}")
+
+        # The modeled makespan must never dip below the max(T_CP, area/P) lower bound.
+        if modeled + 1e-9 >= lower_bound:
+            rep.ok("cpa:modeled-ge-lower-bound")
+        else:
+            rep.bad("cpa:modeled-ge-lower-bound",
+                    f"modeled {modeled} < lower_bound {lower_bound}")
+
+        # CPA beats the fixed-inner-jobs=1 baseline (58s width-1 critical path) once it can widen.
+        if core_budget < 2 or modeled < _CPA_WIDTH1_CRITICAL_PATH_S:
+            rep.ok("cpa:beats-fixed")
+        else:
+            rep.bad("cpa:beats-fixed",
+                    f"CPA modeled makespan {modeled}s did not beat the width-1 critical path "
+                    f"{_CPA_WIDTH1_CRITICAL_PATH_S}s (P={core_budget})")
+
+        # Memory cap: a tight --max-mem must widen the memory-heavy step LESS than an unbounded run.
+        mstore = os.path.join(tmp, "mstore")
+        os.makedirs(mstore, exist_ok=True)
+        with open(os.path.join(mstore, csv_name), "w", encoding="utf-8") as fh:
+            fh.write(_cpa_mem_store_csv())
+        mdag = os.path.join(tmp, "mdag.json")
+        with open(mdag, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(_CPA_MEM_DAG))
+        free_args = ("plan", "--dag", mdag, "--perf-dir", mstore, "--planner", "cpa",
+                     "--format", "json")
+        capped_args = free_args + ("--max-mem", "5G")
+        pf, rf = run(py, free_args, extra), run(rs, free_args, extra)
+        pc, rc = run(py, capped_args, extra), run(rs, capped_args, extra)
+        if pf.stdout != rf.stdout or pc.stdout != rc.stdout:
+            rep.bad("cpa:mem-byte-identical",
+                    "cpa --max-mem plan not byte-identical py vs rs")
+        else:
+            rep.ok("cpa:mem-byte-identical")
+            free_w = (_cpa_widths_from_json(pf.stdout) or {}).get("m.heavy", 0)
+            capped_w = (_cpa_widths_from_json(pc.stdout) or {}).get("m.heavy", 0)
+            try:
+                capped_reason = json.loads(pc.stdout)["allocation"]["stop_reason"]
+                capped_budget = int(json.loads(pc.stdout)["allocation"]["core_budget"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                capped_reason, capped_budget = "", 0
+            # Only assert the memory throttle when cores were not the binding constraint (P >= 8, so
+            # the unbounded run could actually reach width 8 where the footprint doubles).
+            if capped_budget < 8:
+                rep.ok("cpa:mem-capped")  # core-limited box; memory never got to bind
+            elif capped_w < free_w and capped_reason == "mem-capped":
+                rep.ok("cpa:mem-capped")
+            else:
+                rep.bad("cpa:mem-capped",
+                        f"expected --max-mem to throttle m.heavy below the unbounded width "
+                        f"{free_w} with stop_reason 'mem-capped'; got width {capped_w} "
+                        f"reason {capped_reason!r} (P={capped_budget})")
+
+
 def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
     """``sweep --jobs`` malformed inputs must exit 2 with byte-identical stderr in both builds
     (guards the not-an-integer / malformed-range error-text parity)."""
@@ -1385,6 +1621,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)
     compare_speedup_model(py, rs, rep)
+    compare_cpa_planner(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

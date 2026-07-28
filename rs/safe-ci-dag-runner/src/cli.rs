@@ -37,6 +37,7 @@ use crate::estimates::{
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
 use crate::model::{step_classification, DagConfig, Step};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
+use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{run_dag_boxed, run_dag_boxed_ordered, BoxedCgroups};
 use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
 use crate::viz::{to_ascii, to_dot};
@@ -526,7 +527,7 @@ fn validate_planner(value: String) -> Result<String, String> {
     match Planner::from_value(&value) {
         Some(p) => Ok(p.value().to_string()),
         None => Err(format!(
-            "--planner: invalid choice: '{value}' (choose from greedy-lpt, critical-path)"
+            "--planner: invalid choice: '{value}' (choose from greedy-lpt, critical-path, cpa)"
         )),
     }
 }
@@ -552,14 +553,29 @@ fn resolve_feedback_dir(perf_dir: Option<&str>, no_feedback: bool) -> Option<Str
 }
 
 /// Load the profile store (when feedback is on) and build the plan for `planner`. Mirrors Python's
-/// `_build_feedback_plan`.
-fn build_feedback_plan(cfg: &DagConfig, feedback_dir: Option<&str>, planner: Planner) -> Plan {
+/// `_build_feedback_plan`. `core_budget` (`P`) and `mem_budget` drive the CPA allocator under
+/// `--planner cpa` and are ignored by the other planners.
+fn build_feedback_plan(
+    cfg: &DagConfig,
+    feedback_dir: Option<&str>,
+    planner: Planner,
+    core_budget: Option<i64>,
+    mem_budget: Option<i64>,
+) -> Plan {
     match feedback_dir {
         Some(dir) => {
             let (mid, cc) = feedback_identity();
             let samples = load_step_samples(Path::new(dir), &mid, &cc);
             let speedups = load_step_speedups(Path::new(dir), &mid, &cc);
-            build_plan(cfg, &samples, planner, DEFAULT_MIN_SAMPLES, &speedups)
+            build_plan(
+                cfg,
+                &samples,
+                planner,
+                DEFAULT_MIN_SAMPLES,
+                &speedups,
+                core_budget,
+                mem_budget,
+            )
         }
         None => build_plan(
             cfg,
@@ -567,8 +583,21 @@ fn build_feedback_plan(cfg: &DagConfig, feedback_dir: Option<&str>, planner: Pla
             planner,
             DEFAULT_MIN_SAMPLES,
             &std::collections::HashMap::new(),
+            core_budget,
+            mem_budget,
         ),
     }
+}
+
+/// Resolve the `(core_budget, mem_budget)` the CPA allocator balances against, or `(None, None)`
+/// for the non-allocating planners (so they do no cgroup/proc reads). Mirrors Python's
+/// `_cpa_budgets`.
+fn cpa_budgets(planner: Planner, max_mem: Option<&str>) -> (Option<i64>, Option<i64>) {
+    if planner != Planner::Cpa {
+        return (None, None);
+    }
+    let mem_budget = max_mem.filter(|s| !s.is_empty()).and_then(parse_size);
+    (Some(container_core_budget()), mem_budget)
 }
 
 /// Print one visible line naming where profile CSVs were appended (No Silent Failure).
@@ -1070,6 +1099,7 @@ struct PlanArgs {
     format: String,
     perf_dir: Option<String>,
     no_profile_feedback: bool,
+    max_mem: Option<String>,
 }
 
 fn parse_plan_args(rest: &[String]) -> Result<PlanArgs, String> {
@@ -1079,6 +1109,7 @@ fn parse_plan_args(rest: &[String]) -> Result<PlanArgs, String> {
         format: "text".to_string(),
         perf_dir: None,
         no_profile_feedback: false,
+        max_mem: None,
     };
     let mut i = 0;
     while i < rest.len() {
@@ -1111,6 +1142,7 @@ fn parse_plan_args(rest: &[String]) -> Result<PlanArgs, String> {
             }
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile-feedback" => a.no_profile_feedback = true,
+            "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
             other => return Err(format!("unrecognized argument: {other}")),
         }
         i += 1;
@@ -1136,7 +1168,14 @@ fn cmd_plan(a: &PlanArgs) -> i32 {
     };
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
-    let plan = build_feedback_plan(&cfg, feedback_dir.as_deref(), planner);
+    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref());
+    let plan = build_feedback_plan(
+        &cfg,
+        feedback_dir.as_deref(),
+        planner,
+        core_budget,
+        mem_budget,
+    );
     if a.format == "json" {
         println!("{}", plan_to_json(&plan));
     } else {
@@ -1180,7 +1219,14 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // The applied cfg (refined hints) feeds both the memory-aware -j sizing and the scheduler.
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
-    let plan = build_feedback_plan(cfg, feedback_dir.as_deref(), planner);
+    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref());
+    let plan = build_feedback_plan(
+        cfg,
+        feedback_dir.as_deref(),
+        planner,
+        core_budget,
+        mem_budget,
+    );
     let applied = apply_plan_to_config(cfg, &plan);
     let cfg: &DagConfig = &applied;
     if a.show_plan {
@@ -1203,6 +1249,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         verbosity,
         cgroups,
         Some(plan.order.clone()),
+        core_budget,
     );
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
     let failed = result

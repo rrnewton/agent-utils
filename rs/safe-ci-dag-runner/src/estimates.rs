@@ -22,6 +22,7 @@ use std::path::Path;
 use crate::io::json_str;
 use crate::model::{DagConfig, ResourceHint, Step};
 use crate::perflog::{container_class, machine_id, parse_csv_line};
+use crate::sizing::schedulable_peak_mem_bytes_widths;
 
 /// Environment overrides for the feedback identity (mirrors the Python constants). Let a test (or
 /// a caller pinning heterogeneous-but-equivalent runners) force the
@@ -50,6 +51,11 @@ const CONTENTION_PCT_COLUMNS: [&str; 3] =
 pub enum Planner {
     GreedyLpt,
     CriticalPath,
+    /// CPA (Radulescu & van Gemund 2001): a two-phase moldable allocator that first picks each
+    /// step's inner-jobs width by balancing the critical path against the per-core area over the
+    /// MEASURED speedup curves, then list-schedules by critical-path order at the allocated widths.
+    /// See `common/docs/safe-ci-dag-runner/PLANNER_DESIGN.md`.
+    Cpa,
 }
 
 impl Planner {
@@ -58,6 +64,7 @@ impl Planner {
         match self {
             Planner::GreedyLpt => "greedy-lpt",
             Planner::CriticalPath => "critical-path",
+            Planner::Cpa => "cpa",
         }
     }
 
@@ -66,6 +73,7 @@ impl Planner {
         match text {
             "greedy-lpt" => Some(Planner::GreedyLpt),
             "critical-path" => Some(Planner::CriticalPath),
+            "cpa" => Some(Planner::Cpa),
             _ => None,
         }
     }
@@ -522,6 +530,26 @@ pub struct PlanEntry {
     /// The learned parallel-speedup curve for this step, or `None` when the store has fewer than
     /// two inner_jobs widths for it.
     pub speedup: Option<StepSpeedup>,
+    /// The inner-jobs width the CPA allocator assigned this step, or `None` for the non-allocating
+    /// planners. This is the `-j` the step actually runs with under `--planner cpa` (baked into the
+    /// command via [`apply_plan_to_config`]).
+    pub alloc_inner_jobs: Option<i64>,
+}
+
+/// The CPA allocator's whole-DAG summary (`--planner cpa` only). Records the core budget it
+/// balanced against, the area and critical-path terms, the makespan LOWER BOUND `max(T_CP, area/P)`
+/// (Graham/Brent), the achieved MODELED makespan (a deterministic greedy list-schedule of the
+/// allocated widths, always `>=` the lower bound), and WHY the gradient loop stopped. Mirrors
+/// Python's `Allocation`. See `PLANNER_DESIGN.md` §5.8-5.9.
+#[derive(Debug, Clone)]
+pub struct Allocation {
+    pub core_budget: i64,
+    pub area_s: f64,
+    pub area_bound_s: f64,
+    pub critical_path_s: f64,
+    pub lower_bound_s: f64,
+    pub modeled_makespan_s: f64,
+    pub stop_reason: String,
 }
 
 /// A complete plan: per-step resolved estimates, the dispatch order, and the critical path.
@@ -532,6 +560,8 @@ pub struct Plan {
     pub critical_path: Vec<String>,
     pub critical_path_length_s: f64,
     pub entries: Vec<PlanEntry>,
+    /// The CPA allocator summary (`--planner cpa` only), else `None`.
+    pub allocation: Option<Allocation>,
 }
 
 impl Plan {
@@ -681,7 +711,9 @@ fn plan_order(
 ) -> Vec<String> {
     let mut tags: Vec<String> = cfg.steps.iter().map(|s| s.tag()).collect();
     match planner {
-        Planner::CriticalPath => {
+        // CPA list-schedules by critical-path order at the allocated weights, so it uses the same
+        // bottom-level ordering as CriticalPath (PLANNER_DESIGN.md §5.7).
+        Planner::CriticalPath | Planner::Cpa => {
             // by bottom_level DESC, ties by tag ASC.
             tags.sort_by(|a, b| {
                 let ba = bottom.get(a).copied().unwrap_or(0.0);
@@ -704,17 +736,397 @@ fn plan_order(
     tags
 }
 
+// --------------------------------------------------------------------------- CPA allocator
+
+/// Stop-reason labels the CPA gradient loop can end on (PLANNER_DESIGN.md §5.8). Deterministic
+/// given the same store + DAG + budgets, so the two builds report the same one bit-for-bit.
+const CPA_BALANCED: &str = "balanced";
+const CPA_KNEE_EXHAUSTED: &str = "knee-exhausted";
+const CPA_CORE_CAPPED: &str = "core-capped";
+const CPA_MEM_CAPPED: &str = "mem-capped";
+const CPA_FIXED_POINT: &str = "fixed-point";
+
+/// Per-step admissible width set `W_i` (ascending) and the MEASURED wall `T_i(p)` at each admissible
+/// width. Mirrors Python's `_cpa_admissible` (PLANNER_DESIGN.md §5.2): a curve step admits its
+/// measured widths up to the knee (`recommended_inner_jobs`) and the core budget `P`; a curveless
+/// step is rigid at `min(hint or 1, P)` with `T_i` the resolved scalar estimate.
+#[allow(clippy::type_complexity)]
+fn cpa_admissible(
+    cfg: &DagConfig,
+    speedups: &HashMap<String, StepSpeedup>,
+    est: &HashMap<String, f64>,
+    core_budget: i64,
+) -> (
+    HashMap<String, Vec<i64>>,
+    HashMap<String, HashMap<i64, f64>>,
+) {
+    let mut admissible: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut wall: HashMap<String, HashMap<i64, f64>> = HashMap::new();
+    for step in &cfg.steps {
+        let tag = step.tag();
+        match speedups.get(&tag) {
+            Some(sp) if !sp.levels.is_empty() => {
+                let knee_ok: Vec<&SpeedupLevel> = sp
+                    .levels
+                    .iter()
+                    .filter(|l| l.inner_jobs <= sp.recommended_inner_jobs)
+                    .collect();
+                let within: Vec<&SpeedupLevel> = knee_ok
+                    .iter()
+                    .copied()
+                    .filter(|l| l.inner_jobs <= core_budget)
+                    .collect();
+                // Fall back to the narrowest measured width if EVERY admissible width exceeds P.
+                let chosen: Vec<&SpeedupLevel> = if within.is_empty() {
+                    knee_ok[..1].to_vec()
+                } else {
+                    within
+                };
+                let mut widths: Vec<i64> = chosen.iter().map(|l| l.inner_jobs).collect();
+                widths.sort_unstable();
+                let w: HashMap<i64, f64> =
+                    chosen.iter().map(|l| (l.inner_jobs, l.wall_s)).collect();
+                admissible.insert(tag.clone(), widths);
+                wall.insert(tag, w);
+            }
+            _ => {
+                let pref = step.hint.preferred_inner_jobs;
+                let mut ww = match pref {
+                    Some(p) if p > 0 => p,
+                    _ => 1,
+                };
+                if core_budget > 0 && ww > core_budget {
+                    ww = core_budget;
+                }
+                if ww < 1 {
+                    ww = 1;
+                }
+                admissible.insert(tag.clone(), vec![ww]);
+                let mut w: HashMap<i64, f64> = HashMap::new();
+                w.insert(ww, est.get(&tag).copied().unwrap_or(0.0));
+                wall.insert(tag, w);
+            }
+        }
+    }
+    (admissible, wall)
+}
+
+/// The next-larger admissible width after `current` in the ascending `widths`, or `None`.
+fn cpa_next_width(widths: &[i64], current: i64) -> Option<i64> {
+    widths.iter().copied().find(|&w| w > current)
+}
+
+/// Worst-case concurrent memory footprint (bytes) with the given PER-STEP widths (PLANNER_DESIGN.md
+/// §5.6).
+fn cpa_footprint(cfg: &DagConfig, widths: &HashMap<String, i64>) -> i64 {
+    schedulable_peak_mem_bytes_widths(cfg, cfg.steps.len() as i64, widths).0
+}
+
+/// `(widths, admissible, wall, stop_reason)` from the CPA gradient loop.
+type CpaResult = (
+    HashMap<String, i64>,
+    HashMap<String, Vec<i64>>,
+    HashMap<String, HashMap<i64, f64>>,
+    String,
+);
+
+/// The CPA gradient loop (PLANNER_DESIGN.md §5.3-5.8), mirroring Python's `_cpa_allocate`: seed
+/// every step at `min(W_i)` then, while `T_CP > area/P`, widen the critical-path step with the
+/// greatest measured wall-reduction-per-added-core (ties by smallest tag) subject to the core and
+/// memory constraints, until the terms balance or nothing can widen. Deterministic across builds
+/// (identical f64 ops in cfg order, integer core arithmetic, total tag tie-break).
+fn cpa_allocate(
+    cfg: &DagConfig,
+    speedups: &HashMap<String, StepSpeedup>,
+    est: &HashMap<String, f64>,
+    core_budget: i64,
+    mem_budget: Option<i64>,
+) -> CpaResult {
+    let p = if core_budget > 0 { core_budget } else { 1 };
+    let (admissible, wall) = cpa_admissible(cfg, speedups, est, p);
+    let mut widths: HashMap<String, i64> = cfg
+        .steps
+        .iter()
+        .map(|s| {
+            let tag = s.tag();
+            let w0 = admissible[&tag][0];
+            (tag, w0)
+        })
+        .collect();
+    let succ = successors(cfg);
+    let mut stop_reason = CPA_FIXED_POINT.to_string();
+    let max_iters: usize = cfg
+        .steps
+        .iter()
+        .map(|s| admissible[&s.tag()].len().saturating_sub(1))
+        .sum::<usize>()
+        + 2;
+    for _ in 0..max_iters {
+        let weight: HashMap<String, f64> = cfg
+            .steps
+            .iter()
+            .map(|s| {
+                let tag = s.tag();
+                let w = widths[&tag];
+                (tag.clone(), wall[&tag][&w])
+            })
+            .collect();
+        let bottom = bottom_levels(cfg, &weight, &succ);
+        let (cp, t_cp) = critical_path(cfg, &bottom, &succ);
+        let mut area = 0.0;
+        for s in &cfg.steps {
+            let tag = s.tag();
+            area += widths[&tag] as f64 * weight[&tag];
+        }
+        let t_a = area / p as f64;
+        if t_cp <= t_a {
+            stop_reason = CPA_BALANCED.to_string();
+            break;
+        }
+        let mut widenable: Vec<String> = cfg
+            .steps
+            .iter()
+            .map(|s| s.tag())
+            .filter(|tag| {
+                cp.contains(tag) && cpa_next_width(&admissible[tag], widths[tag]).is_some()
+            })
+            .collect();
+        if widenable.is_empty() {
+            stop_reason = CPA_KNEE_EXHAUSTED.to_string();
+            break;
+        }
+        widenable.sort();
+        let mut best_tag: Option<String> = None;
+        let mut best_gain = 0.0f64;
+        let mut blocked_mem = false;
+        // Iterate tag-ascending and keep the FIRST maximum, so ties resolve to the smallest tag.
+        for tag in &widenable {
+            let nxt = cpa_next_width(&admissible[tag], widths[tag]).unwrap();
+            if nxt > p {
+                continue; // single-step core cap (cross-step budget is the dispatch gate)
+            }
+            if let Some(budget) = mem_budget {
+                let mut tentative = widths.clone();
+                tentative.insert(tag.clone(), nxt);
+                if cpa_footprint(cfg, &tentative) > budget {
+                    blocked_mem = true;
+                    continue;
+                }
+            }
+            let cur = widths[tag];
+            let gain = (wall[tag][&cur] - wall[tag][&nxt]) / (nxt - cur) as f64;
+            if best_tag.is_none() || gain > best_gain {
+                best_tag = Some(tag.clone());
+                best_gain = gain;
+            }
+        }
+        match best_tag {
+            None => {
+                stop_reason = if blocked_mem {
+                    CPA_MEM_CAPPED.to_string()
+                } else {
+                    CPA_CORE_CAPPED.to_string()
+                };
+                break;
+            }
+            Some(tag) => {
+                let nxt = cpa_next_width(&admissible[&tag], widths[&tag]).unwrap();
+                widths.insert(tag, nxt);
+            }
+        }
+    }
+    (widths, admissible, wall, stop_reason)
+}
+
+/// The pure CPA allocator: pick each step's inner-jobs width to balance the critical path against
+/// the per-core area over the measured speedup curves, subject to `P` and the RAM budget. Mirrors
+/// Python's `allocate_widths`. See PLANNER_DESIGN.md.
+pub fn allocate_widths(
+    cfg: &DagConfig,
+    speedups: &HashMap<String, StepSpeedup>,
+    est: &HashMap<String, f64>,
+    core_budget: i64,
+    mem_budget: Option<i64>,
+) -> HashMap<String, i64> {
+    cpa_allocate(cfg, speedups, est, core_budget, mem_budget).0
+}
+
+/// A deterministic greedy list-schedule of the allocated widths -> the MODELED makespan (mirrors
+/// Python's `_cpa_simulate_makespan`). Launches ready steps (deps done, core budget
+/// `Σ running widths + p_i <= P`, named resources free) in `order`, advancing to the next finish
+/// event; a step wider than the whole budget runs alone (deadlock guard). Respecting deps AND the
+/// core budget makes the result `>= max(T_CP, area/P)` (PLANNER_DESIGN.md §2). Same f64 ops in
+/// canonical `order` as the Python build, so the 3-decimal makespan is byte-identical.
+fn cpa_simulate_makespan(
+    cfg: &DagConfig,
+    widths: &HashMap<String, i64>,
+    weight: &HashMap<String, f64>,
+    order: &[String],
+    core_budget: i64,
+) -> f64 {
+    let p = if core_budget > 0 { core_budget } else { 1 };
+    let by_tag: HashMap<String, &Step> = cfg.steps.iter().map(|s| (s.tag(), s)).collect();
+    let mut done: HashMap<String, f64> = HashMap::new();
+    let mut running: HashMap<String, f64> = HashMap::new();
+    let mut res_avail: HashMap<String, i64> = cfg
+        .resource_caps
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let mut cores_used: i64 = 0;
+    let mut now = 0.0f64;
+    let mut pending: std::collections::HashSet<String> =
+        cfg.steps.iter().map(|s| s.tag()).collect();
+    while !pending.is_empty() || !running.is_empty() {
+        let mut launched = true;
+        while launched {
+            launched = false;
+            for tag in order {
+                if !pending.contains(tag) {
+                    continue;
+                }
+                let step = by_tag[tag];
+                if !step.deps.iter().all(|d| done.contains_key(d)) {
+                    continue;
+                }
+                let w = widths[tag];
+                if !(cores_used + w <= p || cores_used == 0) {
+                    continue;
+                }
+                let res_free = step
+                    .hint
+                    .resources
+                    .iter()
+                    .all(|(r, n)| res_avail.get(r).copied().unwrap_or(0) >= *n);
+                if !res_free {
+                    continue;
+                }
+                running.insert(tag.clone(), now + weight[tag]);
+                pending.remove(tag);
+                cores_used += w;
+                for (r, n) in &step.hint.resources {
+                    *res_avail.entry(r.clone()).or_insert(0) -= n;
+                }
+                launched = true;
+            }
+        }
+        if running.is_empty() {
+            break;
+        }
+        let finish = running.values().copied().fold(f64::INFINITY, f64::min);
+        now = finish;
+        for tag in order {
+            if running.get(tag).copied() == Some(finish) {
+                done.insert(tag.clone(), finish);
+                running.remove(tag);
+                cores_used -= widths[tag];
+                let step = by_tag[tag];
+                for (r, n) in &step.hint.resources {
+                    *res_avail.entry(r.clone()).or_insert(0) += n;
+                }
+            }
+        }
+    }
+    done.values().copied().fold(0.0, f64::max)
+}
+
+/// Two-phase CPA plan (PLANNER_DESIGN.md §4): allocate widths, then critical-path list-schedule at
+/// the allocated weights `T_i(p_i)`. Mirrors Python's `_build_cpa_plan`.
+fn build_cpa_plan(
+    cfg: &DagConfig,
+    resolved: &HashMap<String, Resolved>,
+    est: &HashMap<String, f64>,
+    speedups: &HashMap<String, StepSpeedup>,
+    succ: &HashMap<String, Vec<String>>,
+    core_budget: Option<i64>,
+    mem_budget: Option<i64>,
+) -> Plan {
+    let p = match core_budget {
+        Some(b) if b > 0 => b,
+        _ => 1,
+    };
+    let (widths, _admissible, wall, stop_reason) = cpa_allocate(cfg, speedups, est, p, mem_budget);
+    let weight: HashMap<String, f64> = cfg
+        .steps
+        .iter()
+        .map(|s| {
+            let tag = s.tag();
+            let w = widths[&tag];
+            (tag.clone(), wall[&tag][&w])
+        })
+        .collect();
+    let bottom = bottom_levels(cfg, &weight, succ);
+    let (critical, t_cp) = critical_path(cfg, &bottom, succ);
+    let order = plan_order(cfg, Planner::CriticalPath, &weight, &bottom);
+    let mut area = 0.0;
+    for s in &cfg.steps {
+        let tag = s.tag();
+        area += widths[&tag] as f64 * weight[&tag];
+    }
+    let t_a = area / p as f64;
+    let lower_bound = if t_cp >= t_a { t_cp } else { t_a };
+    let modeled = cpa_simulate_makespan(cfg, &widths, &weight, &order, p);
+    let allocation = Allocation {
+        core_budget: p,
+        area_s: area,
+        area_bound_s: t_a,
+        critical_path_s: t_cp,
+        lower_bound_s: lower_bound,
+        modeled_makespan_s: modeled,
+        stop_reason,
+    };
+    let entries: Vec<PlanEntry> = cfg
+        .steps
+        .iter()
+        .map(|s| {
+            let tag = s.tag();
+            let r = &resolved[&tag];
+            let has_curve = speedups
+                .get(&tag)
+                .map(|sp| !sp.levels.is_empty())
+                .unwrap_or(false);
+            PlanEntry {
+                tag: tag.clone(),
+                est_duration_s: weight[&tag],
+                est_source: if has_curve {
+                    "store".to_string()
+                } else {
+                    r.est_source.to_string()
+                },
+                rss_estimate_bytes: r.rss,
+                rss_source: r.rss_source.to_string(),
+                bottom_level_s: bottom.get(&tag).copied().unwrap_or(0.0),
+                samples: r.samples,
+                speedup: speedups.get(&tag).cloned(),
+                alloc_inner_jobs: Some(widths[&tag]),
+            }
+        })
+        .collect();
+    Plan {
+        planner: Planner::Cpa,
+        order,
+        critical_path: critical,
+        critical_path_length_s: t_cp,
+        entries,
+        allocation: Some(allocation),
+    }
+}
+
 /// Resolve every step's estimate and build the plan for `planner` (mirrors Python's `build_plan`).
 ///
 /// `speedups` (from [`load_step_speedups`]) attaches each step's learned parallel-speedup curve for
-/// the plan display; it does not change the dispatch order (the co-scheduling inner_jobs allocation
-/// planner is a scoped follow-on).
+/// the plan display. For `Planner::Cpa` it also DRIVES the allocator: each step's inner-jobs width
+/// is chosen by [`allocate_widths`] over those curves, the dispatch order is the critical-path order
+/// at the allocated weights `T_i(p_i)`, and an [`Allocation`] summary is attached. `core_budget`
+/// (`P`) and `mem_budget` bound the allocation; the other planners ignore them.
 pub fn build_plan(
     cfg: &DagConfig,
     store_samples: &HashMap<String, StepSamples>,
     planner: Planner,
     min_samples: i64,
     speedups: &HashMap<String, StepSpeedup>,
+    core_budget: Option<i64>,
+    mem_budget: Option<i64>,
 ) -> Plan {
     let mut resolved: HashMap<String, Resolved> = HashMap::new();
     let mut est: HashMap<String, f64> = HashMap::new();
@@ -724,6 +1136,17 @@ pub fn build_plan(
         resolved.insert(step.tag(), r);
     }
     let succ = successors(cfg);
+    if planner == Planner::Cpa {
+        return build_cpa_plan(
+            cfg,
+            &resolved,
+            &est,
+            speedups,
+            &succ,
+            core_budget,
+            mem_budget,
+        );
+    }
     let bottom = bottom_levels(cfg, &est, &succ);
     let (critical, length) = critical_path(cfg, &bottom, &succ);
     let order = plan_order(cfg, planner, &est, &bottom);
@@ -742,6 +1165,7 @@ pub fn build_plan(
                 bottom_level_s: bottom.get(&tag).copied().unwrap_or(0.0),
                 samples: r.samples,
                 speedup: speedups.get(&tag).cloned(),
+                alloc_inner_jobs: None,
             }
         })
         .collect();
@@ -751,11 +1175,14 @@ pub fn build_plan(
         critical_path: critical,
         critical_path_length_s: length,
         entries,
+        allocation: None,
     }
 }
 
 /// Return a copy of `cfg` whose per-step hints carry the plan's resolved estimates. `rss` is
-/// overridden ONLY when the store won (mirrors Python's `apply_plan_to_config`).
+/// overridden ONLY when the store won (mirrors Python's `apply_plan_to_config`). For a CPA plan
+/// each step also gets `preferred_inner_jobs = alloc_inner_jobs` — the width the allocator chose —
+/// so the step's command runs with that `-j` and its memory cap scales to that width.
 pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
     let by_tag = plan.by_tag();
     let mut new_cfg = cfg.clone();
@@ -771,13 +1198,14 @@ pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
                 } else {
                     step.hint.rss_baseline_bytes
                 };
+                let inner = entry.alloc_inner_jobs.or(step.hint.preferred_inner_jobs);
                 s.hint = ResourceHint {
                     resources: step.hint.resources.clone(),
                     est_duration_s: entry.est_duration_s,
                     rss_baseline_bytes: rss,
                     hard_mem_max_bytes: step.hint.hard_mem_max_bytes,
                     classification: step.hint.classification,
-                    preferred_inner_jobs: step.hint.preferred_inner_jobs,
+                    preferred_inner_jobs: inner,
                     measured_effective_cores: step.hint.measured_effective_cores,
                     measured_cpu_utilization: step.hint.measured_cpu_utilization,
                 };
@@ -868,8 +1296,30 @@ fn json_str_list(items: &[String]) -> String {
     format!("[\n{}\n  ]", inner.join(",\n"))
 }
 
+/// The `"allocation"` field value in the plan JSON: `null` (non-CPA planners) or a nested object
+/// with the core budget, area / critical-path terms, makespan lower bound + modeled makespan, and
+/// the stop reason. Mirrors Python's `_allocation_to_json`.
+fn allocation_to_json(alloc: &Option<Allocation>) -> String {
+    let a = match alloc {
+        None => return "null".to_string(),
+        Some(a) => a,
+    };
+    format!(
+        "{{\n    \"stop_reason\": {},\n    \"core_budget\": {},\n    \"area_s\": \"{}\",\n    \"area_bound_s\": \"{}\",\n    \"critical_path_s\": \"{}\",\n    \"lower_bound_s\": \"{}\",\n    \"modeled_makespan_s\": \"{}\"\n  }}",
+        json_str(&a.stop_reason),
+        a.core_budget,
+        fmt_secs(a.area_s),
+        fmt_secs(a.area_bound_s),
+        fmt_secs(a.critical_path_s),
+        fmt_secs(a.lower_bound_s),
+        fmt_secs(a.modeled_makespan_s),
+    )
+}
+
 /// Canonical, machine-readable plan JSON (2-space indent), byte-identical to Python's
-/// `plan_to_json`. Computed floats are emitted as fixed-3-decimal STRINGS.
+/// `plan_to_json`. Computed floats are emitted as fixed-3-decimal STRINGS. `alloc_inner_jobs` (per
+/// step) and the top-level `allocation` object are `null` for the non-allocating planners and
+/// populated under `--planner cpa`.
 pub fn plan_to_json(plan: &Plan) -> String {
     let by_tag = plan.by_tag();
     let mut parts: Vec<String> = vec![
@@ -884,6 +1334,10 @@ pub fn plan_to_json(plan: &Plan) -> String {
             fmt_secs(plan.critical_path_length_s)
         ),
         format!("  \"order\": {},", json_str_list(&plan.order)),
+        format!(
+            "  \"allocation\": {},",
+            allocation_to_json(&plan.allocation)
+        ),
     ];
     let mut steps_json: Vec<String> = Vec::with_capacity(plan.order.len());
     for tag in &plan.order {
@@ -892,8 +1346,12 @@ pub fn plan_to_json(plan: &Plan) -> String {
             Some(n) => n.to_string(),
             None => "null".to_string(),
         };
+        let alloc = match entry.alloc_inner_jobs {
+            Some(n) => n.to_string(),
+            None => "null".to_string(),
+        };
         steps_json.push(format!(
-            "    {{\n      \"tag\": {},\n      \"est_duration_s\": \"{}\",\n      \"est_source\": {},\n      \"rss_estimate_bytes\": {},\n      \"rss_source\": {},\n      \"bottom_level_s\": \"{}\",\n      \"samples\": {},\n      \"speedup\": {}\n    }}",
+            "    {{\n      \"tag\": {},\n      \"est_duration_s\": \"{}\",\n      \"est_source\": {},\n      \"rss_estimate_bytes\": {},\n      \"rss_source\": {},\n      \"bottom_level_s\": \"{}\",\n      \"samples\": {},\n      \"alloc_inner_jobs\": {},\n      \"speedup\": {}\n    }}",
             json_str(&entry.tag),
             fmt_secs(entry.est_duration_s),
             json_str(&entry.est_source),
@@ -901,6 +1359,7 @@ pub fn plan_to_json(plan: &Plan) -> String {
             json_str(&entry.rss_source),
             fmt_secs(entry.bottom_level_s),
             entry.samples,
+            alloc,
             speedup_to_json(&entry.speedup),
         ));
     }
@@ -918,7 +1377,8 @@ pub fn plan_to_json(plan: &Plan) -> String {
 /// A compact, human-readable plan for the terminal, byte-identical to Python's `plan_to_text`.
 pub fn plan_to_text(plan: &Plan) -> String {
     let by_tag = plan.by_tag();
-    let headers = [
+    let is_cpa = plan.allocation.is_some();
+    let mut headers: Vec<&str> = vec![
         "step",
         "est_duration_s",
         "source",
@@ -927,10 +1387,13 @@ pub fn plan_to_text(plan: &Plan) -> String {
         "bottom_level_s",
         "samples",
     ];
+    if is_cpa {
+        headers.push("alloc_inner_jobs");
+    }
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(plan.order.len());
     for tag in &plan.order {
         let entry = by_tag[tag];
-        rows.push(vec![
+        let mut row = vec![
             tag.clone(),
             fmt_secs(entry.est_duration_s),
             entry.est_source.clone(),
@@ -938,7 +1401,14 @@ pub fn plan_to_text(plan: &Plan) -> String {
             entry.rss_source.clone(),
             fmt_secs(entry.bottom_level_s),
             entry.samples.to_string(),
-        ]);
+        ];
+        if is_cpa {
+            row.push(match entry.alloc_inner_jobs {
+                Some(n) => n.to_string(),
+                None => "-".to_string(),
+            });
+        }
+        rows.push(row);
     }
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in &rows {
@@ -988,8 +1458,29 @@ pub fn plan_to_text(plan: &Plan) -> String {
         plan.order.join(", ")
     };
     lines.push(format!("scheduled order: {order}"));
+    lines.extend(allocation_text_lines(plan));
     lines.extend(speedup_text_lines(plan));
     lines.join("\n") + "\n"
+}
+
+/// The one-line CPA allocator summary for [`plan_to_text`] (`--planner cpa` only): the stop reason,
+/// the core budget, and the balancing terms — critical path vs. per-core area, the makespan lower
+/// bound, and the modeled makespan. Empty for the non-allocating planners. Mirrors Python's
+/// `_allocation_text_lines`.
+fn allocation_text_lines(plan: &Plan) -> Vec<String> {
+    let a = match &plan.allocation {
+        None => return Vec::new(),
+        Some(a) => a,
+    };
+    vec![format!(
+        "allocator (cpa): {}; P={} cores; critical-path={}s, area/P={}s, lower-bound={}s, modeled-makespan={}s",
+        a.stop_reason,
+        a.core_budget,
+        fmt_secs(a.critical_path_s),
+        fmt_secs(a.area_bound_s),
+        fmt_secs(a.lower_bound_s),
+        fmt_secs(a.modeled_makespan_s),
+    )]
 }
 
 /// The optional parallel-speedup section for [`plan_to_text`]: one row per step that HAS a learned
@@ -1259,6 +1750,8 @@ mod tests {
             Planner::GreedyLpt,
             DEFAULT_MIN_SAMPLES,
             &no_speedups,
+            None,
+            None,
         );
         let cp = build_plan(
             &cfg,
@@ -1266,10 +1759,222 @@ mod tests {
             Planner::CriticalPath,
             DEFAULT_MIN_SAMPLES,
             &no_speedups,
+            None,
+            None,
         );
         assert_eq!(lpt.order, vec!["g.heavy", "g.solo", "g.prep"]);
         assert_eq!(cp.order, vec!["g.prep", "g.heavy", "g.solo"]);
         assert_eq!(cp.critical_path, vec!["g.prep", "g.heavy"]);
         assert_ne!(lpt.order, cp.order);
+    }
+
+    // ----------------------------------------------------------------- CPA allocator
+
+    /// Write a synthetic multi-inner_jobs speedup store (affinity16 identity) into a unique temp
+    /// dir and return that dir.
+    fn write_cpa_store(name: &str, rows: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("scdr_cpa_{}_{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,\
+                      enforcement_kind,runner_name,step,classification,inner_jobs,elapsed_s,\
+                      returncode,ok,timed_out,oom_kills,peak_bytes,thread_peak,effective_cores,\
+                      user_s,sys_s,throttled_s\n";
+        std::fs::write(
+            dir.join("step_profiles_m_affinity16_cpu-max-max.csv"),
+            format!("{header}{rows}"),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn cpa_widths(plan: &Plan) -> HashMap<String, Option<i64>> {
+        plan.entries
+            .iter()
+            .map(|e| (e.tag.clone(), e.alloc_inner_jobs))
+            .collect()
+    }
+
+    #[test]
+    fn cpa_spreads_cores_on_independent_tasks() {
+        // Two INDEPENDENT linear-scaling steps, P=4: the allocator balances T_CP vs area/P and
+        // SPREADS cores -> both land at width 2 (not one hogging 4), stopping "balanced".
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.a,cpu-bound,1,10.0,0,True,False,0,1000,,,10.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.a,cpu-bound,2,5.0,0,True,False,0,1000,,,10.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.a,cpu-bound,4,2.5,0,True,False,0,1000,,,10.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,1,10.0,0,True,False,0,1000,,,10.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,2,5.0,0,True,False,0,1000,,,10.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,4,2.5,0,True,False,0,1000,,,10.0,0.0,0.0
+";
+        let dir = write_cpa_store("spread", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let cfg = DagConfig {
+            steps: vec![mk("g", "a", &[], 10.0), mk("g", "b", &[], 10.0)],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            ..Default::default()
+        };
+        let empty: HashMap<String, StepSamples> = HashMap::new();
+        let plan = build_plan(
+            &cfg,
+            &empty,
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(4),
+            None,
+        );
+        let w = cpa_widths(&plan);
+        assert_eq!(w["g.a"], Some(2));
+        assert_eq!(w["g.b"], Some(2));
+        let alloc = plan.allocation.as_ref().unwrap();
+        assert_eq!(alloc.stop_reason, "balanced");
+        assert!(alloc.modeled_makespan_s >= alloc.lower_bound_s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_piles_cores_on_the_chain_and_leaves_plateau_narrow() {
+        // Chain prep(curveless) -> build(scaling) -> test(scaling) plus independent plateau (side).
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,1,40.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,2,20.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,4,10.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,8,5.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.test,cpu-bound,1,16.0,0,True,False,0,1000,,,16.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.test,cpu-bound,2,8.0,0,True,False,0,1000,,,16.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.test,cpu-bound,4,4.0,0,True,False,0,1000,,,16.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.side,cpu-bound,1,9.0,0,True,False,0,1000,,,9.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.side,cpu-bound,2,8.7,0,True,False,0,1000,,,9.0,0.0,0.0
+";
+        let dir = write_cpa_store("chain", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let cfg = DagConfig {
+            steps: vec![
+                mk("c", "prep", &[], 2.0),
+                mk("c", "build", &["c.prep"], 40.0),
+                mk("c", "test", &["c.build"], 16.0),
+                mk("c", "side", &[], 9.0),
+            ],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            ..Default::default()
+        };
+        let empty: HashMap<String, StepSamples> = HashMap::new();
+        let plan = build_plan(
+            &cfg,
+            &empty,
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(16),
+            None,
+        );
+        let w = cpa_widths(&plan);
+        assert_eq!(w["c.build"], Some(8)); // piled onto the chain
+        assert_eq!(w["c.test"], Some(4));
+        assert_eq!(w["c.side"], Some(1)); // plateau: never widened
+        assert_eq!(w["c.prep"], Some(1)); // curveless: rigid
+        let alloc = plan.allocation.as_ref().unwrap();
+        assert_eq!(alloc.stop_reason, "knee-exhausted");
+        assert!(alloc.modeled_makespan_s < 58.0); // beats the width-1 critical path
+        assert!(alloc.modeled_makespan_s >= alloc.lower_bound_s);
+    }
+
+    #[test]
+    fn cpa_memory_blocks_widening_even_with_free_cores() {
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,1,40.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,2,20.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,4,10.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000,,,40.0,0.0,0.0
+";
+        let dir = write_cpa_store("mem", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let heavy = Step {
+            group: "m".into(),
+            job: "heavy".into(),
+            desc: String::new(),
+            description: String::new(),
+            cmd: "true".into(),
+            deps: vec!["m.prep".into()],
+            env: BTreeMap::new(),
+            hint: ResourceHint {
+                est_duration_s: 40.0,
+                rss_baseline_bytes: Some(3 * 1024i64.pow(3)),
+                classification: crate::model::StepClass::CpuBound,
+                ..Default::default()
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: 1800,
+            jobs_flag: None,
+        };
+        let cfg = DagConfig {
+            steps: vec![mk("m", "prep", &[], 2.0), heavy],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            ..Default::default()
+        };
+        let empty: HashMap<String, StepSamples> = HashMap::new();
+        // 5 GiB budget blocks widening m.heavy 4 -> 8 (footprint 3 GiB -> 6 GiB), cores free.
+        let capped = build_plan(
+            &cfg,
+            &empty,
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(16),
+            Some(5 * 1024i64.pow(3)),
+        );
+        assert_eq!(cpa_widths(&capped)["m.heavy"], Some(4));
+        assert_eq!(
+            capped.allocation.as_ref().unwrap().stop_reason,
+            "mem-capped"
+        );
+        // With no RAM budget it widens all the way to the knee (8).
+        let free = build_plan(
+            &cfg,
+            &empty,
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(16),
+            None,
+        );
+        assert_eq!(cpa_widths(&free)["m.heavy"], Some(8));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_allocation_is_idempotent() {
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,1,40.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,2,20.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,4,10.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,8,5.0,0,True,False,0,1000,,,40.0,0.0,0.0
+";
+        let dir = write_cpa_store("idem", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let cfg = DagConfig {
+            steps: vec![
+                mk("c", "prep", &[], 2.0),
+                mk("c", "build", &["c.prep"], 40.0),
+            ],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            ..Default::default()
+        };
+        let est: HashMap<String, f64> = cfg
+            .steps
+            .iter()
+            .map(|s| (s.tag(), s.hint.est_duration_s))
+            .collect();
+        let w1 = allocate_widths(&cfg, &speedups, &est, 16, None);
+        let w2 = allocate_widths(&cfg, &speedups, &est, 16, None);
+        assert_eq!(w1, w2);
+        assert_eq!(w1["c.build"], 8);
+        assert_eq!(w1["c.prep"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

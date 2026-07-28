@@ -134,6 +134,23 @@ Rust builds** for the same profile + DAG.
   *cheap* step heads a *long* dependency chain: LPT would start some other individually-larger step
   first and leave the long chain to finish late, whereas critical-path starts the chain-head
   immediately.
+- **`cpa`** — a **measured-curve moldable allocator** (new in v0.8.0). The two planners above only
+  choose the *order* of steps; `cpa` additionally chooses each step's inner-parallelism width — its
+  `-j` — before ordering. It reads the learned **speedup curves** (below) and, starting from every
+  step at its narrowest measured width, repeatedly hands one more core to the *critical-path* step
+  whose measured wall-time drop per added core is largest, until the critical path and the per-core
+  work ("area") balance — the point that minimizes the whole-DAG makespan bound. It never widens a
+  step past its work-conservation knee, past the machine's core budget, or past what a RAM budget
+  (`--max-mem`) allows; then it list-schedules by critical-path order at the chosen widths and, at
+  run time, refuses to oversubscribe the core budget. The result: cores flow to the steps that
+  actually shorten the whole run and scale, plateau steps stay narrow, and memory-heavy steps are
+  throttled. This is a heuristic (CPA — Radulescu & van Gemund 2001), not an optimal schedule; the
+  full algorithm, its literature grounding, and our deviations are documented in
+  [`PLANNER_DESIGN.md`](PLANNER_DESIGN.md). Requires the profile store to hold multi-width samples
+  for the steps you want widened (a step with no curve stays rigid at its hint/1). It runs each step
+  with the chosen `-j` (via the `jobs_flag` mechanism) and reports, per step, the allocated
+  `alloc_inner_jobs` plus the makespan lower bound and the achieved modeled makespan in
+  `plan` / `run --show-plan` (below).
 
 ### The learned-estimate feedback loop
 
@@ -193,12 +210,13 @@ near-linear step gets the widest measured width (up to the core budget). The cur
 recommendation, and the achieved cores are surfaced by `plan` / `run --show-plan` (below) and are
 byte-identical across the Python and Rust builds for a given store.
 
-**Consuming the recommendation (scoped follow-on).** The model is *surfaced* today; the runner does
-not yet *act* on it. A speedup-aware co-scheduling planner — one that ALLOCATES inner `-j` across
-concurrently-scheduled steps to minimize whole-DAG wall (more threads to critical-path steps that
-scale well, fewer to steps that plateau), subject to the total core budget + memory + resource caps
-— is the next, deliberately separate, piece of work. The current release ships the writer
-enrichment, the per-step model, and the display solidly rather than half-building that allocator.
+**Consuming the recommendation.** As of v0.8.0 the runner can *act* on these curves: the
+`--planner cpa` allocator (above) ALLOCATES inner `-j` across the DAG to minimize whole-DAG wall —
+more threads to critical-path steps that scale well, fewer to steps that plateau — subject to the
+total core budget, memory (`--max-mem`), and resource caps, then list-schedules at those widths and
+enforces the core budget at dispatch. The per-step `recommended_inner_jobs` here is the per-step
+work-conservation knee it never widens past; the whole-DAG allocation is the CPA planner's job. See
+[`PLANNER_DESIGN.md`](PLANNER_DESIGN.md) for the algorithm and its literature grounding.
 
 ### Seeing the plan: `plan` / `run --show-plan`
 
@@ -237,7 +255,24 @@ builds — the estimate strings are fixed-precision so parity does not depend on
 per-step `"speedup"` object (or `null` when the step has fewer than two measured widths) carrying
 `baseline_inner_jobs`, `recommended_inner_jobs`, `measured_effective_cores`, and the `levels` curve.
 `run --show-plan` prints this table and then runs the DAG in that order. `plan` accepts `--planner`,
-`--perf-dir`, and `--no-profile-feedback`.
+`--perf-dir`, `--no-profile-feedback`, and (for `--planner cpa`) `--max-mem`.
+
+With `--planner cpa` the plan gains an **`alloc_inner_jobs`** column (the width the allocator gave
+each step) and a one-line allocator summary — the stop reason, the core budget `P`, and the balancing
+terms (critical path vs. per-core area, the makespan lower bound `max(T_CP, area/P)`, and the achieved
+modeled makespan). The modeled makespan is a deterministic list-schedule of the allocated widths and
+is always at least the lower bound. The JSON form carries the same numbers in a top-level
+`"allocation"` object (`null` for the other planners) plus per-step `"alloc_inner_jobs"`:
+
+```
+$ safe-ci-dag-runner plan --dag dag.json --planner cpa
+...
+step       est_duration_s  source  rss_estimate  rss_source  bottom_level_s  samples  alloc_inner_jobs
+---------  --------------  ------  ------------  ----------  --------------  -------  ----------------
+build.app           5.000   store             -        none           5.000        4                 8
+...
+allocator (cpa): knee-exhausted; P=16 cores; critical-path=11.000s, area/P=4.188s, lower-bound=11.000s, modeled-makespan=11.000s
+```
 
 ## The DAG JSON schema
 

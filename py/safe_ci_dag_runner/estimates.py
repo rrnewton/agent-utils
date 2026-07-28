@@ -39,6 +39,7 @@ from pathlib import Path
 
 from safe_ci_dag_runner import perflog
 from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
+from safe_ci_dag_runner.sizing import schedulable_peak_mem_bytes
 
 __all__ = [
     "MACHINE_ID_ENV",
@@ -49,10 +50,12 @@ __all__ = [
     "SpeedupLevel",
     "StepSpeedup",
     "PlanEntry",
+    "Allocation",
     "Plan",
     "feedback_identity",
     "load_step_samples",
     "load_step_speedups",
+    "allocate_widths",
     "build_plan",
     "apply_plan_to_config",
     "plan_to_json",
@@ -103,6 +106,11 @@ class Planner(Enum):
 
     GREEDY_LPT = "greedy-lpt"
     CRITICAL_PATH = "critical-path"
+    #: CPA (Radulescu & van Gemund 2001): a two-phase moldable allocator that first picks each
+    #: step's inner-jobs width by balancing the critical path against the per-core area over the
+    #: MEASURED speedup curves, then list-schedules by critical-path order at the allocated widths.
+    #: See ``common/docs/safe-ci-dag-runner/PLANNER_DESIGN.md``.
+    CPA = "cpa"
 
     @classmethod
     def from_value(cls, text: str) -> "Planner | None":
@@ -577,6 +585,36 @@ class PlanEntry:
     #: The learned parallel-speedup curve for this step, or ``None`` when the store has fewer than
     #: two inner_jobs widths for it (nothing to model).
     speedup: "StepSpeedup | None" = None
+    #: The inner-jobs width the CPA allocator assigned this step, or ``None`` for the non-allocating
+    #: planners (greedy-lpt / critical-path). This is the ``-j`` the step actually runs with under
+    #: ``--planner cpa`` (baked into the command via :func:`apply_plan_to_config`).
+    alloc_inner_jobs: int | None = None
+
+
+@dataclass(frozen=True)
+class Allocation:
+    """The CPA allocator's whole-DAG summary (``--planner cpa`` only).
+
+    Records the core budget it balanced against, the resulting area and critical-path terms, the
+    makespan LOWER BOUND ``max(T_CP, area/P)`` (Graham/Brent), the achieved MODELED makespan (a
+    deterministic greedy list-schedule of the allocated widths), and WHY the gradient loop stopped
+    — so an operator (or a CI-optimizing agent) can see why each width was chosen. See
+    ``common/docs/safe-ci-dag-runner/PLANNER_DESIGN.md`` §5.8-5.9."""
+
+    core_budget: int
+    #: Total core-seconds Σ p_i·T_i(p_i) at the allocated widths.
+    area_s: float
+    #: The area lower-bound term ``area / P`` (= ``T_A``).
+    area_bound_s: float
+    #: The critical-path length ``T_CP`` at the allocated widths (== ``Plan.critical_path_length_s``).
+    critical_path_s: float
+    #: The makespan lower bound ``max(T_CP, area/P)``.
+    lower_bound_s: float
+    #: The modeled makespan from a greedy list-schedule of the allocated widths; always ``>=``
+    #: :attr:`lower_bound_s`.
+    modeled_makespan_s: float
+    #: One of ``balanced`` / ``knee-exhausted`` / ``core-capped`` / ``mem-capped`` / ``fixed-point``.
+    stop_reason: str
 
 
 @dataclass(frozen=True)
@@ -588,6 +626,8 @@ class Plan:
     critical_path: tuple[str, ...]
     critical_path_length_s: float
     entries: tuple[PlanEntry, ...]
+    #: The CPA allocator summary (``--planner cpa`` only), else ``None``.
+    allocation: "Allocation | None" = None
 
     def by_tag(self) -> dict[str, PlanEntry]:
         return {entry.tag: entry for entry in self.entries}
@@ -713,6 +753,274 @@ def _plan_order(
     return sorted(tags, key=lambda t: est.get(t, 0.0), reverse=True)
 
 
+# --------------------------------------------------------------------------- CPA allocator
+
+#: Stop-reason labels the CPA gradient loop can end on (PLANNER_DESIGN.md §5.8). Deterministic
+#: given the same store + DAG + budgets, so the two builds report the same one bit-for-bit.
+_CPA_BALANCED = "balanced"
+_CPA_KNEE_EXHAUSTED = "knee-exhausted"
+_CPA_CORE_CAPPED = "core-capped"
+_CPA_MEM_CAPPED = "mem-capped"
+_CPA_FIXED_POINT = "fixed-point"
+
+
+def _cpa_admissible(
+    cfg: DagConfig,
+    speedups: Mapping[str, StepSpeedup],
+    est: Mapping[str, float],
+    core_budget: int,
+) -> tuple[dict[str, list[int]], dict[str, dict[int, float]]]:
+    """Per-step admissible width set ``W_i`` (ascending) and the MEASURED wall ``T_i(p)`` at each
+    admissible width (PLANNER_DESIGN.md §5.2).
+
+    A step with a measured curve admits its measured widths up to its work-conservation knee
+    (``recommended_inner_jobs``) and the core budget ``P``; a curveless step is rigid at
+    ``min(hint or 1, P)`` with ``T_i`` the resolved scalar estimate. ``T_i`` is only ever evaluated
+    at these measured widths — no interpolation or extrapolation."""
+    admissible: dict[str, list[int]] = {}
+    wall: dict[str, dict[int, float]] = {}
+    for step in cfg.steps:
+        tag = step.tag
+        sp = speedups.get(tag)
+        if sp is not None and sp.levels:
+            knee_ok = [lvl for lvl in sp.levels if lvl.inner_jobs <= sp.recommended_inner_jobs]
+            within_budget = [lvl for lvl in knee_ok if lvl.inner_jobs <= core_budget]
+            # Fall back to the narrowest measured width if EVERY admissible width exceeds P (a
+            # measured-on-a-wider-box curve); T_i then stays on a real measurement.
+            chosen = within_budget if within_budget else knee_ok[:1]
+            admissible[tag] = sorted(lvl.inner_jobs for lvl in chosen)
+            wall[tag] = {lvl.inner_jobs: lvl.wall_s for lvl in chosen}
+        else:
+            pref = step.hint.preferred_inner_jobs
+            w = pref if (pref is not None and pref > 0) else 1
+            if core_budget > 0 and w > core_budget:
+                w = core_budget
+            if w < 1:
+                w = 1
+            admissible[tag] = [w]
+            wall[tag] = {w: est.get(tag, 0.0)}
+    return admissible, wall
+
+
+def _cpa_next_width(widths: Sequence[int], current: int) -> int | None:
+    """The next-larger admissible width after ``current`` in the ascending ``widths``, or ``None``
+    when ``current`` is already the widest."""
+    for w in widths:
+        if w > current:
+            return w
+    return None
+
+
+def _cpa_footprint(cfg: DagConfig, widths: Mapping[str, int]) -> int:
+    """Worst-case concurrent memory footprint (bytes) with the given PER-STEP widths, over all
+    scheduler-reachable concurrent sets (PLANNER_DESIGN.md §5.6)."""
+    peak, _ = schedulable_peak_mem_bytes(cfg, len(cfg.steps), widths=widths)
+    return peak
+
+
+def _cpa_allocate(
+    cfg: DagConfig,
+    speedups: Mapping[str, StepSpeedup],
+    est: Mapping[str, float],
+    core_budget: int,
+    mem_budget: int | None,
+) -> tuple[dict[str, int], dict[str, list[int]], dict[str, dict[int, float]], str]:
+    """The CPA gradient loop (PLANNER_DESIGN.md §5.3-5.8): seed every step at ``min(W_i)`` then,
+    while the critical path exceeds the per-core area, widen the critical-path step with the
+    greatest MEASURED wall-reduction-per-added-core (ties by smallest tag) subject to the core and
+    memory constraints, until the terms balance or nothing can widen.
+
+    Returns ``(widths, admissible, wall, stop_reason)`` — deterministic across builds (identical
+    float ops in cfg order, integer core arithmetic, total tag tie-break)."""
+    P = core_budget if core_budget > 0 else 1
+    admissible, wall = _cpa_admissible(cfg, speedups, est, P)
+    widths: dict[str, int] = {step.tag: admissible[step.tag][0] for step in cfg.steps}
+    successors = _successors(cfg)
+    stop_reason = _CPA_FIXED_POINT
+    # Each applied widening strictly increases some p_i within a finite W_i, so the loop is bounded
+    # by Σ(|W_i|-1); +2 headroom lets the final balance/exhaustion check run.
+    max_iters = sum(max(0, len(admissible[step.tag]) - 1) for step in cfg.steps) + 2
+    for _ in range(max_iters):
+        weight = {step.tag: wall[step.tag][widths[step.tag]] for step in cfg.steps}
+        bottom = _bottom_levels(cfg, weight, successors)
+        cp, t_cp = _critical_path(cfg, bottom, successors)
+        area = 0.0
+        for step in cfg.steps:
+            area += widths[step.tag] * weight[step.tag]
+        t_a = area / P
+        if t_cp <= t_a:
+            stop_reason = _CPA_BALANCED
+            break
+        cp_set = set(cp)
+        widenable = [
+            tag
+            for tag in (s.tag for s in cfg.steps)
+            if tag in cp_set and _cpa_next_width(admissible[tag], widths[tag]) is not None
+        ]
+        if not widenable:
+            stop_reason = _CPA_KNEE_EXHAUSTED
+            break
+        best_tag: str | None = None
+        best_gain = 0.0
+        blocked_mem = False
+        # Iterate tag-ascending and keep the FIRST maximum, so ties resolve to the smallest tag.
+        for tag in sorted(widenable):
+            nxt = _cpa_next_width(admissible[tag], widths[tag])
+            assert nxt is not None
+            if nxt > P:
+                continue  # single-step core cap (cross-step budget is the dispatch gate)
+            if mem_budget is not None:
+                tentative = dict(widths)
+                tentative[tag] = nxt
+                if _cpa_footprint(cfg, tentative) > mem_budget:
+                    blocked_mem = True
+                    continue
+            cur = widths[tag]
+            gain = (wall[tag][cur] - wall[tag][nxt]) / (nxt - cur)
+            if best_tag is None or gain > best_gain:
+                best_tag, best_gain = tag, gain
+        if best_tag is None:
+            stop_reason = _CPA_MEM_CAPPED if blocked_mem else _CPA_CORE_CAPPED
+            break
+        nxt = _cpa_next_width(admissible[best_tag], widths[best_tag])
+        assert nxt is not None
+        widths[best_tag] = nxt
+    return widths, admissible, wall, stop_reason
+
+
+def allocate_widths(
+    cfg: DagConfig,
+    speedups: Mapping[str, StepSpeedup],
+    est: Mapping[str, float],
+    core_budget: int,
+    mem_budget: int | None = None,
+) -> dict[str, int]:
+    """The pure CPA allocator: pick each step's inner-jobs width to balance the critical path
+    against the per-core area over the measured speedup curves, subject to the core budget ``P``
+    and (optionally) the RAM budget. See PLANNER_DESIGN.md and :func:`_cpa_allocate`."""
+    widths, _admissible, _wall, _reason = _cpa_allocate(
+        cfg, speedups, est, core_budget, mem_budget
+    )
+    return widths
+
+
+def _cpa_simulate_makespan(
+    cfg: DagConfig,
+    widths: Mapping[str, int],
+    weight: Mapping[str, float],
+    order: Sequence[str],
+    core_budget: int,
+) -> float:
+    """A deterministic greedy list-schedule of the allocated widths -> the MODELED makespan.
+
+    Launches ready steps (deps done, core budget ``Σ running widths + p_i <= P``, named resources
+    free) in ``order`` (critical-path first), advancing to the next finish event; a step wider than
+    the whole budget runs alone (deadlock guard). Respecting deps AND the core budget makes the
+    result ``>= max(T_CP, area/P)`` (PLANNER_DESIGN.md §2). Uses the same f64 ops in canonical
+    ``order`` in both builds, so the 3-decimal makespan is byte-identical."""
+    P = core_budget if core_budget > 0 else 1
+    by_tag = cfg.by_tag()
+    done: dict[str, float] = {}
+    running: dict[str, float] = {}
+    res_avail: dict[str, int] = dict(cfg.resource_caps)
+    cores_used = 0
+    now = 0.0
+    pending: set[str] = {step.tag for step in cfg.steps}
+    while pending or running:
+        launched = True
+        while launched:
+            launched = False
+            for tag in order:
+                if tag not in pending:
+                    continue
+                step = by_tag[tag]
+                if not all(d in done for d in step.deps):
+                    continue
+                w = widths[tag]
+                if not (cores_used + w <= P or cores_used == 0):
+                    continue
+                if any(res_avail.get(r, 0) < n for r, n in step.hint.resources.items()):
+                    continue
+                running[tag] = now + weight[tag]
+                pending.discard(tag)
+                cores_used += w
+                for r, n in step.hint.resources.items():
+                    res_avail[r] = res_avail.get(r, 0) - n
+                launched = True
+        if not running:
+            break  # nothing else can be scheduled (unsatisfiable resource demand)
+        finish = min(running.values())
+        now = finish
+        for tag in order:
+            if tag in running and running[tag] == finish:
+                done[tag] = finish
+                del running[tag]
+                cores_used -= widths[tag]
+                for r, n in by_tag[tag].hint.resources.items():
+                    res_avail[r] = res_avail.get(r, 0) + n
+    return max(done.values()) if done else 0.0
+
+
+def _build_cpa_plan(
+    cfg: DagConfig,
+    resolved: Mapping[str, tuple[float, str, int | None, str, int]],
+    est: Mapping[str, float],
+    speedups: Mapping[str, StepSpeedup],
+    successors: Mapping[str, list[str]],
+    core_budget: int | None,
+    mem_budget: int | None,
+) -> Plan:
+    """Two-phase CPA plan: allocate widths (phase 1), then critical-path list-schedule at the
+    allocated weights ``T_i(p_i)`` (phase 2). See PLANNER_DESIGN.md §4."""
+    P = core_budget if (core_budget is not None and core_budget > 0) else 1
+    widths, _admissible, wall, stop_reason = _cpa_allocate(cfg, speedups, est, P, mem_budget)
+    weight = {step.tag: wall[step.tag][widths[step.tag]] for step in cfg.steps}
+    bottom = _bottom_levels(cfg, weight, successors)
+    critical, t_cp = _critical_path(cfg, bottom, successors)
+    order = _plan_order(cfg, Planner.CRITICAL_PATH, weight, bottom)
+    area = 0.0
+    for step in cfg.steps:
+        area += widths[step.tag] * weight[step.tag]
+    t_a = area / P
+    lower_bound = t_cp if t_cp >= t_a else t_a
+    modeled = _cpa_simulate_makespan(cfg, widths, weight, order, P)
+    allocation = Allocation(
+        core_budget=P,
+        area_s=area,
+        area_bound_s=t_a,
+        critical_path_s=t_cp,
+        lower_bound_s=lower_bound,
+        modeled_makespan_s=modeled,
+        stop_reason=stop_reason,
+    )
+    entries: list[PlanEntry] = []
+    for step in cfg.steps:
+        tag = step.tag
+        r = resolved[tag]
+        has_curve = tag in speedups and bool(speedups[tag].levels)
+        entries.append(
+            PlanEntry(
+                tag=tag,
+                est_duration_s=weight[tag],
+                est_source="store" if has_curve else r[1],
+                rss_estimate_bytes=r[2],
+                rss_source=r[3],
+                bottom_level_s=bottom[tag],
+                samples=r[4],
+                speedup=speedups.get(tag),
+                alloc_inner_jobs=widths[tag],
+            )
+        )
+    return Plan(
+        planner=Planner.CPA,
+        order=tuple(order),
+        critical_path=tuple(critical),
+        critical_path_length_s=t_cp,
+        entries=tuple(entries),
+        allocation=allocation,
+    )
+
+
 def build_plan(
     cfg: DagConfig,
     store_samples: Mapping[str, StepSamples],
@@ -720,13 +1028,19 @@ def build_plan(
     planner: Planner = Planner.GREEDY_LPT,
     min_samples: int = DEFAULT_MIN_SAMPLES,
     speedups: Mapping[str, StepSpeedup] | None = None,
+    core_budget: int | None = None,
+    mem_budget: int | None = None,
 ) -> Plan:
     """Resolve every step's estimate (store-over-hint-over-default) and build the plan for
     ``planner``: the per-step resolved estimates, the critical path, and the dispatch order.
 
     ``speedups`` (from :func:`load_step_speedups`) attaches each step's learned parallel-speedup
-    curve for the plan display; it does not change the dispatch order (the co-scheduling
-    inner_jobs allocation planner is a scoped follow-on)."""
+    curve for the plan display. For ``planner=Planner.CPA`` it also DRIVES the allocator: each
+    step's inner-jobs width is chosen by :func:`allocate_widths` over those curves, the dispatch
+    order is the critical-path order at the allocated weights ``T_i(p_i)``, and a whole-DAG
+    :class:`Allocation` summary (widths, lower bound, modeled makespan, stop reason) is attached.
+    ``core_budget`` (``P``, from :func:`profile_enrich.container_core_budget`) and ``mem_budget``
+    (the ``--max-mem`` RAM budget) bound the allocation; they are ignored by the other planners."""
     speedups = speedups or {}
     resolved: dict[str, tuple[float, str, int | None, str, int]] = {}
     est: dict[str, float] = {}
@@ -735,6 +1049,8 @@ def build_plan(
         resolved[step.tag] = r
         est[step.tag] = r[0]
     successors = _successors(cfg)
+    if planner is Planner.CPA:
+        return _build_cpa_plan(cfg, resolved, est, speedups, successors, core_budget, mem_budget)
     bottom = _bottom_levels(cfg, est, successors)
     critical, length = _critical_path(cfg, bottom, successors)
     order = _plan_order(cfg, planner, est, bottom)
@@ -766,7 +1082,11 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
     ``est_duration_s`` is set for every step (store value when the store won, else the unchanged
     hint value), and ``rss_baseline_bytes`` is overridden ONLY when the store won (so a hint-only
     or unmeasured baseline is preserved). This is what feeds both the scheduler's ordering and the
-    memory-aware ``--max-mem`` sizing, so planning improves automatically as runs accumulate."""
+    memory-aware ``--max-mem`` sizing, so planning improves automatically as runs accumulate.
+
+    For a CPA plan each step also gets ``preferred_inner_jobs = alloc_inner_jobs`` — the width the
+    allocator chose — so the step's command actually runs with that ``-j`` (via
+    :func:`model.command_with_inner_jobs`) and its memory cap scales to that width."""
     by_tag = plan.by_tag()
     new_steps: list[Step] = []
     for step in cfg.steps:
@@ -779,13 +1099,18 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
             if entry.rss_source == "store"
             else step.hint.rss_baseline_bytes
         )
+        inner = (
+            entry.alloc_inner_jobs
+            if entry.alloc_inner_jobs is not None
+            else step.hint.preferred_inner_jobs
+        )
         new_hint = ResourceHint(
             resources=step.hint.resources,
             est_duration_s=entry.est_duration_s,
             rss_baseline_bytes=rss,
             hard_mem_max_bytes=step.hint.hard_mem_max_bytes,
             classification=step.hint.classification,
-            preferred_inner_jobs=step.hint.preferred_inner_jobs,
+            preferred_inner_jobs=inner,
             measured_effective_cores=step.hint.measured_effective_cores,
             measured_cpu_utilization=step.hint.measured_cpu_utilization,
         )
@@ -860,17 +1185,38 @@ def _speedup_to_json(speedup: "StepSpeedup | None") -> str:
     )
 
 
+def _allocation_to_json(alloc: "Allocation | None") -> str:
+    """The ``"allocation"`` field value in the plan JSON: ``null`` (non-CPA planners) or a nested
+    object with the core budget, area / critical-path terms, makespan lower bound + modeled
+    makespan, and the stop reason. Floats are fixed-3-decimal STRINGS like the rest of the plan."""
+    if alloc is None:
+        return "null"
+    return (
+        "{\n"
+        f'    "stop_reason": {_json_str(alloc.stop_reason)},\n'
+        f'    "core_budget": {alloc.core_budget},\n'
+        f'    "area_s": "{_fmt_secs(alloc.area_s)}",\n'
+        f'    "area_bound_s": "{_fmt_secs(alloc.area_bound_s)}",\n'
+        f'    "critical_path_s": "{_fmt_secs(alloc.critical_path_s)}",\n'
+        f'    "lower_bound_s": "{_fmt_secs(alloc.lower_bound_s)}",\n'
+        f'    "modeled_makespan_s": "{_fmt_secs(alloc.modeled_makespan_s)}"\n'
+        "  }"
+    )
+
+
 def plan_to_json(plan: Plan) -> str:
     """Canonical, machine-readable plan JSON (2-space indent), byte-identical across builds.
 
     Computed floats are emitted as fixed-3-decimal STRINGS (not JSON numbers), so parity does not
     depend on float ``repr`` — only on the shared fixed-precision formatting. Steps are listed in
-    dispatch order."""
+    dispatch order. ``alloc_inner_jobs`` (per step) and the top-level ``allocation`` object are
+    ``null`` for the non-allocating planners and populated under ``--planner cpa``."""
     by_tag = plan.by_tag()
     steps_json: list[str] = []
     for tag in plan.order:
         entry = by_tag[tag]
         rss = "null" if entry.rss_estimate_bytes is None else str(entry.rss_estimate_bytes)
+        alloc = "null" if entry.alloc_inner_jobs is None else str(entry.alloc_inner_jobs)
         steps_json.append(
             "    {\n"
             f'      "tag": {_json_str(entry.tag)},\n'
@@ -880,6 +1226,7 @@ def plan_to_json(plan: Plan) -> str:
             f'      "rss_source": {_json_str(entry.rss_source)},\n'
             f'      "bottom_level_s": "{_fmt_secs(entry.bottom_level_s)}",\n'
             f'      "samples": {entry.samples},\n'
+            f'      "alloc_inner_jobs": {alloc},\n'
             f'      "speedup": {_speedup_to_json(entry.speedup)}\n'
             "    }"
         )
@@ -889,6 +1236,7 @@ def plan_to_json(plan: Plan) -> str:
         f'  "critical_path": {_json_str_list(plan.critical_path)},',
         f'  "critical_path_length_s": "{_fmt_secs(plan.critical_path_length_s)}",',
         f'  "order": {_json_str_list(plan.order)},',
+        f'  "allocation": {_allocation_to_json(plan.allocation)},',
     ]
     if steps_json:
         parts.append('  "steps": [')
@@ -952,6 +1300,7 @@ def plan_to_text(plan: Plan) -> str:
 
     Deterministic (no color) so it is also cross-checkable; the CLI wraps it in optional color."""
     by_tag = plan.by_tag()
+    is_cpa = plan.allocation is not None
     headers = [
         "step",
         "est_duration_s",
@@ -961,20 +1310,23 @@ def plan_to_text(plan: Plan) -> str:
         "bottom_level_s",
         "samples",
     ]
+    if is_cpa:
+        headers.append("alloc_inner_jobs")
     rows: list[list[str]] = []
     for tag in plan.order:
         entry = by_tag[tag]
-        rows.append(
-            [
-                tag,
-                _fmt_secs(entry.est_duration_s),
-                entry.est_source,
-                _human_bytes(entry.rss_estimate_bytes),
-                entry.rss_source,
-                _fmt_secs(entry.bottom_level_s),
-                str(entry.samples),
-            ]
-        )
+        row = [
+            tag,
+            _fmt_secs(entry.est_duration_s),
+            entry.est_source,
+            _human_bytes(entry.rss_estimate_bytes),
+            entry.rss_source,
+            _fmt_secs(entry.bottom_level_s),
+            str(entry.samples),
+        ]
+        if is_cpa:
+            row.append("-" if entry.alloc_inner_jobs is None else str(entry.alloc_inner_jobs))
+        rows.append(row)
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
@@ -997,8 +1349,25 @@ def plan_to_text(plan: Plan) -> str:
     crit = " -> ".join(plan.critical_path) if plan.critical_path else "(none)"
     lines.append(f"critical path ({_fmt_secs(plan.critical_path_length_s)}s): {crit}")
     lines.append("scheduled order: " + (", ".join(plan.order) if plan.order else "(none)"))
+    lines.extend(_allocation_text_lines(plan))
     lines.extend(_speedup_text_lines(plan))
     return "\n".join(lines) + "\n"
+
+
+def _allocation_text_lines(plan: Plan) -> list[str]:
+    """The one-line CPA allocator summary for :func:`plan_to_text` (``--planner cpa`` only): the
+    stop reason, the core budget, and the balancing terms — the critical path vs. per-core area, the
+    makespan lower bound, and the modeled makespan. Empty for the non-allocating planners."""
+    alloc = plan.allocation
+    if alloc is None:
+        return []
+    return [
+        f"allocator (cpa): {alloc.stop_reason}; P={alloc.core_budget} cores; "
+        f"critical-path={_fmt_secs(alloc.critical_path_s)}s, "
+        f"area/P={_fmt_secs(alloc.area_bound_s)}s, "
+        f"lower-bound={_fmt_secs(alloc.lower_bound_s)}s, "
+        f"modeled-makespan={_fmt_secs(alloc.modeled_makespan_s)}s"
+    ]
 
 
 def _speedup_text_lines(plan: Plan) -> list[str]:

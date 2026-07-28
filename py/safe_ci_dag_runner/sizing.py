@@ -11,7 +11,7 @@ from __future__ import annotations
 import itertools
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from safe_ci_dag_runner.model import DagConfig, Step, StepClass, step_classification
@@ -64,13 +64,23 @@ def transitive_deps(steps: Sequence[Step]) -> dict[str, set[str]]:
 
 
 def schedulable_peak_mem_bytes(
-    cfg: DagConfig, jobs: int, inner_jobs: int | None = None
+    cfg: DagConfig,
+    jobs: int,
+    inner_jobs: int | None = None,
+    *,
+    widths: Mapping[str, int] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Maximum per-step-cap sum over any scheduler-reachable concurrent set of size <= jobs.
 
     A set is reachable only when no member transitively depends on another and the summed
     scarce-resource demand fits ``cfg.resource_caps``. Only steps with a memory baseline
     and that are not engine-only participate (mirrors DeepScry).
+
+    ``inner_jobs`` applies ONE internal-parallelism width to every step (the ``--max-mem``
+    sizing path). ``widths`` instead supplies a PER-STEP width map (a step absent from the map
+    falls back to ``inner_jobs``); the CPA allocator uses it so a step widened on the critical
+    path is charged its own scaled memory cap while its siblings keep theirs (PLANNER_DESIGN.md
+    §5.6). Passing both is allowed; ``widths`` wins per tag.
     """
     by_tag = {
         step.tag: step
@@ -82,6 +92,11 @@ def schedulable_peak_mem_bytes(
     width = min(max(1, jobs), len(tags))
     best_total = 0
     best: tuple[str, ...] = ()
+
+    def cap_of(tag: str) -> int:
+        w = widths.get(tag, inner_jobs) if widths is not None else inner_jobs
+        return step_mem_cap_for_inner_jobs(by_tag[tag], w, mem_cap_factor=cfg.mem_cap_factor)
+
     for count in range(1, width + 1):
         for candidate in itertools.combinations(tags, count):
             if any(
@@ -94,12 +109,7 @@ def schedulable_peak_mem_bytes(
                 for resource, cap in cfg.resource_caps.items()
             ):
                 continue
-            total = sum(
-                step_mem_cap_for_inner_jobs(
-                    by_tag[tag], inner_jobs, mem_cap_factor=cfg.mem_cap_factor
-                )
-                for tag in candidate
-            )
+            total = sum(cap_of(tag) for tag in candidate)
             if total > best_total:
                 best_total, best = total, candidate
     return best_total, best

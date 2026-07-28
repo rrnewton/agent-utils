@@ -48,6 +48,7 @@ from safe_ci_dag_runner.io import (
     dag_to_yaml,
 )
 from safe_ci_dag_runner.model import DagConfig, Step, step_classification
+from safe_ci_dag_runner.profile_enrich import container_core_budget
 from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink
 from safe_ci_dag_runner.scheduler import run_dag
 from safe_ci_dag_runner.sizing import jobs_for_budget, parse_size
@@ -301,8 +302,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--planner",
         choices=[p.value for p in Planner],
         default=Planner.GREEDY_LPT.value,
-        help="dispatch-ordering planner: 'greedy-lpt' (default; longest est_duration first) or "
-        "'critical-path' (longest remaining est-weighted path first, i.e. highest bottom-level)",
+        help="dispatch-ordering planner: 'greedy-lpt' (default; longest est_duration first), "
+        "'critical-path' (longest remaining est-weighted path first, i.e. highest bottom-level), "
+        "or 'cpa' (measured-curve moldable allocator: choose each step's inner -j by balancing the "
+        "critical path against the per-core area, then critical-path list-schedule at those widths)",
     )
     run_p.add_argument(
         "--show-plan",
@@ -400,7 +403,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--planner",
         choices=[p.value for p in Planner],
         default=Planner.GREEDY_LPT.value,
-        help="dispatch-ordering planner: 'greedy-lpt' (default) or 'critical-path'",
+        help="dispatch-ordering planner: 'greedy-lpt' (default), 'critical-path', or 'cpa' "
+        "(measured-curve moldable allocator: pick each step's inner -j by balancing the critical "
+        "path against the per-core area, then list-schedule)",
+    )
+    plan_p.add_argument(
+        "--max-mem",
+        metavar="SPEC",
+        default=None,
+        help="RAM budget (e.g. 8G, 4096M) for the 'cpa' planner's allocation: a step is not "
+        "widened if the DAG's modeled worst-case concurrent footprint would exceed it (ignored by "
+        "the other planners)",
     )
     plan_p.add_argument(
         "--format",
@@ -511,14 +524,20 @@ def _resolve_feedback_dir(perf_dir_arg: str | None, no_feedback: bool) -> str | 
 
 
 def _build_feedback_plan(
-    cfg: DagConfig, feedback_dir: str | None, planner: Planner
+    cfg: DagConfig,
+    feedback_dir: str | None,
+    planner: Planner,
+    *,
+    core_budget: int | None = None,
+    mem_budget: int | None = None,
 ) -> Plan:
     """Load the profile store (when feedback is on) and build the plan for ``planner``.
 
     With ``feedback_dir`` set, the store's learned estimates refine each step (store wins when it
     has enough samples; the DAG hint is the fallback) and the per-step parallel-speedup curves are
     attached for the plan display. With ``feedback_dir`` ``None`` the plan reflects the DAG hints
-    only."""
+    only. ``core_budget`` (``P``) and ``mem_budget`` drive the CPA allocator under
+    ``--planner cpa`` and are ignored by the other planners."""
     if feedback_dir is not None:
         machine_id, container_class = feedback_identity()
         samples = load_step_samples(feedback_dir, machine_id, container_class)
@@ -526,7 +545,27 @@ def _build_feedback_plan(
     else:
         samples = {}
         speedups = {}
-    return build_plan(cfg, samples, planner=planner, speedups=speedups)
+    return build_plan(
+        cfg,
+        samples,
+        planner=planner,
+        speedups=speedups,
+        core_budget=core_budget,
+        mem_budget=mem_budget,
+    )
+
+
+def _cpa_budgets(planner: Planner, max_mem_arg: str | None) -> tuple[int | None, int | None]:
+    """Resolve the ``(core_budget, mem_budget)`` the CPA allocator balances against, or
+    ``(None, None)`` for the non-allocating planners (so they do no cgroup/proc reads).
+
+    ``core_budget`` is :func:`container_core_budget` (the cgroup/affinity core count ``P``);
+    ``mem_budget`` is the parsed ``--max-mem`` RAM budget, or ``None`` (no memory constraint on
+    the allocation)."""
+    if planner is not Planner.CPA:
+        return None, None
+    mem_budget = parse_size(max_mem_arg) if max_mem_arg else None
+    return container_core_budget(), mem_budget
 
 
 def _report_profile_written(perf_dir: str, source: str) -> None:
@@ -960,7 +999,11 @@ def _cmd_plan(ns: argparse.Namespace) -> int:
         return 2
     planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
-    plan = _build_feedback_plan(cfg, feedback_dir, planner)
+    max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
+    core_budget, mem_budget = _cpa_budgets(planner, max_mem)
+    plan = _build_feedback_plan(
+        cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
+    )
     if str(ns.format) == "json":
         print(plan_to_json(plan))
     else:
@@ -993,7 +1036,11 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # and the scheduler see, so planning improves automatically as runs accumulate.
     planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
-    plan = _build_feedback_plan(cfg, feedback_dir, planner)
+    max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
+    core_budget, mem_budget = _cpa_budgets(planner, max_mem)
+    plan = _build_feedback_plan(
+        cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
+    )
     cfg = apply_plan_to_config(cfg, plan)
     if bool(ns.show_plan):
         sys.stdout.write(plan_to_text(plan))
@@ -1016,6 +1063,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         keep_going=bool(ns.keep_going),
         verbosity=verbosity,
         order=list(plan.order),
+        core_budget=core_budget,
     )
     passed = sum(1 for o in result.outcomes if o.ok)
     failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)

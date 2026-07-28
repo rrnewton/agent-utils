@@ -8,14 +8,18 @@ from safe_ci_dag_runner import (
     DagConfig,
     ResourceHint,
     Step,
+    StepClass,
+    allocate_widths,
     apply_plan_to_config,
     build_plan,
     load_step_samples,
+    load_step_speedups,
     plan_to_json,
     plan_to_text,
 )
 from safe_ci_dag_runner.estimates import (
     Planner,
+    StepSpeedup,
     _affinity_width,
     _parse_float,
     _parse_int,
@@ -285,6 +289,9 @@ def test_plan_json_and_text_are_stable(tmp_path: Path) -> None:
     assert '"planner": "greedy-lpt"' in js
     assert js.count('"tag":') == 3
     assert js.startswith("{\n") and js.endswith("}")
+    # Non-CPA planners carry the allocation fields as null (populated only under --planner cpa).
+    assert '"allocation": null' in js
+    assert '"alloc_inner_jobs": null' in js
     text = plan_to_text(plan)
     assert text.startswith("plan: greedy-lpt\n")
     assert "scheduled order: g.heavy, g.solo, g.prep" in text
@@ -426,3 +433,171 @@ def test_plan_includes_speedup_field(tmp_path: Path) -> None:
     bare = build_plan(cfg, {}, planner=Planner.GREEDY_LPT)
     assert '"speedup": null' in plan_to_json(bare)
     assert "parallel-speedup model" not in plan_to_text(bare)
+
+
+# --------------------------------------------------------------------------- CPA allocator
+
+_CPA_CONTAINER = "affinity16_cpu-max-max"
+
+
+def _cpa_speedups(tmp_path: Path, rows: list[str]) -> dict[str, StepSpeedup]:
+    store = _write_speedup_store(tmp_path, rows)
+    return load_step_speedups(store, "m", _CPA_CONTAINER)
+
+
+def _cpa_est(cfg: DagConfig) -> dict[str, float]:
+    return {step.tag: step.hint.est_duration_s for step in cfg.steps}
+
+
+def test_cpa_spreads_cores_on_independent_tasks(tmp_path: Path) -> None:
+    # Two INDEPENDENT linear-scaling steps, P=4: the allocator balances T_CP against area/P and
+    # SPREADS cores — both land at width 2 (not one hogging 4), stopping "balanced" at the balance
+    # point BEFORE the knee (curve reaches 4). This is the area-bound behavior (PLANNER_DESIGN.md §2).
+    rows: list[str] = []
+    for tag in ("g.a", "g.b"):
+        for j, w in ((1, "10.0"), (2, "5.0"), (4, "2.5")):
+            rows.append(_speedup_row(tag, j, w, user_s="10.0", sys_s="0.0"))
+    speedups = _cpa_speedups(tmp_path, rows)
+    cfg = DagConfig(
+        steps=(
+            Step("g", "a", "a", "true", hint=ResourceHint(est_duration_s=10.0)),
+            Step("g", "b", "b", "true", hint=ResourceHint(est_duration_s=10.0)),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    widths = allocate_widths(cfg, speedups, _cpa_est(cfg), 4)
+    assert widths == {"g.a": 2, "g.b": 2}
+    plan = build_plan(cfg, {}, planner=Planner.CPA, speedups=speedups, core_budget=4)
+    assert plan.allocation is not None
+    assert plan.allocation.stop_reason == "balanced"
+    assert plan.allocation.modeled_makespan_s >= plan.allocation.lower_bound_s
+
+
+def test_cpa_piles_cores_on_the_chain_and_leaves_plateau_narrow(tmp_path: Path) -> None:
+    # A chain prep(curveless) -> build(scaling) -> test(scaling) plus an independent plateau (side).
+    # With ample cores CPA PILES cores onto the critical-path chain (build->8, test->4), while the
+    # plateau step and the curveless prep stay at 1, collapsing the width-1 58s path to ~11s.
+    rows: list[str] = []
+    for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0")):
+        rows.append(_speedup_row("c.build", j, w, user_s="40.0", sys_s="0.0"))
+    for j, w in ((1, "16.0"), (2, "8.0"), (4, "4.0")):
+        rows.append(_speedup_row("c.test", j, w, user_s="16.0", sys_s="0.0"))
+    for j, w in ((1, "9.0"), (2, "8.7")):
+        rows.append(_speedup_row("c.side", j, w, user_s="9.0", sys_s="0.0"))
+    speedups = _cpa_speedups(tmp_path, rows)
+    cfg = DagConfig(
+        steps=(
+            Step("c", "prep", "p", "true", hint=ResourceHint(est_duration_s=2.0)),
+            Step("c", "build", "b", "true", deps=["c.prep"], hint=ResourceHint(est_duration_s=40.0)),
+            Step("c", "test", "t", "true", deps=["c.build"], hint=ResourceHint(est_duration_s=16.0)),
+            Step("c", "side", "s", "true", hint=ResourceHint(est_duration_s=9.0)),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    plan = build_plan(cfg, {}, planner=Planner.CPA, speedups=speedups, core_budget=16)
+    widths = {e.tag: e.alloc_inner_jobs for e in plan.entries}
+    assert widths["c.build"] == 8  # piled onto the chain (up to the knee)
+    assert widths["c.test"] == 4
+    assert widths["c.side"] == 1  # plateau: never widened
+    assert widths["c.prep"] == 1  # curveless: rigid
+    assert plan.allocation is not None
+    assert plan.allocation.stop_reason == "knee-exhausted"
+    assert plan.allocation.modeled_makespan_s < 58.0  # beats the width-1 critical path
+    assert plan.allocation.modeled_makespan_s >= plan.allocation.lower_bound_s
+
+
+def test_cpa_memory_blocks_widening_even_with_free_cores(tmp_path: Path) -> None:
+    # A CPU-bound scaling step whose memory cap grows with width: widening m.heavy 4 -> 8 doubles the
+    # modeled footprint (3 GiB -> 6 GiB), so a 5 GiB budget BLOCKS it even though cores are free.
+    rows = [
+        _speedup_row("m.heavy", j, w, user_s="40.0", sys_s="0.0")
+        for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0"))
+    ]
+    speedups = _cpa_speedups(tmp_path, rows)
+    cfg = DagConfig(
+        steps=(
+            Step("m", "prep", "p", "true", hint=ResourceHint(est_duration_s=2.0)),
+            Step(
+                "m",
+                "heavy",
+                "h",
+                "true",
+                deps=["m.prep"],
+                hint=ResourceHint(
+                    est_duration_s=40.0,
+                    rss_baseline_bytes=3 * 1024**3,
+                    classification=StepClass.CPU_BOUND,
+                ),
+            ),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    plan = build_plan(
+        cfg, {}, planner=Planner.CPA, speedups=speedups, core_budget=16, mem_budget=5 * 1024**3
+    )
+    widths = {e.tag: e.alloc_inner_jobs for e in plan.entries}
+    assert widths["m.heavy"] == 4  # memory-capped at 4 (cores were free up to 8)
+    assert plan.allocation is not None
+    assert plan.allocation.stop_reason == "mem-capped"
+    # With no RAM budget the same step widens all the way to its knee (8).
+    free = build_plan(cfg, {}, planner=Planner.CPA, speedups=speedups, core_budget=16)
+    assert {e.tag: e.alloc_inner_jobs for e in free.entries}["m.heavy"] == 8
+
+
+def test_cpa_curveless_dag_stays_rigid(tmp_path: Path) -> None:
+    # No measured curves at all: every step is rigid at its hint width (or 1), nothing is widened.
+    cfg = DagConfig(
+        steps=(
+            Step("g", "a", "a", "true", hint=ResourceHint(est_duration_s=5.0)),
+            Step("g", "b", "b", "true", deps=["g.a"], hint=ResourceHint(est_duration_s=5.0, preferred_inner_jobs=3)),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    widths = allocate_widths(cfg, {}, _cpa_est(cfg), 16)
+    assert widths == {"g.a": 1, "g.b": 3}  # a: default 1; b: its hint 3 (never grown)
+
+
+def test_cpa_allocation_is_idempotent(tmp_path: Path) -> None:
+    rows: list[str] = []
+    for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0")):
+        rows.append(_speedup_row("c.build", j, w, user_s="40.0", sys_s="0.0"))
+    speedups = _cpa_speedups(tmp_path, rows)
+    cfg = DagConfig(
+        steps=(
+            Step("c", "prep", "p", "true", hint=ResourceHint(est_duration_s=2.0)),
+            Step("c", "build", "b", "true", deps=["c.prep"], hint=ResourceHint(est_duration_s=40.0)),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    w1 = allocate_widths(cfg, speedups, _cpa_est(cfg), 16)
+    w2 = allocate_widths(cfg, speedups, _cpa_est(cfg), 16)
+    assert w1 == w2 == {"c.prep": 1, "c.build": 8}
+
+
+def test_cpa_plan_json_and_text_shape(tmp_path: Path) -> None:
+    rows = [
+        _speedup_row("c.build", j, w, user_s="40.0", sys_s="0.0")
+        for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0"))
+    ]
+    speedups = _cpa_speedups(tmp_path, rows)
+    cfg = DagConfig(
+        steps=(Step("c", "build", "b", "true", hint=ResourceHint(est_duration_s=40.0)),),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    plan = build_plan(cfg, {}, planner=Planner.CPA, speedups=speedups, core_budget=16)
+    js = plan_to_json(plan)
+    assert '"planner": "cpa"' in js
+    assert '"allocation": {' in js
+    assert '"stop_reason":' in js
+    assert '"modeled_makespan_s":' in js
+    assert '"alloc_inner_jobs": 8' in js
+    text = plan_to_text(plan)
+    assert text.startswith("plan: cpa\n")
+    assert "alloc_inner_jobs" in text
+    assert "allocator (cpa):" in text

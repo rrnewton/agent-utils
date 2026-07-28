@@ -69,6 +69,9 @@ struct Shared {
     failed: bool,
     /// Stop scheduling new steps after a failure.
     stop: bool,
+    /// Summed inner-jobs width of concurrently-running steps (CPA core-budget gate; see
+    /// [`cores_free`]). Always tracked; only enforced when a `core_budget` is set.
+    cores_used: i64,
     /// Accumulated per-step measurement rows (forwarded to a metrics sink after the run).
     step_profile_rows: Vec<ProfileRow>,
 }
@@ -101,6 +104,26 @@ fn res_free(sh: &Shared, step: &Step) -> bool {
         .all(|(r, n)| sh.resource_avail.get(r).copied().unwrap_or(0) >= *n)
 }
 
+/// The step's inner-jobs width for the core-budget gate (its `preferred_inner_jobs`, else 1).
+/// Under `--planner cpa` this is the allocated width baked into the hint.
+fn step_width(step: &Step) -> i64 {
+    match preferred_inner_jobs(step, None) {
+        Some(w) if w > 0 => w,
+        _ => 1,
+    }
+}
+
+/// True when the step fits the remaining core budget, OR nothing is running (so a step wider than
+/// the whole budget still runs — alone — instead of deadlocking). Inactive (always true) when
+/// `core_budget` is `None` (the non-CPA default). Mirrors Python's `Runner._cores_free`.
+fn cores_free(sh: &Shared, step: &Step, core_budget: Option<i64>) -> bool {
+    match core_budget {
+        None => true,
+        Some(_) if sh.cores_used == 0 => true,
+        Some(p) => sh.cores_used + step_width(step) <= p,
+    }
+}
+
 fn acquire(sh: &mut Shared, step: &Step) {
     for (r, n) in &step.hint.resources {
         *sh.resource_avail.entry(r.clone()).or_insert(0) -= n;
@@ -131,6 +154,10 @@ struct Runner {
     cgroups: BoxedCgroups,
     /// Multiplier from a step's measured RSS baseline to its inner memory cap.
     mem_cap_factor: f64,
+    /// CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set loop
+    /// never lets the summed inner-jobs width of concurrently-running steps exceed this total core
+    /// budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
+    core_budget: Option<i64>,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -142,6 +169,7 @@ impl Runner {
         verbosity: i64,
         cgroups: BoxedCgroups,
         order_override: Option<Vec<String>>,
+        core_budget: Option<i64>,
     ) -> Self {
         let steps: HashMap<String, Step> = cfg.steps.iter().map(|s| (s.tag(), s.clone())).collect();
         // Dispatch order. When the caller supplies an explicit order (e.g. a critical-path
@@ -171,6 +199,7 @@ impl Runner {
             default_jobs_flag: cfg.default_jobs_flag.clone(),
             cgroups,
             mem_cap_factor: cfg.mem_cap_factor,
+            core_budget,
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
                 running: HashSet::new(),
@@ -179,6 +208,7 @@ impl Runner {
                 resource_avail,
                 failed: false,
                 stop: false,
+                cores_used: 0,
                 step_profile_rows: Vec::new(),
             })),
         }
@@ -243,8 +273,12 @@ impl Runner {
                         if !res_free(&sh, &step) {
                             continue;
                         }
+                        if !cores_free(&sh, &step, self.core_budget) {
+                            continue;
+                        }
                         sh.running.insert(tag.clone());
                         acquire(&mut sh, &step);
+                        sh.cores_used += step_width(&step);
                         launchable.push(step);
                     }
                 }
@@ -674,6 +708,7 @@ fn run_step(ctx: StepCtx) {
         sh.running.remove(&tag);
         sh.running_pids.remove(&tag);
         release(&mut sh, &step);
+        sh.cores_used -= step_width(&step);
         sh.step_profile_rows.push(row);
         let was_aborted = sh.aborted.contains(&tag);
         let outcome = if was_aborted {
@@ -778,11 +813,13 @@ pub fn run_dag_boxed(
     verbosity: i64,
     cgroups: BoxedCgroups,
 ) -> RunResult {
-    run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups, None)
+    run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups, None, None)
 }
 
-/// Like [`run_dag_boxed`] but with an explicit dispatch `order` (e.g. a critical-path planner's).
-/// `None` uses the built-in longest-processing-time default.
+/// Like [`run_dag_boxed`] but with an explicit dispatch `order` (e.g. a critical-path planner's)
+/// and an optional CPA `core_budget` (`P`): when set, the scheduler never lets the summed
+/// inner-jobs width of concurrently-running steps exceed it. `order = None` uses the built-in
+/// longest-processing-time default; `core_budget = None` disables the core gate.
 pub fn run_dag_boxed_ordered(
     cfg: &DagConfig,
     jobs: i64,
@@ -790,6 +827,7 @@ pub fn run_dag_boxed_ordered(
     verbosity: i64,
     cgroups: BoxedCgroups,
     order: Option<Vec<String>>,
+    core_budget: Option<i64>,
 ) -> RunResult {
     if let Some(cg) = &cgroups {
         if !cg.enabled() {
@@ -800,7 +838,15 @@ pub fn run_dag_boxed_ordered(
             );
         }
     }
-    let runner = Runner::new(cfg, jobs, keep_going, verbosity, cgroups, order);
+    let runner = Runner::new(
+        cfg,
+        jobs,
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        core_budget,
+    );
     let (_ok, wall) = runner.run();
     runner.result(wall)
 }

@@ -193,6 +193,7 @@ class Runner:
         keep_going: bool = False,
         verbosity: int = 1,
         order: Sequence[str] | None = None,
+        core_budget: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.jobs = max(1, jobs)
@@ -200,6 +201,12 @@ class Runner:
         self.keep_going = keep_going
         # verbosity: 0 quiet(+failures), 1 default(+summaries), >=2 stream child stdout.
         self.verbosity = verbosity
+        # CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set
+        # loop never lets the summed inner-jobs width of concurrently-running steps exceed this
+        # total core budget P, so a boxed run stays true to the measured curves the allocator used.
+        # None (the default, non-CPA planners) disables the gate — behavior is unchanged.
+        self.core_budget = core_budget
+        self.cores_used = 0
         self.steps: dict[str, Step] = cfg.by_tag()
         # Dispatch order. When the caller supplies an explicit `order` (e.g. a critical-path
         # planner's), use it verbatim; otherwise default to LONGEST-processing-time first (LPT
@@ -243,6 +250,22 @@ class Runner:
         return all(
             self.resource_avail.get(r, 0) >= n for r, n in step.hint.resources.items()
         )
+
+    def _step_width(self, step: Step) -> int:
+        """The step's inner-jobs width for the core-budget gate (its ``preferred_inner_jobs``, else
+        1). Under ``--planner cpa`` this is the allocated width baked into the hint."""
+        width = preferred_inner_jobs(step)
+        return width if (width is not None and width > 0) else 1
+
+    def _cores_free(self, step: Step) -> bool:
+        """True when the step fits the remaining core budget, OR nothing is running (so a step
+        wider than the whole budget still runs — alone — instead of deadlocking). The gate is
+        inactive (always True) when ``core_budget`` is ``None``."""
+        if self.core_budget is None:
+            return True
+        if self.cores_used == 0:
+            return True
+        return self.cores_used + self._step_width(step) <= self.core_budget
 
     def _acquire(self, step: Step) -> None:
         for r, n in step.hint.resources.items():
@@ -311,9 +334,12 @@ class Runner:
                             break
                         if not self._res_free(step):
                             continue
+                        if not self._cores_free(step):
+                            continue
                         launchable.append(step)
                         self.running.add(tag)
                         self._acquire(step)
+                        self.cores_used += self._step_width(step)
                 for step in launchable:
                     t = threading.Thread(
                         target=self._run_step, args=(step,), daemon=True
@@ -476,6 +502,7 @@ class Runner:
             self.running.discard(step.tag)
             self.running_procs.pop(step.tag, None)
             self._release(step)
+            self.cores_used -= self._step_width(step)
             self.step_profile_rows.append(row)
             was_aborted = step.tag in self.aborted
             if was_aborted:
@@ -573,6 +600,7 @@ def run_dag(
     keep_going: bool = False,
     verbosity: int = 1,
     order: Sequence[str] | None = None,
+    core_budget: int | None = None,
 ) -> RunResult:
     """Run a whole DAG and return its :class:`RunResult`.
 
@@ -593,6 +621,9 @@ def run_dag(
     :param verbosity: 0 quiet (+failures), 1 default (+summaries), >=2 stream child stdout.
     :param order: explicit dispatch order (e.g. a critical-path planner's); ``None`` uses the
         built-in longest-processing-time default.
+    :param core_budget: total inner-jobs core budget ``P`` for the CPA dispatch gate; when set the
+        scheduler never lets the summed width of concurrently-running steps exceed it. ``None``
+        disables the gate (the non-CPA default).
     """
     sink: MetricsSink = metrics if metrics is not None else _NoopMetricsSink()
     manager: CgroupManager = cgroups if cgroups is not None else _NoopCgroupManager()
@@ -611,6 +642,7 @@ def run_dag(
         keep_going=keep_going,
         verbosity=verbosity,
         order=order,
+        core_budget=core_budget,
     )
     window: RunWindow = sink.start_run_window()
     ok = runner.run()

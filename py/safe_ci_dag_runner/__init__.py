@@ -28,12 +28,14 @@ from safe_ci_dag_runner.analyze import summarize
 from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroups
 from safe_ci_dag_runner.estimates import (
     DEFAULT_MIN_SAMPLES,
+    Allocation,
     Plan,
     PlanEntry,
     Planner,
     SpeedupLevel,
     StepSamples,
     StepSpeedup,
+    allocate_widths,
     apply_plan_to_config,
     build_plan,
     feedback_identity,
@@ -85,7 +87,7 @@ from safe_ci_dag_runner.sizing import (
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
-__version__: str = "0.7.0"
+__version__: str = "0.8.0"
 
 __all__ = [
     "__version__",
@@ -144,11 +146,13 @@ __all__ = [
     "SpeedupLevel",
     "StepSpeedup",
     "PlanEntry",
+    "Allocation",
     "Plan",
     "DEFAULT_MIN_SAMPLES",
     "feedback_identity",
     "load_step_samples",
     "load_step_speedups",
+    "allocate_widths",
     "build_plan",
     "apply_plan_to_config",
     "plan_to_json",

@@ -181,7 +181,7 @@ concurrently. You could equally cap `"gpu"`, `"db"`, or `"api-tokens"` — anyth
 
 ## Planning algorithm
 
-Two planners are available via `--planner`:
+Three planners are available via `--planner`:
 
 - **`greedy-lpt`** (default) — a greedy, **longest-processing-time-first** pass: whenever a worker
   slot frees, the runner starts the ready step (all dependencies done, resource demand fits the
@@ -192,9 +192,20 @@ Two planners are available via `--planner`:
   launches the one with the highest bottom-level first. This keeps the graph's longest chain moving
   and shortens the makespan when a cheap step heads a long dependency chain (a case where plain
   longest-*single*-step ordering picks the wrong step first).
+- **`cpa`** (new in v0.8.0) — a **measured-curve moldable allocator**: it also chooses each step's
+  inner `-j` width. Over the learned speedup curves it balances the critical path against the
+  per-core work ("area"), giving more cores to critical-path steps that scale and leaving plateau
+  steps narrow, subject to the machine's core budget, `--max-mem`, and each step's
+  work-conservation knee — then critical-path list-schedules at those widths and holds the core
+  budget at dispatch. It runs each step with the chosen `-j` and reports the allocated widths plus a
+  makespan lower bound and modeled makespan. It's a heuristic (CPA — Radulescu & van Gemund 2001),
+  not an optimal schedule; see
+  [`PLANNER_DESIGN.md`](PLANNER_DESIGN.md) for the algorithm, its literature grounding, and our
+  deviations.
 
-Both orders are **deterministic and identical across the Python and Rust builds** for the same
-profile + DAG (ties broken stably, by tag for critical-path).
+The `greedy-lpt` and `critical-path` orders — and the `cpa` allocation and its resulting plan — are
+**deterministic and identical across the Python and Rust builds** for the same profile + DAG (ties
+broken stably, by tag).
 
 **Learned estimates (the feedback loop).** `est_duration_s` no longer has to be a static hint you
 hand-author. The runner now **feeds the recorded profile store back in at plan time** (ds-7pzdgm /
@@ -224,11 +235,11 @@ step whose wall halves `-j1`→`-j2` but barely improves `-j2`→`-j4` while its
 gets a recommended `inner_jobs` of 2; a near-linear step gets the widest measured width. This is
 surfaced by `plan` / `run --show-plan` (below) and is byte-identical across the two builds.
 
-Not yet built (a deliberately-separate follow-on): a speedup-aware **co-scheduling allocator** that
-*acts* on the model — distributing inner `-j` across concurrently-scheduled steps to minimize
-whole-DAG wall (more threads to critical-path steps that scale, fewer to steps that plateau), under
-the total core + memory + resource caps. The model is *surfaced* today; the allocator is the next
-piece.
+This model now has a consumer: the **`--planner cpa`** allocator (above) *acts* on these curves,
+distributing inner `-j` across the DAG to minimize whole-DAG wall (more threads to critical-path
+steps that scale, fewer to steps that plateau) under the total core + memory + resource caps. The
+per-step `recommended_inner_jobs` here is the work-conservation knee the allocator never widens past;
+the whole-DAG allocation is CPA's job. See [`PLANNER_DESIGN.md`](PLANNER_DESIGN.md).
 
 ### The `plan` command: see the estimates + the schedule
 
@@ -260,9 +271,21 @@ step       rec_inner_jobs  eff_cores  speedup@rec  curve(inner_jobs->speedup)
 build.app               2      1.980        2.00x     1:1.00x 2:2.00x 4:2.22x
 ```
 
+With `--planner cpa` the table gains an `alloc_inner_jobs` column and a one-line allocator summary
+(stop reason, core budget `P`, and the balancing terms — critical path vs. per-core area, the
+makespan lower bound, and the achieved modeled makespan):
+
+```
+$ safe-ci-dag-runner plan --dag dag.json --planner cpa
+...
+allocator (cpa): knee-exhausted; P=16 cores; critical-path=11.000s, area/P=4.188s, lower-bound=11.000s, modeled-makespan=11.000s
+```
+
 `plan --format json` emits the same plan as canonical, machine-readable JSON (byte-identical across
-the Python and Rust builds), including a per-step `"speedup"` object (or `null`). `run --show-plan`
-prints this table and then runs. All three honor `--planner` and `--no-profile-feedback`.
+the Python and Rust builds), including a per-step `"speedup"` object (or `null`), a per-step
+`"alloc_inner_jobs"`, and a top-level `"allocation"` object (`null` unless `--planner cpa`).
+`run --show-plan` prints this table and then runs. All planners honor `--planner` and
+`--no-profile-feedback`; `--planner cpa` also honors `--max-mem`.
 
 ## CLI reference
 

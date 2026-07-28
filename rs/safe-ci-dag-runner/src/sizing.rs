@@ -117,11 +117,39 @@ fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
 ///
 /// A set is reachable only when no member transitively depends on another and the summed
 /// scarce-resource demand fits `cfg.resource_caps`. Only steps with a memory baseline and that
-/// are not engine-only participate. Returns `(best_total, chosen_tags)`.
+/// are not engine-only participate. Returns `(best_total, chosen_tags)`. `inner_jobs` applies ONE
+/// internal-parallelism width to every step (the `--max-mem` sizing path).
 pub fn schedulable_peak_mem_bytes(
     cfg: &DagConfig,
     jobs: i64,
     inner_jobs: Option<i64>,
+) -> (i64, Vec<String>) {
+    peak_mem_over_sets(cfg, jobs, &|s| {
+        step_mem_cap_for_inner_jobs(s, inner_jobs, cfg.mem_cap_factor)
+    })
+}
+
+/// Like [`schedulable_peak_mem_bytes`] but with a PER-STEP width map (a step absent from the map
+/// falls back to `inner_jobs = None`). The CPA allocator uses this so a step widened on the
+/// critical path is charged its own scaled memory cap while its siblings keep theirs
+/// (PLANNER_DESIGN.md §5.6). Mirrors the Python `schedulable_peak_mem_bytes(..., widths=...)`.
+pub fn schedulable_peak_mem_bytes_widths(
+    cfg: &DagConfig,
+    jobs: i64,
+    widths: &HashMap<String, i64>,
+) -> (i64, Vec<String>) {
+    peak_mem_over_sets(cfg, jobs, &|s| {
+        step_mem_cap_for_inner_jobs(s, widths.get(&s.tag()).copied(), cfg.mem_cap_factor)
+    })
+}
+
+/// Shared core of [`schedulable_peak_mem_bytes`] / [`schedulable_peak_mem_bytes_widths`]: the
+/// reachable-concurrent-set enumeration, parameterized by how a participating step's memory cap is
+/// computed (`cap_of`). DRY: the two public entry points differ only in that closure.
+fn peak_mem_over_sets(
+    cfg: &DagConfig,
+    jobs: i64,
+    cap_of: &dyn Fn(&Step) -> i64,
 ) -> (i64, Vec<String>) {
     // Participating steps keep cfg order (mirrors Python's insertion-ordered `by_tag`); `tags`
     // and `participating` are parallel, so a combination index selects both at once.
@@ -174,12 +202,7 @@ pub fn schedulable_peak_mem_bytes(
             if over_cap {
                 continue;
             }
-            let total: i64 = combo
-                .iter()
-                .map(|&i| {
-                    step_mem_cap_for_inner_jobs(participating[i], inner_jobs, cfg.mem_cap_factor)
-                })
-                .sum();
+            let total: i64 = combo.iter().map(|&i| cap_of(participating[i])).sum();
             if total > best_total {
                 best_total = total;
                 best = combo.iter().map(|&i| tags[i].clone()).collect();
