@@ -88,6 +88,121 @@ pub struct StepSamples {
     pub rss_estimate_bytes: Option<i64>,
 }
 
+/// ONE recorded per-step measurement reduced to exactly the fields the estimator + speedup model
+/// consume — the atom of the mergeable profile summary ([`crate::summary`]). Mirrors Python's
+/// `Sample`. `elapsed_s` (raw wall) + `contention` are kept separately (the intrinsic wall the
+/// estimator medians is `elapsed_s * (1 - contention)`; see [`Sample::intrinsic_s`]).
+#[derive(Debug, Clone)]
+pub struct Sample {
+    pub elapsed_s: Option<f64>,
+    pub contention: f64,
+    pub cpu_s: Option<f64>,
+    pub effective_cores: Option<f64>,
+    pub throttled_s: Option<f64>,
+    pub peak_bytes: Option<i64>,
+}
+
+impl Sample {
+    /// The contention-discounted (intrinsic) wall the estimator medians, or `None` when this sample
+    /// carried no `elapsed_s`.
+    pub fn intrinsic_s(&self) -> Option<f64> {
+        self.elapsed_s.map(|e| e * (1.0 - self.contention))
+    }
+}
+
+/// The bucket key for the mergeable summary + the shared aggregation core: `(step, inner_jobs)`.
+/// `inner_jobs` is `0` for a row whose `inner_jobs` cell is absent / unparseable / non-positive
+/// (such rows still count toward [`step_samples_from_buckets`] but are excluded from
+/// [`step_speedups_from_buckets`]). Mirrors Python's `BucketKey`.
+pub type BucketKey = (String, i64);
+
+/// Reduce one raw profile row to the [`Sample`] the estimator consumes — the SINGLE extraction path
+/// shared by the CSV readers and the summary builder (mirrors Python's `sample_from_row`).
+pub fn sample_from_row(row: &HashMap<String, String>, affinity: Option<i64>) -> Sample {
+    let elapsed_s = parse_float(row.get("elapsed_s")).filter(|e| *e >= 0.0);
+    let cpu_s = match (
+        parse_float(row.get("user_s")),
+        parse_float(row.get("sys_s")),
+    ) {
+        (Some(u), Some(s)) if u >= 0.0 && s >= 0.0 => Some(u + s),
+        _ => None,
+    };
+    Sample {
+        elapsed_s,
+        contention: contention_fraction(row, affinity),
+        cpu_s,
+        effective_cores: parse_float(row.get("effective_cores")).filter(|e| *e >= 0.0),
+        throttled_s: parse_float(row.get("throttled_s")).filter(|t| *t >= 0.0),
+        peak_bytes: parse_int(row.get("peak_bytes")).filter(|p| *p >= 0),
+    }
+}
+
+/// The `inner_jobs` bucket component for a row: the parsed positive width, else `0`.
+fn row_inner_jobs(row: &HashMap<String, String>) -> i64 {
+    match parse_int(row.get("inner_jobs")) {
+        Some(j) if j > 0 => j,
+        _ => 0,
+    }
+}
+
+/// Group raw profile `rows` into per-`(step, inner_jobs)` sample lists (UNCAPPED). A row with no
+/// `step` cell is skipped. Mirrors Python's `bucketize_rows`.
+pub fn bucketize_rows(
+    rows: &[HashMap<String, String>],
+    affinity: Option<i64>,
+) -> HashMap<BucketKey, Vec<Sample>> {
+    let mut buckets: HashMap<BucketKey, Vec<Sample>> = HashMap::new();
+    for row in rows {
+        let step = match row.get("step") {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => continue,
+        };
+        let key: BucketKey = (step, row_inner_jobs(row));
+        buckets
+            .entry(key)
+            .or_default()
+            .push(sample_from_row(row, affinity));
+    }
+    buckets
+}
+
+/// Aggregate per-`(step, inner_jobs)` sample buckets into per-step robust estimates (across ALL of a
+/// step's widths). The shared core behind [`load_step_samples`] and the summary reader. Mirrors
+/// Python's `step_samples_from_buckets`.
+pub fn step_samples_from_buckets(
+    buckets: &HashMap<BucketKey, Vec<Sample>>,
+) -> HashMap<String, StepSamples> {
+    let mut durations: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut peaks: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    for ((step, _inner), samples) in buckets {
+        *counts.entry(step.clone()).or_insert(0) += samples.len() as i64;
+        for sample in samples {
+            if let Some(intrinsic) = sample.intrinsic_s() {
+                durations.entry(step.clone()).or_default().push(intrinsic);
+            }
+            if let Some(peak) = sample.peak_bytes {
+                peaks.entry(step.clone()).or_default().push(peak);
+            }
+        }
+    }
+    let mut result: HashMap<String, StepSamples> = HashMap::new();
+    for (step, n) in counts {
+        let est = durations.get(&step).map(|d| robust_median(d));
+        let rss = peaks.get(&step).map(|p| high_percentile(p));
+        result.insert(
+            step.clone(),
+            StepSamples {
+                step,
+                samples: n,
+                est_duration_s: est,
+                rss_estimate_bytes: rss,
+            },
+        );
+    }
+    result
+}
+
 /// The `(machine_id, container_class)` the feedback reader selects the store file by: the current
 /// host's, unless the env overrides are set. Both builds resolve this identically.
 pub fn feedback_identity() -> (String, String) {
@@ -169,8 +284,8 @@ fn high_percentile(values: &[i64]) -> i64 {
 }
 
 /// Parse the affinity (core) width out of a `container_class` like `affinity316_cpu-max-...` ->
-/// `316`. `None` if the shape is unexpected.
-fn affinity_width(container_class: &str) -> Option<i64> {
+/// `316`. `None` if the shape is unexpected. Shared with the summary (its speedup core budget).
+pub(crate) fn affinity_width(container_class: &str) -> Option<i64> {
     let rest = container_class.strip_prefix("affinity")?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     if digits.is_empty() {
@@ -244,13 +359,17 @@ fn contention_fraction(row: &HashMap<String, String>, affinity: Option<i64>) -> 
 }
 
 /// A loaded store: the column->value row maps plus the parsed affinity (core) width.
-type LoadedStore = (Vec<HashMap<String, String>>, Option<i64>);
+pub(crate) type LoadedStore = (Vec<HashMap<String, String>>, Option<i64>);
 
 /// Read `<profile_dir>/step_profiles_<machine_id>_<container_class>.csv` into a list of
 /// column->value row maps plus the parsed affinity (core) width, or `None` when the file is absent.
 /// The single CSV-reading path shared by [`load_step_samples`] and [`load_step_speedups`] (DRY);
-/// mirrors Python's `_load_store`.
-fn load_store(profile_dir: &Path, machine_id: &str, container_class: &str) -> Option<LoadedStore> {
+/// mirrors Python's `_load_store`. Also used by the summary builder to read a store into rows.
+pub(crate) fn load_store(
+    profile_dir: &Path,
+    machine_id: &str,
+    container_class: &str,
+) -> Option<LoadedStore> {
     let path = profile_dir.join(format!("step_profiles_{machine_id}_{container_class}.csv"));
     let text = std::fs::read_to_string(&path).ok()?;
     let affinity = affinity_width(container_class);
@@ -287,44 +406,7 @@ pub fn load_step_samples(
         Some(x) => x,
         None => return HashMap::new(),
     };
-    let mut durations: HashMap<String, Vec<f64>> = HashMap::new();
-    let mut peaks: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut counts: HashMap<String, i64> = HashMap::new();
-
-    for row in &rows {
-        let step = match row.get("step") {
-            Some(s) if !s.is_empty() => s.clone(),
-            _ => continue,
-        };
-        *counts.entry(step.clone()).or_insert(0) += 1;
-        if let Some(elapsed) = parse_float(row.get("elapsed_s")) {
-            if elapsed >= 0.0 {
-                let intrinsic = elapsed * (1.0 - contention_fraction(row, affinity));
-                durations.entry(step.clone()).or_default().push(intrinsic);
-            }
-        }
-        if let Some(peak) = parse_int(row.get("peak_bytes")) {
-            if peak >= 0 {
-                peaks.entry(step.clone()).or_default().push(peak);
-            }
-        }
-    }
-
-    let mut result: HashMap<String, StepSamples> = HashMap::new();
-    for (step, n) in counts {
-        let est = durations.get(&step).map(|d| robust_median(d));
-        let rss = peaks.get(&step).map(|p| high_percentile(p));
-        result.insert(
-            step.clone(),
-            StepSamples {
-                step,
-                samples: n,
-                est_duration_s: est,
-                rss_estimate_bytes: rss,
-            },
-        );
-    }
-    result
+    step_samples_from_buckets(&bucketize_rows(&rows, affinity))
 }
 
 // --------------------------------------------------------------------------- speedup model
@@ -437,44 +519,36 @@ pub fn load_step_speedups(
         Some(x) => x,
         None => return HashMap::new(),
     };
-    let core_budget = affinity;
-    let mut walls: HashMap<(String, i64), Vec<f64>> = HashMap::new();
-    let mut cpus: HashMap<(String, i64), Vec<f64>> = HashMap::new();
-    let mut effs: HashMap<(String, i64), Vec<f64>> = HashMap::new();
-    let mut thrs: HashMap<(String, i64), Vec<f64>> = HashMap::new();
-    for row in &rows {
-        let step = match row.get("step") {
-            Some(s) if !s.is_empty() => s.clone(),
-            _ => continue,
-        };
-        let inner = match parse_int(row.get("inner_jobs")) {
-            Some(j) if j > 0 => j,
-            _ => continue,
-        };
-        let key = (step, inner);
-        if let Some(elapsed) = parse_float(row.get("elapsed_s")) {
-            if elapsed >= 0.0 {
-                walls
-                    .entry(key.clone())
-                    .or_default()
-                    .push(elapsed * (1.0 - contention_fraction(row, affinity)));
-            }
+    step_speedups_from_buckets(&bucketize_rows(&rows, affinity), affinity)
+}
+
+/// Fit each step's PARALLEL-SPEEDUP curve from per-`(step, inner_jobs)` sample buckets. The shared
+/// core behind [`load_step_speedups`] and the summary reader. Mirrors Python's
+/// `step_speedups_from_buckets`.
+pub fn step_speedups_from_buckets(
+    buckets: &HashMap<BucketKey, Vec<Sample>>,
+    core_budget: Option<i64>,
+) -> HashMap<String, StepSpeedup> {
+    let mut walls: HashMap<BucketKey, Vec<f64>> = HashMap::new();
+    let mut cpus: HashMap<BucketKey, Vec<f64>> = HashMap::new();
+    let mut effs: HashMap<BucketKey, Vec<f64>> = HashMap::new();
+    let mut thrs: HashMap<BucketKey, Vec<f64>> = HashMap::new();
+    for ((step, inner), samples) in buckets {
+        if *inner <= 0 {
+            continue;
         }
-        if let (Some(u), Some(s)) = (
-            parse_float(row.get("user_s")),
-            parse_float(row.get("sys_s")),
-        ) {
-            if u >= 0.0 && s >= 0.0 {
-                cpus.entry(key.clone()).or_default().push(u + s);
+        let key: BucketKey = (step.clone(), *inner);
+        for sample in samples {
+            if let Some(intrinsic) = sample.intrinsic_s() {
+                walls.entry(key.clone()).or_default().push(intrinsic);
             }
-        }
-        if let Some(e) = parse_float(row.get("effective_cores")) {
-            if e >= 0.0 {
+            if let Some(c) = sample.cpu_s {
+                cpus.entry(key.clone()).or_default().push(c);
+            }
+            if let Some(e) = sample.effective_cores {
                 effs.entry(key.clone()).or_default().push(e);
             }
-        }
-        if let Some(t) = parse_float(row.get("throttled_s")) {
-            if t >= 0.0 {
+            if let Some(t) = sample.throttled_s {
                 thrs.entry(key.clone()).or_default().push(t);
             }
         }
@@ -495,7 +569,7 @@ pub fn load_step_speedups(
         for inner in &levels_j {
             let key = (step.clone(), *inner);
             let wall_samples = &walls[&key];
-            let median_of = |m: &HashMap<(String, i64), Vec<f64>>| -> Option<f64> {
+            let median_of = |m: &HashMap<BucketKey, Vec<f64>>| -> Option<f64> {
                 m.get(&key)
                     .filter(|v| !v.is_empty())
                     .map(|v| robust_median(v))
@@ -1218,8 +1292,9 @@ pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
 
 // --------------------------------------------------------------------------- rendering
 
-/// Fixed 3-decimal seconds, byte-identical to the Python `f"{value:.3f}"`.
-fn fmt_secs(value: f64) -> String {
+/// Fixed 3-decimal seconds, byte-identical to the Python `f"{value:.3f}"`. Shared with the summary
+/// serializer so every float in the summary JSON uses the SAME fixed-precision formatting.
+pub(crate) fn fmt_secs(value: f64) -> String {
     format!("{value:.3}")
 }
 

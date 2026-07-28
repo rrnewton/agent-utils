@@ -29,6 +29,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from safe_ci_dag_runner import __version__
+from safe_ci_dag_runner import summary as summarylib
+from safe_ci_dag_runner import sync as synclib
 from safe_ci_dag_runner.estimates import (
     Plan,
     Planner,
@@ -40,6 +42,7 @@ from safe_ci_dag_runner.estimates import (
     plan_to_json,
     plan_to_text,
 )
+from safe_ci_dag_runner.summary import DEFAULT_RESERVOIR_K, Summary
 from safe_ci_dag_runner.io import (
     DagJsonError,
     dag_from_json,
@@ -320,6 +323,24 @@ def build_parser() -> argparse.ArgumentParser:
         "time; use only the DAG-authored hints (for reproducibility)",
     )
     run_p.add_argument(
+        "--profile-sync",
+        metavar="BACKEND",
+        default=None,
+        help="close the profiling feedback loop on EPHEMERAL CI: DOWNLOAD+merge the shared, "
+        "constant-sized profile summary at start (seeding the planner) and merge-in this run's "
+        "samples + UPLOAD at end. BACKEND is 'local:<dir>', 'git:<url>#<branch>[#<subdir>]' "
+        "(atomic), 'github-artifacts:<name>[#<owner/repo>]' (non-atomic), or 's3:<bucket>' (stub). "
+        "Independent of --perf-dir (the local CSV store still writes as usual).",
+    )
+    run_p.add_argument(
+        "--profile-sync-direction",
+        choices=["both", "download", "upload"],
+        default="both",
+        help="which half of --profile-sync to do: 'both' (default), 'download' (only seed the "
+        "planner from the shared summary; do not upload), or 'upload' (only publish this run's "
+        "samples; do not seed). --no-profile-feedback also suppresses the download seed.",
+    )
+    run_p.add_argument(
         "-k",
         "--keep-going",
         action="store_true",
@@ -449,6 +470,64 @@ def build_parser() -> argparse.ArgumentParser:
             help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
         )
 
+    summary_p = sub.add_parser(
+        "summary",
+        help="inspect / build / merge / plan-from the constant-sized mergeable profile SUMMARY "
+        "(the artifact --profile-sync uploads+downloads to close the ephemeral-CI feedback loop)",
+    )
+    summary_sub = summary_p.add_subparsers(dest="summary_command", metavar="<action>")
+
+    sb_build = summary_sub.add_parser(
+        "build", help="build a summary JSON from a profile store (CSV) for the current identity"
+    )
+    sb_build.add_argument(
+        "--perf-dir",
+        metavar="DIR",
+        default=None,
+        help="read the profile store CSV from DIR (else the default store / $"
+        f"{PROFILE_DIR_ENV})",
+    )
+    sb_build.add_argument("--out", metavar="FILE", default=None, help="write JSON here (else stdout)")
+    sb_build.add_argument(
+        "--reservoir-cap",
+        type=int,
+        default=DEFAULT_RESERVOIR_K,
+        metavar="K",
+        help=f"max samples kept per (step, inner_jobs) bucket (default {DEFAULT_RESERVOIR_K})",
+    )
+
+    sb_merge = summary_sub.add_parser(
+        "merge", help="merge two or more summary JSON files into one (order-independent) on stdout"
+    )
+    sb_merge.add_argument("files", nargs="+", metavar="FILE", help="summary JSON files to merge")
+    sb_merge.add_argument("--out", metavar="FILE", default=None, help="write JSON here (else stdout)")
+    sb_merge.add_argument(
+        "--reservoir-cap", type=int, default=DEFAULT_RESERVOIR_K, metavar="K",
+        help=f"max samples per bucket after merge (default {DEFAULT_RESERVOIR_K})",
+    )
+
+    sb_plan = summary_sub.add_parser(
+        "plan", help="build a plan from a summary JSON (same output as `plan`, fed by the summary)"
+    )
+    sb_plan.add_argument("--summary", required=True, metavar="FILE", help="summary JSON file")
+    sb_plan.add_argument(
+        "--dag", required=True, metavar="FILE",
+        help="DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON",
+    )
+    sb_plan.add_argument(
+        "--planner", choices=[p.value for p in Planner], default=Planner.GREEDY_LPT.value,
+        help="dispatch-ordering planner (see `plan --help`)",
+    )
+    sb_plan.add_argument("--max-mem", metavar="SPEC", default=None, help="RAM budget for cpa planner")
+    sb_plan.add_argument(
+        "--format", choices=["text", "json"], default="text", help="output format (default text)"
+    )
+
+    sb_stats = summary_sub.add_parser(
+        "stats", help="print bucket_count / total_samples / max_bucket_samples (the bounded-size witness)"
+    )
+    sb_stats.add_argument("file", metavar="FILE", help="summary JSON file")
+
     sub.add_parser("quickstart", help="print a self-contained getting-started guide")
     return parser
 
@@ -566,6 +645,121 @@ def _cpa_budgets(planner: Planner, max_mem_arg: str | None) -> tuple[int | None,
         return None, None
     mem_budget = parse_size(max_mem_arg) if max_mem_arg else None
     return container_core_budget(), mem_budget
+
+
+def _build_plan_from_summary(
+    cfg: DagConfig,
+    summary: Summary,
+    planner: Planner,
+    *,
+    core_budget: int | None = None,
+    mem_budget: int | None = None,
+) -> Plan:
+    """Build a plan whose learned estimates come from the mergeable SUMMARY (rather than a CSV
+    store). The reader half of the sync feature: the estimates are recomputed from the summary's
+    reservoirs via the same estimator core the CSV path uses, so a summary and the store it came
+    from plan identically (until a bucket is subsampled)."""
+    samples = summarylib.step_samples_from_summary(summary)
+    speedups = summarylib.step_speedups_from_summary(summary)
+    return build_plan(
+        cfg,
+        samples,
+        planner=planner,
+        speedups=speedups,
+        core_budget=core_budget,
+        mem_budget=mem_budget,
+    )
+
+
+def _rows_to_str(rows: Sequence[Mapping[str, object]]) -> list[dict[str, str]]:
+    """Stringify heterogeneous per-step profile rows to the ``str -> str`` shape the sample
+    extractor parses, so this run's ``result.step_profile_rows`` funnel through the SAME
+    :func:`~safe_ci_dag_runner.estimates.sample_from_row` path as CSV cells (one code path)."""
+    return [{str(k): "" if v is None else str(v) for k, v in row.items()} for row in rows]
+
+
+def _local_store_summary(
+    feedback_dir: str | None, machine_id: str, container_class: str
+) -> Summary:
+    """Build a summary from THIS machine's local CSV store (its own not-yet-uploaded history), so a
+    persistent dev box's local runs also seed the planner alongside the downloaded shared summary.
+    Empty when feedback is off or the store is absent."""
+    if feedback_dir is None:
+        return summarylib.empty(machine_id, container_class)
+    from safe_ci_dag_runner.estimates import _load_store
+
+    loaded = _load_store(feedback_dir, machine_id, container_class)
+    if loaded is None:
+        return summarylib.empty(machine_id, container_class)
+    rows, affinity = loaded
+    return summarylib.summary_from_rows(rows, machine_id, container_class, affinity)
+
+
+def _sync_seed_plan(
+    cfg: DagConfig,
+    backend: synclib.SyncBackend | None,
+    feedback_dir: str | None,
+    planner: Planner,
+    do_download: bool,
+    *,
+    core_budget: int | None,
+    mem_budget: int | None,
+) -> Plan | None:
+    """DOWNLOAD the shared summary, MERGE it with this machine's local store, and build the plan from
+    the result. Returns the seeded plan, or ``None`` to fall back to the normal CSV-feedback plan
+    (sync off / download disabled / a backend failure). A backend failure degrades LOUDLY (a
+    warning) rather than failing the run — the loop is best-effort, but never silent."""
+    if backend is None or not do_download:
+        return None
+    machine_id, container_class = feedback_identity()
+    try:
+        downloaded = backend.download(machine_id, container_class)
+    except synclib.SyncError as exc:
+        print(
+            f"{PROG}: --profile-sync: download failed, planning from local store only ({exc})",
+            file=sys.stderr,
+        )
+        return None
+    local = _local_store_summary(feedback_dir, machine_id, container_class)
+    try:
+        seed = summarylib.merge(downloaded, local)
+    except summarylib.SummaryError as exc:
+        print(f"{PROG}: --profile-sync: {exc}; planning from local store only", file=sys.stderr)
+        return None
+    buckets, total, _largest = summarylib.summary_stats(seed)
+    print(
+        f"{PROG}: --profile-sync: seeded planner from {backend.describe()} "
+        f"({buckets} buckets, {total} samples for {machine_id}/{container_class})",
+        file=sys.stderr,
+    )
+    return _build_plan_from_summary(
+        cfg, seed, planner, core_budget=core_budget, mem_budget=mem_budget
+    )
+
+
+def _sync_upload(
+    backend: synclib.SyncBackend, rows: Sequence[Mapping[str, object]]
+) -> None:
+    """Merge THIS run's per-step samples into the shared summary and publish them via ``backend``.
+    Degrades LOUDLY on failure (a warning) so the run's own exit code is preserved but the skip is
+    never silent (No Silent Failure)."""
+    machine_id, container_class = feedback_identity()
+    from safe_ci_dag_runner.estimates import _affinity_width
+
+    delta = summarylib.summary_from_rows(
+        _rows_to_str(rows), machine_id, container_class, _affinity_width(container_class)
+    )
+    try:
+        merged = backend.publish(delta)
+    except synclib.SyncError as exc:
+        print(f"{PROG}: --profile-sync: upload failed ({exc})", file=sys.stderr)
+        return
+    buckets, total, largest = summarylib.summary_stats(merged)
+    print(
+        f"{PROG}: --profile-sync: published this run's samples to {backend.describe()} "
+        f"(summary now {buckets} buckets, {total} samples, <= {largest}/bucket)",
+        file=sys.stderr,
+    )
 
 
 def _report_profile_written(perf_dir: str, source: str) -> None:
@@ -985,6 +1179,125 @@ def _resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, 
     return None, 3
 
 
+def _cmd_summary(ns: argparse.Namespace) -> int:
+    """The ``summary`` subcommand family: build / merge / plan-from / stats the mergeable profile
+    summary. These primitives make the summary format inspectable and drivable from a script, and
+    are what the cross-language differential exercises for byte-identical serialization + merge."""
+    action = ns.summary_command if isinstance(ns.summary_command, str) else None
+    if action == "build":
+        return _cmd_summary_build(ns)
+    if action == "merge":
+        return _cmd_summary_merge(ns)
+    if action == "plan":
+        return _cmd_summary_plan(ns)
+    if action == "stats":
+        return _cmd_summary_stats(ns)
+    print(
+        f"{PROG}: summary: an action is required (build | merge | plan | stats)", file=sys.stderr
+    )
+    return 2
+
+
+def _emit_summary(text: str, out: str | None) -> int:
+    """Write summary JSON to ``out`` (with a trailing newline) or stdout."""
+    if out:
+        try:
+            Path(out).write_text(text + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"{PROG}: summary: cannot write {out}: {exc}", file=sys.stderr)
+            return 2
+    else:
+        print(text)
+    return 0
+
+
+def _cmd_summary_build(ns: argparse.Namespace) -> int:
+    """Build a summary JSON from the profile-store CSV for the CURRENT feedback identity."""
+    perf_dir = _resolve_feedback_dir(ns.perf_dir, False)
+    machine_id, container_class = feedback_identity()
+    from safe_ci_dag_runner.estimates import _affinity_width, _load_store
+
+    if perf_dir is None:
+        summary = summarylib.empty(machine_id, container_class)
+    else:
+        loaded = _load_store(perf_dir, machine_id, container_class)
+        if loaded is None:
+            summary = summarylib.empty(machine_id, container_class)
+        else:
+            rows, affinity = loaded
+            summary = summarylib.summary_from_rows(
+                rows, machine_id, container_class, affinity, reservoir_cap=int(ns.reservoir_cap)
+            )
+    return _emit_summary(summarylib.to_json(summary), ns.out if isinstance(ns.out, str) else None)
+
+
+def _cmd_summary_merge(ns: argparse.Namespace) -> int:
+    """Merge two or more summary JSON files (order-independent) into one on stdout / --out."""
+    files = list(ns.files)
+    try:
+        summaries = [
+            summarylib.from_json(Path(f).read_text(encoding="utf-8")) for f in files
+        ]
+    except (OSError, summarylib.SummaryError) as exc:
+        print(f"{PROG}: summary merge: {exc}", file=sys.stderr)
+        return 2
+    if not summaries:
+        print(f"{PROG}: summary merge: need at least one file", file=sys.stderr)
+        return 2
+    first = summaries[0]
+    try:
+        merged = summarylib.merge_all(
+            summaries,
+            first.machine_id,
+            first.container_class,
+            reservoir_cap=int(ns.reservoir_cap),
+        )
+    except summarylib.SummaryError as exc:
+        print(f"{PROG}: summary merge: {exc}", file=sys.stderr)
+        return 2
+    return _emit_summary(summarylib.to_json(merged), ns.out if isinstance(ns.out, str) else None)
+
+
+def _cmd_summary_plan(ns: argparse.Namespace) -> int:
+    """Build a plan fed by a summary JSON (same output shape as `plan`)."""
+    try:
+        summary = summarylib.from_json(Path(str(ns.summary)).read_text(encoding="utf-8"))
+    except (OSError, summarylib.SummaryError) as exc:
+        print(f"{PROG}: summary plan: {exc}", file=sys.stderr)
+        return 2
+    try:
+        cfg = _load(str(ns.dag))
+    except (OSError, DagJsonError) as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
+    max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
+    core_budget, mem_budget = _cpa_budgets(planner, max_mem)
+    plan = _build_plan_from_summary(
+        cfg, summary, planner, core_budget=core_budget, mem_budget=mem_budget
+    )
+    if str(ns.format) == "json":
+        print(plan_to_json(plan))
+    else:
+        sys.stdout.write(plan_to_text(plan))
+    return 0
+
+
+def _cmd_summary_stats(ns: argparse.Namespace) -> int:
+    """Print the bounded-size witness: bucket_count / total_samples / max_bucket_samples."""
+    try:
+        summary = summarylib.from_json(Path(str(ns.file)).read_text(encoding="utf-8"))
+    except (OSError, summarylib.SummaryError) as exc:
+        print(f"{PROG}: summary stats: {exc}", file=sys.stderr)
+        return 2
+    buckets, total, largest = summarylib.summary_stats(summary)
+    print(
+        f"identity: {summary.machine_id}/{summary.container_class}\n"
+        f"buckets: {buckets}\ntotal_samples: {total}\nmax_bucket_samples: {largest}"
+    )
+    return 0
+
+
 def _cmd_plan(ns: argparse.Namespace) -> int:
     """Show the plan (per-step estimates + sources, critical path, scheduled order) without
     running anything. Text (human) or canonical JSON (machine-readable, cross-identical)."""
@@ -1038,9 +1351,33 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
     core_budget, mem_budget = _cpa_budgets(planner, max_mem)
-    plan = _build_feedback_plan(
-        cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
+
+    # Profile-artifact SYNC (close the ephemeral-CI feedback loop): parse the backend once; the
+    # DOWNLOAD half seeds the planner from the shared summary, the UPLOAD half publishes this run's
+    # samples after it finishes. A malformed spec fails fast (exit 2); a backend I/O failure degrades
+    # LOUDLY (a warning) without failing the run.
+    sync_spec = ns.profile_sync if isinstance(ns.profile_sync, str) and ns.profile_sync else None
+    direction = str(ns.profile_sync_direction)
+    backend: synclib.SyncBackend | None = None
+    if sync_spec is not None:
+        try:
+            backend = synclib.parse_backend(sync_spec)
+        except synclib.SyncError as exc:
+            print(f"{PROG}: --profile-sync: {exc}", file=sys.stderr)
+            return 2
+    do_download = backend is not None and direction in ("both", "download")
+    do_upload = backend is not None and direction in ("both", "upload")
+
+    seed_plan = _sync_seed_plan(
+        cfg, backend, feedback_dir, planner, do_download and not bool(ns.no_profile_feedback),
+        core_budget=core_budget, mem_budget=mem_budget,
     )
+    if seed_plan is not None:
+        plan = seed_plan
+    else:
+        plan = _build_feedback_plan(
+            cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
+        )
     cfg = apply_plan_to_config(cfg, plan)
     if bool(ns.show_plan):
         sys.stdout.write(plan_to_text(plan))
@@ -1076,6 +1413,8 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     )
     if perf_dir is not None:
         _report_profile_written(perf_dir, source)
+    if do_upload and backend is not None:
+        _sync_upload(backend, result.step_profile_rows)
     # Feature C: --profile prints a per-step profile table to stdout.
     if bool(ns.profile):
         _print_profile_table(result.step_profile_rows, c)
@@ -1098,6 +1437,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_sweep(ns, c)
     if command == "plan":
         return _cmd_plan(ns)
+    if command == "summary":
+        return _cmd_summary(ns)
 
     dag_arg = ns.dag if isinstance(ns.dag, str) else None
     if dag_arg is None:

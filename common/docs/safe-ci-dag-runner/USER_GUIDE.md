@@ -12,6 +12,7 @@ start with the README's 60-second quickstart or run `safe-ci-dag-runner quicksta
 - [YAML: an isomorphic, literate alternative to JSON](#yaml-an-isomorphic-literate-alternative-to-json)
 - [Worked examples](#worked-examples)
 - [Profiling and experimenting with individual steps](#profiling-and-experimenting-with-individual-steps)
+- [Closing the loop on ephemeral CI: `--profile-sync`](#closing-the-loop-on-ephemeral-ci---profile-sync)
 - [The Python API in depth](#the-python-api-in-depth)
 - [Enabling real cgroup boxing](#enabling-real-cgroup-boxing)
 - [Troubleshooting](#troubleshooting)
@@ -581,6 +582,77 @@ The tool always prints where it appended (No Silent Failure). The files and sche
 dynamic cgroup `cpu.*` columns under boxing) — so a sweep's rows are browsable per width. Consider
 **gitignoring** `./.safe-ci-dag-runner/` (machine-local perf data, not source), or check it in to
 keep a history — your choice.
+
+## Closing the loop on ephemeral CI: `--profile-sync`
+
+The learned-estimate feedback loop (above) works great on a **persistent** machine: each run appends
+to the local profile store, so the planner's duration / memory / speedup estimates get better over
+time. On **ephemeral CI** (a fresh GitHub Actions runner every run) that loop is **inert**: the
+store starts empty every time, each run writes and uploads its own CSV, and nothing ever downloads
+the accumulated history back — so every run re-learns from zero.
+
+`--profile-sync <backend>` closes that loop. It does BOTH directions around a run:
+
+1. **Download + merge at start** — fetch the shared profile *summary* for this runner's identity,
+   merge it with this machine's own local store, and **seed the planner** from the result.
+2. **Merge + upload at end** — reduce this run's per-step samples to a summary *delta* and publish it
+   back to the shared store.
+
+```sh
+# One flag; both directions. The local CSV store still auto-logs as usual.
+safe-ci-dag-runner run --dag ci.json --profile-sync git:https://github.com/org/repo#ci-profile-data
+```
+
+`--profile-sync-direction {both,download,upload}` restricts it to one half (default `both`);
+`--no-profile-feedback` additionally suppresses the download seed (plan from DAG hints only). A
+malformed backend spec fails fast (exit 2); a backend I/O failure **degrades loudly** (a warning)
+without failing the run — the loop is best-effort, but never silent.
+
+### The summary: a constant-sized, mergeable aggregation
+
+The synced artifact is **not** unbounded raw CSVs. For each `(step, inner_jobs)` bucket the summary
+keeps a **bounded reservoir** of up to **K = 64** samples of exactly the fields the estimator and
+speedup model need (raw wall + contention, total CPU-seconds, effective cores, throttled seconds,
+peak bytes). Merging two summaries **unions** the two buckets' reservoirs then **deterministically
+subsamples** back to K by a content-derived stable order (an FNV-1a hash of each sample's canonical
+JSON, then take the first K — **not** an RNG). That makes merge:
+
+- **Bounded** — a bucket never exceeds K, and the bucket count is bounded by the workload (steps ×
+  widths) and hard-capped, so merging *N* runs never grows the summary past its cap, no matter how
+  large *N* is.
+- **Deterministic, commutative, and associative** — two runners merging the same contributions in
+  any order reach the *same* summary.
+- **Byte-identical across the Python and Rust builds** — every float is serialized as a fixed
+  3-decimal string, so parity never depends on float formatting. (Cross-checked in `cross/`.)
+
+Estimates are recomputed *from* the reservoirs on read via the same estimator core the CSV reader
+uses, so a summary that has not yet subsampled a bucket yields **byte-identical** estimates to
+reading the raw store.
+
+Inspect / build / merge summaries directly with the `summary` subcommand:
+
+```sh
+safe-ci-dag-runner summary build --perf-dir ./store        # store CSV -> summary JSON (stdout)
+safe-ci-dag-runner summary merge a.json b.json             # order-independent merge (stdout)
+safe-ci-dag-runner summary plan  --dag ci.json --summary s.json   # plan fed by a summary
+safe-ci-dag-runner summary stats s.json                    # bucket_count / total_samples / max/bucket
+```
+
+### Backends
+
+| Spec | Backend | Concurrency |
+|------|---------|-------------|
+| `local:<dir>` | A directory on the local filesystem. | Atomic read-merge-write under a file lock. |
+| `git:<url>#<branch>[#<subdir>]` | A dedicated git branch (the **atomic reference**). | Correct concurrent read-modify-write: fetch → merge → commit → push, with **retry-on-conflict** (a rejected push re-fetches the new tip and re-merges the *same* delta, never clobbering a concurrent contributor). |
+| `github-artifacts:<name>[#<owner/repo>]` | A GitHub Actions artifact (downloaded via the `gh` CLI; the merged summary is staged for the workflow's `upload-artifact` step). | **Non-atomic** — two runners finishing concurrently each download the same "latest" and one upload wins, so a contribution can occasionally be dropped. Acceptable for a *statistical* summary (the next run re-contributes); choose the git backend when exact accounting matters. |
+| `s3:<bucket>[/<prefix>]` | Object store (S3 / Cloudflare R2). | **Documented stub** — the pluggable seam is in place; a real client (get-latest / merge / put, optionally with a version-id compare-and-swap for atomicity) is a scoped follow-on. Raises a clear error rather than half-working. |
+
+Each backend is scoped, like the CSV store, to one `(machine_id, container_class)` identity, so a
+heterogeneous fleet keeps one summary per homogeneous runner class and merges only within a class.
+
+> **Wiring it into a real CI** is a project-side follow-on: enable `--profile-sync git:…#<data-branch>`
+> in the pipeline that invokes the runner, and create the data branch once. This tool ships the
+> mechanism; a consumer decides the backend + branch.
 
 ## The Python API in depth
 

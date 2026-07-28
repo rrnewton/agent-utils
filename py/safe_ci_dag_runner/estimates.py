@@ -47,12 +47,18 @@ __all__ = [
     "DEFAULT_MIN_SAMPLES",
     "Planner",
     "StepSamples",
+    "Sample",
+    "BucketKey",
     "SpeedupLevel",
     "StepSpeedup",
     "PlanEntry",
     "Allocation",
     "Plan",
     "feedback_identity",
+    "sample_from_row",
+    "bucketize_rows",
+    "step_samples_from_buckets",
+    "step_speedups_from_buckets",
     "load_step_samples",
     "load_step_speedups",
     "allocate_widths",
@@ -135,6 +141,44 @@ class StepSamples:
     samples: int
     est_duration_s: float | None
     rss_estimate_bytes: int | None
+
+
+@dataclass(frozen=True)
+class Sample:
+    """ONE recorded per-step measurement, reduced to exactly the fields the estimator + speedup
+    model consume. This is the atom of the mergeable profile SUMMARY
+    (:mod:`safe_ci_dag_runner.summary`): a bounded reservoir of these per ``(step, inner_jobs)``
+    bucket is what the summary stores, so the summary's recomputed estimates equal the estimates
+    over the raw rows the samples came from (the reservoir is the only lossy step).
+
+    * ``elapsed_s`` — raw recorded wall seconds (``>= 0``), or ``None`` when the row had no
+      parseable ``elapsed_s``. The INTRINSIC (uncontended) wall the estimator medians is
+      ``elapsed_s * (1 - contention)`` (see :meth:`intrinsic_s`); raw elapsed + contention are kept
+      SEPARATELY (rather than pre-multiplied) so a summary is inspectable and the discount is
+      transparent.
+    * ``contention`` — the fraction of machine capacity OTHER work took during the sample
+      (:func:`_contention_fraction`), clamped to ``[0, _MAX_CONTENTION]``. Always present (``0.0``
+      when the store carried no contention signal).
+    * ``cpu_s`` — total CPU-seconds (``user_s`` + ``sys_s``), the work-conservation signal, or
+      ``None``.
+    * ``effective_cores`` / ``throttled_s`` — achieved parallelism and throttling at this width, or
+      ``None``.
+    * ``peak_bytes`` — peak resident bytes for the memory model, or ``None``.
+    """
+
+    elapsed_s: float | None
+    contention: float
+    cpu_s: float | None
+    effective_cores: float | None
+    throttled_s: float | None
+    peak_bytes: int | None
+
+    def intrinsic_s(self) -> float | None:
+        """The contention-discounted (intrinsic / uncontended) wall the estimator medians, or
+        ``None`` when this sample carried no ``elapsed_s``."""
+        if self.elapsed_s is None:
+            return None
+        return self.elapsed_s * (1.0 - self.contention)
 
 
 def feedback_identity() -> tuple[str, str]:
@@ -342,6 +386,103 @@ def _load_store(
     return rows, _affinity_width(container_class)
 
 
+#: The bucket key for the mergeable summary + the shared aggregation core: ``(step, inner_jobs)``.
+#: ``inner_jobs`` is ``0`` for a row whose ``inner_jobs`` cell is absent / unparseable / non-positive
+#: (such rows still count toward :func:`step_samples_from_buckets`, which aggregates across widths,
+#: but are excluded from :func:`step_speedups_from_buckets`, which needs a real width). Real boxed
+#: rows always resolve ``inner_jobs`` to ``>= 1``, so the ``0`` bucket only appears for hand-written
+#: / synthetic data.
+BucketKey = tuple[str, int]
+
+
+def sample_from_row(row: Mapping[str, str], affinity_width: int | None) -> Sample:
+    """Reduce one raw profile row to the :class:`Sample` the estimator + speedup model consume.
+
+    The SINGLE extraction path: both the CSV readers (:func:`load_step_samples` /
+    :func:`load_step_speedups`) and the mergeable summary
+    (:func:`safe_ci_dag_runner.summary.summary_from_rows`) go through here, so a summary built from
+    a store yields byte-identical estimates to reading the store directly. A cell that fails the
+    strict cross-language parse (:func:`_parse_float` / :func:`_parse_int`) becomes ``None`` for that
+    field (never coerced); a negative value is dropped exactly as the direct readers drop it."""
+    elapsed = _parse_float(row.get("elapsed_s"))
+    elapsed_s = elapsed if (elapsed is not None and elapsed >= 0.0) else None
+    user = _parse_float(row.get("user_s"))
+    system = _parse_float(row.get("sys_s"))
+    if user is not None and system is not None and user >= 0.0 and system >= 0.0:
+        cpu_s: float | None = user + system
+    else:
+        cpu_s = None
+    eff = _parse_float(row.get("effective_cores"))
+    effective_cores = eff if (eff is not None and eff >= 0.0) else None
+    throttled = _parse_float(row.get("throttled_s"))
+    throttled_s = throttled if (throttled is not None and throttled >= 0.0) else None
+    peak = _parse_int(row.get("peak_bytes"))
+    peak_bytes = peak if (peak is not None and peak >= 0) else None
+    return Sample(
+        elapsed_s=elapsed_s,
+        contention=_contention_fraction(row, affinity_width),
+        cpu_s=cpu_s,
+        effective_cores=effective_cores,
+        throttled_s=throttled_s,
+        peak_bytes=peak_bytes,
+    )
+
+
+def _row_inner_jobs(row: Mapping[str, str]) -> int:
+    """The ``inner_jobs`` bucket component for a row: the parsed positive width, else ``0``."""
+    inner = _parse_int(row.get("inner_jobs"))
+    return inner if (inner is not None and inner > 0) else 0
+
+
+def bucketize_rows(
+    rows: Sequence[Mapping[str, str]], affinity_width: int | None
+) -> dict[BucketKey, list[Sample]]:
+    """Group raw profile ``rows`` into per-``(step, inner_jobs)`` sample lists.
+
+    A row with no ``step`` cell is skipped (it cannot be attributed). Every other row becomes one
+    :class:`Sample`. This is the raw (UNCAPPED) bucketization shared by the CSV readers and the
+    summary builder; the summary builder additionally caps each bucket to its reservoir size."""
+    buckets: dict[BucketKey, list[Sample]] = {}
+    for row in rows:
+        step = row.get("step")
+        if not step:
+            continue
+        key: BucketKey = (step, _row_inner_jobs(row))
+        buckets.setdefault(key, []).append(sample_from_row(row, affinity_width))
+    return buckets
+
+
+def step_samples_from_buckets(buckets: Mapping[BucketKey, Sequence[Sample]]) -> dict[str, StepSamples]:
+    """Aggregate per-``(step, inner_jobs)`` sample buckets into per-step robust estimates.
+
+    Aggregates across ALL of a step's widths (the memory + duration model does not distinguish
+    inner_jobs): the contention-discounted MAD-trimmed median intrinsic wall and the high-percentile
+    ``peak_bytes``, plus the total sample count. The shared core behind :func:`load_step_samples`
+    (CSV) and :func:`safe_ci_dag_runner.summary.step_samples_from_summary` (mergeable summary)."""
+    durations: dict[str, list[float]] = {}
+    peaks: dict[str, list[int]] = {}
+    counts: dict[str, int] = {}
+    for (step, _inner), samples in buckets.items():
+        counts[step] = counts.get(step, 0) + len(samples)
+        for sample in samples:
+            intrinsic = sample.intrinsic_s()
+            if intrinsic is not None:
+                durations.setdefault(step, []).append(intrinsic)
+            if sample.peak_bytes is not None:
+                peaks.setdefault(step, []).append(sample.peak_bytes)
+    result: dict[str, StepSamples] = {}
+    for step, n in counts.items():
+        step_durations = durations.get(step, [])
+        step_peaks = peaks.get(step, [])
+        result[step] = StepSamples(
+            step=step,
+            samples=n,
+            est_duration_s=_robust_median(step_durations) if step_durations else None,
+            rss_estimate_bytes=_high_percentile(step_peaks) if step_peaks else None,
+        )
+    return result
+
+
 def load_step_samples(
     profile_dir: str | Path, machine_id: str, container_class: str
 ) -> dict[str, StepSamples]:
@@ -358,32 +499,7 @@ def load_step_samples(
     if loaded is None:
         return {}
     rows, affinity_width = loaded
-    durations: dict[str, list[float]] = {}
-    peaks: dict[str, list[int]] = {}
-    counts: dict[str, int] = {}
-    for row in rows:
-        step = row.get("step")
-        if not step:
-            continue
-        counts[step] = counts.get(step, 0) + 1
-        elapsed = _parse_float(row.get("elapsed_s"))
-        if elapsed is not None and elapsed >= 0.0:
-            intrinsic = elapsed * (1.0 - _contention_fraction(row, affinity_width))
-            durations.setdefault(step, []).append(intrinsic)
-        peak = _parse_int(row.get("peak_bytes"))
-        if peak is not None and peak >= 0:
-            peaks.setdefault(step, []).append(peak)
-    result: dict[str, StepSamples] = {}
-    for step, n in counts.items():
-        step_durations = durations.get(step, [])
-        step_peaks = peaks.get(step, [])
-        result[step] = StepSamples(
-            step=step,
-            samples=n,
-            est_duration_s=_robust_median(step_durations) if step_durations else None,
-            rss_estimate_bytes=_high_percentile(step_peaks) if step_peaks else None,
-        )
-    return result
+    return step_samples_from_buckets(bucketize_rows(rows, affinity_width))
 
 
 # --------------------------------------------------------------------------- speedup model
@@ -491,54 +607,35 @@ def _build_step_speedup(
     )
 
 
-def load_step_speedups(
-    profile_dir: str | Path, machine_id: str, container_class: str
+def step_speedups_from_buckets(
+    buckets: Mapping[BucketKey, Sequence[Sample]], core_budget: int | None
 ) -> dict[str, StepSpeedup]:
-    """Model each step's PARALLEL-SPEEDUP curve from its samples ACROSS inner_jobs widths.
+    """Fit each step's PARALLEL-SPEEDUP curve from per-``(step, inner_jobs)`` sample buckets.
 
-    Reads the same per-step store as :func:`load_step_samples`, groups samples by
-    ``(step, inner_jobs)``, and for each width derives a robust (MAD-trimmed median),
-    contention-discounted wall time plus the work-conservation signal (median total CPU-seconds
-    ``user_s`` + ``sys_s``), achieved ``effective_cores``, and ``throttled_s``. From those it fits
-    the per-step speedup(inner_jobs) curve and a RECOMMENDED width (best wall within the knee and
-    the machine's core budget, the affinity width parsed from ``container_class``).
-
-    Only steps with at least :data:`_SPEEDUP_MIN_LEVELS` distinct widths (with wall data) get a
-    model; the rest are absent (the caller shows no speedup curve for them). Never raises on a
-    malformed row (an unparseable cell is skipped, matching :func:`load_step_samples`).
-    """
-    loaded = _load_store(profile_dir, machine_id, container_class)
-    if loaded is None:
-        return {}
-    rows, affinity_width = loaded
-    core_budget = affinity_width
-    walls: dict[tuple[str, int], list[float]] = {}
-    cpus: dict[tuple[str, int], list[float]] = {}
-    effs: dict[tuple[str, int], list[float]] = {}
-    thrs: dict[tuple[str, int], list[float]] = {}
-    for row in rows:
-        step = row.get("step")
-        if not step:
+    For each width (``inner_jobs > 0``) with wall data, derives a robust (MAD-trimmed median)
+    contention-discounted wall, the work-conservation signal (median total CPU-seconds), achieved
+    ``effective_cores``, and ``throttled_s``, then fits the speedup curve + RECOMMENDED width within
+    the knee and ``core_budget``. Steps with fewer than :data:`_SPEEDUP_MIN_LEVELS` measured widths
+    are absent. The shared core behind :func:`load_step_speedups` (CSV) and
+    :func:`safe_ci_dag_runner.summary.step_speedups_from_summary` (mergeable summary)."""
+    walls: dict[BucketKey, list[float]] = {}
+    cpus: dict[BucketKey, list[float]] = {}
+    effs: dict[BucketKey, list[float]] = {}
+    thrs: dict[BucketKey, list[float]] = {}
+    for (step, inner), samples in buckets.items():
+        if inner <= 0:
             continue
-        inner = _parse_int(row.get("inner_jobs"))
-        if inner is None or inner <= 0:
-            continue
-        key = (step, inner)
-        elapsed = _parse_float(row.get("elapsed_s"))
-        if elapsed is not None and elapsed >= 0.0:
-            walls.setdefault(key, []).append(
-                elapsed * (1.0 - _contention_fraction(row, affinity_width))
-            )
-        user = _parse_float(row.get("user_s"))
-        system = _parse_float(row.get("sys_s"))
-        if user is not None and system is not None and user >= 0.0 and system >= 0.0:
-            cpus.setdefault(key, []).append(user + system)
-        eff = _parse_float(row.get("effective_cores"))
-        if eff is not None and eff >= 0.0:
-            effs.setdefault(key, []).append(eff)
-        throttled = _parse_float(row.get("throttled_s"))
-        if throttled is not None and throttled >= 0.0:
-            thrs.setdefault(key, []).append(throttled)
+        key: BucketKey = (step, inner)
+        for sample in samples:
+            intrinsic = sample.intrinsic_s()
+            if intrinsic is not None:
+                walls.setdefault(key, []).append(intrinsic)
+            if sample.cpu_s is not None:
+                cpus.setdefault(key, []).append(sample.cpu_s)
+            if sample.effective_cores is not None:
+                effs.setdefault(key, []).append(sample.effective_cores)
+            if sample.throttled_s is not None:
+                thrs.setdefault(key, []).append(sample.throttled_s)
     by_step: dict[str, list[int]] = {}
     for step, inner in walls:
         by_step.setdefault(step, []).append(inner)
@@ -566,6 +663,29 @@ def load_step_speedups(
             )
         result[step] = _build_step_speedup(step, raw_levels, core_budget)
     return result
+
+
+def load_step_speedups(
+    profile_dir: str | Path, machine_id: str, container_class: str
+) -> dict[str, StepSpeedup]:
+    """Model each step's PARALLEL-SPEEDUP curve from its samples ACROSS inner_jobs widths.
+
+    Reads the same per-step store as :func:`load_step_samples`, groups samples by
+    ``(step, inner_jobs)``, and for each width derives a robust (MAD-trimmed median),
+    contention-discounted wall time plus the work-conservation signal (median total CPU-seconds
+    ``user_s`` + ``sys_s``), achieved ``effective_cores``, and ``throttled_s``. From those it fits
+    the per-step speedup(inner_jobs) curve and a RECOMMENDED width (best wall within the knee and
+    the machine's core budget, the affinity width parsed from ``container_class``).
+
+    Only steps with at least :data:`_SPEEDUP_MIN_LEVELS` distinct widths (with wall data) get a
+    model; the rest are absent (the caller shows no speedup curve for them). Never raises on a
+    malformed row (an unparseable cell is skipped, matching :func:`load_step_samples`).
+    """
+    loaded = _load_store(profile_dir, machine_id, container_class)
+    if loaded is None:
+        return {}
+    rows, affinity_width = loaded
+    return step_speedups_from_buckets(bucketize_rows(rows, affinity_width), affinity_width)
 
 
 # --------------------------------------------------------------------------- planner

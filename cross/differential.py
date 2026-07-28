@@ -1583,6 +1583,122 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
                 rep.ok(label)
 
 
+def _summary_sync_case(
+    py: list[str],
+    rs: list[str],
+    rep: Report,
+    *,
+    label: str,
+    machine: str,
+    container: str,
+    csv: str,
+    dag: dict[str, object],
+) -> None:
+    """One profile-SUMMARY parity case against a fixed synthetic store + DAG. Asserts, across the
+    Python and Rust builds:
+
+    * ``summary build`` (store CSV -> summary JSON) is BYTE-IDENTICAL — the serialization correctness
+      core (float-as-fixed-string, canonical bucket + reservoir order, FNV-1a subsample order).
+    * ``summary plan`` FROM that summary equals ``plan --perf-dir`` from the raw store in EACH build
+      (the summary recomputes the same estimates as the direct reader) AND is byte-identical across
+      builds.
+    * ``summary merge`` is byte-identical AND COMMUTATIVE (merge(a,b) == merge(b,a)), across builds —
+      the mergeable-summary property that makes concurrent contributions order-independent."""
+    extra = {
+        "SAFE_CI_DAG_RUNNER_MACHINE_ID": machine,
+        "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": container,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        with open(os.path.join(store, f"step_profiles_{machine}_{container}.csv"), "w") as fh:
+            fh.write(csv)
+        dag_path = os.path.join(tmp, "dag.json")
+        with open(dag_path, "w") as fh:
+            fh.write(json.dumps(dag))
+
+        # 1) summary build: byte-identical.
+        build = ("summary", "build", "--perf-dir", store)
+        pb, rb = run(py, build, extra), run(rs, build, extra)
+        if pb.returncode != 0 or rb.returncode != 0:
+            rep.bad(f"summary-build:{label}", f"exit py={pb.returncode} rs={rb.returncode} "
+                                               f"(py {pb.stderr!r}; rs {rb.stderr!r})")
+            return
+        if pb.stdout != rb.stdout:
+            rep.bad(f"summary-build:{label}",
+                    f"summary JSON not byte-identical\n--- py ---\n{pb.stdout}\n--- rs ---\n{rb.stdout}")
+            return
+        rep.ok(f"summary-build:{label}")
+
+        s_path = os.path.join(tmp, "summary.json")
+        with open(s_path, "w") as fh:
+            fh.write(pb.stdout)
+
+        # 2) summary plan (from the summary) == plan --perf-dir (from the store), per build + cross.
+        for fmt in ("text", "json"):
+            sp = ("summary", "plan", "--dag", dag_path, "--summary", s_path, "--format", fmt)
+            pp = ("plan", "--dag", dag_path, "--perf-dir", store, "--format", fmt)
+            psp, rsp = run(py, sp, extra), run(rs, sp, extra)
+            ppp = run(py, pp, extra)
+            if psp.stdout != ppp.stdout:
+                rep.bad(f"summary-plan-eq-store:{label}/{fmt}",
+                        f"summary plan != store plan (py)\n--- summary ---\n{psp.stdout}\n"
+                        f"--- store ---\n{ppp.stdout}")
+            else:
+                rep.ok(f"summary-plan-eq-store:{label}/{fmt}")
+            if psp.stdout != rsp.stdout:
+                rep.bad(f"summary-plan:{label}/{fmt}",
+                        f"summary plan not byte-identical\n--- py ---\n{psp.stdout}\n--- rs ---\n{rsp.stdout}")
+            else:
+                rep.ok(f"summary-plan:{label}/{fmt}")
+
+        # 3) summary merge: byte-identical + commutative, across builds. Split the store into two
+        # halves so the merge actually combines distinct contributions.
+        lines = csv.splitlines(keepends=True)
+        header, body = lines[0], lines[1:]
+        mid = max(1, len(body) // 2)
+        a_csv, b_csv = header + "".join(body[:mid]), header + "".join(body[mid:])
+        a_path, b_path = os.path.join(tmp, "a.json"), os.path.join(tmp, "b.json")
+        for half, path in ((a_csv, a_path), (b_csv, b_path)):
+            half_store = os.path.join(tmp, "half")
+            os.makedirs(half_store, exist_ok=True)
+            with open(os.path.join(half_store, f"step_profiles_{machine}_{container}.csv"), "w") as fh:
+                fh.write(half)
+            out = run(py, ("summary", "build", "--perf-dir", half_store), extra)
+            with open(path, "w") as fh:
+                fh.write(out.stdout)
+        for order, name in (((a_path, b_path), "ab"), ((b_path, a_path), "ba")):
+            args = ("summary", "merge", *order)
+            pm, rm = run(py, args), run(rs, args)
+            if pm.stdout != rm.stdout:
+                rep.bad(f"summary-merge:{label}/{name}",
+                        f"merge not byte-identical\n--- py ---\n{pm.stdout}\n--- rs ---\n{rm.stdout}")
+            else:
+                rep.ok(f"summary-merge:{label}/{name}")
+        # Commutativity: merge(a,b) == merge(b,a) in the python build (already cross-checked identical).
+        m_ab = run(py, ("summary", "merge", a_path, b_path)).stdout
+        m_ba = run(py, ("summary", "merge", b_path, a_path)).stdout
+        if m_ab == m_ba:
+            rep.ok(f"summary-merge-commutative:{label}")
+        else:
+            rep.bad(f"summary-merge-commutative:{label}",
+                    f"merge(a,b) != merge(b,a)\n--- ab ---\n{m_ab}\n--- ba ---\n{m_ba}")
+
+
+def compare_summary_sync(py: list[str], rs: list[str], rep: Report) -> None:
+    """Prove the mergeable profile SUMMARY (the profile-artifact sync feature's correctness core) is
+    byte-identical py<->rs for serialization, merge, and recomputed plan — on BOTH the feedback store
+    (contention discount) and the multi-width speedup store (speedup curves)."""
+    _summary_sync_case(
+        py, rs, rep, label="feedback", machine=SYNTH_MACHINE, container=SYNTH_CONTAINER,
+        csv=_FEEDBACK_STORE_CSV, dag=_FEEDBACK_DAG,
+    )
+    _summary_sync_case(
+        py, rs, rep, label="speedup", machine=_SPEEDUP_MACHINE, container=_SPEEDUP_CONTAINER,
+        csv=_speedup_store_csv(), dag=_SPEEDUP_DAG,
+    )
+
+
 INVOCATIONS: tuple[Invocation, ...] = (
     Invocation("version", ("--version",)),
     Invocation("help", ("--help",)),
@@ -1622,6 +1738,7 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     compare_hostile_numeric_cells(py, rs, rep)
     compare_speedup_model(py, rs, rep)
     compare_cpa_planner(py, rs, rep)
+    compare_summary_sync(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

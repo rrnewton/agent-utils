@@ -23,7 +23,7 @@
 //! `--allow-cgroup-failure` downgrades to a best-effort UNBOXED run with a visible warning.
 //! `--perf-dir DIR` writes per-step + whole-run resource-usage CSVs.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 use std::sync::Arc;
@@ -40,6 +40,8 @@ use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{run_dag_boxed, run_dag_boxed_ordered, BoxedCgroups};
 use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
+use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
+use crate::sync::{self, SyncBackend};
 use crate::viz::{to_ascii, to_dot};
 use crate::{PROG, VERSION};
 
@@ -306,6 +308,8 @@ struct RunArgs {
     planner: String,
     show_plan: bool,
     no_profile_feedback: bool,
+    profile_sync: Option<String>,
+    profile_sync_direction: String,
     keep_going: bool,
     cgroups: bool,
     allow_cgroup_failure: bool,
@@ -325,6 +329,8 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         planner: Planner::GreedyLpt.value().to_string(),
         show_plan: false,
         no_profile_feedback: false,
+        profile_sync: None,
+        profile_sync_direction: "both".to_string(),
         keep_going: false,
         cgroups: false,
         allow_cgroup_failure: false,
@@ -366,6 +372,16 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "--planner" => a.planner = validate_planner(take_value(inline, &mut i)?)?,
             "--show-plan" => a.show_plan = true,
             "--no-profile-feedback" => a.no_profile_feedback = true,
+            "--profile-sync" => a.profile_sync = Some(take_value(inline, &mut i)?),
+            "--profile-sync-direction" => {
+                let v = take_value(inline, &mut i)?;
+                if !matches!(v.as_str(), "both" | "download" | "upload") {
+                    return Err(format!(
+                        "--profile-sync-direction: invalid value '{v}' (both|download|upload)"
+                    ));
+                }
+                a.profile_sync_direction = v;
+            }
             "-k" | "--keep-going" => a.keep_going = true,
             "--cgroups" => a.cgroups = true,
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
@@ -586,6 +602,121 @@ fn build_feedback_plan(
             core_budget,
             mem_budget,
         ),
+    }
+}
+
+/// Build a plan whose learned estimates come from the mergeable SUMMARY (rather than a CSV store) —
+/// the reader half of the sync feature. Mirrors Python's `_build_plan_from_summary`.
+fn build_plan_from_summary(
+    cfg: &DagConfig,
+    summary: &Summary,
+    planner: Planner,
+    core_budget: Option<i64>,
+    mem_budget: Option<i64>,
+) -> Plan {
+    let samples = summary::step_samples_from_summary(summary);
+    let speedups = summary::step_speedups_from_summary(summary, None);
+    build_plan(
+        cfg,
+        &samples,
+        planner,
+        DEFAULT_MIN_SAMPLES,
+        &speedups,
+        core_budget,
+        mem_budget,
+    )
+}
+
+/// A summary built from THIS machine's local CSV store (its own not-yet-uploaded history), so a
+/// persistent box's local runs also seed the planner. Empty when feedback is off / the store is
+/// absent. Mirrors Python's `_local_store_summary`.
+fn local_store_summary(feedback_dir: Option<&str>, mid: &str, cc: &str) -> Summary {
+    match feedback_dir {
+        Some(dir) => summary::summary_from_store(Path::new(dir), mid, cc, DEFAULT_RESERVOIR_K),
+        None => summary::empty(mid, cc),
+    }
+}
+
+/// DOWNLOAD the shared summary, MERGE it with this machine's local store, and build the plan from
+/// the result. Returns `None` to fall back to the normal CSV-feedback plan (sync off / a backend
+/// failure). A backend failure degrades LOUDLY without failing the run. Mirrors `_sync_seed_plan`.
+fn sync_seed_plan(
+    cfg: &DagConfig,
+    backend: Option<&dyn SyncBackend>,
+    feedback_dir: Option<&str>,
+    planner: Planner,
+    do_download: bool,
+    core_budget: Option<i64>,
+    mem_budget: Option<i64>,
+) -> Option<Plan> {
+    let backend = backend?;
+    if !do_download {
+        return None;
+    }
+    let (mid, cc) = feedback_identity();
+    let downloaded = match backend.download(&mid, &cc) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "{PROG}: --profile-sync: download failed, planning from local store only ({e})"
+            );
+            return None;
+        }
+    };
+    let local = local_store_summary(feedback_dir, &mid, &cc);
+    let seed = match summary::merge(
+        &downloaded,
+        &local,
+        DEFAULT_RESERVOIR_K,
+        DEFAULT_MAX_BUCKETS,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{PROG}: --profile-sync: {e}; planning from local store only");
+            return None;
+        }
+    };
+    let (buckets, total, _largest) = summary::summary_stats(&seed);
+    eprintln!(
+        "{PROG}: --profile-sync: seeded planner from {} ({buckets} buckets, {total} samples for {mid}/{cc})",
+        backend.describe()
+    );
+    Some(build_plan_from_summary(
+        cfg,
+        &seed,
+        planner,
+        core_budget,
+        mem_budget,
+    ))
+}
+
+/// Merge THIS run's per-step samples into the shared summary and publish them. Degrades LOUDLY on
+/// failure (a warning) so the run's exit code is preserved but the skip is never silent. Mirrors
+/// Python's `_sync_upload`.
+fn sync_upload(backend: &dyn SyncBackend, rows: &[std::collections::BTreeMap<String, String>]) {
+    let (mid, cc) = feedback_identity();
+    let hash_rows: Vec<std::collections::HashMap<String, String>> = rows
+        .iter()
+        .map(|r| r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .collect();
+    let affinity = crate::estimates::affinity_width(&cc);
+    let delta = summary::summary_from_rows(
+        &hash_rows,
+        &mid,
+        &cc,
+        affinity,
+        DEFAULT_RESERVOIR_K,
+        DEFAULT_MAX_BUCKETS,
+    );
+    match backend.publish(&delta, DEFAULT_RESERVOIR_K, DEFAULT_MAX_BUCKETS) {
+        Ok(merged) => {
+            let (buckets, total, largest) = summary::summary_stats(&merged);
+            eprintln!(
+                "{PROG}: --profile-sync: published this run's samples to {} (summary now {buckets} buckets, {total} samples, <= {largest}/bucket)",
+                backend.describe()
+            );
+        }
+        Err(e) => eprintln!("{PROG}: --profile-sync: upload failed ({e})"),
     }
 }
 
@@ -1220,13 +1351,43 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
     let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref());
-    let plan = build_feedback_plan(
+
+    // Profile-artifact SYNC: parse the backend once; DOWNLOAD seeds the planner, UPLOAD (after the
+    // run) publishes this run's samples. A malformed spec fails fast; a backend I/O failure degrades
+    // LOUDLY without failing the run.
+    let backend: Option<Box<dyn SyncBackend>> = match a.profile_sync.as_deref() {
+        Some(spec) => match sync::parse_backend(spec) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("{PROG}: --profile-sync: {e}");
+                return 2;
+            }
+        },
+        None => None,
+    };
+    let do_download =
+        backend.is_some() && matches!(a.profile_sync_direction.as_str(), "both" | "download");
+    let do_upload =
+        backend.is_some() && matches!(a.profile_sync_direction.as_str(), "both" | "upload");
+
+    let plan = sync_seed_plan(
         cfg,
+        backend.as_deref(),
         feedback_dir.as_deref(),
         planner,
+        do_download && !a.no_profile_feedback,
         core_budget,
         mem_budget,
-    );
+    )
+    .unwrap_or_else(|| {
+        build_feedback_plan(
+            cfg,
+            feedback_dir.as_deref(),
+            planner,
+            core_budget,
+            mem_budget,
+        )
+    });
     let applied = apply_plan_to_config(cfg, &plan);
     let cfg: &DagConfig = &applied;
     if a.show_plan {
@@ -1287,6 +1448,12 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             "local",
         );
         report_profile_written(d, source);
+    }
+
+    if do_upload {
+        if let Some(b) = backend.as_deref() {
+            sync_upload(b, &result.step_profile_rows);
+        }
     }
 
     // Feature C: --profile prints a per-step profile table to stdout.
@@ -1374,6 +1541,7 @@ pub fn run(argv: &[String]) -> i32 {
             };
             cmd_plan(&a)
         }
+        "summary" => cmd_summary(rest),
         "list" | "ascii" | "dot" | "json" | "yaml" => {
             let dag_arg = match parse_simple_dag(rest) {
                 Ok(Some(d)) => d,
@@ -1410,11 +1578,253 @@ pub fn run(argv: &[String]) -> i32 {
             eprintln!(
                 "usage: {PROG} [-h] [--version] <command> ...\n\
                  {PROG}: error: argument <command>: invalid choice: '{other}' \
-                 (choose from run, sweep, plan, list, ascii, dot, json, yaml, quickstart)"
+                 (choose from run, sweep, plan, summary, list, ascii, dot, json, yaml, quickstart)"
             );
             2
         }
     }
+}
+
+// --------------------------------------------------------------------------- summary subcommand
+
+/// The `summary` subcommand family: build / merge / plan / stats the mergeable profile summary.
+/// These primitives make the summary format inspectable and drivable from a script, and are what the
+/// cross-language differential exercises for byte-identical serialization + merge. Mirrors Python's
+/// `_cmd_summary`.
+fn cmd_summary(rest: &[String]) -> i32 {
+    let action = match rest.first() {
+        Some(a) => a.as_str(),
+        None => {
+            eprintln!("{PROG}: summary: an action is required (build | merge | plan | stats)");
+            return 2;
+        }
+    };
+    let args = &rest[1..];
+    match action {
+        "build" => cmd_summary_build(args),
+        "merge" => cmd_summary_merge(args),
+        "plan" => cmd_summary_plan(args),
+        "stats" => cmd_summary_stats(args),
+        other => {
+            eprintln!("{PROG}: summary: unknown action '{other}' (build | merge | plan | stats)");
+            2
+        }
+    }
+}
+
+/// Parse `--key value` / `--key=value` flags plus positional args into (flags, positionals).
+fn parse_flags(
+    rest: &[String],
+    value_keys: &[&str],
+) -> Result<(HashMap<String, String>, Vec<String>), String> {
+    let mut flags: HashMap<String, String> = HashMap::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if let Some(key) = arg.strip_prefix("--") {
+            let (k, inline) = match key.split_once('=') {
+                Some((k, v)) => (k.to_string(), Some(v.to_string())),
+                None => (key.to_string(), None),
+            };
+            if value_keys.contains(&k.as_str()) {
+                let v = match inline {
+                    Some(v) => v,
+                    None => {
+                        i += 1;
+                        rest.get(i)
+                            .cloned()
+                            .ok_or_else(|| format!("the argument --{k} requires a value"))?
+                    }
+                };
+                flags.insert(k, v);
+            } else {
+                return Err(format!("unrecognized argument: --{k}"));
+            }
+        } else {
+            positional.push(arg.clone());
+        }
+        i += 1;
+    }
+    Ok((flags, positional))
+}
+
+fn write_or_print(text: &str, out: Option<&String>) -> i32 {
+    match out {
+        Some(path) => match std::fs::write(path, format!("{text}\n")) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{PROG}: summary: cannot write {path}: {e}");
+                2
+            }
+        },
+        None => {
+            println!("{text}");
+            0
+        }
+    }
+}
+
+fn cmd_summary_build(args: &[String]) -> i32 {
+    let (flags, _pos) = match parse_flags(args, &["perf-dir", "out", "reservoir-cap"]) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{PROG} summary build: error: {e}");
+            return 2;
+        }
+    };
+    let cap = flags
+        .get("reservoir-cap")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RESERVOIR_K);
+    let feedback_dir = resolve_feedback_dir(flags.get("perf-dir").map(|s| s.as_str()), false);
+    let (mid, cc) = feedback_identity();
+    let summary = match feedback_dir {
+        Some(dir) => summary::summary_from_store(Path::new(&dir), &mid, &cc, cap),
+        None => summary::empty(&mid, &cc),
+    };
+    write_or_print(&summary::to_json(&summary), flags.get("out"))
+}
+
+fn cmd_summary_merge(args: &[String]) -> i32 {
+    let (flags, files) = match parse_flags(args, &["out", "reservoir-cap"]) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{PROG} summary merge: error: {e}");
+            return 2;
+        }
+    };
+    if files.is_empty() {
+        eprintln!("{PROG}: summary merge: need at least one file");
+        return 2;
+    }
+    let cap = flags
+        .get("reservoir-cap")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_RESERVOIR_K);
+    let mut summaries: Vec<Summary> = Vec::with_capacity(files.len());
+    for file in &files {
+        match std::fs::read_to_string(file) {
+            Ok(text) => match summary::from_json(&text) {
+                Ok(s) => summaries.push(s),
+                Err(e) => {
+                    eprintln!("{PROG}: summary merge: {file}: {e}");
+                    return 2;
+                }
+            },
+            Err(e) => {
+                eprintln!("{PROG}: summary merge: cannot read {file}: {e}");
+                return 2;
+            }
+        }
+    }
+    let first = &summaries[0];
+    match summary::merge_all(
+        &summaries,
+        &first.machine_id,
+        &first.container_class,
+        cap,
+        DEFAULT_MAX_BUCKETS,
+    ) {
+        Ok(merged) => write_or_print(&summary::to_json(&merged), flags.get("out")),
+        Err(e) => {
+            eprintln!("{PROG}: summary merge: {e}");
+            2
+        }
+    }
+}
+
+fn cmd_summary_plan(args: &[String]) -> i32 {
+    let (flags, _pos) = match parse_flags(args, &["summary", "dag", "planner", "max-mem", "format"])
+    {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{PROG} summary plan: error: {e}");
+            return 2;
+        }
+    };
+    let summary_file = match flags.get("summary") {
+        Some(f) => f,
+        None => {
+            eprintln!("{PROG} summary plan: error: --summary is required");
+            return 2;
+        }
+    };
+    let dag_file = match flags.get("dag") {
+        Some(f) => f,
+        None => {
+            eprintln!("{PROG} summary plan: error: --dag is required");
+            return 2;
+        }
+    };
+    let summary = match std::fs::read_to_string(summary_file) {
+        Ok(text) => match summary::from_json(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{PROG}: summary plan: {e}");
+                return 2;
+            }
+        },
+        Err(e) => {
+            eprintln!("{PROG}: summary plan: cannot read {summary_file}: {e}");
+            return 2;
+        }
+    };
+    let cfg = match load(dag_file) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("{PROG}: {}", e.0);
+            return 2;
+        }
+    };
+    let planner = flags
+        .get("planner")
+        .and_then(|p| Planner::from_value(p))
+        .unwrap_or(Planner::GreedyLpt);
+    let (core_budget, mem_budget) = cpa_budgets(planner, flags.get("max-mem").map(|s| s.as_str()));
+    let plan = build_plan_from_summary(&cfg, &summary, planner, core_budget, mem_budget);
+    if flags.get("format").map(|s| s.as_str()) == Some("json") {
+        println!("{}", plan_to_json(&plan));
+    } else {
+        print!("{}", plan_to_text(&plan));
+    }
+    0
+}
+
+fn cmd_summary_stats(args: &[String]) -> i32 {
+    let (_flags, files) = match parse_flags(args, &[]) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("{PROG} summary stats: error: {e}");
+            return 2;
+        }
+    };
+    let file = match files.first() {
+        Some(f) => f,
+        None => {
+            eprintln!("{PROG} summary stats: error: a summary FILE is required");
+            return 2;
+        }
+    };
+    let summary = match std::fs::read_to_string(file) {
+        Ok(text) => match summary::from_json(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("{PROG}: summary stats: {e}");
+                return 2;
+            }
+        },
+        Err(e) => {
+            eprintln!("{PROG}: summary stats: cannot read {file}: {e}");
+            return 2;
+        }
+    };
+    let (buckets, total, largest) = summary::summary_stats(&summary);
+    println!(
+        "identity: {}/{}\nbuckets: {buckets}\ntotal_samples: {total}\nmax_bucket_samples: {largest}",
+        summary.machine_id, summary.container_class
+    );
+    0
 }
 
 /// Parse the `--dag FILE` argument for the read-only subcommands.
