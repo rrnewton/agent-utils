@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from safe_ci_dag_runner import __version__
-from safe_ci_dag_runner.cli import PROG, main
+from safe_ci_dag_runner.cli import PROG, _load_userguide, main
 
 _DEMO = '{"steps": [{"group": "g", "job": "j", "cmd": "true", "deps": []}]}'
 
@@ -41,6 +41,17 @@ def test_quickstart_is_self_contained() -> None:
     assert rc == 0
     for marker in ("Install", "Write a DAG", "run", "DAG schema", "Exit codes"):
         assert marker in out
+
+
+def test_userguide_prints_embedded_guide() -> None:
+    """`--userguide` prints the full embedded guide VERBATIM (byte-for-byte, no coloring)."""
+    rc, out, _ = _capture(["--userguide"])
+    assert rc == 0
+    embedded = _load_userguide()
+    assert out == embedded
+    # A real, substantial guide (not a stub) with recognizable content.
+    assert len(out) > 5000
+    assert "safe-ci-dag-runner" in out
 
 
 def test_list_and_ascii() -> None:

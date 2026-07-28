@@ -23,16 +23,18 @@ agent-utils/
 ├── Makefile                  # `make` == ./setup both
 ├── bin/            ->  rs/bin (or py/bin)   # convenience symlink, created by setup
 ├── common/                   # language-neutral shared material (single source of truth)
-│   └── docs/<tool>/          #   userguide, symlinked into py/ and rs/ for DRY
+│   └── docs/<tool>/          #   USER_GUIDE.md (the ONE editable guide) + README.md
 ├── examples/                 # small, runnable DAG files (one per core idea), run by either build
+├── skills/                   # thin per-tool agent skills (point at `<tool> --userguide`)
+├── scripts/                  # build helpers (e.g. embed_userguides.py, run by setup)
 ├── py/
 │   ├── bin/<tool>            # command entrypoints (shebang symlinks; no build needed)
-│   ├── <tool_pkg>/           # the Python package (mypy strict, zero `Any`)
+│   ├── <tool_pkg>/           # the Python package (mypy strict, zero `Any`); USER_GUIDE.md embedded here
 │   └── pyproject.toml
 ├── rs/
 │   ├── bin/<tool>            # compiled release binaries (created by setup; standalone)
 │   ├── Cargo.toml            # workspace
-│   └── <tool>/               # the crate
+│   └── <tool>/               # the crate (src/embedded_userguide.md is the include_str! target)
 ├── cross/                    # randomized py-vs-rs differential tests
 └── .github/workflows/        # per-tool py / rs / cross / examples workflows, path-filtered
 ```
@@ -62,11 +64,43 @@ make test            # pytest + cargo test
 On a Meta host, prefix any network step with `with-proxy` (see the `with-proxy` skill): external
 package fetches (crates.io, PyPI) must egress through fwdproxy.
 
-## Shared docs (DRY)
+## Shared docs (DRY) — the CLI is the single source of truth
 
-Each tool's userguide lives once under `common/docs/<tool>/` and is symlinked into `py/<tool>` and
-`rs/<tool>` so the crates.io and PyPI READMEs stay in sync. (If publishing tooling refuses to follow
-those symlinks, the publish step generates a copy instead — tracked as a known trade-off.)
+Each tool's user guide lives **once** under `common/docs/<tool>/USER_GUIDE.md`. That single source is
+*embedded into each distributable unit* so the guide travels with the tool through `pip install` /
+`cargo install` / crates.io, where `common/docs/` is **not** shipped:
+
+- **Python:** `scripts/embed_userguides.py` copies the guide to `py/<pkg>/USER_GUIDE.md`, declared as
+  `package-data` in `pyproject.toml`. The CLI reads it at runtime via `importlib.resources` (a real
+  package resource — not a path outside the package).
+- **Rust:** the same script copies the guide to `rs/<crate>/src/embedded_userguide.md`, baked in with
+  `include_str!`. Keeping it **under `src/`** is what makes the `include_str!` target survive
+  `cargo package` (an include pointing outside the crate would break crates.io packaging).
+
+`./setup` runs `scripts/embed_userguides.py` on every build, so a fresh checkout always has the
+embedded guides. The embedded copies are **committed derived artifacts** (so CI, which builds/imports
+directly without running `./setup`, has them present); `common/docs/<tool>/USER_GUIDE.md` remains the
+one editable source. Run `scripts/embed_userguides.py --check` to verify they are in sync (CI does).
+
+Every tool exposes the guide from its own CLI:
+
+- `<tool> quickstart` — short in-CLI getting-started tour.
+- `<tool> --help` — commands and flags.
+- `<tool> --userguide` — the full embedded guide (the complete reference). For `safe-ci-dag-runner`,
+  the py and rs builds embed the identical source, so `--userguide` output is **byte-identical**
+  across builds (cross-checked in `cross/differential.py`, alongside `--version`).
+
+The README shown on crates.io / PyPI stays in sync via a symlink from `py/README.md` and
+`rs/<crate>/README.md` to `common/docs/<tool>/README.md` (build tooling follows the symlink at
+publish time). Only the runtime **user guide** needs the embed treatment, because it must be readable
+from an *installed* tool.
+
+## Skills (agent-facing)
+
+`skills/<tool>/SKILL.md` are thin, symlinkable agent skills — each a one-line description plus a
+pointer to `<tool> quickstart` / `--help` / `--userguide`. They deliberately do NOT duplicate the
+guide; the CLI is the source of truth. See [`skills/README.md`](skills/README.md) for how to link
+them into an agent's `.claude/skills/`.
 
 ## License
 

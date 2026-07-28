@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from tick_hub import __version__
-from tick_hub.cli import PROG, STATE_FILE_ENV, main
+from tick_hub.cli import PROG, STATE_FILE_ENV, _load_userguide, main
 
 _CONFIG = """
 reminders:
@@ -73,6 +73,16 @@ def test_quickstart_is_self_contained() -> None:
     assert rc == 0
     for marker in ("Install", "output contract", "Reminders", "ops-state", "Exit codes"):
         assert marker in out
+
+
+def test_userguide_prints_embedded_guide() -> None:
+    """`--userguide` prints the full embedded guide VERBATIM (byte-for-byte, no coloring)."""
+    rc, out, _ = _capture(["--userguide"])
+    assert rc == 0
+    embedded = _load_userguide()
+    assert out == embedded
+    assert len(out) > 3000
+    assert "tick-hub" in out
 
 
 def test_list(tmp_path: Path) -> None:

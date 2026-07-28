@@ -1,6 +1,6 @@
 [package]
 name = "safe-ci-dag-runner"
-version = "0.9.0"
+version = "0.10.0"
 description = "Run a DAG of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on resource logging."
 readme = "README.md"
 keywords = ["ci", "dag", "cgroup", "scheduler"]

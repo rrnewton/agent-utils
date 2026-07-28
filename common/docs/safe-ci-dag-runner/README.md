@@ -308,6 +308,7 @@ isomorphic to the JSON schema — see [The DAG format: JSON or YAML](#the-dag-fo
 | `json`       | Re-emit the DAG as canonical, fully-defaulted JSON.                 |
 | `yaml`       | Re-emit the DAG as YAML.                                            |
 | `quickstart` | Print a self-contained getting-started guide (no `--dag` needed).  |
+| `--userguide`| Print this full user guide (the complete reference), embedded in the tool so it works after `pip install` / `cargo install`. Byte-identical across the Python and Rust builds. |
 
 Global: `--version`, `-h/--help`. Running with no command prints help and exits `0`.
 

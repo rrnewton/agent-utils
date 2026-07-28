@@ -45,7 +45,8 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   ``--no-profile-feedback`` (no store READ / hint refinement), so the base scheduling behavior under
   test stays hermetic and hint-only; feedback parity is asserted separately (above).
 
-It also keeps the bootstrap ``--version`` / ``--help`` / no-args exit-code checks.
+It also keeps the bootstrap ``--version`` / ``--help`` / no-args exit-code checks, and asserts
+``--userguide`` stdout is BYTE-IDENTICAL across builds (both embed the same single-source guide).
 
 Exit status is nonzero on any divergence. The module is kept mypy-strict clean.
 """
@@ -1703,7 +1704,14 @@ INVOCATIONS: tuple[Invocation, ...] = (
     Invocation("version", ("--version",)),
     Invocation("help", ("--help",)),
     Invocation("noargs", ()),
+    # --userguide prints the EMBEDDED user guide. Both builds embed the SAME single source
+    # (common/docs/safe-ci-dag-runner/USER_GUIDE.md) verbatim, so — unlike quickstart/help, whose
+    # colored wording may differ — the guide bytes are guaranteed identical and ARE cross-checked.
+    Invocation("userguide", ("--userguide",)),
 )
+
+#: Invocations whose stdout must be BYTE-IDENTICAL across builds (not just exit-code equal).
+_BYTE_IDENTICAL_INVOCATIONS = frozenset({"version", "userguide"})
 
 
 def compare_invocations(py: list[str], rs: list[str], rep: Report) -> None:
@@ -1712,8 +1720,11 @@ def compare_invocations(py: list[str], rs: list[str], rep: Report) -> None:
         ro = run(rs, inv.args)
         if po.returncode != ro.returncode:
             rep.bad(f"invocation/{inv.name}", f"exit py={po.returncode} rs={ro.returncode}")
-        elif inv.name == "version" and po.stdout != ro.stdout:
-            rep.bad("invocation/version", f"stdout py={po.stdout!r} rs={ro.stdout!r}")
+        elif inv.name in _BYTE_IDENTICAL_INVOCATIONS and po.stdout != ro.stdout:
+            rep.bad(
+                f"invocation/{inv.name}",
+                f"stdout not byte-identical\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+            )
         else:
             rep.ok(f"invocation/{inv.name}")
 

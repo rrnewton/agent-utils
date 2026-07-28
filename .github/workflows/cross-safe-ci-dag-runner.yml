@@ -13,6 +13,8 @@ on:
       - 'rs/safe-ci-dag-runner/**'
       - 'cross/**'
       - 'examples/**'
+      - 'common/docs/**'
+      - 'scripts/embed_userguides.py'
       - '.github/workflows/cross-safe-ci-dag-runner.yml'
   pull_request:
     paths:
@@ -23,6 +25,8 @@ on:
       - 'rs/safe-ci-dag-runner/**'
       - 'cross/**'
       - 'examples/**'
+      - 'common/docs/**'
+      - 'scripts/embed_userguides.py'
       - '.github/workflows/cross-safe-ci-dag-runner.yml'
 
 jobs:
@@ -38,6 +42,10 @@ jobs:
         # pyyaml is a runtime dep of the Python CLI (which the differential invokes to load the
         # YAML fixtures); mypy is for the harness typecheck below.
         run: python -m pip install --upgrade mypy pyyaml
+      - name: embedded user guides in sync with their single source
+        # No Silent Failure: fail loudly if common/docs/<tool>/USER_GUIDE.md was edited without
+        # regenerating the committed embedded copies (py package resource + rs include_str! target).
+        run: python scripts/embed_userguides.py --check
       - name: build rust
         run: cargo build --release --workspace --manifest-path rs/Cargo.toml
       - name: mypy the differential harness

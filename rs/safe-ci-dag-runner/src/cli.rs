@@ -8,6 +8,7 @@
 //!   json --dag FILE   re-emit the DAG as canonical JSON
 //!   yaml --dag FILE   re-emit the DAG as YAML
 //!   quickstart        print a self-contained getting-started guide
+//!   --userguide       print the full embedded user guide (the complete reference)
 //!
 //! `--dag FILE` auto-detects the input format by extension: `.yaml`/`.yml` load as YAML (which is
 //! ISOMORPHIC to the JSON schema — same model), everything else as JSON. `--dag -` reads JSON from
@@ -53,6 +54,13 @@ const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
 /// `--perf-dir` nor `$SAFE_CI_DAG_RUNNER_PROFILE_DIR` is set and `--no-profile` is absent. Created
 /// on demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
 const DEFAULT_PROFILE_DIR: &str = ".safe-ci-dag-runner/profiles";
+
+/// The full user guide, embedded at compile time. `scripts/embed_userguides.py` (run by `./setup`)
+/// copies the single source `common/docs/safe-ci-dag-runner/USER_GUIDE.md` to this crate-internal
+/// path; keeping it UNDER `src/` is what makes the `include_str!` target survive `cargo package` /
+/// crates.io (an `include_str!` pointing OUTSIDE the crate would break packaging). The bytes match
+/// the Python build's package-resource copy, so `--userguide` is byte-identical across builds.
+const USERGUIDE: &str = include_str!("embedded_userguide.md");
 
 // --------------------------------------------------------------------------- colors
 
@@ -121,7 +129,8 @@ fn help_text(c: &Palette) -> String {
          \x20 dot        emit Graphviz DOT (pipe to `dot -Tsvg`)\n\
          \x20 json       re-emit the DAG as canonical JSON\n\
          \x20 yaml       re-emit the DAG as YAML\n\
-         \x20 quickstart print a self-contained getting-started guide\n\n\
+         \x20 quickstart print a self-contained getting-started guide\n\
+         \x20 --userguide print the full embedded user guide (the complete reference)\n\n\
          {examples}\n\
          \x20 {e1}\n\
          \x20 {e2}\n\
@@ -1495,6 +1504,12 @@ pub fn run(argv: &[String]) -> i32 {
         }
         "quickstart" => {
             println!("{}", quickstart(&c));
+            0
+        }
+        "--userguide" => {
+            // Write the embedded guide VERBATIM (no added/stripped newline) so it is byte-identical
+            // to the Python build's --userguide and to the single source guide.
+            print!("{USERGUIDE}");
             0
         }
         "run" => {

@@ -14,6 +14,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# Embed each tool's user guide INTO its package/crate from the single source
+# common/docs/<tool>/USER_GUIDE.md, so `<tool> --userguide` survives `pip install` / `cargo install`
+# (common/docs/ is NOT shipped). Run for BOTH languages regardless of the py/rs/both selection so a
+# fresh checkout/build always has the embedded guides present. Idempotent: no-op when in sync.
+embed_userguides() {
+  echo "==> [docs] embed user guides (single source: common/docs/<tool>/USER_GUIDE.md)"
+  command -v python3 >/dev/null || { echo "docs: python3 not found (needed to embed guides)" >&2; return 1; }
+  python3 "$ROOT/scripts/embed_userguides.py"
+}
+
 WHAT="both"
 CLEAN=0
 for arg in "$@"; do
@@ -71,6 +81,7 @@ PY
 
 wire_bin() { rm -f bin; ln -s "$1" bin; echo "==> ./bin -> $1"; }
 
+embed_userguides
 case "$WHAT" in
   py)   setup_py; wire_bin "py/bin" ;;
   rs)   setup_rs; wire_bin "rs/bin" ;;

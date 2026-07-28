@@ -176,8 +176,9 @@ tick-hub <command> [options]
 | `json`       | Re-emit the config as canonical, fully-defaulted JSON.                    |
 | `yaml`       | Re-emit the config as YAML.                                              |
 | `quickstart` | Print a self-contained getting-started guide (no `--config` needed).     |
+| `--userguide`| Print this full user guide (the complete reference), embedded in the package so it works after `pip install`. |
 
-Global: `--version`, `-h/--help`. Running with no command prints help and exits `0`.
+Global: `--version`, `--userguide`, `-h/--help`. Running with no command prints help and exits `0`.
 
 ### `tick` flags
 
