@@ -108,11 +108,22 @@ fn sort_f64(values: &mut [f64]) {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 }
 
-/// MAD-trimmed median (mirrors Python's `_robust_median`): median after dropping samples more than
-/// `MAD_TRIM_K` MADs from the median; falls back to the plain median when the MAD is zero.
+/// A robust central estimate of contention-/noise-inflated samples (mirrors Python's
+/// `_robust_median`). At THREE or more samples: MAD-trimmed median (drop samples more than
+/// `MAD_TRIM_K` MADs from the median, falling back to the plain median when the MAD is zero). At
+/// FEWER than three samples MAD-trim provably cannot reject an outlier — the median of two points
+/// sits midway between them, so any symmetric cutoff keeps BOTH and the estimate collapses to their
+/// MEAN, which a single slow sample drags by half its excess (`[5, 100] -> 52.5`, inverting a real
+/// speedup). Since these quantities can only be INFLATED by contention/noise, the smaller
+/// observation is the better intrinsic estimate, so at `n < 3` we return the MINIMUM: robust to one
+/// upward (slow/contended) outlier at `n == 2` and self-healing to the MAD-trimmed median as samples
+/// accumulate. Caller guarantees a non-empty slice.
 fn robust_median(values: &[f64]) -> f64 {
     let mut xs = values.to_vec();
     sort_f64(&mut xs);
+    if xs.len() < 3 {
+        return xs[0]; // sorted ascending -> min (robust to a slow outlier; see doc comment)
+    }
     let m = median(&xs);
     let mut deviations: Vec<f64> = xs.iter().map(|x| (x - m).abs()).collect();
     sort_f64(&mut deviations);
@@ -177,7 +188,12 @@ fn clean_numeric_cell(cell: Option<&String>) -> Option<&str> {
 }
 
 fn parse_float(cell: Option<&String>) -> Option<f64> {
-    clean_numeric_cell(cell).and_then(|t| t.parse::<f64>().ok())
+    // Reject non-finite values (`inf`/`-inf`/`nan`, and overflowing literals like `1e400` -> inf):
+    // Python's `float()` accepts the same set, so both builds must drop them to stay byte-identical
+    // AND to keep one bogus cell from poisoning a median or a contention fraction.
+    clean_numeric_cell(cell)
+        .and_then(|t| t.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
 }
 
 fn parse_int(cell: Option<&String>) -> Option<i64> {
@@ -1089,9 +1105,26 @@ mod tests {
 
     #[test]
     fn robust_median_discards_outlier() {
-        // one huge outlier must not move the median (MAD-trim).
+        // At n>=3 one huge outlier must not move the median (MAD-trim).
         assert_eq!(robust_median(&[3.0, 3.0, 3.0, 3.0, 100.0]), 3.0);
-        assert_eq!(robust_median(&[2.0, 4.0]), 3.0);
+        assert_eq!(robust_median(&[5.0, 5.0, 100.0]), 5.0);
+        // At n<3 MAD-trim cannot reject an outlier; the robust estimate is the MINIMUM (intrinsic
+        // value), NOT the mean, so a single slow sample cannot invert a real speedup.
+        assert_eq!(robust_median(&[5.0]), 5.0);
+        assert_eq!(robust_median(&[5.0, 100.0]), 5.0);
+        assert_eq!(robust_median(&[100.0, 5.0]), 5.0);
+        assert_eq!(robust_median(&[2.0, 4.0]), 2.0);
+    }
+
+    #[test]
+    fn parse_float_rejects_non_finite() {
+        // inf / -inf / nan / overflowing literals must be dropped so a bogus cell cannot poison a
+        // median or contention fraction (they pass a bare `>= 0.0` filter otherwise).
+        assert_eq!(parse_float(Some(&"inf".to_string())), None);
+        assert_eq!(parse_float(Some(&"-inf".to_string())), None);
+        assert_eq!(parse_float(Some(&"nan".to_string())), None);
+        assert_eq!(parse_float(Some(&"1e400".to_string())), None);
+        assert_eq!(parse_float(Some(&"5.0".to_string())), Some(5.0));
     }
 
     #[test]
@@ -1153,10 +1186,11 @@ mod tests {
         assert_eq!(a.samples, 3);
         assert_eq!(a.est_duration_s, Some(5.0));
         assert_eq!(a.rss_estimate_bytes, Some(3000));
-        // g.b: '1_0.0' rejected -> [4,6] median 5; '1_000' + out-of-i64 peak rejected -> [5000].
+        // g.b: '1_0.0' rejected -> [4,6]. Two samples cannot MAD-reject an outlier, so the robust
+        // estimate is the minimum (4.0); '1_000' + out-of-i64 peak rejected -> [5000].
         let b = &samples["g.b"];
         assert_eq!(b.samples, 3);
-        assert_eq!(b.est_duration_s, Some(5.0));
+        assert_eq!(b.est_duration_s, Some(4.0));
         assert_eq!(b.rss_estimate_bytes, Some(5000));
         let _ = std::fs::remove_file(&path);
     }

@@ -19,6 +19,7 @@ from safe_ci_dag_runner.estimates import (
     _affinity_width,
     _parse_float,
     _parse_int,
+    _robust_median,
 )
 
 _HEADER = (
@@ -84,6 +85,55 @@ def test_mad_trim_ignores_outlier(tmp_path: Path) -> None:
         [_row("g.a", v) for v in ("3.0", "3.0", "3.0", "3.0", "100.0")],
     )
     samples = load_step_samples(store, "m", "c")
+    assert samples["g.a"].est_duration_s == 3.0
+
+
+def test_robust_median_small_samples_resist_one_slow_outlier() -> None:
+    # At n<3 MAD-trim cannot reject an outlier; the estimate must be the MINIMUM (intrinsic value),
+    # NOT the mean, so a single slow sample cannot invert a real speedup ([5, 100] -> 5, not 52.5).
+    assert _robust_median([5.0]) == 5.0
+    assert _robust_median([5.0, 100.0]) == 5.0
+    assert _robust_median([100.0, 5.0]) == 5.0
+    assert _robust_median([10.0, 10.1]) == 10.0
+    # At n>=3 the MAD-trimmed median takes over and rejects the outlier symmetrically.
+    assert _robust_median([5.0, 5.0, 100.0]) == 5.0
+    assert _robust_median([2.0, 3.0, 4.0]) == 3.0
+
+
+def test_two_sample_slow_outlier_does_not_invert_speedup(tmp_path: Path) -> None:
+    from safe_ci_dag_runner import load_step_speedups
+
+    # A -j2 width with one clean 5s run and one slow 100s outlier (a single slow CI run) must NOT be
+    # read as slower than -j1's 10s. With the min-based small-sample estimator -j2 reads as 5s, so
+    # the real 2x speedup survives and -j2 is recommended (the old mean-of-two read 52.5s -> -j1).
+    store = _write_speedup_store(
+        tmp_path,
+        [
+            _speedup_row("build.app", 1, "10.0", user_s="10.0", sys_s="0.0"),
+            _speedup_row("build.app", 1, "10.1", user_s="10.1", sys_s="0.0"),
+            _speedup_row("build.app", 2, "5.0", user_s="10.0", sys_s="0.0"),
+            _speedup_row("build.app", 2, "100.0", user_s="10.1", sys_s="0.0"),
+        ],
+    )
+    sp = load_step_speedups(store, "m", "affinity16_cpu-max-max")["build.app"]
+    assert sp.recommended_inner_jobs == 2
+    lvl2 = next(lvl for lvl in sp.levels if lvl.inner_jobs == 2)
+    assert lvl2.wall_s == 5.0
+
+
+def test_non_finite_cells_are_rejected(tmp_path: Path) -> None:
+    # An 'inf' (or overflowing) elapsed cell must be dropped, not fold into the width median: it
+    # passes a bare `>= 0.0` filter but is non-finite, so it would otherwise poison the estimate.
+    assert _parse_float("inf") is None
+    assert _parse_float("-inf") is None
+    assert _parse_float("nan") is None
+    assert _parse_float("1e400") is None
+    store = _write_store(
+        tmp_path,
+        [_row("g.a", "3.0"), _row("g.a", "inf"), _row("g.a", "5.0")],
+    )
+    samples = load_step_samples(store, "m", "c")
+    # 'inf' dropped -> durations [3.0, 5.0]; at n<3 the robust estimate is the minimum -> 3.0.
     assert samples["g.a"].est_duration_s == 3.0
 
 
@@ -155,8 +205,9 @@ def test_underscore_and_overflow_cells_rejected(tmp_path: Path) -> None:
     )
     samples = load_step_samples(store, "m", "c")
     assert samples["g.a"].samples == 3
-    # '1_0.0' rejected -> durations [4, 6] -> median 5.0.
-    assert samples["g.a"].est_duration_s == 5.0
+    # '1_0.0' rejected -> durations [4, 6]. With only TWO samples MAD-trim cannot reject an outlier,
+    # so the robust estimate is the MINIMUM (the intrinsic, uncontended value) -> 4.0.
+    assert samples["g.a"].est_duration_s == 4.0
     # '1_000' and the out-of-i64 peak rejected -> peaks [5000] -> p90 5000.
     assert samples["g.a"].rss_estimate_bytes == 5000
 

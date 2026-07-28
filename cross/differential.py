@@ -970,9 +970,10 @@ _HOSTILE_DAG = {
 #: equivalence across the two builds.
 #:
 #: Expected (identical) derivation in BOTH builds:
-#:   h.ws elapsed [' 8.0 '->8, 4.0, '10.0' under ' 50.0 '% -> 5] => robust median 5.000; peaks
+#:   h.ws elapsed [' 8.0 '->8, 4.0, '10.0' under ' 50.0 '% -> 5] => robust median 5.000 (n=3); peaks
 #:        [1000,2000,3000] => p90 3000.
-#:   h.us elapsed ['1_0.0' rejected, 4.0, 6.0] => robust median 5.000; peaks ['1_000' rejected,
+#:   h.us elapsed ['1_0.0' rejected, 4.0, 6.0] => two surviving samples cannot MAD-reject an outlier,
+#:        so the robust estimate is the MINIMUM => 4.000 (n<3); peaks ['1_000' rejected,
 #:        9999999999999999999999 rejected, 5000] => p90 5000.
 _HOSTILE_STORE_CSV = (
     "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
@@ -1035,14 +1036,21 @@ def compare_hostile_numeric_cells(py: list[str], rs: list[str], rep: Report) -> 
             return
         rep.ok("hostile-cells")
         # Positive proof the whitespace-trim + reject rules actually fired (both agree, checked py):
-        #   both hostile steps must derive est_duration 5.000 FROM THE STORE (not the 99.0 hint).
-        if '"est_source": "store"' in po.stdout and po.stdout.count('"est_duration_s": "5.000"') == 2:
+        #   both hostile steps must derive their est_duration FROM THE STORE (not the 99.0 hint).
+        #   h.ws has 3 surviving samples -> robust median 5.000; h.us has 2 -> the small-sample
+        #   estimator returns the minimum 4.000 (see estimates._robust_median). Distinct values also
+        #   prove BOTH steps were read (not one value coincidentally matched twice).
+        if (
+            '"est_source": "store"' in po.stdout
+            and po.stdout.count('"est_duration_s": "5.000"') == 1
+            and po.stdout.count('"est_duration_s": "4.000"') == 1
+        ):
             rep.ok("hostile-cells:trim-applied")
         else:
             rep.bad(
                 "hostile-cells:trim-applied",
-                "expected both steps to learn est_duration 5.000 from the trimmed store cells; "
-                f"got\n{po.stdout}",
+                "expected h.ws to learn est_duration 5.000 and h.us 4.000 from the trimmed store "
+                f"cells; got\n{po.stdout}",
             )
 
 

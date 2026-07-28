@@ -146,7 +146,11 @@ step:
   *discounted* by whatever contention signal the store carries (`pct_other`, `external_cores`, a
   CPU-pressure column, or `co_tenants`) to recover the step's *intrinsic*, uncontended duration —
   correcting a duration that was measured on a loaded box back toward its quiet-box value. Robust
-  stats (median / MAD-trim) keep noise and outliers from dominating.
+  stats (median / MAD-trim) keep noise and outliers from dominating. With **fewer than three**
+  samples MAD-trim cannot reject an outlier (the median of two points sits midway between them, so
+  it would collapse to their mean and a single slow run would drag it), so the estimate is the
+  **minimum** of the samples instead — the intrinsic, uncontended value — self-healing to the
+  MAD-trimmed median once three or more samples accumulate.
 - a robust **`rss_estimate_bytes`** — a **high percentile** (90th, nearest-rank) of that step's past
   `peak_bytes`, so one spurious spike does not inflate the memory model while a genuinely high
   footprint is still respected.

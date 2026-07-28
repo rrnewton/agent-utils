@@ -30,6 +30,7 @@ reason. See ``cross/differential.py``.
 from __future__ import annotations
 
 import csv
+import math
 import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -151,10 +152,23 @@ def _median(sorted_values: Sequence[float]) -> float:
 
 
 def _robust_median(values: Sequence[float]) -> float:
-    """MAD-trimmed median: median after dropping samples more than ``_MAD_TRIM_K`` MADs from the
-    median (median-absolute-deviation outlier rejection). Falls back to the plain median when the
-    MAD is zero (all-equal, or a single sample)."""
+    """A robust central estimate of contention-/noise-inflated samples (wall, CPU-seconds, ...).
+
+    At THREE or more samples this is a MAD-trimmed median: the median after dropping samples more
+    than ``_MAD_TRIM_K`` MADs from it (median-absolute-deviation outlier rejection), falling back to
+    the plain median when the MAD is zero (all-equal).
+
+    At FEWER than three samples MAD-trim provably cannot reject an outlier — the median of two points
+    sits midway between them, so any symmetric cutoff keeps BOTH and the estimate collapses to their
+    MEAN, which a single slow sample drags by half its excess (e.g. ``[5, 100] -> 52.5``, inverting a
+    real 2x speedup into an apparent slowdown). Since every quantity fed here can only be INFLATED by
+    contention/noise (a step never runs faster than its intrinsic cost), the smaller observation is
+    the better intrinsic estimate, so at ``n < 3`` we return the MINIMUM: robust to one upward
+    (slow/contended) outlier at ``n == 2`` and self-healing to the MAD-trimmed median as samples
+    accumulate. The caller guarantees a non-empty sequence."""
     xs = sorted(values)
+    if len(xs) < 3:
+        return xs[0]  # sorted ascending -> the minimum (see docstring: robust to a slow outlier)
     m = _median(xs)
     deviations = sorted(abs(x - m) for x in xs)
     mad = _median(deviations)
@@ -188,10 +202,13 @@ def _high_percentile(values: Sequence[int]) -> int:
 #: parseable column is used. ``pct_*`` are percentages (0..100); ``external_cores`` is absolute
 #: cores (divided by the affinity width parsed from ``container_class``); ``co_tenants`` is a count
 #: of co-running tenants (n co-tenants sharing equally => the step keeps ``1/(n+1)`` => ``c =
-#: n/(n+1)``). These are consumed "where present": today's store does not populate per-step
-#: contention columns, so a real run currently uses the plain (undiscounted) median; a synthetic
-#: fixture with these columns exercises the discount path, and a future writer enhancement can
-#: populate them (see the speedup-curve follow-on).
+#: n/(n+1)``). These are consumed "where present": the boxed writer now populates ``external_cores``
+#: on every real per-step row (see :func:`safe_ci_dag_runner.profile_enrich.step_enrichment_columns`),
+#: so a real boxed run's median IS contention-discounted via that signal. The ``pct_*`` columns are
+#: still supplied only by synthetic fixtures (they exercise the percentage-discount path); the
+#: ``co_tenants`` / PSI fallback NAMES here predate the writer and do NOT yet match the columns it
+#: emits (``co_tenants_start``/``_end``, ``*_psi_avg10_start``/``_end``) — folding those start/end
+#: pairs into a discount is a scoped follow-on, so they are inert on real data today.
 _CONTENTION_PCT_COLUMNS = ("pct_other", "psi_cpu_some_avg10", "cpu_pressure_some_avg10")
 
 
@@ -244,9 +261,16 @@ def _parse_float(cell: str | None) -> float | None:
     if token is None:
         return None
     try:
-        return float(token)
+        value = float(token)
     except ValueError:
         return None
+    # Reject non-finite values. Python's ``float()`` accepts ``"inf"`` / ``"nan"`` and overflowing
+    # literals (``"1e400"`` -> ``inf``); Rust's ``str::parse::<f64>()`` accepts the same set, so both
+    # builds MUST drop them to stay byte-identical AND to keep one bogus cell from poisoning a median
+    # or a contention fraction (a lone ``inf`` elapsed_s would otherwise dominate a width's wall).
+    if not math.isfinite(value):
+        return None
+    return value
 
 
 def _parse_int(cell: str | None) -> int | None:
