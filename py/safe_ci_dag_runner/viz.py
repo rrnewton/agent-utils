@@ -27,6 +27,50 @@ def _kept_deps(steps: list[Step]) -> dict[str, list[str]]:
     return {s.tag: [d for d in s.deps if d in tags] for s in steps}
 
 
+def _profile_suffix(step: Step) -> str:
+    r"""Concise per-node profiling annotation for a DOT label: ``\n{est}s, {mb}MB``
+    (expected wall-seconds and max resident memory in decimal MB, floored).
+
+    Returns ``""`` when the step carries neither a duration nor an RSS estimate, so
+    undecorated DAGs render exactly as before. Formatting is integer-floored for MB and
+    fixed one-decimal for seconds so the Python and Rust builds stay byte-identical.
+    """
+    est = step.hint.est_duration_s
+    rss = step.hint.rss_baseline_bytes
+    if est <= 0.0 and rss is None:
+        return ""
+    mb = (rss or 0) // 1_000_000
+    return f"\\n{est:.1f}s, {mb}MB"
+
+
+def _critical_path_seconds(steps: list[Step], deps: dict[str, list[str]]) -> float:
+    """Longest weighted finish time over the DAG (critical path in expected seconds),
+    weighting each node by its ``est_duration_s``. Memoized; visits in ``steps`` order."""
+    est_of = {s.tag: s.hint.est_duration_s for s in steps}
+    finish: dict[str, float] = {}
+
+    def visit(tag: str) -> float:
+        if tag in finish:
+            return finish[tag]
+        parents = deps.get(tag, [])
+        base = max((visit(p) for p in parents), default=0.0)
+        finish[tag] = base + est_of.get(tag, 0.0)
+        return finish[tag]
+
+    return max((visit(s.tag) for s in steps), default=0.0)
+
+
+def _scaling_suffix(steps: list[Step], deps: dict[str, list[str]]) -> str:
+    """Graph-title scaling annotation: ``  |  {N.N}X max par-spdup``, the ideal parallel
+    speedup (total serial work / critical path). Omitted when no step has a duration estimate
+    (critical path is zero), so undecorated DAGs render exactly as before."""
+    serial = sum(s.hint.est_duration_s for s in steps)
+    crit = _critical_path_seconds(steps, deps)
+    if crit <= 0.0:
+        return ""
+    return f"  |  {serial / crit:.1f}X max par-spdup"
+
+
 def to_dot(cfg: DagConfig, *, name: str = "dag", selected: set[str] | None = None) -> str:
     """Render the DAG as Graphviz DOT."""
     steps = _selected_steps(cfg, selected)
@@ -35,18 +79,22 @@ def to_dot(cfg: DagConfig, *, name: str = "dag", selected: set[str] | None = Non
     for step in steps:
         by_group.setdefault(step.group, []).append(step)
 
+    scaling = _scaling_suffix(steps, deps)
     out: list[str] = [
         f"digraph {name} {{",
         "  rankdir=LR;",
         "  node [shape=box, style=rounded, fontsize=10];",
         '  labelloc="t";',
-        '  label="DAG  (solid = dependency;  dashed = shared cap-1 resource -> serialized)";',
+        f'  label="DAG  (solid = dependency;  dashed = shared cap-1 resource -> serialized){scaling}";',
     ]
     for i, group in enumerate(sorted(by_group)):
         out.append(f"  subgraph cluster_{i} {{")
         out.append(f'    label="{group}"; style=dashed; color=gray70;')
         for step in sorted(by_group[group], key=lambda s: s.job):
-            out.append(f'    "{step.tag}" [label="{step.tag}\\n[{step_classification(step).value}]"];')
+            suffix = _profile_suffix(step)
+            out.append(
+                f'    "{step.tag}" [label="{step.tag}\\n[{step_classification(step).value}]{suffix}"];'
+            )
         out.append("  }")
 
     for step in steps:

@@ -34,3 +34,45 @@ def test_ascii_shows_layers_deps_and_resources() -> None:
     assert "build.app" in art
     assert "<- build.app" in art  # dependent lists its dep
     assert "{browser:1}" in art  # resource demand shown
+
+
+def test_dot_omits_profiling_when_no_estimates() -> None:
+    # An undecorated DAG (no est/rss) renders exactly as before: no "Xs, YMB" and no scaling.
+    dot = to_dot(_cfg())
+    assert '"build.app" [label="build.app\\n[light]"];' in dot
+    assert "max par-spdup" not in dot
+    assert "MB" not in dot
+
+
+def _profiled_cfg() -> DagConfig:
+    # a: 30s -> b: 60s = 90s critical path; off-path c: 30s. Serial 120s, ideal speedup 1.3X.
+    return DagConfig(
+        steps=(
+            Step("build", "a", "", "true", hint=ResourceHint(est_duration_s=30.0, rss_baseline_bytes=268_435_456)),
+            Step(
+                "test",
+                "b",
+                "",
+                "true",
+                deps=["build.a"],
+                hint=ResourceHint(est_duration_s=60.0, rss_baseline_bytes=3_221_225_472),
+            ),
+            Step(
+                "test",
+                "c",
+                "",
+                "true",
+                deps=["build.a"],
+                hint=ResourceHint(est_duration_s=30.0, rss_baseline_bytes=1_073_741_824),
+            ),
+        ),
+    )
+
+
+def test_dot_annotates_profiling_and_scaling() -> None:
+    dot = to_dot(_profiled_cfg())
+    # Per-node "est-s, RSS-MB" (RSS floored to decimal MB).
+    assert '"build.a" [label="build.a\\n[light]\\n30.0s, 268MB"];' in dot
+    assert '"test.b" [label="test.b\\n[light]\\n60.0s, 3221MB"];' in dot
+    # Graph-title scaling: serial 120 / critpath 90 = 1.3X.
+    assert "|  1.3X max par-spdup" in dot

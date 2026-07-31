@@ -38,6 +38,66 @@ fn kept_deps(steps: &[&Step]) -> HashMap<String, Vec<String>> {
         .collect()
 }
 
+/// Concise per-node profiling annotation for a DOT label: `\n{est}s, {mb}MB`
+/// (expected wall-seconds and max resident memory in decimal MB, floored).
+///
+/// Returns `""` when the step carries neither a duration nor an RSS estimate, so
+/// undecorated DAGs render exactly as before. Formatting is integer-floored for MB
+/// and fixed one-decimal for seconds so the Rust and Python builds stay byte-identical.
+fn profile_suffix(step: &Step) -> String {
+    let est = step.hint.est_duration_s;
+    let rss = step.hint.rss_baseline_bytes;
+    if est <= 0.0 && rss.is_none() {
+        return String::new();
+    }
+    let mb = rss.unwrap_or(0) / 1_000_000;
+    format!("\\n{est:.1}s, {mb}MB")
+}
+
+/// Longest weighted finish time over the DAG (critical path in expected seconds),
+/// weighting each node by its `est_duration_s`. Memoized; visits in `steps` order.
+fn critical_path_seconds(steps: &[&Step], deps: &HashMap<String, Vec<String>>) -> f64 {
+    fn visit(
+        tag: &str,
+        est_of: &HashMap<String, f64>,
+        deps: &HashMap<String, Vec<String>>,
+        finish: &mut HashMap<String, f64>,
+    ) -> f64 {
+        if let Some(f) = finish.get(tag) {
+            return *f;
+        }
+        let parents = deps.get(tag).cloned().unwrap_or_default();
+        let base = parents
+            .iter()
+            .map(|p| visit(p, est_of, deps, finish))
+            .fold(0.0_f64, f64::max);
+        let f = base + est_of.get(tag).copied().unwrap_or(0.0);
+        finish.insert(tag.to_string(), f);
+        f
+    }
+    let est_of: HashMap<String, f64> = steps
+        .iter()
+        .map(|s| (s.tag(), s.hint.est_duration_s))
+        .collect();
+    let mut finish: HashMap<String, f64> = HashMap::new();
+    steps
+        .iter()
+        .map(|s| visit(&s.tag(), &est_of, deps, &mut finish))
+        .fold(0.0_f64, f64::max)
+}
+
+/// Graph-title scaling annotation: `  |  {N.N}X max par-spdup`, the ideal parallel
+/// speedup (total serial work / critical path). Omitted when no step has a duration
+/// estimate (critical path is zero), so undecorated DAGs render exactly as before.
+fn scaling_suffix(steps: &[&Step], deps: &HashMap<String, Vec<String>>) -> String {
+    let serial: f64 = steps.iter().map(|s| s.hint.est_duration_s).sum();
+    let crit = critical_path_seconds(steps, deps);
+    if crit <= 0.0 {
+        return String::new();
+    }
+    format!("  |  {:.1}X max par-spdup", serial / crit)
+}
+
 /// Render the DAG as Graphviz DOT.
 pub fn to_dot(cfg: &DagConfig, name: &str, selected: Option<&HashSet<String>>) -> String {
     let steps = selected_steps(cfg, selected);
@@ -49,13 +109,15 @@ pub fn to_dot(cfg: &DagConfig, name: &str, selected: Option<&HashSet<String>>) -
         by_group.entry(step.group.clone()).or_default().push(step);
     }
 
+    let scaling = scaling_suffix(&steps, &deps);
     let mut out: Vec<String> = vec![
         format!("digraph {name} {{"),
         "  rankdir=LR;".to_string(),
         "  node [shape=box, style=rounded, fontsize=10];".to_string(),
         "  labelloc=\"t\";".to_string(),
-        "  label=\"DAG  (solid = dependency;  dashed = shared cap-1 resource -> serialized)\";"
-            .to_string(),
+        format!(
+            "  label=\"DAG  (solid = dependency;  dashed = shared cap-1 resource -> serialized){scaling}\";"
+        ),
     ];
 
     for (i, (group, group_steps)) in by_group.iter().enumerate() {
@@ -68,8 +130,9 @@ pub fn to_dot(cfg: &DagConfig, name: &str, selected: Option<&HashSet<String>>) -
         for step in sorted_steps {
             let tag = step.tag();
             out.push(format!(
-                "    \"{tag}\" [label=\"{tag}\\n[{}]\"];",
-                step_classification(step).value()
+                "    \"{tag}\" [label=\"{tag}\\n[{}]{}\"];",
+                step_classification(step).value(),
+                profile_suffix(step)
             ));
         }
         out.push("  }".to_string());
@@ -248,5 +311,87 @@ mod tests {
         assert!(art.contains("build.app"));
         assert!(art.contains("<- build.app"));
         assert!(art.contains("{browser:1}"));
+    }
+
+    #[test]
+    fn dot_omits_profiling_when_no_estimates() {
+        // An undecorated DAG (no est/rss) must render exactly as before: no per-node
+        // "Xs, YMB" annotation and no scaling suffix on the graph title.
+        let dot = to_dot(&cfg(), "dag", None);
+        assert!(dot.contains("\"build.app\" [label=\"build.app\\n[light]\"];"));
+        assert!(!dot.contains("max par-spdup"));
+        assert!(!dot.contains("MB"));
+    }
+
+    #[test]
+    fn dot_annotates_profiling_and_scaling() {
+        // Two nodes on the critical path (a: 30s -> b: 60s = 90s), plus an off-path
+        // node c: 30s. Serial = 120s, critical path = 90s, ideal speedup = 1.3X.
+        let profiled = |group: &str, job: &str, deps: &[&str], est: f64, rss: i64| Step {
+            group: group.into(),
+            job: job.into(),
+            desc: String::new(),
+            description: String::new(),
+            cmd: "true".into(),
+            deps: deps.iter().map(|s| s.to_string()).collect(),
+            env: BTreeMap::new(),
+            hint: ResourceHint {
+                est_duration_s: est,
+                rss_baseline_bytes: Some(rss),
+                ..Default::default()
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: 1800,
+            jobs_flag: None,
+        };
+        let cfg = DagConfig {
+            steps: vec![
+                profiled("build", "a", &[], 30.0, 268_435_456),
+                profiled("test", "b", &["build.a"], 60.0, 3_221_225_472),
+                profiled("test", "c", &["build.a"], 30.0, 1_073_741_824),
+            ],
+            ..Default::default()
+        };
+        let dot = to_dot(&cfg, "dag", None);
+        // Per-node "est-s, RSS-MB" (RSS floored to decimal MB).
+        assert!(dot.contains("\"build.a\" [label=\"build.a\\n[light]\\n30.0s, 268MB\"];"));
+        assert!(dot.contains("\"test.b\" [label=\"test.b\\n[light]\\n60.0s, 3221MB\"];"));
+        // Graph-title scaling: serial 120 / critpath 90 = 1.3X.
+        assert!(dot.contains("max par-spdup"));
+        assert!(dot.contains("|  1.3X max par-spdup"));
+    }
+
+    #[test]
+    fn critical_path_is_longest_weighted_chain() {
+        let profiled = |group: &str, job: &str, deps: &[&str], est: f64| Step {
+            group: group.into(),
+            job: job.into(),
+            desc: String::new(),
+            description: String::new(),
+            cmd: "true".into(),
+            deps: deps.iter().map(|s| s.to_string()).collect(),
+            env: BTreeMap::new(),
+            hint: ResourceHint {
+                est_duration_s: est,
+                ..Default::default()
+            },
+            networkonly: false,
+            engine_only: false,
+            timeout: 1800,
+            jobs_flag: None,
+        };
+        let cfg = DagConfig {
+            steps: vec![
+                profiled("a", "x", &[], 10.0),
+                profiled("b", "y", &["a.x"], 5.0),
+                profiled("c", "z", &["a.x", "b.y"], 7.0),
+            ],
+            ..Default::default()
+        };
+        let steps = selected_steps(&cfg, None);
+        let deps = kept_deps(&steps);
+        // Longest chain a.x(10) -> b.y(5) -> c.z(7) = 22, not a.x -> c.z = 17.
+        assert_eq!(critical_path_seconds(&steps, &deps), 22.0);
     }
 }
