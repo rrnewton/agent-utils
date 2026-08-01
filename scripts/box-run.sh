@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # box-run.sh — run ONE command inside safe-ci-dag-runner's cgroup box: a hard per-run
-# memory cap (inner cgroup memory.max), a hard wall-clock timeout, and a SETSID-PROOF
-# whole-subtree teardown (cgroup.kill), so a wedging/leaking command can neither OOM the
-# host nor leave escaped qemu/supervisor processes alive after it is killed.
+# memory cap (inner cgroup memory.max), an optional per-run CPU cap (inner cgroup cpu.max),
+# a hard wall-clock timeout, and a SETSID-PROOF whole-subtree teardown (cgroup.kill), so a
+# wedging/leaking command can neither OOM the host nor leave escaped qemu/supervisor
+# processes alive after it is killed.
 #
-# This is the single-command front end to `safe-ci-dag-runner run` (which is a DAG runner):
-# it emits a one-step DAG, runs it boxed with --no-fail-fast, and classifies the outcome.
+# This is a thin front end to the runner's native one-off boxer, `safe-ci-dag-runner box`
+# (which synthesizes a singleton in-memory DAG, runs it once, and prints a VERDICT). This
+# wrapper adds binary resolution, an --allow-unboxed alias, and optional CSV logging.
 #
 # Usage:
-#   box-run.sh --mem 6G --timeout 175 [--label NAME] [--perf-dir DIR]
+#   box-run.sh --mem 6G --timeout 175 [--cores N] [--label NAME] [--perf-dir DIR]
 #              [--verdicts-csv FILE] [--allow-unboxed] [-q] -- CMD [ARGS...]
 #
 #   --mem SIZE          hard per-run memory cap (K/M/G/T suffix or raw bytes). Required.
 #   --timeout SECS      hard wall-clock cap; the whole subtree is SIGKILLed at SECS. Required.
+#   --cores N           cap the boxed command to N full CPUs (inner cgroup cpu.max). Optional.
 #   --label NAME        label for the verdict line / CSV row (default: "run").
 #   --perf-dir DIR      write safe-ci-dag-runner per-step + whole-run resource CSVs here.
 #   --verdicts-csv FILE append one row: label,class,exit,wall_s,detail  (header auto-created).
@@ -33,11 +36,12 @@ set -euo pipefail
 
 die() { echo "box-run.sh: $*" >&2; exit 2; }
 
-mem=""; timeout=""; label="run"; perf_dir=""; verdicts_csv=""; allow_unboxed=0; quiet=0
+mem=""; timeout=""; cores=""; label="run"; perf_dir=""; verdicts_csv=""; allow_unboxed=0; quiet=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mem)          mem="${2:?}"; shift 2 ;;
     --timeout)      timeout="${2:?}"; shift 2 ;;
+    --cores)        cores="${2:?}"; shift 2 ;;
     --label)        label="${2:?}"; shift 2 ;;
     --perf-dir)     perf_dir="${2:?}"; shift 2 ;;
     --verdicts-csv) verdicts_csv="${2:?}"; shift 2 ;;
@@ -64,72 +68,29 @@ done
 [[ -z "$bin" ]] && bin="$(command -v safe-ci-dag-runner || true)"
 [[ -n "$bin" ]] || die "safe-ci-dag-runner binary not found (set \$SAFE_CI_DAG_RUNNER_BIN or 'cargo build --release' in rs/)"
 
-# --- parse --mem to bytes ------------------------------------------------------------------
-to_bytes() {
-  local s="${1//[[:space:]]/}"; local n unit
-  if [[ "$s" =~ ^([0-9]+)([KkMmGgTt]?[Bb]?)$ ]]; then
-    n="${BASH_REMATCH[1]}"; unit="${BASH_REMATCH[2]}"
-    case "${unit^^}" in
-      ""|"B")      echo "$n" ;;
-      "K"|"KB")    echo $(( n * 1024 )) ;;
-      "M"|"MB")    echo $(( n * 1024 * 1024 )) ;;
-      "G"|"GB")    echo $(( n * 1024 * 1024 * 1024 )) ;;
-      "T"|"TB")    echo $(( n * 1024 * 1024 * 1024 * 1024 )) ;;
-      *)           return 1 ;;
-    esac
-  else
-    return 1
-  fi
-}
-mem_bytes="$(to_bytes "$mem")" || die "cannot parse --mem '$mem' (use e.g. 6G, 512M, 2048K, or raw bytes)"
+# --- delegate to the native `box` subcommand -----------------------------------------------
+box_args=(box --mem "$mem" --timeout "$timeout" --label "$label")
+[[ -n "$cores" ]]              && box_args+=(--cores "$cores")
+[[ -n "$perf_dir" ]]          && box_args+=(--perf-dir "$perf_dir")
+[[ "$allow_unboxed" -eq 1 ]]  && box_args+=(--allow-cgroup-failure)
+[[ "$quiet" -eq 1 ]]          && box_args+=(-q)
 
-# --- build the one-step DAG (command joined into one properly-quoted bash string) ----------
-cmd_str="$(printf '%q ' "$@")"; cmd_str="${cmd_str% }"
 work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT
-dag="$work/dag.json"
-python3 - "$dag" "$label" "$cmd_str" "$timeout" "$mem_bytes" <<'PY'
-import json, sys
-dag, label, cmd, timeout, mem = sys.argv[1:6]
-json.dump({"steps": [{
-    "group": "box", "job": label, "cmd": cmd,
-    "timeout": int(timeout),
-    "hint": {"hard_mem_max_bytes": int(mem)},
-}]}, open(dag, "w"))
-PY
-
-# --- run boxed -----------------------------------------------------------------------------
-run_args=(run --dag "$dag" -j1 --no-fail-fast)
-[[ -n "$perf_dir" ]] && run_args+=(--perf-dir "$perf_dir")
-[[ "$allow_unboxed" -eq 1 ]] && run_args+=(--allow-cgroup-failure)
-
 out="$work/out.txt"
-start=$SECONDS
 set +e
-"$bin" "${run_args[@]}" >"$out" 2>&1
-rc=$?
+"$bin" "${box_args[@]}" -- "$@" 2>&1 | tee "$out"
+rc="${PIPESTATUS[0]}"
 set -e
-wall=$(( SECONDS - start ))
 
-[[ "$quiet" -eq 0 ]] && { grep -vE 'profile data appended|^  \.safe-ci-dag-runner|\.csv$' "$out" >&2 || true; }
+# --- parse the VERDICT line the native subcommand printed ----------------------------------
+verdict_line="$(grep -E '^VERDICT ' "$out" | tail -1 || true)"
+class="$(sed -n 's/.*class=\([^ ]*\).*/\1/p' <<<"$verdict_line")"
+wall="$(sed -n 's/.*wall_s=\([^ ]*\).*/\1/p' <<<"$verdict_line")"
+detail="$(sed -n 's/.*detail=\(.*\)$/\1/p' <<<"$verdict_line")"
+: "${class:=FAIL}" "${wall:=0.0}" "${detail:=none}"
 
-# --- classify from the outcome + exit code -------------------------------------------------
-# rc: 0 all-pass | 1 a step failed | 3 cgroup boxing required but unavailable | 2 bad usage
-detail="$(grep -oE '(OOM-KILLED \(hit inner MemoryMax; [0-9]+ oom_kill event\(s\)\)|TIMEOUT >[0-9]+s|exit -?[0-9]+)' "$out" | tail -1 || true)"
-if [[ "$rc" -eq 3 ]]; then
-  class="BOX-UNAVAILABLE"; ec=3
-elif grep -q 'OOM-KILLED' "$out"; then
-  class="OOM"; ec=1
-elif grep -q 'TIMEOUT >' "$out"; then
-  class="TIMEOUT"; ec=1
-elif [[ "$rc" -eq 0 ]] && grep -q '\bPASS\b' "$out"; then
-  class="PASS"; ec=0
-else
-  class="FAIL"; ec="${rc:-1}"; [[ "$ec" -eq 0 ]] && ec=1
-fi
-
-echo "VERDICT label=$label class=$class exit=$ec wall_s=$wall detail=${detail:-none}"
 if [[ -n "$verdicts_csv" ]]; then
   [[ -f "$verdicts_csv" ]] || echo "label,class,exit,wall_s,detail" >"$verdicts_csv"
-  printf '%s,%s,%s,%s,%s\n' "$label" "$class" "$ec" "$wall" "${detail:-none}" >>"$verdicts_csv"
+  printf '%s,%s,%s,%s,%s\n' "$label" "$class" "$rc" "$wall" "$detail" >>"$verdicts_csv"
 fi
-exit "$ec"
+exit "$rc"
