@@ -147,6 +147,12 @@ struct Runner {
     order: Vec<String>,
     jobs: i64,
     keep_going: bool,
+    /// No-fail-fast: a genuine failure records `Shared::failed` but does NOT set `Shared::stop`, so
+    /// every still-runnable INDEPENDENT step is launched. A failed step's dependents are still
+    /// skipped (dependency correctness is preserved). Implies `keep_going` (in-flight steps are
+    /// never eager-reaped). The overall run still fails (`ok == false`, nonzero exit) iff any step
+    /// failed. This is what an expansion sweep (cells >> jobs) needs: bound + observe every cell.
+    run_to_completion: bool,
     verbosity: i64,
     /// Default inner-parallelism flag template (e.g. "-j") for steps without their own.
     default_jobs_flag: String,
@@ -162,10 +168,14 @@ struct Runner {
 }
 
 impl Runner {
+    // Policy + graph + boxing + CPA gate are all distinct inputs; grouping them into a struct
+    // would just move the same fields behind one more indirection.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cfg: &DagConfig,
         jobs: i64,
         keep_going: bool,
+        run_to_completion: bool,
         verbosity: i64,
         cgroups: BoxedCgroups,
         order_override: Option<Vec<String>>,
@@ -194,7 +204,9 @@ impl Runner {
             steps: Arc::new(steps),
             order,
             jobs: jobs.max(1),
-            keep_going,
+            // run_to_completion implies keep_going: never eager-reap in-flight steps either.
+            keep_going: keep_going || run_to_completion,
+            run_to_completion,
             verbosity,
             default_jobs_flag: cfg.default_jobs_flag.clone(),
             cgroups,
@@ -286,6 +298,7 @@ impl Runner {
             for step in launchable {
                 let shared = Arc::clone(&self.shared);
                 let keep_going = self.keep_going;
+                let run_to_completion = self.run_to_completion;
                 let verbosity = self.verbosity;
                 let default_jobs_flag = self.default_jobs_flag.clone();
                 let cgroups = self.cgroups.clone();
@@ -295,6 +308,7 @@ impl Runner {
                         step,
                         shared,
                         keep_going,
+                        run_to_completion,
                         verbosity,
                         default_jobs_flag,
                         cgroups,
@@ -397,6 +411,7 @@ struct StepCtx {
     step: Step,
     shared: Arc<Mutex<Shared>>,
     keep_going: bool,
+    run_to_completion: bool,
     verbosity: i64,
     default_jobs_flag: String,
     cgroups: BoxedCgroups,
@@ -447,6 +462,7 @@ fn run_step(ctx: StepCtx) {
         step,
         shared,
         keep_going,
+        run_to_completion,
         verbosity,
         default_jobs_flag,
         cgroups,
@@ -522,7 +538,10 @@ fn run_step(ctx: StepCtx) {
             );
             sh.done.insert(tag.clone(), outcome);
             sh.failed = true;
-            sh.stop = true;
+            // run_to_completion: record the failure but keep launching independent steps.
+            if !run_to_completion {
+                sh.stop = true;
+            }
             drop(sh);
             emit(&format!(
                 "[{tag}] \u{2717} FAIL   {} (spawn failed: {e})",
@@ -734,8 +753,13 @@ fn run_step(ctx: StepCtx) {
             // A REAL failure: mark failed + stop launching NEW steps. Eager-exit (default): reap
             // every step still running so a fast failure doesn't wait for a slow in-flight build.
             // keep_going instead lets those in-flight steps finish; it does NOT launch further steps.
+            // run_to_completion (no-fail-fast): record the failure but keep launching independent
+            // steps (dependents are still skipped); it also implies keep_going, so the reap below
+            // never runs. The overall run still fails iff any step failed.
             sh.failed = true;
-            sh.stop = true;
+            if !run_to_completion {
+                sh.stop = true;
+            }
             if !keep_going {
                 let others: Vec<(String, u32)> = sh
                     .running_pids
@@ -801,6 +825,29 @@ pub fn run_dag(cfg: &DagConfig, jobs: i64, keep_going: bool, verbosity: i64) -> 
     run_dag_boxed(cfg, jobs, keep_going, verbosity, None)
 }
 
+/// Like [`run_dag_boxed_ordered`] but with the common defaults (no explicit order, no core budget),
+/// exposing `run_to_completion` (no-fail-fast) for an expansion sweep that must launch and observe
+/// every independent cell rather than halting at the first failure. See [`Runner::run_to_completion`].
+pub fn run_dag_run_to_completion(
+    cfg: &DagConfig,
+    jobs: i64,
+    keep_going: bool,
+    run_to_completion: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+) -> RunResult {
+    run_dag_boxed_ordered(
+        cfg,
+        jobs,
+        keep_going,
+        run_to_completion,
+        verbosity,
+        cgroups,
+        None,
+        None,
+    )
+}
+
 /// Run a whole DAG with an optional per-step cgroup manager (the real-work entry point).
 ///
 /// `cgroups` supplies two-level cgroup-v2 per-step boxing + setsid-proof teardown when enabled;
@@ -813,17 +860,19 @@ pub fn run_dag_boxed(
     verbosity: i64,
     cgroups: BoxedCgroups,
 ) -> RunResult {
-    run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups, None, None)
+    run_dag_boxed_ordered(cfg, jobs, keep_going, false, verbosity, cgroups, None, None)
 }
 
 /// Like [`run_dag_boxed`] but with an explicit dispatch `order` (e.g. a critical-path planner's)
 /// and an optional CPA `core_budget` (`P`): when set, the scheduler never lets the summed
 /// inner-jobs width of concurrently-running steps exceed it. `order = None` uses the built-in
 /// longest-processing-time default; `core_budget = None` disables the core gate.
+#[allow(clippy::too_many_arguments)]
 pub fn run_dag_boxed_ordered(
     cfg: &DagConfig,
     jobs: i64,
     keep_going: bool,
+    run_to_completion: bool,
     verbosity: i64,
     cgroups: BoxedCgroups,
     order: Option<Vec<String>>,
@@ -842,6 +891,7 @@ pub fn run_dag_boxed_ordered(
         cfg,
         jobs,
         keep_going,
+        run_to_completion,
         verbosity,
         cgroups,
         order,
@@ -1017,5 +1067,136 @@ mod tests {
         };
         let res = run_dag(&cfg, 1, false, 0);
         assert!(res.ok, "expected '-j4' to be appended so the check passes");
+    }
+
+    fn outcomes_of(res: &RunResult) -> HashMap<String, StepOutcome> {
+        res.outcomes
+            .iter()
+            .map(|o| (o.tag.clone(), o.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn fail_fast_stops_launching_queued_independent_steps() {
+        // Baseline (default fail-fast): with jobs=1 the highest-est step is dispatched FIRST; when
+        // it fails, Shared::stop halts launching, so the independent later steps never run.
+        let dir = std::env::temp_dir().join(format!("scdr_ff_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ran = dir.join("ran");
+        let rf = ran.to_string_lossy().to_string();
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "boom", "exit 1", &[], 100.0, &[]), // LPT: dispatched first
+                step("g", "later1", &format!("echo 1 >> {rf}"), &[], 1.0, &[]),
+                step("g", "later2", &format!("echo 2 >> {rf}"), &[], 1.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 1, false, 0);
+        assert!(!res.ok);
+        // The independent later steps were never launched (no outcome, no marker file).
+        assert!(!ran.exists());
+        let tags: std::collections::HashSet<String> =
+            res.outcomes.iter().map(|o| o.tag.clone()).collect();
+        assert_eq!(
+            tags,
+            std::collections::HashSet::from(["g.boom".to_string()])
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_to_completion_runs_queued_steps_after_failure() {
+        // run_to_completion: same DAG, jobs=1, but every INDEPENDENT step still runs to its own
+        // outcome after the first failure. Overall result.ok is still false (a step failed).
+        let dir = std::env::temp_dir().join(format!("scdr_rtc_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ran = dir.join("ran");
+        let rf = ran.to_string_lossy().to_string();
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "boom", "exit 1", &[], 100.0, &[]), // LPT: dispatched first, fails
+                step("g", "later1", &format!("echo 1 >> {rf}"), &[], 1.0, &[]),
+                step("g", "later2", &format!("echo 2 >> {rf}"), &[], 1.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag_run_to_completion(&cfg, 1, false, true, 0, None);
+        assert!(!res.ok); // a genuine failure still makes the run fail overall
+        let outcomes = outcomes_of(&res);
+        assert!(!outcomes["g.boom"].ok);
+        assert!(outcomes["g.later1"].ok); // independent steps ran despite the failure
+        assert!(outcomes["g.later2"].ok);
+        let contents = std::fs::read_to_string(&ran).unwrap();
+        let mut lines: Vec<&str> = contents.split_whitespace().collect();
+        lines.sort_unstable();
+        assert_eq!(lines, vec!["1", "2"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_to_completion_still_skips_dependents_of_failure() {
+        // No-fail-fast must NOT run a failed step's dependents: dependency correctness preserved.
+        let dir = std::env::temp_dir().join(format!("scdr_rtcskip_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ran = dir.join("ran");
+        let rf = ran.to_string_lossy().to_string();
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "boom", "exit 1", &[], 100.0, &[]),
+                step(
+                    "g",
+                    "dependent",
+                    &format!("echo dep >> {rf}"),
+                    &["g.boom"],
+                    1.0,
+                    &[],
+                ),
+                step(
+                    "g",
+                    "independent",
+                    &format!("echo ind >> {rf}"),
+                    &[],
+                    1.0,
+                    &[],
+                ),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag_run_to_completion(&cfg, 1, false, true, 0, None);
+        assert!(!res.ok);
+        let outcomes = outcomes_of(&res);
+        assert!(outcomes["g.independent"].ok); // independent step ran
+        assert!(res.skipped.contains(&"g.dependent".to_string())); // dependent still skipped
+        assert!(!outcomes.contains_key("g.dependent"));
+        let contents = std::fs::read_to_string(&ran).unwrap();
+        let lines: Vec<&str> = contents.split_whitespace().collect();
+        assert_eq!(lines, vec!["ind"]); // only the independent step wrote
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_step_timeout_is_enforced() {
+        // Documents the (pre-existing) per-step timeout: a step that overruns its own Step.timeout
+        // is killed and reported as a timeout failure, without waiting for the whole run.
+        let mut hang = step("g", "hang", "sleep 30", &[], 0.0, &[]);
+        hang.timeout = 1;
+        let cfg = DagConfig {
+            steps: vec![hang, step("g", "quick", "true", &[], 0.0, &[])],
+            ..Default::default()
+        };
+        let res = run_dag_run_to_completion(&cfg, 2, false, true, 0, None);
+        assert!(!res.ok);
+        let outcomes = outcomes_of(&res);
+        assert!(!outcomes["g.hang"].ok);
+        assert!(
+            outcomes["g.hang"].reason.contains("TIMEOUT"),
+            "expected TIMEOUT reason, got {:?}",
+            outcomes["g.hang"].reason
+        );
+        assert!(outcomes["g.quick"].ok); // the healthy step still passes
     }
 }

@@ -49,7 +49,7 @@ pub use perflog::{append_step_profiles, PerfWindow};
 pub use profile_enrich::{
     container_core_budget, resolve_effective_inner_jobs, step_enrichment_columns,
 };
-pub use scheduler::{run_dag, run_dag_boxed, run_dag_boxed_ordered};
+pub use scheduler::{run_dag, run_dag_boxed, run_dag_boxed_ordered, run_dag_run_to_completion};
 pub use sizing::{
     jobs_footprint_bytes, jobs_for_budget, mem_available_bytes, parse_size,
     schedulable_peak_mem_bytes, schedulable_peak_mem_bytes_widths, step_mem_cap_bytes,

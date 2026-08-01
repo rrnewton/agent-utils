@@ -182,6 +182,7 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
 - concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
 - learned est_duration / rss from the profile store override the DAG hints at plan time\n    (disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
+- {nofailfast} runs every independent step to its own outcome despite failures (dependents of a\n    failed step are still skipped); the run still exits 1 iff any step failed \u{2014} for expansion sweeps\n  \
 - {maxmem} picks the largest -j whose modeled worst-case RAM fits the budget\n\n\
 {note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. {perfdir} writes per-step + whole-run resource-usage CSVs.\n\n\
 {exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = cgroup\n           boxing required but unavailable (use {acf})\n",
@@ -238,6 +239,7 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         schema_note = c.dim("(only group/job/cmd are required per step; everything else has defaults)"),
         what = h("What you get"),
         keepgoing = k("--keep-going"),
+        nofailfast = k("--no-fail-fast"),
         maxmem = k("run --max-mem 8G"),
         acf = k("--allow-cgroup-failure"),
         perfdir = k("run --perf-dir DIR"),
@@ -320,6 +322,7 @@ struct RunArgs {
     profile_sync: Option<String>,
     profile_sync_direction: String,
     keep_going: bool,
+    run_to_completion: bool,
     cgroups: bool,
     allow_cgroup_failure: bool,
     verbosity: i64,
@@ -341,6 +344,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         profile_sync: None,
         profile_sync_direction: "both".to_string(),
         keep_going: false,
+        run_to_completion: false,
         cgroups: false,
         allow_cgroup_failure: false,
         verbosity: 1,
@@ -392,6 +396,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 a.profile_sync_direction = v;
             }
             "-k" | "--keep-going" => a.keep_going = true,
+            "--run-to-completion" | "--no-fail-fast" => a.run_to_completion = true,
             "--cgroups" => a.cgroups = true,
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "-v" => a.verbosity += 1,
@@ -1416,6 +1421,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         cfg,
         jobs,
         a.keep_going,
+        a.run_to_completion,
         verbosity,
         cgroups,
         Some(plan.order.clone()),
