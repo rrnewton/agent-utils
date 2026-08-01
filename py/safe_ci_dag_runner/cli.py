@@ -214,6 +214,9 @@ def _quickstart(c: Palette) -> str:
     {c.dim('(disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)')}
   - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps
     ({k('--keep-going')} lets already-running steps finish instead; it still stops launching new steps)
+  - {k('--run-to-completion')} (a.k.a. {k('--no-fail-fast')}) runs EVERY independent step even after a
+    failure (only a failed step's dependents skip); exit code still nonzero if any step failed.
+    {c.dim('Use for a full-superset sweep: bound each cell with per-step timeout + hard_mem_max_bytes.')}
   - Linux cgroup-v2 per-step memory/CPU boxing is ON BY DEFAULT (the tool's primary purpose):
     {k('run')} re-execs inside a systemd --user scope and caps each step in its own child cgroup
     {c.dim('(no cgroup-v2 + systemd --user scope? the run errors — pass')} {k('--allow-cgroup-failure')} {c.dim('to run un-boxed)')}
@@ -365,6 +368,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-going",
         action="store_true",
         help="on a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps)",
+    )
+    run_p.add_argument(
+        "--run-to-completion",
+        "--no-fail-fast",
+        dest="run_to_completion",
+        action="store_true",
+        help="no-fail-fast: a failing step never halts the run; every independent step still runs "
+        "(only a failed step's dependents are skipped). Exit code still nonzero if any step failed. "
+        "Use for a full-superset sweep where per-step outcomes matter, not the aggregate verdict.",
     )
     run_p.add_argument(
         "--cgroups",
@@ -1418,6 +1430,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         cgroups=cgroups,
         metrics=metrics,
         keep_going=bool(ns.keep_going),
+        run_to_completion=bool(getattr(ns, "run_to_completion", False)),
         verbosity=verbosity,
         order=list(plan.order),
         core_budget=core_budget,

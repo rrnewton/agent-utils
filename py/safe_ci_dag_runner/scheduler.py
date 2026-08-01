@@ -191,6 +191,7 @@ class Runner:
         jobs: int,
         cgroups: CgroupManager,
         keep_going: bool = False,
+        run_to_completion: bool = False,
         verbosity: int = 1,
         order: Sequence[str] | None = None,
         core_budget: int | None = None,
@@ -199,6 +200,15 @@ class Runner:
         self.jobs = max(1, jobs)
         self.cgroups = cgroups
         self.keep_going = keep_going
+        # run_to_completion (no-fail-fast): a failure records self.failed but does NOT set
+        # self.stop, so every independent step still launches. Dependents of a failed step are
+        # still correctly skipped (via _skipped). Implies keep_going (never eager-cancel a
+        # sibling just because another step failed). Built for the compat-envelope EXPANSION
+        # sweep, where each cell is an independent step and one failing cell must not abort the
+        # rest of the superset. Overall result.ok is still False iff any step genuinely failed.
+        self.run_to_completion = run_to_completion
+        if run_to_completion:
+            self.keep_going = True
         # verbosity: 0 quiet(+failures), 1 default(+summaries), >=2 stream child stdout.
         self.verbosity = verbosity
         # CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set
@@ -543,8 +553,11 @@ class Runner:
                 # reap every step still running in parallel NOW so a fast failure doesn't wait for
                 # a slow in-flight build. keep_going instead lets those in-flight steps finish (so
                 # they report their own pass/fail); it does NOT launch any further steps.
+                # run_to_completion goes further: DON'T stop launching either — every independent
+                # step still runs to its own outcome; only this step's dependents are skipped.
                 self.failed = True
-                self.stop = True
+                if not self.run_to_completion:
+                    self.stop = True
                 if not self.keep_going:
                     for other, other_proc in list(self.running_procs.items()):
                         self.aborted.add(other)  # its thread will label itself ABORTED
@@ -598,6 +611,7 @@ def run_dag(
     cgroups: CgroupManager | None = None,
     metrics: MetricsSink | None = None,
     keep_going: bool = False,
+    run_to_completion: bool = False,
     verbosity: int = 1,
     order: Sequence[str] | None = None,
     core_budget: int | None = None,
@@ -618,6 +632,12 @@ def run_dag(
     :param keep_going: on a failure, let already-running steps finish instead of eager-cancelling
         them; the scheduler still stops launching new steps (it does NOT run every still-runnable
         step), so in-flight steps report their own pass/fail rather than ABORTED.
+    :param run_to_completion: no-fail-fast mode. A failing step no longer halts the scheduler:
+        every step whose deps succeeded still launches and reports its own outcome; only a failed
+        step's dependents are skipped. Implies ``keep_going``. Overall ``result.ok`` is still
+        ``False`` iff any step genuinely failed. This is the mode for a full-superset sweep (e.g.
+        the compat-envelope EXPANSION run) where one failing cell must not abort the rest and the
+        caller consumes per-step outcomes, not the aggregate exit code.
     :param verbosity: 0 quiet (+failures), 1 default (+summaries), >=2 stream child stdout.
     :param order: explicit dispatch order (e.g. a critical-path planner's); ``None`` uses the
         built-in longest-processing-time default.
@@ -640,6 +660,7 @@ def run_dag(
         jobs=jobs,
         cgroups=manager,
         keep_going=keep_going,
+        run_to_completion=run_to_completion,
         verbosity=verbosity,
         order=order,
         core_budget=core_budget,
