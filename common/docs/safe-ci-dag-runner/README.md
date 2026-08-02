@@ -167,6 +167,29 @@ knobs easy to place:
    `preferred_inner_jobs` (e.g. it runs `make -j8`); and under cgroup boxing the whole run and each
    step get CPU caps from the delegated scope. CPU governs *how many things run*, not *which are
    allowed to co-run*.
+
+### Timeouts: wall-clock vs. CPU-time budget
+
+Each step has two independent timeouts:
+
+- **`timeout`** (seconds, default `1800`; DAG-level default `default_step_timeout`) — a **wall-clock**
+  limit. The step is SIGTERM'd when this much real time elapses regardless of how much of it was spent
+  on-CPU. Under host contention wall time inflates, so a wall timeout tight enough to catch a real
+  hang can *spuriously* fire on a legitimately slow-because-loaded step (a CI flake).
+- **`cpu_timeout`** (seconds, default `0` = disabled; DAG-level default `default_cpu_timeout`) — a
+  **CPU-time** budget enforced via `RLIMIT_CPU` (soft → `SIGXCPU`, hard = `cpu_timeout + 5` →
+  `SIGKILL`) on the step's whole process tree. A CPU-second is *physical work*: the same legitimate
+  step costs the same CPU-seconds whether the host is idle or heavily contended, so this budget is
+  **load-invariant** — it never trips on legitimate work just because the host is busy, yet still
+  bounds a genuine runaway. The recommended robust policy is a **generous `timeout`** (wall backstop)
+  paired with an **aggressive `cpu_timeout`** (the real limit). Accounting is per-process — it catches
+  the dominant-CPU process; a multi-process fan-out is still backstopped by the wall-clock `timeout`.
+  A step killed by its CPU budget fails with per-step reason `CPU-TIMEOUT >Ns cpu-time (RLIMIT_CPU)`
+  and returncode `-24`. Enforcement requires `prlimit(1)` on `PATH`. **Rust build only** for now: the
+  Python build ignores `cpu_timeout` (byte-parity is preserved because the field is emitted only when
+  non-default, which the parity corpus never sets).
+
+
 3. **Named scarce resources (semaphores).** For constraints that memory and CPU do not capture, a
    step declares demand in `hint.resources` (e.g. `{"browser": 1}`) and the top-level `resource_caps`
    bounds the total concurrent demand (e.g. `{"browser": 1}` lets only one browser step run at a
@@ -483,6 +506,10 @@ to plug in a real cgroup manager or a metrics sink.
 | `1`  | A step failed (or was aborted/skipped because one did). |
 | `2`  | Bad usage, or a missing / malformed DAG file.           |
 | `3`  | cgroup boxing was required (the default) but could not be established; re-run with `--allow-cgroup-failure` to run un-boxed. |
+
+A step killed by its **wall-clock `timeout`** reports the per-step reason `TIMEOUT`; a step killed by
+its **CPU-time `cpu_timeout`** (`RLIMIT_CPU`) reports `CPU-TIMEOUT >Ns cpu-time (RLIMIT_CPU)` with
+returncode `-24` (`SIGXCPU`). Both are ordinary step failures, so either makes the whole run exit `1`.
 
 ## Status & limitations
 

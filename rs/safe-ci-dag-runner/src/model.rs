@@ -11,6 +11,15 @@ use std::collections::BTreeMap;
 /// Default per-step timeout (seconds); mirrors Python's `DEFAULT_STEP_TIMEOUT`.
 pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
 
+/// Default per-step CPU-time budget (seconds). `0` disables the CPU budget, leaving the wall-clock
+/// `timeout` as the only limit (today's behavior). When positive it is enforced via `RLIMIT_CPU`
+/// (SIGXCPU) on the step's process tree.
+pub const DEFAULT_CPU_TIMEOUT: i64 = 0;
+
+/// Grace added to the soft `RLIMIT_CPU` (SIGXCPU) to form the hard limit (SIGKILL): a step that
+/// catches or ignores SIGXCPU is still force-killed this many extra CPU-seconds later.
+pub const CPU_TIMEOUT_HARD_GRACE: i64 = 5;
+
 /// Default template for the inner-parallelism (concurrency) flag appended to a step's command
 /// when the step declares `preferred_inner_jobs`. Mirrors Python's `DEFAULT_JOBS_FLAG`.
 pub const DEFAULT_JOBS_FLAG: &str = "-j";
@@ -92,6 +101,15 @@ pub struct Step {
     /// Selected only by an engine-only subset preset.
     pub engine_only: bool,
     pub timeout: i64,
+    /// Per-step CPU-time budget in seconds, enforced via `RLIMIT_CPU` (SIGXCPU) on the whole step
+    /// process tree. `0` (the default) disables it, leaving `timeout` (wall-clock) as the only
+    /// limit. When positive, this is LOAD-INVARIANT: a CPU-second is physical work, so the same
+    /// legitimate step costs the same CPU-seconds whether the host is idle or heavily contended,
+    /// whereas its WALL time inflates under contention. A generous `timeout` plus an aggressive
+    /// `cpu_timeout` therefore avoids spurious wall-timeout flakes on a loaded host while still
+    /// bounding a genuine runaway. Accounting is per-process (it catches the dominant-CPU process;
+    /// a multi-process fan-out is still backstopped by the wall-clock `timeout`).
+    pub cpu_timeout: i64,
     /// Template for the inner-parallelism flag appended to `cmd` when this step declares
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
     /// disables appending (the step manages its own concurrency). See [`render_jobs_flag`].
@@ -270,6 +288,9 @@ pub struct DagConfig {
     /// Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.
     pub outer_mem_safety_factor: f64,
     pub default_step_timeout: i64,
+    /// Default per-step CPU-time budget (seconds) for steps that don't set their own `cpu_timeout`.
+    /// `0` (the default) disables the CPU budget DAG-wide. See [`Step::cpu_timeout`].
+    pub default_cpu_timeout: i64,
     /// Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     pub default_jobs_flag: String,
 }
@@ -284,6 +305,7 @@ impl Default for DagConfig {
             mem_cap_floor_bytes: 8 * 1024i64.pow(3),
             outer_mem_safety_factor: 1.0,
             default_step_timeout: DEFAULT_STEP_TIMEOUT,
+            default_cpu_timeout: DEFAULT_CPU_TIMEOUT,
             default_jobs_flag: DEFAULT_JOBS_FLAG.to_string(),
         }
     }
@@ -381,6 +403,28 @@ impl StepOutcome {
             aborted: true,
         }
     }
+
+    /// Build a CPU-budget-exceeded outcome: the step's process tree burned more than
+    /// `cpu_timeout` CPU-seconds and was killed by `RLIMIT_CPU` (SIGXCPU). This is a genuine
+    /// failure (`ok: false`, `aborted: false`) — the step really overran its physical CPU budget —
+    /// distinct from a wall-clock `TIMEOUT` and from an eager-exit `ABORTED`.
+    pub fn cpu_timed_out(
+        tag: String,
+        duration_s: f64,
+        summary: String,
+        returncode: Option<i64>,
+        cpu_timeout: i64,
+    ) -> Self {
+        StepOutcome {
+            tag,
+            ok: false,
+            duration_s,
+            summary,
+            returncode,
+            reason: format!("CPU-TIMEOUT >{cpu_timeout}s cpu-time (RLIMIT_CPU)"),
+            aborted: false,
+        }
+    }
 }
 
 /// Aggregate outcome of a whole DAG run.
@@ -419,6 +463,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: DEFAULT_STEP_TIMEOUT,
+            cpu_timeout: DEFAULT_CPU_TIMEOUT,
             jobs_flag: None,
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
@@ -437,6 +482,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: DEFAULT_STEP_TIMEOUT,
+            cpu_timeout: DEFAULT_CPU_TIMEOUT,
             jobs_flag: jobs_flag.map(str::to_string),
         }
     }

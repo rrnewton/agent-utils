@@ -24,7 +24,8 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::model::{
-    DagConfig, ResourceHint, Step, StepClass, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    DagConfig, ResourceHint, Step, StepClass, DEFAULT_CPU_TIMEOUT, DEFAULT_JOBS_FLAG,
+    DEFAULT_STEP_TIMEOUT,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -289,6 +290,7 @@ pub fn dag_from_yaml(text: &str) -> Result<DagConfig, DagJsonError> {
 pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     let doc = as_obj(raw, "<root>")?;
     let default_step_timeout = opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)?;
+    let default_cpu_timeout = opt_int(doc, "default_cpu_timeout", DEFAULT_CPU_TIMEOUT)?;
     let steps_raw = match doc.get("steps") {
         Some(Value::Array(items)) => items,
         _ => return Err(err("<root>: 'steps' must be a list")),
@@ -309,6 +311,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             networkonly: opt_bool(sm, "networkonly", false)?,
             engine_only: opt_bool(sm, "engine_only", false)?,
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
+            cpu_timeout: opt_int(sm, "cpu_timeout", default_cpu_timeout)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
         });
     }
@@ -320,6 +323,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
         mem_cap_floor_bytes: opt_int(doc, "mem_cap_floor_bytes", DEFAULT_MEM_CAP_FLOOR)?,
         outer_mem_safety_factor: opt_float(doc, "outer_mem_safety_factor", 1.0)?,
         default_step_timeout,
+        default_cpu_timeout,
         default_jobs_flag: opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG)?,
     })
 }
@@ -621,6 +625,12 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&format!("\"engine_only\": {},\n", step.engine_only));
     s.push_str(&key);
     s.push_str(&format!("\"timeout\": {},\n", step.timeout));
+    // Emit cpu_timeout only when non-default, preserving byte-identical output for the vast
+    // majority of DAGs that never set it (cross-differential parity with the Python reference).
+    if step.cpu_timeout != DEFAULT_CPU_TIMEOUT {
+        s.push_str(&key);
+        s.push_str(&format!("\"cpu_timeout\": {},\n", step.cpu_timeout));
+    }
     s.push_str(&key);
     s.push_str(&format!(
         "\"jobs_flag\": {},\n",
@@ -662,6 +672,12 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
         "  \"default_step_timeout\": {},\n",
         cfg.default_step_timeout
     ));
+    if cfg.default_cpu_timeout != DEFAULT_CPU_TIMEOUT {
+        s.push_str(&format!(
+            "  \"default_cpu_timeout\": {},\n",
+            cfg.default_cpu_timeout
+        ));
+    }
     s.push_str(&format!(
         "  \"default_jobs_flag\": {},\n",
         json_str(&cfg.default_jobs_flag)

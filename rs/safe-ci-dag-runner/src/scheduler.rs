@@ -36,7 +36,7 @@ use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::cgroup::CgroupManager;
 use crate::model::{
     command_with_inner_jobs, preferred_inner_jobs, step_classification, DagConfig, RunResult, Step,
-    StepOutcome,
+    StepOutcome, CPU_TIMEOUT_HARD_GRACE,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -48,6 +48,10 @@ pub type BoxedCgroups = Option<Arc<dyn CgroupManager>>;
 
 /// Per-step monitor poll interval (seconds) for descendant-thread-peak sampling.
 const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+
+/// `SIGXCPU` signal number (soft `RLIMIT_CPU` breach). A child killed by it reports exit code
+/// `-24`; we map that to a CPU-budget failure when the step set a positive `cpu_timeout`.
+const SIGXCPU: i64 = 24;
 
 /// Scheduler idle interval between ready-set sweeps (matches Python's `time.sleep(0.05)`).
 const LOOP_SLEEP: Duration = Duration::from_millis(50);
@@ -486,8 +490,27 @@ fn run_step(ctx: StepCtx) {
         None
     };
 
-    let mut cmd = Command::new("bash");
-    cmd.arg("-c").arg(&run_cmd);
+    // When a CPU-time budget is set, run the step under `prlimit --cpu=soft:hard`, which installs
+    // RLIMIT_CPU before exec. The limit is inherited across the whole fork/exec tree, so any
+    // grandchild is subject to it too. soft (SIGXCPU) == cpu_timeout is the intended trip point
+    // (default action terminates); hard (SIGKILL) == cpu_timeout + grace force-kills a step that
+    // catches/ignores SIGXCPU. RLIMIT_CPU accounts PHYSICAL CPU-seconds, so it is load-invariant:
+    // host contention inflates wall time but never the CPU budget. No `unsafe`/`libc` needed.
+    let mut cmd = if step.cpu_timeout > 0 {
+        let soft = step.cpu_timeout;
+        let hard = step.cpu_timeout + CPU_TIMEOUT_HARD_GRACE;
+        let mut c = Command::new("prlimit");
+        c.arg(format!("--cpu={soft}:{hard}"));
+        c.arg("--");
+        c.arg("bash");
+        c.arg("-c");
+        c.arg(&run_cmd);
+        c
+    } else {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(&run_cmd);
+        c
+    };
     for (k, v) in &step.env {
         cmd.env(k, v);
     }
@@ -646,6 +669,10 @@ fn run_step(ctx: StepCtx) {
         None => status.signal().map(|s| -(s as i64)),
     };
     let ok = returncode == Some(0) && !timed_out;
+    // A positive cpu_timeout that ends in SIGXCPU means RLIMIT_CPU tripped: the step overran its
+    // physical CPU-second budget. Kept distinct from a wall-clock TIMEOUT (set by the timeout
+    // thread) and only considered when the wall timeout did NOT already fire.
+    let cpu_timed_out = step.cpu_timeout > 0 && !timed_out && returncode == Some(-SIGXCPU);
 
     // Combined captured output (stdout then stderr) for the summary + failure detail.
     let mut combined: Vec<u8> = out_buf.lock().unwrap().clone();
@@ -715,6 +742,14 @@ fn run_step(ctx: StepCtx) {
             StepOutcome::aborted_outcome(tag.clone(), elapsed, summary.clone(), returncode)
         } else if ok {
             StepOutcome::passed(tag.clone(), elapsed, summary.clone(), returncode)
+        } else if cpu_timed_out {
+            StepOutcome::cpu_timed_out(
+                tag.clone(),
+                elapsed,
+                summary.clone(),
+                returncode,
+                step.cpu_timeout,
+            )
         } else {
             StepOutcome::failed(
                 tag.clone(),
@@ -885,6 +920,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         }
     }
@@ -1017,5 +1053,43 @@ mod tests {
         };
         let res = run_dag(&cfg, 1, false, 0);
         assert!(res.ok, "expected '-j4' to be appended so the check passes");
+    }
+
+    #[test]
+    fn cpu_budget_trips_before_generous_wall() {
+        // A CPU runaway (infinite busy-loop) under a GENEROUS wall timeout but an AGGRESSIVE CPU
+        // budget must be killed by RLIMIT_CPU (SIGXCPU) at ~cpu_timeout CPU-seconds — well before
+        // the 60s wall — proving the CPU budget bounds a runaway without relying on the wall clock.
+        let mut s = step("g", "runaway", "while : ; do : ; done", &[], 0.0, &[]);
+        s.cpu_timeout = 1;
+        s.timeout = 60;
+        let cfg = DagConfig {
+            steps: vec![s],
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let res = run_dag(&cfg, 1, false, 0);
+        let wall = start.elapsed().as_secs_f64();
+        assert!(!res.ok, "a CPU runaway must fail the run");
+        let o = &res.outcomes[0];
+        assert_eq!(
+            o.returncode,
+            Some(-SIGXCPU),
+            "the runaway should be killed by SIGXCPU (RLIMIT_CPU), got {:?}",
+            o.returncode
+        );
+        assert!(
+            o.reason.contains("CPU-TIMEOUT"),
+            "reason should name the CPU budget, got: {}",
+            o.reason
+        );
+        assert!(
+            !o.aborted,
+            "a CPU-budget kill is a genuine failure, not an eager-exit abort"
+        );
+        assert!(
+            wall < 30.0,
+            "the CPU budget must trip well before the 60s wall (took {wall:.1}s)"
+        );
     }
 }
