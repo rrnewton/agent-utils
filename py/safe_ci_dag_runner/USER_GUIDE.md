@@ -922,8 +922,10 @@ The CLI `run` performs the outer `reexec_in_scope` step for you: on a Linux host
 working systemd `--user` scope, a bare `run` re-execs into a transient delegated scope and boxes every
 step — no wrapper needed. Where that environment is unavailable it **errors with exit 3** rather than
 silently running unprotected; pass `--allow-cgroup-failure` to run un-boxed with a visible warning.
-The old opt-in `--cgroups` flag is now a deprecated no-op (accepted for backward compatibility), and
-the Python and Rust builds behave identically here. Use the `reexec_in_scope` + `Cgroups` recipe above
+The old opt-in `--cgroups` flag has been **removed**: once boxing became the default it enforced
+nothing, and a flag that enforces nothing is worse than no flag. Passing `--cgroups` is now a hard
+error (exit 2) that names the replacement, in both the Python and Rust builds. Use the
+`reexec_in_scope` + `Cgroups` recipe above
 when you want the same turn-key boxing from your own Python program rather than the CLI.
 
 ## Troubleshooting
@@ -971,9 +973,9 @@ broken previously and is now fixed): `run_dag(cfg, metrics=CsvMetricsSink(dir, g
 CLI `run --perf-dir DIR`, writes a per-step CSV and a whole-run CSV, creating the directory and files
 as needed. The per-step CSV's columns are derived from the actual row keys, so it never drops data.
 The dynamic `cpu.*` per-step columns only appear when cgroup boxing is active (see the "containment
-is DEGRADED" note above): the CLI's `--cgroups` only boxes steps when the process is already inside a
-delegated cgroup-v2 scope, so on a plain host those cgroup-derived measurements are simply absent from
-the CSV rather than an error.
+is DEGRADED" note above): a bare `run` boxes steps only when it can enter a delegated cgroup-v2 scope,
+so on a plain host those cgroup-derived measurements are simply absent from the CSV rather than an
+error.
 
 **Python vs Rust.** The Rust binary is at **full parity** with the Python build: `run`, `list`,
 `ascii`, `dot`, `json`, and `quickstart` all work, with `list`/`ascii`/`dot` output byte-identical to
@@ -981,7 +983,7 @@ the Python build, `json` parsed-identical, and `run` exit code + step counts ide
 `cross/differential.py` harness). The Rust `run` also **boxes each step in a cgroup-v2 sandbox by
 default** (identical `--allow-cgroup-failure` opt-out and exit-3 behavior) and **writes per-step +
 whole-run perf CSVs via `--perf-dir`**; the earlier Python-only gap for Linux cgroup boxing, perf
-logging, and ambient-load bucketing has been closed. `--cgroups` is a deprecated no-op in both builds.
+logging, and ambient-load bucketing has been closed. The removed `--cgroups` flag hard-errors in both builds.
 Either package works — install the Python one with
 `pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"`, or build the Rust crate
 under `rs/`.

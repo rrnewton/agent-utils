@@ -320,7 +320,6 @@ struct RunArgs {
     profile_sync: Option<String>,
     profile_sync_direction: String,
     keep_going: bool,
-    cgroups: bool,
     allow_cgroup_failure: bool,
     verbosity: i64,
     quiet: bool,
@@ -341,7 +340,6 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         profile_sync: None,
         profile_sync_direction: "both".to_string(),
         keep_going: false,
-        cgroups: false,
         allow_cgroup_failure: false,
         verbosity: 1,
         quiet: false,
@@ -392,7 +390,14 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 a.profile_sync_direction = v;
             }
             "-k" | "--keep-going" => a.keep_going = true,
-            "--cgroups" => a.cgroups = true,
+            // `--cgroups` was an accepted no-op (boxing has been ON by default). It is now removed
+            // rather than silently tolerated: a flag that enforces nothing is worse than no flag.
+            "--cgroups" => {
+                return Err("--cgroups has been removed: cgroup-v2 boxing is ON by default, so the \
+                            flag enforced nothing. Drop it. To tolerate a cgroup setup failure \
+                            instead of aborting, use --allow-cgroup-failure."
+                    .to_string());
+            }
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
@@ -1350,9 +1355,6 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         Ok(cg) => cg,
         Err(code) => return code,
     };
-    if a.cgroups {
-        eprintln!("{PROG}: note: --cgroups is a deprecated no-op (boxing is ON by default)");
-    }
 
     // Plan-time profile-store FEEDBACK (ds-7pzdgm / ds-afzsqf): refine each step's est_duration_s
     // and rss_baseline_bytes from the recorded store, then pick the dispatch order for --planner.

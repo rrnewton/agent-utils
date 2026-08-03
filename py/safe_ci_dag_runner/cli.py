@@ -367,11 +367,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="on a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps)",
     )
     run_p.add_argument(
-        "--cgroups",
-        action="store_true",
-        help="(deprecated no-op; cgroup-v2 boxing is now ON by default) accepted for compatibility",
-    )
-    run_p.add_argument(
         "--allow-cgroup-failure",
         action="store_true",
         help="downgrade to a best-effort UNBOXED run (with a visible warning) instead of erroring "
@@ -1447,7 +1442,18 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    ns = parser.parse_args(list(argv) if argv is not None else None)
+    raw = list(argv) if argv is not None else list(sys.argv[1:])
+    # `--cgroups` was an accepted no-op (boxing has been ON by default). It is now removed rather
+    # than silently tolerated: a flag that enforces nothing is worse than no flag. Emit a targeted
+    # hard error (exit 2, matching bad-usage) instead of argparse's generic "unrecognized argument".
+    if "--cgroups" in raw:
+        sys.stderr.write(
+            f"{PROG}: error: --cgroups has been removed: cgroup-v2 boxing is ON by default, so the "
+            "flag enforced nothing. Drop it. To tolerate a cgroup setup failure instead of "
+            "aborting, use --allow-cgroup-failure.\n"
+        )
+        return 2
+    ns = parser.parse_args(raw)
     c = Palette(_color_enabled(sys.stdout))
 
     if bool(ns.userguide):
