@@ -18,7 +18,12 @@ import sys
 from pathlib import Path
 
 # Console-script entrypoints declared in py/pyproject.toml ([project.scripts]).
-ENTRYPOINT_MODULES = ["safe_ci_dag_runner", "tick_hub", "pr_landing_planner"]
+ENTRYPOINT_MODULES = [
+    "safe_ci_dag_runner",
+    "tick_hub",
+    "pr_landing_planner",
+    "parallel_experiment_runner",
+]
 
 # Invocations that MUST succeed with no optional dependencies installed.
 DEPFREE_ARGS: list[list[str]] = [["--help"], ["--version"], []]
