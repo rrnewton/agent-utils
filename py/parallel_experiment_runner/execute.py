@@ -51,6 +51,7 @@ from parallel_experiment_runner.profile import (
     Sample,
     profile_identity,
 )
+from parallel_experiment_runner import reaper
 
 #: The experiment scope's names — distinct from ``safe-ci.slice`` so a sweep and a CI run box
 #: under separate slices/scopes and never share a CPUQuota by accident.
@@ -111,6 +112,11 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
             file=sys.stderr,
         )
         return None, 3
+    # OUTER process (not yet in a scope): before minting our own scope, reap any scopes left
+    # behind by abandoned prior runs (agent recycle / 120s tool cap / detached run outliving its
+    # launcher). Abandonment is the common exit path, so next-run-cleans-previous is what keeps
+    # leaked, futex-parked descendants from accumulating across runs.
+    reaper.reap_orphaned_runs(naming, emit=lambda m: print(m, file=sys.stderr))
     if allow_failure:
         print(
             f"{PROG}: warning: resource containment not established (--allow-cgroup-failure); "
@@ -423,7 +429,8 @@ def run_sweep(
         emit(
             f"round {round_index}: launching width={min(width, len(batch))} "
             f"(limiting={fit.limiting_dimension}; lane rev {slice_.revision}, "
-            f"load1m={live.load_avg_1m:.1f}) over {len(batch)} seed(s)…"
+            f"cpu headroom {live.available_cpu_cores}/{live.cpu_cores} cores measured idle) "
+            f"over {len(batch)} seed(s)…"
         )
         round_result = execute_round(plan, cgroups=cgroups)
         rounds.append(round_result)
