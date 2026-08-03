@@ -75,19 +75,25 @@ def test_scan_confounds_cpu0_always_and_irq_reasons() -> None:
 
 def test_scan_confounds_pinned_kthread_but_not_percpu(tmp_path: Path) -> None:
     proc = tmp_path / "proc"
-    # A genuinely-pinned helper kthread on core 3 (comm does not end in /3) -> confound.
+    # A genuinely-pinned helper kthread on core 3 (comm does not encode core 3) -> confound.
     _make_kthread(proc, pid=101, comm="my-worker/0", cpus_allowed="3")
-    # A per-cpu kthread naturally on core 2 (comm ends in /2) -> must NOT confound.
+    # A per-cpu kthread naturally on core 2 (bare index form) -> must NOT confound.
     _make_kthread(proc, pid=102, comm="ksoftirqd/2", cpus_allowed="2")
     # A userspace process pinned to core 1 -> not a kernel thread, ignored.
     _make_kthread(proc, pid=103, comm="app", cpus_allowed="1", cmdline=b"app\x00--flag\x00")
+    # Per-cpu KWORKERS on cores 4 and 5 (kworker/N:M[-suffix]) -> must NOT confound.
+    # These are the common case the old bare-endswith test wrongly flagged.
+    _make_kthread(proc, pid=104, comm="kworker/4:1", cpus_allowed="4")
+    _make_kthread(proc, pid=105, comm="kworker/5:1-events", cpus_allowed="5")
 
     verdict = scan_confounds(
-        range(4), interrupts_text="", proc_root=proc, include_kthreads=True
+        range(6), interrupts_text="", proc_root=proc, include_kthreads=True
     )
     assert verdict[3].reasons == ("kthread:my-worker/0",)
-    assert verdict[2].is_clean  # per-cpu kthread excluded
+    assert verdict[2].is_clean  # bare-index per-cpu kthread excluded
     assert verdict[1].is_clean  # userspace process excluded
+    assert verdict[4].is_clean  # kworker/4:1 recognised as per-cpu home
+    assert verdict[5].is_clean  # kworker/5:1-events recognised as per-cpu home
 
 
 def _make_kthread(

@@ -178,10 +178,25 @@ def _scan_pinned_kthreads(proc_root: Path) -> dict[int, tuple[str, ...]]:
         if allowed is None or len(allowed) != 1:
             continue  # unpinned or spread kthread — not a single-core confound
         (core,) = tuple(allowed)
-        if comm.endswith(f"/{core}"):
-            continue  # natural per-cpu home (ksoftirqd/N etc.)
+        if _percpu_home(comm) == core:
+            continue  # natural per-cpu home: ksoftirqd/N, migration/N, kworker/N:M[-suffix]
         acc.setdefault(core, []).append(f"kthread:{comm}")
     return {core: tuple(tags) for core, tags in acc.items()}
+
+
+def _percpu_home(comm: str) -> int | None:
+    """Core index a per-cpu kernel thread names itself after, or ``None``.
+
+    Per-cpu helpers encode their home core in the segment after the last ``/``:
+    ``ksoftirqd/7`` and ``migration/7`` (bare index), but also ``kworker/7:1`` and
+    ``kworker/7:1-events`` (index followed by ``:worker`` and an optional ``-suffix``).
+    The bare-``endswith`` test missed the kworker forms — the most common per-cpu
+    threads — and wrongly flagged their cores as confounds. Unbound rescuer kworkers
+    (``kworker/R-kblockd``) have no leading integer and return ``None`` (they are also
+    spread across cores, so the single-core pin filter excludes them anyway)."""
+    seg = comm.rsplit("/", 1)[-1]
+    m = re.match(r"(\d+)", seg)
+    return int(m.group(1)) if m is not None else None
 
 
 def _status_field(status_path: Path, field: str) -> str | None:
