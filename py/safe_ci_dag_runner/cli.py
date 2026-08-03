@@ -55,6 +55,7 @@ from safe_ci_dag_runner.io import (
 from safe_ci_dag_runner.model import DagConfig, Step, step_classification
 from safe_ci_dag_runner.profile_enrich import container_core_budget
 from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink
+from safe_ci_dag_runner.admission import Admitter
 from safe_ci_dag_runner.scheduler import run_dag
 from safe_ci_dag_runner.sizing import jobs_for_budget, parse_size
 from safe_ci_dag_runner.viz import to_ascii, to_dot
@@ -376,6 +377,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="downgrade to a best-effort UNBOXED run (with a visible warning) instead of erroring "
         "when two-level cgroup-v2 + systemd --user scope boxing cannot be established",
+    )
+    run_p.add_argument(
+        "--admission",
+        action="store_true",
+        help="memory-primary admission control: reserve the whole box's worst-case footprint "
+        "against LIVE host memory + a shared cross-run ledger BEFORE launching any step, so the "
+        "box GRANTs, QUEUEs (printing its position), or is REFUSED with a reason instead of "
+        "silently contending on a saturated host. Off by default (behaviour unchanged).",
+    )
+    run_p.add_argument(
+        "--admission-wait",
+        metavar="SECONDS",
+        type=float,
+        default=None,
+        help="max seconds to wait in the admission queue before giving up and failing the box "
+        "(default: wait indefinitely for memory to free). Only meaningful with --admission.",
     )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
@@ -1416,6 +1433,15 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
         metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
 
+    # Opt-in memory-primary admission: the box reserves its worst-case footprint against live host
+    # memory + the shared ledger BEFORE any step launches (GRANT/QUEUE/REFUSE), so it never
+    # silently contends on a saturated host. Off by default -> admitter=None -> unchanged.
+    admitter: Admitter | None = None
+    admission_wait: float | None = None
+    if bool(ns.admission):
+        admitter = Admitter()
+        admission_wait = ns.admission_wait if isinstance(ns.admission_wait, float) else None
+
     result = run_dag(
         cfg,
         jobs=jobs,
@@ -1425,6 +1451,8 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         verbosity=verbosity,
         order=list(plan.order),
         core_budget=core_budget,
+        admitter=admitter,
+        admission_wait_s=admission_wait,
     )
     passed = sum(1 for o in result.outcomes if o.ok)
     failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)
