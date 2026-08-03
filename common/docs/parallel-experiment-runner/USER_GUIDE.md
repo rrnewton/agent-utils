@@ -5,15 +5,26 @@ two-level cgroup-v2 scope. A seed sweep is one command template with a `{seed}` 
 over a range of seeds — a chaos search, a fuzz sweep, a flaky-repro hunt, a parameter scan.
 
 This tool exists because unbounded parallel experiments once left hundreds of processes piled up
-on a host. Two separate measurements sharpened *how* they piled up: the CPU "saturation" was
-largely **phantom** — most of those processes were zombies and the alarming load average counts
-uninterruptible-sleep, not CPU demand (the box was ~64% idle) — while the *real* damage was
-**leaked descendants that nothing ever reaped** (415 futex-parked threads accumulated across 8
-abandoned runs, consuming zero CPU and zero memory). This tool fixes both structurally:
-**concurrency is a declared, enforced number sized from measured idle headroom** (not a phantom
-load reading), every worker runs under real cgroup limits, a worker that breaches a limit is
-cleanly killed with a message naming what breached and by how much, and every fresh run
-**reaps the leaked scopes of abandoned predecessors**.
+on a host. Reproduction sharpened *how* they piled up, and corrected two first impressions:
+
+- The CPU "saturation" was largely **phantom** — most of those processes were zombies and the
+  alarming load average counts uninterruptible-sleep, not CPU demand (the box was ~64% idle). So
+  concurrency should be sized from **measured idle headroom**, not from a load reading.
+- The zombies were real and genuinely held **PID slots** at **zero CPU and zero memory** — a box
+  that validated only cpu and memory would have reported perfect health while they piled up. That
+  is what the **pids** axis catches. But their *cause* was not a leaked `tracing-appender` thread
+  (that was a 15-char `comm`-truncation artifact, `tracing-appende`; five reproduced abandonment
+  scenarios stranded **zero** workers). The cause was a **live, hung `target-runner --strict --verify`**
+  — its main parked in tokio `epoll_wait` while the guest made no progress — holding a PID namespace
+  open so the kernel never reaped the zombies inside it.
+
+A live hang is exactly what a **cpu-time / wall backstop** exists to kill, and the box kills it
+with a **cgroup-subtree `cgroup.kill`** that takes the hung main *and everything in its PID
+namespace* at once — releasing the namespace so the zombies are reaped, rather than killing one pid
+and inheriting the orphans. So containment is the whole fix: **concurrency is a declared, enforced
+number sized from measured idle headroom**, every worker runs under real cgroup limits on four
+axes, and a worker that breaches a limit — including a hang — is cleanly killed, subtree and
+namespace included, with a message naming what breached and by how much.
 
 ## Resource containment, not a security sandbox
 
@@ -142,25 +153,26 @@ silently run uncontained. `--allow-cgroup-failure` opts into an explicit UNCONTA
 (process-group teardown only, no per-worker caps) — not recommended, and the reason the box is the
 point.
 
-### Reap-on-teardown: abandonment is the normal exit path
+### The kill reclaims the namespace, not just the process
 
-A limit that is never breached still leaks if nothing reaps. Here **abandonment is the common exit,
-not the exception**: an agent recycle, the 120-second tool cap killing a run mid-flight, or a
-detached run outliving its launcher all SIGKILL the launcher before any `finally` block or
-SIGINT/SIGTERM handler can run. When that happens the transient `parallel-experiment-<pid>.scope`
-stays `active running` with its descendants still inside it — most damagingly `setsid`/double-forked
-escapees (e.g. `tracing-appender` workers parked in `__futex_wait`, each pinning a PID namespace so
-its zombies are never reaped). Those descendants burn **zero CPU and zero memory**, so a box that
-validated only the CPU and memory axes would report perfect health while the leak accumulated, and
-`systemd-run --collect` will not GC a scope that still has live members.
+The zombie pile-up that motivated this tool looked at first like leaked teardown threads that a
+"clean up after abandoned runs" reaper would fix. Reproduction refuted that: five abandonment
+scenarios (SIGKILL the launcher mid-run, launcher-then-guest kill, `--verify` kill mid-Run-1, six
+staggered kills) each stranded **zero** workers. A SIGKILLed launcher's direct children die with
+it, and `install_scope_teardown`'s SIGTERM/SIGKILL/atexit hook `cgroup.kill`s the whole scope on
+the exits that *do* run a handler. There is no leaked-thread class to reap on teardown.
 
-So the box **cleans up its own descendants**: on every fresh launch, before it mints its own scope,
-it enumerates sibling `parallel-experiment-*.scope` units and, for each whose launcher pid is dead,
-`cgroup.kill`s and stops it — logging the unit, the dead pid, and how many tasks it reaped (never a
-silent cleanup). This is next-run-cleans-previous, so leaked descendants cannot pile up across runs.
-Reaping is conservative: a scope whose launcher pid is still alive is left untouched (a live run
-owns it), so the only failure mode is a missed reap under pid reuse — never a false kill of a
-healthy run.
+What actually held the zombies open was a **live, hung** `target-runner --strict --verify` — its main
+parked in tokio `epoll_wait` while the guest made no progress — keeping a PID namespace alive so the
+kernel could not reap the zombies inside it. That is a running process over its time budget, and it
+is precisely what the per-worker **cpu-time / wall backstop** kills. The requirement that follows is
+about *how* the kill lands: it must reclaim the **namespace**, not just one process. It does — every
+breach (and normal exit) routes through a **cgroup-subtree `cgroup.kill`** (see
+`safe_ci_dag_runner.teardown.reap`) that SIGKILLs *every* member of the worker's cgroup atomically,
+including `setsid`/double-fork escapees a process-group kill would miss. When the hung main and all
+its namespace peers die together, the namespace refcount drops to zero and the kernel reaps the
+zombies — so the box does not kill one pid and inherit the orphans. No separate teardown reaper is
+needed; the containment kill is the fix.
 
 ## Spec files
 
