@@ -30,10 +30,15 @@ import json
 import math
 import re
 from collections.abc import Mapping
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
-import yaml
-from yaml.nodes import ScalarNode
+if TYPE_CHECKING:
+    # PyYAML is a dependency of the YAML codepaths ONLY. It is imported lazily inside
+    # `_core_loader()` / `_core_dumper()` (and the two YAML entry points) so that reading or
+    # executing a JSON DAG — the entire hermit CI path — never requires PyYAML to be installed.
+    # Under `from __future__ import annotations` these names are needed for type checking only.
+    import yaml
+    from yaml.nodes import ScalarNode
 
 from safe_ci_dag_runner.model import (
     DEFAULT_JOBS_FLAG,
@@ -306,28 +311,43 @@ def _resolve_core_scalar(value: str) -> object:
     return value
 
 
-def _construct_core_scalar(loader: yaml.SafeLoader, node: ScalarNode) -> object:
-    return _resolve_core_scalar(loader.construct_scalar(node))
+# Lazily-built, cached core-schema loader class. `None` until the first YAML load, so importing
+# this module (and every JSON codepath) never touches PyYAML.
+_CORE_LOADER_CLS: type[yaml.SafeLoader] | None = None
 
 
-class _CoreLoader(yaml.SafeLoader):
-    """A ``SafeLoader`` that resolves PLAIN scalars with :func:`_resolve_core_scalar`.
+def _core_loader() -> type[yaml.SafeLoader]:
+    """Build (once) a ``SafeLoader`` that resolves PLAIN scalars with :func:`_resolve_core_scalar`.
 
-    Every PLAIN (unquoted) scalar is routed to :func:`_construct_core_scalar` via a single
-    catch-all implicit resolver (installed below) that REPLACES PyYAML's default YAML-1.1 implicit
-    typing. Quoted and block scalars keep the default string tag, so a quoted ``"no"`` stays the
-    string ``"no"`` and a plain ``no`` also stays a string — matching serde_norway and never
-    resurrecting the Norway problem.
+    PyYAML is imported HERE, lazily, not at module import — so reading/executing a JSON DAG never
+    requires PyYAML; only the YAML codepaths do. Every PLAIN (unquoted) scalar is routed to the
+    core-schema constructor via a single catch-all implicit resolver that REPLACES PyYAML's default
+    YAML-1.1 implicit typing. Quoted and block scalars keep the default string tag, so a quoted
+    ``"no"`` stays the string ``"no"`` and a plain ``no`` also stays a string — matching
+    serde_norway and never resurrecting the Norway problem.
     """
+    global _CORE_LOADER_CLS
+    if _CORE_LOADER_CLS is not None:
+        return _CORE_LOADER_CLS
+    import yaml
+    from yaml.nodes import ScalarNode
 
+    def _construct_core_scalar(loader: yaml.SafeLoader, node: ScalarNode) -> object:
+        return _resolve_core_scalar(loader.construct_scalar(node))
 
-# Replace PyYAML's implicit resolvers with ONE catch-all under the wildcard (``None``) first-char
-# key: every plain scalar therefore resolves to ``_CORE_TAG`` and is handed to our core-schema
-# constructor, while quoted/block scalars fall through to the default string tag. Assigned directly
-# (not via the untyped ``add_implicit_resolver`` classmethod) so this stays mypy-strict clean, and
-# only on the subclass so PyYAML's shared ``SafeLoader`` table is left untouched.
-_CoreLoader.yaml_implicit_resolvers = {None: [(_CORE_TAG, re.compile(r".*", re.DOTALL))]}
-_CoreLoader.add_constructor(_CORE_TAG, _construct_core_scalar)
+    class _CoreLoader(yaml.SafeLoader):
+        pass
+
+    # Replace PyYAML's implicit resolvers with ONE catch-all under the wildcard (``None``)
+    # first-char key: every plain scalar therefore resolves to ``_CORE_TAG`` and is handed to our
+    # core-schema constructor, while quoted/block scalars fall through to the default string tag.
+    # Assigned directly (not via the untyped ``add_implicit_resolver`` classmethod) so this stays
+    # mypy-strict clean, and only on the subclass so PyYAML's shared ``SafeLoader`` table is left
+    # untouched.
+    _CoreLoader.yaml_implicit_resolvers = {None: [(_CORE_TAG, re.compile(r".*", re.DOTALL))]}
+    _CoreLoader.add_constructor(_CORE_TAG, _construct_core_scalar)
+    _CORE_LOADER_CLS = _CoreLoader
+    return _CoreLoader
 
 
 def dag_from_yaml(text: str) -> DagConfig:
@@ -336,13 +356,15 @@ def dag_from_yaml(text: str) -> DagConfig:
     YAML is ISOMORPHIC to the JSON schema: the parsed object is funneled through the SAME typed
     narrowing (:func:`_dag_from_obj`) that :func:`dag_from_json` uses, AND plain scalars are
     resolved with the SAME YAML-1.2 core-schema rules the Rust build (serde_norway) uses (see
-    :class:`_CoreLoader`), so a given ``.yaml`` builds the identical model — or is rejected — in
+    :func:`_core_loader`), so a given ``.yaml`` builds the identical model — or is rejected — in
     both builds. The only surface differences are comments and multi-line block scalars.
     """
+    import yaml
+
     try:
         # yaml.load returns Any; pin it to `object` at the parse boundary so no Any leaks past here
         # (the strict narrowing in _dag_from_obj re-validates every field's type anyway).
-        raw: object = yaml.load(text, Loader=_CoreLoader)
+        raw: object = yaml.load(text, Loader=_core_loader())
     except yaml.YAMLError as exc:
         # Match the Rust build, which returns a load error (exit 2) on malformed YAML rather than
         # letting an exception escape.
@@ -463,23 +485,38 @@ def dag_to_json(cfg: DagConfig) -> str:
     return json.dumps(_dag_to_obj(cfg), indent=2, ensure_ascii=False)
 
 
-def _represent_core_str(dumper: yaml.SafeDumper, data: str) -> yaml.nodes.ScalarNode:
-    """Force-quote any string that :func:`_resolve_core_scalar` would re-read as a NON-string.
+# Lazily-built, cached core-schema dumper class (see :func:`_core_loader` for the lazy-PyYAML
+# rationale). `None` until the first YAML emit.
+_CORE_DUMPER_CLS: type[yaml.SafeDumper] | None = None
 
-    PyYAML's default dumper decides quoting from its YAML-1.1 resolver, so it leaves e.g. ``1e3``
-    or ``0o17`` (and the empty string) UNQUOTED — but :class:`_CoreLoader` (YAML-1.2 core) would
-    then re-read those as a float / int / null. Quoting exactly those strings keeps
-    :func:`dag_to_yaml` output round-trippable back through :func:`dag_from_yaml`.
+
+def _core_dumper() -> type[yaml.SafeDumper]:
+    """Build (once) a ``SafeDumper`` whose string representer round-trips through :func:`_core_loader`.
+
+    PyYAML is imported lazily here, so JSON serialization never requires it.
     """
-    style = "'" if not isinstance(_resolve_core_scalar(data), str) else None
-    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
+    global _CORE_DUMPER_CLS
+    if _CORE_DUMPER_CLS is not None:
+        return _CORE_DUMPER_CLS
+    import yaml
 
+    def _represent_core_str(dumper: yaml.SafeDumper, data: str) -> yaml.nodes.ScalarNode:
+        """Force-quote any string that :func:`_resolve_core_scalar` would re-read as a NON-string.
 
-class _CoreDumper(yaml.SafeDumper):
-    """SafeDumper whose string representer round-trips through :class:`_CoreLoader`."""
+        PyYAML's default dumper decides quoting from its YAML-1.1 resolver, so it leaves e.g.
+        ``1e3`` or ``0o17`` (and the empty string) UNQUOTED — but the core loader (YAML-1.2 core)
+        would then re-read those as a float / int / null. Quoting exactly those strings keeps
+        :func:`dag_to_yaml` output round-trippable back through :func:`dag_from_yaml`.
+        """
+        style = "'" if not isinstance(_resolve_core_scalar(data), str) else None
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
 
+    class _CoreDumper(yaml.SafeDumper):
+        pass
 
-_CoreDumper.add_representer(str, _represent_core_str)
+    _CoreDumper.add_representer(str, _represent_core_str)
+    _CORE_DUMPER_CLS = _CoreDumper
+    return _CoreDumper
 
 
 def dag_to_yaml(cfg: DagConfig) -> str:
@@ -488,12 +525,14 @@ def dag_to_yaml(cfg: DagConfig) -> str:
     YAML byte-output need NOT match the Rust build (only YAML *loading* is isomorphic across the
     two languages); the emitted document round-trips back through :func:`dag_from_yaml` to an
     identical :class:`DagConfig` — including exotic string values like ``"1e3"`` or ``"0o17"``,
-    which :class:`_CoreDumper` force-quotes so the core-schema loader reads them back as strings.
+    which :func:`_core_dumper` force-quotes so the core-schema loader reads them back as strings.
     Built from the same canonical document dict as :func:`dag_to_json`.
     """
+    import yaml
+
     return yaml.dump(
         _dag_to_obj(cfg),
-        Dumper=_CoreDumper,
+        Dumper=_core_dumper(),
         sort_keys=False,  # preserve our deliberate key order
         allow_unicode=True,  # keep unicode raw rather than \\xNN escapes
         default_flow_style=False,  # block style, human-readable
