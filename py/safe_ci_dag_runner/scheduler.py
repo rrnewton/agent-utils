@@ -48,7 +48,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 from safe_ci_dag_runner.ambient import (
     AmbientSnapshot,
@@ -73,7 +73,8 @@ from safe_ci_dag_runner.protocols import (
     RunWindow,
     StepOutcome,
 )
-from safe_ci_dag_runner.sizing import step_mem_cap_bytes
+from safe_ci_dag_runner.admission import Admitter, Verdict
+from safe_ci_dag_runner.sizing import jobs_footprint_bytes, step_mem_cap_bytes
 from safe_ci_dag_runner.teardown import reap
 
 __all__ = ["Runner", "run_dag"]
@@ -611,6 +612,46 @@ class Runner:
         )
 
 
+def _admit_box(
+    admitter: Admitter,
+    mem_bytes: int,
+    box: str,
+    *,
+    poll_s: float,
+    wait_s: float | None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> str | None:
+    """Admit the whole box against LIVE host memory before it launches a single step.
+
+    Returns the reservation id on GRANT (release it after the run), or ``None`` when the box
+    must NOT run — either REFUSED (its footprint alone exceeds the whole-host budget, so waiting
+    can never help) or the caller's ``wait_s`` queue budget elapsed. The QUEUE message (with its
+    position) is printed whenever it changes, so a box that is waiting SAYS SO instead of
+    silently contending — the one behaviour admission must never skip."""
+    waited = 0.0
+    last_msg = ""
+    while True:
+        decision = admitter.request(mem_bytes, box=box)
+        if decision.verdict is Verdict.GRANT:
+            print(f"[admission] {decision.message}")
+            return decision.reservation_id
+        if decision.verdict is Verdict.REFUSE:
+            print(f"[admission] {decision.message}")
+            return None
+        # QUEUE: print position when it changes, then wait (bounded by wait_s if set).
+        if decision.message != last_msg:
+            print(f"[admission] {decision.message}")
+            last_msg = decision.message
+        if wait_s is not None and waited >= wait_s:
+            print(
+                f"[admission] gave up after waiting {int(waited)}s in queue for {box!r}; "
+                "the host did not free enough memory."
+            )
+            return None
+        sleep(poll_s)
+        waited += poll_s
+
+
 def run_dag(
     cfg: DagConfig,
     *,
@@ -621,6 +662,10 @@ def run_dag(
     verbosity: int = 1,
     order: Sequence[str] | None = None,
     core_budget: int | None = None,
+    admitter: Admitter | None = None,
+    admission_box: str = "safe-ci-dag",
+    admission_poll_s: float = 5.0,
+    admission_wait_s: float | None = None,
 ) -> RunResult:
     """Run a whole DAG and return its :class:`RunResult`.
 
@@ -644,6 +689,18 @@ def run_dag(
     :param core_budget: total inner-jobs core budget ``P`` for the CPA dispatch gate; when set the
         scheduler never lets the summed width of concurrently-running steps exceed it. ``None``
         disables the gate (the non-CPA default).
+    :param admitter: memory-primary admission controller. When supplied, the WHOLE box is admitted
+        against live host memory + the shared reservation ledger BEFORE any step launches: its
+        worst-case footprint (:func:`safe_ci_dag_runner.sizing.jobs_footprint_bytes`) is reserved
+        on GRANT and released after the run; a REFUSE (footprint exceeds the whole-host budget) or
+        an exhausted queue wait returns a failed :class:`RunResult` without running a step, so the
+        box never silently contends for a saturated host. ``None`` (default) disables admission —
+        behaviour is unchanged. This composes with, and does not replace, the per-step
+        ``core_budget`` / cpu_timeout / cgroup caps, which remain the INTRA-box gates.
+    :param admission_box: human-readable label for the box in admission messages.
+    :param admission_poll_s: seconds between re-checks while QUEUEd.
+    :param admission_wait_s: max seconds to wait in the queue before giving up (``None`` waits
+        indefinitely for memory to free).
     """
     sink: MetricsSink = metrics if metrics is not None else _NoopMetricsSink()
     manager: CgroupManager = cgroups if cgroups is not None else _NoopCgroupManager()
@@ -665,28 +722,53 @@ def run_dag(
         core_budget=core_budget,
     )
     window: RunWindow = sink.start_run_window()
-    ok = runner.run()
 
-    # NORMAL-exit backstop: reap any step cgroup that still has live procs (a setsid orphan a
-    # step left behind lives there). Does NOT stop the outer scope, so a green run stays green.
-    if manager.enabled:
-        leftover = manager.kill_all_remaining()
-        if leftover:
-            print(
-                f"[scheduler] reaped {leftover} leftover step cgroup(s) on exit "
-                "(setsid orphans a step left behind)."
-            )
-
-    result = runner.result()
-    window.finish(result="pass" if ok else "fail", n_steps=len(runner.done), jobs=jobs)
-    location = sink.record_step_profiles(result.step_profile_rows, jobs=jobs)
-    if metrics is not None and location is None and result.step_profile_rows:
-        # A real sink was supplied yet recording was skipped — surface it (No Silent Failure).
-        _warn(
-            f"metrics sink recorded no location for {len(result.step_profile_rows)} step "
-            "profile row(s); the rows may have been dropped."
+    # Memory-primary admission: reserve the whole box's worst-case footprint against LIVE host
+    # memory + the shared ledger BEFORE launching a step. A REFUSE (or exhausted queue wait) is an
+    # honest non-start, not a silent contention. None disables admission (behaviour unchanged).
+    reservation_id: str | None = None
+    if admitter is not None:
+        footprint = jobs_footprint_bytes(cfg, jobs)
+        reservation_id = _admit_box(
+            admitter,
+            footprint,
+            admission_box,
+            poll_s=admission_poll_s,
+            wait_s=admission_wait_s,
         )
-    return result
+        if reservation_id is None:
+            # Box not admitted -> run nothing, report failure (an unrun box is NOT a pass).
+            runner.failed = True
+            result = runner.result()
+            window.finish(result="fail", n_steps=0, jobs=jobs)
+            return result
+
+    try:
+        ok = runner.run()
+
+        # NORMAL-exit backstop: reap any step cgroup that still has live procs (a setsid orphan a
+        # step left behind lives there). Does NOT stop the outer scope, so a green run stays green.
+        if manager.enabled:
+            leftover = manager.kill_all_remaining()
+            if leftover:
+                print(
+                    f"[scheduler] reaped {leftover} leftover step cgroup(s) on exit "
+                    "(setsid orphans a step left behind)."
+                )
+
+        result = runner.result()
+        window.finish(result="pass" if ok else "fail", n_steps=len(runner.done), jobs=jobs)
+        location = sink.record_step_profiles(result.step_profile_rows, jobs=jobs)
+        if metrics is not None and location is None and result.step_profile_rows:
+            # A real sink was supplied yet recording was skipped — surface it (No Silent Failure).
+            _warn(
+                f"metrics sink recorded no location for {len(result.step_profile_rows)} step "
+                "profile row(s); the rows may have been dropped."
+            )
+        return result
+    finally:
+        if admitter is not None and reservation_id is not None:
+            admitter.release(reservation_id)
 
 
 def _last_line(chunks: Sequence[bytes]) -> str:
