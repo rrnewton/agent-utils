@@ -31,6 +31,7 @@ from parallel_experiment_runner.model import (
     STATUS_CANCELLED,
     STATUS_CPU_TIMEOUT,
     STATUS_MEMORY_CAP,
+    STATUS_PIDS_CAP,
     STATUS_TIMEOUT,
     BREACH_STATUSES,
     CostEstimate,
@@ -73,12 +74,16 @@ Emit = Callable[[str], None]
 
 
 def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, int]:
-    """Establish the two-level cgroup-v2 boxing for a sweep (mirrors safe-ci's CLI bring-up).
+    """Establish the two-level cgroup-v2 RESOURCE CONTAINMENT for a sweep (mirrors safe-ci's CLI
+    bring-up).
 
-    Returns ``(manager, 0)`` when boxing is active, ``(None, 0)`` for an intentional UNBOXED run
-    (``allow_failure``), or ``(None, 3)`` when boxing is REQUIRED but unavailable and the caller
-    must exit 3. Boxing is ON BY DEFAULT: an unboxed sweep is the very failure mode this tool
-    exists to prevent, so it happens only with an explicit opt-out.
+    This is a resource box, not a security sandbox: it defends against a BUG in our own code
+    (leak memory, run forever, fork bomb) via cgroup CPU-time / memory / PID caps, and does NOT
+    reach for seccomp or user-namespace isolation. Returns ``(manager, 0)`` when containment is
+    active, ``(None, 0)`` for an intentional UNCONTAINED run (``allow_failure``), or ``(None, 3)``
+    when containment is REQUIRED but unavailable and the caller must exit 3. Containment is ON BY
+    DEFAULT: an uncontained sweep is the very failure mode this tool exists to prevent, so it
+    happens only with an explicit opt-out.
     """
     from safe_ci_dag_runner import cgroup as cg
 
@@ -88,41 +93,42 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
         if manager.enabled:
             cg.install_scope_teardown(naming=naming)
             print(
-                f"{PROG}: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-worker "
-                "memory/CPU/CPU-time caps + setsid-proof teardown).",
+                f"{PROG}: resource containment ACTIVE (two-level cgroup-v2 scope; per-worker "
+                "CPU-time/memory/PID caps + setsid-proof teardown).",
                 file=sys.stderr,
             )
             return manager, 0
         if allow_failure:
             print(
                 f"{PROG}: warning: inside a scope but per-worker cgroup setup failed; running "
-                "best-effort UNBOXED (--allow-cgroup-failure).",
+                "best-effort UNCONTAINED (--allow-cgroup-failure).",
                 file=sys.stderr,
             )
             return None, 0
         print(
             f"{PROG}: ERROR: inside a managed scope but per-worker cgroups could not be set up; "
-            "re-run with --allow-cgroup-failure to run UNBOXED.",
+            "re-run with --allow-cgroup-failure to run UNCONTAINED.",
             file=sys.stderr,
         )
         return None, 3
     if allow_failure:
         print(
-            f"{PROG}: warning: cgroup boxing not established (--allow-cgroup-failure); running "
-            "UNBOXED (process-group teardown only, no per-worker caps).",
+            f"{PROG}: warning: resource containment not established (--allow-cgroup-failure); "
+            "running UNCONTAINED (process-group teardown only, no per-worker caps).",
             file=sys.stderr,
         )
         return None, 0
     argv = [sys.executable, "-m", "parallel_experiment_runner", *sys.argv[1:]]
     reexeced_or_skipped = cg.reexec_in_scope(argv, memory_max=None, naming=naming)
     detail = (
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
+        "containment was skipped (e.g. CI without a systemd --user scope)"
         if reexeced_or_skipped
         else "cgroup-v2 + a working systemd --user scope are unavailable"
     )
     print(
-        f"{PROG}: ERROR: cgroup boxing could not be established: {detail}. Boxing every worker is "
-        "this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED.",
+        f"{PROG}: ERROR: resource containment could not be established: {detail}. Containing every "
+        "worker is this tool's primary purpose; re-run with --allow-cgroup-failure to run "
+        "UNCONTAINED.",
         file=sys.stderr,
     )
     return None, 3
@@ -153,7 +159,8 @@ def _read_log_tail(path: Path, limit: int = LOG_TAIL_BYTES) -> str:
 
 def _breach_message(
     status: str, *, limits_cpu: int | None, limits_mem: int | None, limits_wall: int,
-    cpu_s: float | None, peak_bytes: int | None, wall_s: float, oom_kills: int,
+    limits_pids: int | None, cpu_s: float | None, peak_bytes: int | None, wall_s: float,
+    oom_kills: int, pids_events: int,
 ) -> str:
     """A human-readable 'what breached and by how much' line for a breach status (requirement 4)."""
     if status == STATUS_CPU_TIMEOUT:
@@ -163,6 +170,13 @@ def _breach_message(
         used = f"{peak_bytes}B" if peak_bytes is not None else "unknown"
         cap = f"{limits_mem}B" if limits_mem is not None else "floor"
         return f"MEMORY-CAP: peak {used} >= memory.max {cap} ({oom_kills} oom_kill event(s))"
+    if status == STATUS_PIDS_CAP:
+        cap = f"{limits_pids}" if limits_pids is not None else "cap"
+        return (
+            f"PIDS-CAP: {pids_events} fork/clone(s) denied at pids.max {cap} "
+            "(fork-bomb / PID-exhaustion containment; worker contained not killed, reaped by "
+            "the cpu/wall guard)"
+        )
     if status == STATUS_TIMEOUT:
         return f"TIMEOUT: wall {wall_s:.0f}s >= {limits_wall}s backstop"
     if status == STATUS_CANCELLED:
@@ -178,8 +192,10 @@ def _classify_outcome(
 ) -> SeedOutcome:
     """Fold a safe-ci ``StepOutcome`` + its profile row into a :class:`SeedOutcome`.
 
-    Breach precedence (cancel > cpu-timeout > memory-cap > timeout) is applied BEFORE any
-    hit/miss decision, so an infrastructure kill is never counted as a discovered hit.
+    Breach precedence (cancel > cpu-timeout > memory-cap > pids-cap > timeout) is applied BEFORE
+    any hit/miss decision, so an infrastructure kill is never counted as a discovered hit. The
+    PID-cap axis sits below the two kill-based axes (a fork-bombing worker may also OOM or exhaust
+    CPU) and above the plain wall timeout, since a denied fork is a more specific cause than a hang.
     """
     seed = int(outcome.tag.split(".", 1)[1])
     limits = spec.worker_limits
@@ -189,6 +205,9 @@ def _classify_outcome(
     peak_bytes = int(peak) if isinstance(peak, (int, float)) else None
     wall_s = _row_float(row, "elapsed_s") or outcome.duration_s
     oom = _row_int(row, "oom_kills")
+    # pids.events rides on the in-memory StepOutcome, NOT the CSV row: it stays off the
+    # profile-store schema (Python/Rust CSV-header parity) yet still classifies a fork-bomb.
+    pids_events = outcome.pids_events
     cpu_timed_out = bool(row.get("cpu_timed_out"))
     timed_out = bool(row.get("timed_out"))
 
@@ -198,6 +217,8 @@ def _classify_outcome(
         status = STATUS_CPU_TIMEOUT
     elif oom > 0:
         status = STATUS_MEMORY_CAP
+    elif pids_events > 0:
+        status = STATUS_PIDS_CAP
     elif timed_out:
         status = STATUS_TIMEOUT
     else:
@@ -209,11 +230,13 @@ def _classify_outcome(
             status,
             limits_cpu=limits.cpu_timeout_s,
             limits_mem=limits.memory_bytes,
-            limits_wall=limits.wall_timeout_s,
+            limits_wall=limits.resolved_wall_timeout_s(),
+            limits_pids=limits.pids_max,
             cpu_s=cpu_s,
             peak_bytes=peak_bytes,
             wall_s=wall_s,
             oom_kills=oom,
+            pids_events=pids_events,
         )
         if status in BREACH_STATUSES
         else ""

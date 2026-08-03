@@ -907,6 +907,11 @@ class Cgroups:
         self.enabled: bool = False
         self.root: Path | None = None  # the delegated scope cgroup root
         self._made: set[str] = set()
+        # Uniform per-step ``pids.max`` cap applied to EVERY child cgroup, or None for no cap.
+        # Set at runtime (never serialized in the DAG) so a caller like parallel-experiment-runner
+        # can bound each worker's PID count — the one axis cpu.max/memory.max cannot contain (a
+        # fork bomb exhausts PIDs, not CPU or RAM). See :meth:`set_worker_pids_max`.
+        self.worker_pids_max: int | None = None
         # Only meaningful inside the scope (the re-exec sets this sentinel).
         if os.environ.get(naming.env_in_scope) != "1":
             return
@@ -1022,6 +1027,17 @@ class Cgroups:
             except OSError as exc:
                 return (f"echo 'ERROR: step {tag} cpu.max could not be applied: {exc}' >&2\n"
                         "exit 1\n")
+        if self.worker_pids_max is not None:
+            # A PID cap CONTAINS a fork bomb (fork() returns EAGAIN past the cap) rather than
+            # killing it; the runner surfaces the breach via :meth:`pids_events` and the cpu/wall
+            # guard reaps the contained process. No Silent Failure: a failed write warns but the
+            # step still runs under the outer cap.
+            try:
+                (child / "pids.max").write_text(str(int(self.worker_pids_max)))
+            except OSError as exc:
+                _warn(self._naming, f"step {tag}: could not apply inner pids cap "
+                      f"pids.max={self.worker_pids_max} ({exc}); pids controller may not be "
+                      "delegated — step runs under the outer cap only")
         procs = child / "cgroup.procs"
         # $$ is the bash leader's own pid. Writing it migrates the leader; every
         # subsequently-forked child/grandchild inherits this cgroup at fork.
@@ -1029,6 +1045,27 @@ class Cgroups:
         # step still runs and the outer-scope reaper remains the backstop.
         # Errors are redirected so a delegation hiccup can't corrupt stdout.
         return f'echo $$ > {procs} 2>/dev/null || true\n{cmd}'
+
+    def set_worker_pids_max(self, limit: int | None) -> None:
+        """Set the uniform per-step ``pids.max`` cap applied to every subsequently-prepared
+        child cgroup (``None`` disables it). Runtime-only; never part of the serialized DAG."""
+        self.worker_pids_max = limit
+
+    def pids_events(self, tag: str) -> int:
+        """``pids.events`` ``max`` counter inside the step's cgroup — the number of times a
+        ``fork``/``clone`` was denied because the step hit its inner ``pids.max``. ``> 0`` is
+        the actionable fork-bomb / PID-exhaustion signal (distinct from an OOM or a wall
+        timeout). 0 if absent/unreadable. Read BEFORE :meth:`cleanup`."""
+        if not self.enabled or self.root is None or tag not in self._made:
+            return 0
+        try:
+            events = (self.root / _sanitize(tag) / "pids.events").read_text()
+            for line in events.splitlines():
+                if line.startswith("max "):
+                    return int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
 
     def oom_kills(self, tag: str) -> int:
         """OOM-kill event count inside the step's cgroup (``memory.events``
@@ -1173,6 +1210,12 @@ class NoopCgroups:
 
     def cleanup(self, tag: str) -> None:
         return None
+
+    def set_worker_pids_max(self, limit: int | None) -> None:
+        return None
+
+    def pids_events(self, tag: str) -> int:
+        return 0
 
     def oom_kills(self, tag: str) -> int:
         return 0

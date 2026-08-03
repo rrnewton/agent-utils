@@ -8,7 +8,13 @@ per-step control the executor already enforces —
 * ``worker_limits.cpu_cores``    -> ``ResourceHint.preferred_inner_jobs`` (inner ``cpu.max``, and
   the core-budget width unit),
 * ``worker_limits.cpu_timeout_s``-> ``Step.cpu_timeout`` (cgroup ``cpu.stat`` CPU-second budget),
-* ``worker_limits.wall_timeout_s``-> ``Step.timeout`` (load-tolerant wall backstop).
+* ``worker_limits.wall_timeout_s``-> ``Step.timeout`` (load-tolerant wall backstop, DERIVED at
+  ~3x the CPU budget when the spec leaves it unset; see ``WorkerLimits.resolved_wall_timeout_s``).
+
+The fourth containment axis, ``worker_limits.pids_max`` (inner ``pids.max``, the fork-bomb
+guard), is NOT a per-step serialized field: it is applied uniformly to every child cgroup by the
+cgroup manager at runtime (``manager.set_worker_pids_max(...)`` in execute.py), which keeps it out
+of the DAG JSON and off the Python/Rust differential-parity surface.
 
 ``jobs_flag=""`` is set on every step so the executor never appends its own ``-j N`` to the
 workload command — a seed sweep's command is a complete argv, not a build tool that takes a
@@ -100,7 +106,7 @@ def generate_round_dag(plan: RoundPlan) -> DagConfig:
                 cmd=build_worker_command(plan.spec, seed, log_path),
                 env=dict(plan.spec.env),
                 hint=hint,
-                timeout=limits.wall_timeout_s,
+                timeout=limits.resolved_wall_timeout_s(),
                 cpu_timeout=limits.cpu_timeout_s or 0,
                 jobs_flag="",  # never append -j to a complete workload argv
             )

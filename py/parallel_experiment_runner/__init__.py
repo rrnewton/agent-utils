@@ -1,9 +1,20 @@
-"""parallel-experiment-runner: run N concurrent seed-sweep workers BOXED under safe-ci-dag-runner.
+"""parallel-experiment-runner: run N concurrent seed-sweep workers under RESOURCE CONTAINMENT.
 
 This is a thin, additive generalization of ``safe-ci-dag-runner`` for the seed-sweep shape: a
 single command template with a ``{seed}`` placeholder, run over a range of seeds, with each worker
-contained by the SAME two-level cgroup-v2 boxing CI steps use — real per-worker ``memory.max`` /
-``cpu.max`` / CPU-second / wall caps and a clean ``cgroup.kill`` on breach.
+contained by the SAME two-level cgroup-v2 mechanism CI steps use. The threat model is a BUG in our
+OWN code — not an adversary — so this is a *resource box*, not a security sandbox: no seccomp, no
+user-namespace isolation. We distrust exactly one thing about a worker: its RESOURCE USAGE.
+
+That distrust is enforced on FOUR independent axes, each mapped to a named failure mode:
+
+* **cpu** — 'run forever': a CPU-SECOND budget measured from the cgroup ``cpu.stat`` (NOT wall
+  clock, which conflates a slow build with a spin loop).
+* **memory** — 'leak memory': ``memory.max`` with OOM detection via ``memory.events``.
+* **pids** — 'fork bomb': ``pids.max``. Neither ``cpu.max`` nor ``memory.max`` stops PID
+  exhaustion; only a pids cap does. A breach CONTAINS the fork (EAGAIN), it does not kernel-kill,
+  so the cpu/wall guard reaps the contained worker and the denied-fork count names the cause.
+* **wall** — defence-in-depth BACKSTOP only, derived at ~3x the CPU budget when left unset.
 
 The four hard requirements, each realized by a specific piece:
 
@@ -14,14 +25,14 @@ The four hard requirements, each realized by a specific piece:
    capacity, and measured per-worker footprint; the round runs EXACTLY that many workers.
 3. Up-front ESTIMATE + measured ACTUAL -> :class:`profile.ProfileStore` (derived estimate or an
    honest UNSET) and :class:`model.RoundResult` / :class:`execute.SweepResult` (measured actuals).
-4. Clean kill NAMING the breach -> :func:`execute._breach_message` + the breach statuses in
-   :mod:`model`.
+4. Clean kill NAMING the breach + BY HOW MUCH -> :func:`execute._breach_message` + the breach
+   statuses in :mod:`model` (including ``pids-cap``, which the reason string alone would mask).
 
 The programmatic entry point is :func:`execute.run_sweep`; the CLI is :func:`cli.main`.
 """
 
 from __future__ import annotations
 
-__version__: str = "0.1.0"
+__version__: str = "0.2.0"
 
 __all__ = ["__version__"]
