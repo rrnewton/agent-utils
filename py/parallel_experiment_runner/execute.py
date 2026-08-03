@@ -51,7 +51,6 @@ from parallel_experiment_runner.profile import (
     Sample,
     profile_identity,
 )
-from parallel_experiment_runner import reaper
 
 #: The experiment scope's names — distinct from ``safe-ci.slice`` so a sweep and a CI run box
 #: under separate slices/scopes and never share a CPUQuota by accident.
@@ -112,11 +111,15 @@ def resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, i
             file=sys.stderr,
         )
         return None, 3
-    # OUTER process (not yet in a scope): before minting our own scope, reap any scopes left
-    # behind by abandoned prior runs (agent recycle / 120s tool cap / detached run outliving its
-    # launcher). Abandonment is the common exit path, so next-run-cleans-previous is what keeps
-    # leaked, futex-parked descendants from accumulating across runs.
-    reaper.reap_orphaned_runs(naming, emit=lambda m: print(m, file=sys.stderr))
+    # OUTER process (not yet in a scope): re-exec into a fresh transient scope. We do NOT try to
+    # "reap abandoned prior-run scopes" here — reproduction (hermit-ci, 5 abandonment scenarios)
+    # showed abandonment strands NOTHING: a SIGKILLed launcher's direct children die with it, and
+    # install_scope_teardown's SIGTERM/SIGKILL/atexit hook cgroup.kill's the whole scope on the
+    # exits that DO run a handler. The zombie pile-up that motivated this tool was a LIVE hung
+    # `hermit run --strict --verify` (main parked in tokio epoll_wait) holding a PID namespace
+    # open, NOT a leaked appender thread — and a live hang is exactly what the per-worker cpu-time
+    # / wall backstop kills, via a cgroup-subtree cgroup.kill that reclaims the namespace (see
+    # safe_ci_dag_runner.teardown.reap). Containment IS the fix; a next-run reaper is not needed.
     if allow_failure:
         print(
             f"{PROG}: warning: resource containment not established (--allow-cgroup-failure); "
