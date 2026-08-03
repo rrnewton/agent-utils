@@ -76,6 +76,12 @@ class Step:
     networkonly: bool = False  # skipped when networking is disabled
     engine_only: bool = False  # selected only by an engine-only subset preset
     timeout: int = DEFAULT_STEP_TIMEOUT
+    # CPU-time budget in seconds (user+system, measured from the step's cgroup
+    # cpu.stat). 0 disables the CPU-time guard, leaving only the wall `timeout`.
+    # Unlike wall time, CPU time is immune to machine load, so a CPU budget can be
+    # set much tighter than a load-tolerant wall timeout without flaking. Enforced
+    # only when cgroup boxing is active (cpu.stat available); otherwise inert.
+    cpu_timeout: int = 0
     # Template for the inner-parallelism flag appended to `cmd` when this step declares
     # `preferred_inner_jobs`. None inherits DagConfig.default_jobs_flag; "" disables appending
     # (the step manages its own concurrency). See render_jobs_flag for the template forms.
@@ -155,11 +161,18 @@ def step_failure_reason(
     pids_guard_tripped: bool,
     pids_guard_reason: str | None,
     detail_write_failure: Sequence[str],
+    cpu_timed_out: bool = False,
+    cpu_timeout: int = 0,
 ) -> str:
     """Describe a failed step without conflating an external signal with an OOM.
 
     Precedence (load-bearing for cross-language parity):
-    OOM > timeout > pids-guard > detail-capture-failure > signal > exit code.
+    OOM > CPU-timeout > timeout > pids-guard > detail-capture-failure > signal > exit code.
+
+    CPU-timeout is reported ahead of the wall timeout because it is the more specific
+    cause: when a CPU budget is exceeded the runner reaps the step, and the wall guard
+    may also observe the resulting exit. Distinguishing them keeps the failure reason
+    honest about which budget actually tripped.
 
     A negative ``returncode`` means the child received a Unix signal; that must never be
     reported as an OOM, since raising a memory baseline when an external supervisor killed
@@ -167,6 +180,8 @@ def step_failure_reason(
     """
     if oomed:
         return f"OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))"
+    if cpu_timed_out:
+        return f"CPU-TIMEOUT >{cpu_timeout}s cpu"
     if timed_out:
         return f"TIMEOUT >{timeout}s"
     if pids_guard_tripped:

@@ -276,11 +276,13 @@ class StepOutcome:
         pids_guard_tripped: bool,
         pids_guard_reason: str | None,
         detail_write_failure: Sequence[str],
+        cpu_timed_out: bool = False,
+        cpu_timeout: int = 0,
         aborted: bool = False,
     ) -> "StepOutcome":
         """Build a failed outcome, deriving :attr:`reason` from the shared precedence
-        rule (OOM > timeout > pids-guard > detail-capture > signal > exit) so every caller
-        reports failures identically."""
+        rule (OOM > CPU-timeout > timeout > pids-guard > detail-capture > signal > exit) so
+        every caller reports failures identically."""
         reason = step_failure_reason(
             returncode=returncode,
             oomed=oomed,
@@ -290,6 +292,8 @@ class StepOutcome:
             pids_guard_tripped=pids_guard_tripped,
             pids_guard_reason=pids_guard_reason,
             detail_write_failure=detail_write_failure,
+            cpu_timed_out=cpu_timed_out,
+            cpu_timeout=cpu_timeout,
         )
         return cls(
             tag=tag,

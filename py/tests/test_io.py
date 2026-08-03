@@ -68,8 +68,30 @@ def test_minimal_document_defaults() -> None:
     assert step.desc == "" and step.deps == [] and step.env == {}
     assert step.description == "" and cfg.description == ""  # default empty
     assert step.timeout == 1800
+    assert step.cpu_timeout == 0  # CPU-time guard disabled by default
     assert step.hint.classification is StepClass.LIGHT
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25
+
+
+def test_cpu_timeout_roundtrip_and_conditional_emit() -> None:
+    # A step with a CPU-time budget parses it and round-trips; a step without one omits the
+    # key entirely, so existing DAGs stay byte-for-byte unchanged (absence parses back to 0).
+    doc = (
+        '{"steps": ['
+        '{"group": "g", "job": "cpu", "cmd": "true", "cpu_timeout": 30},'
+        '{"group": "g", "job": "nocpu", "cmd": "true"}]}'
+    )
+    cfg = dag_from_json(doc)
+    by_tag = cfg.by_tag()
+    assert by_tag["g.cpu"].cpu_timeout == 30
+    assert by_tag["g.nocpu"].cpu_timeout == 0  # absent -> default 0
+
+    out = dag_to_json(cfg)
+    assert '"cpu_timeout": 30' in out  # present only for the step that set it
+    # Exactly one step emits the key; the default-0 step must not.
+    assert out.count('"cpu_timeout"') == 1
+    # Stable across a second serialization pass.
+    assert dag_to_json(dag_from_json(out)) == out
 
 
 def test_default_step_timeout_applied() -> None:

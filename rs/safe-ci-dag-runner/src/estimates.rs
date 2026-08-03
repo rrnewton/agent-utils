@@ -1665,6 +1665,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         }
     }
@@ -1983,6 +1984,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         };
         let cfg = DagConfig {
