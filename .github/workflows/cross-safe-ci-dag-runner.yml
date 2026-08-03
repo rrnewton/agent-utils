@@ -1,33 +1,13 @@
-name: cross-safe-ci-dag-runner
+name: repository-ci
 
-# Run when EITHER implementation of this tool (or the cross harness) changes:
-# builds both and asserts identical observable behavior.
+# Authoritative repository gate. Run for every change so edits to the Makefile,
+# setup driver, workflows, or a new utility cannot bypass the repository's own
+# build/test contract. The focused workflows remain useful diagnostics.
 on:
   push:
     branches: [main]
-    paths:
-      - 'py/pyproject.toml'
-      - 'py/safe_ci_dag_runner/**'
-      - 'rs/Cargo.toml'
-      - 'rs/Cargo.lock'
-      - 'rs/safe-ci-dag-runner/**'
-      - 'cross/**'
-      - 'examples/**'
-      - 'common/docs/**'
-      - 'scripts/embed_userguides.py'
-      - '.github/workflows/cross-safe-ci-dag-runner.yml'
   pull_request:
-    paths:
-      - 'py/pyproject.toml'
-      - 'py/safe_ci_dag_runner/**'
-      - 'rs/Cargo.toml'
-      - 'rs/Cargo.lock'
-      - 'rs/safe-ci-dag-runner/**'
-      - 'cross/**'
-      - 'examples/**'
-      - 'common/docs/**'
-      - 'scripts/embed_userguides.py'
-      - '.github/workflows/cross-safe-ci-dag-runner.yml'
+  workflow_dispatch:
 
 jobs:
   cross:
@@ -38,16 +18,23 @@ jobs:
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: install python deps
-        # pyyaml is a runtime dep of the Python CLI (which the differential invokes to load the
-        # YAML fixtures); mypy is for the harness typecheck below.
-        run: python -m pip install --upgrade mypy pyyaml
+        # PyYAML is a runtime dep; types-PyYAML supplies the stubs required by
+        # the strict mypy gate.
+        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
       - name: embedded user guides in sync with their single source
-        # No Silent Failure: fail loudly if common/docs/<tool>/USER_GUIDE.md was edited without
-        # regenerating the committed embedded copies (py package resource + rs include_str! target).
+        # Run before `make both`, whose setup step regenerates the copies.
         run: python scripts/embed_userguides.py --check
-      - name: build rust
-        run: cargo build --release --workspace --manifest-path rs/Cargo.toml
+      - name: rustfmt
+        run: cargo fmt --all --manifest-path rs/Cargo.toml -- --check
+      - name: build both implementations
+        run: make both
+      - name: repository checks
+        run: make check
+      - name: repository tests
+        run: make test
       - name: mypy the differential harness
         run: python -m mypy cross/differential.py
       - name: differential (py vs rs, incl. YAML isomorphism)
