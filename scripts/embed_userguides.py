@@ -198,6 +198,20 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         language="python",
         source="common/docs/agent-team-timeline/USER_GUIDE.md",
     ),
+    StandaloneDocument(
+        tool="parallel-experiment-runner",
+        document="README",
+        language="python",
+        source="common/docs/parallel-experiment-runner/README.md",
+        exemptions=("sibling package",),
+    ),
+    StandaloneDocument(
+        tool="parallel-experiment-runner",
+        document="USER_GUIDE",
+        language="python",
+        source="common/docs/parallel-experiment-runner/USER_GUIDE.md",
+        exemptions=("sibling package",),
+    ),
 )
 
 
@@ -245,6 +259,15 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/agent-team-timeline/USER_GUIDE.md",
             ),
             PackageLink("py/agent_team_timeline/LICENSE", "LICENSE"),
+            PackageLink(
+                "py/parallel_experiment_runner/README.md",
+                "common/docs/parallel-experiment-runner/README.md",
+            ),
+            PackageLink(
+                "py/parallel_experiment_runner/USER_GUIDE.md",
+                "common/docs/parallel-experiment-runner/USER_GUIDE.md",
+            ),
+            PackageLink("py/parallel_experiment_runner/LICENSE", "LICENSE"),
         )
     )
     return tuple(links)
@@ -288,6 +311,8 @@ def _lint(item: Render | StandaloneDocument, text: str) -> list[str]:
             line = text.count("\n", 0, match.start()) + 1
             errors.append(f"{description} at line {line}: {match.group(0)!r}")
     for tool, py_package, rust_crate in TOOLS:
+        if "sibling package" in exemptions:
+            break
         if tool == item.tool:
             continue
         sibling = re.compile(

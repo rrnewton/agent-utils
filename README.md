@@ -24,14 +24,15 @@ Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
 need this source tree or knowledge of the sibling implementation.
 
-## Python-only tool
+## Python-only tools
 
 | Command | Purpose | Python distribution |
 |---|---|---|
 | `agent-team-timeline` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `agent-team-timeline` |
+| `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps through `safe-ci-dag-runner`. | `parallel-experiment-runner` |
 
-`agent-team-timeline` is independently installable and follows the same package
-documentation and artifact checks. It is the explicit exception to the
+These tools are independently installable and follow the same package
+documentation and artifact checks. They are explicit exceptions to the
 two-language implementation and behavioral-differential contract.
 
 ## Repository layout

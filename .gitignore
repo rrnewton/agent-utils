@@ -30,6 +30,11 @@ dist/
 # machine-local runtime state, not source.
 .tick-hub/
 
+# --- default work dir (parallel-experiment-runner) ---
+# A sweep writes per-worker logs + its sample store under `<work-dir>/ignored/` by default;
+# it is machine-local runtime output, not source.
+ignored/
+
 # --- editor / os ---
 *.swp
 .DS_Store

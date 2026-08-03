@@ -24,6 +24,7 @@ ENTRYPOINT_MODULES = [
     "safe_ci_dag_runner.cpuset_allocator",
     "tick_hub",
     "pr_landing_planner",
+    "parallel_experiment_runner",
     "agent_team_timeline",
     "herdr_run",
     "herdr_run.agent_cli",
