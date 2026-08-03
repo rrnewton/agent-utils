@@ -29,11 +29,18 @@ The hard requirements, each realized by a specific piece:
    honest UNSET) and :class:`model.RoundResult` / :class:`execute.SweepResult` (measured actuals).
 4. Clean kill NAMING the breach + BY HOW MUCH -> :func:`execute._breach_message` + the breach
    statuses in :mod:`model` (including ``pids-cap``, which the reason string alone would mask).
-5. REAP-ON-TEARDOWN (abandonment is the common exit) -> :mod:`reaper` reaps the leaked scopes of
-   abandoned predecessors on every fresh launch. A limit never breached still leaks if nothing
-   reaps: an agent recycle / 120s tool cap / detached run SIGKILLs the launcher before any handler
-   runs, leaving ``setsid`` escapees pinning the scope at zero CPU and zero memory. Next-run-cleans-
-   previous kills any scope whose launcher pid is dead, naming the unit, the pid, and the count.
+5. KILL RECLAIMS THE NAMESPACE, not just the process. The real-world pile-up that motivated this
+   tool was NOT a leaked ``tracing-appender`` thread on teardown (reproduction refuted that: five
+   abandonment scenarios stranded zero workers, and the ``appender-holds-namespace`` link was a
+   15-char ``comm`` truncation artifact). It was a LIVE, HUNG ``hermit run --strict --verify`` —
+   its main parked in tokio ``epoll_wait`` while the guest made no progress — holding a PID
+   namespace open so its zombies (which cost zero CPU and zero memory, invisible to a
+   cpu-and-memory-only box) were never reaped. A hang is exactly what the per-worker cpu-time /
+   wall backstop (guarantee 1) exists to kill, and the kill goes through a cgroup-subtree
+   ``cgroup.kill`` (``safe_ci_dag_runner.teardown.reap``), which SIGKILLs EVERY member of the
+   step's cgroup at once — so the hung main dies WITH everything in its PID namespace, releasing
+   the namespace and letting the kernel reap the zombies, instead of killing one pid and
+   inheriting the orphans. Containment is the fix; no separate teardown reaper is required.
 
 The programmatic entry point is :func:`execute.run_sweep`; the CLI is :func:`cli.main`.
 """

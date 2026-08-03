@@ -289,37 +289,46 @@ only on the captured PGID. The outer-scope teardown is the final backstop for
 `setsid`/double-fork escapees. The experiment runner must call these APIs; it
 must never use broad `pkill`, process-name matching, or host-wide cleanup.
 
-### 7.1 Reap-on-teardown: abandonment is the normal exit path (v0.3.0)
+### 7.1 The kill reclaims the namespace, not just the process (v0.3.0)
 
-The teardown above handles the normal exit (`finally`) and interactive
-SIGINT/SIGTERM (a handler that runs `cgroup.kill`). It does **not** handle the
-**common** exit here: **abandonment**. An agent recycle, the 120-second tool cap
-killing a run mid-flight, or a detached run outliving its launcher all SIGKILL the
-launcher before any `finally` or signal handler can run. When that happens the
-transient `parallel-experiment-<pid>.scope` stays `active running` with its
-descendants inside it — most damagingly `setsid`/double-fork escapees (e.g.
-`tracing-appender` workers parked in `__futex_wait`, each pinning a PID namespace
-so its zombies are never reaped). Those descendants burn **zero CPU and zero
-memory** — measured at 415 leaked threads across 8 abandoned runs — so a box that
-validated only the cpu and memory axes would report *perfect health* while the leak
-accumulated, and `systemd-run --collect` will not GC a scope that still has live
-members. A limit that is never breached still leaks if nothing reaps.
+An earlier draft of this section proposed a *next-run-cleans-previous* reaper on
+the theory that abandonment (an agent recycle, the 120-second tool cap, a detached
+run outliving its launcher) strands leaked `tracing-appender` threads that pin a
+scope. **Reproduction (hermit-ci) refuted that theory**, so the reaper was removed:
 
-The runner therefore treats abandonment as the normal exit path and makes cleanup
-**next-run-cleans-previous**: on every fresh (outer, pre-re-exec) launch, before it
-mints its own scope, it enumerates sibling `parallel-experiment-*.scope` units and,
-for each whose launcher pid (encoded in the unit name) is dead, `cgroup.kill`s and
-stops it — logging the unit, the dead pid, and the reaped-task count (never a silent
-cleanup). This is implemented in a new pure-planner + isolated-impure `reaper`
-module reusing `safe_ci_dag_runner.cgroup`'s `stop_scope`/`_scope_cgroup_path`
-primitives; it is runtime-only, so the `cross/` differential schema is untouched.
-Reaping is conservative: a scope whose launcher pid is still alive is left untouched
-(a live run owns it — verified live: `/proc/<unit-pid>` is alive for the whole
-healthy run), so the only failure mode is a missed reap under pid reuse, never a
-false kill of a healthy run. Live validation: an abandoned run left 8 `setsid`
-escapees pinning an `active` scope at zero CPU/memory; the next launch reaped it
-(`REAPED abandoned run parallel-experiment-<pid>.scope (launcher pid <pid> dead):
-killed 8 leaked task(s)/thread(s)`) and the scope went inactive.
+- Five abandonment scenarios — SIGKILL the launcher mid-run, launcher-then-guest
+  kill, `--verify` kill mid-Run-1, and six staggered kills — each stranded **zero**
+  workers. A SIGKILLed launcher's direct children die with it, and the
+  `install_scope_teardown` SIGTERM/SIGKILL/atexit hook `cgroup.kill`s the whole
+  scope on the exits that *do* run a handler. There is no leaked-thread class to
+  reap on teardown.
+- The 39 concurrent zombies had **zero** zombie children; none descended from an
+  appender-carrying supervisor. The `appender-holds-namespace` link was absent, and
+  the `tracing-appende` name that suggested it was a 15-character `comm` truncation
+  artifact.
+
+What survives the refutation, and is a cleaner justification for the box:
+
+1. **The pids axis stands.** The zombies were real and genuinely consumed **PID
+   slots** at **zero CPU and zero memory** (that measurement was never refuted, only
+   its cause) — so a box validating only cpu and memory would still report *perfect
+   health*. Only a `pids.max` cap catches this.
+2. **The real cause is a live hang the box already kills.** The zombies were held
+   open by a **live, hung** `hermit run --strict --verify` — its main parked in
+   tokio `epoll_wait`, guest not progressing — keeping a PID namespace alive. A hang
+   is exactly what the per-worker **cpu-time / wall backstop** (§7, guarantee 1)
+   exists to kill.
+
+The requirement the real cause implies is about *how* the kill lands: it must
+reclaim the **namespace**, not just one process — otherwise the box kills the hung
+main and inherits its zombies. It does. Every breach and the normal exit route
+through `safe_ci_dag_runner.teardown.reap`, which writes the step's child
+`cgroup.kill` — an **atomic SIGKILL of the entire cgroup subtree**, including
+`setsid`/double-fork escapees a process-group kill misses. When the hung main and
+all its PID-namespace peers die together, the namespace refcount drops to zero and
+the kernel reaps the zombies inside. This reuses existing machinery (no new module,
+no schema change; the `cross/` differential is untouched), so containment is the
+whole fix — no separate teardown reaper is needed.
 
 Disk has no generic cgroup-v2 space controller. The design therefore combines:
 
@@ -360,16 +369,18 @@ This is additive and should release as **agent-utils v0.12.0**:
 
 - new Python-first `parallel-experiment-runner` tool, shipped `0.1.0`, then
   `0.2.0` (additive four-axis containment: the `pids` axis and the derived wall
-  backstop), now at tool version `0.3.0` (two evidence-backed additions:
-  measured-idle-headroom capacity replacing the misleading load-average signal,
-  and reap-on-teardown for abandoned runs);
+  backstop), now at tool version `0.3.0` (one evidence-backed addition plus one
+  correction: **measured-idle-headroom capacity** replaces the misleading
+  load-average signal, and the earlier draft's **reap-on-teardown reaper was
+  removed** after reproduction refuted its premise — the namespace-reclaiming
+  breach kill via the existing subtree `cgroup.kill` is the fix, see §7.1);
 - additive dynamic-DAG/profile-key API in `safe-ci-dag-runner`;
 - the `pids` axis rides an in-memory `StepOutcome.pids_events` field and adds no
   profile-store CSV column; measured-headroom capacity (a `/proc/stat` sample in
-  `calibrate`) and reap-on-teardown (the new `reaper` module) are likewise
-  runtime-only, so the `cross/` schema and the Rust runner are all unaffected;
-  live cgroup boxing (`cpu.*` columns) remains out of differential scope, as
-  before;
+  `calibrate`) is likewise runtime-only, and the namespace-reclaiming breach kill
+  reuses `safe-ci-dag-runner`'s existing subtree `cgroup.kill` (no new module), so
+  the `cross/` schema and the Rust runner are all unaffected; live cgroup boxing
+  (`cpu.*` columns) remains out of differential scope, as before;
 - no change to existing fixed JSON/YAML DAG behavior or schemas when
   `profile_key` is absent; and
 - a future Rust port/differential test tracked explicitly rather than delaying
