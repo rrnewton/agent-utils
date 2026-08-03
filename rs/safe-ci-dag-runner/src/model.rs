@@ -95,7 +95,7 @@ pub struct Step {
     /// CPU-time budget in seconds (user+system, from the step's cgroup `cpu.stat`). `0` disables
     /// the CPU-time guard, leaving only the wall `timeout`. CPU time is immune to machine load, so
     /// this can be set far tighter than a load-tolerant wall timeout without flaking. Mirrors
-    /// Python's `Step.cpu_timeout`; the Python runner is the enforcing implementation today.
+    /// Python's `Step.cpu_timeout`; both runners enforce it identically under cgroup boxing.
     pub cpu_timeout: i64,
     /// Template for the inner-parallelism flag appended to `cmd` when this step declares
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
@@ -350,6 +350,8 @@ impl StepOutcome {
         oom_kills: i64,
         timed_out: bool,
         timeout: i64,
+        cpu_timed_out: bool,
+        cpu_timeout: i64,
         aborted: bool,
     ) -> Self {
         let reason = step_failure_reason(
@@ -361,10 +363,10 @@ impl StepOutcome {
             false,
             None,
             &[],
-            // The Rust scheduler does not enforce CPU-time budgets yet (Python is the
-            // enforcing implementation); never report a CPU-timeout reason from here.
-            false,
-            0,
+            // The Rust scheduler now enforces per-step CPU-time budgets under boxing,
+            // at parity with the Python runner; thread the real breach flag through.
+            cpu_timed_out,
+            cpu_timeout,
         );
         StepOutcome {
             tag,

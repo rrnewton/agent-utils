@@ -1671,6 +1671,50 @@ mod tests {
     }
 
     #[test]
+    fn apply_plan_preserves_all_non_hint_step_fields() {
+        // Recurrence guard, mirroring the Python test of the same name (environment-independent, so
+        // it fires without cgroups too): the planner rewrites ONLY a step's hint; every other field
+        // must survive verbatim. The Python build once dropped `cpu_timeout` here by rebuilding
+        // Step field-by-field, silently disabling per-step CPU-time enforcement while this Rust
+        // build kept it via clone-and-override. This locks the contract in for BOTH engines.
+        let mut step = mk("g", "burn", &[], 3.0);
+        step.cmd = "while :; do :; done".into();
+        step.env.insert("K".into(), "V".into());
+        step.networkonly = true;
+        step.engine_only = true;
+        step.timeout = 123;
+        step.cpu_timeout = 7;
+        step.jobs_flag = Some("-J".into());
+        let cfg = DagConfig {
+            steps: vec![step],
+            ..Default::default()
+        };
+        let empty: HashMap<String, StepSamples> = HashMap::new();
+        let no_speedups: HashMap<String, StepSpeedup> = HashMap::new();
+        let plan = build_plan(
+            &cfg,
+            &empty,
+            Planner::GreedyLpt,
+            DEFAULT_MIN_SAMPLES,
+            &no_speedups,
+            None,
+            None,
+        );
+        let applied = apply_plan_to_config(&cfg, &plan);
+        let out = &applied.steps[0];
+        assert_eq!(
+            out.cpu_timeout, 7,
+            "planner dropped cpu_timeout -> CPU-time enforcement silently off"
+        );
+        assert_eq!(out.timeout, 123);
+        assert!(out.networkonly);
+        assert!(out.engine_only);
+        assert_eq!(out.jobs_flag.as_deref(), Some("-J"));
+        assert_eq!(out.cmd, "while :; do :; done");
+        assert_eq!(out.env.get("K").map(String::as_str), Some("V"));
+    }
+
+    #[test]
     fn robust_median_discards_outlier() {
         // At n>=3 one huge outlier must not move the median (MAD-trim).
         assert_eq!(robust_median(&[3.0, 3.0, 3.0, 3.0, 100.0]), 3.0);

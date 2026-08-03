@@ -195,6 +195,11 @@ def representative_fixtures() -> list[Fixture]:
                         "job": "app",
                         "desc": "compile",
                         "cmd": "echo build",
+                        # cpu_timeout is a per-step enforcement field; carrying it on a fixture step
+                        # makes the json/yaml byte-identity round-trip cross-check its serialization
+                        # across both engines (environment-independent), complementing the boxed
+                        # behavioral smoke tests that only run where cgroups exist.
+                        "cpu_timeout": 45,
                         "hint": {
                             "est_duration_s": 90,
                             "classification": "cpu-bound",
@@ -1708,10 +1713,20 @@ INVOCATIONS: tuple[Invocation, ...] = (
     # (common/docs/safe-ci-dag-runner/USER_GUIDE.md) verbatim, so — unlike quickstart/help, whose
     # colored wording may differ — the guide bytes are guaranteed identical and ARE cross-checked.
     Invocation("userguide", ("--userguide",)),
+    # `capabilities` prints each engine's machine-readable enforcement manifest (which guards it
+    # actually implements: cpu_timeout, memory_max, oom_detection, pids_guard, wall_timeout). The
+    # WHOLE POINT is that the two engines must enforce the SAME set, so the manifests are asserted
+    # byte-identical. This is the recurrence guard for the historical gap where the Rust runner
+    # silently did NOT enforce `cpu_timeout` while the Python runner did: with this check, that
+    # divergence is a `cross` failure in ANY environment (it needs no cgroup boxing, so it fires on
+    # ubuntu-latest CI where the behavioral boxed tests can only loud-skip). The boxed smoke tests
+    # in each build (boxing_smoke / cpu_timeout_smoke, and the Python pytest equivalents) anchor
+    # these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
+    Invocation("capabilities", ("capabilities",)),
 )
 
 #: Invocations whose stdout must be BYTE-IDENTICAL across builds (not just exit-code equal).
-_BYTE_IDENTICAL_INVOCATIONS = frozenset({"version", "userguide"})
+_BYTE_IDENTICAL_INVOCATIONS = frozenset({"version", "userguide", "capabilities"})
 
 
 def compare_invocations(py: list[str], rs: list[str], rep: Report) -> None:

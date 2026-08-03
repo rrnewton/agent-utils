@@ -30,7 +30,7 @@ from collections.abc import Mapping, Sequence
 from importlib.resources import files
 from pathlib import Path
 
-from safe_ci_dag_runner import __version__
+from safe_ci_dag_runner import ENFORCEMENT_CAPABILITIES, __version__
 from safe_ci_dag_runner import summary as summarylib
 from safe_ci_dag_runner import sync as synclib
 from safe_ci_dag_runner.estimates import (
@@ -549,6 +549,10 @@ def build_parser() -> argparse.ArgumentParser:
     sb_stats.add_argument("file", metavar="FILE", help="summary JSON file")
 
     sub.add_parser("quickstart", help="print a self-contained getting-started guide")
+    sub.add_parser(
+        "capabilities",
+        help="print the machine-readable enforcement-capability manifest (cross-checked vs Rust)",
+    )
     return parser
 
 
@@ -1458,6 +1462,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if command == "quickstart":
         print(_quickstart(c))
+        return 0
+    if command == "capabilities":
+        # Machine-readable enforcement manifest; byte-identical to the Rust build and cross-checked,
+        # so an enforcement guard in one build but not the other fails `cross`.
+        print(ENFORCEMENT_CAPABILITIES)
         return 0
     if command == "sweep":
         return _cmd_sweep(ns, c)

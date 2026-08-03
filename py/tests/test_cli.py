@@ -319,3 +319,43 @@ def test_run_default_requires_cgroups_or_flag() -> None:
         )
         assert allowed.returncode == 0, allowed.stderr
         assert "UNBOXED" in allowed.stderr
+
+
+def test_boxed_run_enforces_cpu_timeout() -> None:
+    # Behavioral parity anchor for the Rust `cpu_timeout_smoke.rs`: prove the DEFAULT boxed run
+    # actually ENFORCES a per-step CPU-time budget. A step that busy-loops forever with a tiny
+    # cpu_timeout must be reaped as a CPU-TIMEOUT well before its (much larger) wall timeout.
+    #
+    # Run boxed (no --allow-cgroup-failure) in a SUBPROCESS so the boxing re-exec is real; do NOT
+    # set CI=1 here (that would skip boxing). Cgroup boxing is environment-dependent, so when it
+    # genuinely cannot be established the default run exits 3 and we skip LOUDLY, never silently.
+    import os
+
+    dag = (
+        '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn CPU past budget",'
+        ' "cmd": "while :; do :; done", "cpu_timeout": 1, "timeout": 30}]}'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "cpu.json"
+        path.write_text(dag, encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
+             "-q", "--no-profile"],
+            capture_output=True,
+            text=True,
+            env=dict(os.environ),
+        )
+        if proc.returncode == 3:
+            pytest.skip(
+                "cgroup boxing unavailable (need cgroup-v2 + a working systemd --user scope); "
+                f"cannot verify CPU-timeout enforcement here. Details:\n{proc.stderr}"
+            )
+        combined = proc.stdout + proc.stderr
+        assert proc.returncode == 1, (
+            "boxed run should FAIL (exit 1) when a step exceeds its CPU-time budget; "
+            f"got {proc.returncode}\n{combined}"
+        )
+        assert "CPU-TIMEOUT" in combined, (
+            "expected a CPU-TIMEOUT report proving the per-step CPU-time budget fired "
+            f"(not the wall TIMEOUT):\n{combined}"
+        )
