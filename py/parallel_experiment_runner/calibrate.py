@@ -10,6 +10,7 @@ directly unit-testable; the one impure helper (:func:`live_capacity`) is isolate
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,15 +22,26 @@ from parallel_experiment_runner.model import ResourceSlice, WorkerLimits
 #: headroom so a worker slightly hotter than its sample does not blow the budget.
 MEM_HEADROOM = 1.25
 
+#: Wall interval over which busy-CPU is sampled from ``/proc/stat`` to derive idle headroom.
+_IDLE_SAMPLE_S = 0.1
+
 
 @dataclass(frozen=True)
 class LiveCapacity:
-    """A snapshot of what the host can actually give RIGHT NOW (never trusts the lane alone)."""
+    """A snapshot of what the host can actually give RIGHT NOW (never trusts the lane alone).
+
+    ``available_cpu_cores`` is the MEASURED idle headroom — total cores scaled by the fraction of
+    CPU time that was idle over a short ``/proc/stat`` sample — NOT the total core count and NOT
+    derived from load average. Load average was deliberately dropped: it counts uninterruptible-
+    sleep and zombie tasks as "load", so on a box that is actually 64% idle it can read as
+    catastrophically busy (the phantom-saturation signal this tool was mis-sized by). Busy-CPU
+    from ``/proc/stat`` counts only real CPU demand, so width is sized from true headroom.
+    """
 
     cpu_cores: int
+    available_cpu_cores: int
     mem_available_bytes: int
     disk_free_bytes: int
-    load_avg_1m: float
 
 
 @dataclass(frozen=True)
@@ -58,21 +70,67 @@ class WidthDecision:
     ceiling: int
 
 
+def _cpu_busy_idle_jiffies() -> tuple[int, int] | None:
+    """Read the aggregate ``cpu`` line of ``/proc/stat`` -> (busy_jiffies, idle_jiffies).
+
+    Idle = idle + iowait; busy = everything else. Returns ``None`` if ``/proc/stat`` is
+    unreadable or malformed (caller then falls back to trusting total cores)."""
+    try:
+        with open("/proc/stat", encoding="ascii") as fh:
+            first = fh.readline()
+    except OSError:
+        return None
+    parts = first.split()
+    if not parts or parts[0] != "cpu" or len(parts) < 5:
+        return None
+    try:
+        fields = [int(x) for x in parts[1:]]
+    except ValueError:
+        return None
+    # user nice system idle iowait irq softirq steal guest guest_nice
+    idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
+    total = sum(fields)
+    return total - idle, idle
+
+
+def _measured_available_cores(total_cores: int, *, sample_s: float = _IDLE_SAMPLE_S) -> int:
+    """Total cores scaled by the MEASURED idle fraction over a short ``/proc/stat`` interval.
+
+    This is real CPU-demand headroom, not load average (which counts uninterruptible-sleep and
+    zombies). Floors at 1 so a fully-busy instant still admits the stage-1 profiling worker, and
+    caps at ``total_cores``. Falls back to ``total_cores`` if ``/proc/stat`` cannot be sampled —
+    trusting the lane/ceiling rather than fabricating scarcity."""
+    a = _cpu_busy_idle_jiffies()
+    if a is None:
+        return total_cores
+    time.sleep(sample_s)
+    b = _cpu_busy_idle_jiffies()
+    if b is None:
+        return total_cores
+    busy_delta = b[0] - a[0]
+    idle_delta = b[1] - a[1]
+    span = busy_delta + idle_delta
+    if span <= 0:
+        return total_cores
+    idle_fraction = max(0.0, min(1.0, idle_delta / span))
+    return max(1, min(total_cores, round(total_cores * idle_fraction)))
+
+
 def live_capacity(work_dir: Path) -> LiveCapacity:
-    """Sample physical cores, allocatable memory, free disk (at ``work_dir``), and 1m load."""
+    """Sample physical cores, MEASURED idle-core headroom, allocatable memory, and free disk."""
     cores = os.cpu_count() or 1
+    available = _measured_available_cores(cores)
     mem = mem_available_bytes() or 0
     try:
         st = os.statvfs(str(work_dir))
         disk_free = st.f_bavail * st.f_frsize
     except OSError:
         disk_free = 0
-    try:
-        load = os.getloadavg()[0]
-    except OSError:
-        load = 0.0
     return LiveCapacity(
-        cpu_cores=cores, mem_available_bytes=mem, disk_free_bytes=disk_free, load_avg_1m=load
+        cpu_cores=cores,
+        available_cpu_cores=available,
+        mem_available_bytes=mem,
+        disk_free_bytes=disk_free,
     )
 
 
@@ -93,9 +151,12 @@ def resolve_width(
 
     ``width = min(cpu_slots, mem_slots, disk_slots, ceiling)``. Live capacity can only ever
     REDUCE the lane (never raise it), so a busy host shrinks the round even when the coordinator
-    granted more. The returned slot counts make the binding constraint auditable.
+    granted more. The CPU budget uses ``available_cpu_cores`` — MEASURED idle headroom, not the
+    total core count — so an idle box scales up generously and a genuinely busy one steps back,
+    both from real CPU demand rather than a phantom-saturation proxy. The returned slot counts
+    make the binding constraint auditable.
     """
-    usable_cpu = min(slice_.cpu_cores, live.cpu_cores)
+    usable_cpu = min(slice_.cpu_cores, live.available_cpu_cores)
     usable_mem = min(slice_.memory_bytes, live.mem_available_bytes)
     usable_disk = min(slice_.disk_bytes, live.disk_free_bytes)
 

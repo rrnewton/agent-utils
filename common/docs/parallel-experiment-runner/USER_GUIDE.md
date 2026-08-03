@@ -4,11 +4,16 @@ Run **N concurrent seed-sweep workers under RESOURCE CONTAINMENT**, using `safe-
 two-level cgroup-v2 scope. A seed sweep is one command template with a `{seed}` placeholder, run
 over a range of seeds — a chaos search, a fuzz sweep, a flaky-repro hunt, a parameter scan.
 
-This tool exists because unbounded parallel experiments once saturated a host to ~470
-concurrent processes, starving the very measurements they were launched to produce. It fixes
-that structurally: **concurrency is a declared, enforced number**, every worker runs under real
-cgroup limits, and a worker that breaches a limit is cleanly killed with a message naming what
-breached and by how much.
+This tool exists because unbounded parallel experiments once left hundreds of processes piled up
+on a host. Two separate measurements sharpened *how* they piled up: the CPU "saturation" was
+largely **phantom** — most of those processes were zombies and the alarming load average counts
+uninterruptible-sleep, not CPU demand (the box was ~64% idle) — while the *real* damage was
+**leaked descendants that nothing ever reaped** (415 futex-parked threads accumulated across 8
+abandoned runs, consuming zero CPU and zero memory). This tool fixes both structurally:
+**concurrency is a declared, enforced number sized from measured idle headroom** (not a phantom
+load reading), every worker runs under real cgroup limits, a worker that breaches a limit is
+cleanly killed with a message naming what breached and by how much, and every fresh run
+**reaps the leaked scopes of abandoned predecessors**.
 
 ## Resource containment, not a security sandbox
 
@@ -43,9 +48,13 @@ teardown, CPU-second budget, and per-step measurement are all the CI runner's, r
    wall-derived CPU budget would be ~1/N of what a worker needs and would false-kill healthy
    workers in a way indistinguishable from a flaky test. Omit the flag to leave it **UNSET**
    (honest; the derived wall backstop still applies) rather than guess a too-tight number.
-2. **Declared + enforced concurrency.** The width is resolved from three budgets — the
-   coordinator's lane, live host capacity, and the measured per-worker footprint — and the round
-   runs *exactly* that many workers. Never "however many the caller spawned".
+2. **Declared + enforced concurrency, sized from MEASURED headroom.** The width is resolved from
+   three budgets — the coordinator's lane, live host capacity, and the measured per-worker
+   footprint — and the round runs *exactly* that many workers, never "however many the caller
+   spawned". Live CPU capacity is the **measured idle-core headroom** (total cores scaled by the
+   idle fraction sampled from `/proc/stat`), **not** the total core count and **not** load average
+   — so an idle box fans out generously and a genuinely busy one steps back, both from real CPU
+   demand rather than a phantom-saturation proxy.
 3. **Estimate up front, actuals on completion.** Before the sweep, a **derived** per-worker cost
    estimate (from prior samples of the same profile key) is printed — or an explicit **UNSET**
    when there is no comparable sample. Never a plausible-looking constant. After each round and at
@@ -132,6 +141,26 @@ carves a child cgroup per worker with its `memory.max` / `cpu.max` / `pids.max` 
 silently run uncontained. `--allow-cgroup-failure` opts into an explicit UNCONTAINED run
 (process-group teardown only, no per-worker caps) — not recommended, and the reason the box is the
 point.
+
+### Reap-on-teardown: abandonment is the normal exit path
+
+A limit that is never breached still leaks if nothing reaps. Here **abandonment is the common exit,
+not the exception**: an agent recycle, the 120-second tool cap killing a run mid-flight, or a
+detached run outliving its launcher all SIGKILL the launcher before any `finally` block or
+SIGINT/SIGTERM handler can run. When that happens the transient `parallel-experiment-<pid>.scope`
+stays `active running` with its descendants still inside it — most damagingly `setsid`/double-forked
+escapees (e.g. `tracing-appender` workers parked in `__futex_wait`, each pinning a PID namespace so
+its zombies are never reaped). Those descendants burn **zero CPU and zero memory**, so a box that
+validated only the CPU and memory axes would report perfect health while the leak accumulated, and
+`systemd-run --collect` will not GC a scope that still has live members.
+
+So the box **cleans up its own descendants**: on every fresh launch, before it mints its own scope,
+it enumerates sibling `parallel-experiment-*.scope` units and, for each whose launcher pid is dead,
+`cgroup.kill`s and stops it — logging the unit, the dead pid, and how many tasks it reaped (never a
+silent cleanup). This is next-run-cleans-previous, so leaked descendants cannot pile up across runs.
+Reaping is conservative: a scope whose launcher pid is still alive is left untouched (a live run
+owns it), so the only failure mode is a missed reap under pid reuse — never a false kill of a
+healthy run.
 
 ## Spec files
 

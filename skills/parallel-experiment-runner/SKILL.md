@@ -1,18 +1,23 @@
 ---
 name: parallel-experiment-runner
-description: Run N concurrent seed-sweep workers under RESOURCE CONTAINMENT via safe-ci-dag-runner. A seed sweep is one command template with a {seed} placeholder run over a range of seeds — a chaos search, fuzz sweep, flaky-repro hunt, or parameter scan. Concurrency is a declared, enforced number (not unbounded fan-out); every worker is contained on FOUR resource axes — cpu (CPU-second budget = 'run forever'), memory (memory.max = 'leak'), pids (pids.max = 'fork bomb'), and a wall backstop derived at ~3× the CPU budget — with a clean kill naming what breached and by how much; per-worker footprint is measured via a 1→2→4 calibration ramp; an up-front derived cost estimate (or honest UNSET) is printed before the sweep and measured actuals after. This is a resource box against a BUG in our own code, NOT a security sandbox — no seccomp, no user-namespace isolation. Use when running many parallel experiment instances that must not saturate the host, when a sweep needs real per-worker resource limits, or when hunting a seed that reproduces a bug. It reuses safe-ci-dag-runner's containment — it is not a second runner.
+description: Run N concurrent seed-sweep workers under RESOURCE CONTAINMENT via safe-ci-dag-runner. A seed sweep is one command template with a {seed} placeholder run over a range of seeds — a chaos search, fuzz sweep, flaky-repro hunt, or parameter scan. Concurrency is a declared, enforced number (not unbounded fan-out) sized from MEASURED idle-core headroom (from /proc/stat, not total cores and not load average); every worker is contained on FOUR resource axes — cpu (CPU-second budget = 'run forever'), memory (memory.max = 'leak'), pids (pids.max = 'fork bomb'), and a wall backstop derived at ~3× the CPU budget — with a clean kill naming what breached and by how much; per-worker footprint is measured via a 1→2→4 calibration ramp; an up-front derived cost estimate (or honest UNSET) is printed before the sweep and measured actuals after; and because abandonment (agent recycle / 120s tool cap / detached run) is the common exit, every fresh run REAPS the leaked scopes of abandoned predecessors (a limit never breached still leaks if nothing reaps). This is a resource box against a BUG in our own code, NOT a security sandbox — no seccomp, no user-namespace isolation. Use when running many parallel experiment instances that must not saturate the host, when a sweep needs real per-worker resource limits, or when hunting a seed that reproduces a bug. It reuses safe-ci-dag-runner's containment — it is not a second runner.
 ---
 
 # parallel-experiment-runner
 
 Runs a seed sweep as N resource-contained workers under `safe-ci-dag-runner`'s two-level
-cgroup-v2 scope. Exists to prevent the failure where unbounded parallel experiments saturate the
-host and starve their own measurements. It is a resource box against a BUG in our own code (leak,
-run-forever, fork-bomb) — NOT a security sandbox: no seccomp, no user-namespace isolation.
-Concurrency is declared+enforced; containment is four-axis — **cpu** (CPU-second budget, not
-wall), **memory** (`memory.max`), **pids** (`pids.max`, the only axis that stops a fork bomb), and
-a **wall** backstop derived at ~3× the CPU budget when unset; cost is estimated up front and
-measured after; a breach is a clean kill naming what breached and by how much.
+cgroup-v2 scope. Exists to prevent two measured failure modes of unbounded parallel experiments:
+process pile-up on the host, and leaked descendants that nothing ever reaps. It is a resource box
+against a BUG in our own code (leak, run-forever, fork-bomb) — NOT a security sandbox: no seccomp,
+no user-namespace isolation. Concurrency is declared+enforced, sized from **measured idle-core
+headroom** (from `/proc/stat`, not total cores and not the misleading load average). Containment is
+four-axis — **cpu** (CPU-second budget, not wall), **memory** (`memory.max`), **pids**
+(`pids.max`, the only axis that stops a fork bomb), and a **wall** backstop derived at ~3× the CPU
+budget when unset; cost is estimated up front and measured after; a breach is a clean kill naming
+what breached and by how much. Because **abandonment is the common exit path** (agent recycle, the
+120s tool cap, a detached run outliving its launcher — all SIGKILL the launcher before any handler
+runs), every fresh run **reaps the leaked scopes of abandoned predecessors** (`setsid` escapees
+that pin a scope at zero CPU/memory), naming the unit, dead pid, and reaped-task count.
 
 The CLI is the source of truth for usage — do not rely on this file for details. Run:
 

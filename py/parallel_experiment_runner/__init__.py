@@ -16,23 +16,30 @@ That distrust is enforced on FOUR independent axes, each mapped to a named failu
   so the cpu/wall guard reaps the contained worker and the denied-fork count names the cause.
 * **wall** — defence-in-depth BACKSTOP only, derived at ~3x the CPU budget when left unset.
 
-The four hard requirements, each realized by a specific piece:
+The hard requirements, each realized by a specific piece:
 
 1. CPU-TIME (not wall) budgets -> :attr:`model.WorkerLimits.cpu_timeout_s` lowered onto
    ``safe_ci_dag_runner.Step.cpu_timeout`` (measured from the cgroup ``cpu.stat``; ``None`` = UNSET,
    never wall-derived).
-2. DECLARED + ENFORCED concurrency -> :mod:`calibrate` resolves a width from the lane, live
-   capacity, and measured per-worker footprint; the round runs EXACTLY that many workers.
+2. DECLARED + ENFORCED concurrency, sized from MEASURED headroom -> :mod:`calibrate` resolves a
+   width from the lane, live capacity, and measured per-worker footprint; live CPU capacity is the
+   MEASURED idle-core headroom sampled from ``/proc/stat`` (not total cores, not load average, which
+   counts uninterruptible-sleep/zombies), so the round runs EXACTLY that many workers.
 3. Up-front ESTIMATE + measured ACTUAL -> :class:`profile.ProfileStore` (derived estimate or an
    honest UNSET) and :class:`model.RoundResult` / :class:`execute.SweepResult` (measured actuals).
 4. Clean kill NAMING the breach + BY HOW MUCH -> :func:`execute._breach_message` + the breach
    statuses in :mod:`model` (including ``pids-cap``, which the reason string alone would mask).
+5. REAP-ON-TEARDOWN (abandonment is the common exit) -> :mod:`reaper` reaps the leaked scopes of
+   abandoned predecessors on every fresh launch. A limit never breached still leaks if nothing
+   reaps: an agent recycle / 120s tool cap / detached run SIGKILLs the launcher before any handler
+   runs, leaving ``setsid`` escapees pinning the scope at zero CPU and zero memory. Next-run-cleans-
+   previous kills any scope whose launcher pid is dead, naming the unit, the pid, and the count.
 
 The programmatic entry point is :func:`execute.run_sweep`; the CLI is :func:`cli.main`.
 """
 
 from __future__ import annotations
 
-__version__: str = "0.2.0"
+__version__: str = "0.3.0"
 
 __all__ = ["__version__"]

@@ -203,9 +203,17 @@ workers launch; active workers remain within their already enforced caps and
 finish or are cancelled as a group. An increase does not cause an immediate
 jump: it only permits the next calibration doubling.
 
-The runner also samples physical cores, load average/CPU pressure, cgroup and
-host `MemAvailable`, and filesystem free space. Live capacity can reduce a lane
-allocation but never increase it. The decision is:
+The runner also samples physical cores, **measured idle-core CPU headroom**, cgroup
+and host `MemAvailable`, and filesystem free space. Live CPU capacity is total
+cores scaled by the idle fraction sampled from `/proc/stat` — **not** the total
+core count and **not** load average. Load average was deliberately rejected as the
+capacity signal: it counts uninterruptible-sleep and zombie tasks as "load", so on
+a box that is actually ~64% idle it can read as catastrophically busy (a
+phantom-saturation reading measured directly: 46 of 316 cores in use while the load
+average implied the host was overloaded). Busy-CPU from `/proc/stat` counts only
+real CPU demand, so an idle box scales up generously and a genuinely busy one steps
+back. Live capacity can reduce a lane allocation but never increase it. The decision
+is:
 
 ```text
 usable = min(coordinator lane, live host capacity minus reserves)
@@ -229,9 +237,9 @@ No invocation may jump from zero knowledge to dozens of workers.
    measurements before the next doubling.
 4. **Steady state.** Use the last successful power-of-two width for subsequent
    rounds. Reload the coordinator allocation and live probes before each round.
-5. **Downshift immediately.** If load, memory, disk, or allocation shrinks,
-   reduce the next round to the largest safe lower width. Never rely on a past
-   wide run to ignore current pressure.
+5. **Downshift immediately.** If measured idle-core headroom, memory, disk, or
+   allocation shrinks, reduce the next round to the largest safe lower width. Never
+   rely on a past wide run to ignore current pressure.
 6. **Restart calibration when identity changes.** A new stable profile key,
    worker cap, VM image, backend, or execution class restarts at one. Historical
    data may inform the initial hard caps but may not skip the ramp.
@@ -242,7 +250,7 @@ but the current round is reaped through the normal scheduler path.
 
 ## 7. Resource containment, caps, logs, and teardown
 
-**Framing (v0.2.0):** the threat model is a **bug in our own code**, not an
+**Framing (v0.3.0):** the threat model is a **bug in our own code**, not an
 adversary. We trust the workload's intent and distrust exactly one thing about
 it — its **resource usage**. This is therefore **resource containment**, a
 *resource box*, **not a security sandbox**: it deliberately does **not** reach
@@ -281,6 +289,38 @@ only on the captured PGID. The outer-scope teardown is the final backstop for
 `setsid`/double-fork escapees. The experiment runner must call these APIs; it
 must never use broad `pkill`, process-name matching, or host-wide cleanup.
 
+### 7.1 Reap-on-teardown: abandonment is the normal exit path (v0.3.0)
+
+The teardown above handles the normal exit (`finally`) and interactive
+SIGINT/SIGTERM (a handler that runs `cgroup.kill`). It does **not** handle the
+**common** exit here: **abandonment**. An agent recycle, the 120-second tool cap
+killing a run mid-flight, or a detached run outliving its launcher all SIGKILL the
+launcher before any `finally` or signal handler can run. When that happens the
+transient `parallel-experiment-<pid>.scope` stays `active running` with its
+descendants inside it — most damagingly `setsid`/double-fork escapees (e.g.
+`tracing-appender` workers parked in `__futex_wait`, each pinning a PID namespace
+so its zombies are never reaped). Those descendants burn **zero CPU and zero
+memory** — measured at 415 leaked threads across 8 abandoned runs — so a box that
+validated only the cpu and memory axes would report *perfect health* while the leak
+accumulated, and `systemd-run --collect` will not GC a scope that still has live
+members. A limit that is never breached still leaks if nothing reaps.
+
+The runner therefore treats abandonment as the normal exit path and makes cleanup
+**next-run-cleans-previous**: on every fresh (outer, pre-re-exec) launch, before it
+mints its own scope, it enumerates sibling `parallel-experiment-*.scope` units and,
+for each whose launcher pid (encoded in the unit name) is dead, `cgroup.kill`s and
+stops it — logging the unit, the dead pid, and the reaped-task count (never a silent
+cleanup). This is implemented in a new pure-planner + isolated-impure `reaper`
+module reusing `safe_ci_dag_runner.cgroup`'s `stop_scope`/`_scope_cgroup_path`
+primitives; it is runtime-only, so the `cross/` differential schema is untouched.
+Reaping is conservative: a scope whose launcher pid is still alive is left untouched
+(a live run owns it — verified live: `/proc/<unit-pid>` is alive for the whole
+healthy run), so the only failure mode is a missed reap under pid reuse, never a
+false kill of a healthy run. Live validation: an abandoned run left 8 `setsid`
+escapees pinning an `active` scope at zero CPU/memory; the next launch reaped it
+(`REAPED abandoned run parallel-experiment-<pid>.scope (launcher pid <pid> dead):
+killed 8 leaked task(s)/thread(s)`) and the scope went inactive.
+
 Disk has no generic cgroup-v2 space controller. The design therefore combines:
 
 - a coordinator lane disk budget and host free-space reserve;
@@ -318,14 +358,18 @@ The final summary includes:
 
 This is additive and should release as **agent-utils v0.12.0**:
 
-- new Python-first `parallel-experiment-runner` tool, shipped `0.1.0`, now at
-  tool version `0.2.0` (additive four-axis containment: the `pids` axis and the
-  derived wall backstop);
+- new Python-first `parallel-experiment-runner` tool, shipped `0.1.0`, then
+  `0.2.0` (additive four-axis containment: the `pids` axis and the derived wall
+  backstop), now at tool version `0.3.0` (two evidence-backed additions:
+  measured-idle-headroom capacity replacing the misleading load-average signal,
+  and reap-on-teardown for abandoned runs);
 - additive dynamic-DAG/profile-key API in `safe-ci-dag-runner`;
 - the `pids` axis rides an in-memory `StepOutcome.pids_events` field and adds no
-  profile-store CSV column, so the `cross/` schema and the Rust runner are
-  unaffected; live cgroup boxing (`cpu.*` columns) remains out of differential
-  scope, as before;
+  profile-store CSV column; measured-headroom capacity (a `/proc/stat` sample in
+  `calibrate`) and reap-on-teardown (the new `reaper` module) are likewise
+  runtime-only, so the `cross/` schema and the Rust runner are all unaffected;
+  live cgroup boxing (`cpu.*` columns) remains out of differential scope, as
+  before;
 - no change to existing fixed JSON/YAML DAG behavior or schemas when
   `profile_key` is absent; and
 - a future Rust port/differential test tracked explicitly rather than delaying

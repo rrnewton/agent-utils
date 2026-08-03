@@ -20,8 +20,20 @@ def _slice(cpu: int = 1000, mem: int = 1000 * _GIB, disk: int = 1000 * _GIB) -> 
     return ResourceSlice(revision=0, cpu_cores=cpu, memory_bytes=mem, disk_bytes=disk)
 
 
-def _live(cpu: int = 8, mem: int = 64 * _GIB, disk: int = 500 * _GIB, load: float = 0.0) -> LiveCapacity:
-    return LiveCapacity(cpu_cores=cpu, mem_available_bytes=mem, disk_free_bytes=disk, load_avg_1m=load)
+def _live(
+    cpu: int = 8,
+    mem: int = 64 * _GIB,
+    disk: int = 500 * _GIB,
+    available: int | None = None,
+) -> LiveCapacity:
+    # By default the whole box is idle (available == total), so tests that don't exercise the
+    # headroom axis bind on lane/ceiling exactly as before.
+    return LiveCapacity(
+        cpu_cores=cpu,
+        available_cpu_cores=cpu if available is None else available,
+        mem_available_bytes=mem,
+        disk_free_bytes=disk,
+    )
 
 
 def test_resolve_width_cpu_limited() -> None:
@@ -30,6 +42,23 @@ def test_resolve_width_cpu_limited() -> None:
     assert fit.width == 8
     assert fit.limiting_dimension == "cpu"
     assert fit.cpu_slots == 8
+
+
+def test_resolve_width_uses_measured_headroom_not_total_cores() -> None:
+    # 64 cores total but only 4 measured idle => the busy box binds width to real headroom, not
+    # the full core count (the phantom-saturation fix: size from measured idle, not total/load).
+    fit = resolve_width(_slice(), _live(cpu=64, available=4), PerInstance(1, None, None), ceiling=64)
+    assert fit.width == 4
+    assert fit.limiting_dimension == "cpu"
+    assert fit.cpu_slots == 4
+
+
+def test_resolve_width_idle_box_scales_generously() -> None:
+    # A fully-idle 64-core box (available == total) is bound only by the ceiling, not by a
+    # phantom load reading — the runner may fan out to the granted ceiling.
+    fit = resolve_width(_slice(), _live(cpu=64, available=64), PerInstance(1, None, None), ceiling=48)
+    assert fit.width == 48
+    assert fit.limiting_dimension == "ceiling"
 
 
 def test_resolve_width_memory_limited() -> None:
