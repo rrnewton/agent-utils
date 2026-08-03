@@ -120,6 +120,25 @@ class CgroupManager(Protocol):
         """
         ...
 
+    def set_worker_pids_max(self, limit: int | None) -> None:
+        """Set a uniform per-step ``pids.max`` cap applied to every subsequently-prepared child
+        cgroup (``None`` disables it). Runtime-only, never serialized in the DAG. The PID axis is
+        the one a fork bomb exhausts that ``cpu.max`` / ``memory.max`` cannot contain.
+        """
+        ...
+
+    def pids_events(self, tag: str) -> int:
+        """Number of denied ``fork``/``clone`` events inside the step's cgroup (cgroup-v2
+        ``pids.events`` ``max`` line).
+
+        ``> 0`` means the step hit its INNER ``pids.max`` and a fork was refused — the
+        actionable PID-exhaustion / fork-bomb signal, distinct from an OOM or a wall timeout.
+        Unlike an OOM the kernel does not kill the process; it is contained and the cpu/wall
+        guard reaps it. Returns ``0`` when disabled, unknown, or unreadable. Read BEFORE
+        :meth:`cleanup`.
+        """
+        ...
+
     def oom_kills(self, tag: str) -> int:
         """Number of kernel OOM-kill events inside the step's cgroup (cgroup-v2
         ``memory.events`` ``oom_kill`` line).
@@ -260,6 +279,12 @@ class StepOutcome:
     #: True when eager-exit killed this in-flight step after ANOTHER step failed — a
     #: cancellation, reported distinctly from a genuine FAIL.
     aborted: bool = False
+    #: Count of ``fork``/``clone`` calls the kernel denied at the step's inner ``pids.max``
+    #: (the fork-bomb / PID-exhaustion signal), or 0. Carried IN MEMORY only — deliberately NOT
+    #: written to the CSV profile store, so the Python/Rust CSV-header differential stays
+    #: byte-identical while a consumer can still classify a PID-cap breach. ``> 0`` means the step
+    #: was CONTAINED (fork refused), not kernel-killed; a cpu/wall guard does the actual reaping.
+    pids_events: int = 0
 
     @classmethod
     def failed(
@@ -279,10 +304,16 @@ class StepOutcome:
         cpu_timed_out: bool = False,
         cpu_timeout: int = 0,
         aborted: bool = False,
+        pids_events: int = 0,
     ) -> "StepOutcome":
         """Build a failed outcome, deriving :attr:`reason` from the shared precedence
         rule (OOM > CPU-timeout > timeout > pids-guard > detail-capture > signal > exit) so
-        every caller reports failures identically."""
+        every caller reports failures identically.
+
+        ``pids_events`` is retained on the instance (see the field docs) so a consumer can
+        classify a PID-cap breach even when a higher-precedence reap (cpu/wall) owns the
+        human-readable :attr:`reason`; it never affects ``reason``.
+        """
         reason = step_failure_reason(
             returncode=returncode,
             oomed=oomed,
@@ -303,6 +334,7 @@ class StepOutcome:
             returncode=returncode,
             reason=reason,
             aborted=aborted,
+            pids_events=pids_events,
         )
 
 
