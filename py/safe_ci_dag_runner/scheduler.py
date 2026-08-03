@@ -138,6 +138,12 @@ class _NoopCgroupManager:
     def cleanup(self, tag: str) -> None:
         return None
 
+    def set_worker_pids_max(self, limit: int | None) -> None:
+        return None
+
+    def pids_events(self, tag: str) -> int:
+        return 0
+
     def oom_kills(self, tag: str) -> int:
         return 0
 
@@ -657,6 +663,7 @@ class Runner:
 
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
         oom = self.cgroups.oom_kills(step.tag)
+        pids_events = self.cgroups.pids_events(step.tag)
         peak = self.cgroups.peak_bytes(step.tag)
         cpu_stats = self.cgroups.cpu_stats(step.tag)
         step_pressure_end = _psi_reading(self.cgroups.cpu_pressure(step.tag)) if boxed else None
@@ -689,6 +696,9 @@ class Runner:
             "peak_bytes": peak,
             "thread_peak": thread_peak,
         }
+        # NOTE: pids_events is deliberately NOT a CSV column — it rides on the in-memory
+        # StepOutcome instead (see StepOutcome.pids_events), so the Python/Rust CSV-header
+        # differential stays byte-identical while a PID-cap breach is still classifiable.
         if cpu_stats is not None:
             for key, value in cpu_stats.items():
                 row[f"cpu.{key}"] = value
@@ -725,14 +735,19 @@ class Runner:
                     returncode=returncode,
                     reason="ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)",
                     aborted=True,
+                    pids_events=pids_events,
                 )
             elif ok:
+                # A step can exit 0 yet still have hit its inner pids.max (e.g. a shell whose
+                # backgrounded forks were denied but that returns 0 anyway). Carry the count so a
+                # consumer can still surface the fork-bomb containment; ``ok`` itself is unchanged.
                 outcome = StepOutcome(
                     tag=step.tag,
                     ok=True,
                     duration_s=elapsed,
                     summary=summary,
                     returncode=returncode,
+                    pids_events=pids_events,
                 )
             else:
                 outcome = StepOutcome.failed(
@@ -746,8 +761,12 @@ class Runner:
                     timeout=step.timeout,
                     cpu_timed_out=cpu_timed_out,
                     cpu_timeout=cpu_budget,
-                    pids_guard_tripped=False,
-                    pids_guard_reason=None,
+                    pids_guard_tripped=pids_events > 0,
+                    pids_guard_reason=(
+                        f"hit inner pids.max ({pids_events} denied fork/clone event(s))"
+                        if pids_events > 0 else None
+                    ),
+                    pids_events=pids_events,
                     detail_write_failure=(),
                 )
             self.done[step.tag] = outcome
@@ -803,6 +822,12 @@ class Runner:
                     f"MemoryMax (cap≈{_fmt_bytes(mem_max)}, peak≈{_fmt_bytes(peak)}). "
                     "Confirm this is genuine growth, not an unbounded leak, before raising the "
                     "step's rss_baseline_bytes / hard_mem_max_bytes hint."
+                )
+            if pids_events > 0:
+                self._emit(
+                    f"[{step.tag}] ▲ PIDS CAP HIT: {pids_events} fork/clone(s) denied at its "
+                    "inner cgroup pids.max (PID-exhaustion / fork-bomb containment). The process "
+                    "was contained, not kernel-killed; the cpu/wall guard reaps it."
                 )
             # Self-contained failure: dump the captured child output, tagged.
             self._emit(f"[{step.tag}] ----- detail -----")

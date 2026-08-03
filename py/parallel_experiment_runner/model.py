@@ -7,10 +7,23 @@ planning/calibration logic is trivially testable and the runner never hides a sc
 containment implementation of its own — it lowers each round onto a
 :class:`safe_ci_dag_runner.DagConfig` and hands it to ``safe-ci-dag-runner``.
 
-Design note (why these mirror the design doc): the four hard requirements —
-CPU-time (not wall) budgets, a DECLARED+ENFORCED concurrency width, an up-front cost
-ESTIMATE plus a measured ACTUAL, and a clean kill that NAMES what breached — each map to a
-field or type below. See ``ai_docs/2026-07-29-parallel-experiment-runner-design.md``.
+This is RESOURCE CONTAINMENT, not a security sandbox. The workers run our own code; the
+only thing we don't trust about it is its RESOURCE USAGE — code that leaks memory, runs
+forever, or fork-bombs. So the box has four enforced axes, each mapped to one named failure
+mode, and NONE of them reach for seccomp or user-namespace isolation:
+
+* ``cpu``    — "run forever": a CPU-SECOND budget (not wall), the load-immune guard.
+* ``memory`` — "leak memory": an inner ``memory.max`` cap; a breach is a self-contained OOM-kill.
+* ``pids``   — "fork bomb": an inner ``pids.max`` cap. A fork bomb exhausts PIDs, not CPU or
+  memory, so neither of the two above can contain one — this is a distinct, required axis.
+* ``wall``   — defence-in-depth backstop only, load-DEPENDENT; derived at ~3x the CPU budget
+  when a spec leaves it unset (see :func:`WorkerLimits.resolved_wall_timeout_s`).
+
+Design note (why these mirror the design doc): the hard requirements — the four-axis box
+above with CPU-time (not wall) budgets, a DECLARED+ENFORCED concurrency width, an up-front
+cost ESTIMATE plus a measured ACTUAL, and a clean kill that NAMES what breached and by how
+much — each map to a field or type below. See
+``ai_docs/2026-07-29-parallel-experiment-runner-design.md``.
 """
 
 from __future__ import annotations
@@ -18,10 +31,18 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
-#: Wall-clock backstop (seconds) for a worker when a spec declares none. Wall time is
-#: LOAD-DEPENDENT, so it is only a hang backstop — the CPU-time budget is the real,
-#: load-immune guard (see :attr:`WorkerLimits.cpu_timeout_s`).
+#: Wall-clock backstop (seconds) for a worker when a spec declares NO wall timeout AND no
+#: CPU-second budget to derive one from. Wall time is LOAD-DEPENDENT, so it is only a
+#: defence-in-depth hang backstop — the CPU-time budget is the real, load-immune guard
+#: (see :attr:`WorkerLimits.cpu_timeout_s`).
 DEFAULT_WALL_TIMEOUT_S = 1800
+
+#: When a spec sets a CPU-second budget but no explicit wall backstop, the wall backstop is
+#: derived at this multiple of the CPU budget. A worker legitimately spending C CPU-seconds
+#: can take up to ~C wall-seconds when serialized on one core, plus scheduling slack under
+#: load; 3x leaves generous headroom so the wall guard only ever fires on a true hang, never
+#: races the (authoritative) CPU-second guard.
+WALL_CPU_BACKSTOP_FACTOR = 3
 
 #: Placeholder substituted with each concrete seed in a command template argument.
 SEED_PLACEHOLDER = "{seed}"
@@ -30,20 +51,21 @@ SEED_PLACEHOLDER = "{seed}"
 # Worker terminal-status vocabulary. A HIT is the target condition the sweep hunts for; a
 # MISS ran cleanly without it. Everything else is an infrastructure outcome that is NEVER
 # counted as a hit (design §8): a nonzero exit that is not a declared hit code, a wall hang,
-# a CPU-budget or memory-cap breach, a disk-reserve stop, or an eager-cancel.
+# a CPU-budget / memory-cap / PID-cap breach, a disk-reserve stop, or an eager-cancel.
 STATUS_HIT = "hit"
 STATUS_MISS = "miss"
 STATUS_COMMAND_ERROR = "command-error"
 STATUS_TIMEOUT = "timeout"
 STATUS_CPU_TIMEOUT = "cpu-timeout"
 STATUS_MEMORY_CAP = "memory-cap"
+STATUS_PIDS_CAP = "pids-cap"
 STATUS_DISK_CAP = "disk-cap"
 STATUS_CANCELLED = "cancelled"
 
 #: Statuses that represent a breach of a declared per-worker limit (reported distinctly and
 #: never as a hit). ``command-error`` is a workload failure, not a limit breach.
 BREACH_STATUSES = frozenset(
-    {STATUS_TIMEOUT, STATUS_CPU_TIMEOUT, STATUS_MEMORY_CAP, STATUS_DISK_CAP}
+    {STATUS_TIMEOUT, STATUS_CPU_TIMEOUT, STATUS_MEMORY_CAP, STATUS_PIDS_CAP, STATUS_DISK_CAP}
 )
 
 
@@ -64,8 +86,16 @@ class WorkerLimits:
       wall time. On an N-core host, N wall-seconds is up to N CPU-seconds, so a wall-derived
       CPU budget is ~1/N of what a worker needs and would FALSE-KILL healthy workers in a way
       indistinguishable from a flaky test. UNSET (honest, wall backstop still applies) beats a
-      guessed, too-tight budget.
-    * ``wall_timeout_s`` -> the step's wall ``timeout``, a load-tolerant hang backstop only.
+      guessed, too-tight budget. This axis contains "run forever".
+    * ``pids_max`` -> the step's inner ``pids.max`` cap (applied uniformly by the cgroup
+      manager). This axis contains "fork bomb": a fork bomb exhausts PIDs, not CPU or memory,
+      so neither ``cpu_timeout_s`` nor ``memory_bytes`` can stop one. Past the cap the kernel
+      refuses further ``fork``/``clone`` (EAGAIN) — the worker is CONTAINED, not killed, and
+      the CPU/wall guard reaps it. ``None`` means no PID cap.
+    * ``wall_timeout_s`` -> the step's wall ``timeout``, a load-tolerant DEFENCE-IN-DEPTH hang
+      backstop only. ``None`` means DERIVE it (see :meth:`resolved_wall_timeout_s`): ~3x the
+      CPU-second budget when one is set, else :data:`DEFAULT_WALL_TIMEOUT_S`. The CPU-second
+      budget, not this, is the authoritative guard.
     * ``disk_bytes`` -> the per-worker workspace/overlay budget used for the round's
       free-space reserve check (cgroup-v2 has no space controller; see the runner's disk
       handling).
@@ -74,7 +104,8 @@ class WorkerLimits:
     cpu_cores: int = 1
     memory_bytes: int | None = None
     cpu_timeout_s: int | None = None
-    wall_timeout_s: int = DEFAULT_WALL_TIMEOUT_S
+    pids_max: int | None = None
+    wall_timeout_s: int | None = None
     disk_bytes: int | None = None
 
     def __post_init__(self) -> None:
@@ -86,10 +117,30 @@ class WorkerLimits:
             raise ValueError(
                 f"cpu_timeout_s must be positive when set (None = UNSET), got {self.cpu_timeout_s}"
             )
-        if self.wall_timeout_s <= 0:
-            raise ValueError(f"wall_timeout_s must be positive, got {self.wall_timeout_s}")
+        if self.pids_max is not None and self.pids_max < 1:
+            raise ValueError(f"pids_max must be >= 1 when set (None = no cap), got {self.pids_max}")
+        if self.wall_timeout_s is not None and self.wall_timeout_s <= 0:
+            raise ValueError(
+                f"wall_timeout_s must be positive when set (None = derive), got {self.wall_timeout_s}"
+            )
         if self.disk_bytes is not None and self.disk_bytes <= 0:
             raise ValueError(f"disk_bytes must be positive when set, got {self.disk_bytes}")
+
+    def resolved_wall_timeout_s(self) -> int:
+        """The effective wall backstop in seconds, applying the derive-when-unset idiom.
+
+        Wall time is only defence-in-depth, so its value is chosen to sit generously ABOVE the
+        authoritative CPU-second guard, never to race it:
+
+        * explicit ``wall_timeout_s`` -> used as-is;
+        * else a CPU-second budget is set -> ``WALL_CPU_BACKSTOP_FACTOR`` x that budget;
+        * else -> :data:`DEFAULT_WALL_TIMEOUT_S`.
+        """
+        if self.wall_timeout_s is not None:
+            return self.wall_timeout_s
+        if self.cpu_timeout_s is not None:
+            return WALL_CPU_BACKSTOP_FACTOR * self.cpu_timeout_s
+        return DEFAULT_WALL_TIMEOUT_S
 
 
 @dataclass(frozen=True)

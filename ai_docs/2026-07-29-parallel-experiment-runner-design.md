@@ -240,7 +240,31 @@ The ramp uses real search seeds, so calibration work is not discarded. Hits
 found during calibration are reported normally. A hit can stop future rounds,
 but the current round is reaped through the normal scheduler path.
 
-## 7. Isolation, caps, logs, and teardown
+## 7. Resource containment, caps, logs, and teardown
+
+**Framing (v0.2.0):** the threat model is a **bug in our own code**, not an
+adversary. We trust the workload's intent and distrust exactly one thing about
+it — its **resource usage**. This is therefore **resource containment**, a
+*resource box*, **not a security sandbox**: it deliberately does **not** reach
+for seccomp or user-namespace isolation. Containment is enforced on **four
+independent axes**, each mapped to one named failure mode:
+
+- **cpu** — 'run forever': a CPU-**second** budget from `cpu.stat` (never wall).
+- **memory** — 'leak memory': `memory.max`, OOM via `memory.events`.
+- **pids** — 'fork bomb': `pids.max`. Neither `cpu.max` nor `memory.max` stops
+  PID exhaustion; only a pids cap does. A breach **contains** the fork (`EAGAIN`
+  from `clone`/`fork`) rather than kernel-killing the worker, so the denied-fork
+  count (`pids.events` `max` line) is captured and the cpu/wall guard reaps the
+  contained worker. The count rides an **in-memory `StepOutcome` field, not a new
+  profile-store CSV column**, so the `cross/` differential schema stays
+  byte-identical and the in-flight Rust-runner workstream is not disturbed.
+- **wall** — defence-in-depth backstop only, **derived at ~3× the CPU budget**
+  when left unset (never a hardcoded default when a CPU budget exists).
+
+The kill message names **what breached and by how much** (e.g. `PIDS-CAP: 4
+fork/clone(s) denied at pids.max 16`). Because a contained fork bomb is reaped by
+the wall/CPU guard, the classifier ranks `pids-cap` ahead of `timeout` using the
+in-memory denied-fork count, so a fork bomb is never mislabelled as a plain hang.
 
 This design builds directly on `safe-ci-dag-runner`'s existing two levels:
 
@@ -273,10 +297,12 @@ contains the full structured results without embedding raw logs.
 
 ## 8. Result and failure semantics
 
-Worker outcomes distinguish `miss`, `hit`, `command-error`, `timeout`,
-`memory-cap`, `disk-cap`, and `cancelled`. A hit predicate may be a bounded log
-regex, a designated exit code, or a structured result-file field. Infrastructure
-failures are never silently counted as target hits.
+Worker outcomes distinguish `miss`, `hit`, `command-error`, `cpu-timeout`,
+`timeout`, `memory-cap`, `pids-cap`, `disk-cap`, and `cancelled`. A hit predicate
+may be a bounded log regex, a designated exit code, or a structured result-file
+field. Infrastructure failures are never silently counted as target hits.
+Breaches are classified before hits, and `pids-cap` outranks `timeout` (see §7),
+so a contained fork bomb reaped by the wall guard is named as the fork bomb it is.
 
 The final summary includes:
 
@@ -292,8 +318,14 @@ The final summary includes:
 
 This is additive and should release as **agent-utils v0.12.0**:
 
-- new Python-first `parallel-experiment-runner` tool at tool version `0.1.0`;
+- new Python-first `parallel-experiment-runner` tool, shipped `0.1.0`, now at
+  tool version `0.2.0` (additive four-axis containment: the `pids` axis and the
+  derived wall backstop);
 - additive dynamic-DAG/profile-key API in `safe-ci-dag-runner`;
+- the `pids` axis rides an in-memory `StepOutcome.pids_events` field and adds no
+  profile-store CSV column, so the `cross/` schema and the Rust runner are
+  unaffected; live cgroup boxing (`cpu.*` columns) remains out of differential
+  scope, as before;
 - no change to existing fixed JSON/YAML DAG behavior or schemas when
   `profile_key` is absent; and
 - a future Rust port/differential test tracked explicitly rather than delaying

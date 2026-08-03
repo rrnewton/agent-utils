@@ -9,13 +9,14 @@ import pytest
 
 from safe_ci_dag_runner import StepOutcome
 
-from parallel_experiment_runner.cli import main, parse_seeds
+from parallel_experiment_runner.cli import _spec_from_args, build_parser, main, parse_seeds
 from parallel_experiment_runner.execute import _classify_outcome
 from parallel_experiment_runner.model import (
     STATUS_CANCELLED,
     STATUS_CPU_TIMEOUT,
     STATUS_HIT,
     STATUS_MEMORY_CAP,
+    STATUS_PIDS_CAP,
     STATUS_TIMEOUT,
     ExperimentSpec,
     HitCondition,
@@ -52,10 +53,10 @@ def _spec(**kw: object) -> ExperimentSpec:
     return ExperimentSpec(**base)  # type: ignore[arg-type]
 
 
-def _outcome(returncode: int = 0, *, aborted: bool = False) -> StepOutcome:
+def _outcome(returncode: int = 0, *, aborted: bool = False, pids_events: int = 0) -> StepOutcome:
     return StepOutcome(
         tag="seed.3", ok=(returncode == 0 and not aborted), duration_s=1.0,
-        summary="", returncode=returncode, aborted=aborted,
+        summary="", returncode=returncode, aborted=aborted, pids_events=pids_events,
     )
 
 
@@ -81,11 +82,53 @@ def test_breach_wall_timeout_named(tmp_path: Path) -> None:
     assert "TIMEOUT" in res.breach
 
 
+def test_breach_pids_cap_named(tmp_path: Path) -> None:
+    # A fork-bomb worker: StepOutcome.pids_events > 0 means forks were denied at the inner
+    # pids.max (carried in-memory, deliberately NOT a CSV column).
+    spec = _spec(
+        worker_limits=WorkerLimits(cpu_cores=1, cpu_timeout_s=3, wall_timeout_s=60, pids_max=64)
+    )
+    res = _classify_outcome(
+        spec, _outcome(returncode=1, pids_events=12), {}, tmp_path / "seed-3.log"
+    )
+    assert res.status == STATUS_PIDS_CAP
+    assert res.is_breach
+    assert "PIDS-CAP" in res.breach
+    assert "12 fork/clone(s) denied" in res.breach and "pids.max 64" in res.breach
+
+
 def test_breach_precedence_cancel_beats_cpu_timeout(tmp_path: Path) -> None:
     # An eager-cancel outranks a same-round cpu-timeout signal: a killed sibling is CANCELLED.
     row = {"cpu_timed_out": True, "cpu.usage_usec": 3_000_000}
     res = _classify_outcome(_spec(), _outcome(returncode=1, aborted=True), row, tmp_path / "s.log")
     assert res.status == STATUS_CANCELLED
+
+
+def test_breach_precedence_oom_beats_pids_cap(tmp_path: Path) -> None:
+    # A worker that both OOM-killed and hit its pids cap is reported by the kill-based axis (OOM),
+    # which is a more definitive cause than a denied fork.
+    row = {"oom_kills": 1, "peak_bytes": 5000}
+    spec = _spec(
+        worker_limits=WorkerLimits(cpu_cores=1, cpu_timeout_s=3, wall_timeout_s=60, pids_max=64)
+    )
+    res = _classify_outcome(
+        spec, _outcome(returncode=137, pids_events=4), row, tmp_path / "seed-3.log"
+    )
+    assert res.status == STATUS_MEMORY_CAP
+
+
+def test_breach_precedence_pids_cap_beats_wall_timeout(tmp_path: Path) -> None:
+    # A denied fork is a more specific cause than a plain wall hang, so pids-cap outranks timeout.
+    # This is the case the reason-string precedence would MASK (it reaps as TIMEOUT); the
+    # in-memory pids_events lets the classifier still name the fork-bomb.
+    row = {"timed_out": True, "elapsed_s": 60.0}
+    spec = _spec(
+        worker_limits=WorkerLimits(cpu_cores=1, cpu_timeout_s=3, wall_timeout_s=60, pids_max=64)
+    )
+    res = _classify_outcome(
+        spec, _outcome(returncode=1, pids_events=3), row, tmp_path / "seed-3.log"
+    )
+    assert res.status == STATUS_PIDS_CAP
 
 
 def test_clean_zero_is_hit_when_default(tmp_path: Path) -> None:
@@ -114,6 +157,37 @@ def test_leading_double_dash_is_stripped_from_command(tmp_path: Path) -> None:
         "--slice-disk", "50G", "--", "echo", "{seed}",
     ])
     assert code == 0
+
+
+def _parsed_spec(*extra: str) -> ExperimentSpec:
+    ns = build_parser().parse_args(
+        ["run", "--name", "s", "--seeds", "0", *extra, "--", "run", "{seed}"]
+    )
+    spec = _spec_from_args(ns)
+    assert isinstance(spec, ExperimentSpec)
+    return spec
+
+
+def test_pids_flag_flows_into_worker_limits() -> None:
+    limits = _parsed_spec("--pids", "128", "--cpu-timeout", "10").worker_limits
+    assert limits.pids_max == 128
+
+
+def test_pids_flag_omitted_is_no_cap() -> None:
+    assert _parsed_spec("--cpu-timeout", "10").worker_limits.pids_max is None
+
+
+def test_wall_timeout_omitted_derives_from_cpu_budget() -> None:
+    # No --wall-timeout + a --cpu-timeout -> the derived ~3x backstop, never a hardcoded default.
+    limits = _parsed_spec("--cpu-timeout", "10").worker_limits
+    assert limits.wall_timeout_s is None
+    assert limits.resolved_wall_timeout_s() == 30
+
+
+def test_wall_timeout_explicit_is_honoured() -> None:
+    limits = _parsed_spec("--cpu-timeout", "10", "--wall-timeout", "200").worker_limits
+    assert limits.wall_timeout_s == 200
+    assert limits.resolved_wall_timeout_s() == 200
 
 
 def test_quickstart_and_version() -> None:

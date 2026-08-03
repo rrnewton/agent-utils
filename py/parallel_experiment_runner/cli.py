@@ -1,7 +1,7 @@
 """Command-line entry point for parallel-experiment-runner.
 
 Subcommands:
-  run          run a seed sweep BOXED under safe-ci-dag-runner's two-level cgroup scope
+  run          run a seed sweep CONTAINED under safe-ci-dag-runner's two-level cgroup scope
   plan-round   resolve + print ONE round's enforced width and lowered DAG (dry, no boxing)
   quickstart   print a self-contained getting-started guide
 
@@ -97,7 +97,8 @@ def _spec_from_args(ns: argparse.Namespace) -> "object":
         cpu_cores=int(ns.cpu_cores),
         memory_bytes=memory,
         cpu_timeout_s=int(ns.cpu_timeout) if ns.cpu_timeout is not None else None,
-        wall_timeout_s=int(ns.wall_timeout),
+        pids_max=int(ns.pids) if ns.pids is not None else None,
+        wall_timeout_s=int(ns.wall_timeout) if ns.wall_timeout is not None else None,
         disk_bytes=disk,
     )
     exit_codes = tuple(int(x) for x in ns.hit_exit_codes)
@@ -140,7 +141,9 @@ def _spec_from_file(path: Path) -> "object":
         cpu_cores=int(wl.get("cpu_cores", 1)),
         memory_bytes=_opt_int(wl.get("memory_bytes")),
         cpu_timeout_s=_opt_int(wl.get("cpu_timeout_s")),
-        wall_timeout_s=int(wl.get("wall_timeout_s", DEFAULT_WALL_TIMEOUT_S)),
+        pids_max=_opt_int(wl.get("pids_max")),
+        # Omit or null -> derive the wall backstop at ~3x the CPU budget (see WorkerLimits).
+        wall_timeout_s=_opt_int(wl.get("wall_timeout_s")),
         disk_bytes=_opt_int(wl.get("disk_bytes")),
     )
     hd = data.get("hit", {})
@@ -208,6 +211,15 @@ def _cmd_run(ns: argparse.Namespace) -> int:
     except (ValueError, OSError) as exc:
         print(f"{PROG}: {exc}", file=sys.stderr)
         return 2
+
+    # Fork-bomb containment (the PID axis) is applied uniformly to every child cgroup at runtime,
+    # so it is set on the manager here rather than serialized per-step in the DAG.
+    from typing import cast as _cast_spec
+
+    from parallel_experiment_runner.model import ExperimentSpec as _ExperimentSpec
+
+    if manager is not None:
+        manager.set_worker_pids_max(_cast_spec(_ExperimentSpec, spec).worker_limits.pids_max)
 
     work_dir = Path(ns.work_dir).resolve()
     log_dir = Path(ns.log_dir).resolve() if ns.log_dir else work_dir / "ignored" / "logs"
@@ -357,7 +369,10 @@ def _cmd_plan_round(ns: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
-        description="Run N concurrent seed-sweep workers BOXED under safe-ci-dag-runner.",
+        description=(
+            "Run N concurrent seed-sweep workers under safe-ci-dag-runner's cgroup RESOURCE "
+            "CONTAINMENT (CPU-time / memory / PID / wall caps)."
+        ),
     )
     parser.add_argument("--version", action="version", version=f"{PROG} {__version__}")
     parser.add_argument(
@@ -368,8 +383,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="subcommand", metavar="<command>")
 
     for name, help_text in (
-        ("run", "run a seed sweep boxed under cgroups"),
-        ("plan-round", "resolve + print one round's width and DAG (dry, no boxing)"),
+        ("run", "run a seed sweep under cgroup resource containment"),
+        ("plan-round", "resolve + print one round's width and DAG (dry, no containment)"),
     ):
         sp = sub.add_parser(name, help=help_text)
         sp.add_argument("--name", default="sweep", help="experiment name (default: sweep)")
@@ -384,10 +399,21 @@ def build_parser() -> argparse.ArgumentParser:
             help="per-worker CPU-SECOND budget (user+sys). Omit = UNSET (never wall-derived)",
         )
         sp.add_argument(
+            "--pids",
+            "--max-pids",
+            type=int,
+            default=None,
+            dest="pids",
+            help="per-worker PID cap (pids.max) — the fork-bomb guard. Omit = no cap",
+        )
+        sp.add_argument(
             "--wall-timeout",
             type=int,
-            default=DEFAULT_WALL_TIMEOUT_S,
-            help=f"per-worker wall backstop seconds (default {DEFAULT_WALL_TIMEOUT_S})",
+            default=None,
+            help=(
+                "per-worker wall backstop seconds (defence-in-depth). Omit = DERIVE: ~3x the "
+                f"--cpu-timeout budget when set, else {DEFAULT_WALL_TIMEOUT_S}"
+            ),
         )
         sp.add_argument("--disk", default=None, help="per-worker disk reserve, e.g. 8G")
         sp.add_argument(
@@ -426,7 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument(
                 "--allow-cgroup-failure",
                 action="store_true",
-                help="run UNBOXED if cgroup boxing can't be established (NOT recommended)",
+                help="run UNCONTAINED if cgroup containment can't be established (NOT recommended)",
             )
         sp.add_argument(
             "command",
@@ -439,19 +465,28 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _QUICKSTART = f"""\
-{PROG} — run N concurrent seed-sweep workers BOXED under safe-ci-dag-runner.
+{PROG} — run N concurrent seed-sweep workers under safe-ci-dag-runner's RESOURCE CONTAINMENT.
 
 Why: unbounded parallel experiments once saturated the host to ~470 concurrent processes,
-starving the very measurements they existed to produce. This tool makes concurrency a
-DECLARED, ENFORCED number and runs every worker under real cgroup CPU/memory/CPU-time caps
-with a clean kill on breach.
+starving the very measurements they existed to produce. This is a resource box, not a
+security sandbox — it defends against a BUG in our own code (leak memory, run forever, fork
+bomb), NOT against an adversary, so it never reaches for seccomp or user-namespace isolation.
+It makes concurrency a DECLARED, ENFORCED number and runs every worker under four cgroup
+axes, each mapped to one failure mode, with a clean kill that NAMES what breached:
 
-Example — sweep seeds 0..199, 1 core + 4G + a 120 CPU-second budget per worker, hunting a
-divergence in the log, capped at 32 concurrent workers:
+  * cpu    — "run forever": a CPU-SECOND budget (--cpu-timeout), the load-immune guard.
+  * memory — "leak memory": an inner memory.max cap (--memory).
+  * pids   — "fork bomb":   an inner pids.max cap (--pids). A fork bomb exhausts PIDs, which
+             neither the cpu nor the memory cap can contain — this is a distinct axis.
+  * wall   — defence-in-depth hang backstop only (--wall-timeout); derived at ~3x the CPU
+             budget when left unset.
+
+Example — sweep seeds 0..199, 1 core + 4G + a 120 CPU-second budget + a 512-PID cap per
+worker, hunting a divergence in the log, capped at 32 concurrent workers:
 
   {PROG} run \\
     --name chaos-divergence --seeds 0-199 \\
-    --cpu-cores 1 --memory 4G --cpu-timeout 120 --wall-timeout 900 \\
+    --cpu-cores 1 --memory 4G --cpu-timeout 120 --pids 512 \\
     --hit-regex 'DIVERGENCE|panic' --max-concurrency 32 \\
     --identity backend=ptrace image=demo5 \\
     -- hermit run --chaos --seed {{seed}} ./demo
@@ -459,6 +494,7 @@ divergence in the log, capped at 32 concurrent workers:
 Notes:
   * CPU-time is the real, load-immune guard; omit --cpu-timeout to leave it UNSET (honest).
     Never derive a CPU budget from wall time — on an N-core host it would be ~1/N too tight.
+  * --wall-timeout is only a backstop; omit it to derive ~3x the CPU budget automatically.
   * The runner ramps width 1 -> 2 -> 4 -> …, measuring per-worker footprint before scaling.
   * Per-worker logs go to <work-dir>/ignored/logs/seed-<n>.log; the run prints only a summary.
   * `plan-round` shows the resolved width + DAG without running (and needs no cgroups).

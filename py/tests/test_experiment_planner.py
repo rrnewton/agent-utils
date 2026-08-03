@@ -76,6 +76,13 @@ def test_lowering_cpu_timeout_unset_becomes_zero(tmp_path: Path) -> None:
     assert step.cpu_timeout == 0
 
 
+def test_lowering_derives_wall_backstop_from_cpu_budget(tmp_path: Path) -> None:
+    # wall_timeout_s unset + a CPU budget -> Step.timeout is the derived ~3x backstop, not None.
+    spec = _spec(worker_limits=WorkerLimits(cpu_cores=1, cpu_timeout_s=120, wall_timeout_s=None))
+    step = generate_round_dag(_plan(spec, (7,), tmp_path)).steps[0]
+    assert step.timeout == 360  # 3 * 120, sitting above the authoritative CPU-second guard
+
+
 def test_build_worker_command_quotes_and_redirects(tmp_path: Path) -> None:
     spec = _spec(command=("echo", "hi there", "{seed}"))
     log = worker_log_path(tmp_path, 5)

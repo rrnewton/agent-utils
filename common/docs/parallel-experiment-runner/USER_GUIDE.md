@@ -1,8 +1,8 @@
 # parallel-experiment-runner — user guide
 
-Run **N concurrent seed-sweep workers, BOXED** under `safe-ci-dag-runner`'s two-level
-cgroup-v2 scope. A seed sweep is one command template with a `{seed}` placeholder, run over a
-range of seeds — a chaos search, a fuzz sweep, a flaky-repro hunt, a parameter scan.
+Run **N concurrent seed-sweep workers under RESOURCE CONTAINMENT**, using `safe-ci-dag-runner`'s
+two-level cgroup-v2 scope. A seed sweep is one command template with a `{seed}` placeholder, run
+over a range of seeds — a chaos search, a fuzz sweep, a flaky-repro hunt, a parameter scan.
 
 This tool exists because unbounded parallel experiments once saturated a host to ~470
 concurrent processes, starving the very measurements they were launched to produce. It fixes
@@ -10,7 +10,28 @@ that structurally: **concurrency is a declared, enforced number**, every worker 
 cgroup limits, and a worker that breaches a limit is cleanly killed with a message naming what
 breached and by how much.
 
-It is a thin, additive generalization of `safe-ci-dag-runner`: each seed becomes one boxed
+## Resource containment, not a security sandbox
+
+The threat model is a **bug in our own code**, not an adversary. We trust the workload's *intent*;
+we distrust exactly one thing about it — its **resource usage**: it may leak memory, run forever,
+or fork-bomb. So this is a **resource box**, not a security sandbox: it does **not** reach for
+seccomp or user-namespace isolation. Containment is enforced on **four independent axes**, each
+mapped to one named failure mode:
+
+| axis | failure it stops | mechanism |
+| --- | --- | --- |
+| **cpu** | *run forever* | a CPU-**second** budget from the cgroup `cpu.stat` (not wall) |
+| **memory** | *leak memory* | `memory.max`, OOM detected via `memory.events` |
+| **pids** | *fork bomb* | `pids.max` — the only axis that stops PID exhaustion |
+| **wall** | defence-in-depth backstop | wall timeout, **derived at ~3× the CPU budget** when unset |
+
+The pids axis matters because neither `cpu.max` nor `memory.max` stops a fork bomb: it exhausts
+the PID space, not CPU or memory. A `pids.max` breach **contains** the fork (the `clone`/`fork`
+returns `EAGAIN`) rather than kernel-killing the worker, so the denied-fork count is captured and
+the cpu/wall guard reaps the contained worker. The kill message then names the fork-bomb even
+though the reaping cause was the wall/CPU guard.
+
+It is a thin, additive generalization of `safe-ci-dag-runner`: each seed becomes one contained
 `Step`, and the existing scheduler runs them. There is **no second runner** — the containment,
 teardown, CPU-second budget, and per-step measurement are all the CI runner's, reused.
 
@@ -21,7 +42,7 @@ teardown, CPU-second budget, and per-step measurement are all the CI runner's, r
    never derived from wall time: on an N-core host, N wall-seconds is up to N CPU-seconds, so a
    wall-derived CPU budget would be ~1/N of what a worker needs and would false-kill healthy
    workers in a way indistinguishable from a flaky test. Omit the flag to leave it **UNSET**
-   (honest; the load-tolerant wall backstop still applies) rather than guess a too-tight number.
+   (honest; the derived wall backstop still applies) rather than guess a too-tight number.
 2. **Declared + enforced concurrency.** The width is resolved from three budgets — the
    coordinator's lane, live host capacity, and the measured per-worker footprint — and the round
    runs *exactly* that many workers. Never "however many the caller spawned".
@@ -29,20 +50,25 @@ teardown, CPU-second budget, and per-step measurement are all the CI runner's, r
    estimate (from prior samples of the same profile key) is printed — or an explicit **UNSET**
    when there is no comparable sample. Never a plausible-looking constant. After each round and at
    the end, the measured wall and CPU actuals are printed.
-4. **Clean kill naming the breach.** A worker over its CPU budget, over `memory.max` (OOM), or
-   past its wall backstop is reaped via `cgroup.kill` (setsid-proof) and reported as e.g.
-   `CPU-TIMEOUT: used 3.0s cpu >= budget 3s`.
+4. **Clean kill naming the breach, and by how much.** A worker over its CPU budget, over
+   `memory.max` (OOM), past its `pids.max`, or past its wall backstop is reaped via `cgroup.kill`
+   (setsid-proof) and reported as e.g. `CPU-TIMEOUT: used 3.0s cpu >= budget 3s` or
+   `PIDS-CAP: 4 fork/clone(s) denied at pids.max 16 (fork-bomb / PID-exhaustion containment)`.
 
 ## Quick start
 
 ```bash
 parallel-experiment-runner run \
   --name chaos-divergence --seeds 0-199 \
-  --cpu-cores 1 --memory 4G --cpu-timeout 120 --wall-timeout 900 \
+  --cpu-cores 1 --memory 4G --cpu-timeout 120 --pids 512 \
   --hit-regex 'DIVERGENCE|panic' --max-concurrency 32 \
   --identity backend=ptrace image=demo5 \
   -- target-runner --chaos --seed {seed} ./demo
 ```
+
+`--wall-timeout` is omitted above on purpose: with a `--cpu-timeout`, the wall backstop is
+**derived at ~3× the CPU budget** (here 360s), so you set the authoritative CPU guard once and the
+hang-guard follows. Pass `--wall-timeout` only to override that derivation.
 
 * Every occurrence of `{seed}` in the argv after `--` is replaced with the concrete seed.
 * Per-worker logs are written to `<work-dir>/ignored/logs/seed-<n>.log`; the run prints only an
@@ -70,8 +96,14 @@ had to kill is never miscounted as a discovered hit:
 | `command-error` | nonzero exit that is not a declared hit code |
 | `cpu-timeout` | exceeded the CPU-second budget → reaped |
 | `memory-cap` | hit `memory.max` → OOM-killed inside its own cgroup |
+| `pids-cap` | hit `pids.max` → fork/clone denied (fork-bomb / PID-exhaustion containment) |
 | `timeout` | exceeded the wall backstop (a hang burning no CPU) |
 | `cancelled` | never ran / eager-cancelled |
+
+A `pids-cap` breach is special: `pids.max` **contains** the fork (`EAGAIN`) rather than killing
+the worker, so the worker is reaped by the cpu/wall guard. The classifier still reports it as
+`pids-cap` (ahead of `timeout`) using the in-memory denied-fork count, so a fork bomb is never
+mislabelled as a plain hang.
 
 A hunt for a bug sets `--hit-regex` (e.g. `panic|DIVERGENCE|ASAN`) and/or `--hit-exit-codes`
 (e.g. `134` for SIGABRT). With neither, the default hit is exit code `0` (a sweep for successful
@@ -91,14 +123,15 @@ another sweep's estimates. Give at least one `--identity K=V` to build reusable 
 The estimate is conservative where it matters: median wall (wall is contention-inflated, so its
 median is the fairer central figure) and p90 CPU/memory (don't under-provision).
 
-## Boxing
+## Resource containment mechanics
 
-Boxing is **on by default**. On first launch the process re-execs into a transient
+Containment is **on by default**. On first launch the process re-execs into a transient
 `systemd-run --user --scope` (a delegated cgroup) named under `parallel-experiment.slice`, then
-carves a child cgroup per worker with its `memory.max` / `cpu.max` caps. If cgroup-v2 + a working
-`systemd --user` scope are unavailable, the run refuses with exit 3 rather than silently run
-unboxed. `--allow-cgroup-failure` opts into an explicit unboxed run (process-group teardown only,
-no per-worker caps) — not recommended, and the reason the box is the point.
+carves a child cgroup per worker with its `memory.max` / `cpu.max` / `pids.max` caps. If cgroup-v2
++ a working `systemd --user` scope are unavailable, the run refuses with exit 3 rather than
+silently run uncontained. `--allow-cgroup-failure` opts into an explicit UNCONTAINED run
+(process-group teardown only, no per-worker caps) — not recommended, and the reason the box is the
+point.
 
 ## Spec files
 
@@ -108,7 +141,7 @@ Instead of inline flags, pass `--spec sweep.json` (or `.yaml`, needing PyYAML):
 {
   "name": "chaos-divergence",
   "command": ["target-runner", "--chaos", "--seed", "{seed}", "./demo"],
-  "worker_limits": {"cpu_cores": 1, "memory_bytes": 4294967296, "cpu_timeout_s": 120, "wall_timeout_s": 900},
+  "worker_limits": {"cpu_cores": 1, "memory_bytes": 4294967296, "cpu_timeout_s": 120, "pids_max": 512},
   "hit": {"regex": "DIVERGENCE|panic", "hit_exit_codes": [134]},
   "identity": {"backend": "ptrace", "image": "demo5"}
 }
@@ -124,7 +157,8 @@ Run `parallel-experiment-runner run --help` for the full list. The important one
 | `--cpu-cores` | per-worker CPU cores → inner `cpu.max` and the width core-unit |
 | `--memory` | per-worker memory cap (e.g. `4G`) → inner `memory.max` |
 | `--cpu-timeout` | per-worker CPU-second budget; omit = UNSET (never wall-derived) |
-| `--wall-timeout` | per-worker wall backstop seconds (hang guard only) |
+| `--pids` / `--max-pids` | per-worker `pids.max` (fork-bomb containment); omit = no cap |
+| `--wall-timeout` | per-worker wall backstop; omit = derived at ~3× the CPU budget |
 | `--disk` | per-worker disk reserve used to bound width (cgroup-v2 has no space controller) |
 | `--hit-regex` / `--hit-exit-codes` | what marks a worker a HIT |
 | `--identity K=V` | apples-to-apples fields hashed into the profile key |
