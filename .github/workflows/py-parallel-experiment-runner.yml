@@ -1,0 +1,50 @@
+name: py-parallel-experiment-runner
+
+# Only run when the Python side of this tool (its package, tests, or shared docs) changes.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/parallel_experiment_runner/**'
+      - 'py/tests/test_experiment_*.py'
+      - 'common/docs/parallel-experiment-runner/**'
+      - 'scripts/embed_userguides.py'
+      - '.github/workflows/py-parallel-experiment-runner.yml'
+  pull_request:
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/parallel_experiment_runner/**'
+      - 'py/tests/test_experiment_*.py'
+      - 'common/docs/parallel-experiment-runner/**'
+      - 'scripts/embed_userguides.py'
+      - '.github/workflows/py-parallel-experiment-runner.yml'
+
+jobs:
+  py:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tooling
+        # pyyaml is an optional runtime dep (YAML spec files); types-PyYAML supplies the stubs
+        # mypy --strict needs (PyYAML ships none).
+        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
+      - name: Embedded user guides in sync with source
+        working-directory: .
+        run: python scripts/embed_userguides.py --check
+      - name: mypy (strict, no explicit Any)
+        run: python -m mypy .
+      - name: pytest (parallel-experiment-runner)
+        run: python -m pytest -q tests/test_experiment_*.py
+      - name: smoke --version
+        run: python -m parallel_experiment_runner --version
+      - name: smoke quickstart
+        run: python -m parallel_experiment_runner quickstart
+      - name: smoke plan-round (dry, no cgroups)
+        run: python -m parallel_experiment_runner plan-round --name smoke --seeds 0-3 --cpu-cores 1 --memory 1G --max-concurrency 2 -- /bin/true {seed}

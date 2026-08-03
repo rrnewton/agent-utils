@@ -63,6 +63,11 @@ EMBEDS: tuple[Embed, ...] = (
         source="common/docs/pr-landing-planner/USER_GUIDE.md",
         destinations=("py/pr_landing_planner/USER_GUIDE.md",),
     ),
+    Embed(
+        tool="parallel-experiment-runner",
+        source="common/docs/parallel-experiment-runner/USER_GUIDE.md",
+        destinations=("py/parallel_experiment_runner/USER_GUIDE.md",),
+    ),
 )
 
 _GENERATED_BANNER = (

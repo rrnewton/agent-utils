@@ -15,6 +15,9 @@ by `<tool> --userguide`). This keeps exactly one guide and one skill per tool, b
   HEALTH/ACTION/NOTE/ERROR lines.
 - `pr-landing-planner/SKILL.md` — conflict-graph + CI-aware advisory landing planner: classifies each
   red CI, partitions PRs into parallel-safe groups, and recommends a per-PR action.
+- `parallel-experiment-runner/SKILL.md` — run N concurrent seed-sweep workers BOXED under
+  safe-ci-dag-runner: declared+enforced concurrency, real per-worker CPU/memory/CPU-second/wall caps
+  with a clean kill on breach, a 1→2→4 calibration ramp, and up-front estimate + measured actuals.
 
 ## Linking a skill into an agent
 
