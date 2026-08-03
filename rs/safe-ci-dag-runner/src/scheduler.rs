@@ -519,6 +519,8 @@ fn run_step(ctx: StepCtx) {
                 false,
                 step.timeout,
                 false,
+                step.cpu_timeout,
+                false,
             );
             sh.done.insert(tag.clone(), outcome);
             sh.failed = true;
@@ -547,17 +549,22 @@ fn run_step(ctx: StepCtx) {
         readers.push(spawn_reader(err, Arc::clone(&err_buf), tag.clone(), stream));
     }
 
-    // Poll the step's cgroup descendant-thread count for a per-step peak (metrics only). Only when
-    // boxing is enabled (thread_count is meaningless otherwise), so the un-boxed path adds no
-    // extra thread. The poll is interruptible (checks the stop flag every 50ms and only samples
-    // once per MONITOR_INTERVAL), so joining it at step end returns promptly.
+    // Poll the step's cgroup once per MONITOR_INTERVAL for two purposes: (1) a per-step peak
+    // descendant-thread count (metrics only), and (2) CPU-time budget enforcement. Only when
+    // boxing is enabled (both readings are meaningless otherwise), so the un-boxed path adds no
+    // extra thread. The poll is interruptible (checks the stop flag every 50ms), so joining it at
+    // step end returns promptly.
     let monitor_stop = Arc::new(AtomicBool::new(false));
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
+    let cpu_exceeded = Arc::new(AtomicBool::new(false));
     let monitor: Option<thread::JoinHandle<()>> = if boxed {
         let stop = Arc::clone(&monitor_stop);
         let peak = Arc::clone(&thread_peak);
+        let cpu_flag = Arc::clone(&cpu_exceeded);
         let cg = cgroups.clone();
         let t = tag.clone();
+        let cpu_timeout = step.cpu_timeout;
+        let mpid = pid;
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
             let tick = Duration::from_millis(50);
@@ -568,10 +575,24 @@ fn run_step(ctx: StepCtx) {
                     continue;
                 }
                 since = Duration::ZERO;
-                if let Some(cg) = &cg {
-                    if let Some(n) = cg.thread_count(&t) {
+                if let Some(c) = &cg {
+                    if let Some(n) = c.thread_count(&t) {
                         let mut p = peak.lock().unwrap();
                         *p = Some(p.map_or(n, |cur| cur.max(n)));
+                    }
+                    // CPU-time budget: a load-invariant per-step ceiling on consumed user+system
+                    // CPU (cgroup cpu.stat usage_usec), mirroring the Python runner exactly. Reap
+                    // the whole tree once when over budget, then exit the monitor.
+                    if cpu_timeout > 0 && !cpu_flag.load(Ordering::Relaxed) {
+                        if let Some(cs) = c.cpu_stats(&t) {
+                            let cpu_used_s =
+                                cs.get("usage_usec").copied().unwrap_or(0) as f64 / 1_000_000.0;
+                            if cpu_used_s >= cpu_timeout as f64 {
+                                cpu_flag.store(true, Ordering::Relaxed);
+                                reap(&cg, &t, mpid);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -638,6 +659,7 @@ fn run_step(ctx: StepCtx) {
         }
     }
     let thread_peak = *thread_peak.lock().unwrap();
+    let cpu_timed_out = cpu_exceeded.load(Ordering::Relaxed);
 
     let elapsed = start.elapsed().as_secs_f64();
     let dur = elapsed.round() as i64;
@@ -645,7 +667,7 @@ fn run_step(ctx: StepCtx) {
         Some(c) => Some(c as i64),
         None => status.signal().map(|s| -(s as i64)),
     };
-    let ok = returncode == Some(0) && !timed_out;
+    let ok = returncode == Some(0) && !timed_out && !cpu_timed_out;
 
     // Combined captured output (stdout then stderr) for the summary + failure detail.
     let mut combined: Vec<u8> = out_buf.lock().unwrap().clone();
@@ -672,10 +694,9 @@ fn run_step(ctx: StepCtx) {
     );
     row.insert("ok".into(), ok.to_string());
     row.insert("timed_out".into(), timed_out.to_string());
-    // Rust parses and preserves cpu_timeout for schema parity, but enforcement
-    // remains Python-only. Emit the shared profile column explicitly so the
-    // on-disk schema stays byte-identical across implementations.
-    row.insert("cpu_timed_out".into(), false.to_string());
+    // CPU-time budget enforcement is now at parity with the Python runner: emit the
+    // real breach flag so the on-disk schema stays byte-identical across implementations.
+    row.insert("cpu_timed_out".into(), cpu_timed_out.to_string());
     row.insert("oom_kills".into(), oom.to_string());
     row.insert(
         "peak_bytes".into(),
@@ -729,6 +750,8 @@ fn run_step(ctx: StepCtx) {
                 oom,
                 timed_out,
                 step.timeout,
+                cpu_timed_out,
+                step.cpu_timeout,
                 false,
             )
         };

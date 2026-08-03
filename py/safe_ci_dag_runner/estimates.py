@@ -33,7 +33,7 @@ import csv
 import math
 import os
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -1234,21 +1234,15 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
             measured_effective_cores=step.hint.measured_effective_cores,
             measured_cpu_utilization=step.hint.measured_cpu_utilization,
         )
+        # Clone-and-override, mirroring the Rust build's `let mut s = step.clone(); s.hint = …`.
+        # Only `hint` (and its defensive copies of the mutable containers) is replaced; EVERY other
+        # field is carried verbatim. A prior field-by-field rebuild silently dropped `cpu_timeout`
+        # (defaulting it to 0), disabling the per-step CPU-time guard on every planned run while the
+        # Rust build kept enforcing it — a divergence that behavioral cross-checks catch only where
+        # cgroups exist. `replace` makes it structurally impossible for a newly added Step field to
+        # go missing here again.
         new_steps.append(
-            Step(
-                group=step.group,
-                job=step.job,
-                desc=step.desc,
-                cmd=step.cmd,
-                description=step.description,
-                deps=list(step.deps),
-                env=dict(step.env),
-                hint=new_hint,
-                networkonly=step.networkonly,
-                engine_only=step.engine_only,
-                timeout=step.timeout,
-                jobs_flag=step.jobs_flag,
-            )
+            replace(step, hint=new_hint, deps=list(step.deps), env=dict(step.env))
         )
     return DagConfig(
         steps=tuple(new_steps),

@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# TRACKED, deterministic engine resolver for agent-utils tools.
+#
+# Why this exists
+# ---------------
+# Several agent-utils tools ship two implementations: a TRACKED Python entrypoint
+# (`py/bin/<tool>`, a versioned symlink into the package) and, for `safe-ci-dag-runner`, an
+# UNTRACKED Rust build artifact (`rs/bin/<tool>` / `rs/target/release/<tool>`, produced by
+# `./setup rs`). The old `./setup both` wired the top-level `./bin` symlink straight at `rs/bin`,
+# so `./agent-utils/bin/<tool>` silently ran whatever Rust binary was last built — an UNTRACKED,
+# possibly STALE artifact silently beating the tracked entrypoint, with nothing logging which
+# engine actually ran. That is exactly how a Rust runner missing an enforcement guard (the
+# historical `cpu_timeout` gap) can run in production unnoticed.
+#
+# Contract enforced here
+# ----------------------
+#   * DETERMINISTIC + TRACKED default: with no override, ALWAYS the tracked Python entrypoint.
+#   * Rust is opt-in ONLY, via SAFE_CI_DAG_RUNNER_ENGINE=rust, and is NEVER a silent fallback:
+#     if Rust is requested but not built, this errors instead of quietly running Python.
+#   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
+#     exact path are always visible in logs.
+#
+# The resolved tool name is this script's invocation basename (the wired symlinks
+# `safe-ci-dag-runner` / `pr-landing-planner` / `tick-hub` all point here).
+set -euo pipefail
+
+# Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent
+# of how the tool was invoked. common/bin/engine-resolver -> root is two levels up.
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
+
+TOOL="$(basename "$0")"
+if [[ "$TOOL" == "engine-resolver" ]]; then
+    echo "engine-resolver: invoke via a tool symlink (safe-ci-dag-runner|pr-landing-planner|tick-hub), not directly" >&2
+    exit 2
+fi
+
+# Deterministic default: the TRACKED Python entrypoint. Rust is explicit opt-in only.
+ENGINE="${SAFE_CI_DAG_RUNNER_ENGINE:-python}"
+
+case "$ENGINE" in
+    python|py)
+        TARGET="$ROOT/py/bin/$TOOL"
+        if [[ ! -e "$TARGET" ]]; then
+            echo "[$TOOL] engine=python: no tracked entrypoint at py/bin/$TOOL" >&2
+            exit 127
+        fi
+        echo "[$TOOL] engine=python (tracked entrypoint: py/bin/$TOOL)" >&2
+        exec "${CI_HUB_PYTHON:-python3}" "$TARGET" "$@"
+        ;;
+    rust|rs)
+        # Rust binaries are UNTRACKED build artifacts. Use ONLY when explicitly requested AND
+        # present; never fall back to Python silently — that would re-hide an engine mismatch.
+        TARGET="$ROOT/rs/bin/$TOOL"
+        [[ -x "$TARGET" ]] || TARGET="$ROOT/rs/target/release/$TOOL"
+        if [[ ! -x "$TARGET" ]]; then
+            echo "[$TOOL] engine=rust requested but no built binary found (rs/bin/$TOOL or rs/target/release/$TOOL); run './setup rs'. Refusing to silently fall back to Python." >&2
+            exit 127
+        fi
+        echo "[$TOOL] engine=rust (UNTRACKED build artifact: ${TARGET#$ROOT/})" >&2
+        exec "$TARGET" "$@"
+        ;;
+    *)
+        echo "[$TOOL] SAFE_CI_DAG_RUNNER_ENGINE='$ENGINE' is invalid (want 'python' or 'rust')" >&2
+        exit 2
+        ;;
+esac

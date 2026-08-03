@@ -44,7 +44,7 @@ use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sync::{self, SyncBackend};
 use crate::viz::{to_ascii, to_dot};
-use crate::{PROG, VERSION};
+use crate::{ENFORCEMENT_CAPABILITIES, PROG, VERSION};
 
 /// Environment variable overriding the default profile-store location (Feature D). An explicit
 /// `--perf-dir` still wins over this; `--no-profile` disables logging entirely.
@@ -1506,6 +1506,12 @@ pub fn run(argv: &[String]) -> i32 {
             println!("{}", quickstart(&c));
             0
         }
+        "capabilities" => {
+            // Machine-readable enforcement manifest; byte-identical to the Python build and
+            // cross-checked, so an enforcement guard in one build but not the other fails `cross`.
+            println!("{ENFORCEMENT_CAPABILITIES}");
+            0
+        }
         "--userguide" => {
             // Write the embedded guide VERBATIM (no added/stripped newline) so it is byte-identical
             // to the Python build's --userguide and to the single source guide.
@@ -1593,7 +1599,7 @@ pub fn run(argv: &[String]) -> i32 {
             eprintln!(
                 "usage: {PROG} [-h] [--version] <command> ...\n\
                  {PROG}: error: argument <command>: invalid choice: '{other}' \
-                 (choose from run, sweep, plan, summary, list, ascii, dot, json, yaml, quickstart)"
+                 (choose from run, sweep, plan, summary, list, ascii, dot, json, yaml, quickstart, capabilities)"
             );
             2
         }

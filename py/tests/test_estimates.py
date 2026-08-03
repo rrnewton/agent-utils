@@ -271,6 +271,40 @@ def test_store_wins_over_hint_and_feeds_config(tmp_path: Path) -> None:
     assert heavy.hint.rss_baseline_bytes == 6000
 
 
+def test_apply_plan_preserves_all_non_hint_step_fields() -> None:
+    # Recurrence guard (environment-independent, so it also fires on a boxing-less CI host): the
+    # planner rewrites ONLY a step's hint; every other field must survive verbatim. A field-by-field
+    # rebuild here once silently dropped `cpu_timeout` (default 0), disabling the per-step CPU-time
+    # guard on every planned run while the Rust build kept enforcing it. Behavioral cross-checks
+    # catch that only where cgroups exist; this unit test catches the field drop everywhere.
+    step = Step(
+        "g",
+        "burn",
+        "burn",
+        "while :; do :; done",
+        deps=[],
+        env={"K": "V"},
+        hint=ResourceHint(est_duration_s=3.0),
+        networkonly=True,
+        engine_only=True,
+        timeout=123,
+        cpu_timeout=7,
+        jobs_flag="-J",
+    )
+    cfg = DagConfig(steps=(step,))
+    applied = apply_plan_to_config(cfg, build_plan(cfg, {}, planner=Planner.GREEDY_LPT))
+    out = applied.by_tag()["g.burn"]
+    # The guard that regressed:
+    assert out.cpu_timeout == 7, "planner dropped cpu_timeout -> CPU-time enforcement silently off"
+    # Every other non-hint field must round-trip through planning unchanged.
+    assert out.timeout == 123
+    assert out.networkonly is True
+    assert out.engine_only is True
+    assert out.jobs_flag == "-J"
+    assert out.cmd == "while :; do :; done"
+    assert out.env == {"K": "V"}
+
+
 def test_min_samples_threshold_falls_back_to_hint(tmp_path: Path) -> None:
     store = _write_store(tmp_path, [_row("g.heavy", "8.0", "6000")])
     samples = load_step_samples(store, "m", "c")

@@ -89,8 +89,27 @@ from safe_ci_dag_runner.viz import to_ascii, to_dot
 
 __version__: str = "0.11.0"
 
+#: Machine-readable manifest of the enforcement guards THIS engine implements, emitted verbatim by
+#: the ``capabilities`` subcommand. Each engine declares its own truth; the py-vs-rs differential
+#: asserts the two manifests are BYTE-IDENTICAL, so any enforcement guard present in one build but
+#: missing from the other is a cross-check failure (the recurrence guard for the historical
+#: Rust-vs-Python ``cpu_timeout`` gap). Keys are sorted; values reflect real behavior:
+#:   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
+#:   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
+#:   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
+#:   pids_guard    per-step PID/thread ceiling (plumbed in both, enforced in neither -> false)
+#:   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
+#: The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
+#: anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
+#: MUST stay byte-identical to Rust's ``ENFORCEMENT_CAPABILITIES`` (lib.rs).
+ENFORCEMENT_CAPABILITIES: str = (
+    '{"cpu_timeout":true,"memory_max":true,"oom_detection":true,'
+    '"pids_guard":false,"wall_timeout":true}'
+)
+
 __all__ = [
     "__version__",
+    "ENFORCEMENT_CAPABILITIES",
     # DAG model
     "Step",
     "StepClass",
