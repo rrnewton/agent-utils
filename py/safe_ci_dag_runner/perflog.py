@@ -125,7 +125,7 @@ STEP_PROFILE_COLUMNS = [
     "profile_base_sha", "enforcement_kind", "runner_name",
     # Per-step measurements produced by the scheduler.
     "step", "classification", "inner_jobs", "elapsed_s", "returncode", "ok",
-    "timed_out", "oom_kills", "peak_bytes", "thread_peak",
+    "timed_out", "cpu_timed_out", "oom_kills", "peak_bytes", "thread_peak",
     # Rich parallel-speedup enrichment (appended; blank when unavailable).
     *ENRICHMENT_COLUMNS,
 ]

@@ -381,6 +381,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 networkonly=_opt_bool(sm, "networkonly", False),
                 engine_only=_opt_bool(sm, "engine_only", False),
                 timeout=_opt_int(sm, "timeout", default_step_timeout),
+                cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
             )
         )
@@ -410,7 +411,7 @@ def _hint_to_json(hint: ResourceHint) -> dict[str, object]:
 
 
 def _step_to_json(step: Step) -> dict[str, object]:
-    return {
+    obj: dict[str, object] = {
         "group": step.group,
         "job": step.job,
         "desc": step.desc,
@@ -421,9 +422,16 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "networkonly": step.networkonly,
         "engine_only": step.engine_only,
         "timeout": step.timeout,
+        # Emitted only when set, so existing DAGs (all cpu_timeout=0) stay byte-for-byte
+        # unchanged; absence parses back to 0, keeping round-trip stable. Positioned
+        # immediately after `timeout` to match the Rust serializer's key order.
+        "cpu_timeout": step.cpu_timeout,
         "jobs_flag": step.jobs_flag,
         "hint": _hint_to_json(step.hint),
     }
+    if step.cpu_timeout == 0:
+        del obj["cpu_timeout"]
+    return obj
 
 
 def _dag_to_obj(cfg: DagConfig) -> dict[str, object]:

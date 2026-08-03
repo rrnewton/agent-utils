@@ -46,7 +46,7 @@ pub const CSV_COLUMNS: [&str; 15] = [
 /// unification is a rename, not a redesign. This MUST stay byte-for-byte identical to
 /// `perflog.STEP_PROFILE_COLUMNS` in the Python build (the cross differential compares the CSV
 /// header).
-pub const STEP_PROFILE_COLUMNS: [&str; 48] = [
+pub const STEP_PROFILE_COLUMNS: [&str; 49] = [
     "timestamp",
     "machine_id",
     "container_class",
@@ -62,6 +62,7 @@ pub const STEP_PROFILE_COLUMNS: [&str; 48] = [
     "returncode",
     "ok",
     "timed_out",
+    "cpu_timed_out",
     "oom_kills",
     "peak_bytes",
     "thread_peak",
@@ -608,6 +609,7 @@ mod tests {
         let header = text.lines().next().unwrap();
         assert!(header.starts_with("timestamp,machine_id,container_class,git_sha,outer_jobs"));
         assert!(header.contains("step,classification,inner_jobs"));
+        assert!(header.contains("ok,timed_out,cpu_timed_out,oom_kills"));
         assert!(header.trim_end().ends_with("cpu.usage_usec"));
         assert!(text.lines().nth(1).unwrap().contains("g.j"));
         let _ = fs::remove_dir_all(&dir);

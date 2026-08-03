@@ -278,6 +278,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         };
         let mut caps = BTreeMap::new();
@@ -343,6 +344,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         };
         let cfg = DagConfig {
@@ -379,6 +381,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         };
         let cfg = DagConfig {

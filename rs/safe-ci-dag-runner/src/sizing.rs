@@ -406,6 +406,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         }
     }
@@ -469,6 +470,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         };
         assert_eq!(step_mem_cap_bytes(&s, 1.25), Some(9 * GIB));

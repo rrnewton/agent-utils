@@ -92,6 +92,11 @@ pub struct Step {
     /// Selected only by an engine-only subset preset.
     pub engine_only: bool,
     pub timeout: i64,
+    /// CPU-time budget in seconds (user+system, from the step's cgroup `cpu.stat`). `0` disables
+    /// the CPU-time guard, leaving only the wall `timeout`. CPU time is immune to machine load, so
+    /// this can be set far tighter than a load-tolerant wall timeout without flaking. Mirrors
+    /// Python's `Step.cpu_timeout`; the Python runner is the enforcing implementation today.
+    pub cpu_timeout: i64,
     /// Template for the inner-parallelism flag appended to `cmd` when this step declares
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
     /// disables appending (the step manages its own concurrency). See [`render_jobs_flag`].
@@ -209,7 +214,7 @@ fn signal_name(sig: i64) -> String {
 /// Describe a failed step without conflating an external signal with an OOM.
 ///
 /// Precedence (load-bearing for cross-language parity):
-/// OOM > timeout > pids-guard > detail-capture-failure > signal > exit code.
+/// OOM > CPU-timeout > timeout > pids-guard > detail-capture-failure > signal > exit code.
 ///
 /// A negative `returncode` means the child received a Unix signal; that must never be
 /// reported as an OOM.
@@ -223,9 +228,14 @@ pub fn step_failure_reason(
     pids_guard_tripped: bool,
     pids_guard_reason: Option<&str>,
     detail_write_failure: &[String],
+    cpu_timed_out: bool,
+    cpu_timeout: i64,
 ) -> String {
     if oomed {
         return format!("OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))");
+    }
+    if cpu_timed_out {
+        return format!("CPU-TIMEOUT >{cpu_timeout}s cpu");
     }
     if timed_out {
         return format!("TIMEOUT >{timeout}s");
@@ -351,6 +361,10 @@ impl StepOutcome {
             false,
             None,
             &[],
+            // The Rust scheduler does not enforce CPU-time budgets yet (Python is the
+            // enforcing implementation); never report a CPU-timeout reason from here.
+            false,
+            0,
         );
         StepOutcome {
             tag,
@@ -419,6 +433,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: DEFAULT_STEP_TIMEOUT,
+            cpu_timeout: 0,
             jobs_flag: None,
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
@@ -437,6 +452,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: DEFAULT_STEP_TIMEOUT,
+            cpu_timeout: 0,
             jobs_flag: jobs_flag.map(str::to_string),
         }
     }
@@ -472,23 +488,28 @@ mod tests {
     fn failure_reason_precedence() {
         // OOM beats a signal.
         assert_eq!(
-            step_failure_reason(Some(-9), true, 2, false, 10, false, None, &[]),
+            step_failure_reason(Some(-9), true, 2, false, 10, false, None, &[], false, 0),
             "OOM-KILLED (hit inner MemoryMax; 2 oom_kill event(s))"
+        );
+        // CPU-timeout beats a wall timeout (more specific cause).
+        assert_eq!(
+            step_failure_reason(Some(-9), false, 0, true, 600, false, None, &[], true, 30),
+            "CPU-TIMEOUT >30s cpu"
         );
         // timeout beats a signal.
         assert_eq!(
-            step_failure_reason(Some(-15), false, 0, true, 30, false, None, &[]),
+            step_failure_reason(Some(-15), false, 0, true, 30, false, None, &[], false, 0),
             "TIMEOUT >30s"
         );
         // negative return code without oom/timeout -> signal name.
         assert_eq!(
-            step_failure_reason(Some(-9), false, 0, false, 10, false, None, &[]),
+            step_failure_reason(Some(-9), false, 0, false, 10, false, None, &[], false, 0),
             "received SIGKILL with no validate timeout, pids guard, \
              or child-cgroup OOM recorded"
         );
         // plain non-zero exit.
         assert_eq!(
-            step_failure_reason(Some(1), false, 0, false, 10, false, None, &[]),
+            step_failure_reason(Some(1), false, 0, false, 10, false, None, &[], false, 0),
             "exit 1"
         );
     }

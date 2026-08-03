@@ -362,6 +362,7 @@ class Runner:
         start = time.time()
         stream = self.verbosity >= 2
         timed_out = False
+        cpu_timed_out = False
 
         # Append the step's inner-parallelism (concurrency) flag when it declares one, using the
         # step's jobs_flag template (or the DagConfig default, e.g. "-j"). No-op when the step
@@ -421,11 +422,27 @@ class Runner:
         def _monitor() -> None:
             # Poll the step's cgroup descendant-thread count for a per-step peak (metrics
             # only; a noop/disabled manager returns None and this stays a cheap no-op).
-            nonlocal thread_peak
+            # When the step declares a CPU-time budget, this same 1 Hz loop also enforces
+            # it from the cgroup's cpu.stat usage_usec (user+system). CPU time is immune to
+            # machine load, so this guard can be far tighter than the wall `timeout` without
+            # flaking; the wall timeout stays as a backstop for a step that blocks/hangs
+            # while burning no CPU. Enforcement is best-effort at the poll granularity
+            # (_MONITOR_INTERVAL_S), and inert when cgroup boxing is off (cpu_stats is None).
+            nonlocal thread_peak, cpu_timed_out
             while not monitor_stop.wait(_MONITOR_INTERVAL_S):
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
                     thread_peak = count if thread_peak is None else max(thread_peak, count)
+                if step.cpu_timeout > 0 and not cpu_timed_out:
+                    cs = self.cgroups.cpu_stats(step.tag)
+                    if cs is not None:
+                        cpu_used_s = cs.get("usage_usec", 0) / 1_000_000
+                        if cpu_used_s >= step.cpu_timeout:
+                            # Over CPU budget: reap the whole group now. The main thread's
+                            # proc.wait() then returns normally (no wall TimeoutExpired).
+                            cpu_timed_out = True
+                            reap(proc, self.cgroups, step.tag)
+                            return
 
         reader = threading.Thread(target=_pump, daemon=True)
         monitor = threading.Thread(target=_monitor, daemon=True)
@@ -462,7 +479,7 @@ class Runner:
         elapsed = time.time() - start
         dur = round(elapsed)
         returncode = proc.returncode
-        ok = returncode == 0 and not timed_out
+        ok = returncode == 0 and not timed_out and not cpu_timed_out
         summary = _last_line(captured)
 
         row: dict[str, object] = {
@@ -475,6 +492,7 @@ class Runner:
             "returncode": returncode,
             "ok": ok,
             "timed_out": timed_out,
+            "cpu_timed_out": cpu_timed_out,
             "oom_kills": oom,
             "peak_bytes": peak,
             "thread_peak": thread_peak,
@@ -533,6 +551,8 @@ class Runner:
                     oom_kills=oom,
                     timed_out=timed_out,
                     timeout=step.timeout,
+                    cpu_timed_out=cpu_timed_out,
+                    cpu_timeout=step.cpu_timeout,
                     pids_guard_tripped=False,
                     pids_guard_reason=None,
                     detail_write_failure=(),

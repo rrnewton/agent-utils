@@ -312,7 +312,8 @@ field filled in, which is the easiest way to see the defaults applied to your fi
 | `jobs_flag`   | string or `null`    | `null` (inherit) | Template for the inner-jobs flag appended to `cmd` when the step declares `preferred_inner_jobs`. `null` inherits the DAG's `default_jobs_flag`; `""` **disables** the append (the command manages its own concurrency). Spellings: `"-j"` → `-j 8`, `"-j%d"` → `-j8`, `"--jobs="` → `--jobs=8`, `"--num-threads"` → `--num-threads 8`. |
 | `networkonly` | boolean             | `false`        | Caller-facing selection flag (a preset can drop these when networking is disabled). Preserved but not acted on by the core scheduler. |
 | `engine_only` | boolean             | `false`        | Caller-facing subset flag. Concretely, `engine_only` steps are **excluded from the memory-budget model**.    |
-| `timeout`     | integer             | `1800`         | Per-step timeout in seconds. On expiry the step's whole process tree is reaped and the step FAILS as TIMEOUT. |
+| `timeout`     | integer             | `1800`         | Per-step **wall-time** timeout in seconds. On expiry the step's whole process tree is reaped and the step FAILS as TIMEOUT. |
+| `cpu_timeout` | integer             | `0` (off)      | Per-step **CPU-time** budget in seconds (user+system, from the step's cgroup `cpu.stat`). `0` disables. Unlike wall time, CPU time is immune to machine load, so this can be set far tighter than `timeout` without flaking. On exceed the step is reaped and FAILS as CPU-TIMEOUT. Enforced only under cgroup boxing (inert otherwise); the wall `timeout` remains as a backstop for a step that blocks without burning CPU. |
 
 ### Hint (`hint`) fields
 
@@ -727,8 +728,9 @@ Each `StepOutcome` is frozen too:
 | `reason`      | `str`           | Human-readable failure reason (e.g. `exit 3`, `TIMEOUT >1800s`, `OOM-KILLED ...`); `""` when `ok`. |
 | `aborted`     | `bool`          | `True` when eager-exit cancelled this in-flight step after *another* step failed.    |
 
-Failure reasons follow a fixed precedence: OOM > timeout > pids-guard > detail-capture > signal >
-exit code — so an externally-signalled kill is never misreported as an out-of-memory.
+Failure reasons follow a fixed precedence: OOM > CPU-timeout > timeout > pids-guard >
+detail-capture > signal > exit code — so an externally-signalled kill is never misreported as
+an out-of-memory, and a CPU-budget trip is distinguished from a wall-timeout.
 
 ### Building a DAG from / to JSON
 

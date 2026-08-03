@@ -672,6 +672,10 @@ fn run_step(ctx: StepCtx) {
     );
     row.insert("ok".into(), ok.to_string());
     row.insert("timed_out".into(), timed_out.to_string());
+    // Rust parses and preserves cpu_timeout for schema parity, but enforcement
+    // remains Python-only. Emit the shared profile column explicitly so the
+    // on-disk schema stays byte-identical across implementations.
+    row.insert("cpu_timed_out".into(), false.to_string());
     row.insert("oom_kills".into(), oom.to_string());
     row.insert(
         "peak_bytes".into(),
@@ -885,6 +889,7 @@ mod tests {
             networkonly: false,
             engine_only: false,
             timeout: 1800,
+            cpu_timeout: 0,
             jobs_flag: None,
         }
     }

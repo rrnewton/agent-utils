@@ -309,6 +309,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             networkonly: opt_bool(sm, "networkonly", false)?,
             engine_only: opt_bool(sm, "engine_only", false)?,
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
+            cpu_timeout: opt_int(sm, "cpu_timeout", 0)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
         });
     }
@@ -621,6 +622,12 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&format!("\"engine_only\": {},\n", step.engine_only));
     s.push_str(&key);
     s.push_str(&format!("\"timeout\": {},\n", step.timeout));
+    // Emitted only when set, so existing DAGs (all cpu_timeout=0) stay byte-for-byte
+    // unchanged and absence parses back to 0. Mirrors the Python serializer exactly.
+    if step.cpu_timeout != 0 {
+        s.push_str(&key);
+        s.push_str(&format!("\"cpu_timeout\": {},\n", step.cpu_timeout));
+    }
     s.push_str(&key);
     s.push_str(&format!(
         "\"jobs_flag\": {},\n",
