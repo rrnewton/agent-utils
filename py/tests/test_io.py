@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step, StepClass
+from safe_ci_dag_runner.model import (
+    DagConfig,
+    ResourceHint,
+    Step,
+    StepClass,
+    resolved_wall_timeout,
+)
 
 
 #: Multi-line description with quotes, backslashes, a tab, and unicode — proves the JSON string
@@ -67,7 +73,10 @@ def test_minimal_document_defaults() -> None:
     assert step.tag == "g.j"
     assert step.desc == "" and step.deps == [] and step.env == {}
     assert step.description == "" and cfg.description == ""  # default empty
-    assert step.timeout == 1800
+    # An omitted wall timeout loads as the 0 "unset" sentinel; the effective backstop is
+    # resolved lazily and falls back to the doc default (1800 here).
+    assert step.timeout == 0
+    assert resolved_wall_timeout(step, cfg.default_step_timeout) == 1800
     assert step.cpu_timeout == 0  # CPU-time guard disabled by default
     assert step.hint.classification is StepClass.LIGHT
     assert cfg.resource_caps == {} and cfg.mem_cap_factor == 1.25
@@ -104,16 +113,54 @@ def test_default_step_timeout_applied() -> None:
     )
     cfg = dag_from_json(doc)
     by_tag = cfg.by_tag()
-    assert by_tag["g.a"].timeout == 42  # inherited document default
-    assert by_tag["g.b"].timeout == 7  # explicit per-step timeout wins
+    # g.a omits `timeout` -> raw 0 sentinel, resolving to the doc default (42).
+    assert by_tag["g.a"].timeout == 0
+    assert resolved_wall_timeout(by_tag["g.a"], cfg.default_step_timeout) == 42
+    # g.b declares an explicit wall timeout -> preserved verbatim through the resolver.
+    assert by_tag["g.b"].timeout == 7
+    assert resolved_wall_timeout(by_tag["g.b"], cfg.default_step_timeout) == 7
     assert cfg.default_step_timeout == 42
 
 
 def test_default_step_timeout_falls_back_to_module_constant() -> None:
-    # Without a document-level default, steps fall back to the module DEFAULT_STEP_TIMEOUT.
+    # Without a document-level default, an omitted per-step `timeout` stays the 0 sentinel and
+    # resolves to the module DEFAULT_STEP_TIMEOUT via resolved_wall_timeout.
     cfg = dag_from_json('{"steps": [{"group": "g", "job": "a", "cmd": "true"}]}')
-    assert cfg.steps[0].timeout == 1800
+    assert cfg.steps[0].timeout == 0
+    assert resolved_wall_timeout(cfg.steps[0], cfg.default_step_timeout) == 1800
     assert cfg.default_step_timeout == 1800
+
+
+def test_wall_timeout_omitted_when_unset_and_roundtrips() -> None:
+    # The idiom: a step that leaves `timeout` unset must NOT emit the key (byte-stable), and an
+    # explicit wall timeout must round-trip. Mirrors the cpu_timeout conditional-emit contract.
+    doc = (
+        '{"steps": ['
+        '{"group": "g", "job": "wall", "cmd": "true", "timeout": 55},'
+        '{"group": "g", "job": "nowall", "cmd": "true"}]}'
+    )
+    cfg = dag_from_json(doc)
+    by_tag = cfg.by_tag()
+    assert by_tag["g.wall"].timeout == 55
+    assert by_tag["g.nowall"].timeout == 0  # absent -> 0 sentinel
+
+    out = dag_to_json(cfg)
+    assert '"timeout": 55' in out  # present only for the step that set it
+    assert out.count('"timeout"') == 1  # the unset step omits the key
+    assert dag_to_json(dag_from_json(out)) == out  # stable across a second pass
+
+
+def test_resolved_wall_timeout_precedence() -> None:
+    # 1. explicit wall timeout wins verbatim even with a cpu_timeout present;
+    # 2. unset wall + cpu_timeout -> 3x hang-catcher backstop;
+    # 3. both unset -> document default.
+    s = Step("g", "j", "", "true", timeout=900, cpu_timeout=100)
+    assert resolved_wall_timeout(s, 1800) == 900
+    s = Step("g", "j", "", "true", timeout=0, cpu_timeout=100)
+    assert resolved_wall_timeout(s, 1800) == 300
+    s = Step("g", "j", "", "true", timeout=0, cpu_timeout=0)
+    assert resolved_wall_timeout(s, 1800) == 1800
+    assert resolved_wall_timeout(s, 42) == 42
 
 
 def test_strict_parse_errors() -> None:

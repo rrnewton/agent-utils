@@ -28,7 +28,7 @@ these — see the accompanying report):
 * **Per-step supervision.** One daemon supervisor thread per step runs ``bash -c`` with
   ``start_new_session=True`` (its own process group/session for whole-tree reaping) plus a
   daemon stdout-reader thread so an orphan holding the stdout pipe can never wedge the run;
-  the supervisor blocks only on ``proc.wait(timeout=step.timeout)``.
+  the supervisor blocks only on ``proc.wait(timeout=resolved_wall_timeout(step, ...))``.
 * **Fail-fast (eager-exit) with ``--keep-going`` override.** The first genuine failure stops
   the scheduler launching any NEW step. By default it also eager-reaps every in-flight step,
   labelling those ABORTED (a cancellation) rather than FAILED; ``keep_going`` only suppresses
@@ -60,6 +60,7 @@ from safe_ci_dag_runner.model import (
     Step,
     command_with_inner_jobs,
     preferred_inner_jobs,
+    resolved_wall_timeout,
     step_classification,
 )
 from safe_ci_dag_runner.profile_enrich import (
@@ -363,6 +364,11 @@ class Runner:
         stream = self.verbosity >= 2
         timed_out = False
         cpu_timed_out = False
+        # Resolve the "unset" wall-timeout idiom ONCE: explicit timeout wins, else derive
+        # 3x cpu_timeout as a hang-catching backstop, else the doc default. Enforcement and
+        # reporting both use this, never the raw step.timeout sentinel. See
+        # model.resolved_wall_timeout / WALL_FALLBACK_CPU_MULTIPLIER for the rationale.
+        wall_timeout = resolved_wall_timeout(step, self.cfg.default_step_timeout)
 
         # Append the step's inner-parallelism (concurrency) flag when it declares one, using the
         # step's jobs_flag template (or the DagConfig default, e.g. "-j"). No-op when the step
@@ -449,7 +455,7 @@ class Runner:
         reader.start()
         monitor.start()
         try:
-            proc.wait(timeout=step.timeout)
+            proc.wait(timeout=wall_timeout)
         except subprocess.TimeoutExpired:
             # Genuine hang: reap the step's whole process group now (safe because
             # start_new_session gave it its own group; reap guards the runner's group).
@@ -550,7 +556,7 @@ class Runner:
                     oomed=oom > 0,
                     oom_kills=oom,
                     timed_out=timed_out,
-                    timeout=step.timeout,
+                    timeout=wall_timeout,
                     cpu_timed_out=cpu_timed_out,
                     cpu_timeout=step.cpu_timeout,
                     pids_guard_tripped=False,

@@ -154,6 +154,9 @@ struct Runner {
     cgroups: BoxedCgroups,
     /// Multiplier from a step's measured RSS baseline to its inner memory cap.
     mem_cap_factor: f64,
+    /// Document-level fallback wall timeout (seconds) fed to `resolved_wall_timeout` for steps
+    /// that neither declare an explicit wall `timeout` nor a `cpu_timeout` to derive one from.
+    default_step_timeout: i64,
     /// CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set loop
     /// never lets the summed inner-jobs width of concurrently-running steps exceed this total core
     /// budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
@@ -199,6 +202,7 @@ impl Runner {
             default_jobs_flag: cfg.default_jobs_flag.clone(),
             cgroups,
             mem_cap_factor: cfg.mem_cap_factor,
+            default_step_timeout: cfg.default_step_timeout,
             core_budget,
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
@@ -290,6 +294,7 @@ impl Runner {
                 let default_jobs_flag = self.default_jobs_flag.clone();
                 let cgroups = self.cgroups.clone();
                 let mem_cap_factor = self.mem_cap_factor;
+                let default_step_timeout = self.default_step_timeout;
                 handles.push(thread::spawn(move || {
                     run_step(StepCtx {
                         step,
@@ -299,6 +304,7 @@ impl Runner {
                         default_jobs_flag,
                         cgroups,
                         mem_cap_factor,
+                        default_step_timeout,
                     });
                 }));
             }
@@ -401,6 +407,7 @@ struct StepCtx {
     default_jobs_flag: String,
     cgroups: BoxedCgroups,
     mem_cap_factor: f64,
+    default_step_timeout: i64,
 }
 
 /// Tear down one step's whole process tree: `cgroup.kill` first (setsid-proof), then killpg.
@@ -451,8 +458,13 @@ fn run_step(ctx: StepCtx) {
         default_jobs_flag,
         cgroups,
         mem_cap_factor,
+        default_step_timeout,
     } = ctx;
     let tag = step.tag();
+    // Resolve the "unset" wall-timeout idiom ONCE for this step: an explicit `timeout` wins,
+    // else derive `3x cpu_timeout` as a hang-catching backstop, else the doc default. See
+    // `model::resolved_wall_timeout` / `WALL_FALLBACK_CPU_MULTIPLIER` for the full rationale.
+    let wall_timeout = crate::model::resolved_wall_timeout(&step, default_step_timeout);
     emit(&format!("[{tag}] \u{25b6} START  {}", step.desc));
 
     // Append the step's inner-parallelism (concurrency) flag when it declares one. No-op when the
@@ -517,7 +529,7 @@ fn run_step(ctx: StepCtx) {
                 false,
                 0,
                 false,
-                step.timeout,
+                wall_timeout,
                 false,
                 step.cpu_timeout,
                 false,
@@ -607,7 +619,7 @@ fn run_step(ctx: StepCtx) {
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) => {
-                if start.elapsed().as_secs() as i64 >= step.timeout {
+                if start.elapsed().as_secs() as i64 >= wall_timeout {
                     timed_out = true;
                     reap(&cgroups, &tag, pid);
                     break child.wait().unwrap_or_else(|_| {
@@ -749,7 +761,7 @@ fn run_step(ctx: StepCtx) {
                 oom > 0, // oomed: a step (or descendant) hit its inner memory.max
                 oom,
                 timed_out,
-                step.timeout,
+                wall_timeout,
                 cpu_timed_out,
                 step.cpu_timeout,
                 false,

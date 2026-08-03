@@ -308,7 +308,11 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             hint: hint_from(sm.get("hint"), &format!("{where_}.hint"))?,
             networkonly: opt_bool(sm, "networkonly", false)?,
             engine_only: opt_bool(sm, "engine_only", false)?,
-            timeout: opt_int(sm, "timeout", default_step_timeout)?,
+            // An omitted wall `timeout` loads as the `0` "unset" sentinel (NOT the doc default),
+            // so the idiom of leaving it out is preserved through to enforcement, where
+            // `resolved_wall_timeout` applies `default_step_timeout` (or derives `3x cpu_timeout`)
+            // lazily. Mirrors `cpu_timeout`'s `0`-disables sentinel.
+            timeout: opt_int(sm, "timeout", 0)?,
             cpu_timeout: opt_int(sm, "cpu_timeout", 0)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
         });
@@ -620,10 +624,14 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&format!("\"networkonly\": {},\n", step.networkonly));
     s.push_str(&key);
     s.push_str(&format!("\"engine_only\": {},\n", step.engine_only));
-    s.push_str(&key);
-    s.push_str(&format!("\"timeout\": {},\n", step.timeout));
-    // Emitted only when set, so existing DAGs (all cpu_timeout=0) stay byte-for-byte
-    // unchanged and absence parses back to 0. Mirrors the Python serializer exactly.
+    // Wall `timeout` and `cpu_timeout` are both emitted only when set (non-zero). Omitting an
+    // unset wall timeout is the idiom: absence parses back to the `0` sentinel and
+    // `resolved_wall_timeout` derives the backstop at enforcement time. Mirrors the Python
+    // serializer exactly, keeping DAGs that leave `timeout` out byte-for-byte stable.
+    if step.timeout != 0 {
+        s.push_str(&key);
+        s.push_str(&format!("\"timeout\": {},\n", step.timeout));
+    }
     if step.cpu_timeout != 0 {
         s.push_str(&key);
         s.push_str(&format!("\"cpu_timeout\": {},\n", step.cpu_timeout));
@@ -820,7 +828,13 @@ steps:
         assert_eq!(cfg.description, "");
         assert!(step.deps.is_empty());
         assert!(step.env.is_empty());
-        assert_eq!(step.timeout, 1800);
+        // An omitted wall timeout loads as the `0` "unset" sentinel; the effective wall
+        // backstop is resolved lazily and falls back to the doc default (1800 here).
+        assert_eq!(step.timeout, 0);
+        assert_eq!(
+            crate::model::resolved_wall_timeout(step, cfg.default_step_timeout),
+            1800
+        );
         assert_eq!(step.hint.classification, StepClass::Light);
         assert_eq!(step.jobs_flag, None);
         assert!(cfg.resource_caps.is_empty());
@@ -835,8 +849,18 @@ steps:
             {"group": "g", "job": "b", "cmd": "true", "timeout": 7}]}"#;
         let cfg = dag_from_json(doc).unwrap();
         let by_tag = cfg.by_tag();
-        assert_eq!(by_tag["g.a"].timeout, 42);
+        // g.a omits `timeout` -> raw 0 sentinel, resolving to the doc default (42).
+        assert_eq!(by_tag["g.a"].timeout, 0);
+        assert_eq!(
+            crate::model::resolved_wall_timeout(by_tag["g.a"], cfg.default_step_timeout),
+            42
+        );
+        // g.b declares an explicit wall timeout -> preserved verbatim through the resolver.
         assert_eq!(by_tag["g.b"].timeout, 7);
+        assert_eq!(
+            crate::model::resolved_wall_timeout(by_tag["g.b"], cfg.default_step_timeout),
+            7
+        );
         assert_eq!(cfg.default_step_timeout, 42);
     }
 

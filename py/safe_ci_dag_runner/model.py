@@ -16,6 +16,17 @@ from enum import Enum
 
 DEFAULT_STEP_TIMEOUT = 1800
 
+#: Multiplier from a step's ``cpu_timeout`` to its DERIVED wall-timeout backstop when the step
+#: declares no explicit wall ``timeout``. Mirrors Rust's ``WALL_FALLBACK_CPU_MULTIPLIER``.
+#:
+#: THIS IS A HANG-CATCHER, NOT A PERFORMANCE BUDGET. The idiom is to leave wall ``timeout``
+#: unset and bound work with a load-immune ``cpu_timeout`` instead; this factor exists only so
+#: a defense-in-depth wall backstop still fires if the CPU-time guard somehow does not (e.g. a
+#: fully sequentialized step where wall ~= CPU). Keep it GENEROUS: 3x covers that worst case
+#: without manufacturing false wall kills. To make a step fail sooner, tighten its
+#: ``cpu_timeout`` (load-immune) — never this factor.
+WALL_FALLBACK_CPU_MULTIPLIER = 3
+
 #: Default template for the inner-parallelism (concurrency) flag appended to a step's command
 #: when the step declares ``preferred_inner_jobs``. See :func:`render_jobs_flag`.
 DEFAULT_JOBS_FLAG = "-j"
@@ -75,6 +86,13 @@ class Step:
     hint: ResourceHint = field(default_factory=ResourceHint)
     networkonly: bool = False  # skipped when networking is disabled
     engine_only: bool = False  # selected only by an engine-only subset preset
+    # Wall-clock timeout in seconds. 0 is the "unset" sentinel: the DAG-authoring idiom is to
+    # leave `timeout` out of the DAG file entirely (the loader supplies 0, and the serializer
+    # omits it when 0) and let `resolved_wall_timeout` derive a defense-in-depth backstop —
+    # `WALL_FALLBACK_CPU_MULTIPLIER * cpu_timeout` when a CPU budget is set, else the
+    # document-level default_step_timeout. Enforcement ALWAYS goes through resolved_wall_timeout,
+    # never this raw field. A programmatic `Step(...)` with no timeout keeps the legacy
+    # DEFAULT_STEP_TIMEOUT default for backward compatibility; prefer setting `cpu_timeout`.
     timeout: int = DEFAULT_STEP_TIMEOUT
     # CPU-time budget in seconds (user+system, measured from the step's cgroup
     # cpu.stat). 0 disables the CPU-time guard, leaving only the wall `timeout`.
@@ -90,6 +108,27 @@ class Step:
     @property
     def tag(self) -> str:
         return f"{self.group}.{self.job}"
+
+
+def resolved_wall_timeout(step: Step, default_step_timeout: int) -> int:
+    """Effective wall-clock timeout (seconds) for a step, resolving the "unset" idiom.
+
+    Precedence (mirrors Rust's ``resolved_wall_timeout``):
+
+    1. an explicit wall ``timeout > 0`` is honored verbatim (defense-in-depth for the rare
+       step that genuinely needs a fixed outer wall bound);
+    2. otherwise, if ``cpu_timeout > 0``, derive a generous hang-catcher backstop of
+       ``WALL_FALLBACK_CPU_MULTIPLIER * cpu_timeout``;
+    3. otherwise fall back to the document-level ``default_step_timeout``.
+
+    This is the ONLY place enforcement should read a step's wall timeout from; never enforce
+    against the raw ``step.timeout`` field, which may hold the 0 "unset" sentinel.
+    """
+    if step.timeout > 0:
+        return step.timeout
+    if step.cpu_timeout > 0:
+        return WALL_FALLBACK_CPU_MULTIPLIER * step.cpu_timeout
+    return default_step_timeout
 
 
 def render_jobs_flag(template: str, inner_jobs: int) -> str:

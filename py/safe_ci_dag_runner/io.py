@@ -416,7 +416,11 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 hint=_hint_from(sm.get("hint"), f"{where}.hint"),
                 networkonly=_opt_bool(sm, "networkonly", False),
                 engine_only=_opt_bool(sm, "engine_only", False),
-                timeout=_opt_int(sm, "timeout", default_step_timeout),
+                # An omitted wall `timeout` loads as the `0` "unset" sentinel (NOT the doc
+                # default), preserving the idiom of leaving it out through to enforcement, where
+                # resolved_wall_timeout applies default_step_timeout (or derives 3x cpu_timeout)
+                # lazily. Mirrors cpu_timeout's `0`-disables sentinel and the Rust loader.
+                timeout=_opt_int(sm, "timeout", 0),
                 cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
             )
@@ -457,14 +461,17 @@ def _step_to_json(step: Step) -> dict[str, object]:
         "env": dict(sorted(step.env.items())),
         "networkonly": step.networkonly,
         "engine_only": step.engine_only,
+        # Wall `timeout` and `cpu_timeout` are both emitted only when set (non-zero). Omitting
+        # an unset wall timeout is the idiom: absence parses back to the `0` sentinel and
+        # resolved_wall_timeout derives the backstop at enforcement time. Keeps DAGs that leave
+        # `timeout` out byte-for-byte stable and matches the Rust serializer's key order.
         "timeout": step.timeout,
-        # Emitted only when set, so existing DAGs (all cpu_timeout=0) stay byte-for-byte
-        # unchanged; absence parses back to 0, keeping round-trip stable. Positioned
-        # immediately after `timeout` to match the Rust serializer's key order.
         "cpu_timeout": step.cpu_timeout,
         "jobs_flag": step.jobs_flag,
         "hint": _hint_to_json(step.hint),
     }
+    if step.timeout == 0:
+        del obj["timeout"]
     if step.cpu_timeout == 0:
         del obj["cpu_timeout"]
     return obj

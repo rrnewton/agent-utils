@@ -11,6 +11,42 @@ use std::collections::BTreeMap;
 /// Default per-step timeout (seconds); mirrors Python's `DEFAULT_STEP_TIMEOUT`.
 pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
 
+/// Multiplier from a step's `cpu_timeout` to its DERIVED wall-timeout backstop when the step
+/// declares no explicit wall `timeout`. Mirrors Python's `WALL_FALLBACK_CPU_MULTIPLIER`.
+///
+/// THIS IS A HANG-CATCHER, NOT A PERFORMANCE BUDGET. The intended idiom is to declare a tight,
+/// load-immune `cpu_timeout` and leave the wall `timeout` UNSET (`0`); the wall then exists only
+/// as defense-in-depth for a step that wedges while burning ~no CPU (a deadlock/blocked syscall
+/// the cpu.stat guard can never catch). The `3x` is deliberately generous so a fully
+/// SEQUENTIALIZED step (wall ~= CPU) has ample headroom and the wall never fires before the
+/// cpu_timeout on a legitimately-busy step. DO NOT tune this down toward the CPU budget to make
+/// it a tighter "performance" bound: that manufactures false wall kills under load, exactly the
+/// load-sensitivity that motivated preferring CPU budgets in the first place. Tighten the
+/// `cpu_timeout`, never this factor.
+pub const WALL_FALLBACK_CPU_MULTIPLIER: i64 = 3;
+
+/// The effective wall-clock timeout (seconds) enforced for a step, resolving the "unset" idiom.
+///
+/// Precedence (mirrors Python's `resolved_wall_timeout`, load-bearing for cross-engine parity):
+///  1. an explicit wall `timeout > 0` is used verbatim (an author who sets it means it);
+///  2. else, when a `cpu_timeout > 0` is declared, the wall is DERIVED as
+///     `WALL_FALLBACK_CPU_MULTIPLIER * cpu_timeout` — a generous hang-catcher backstopping the
+///     CPU-time guard (see the constant's caveat);
+///  3. else, neither is set, so the DAG-level `default_step_timeout` applies.
+///
+/// A `timeout` of `0` therefore means "unset — derive me", the same sentinel `cpu_timeout` uses
+/// for "disabled". The serializer omits `timeout` when `0`, so the on-disk idiom is simply to
+/// leave it out.
+pub fn resolved_wall_timeout(step: &Step, default_step_timeout: i64) -> i64 {
+    if step.timeout > 0 {
+        step.timeout
+    } else if step.cpu_timeout > 0 {
+        WALL_FALLBACK_CPU_MULTIPLIER * step.cpu_timeout
+    } else {
+        default_step_timeout
+    }
+}
+
 /// Default template for the inner-parallelism (concurrency) flag appended to a step's command
 /// when the step declares `preferred_inner_jobs`. Mirrors Python's `DEFAULT_JOBS_FLAG`.
 pub const DEFAULT_JOBS_FLAG: &str = "-j";
@@ -91,6 +127,12 @@ pub struct Step {
     pub networkonly: bool,
     /// Selected only by an engine-only subset preset.
     pub engine_only: bool,
+    /// Wall-clock timeout budget in seconds. `0` means UNSET — the runner then derives an
+    /// effective wall via [`resolved_wall_timeout`] (`3x cpu_timeout` when a CPU budget is
+    /// declared, else the DAG's `default_step_timeout`). The idiom is to LEAVE THIS UNSET and
+    /// rely on a load-immune `cpu_timeout`; a hardcoded wall is load-sensitive and discouraged.
+    /// The serializer omits this field when `0`. Enforcement always goes through
+    /// [`resolved_wall_timeout`], never this raw value.
     pub timeout: i64,
     /// CPU-time budget in seconds (user+system, from the step's cgroup `cpu.stat`). `0` disables
     /// the CPU-time guard, leaving only the wall `timeout`. CPU time is immune to machine load, so
@@ -457,6 +499,32 @@ mod tests {
             cpu_timeout: 0,
             jobs_flag: jobs_flag.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn resolved_wall_timeout_precedence() {
+        // 1. An explicit wall timeout (>0) wins verbatim, even when a cpu_timeout is present.
+        let mut s = bare_step("true", None);
+        s.timeout = 900;
+        s.cpu_timeout = 100;
+        assert_eq!(resolved_wall_timeout(&s, 1800), 900);
+
+        // 2. Unset wall (0) + cpu_timeout>0 -> derived 3x hang-catcher backstop.
+        let mut s = bare_step("true", None);
+        s.timeout = 0;
+        s.cpu_timeout = 100;
+        assert_eq!(resolved_wall_timeout(&s, 1800), 300);
+        assert_eq!(
+            resolved_wall_timeout(&s, 1800),
+            WALL_FALLBACK_CPU_MULTIPLIER * s.cpu_timeout
+        );
+
+        // 3. Both unset -> fall back to the document default_step_timeout.
+        let mut s = bare_step("true", None);
+        s.timeout = 0;
+        s.cpu_timeout = 0;
+        assert_eq!(resolved_wall_timeout(&s, 1800), 1800);
+        assert_eq!(resolved_wall_timeout(&s, 42), 42);
     }
 
     #[test]
