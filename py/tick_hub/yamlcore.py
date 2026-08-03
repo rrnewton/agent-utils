@@ -15,11 +15,24 @@ from __future__ import annotations
 
 import math
 import re
+from typing import TYPE_CHECKING
 
-import yaml
-from yaml.nodes import ScalarNode
+if TYPE_CHECKING:
+    # PyYAML is an OPTIONAL runtime dependency: only core_load / core_dump need it, so it is
+    # imported lazily there rather than at module scope. Importing it here would pull the
+    # dependency into every importer of this module (and thus into `--help` / `--version`). Under
+    # `from __future__ import annotations` these type-only imports cost nothing at runtime.
+    import yaml
+    from yaml.nodes import ScalarNode
 
 __all__ = ["core_load", "core_dump", "resolve_core_scalar"]
+
+# Raised (as ModuleNotFoundError) by core_load / core_dump when PyYAML is absent; callers convert it
+# to their own typed error so the CLI prints it cleanly instead of dumping a traceback.
+_MISSING_YAML_MSG = (
+    "reading or writing YAML requires the optional PyYAML dependency, which is not installed. "
+    "Install it with: python3 -m pip install 'pyyaml>=6'  (or run: agent-utils/setup)."
+)
 
 _RE_INT_DEC = re.compile(r"^[-+]?(0|[1-9][0-9]*)$")
 _RE_INT_OCT = re.compile(r"^0o[0-7]+$")
@@ -74,12 +87,26 @@ def _construct_core_scalar(loader: yaml.SafeLoader, node: ScalarNode) -> object:
     return resolve_core_scalar(loader.construct_scalar(node))
 
 
-class _CoreLoader(yaml.SafeLoader):
-    """A ``SafeLoader`` that resolves PLAIN scalars with :func:`resolve_core_scalar`."""
+# Caches for the lazily-built loader/dumper subclasses; PyYAML is imported and the subclasses
+# defined only on first use (see _core_loader / _core_dumper), keeping the dependency optional.
+_CORE_LOADER: type[yaml.SafeLoader] | None = None
+_CORE_DUMPER: type[yaml.SafeDumper] | None = None
 
 
-_CoreLoader.yaml_implicit_resolvers = {None: [(_CORE_TAG, re.compile(r".*", re.DOTALL))]}
-_CoreLoader.add_constructor(_CORE_TAG, _construct_core_scalar)
+def _core_loader() -> type[yaml.SafeLoader]:
+    """Build (once, lazily) the ``SafeLoader`` that resolves PLAIN scalars via core-schema rules."""
+    global _CORE_LOADER
+    if _CORE_LOADER is not None:
+        return _CORE_LOADER
+    import yaml
+
+    class _CoreLoader(yaml.SafeLoader):
+        pass
+
+    _CoreLoader.yaml_implicit_resolvers = {None: [(_CORE_TAG, re.compile(r".*", re.DOTALL))]}
+    _CoreLoader.add_constructor(_CORE_TAG, _construct_core_scalar)
+    _CORE_LOADER = _CoreLoader
+    return _CoreLoader
 
 
 def _represent_core_str(dumper: yaml.SafeDumper, data: str) -> ScalarNode:
@@ -88,24 +115,48 @@ def _represent_core_str(dumper: yaml.SafeDumper, data: str) -> ScalarNode:
     return dumper.represent_scalar("tag:yaml.org,2002:str", data, style=style)
 
 
-class _CoreDumper(yaml.SafeDumper):
-    """SafeDumper whose string representer round-trips through :class:`_CoreLoader`."""
+def _core_dumper() -> type[yaml.SafeDumper]:
+    """Build (once, lazily) the ``SafeDumper`` whose representer round-trips through the loader."""
+    global _CORE_DUMPER
+    if _CORE_DUMPER is not None:
+        return _CORE_DUMPER
+    import yaml
 
+    class _CoreDumper(yaml.SafeDumper):
+        pass
 
-_CoreDumper.add_representer(str, _represent_core_str)
+    _CoreDumper.add_representer(str, _represent_core_str)
+    _CORE_DUMPER = _CoreDumper
+    return _CoreDumper
 
 
 def core_load(text: str) -> object:
-    """Parse YAML with core-schema plain-scalar resolution; result pinned to ``object``."""
-    raw: object = yaml.load(text, Loader=_CoreLoader)
+    """Parse YAML with core-schema plain-scalar resolution; result pinned to ``object``.
+
+    Raises :class:`ModuleNotFoundError` (with an actionable install hint) if PyYAML is not
+    installed; callers convert it to their own typed error.
+    """
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(_MISSING_YAML_MSG) from exc
+    raw: object = yaml.load(text, Loader=_core_loader())
     return raw
 
 
 def core_dump(obj: object) -> str:
-    """Dump ``obj`` to a YAML document that round-trips back through :func:`core_load`."""
+    """Dump ``obj`` to a YAML document that round-trips back through :func:`core_load`.
+
+    Raises :class:`ModuleNotFoundError` (with an actionable install hint) if PyYAML is not
+    installed; callers convert it to their own typed error.
+    """
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(_MISSING_YAML_MSG) from exc
     return yaml.dump(
         obj,
-        Dumper=_CoreDumper,
+        Dumper=_core_dumper(),
         sort_keys=False,
         allow_unicode=True,
         default_flow_style=False,

@@ -44,6 +44,10 @@ setup_py() {
   fi
   ( cd py && python3 -m mypy . )
   [ -d py/bin ] && chmod +x py/bin/* 2>/dev/null || true
+  # Smoke-check that every entrypoint starts cleanly with zero optional deps (stdlib-only; catches
+  # an optional dependency imported at module scope taking down `--help` on a bare host).
+  echo "==> [py] check-deps (dependency-free entrypoint smoke test)"
+  python3 "$ROOT/scripts/check_deps.py"
   echo "==> [py] ok"
 }
 

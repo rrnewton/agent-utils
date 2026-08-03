@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
-import yaml
+if TYPE_CHECKING:
+    # PyYAML is optional: only config_from_yaml catches yaml.YAMLError, and it imports yaml lazily
+    # there. Keeping the import out of module scope means the JSON paths and `--help` never need it.
+    import yaml
 
 from tick_hub.model import (
     Emit,
@@ -34,7 +37,7 @@ from tick_hub.model import (
     Reminder,
     TickConfig,
 )
-from tick_hub.yamlcore import core_dump, core_load
+from tick_hub.yamlcore import _MISSING_YAML_MSG, core_dump, core_load
 
 __all__ = [
     "config_from_json",
@@ -213,7 +216,14 @@ def config_from_yaml(text: str) -> TickConfig:
 
     YAML is ISOMORPHIC to the JSON schema: the parsed object funnels through the same typed
     narrowing (:func:`_config_from_obj`), and plain scalars resolve with YAML-1.2 core-schema rules
-    (:mod:`tick_hub.yamlcore`)."""
+    (:mod:`tick_hub.yamlcore`).
+
+    PyYAML is optional; if it is not installed this raises :class:`TickConfigError` with an
+    actionable install hint (JSON works without it)."""
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise TickConfigError(_MISSING_YAML_MSG) from exc
     try:
         raw: object = core_load(text)
     except yaml.YAMLError as exc:
@@ -296,5 +306,11 @@ def config_to_json(cfg: TickConfig) -> str:
 
 def config_to_yaml(cfg: TickConfig) -> str:
     """Serialize a :class:`TickConfig` to a YAML document that round-trips through
-    :func:`config_from_yaml`."""
-    return core_dump(_config_to_obj(cfg))
+    :func:`config_from_yaml`.
+
+    PyYAML is optional; if it is not installed this raises :class:`TickConfigError` with an
+    actionable install hint (JSON works without it)."""
+    try:
+        return core_dump(_config_to_obj(cfg))
+    except ModuleNotFoundError as exc:
+        raise TickConfigError(_MISSING_YAML_MSG) from exc

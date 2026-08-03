@@ -12,14 +12,27 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
-import yaml
+if TYPE_CHECKING:
+    # PyYAML is optional: only the YAML branch of load_fixture_text needs it, and it imports yaml
+    # lazily there. JSON fixtures, `--help`, and `--version` never need the dependency.
+    import yaml
 
 from pr_landing_planner.model import CheckRun, RawPr, edge_key
 
 
 class FixtureError(ValueError):
     """Raised when a FakeHost fixture document is malformed."""
+
+
+# Surfaced (as a FixtureError, so the CLI prints it cleanly) when a YAML fixture is requested but
+# PyYAML is not installed. JSON fixtures need no optional dependency.
+_MISSING_YAML_MSG = (
+    "loading a YAML fixture requires the optional PyYAML dependency, which is not installed. "
+    "Install it with: python3 -m pip install 'pyyaml>=6'  (or run: agent-utils/setup). "
+    "JSON fixtures need no extra dependency."
+)
 
 
 # --------------------------------------------------------------------------- narrowing helpers
@@ -227,8 +240,15 @@ def _as_list(value: object) -> list[object]:
 
 
 def load_fixture_text(text: str, *, as_yaml: bool) -> object:
-    """Parse a fixture document from ``text`` (YAML or JSON) into a plain ``object`` (no Any leak)."""
+    """Parse a fixture document from ``text`` (YAML or JSON) into a plain ``object`` (no Any leak).
+
+    PyYAML is optional; a YAML fixture requested without it raises :class:`FixtureError` with an
+    actionable install hint (JSON fixtures work without it)."""
     if as_yaml:
+        try:
+            import yaml
+        except ModuleNotFoundError as exc:
+            raise FixtureError(_MISSING_YAML_MSG) from exc
         raw: object = yaml.safe_load(text)
     else:
         try:

@@ -422,7 +422,14 @@ def _cmd_config_render(ns: argparse.Namespace, command: str, c: Palette) -> int:
     elif command == "json":
         print(config_to_json(cfg))
     elif command == "yaml":
-        sys.stdout.write(config_to_yaml(cfg))
+        # config_to_yaml needs the optional PyYAML dependency; surface its absence as a clean
+        # actionable message (exit 2) rather than letting TickConfigError escape as a traceback.
+        try:
+            text = config_to_yaml(cfg)
+        except TickConfigError as exc:
+            print(f"{PROG}: {exc}", file=sys.stderr)
+            return 2
+        sys.stdout.write(text)
     return 0
 
 

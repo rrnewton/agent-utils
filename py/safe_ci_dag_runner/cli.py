@@ -1489,8 +1489,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(dag_to_json(cfg))
         return 0
     if command == "yaml":
+        # dag_to_yaml needs the optional PyYAML dependency; surface its absence as a clean
+        # actionable message (exit 2) rather than letting DagJsonError escape as a traceback.
+        try:
+            text = dag_to_yaml(cfg)
+        except DagJsonError as exc:
+            print(f"{PROG}: {exc}", file=sys.stderr)
+            return 2
         # dag_to_yaml already ends with a trailing newline.
-        sys.stdout.write(dag_to_yaml(cfg))
+        sys.stdout.write(text)
         return 0
     if command == "run":
         return _run(cfg, ns, c)

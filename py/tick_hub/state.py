@@ -24,7 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from tick_hub.emit import format_action, format_note
-from tick_hub.yamlcore import core_dump, core_load
+from tick_hub.yamlcore import _MISSING_YAML_MSG, core_dump, core_load
 
 DEFAULT_TICK_FREQUENCY_MIN = 30
 
@@ -104,8 +104,15 @@ class OpsState:
 
     @classmethod
     def from_yaml(cls, text: str) -> "OpsState":
-        """Parse an ops-state YAML document (core-schema plain scalars) into an :class:`OpsState`."""
-        return cls.from_obj(core_load(text))
+        """Parse an ops-state YAML document (core-schema plain scalars) into an :class:`OpsState`.
+
+        PyYAML is optional; if it is not installed this raises :class:`StateError` with an
+        actionable install hint."""
+        try:
+            raw = core_load(text)
+        except ModuleNotFoundError as exc:
+            raise StateError(_MISSING_YAML_MSG) from exc
+        return cls.from_obj(raw)
 
     @classmethod
     def load(cls, path: str) -> "OpsState":
@@ -122,8 +129,14 @@ class OpsState:
         }
 
     def to_yaml(self) -> str:
-        """Serialize to a YAML document that round-trips back through :meth:`from_yaml`."""
-        return core_dump(self.to_obj())
+        """Serialize to a YAML document that round-trips back through :meth:`from_yaml`.
+
+        PyYAML is optional; if it is not installed this raises :class:`StateError` with an
+        actionable install hint."""
+        try:
+            return core_dump(self.to_obj())
+        except ModuleNotFoundError as exc:
+            raise StateError(_MISSING_YAML_MSG) from exc
 
 
 def _parse_flags(value: object) -> dict[str, FlagValue]:
