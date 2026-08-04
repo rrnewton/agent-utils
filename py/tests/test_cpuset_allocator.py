@@ -19,11 +19,13 @@ import json
 import os
 import shutil
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
 
 from safe_ci_dag_runner import cpuset_allocator as ca
+from safe_ci_dag_runner import reservation
 
 
 def _systemd() -> bool:
@@ -75,6 +77,28 @@ def test_run_rejects_empty_command(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ca.main(["run", "--cores", "1"]) == 2
 
 
+def test_run_refuses_when_allowed_cpus_is_soft_or_inert(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ca, "_systemd_run_available", lambda: True)
+    monkeypatch.setattr(
+        reservation,
+        "reserve_cores",
+        lambda *args, **kwargs: nullcontext([0]),
+    )
+    monkeypatch.setattr(
+        ca,
+        "_probe_hard_pin",
+        lambda cores: {"verdict": "SOFT_OR_INERT", "cores": list(cores)},
+    )
+
+    def _no_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        raise AssertionError("the benchmark command must not run after a soft pin probe")
+
+    monkeypatch.setattr(subprocess, "run", _no_run)
+    assert ca.main(["run", "--cores", "1", "--", "echo", "hi"]) == 3
+
+
 # --------------------------------------------------------------------------- #
 # status / reclaim JSON over an isolated ledger                                #
 # --------------------------------------------------------------------------- #
@@ -108,8 +132,9 @@ def test_selftest_verdict_is_hard_when_systemd_available(
     k = 2 if len(os.sched_getaffinity(0)) >= 3 else 1
     rc = ca.main(["selftest", "--cores", str(k), "--sample-s", "0.05"])
     out = json.loads(capsys.readouterr().out)
-    if out.get("verdict") == "UNTESTABLE":
-        pytest.skip(f"systemd present but scope uncreatable: {out.get('reason')}")
+    if out.get("verdict") != "HARD":
+        assert rc != 0
+        pytest.skip(f"host does not provide a HARD AllowedCPUs scope: {out}")
     assert out["verdict"] == "HARD", out
     assert rc == 0
     assert out["count"] == k

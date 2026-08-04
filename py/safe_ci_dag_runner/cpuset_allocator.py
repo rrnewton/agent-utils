@@ -131,6 +131,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     with reservation.reserve_cores(
         args.cores, tag=args.tag, sample_s=args.sample_s
     ) as cores:
+        probe = _probe_hard_pin(cores)
+        if probe.get("verdict") != "HARD":
+            print(
+                f"{PROG}: run: reserved cores could not be mutation-verified as a HARD "
+                f"tree-wide pin; refusing to run: {json.dumps(probe, sort_keys=True)}",
+                file=sys.stderr,
+            )
+            return 3
         # CONDITION CARRIED WITH THE VALUE: which cores, and how many.
         assignment = {"cores": cores, "count": len(cores)}
         print(
@@ -237,6 +245,59 @@ print(json.dumps({
 """
 
 
+def _probe_hard_pin(cores: Sequence[int]) -> dict[str, object]:
+    """Mutation-probe an ``AllowedCPUs`` scope before trusting it.
+
+    Some hosts accept the systemd property yet leave the child able to escape
+    onto an excluded core. That is a soft/inert mechanism, not containment.
+    """
+    allowed = sorted(os.sched_getaffinity(0))
+    excluded = next((core for core in allowed if core not in set(cores)), None)
+    if excluded is None:
+        return {"verdict": "UNTESTABLE", "reason": "no core outside the reserved set"}
+
+    argv = _scope_argv(
+        cores,
+        [sys.executable, "-c", _SELFTEST_INNER, str(excluded), str(len(cores))],
+    )
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"verdict": "ERROR", "reason": str(exc)}
+
+    inner: dict[str, object] = {}
+    for line in completed.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                inner = json.loads(line)
+            except json.JSONDecodeError:
+                pass
+    if not inner:
+        return {
+            "verdict": "ERROR",
+            "reason": "scope probe produced no result",
+            "returncode": completed.returncode,
+            "stderr": completed.stderr.strip(),
+        }
+
+    escape_masked = bool(inner.get("escape_masked", False))
+    used_raw = inner.get("positive_cores_used", [])
+    used = [int(core) for core in used_raw] if isinstance(used_raw, list) else []
+    positive_ok = bool(used) and set(used).issubset(set(cores))
+    verdict = "HARD" if (escape_masked and positive_ok) else "SOFT_OR_INERT"
+    return {
+        "verdict": verdict,
+        "cores": list(cores),
+        "count": len(cores),
+        "excluded_core": excluded,
+        "negative_escape_masked": escape_masked,
+        "positive_cores_used": used,
+        "positive_stayed_in_set": positive_ok,
+        "inner": inner,
+    }
+
+
 def cmd_selftest(args: argparse.Namespace) -> int:
     """``selftest``: reserve K cores, hard-pin a scope onto them, and MUTATE —
     try to escape a pinned child onto a K+1th (excluded) core. A HARD bound masks
@@ -255,45 +316,12 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         return 3
 
     with reservation.reserve_cores(args.cores, tag="selftest", sample_s=args.sample_s) as cores:
-        allowed = sorted(os.sched_getaffinity(0))
-        excluded = next((c for c in allowed if c not in set(cores)), None)
-        if excluded is None:
-            print(json.dumps({"verdict": "UNTESTABLE", "reason": "no core outside the reserved set"}))
-            return 3
-
-        argv = _scope_argv(cores, [sys.executable, "-c", _SELFTEST_INNER, str(excluded), str(len(cores))])
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=60)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            print(json.dumps({"verdict": "ERROR", "reason": str(exc)}))
-            return 3
-
-        inner: dict[str, object] = {}
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    inner = json.loads(line)
-                except json.JSONDecodeError:
-                    pass
-        escape_masked = bool(inner.get("escape_masked", False))
-        used_raw = inner.get("positive_cores_used", [])
-        used = [int(c) for c in used_raw] if isinstance(used_raw, list) else []
-        # POSITIVE: every core the tree ran on is within the reserved set (never spilled).
-        positive_ok = bool(used) and set(used).issubset(set(cores))
-        verdict = "HARD" if (escape_masked and positive_ok) else "SOFT_OR_INERT"
-        result = {
-            "verdict": verdict,
-            "cores": cores,
-            "count": len(cores),
-            "excluded_core": excluded,
-            "negative_escape_masked": escape_masked,
-            "positive_cores_used": used,
-            "positive_stayed_in_set": positive_ok,
-            "inner": inner,
-        }
+        result = _probe_hard_pin(cores)
         print(json.dumps(result, indent=2))
-        return 0 if verdict == "HARD" else 1
+        verdict = result.get("verdict")
+        if verdict == "HARD":
+            return 0
+        return 1 if verdict == "SOFT_OR_INERT" else 3
 
 
 def _build_parser() -> argparse.ArgumentParser:
