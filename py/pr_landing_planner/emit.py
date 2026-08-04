@@ -19,6 +19,7 @@ from typing import Callable
 from pr_landing_planner.model import (
     CiState,
     HeldPr,
+    MechanismEdge,
     PlanResult,
     PrAction,
     PrActionDecision,
@@ -82,6 +83,10 @@ def render_json(result: PlanResult) -> str:
             {"before": e.before, "after": e.after, "reason": e.reason}
             for e in graph.ordering_edges
         ],
+        "mechanism_overlap_edges": [
+            {"a": e.a, "b": e.b, "mechanisms": list(e.mechanisms)}
+            for e in graph.mechanism_edges
+        ],
         "stacks": [list(stack) for stack in result.stacks],
         "held_prs": [{"pr": h.pr, "reasons": list(h.reasons)} for h in result.held],
         "plan": {
@@ -134,6 +139,7 @@ def _summary_counts(result: PlanResult) -> list[tuple[str, int]]:
         ("flaky_reds", len(diag.flaky_reds)),
         ("real_reds", len(diag.real_reds)),
         ("evaluate_once_race", len(diag.evaluate_once_race)),
+        ("mechanism_overlaps", len(result.graph.mechanism_edges)),
         ("outage", 1 if diag.outage_suspected else 0),
     ]
 
@@ -169,6 +175,12 @@ def render_actions(result: PlanResult) -> str:
             f"NOTE: evaluate-once-race pr={pr} "
             "(benign gate noise; treat as pending, ds-xdc7m9)"
         )
+    for me in result.graph.mechanism_edges:
+        lines.append(
+            f"NOTE: mechanism-overlap prs={me.a},{me.b} "
+            f"mechanisms={_quote(','.join(me.mechanisms))} "
+            "(same mechanism — review together; may be opposite intent)"
+        )
 
     decisions = {d.pr: d for d in result.plan.per_pr_actions}
     emitted: set[int] = set()
@@ -203,7 +215,8 @@ def render_human(result: PlanResult, color: ColorFn | None = None) -> str:
         c("bold", f"Repository: {graph.repository}  base: {graph.base}"),
         (
             f"{len(graph.nodes)} open PR(s), {n_conflict} real conflict(s), "
-            f"{n_overlap} file-overlap risk(s), {len(graph.ordering_edges)} ordering edge(s)"
+            f"{n_overlap} file-overlap risk(s), {len(graph.ordering_edges)} ordering edge(s), "
+            f"{len(graph.mechanism_edges)} mechanism overlap(s)"
         ),
         "",
         c("bold", "CI health:"),
@@ -243,6 +256,15 @@ def render_human(result: PlanResult, color: ColorFn | None = None) -> str:
             f"  #{decision.pr:<5} {c('cyan', decision.action.value):<22} {decision.why}"
             + (f"  ({title})" if title else "")
         )
+
+    lines.extend(
+        ["", c("bold", "Mechanism overlaps (same mechanism — review together, may be opposite intent):")]
+    )
+    if graph.mechanism_edges:
+        for me in graph.mechanism_edges:
+            lines.append(f"  #{me.a} <-> #{me.b}: {', '.join(me.mechanisms)}")
+    else:
+        lines.append("  (none)")
 
     lines.extend(["", c("bold", "Diagnostics:")])
     _append_diag(lines, "stale required-check (refire gate)", diag.stale_gates)
@@ -286,6 +308,10 @@ def render_graph_json(result: PlanResult) -> str:
             {"before": e.before, "after": e.after, "reason": e.reason}
             for e in graph.ordering_edges
         ],
+        "mechanism_overlap_edges": [
+            {"a": e.a, "b": e.b, "mechanisms": list(e.mechanisms)}
+            for e in graph.mechanism_edges
+        ],
         "stacks": [list(stack) for stack in result.stacks],
         "held_prs": [{"pr": h.pr, "reasons": list(h.reasons)} for h in result.held],
     }
@@ -301,7 +327,8 @@ def render_graph_human(result: PlanResult, color: ColorFn | None = None) -> str:
         (
             f"{len(graph.nodes)} open PR(s), {len(graph.conflict_edges)} real conflict(s), "
             f"{len(graph.overlap_edges)} file-overlap risk(s), "
-            f"{len(graph.ordering_edges)} ordering edge(s)"
+            f"{len(graph.ordering_edges)} ordering edge(s), "
+            f"{len(graph.mechanism_edges)} mechanism overlap(s)"
         ),
         "",
         c("bold", "Stacks:"),
@@ -324,6 +351,14 @@ def render_graph_human(result: PlanResult, color: ColorFn | None = None) -> str:
             preview = ", ".join(oe.paths[:5])
             more = f" (+{len(oe.paths) - 5} more)" if len(oe.paths) > 5 else ""
             lines.append(f"  #{oe.a} <-> #{oe.b}: {preview}{more}")
+    else:
+        lines.append("  (none)")
+    lines.extend(
+        ["", c("bold", "Mechanism overlaps (same mechanism — review together, may be opposite intent):")]
+    )
+    if graph.mechanism_edges:
+        for me in graph.mechanism_edges:
+            lines.append(f"  #{me.a} <-> #{me.b}: {', '.join(me.mechanisms)}")
     else:
         lines.append("  (none)")
     lines.extend(["", c("bold", "Held PRs:")])
