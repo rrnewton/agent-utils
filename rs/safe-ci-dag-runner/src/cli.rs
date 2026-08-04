@@ -390,13 +390,11 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 a.profile_sync_direction = v;
             }
             "-k" | "--keep-going" => a.keep_going = true,
-            "--cgroups" => {
-                return Err(
-                    "--cgroups has been removed (cgroup-v2 boxing is ON by default); drop the flag. \
+            "--cgroups" => return Err(
+                "--cgroups has been removed (cgroup-v2 boxing is ON by default); drop the flag. \
                      Per-node resource limits are DAG fields (cpu_timeout, memory, pids)."
-                        .to_string(),
-                )
-            }
+                    .to_string(),
+            ),
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
