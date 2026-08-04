@@ -49,7 +49,15 @@ def _fake_run_factory(*, fail_view_for: frozenset[int] = frozenset()) -> _FakeRu
                 raise HostCommandError(cmd, 1, "boom")
             rollup = [{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
                        "conclusion": "SUCCESS"}]
-            return _completed(json.dumps({"number": number, "statusCheckRollup": rollup}))
+            return _completed(
+                json.dumps(
+                    {
+                        "number": number,
+                        "headRefOid": "a" * 40,
+                        "statusCheckRollup": rollup,
+                    }
+                )
+            )
         raise AssertionError(f"unexpected command: {parts}")
 
     return fake_run

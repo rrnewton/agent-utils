@@ -155,6 +155,32 @@ def test_parse_rollup_narrows_gh_json() -> None:
     assert classify_state(checks) is CiState.PASSED
 
 
+def test_parse_rollup_uses_latest_exact_head_attempt_in_both_orders() -> None:
+    sha = "a" * 40
+    older = {
+        "name": "merge-gate",
+        "headSha": sha,
+        "status": "COMPLETED",
+        "conclusion": "FAILURE",
+        "startedAt": "2026-08-04T15:12:05Z",
+        "detailsUrl": "https://github.com/o/r/actions/runs/30922888575/job/1",
+    }
+    newer = {
+        "name": "merge-gate",
+        "headSha": sha,
+        "status": "COMPLETED",
+        "conclusion": "SUCCESS",
+        "startedAt": "2026-08-04T15:24:36Z",
+        "detailsUrl": "https://github.com/o/r/actions/runs/30923975433/job/2",
+    }
+    wrong_head = {**newer, "headSha": "b" * 40, "conclusion": "FAILURE"}
+    for raw in ([older, newer, wrong_head], [wrong_head, newer, older]):
+        checks = parse_rollup(raw, head_sha=sha)
+        assert len(checks) == 1
+        assert checks[0].conclusion == "SUCCESS"
+        assert classify_state(checks) is CiState.PASSED
+
+
 def test_flaky_signatures_from_objs() -> None:
     doc: object = {"signatures": [{"name_regex": "wasm"}, {"text_regex": "flake"}, {"note": "no regex"}]}
     sigs = flaky_signatures_from_objs(doc)

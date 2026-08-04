@@ -25,7 +25,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from ci_hub_check_outcome import FAIL_CONCLUSIONS, classify_check
+from ci_hub_check_outcome import FAIL_CONCLUSIONS, classify_check, select_latest_checks
 from pr_landing_planner.model import CheckRun, CiState, CiVerdict, RedClass
 
 #: Derived from the canonical ci-hub authority; retained as an exported name
@@ -110,14 +110,14 @@ def _get_int(m: Mapping[str, object], *keys: str) -> int | None:
     return None
 
 
-def parse_rollup(raw: object) -> tuple[CheckRun, ...]:
+def parse_rollup(raw: object, *, head_sha: str = "") -> tuple[CheckRun, ...]:
     """Narrow a host's raw ``statusCheckRollup`` (a list of dicts) into :class:`CheckRun` values.
 
     This is the single Any-narrowing boundary for a rollup: ``raw`` is ``object`` and every field is
     re-typed here, so nothing untyped leaks into the pure classifier. Unknown shapes are skipped
     rather than crashing (a rollup entry that is not a dict is ignored)."""
     checks: list[CheckRun] = []
-    for entry in _as_list(raw):
+    for entry in select_latest_checks(raw, head_sha=head_sha):
         if not isinstance(entry, dict):
             continue
         item: dict[str, object] = {str(k): v for k, v in entry.items()}

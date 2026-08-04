@@ -16,8 +16,8 @@ from typing import Callable, Sequence, cast
 from urllib.request import urlopen
 
 
-AUTHORITY_COMMIT = "f9e61247e83bb07c11297541b591606de24a89a8"
-AUTHORITY_SHA256 = "d37794a8a67b1e565fe68e6435ef2af672b31bfdf2a34ab01ba1037b598bf113"
+AUTHORITY_COMMIT = "173d87688483189154cdd44feb031347a737e29a"
+AUTHORITY_SHA256 = "1621505969c9aa35bb7d48fb14fff6759153f3d610efb3995ad80a96eca6a9aa"
 AUTHORITY_RELATIVE_PATH = Path("ci-hub/check_outcome.py")
 
 
@@ -66,6 +66,7 @@ def _load_authority() -> ModuleType:
 
 AUTHORITY = _load_authority()
 _classify = cast(Callable[[object, object], object], AUTHORITY.classify_check)
+_select_latest = cast(Callable[..., list[dict[str, object]]], AUTHORITY.select_latest_checks)
 FAIL_CONCLUSIONS = cast(frozenset[str], AUTHORITY.FAIL_CONCLUSIONS)
 
 
@@ -78,13 +79,22 @@ def classify_check(status: object, conclusion: object) -> str:
     return cast(str, value)
 
 
+def select_latest_checks(value: object, *, head_sha: str = "") -> list[dict[str, object]]:
+    """Delegate exact-head/latest-context selection to the pinned authority."""
+    return _select_latest(value, head_sha=head_sha)
+
+
 def annotate_rollups(value: object) -> object:
     """Attach the canonical result to every check-like object in JSON."""
     if isinstance(value, list):
         return [annotate_rollups(item) for item in value]
     if not isinstance(value, dict):
         return value
-    result = {key: annotate_rollups(item) for key, item in value.items()}
+    result: dict[object, object] = {}
+    for key, item in value.items():
+        if key == "statusCheckRollup":
+            item = select_latest_checks(item, head_sha=str(value.get("headRefOid") or ""))
+        result[key] = annotate_rollups(item)
     if "status" in value or "conclusion" in value or "state" in value:
         result["_checkOutcome"] = classify_check(
             value.get("status"), value.get("conclusion", value.get("state"))
@@ -97,9 +107,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--status", default="")
     parser.add_argument("--conclusion", default="")
     parser.add_argument("--annotate-rollups", action="store_true")
+    parser.add_argument("--select-latest-rollup", action="store_true")
+    parser.add_argument("--head-sha", default="")
     args = parser.parse_args(argv)
     if args.annotate_rollups:
         json.dump(annotate_rollups(json.load(sys.stdin)), sys.stdout, separators=(",", ":"))
+        print()
+    elif args.select_latest_rollup:
+        json.dump(
+            select_latest_checks(json.load(sys.stdin), head_sha=args.head_sha),
+            sys.stdout,
+            separators=(",", ":"),
+        )
         print()
     else:
         print(classify_check(args.status, args.conclusion))

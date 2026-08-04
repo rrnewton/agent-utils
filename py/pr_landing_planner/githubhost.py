@@ -190,7 +190,7 @@ class GitHubHost:
                         [
                             self._gh, "pr", "view", str(number),
                             "--repo", repo,
-                            "--json", "number,statusCheckRollup",
+                            "--json", "number,headRefOid,statusCheckRollup",
                         ]
                     ),
                     cwd=None,
@@ -200,7 +200,9 @@ class GitHubHost:
             obj = json.loads(proc.stdout) if proc.stdout.strip() else {}
             if not isinstance(obj, dict):
                 return number, None
-            return number, parse_rollup(obj.get("statusCheckRollup"))
+            return number, parse_rollup(
+                obj.get("statusCheckRollup"), head_sha=_str(obj, "headRefOid")
+            )
 
         if numbers:
             with ThreadPoolExecutor(max_workers=_ROLLUP_WORKERS) as pool:
