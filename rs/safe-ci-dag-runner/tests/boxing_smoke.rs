@@ -127,7 +127,9 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
     let code = output.status.code();
-    if code == Some(3) && combined.contains("systemd --user scope is unavailable") {
+    let boxing_unavailable = combined.contains("systemd --user scope is unavailable")
+        || combined.contains("boxing was skipped (e.g. CI without a systemd --user scope)");
+    if code == Some(3) && boxing_unavailable {
         eprintln!(
             "SKIP boxed_oom_does_not_truncate_a_neighbour_artifact: cgroup boxing is unavailable \
              in this environment (need cgroup-v2 + a working systemd --user scope). Details:\n{stderr}"
