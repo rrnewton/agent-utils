@@ -16,9 +16,10 @@ unit-testable and is the byte-stable target a future Rust port would cross-check
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from pr_landing_planner.model import (
+    Cluster,
     ConflictEdge,
     HeldPr,
     MechanismEdge,
@@ -260,6 +261,134 @@ def partition_parallel_safe(
     return tuple(groups)
 
 
+# --------------------------------------------------------------------------- conflict clustering
+def connected_components(
+    numbers: Sequence[int], conflict_edges: Sequence[ConflictEdge]
+) -> tuple[tuple[int, ...], ...]:
+    """Connected components of the UNDIRECTED real-conflict graph (union-find).
+
+    Every number in ``numbers`` appears in exactly one component; a PR with no conflict edge is its
+    own singleton. Components are returned largest-first, ties broken by least member; each component's
+    members are sorted ascending. Edges naming a number absent from ``numbers`` are ignored. This is
+    the clustering step the parallel-safe partition is the DUAL of: partitioning splits a component
+    across layers to run in parallel, whereas clustering keeps a component together to land as one
+    rebase stack."""
+    parent: dict[int, int] = {n: n for n in numbers}
+
+    def find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            lo, hi = (ra, rb) if ra < rb else (rb, ra)
+            parent[hi] = lo
+
+    for edge in conflict_edges:
+        if edge.a in parent and edge.b in parent:
+            union(edge.a, edge.b)
+
+    groups: dict[int, list[int]] = {}
+    for n in parent:
+        groups.setdefault(find(n), []).append(n)
+    components = [tuple(sorted(members)) for members in groups.values()]
+    components.sort(key=lambda comp: (-len(comp), comp[0]))
+    return tuple(components)
+
+
+def _land_rank(node: PrNode) -> tuple[int, int, str, int]:
+    """The deterministic land priority shared by partitioning and stack ordering."""
+    return (node.priority, node.size, node.created_at, node.number)
+
+
+def _stack_order(
+    members: Sequence[int],
+    by_number: Mapping[int, PrNode],
+    ordering_edges: Sequence[OrderingEdge],
+) -> tuple[int, ...]:
+    """Deterministic topological order (base -> tip) over the intra-member ordering edges.
+
+    Kahn's algorithm with a land-rank tie-break: among the currently-buildable (in-degree-zero)
+    members, the lowest land rank lands first. Members with no ordering constraint therefore fall back
+    to pure rank order. A residual cycle degrades to rank order over whatever remains, so the function
+    always returns a total order of every member and never loops. Because the result is a total order,
+    dropping any one member leaves the rest in the same relative order — the stack is not
+    all-or-nothing."""
+    member_set = set(members)
+    succ: dict[int, set[int]] = {m: set() for m in member_set}
+    indeg: dict[int, int] = {m: 0 for m in member_set}
+    for edge in ordering_edges:
+        if (
+            edge.before in member_set
+            and edge.after in member_set
+            and edge.after not in succ[edge.before]
+        ):
+            succ[edge.before].add(edge.after)
+            indeg[edge.after] += 1
+
+    def rank(number: int) -> tuple[int, int, str, int]:
+        return _land_rank(by_number[number])
+
+    ready = sorted((m for m in member_set if indeg[m] == 0), key=rank)
+    ordered: list[int] = []
+    placed: set[int] = set()
+    while ready:
+        node = ready.pop(0)
+        ordered.append(node)
+        placed.add(node)
+        for child in succ[node]:
+            indeg[child] -= 1
+            if indeg[child] == 0:
+                ready.append(child)
+        ready.sort(key=rank)
+    if len(ordered) < len(member_set):  # residual ordering cycle: append leftovers deterministically
+        ordered.extend(sorted(member_set - placed, key=rank))
+    return tuple(ordered)
+
+
+def cluster_by_conflict(
+    nodes: Sequence[PrNode],
+    conflict_edges: Sequence[ConflictEdge],
+    ordering_edges: Sequence[OrderingEdge] = (),
+) -> tuple[Cluster, ...]:
+    """Group PRs into stack-landable clusters: connected components of the REAL-conflict graph.
+
+    Each :class:`~pr_landing_planner.model.Cluster` is one connected component (PRs that transitively
+    conflict and so cannot land in parallel), with its members in STACK ORDER (base -> tip) and the
+    union of the component's real conflicting paths. Distinct clusters share no real conflict by
+    construction, so they are the parallel landing LANES. Clustering runs over the merge-tree
+    ``conflict_edges``, NOT shared-file overlap: disjoint-region edits of one file produce no conflict
+    edge and so are NOT falsely fused into one stack (contrast
+    :func:`build_conflict_edges_file_overlap`)."""
+    by_number = {n.number: n for n in nodes}
+    components = connected_components([n.number for n in nodes], conflict_edges)
+    edge_pairs = [(frozenset((e.a, e.b)), e.paths) for e in conflict_edges]
+    clusters: list[Cluster] = []
+    for comp in components:
+        comp_set = set(comp)
+        paths: set[str] = set()
+        for pair, ps in edge_pairs:
+            if pair <= comp_set:
+                paths.update(ps)
+        members = _stack_order(comp, by_number, ordering_edges)
+        clusters.append(Cluster(members=members, conflict_paths=tuple(sorted(paths))))
+    return tuple(clusters)
+
+
+def rebases_avoided(clusters: Sequence[Cluster]) -> int:
+    """Total serial rebases avoided by landing each cluster as one stack: sum of (size - 1).
+
+    Serial landing rebases every one of a cluster's N PRs onto the freshly-moved base (N rebases);
+    landing the cluster as a single rebase chain costs one, so the cluster saves N-1. Singletons
+    contribute 0."""
+    return sum(c.rebases_avoided for c in clusters)
+
+
 __all__ = [
     "MECHANISM_LABEL_PREFIX",
     "mechanism_slugs",
@@ -272,4 +401,7 @@ __all__ = [
     "build_stacks",
     "held_reasons",
     "partition_parallel_safe",
+    "connected_components",
+    "cluster_by_conflict",
+    "rebases_avoided",
 ]

@@ -16,8 +16,10 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Callable
 
+from pr_landing_planner.graph import cluster_by_conflict, rebases_avoided
 from pr_landing_planner.model import (
     CiState,
+    Cluster,
     HeldPr,
     MechanismEdge,
     PlanResult,
@@ -432,6 +434,100 @@ def render_status_human(
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- clusters view
+def _clusters_of(result: PlanResult) -> tuple[Cluster, ...]:
+    graph = result.graph
+    return cluster_by_conflict(graph.nodes, graph.conflict_edges, graph.ordering_edges)
+
+
+def _clusters_summary(clusters: Sequence[Cluster], open_prs: int) -> dict[str, object]:
+    stacks = [c for c in clusters if c.size >= 2]
+    return {
+        "open_prs": open_prs,
+        "clusters": len(clusters),
+        "multi_pr_clusters": len(stacks),
+        "singletons": sum(1 for c in clusters if c.size == 1),
+        "largest_cluster": max((c.size for c in clusters), default=0),
+        # Distinct clusters share no real conflict, so every cluster is an independent landing lane.
+        "parallel_lanes": len(clusters),
+        "rebases_avoided": rebases_avoided(clusters),
+    }
+
+
+def render_clusters_json(result: PlanResult) -> str:
+    """Conflict-cluster view: connected components of the real-conflict graph as stack-land lanes.
+
+    Additive to the plan schema (does not touch :class:`PlanResult`): recomputed from the graph so the
+    schema owner can later lift a top-level ``clusters`` block verbatim."""
+    graph = result.graph
+    clusters = _clusters_of(result)
+    obj: dict[str, object] = {
+        "repository": graph.repository,
+        "base": graph.base,
+        "clusters": [
+            {
+                "members": list(c.members),
+                "size": c.size,
+                "conflict_paths": list(c.conflict_paths),
+                "rebases_avoided": c.rebases_avoided,
+            }
+            for c in clusters
+        ],
+        "summary": _clusters_summary(clusters, len(graph.nodes)),
+    }
+    return json.dumps(obj, indent=2, sort_keys=True, ensure_ascii=False)
+
+
+def render_clusters_human(result: PlanResult, color: ColorFn | None = None) -> str:
+    """A readable conflict-cluster / stack-landing summary with the rebases-avoided metric."""
+    c = color if color is not None else (lambda _style, text: text)
+    graph = result.graph
+    clusters = _clusters_of(result)
+    stacks = [cl for cl in clusters if cl.size >= 2]
+    singletons = [cl for cl in clusters if cl.size == 1]
+    saved = rebases_avoided(clusters)
+
+    lines: list[str] = [
+        c("bold", f"Repository: {graph.repository}  base: {graph.base}"),
+        (
+            f"{len(graph.nodes)} open PR(s), {len(graph.conflict_edges)} real conflict(s) => "
+            f"{len(clusters)} cluster(s): {len(stacks)} multi-PR stack(s), "
+            f"{len(singletons)} independent singleton(s)"
+        ),
+        "",
+        c("bold", "Conflict clusters land each as ONE stack (base -> tip):"),
+    ]
+    if stacks:
+        for idx, cl in enumerate(stacks):
+            chain = " -> ".join(f"#{n}" for n in cl.members)
+            lines.append(
+                f"  stack {idx}: {chain}  "
+                f"({cl.size} PRs, {cl.rebases_avoided} rebases avoided)"
+            )
+            if cl.conflict_paths:
+                preview = ", ".join(cl.conflict_paths[:5])
+                more = f" (+{len(cl.conflict_paths) - 5} more)" if len(cl.conflict_paths) > 5 else ""
+                lines.append(f"      shared conflict set: {preview}{more}")
+    else:
+        lines.append("  (no multi-PR conflict clusters)")
+
+    lines.extend(["", c("bold", "Parallel lanes (clusters share no conflict => land concurrently):")])
+    lane_bits = [f"#{cl.members[0]}(+{cl.size - 1})" if cl.size > 1 else f"#{cl.members[0]}" for cl in clusters]
+    lines.append("  " + (", ".join(lane_bits) if lane_bits else "(none)"))
+
+    lines.extend(
+        [
+            "",
+            c("bold", "Metric:"),
+            f"  rebases avoided by stacking = {saved} "
+            f"(serial landing of these clusters would cost {saved} extra rebase(s))",
+            "",
+            c("dim", "Advisory only: this plan recommends; it never arms or merges anything."),
+        ]
+    )
+    return "\n".join(lines)
+
+
 __all__ = [
     "render_json",
     "render_actions",
@@ -440,5 +536,7 @@ __all__ = [
     "render_graph_human",
     "render_status_json",
     "render_status_human",
+    "render_clusters_json",
+    "render_clusters_human",
     "ColorFn",
 ]

@@ -31,6 +31,8 @@ from pr_landing_planner.classify import (
 from pr_landing_planner.collect import CollectionError, collect_graph
 from pr_landing_planner.emit import (
     render_actions,
+    render_clusters_human,
+    render_clusters_json,
     render_graph_human,
     render_graph_json,
     render_human,
@@ -426,6 +428,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_collect_flags(graph_p)
     graph_p.add_argument("--format", choices=["human", "json"], default="human", help="output format")
 
+    clusters_p = sub.add_parser(
+        "clusters", help="cluster PRs by shared conflict set into stack-land lanes (rebases-avoided)"
+    )
+    _add_collect_flags(clusters_p)
+    clusters_p.add_argument(
+        "--format", choices=["human", "json"], default="human", help="output format"
+    )
+
     status_p = sub.add_parser("status", help="just per-PR CI/label health")
     _add_collect_flags(status_p)
     status_p.add_argument("--format", choices=["human", "json"], default="human", help="output format")
@@ -475,6 +485,19 @@ def _cmd_graph(ns: argparse.Namespace, c: Palette) -> int:
     return 0
 
 
+def _cmd_clusters(ns: argparse.Namespace, c: Palette) -> int:
+    try:
+        result = _build_result(ns)
+    except (CollectionError, FixtureError, HostCommandError, OSError, ValueError) as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return 2
+    if ns.format == "json":
+        print(render_clusters_json(result))
+    else:
+        print(render_clusters_human(result, color=c.style))
+    return 0
+
+
 def _cmd_status(ns: argparse.Namespace, c: Palette) -> int:
     try:
         result = _build_result(ns)
@@ -512,6 +535,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_plan(ns, c)
     if command == "graph":
         return _cmd_graph(ns, c)
+    if command == "clusters":
+        return _cmd_clusters(ns, c)
     if command == "status":
         return _cmd_status(ns, c)
     parser.print_help()

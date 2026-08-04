@@ -207,6 +207,30 @@ class MechanismEdge:
 
 
 @dataclass(frozen=True)
+class Cluster:
+    """A connected component of the REAL-conflict graph: PRs that must land as ONE rebase stack.
+
+    Two PRs are in the same cluster when Git confirms they conflict (a ``ConflictEdge``), transitively.
+    Because distinct clusters share no real conflict, they define independent landing LANES that a
+    coordinator can drive concurrently. ``members`` is the intra-cluster STACK ORDER (base -> tip): a
+    deterministic topological order over the cluster's ordering edges, tie-broken by land rank
+    (priority, size, age, number), so one bad PR mid-stack can be dropped and the rest re-chained in
+    the same relative order. ``conflict_paths`` is the union of the real conflicting paths among the
+    cluster's members. A cluster of N PRs lands as one rebase chain, avoiding N-1 serial rebases."""
+
+    members: tuple[int, ...]
+    conflict_paths: tuple[str, ...] = ()
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
+
+    @property
+    def rebases_avoided(self) -> int:
+        return max(0, self.size - 1)
+
+
+@dataclass(frozen=True)
 class OrderingEdge:
     """A directed "``before`` must land before ``after``" constraint (base-stacking or ancestry)."""
 
