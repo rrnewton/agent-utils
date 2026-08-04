@@ -377,6 +377,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="downgrade to a best-effort UNBOXED run (with a visible warning) instead of erroring "
         "when two-level cgroup-v2 + systemd --user scope boxing cannot be established",
     )
+    run_p.add_argument(
+        "--unsafe-no-cgroups",
+        action="store_true",
+        help="DELIBERATELY skip cgroup boxing entirely, even where it is available (no per-step "
+        "memory/CPU/pids caps). The word 'unsafe' is intentional friction: unlike "
+        "--allow-cgroup-failure (a capability fallback), this is an explicit opt-out that is "
+        "logged loudly and should be reviewed. Use only when you have a specific reason not to box.",
+    )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
 
@@ -426,6 +434,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-cgroup-failure",
         action="store_true",
         help="run UNBOXED (with a warning) instead of erroring when cgroup-v2 boxing is unavailable",
+    )
+    sweep_p.add_argument(
+        "--unsafe-no-cgroups",
+        action="store_true",
+        help="DELIBERATELY skip cgroup boxing entirely (logged loudly); an explicit reviewable "
+        "opt-out, distinct from --allow-cgroup-failure's capability fallback",
     )
     sweep_p.add_argument("-v", dest="verbosity", action="count", default=0, help="-v: stream child output")
 
@@ -1025,7 +1039,9 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
     repeat = max(1, int(ns.repeat))
 
     # Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
-    cgroups, code = _resolve_cgroup_manager(bool(ns.allow_cgroup_failure))
+    cgroups, code = _resolve_cgroup_manager(
+        bool(ns.allow_cgroup_failure), bool(getattr(ns, "unsafe_no_cgroups", False))
+    )
     if code != 0:
         return code
 
@@ -1133,13 +1149,21 @@ def _select_jobs(cfg: DagConfig, ns: argparse.Namespace) -> int:
     return os.cpu_count() or 4
 
 
-def _resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, int]:
+def _resolve_cgroup_manager(
+    allow_failure: bool, unsafe_no_cgroups: bool = False
+) -> tuple[CgroupManager | None, int]:
     """Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose.
 
     Cgroup boxing is ON BY DEFAULT. This returns ``(manager, 0)`` when boxing is active (the
     caller runs boxed), ``(None, 0)`` for an intentional best-effort UNBOXED run, or
     ``(None, <nonzero>)`` when boxing is REQUIRED but unavailable and the caller must exit with
     that code (No Silent Failure: the reason is printed to stderr first).
+
+    ``unsafe_no_cgroups`` (``--unsafe-no-cgroups``) is a DELIBERATE opt-out: skip scope bring-up
+    entirely and run unboxed even where boxing is available. It is distinct from ``allow_failure``
+    (``--allow-cgroup-failure``), which TRIES to box and only downgrades when boxing is
+    unavailable. The deliberate opt-out is logged loudly (the reason is a reviewable audit signal),
+    and takes precedence over ``allow_failure`` when both are set.
 
     Flow (mirrors DeepScry's validate cgroup bring-up):
 
@@ -1154,6 +1178,15 @@ def _resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, 
       skipped in CI), print a clear error and return a nonzero exit code.
     """
     from safe_ci_dag_runner import cgroup as cg
+
+    if unsafe_no_cgroups:
+        print(
+            f"{PROG}: WARNING: DELIBERATELY UNBOXED via --unsafe-no-cgroups: per-step "
+            "memory/CPU/pids caps are NOT enforced. This is an explicit, reviewable opt-out of "
+            "cgroup resource boxing (not a capability fallback).",
+            file=sys.stderr,
+        )
+        return None, 0
 
     naming = cg.DEFAULT_NAMING
     if os.environ.get(naming.env_in_scope) == "1":
@@ -1370,7 +1403,9 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             print(f"{PROG}: {exc}", file=sys.stderr)
             return 2
 
-    cgroups, code = _resolve_cgroup_manager(bool(ns.allow_cgroup_failure))
+    cgroups, code = _resolve_cgroup_manager(
+        bool(ns.allow_cgroup_failure), bool(getattr(ns, "unsafe_no_cgroups", False))
+    )
     if code != 0:
         return code
 
