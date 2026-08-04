@@ -427,6 +427,12 @@ impl CgroupManager for Cgroups {
             ));
         }
         let _ = fs::write(child.join("memory.high"), "max");
+        // Kill the WHOLE step cgroup as a unit on OOM (`memory.oom.group=1`). Without it the kernel
+        // kills one victim process inside whichever cgroup it OOMs: a capped step is left half-dead,
+        // and a runaway escalating past its own cap to a shared ancestor gets a victim chosen by
+        // badness across ALL steps — so the kill can land on an INNOCENT NEIGHBOUR and be attributed
+        // to the wrong PR. Best-effort: a kernel without oom.group must not drop the caps above.
+        let _ = fs::write(child.join("memory.oom.group"), "1");
         if let Some(m) = mem_max {
             if let Err(e) = fs::write(child.join("memory.max"), m.to_string()) {
                 warn(&format!(

@@ -496,6 +496,13 @@ def enter_delegated_scope(
         # Keep hard caps only. Soft reclaim throttling would mark a legitimately
         # long run as memory-pressure-heavy on some hosts.
         (child / "memory.high").write_text("max")
+        # Die as a unit on OOM so the breach lands on THIS job whole, not one
+        # victim process (see prepare_command). Best-effort: a kernel without
+        # oom.group must not abort an otherwise-valid boxed scope.
+        try:
+            (child / "memory.oom.group").write_text("1")
+        except OSError:
+            pass
         quota = cpu_count * 100 if cpu_count is not None else cpu_quota_percent()
         (child / "cpu.max").write_text(f"{quota * 1000} 100000")
         (child / "cgroup.procs").write_text(str(os.getpid()))
@@ -1003,6 +1010,18 @@ class Cgroups:
         except OSError as exc:
             _warn(self._naming, f"step {tag}: could not disable swap / clear soft cap "
                   f"({exc}); memory controller may not be delegated — outer cap still applies")
+        # Kill the WHOLE step cgroup as a unit on OOM (`memory.oom.group=1`). Without it the
+        # kernel picks one victim process inside whichever cgroup it OOMs: a capped step is left
+        # half-dead (its build leader survives a killed cc1plus and fails confusingly), and — when
+        # a runaway escalates past its own cap to a shared ancestor — the victim is chosen by
+        # badness across ALL steps, so the kill can land on an INNOCENT NEIGHBOUR and be attributed
+        # to the wrong PR. Set on every per-step cgroup (best-effort: a kernel without oom.group
+        # must not lose the swap/mem caps above), so the breach lands on the offending step whole.
+        try:
+            (child / "memory.oom.group").write_text("1")
+        except OSError as exc:
+            _warn(self._naming, f"step {tag}: could not set memory.oom.group ({exc}); an OOM may "
+                  "kill a single process instead of the whole step (mis-attributed blast radius)")
         if mem_max:
             try:
                 (child / "memory.max").write_text(str(int(mem_max)))
