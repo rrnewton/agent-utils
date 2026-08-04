@@ -59,6 +59,7 @@ __all__ = [
     "CoreExhausted",
     "CoreAllocator",
     "parse_interrupts",
+    "parse_irq_affinity",
     "scan_confounds",
     "pin_current_process",
     "main",
@@ -75,14 +76,14 @@ _NET_IRQ_RE: Final = re.compile(
     re.IGNORECASE,
 )
 
-#: A core with a device-IRQ count strictly above this is treated as an IRQ target. 0 = any
-#: activity confounds (the conservative default a clean-core guarantee wants); the CLI can
-#: raise it for hosts where irqbalance sprays tiny counts across every core.
-DEFAULT_IRQ_COUNT_THRESHOLD: Final = 0
-
 #: CPU0 is, by strong convention, the default sink for the timer tick, RCU callbacks and
 #: unpinned IRQs on most Linux hosts. Always treated as confounded.
 _CPU0_REASON: Final = "cpu0-timer-sink"
+
+
+def _classify_irq(desc: str) -> str:
+    """``net-irq`` if the description names a genuine NIC, else ``dev-irq``."""
+    return "net-irq" if _NET_IRQ_RE.search(desc) else "dev-irq"
 
 
 @dataclass(frozen=True)
@@ -119,7 +120,14 @@ class CoreExhausted(RuntimeError):
 
 
 def parse_interrupts(text: str) -> dict[int, tuple[str, ...]]:
-    """Map core index -> device-IRQ reason tags active on it, from ``/proc/interrupts`` text.
+    """Map core index -> device-IRQ tags that have *actually fired* on it (count > 0).
+
+    SECONDARY signal only. This reports observed *activity* (cumulative-since-boot counts),
+    which is a proxy: on a densely-steered host every core has fired something, so an
+    activity-based filter would confound the whole machine (the "excludes everything" mirror
+    failure). The confound *condition* the allocator gates on is designated IRQ affinity
+    (:func:`parse_irq_affinity` / ``/proc/irq/<N>/smp_affinity_list``), not this. Kept as a
+    liveness/annotation helper and for callers that want the observed-activity view.
 
     Only NUMBERED IRQ rows (real device interrupts) are considered. Architectural per-cpu
     summary rows (``LOC``, ``RES``, ``CAL``, ``TLB``, ``NMI``, ...) are skipped: those fire
@@ -141,13 +149,65 @@ def parse_interrupts(text: str) -> dict[int, tuple[str, ...]]:
             continue
         counts = parts[1 : 1 + ncpu]
         desc = " ".join(parts[1 + ncpu :])
-        kind = "net-irq" if _NET_IRQ_RE.search(desc) else "dev-irq"
+        kind = _classify_irq(desc)
         for core, raw in enumerate(counts):
             try:
                 n = int(raw)
             except ValueError:
                 continue
-            if n > DEFAULT_IRQ_COUNT_THRESHOLD:
+            if n > 0:  # actually fired here
+                acc.setdefault(core, []).append(f"{kind}:{name}")
+    return {core: tuple(tags) for core, tags in acc.items()}
+
+
+def _interrupt_descriptions(text: str) -> dict[str, str]:
+    """Map numbered-IRQ name -> its device description from ``/proc/interrupts`` text.
+
+    Used to classify an affinity entry (net vs plain device) since the affinity file itself
+    (``/proc/irq/<N>/smp_affinity_list``) carries no device name.
+    """
+    lines = text.splitlines()
+    if not lines:
+        return {}
+    ncpu = len(lines[0].split())
+    out: dict[str, str] = {}
+    for line in lines[1:]:
+        parts = line.split()
+        if not parts or not parts[0].endswith(":"):
+            continue
+        name = parts[0][:-1]
+        if not name.isdigit():
+            continue
+        out[name] = " ".join(parts[1 + ncpu :])
+    return out
+
+
+def parse_irq_affinity(
+    entries: Iterable[tuple[str, str, str]], *, ncpu: int
+) -> dict[int, tuple[str, ...]]:
+    """Map core index -> IRQ reason tags from DESIGNATED affinity (the condition, not a proxy).
+
+    ``entries`` is ``(irq_name, smp_affinity_list_spec, description)`` per numbered IRQ. A
+    core is a target of IRQ N iff N's affinity list is a **proper subset** of the host's
+    ``ncpu`` cores (the kernel/irqbalance deliberately *steered* that IRQ to specific cores)
+    AND the core is in it. A full-span list (every core) is the unsteered default — it
+    designates no particular core and contributes nothing, so it does NOT confound the whole
+    machine. This is the "carry the condition with the value" cure: we key on where an IRQ is
+    *aimed* (which travels with the affinity file), not on cumulative counts (activity that
+    every core accrues, telling us nothing about which core is a deliberate target).
+    """
+    if ncpu <= 0:
+        return {}
+    acc: dict[int, list[str]] = {}
+    for name, spec, desc in entries:
+        targets = _parse_cpu_list(spec)
+        if targets is None:
+            continue
+        if len(targets) >= ncpu:  # full span => unsteered default, designates nothing
+            continue
+        kind = _classify_irq(desc)
+        for core in targets:
+            if 0 <= core < ncpu:
                 acc.setdefault(core, []).append(f"{kind}:{name}")
     return {core: tuple(tags) for core, tags in acc.items()}
 
@@ -233,22 +293,56 @@ def _parse_cpu_list(spec: str | None) -> frozenset[int] | None:
     return frozenset(out)
 
 
+def _iter_host_irq_entries(
+    irq_root: Path, descriptions: Mapping[str, str]
+) -> Iterator[tuple[str, str, str]]:
+    """Yield ``(irq_name, smp_affinity_list_spec, description)`` from ``/proc/irq/<N>/``."""
+    try:
+        names = [p.name for p in irq_root.iterdir() if p.name.isdigit()]
+    except OSError:
+        return
+    for name in names:
+        spec = _read_text_or_empty(irq_root / name / "smp_affinity_list").strip()
+        if spec:
+            yield (name, spec, descriptions.get(name, ""))
+
+
 def scan_confounds(
     cores: Iterable[int],
     *,
     interrupts_text: str | None = None,
+    irq_root: Path | None = None,
+    irq_affinity_entries: Iterable[tuple[str, str, str]] | None = None,
     proc_root: Path | None = None,
     include_kthreads: bool = True,
 ) -> dict[int, CoreConfound]:
     """Build the confound verdict for every core in ``cores``.
 
-    Readers are injectable so tests feed synthetic ``/proc`` content; when a reader is not
-    supplied the live host is read best-effort (a missing/unreadable source contributes no
-    reasons rather than raising).
+    The IRQ confound gate is DESIGNATED affinity (:func:`parse_irq_affinity`), not cumulative
+    counts — a core is confounded by an IRQ only when that IRQ is *steered* to it. Cumulative
+    counts (:func:`parse_interrupts`) remain available as a secondary activity view but are
+    deliberately NOT unioned in here: on a densely-steered host every core has fired
+    something, so gating on activity would exclude the whole machine (the mirror failure).
+
+    Readers are injectable so tests feed synthetic content; when a reader is not supplied the
+    live host is read best-effort (a missing/unreadable source contributes no reasons rather
+    than raising). ``interrupts_text`` supplies IRQ *descriptions* (for net/dev classification)
+    and the core count; ``irq_root``/``irq_affinity_entries`` supply the affinity condition.
     """
     if interrupts_text is None:
         interrupts_text = _read_text_or_empty(Path("/proc/interrupts"))
-    irq = parse_interrupts(interrupts_text)
+    descriptions = _interrupt_descriptions(interrupts_text)
+    ncpu = len(interrupts_text.splitlines()[0].split()) if interrupts_text.strip() else 0
+    cores = list(cores)
+    if not ncpu and cores:
+        ncpu = max(cores) + 1  # tests may omit /proc/interrupts; bound by requested cores
+
+    if irq_affinity_entries is None:
+        irq_affinity_entries = _iter_host_irq_entries(
+            irq_root or Path("/proc/irq"), descriptions
+        )
+    irq = parse_irq_affinity(irq_affinity_entries, ncpu=ncpu)
+
     kthreads: dict[int, tuple[str, ...]] = {}
     if include_kthreads:
         kthreads = _scan_pinned_kthreads(proc_root or Path("/proc"))
@@ -428,10 +522,18 @@ def _cmd_scan(ns: argparse.Namespace, out: IO[str]) -> int:
     alloc = CoreAllocator()
     report = alloc.confound_report()
     clean = [c.core for c in report if c.is_clean]
+    # Strict-clean (severity 0) can legitimately be 0 on a densely-steered host where every
+    # core carries a per-core device queue (e.g. nvme). The actionable set is the cores free
+    # of the confound that matters for a scheduling/latency benchmark — a NETWORK IRQ — which
+    # the allocator hands out first. Report both so a caller sees N ordinary cores, not "0".
+    net_free = [c.core for c in report if not c.is_network]
     obj = {
         "total": len(report),
         "clean_count": len(clean),
         "clean": clean,
+        "network_free_count": len(net_free),
+        "network_free": net_free,
+        "network_loaded_count": len(report) - len(net_free),
         "confounded": {
             str(c.core): list(c.reasons) for c in report if not c.is_clean
         },

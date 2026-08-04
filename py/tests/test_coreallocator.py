@@ -18,6 +18,7 @@ from safe_ci_dag_runner.coreallocator import (
     CoreConfound,
     CoreExhausted,
     parse_interrupts,
+    parse_irq_affinity,
     pin_current_process,
     scan_confounds,
 )
@@ -46,10 +47,20 @@ _INTERRUPTS = """\
 """
 
 
+# Designated IRQ affinity is the confound CONDITION: (irq_name, smp_affinity_list, desc).
+# irq 24 (a NIC) is steered to core 2; irq 130 (ahci) to core 0; irq 25 (nvme) to core 3;
+# irq 9 is FULL-SPAN (0-3 == every core) -> unsteered default, designates nothing.
+_AFFINITY = [
+    ("24", "2", "IR-PCI-MSI 512000-edge eth0-TxRx-0"),
+    ("130", "0", "IR-PCI-MSI 0000:aa ahci"),
+    ("25", "3", "IR-PCI-MSI 0000:00 nvme0q1"),
+    ("9", "0-3", "IR-IO-APIC 9-fasteoi acpi"),
+]
+
+
 def test_parse_interrupts_numbered_rows_only_and_network_tagging() -> None:
+    # SECONDARY activity view: cores where an IRQ actually fired (count > 0).
     got = parse_interrupts(_INTERRUPTS)
-    # eth0 fired on CPU2 -> network tag; nvme on CPU3 and ahci on CPU0 are storage/device
-    # IRQs, NOT network -> dev-irq (the narrowed regex matches only genuine NICs).
     assert got[2] == ("net-irq:24",)
     assert got[3] == ("dev-irq:25",)  # nvme0q1 is a storage queue, not a network IRQ
     assert got[0] == ("dev-irq:130",)
@@ -62,9 +73,24 @@ def test_parse_interrupts_empty_and_headerless() -> None:
     assert parse_interrupts("\n\n") == {}
 
 
-def test_scan_confounds_cpu0_always_and_irq_reasons() -> None:
+def test_parse_irq_affinity_steered_subset_only() -> None:
+    # The condition: a proper-subset affinity list designates its cores; a full-span list
+    # (every core) is the unsteered default and designates NONE (mirror-failure guard).
+    got = parse_irq_affinity(_AFFINITY, ncpu=4)
+    assert got[2] == ("net-irq:24",)
+    assert got[0] == ("dev-irq:130",)
+    assert got[3] == ("dev-irq:25",)
+    assert 1 not in got  # nothing steered to core 1
+    # irq 9 spanned all four cores -> excluded from every core, not confounding the machine.
+    assert all("dev-irq:9" not in tags for tags in got.values())
+
+
+def test_scan_confounds_cpu0_always_and_affinity_reasons() -> None:
     verdict = scan_confounds(
-        range(4), interrupts_text=_INTERRUPTS, include_kthreads=False
+        range(4),
+        interrupts_text=_INTERRUPTS,
+        irq_affinity_entries=_AFFINITY,
+        include_kthreads=False,
     )
     assert verdict[0].reasons[0] == "cpu0-timer-sink"  # CPU0 always flagged
     assert "dev-irq:130" in verdict[0].reasons
@@ -87,7 +113,11 @@ def test_scan_confounds_pinned_kthread_but_not_percpu(tmp_path: Path) -> None:
     _make_kthread(proc, pid=105, comm="kworker/5:1-events", cpus_allowed="5")
 
     verdict = scan_confounds(
-        range(6), interrupts_text="", proc_root=proc, include_kthreads=True
+        range(6),
+        interrupts_text="",
+        irq_affinity_entries=[],
+        proc_root=proc,
+        include_kthreads=True,
     )
     assert verdict[3].reasons == ("kthread:my-worker/0",)
     assert verdict[2].is_clean  # bare-index per-cpu kthread excluded
@@ -193,6 +223,64 @@ def test_confounded_annotation_when_no_clean_core(tmp_path: Path) -> None:
     assert lease.cores == (0,)  # lower severity first
     assert lease.confounded == (0,)  # handed out, but ANNOTATED (never silent)
     assert not lease.all_clean
+
+
+def test_irq_core_skipped_and_ordinary_cores_allocatable(tmp_path: Path) -> None:
+    """IRQ half, both directions: a NETWORK-IRQ core is skipped while ordinary cores remain,
+    and the count of ordinary cores is asserted (guards the 'filter excludes everything'
+    mirror failure)."""
+    import os
+
+    # 6-core synthetic host: every core carries a per-core nvme queue (steered to itself);
+    # cores 1 and 4 ALSO carry a network IRQ. So 0 cores are strictly clean, but 4 cores
+    # (0,2,3,5) are network-free ordinary cores. (Core 0 also gets cpu0-timer-sink.)
+    ncpu = 6
+    affinity = [(f"{100 + c}", str(c), f"nvme0q{c}") for c in range(ncpu)]
+    affinity += [("200", "1", "eth0-TxRx-0"), ("201", "4", "eth0-TxRx-3")]
+    confounds = scan_confounds(
+        range(ncpu),
+        interrupts_text=" ".join(f"CPU{c}" for c in range(ncpu)),
+        irq_affinity_entries=affinity,
+        include_kthreads=False,
+    )
+    ordinary = sorted(c for c, v in confounds.items() if not v.is_network)
+    N_ORDINARY = 4  # STATED: cores 0,2,3,5 are network-free
+    assert ordinary == [0, 2, 3, 5]
+    assert len(ordinary) == N_ORDINARY
+    net_cores = sorted(c for c, v in confounds.items() if v.is_network)
+    assert net_cores == [1, 4]
+
+    alloc = CoreAllocator(
+        cores=range(ncpu), state_dir=tmp_path / "leases", confounds=confounds, pid=os.getpid()
+    )
+    # Leasing all N_ORDINARY cores must hand out exactly the network-free set, skipping the
+    # network cores entirely (they rank worse by severity).
+    lease = alloc.acquire(N_ORDINARY)
+    assert set(lease.cores) == set(ordinary)
+    for net in net_cores:
+        assert net not in lease.cores  # a core WITH network-IRQ affinity is SKIPPED
+    # The two network cores are only handed out once ordinary cores are exhausted, ANNOTATED.
+    fallback = alloc.acquire(2)
+    assert set(fallback.cores) == set(net_cores)
+    assert set(fallback.confounded) == set(net_cores)
+
+
+def test_n_sequential_acquire_and_release_all_return(tmp_path: Path) -> None:
+    """N sequential acquire+release cycles each grant AND free (guards an allocator that
+    hands out nothing). N is STATED."""
+    import os
+
+    N = 5  # STATED number of cycles
+    d = tmp_path / "leases"
+    for i in range(N):
+        alloc = CoreAllocator(
+            cores=range(3), state_dir=d, confounds=_clean(range(3)), pid=os.getpid()
+        )
+        lease = alloc.acquire(3)
+        assert len(lease.cores) == 3, f"cycle {i}: acquire returned nothing"
+        alloc.release(lease)
+        # After release the whole host is free again -> next cycle can take all 3.
+        assert not alloc._load(), f"cycle {i}: release did not free the leases"
 
 
 def test_pin_current_process_roundtrip() -> None:
