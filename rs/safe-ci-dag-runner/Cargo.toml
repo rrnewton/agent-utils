@@ -34,6 +34,10 @@ serde_norway = "0.9"
 # Ctrl-C the whole outer scope is torn down so no setsid-escapee orphans survive. std has no
 # signal API, and this project is safe-rust; signal-hook encapsulates the unsafe internally.
 signal-hook = "0.4.4"
+# CPU affinity for the opt-in `--cores K` core box (whole-tree size-K cpuset fallback). std has no
+# sched_getaffinity/sched_setaffinity binding; the two calls are the ONLY `unsafe` this crate's own
+# code performs and are wrapped + documented in cgroup.rs. libc is already in the dependency tree.
+libc = "0.2"
 
 [[bin]]
 name = "safe-ci-dag-runner"

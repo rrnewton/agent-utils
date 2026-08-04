@@ -94,6 +94,8 @@ __version__: str = "0.11.0"
 #: asserts the two manifests are BYTE-IDENTICAL, so any enforcement guard present in one build but
 #: missing from the other is a cross-check failure (the recurrence guard for the historical
 #: Rust-vs-Python ``cpu_timeout`` gap). Keys are sorted; values reflect real behavior:
+#:   cpu_affinity  opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores
+#:                 (cgroup cpuset where delegated, else sched_setaffinity; verified + logged)
 #:   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
 #:   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
 #:   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
@@ -103,7 +105,7 @@ __version__: str = "0.11.0"
 #: anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
 #: MUST stay byte-identical to Rust's ``ENFORCEMENT_CAPABILITIES`` (lib.rs).
 ENFORCEMENT_CAPABILITIES: str = (
-    '{"cpu_timeout":true,"memory_max":true,"oom_detection":true,'
+    '{"cpu_affinity":true,"cpu_timeout":true,"memory_max":true,"oom_detection":true,'
     '"pids_guard":false,"wall_timeout":true}'
 )
 

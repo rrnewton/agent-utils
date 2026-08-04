@@ -288,6 +288,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_p.add_argument("-j", "--jobs", type=int, default=None, help="max concurrent steps (default: CPU count)")
     run_p.add_argument(
+        "--cores",
+        type=int,
+        default=None,
+        metavar="K",
+        help="constrain the WHOLE run process tree (all steps + descendants, native/non-hermit "
+        "included) to K least-busy FREE cores; K=1 forces sequential execution for "
+        "gVisor/backend-perf measurement. Never pins a fixed core id (picks the K least-busy of "
+        "this process's allowed set). Uses a cgroup cpuset where the controller is delegated, "
+        "else sched_setaffinity; the active mechanism is logged. Absent = today's behavior.",
+    )
+    run_p.add_argument(
         "--max-mem",
         metavar="SPEC",
         default=None,
@@ -1368,6 +1379,16 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     cgroups, code = _resolve_cgroup_manager(bool(ns.allow_cgroup_failure))
     if code != 0:
         return code
+
+    # Opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores. Apply it HERE,
+    # after the boxing re-exec has settled (the re-exec'd in-scope child re-enters _run and applies
+    # it there) and BEFORE the scheduler spawns any worker thread or forks any step — pthreads
+    # inherit the creator's affinity and forked steps inherit at fork, so an early application
+    # covers the whole descendant tree (cgroup cpuset where delegated, else sched_setaffinity).
+    if ns.cores is not None:
+        from safe_ci_dag_runner import cgroup as _cg
+
+        _cg.apply_core_box(int(ns.cores))
 
     # Plan-time profile-store FEEDBACK (ds-7pzdgm / ds-afzsqf): refine each step's est_duration_s
     # and rss_baseline_bytes from the recorded store, then pick the dispatch order for the chosen

@@ -927,6 +927,39 @@ The old opt-in `--cgroups` flag has been removed — boxing is ON by default, so
 the `reexec_in_scope` + `Cgroups` recipe above
 when you want the same turn-key boxing from your own Python program rather than the CLI.
 
+### Pinning the whole run to K cores: `run --cores K`
+
+`--cores K` is an **opt-in** whole-tree CPU core box: it constrains the ENTIRE run process tree —
+the runner, every worker, and every step it forks — to `K` cores, on top of (and independent of) the
+per-step memory/CPU-time boxing above. Absent the flag, behavior is unchanged (the run uses every
+core its affinity mask allows). The cores are not fixed ids: the runner reads its own affinity mask,
+briefly samples `/proc/stat`, and picks the `K` **least-busy free** cores, so concurrent runs on the
+same host tend to spread rather than collide. `K` is clamped to `[1, allowed-core-count]`.
+
+`--cores 1` is the important special case: it collapses the whole run onto a single core, which is
+the methodology a gVisor / backend-perf comparison needs — every process shares one CPU so a
+CPU-bound multi-process workload measures a CPU-time/wall ratio of ≈ 1.0 instead of scaling out.
+
+Two mechanisms are attempted, strongest first, and the one that engaged is logged (the tool never
+silently fails to constrain):
+
+- **cgroup cpuset** (preferred): where the run's scope cgroup carries the `cpuset` controller, the
+  runner writes `cpuset.cpus` on the scope and **verifies** via `cpuset.cpus.effective` that exactly
+  `K` cores took effect. This binds the whole subtree by cgroup membership.
+- **`sched_setaffinity`** (fallback): where `cpuset` is not delegated to the scope, the runner sets
+  the process affinity mask and **verifies** it via a `sched_getaffinity` read-back. The mask is
+  inherited across `fork`/`execve`, so every descendant step is constrained too.
+
+Either way the runner prints, e.g.:
+
+```
+[safe-ci] core box: constrained to 1 core(s) [5] via sched_setaffinity
+```
+
+If NEITHER mechanism can be verified, the runner warns and leaves the run unconstrained rather than
+claiming a box that did not engage. Because affinity is inherited at fork time, the box is applied
+once, up front, before any worker thread or step is spawned.
+
 ## Troubleshooting
 
 **"containment is DEGRADED" / steps run un-boxed.** This is a **library**-path signal: you passed
