@@ -131,6 +131,9 @@ class RawPr:
     deletions: int = 0
     labels: tuple[str, ...] = ()
     checks: tuple[CheckRun, ...] = ()
+    #: DERIVE-stage output: mechanism-candidate strings pulled mechanically from the diff (const/env
+    #: names, YAML keys). Classified into the stable mechanism enum downstream; defaults empty.
+    mechanism_symbols: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -173,6 +176,9 @@ class PrNode:
     additions: int = 0
     deletions: int = 0
     labels: tuple[str, ...] = ()
+    #: DERIVE-stage output carried through from :class:`RawPr` (see there); classified into the
+    #: mechanism enum by the graph layer. Defaults empty for back-compat with predating constructors.
+    mechanism_symbols: tuple[str, ...] = ()
     files: frozenset[str] = field(default_factory=frozenset)
     base_conflict_paths: tuple[str, ...] = ()
     commits_behind: int = 0
@@ -213,13 +219,16 @@ class OverlapEdge:
 
 @dataclass(frozen=True)
 class MechanismEdge:
-    """Two PRs that declare the same ``mechanism:<slug>`` label — a SEMANTIC overlap.
+    """Two PRs that change the same mechanism — a SEMANTIC overlap keyed on a normalised enum value.
 
     Unlike a :class:`ConflictEdge` (git can't merge them) or an :class:`OverlapEdge` (they share a
     file), a mechanism edge links two PRs that change the SAME mechanism — a config key, flag, label,
-    or concurrency group — possibly in DIFFERENT files and possibly with OPPOSITE intent, so it
-    SURVIVES a clean merge and git has no opinion on it (the #1567-vs-#1575 ``cancel-in-progress``
-    near-miss). The planner only SURFACES the pair for coordinator review; it never judges intent.
+    or concurrency group — possibly in DIFFERENT files, under DIFFERENT SPELLINGS, and possibly with
+    OPPOSITE intent, so it SURVIVES a clean merge and git has no opinion on it (the #1567-vs-#1575
+    ``cancel-in-progress`` near-miss). ``mechanisms`` are canonical :class:`~pr_landing_planner.
+    mechanism.Mechanism` values, NOT raw derived strings — that normalisation is what unifies
+    ``concurrency.cancel-in-progress`` and ``CANCEL_IN_PROGRESS`` into one bucket. The planner only
+    SURFACES the pair for coordinator review; it never judges intent.
     """
 
     a: int
@@ -252,6 +261,20 @@ class Cluster:
 
 
 @dataclass(frozen=True)
+class UnclassifiedMechanism:
+    """DERIVE-stage candidate strings on one PR that CLASSIFY could not map to a known mechanism.
+
+    UNCLASSIFIED is a valid, load-bearing output: it is the signal that the mechanism enum may need a
+    new member (a classifier that always returns a known value would silently merge distinct
+    mechanisms or force-fit a new one). Surfaced loudly so an agent can recognise each candidate as an
+    existing member (add an alias) or genuinely new (add an enum member).
+    """
+
+    pr: int
+    candidates: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class OrderingEdge:
     """A directed "``before`` must land before ``after``" constraint (base-stacking or ancestry)."""
 
@@ -278,9 +301,11 @@ class CollectedGraph:
     conflict_edges: tuple[ConflictEdge, ...]
     overlap_edges: tuple[OverlapEdge, ...]
     ordering_edges: tuple[OrderingEdge, ...]
-    #: Semantic same-mechanism overlaps (``mechanism:<slug>`` label pairs); defaults empty for
-    #: back-compat with callers that predate the mechanism dimension.
+    #: Semantic same-mechanism overlaps, clustered on the normalised mechanism enum value; defaults
+    #: empty for back-compat with callers that predate the mechanism dimension.
     mechanism_edges: tuple[MechanismEdge, ...] = ()
+    #: Per-PR derived strings that CLASSIFY could not map — the "enum may need a new member" signal.
+    unclassified_mechanisms: tuple[UnclassifiedMechanism, ...] = ()
 
 
 @dataclass(frozen=True)
