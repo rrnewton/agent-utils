@@ -10,6 +10,18 @@ plan. The headline value is classifying WHY a PR is red — into real, flaky, st
 evaluate-once-race, or runner-outage — so a lander does not treat benign gate noise as a failure. It
 recommends per-PR actions and parallel-safe groups; it never arms, refires, or merges anything.
 
+Beyond git conflicts and shared-file overlaps, it surfaces a SEMANTIC dimension: two PRs that change
+the same MECHANISM (a config key, flag, label, or concurrency group) in DIFFERENT files, under
+DIFFERENT SPELLINGS — the kind git merges cleanly yet a coordinator must review together (the
+`cancel-in-progress` #1567-vs-#1575 near-miss). This runs a three-stage pipeline: DERIVE mechanism
+candidates mechanically from a PR's diff and its `mechanism:<slug>` labels (no agent); CLASSIFY each
+candidate into a stable `Mechanism` enum by normalising spellings; then CLUSTER on the ENUM VALUE, so
+`concurrency.cancel-in-progress` and `CANCEL_IN_PROGRESS` land in ONE bucket. `mechanism_overlap_edges`
+carries the clustered pairs (canonical enum values). CLASSIFY can return UNCLASSIFIED — a valid,
+load-bearing output surfaced loudly as `unclassified_mechanism_candidates`: the signal that the enum
+needs a new member. Extending it is a deterministic, offline, recognition-not-recall edit of the
+alias table in `pr_landing_planner/mechanism.py`, keeping the planner pure and batch-friendly.
+
 The CLI is the source of truth for usage — do not rely on this file for details. Run:
 
 - `pr-landing-planner quickstart` — self-contained getting-started tour (add `--emit-demo` for a demo fixture).
