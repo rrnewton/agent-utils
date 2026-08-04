@@ -118,6 +118,35 @@ fn read_trim(group: &Path, name: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+/// Whole granted cores from a `cpu.max` string (`"<quota> <period>"`), or `None` when
+/// unbounded (`"max ..."`) / unparseable. Floors to >=1 for any positive quota. Mirrors
+/// Python `_cpu_max_cores`.
+fn cpu_max_cores(value: Option<String>) -> Option<i64> {
+    let value = value?;
+    let mut parts = value.split_whitespace();
+    let quota = parts.next()?;
+    let period = parts.next()?;
+    if parts.next().is_some() || quota == "max" {
+        return None;
+    }
+    let quota: i64 = quota.parse().ok()?;
+    let period: i64 = period.parse().ok()?;
+    if quota <= 0 || period <= 0 {
+        return None;
+    }
+    Some((quota / period).max(1))
+}
+
+/// Byte cap from a `memory.max` string, or `None` when unbounded/unparseable. Mirrors Python
+/// `_memory_max_bytes`.
+fn memory_max_bytes(value: Option<String>) -> Option<i64> {
+    let value = value?;
+    if value == "max" {
+        return None;
+    }
+    value.parse().ok()
+}
+
 /// Create a cgroup directory, tolerating "already exists".
 fn make_dir(path: &Path) -> std::io::Result<()> {
     match fs::create_dir(path) {
@@ -232,6 +261,13 @@ pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool 
         args.push("-p".into());
         args.push(format!("MemoryMax={m}"));
     }
+    // Scope-wide build-job default, derived from the granted cores + memory cap, so a command
+    // run directly in the scope (not via a per-step child) still can't compute NUM_JOBS=<all
+    // cores>. Per-step prepare_command refines it downward; this is the inherited floor.
+    args.push(format!(
+        "--setenv=CARGO_BUILD_JOBS={}",
+        crate::sizing::derive_build_jobs(cpu_count, memory_max)
+    ));
     args.push(format!("--setenv={ENV_IN_SCOPE}=1"));
     args.push(format!("--setenv={ENV_SCOPE_UNIT}={unit}.scope"));
     args.push("--".into());
@@ -461,10 +497,25 @@ impl CgroupManager for Cgroups {
                 }
             }
         }
+        // Carry the build `-j` WITH the caps just written. cargo (and the NUM_JOBS it exports to
+        // build scripts) auto-detects parallelism from the effective CPU quota; an UNPINNED step
+        // (cpu_count None -> no per-step cpu.max) inherits the wide scope quota and computes
+        // NUM_JOBS=<all-granted-cores> (observed 284), OOM-racing the linker (hermit#1584
+        // build.dbi_release, 8.0 GiB cap, oom_kill=2). Derive the cap here, where the quota is
+        // granted, from the step's cores+mem if pinned else the SCOPE's effective
+        // cpu.max/memory.max. Only CARGO_BUILD_JOBS (never MAKEFLAGS): a global make -j could
+        // parallelize a determinism-sensitive target (cf. make -jN nondeterminism #1157). An
+        // explicit `cargo -j` in the step command still overrides this env floor.
+        let eff_cores = cpu_count.or_else(|| cpu_max_cores(read_trim(root, "cpu.max")));
+        let eff_mem = mem_max.or_else(|| memory_max_bytes(read_trim(root, "memory.max")));
+        let jobs = crate::sizing::derive_build_jobs(eff_cores, eff_mem);
         // $$ is the bash leader's pid; writing it migrates the leader so every subsequently
         // forked descendant inherits this cgroup at fork. Best-effort in the shell.
         let procs = child.join("cgroup.procs");
-        format!("echo $$ > {} 2>/dev/null || true\n{cmd}", procs.display())
+        format!(
+            "echo $$ > {} 2>/dev/null || true\nexport CARGO_BUILD_JOBS={jobs}\n{cmd}",
+            procs.display()
+        )
     }
 
     fn kill(&self, tag: &str) -> bool {

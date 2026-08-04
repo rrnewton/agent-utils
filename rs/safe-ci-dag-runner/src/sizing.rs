@@ -234,6 +234,39 @@ pub fn jobs_for_budget(cfg: &DagConfig, budget: i64) -> (i64, i64) {
     (best, jobs_footprint_bytes(cfg, best, None))
 }
 
+/// Worst-case peak RSS of ONE compile/link job, used to bound build parallelism by the
+/// memory a boxed scope actually grants. DERIVED from a measured footprint, never guessed:
+/// hermit#1584's `build.dbi_release` OOM-killed at the 8.0 GiB cap under j=32 (`memory.events`
+/// `oom_kill=2`) yet is stable at j8 (dag-mem-caps-pinned-jobs-fix #1583), i.e. ~8.0 GiB / 8
+/// ~= 1.0 GiB is the largest per-job footprint that still fits. Single source (mirrors
+/// Python `PER_BUILD_JOB_MEM_BYTES`) so the `-j` a cap implies is never re-derived at a second
+/// site.
+pub const PER_BUILD_JOB_MEM_BYTES: i64 = 1024 * 1024 * 1024;
+
+/// Bounded `CARGO_BUILD_JOBS` for a boxed command, carrying its `-j` WITH the caps.
+///
+/// Cargo (and the `NUM_JOBS` it exports to build scripts) otherwise auto-detects parallelism
+/// from the effective CPU quota, so an unpinned step under a wide scope quota computes
+/// `NUM_JOBS=<all-granted-cores>` (observed 284) and OOM-races the linker. Derive the job count
+/// where the quota is granted: `jobs = min(granted_cores, mem_cap / PER_BUILD_JOB_MEM_BYTES)`.
+/// `cpu_count` is the granted cores (a step's inner `cpu.max`, or the scope's effective quota
+/// for an unpinned step); `mem_max_bytes` is the co-located memory cap. Always `>= 1`. Mirrors
+/// Python `derive_build_jobs` byte-for-byte.
+pub fn derive_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> i64 {
+    let cores = match cpu_count {
+        Some(c) if c > 0 => c,
+        // Full path: the `cpu_count` parameter shadows the module fn of the same name.
+        _ => crate::sizing::cpu_count(),
+    };
+    let mut jobs = cores;
+    if let Some(m) = mem_max_bytes {
+        if m > 0 {
+            jobs = jobs.min(m / PER_BUILD_JOB_MEM_BYTES);
+        }
+    }
+    jobs.max(1)
+}
+
 /// Number of logical CPUs, matching Python's `os.cpu_count()` (online, affinity-independent).
 ///
 /// Read from `/sys/devices/system/cpu/online` (the same set `sysconf(_SC_NPROCESSORS_ONLN)`

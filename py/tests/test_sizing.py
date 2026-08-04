@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
 from safe_ci_dag_runner.sizing import (
+    PER_BUILD_JOB_MEM_BYTES,
+    derive_build_jobs,
     jobs_footprint_bytes,
     jobs_for_budget,
     parse_size,
@@ -13,6 +15,24 @@ from safe_ci_dag_runner.sizing import (
 )
 
 GIB = 1024**3
+
+
+def test_derive_build_jobs_caps_the_284_leak() -> None:
+    """Three-part bracket for the CARGO_BUILD_JOBS/NUM_JOBS quota leak (hermit#1584)."""
+    # CAUGHT: an unpinned wide-quota step under an 8 GiB cap must be bounded by memory,
+    # never the granted core count (the observed NUM_JOBS=284 -> OOM-killed linker).
+    assert derive_build_jobs(284, 8 * GIB) == 8
+    assert 8 == 8 * GIB // PER_BUILD_JOB_MEM_BYTES  # the bound is the #1584-safe j8
+
+    # LEGITIMATE, N=3 (a mechanism that clamps EVERYTHING to 1 would pass the CAUGHT
+    # assertion too, so these prove it does not over-constrain honest configs):
+    assert derive_build_jobs(4, 64 * GIB) == 4  # (1) cpu-bound small box, unharmed
+    assert derive_build_jobs(8, None) == 8  # (2) no mem cap -> cpu-bound, unharmed
+    assert derive_build_jobs(32, 8 * GIB) == 8  # (3) mem-bound == #1584 safe width
+
+    # FLOOR: never 0 / never negative, even when a cap fits less than one job.
+    assert derive_build_jobs(284, 512 * 1024**2) == 1
+    assert derive_build_jobs(1, 1) == 1
 
 
 def _cfg() -> DagConfig:

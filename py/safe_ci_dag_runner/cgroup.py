@@ -72,6 +72,8 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
+from safe_ci_dag_runner.sizing import derive_build_jobs
+
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 #: Fraction of WHOLE-SYSTEM CPU the shared aggregate slice may use. 0.90 leaves
@@ -186,6 +188,34 @@ def _read_cgroup_value(group: Path | None, name: str) -> str | None:
     try:
         return (group / name).read_text().strip()
     except OSError:
+        return None
+
+
+def _cpu_max_cores(value: str | None) -> int | None:
+    """Whole granted cores from a ``cpu.max`` string (``"<quota> <period>"``), or None
+    when unbounded (``"max ..."``) / unreadable. Floors to >=1 for any positive quota so a
+    sub-core slice still affords one build job."""
+    if not value:
+        return None
+    parts = value.split()
+    if len(parts) != 2 or parts[0] == "max":
+        return None
+    try:
+        quota, period = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if quota <= 0 or period <= 0:
+        return None
+    return max(1, quota // period)
+
+
+def _memory_max_bytes(value: str | None) -> int | None:
+    """Byte cap from a ``memory.max`` string, or None when unbounded/unreadable."""
+    if not value or value == "max":
+        return None
+    try:
+        return int(value)
+    except ValueError:
         return None
 
 
@@ -505,6 +535,11 @@ def enter_delegated_scope(
             pass
         quota = cpu_count * 100 if cpu_count is not None else cpu_quota_percent()
         (child / "cpu.max").write_text(f"{quota * 1000} 100000")
+        # Scope-wide build-job default, derived from THIS granted quota + memory cap, so a
+        # command run directly in the scope (not via a per-step child) still can't compute
+        # NUM_JOBS=<all-cores>. Per-step prepare_command refines it downward per step; this
+        # is the floor every boxed child inherits (see derive_build_jobs).
+        os.environ["CARGO_BUILD_JOBS"] = str(derive_build_jobs(quota // 100, memory_max))
         (child / "cgroup.procs").write_text(str(os.getpid()))
         os.environ[naming.env_in_scope] = "1"
         os.environ[naming.env_direct_cgroup] = str(child)
@@ -588,6 +623,11 @@ def reexec_in_scope(
 
     cmd = ["systemd-run", "--user", "--scope", "--collect", "--quiet",
            f"--unit={unit}", *slice_args, *props,
+           # Scope-wide build-job default, derived from the granted cores + memory cap, so a
+           # command run directly in the scope (not via a per-step child) still can't compute
+           # NUM_JOBS=<all cores>. Per-step prepare_command refines it downward; this is the
+           # inherited floor. Mirrors reexec_in_scope in the Rust engine.
+           f"--setenv=CARGO_BUILD_JOBS={derive_build_jobs(cpu_count, memory_max)}",
            f"--setenv={naming.env_in_scope}=1",
            f"--setenv={naming.env_scope_unit}={unit}.scope",
            "--", *argv]
@@ -1041,13 +1081,28 @@ class Cgroups:
             except OSError as exc:
                 return (f"echo 'ERROR: step {tag} cpu.max could not be applied: {exc}' >&2\n"
                         "exit 1\n")
+        # Carry the build ``-j`` WITH the caps just written. cargo (and the NUM_JOBS it
+        # exports to build scripts) auto-detects parallelism from the effective CPU quota;
+        # an UNPINNED step (cpu_count None -> no per-step cpu.max) inherits the wide scope
+        # quota and computes NUM_JOBS=<all-granted-cores> (observed 284), OOM-racing the
+        # linker (hermit#1584 build.dbi_release, 8.0 GiB cap, oom_kill=2). Derive the cap
+        # here, where the quota is granted, from the step's cores+mem if pinned else the
+        # SCOPE's effective cpu.max/memory.max, so even an unpinned step is bounded. Only
+        # CARGO_BUILD_JOBS is set (never MAKEFLAGS): a global make -j could parallelize a
+        # determinism-sensitive target (cf. make -jN nondeterminism #1157). An explicit
+        # ``cargo -j`` in the step command still overrides this env floor.
+        eff_cores = cpu_count if cpu_count else _cpu_max_cores(
+            _read_cgroup_value(self.root, "cpu.max"))
+        eff_mem = mem_max if mem_max else _memory_max_bytes(
+            _read_cgroup_value(self.root, "memory.max"))
+        jobs = derive_build_jobs(eff_cores, eff_mem)
         procs = child / "cgroup.procs"
         # $$ is the bash leader's own pid. Writing it migrates the leader; every
         # subsequently-forked child/grandchild inherits this cgroup at fork.
         # The self-move is best-effort in the shell (`|| true`): if it fails the
         # step still runs and the outer-scope reaper remains the backstop.
         # Errors are redirected so a delegation hiccup can't corrupt stdout.
-        return f'echo $$ > {procs} 2>/dev/null || true\n{cmd}'
+        return f'echo $$ > {procs} 2>/dev/null || true\nexport CARGO_BUILD_JOBS={jobs}\n{cmd}'
 
     def oom_kills(self, tag: str) -> int:
         """OOM-kill event count inside the step's cgroup (``memory.events``

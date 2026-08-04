@@ -135,6 +135,38 @@ def jobs_for_budget(cfg: DagConfig, budget: int) -> tuple[int, int]:
     return best, jobs_footprint_bytes(cfg, best)
 
 
+# Worst-case peak RSS of ONE compile/link job, used to bound build parallelism by the
+# memory a boxed scope actually grants. DERIVED from a measured footprint, never guessed:
+# hermit#1584's build.dbi_release OOM-killed at the 8.0 GiB cap under j=32 (memory.events
+# oom_kill=2) yet is stable at j8 (dag-mem-caps-pinned-jobs-fix #1583), i.e. ~8.0 GiB / 8
+# ~= 1.0 GiB is the largest per-job footprint that still fits. This constant is the single
+# source for "how many build jobs does a given memory cap afford" so the -j a cap implies
+# is never re-derived (or drift) at a second site.
+PER_BUILD_JOB_MEM_BYTES = 1 * 1024**3
+
+
+def derive_build_jobs(cpu_count: int | None, mem_max_bytes: int | None) -> int:
+    """Bounded ``CARGO_BUILD_JOBS`` for a boxed command, carrying its ``-j`` WITH the caps.
+
+    Cargo (and the ``NUM_JOBS`` it exports to build scripts) otherwise auto-detects
+    parallelism from the effective CPU quota, so an unpinned step under a wide scope quota
+    computes ``NUM_JOBS=<all-granted-cores>`` (observed 284) and OOM-races the linker. The
+    fix is to derive the job count where the quota is granted:
+
+      jobs = min(granted_cores, mem_cap // PER_BUILD_JOB_MEM_BYTES)
+
+    ``cpu_count`` is the granted cores (a step's inner ``cpu.max``, or the scope's effective
+    quota for an unpinned step); ``mem_max_bytes`` is the co-located memory cap (the step's
+    ``memory.max`` or the scope's). Either bound alone is insufficient: cores without memory
+    is the 284-job OOM; memory without cores over-subscribes a tiny box. Always ``>= 1`` — a
+    cap too small for even one job is a scheduling decision for the caller, not a ``-j0``."""
+    cores = cpu_count if (cpu_count is not None and cpu_count > 0) else (os.cpu_count() or 1)
+    jobs = int(cores)
+    if mem_max_bytes is not None and mem_max_bytes > 0:
+        jobs = min(jobs, mem_max_bytes // PER_BUILD_JOB_MEM_BYTES)
+    return max(1, int(jobs))
+
+
 _SIZE_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([KkMmGgTt]?)([Bb]?)\s*")
 _SIZE_MULT = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
 
