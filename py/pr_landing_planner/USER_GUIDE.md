@@ -182,7 +182,7 @@ break by diff size, then age, then PR number):
   `mechanism_overlap_edges[]`, `ordering_edges[]`,
   `stacks[]`, `held_prs[]`, `plan{parallel_safe_groups, land_now, order, batch, per_pr_actions[]}`,
   `diagnostics{stale_gates, flaky_reds, real_reds, evaluate_once_race, outage_prs, outage_suspected}`.
-  Each node includes `assigned_agent`, `validation_evidence`, `policy_class`, and `mechanisms`.
+  Each node includes `assigned_agent`, `validation_evidence`, and `policy_class`.
 - `actions` — tick-hub-style line output: a block of bare `key=value` summary counts (so a tick-hub
   reminder's `capture: true` gate can lift `land_now` / `stale_gates` / `outage` into its emitted
   line), then loud diagnostic `ERROR:` / `NOTE:` lines, then one `ACTION:` / `ERROR:` / `NOTE:` line
