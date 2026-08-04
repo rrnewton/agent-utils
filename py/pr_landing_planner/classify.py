@@ -25,13 +25,12 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from ci_hub_check_outcome import FAIL_CONCLUSIONS, classify_check
 from pr_landing_planner.model import CheckRun, CiState, CiVerdict, RedClass
 
-#: Conclusions that carry a genuine failed result. Every other non-success
-#: token is NO_RESULT, including cancelled/skipped/neutral/stale and unknowns.
-FAILED_CONCLUSIONS: frozenset[str] = frozenset(
-    ("FAILURE", "TIMED_OUT", "ERROR", "STARTUP_FAILURE")
-)
+#: Derived from the canonical ci-hub authority; retained as an exported name
+#: for callers that use the failure set in outage signatures.
+FAILED_CONCLUSIONS: frozenset[str] = frozenset(value.upper() for value in FAIL_CONCLUSIONS)
 
 #: Default substrings that identify the benign "evaluate-once race" gate message (ds-xdc7m9).
 DEFAULT_EVALUATE_ONCE_MARKERS: tuple[str, ...] = (
@@ -147,12 +146,12 @@ def parse_rollup(raw: object) -> tuple[CheckRun, ...]:
 
 # --------------------------------------------------------------------------- base state
 def _check_state(check: CheckRun) -> CiState:
-    terminal = not check.status or check.status == "COMPLETED"
-    if terminal and check.conclusion == "SUCCESS":
-        return CiState.PASSED
-    if terminal and check.conclusion in FAILED_CONCLUSIONS:
-        return CiState.FAILED
-    return CiState.NO_RESULT
+    outcome = classify_check(check.status, check.conclusion)
+    return {
+        "PASSED": CiState.PASSED,
+        "FAILED": CiState.FAILED,
+        "NO_RESULT": CiState.NO_RESULT,
+    }[outcome]
 
 
 def classify_state(checks: Sequence[CheckRun]) -> CiState:
