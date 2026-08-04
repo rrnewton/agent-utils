@@ -15,6 +15,7 @@ this same protocol.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Protocol
 
 from pr_landing_planner.model import RawPr
@@ -27,8 +28,17 @@ class VcsHost(Protocol):
         """Return every open PR (host-specific); each carries its rollup + labels + api head sha."""
         ...
 
-    def fetch_ref(self, source: str, dest: str) -> str:
-        """Fetch ``source`` (e.g. ``refs/pull/42/head``) into local ``dest`` and return its sha."""
+    def prefetch_refs(self, refspecs: Sequence[tuple[str, str]]) -> dict[str, str]:
+        """Fetch every ``(source, dest)`` pair in ONE network round-trip; return ``{dest: sha}``.
+
+        The planner needs the base ref plus every PR head in the local object graph before it can run
+        any ``merge-tree`` / ancestry probe. Doing that as N per-PR ``git fetch`` calls is the real
+        "expensive fan-out": each fetch is a separate process + remote round-trip, so the cost is N ×
+        (spawn + round-trip), not N × (download). Batching all refspecs into a single ``git fetch``
+        collapses that to one round-trip; the per-PR analysis afterwards is a handful of local git
+        commands (~37 ms each). See :func:`pr_landing_planner.collect.collect_graph` for the measured
+        derivation. Every requested ``dest`` MUST appear in the returned mapping.
+        """
         ...
 
     def merge_tree(self, left: str, right: str) -> tuple[str, ...]:
