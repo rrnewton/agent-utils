@@ -7,12 +7,15 @@ from pr_landing_planner.graph import (
     build_ordering_edges_base_ref,
     build_overlap_edges,
     build_stacks,
+    cluster_by_conflict,
+    connected_components,
     dedupe_ordering,
     held_reasons,
     partition_parallel_safe,
+    rebases_avoided,
     transitive_reduce,
 )
-from pr_landing_planner.model import ConflictEdge, OrderingEdge, PrNode
+from pr_landing_planner.model import Cluster, ConflictEdge, OrderingEdge, PrNode
 
 
 def _node(
@@ -122,3 +125,58 @@ def test_partition_excludes_held() -> None:
     b = _node(2)
     groups = partition_parallel_safe([a, b], [], [], exclude=frozenset({2}))
     assert groups == ((1,),)
+
+
+# --------------------------------------------------------------------------- conflict clustering
+def test_connected_components_transitive_and_singleton() -> None:
+    # 1-2 and 2-3 conflict (one 3-PR component); 4-5 conflict; 6 is isolated.
+    edges = [ConflictEdge(1, 2, ("a",)), ConflictEdge(2, 3, ("b",)), ConflictEdge(4, 5, ("c",))]
+    comps = connected_components([1, 2, 3, 4, 5, 6], edges)
+    # Largest-first, ties by least member; members sorted ascending.
+    assert comps == ((1, 2, 3), (4, 5), (6,))
+
+
+def test_connected_components_ignores_edges_outside_node_set() -> None:
+    edges = [ConflictEdge(1, 99, ("a",))]  # 99 is not in the node set
+    assert connected_components([1, 2], edges) == ((1,), (2,))
+
+
+def test_cluster_by_conflict_stack_order_follows_ordering_then_rank() -> None:
+    # A 3-PR conflict component. Ordering says #3 must land before #1 (base-ref stacking).
+    n1 = _node(1, priority=0, size=5)
+    n2 = _node(2, priority=0, size=1)
+    n3 = _node(3, priority=0, size=9)
+    conflicts = [ConflictEdge(1, 2, ("shared.toml",)), ConflictEdge(2, 3, ("shared.toml",))]
+    ordering = [OrderingEdge(3, 1, "base-ref")]  # 3 is the base of 1
+    clusters = cluster_by_conflict([n1, n2, n3], conflicts, ordering)
+    assert len(clusters) == 1
+    cl = clusters[0]
+    # #3 must come before #1 (ordering); among rank-free choices the smallest rank leads. #3 has no
+    # predecessor so it's a root; #2 (rank size=1) is also a root and ranks before #3 (size=9).
+    assert cl.members[0] == 2  # lowest-rank root lands first
+    assert cl.members.index(3) < cl.members.index(1)  # ordering constraint respected
+    assert cl.conflict_paths == ("shared.toml",)
+    assert cl.size == 3
+    assert cl.rebases_avoided == 2
+
+
+def test_cluster_uses_merge_tree_edges_not_file_overlap() -> None:
+    # Two PRs edit the SAME file but produce NO real conflict edge (disjoint regions). File-overlap
+    # would fuse them; conflict-clustering must keep them as separate singleton lanes.
+    a = _node(1, files=frozenset({"big.rs"}))
+    b = _node(2, files=frozenset({"big.rs"}))
+    # No ConflictEdge between them => separate clusters.
+    clusters = cluster_by_conflict([a, b], [], [])
+    assert {cl.members for cl in clusters} == {(1,), (2,)}
+    # Contrast: the file-overlap fallback WOULD have linked them into one conflict edge.
+    assert [(e.a, e.b) for e in build_conflict_edges_file_overlap([a, b])] == [(1, 2)]
+
+
+def test_rebases_avoided_sums_size_minus_one() -> None:
+    clusters = (
+        Cluster(members=(1, 2, 3, 4, 5), conflict_paths=("x",)),  # 4 avoided
+        Cluster(members=(6, 7), conflict_paths=("y",)),  # 1 avoided
+        Cluster(members=(8,), conflict_paths=()),  # 0
+    )
+    assert rebases_avoided(clusters) == 5
+    assert [c.rebases_avoided for c in clusters] == [4, 1, 0]
