@@ -87,6 +87,22 @@ for pkg in meta["packages"]:
                 installed.append(tgt["name"])
 print("rs: installed binaries:", ", ".join(sorted(installed)) or "(none)")
 PY
+  # Stamp build provenance next to each installed binary so the engine resolver can content-verify,
+  # at run time, that the UNTRACKED rs/bin artifact was built from the currently-pinned source. This
+  # closes the stale/planted-binary gap: a warm binary built from source older than the pinned gitlink
+  # (or a binary swapped in without a rebuild) is REFUSED instead of silently run. Both sides compute
+  # the source fingerprint via the SAME tracked helper (common/bin/rs-source-fingerprint), so they
+  # cannot drift. The .provenance files land in rs/bin, which is already gitignored.
+  local src_fp
+  src_fp="$("$ROOT/common/bin/rs-source-fingerprint")"
+  local bin bin_sha
+  for bin in rs/bin/*; do
+    [ -f "$bin" ] || continue
+    case "$(basename "$bin")" in .gitkeep | *.provenance) continue ;; esac
+    bin_sha="$(sha256sum -- "$bin" | cut -d' ' -f1)"
+    printf 'source_fp=%s\nbinary_sha256=%s\n' "$src_fp" "$bin_sha" >"$bin.provenance"
+  done
+  echo "==> [rs] stamped build provenance (source_fp=${src_fp:0:12}...)"
   if [ "$CLEAN" = 1 ]; then echo "==> [rs] --clean: removing rs/target"; rm -rf rs/target; fi
   echo "==> [rs] ok"
 }

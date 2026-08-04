@@ -49,15 +49,40 @@ case "$ENGINE" in
         exec "${CI_HUB_PYTHON:-python3}" "$TARGET" "$@"
         ;;
     rust|rs)
-        # Rust binaries are UNTRACKED build artifacts. Use ONLY when explicitly requested AND
-        # present; never fall back to Python silently — that would re-hide an engine mismatch.
+        # Rust binaries are UNTRACKED build artifacts. Use ONLY when explicitly requested, present,
+        # AND content-verified against the currently-pinned source. A binary built from source older
+        # than the pinned gitlink (a warm/stale artifact) or a binary swapped in without a rebuild is
+        # REFUSED, never silently run — that is exactly how a runner missing an enforcement guard can
+        # run while we believe the tracked source is executing. Never fall back to Python silently
+        # either; that would re-hide the engine mismatch.
         TARGET="$ROOT/rs/bin/$TOOL"
-        [[ -x "$TARGET" ]] || TARGET="$ROOT/rs/target/release/$TOOL"
         if [[ ! -x "$TARGET" ]]; then
-            echo "[$TOOL] engine=rust requested but no built binary found (rs/bin/$TOOL or rs/target/release/$TOOL); run './setup rs'. Refusing to silently fall back to Python." >&2
+            echo "[$TOOL] engine=rust requested but no built binary at rs/bin/$TOOL; run './setup rs'. Refusing to silently fall back to Python." >&2
             exit 127
         fi
-        echo "[$TOOL] engine=rust (UNTRACKED build artifact: ${TARGET#$ROOT/})" >&2
+        # Content-verify against build provenance stamped by `setup rs`.
+        prov="$TARGET.provenance"
+        if [[ ! -f "$prov" ]]; then
+            echo "[$TOOL] engine=rust REFUSED: no build provenance ($TOOL.provenance). The UNTRACKED binary cannot be verified against pinned source; rebuild with './setup rs'." >&2
+            exit 3
+        fi
+        want_src="$(sed -n 's/^source_fp=//p' "$prov")"
+        want_bin="$(sed -n 's/^binary_sha256=//p' "$prov")"
+        if [[ -z "$want_src" || -z "$want_bin" ]]; then
+            echo "[$TOOL] engine=rust REFUSED: malformed provenance ($TOOL.provenance); rebuild with './setup rs'." >&2
+            exit 3
+        fi
+        have_src="$("$ROOT/common/bin/rs-source-fingerprint")"
+        have_bin="$(sha256sum -- "$TARGET" | cut -d' ' -f1)"
+        if [[ "$have_src" != "$want_src" ]]; then
+            echo "[$TOOL] engine=rust REFUSED: STALE binary — built from source ${want_src:0:12} but pinned source is now ${have_src:0:12}. Rebuild with './setup rs'." >&2
+            exit 3
+        fi
+        if [[ "$have_bin" != "$want_bin" ]]; then
+            echo "[$TOOL] engine=rust REFUSED: binary ${TARGET#"$ROOT"/} does not match its provenance (have ${have_bin:0:12}, want ${want_bin:0:12}) — modified/planted artifact. Rebuild with './setup rs'." >&2
+            exit 3
+        fi
+        echo "[$TOOL] engine=rust (source-verified ${have_src:0:12}: ${TARGET#"$ROOT"/})" >&2
         exec "$TARGET" "$@"
         ;;
     *)

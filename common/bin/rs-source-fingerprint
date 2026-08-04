@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# TRACKED helper: print a deterministic fingerprint of the agent-utils Rust SOURCE tree.
+#
+# SINGLE SOURCE OF TRUTH for source<->binary provenance. Both `setup` (at BUILD time, to stamp the
+# provenance of the UNTRACKED rs/bin artifact) and the engine resolver (at RUN time, to content-verify
+# that artifact against currently-pinned source) call THIS ONE script. Two independent hash
+# implementations would themselves be the defect class this guards against — a compiled artifact
+# silently diverging from its source — so there is deliberately only one.
+#
+# Output (stdout): a single line, "<64-hex sha256>", covering the WORKING-TREE contents of every
+# git-tracked file under rs/ EXCEPT the untracked build outputs rs/bin and rs/target. Any change to
+# Cargo.toml/Cargo.lock or a source file changes the fingerprint; a rebuild refreshes the stamp.
+# Exits nonzero (no output) if the rs/ source cannot be enumerated, so callers fail closed.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
+cd "$ROOT"
+
+# Deterministic order: git ls-files is sorted, but pin the locale so it is stable everywhere.
+mapfile -t files < <(git ls-files -- rs ':!rs/bin' ':!rs/target' | LC_ALL=C sort)
+if ((${#files[@]} == 0)); then
+    echo "rs-source-fingerprint: no tracked rs/ source files found under $ROOT (not a checkout?)" >&2
+    exit 3
+fi
+
+# Hash each file's working-tree content, prefixed by its path (so renames also move the fingerprint),
+# then hash the whole list into one stable digest.
+for f in "${files[@]}"; do
+    printf '%s  %s\n' "$f" "$(sha256sum -- "$f" | cut -d' ' -f1)"
+done | sha256sum | cut -d' ' -f1
