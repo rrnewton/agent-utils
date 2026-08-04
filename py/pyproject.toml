@@ -33,6 +33,7 @@ Repository = "https://github.com/rrnewton/agent-utils"
 # follow-up. `cd py && python3 -m mypy .` / `pytest -q` already cover every package here.
 [project.scripts]
 safe-ci-dag-runner = "safe_ci_dag_runner.cli:main"
+cpuset-alloc = "safe_ci_dag_runner.cpuset_allocator:main"
 tick-hub = "tick_hub.cli:main"
 pr-landing-planner = "pr_landing_planner.cli:main"
 
