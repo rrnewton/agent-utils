@@ -324,6 +324,7 @@ struct RunArgs {
     profile_sync_direction: String,
     keep_going: bool,
     allow_cgroup_failure: bool,
+    unsafe_no_cgroups: bool,
     verbosity: i64,
     quiet: bool,
 }
@@ -345,6 +346,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         profile_sync_direction: "both".to_string(),
         keep_going: false,
         allow_cgroup_failure: false,
+        unsafe_no_cgroups: false,
         verbosity: 1,
         quiet: false,
     };
@@ -407,6 +409,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                     .to_string(),
             ),
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
+            "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
             other => {
@@ -490,7 +493,19 @@ fn git_sha() -> String {
 /// Python `_resolve_cgroup_manager`). Returns the manager to use (`None` = intentional UNBOXED
 /// run), or an `Err(exit_code)` the caller must return when boxing is required but unavailable.
 /// May re-exec this process into a systemd scope (never returns on success).
-fn resolve_cgroups(allow_failure: bool) -> Result<BoxedCgroups, i32> {
+fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<BoxedCgroups, i32> {
+    if unsafe_no_cgroups {
+        // Deliberate opt-out (--unsafe-no-cgroups): skip scope bring-up entirely and run unboxed
+        // even where boxing is available. Distinct from --allow-cgroup-failure (a capability
+        // fallback); logged loudly as a reviewable audit signal. Takes precedence over
+        // allow_failure when both are set.
+        eprintln!(
+            "{PROG}: WARNING: DELIBERATELY UNBOXED via --unsafe-no-cgroups: per-step \
+             memory/CPU/pids caps are NOT enforced. This is an explicit, reviewable opt-out of \
+             cgroup resource boxing (not a capability fallback)."
+        );
+        return Ok(None);
+    }
     if is_in_scope() {
         let mgr = Cgroups::new();
         if mgr.enabled() {
@@ -1093,6 +1108,7 @@ struct SweepArgs {
     perf_dir: Option<String>,
     no_profile: bool,
     allow_cgroup_failure: bool,
+    unsafe_no_cgroups: bool,
     verbosity: i64,
 }
 
@@ -1105,6 +1121,7 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
         perf_dir: None,
         no_profile: false,
         allow_cgroup_failure: false,
+        unsafe_no_cgroups: false,
         verbosity: 0,
     };
     let mut i = 0;
@@ -1137,6 +1154,7 @@ fn parse_sweep_args(rest: &[String]) -> Result<SweepArgs, String> {
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile" => a.no_profile = true,
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
+            "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
             "-v" => a.verbosity += 1,
             other => return Err(format!("unrecognized argument: {other}")),
         }
@@ -1197,7 +1215,7 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     let repeat = a.repeat.max(1);
 
     // Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
-    let cgroups = match resolve_cgroups(a.allow_cgroup_failure) {
+    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups) {
         Ok(cg) => cg,
         Err(code) => return code,
     };
@@ -1359,7 +1377,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let cfg: &DagConfig = filtered.as_ref().unwrap_or(cfg);
 
     // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
-    let cgroups = match resolve_cgroups(a.allow_cgroup_failure) {
+    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups) {
         Ok(cg) => cg,
         Err(code) => return code,
     };

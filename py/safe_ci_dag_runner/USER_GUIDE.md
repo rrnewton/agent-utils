@@ -108,7 +108,11 @@ is OOM-killed in isolation instead of taking down the host; (2) teardown writes 
 `cgroup.kill`, an **atomic SIGKILL of the entire subtree** that catches `setsid`/double-fork escapees
 (orphan servers, browsers) a process-group kill misses. Where a delegated cgroup is unavailable a
 bare `run` **errors with exit 3**; `--allow-cgroup-failure` downgrades to a process-group kill and
-says so out loud.
+says so out loud. That fallback is about *capability* — box if you can, downgrade if you can't.
+`--unsafe-no-cgroups` is a different, *intentional* opt-out: it skips scope bring-up entirely and
+runs unboxed **even where boxing is available**, with no per-step memory/CPU/pids caps. The word
+`unsafe` is deliberate friction — its use is logged loudly as a reviewable audit signal — so reach
+for it only when you have a specific reason not to box, not as a way to quiet a boxing error.
 
 **Metrics sink.** An optional pluggable destination for durable measurements: one whole-run summary
 row (wall time, CPU contention split, cores) and per-step rows (CPU, memory peak, threads, ambient

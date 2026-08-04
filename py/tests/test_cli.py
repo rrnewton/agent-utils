@@ -321,6 +321,30 @@ def test_run_default_requires_cgroups_or_flag() -> None:
         assert "UNBOXED" in allowed.stderr
 
 
+def test_unsafe_no_cgroups_deliberately_skips_boxing() -> None:
+    # --unsafe-no-cgroups is the DELIBERATE opt-out: it skips scope bring-up entirely and runs
+    # unboxed even where boxing IS available (distinct from --allow-cgroup-failure's
+    # capability fallback). It must exit 0, emit a LOUD reviewable warning naming the flag, and
+    # never claim boxing is ACTIVE. Run in a SUBPROCESS so any (absent) re-exec is real.
+    import os
+
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _demo_path(tmp)
+        # Do NOT force the re-exec skip: the point is that the deliberate opt-out short-circuits
+        # regardless of whether boxing could have been established.
+        env = dict(os.environ)
+        result = subprocess.run(
+            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", dag, "-q",
+             "--unsafe-no-cgroups"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "DELIBERATELY UNBOXED via --unsafe-no-cgroups" in result.stderr
+        assert "cgroup boxing ACTIVE" not in result.stderr
+
+
 def test_boxed_run_enforces_cpu_timeout() -> None:
     # Behavioral parity anchor for the Rust `cpu_timeout_smoke.rs`: prove the DEFAULT boxed run
     # actually ENFORCES a per-step CPU-time budget. A step that busy-loops forever with a tiny
