@@ -128,6 +128,7 @@ def _fake_pr_from(value: object, where: str) -> _FakePr:
         deletions=_opt_int(obj, "deletions", 0),
         labels=_opt_str_list(obj, "labels"),
         checks=_checks_from(obj.get("checks"), where),
+        mechanism_symbols=_opt_str_list(obj, "mechanism_symbols"),
     )
     return _FakePr(
         raw=raw,
