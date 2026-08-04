@@ -10,7 +10,7 @@ the content-identity guard.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -165,7 +165,10 @@ class FakeHost:
     def list_open_prs(self, repo: str, base: str | None) -> tuple[RawPr, ...]:
         return tuple(p.raw for p in self._prs)
 
-    def fetch_ref(self, source: str, dest: str) -> str:
+    def prefetch_refs(self, refspecs: Sequence[tuple[str, str]]) -> dict[str, str]:
+        return {dest: self._resolve_source(source) for source, dest in refspecs}
+
+    def _resolve_source(self, source: str) -> str:
         if source.startswith("refs/heads/"):
             ref = source[len("refs/heads/") :]
             return self._base_shas.get(ref, f"basesha-{ref}")
@@ -174,9 +177,9 @@ class FakeHost:
             number = int(middle)
             pr = self._by_number.get(number)
             if pr is None:
-                raise FixtureError(f"fetch_ref: unknown PR in {source!r}")
+                raise FixtureError(f"prefetch_refs: unknown PR in {source!r}")
             return pr.fetched_head_sha
-        raise FixtureError(f"fetch_ref: unrecognized source ref {source!r}")
+        raise FixtureError(f"prefetch_refs: unrecognized source ref {source!r}")
 
     def merge_tree(self, left: str, right: str) -> tuple[str, ...]:
         left_pr = self._number_by_sha.get(left)

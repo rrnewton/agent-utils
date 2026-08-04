@@ -127,3 +127,35 @@ def test_transitive_stack_selection_across_base() -> None:
 def test_unknown_detector_raises() -> None:
     with pytest.raises(ValueError, match="unknown conflict detector"):
         collect_graph(_host(), repo="R", base="integration", conflict_detector="bogus")
+
+
+class _RecordingHost:
+    """Wrap a FakeHost and record how many times refs are fetched, and with which refspecs."""
+
+    def __init__(self, inner: FakeHost) -> None:
+        self._inner = inner
+        self.prefetch_calls: list[tuple[tuple[str, str], ...]] = []
+
+    def prefetch_refs(self, refspecs):  # type: ignore[no-untyped-def]
+        self.prefetch_calls.append(tuple(refspecs))
+        return self._inner.prefetch_refs(refspecs)
+
+    def __getattr__(self, name: str):  # type: ignore[no-untyped-def]
+        return getattr(self._inner, name)
+
+
+def test_collection_fetches_in_one_batched_call_not_per_pr() -> None:
+    # The whole cost argument for defaulting to merge-tree is that the fetch is ONE round-trip, not a
+    # per-PR fan-out. Guard that here: three PRs -> exactly one prefetch call carrying the base ref
+    # plus all three PR heads (four refspecs), never one fetch per PR.
+    host = _RecordingHost(_host())
+    graph = collect_graph(host, repo="OWNER/NAME", base="integration")
+    assert {n.number for n in graph.nodes} == {1, 2, 3}
+    assert len(host.prefetch_calls) == 1
+    sources = {source for source, _dest in host.prefetch_calls[0]}
+    assert sources == {
+        "refs/heads/integration",
+        "refs/pull/1/head",
+        "refs/pull/2/head",
+        "refs/pull/3/head",
+    }
