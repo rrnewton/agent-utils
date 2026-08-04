@@ -137,10 +137,13 @@ def test_authoritative_ci_is_reported_as_evidence() -> None:
 
 
 def test_json_schema_exposes_context_and_mechanism_overlap() -> None:
+    # Uses a RECOGNISED mechanism: under the enum redesign, clustering keys on the normalised
+    # Mechanism enum value, not the raw slug, so an unknown slug ("shared") would be UNCLASSIFIED
+    # rather than an edge. `cancel-in-progress` is a seeded enum member, so the pair still clusters.
     nodes = apply_landing_context(
         [
-            _node(1, labels=("locally-validated", "mechanism:shared")),
-            _node(2, labels=("mechanism:shared",)),
+            _node(1, labels=("locally-validated", "mechanism:cancel-in-progress")),
+            _node(2, labels=("mechanism:cancel-in-progress",)),
         ],
         [],
     )
@@ -159,5 +162,5 @@ def test_json_schema_exposes_context_and_mechanism_overlap() -> None:
     payload = json.loads(render_json(result))
     assert payload["nodes"][0]["validation_evidence"] == "locally-validated"
     assert payload["mechanism_overlap_edges"] == [
-        {"a": 1, "b": 2, "mechanisms": ["shared"]}
+        {"a": 1, "b": 2, "mechanisms": ["cancel-in-progress"]}
     ]
