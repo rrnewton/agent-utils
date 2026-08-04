@@ -337,9 +337,15 @@ class reserve_cores:
     """Context manager: acquire on enter, release on exit (normal or exception).
 
         with reserve_cores(1, tag="ptrace-bench") as cores:
-            os.sched_setaffinity(0, set(cores))  # whole subtree inherits
-            run_benchmark()
-    """
+            # HARD-pin the whole tree via a transient scope's cgroup cpuset.
+            # (sched_setaffinity is ESCAPABLE — a child can widen its own mask;
+            #  mutation-verified 2026-08-04. Use AllowedCPUs, not affinity.)
+            subprocess.run(["systemd-run", "--user", "--scope", "--collect",
+                            f"-pAllowedCPUs={','.join(map(str, cores))}",
+                            "--", *benchmark_cmd])
+
+    The `cpuset-alloc run --cores K -- CMD` CLI
+    (:mod:`safe_ci_dag_runner.cpuset_allocator`) wraps exactly this."""
 
     def __init__(
         self,
