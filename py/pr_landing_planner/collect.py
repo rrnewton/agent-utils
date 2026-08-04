@@ -26,6 +26,7 @@ from pr_landing_planner.graph import (
     build_mechanism_edges,
     build_ordering_edges_base_ref,
     build_overlap_edges,
+    build_unclassified_mechanisms,
     dedupe_ordering,
 )
 from pr_landing_planner.host import VcsHost
@@ -164,6 +165,7 @@ def collect_graph(
                 additions=pr.additions,
                 deletions=pr.deletions,
                 labels=pr.labels,
+                mechanism_symbols=pr.mechanism_symbols,
                 files=files,
                 base_conflict_paths=base_conflict,
                 commits_behind=behind,
@@ -189,6 +191,7 @@ def collect_graph(
         overlap_edges=overlap_edges,
         ordering_edges=ordering_edges,
         mechanism_edges=build_mechanism_edges(enriched_nodes),
+        unclassified_mechanisms=build_unclassified_mechanisms(enriched_nodes),
     )
 
 
