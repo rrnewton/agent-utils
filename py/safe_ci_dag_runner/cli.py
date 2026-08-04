@@ -554,6 +554,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sb_stats.add_argument("file", metavar="FILE", help="summary JSON file")
 
+    pin_p = sub.add_parser(
+        "pin-run",
+        help="reserve K collision-free cores, box a command onto them, run it, release on exit",
+    )
+    pin_p.add_argument(
+        "--cores",
+        type=int,
+        required=True,
+        metavar="K",
+        help="reserve K disjoint cores via the durable cross-process ledger (never collides with "
+        "a concurrent pin-run/run --cores), constrain the WHOLE command subtree to them, run the "
+        "command, and RELEASE on exit (incl. failure). Assigned cores print to stderr; exit code "
+        "== the command's. Dead holders are reclaimed automatically.",
+    )
+    pin_p.add_argument(
+        "--tag",
+        default="",
+        metavar="STR",
+        help="label recorded in the ledger for this reservation (for inspection/debugging)",
+    )
+    pin_p.add_argument(
+        "cmd",
+        nargs=argparse.REMAINDER,
+        metavar="-- CMD [ARGS...]",
+        help="the command to run pinned (put it after '--')",
+    )
+
     sub.add_parser("quickstart", help="print a self-contained getting-started guide")
     sub.add_parser(
         "capabilities",
@@ -1002,6 +1029,54 @@ def _run_single_step(
     return _SweepMeasure(wall_s=wall_s, user_s=user_s, sys_s=sys_s, rss_hwm=rss, ok=result.ok)
 
 
+def _cmd_pin_run(ns: argparse.Namespace) -> int:
+    """Reserve K collision-free cores, box the command's whole subtree onto them,
+    run it, and RELEASE on exit (normal or failure).
+
+    This is the consumer wrapper a same-core benchmark harness wants: it never
+    picks a core itself and never collides with a concurrent reservation, so two
+    benchmarks running at once land on DISJOINT cores. The reservation is held
+    for exactly the command's lifetime; a crash is reclaimed by the next
+    acquire's dead-holder sweep."""
+    from safe_ci_dag_runner import cgroup as _cg
+    from safe_ci_dag_runner import reservation as _res
+
+    cmd = list(ns.cmd or [])
+    # argparse.REMAINDER keeps a leading '--'; drop it so 'pin-run --cores 1 -- echo hi' works.
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        print(f"{PROG}: pin-run: no command given (use '-- CMD [ARGS...]')", file=sys.stderr)
+        return 2
+
+    k = int(ns.cores)
+    try:
+        reservation = _res.acquire(k, tag=str(ns.tag or "pin-run"))
+    except _res.InsufficientCoresError as exc:
+        print(f"{PROG}: pin-run: {exc}", file=sys.stderr)
+        return 3
+    try:
+        applied = _cg.apply_specific_cores(reservation.cores, label=f"pin-run --cores {k}")
+        if applied is None:
+            print(
+                f"{PROG}: pin-run: reserved cores {reservation.cores} but could NOT box the "
+                "command onto them (no cgroup cpuset and sched_setaffinity failed); refusing to "
+                "run un-pinned",
+                file=sys.stderr,
+            )
+            return 3
+        mechanism, cores = applied
+        print(
+            f"{PROG}: pin-run: reserved + boxed onto core(s) {cores} via {mechanism}; running command",
+            file=sys.stderr,
+        )
+        sys.stderr.flush()
+        proc = subprocess.run(cmd)
+        return proc.returncode
+    finally:
+        reservation.release()
+
+
 def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
     """Per-step parallel-speedup sweep (Feature B)."""
     dag_arg = ns.dag if isinstance(ns.dag, str) else None
@@ -1387,8 +1462,18 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # covers the whole descendant tree (cgroup cpuset where delegated, else sched_setaffinity).
     if ns.cores is not None:
         from safe_ci_dag_runner import cgroup as _cg
+        from safe_ci_dag_runner import reservation as _res
 
-        _cg.apply_core_box(int(ns.cores))
+        # Reserve K disjoint cores from the durable ledger FIRST (collision-free vs a concurrent
+        # run/pin-run), then box the whole tree onto exactly those cores. The reservation is held
+        # for this run process's lifetime (released at exit via the ledger's atexit hook, and
+        # reclaimed by the next acquire's dead-holder sweep if this process crashes). If the pool
+        # is exhausted, fall back to the standalone picker rather than aborting the run.
+        try:
+            _reservation = _res.acquire(int(ns.cores), tag="run")
+            _cg.apply_specific_cores(_reservation.cores, label=f"--cores {ns.cores}")
+        except _res.InsufficientCoresError:
+            _cg.apply_core_box(int(ns.cores))
 
     # Plan-time profile-store FEEDBACK (ds-7pzdgm / ds-afzsqf): refine each step's est_duration_s
     # and rss_baseline_bytes from the recorded store, then pick the dispatch order for the chosen
@@ -1502,6 +1587,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # so an enforcement guard in one build but not the other fails `cross`.
         print(ENFORCEMENT_CAPABILITIES)
         return 0
+    if command == "pin-run":
+        return _cmd_pin_run(ns)
     if command == "sweep":
         return _cmd_sweep(ns, c)
     if command == "plan":

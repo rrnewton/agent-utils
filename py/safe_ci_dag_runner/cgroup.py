@@ -66,7 +66,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -953,7 +953,9 @@ def report_current_usage(naming: ScopeNaming = DEFAULT_NAMING) -> bool:
 # tree to K cores, a warning is emitted and ``apply_core_box`` returns ``None``.
 
 
-def pick_least_busy_free_cores(k: int, sample_s: float = 0.3) -> list[int]:
+def pick_least_busy_free_cores(
+    k: int, sample_s: float = 0.3, exclude: Collection[int] = ()
+) -> list[int]:
     """Pick ``k`` LEAST-BUSY cores from THIS process's allowed CPU set.
 
     Reads the allowed set (``sched_getaffinity``), samples per-CPU idle jiffies
@@ -961,8 +963,16 @@ def pick_least_busy_free_cores(k: int, sample_s: float = 0.3) -> list[int]:
     with the highest idle fraction — never a fixed core id, per the standing
     benchmark rule (a fixed core may be busy). ``k`` is clamped to
     ``[1, len(allowed)]``. Verified recipe (task
-    ``runner-cpu-affinity-single-core-runs``, 2026-08-04)."""
-    allowed = sorted(os.sched_getaffinity(0))
+    ``runner-cpu-affinity-single-core-runs``, 2026-08-04).
+
+    ``exclude`` removes cores already HELD by a concurrent reservation BEFORE
+    ranking, so the least-busy heuristic (which prevents over-use) is composed
+    with a held-set (which prevents COLLISION). Idle-fraction sampling alone
+    cannot prevent two callers picking the same idle core at the same instant;
+    the caller passes the reservation ledger's held set here. Additive: the
+    default empty ``exclude`` preserves the standalone behavior."""
+    excluded = frozenset(int(c) for c in exclude)
+    allowed = [c for c in sorted(os.sched_getaffinity(0)) if c not in excluded]
     if not allowed:
         return []
     k = max(1, min(int(k), len(allowed)))
@@ -1040,11 +1050,33 @@ def apply_core_box(
 
     Call this in the runner BEFORE the scheduler spawns worker threads or forks
     any step: pthreads inherit the creator's affinity and forked steps inherit at
-    fork, so an early application covers the whole tree."""
+    fork, so an early application covers the whole tree.
+
+    This is the STANDALONE picker path (no cross-process reservation): it prevents
+    OVER-use but two concurrent calls can pick the same idle core. For
+    collision-free allocation across concurrent runs, use
+    :func:`safe_ci_dag_runner.reservation.acquire` and pass its cores to
+    :func:`apply_specific_cores`."""
     cores = pick_least_busy_free_cores(k)
     if not cores:
         _warn(naming, f"--cores {k}: no allowed CPUs found (sched_getaffinity empty); "
               "cannot constrain the run tree to a core box")
+        return None
+    return apply_specific_cores(cores, naming, label=f"--cores {k}")
+
+
+def apply_specific_cores(
+    cores: Sequence[int], naming: ScopeNaming = DEFAULT_NAMING, label: str = "core box"
+) -> tuple[str, list[int]] | None:
+    """Constrain the WHOLE run tree to an EXPLICIT set of ``cores``.
+
+    Same mechanism + verification as :func:`apply_core_box`, but the caller
+    supplies the cores (e.g. a reservation from the ledger) instead of this
+    function picking them. Returns ``(mechanism, cores)`` on a verified box, else
+    ``None`` with a warning."""
+    cores = list(cores)
+    if not cores:
+        _warn(naming, f"{label}: empty core set; cannot constrain the run tree")
         return None
     want = len(cores)
 
@@ -1061,11 +1093,11 @@ def apply_core_box(
         os.sched_setaffinity(0, set(cores))
         applied = os.sched_getaffinity(0)
     except OSError as exc:
-        _warn(naming, f"--cores {k}: sched_setaffinity failed ({exc}) and cgroup cpuset "
+        _warn(naming, f"{label}: sched_setaffinity failed ({exc}) and cgroup cpuset "
               "was unavailable; the run tree is NOT constrained to a core box")
         return None
     if len(applied) != want:
-        _warn(naming, f"--cores {k}: sched_setaffinity read-back shows {len(applied)} core(s), "
+        _warn(naming, f"{label}: sched_setaffinity read-back shows {len(applied)} core(s), "
               f"expected {want}; the run tree is NOT reliably constrained")
         return None
     print(f"{naming.log_prefix} core box: constrained to {want} core(s) "
