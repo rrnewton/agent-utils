@@ -65,45 +65,58 @@ fn boxing_oom_kills_a_step_past_its_cap() {
 
 #[test]
 fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
+    const NEIGHBOUR_COUNT: usize = 4;
+
     let bin = env!("CARGO_BIN_EXE_safe-ci-dag-runner");
     let dir = std::env::temp_dir().join(format!("scdr_oom_artifact_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let source = dir.join("neighbour.c");
-    let object = dir.join("neighbour.o");
-    let executable = dir.join("neighbour");
     let dag = dir.join("oom-neighbour.json");
 
-    // The neighbour first creates the exact persistent failure shape observed in
-    // the DynamoRIO tree: a zero-byte .o with a valid mtime. It then sleeps across
-    // the offender's OOM, compiles over that placeholder, links, and executes. If
-    // the OOM is misattributed to the neighbour, the zero-byte object remains.
-    let neighbour_cmd = format!(
-        "printf 'int main(void) {{ return 0; }}\\n' > {source}; \
-         : > {object}; sleep 1; \
-         cc -c {source} -o {object}; test -s {object}; \
-         cc {object} -o {executable}; {executable}",
-        source = source.display(),
-        object = object.display(),
-        executable = executable.display(),
-    );
-    let dag_json = format!(
-        r#"{{"steps": [
-          {{"group": "artifact", "job": "neighbour", "desc": "compile through sibling OOM",
-            "cmd": {neighbour_cmd:?}, "hint": {{"hard_mem_max_bytes": 268435456}}}},
-          {{"group": "mem", "job": "offender", "desc": "allocate past cap",
+    let mut artifacts = Vec::new();
+    let mut steps = Vec::new();
+    for index in 0..NEIGHBOUR_COUNT {
+        let source = dir.join(format!("neighbour-{index}.c"));
+        let object = dir.join(format!("neighbour-{index}.o"));
+        let executable = dir.join(format!("neighbour-{index}"));
+        let description = format!("compile neighbour-{index} through sibling OOM");
+
+        // Every neighbour first creates the exact persistent failure shape
+        // observed in the DynamoRIO tree: a zero-byte .o with a valid mtime. It
+        // then sleeps across the offender's OOM, compiles over that placeholder,
+        // links, and executes. A misattributed kill leaves at least one zero.
+        let command = format!(
+            "printf 'int main(void) {{ return 0; }}\\n' > {source}; \
+             : > {object}; sleep 1; \
+             cc -c {source} -o {object}; test -s {object}; \
+             cc {object} -o {executable}; {executable}",
+            source = source.display(),
+            object = object.display(),
+            executable = executable.display(),
+        );
+        steps.push(format!(
+            r#"{{"group": "artifact", "job": "neighbour-{index}",
+                "desc": {description:?}, "cmd": {command:?},
+                "hint": {{"hard_mem_max_bytes": 268435456}}}}"#
+        ));
+        artifacts.push((index, description, object, executable));
+    }
+    steps.push(
+        r#"{"group": "mem", "job": "offender", "desc": "allocate past cap",
             "cmd": "s=x; while true; do s=\"$s$s\"; done",
-            "hint": {{"hard_mem_max_bytes": 67108864}}}}
-        ]}}"#
+            "hint": {"hard_mem_max_bytes": 67108864}}"#
+            .to_string(),
     );
+    let dag_json = format!(r#"{{"steps": [{}]}}"#, steps.join(","));
     std::fs::write(&dag, dag_json).unwrap();
 
+    let jobs = (NEIGHBOUR_COUNT + 1).to_string();
     let output = Command::new(bin)
         .args([
             "run",
             "--dag",
             dag.to_str().unwrap(),
             "--jobs",
-            "2",
+            &jobs,
             "--keep-going",
             "--no-profile",
         ])
@@ -114,7 +127,7 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
     let code = output.status.code();
-    if code == Some(3) {
+    if code == Some(3) && combined.contains("systemd --user scope is unavailable") {
         eprintln!(
             "SKIP boxed_oom_does_not_truncate_a_neighbour_artifact: cgroup boxing is unavailable \
              in this environment (need cgroup-v2 + a working systemd --user scope). Details:\n{stderr}"
@@ -123,10 +136,16 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
         return;
     }
 
+    assert_ne!(
+        code,
+        Some(3),
+        "boxing was available but cgroup control readback failed:\n{combined}"
+    );
+
     assert_eq!(
         code,
         Some(1),
-        "the offender should fail the overall run while the neighbour completes; got \
+        "the offender should fail the overall run while all neighbours complete; got \
          {code:?}\n{combined}"
     );
     assert!(
@@ -135,20 +154,33 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
         "failure attribution must name the OOM offender:\n{combined}"
     );
     assert!(
-        combined.contains("[artifact.neighbour]")
-            && combined.contains("PASS   compile through sibling OOM"),
-        "the neighbour must complete after the sibling OOM:\n{combined}"
+        combined.contains("memory.max=")
+            && combined.contains("(bound)")
+            && combined.contains("memory.swap.max=0 (disabled)")
+            && combined.contains("memory.oom.group=1 (enabled)"),
+        "outer cgroup controls must be read back before the run starts:\n{combined}"
     );
-    let object_len = std::fs::metadata(&object)
-        .map(|meta| meta.len())
-        .unwrap_or(0);
-    assert!(
-        object_len > 0,
-        "neighbour survived as a process but left a truncated zero-byte object"
-    );
-    assert!(
-        executable.is_file(),
-        "neighbour object was not linkable into an executable"
+    for (index, description, object, executable) in artifacts {
+        assert!(
+            combined.contains(&format!("[artifact.neighbour-{index}]"))
+                && combined.contains(&format!("PASS   {description}")),
+            "neighbour {index} must complete after the sibling OOM:\n{combined}"
+        );
+        let object_len = std::fs::metadata(&object)
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        assert!(
+            object_len > 0,
+            "neighbour {index} survived as a process but left a truncated zero-byte object"
+        );
+        assert!(
+            executable.is_file(),
+            "neighbour {index} object was not linkable into an executable"
+        );
+    }
+    eprintln!(
+        "boxed OOM artifact integrity: {NEIGHBOUR_COUNT}/{NEIGHBOUR_COUNT} concurrent neighbours \
+         produced nonzero, linkable, executable artifacts"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
