@@ -257,6 +257,112 @@ def test_no_mechanism_overlap_when_slugs_differ(tmp_path: Path) -> None:
     assert json.loads(out)["mechanism_overlap_edges"] == []
 
 
+# A PR declares no mechanism: label at all; the mechanism candidate arrives ONLY as a diff-derived
+# symbol, under a DIFFERENT SPELLING in each PR, in DIFFERENT files. The three-stage pipeline must
+# still cluster them into ONE bucket by NORMALISING to the same enum value — the collision that raw
+# per-string clustering (and every file-based dimension) misses.
+_MECHANISM_SYMBOLS_FIXTURE = (
+    "repo: OWNER/NAME\n"
+    "base: integration\n"
+    "prs:\n"
+    "  - number: 2001\n"
+    "    title: guard concurrency in the workflow\n"
+    "    head_ref: feat-workflow\n"
+    "    mechanism_symbols: [concurrency.cancel-in-progress]\n"
+    "    changed_files: [.github/workflows/ci-a.yml]\n"
+    "    checks:\n"
+    "      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}\n"
+    "  - number: 2002\n"
+    "    title: add a cancel env var to the runner\n"
+    "    head_ref: feat-runner\n"
+    "    mechanism_symbols: [CANCEL_IN_PROGRESS]\n"
+    "    changed_files: [rs/src/runner.rs]\n"
+    "    checks:\n"
+    "      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}\n"
+)
+
+
+def test_mechanism_overlap_clusters_different_spellings_in_different_files(tmp_path: Path) -> None:
+    # THE MONEY TEST for the enum redesign: no shared label, no shared file, and the two mechanism
+    # candidates are spelled differently (concurrency.cancel-in-progress vs CANCEL_IN_PROGRESS).
+    # CLASSIFY normalises both to Mechanism.CANCEL_IN_PROGRESS, so CLUSTER lands them in one edge.
+    fixture = tmp_path / "symbols.yaml"
+    fixture.write_text(_MECHANISM_SYMBOLS_FIXTURE)
+    rc, out, _ = _capture(["plan", "--fixture", str(fixture), "--format", "json"])
+    assert rc == 0
+    obj = json.loads(out)
+    assert obj["mechanism_overlap_edges"] == [
+        {"a": 2001, "b": 2002, "mechanisms": ["cancel-in-progress"]}
+    ]
+    # Different spellings normalised to the same enum: nothing was left UNCLASSIFIED here.
+    assert obj["unclassified_mechanism_candidates"] == []
+    # Invisible to git: the pair shares no file and does not conflict.
+    assert obj["conflict_edges"] == []
+    assert obj["file_overlap_edges"] == []
+
+
+def test_unclassified_mechanism_candidate_is_surfaced_loudly(tmp_path: Path) -> None:
+    # A derived symbol that maps to NO enum member must be surfaced (not silently dropped): it is the
+    # signal that the enum may need a new member. It must NOT create a mechanism edge.
+    fixture = tmp_path / "unclassified.yaml"
+    fixture.write_text(
+        _MECHANISM_SYMBOLS_FIXTURE.replace(
+            "mechanism_symbols: [CANCEL_IN_PROGRESS]",
+            "mechanism_symbols: [SOME_BRAND_NEW_FLAG]",
+        )
+    )
+    rc, out, _ = _capture(["plan", "--fixture", str(fixture), "--format", "json"])
+    assert rc == 0
+    obj = json.loads(out)
+    # #2001 still classifies; #2002's SOME_BRAND_NEW_FLAG does not -> no shared mechanism, no edge.
+    assert obj["mechanism_overlap_edges"] == []
+    assert {"pr": 2002, "candidates": ["SOME_BRAND_NEW_FLAG"]} in obj[
+        "unclassified_mechanism_candidates"
+    ]
+    # Loud in the actions view too.
+    rc, actions, _ = _capture(["plan", "--fixture", str(fixture), "--format", "actions"])
+    assert rc == 0
+    lines = actions.splitlines()
+    assert "unclassified_mechanisms=1" in lines
+    assert any(
+        line.startswith("NOTE: unclassified-mechanism pr=2002") for line in lines
+    )
+
+
+def test_classify_recognises_spellings_and_returns_none_for_unknown() -> None:
+    from pr_landing_planner.mechanism import Mechanism, classify
+
+    # Recognition across spellings for one mechanism.
+    assert classify("CANCEL_IN_PROGRESS") is Mechanism.CANCEL_IN_PROGRESS
+    assert classify("concurrency.cancel-in-progress") is Mechanism.CANCEL_IN_PROGRESS
+    assert classify("cancel_in_progress") is Mechanism.CANCEL_IN_PROGRESS
+    # Other seeded members via their aliases.
+    assert classify("CI_DAG_JOBS") is Mechanism.DAG_SCHEDULER_WIDTH
+    assert classify("merge-gate") is Mechanism.MERGE_GATE_REQUIRED_CHECKS
+    # UNCLASSIFIED is a valid, load-bearing output.
+    assert classify("SOME_BRAND_NEW_FLAG") is None
+    assert classify("") is None
+    # Boundary-aware: a bare token must not match a longer unrelated identifier it is a substring of.
+    assert classify("dag-jobsworth") is None
+
+
+def test_derive_symbols_from_diff_pulls_consts_and_yaml_keys() -> None:
+    from pr_landing_planner.mechanism import derive_symbols_from_diff
+
+    diff = (
+        "--- a/x\n"
+        "+++ b/x\n"
+        "+CANCEL_IN_PROGRESS = true\n"
+        "+  cancel-in-progress: true\n"
+        "+SOME_NEW_FLAG=1\n"
+        "-REMOVED_CONST = 0\n"
+        " CONTEXT_CONST = 2\n"
+    )
+    symbols = derive_symbols_from_diff(diff)
+    # Added lines only: SCREAMING_SNAKE consts + YAML-ish keys; removed/context lines ignored.
+    assert symbols == ("CANCEL_IN_PROGRESS", "SOME_NEW_FLAG", "cancel-in-progress")
+
+
 def test_status_view_and_threshold_warning() -> None:
     rc, out, _ = _capture(["status", "--fixture", DEMO, "--warn-threshold", "3"])
     assert rc == 0
