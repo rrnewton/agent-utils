@@ -267,6 +267,25 @@ pub fn derive_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> 
     jobs.max(1)
 }
 
+/// Use an explicit Cargo pool width when configured, otherwise derive a containment fallback.
+///
+/// A CPU quota is a resource ceiling, not a parallelism instruction.  The explicit value is the
+/// pool width against which the caller measured its memory cap, so it wins over the quota-derived
+/// fallback.  Invalid/non-positive values fall back to [`derive_build_jobs`]; callers should
+/// validate the configuration where they set it. Mirrors Python `select_build_jobs`.
+pub fn select_build_jobs(
+    configured: Option<&str>,
+    cpu_count: Option<i64>,
+    mem_max_bytes: Option<i64>,
+) -> i64 {
+    if let Some(jobs) = configured.and_then(|raw| raw.parse::<i64>().ok()) {
+        if jobs > 0 {
+            return jobs;
+        }
+    }
+    derive_build_jobs(cpu_count, mem_max_bytes)
+}
+
 /// Number of logical CPUs, matching Python's `os.cpu_count()` (online, affinity-independent).
 ///
 /// Read from `/sys/devices/system/cpu/online` (the same set `sysconf(_SC_NPROCESSORS_ONLN)`
@@ -523,5 +542,13 @@ mod tests {
         assert_eq!(jobs_footprint_bytes(&c, 1, None), 4 * GIB);
         assert_eq!(jobs_for_budget(&c, 6 * GIB), (1, 4 * GIB));
         assert_eq!(jobs_for_budget(&c, GIB).0, 1);
+    }
+
+    #[test]
+    fn explicit_pool_width_wins_over_284_core_quota() {
+        // MUTATION CONTROL: with ample memory, the old quota-derived rule returned 284.
+        // Configuring K=8 must return exactly 8 instead.
+        assert_eq!(select_build_jobs(Some("8"), Some(284), Some(512 * GIB)), 8);
+        assert_eq!(select_build_jobs(None, Some(284), Some(512 * GIB)), 284);
     }
 }

@@ -261,12 +261,15 @@ pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool 
         args.push("-p".into());
         args.push(format!("MemoryMax={m}"));
     }
-    // Scope-wide build-job default, derived from the granted cores + memory cap, so a command
-    // run directly in the scope (not via a per-step child) still can't compute NUM_JOBS=<all
-    // cores>. Per-step prepare_command refines it downward; this is the inherited floor.
+    // Preserve a caller-configured pool width through the systemd re-exec. Only derive a
+    // containment fallback from the resource envelope when no width was configured.
     args.push(format!(
         "--setenv=CARGO_BUILD_JOBS={}",
-        crate::sizing::derive_build_jobs(cpu_count, memory_max)
+        crate::sizing::select_build_jobs(
+            std::env::var("CARGO_BUILD_JOBS").ok().as_deref(),
+            cpu_count,
+            memory_max,
+        )
     ));
     args.push(format!("--setenv={ENV_IN_SCOPE}=1"));
     args.push(format!("--setenv={ENV_SCOPE_UNIT}={unit}.scope"));
@@ -503,12 +506,14 @@ impl CgroupManager for Cgroups {
         // NUM_JOBS=<all-granted-cores> (observed 284), OOM-racing the linker (hermit#1584
         // build.dbi_release, 8.0 GiB cap, oom_kill=2). Derive the cap here, where the quota is
         // granted, from the step's cores+mem if pinned else the SCOPE's effective
-        // cpu.max/memory.max. Only CARGO_BUILD_JOBS (never MAKEFLAGS): a global make -j could
-        // parallelize a determinism-sensitive target (cf. make -jN nondeterminism #1157). An
-        // explicit `cargo -j` in the step command still overrides this env floor.
+        // cpu.max/memory.max. A caller-configured width wins: the quota is a ceiling, not a
+        // parallelism instruction. Only CARGO_BUILD_JOBS (never MAKEFLAGS): a global make -j
+        // could parallelize a determinism-sensitive target (cf. make -jN nondeterminism #1157).
+        // An explicit `cargo -j` in the step command still overrides this env floor.
         let eff_cores = cpu_count.or_else(|| cpu_max_cores(read_trim(root, "cpu.max")));
         let eff_mem = mem_max.or_else(|| memory_max_bytes(read_trim(root, "memory.max")));
-        let jobs = crate::sizing::derive_build_jobs(eff_cores, eff_mem);
+        let configured = std::env::var("CARGO_BUILD_JOBS").ok();
+        let jobs = crate::sizing::select_build_jobs(configured.as_deref(), eff_cores, eff_mem);
         // $$ is the bash leader's pid; writing it migrates the leader so every subsequently
         // forked descendant inherits this cgroup at fork. Best-effort in the shell.
         let procs = child.join("cgroup.procs");

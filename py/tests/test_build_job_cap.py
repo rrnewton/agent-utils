@@ -17,6 +17,8 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 from safe_ci_dag_runner.cgroup import Cgroups
 
 GIB = 1024**3
@@ -38,7 +40,11 @@ def _cargo_jobs(cmd: str) -> int:
     return int(m.group(1))
 
 
-def test_unpinned_step_is_bounded_not_284(tmp_path: Path) -> None:
+def test_unpinned_step_is_bounded_not_284(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No explicit configuration: exercise the containment fallback.
+    monkeypatch.delenv("CARGO_BUILD_JOBS", raising=False)
     # Scope grants 284 cores (28400000/100000) and an 8 GiB aggregate cap.
     cg = _boxed(tmp_path, cpu_max="28400000 100000", memory_max=str(8 * GIB))
     # CAUGHT: unpinned step (no inner cpu/mem) — inherits scope caps -> j8, never 284.
@@ -47,7 +53,20 @@ def test_unpinned_step_is_bounded_not_284(tmp_path: Path) -> None:
     assert "cargo build --release" in wrapped
 
 
-def test_legitimate_configs_pass_unharmed(tmp_path: Path) -> None:
+def test_explicit_pool_width_wins_over_284_core_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # MUTATION CONTROL: with ample memory, the old quota-derived rule produced 284.  Setting
+    # the configured pool to K=8 must make the wrapped command export exactly 8 instead.
+    monkeypatch.setenv("CARGO_BUILD_JOBS", "8")
+    cg = _boxed(tmp_path, cpu_max="28400000 100000", memory_max=str(512 * GIB))
+    assert _cargo_jobs(cg.prepare_command("build.dbi_release", "cargo build")) == 8
+
+
+def test_legitimate_configs_pass_unharmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CARGO_BUILD_JOBS", raising=False)
     cg = _boxed(tmp_path, cpu_max="28400000 100000", memory_max=str(64 * GIB))
     # LEGITIMATE N=3:
     # (1) a pinned small step keeps its own width (cpu-bound 4, roomy 64 GiB scope).
@@ -59,10 +78,12 @@ def test_legitimate_configs_pass_unharmed(tmp_path: Path) -> None:
     assert "cargo build -j2" in w3 and _cargo_jobs(w3) == 16
 
 
-def test_cap_does_not_leak_into_runner_env(tmp_path: Path) -> None:
+def test_cap_does_not_leak_into_runner_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # CLEANUP: prepare_command emits the export INTO the step's shell string only; it must
     # not mutate the runner process env (that would cross-contaminate sibling steps).
-    os.environ.pop("CARGO_BUILD_JOBS", None)
+    monkeypatch.delenv("CARGO_BUILD_JOBS", raising=False)
     cg = _boxed(tmp_path, cpu_max="28400000 100000", memory_max=str(8 * GIB))
     cg.prepare_command("s", "cargo build", cpu_count=4, mem_max=4 * GIB)
     assert "CARGO_BUILD_JOBS" not in os.environ

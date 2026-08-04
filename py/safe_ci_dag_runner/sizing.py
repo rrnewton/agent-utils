@@ -167,6 +167,27 @@ def derive_build_jobs(cpu_count: int | None, mem_max_bytes: int | None) -> int:
     return max(1, int(jobs))
 
 
+def select_build_jobs(
+    configured: str | None, cpu_count: int | None, mem_max_bytes: int | None
+) -> int:
+    """Use an explicit Cargo job count when configured, else derive a containment fallback.
+
+    The CPU quota is a resource ceiling, not a parallelism instruction.  A caller that sets
+    ``CARGO_BUILD_JOBS=K`` has chosen the pool width against which its memory cap was measured,
+    so that value must win over the host- or quota-derived fallback.  Invalid values fall back
+    to :func:`derive_build_jobs`; Cargo requires a positive integer and callers should validate
+    their configuration at the boundary where they set it.
+    """
+    if configured is not None:
+        try:
+            jobs = int(configured)
+        except ValueError:
+            jobs = 0
+        if jobs > 0:
+            return jobs
+    return derive_build_jobs(cpu_count, mem_max_bytes)
+
+
 _SIZE_RE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*([KkMmGgTt]?)([Bb]?)\s*")
 _SIZE_MULT = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
 
