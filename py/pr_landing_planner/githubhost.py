@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import shlex
 import subprocess
+import sys
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 
 from pr_landing_planner.classify import parse_rollup
-from pr_landing_planner.model import RawPr
+from pr_landing_planner.model import CheckRun, RawPr
 
 GH_FIELDS: tuple[str, ...] = (
     "number",
@@ -35,6 +37,17 @@ GH_FIELDS: tuple[str, ...] = (
     "labels",
     "statusCheckRollup",
 )
+
+#: The heavy ``statusCheckRollup`` field makes a single ``gh pr list`` over a large open set 504 at
+#: the GraphQL layer (measured: fails at 60 PRs on rrnewton/hermit). So the light metadata is fetched
+#: in one cheap list call (:data:`LIGHT_FIELDS`) and the rollup is enriched per PR, in parallel,
+#: below. Each per-PR ``gh pr view`` is small and reliable; a rollup that still fails degrades that one
+#: PR to "no checks" (classified pending) with a LOUD stderr NOTE rather than aborting the whole plan.
+LIGHT_FIELDS: tuple[str, ...] = tuple(f for f in GH_FIELDS if f != "statusCheckRollup")
+
+#: Concurrency for the per-PR rollup enrichment. Bounded so we never fan out hundreds of ``gh``
+#: processes; the work is network-bound so a small pool already hides most latency.
+_ROLLUP_WORKERS = 8
 
 
 class HostCommandError(RuntimeError):
@@ -112,6 +125,7 @@ class GitHubHost:
         return [*self._wrapper, *cmd]
 
     def list_open_prs(self, repo: str, base: str | None) -> tuple[RawPr, ...]:
+        # One cheap list for the light metadata (no rollup -> no GraphQL 504 on a large open set)...
         proc = _run(
             self._net(
                 [
@@ -119,7 +133,7 @@ class GitHubHost:
                     "--repo", repo,
                     "--state", "open",
                     "--limit", "500",
-                    "--json", ",".join(GH_FIELDS),
+                    "--json", ",".join(LIGHT_FIELDS),
                 ]
             ),
             cwd=None,
@@ -127,14 +141,18 @@ class GitHubHost:
         raw: object = json.loads(proc.stdout) if proc.stdout.strip() else []
         if not isinstance(raw, list):
             raise HostCommandError(["gh", "pr", "list"], 0, "expected a JSON array from gh")
+        entries: list[dict[str, object]] = [
+            {str(k): v for k, v in entry.items()} for entry in raw if isinstance(entry, dict)
+        ]
+        # ...then enrich each PR's rollup with a small per-PR ``gh pr view``, in parallel.
+        numbers = [_int(obj, "number") for obj in entries]
+        rollups = self._fetch_rollups(repo, numbers)
         prs: list[RawPr] = []
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            obj: dict[str, object] = {str(k): v for k, v in entry.items()}
+        for obj in entries:
+            number = _int(obj, "number")
             prs.append(
                 RawPr(
-                    number=_int(obj, "number"),
+                    number=number,
                     head_ref=_str(obj, "headRefName"),
                     base_ref=_str(obj, "baseRefName"),
                     api_head_sha=_str(obj, "headRefOid"),
@@ -148,10 +166,57 @@ class GitHubHost:
                     additions=_int(obj, "additions"),
                     deletions=_int(obj, "deletions"),
                     labels=_labels(obj.get("labels")),
-                    checks=parse_rollup(obj.get("statusCheckRollup")),
+                    checks=rollups.get(number, ()),
                 )
             )
         return tuple(prs)
+
+    def _fetch_rollups(
+        self, repo: str, numbers: Sequence[int]
+    ) -> Mapping[int, tuple[CheckRun, ...]]:
+        """Fetch each PR's ``statusCheckRollup`` with a small per-PR ``gh pr view``, in parallel.
+
+        A single per-PR failure degrades that PR to no checks (classified pending) with a LOUD stderr
+        NOTE — No Silent Failure — instead of aborting the whole plan. The returned mapping is by PR
+        number, so the caller's order is unaffected by completion order (result stays deterministic).
+        """
+        rollups: dict[int, tuple[CheckRun, ...]] = {}
+        failed: list[int] = []
+
+        def one(number: int) -> tuple[int, tuple[CheckRun, ...] | None]:
+            try:
+                proc = _run(
+                    self._net(
+                        [
+                            self._gh, "pr", "view", str(number),
+                            "--repo", repo,
+                            "--json", "number,statusCheckRollup",
+                        ]
+                    ),
+                    cwd=None,
+                )
+            except HostCommandError:
+                return number, None
+            obj = json.loads(proc.stdout) if proc.stdout.strip() else {}
+            if not isinstance(obj, dict):
+                return number, None
+            return number, parse_rollup(obj.get("statusCheckRollup"))
+
+        if numbers:
+            with ThreadPoolExecutor(max_workers=_ROLLUP_WORKERS) as pool:
+                for number, checks in pool.map(one, numbers):
+                    if checks is None:
+                        failed.append(number)
+                    else:
+                        rollups[number] = checks
+        if failed:
+            listed = ",".join(f"#{n}" for n in sorted(failed))
+            print(
+                f"pr-landing-planner: NOTE: rollup fetch failed for {len(failed)} PR(s) "
+                f"({listed}); treating them as pending (no checks)",
+                file=sys.stderr,
+            )
+        return rollups
 
     def fetch_ref(self, source: str, dest: str) -> str:
         _run(
@@ -206,4 +271,4 @@ class GitHubHost:
             return 0
 
 
-__all__ = ["GitHubHost", "HostCommandError", "GH_FIELDS"]
+__all__ = ["GitHubHost", "HostCommandError", "GH_FIELDS", "LIGHT_FIELDS"]
