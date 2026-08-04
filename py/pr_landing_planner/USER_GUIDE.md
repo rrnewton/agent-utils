@@ -2,10 +2,10 @@
 
 `pr-landing-planner` is a **conflict-graph + CI-aware, advisory pull-request landing planner**. Given
 the open pull requests targeting a base branch, it computes — in one shot — which PRs truly conflict,
-which red CI results are real versus benign, how stale each green PR is, which PRs are held, and a
-recommended per-PR action, ordered by priority. It is **advisory only**: it recommends actions; it
-never arms a merge queue, re-fires a gate, or merges anything itself. A landing skill or coordinator
-executes the mutations.
+which red CI results are real versus benign, exact-head validation evidence, gate-policy disposition,
+assigned agents, mechanism overlaps, freshness, holds, and an ordered action per PR. It is
+**advisory only**: it recommends actions and never mutates a pull request. A landing skill or
+coordinator executes the mutations.
 
 It generalizes three predecessor scripts into one host-pluggable tool: DeepScry's `pr_interference.py`
 (the conflict/ordering-graph → batch mechanic), hermit's `pr_conflict_graph.py` (real `git merge-tree`
@@ -43,9 +43,10 @@ Run against a real repository:
 
 ```sh
 pr-landing-planner plan \
-  --repo OWNER/NAME --base integration --git-dir /path/to/clone \
+  --repo OWNER/NAME --base main --git-dir /path/to/clone \
   --net-wrapper with-proxy --gh-cmd ./scripts/gh_human \
-  --flaky-signatures flaky-signatures.yaml
+  --flaky-signatures flaky-signatures.yaml \
+  --landing-context landing-context.json
 ```
 
 `gh pr list` supplies the PRs (with the CI rollup + labels); `git merge-tree` finds the real
@@ -81,13 +82,29 @@ conflicts against a local clone.
 4. **Build ordering edges** from explicit base-branch stacking and from git ancestry (so that when
    you rebase PR B onto PR A's tip, the next run detects the new ancestry and the pair becomes a
    satisfied ordering constraint). Ordering edges are transitively reduced; stacks are extracted.
-5. **Classify each PR's CI** (see below) and compute **freshness** (commits behind base).
+5. **Classify each PR's CI** (see below), apply exact-head caller context, and compute **freshness**.
 6. **Compute held reasons**: `draft`, `local-base-conflict` (a real merge-tree conflict with the
    base), `github-base-conflicting`, and `depends-on-held:#N` (propagated transitively).
 7. **Partition** the non-held PRs into **parallel-safe groups**: a greedy independent-set layering
    over the conflict graph that respects ordering edges. PRs in a group are safe to land / review in
    parallel.
-8. **Assign each PR an action** via the fusion table, ordered priority → diff size → age → PR number.
+8. **Surface mechanism overlaps** from shared `mechanism:<slug>` labels. They request coordinator
+   review but do not prove conflicting intent.
+9. **Assign each PR an action** via the fusion table, ordered priority → diff size → age → PR number.
+
+### Landing context
+
+GitHub does not know a caller's local validation ledger, task assignment, or policy classification.
+Pass those facts in a JSON or YAML file. Clean validation evidence is accepted only when guarded by
+the exact current head SHA:
+
+```json
+{"prs":[{"pr":123,"head_sha":"<40-hex>","validation_evidence":"clean-validate-record","policy_class":"ci-hygiene","assigned_agent":"agent-name"}]}
+```
+
+`validation_evidence` is `clean-validate-record`, `locally-validated`, `authoritative-ci`, or `none`.
+`policy_class` is `ci-hygiene`, `gate-policy`, or `unclassified`. Labels can also provide
+`locally-validated`, `agent:<name>`, `landing-policy:<class>`, and `mechanism:<slug>`.
 
 ---
 
@@ -133,10 +150,11 @@ Keep this file curated and owned — a stale signature silently masks a real reg
 
 | Action | When |
 |--------|------|
-| `land-now` | green, fresh, gate ok |
+| `land-now` | authoritative CI is green, or exact-head local evidence is present; fresh enough to land |
 | `rebase-then-land` | green but more than `--freshness-max-behind` commits behind base, OR held on a base conflict |
 | `refire-stale-gate` | CI green on head; the required gate is stale |
 | `escalate-runner-outage` | the gate job never ran |
+| `escalate-gate-policy` | the PR changes landing/gate policy; validation is not policy approval |
 | `refire-ci` | a flaky red |
 | `hold-fix` | a real red |
 | `wait` | pending, no checks, an evaluate-once race, a draft, or depends-on-held |
@@ -160,9 +178,11 @@ break by diff size, then age, then PR number):
 
 - `human` (default) — a readable landing summary.
 - `json` — the full machine schema, deterministic (2-space indent, sorted keys). Schema top level:
-  `repository`, `base`, `nodes[]`, `conflict_edges[]`, `file_overlap_edges[]`, `ordering_edges[]`,
+  `repository`, `base`, `nodes[]`, `conflict_edges[]`, `file_overlap_edges[]`,
+  `mechanism_overlap_edges[]`, `ordering_edges[]`,
   `stacks[]`, `held_prs[]`, `plan{parallel_safe_groups, land_now, order, batch, per_pr_actions[]}`,
   `diagnostics{stale_gates, flaky_reds, real_reds, evaluate_once_race, outage_prs, outage_suspected}`.
+  Each node includes `assigned_agent`, `validation_evidence`, `policy_class`, and `mechanisms`.
 - `actions` — tick-hub-style line output: a block of bare `key=value` summary counts (so a tick-hub
   reminder's `capture: true` gate can lift `land_now` / `stale_gates` / `outage` into its emitted
   line), then loud diagnostic `ERROR:` / `NOTE:` lines, then one `ACTION:` / `ERROR:` / `NOTE:` line

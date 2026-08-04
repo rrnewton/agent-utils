@@ -64,9 +64,27 @@ class PrAction(Enum):
     REBASE_THEN_LAND = "rebase-then-land"
     REFIRE_STALE_GATE = "refire-stale-gate"
     ESCALATE_RUNNER_OUTAGE = "escalate-runner-outage"
+    ESCALATE_GATE_POLICY = "escalate-gate-policy"
     REFIRE_CI = "refire-ci"
     HOLD_FIX = "hold-fix"
     WAIT = "wait"
+
+
+class ValidationEvidence(Enum):
+    """Evidence that can satisfy a caller's landing precondition at this exact PR head."""
+
+    NONE = "none"
+    AUTHORITATIVE_CI = "authoritative-ci"
+    LOCALLY_VALIDATED = "locally-validated"
+    CLEAN_VALIDATE_RECORD = "clean-validate-record"
+
+
+class PolicyClass(Enum):
+    """Whether a change is routine CI hygiene or changes the gate policy itself."""
+
+    UNCLASSIFIED = "unclassified"
+    CI_HYGIENE = "ci-hygiene"
+    GATE_POLICY = "gate-policy"
 
 
 @dataclass(frozen=True)
@@ -162,6 +180,9 @@ class PrNode:
         default_factory=lambda: CiVerdict(CiState.NONE, None, False, False, False, "")
     )
     priority: int = 0
+    assigned_agent: str = ""
+    validation_evidence: ValidationEvidence = ValidationEvidence.NONE
+    policy_class: PolicyClass = PolicyClass.UNCLASSIFIED
 
     @property
     def size(self) -> int:

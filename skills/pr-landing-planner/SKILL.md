@@ -1,24 +1,37 @@
 ---
 name: pr-landing-planner
-description: Conflict-graph + CI-aware, advisory pull-request landing planner. Given the open PRs targeting a base branch, it computes which truly conflict, classifies each red CI (real / flaky / stale-required-check / evaluate-once-race / runner-outage), computes freshness + hold reasons, partitions into parallel-safe groups, and recommends a per-PR action (land-now / rebase-then-land / refire-stale-gate / escalate-runner-outage / refire-ci / hold-fix / wait). Use when planning a landing wave over many open PRs, triaging which reds are real vs. benign, or wiring a tick reminder that surfaces ready-to-land PRs. Advisory only — it never merges or refires anything.
+description: Advisory PR landing planner that combines real merge conflicts, exact-head validation evidence, policy disposition, assigned agents, mechanism overlaps, freshness, and CI diagnosis. Use it before choosing or assigning a landing batch; it never mutates a PR.
 ---
 
-# pr-landing-planner
+# PR landing planner
 
-Fuses the PR conflict graph with LIVE CI health, freshness, and priority into one advisory landing
-plan. The headline value is classifying WHY a PR is red — into real, flaky, stale-required-check,
-evaluate-once-race, or runner-outage — so a lander does not treat benign gate noise as a failure. It
-recommends per-PR actions and parallel-safe groups; it never arms, refires, or merges anything.
+Use the planner to produce the shared, machine-readable landing plan. Do not rebuild its conflict
+map or readiness table by hand.
 
-The CLI is the source of truth for usage — do not rely on this file for details. Run:
+## Current contract
 
-- `pr-landing-planner quickstart` — self-contained getting-started tour (add `--emit-demo` for a demo fixture).
-- `pr-landing-planner --help` — commands and flags.
-- `pr-landing-planner --userguide` — the full user guide (complete reference).
+1. Collect open PRs and real pairwise conflicts with `git merge-tree` (the default detector).
+2. Supply caller-owned facts with `--landing-context FILE`: exact-head clean validation evidence,
+   `ci-hygiene` versus `gate-policy`, and the assigned agent. A `clean-validate-record` entry without
+   an exact `head_sha`, or one whose SHA drifted, fails loudly.
+3. Treat either the `locally-validated` label or an exact-head `clean-validate-record` as sufficient
+   validation evidence. Those signals do not wait for, or refire, a stale merge gate.
+4. Escalate `gate-policy` changes even when validation evidence is green. Validation proves the code
+   passed; it does not approve a change to landing policy. Routine `ci-hygiene` remains autonomous.
+5. Surface every shared `mechanism:<slug>` label as a `mechanism_overlap_edge`. This requests
+   coordinator review; it does not claim the two PRs have opposing intent.
+6. Use `assigned_agent`, the ordered decisions, and the conflict-safe groups to dispatch the batch.
 
-Canonical commands:
+The planner is advisory. The caller's landing executor still owns serialization, fresh-base checks,
+the merge mode, and ancestry verification.
 
-- `pr-landing-planner plan --repo OWNER/NAME --base integration --net-wrapper with-proxy --gh-cmd ./scripts/gh_human` — the full plan.
-- `pr-landing-planner plan --fixture demo.yaml` — a plan from a fixture (no network).
-- `pr-landing-planner plan --format actions ...` — tick-hub-integrable line output (Option B).
-- `pr-landing-planner graph` / `status` — just the conflict graph / just per-PR CI health.
+## Commands
+
+- `pr-landing-planner plan --repo OWNER/NAME --base BASE --git-dir /path/to/clone --net-wrapper with-proxy --landing-context context.json --format json`
+- `pr-landing-planner plan --fixture demo.yaml --landing-context context.json`
+- `pr-landing-planner graph` / `status` for the narrower views.
+- `pr-landing-planner quickstart` and `--userguide` for the complete CLI reference.
+
+The JSON schema exposes `assigned_agent`, `validation_evidence`, and `policy_class` on each node,
+plus top-level `mechanism_overlap_edges`. Never infer those fields from prose after the plan has
+been emitted.

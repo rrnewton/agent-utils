@@ -29,6 +29,10 @@ from pr_landing_planner.graph import (
     dedupe_ordering,
 )
 from pr_landing_planner.host import VcsHost
+from pr_landing_planner.landing_context import (
+    LandingContext,
+    apply_landing_context,
+)
 from pr_landing_planner.model import (
     CollectedGraph,
     ConflictEdge,
@@ -111,6 +115,7 @@ def collect_graph(
     conflict_detector: str = CONFLICT_DETECTOR_MERGE_TREE,
     classify_config: ClassifyConfig | None = None,
     priority_provider: PriorityProvider | None = None,
+    landing_context: Sequence[LandingContext] = (),
 ) -> CollectedGraph:
     """Collect a full :class:`CollectedGraph` from ``host``. Raises :class:`CollectionError` on drift."""
     if conflict_detector not in (CONFLICT_DETECTOR_MERGE_TREE, CONFLICT_DETECTOR_FILE_OVERLAP):
@@ -167,19 +172,23 @@ def collect_graph(
             )
         )
 
-    conflict_edges = _build_conflict_edges(host, nodes, conflict_detector)
-    overlap_edges = build_overlap_edges(nodes)
+    enriched_nodes = apply_landing_context(nodes, landing_context)
+    conflict_edges = _build_conflict_edges(host, enriched_nodes, conflict_detector)
+    overlap_edges = build_overlap_edges(enriched_nodes)
     ordering_edges = dedupe_ordering(
-        (*build_ordering_edges_base_ref(nodes), *_build_ancestry_edges(host, nodes))
+        (
+            *build_ordering_edges_base_ref(enriched_nodes),
+            *_build_ancestry_edges(host, enriched_nodes),
+        )
     )
     return CollectedGraph(
         repository=repo,
         base=base,
-        nodes=tuple(nodes),
+        nodes=enriched_nodes,
         conflict_edges=conflict_edges,
         overlap_edges=overlap_edges,
         ordering_edges=ordering_edges,
-        mechanism_edges=build_mechanism_edges(nodes),
+        mechanism_edges=build_mechanism_edges(enriched_nodes),
     )
 
 

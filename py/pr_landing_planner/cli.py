@@ -44,6 +44,7 @@ from pr_landing_planner.emit import (
 from pr_landing_planner.fakehost import FakeHost, FixtureError, load_fixture_text
 from pr_landing_planner.githubhost import GitHubHost, HostCommandError
 from pr_landing_planner.host import VcsHost
+from pr_landing_planner.landing_context import parse_landing_context
 from pr_landing_planner.model import DEFAULT_BASE, DEFAULT_GATE_CHECK, DEFAULT_REPO, PlanResult
 from pr_landing_planner.plan import assemble_result
 from pr_landing_planner.priority import (
@@ -109,8 +110,8 @@ def _banner(c: Palette) -> str:
         f"{c.bold(PROG)} {c.dim('v' + __version__)}\n"
         "A conflict-graph + CI-aware, ADVISORY pull-request landing planner. It builds the real\n"
         "merge-conflict graph over the open PRs, classifies each red CI into one of five failure\n"
-        "modes, computes freshness + hold reasons, partitions into parallel-safe groups, and\n"
-        "recommends a per-PR action. It NEVER arms, refires, or merges anything itself."
+        "modes, exact-head validation evidence, policy disposition, freshness + hold reasons, and\n"
+        "mechanism overlaps, then recommends a per-PR action. It NEVER mutates a PR."
     )
 
 
@@ -140,7 +141,9 @@ def _quickstart(c: Palette) -> str:
     * which reds are REAL vs. benign (flaky / stale gate / evaluate-once race / runner outage),
     * how stale each green PR is (commits behind the base),
     * which PRs are held (draft / base-conflict / depends-on-held), and
-    * a recommended per-PR ACTION, ordered priority -> size -> age.
+    * exact-head local validation + CI evidence and gate-policy disposition,
+    * shared mechanism tags that require coordinator review, and
+    * a recommended per-PR ACTION with an assigned agent, ordered priority -> size -> age.
   It is ADVISORY: it recommends; a landing skill / coordinator executes the mutations.
 
 {h('1. Install')}
@@ -158,13 +161,13 @@ def _quickstart(c: Palette) -> str:
 {h('The five red classifications')}  {c.dim('(the headline value)')}
   real                   a genuine regression        -> hold-fix
   flaky                  matches --flaky-signatures   -> refire-ci
-  stale-required-check   CI green, gate frozen        -> refire-stale-gate
+  stale-required-check   CI green, gate frozen        -> refire-stale-gate (unless local evidence)
   evaluate-once-race     gate fired while CI queued   -> wait (benign)
   runner-outage          gate job never ran           -> escalate-runner-outage
 
 {h('Per-PR actions')}
   land-now | rebase-then-land | refire-stale-gate | escalate-runner-outage |
-  refire-ci | hold-fix | wait
+  escalate-gate-policy | refire-ci | hold-fix | wait
 
 {h('Output formats')}  {c.dim('--format {{human,json,actions}}')}
   human    a readable landing summary (default)
@@ -181,6 +184,7 @@ def _quickstart(c: Palette) -> str:
   --batch                                         also propose one green-only conflict-free batch
   --archive-dir DIR / --no-archive                archive the plan JSON to disk (on by default for
                                                   live runs; path printed as a NOTE on stderr)
+  --landing-context FILE                          exact-head evidence / policy / assigned agent
 
 {h('tick-hub integration (Option B; zero tick-hub change)')}
   Wire a tick-hub reminder whose gate runs {k(f'{PROG} plan --format actions ...')} with
@@ -310,6 +314,12 @@ def _build_host(ns: argparse.Namespace) -> tuple[VcsHost, str, str]:
 
 def _build_result(ns: argparse.Namespace) -> PlanResult:
     host, repo, base = _build_host(ns)
+    context_arg = getattr(ns, "landing_context", None)
+    landing_context = (
+        parse_landing_context(_load_doc(context_arg))
+        if isinstance(context_arg, str) and context_arg
+        else ()
+    )
     graph = collect_graph(
         host,
         repo=repo,
@@ -318,6 +328,7 @@ def _build_result(ns: argparse.Namespace) -> PlanResult:
         conflict_detector=ns.conflict_detector,
         classify_config=_classify_config(ns),
         priority_provider=_priority_provider(ns),
+        landing_context=landing_context,
     )
     freshness = getattr(ns, "freshness_max_behind", 0)
     batch = bool(getattr(ns, "batch", False))
@@ -341,6 +352,14 @@ def _add_collect_flags(sp: argparse.ArgumentParser) -> None:
     sp.add_argument("--prs", default=None, help="comma-separated PR numbers to restrict to")
     sp.add_argument("--git-dir", default=".", help="path to a local clone of --repo")
     sp.add_argument("--remote", default="origin", help="git remote to fetch from")
+    sp.add_argument(
+        "--landing-context",
+        default=None,
+        metavar="FILE",
+        help=(
+            "JSON/YAML exact-head context for validation evidence, policy class, and assigned agent"
+        ),
+    )
     sp.add_argument(
         "--net-wrapper",
         default="",

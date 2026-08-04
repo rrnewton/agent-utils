@@ -55,6 +55,9 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "held": held,
         "priority": node.priority,
         "labels": list(node.labels),
+        "assigned_agent": node.assigned_agent or None,
+        "validation_evidence": node.validation_evidence.value,
+        "policy_class": node.policy_class.value,
     }
 
 
@@ -118,6 +121,7 @@ _ACTION_LINE_KIND: Mapping[PrAction, str] = {
     PrAction.REFIRE_CI: "ACTION",
     PrAction.HOLD_FIX: "ACTION",
     PrAction.ESCALATE_RUNNER_OUTAGE: "ERROR",
+    PrAction.ESCALATE_GATE_POLICY: "ERROR",
     PrAction.WAIT: "NOTE",
 }
 
@@ -135,6 +139,7 @@ def _summary_counts(result: PlanResult) -> list[tuple[str, int]]:
         ("refire_ci", counts[PrAction.REFIRE_CI]),
         ("hold_fix", counts[PrAction.HOLD_FIX]),
         ("escalate_outage", counts[PrAction.ESCALATE_RUNNER_OUTAGE]),
+        ("escalate_gate_policy", counts[PrAction.ESCALATE_GATE_POLICY]),
         ("wait", counts[PrAction.WAIT]),
         ("held", len(result.held)),
         ("stale_gates", len(diag.stale_gates)),

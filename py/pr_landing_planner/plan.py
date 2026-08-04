@@ -9,6 +9,8 @@ Per-PR action assignment (the fusion table):
 
 * held (base-conflict)          -> ``rebase-then-land``
 * held (draft / depends-on-held)-> ``wait``
+* gate-policy change            -> ``escalate-gate-policy``
+* exact-head local evidence     -> ``land-now`` (or rebase first), without a merge-gate wait
 * CI runner-outage              -> ``escalate-runner-outage``
 * CI evaluate-once race         -> ``wait`` (benign; treat as pending)
 * CI stale required check       -> ``refire-stale-gate``
@@ -39,7 +41,9 @@ from pr_landing_planner.model import (
     PrAction,
     PrActionDecision,
     PrNode,
+    PolicyClass,
     RedClass,
+    ValidationEvidence,
 )
 
 DEFAULT_FRESHNESS_MAX_BEHIND = 0
@@ -58,6 +62,25 @@ def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
 def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
     ci = node.ci
     red = ci.red_class
+    if node.policy_class is PolicyClass.GATE_POLICY:
+        return (
+            PrAction.ESCALATE_GATE_POLICY,
+            "gate-policy change requires coordinator decision; validation evidence is not approval",
+        )
+    if node.validation_evidence in (
+        ValidationEvidence.LOCALLY_VALIDATED,
+        ValidationEvidence.CLEAN_VALIDATE_RECORD,
+    ):
+        if node.commits_behind > freshness_max_behind:
+            return (
+                PrAction.REBASE_THEN_LAND,
+                f"{node.validation_evidence.value} at exact head; "
+                f"rebase {node.commits_behind} commit(s) then land without waiting for merge-gate",
+            )
+        return (
+            PrAction.LAND_NOW,
+            f"{node.validation_evidence.value} at exact head; no merge-gate wait",
+        )
     if red is RedClass.RUNNER_OUTAGE:
         return PrAction.ESCALATE_RUNNER_OUTAGE, ci.detail
     if red is RedClass.EVALUATE_ONCE_RACE:
@@ -78,7 +101,7 @@ def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
             PrAction.REBASE_THEN_LAND,
             f"green but {node.commits_behind} commit(s) behind base",
         )
-    return PrAction.LAND_NOW, "green, fresh, gate ok"
+    return PrAction.LAND_NOW, "authoritative CI green, fresh, gate ok"
 
 
 def _greedy_conflict_free(

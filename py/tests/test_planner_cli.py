@@ -123,6 +123,45 @@ def test_plan_no_archive_and_fixture_default_leave_no_files(tmp_path: Path) -> N
     assert "NOTE: plan archived to" not in err2
 
 
+def test_plan_context_exact_head_bypasses_stale_gate(tmp_path: Path) -> None:
+    context = tmp_path / "landing-context.json"
+    context.write_text(
+        json.dumps(
+            {
+                "prs": [
+                    {
+                        "pr": 942,
+                        "head_sha": "sha-942",
+                        "validation_evidence": "clean-validate-record",
+                        "policy_class": "ci-hygiene",
+                        "assigned_agent": "agent-a",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc, out, err = _capture(
+        [
+            "plan",
+            "--fixture",
+            DEMO,
+            "--landing-context",
+            str(context),
+            "--format",
+            "json",
+        ]
+    )
+    assert rc == 0, err
+    obj = json.loads(out)
+    node = next(item for item in obj["nodes"] if item["pr"] == 942)
+    decision = next(item for item in obj["plan"]["per_pr_actions"] if item["pr"] == 942)
+    assert node["assigned_agent"] == "agent-a"
+    assert node["validation_evidence"] == "clean-validate-record"
+    assert decision["action"] == "land-now"
+    assert "no merge-gate wait" in decision["why"]
+
+
 def test_plan_actions_has_capturable_summary_and_loud_lines() -> None:
     rc, out, _ = _capture(["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY, "--format", "actions"])
     assert rc == 0

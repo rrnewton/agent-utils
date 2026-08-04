@@ -2,10 +2,10 @@
 
 Collect the open pull requests targeting a base branch, build the real merge-conflict graph (via
 ``git merge-tree``, with a file-overlap fallback), classify each red CI into one of five failure
-modes (real / flaky / stale-required-check / evaluate-once-race / runner-outage), compute freshness
-and hold reasons, partition into parallel-safe groups, and assign each PR a recommended action
-(land-now / rebase-then-land / refire-stale-gate / escalate-runner-outage / refire-ci / hold-fix /
-wait). It is ADVISORY ONLY — it recommends actions; it never arms, refires, or merges anything.
+modes (real / flaky / stale-required-check / evaluate-once-race / runner-outage), apply exact-head
+validation evidence and policy disposition, surface mechanism overlaps, compute freshness and holds,
+partition into parallel-safe groups, and assign each PR a recommended action. It is ADVISORY ONLY —
+it recommends actions and never mutates a pull request.
 
 The pure core (:mod:`pr_landing_planner.graph` / ``classify`` / ``plan`` / ``emit``) operates on
 already-collected data and is unit-testable with :class:`pr_landing_planner.fakehost.FakeHost`; the
@@ -56,6 +56,7 @@ from pr_landing_planner.model import (
     ConflictEdge,
     Diagnostics,
     HeldPr,
+    MechanismEdge,
     OrderingEdge,
     OverlapEdge,
     Plan,
@@ -63,8 +64,10 @@ from pr_landing_planner.model import (
     PrAction,
     PrActionDecision,
     PrNode,
+    PolicyClass,
     RawPr,
     RedClass,
+    ValidationEvidence,
 )
 from pr_landing_planner.plan import assemble_result, compute_plan
 from pr_landing_planner.priority import (
@@ -86,6 +89,7 @@ __all__ = [
     "ConflictEdge",
     "Diagnostics",
     "HeldPr",
+    "MechanismEdge",
     "OrderingEdge",
     "OverlapEdge",
     "Plan",
@@ -93,8 +97,10 @@ __all__ = [
     "PrAction",
     "PrActionDecision",
     "PrNode",
+    "PolicyClass",
     "RawPr",
     "RedClass",
+    "ValidationEvidence",
     # classify
     "ClassifyConfig",
     "FlakySignature",
