@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 import tempfile
 from types import ModuleType
-from typing import Callable, Sequence, cast
+from typing import Callable, Protocol, Sequence, cast
 from urllib.request import urlopen
 
 
@@ -64,9 +64,15 @@ def _load_authority() -> ModuleType:
         return module
 
 
+class _SelectLatestChecks(Protocol):
+    # The authority is loaded dynamically, so its return shape is not statically
+    # guaranteed: elements are `object`, forcing every consumer to narrow defensively.
+    def __call__(self, value: object, *, head_sha: str = ...) -> list[object]: ...
+
+
 AUTHORITY = _load_authority()
 _classify = cast(Callable[[object, object], object], AUTHORITY.classify_check)
-_select_latest = cast(Callable[..., list[dict[str, object]]], AUTHORITY.select_latest_checks)
+_select_latest = cast(_SelectLatestChecks, AUTHORITY.select_latest_checks)
 FAIL_CONCLUSIONS = cast(frozenset[str], AUTHORITY.FAIL_CONCLUSIONS)
 
 
@@ -79,8 +85,12 @@ def classify_check(status: object, conclusion: object) -> str:
     return cast(str, value)
 
 
-def select_latest_checks(value: object, *, head_sha: str = "") -> list[dict[str, object]]:
-    """Delegate exact-head/latest-context selection to the pinned authority."""
+def select_latest_checks(value: object, *, head_sha: str = "") -> list[object]:
+    """Delegate exact-head/latest-context selection to the pinned authority.
+
+    Elements are typed `object` (not `dict`): the authority is loaded dynamically, so no
+    element shape is statically guaranteed and callers must narrow defensively.
+    """
     return _select_latest(value, head_sha=head_sha)
 
 
