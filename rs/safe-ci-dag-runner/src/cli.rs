@@ -30,7 +30,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::cgroup::{install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups};
+use crate::cgroup::{
+    apply_core_box, install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups,
+};
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
     plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
@@ -309,6 +311,7 @@ impl From<DagJsonError> for LoadError {
 struct RunArgs {
     dag: Option<String>,
     jobs: Option<i64>,
+    cores: Option<i64>,
     max_mem: Option<String>,
     only: Option<String>,
     perf_dir: Option<String>,
@@ -329,6 +332,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
     let mut a = RunArgs {
         dag: None,
         jobs: None,
+        cores: None,
         max_mem: None,
         only: None,
         perf_dir: None,
@@ -369,6 +373,13 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                 a.jobs = Some(
                     v.parse::<i64>()
                         .map_err(|_| format!("--jobs: invalid int value: '{v}'"))?,
+                );
+            }
+            "--cores" => {
+                let v = take_value(inline, &mut i)?;
+                a.cores = Some(
+                    v.parse::<i64>()
+                        .map_err(|_| format!("--cores: invalid int value: '{v}'"))?,
                 );
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
@@ -1352,6 +1363,16 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         Ok(cg) => cg,
         Err(code) => return code,
     };
+
+    // Opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores. Apply it HERE,
+    // after the boxing re-exec has settled (the re-exec'd in-scope child re-enters cmd_run and
+    // applies it there) and BEFORE the scheduler spawns any worker thread or forks any step —
+    // threads inherit the creator's affinity and forked steps inherit at fork, so an early
+    // application covers the whole descendant tree (cgroup cpuset where delegated, else
+    // sched_setaffinity).
+    if let Some(k) = a.cores {
+        apply_core_box(k);
+    }
 
     // Plan-time profile-store FEEDBACK (ds-7pzdgm / ds-afzsqf): refine each step's est_duration_s
     // and rss_baseline_bytes from the recorded store, then pick the dispatch order for --planner.

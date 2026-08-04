@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
+use std::time::Duration;
 
 use crate::sizing::cpu_count;
 
@@ -308,6 +309,241 @@ fn scope_cgroup_from_self() -> Option<PathBuf> {
         return Some(mine);
     }
     None
+}
+
+// --------------------------------------------------------------------------- //
+// Opt-in size-K core box (whole-tree cpuset) — mirror of cgroup.py             //
+// --------------------------------------------------------------------------- //
+//
+// `--cores K` constrains the WHOLE run process tree to K least-busy FREE cores
+// (K=1 = sequential box, for the gVisor / backend-perf methodology). It NEVER
+// pins a fixed core id (the standing benchmark rule — a fixed core may be busy):
+// it reads THIS process's allowed set, samples `/proc/stat` briefly, and picks
+// the K LEAST-BUSY of them. Two whole-tree mechanisms, tried in order: a cgroup
+// `cpuset` on the scope (PRIMARY; children inherit; hosts/CI where the controller
+// is delegated), else `sched_setaffinity` (FALLBACK; a size-K mask inherits
+// across fork+execve). Each is VERIFIED before acceptance and the active
+// mechanism is LOGGED (No Silent Failure).
+
+/// Read THIS process's CPU-affinity mask (`sched_getaffinity`) as a sorted core list.
+fn current_affinity() -> Vec<usize> {
+    // SAFETY: a zeroed `cpu_set_t` is a valid empty mask; `sched_getaffinity` fills it for pid 0
+    // (this process). We pass the type's exact size and a valid &mut, per the man page.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let rc =
+        unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) };
+    if rc != 0 {
+        return Vec::new();
+    }
+    let mut cores = Vec::new();
+    for c in 0..(8 * std::mem::size_of::<libc::cpu_set_t>()) {
+        // SAFETY: `c` is within the cpu_set_t bit range; `CPU_ISSET` only reads a bit.
+        if unsafe { libc::CPU_ISSET(c, &set) } {
+            cores.push(c);
+        }
+    }
+    cores
+}
+
+/// Set THIS process's CPU-affinity mask (`sched_setaffinity`) to exactly `cores`.
+fn set_affinity(cores: &[usize]) -> std::io::Result<()> {
+    // SAFETY: a zeroed `cpu_set_t` is a valid empty mask; `CPU_SET` sets one in-range bit at a
+    // time. Every `c` comes from `current_affinity()`, so it is < CPU_SETSIZE and representable.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::CPU_ZERO(&mut set) };
+    for &c in cores {
+        unsafe { libc::CPU_SET(c, &mut set) };
+    }
+    // SAFETY: `set` is a valid cpu_set_t of the passed size; pid 0 targets this process.
+    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Per-CPU (idle+iowait, total) jiffies snapshot from `/proc/stat` (keyed by cpu id).
+fn proc_stat_snapshot() -> BTreeMap<usize, (u64, u64)> {
+    let mut d = BTreeMap::new();
+    let text = match fs::read_to_string("/proc/stat") {
+        Ok(t) => t,
+        Err(_) => return d,
+    };
+    for line in text.lines() {
+        // Per-cpu lines are `cpuN ...`; skip the aggregate `cpu ...` line (no digit after "cpu").
+        let rest = match line.strip_prefix("cpu") {
+            Some(r) => r,
+            None => continue,
+        };
+        if !rest
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let cid: usize = match parts[0][3..].parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let nums: Vec<u64> = parts[1..].iter().filter_map(|p| p.parse().ok()).collect();
+        if nums.len() < 5 {
+            continue;
+        }
+        let idle = nums[3] + nums[4]; // idle + iowait (matches Python p[4]+p[5])
+        let total: u64 = nums.iter().sum();
+        d.insert(cid, (idle, total));
+    }
+    d
+}
+
+/// Count entries in a Linux cpulist such as `0-3,8,10-11` (mirror of `_cpuset_count`).
+fn cpuset_count(value: Option<&str>) -> Option<i64> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let mut count: i64 = 0;
+    for item in value.split(',') {
+        let mut bounds = item.splitn(2, '-');
+        let start: i64 = bounds.next()?.trim().parse().ok()?;
+        let end: i64 = match bounds.next() {
+            Some(e) => e.trim().parse().ok()?,
+            None => start,
+        };
+        if end < start {
+            return None;
+        }
+        count += end - start + 1;
+    }
+    Some(count)
+}
+
+/// Pick `k` LEAST-BUSY cores from THIS process's allowed CPU set (never a fixed id).
+///
+/// Reads the allowed set (`sched_getaffinity`), samples per-CPU idle jiffies from `/proc/stat`
+/// over `sample_s` seconds, and returns the `k` cores with the highest idle fraction. `k` is
+/// clamped to `[1, len(allowed)]`. Verified recipe (task `runner-cpu-affinity-single-core-runs`).
+pub fn pick_least_busy_free_cores(k: i64, sample_s: f64) -> Vec<usize> {
+    let allowed = current_affinity();
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+    let k = k.clamp(1, allowed.len() as i64) as usize;
+    let a = proc_stat_snapshot();
+    thread::sleep(Duration::from_secs_f64(sample_s));
+    let b = proc_stat_snapshot();
+    let idle_frac = |c: usize| -> f64 {
+        match (a.get(&c), b.get(&c)) {
+            (Some(&(ai, at)), Some(&(bi, bt))) => {
+                let dt = bt.saturating_sub(at);
+                if dt == 0 {
+                    1.0
+                } else {
+                    bi.saturating_sub(ai) as f64 / dt as f64
+                }
+            }
+            _ => 1.0,
+        }
+    };
+    let mut ranked: Vec<usize> = allowed.into_iter().filter(|c| b.contains_key(c)).collect();
+    // Descending idle fraction; stable so ties keep ascending core-id order (matches Python).
+    ranked.sort_by(|&x, &y| {
+        idle_frac(y)
+            .partial_cmp(&idle_frac(x))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    ranked.truncate(k);
+    ranked
+}
+
+/// Write `cpuset.cpus` on `scope` and VERIFY via `cpuset.cpus.effective` (mirror of Python).
+///
+/// Returns true only when the `cpuset` controller is present on the scope AND the effective
+/// cpuset count equals `cores.len()` after the write (proving the constraint took — not just that
+/// the write returned Ok). On success, best-effort enables `+cpuset` in `subtree_control` so
+/// per-step child cgroups inherit it.
+fn try_cgroup_cpuset(scope: &Path, cores: &[usize]) -> bool {
+    let controllers: HashSet<String> = read_trim(scope, "cgroup.controllers")
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default();
+    if !controllers.contains("cpuset") {
+        return false;
+    }
+    let cpulist = cores
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if fs::write(scope.join("cpuset.cpus"), &cpulist).is_err() {
+        return false;
+    }
+    if cpuset_count(read_trim(scope, "cpuset.cpus.effective").as_deref())
+        != Some(cores.len() as i64)
+    {
+        return false;
+    }
+    // Verified. Let per-step child cgroups inherit the cpuset constraint.
+    let _ = fs::write(scope.join("cgroup.subtree_control"), "+cpuset");
+    true
+}
+
+/// Constrain the WHOLE run process tree to `k` least-busy FREE cores.
+///
+/// Tries the cgroup `cpuset` first (works on hosts/CI where it is delegated; children under the
+/// scope inherit it), then falls back to `sched_setaffinity` (a size-K mask inherits across
+/// fork+execve to every descendant). Each mechanism is VERIFIED (cpuset via `cpuset.cpus.effective`;
+/// affinity via a `sched_getaffinity` read-back) before it is accepted. Returns `(mechanism, cores)`
+/// and LOGS the active mechanism; returns `None` (with a warning) when NEITHER can constrain the
+/// tree to `k` cores — never silently claims a box that is not real.
+///
+/// Call this in the runner BEFORE the scheduler spawns worker threads or forks any step: threads
+/// inherit the creator's affinity and forked steps inherit at fork, so an early application covers
+/// the whole tree.
+pub fn apply_core_box(k: i64) -> Option<(String, Vec<usize>)> {
+    let cores = pick_least_busy_free_cores(k, 0.3);
+    if cores.is_empty() {
+        warn(&format!(
+            "--cores {k}: no allowed CPUs found (sched_getaffinity empty); cannot constrain the \
+             run tree to a core box"
+        ));
+        return None;
+    }
+    let want = cores.len();
+
+    // PRIMARY: cgroup cpuset on the scope (whole subtree inherits; hosts/CI).
+    if let Some(scope) = scope_cgroup_from_self() {
+        if try_cgroup_cpuset(&scope, &cores) {
+            eprintln!(
+                "{LOG_PREFIX} core box: constrained to {want} core(s) {cores:?} via cgroup cpuset"
+            );
+            return Some(("cgroup cpuset".to_string(), cores));
+        }
+    }
+
+    // FALLBACK: sched_setaffinity (inherits across fork+execve to the whole tree).
+    if let Err(e) = set_affinity(&cores) {
+        warn(&format!(
+            "--cores {k}: sched_setaffinity failed ({e}) and cgroup cpuset was unavailable; the \
+             run tree is NOT constrained to a core box"
+        ));
+        return None;
+    }
+    let applied = current_affinity();
+    if applied.len() != want {
+        warn(&format!(
+            "--cores {k}: sched_setaffinity read-back shows {} core(s), expected {want}; the run \
+             tree is NOT reliably constrained",
+            applied.len()
+        ));
+        return None;
+    }
+    eprintln!(
+        "{LOG_PREFIX} core box: constrained to {want} core(s) {applied:?} via sched_setaffinity"
+    );
+    Some(("sched_setaffinity".to_string(), applied))
 }
 
 /// Install a SIGINT/SIGTERM handler that tears down the WHOLE outer scope, then exits.

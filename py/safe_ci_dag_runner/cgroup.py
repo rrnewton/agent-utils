@@ -65,6 +65,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -926,6 +927,151 @@ def report_current_usage(naming: ScopeNaming = DEFAULT_NAMING) -> bool:
     print(f"{naming.log_prefix} container cgroup usage: memory.peak={peak} bytes; "
           f"oom_kill={oom_kill}; cpu.stat {cpu_stat.replace(chr(10), ' ')}")
     return oom_kill == 0
+
+
+# --------------------------------------------------------------------------- #
+# Opt-in size-K core box (whole-tree cpuset)                                  #
+# --------------------------------------------------------------------------- #
+#
+# The ``--cores K`` feature constrains the WHOLE run process tree to K least-busy
+# FREE cores, for the gVisor / backend-perf methodology (K=1 = sequential box, to
+# separate SEQUENTIALIZATION cost from INSTRUMENTATION cost). It NEVER pins a
+# fixed core id (a fixed core may be busy — the standing benchmark rule): it reads
+# THIS process's allowed set, samples ``/proc/stat`` briefly, and picks the K
+# LEAST-BUSY of them.
+#
+# Two mechanisms, tried in order, both of which cover the whole descendant tree:
+#   1. cgroup cpuset (PRIMARY) — write ``cpuset.cpus`` on the scope cgroup and
+#      VERIFY via ``cpuset.cpus.effective``. Children created under the scope
+#      inherit it. Works on hosts/CI where the ``cpuset`` controller is delegated.
+#   2. ``sched_setaffinity`` (FALLBACK) — a size-K affinity mask on the root
+#      process inherits across fork+execve to every descendant. This is the only
+#      working mechanism where ``cpuset`` is NOT delegated (e.g. the 3pai sandbox,
+#      whose scope exposes only ``io memory pids``). VERIFIED via a
+#      ``sched_getaffinity`` read-back.
+# The active mechanism is LOGGED (No Silent Failure); if NEITHER can constrain the
+# tree to K cores, a warning is emitted and ``apply_core_box`` returns ``None``.
+
+
+def pick_least_busy_free_cores(k: int, sample_s: float = 0.3) -> list[int]:
+    """Pick ``k`` LEAST-BUSY cores from THIS process's allowed CPU set.
+
+    Reads the allowed set (``sched_getaffinity``), samples per-CPU idle jiffies
+    from ``/proc/stat`` over ``sample_s`` seconds, and returns the ``k`` cores
+    with the highest idle fraction — never a fixed core id, per the standing
+    benchmark rule (a fixed core may be busy). ``k`` is clamped to
+    ``[1, len(allowed)]``. Verified recipe (task
+    ``runner-cpu-affinity-single-core-runs``, 2026-08-04)."""
+    allowed = sorted(os.sched_getaffinity(0))
+    if not allowed:
+        return []
+    k = max(1, min(int(k), len(allowed)))
+
+    def snap() -> dict[int, tuple[int, int]]:
+        d: dict[int, tuple[int, int]] = {}
+        with open("/proc/stat") as fh:
+            for line in fh:
+                if line.startswith("cpu") and len(line) > 3 and line[3].isdigit():
+                    p = line.split()
+                    cid = int(p[0][3:])
+                    idle = int(p[4]) + int(p[5])  # idle + iowait
+                    total = sum(int(x) for x in p[1:])
+                    d[cid] = (idle, total)
+        return d
+
+    a = snap()
+    time.sleep(sample_s)
+    b = snap()
+
+    def idle_frac(c: int) -> float:
+        di = b[c][0] - a[c][0]
+        dt = b[c][1] - a[c][1]
+        return di / dt if dt else 1.0
+
+    ranked = sorted((c for c in allowed if c in b), key=idle_frac, reverse=True)
+    return ranked[:k]
+
+
+def _cpulist(cores: Sequence[int]) -> str:
+    """Render cores as a Linux cpulist (plain comma form; the kernel may re-render
+    it with ranges in ``cpuset.cpus.effective``, which :func:`_cpuset_count`
+    parses back)."""
+    return ",".join(str(c) for c in cores)
+
+
+def _try_cgroup_cpuset(scope: Path, cores: Sequence[int]) -> bool:
+    """Write ``cpuset.cpus`` on ``scope`` and VERIFY via ``cpuset.cpus.effective``.
+
+    Returns True only when the ``cpuset`` controller is present on the scope AND
+    the effective cpuset count equals ``len(cores)`` after the write (proving the
+    constraint actually took — a proxy read of the flag alone is not evidence). On
+    success, best-effort enables ``+cpuset`` in the scope's ``subtree_control`` so
+    per-step child cgroups inherit the constraint."""
+    if "cpuset" not in _controller_set(scope, "cgroup.controllers"):
+        return False
+    want = len(cores)
+    try:
+        (scope / "cpuset.cpus").write_text(_cpulist(cores))
+    except OSError:
+        return False
+    if _cpuset_count(_read_cgroup_value(scope, "cpuset.cpus.effective")) != want:
+        return False
+    # Verified. Let per-step child cgroups inherit the cpuset constraint.
+    try:
+        (scope / "cgroup.subtree_control").write_text("+cpuset")
+    except OSError:
+        pass  # best-effort: the scope-level cpuset already bounds the whole tree
+    return True
+
+
+def apply_core_box(
+    k: int, naming: ScopeNaming = DEFAULT_NAMING
+) -> tuple[str, list[int]] | None:
+    """Constrain the WHOLE run process tree to ``k`` least-busy FREE cores.
+
+    Tries the cgroup ``cpuset`` first (works on hosts/CI where it is delegated;
+    children under the scope inherit it), then falls back to
+    ``sched_setaffinity`` (a size-K mask on THIS process inherits across
+    fork+execve to every descendant). Each mechanism is VERIFIED (cpuset via
+    ``cpuset.cpus.effective``; affinity via a ``sched_getaffinity`` read-back)
+    before it is accepted. Returns ``(mechanism, cores)`` and LOGS the active
+    mechanism; returns ``None`` (with a warning) when NEITHER can constrain the
+    tree to ``k`` cores — never silently claims a box that is not real.
+
+    Call this in the runner BEFORE the scheduler spawns worker threads or forks
+    any step: pthreads inherit the creator's affinity and forked steps inherit at
+    fork, so an early application covers the whole tree."""
+    cores = pick_least_busy_free_cores(k)
+    if not cores:
+        _warn(naming, f"--cores {k}: no allowed CPUs found (sched_getaffinity empty); "
+              "cannot constrain the run tree to a core box")
+        return None
+    want = len(cores)
+
+    # PRIMARY: cgroup cpuset on the scope (whole subtree inherits; hosts/CI).
+    scope = scope_cgroup_from_self(naming)
+    if scope is not None and _try_cgroup_cpuset(scope, cores):
+        print(f"{naming.log_prefix} core box: constrained to {want} core(s) "
+              f"{cores} via cgroup cpuset")
+        sys.stdout.flush()
+        return "cgroup cpuset", cores
+
+    # FALLBACK: sched_setaffinity (inherits across fork+execve to the whole tree).
+    try:
+        os.sched_setaffinity(0, set(cores))
+        applied = os.sched_getaffinity(0)
+    except OSError as exc:
+        _warn(naming, f"--cores {k}: sched_setaffinity failed ({exc}) and cgroup cpuset "
+              "was unavailable; the run tree is NOT constrained to a core box")
+        return None
+    if len(applied) != want:
+        _warn(naming, f"--cores {k}: sched_setaffinity read-back shows {len(applied)} core(s), "
+              f"expected {want}; the run tree is NOT reliably constrained")
+        return None
+    print(f"{naming.log_prefix} core box: constrained to {want} core(s) "
+          f"{sorted(applied)} via sched_setaffinity")
+    sys.stdout.flush()
+    return "sched_setaffinity", sorted(applied)
 
 
 # --------------------------------------------------------------------------- #
