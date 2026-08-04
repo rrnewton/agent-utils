@@ -10,16 +10,23 @@ use std::collections::{HashMap, HashSet};
 
 use crate::model::{step_classification, DagConfig, Step, StepClass};
 
-/// Inner-cgroup MemoryMax for a step, or `None` if uncharacterized. An explicit hard cap
-/// wins; otherwise `factor x` the RSS baseline. A zero (or absent) baseline yields `None`,
-/// matching Python's falsy `if base` guard.
-pub fn step_mem_cap_bytes(step: &Step, mem_cap_factor: f64) -> Option<i64> {
+/// Inner-cgroup MemoryMax for a step. An explicit hard cap wins; otherwise `factor x` the RSS
+/// baseline. When the step declares NEITHER (uncharacterized), fall back to `default_cap_bytes`
+/// — the SMALL forcing-function default the scheduler passes from
+/// `DagConfig::default_step_mem_cap_bytes` — or `None` when no default is supplied (the -j sizing
+/// model passes `None`, so an uncharacterized step stays excluded from the footprint sum, matching
+/// Python's falsy `if base` guard). Mirrors Python's `step_mem_cap_bytes`.
+pub fn step_mem_cap_bytes(
+    step: &Step,
+    mem_cap_factor: f64,
+    default_cap_bytes: Option<i64>,
+) -> Option<i64> {
     if let Some(hard) = step.hint.hard_mem_max_bytes {
         return Some(hard);
     }
     match step.hint.rss_baseline_bytes {
         Some(base) if base != 0 => Some((base as f64 * mem_cap_factor) as i64),
-        _ => None,
+        _ => default_cap_bytes,
     }
 }
 
@@ -32,7 +39,8 @@ pub fn step_mem_cap_for_inner_jobs(
     inner_jobs: Option<i64>,
     mem_cap_factor: f64,
 ) -> i64 {
-    let cap = step_mem_cap_bytes(step, mem_cap_factor).unwrap_or(0);
+    // The -j sizing model excludes uncharacterized steps (no default here), matching Python.
+    let cap = step_mem_cap_bytes(step, mem_cap_factor, None).unwrap_or(0);
     match inner_jobs {
         Some(jobs)
             if step.hint.hard_mem_max_bytes.is_none()
@@ -428,6 +436,7 @@ mod tests {
             mem_cap_floor_bytes: 0,
             default_step_timeout: 1800,
             default_jobs_flag: "-j".to_string(),
+            ..Default::default()
         }
     }
 
@@ -473,7 +482,7 @@ mod tests {
             cpu_timeout: 0,
             jobs_flag: None,
         };
-        assert_eq!(step_mem_cap_bytes(&s, 1.25), Some(9 * GIB));
+        assert_eq!(step_mem_cap_bytes(&s, 1.25, None), Some(9 * GIB));
     }
 
     #[test]

@@ -322,6 +322,10 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
         outer_mem_safety_factor: opt_float(doc, "outer_mem_safety_factor", 1.0)?,
         default_step_timeout,
         default_jobs_flag: opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG)?,
+        // SMALL forcing-function default caps for undeclared steps: not parsed from the document
+        // (mirrors the Python io parser, which relies on the DagConfig dataclass defaults), so a
+        // parsed DAG gets the 1-GiB / 1-core / 10-s floor. Callers override via the DagConfig fields.
+        ..DagConfig::default()
     })
 }
 

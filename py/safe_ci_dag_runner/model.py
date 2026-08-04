@@ -16,6 +16,16 @@ from enum import Enum
 
 DEFAULT_STEP_TIMEOUT = 1800
 
+#: Deliberately SMALL default caps for a step that DECLARES NOTHING — the "forcing function".
+#: An undeclared step is boxed into a tight 1-core / 1-GiB / 10-s-CPU floor, so a real step
+#: immediately hits the cap and must DECLARE its true needs. That generates per-node resource
+#: metadata EMPIRICALLY (from measured breaches) instead of by guessing. Each default applies
+#: ONLY when the step leaves the matching hint unset; an explicit hint always wins. They are
+#: DagConfig fields (below), so any caller can override or disable a dimension.
+DEFAULT_SMALL_MEM_CAP_BYTES = 1024**3  # 1 GiB inner memory.max when no memory hint is declared
+DEFAULT_SMALL_CPU_COUNT = 1  # 1-core cpu.max when no inner-parallelism width is declared
+DEFAULT_SMALL_CPU_TIMEOUT = 10  # 10 s CPU-time budget when cpu_timeout is unset
+
 #: Default template for the inner-parallelism (concurrency) flag appended to a step's command
 #: when the step declares ``preferred_inner_jobs``. See :func:`render_jobs_flag`.
 DEFAULT_JOBS_FLAG = "-j"
@@ -151,6 +161,22 @@ def preferred_inner_jobs(step: Step, experiment_override: int | None = None) -> 
     return step.hint.preferred_inner_jobs
 
 
+def effective_cpu_timeout(step: Step, default_cpu_timeout: int) -> int:
+    """CPU-time budget (seconds) in effect for a step: its declared ``cpu_timeout`` (>0) wins;
+    otherwise the DAG's SMALL default. Both 0 means the guard is disabled. This is the
+    forcing-function default for the CPU-time dimension (see DEFAULT_SMALL_CPU_TIMEOUT)."""
+    return step.cpu_timeout if step.cpu_timeout > 0 else default_cpu_timeout
+
+
+def effective_cpu_count(step: Step, default_cpu_count: int | None) -> int | None:
+    """Core cap (cgroup ``cpu.max``) in effect for a step: its declared ``preferred_inner_jobs``
+    wins; otherwise the DAG's SMALL default. Bounds ONLY the cgroup cpu.max, never the command's
+    inner ``-j`` flag (which stays keyed to the declared width, so an undeclared step gets a
+    1-core box without a bogus ``-j 1`` appended to a command that may not accept it)."""
+    inner = step.hint.preferred_inner_jobs
+    return inner if inner is not None else default_cpu_count
+
+
 def step_failure_reason(
     *,
     returncode: int | None,
@@ -224,6 +250,14 @@ class DagConfig:
     default_step_timeout: int = DEFAULT_STEP_TIMEOUT
     # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
+    # --- Deliberately SMALL default caps applied to a step that DECLARES NOTHING ---
+    # The forcing function (see the module-level DEFAULT_SMALL_* constants): an undeclared step
+    # is boxed into a tight floor so it must declare its real needs. Each applies ONLY when the
+    # step leaves the matching hint unset (an explicit hint wins). Set mem/cpu_count to None or
+    # cpu_timeout to 0 to disable that dimension's default (restores pre-forcing-function behavior).
+    default_step_mem_cap_bytes: int | None = DEFAULT_SMALL_MEM_CAP_BYTES
+    default_step_cpu_count: int | None = DEFAULT_SMALL_CPU_COUNT
+    default_step_cpu_timeout: int = DEFAULT_SMALL_CPU_TIMEOUT
 
     def by_tag(self) -> dict[str, Step]:
         return {step.tag: step for step in self.steps}

@@ -17,13 +17,20 @@ from pathlib import Path
 from safe_ci_dag_runner.model import DagConfig, Step, StepClass, step_classification
 
 
-def step_mem_cap_bytes(step: Step, *, mem_cap_factor: float) -> int | None:
-    """Inner-cgroup MemoryMax for a step, or None if uncharacterized (only the outer cap
-    then applies). An explicit hard cap wins; otherwise ``factor x`` the RSS baseline."""
+def step_mem_cap_bytes(
+    step: Step, *, mem_cap_factor: float, default_cap_bytes: int | None = None
+) -> int | None:
+    """Inner-cgroup MemoryMax for a step. An explicit hard cap wins; otherwise ``factor x`` the
+    RSS baseline. When the step declares NEITHER (uncharacterized), fall back to
+    ``default_cap_bytes`` — the SMALL forcing-function default the scheduler passes from
+    ``DagConfig.default_step_mem_cap_bytes`` — or None if no default is supplied (the -j sizing
+    model calls with no default, so an uncharacterized step stays excluded from the footprint sum)."""
     if step.hint.hard_mem_max_bytes is not None:
         return step.hint.hard_mem_max_bytes
     base = step.hint.rss_baseline_bytes
-    return int(base * mem_cap_factor) if base else None
+    if base:
+        return int(base * mem_cap_factor)
+    return default_cap_bytes
 
 
 def step_mem_cap_for_inner_jobs(
