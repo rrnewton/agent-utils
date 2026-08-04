@@ -80,6 +80,49 @@ def test_plan_json_is_valid_and_has_schema() -> None:
     assert out == out2
 
 
+def test_plan_archives_json_to_disk_when_archive_dir_set(tmp_path: Path) -> None:
+    archive = tmp_path / "plans"
+    rc, out, err = _capture(
+        ["plan", "--fixture", DEMO, "--format", "json", "--archive-dir", str(archive)]
+    )
+    assert rc == 0
+    # The path is announced on STDERR (stdout stays pure JSON) and the file really exists.
+    assert "NOTE: plan archived to" in err
+    written = sorted(archive.glob("plan-*.json"))
+    assert len(written) == 1
+    announced = err.split("NOTE: plan archived to", 1)[1].strip().splitlines()[0]
+    assert Path(announced) == written[0]
+    # The archived artifact is the canonical machine schema, byte-identical to stdout json.
+    assert written[0].read_text(encoding="utf-8") == out
+
+
+def test_plan_archives_even_for_human_format(tmp_path: Path) -> None:
+    archive = tmp_path / "plans"
+    rc, _, err = _capture(
+        ["plan", "--fixture", DEMO, "--format", "human", "--archive-dir", str(archive)]
+    )
+    assert rc == 0
+    written = sorted(archive.glob("plan-*.json"))
+    assert len(written) == 1
+    obj = json.loads(written[0].read_text(encoding="utf-8"))
+    assert obj["repository"] == "OWNER/NAME"
+    assert "NOTE: plan archived to" in err
+
+
+def test_plan_no_archive_and_fixture_default_leave_no_files(tmp_path: Path) -> None:
+    # --no-archive suppresses archiving even with an explicit dir.
+    rc, _, err = _capture(
+        ["plan", "--fixture", DEMO, "--archive-dir", str(tmp_path), "--no-archive"]
+    )
+    assert rc == 0
+    assert list(tmp_path.glob("plan-*.json")) == []
+    assert "NOTE: plan archived to" not in err
+    # A bare --fixture run (no --archive-dir) archives nothing and stays stderr-clean.
+    rc2, _, err2 = _capture(["plan", "--fixture", DEMO, "--format", "json"])
+    assert rc2 == 0
+    assert "NOTE: plan archived to" not in err2
+
+
 def test_plan_actions_has_capturable_summary_and_loud_lines() -> None:
     rc, out, _ = _capture(["plan", "--fixture", DEMO, "--flaky-signatures", FLAKY, "--format", "actions"])
     assert rc == 0

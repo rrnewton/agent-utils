@@ -19,6 +19,7 @@ import os
 import shlex
 import sys
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from importlib.resources import files
 from pathlib import Path
 
@@ -176,6 +177,8 @@ def _quickstart(c: Palette) -> str:
   --freshness-max-behind N                        a green PR >N commits behind => rebase-then-land
   --priority-source {{none,labels,beads}}           ordering priority (default: none)
   --batch                                         also propose one green-only conflict-free batch
+  --archive-dir DIR / --no-archive                archive the plan JSON to disk (on by default for
+                                                  live runs; path printed as a NOTE on stderr)
 
 {h('tick-hub integration (Option B; zero tick-hub change)')}
   Wire a tick-hub reminder whose gate runs {k(f'{PROG} plan --format actions ...')} with
@@ -421,6 +424,22 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument(
         "--format", choices=["human", "json", "actions"], default="human", help="output format"
     )
+    plan_p.add_argument(
+        "--archive-dir",
+        default=None,
+        metavar="DIR",
+        help=(
+            "directory to archive the emitted plan JSON into so past plans are readable on disk "
+            "(default: $PR_LANDING_PLANNER_ARCHIVE_DIR, else $XDG_STATE_HOME/pr-landing-planner/plans, "
+            "else ~/.local/state/pr-landing-planner/plans; skipped for --fixture runs unless set here). "
+            "The archived path is printed as a NOTE on stderr."
+        ),
+    )
+    plan_p.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="do not archive the emitted plan to disk (archiving is on by default for live runs)",
+    )
 
     graph_p = sub.add_parser("graph", help="just the conflict/ordering graph view")
     _add_collect_flags(graph_p)
@@ -445,6 +464,58 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# --------------------------------------------------------------------------- archiving
+def _resolve_archive_dir(ns: argparse.Namespace) -> Path | None:
+    """Resolve where an emitted plan should be archived, or ``None`` to skip archiving.
+
+    Precedence: explicit ``--archive-dir`` > ``$PR_LANDING_PLANNER_ARCHIVE_DIR`` >
+    ``$XDG_STATE_HOME/pr-landing-planner/plans`` > ``~/.local/state/pr-landing-planner/plans``.
+    Archiving is skipped when ``--no-archive`` is passed, and for ``--fixture`` runs unless
+    ``--archive-dir`` is explicit — that keeps the demo and the test suite side-effect-free and
+    their stdout byte-deterministic.
+    """
+    if bool(getattr(ns, "no_archive", False)):
+        return None
+    explicit = getattr(ns, "archive_dir", None)
+    if isinstance(explicit, str) and explicit:
+        return Path(explicit).expanduser()
+    fixture = getattr(ns, "fixture", None)
+    if isinstance(fixture, str) and fixture:
+        return None  # demo/test run: do not archive unless --archive-dir is explicit
+    env_dir = os.environ.get("PR_LANDING_PLANNER_ARCHIVE_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "state"
+    return base / "pr-landing-planner" / "plans"
+
+
+def _archive_plan(ns: argparse.Namespace, result: PlanResult) -> None:
+    """Write the canonical plan JSON to a durable, timestamped file and NOTE its path.
+
+    The archived artifact is ALWAYS the full machine schema (:func:`render_json`), independent of
+    the on-screen ``--format`` — so ``plan --format human`` still leaves a machine-readable record
+    on disk. The path is printed to STDERR so stdout stays pure output. A write failure is a loud
+    WARN, never fatal: archiving must not break planning. The UTC timestamp lives only in the
+    FILENAME (not in ``render_json``), keeping the JSON body byte-deterministic.
+    """
+    directory = _resolve_archive_dir(ns)
+    if directory is None:
+        return
+    graph = result.graph
+    repo_slug = graph.repository.replace("/", "_") or "repo"
+    base_slug = graph.base.replace("/", "_") or "base"
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    path = directory / f"plan-{repo_slug}-{base_slug}-{stamp}.json"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path.write_text(render_json(result) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"{PROG}: WARN: could not archive plan to {path}: {exc}", file=sys.stderr)
+        return
+    print(f"{PROG}: NOTE: plan archived to {path}", file=sys.stderr)
+
+
 # --------------------------------------------------------------------------- commands
 def _cmd_plan(ns: argparse.Namespace, c: Palette) -> int:
     try:
@@ -459,6 +530,7 @@ def _cmd_plan(ns: argparse.Namespace, c: Palette) -> int:
         print(render_actions(result))
     else:
         print(render_human(result, color=c.style))
+    _archive_plan(ns, result)
     return 0
 
 
