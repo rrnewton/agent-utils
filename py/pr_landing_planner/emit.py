@@ -87,6 +87,9 @@ def render_json(result: PlanResult) -> str:
             {"a": e.a, "b": e.b, "mechanisms": list(e.mechanisms)}
             for e in graph.mechanism_edges
         ],
+        "unclassified_mechanism_candidates": [
+            {"pr": u.pr, "candidates": list(u.candidates)} for u in graph.unclassified_mechanisms
+        ],
         "stacks": [list(stack) for stack in result.stacks],
         "held_prs": [{"pr": h.pr, "reasons": list(h.reasons)} for h in result.held],
         "plan": {
@@ -311,6 +314,9 @@ def render_graph_json(result: PlanResult) -> str:
         "mechanism_overlap_edges": [
             {"a": e.a, "b": e.b, "mechanisms": list(e.mechanisms)}
             for e in graph.mechanism_edges
+        ],
+        "unclassified_mechanism_candidates": [
+            {"pr": u.pr, "candidates": list(u.candidates)} for u in graph.unclassified_mechanisms
         ],
         "stacks": [list(stack) for stack in result.stacks],
         "held_prs": [{"pr": h.pr, "reasons": list(h.reasons)} for h in result.held],

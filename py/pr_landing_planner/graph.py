@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from pr_landing_planner.mechanism import Mechanism, classify
 from pr_landing_planner.model import (
     ConflictEdge,
     HeldPr,
@@ -25,10 +26,12 @@ from pr_landing_planner.model import (
     OrderingEdge,
     OverlapEdge,
     PrNode,
+    UnclassifiedMechanism,
 )
 
-#: PRs/tasks declare the mechanism they change with a ``mechanism:<slug>`` label (owner convention,
-#: landed in dev-hermit AGENTS.md). Two PRs sharing a slug get a :class:`MechanismEdge`.
+#: PRs/tasks may declare the mechanism they change with a ``mechanism:<slug>`` label (owner
+#: convention, dev-hermit AGENTS.md). The slug is ONE derive source, fed through the same classifier
+#: as diff-derived symbols so a label and a raw identifier for the same mechanism normalise together.
 MECHANISM_LABEL_PREFIX = "mechanism:"
 
 
@@ -43,23 +46,57 @@ def mechanism_slugs(labels: Sequence[str]) -> tuple[str, ...]:
     return tuple(sorted(dict.fromkeys(slugs)))
 
 
-def build_mechanism_edges(nodes: Sequence[PrNode]) -> tuple[MechanismEdge, ...]:
-    """Undirected same-mechanism edges: two PRs whose ``mechanism:<slug>`` label sets intersect.
+def mechanism_candidates(node: PrNode) -> tuple[str, ...]:
+    """DERIVE stage: all mechanism-candidate strings for a PR — label slugs + diff-derived symbols.
 
-    This is the SEMANTIC companion to the file-conflict map: it catches PRs that change the same
-    mechanism (config key / flag / label / concurrency group) even when they touch different files
-    and merge cleanly. It only surfaces the pair; it never judges whether the intents agree.
+    Deliberately does NOT feed arbitrary labels (``p1``, ``draft``): only declared ``mechanism:``
+    slugs and mechanically-derived diff symbols are candidates, so an UNCLASSIFIED result stays
+    meaningful instead of drowning in ordinary label noise.
     """
+    return tuple(sorted(dict.fromkeys((*mechanism_slugs(node.labels), *node.mechanism_symbols))))
+
+
+def classify_node_mechanisms(node: PrNode) -> tuple[frozenset[Mechanism], tuple[str, ...]]:
+    """CLASSIFY a PR's candidates: ``(recognised mechanisms, UNCLASSIFIED candidate strings)``."""
+    recognised: set[Mechanism] = set()
+    unclassified: list[str] = []
+    for candidate in mechanism_candidates(node):
+        mechanism = classify(candidate)
+        if mechanism is None:
+            unclassified.append(candidate)
+        else:
+            recognised.add(mechanism)
+    return frozenset(recognised), tuple(unclassified)
+
+
+def build_mechanism_edges(nodes: Sequence[PrNode]) -> tuple[MechanismEdge, ...]:
+    """CLUSTER stage: undirected edges between PRs that share a mechanism ENUM VALUE (not raw string).
+
+    Clustering on the normalised enum is what catches the collision raw derivation misses: two PRs
+    that touch the same mechanism under different spellings in different files land in one bucket. It
+    only surfaces the pair; it never judges whether the intents agree.
+    """
+    recognised = [classify_node_mechanisms(node)[0] for node in nodes]
     edges: list[MechanismEdge] = []
     for i, a in enumerate(nodes):
-        a_slugs = set(mechanism_slugs(a.labels))
-        if not a_slugs:
+        if not recognised[i]:
             continue
-        for b in nodes[i + 1 :]:
-            shared = tuple(sorted(a_slugs & set(mechanism_slugs(b.labels))))
+        for j in range(i + 1, len(nodes)):
+            shared = recognised[i] & recognised[j]
             if shared:
-                edges.append(MechanismEdge(a.number, b.number, shared))
+                mechanisms = tuple(sorted(m.value for m in shared))
+                edges.append(MechanismEdge(a.number, nodes[j].number, mechanisms))
     return tuple(edges)
+
+
+def build_unclassified_mechanisms(nodes: Sequence[PrNode]) -> tuple[UnclassifiedMechanism, ...]:
+    """Per-PR derived candidates the classifier could not map — the "enum needs a new member" signal."""
+    out: list[UnclassifiedMechanism] = []
+    for node in nodes:
+        _, unclassified = classify_node_mechanisms(node)
+        if unclassified:
+            out.append(UnclassifiedMechanism(node.number, unclassified))
+    return tuple(out)
 
 
 # --------------------------------------------------------------------------- file-based edges
@@ -263,7 +300,10 @@ def partition_parallel_safe(
 __all__ = [
     "MECHANISM_LABEL_PREFIX",
     "mechanism_slugs",
+    "mechanism_candidates",
+    "classify_node_mechanisms",
     "build_mechanism_edges",
+    "build_unclassified_mechanisms",
     "build_overlap_edges",
     "build_conflict_edges_file_overlap",
     "build_ordering_edges_base_ref",
