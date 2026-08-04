@@ -21,10 +21,45 @@ from collections.abc import Sequence
 from pr_landing_planner.model import (
     ConflictEdge,
     HeldPr,
+    MechanismEdge,
     OrderingEdge,
     OverlapEdge,
     PrNode,
 )
+
+#: PRs/tasks declare the mechanism they change with a ``mechanism:<slug>`` label (owner convention,
+#: landed in dev-hermit AGENTS.md). Two PRs sharing a slug get a :class:`MechanismEdge`.
+MECHANISM_LABEL_PREFIX = "mechanism:"
+
+
+# --------------------------------------------------------------------------- mechanism (semantic) edges
+def mechanism_slugs(labels: Sequence[str]) -> tuple[str, ...]:
+    """The distinct ``mechanism:<slug>`` slugs declared by ``labels``, sorted and de-duplicated."""
+    slugs = [
+        label[len(MECHANISM_LABEL_PREFIX) :]
+        for label in labels
+        if label.startswith(MECHANISM_LABEL_PREFIX) and len(label) > len(MECHANISM_LABEL_PREFIX)
+    ]
+    return tuple(sorted(dict.fromkeys(slugs)))
+
+
+def build_mechanism_edges(nodes: Sequence[PrNode]) -> tuple[MechanismEdge, ...]:
+    """Undirected same-mechanism edges: two PRs whose ``mechanism:<slug>`` label sets intersect.
+
+    This is the SEMANTIC companion to the file-conflict map: it catches PRs that change the same
+    mechanism (config key / flag / label / concurrency group) even when they touch different files
+    and merge cleanly. It only surfaces the pair; it never judges whether the intents agree.
+    """
+    edges: list[MechanismEdge] = []
+    for i, a in enumerate(nodes):
+        a_slugs = set(mechanism_slugs(a.labels))
+        if not a_slugs:
+            continue
+        for b in nodes[i + 1 :]:
+            shared = tuple(sorted(a_slugs & set(mechanism_slugs(b.labels))))
+            if shared:
+                edges.append(MechanismEdge(a.number, b.number, shared))
+    return tuple(edges)
 
 
 # --------------------------------------------------------------------------- file-based edges
@@ -226,6 +261,9 @@ def partition_parallel_safe(
 
 
 __all__ = [
+    "MECHANISM_LABEL_PREFIX",
+    "mechanism_slugs",
+    "build_mechanism_edges",
     "build_overlap_edges",
     "build_conflict_edges_file_overlap",
     "build_ordering_edges_base_ref",

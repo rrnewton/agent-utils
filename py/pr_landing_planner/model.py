@@ -191,6 +191,22 @@ class OverlapEdge:
 
 
 @dataclass(frozen=True)
+class MechanismEdge:
+    """Two PRs that declare the same ``mechanism:<slug>`` label — a SEMANTIC overlap.
+
+    Unlike a :class:`ConflictEdge` (git can't merge them) or an :class:`OverlapEdge` (they share a
+    file), a mechanism edge links two PRs that change the SAME mechanism — a config key, flag, label,
+    or concurrency group — possibly in DIFFERENT files and possibly with OPPOSITE intent, so it
+    SURVIVES a clean merge and git has no opinion on it (the #1567-vs-#1575 ``cancel-in-progress``
+    near-miss). The planner only SURFACES the pair for coordinator review; it never judges intent.
+    """
+
+    a: int
+    b: int
+    mechanisms: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class OrderingEdge:
     """A directed "``before`` must land before ``after``" constraint (base-stacking or ancestry)."""
 
@@ -217,6 +233,9 @@ class CollectedGraph:
     conflict_edges: tuple[ConflictEdge, ...]
     overlap_edges: tuple[OverlapEdge, ...]
     ordering_edges: tuple[OrderingEdge, ...]
+    #: Semantic same-mechanism overlaps (``mechanism:<slug>`` label pairs); defaults empty for
+    #: back-compat with callers that predate the mechanism dimension.
+    mechanism_edges: tuple[MechanismEdge, ...] = ()
 
 
 @dataclass(frozen=True)

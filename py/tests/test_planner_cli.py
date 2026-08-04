@@ -103,6 +103,78 @@ def test_graph_view() -> None:
     assert "conflict_edges" in obj and "plan" not in obj
 
 
+_MECHANISM_FIXTURE = (
+    "repo: OWNER/NAME\n"
+    "base: integration\n"
+    "prs:\n"
+    "  - number: 1567\n"
+    "    title: cancel-in-progress on the privileged workflow\n"
+    "    head_ref: feat-priv\n"
+    "    labels: [mechanism:cancel-in-progress]\n"
+    "    changed_files: [.github/workflows/ci-privileged.yml]\n"
+    "    checks:\n"
+    "      - {name: CI, status: COMPLETED, conclusion: SUCCESS}\n"
+    "      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}\n"
+    "  - number: 1575\n"
+    "    title: cancel-in-progress on the portable workflow\n"
+    "    head_ref: feat-port\n"
+    "    labels: [mechanism:cancel-in-progress]\n"
+    "    changed_files: [.github/workflows/ci-portable.yml]\n"
+    "    checks:\n"
+    "      - {name: CI, status: COMPLETED, conclusion: SUCCESS}\n"
+    "      - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}\n"
+)
+
+
+def test_mechanism_overlap_surfaces_same_slug_without_file_conflict(tmp_path: Path) -> None:
+    # #1567 and #1575 both declare mechanism:cancel-in-progress but edit DIFFERENT workflow files:
+    # git sees no conflict and no file overlap, yet they change the same mechanism (the real
+    # #1567-vs-#1575 near-miss). The semantic dimension must surface the pair anyway.
+    fixture = tmp_path / "mechanism.yaml"
+    fixture.write_text(_MECHANISM_FIXTURE)
+    rc, out, _ = _capture(["plan", "--fixture", str(fixture), "--format", "json"])
+    assert rc == 0
+    obj = json.loads(out)
+    assert obj["mechanism_overlap_edges"] == [
+        {"a": 1567, "b": 1575, "mechanisms": ["cancel-in-progress"]}
+    ]
+    # Invisible to the file-based dimensions — that is exactly why the semantic edge is needed.
+    assert obj["conflict_edges"] == []
+    assert obj["file_overlap_edges"] == []
+
+
+def test_mechanism_overlap_is_loud_in_actions_and_human(tmp_path: Path) -> None:
+    fixture = tmp_path / "mechanism.yaml"
+    fixture.write_text(_MECHANISM_FIXTURE)
+    rc, actions, _ = _capture(["plan", "--fixture", str(fixture), "--format", "actions"])
+    assert rc == 0
+    lines = actions.splitlines()
+    assert "mechanism_overlaps=1" in lines
+    assert any(
+        line.startswith("NOTE: mechanism-overlap prs=1567,1575") for line in lines
+    )
+    rc, human, _ = _capture(["plan", "--fixture", str(fixture)])
+    assert rc == 0
+    assert "Mechanism overlaps" in human
+    assert "#1567 <-> #1575: cancel-in-progress" in human
+
+
+def test_no_mechanism_overlap_when_slugs_differ(tmp_path: Path) -> None:
+    # Distinct slugs must NOT be paired; only a shared mechanism links two PRs.
+    fixture = tmp_path / "distinct.yaml"
+    fixture.write_text(
+        _MECHANISM_FIXTURE.replace(
+            "labels: [mechanism:cancel-in-progress]\n"
+            "    changed_files: [.github/workflows/ci-portable.yml]",
+            "labels: [mechanism:CI_DAG_JOBS]\n"
+            "    changed_files: [.github/workflows/ci-portable.yml]",
+        )
+    )
+    rc, out, _ = _capture(["plan", "--fixture", str(fixture), "--format", "json"])
+    assert rc == 0
+    assert json.loads(out)["mechanism_overlap_edges"] == []
+
+
 def test_status_view_and_threshold_warning() -> None:
     rc, out, _ = _capture(["status", "--fixture", DEMO, "--warn-threshold", "3"])
     assert rc == 0

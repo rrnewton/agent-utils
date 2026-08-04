@@ -23,6 +23,7 @@ from collections.abc import Sequence
 
 from pr_landing_planner.classify import ClassifyConfig, classify_pr
 from pr_landing_planner.graph import (
+    build_mechanism_edges,
     build_ordering_edges_base_ref,
     build_overlap_edges,
     dedupe_ordering,
@@ -178,6 +179,7 @@ def collect_graph(
         conflict_edges=conflict_edges,
         overlap_edges=overlap_edges,
         ordering_edges=ordering_edges,
+        mechanism_edges=build_mechanism_edges(nodes),
     )
 
 
