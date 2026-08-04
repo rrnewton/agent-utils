@@ -10,19 +10,23 @@ from __future__ import annotations
 
 import json
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import pytest
 
 from pr_landing_planner import githubhost
 from pr_landing_planner.githubhost import GitHubHost, HostCommandError
 
+_FakeRun = Callable[
+    [Sequence[str], "str | None", tuple[int, ...]], subprocess.CompletedProcess[str]
+]
+
 
 def _completed(stdout: str) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
 
 
-def _fake_run_factory(*, fail_view_for: frozenset[int] = frozenset()):
+def _fake_run_factory(*, fail_view_for: frozenset[int] = frozenset()) -> _FakeRun:
     """Build a fake ``_run`` that answers the light list and each per-PR ``gh pr view``."""
 
     def fake_run(

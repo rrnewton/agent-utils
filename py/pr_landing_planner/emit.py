@@ -31,6 +31,37 @@ from pr_landing_planner.model import (
 #: A colorizer: ``(style_name, text) -> styled_text``. The default (identity) leaves text plain.
 ColorFn = Callable[[str, str], str]
 
+#: Why clustering saves *validate runs*, not just rebases. The locally-validated / clean-validate
+#: record is keyed to the exact head SHA, so a rebase (which changes the head) INVALIDATES it and
+#: forces a fresh validate run. Serial draining rebases every queued PR onto the moved base, so N
+#: serial rebases invalidate N SHA-keyed validate records — self-defeating, because each land
+#: destroys the validation evidence of everything queued behind it. Landing each real-conflict
+#: cluster as ONE stack collapses that to one rebase and one validate per cluster, so the rebases
+#: clustering avoids are ALSO validate runs it avoids (1:1). Single source: reused by every renderer.
+VALIDATE_ECONOMICS_RATIONALE = (
+    "The locally-validated / clean-validate record is keyed to the exact head SHA, so a rebase "
+    "changes the head and INVALIDATES the record — forcing a fresh validate run. Serial draining "
+    "rebases every queued PR onto the moved base, so N serial rebases invalidate N SHA-keyed "
+    "validate records (self-defeating: each land destroys the validation evidence of everything "
+    "queued behind it). Landing each real-conflict cluster as ONE stack collapses that to one "
+    "rebase and one validate per cluster, so clustering avoids the same count of rebases AND "
+    "validate runs."
+)
+
+
+def _rebase_economics(clusters: Sequence[Cluster]) -> dict[str, object]:
+    """The rebase/validate economics of this plan: rebases avoided by clustering are ALSO the
+    validate runs avoided, because the validate record is SHA-keyed (see
+    :data:`VALIDATE_ECONOMICS_RATIONALE`). Pure; deterministic."""
+    saved = rebases_avoided(clusters)
+    return {
+        "validate_record_keyed_to": "head_sha",
+        "rebases_avoided_by_clustering": saved,
+        # 1:1 with rebases: a rebase changes the head SHA, which invalidates that PR's validate record.
+        "validate_runs_avoided_by_clustering": saved,
+        "rationale": VALIDATE_ECONOMICS_RATIONALE,
+    }
+
 
 # --------------------------------------------------------------------------- quoting
 def _quote(value: str) -> str:
@@ -74,6 +105,7 @@ def render_json(result: PlanResult) -> str:
     """Render the whole plan as canonical, deterministic JSON."""
     graph = result.graph
     held_set = {h.pr for h in result.held}
+    clusters = cluster_by_conflict(graph.nodes, graph.conflict_edges, graph.ordering_edges)
     obj: dict[str, object] = {
         "repository": graph.repository,
         "base": graph.base,
@@ -100,6 +132,7 @@ def render_json(result: PlanResult) -> str:
             "order": list(result.plan.order),
             "batch": list(result.plan.batch),
             "per_pr_actions": [_decision_obj(d) for d in result.plan.per_pr_actions],
+            "rebase_economics": _rebase_economics(clusters),
         },
         "diagnostics": {
             "stale_gates": list(result.diagnostics.stale_gates),
@@ -131,6 +164,9 @@ def _summary_counts(result: PlanResult) -> list[tuple[str, int]]:
     for decision in result.plan.per_pr_actions:
         counts[decision.action] += 1
     diag = result.diagnostics
+    graph = result.graph
+    clusters = cluster_by_conflict(graph.nodes, graph.conflict_edges, graph.ordering_edges)
+    saved = rebases_avoided(clusters)
     return [
         ("open_prs", len(result.graph.nodes)),
         ("land_now", counts[PrAction.LAND_NOW]),
@@ -147,6 +183,9 @@ def _summary_counts(result: PlanResult) -> list[tuple[str, int]]:
         ("real_reds", len(diag.real_reds)),
         ("evaluate_once_race", len(diag.evaluate_once_race)),
         ("mechanism_overlaps", len(result.graph.mechanism_edges)),
+        ("rebases_avoided", saved),
+        # SHA-keyed validate record => each avoided rebase is an avoided validate run (1:1).
+        ("validate_runs_avoided", saved),
         ("outage", 1 if diag.outage_suspected else 0),
     ]
 
@@ -456,6 +495,8 @@ def _clusters_summary(clusters: Sequence[Cluster], open_prs: int) -> dict[str, o
         # Distinct clusters share no real conflict, so every cluster is an independent landing lane.
         "parallel_lanes": len(clusters),
         "rebases_avoided": rebases_avoided(clusters),
+        # Each avoided rebase is an avoided validate run too — the record is SHA-keyed.
+        "validate_runs_avoided": rebases_avoided(clusters),
     }
 
 
@@ -526,6 +567,9 @@ def render_clusters_human(result: PlanResult, color: ColorFn | None = None) -> s
             c("bold", "Metric:"),
             f"  rebases avoided by stacking = {saved} "
             f"(serial landing of these clusters would cost {saved} extra rebase(s))",
+            f"  validate runs avoided = {saved} "
+            "(the validate record is SHA-keyed, so each avoided rebase is an avoided validate run)",
+            "  " + VALIDATE_ECONOMICS_RATIONALE,
             "",
             c("dim", "Advisory only: this plan recommends; it never arms or merges anything."),
         ]
@@ -543,5 +587,6 @@ __all__ = [
     "render_status_human",
     "render_clusters_json",
     "render_clusters_human",
+    "VALIDATE_ECONOMICS_RATIONALE",
     "ColorFn",
 ]
