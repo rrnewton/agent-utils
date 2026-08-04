@@ -181,6 +181,25 @@ def test_parse_rollup_uses_latest_exact_head_attempt_in_both_orders() -> None:
         assert classify_state(checks) is CiState.PASSED
 
 
+def test_parse_rollup_tied_contrary_verdicts_are_no_result_in_both_orders() -> None:
+    failure = {
+        "name": "merge-gate",
+        "status": "COMPLETED",
+        "conclusion": "FAILURE",
+        "startedAt": "2026-08-04T15:24:36Z",
+        "detailsUrl": "https://github.com/o/r/actions/runs/11/job/100",
+    }
+    success = {
+        **failure,
+        "conclusion": "SUCCESS",
+        "detailsUrl": "https://github.com/o/r/actions/runs/11/job/101",
+    }
+    for raw in ([failure, success], [success, failure]):
+        checks = parse_rollup(raw)
+        assert len(checks) == 1
+        assert classify_state(checks) is CiState.NO_RESULT
+
+
 def test_flaky_signatures_from_objs() -> None:
     doc: object = {"signatures": [{"name_regex": "wasm"}, {"text_regex": "flake"}, {"note": "no regex"}]}
     sigs = flaky_signatures_from_objs(doc)
