@@ -59,6 +59,8 @@ from safe_ci_dag_runner.model import (
     DagConfig,
     Step,
     command_with_inner_jobs,
+    effective_cpu_count,
+    effective_cpu_timeout,
     preferred_inner_jobs,
     step_classification,
 )
@@ -358,7 +360,16 @@ class Runner:
         env = dict(os.environ)
         env.update(step.env)
         inner_jobs = preferred_inner_jobs(step)
-        mem_max = step_mem_cap_bytes(step, mem_cap_factor=self.cfg.mem_cap_factor)
+        # SMALL default caps for an undeclared step (the forcing function): fall back to the
+        # DAG's tight 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor when the step
+        # declares nothing for that dimension. An explicit hint always wins.
+        mem_max = step_mem_cap_bytes(
+            step,
+            mem_cap_factor=self.cfg.mem_cap_factor,
+            default_cap_bytes=self.cfg.default_step_mem_cap_bytes,
+        )
+        cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
+        cpu_budget = effective_cpu_timeout(step, self.cfg.default_step_cpu_timeout)
         start = time.time()
         stream = self.verbosity >= 2
         timed_out = False
@@ -374,7 +385,7 @@ class Runner:
         # cgroup-v2 fork-inheritance rule), applying the inner memory/CPU caps. A disabled /
         # noop manager returns the command unchanged.
         run_cmd = self.cgroups.prepare_command(
-            step.tag, base_cmd, mem_max=mem_max, cpu_count=inner_jobs
+            step.tag, base_cmd, mem_max=mem_max, cpu_count=cpu_count
         )
         # Parallel-speedup ENRICHMENT capture (only under real cgroup boxing, matching DeepScry).
         # prepare_command has already created the step's child cgroup, so cpu.pressure is readable;
@@ -433,11 +444,11 @@ class Runner:
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
                     thread_peak = count if thread_peak is None else max(thread_peak, count)
-                if step.cpu_timeout > 0 and not cpu_timed_out:
+                if cpu_budget > 0 and not cpu_timed_out:
                     cs = self.cgroups.cpu_stats(step.tag)
                     if cs is not None:
                         cpu_used_s = cs.get("usage_usec", 0) / 1_000_000
-                        if cpu_used_s >= step.cpu_timeout:
+                        if cpu_used_s >= cpu_budget:
                             # Over CPU budget: reap the whole group now. The main thread's
                             # proc.wait() then returns normally (no wall TimeoutExpired).
                             cpu_timed_out = True
@@ -552,7 +563,7 @@ class Runner:
                     timed_out=timed_out,
                     timeout=step.timeout,
                     cpu_timed_out=cpu_timed_out,
-                    cpu_timeout=step.cpu_timeout,
+                    cpu_timeout=cpu_budget,
                     pids_guard_tripped=False,
                     pids_guard_reason=None,
                     detail_write_failure=(),

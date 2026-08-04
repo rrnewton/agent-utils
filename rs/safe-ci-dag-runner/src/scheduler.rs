@@ -35,8 +35,8 @@ use std::time::{Duration, Instant};
 use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::cgroup::CgroupManager;
 use crate::model::{
-    command_with_inner_jobs, preferred_inner_jobs, step_classification, DagConfig, RunResult, Step,
-    StepOutcome,
+    command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout, preferred_inner_jobs,
+    step_classification, DagConfig, RunResult, Step, StepOutcome,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -154,6 +154,12 @@ struct Runner {
     cgroups: BoxedCgroups,
     /// Multiplier from a step's measured RSS baseline to its inner memory cap.
     mem_cap_factor: f64,
+    /// SMALL forcing-function defaults applied to a step that DECLARES NOTHING for a dimension
+    /// (see `model::DEFAULT_SMALL_*`): an undeclared step is boxed into a tight
+    /// 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor so it must declare real needs.
+    default_step_mem_cap_bytes: Option<i64>,
+    default_step_cpu_count: Option<i64>,
+    default_step_cpu_timeout: i64,
     /// CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set loop
     /// never lets the summed inner-jobs width of concurrently-running steps exceed this total core
     /// budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
@@ -199,6 +205,9 @@ impl Runner {
             default_jobs_flag: cfg.default_jobs_flag.clone(),
             cgroups,
             mem_cap_factor: cfg.mem_cap_factor,
+            default_step_mem_cap_bytes: cfg.default_step_mem_cap_bytes,
+            default_step_cpu_count: cfg.default_step_cpu_count,
+            default_step_cpu_timeout: cfg.default_step_cpu_timeout,
             core_budget,
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
@@ -290,6 +299,9 @@ impl Runner {
                 let default_jobs_flag = self.default_jobs_flag.clone();
                 let cgroups = self.cgroups.clone();
                 let mem_cap_factor = self.mem_cap_factor;
+                let default_step_mem_cap_bytes = self.default_step_mem_cap_bytes;
+                let default_step_cpu_count = self.default_step_cpu_count;
+                let default_step_cpu_timeout = self.default_step_cpu_timeout;
                 handles.push(thread::spawn(move || {
                     run_step(StepCtx {
                         step,
@@ -299,6 +311,9 @@ impl Runner {
                         default_jobs_flag,
                         cgroups,
                         mem_cap_factor,
+                        default_step_mem_cap_bytes,
+                        default_step_cpu_count,
+                        default_step_cpu_timeout,
                     });
                 }));
             }
@@ -401,6 +416,10 @@ struct StepCtx {
     default_jobs_flag: String,
     cgroups: BoxedCgroups,
     mem_cap_factor: f64,
+    /// SMALL forcing-function defaults for an undeclared step (see `model::DEFAULT_SMALL_*`).
+    default_step_mem_cap_bytes: Option<i64>,
+    default_step_cpu_count: Option<i64>,
+    default_step_cpu_timeout: i64,
 }
 
 /// Tear down one step's whole process tree: `cgroup.kill` first (setsid-proof), then killpg.
@@ -451,6 +470,9 @@ fn run_step(ctx: StepCtx) {
         default_jobs_flag,
         cgroups,
         mem_cap_factor,
+        default_step_mem_cap_bytes,
+        default_step_cpu_count,
+        default_step_cpu_timeout,
     } = ctx;
     let tag = step.tag();
     emit(&format!("[{tag}] \u{25b6} START  {}", step.desc));
@@ -459,13 +481,22 @@ fn run_step(ctx: StepCtx) {
     // step has no preferred_inner_jobs.
     let inner_jobs = preferred_inner_jobs(&step, None);
     let base_cmd = command_with_inner_jobs(&step, &default_jobs_flag, inner_jobs);
-    // Inner per-step memory cap (bytes) from the step's hint (hard cap wins; else factor*rss).
-    let mem_max = crate::sizing::step_mem_cap_bytes(&step, mem_cap_factor);
+    // SMALL forcing-function defaults for an undeclared step: fall back to the DAG's tight
+    // 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor when the step declares nothing
+    // for that dimension. An explicit hint always wins.
+    let mem_max =
+        crate::sizing::step_mem_cap_bytes(&step, mem_cap_factor, default_step_mem_cap_bytes);
+    // cpu.max core cap. `inner_jobs` (declared width) still keys the command's `-j` flag above;
+    // the cgroup core cap falls back to the small default so an undeclared step is 1-core-boxed
+    // WITHOUT appending a bogus `-j 1` to a command that may not accept it.
+    let cpu_count = effective_cpu_count(&step, default_step_cpu_count);
+    // CPU-time budget: declared cpu_timeout (>0) wins, else the small 10-s default.
+    let cpu_budget = effective_cpu_timeout(&step, default_step_cpu_timeout);
     // When boxing is enabled, prepare_command wraps the command so the bash leader self-moves into
     // the step's child cgroup BEFORE forking any grandchild (the cgroup-v2 fork-inheritance rule),
     // applying the inner memory/CPU caps. Disabled / absent -> the command is unchanged.
     let run_cmd = match &cgroups {
-        Some(cg) if cg.enabled() => cg.prepare_command(&tag, &base_cmd, mem_max, inner_jobs),
+        Some(cg) if cg.enabled() => cg.prepare_command(&tag, &base_cmd, mem_max, cpu_count),
         _ => base_cmd,
     };
 
@@ -519,7 +550,7 @@ fn run_step(ctx: StepCtx) {
                 false,
                 step.timeout,
                 false,
-                step.cpu_timeout,
+                cpu_budget,
                 false,
             );
             sh.done.insert(tag.clone(), outcome);
@@ -563,7 +594,7 @@ fn run_step(ctx: StepCtx) {
         let cpu_flag = Arc::clone(&cpu_exceeded);
         let cg = cgroups.clone();
         let t = tag.clone();
-        let cpu_timeout = step.cpu_timeout;
+        let cpu_timeout = cpu_budget;
         let mpid = pid;
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
@@ -751,7 +782,7 @@ fn run_step(ctx: StepCtx) {
                 timed_out,
                 step.timeout,
                 cpu_timed_out,
-                step.cpu_timeout,
+                cpu_budget,
                 false,
             )
         };
