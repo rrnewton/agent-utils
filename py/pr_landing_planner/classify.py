@@ -27,13 +27,10 @@ from dataclasses import dataclass
 
 from pr_landing_planner.model import CheckRun, CiState, CiVerdict, RedClass
 
-#: Conclusions that make a check (and thus the PR) red.
-RED_CONCLUSIONS: frozenset[str] = frozenset(
-    ("FAILURE", "TIMED_OUT", "CANCELLED", "ERROR", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE")
-)
-#: States that mean a check is still running / not yet concluded.
-PENDING_STATES: frozenset[str] = frozenset(
-    ("PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED")
+#: Conclusions that carry a genuine failed result. Every other non-success
+#: token is NO_RESULT, including cancelled/skipped/neutral/stale and unknowns.
+FAILED_CONCLUSIONS: frozenset[str] = frozenset(
+    ("FAILURE", "TIMED_OUT", "ERROR", "STARTUP_FAILURE")
 )
 
 #: Default substrings that identify the benign "evaluate-once race" gate message (ds-xdc7m9).
@@ -129,11 +126,17 @@ def parse_rollup(raw: object) -> tuple[CheckRun, ...]:
         if not name:
             # A generic StatusContext uses `context`; a CheckRun uses `name`. Skip truly nameless.
             name = _get_str(item, "workflowName")
+        status = _get_str(item, "status").upper()
+        conclusion = _get_str(item, "conclusion").upper()
+        if not conclusion:
+            # A legacy StatusContext uses terminal `state` in place of the
+            # CheckRun status/conclusion pair.
+            conclusion = _get_str(item, "state").upper()
         checks.append(
             CheckRun(
                 name=name,
-                status=_get_str(item, "status", "state").upper(),
-                conclusion=_get_str(item, "conclusion").upper(),
+                status=status,
+                conclusion=conclusion,
                 text=_get_str(item, "text", "title", "description", "summary"),
                 workflow=_get_str(item, "workflowName", "workflow"),
                 duration_secs=_get_int(item, "duration_secs", "durationSecs"),
@@ -144,37 +147,31 @@ def parse_rollup(raw: object) -> tuple[CheckRun, ...]:
 
 # --------------------------------------------------------------------------- base state
 def _check_state(check: CheckRun) -> CiState:
-    if check.conclusion in RED_CONCLUSIONS:
-        return CiState.RED
-    if check.conclusion == "SUCCESS" or check.conclusion == "NEUTRAL" or check.conclusion == "SKIPPED":
-        return CiState.GREEN
-    if check.conclusion in PENDING_STATES or not check.conclusion:
-        # No conclusion yet: pending unless it is a completed context with a bare state.
-        if check.status and check.status != "COMPLETED":
-            return CiState.PENDING
-        if not check.status and not check.conclusion:
-            return CiState.PENDING
-        return CiState.PENDING
-    return CiState.PENDING
+    terminal = not check.status or check.status == "COMPLETED"
+    if terminal and check.conclusion == "SUCCESS":
+        return CiState.PASSED
+    if terminal and check.conclusion in FAILED_CONCLUSIONS:
+        return CiState.FAILED
+    return CiState.NO_RESULT
 
 
 def classify_state(checks: Sequence[CheckRun]) -> CiState:
-    """Coarse green/red/pending/none over a whole rollup (a single red anywhere makes the PR red)."""
+    """Return PASSED/FAILED/NO_RESULT over the whole rollup."""
     if not checks:
-        return CiState.NONE
-    saw_red = False
-    saw_pending = False
+        return CiState.NO_RESULT
+    saw_failed = False
+    saw_no_result = False
     for check in checks:
         state = _check_state(check)
-        if state is CiState.RED:
-            saw_red = True
-        elif state is CiState.PENDING:
-            saw_pending = True
-    if saw_red:
-        return CiState.RED
-    if saw_pending:
-        return CiState.PENDING
-    return CiState.GREEN
+        if state is CiState.FAILED:
+            saw_failed = True
+        elif state is CiState.NO_RESULT:
+            saw_no_result = True
+    if saw_failed:
+        return CiState.FAILED
+    if saw_no_result:
+        return CiState.NO_RESULT
+    return CiState.PASSED
 
 
 # --------------------------------------------------------------------------- signatures
@@ -192,7 +189,7 @@ def _looks_like_missing_run(check: CheckRun, cfg: ClassifyConfig) -> bool:
     if (
         check.duration_secs is not None
         and check.duration_secs <= cfg.outage_max_duration_secs
-        and check.conclusion in RED_CONCLUSIONS
+        and check.conclusion in FAILED_CONCLUSIONS
     ):
         return True
     return False
@@ -217,10 +214,10 @@ def classify_pr(checks: Sequence[CheckRun], cfg: ClassifyConfig) -> CiVerdict:
     raw_state = classify_state(checks)
     gate = next((c for c in checks if c.name == cfg.gate_check), None)
     gate_present = gate is not None
-    gate_ok = gate is not None and _check_state(gate) is CiState.GREEN
+    gate_ok = gate is not None and _check_state(gate) is CiState.PASSED
     gate_missing_run = gate is not None and _looks_like_missing_run(gate, cfg)
 
-    if raw_state is not CiState.RED:
+    if raw_state is not CiState.FAILED:
         return CiVerdict(
             raw_state=raw_state,
             red_class=None,
@@ -230,9 +227,9 @@ def classify_pr(checks: Sequence[CheckRun], cfg: ClassifyConfig) -> CiVerdict:
             detail=f"{raw_state.value}",
         )
 
-    red_checks = [c for c in checks if _check_state(c) is CiState.RED]
+    red_checks = [c for c in checks if _check_state(c) is CiState.FAILED]
     non_gate_checks = [c for c in checks if c.name != cfg.gate_check]
-    non_gate_state = classify_state(non_gate_checks) if non_gate_checks else CiState.NONE
+    non_gate_state = classify_state(non_gate_checks) if non_gate_checks else CiState.NO_RESULT
 
     # (1) Systemic outage: the gate job never ran.
     if gate_missing_run:
@@ -249,9 +246,9 @@ def classify_pr(checks: Sequence[CheckRun], cfg: ClassifyConfig) -> CiVerdict:
         )
 
     # (3) Stale required check: real CI green, only the gate is stale-red.
-    gate_is_red = gate is not None and _check_state(gate) is CiState.RED
+    gate_is_red = gate is not None and _check_state(gate) is CiState.FAILED
     non_gate_reds = [c for c in red_checks if c.name != cfg.gate_check]
-    if gate_is_red and not non_gate_reds and non_gate_state is CiState.GREEN:
+    if gate_is_red and not non_gate_reds and non_gate_state is CiState.PASSED:
         return CiVerdict(
             raw_state, RedClass.STALE_REQUIRED_CHECK, gate_present, gate_ok, False,
             detail=f"CI green on head; required gate {cfg.gate_check!r} is stale (ds-4171)",
@@ -305,8 +302,7 @@ def flaky_signatures_from_objs(raw: object) -> tuple[FlakySignature, ...]:
 
 
 __all__ = [
-    "RED_CONCLUSIONS",
-    "PENDING_STATES",
+    "FAILED_CONCLUSIONS",
     "FlakySignature",
     "ClassifyConfig",
     "parse_rollup",

@@ -16,7 +16,7 @@ Per-PR action assignment (the fusion table):
 * CI stale required check       -> ``refire-stale-gate``
 * CI flaky red                  -> ``refire-ci``
 * CI real red                   -> ``hold-fix``
-* CI pending / no checks        -> ``wait``
+* CI no-result at required gate -> ``refire-ci``
 * CI green but behind base      -> ``rebase-then-land``
 * CI green, fresh, gate ok      -> ``land-now``
 
@@ -91,10 +91,12 @@ def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
         return PrAction.REFIRE_CI, ci.detail
     if red is RedClass.REAL:
         return PrAction.HOLD_FIX, ci.detail
-    if ci.raw_state is CiState.PENDING:
-        return PrAction.WAIT, "CI pending"
-    if ci.raw_state is CiState.NONE:
-        return PrAction.WAIT, "no CI checks configured"
+    if ci.raw_state is CiState.NO_RESULT:
+        if not ci.gate_present:
+            return PrAction.REFIRE_CI, "required gate has NO_RESULT (absent); re-dispatch"
+        if not ci.gate_ok:
+            return PrAction.REFIRE_CI, "required gate has NO_RESULT; re-dispatch"
+        return PrAction.WAIT, "required gate passed; another CI check has NO_RESULT"
     # GREEN.
     if node.commits_behind > freshness_max_behind:
         return (

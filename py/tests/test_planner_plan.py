@@ -40,7 +40,7 @@ def _node(
         base_sha="base",
         files=files,
         commits_behind=behind,
-        ci=_verdict(state, red),
+        ci=_verdict(state, red, gate_ok=state is CiState.PASSED),
         priority=priority,
         additions=size,
     )
@@ -62,8 +62,8 @@ def test_fusion_table_actions() -> None:
         _node(5, state=CiState.RED, red=RedClass.REAL),
         _node(6, state=CiState.RED, red=RedClass.EVALUATE_ONCE_RACE),
         _node(7, state=CiState.RED, red=RedClass.RUNNER_OUTAGE),
-        _node(8, state=CiState.PENDING),
-        _node(9, state=CiState.NONE),
+        _node(8, state=CiState.NO_RESULT),
+        _node(9, state=CiState.NO_RESULT),
     ]
     plan, _ = compute_plan(nodes, [], [], [])
     acts = plan.per_pr_actions
@@ -74,8 +74,8 @@ def test_fusion_table_actions() -> None:
     assert _action(acts, 5) is PrAction.HOLD_FIX
     assert _action(acts, 6) is PrAction.WAIT
     assert _action(acts, 7) is PrAction.ESCALATE_RUNNER_OUTAGE
-    assert _action(acts, 8) is PrAction.WAIT
-    assert _action(acts, 9) is PrAction.WAIT
+    assert _action(acts, 8) is PrAction.REFIRE_CI
+    assert _action(acts, 9) is PrAction.REFIRE_CI
 
 
 def test_freshness_threshold() -> None:

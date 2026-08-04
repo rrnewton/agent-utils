@@ -462,9 +462,11 @@ def render_status_json(result: PlanResult) -> str:
         ],
         "summary": {
             "open": len(result.graph.nodes),
-            "green": sum(n.ci.raw_state is CiState.GREEN for n in result.graph.nodes),
-            "red": sum(n.ci.raw_state is CiState.RED for n in result.graph.nodes),
-            "pending": sum(n.ci.raw_state is CiState.PENDING for n in result.graph.nodes),
+            "passed": sum(n.ci.raw_state is CiState.PASSED for n in result.graph.nodes),
+            "failed": sum(n.ci.raw_state is CiState.FAILED for n in result.graph.nodes),
+            "no_result": sum(
+                n.ci.raw_state is CiState.NO_RESULT for n in result.graph.nodes
+            ),
             "real_reds": len(diag.real_reds),
             "outage_suspected": diag.outage_suspected,
         },
@@ -481,12 +483,15 @@ def render_status_human(
     lines: list[str] = [c("bold", f"Open PR health: {result.graph.repository}"), ""]
     for n in nodes:
         state = n.ci.raw_state.value
-        styled = c("green" if state == "green" else ("yellow" if state == "pending" else "red"), state)
+        styled = c(
+            "green" if state == "passed" else ("yellow" if state == "no-result" else "red"),
+            state,
+        )
         red = f" [{n.ci.red_class.value}]" if n.ci.red_class is not None else ""
         draft = " draft" if n.is_draft else ""
         labels = f"  labels={','.join(n.labels)}" if n.labels else ""
         lines.append(f"  #{n.number:<5} ci={styled}{red}{draft}{labels}  {n.title}")
-    reds = sum(n.ci.raw_state is CiState.RED for n in nodes)
+    reds = sum(n.ci.raw_state is CiState.FAILED for n in nodes)
     lines.extend(
         [
             "",

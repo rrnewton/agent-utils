@@ -25,13 +25,20 @@ DEFAULT_GATE_CHECK = "merge-gate"
 
 
 class CiState(Enum):
-    """The coarse CI verdict for a PR's whole check rollup."""
+    """The trinary CI verdict for a PR's whole check rollup.
 
-    GREEN = "green"
-    RED = "red"
-    PENDING = "pending"
-    #: No checks configured at all.
-    NONE = "none"
+    ``PENDING`` and ``NONE`` remain aliases for callers compiled against the
+    older vocabulary. Neither is a fourth outcome: active, absent, cancelled,
+    skipped, neutral, stale, and unknown checks all have ``NO_RESULT``.
+    """
+
+    PASSED = "passed"
+    FAILED = "failed"
+    NO_RESULT = "no-result"
+    GREEN = "passed"
+    RED = "failed"
+    PENDING = "no-result"
+    NONE = "no-result"
 
 
 class RedClass(Enum):

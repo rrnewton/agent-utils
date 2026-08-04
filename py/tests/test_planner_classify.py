@@ -22,17 +22,50 @@ CFG = ClassifyConfig(gate_check="merge-gate")
 
 
 def test_classify_state_green_red_pending_none() -> None:
-    assert classify_state([]) is CiState.NONE
-    assert classify_state([_check("CI", "SUCCESS")]) is CiState.GREEN
-    assert classify_state([_check("CI", "SUCCESS"), _check("x", "FAILURE")]) is CiState.RED
-    assert classify_state([_check("CI", "", "IN_PROGRESS")]) is CiState.PENDING
-    # A single red anywhere makes the PR red even when others pass.
-    assert classify_state([_check("a", "SUCCESS"), _check("b", "TIMED_OUT")]) is CiState.RED
+    assert classify_state([]) is CiState.NO_RESULT
+    assert classify_state([_check("CI", "SUCCESS")]) is CiState.PASSED
+    assert classify_state([_check("CI", "SUCCESS"), _check("x", "FAILURE")]) is CiState.FAILED
+    assert classify_state([_check("CI", "", "IN_PROGRESS")]) is CiState.NO_RESULT
+    # A single genuine failure dominates passes and no-results.
+    assert classify_state([_check("a", "SUCCESS"), _check("b", "TIMED_OUT")]) is CiState.FAILED
+
+
+def test_two_passes_four_failures_eleven_no_results() -> None:
+    passes = (
+        _check("check-run", "SUCCESS", "COMPLETED"),
+        _check("status-context", "SUCCESS", ""),
+    )
+    assert all(classify_state([check]) is CiState.PASSED for check in passes)
+
+    failures = ("FAILURE", "TIMED_OUT", "ERROR", "STARTUP_FAILURE")
+    assert all(classify_state([_check("CI", value)]) is CiState.FAILED for value in failures)
+
+    no_results = (
+        _check("CI", "CANCELLED"),
+        _check("CI", "SKIPPED"),
+        _check("CI", "NEUTRAL"),
+        _check("CI", "STALE"),
+        _check("CI", "ACTION_REQUIRED"),
+        _check("CI", "", "QUEUED"),
+        _check("CI", "", "IN_PROGRESS"),
+        _check("CI", "", "WAITING"),
+        _check("CI", "", "REQUESTED"),
+        _check("CI", "", "MISSING"),
+        _check("CI", "FUTURE_STATE"),
+    )
+    assert all(classify_state([check]) is CiState.NO_RESULT for check in no_results)
+
+
+def test_cancelled_required_gate_neither_satisfies_nor_fails() -> None:
+    verdict = classify_pr([_check("merge-gate", "CANCELLED")], CFG)
+    assert verdict.raw_state is CiState.NO_RESULT
+    assert not verdict.gate_ok
+    assert verdict.red_class is None
 
 
 def test_green_fresh_gate_ok() -> None:
     v = classify_pr([_check("CI", "SUCCESS"), _check("merge-gate", "SUCCESS")], CFG)
-    assert v.raw_state is CiState.GREEN
+    assert v.raw_state is CiState.PASSED
     assert v.red_class is None
     assert v.gate_present and v.gate_ok
 
@@ -42,7 +75,7 @@ def test_stale_required_check() -> None:
     v = classify_pr(
         [_check("CI", "SUCCESS"), _check("merge-gate", "FAILURE", text="stale")], CFG
     )
-    assert v.raw_state is CiState.RED
+    assert v.raw_state is CiState.FAILED
     assert v.red_class is RedClass.STALE_REQUIRED_CHECK
 
 
@@ -118,7 +151,8 @@ def test_parse_rollup_narrows_gh_json() -> None:
     checks = parse_rollup(raw)
     assert len(checks) == 2
     assert checks[0].name == "CI" and checks[0].conclusion == "SUCCESS"
-    assert checks[1].name == "legacy-status"
+    assert checks[1].name == "legacy-status" and checks[1].conclusion == "SUCCESS"
+    assert classify_state(checks) is CiState.PASSED
 
 
 def test_flaky_signatures_from_objs() -> None:
