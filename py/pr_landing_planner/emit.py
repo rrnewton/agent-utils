@@ -143,6 +143,7 @@ def _summary_counts(result: PlanResult) -> list[tuple[str, int]]:
         ("real_reds", len(diag.real_reds)),
         ("evaluate_once_race", len(diag.evaluate_once_race)),
         ("mechanism_overlaps", len(result.graph.mechanism_edges)),
+        ("unclassified_mechanisms", len(result.graph.unclassified_mechanisms)),
         ("outage", 1 if diag.outage_suspected else 0),
     ]
 
@@ -183,6 +184,12 @@ def render_actions(result: PlanResult) -> str:
             f"NOTE: mechanism-overlap prs={me.a},{me.b} "
             f"mechanisms={_quote(','.join(me.mechanisms))} "
             "(same mechanism — review together; may be opposite intent)"
+        )
+    for um in result.graph.unclassified_mechanisms:
+        lines.append(
+            f"NOTE: unclassified-mechanism pr={um.pr} "
+            f"candidates={_quote(','.join(um.candidates))} "
+            "(not in the enum — recognise as an existing member or add a new one)"
         )
 
     decisions = {d.pr: d for d in result.plan.per_pr_actions}
@@ -268,6 +275,13 @@ def render_human(result: PlanResult, color: ColorFn | None = None) -> str:
             lines.append(f"  #{me.a} <-> #{me.b}: {', '.join(me.mechanisms)}")
     else:
         lines.append("  (none)")
+
+    if graph.unclassified_mechanisms:
+        lines.extend(
+            ["", c("bold", "Unclassified mechanism candidates (recognise, then extend the enum):")]
+        )
+        for um in graph.unclassified_mechanisms:
+            lines.append(f"  #{um.pr}: {', '.join(um.candidates)}")
 
     lines.extend(["", c("bold", "Diagnostics:")])
     _append_diag(lines, "stale required-check (refire gate)", diag.stale_gates)
@@ -365,6 +379,14 @@ def render_graph_human(result: PlanResult, color: ColorFn | None = None) -> str:
     if graph.mechanism_edges:
         for me in graph.mechanism_edges:
             lines.append(f"  #{me.a} <-> #{me.b}: {', '.join(me.mechanisms)}")
+    else:
+        lines.append("  (none)")
+    lines.extend(
+        ["", c("bold", "Unclassified mechanism candidates (recognise, then extend the enum):")]
+    )
+    if graph.unclassified_mechanisms:
+        for um in graph.unclassified_mechanisms:
+            lines.append(f"  #{um.pr}: {', '.join(um.candidates)}")
     else:
         lines.append("  (none)")
     lines.extend(["", c("bold", "Held PRs:")])
