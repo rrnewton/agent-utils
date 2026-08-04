@@ -1187,7 +1187,14 @@ def _resolve_cgroup_manager(allow_failure: bool) -> tuple[CgroupManager | None, 
         )
         return None, 0
     # Default: boxing is required -> re-exec into a transient systemd --user scope.
-    argv = [sys.executable, "-m", "safe_ci_dag_runner", *sys.argv[1:]]
+    # Re-exec through __main__.py by absolute path (NOT '-m safe_ci_dag_runner'): the tool is
+    # invoked via the py/bin symlink without a pip install, so a fresh child interpreter's
+    # sys.path lacks py/ and '-m safe_ci_dag_runner' dies with 'No module named
+    # safe_ci_dag_runner'. __main__.py does its own sys.path fixup, so invoking it directly
+    # imports the package cleanly. This keeps default-on boxing working outside CI (local
+    # validate.sh), not just in Actions where boxing is skipped.
+    _main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__main__.py")
+    argv = [sys.executable, _main_py, *sys.argv[1:]]
     reexeced_or_skipped = cg.reexec_in_scope(argv, memory_max=None)
     # Only reached when NO exec happened (execvp on success never returns).
     detail = (

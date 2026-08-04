@@ -359,3 +359,48 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
             "expected a CPU-TIMEOUT report proving the per-step CPU-time budget fired "
             f"(not the wall TIMEOUT):\n{combined}"
         )
+
+
+def test_boxed_reexec_via_symlink_imports_package() -> None:
+    # Regression guard for the fleet-wide local-validate breakage: a DEFAULT boxed run invoked
+    # through the py/bin symlink (NOT `python -m`, NOT pip-installed) must re-exec a child that
+    # can still import the package. The old code re-exec'd `python -m safe_ci_dag_runner`, whose
+    # fresh child had py/ off sys.path -> `No module named safe_ci_dag_runner`, so every non-CI
+    # `run` (i.e. validate.sh) died. The fix re-execs __main__.py by absolute path, which does its
+    # own sys.path fixup. Run from a CWD *outside* py/ so an accidental cwd-relative import can't
+    # mask the bug. Boxing is environment-dependent, so exit 3 (boxing genuinely unavailable) is a
+    # valid LOUD skip; the one thing that must NEVER appear is the import failure.
+    import os
+
+    symlink = Path(__file__).resolve().parent.parent / "bin" / "safe-ci-dag-runner"
+    assert symlink.exists(), f"expected the console symlink at {symlink}"
+    dag = (
+        '{"steps": [{"group": "cpu", "job": "burn", "desc": "burn",'
+        ' "cmd": "while :; do :; done", "cpu_timeout": 1, "timeout": 30}]}'
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "cpu.json"
+        path.write_text(dag, encoding="utf-8")
+        # Scrub CI markers so boxing is NOT skipped: this must exercise the real re-exec.
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
+        proc = subprocess.run(
+            [sys.executable, str(symlink), "run", "--dag", str(path), "-q", "--no-profile"],
+            capture_output=True,
+            text=True,
+            cwd=tmp,
+            env=env,
+        )
+        combined = proc.stdout + proc.stderr
+        assert "No module named safe_ci_dag_runner" not in combined, (
+            "boxed re-exec child failed to import the package (the regression this guards): "
+            f"rc={proc.returncode}\n{combined}"
+        )
+        if proc.returncode == 3:
+            pytest.skip(
+                "cgroup boxing unavailable here; re-exec child imported OK (no import error), "
+                f"which is what this test guards.\n{proc.stderr}"
+            )
+        assert proc.returncode == 1 and "CPU-TIMEOUT" in combined, (
+            "boxed symlink run should enforce the CPU budget once boxing is active; "
+            f"got rc={proc.returncode}\n{combined}"
+        )
