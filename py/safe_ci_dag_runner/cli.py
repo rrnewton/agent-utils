@@ -52,7 +52,14 @@ from safe_ci_dag_runner.io import (
     dag_to_json,
     dag_to_yaml,
 )
-from safe_ci_dag_runner.model import DagConfig, Step, step_classification
+from safe_ci_dag_runner.model import (
+    DEFAULT_SMALL_CPU_COUNT,
+    DEFAULT_SMALL_CPU_TIMEOUT,
+    DEFAULT_SMALL_MEM_CAP_BYTES,
+    DagConfig,
+    Step,
+    step_classification,
+)
 from safe_ci_dag_runner.profile_enrich import container_core_budget
 from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink
 from safe_ci_dag_runner.scheduler import run_dag
@@ -390,6 +397,13 @@ def build_parser() -> argparse.ArgumentParser:
         "memory/CPU/pids caps). The word 'unsafe' is intentional friction: unlike "
         "--allow-cgroup-failure (a capability fallback), this is an explicit opt-out that is "
         "logged loudly and should be reviewed. Use only when you have a specific reason not to box.",
+    )
+    run_p.add_argument(
+        "--small-default-cap",
+        action="store_true",
+        help="OPT IN to the SMALL forcing-function caps (1 core / 1 GiB / 10 s CPU) for steps that "
+        "DECLARE NOTHING. OFF by default: an active cap on the shared canonical checkout would wedge "
+        "every undeclared step in a concurrent validate run. An explicit per-step hint still wins.",
     )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
@@ -1546,6 +1560,23 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
         )
     cfg = apply_plan_to_config(cfg, plan)
+    # Opt-in --small-default-cap: turn ON the SMALL forcing-function caps for THIS run only. They are
+    # OFF by default so an active cap never wedges a concurrent validate on the shared checkout; this
+    # supplies the 1-core / 1-GiB / 10-s floor to steps that DECLARE NOTHING (an explicit per-step
+    # hint still wins via the effective_* helpers). Announce it so its use is visible in logs.
+    if bool(getattr(ns, "small_default_cap", False)):
+        cfg = dataclasses.replace(
+            cfg,
+            default_step_mem_cap_bytes=DEFAULT_SMALL_MEM_CAP_BYTES,
+            default_step_cpu_count=DEFAULT_SMALL_CPU_COUNT,
+            default_step_cpu_timeout=DEFAULT_SMALL_CPU_TIMEOUT,
+        )
+        print(
+            f"{PROG}: --small-default-cap: undeclared steps boxed to the SMALL default floor "
+            f"(mem {DEFAULT_SMALL_MEM_CAP_BYTES} B / {DEFAULT_SMALL_CPU_COUNT} core / "
+            f"{DEFAULT_SMALL_CPU_TIMEOUT} s CPU); declared per-step hints still win",
+            file=sys.stderr,
+        )
     if bool(ns.show_plan):
         sys.stdout.write(plan_to_text(plan))
 
