@@ -21,9 +21,15 @@ map or readiness table by hand.
 5. Surface every shared `mechanism:<slug>` label as a `mechanism_overlap_edge`. This requests
    coordinator review; it does not claim the two PRs have opposing intent.
 6. Use `assigned_agent`, the ordered decisions, and the conflict-safe groups to dispatch the batch.
+7. Treat adversarial review as the default for every PR. Only a documented process exemption may
+   skip it; missing review evidence is not approval.
+8. For a policy-changing PR, inspect the rationale date and compare it with the current policy before
+   dispatch. A rationale that predates the policy it would change requires coordinator review.
 
-The planner is advisory. The caller's landing executor still owns serialization, fresh-base checks,
-the merge mode, and ancestry verification.
+The planner is advisory. For Hermit, execute an approved landing through the tracked landing executor,
+which owns serialization and fresh-base checks. It must merge with `--rebase`, never `--admin`, then
+fetch the destination and prove the landed commit is its ancestor. A GitHub API `MERGED` flag is not
+landing evidence.
 
 ## Commands
 
