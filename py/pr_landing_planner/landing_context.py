@@ -114,10 +114,12 @@ def _label_context(node: PrNode) -> PrNode:
             f"PR #{node.number} has unknown landing-policy label {policy_raw!r}"
         ) from exc
 
-    if LOCALLY_VALIDATED_LABEL in node.labels:
-        evidence = ValidationEvidence.LOCALLY_VALIDATED
-    elif node.ci.raw_state is CiState.GREEN and node.ci.gate_ok:
+    if node.ci.raw_state is CiState.GREEN and node.ci.gate_ok:
         evidence = ValidationEvidence.AUTHORITATIVE_CI
+    elif LOCALLY_VALIDATED_LABEL in node.labels:
+        # The label is an observable cache hint, not evidence.  Only caller-supplied
+        # exact-head records and authoritative CI can authorize a landing.
+        evidence = ValidationEvidence.LOCALLY_VALIDATED
     else:
         evidence = ValidationEvidence.NONE
     return replace(

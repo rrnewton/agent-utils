@@ -104,7 +104,9 @@ the exact current head SHA:
 
 `validation_evidence` is `clean-validate-record`, `locally-validated`, `authoritative-ci`, or `none`.
 `policy_class` is `ci-hygiene`, `gate-policy`, or `unclassified`. Labels can also provide
-`locally-validated`, `agent:<name>`, `landing-policy:<class>`, and `mechanism:<slug>`.
+`locally-validated`, `agent:<name>`, `landing-policy:<class>`, and `mechanism:<slug>`. The
+`locally-validated` value records that the cache label was observed; it never authorizes landing.
+Only authoritative CI or a caller-supplied `clean-validate-record` bound to the exact head does.
 
 ---
 

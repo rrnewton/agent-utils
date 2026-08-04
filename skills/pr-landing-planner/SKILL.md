@@ -14,8 +14,9 @@ map or readiness table by hand.
 2. Supply caller-owned facts with `--landing-context FILE`: exact-head clean validation evidence,
    `ci-hygiene` versus `gate-policy`, and the assigned agent. A `clean-validate-record` entry without
    an exact `head_sha`, or one whose SHA drifted, fails loudly.
-3. Treat either the `locally-validated` label or an exact-head `clean-validate-record` as sufficient
-   validation evidence. Those signals do not wait for, or refire, a stale merge gate.
+3. Treat a raw `locally-validated` label as an observed cache hint, never as landing evidence. Only
+   authoritative CI or a caller-supplied exact-head `clean-validate-record` can authorize landing
+   without waiting for or refiring a stale merge gate.
 4. Escalate `gate-policy` changes even when validation evidence is green. Validation proves the code
    passed; it does not approve a change to landing policy. Routine `ci-hygiene` remains autonomous.
 5. Surface PRs that change the same MECHANISM as a `mechanism_overlap_edge`, even in DIFFERENT files

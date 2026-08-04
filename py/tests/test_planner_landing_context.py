@@ -49,7 +49,7 @@ def _node(
     )
 
 
-def test_labels_supply_local_evidence_agent_policy_and_mechanism_overlap() -> None:
+def test_raw_local_label_is_observed_but_does_not_authorize_landing() -> None:
     nodes = apply_landing_context(
         [
             _node(
@@ -69,6 +69,10 @@ def test_labels_supply_local_evidence_agent_policy_and_mechanism_overlap() -> No
     assert nodes[0].assigned_agent == "hermit-a"
     assert nodes[0].policy_class is PolicyClass.CI_HYGIENE
     assert build_mechanism_edges(nodes)[0].mechanisms == ("cancel-in-progress",)
+    plan, _ = compute_plan(nodes, [], [], [])
+    actions = {decision.pr: decision.action for decision in plan.per_pr_actions}
+    assert actions[1] is PrAction.REFIRE_CI
+    assert 1 not in plan.land_now
 
 
 def test_clean_record_requires_and_checks_exact_head() -> None:
@@ -132,7 +136,9 @@ def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
 
 
 def test_authoritative_ci_is_reported_as_evidence() -> None:
-    node = apply_landing_context([_node(1, state=CiState.GREEN)], [])[0]
+    node = apply_landing_context(
+        [_node(1, labels=("locally-validated",), state=CiState.GREEN)], []
+    )[0]
     assert node.validation_evidence is ValidationEvidence.AUTHORITATIVE_CI
 
 

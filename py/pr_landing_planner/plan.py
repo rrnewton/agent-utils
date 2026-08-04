@@ -67,10 +67,7 @@ def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
             PrAction.ESCALATE_GATE_POLICY,
             "gate-policy change requires coordinator decision; validation evidence is not approval",
         )
-    if node.validation_evidence in (
-        ValidationEvidence.LOCALLY_VALIDATED,
-        ValidationEvidence.CLEAN_VALIDATE_RECORD,
-    ):
+    if node.validation_evidence is ValidationEvidence.CLEAN_VALIDATE_RECORD:
         if node.commits_behind > freshness_max_behind:
             return (
                 PrAction.REBASE_THEN_LAND,
