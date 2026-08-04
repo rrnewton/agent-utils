@@ -18,8 +18,15 @@ map or readiness table by hand.
    validation evidence. Those signals do not wait for, or refire, a stale merge gate.
 4. Escalate `gate-policy` changes even when validation evidence is green. Validation proves the code
    passed; it does not approve a change to landing policy. Routine `ci-hygiene` remains autonomous.
-5. Surface every shared `mechanism:<slug>` label as a `mechanism_overlap_edge`. This requests
-   coordinator review; it does not claim the two PRs have opposing intent.
+5. Surface PRs that change the same MECHANISM as a `mechanism_overlap_edge`, even in DIFFERENT files
+   under DIFFERENT SPELLINGS (the `cancel-in-progress` #1567-vs-#1575 near-miss git merges cleanly).
+   A three-stage pipeline gets this right: DERIVE candidates mechanically from the diff and
+   `mechanism:<slug>` labels (no agent); CLASSIFY each into a stable `Mechanism` enum by normalising
+   spellings; CLUSTER on the ENUM VALUE, so `concurrency.cancel-in-progress` and `CANCEL_IN_PROGRESS`
+   land in ONE bucket. CLASSIFY may return UNCLASSIFIED — a valid output surfaced as
+   `unclassified_mechanism_candidates`, the signal the enum needs a new member (extend the
+   recognition table in `pr_landing_planner/mechanism.py` offline). An edge requests coordinator
+   review; it does not claim the two PRs have opposing intent.
 6. Use `assigned_agent`, the ordered decisions, and the conflict-safe groups to dispatch the batch.
 7. Treat adversarial review as the default for every PR. Only a documented process exemption may
    skip it; missing review evidence is not approval.
@@ -39,5 +46,5 @@ landing evidence.
 - `pr-landing-planner quickstart` and `--userguide` for the complete CLI reference.
 
 The JSON schema exposes `assigned_agent`, `validation_evidence`, and `policy_class` on each node,
-plus top-level `mechanism_overlap_edges`. Never infer those fields from prose after the plan has
-been emitted.
+plus top-level `mechanism_overlap_edges` and `unclassified_mechanism_candidates`. Never infer those
+fields from prose after the plan has been emitted.
