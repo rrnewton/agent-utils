@@ -16,8 +16,8 @@ from typing import Callable, Sequence, cast
 from urllib.request import urlopen
 
 
-AUTHORITY_COMMIT = "eb16a49c4c871734091639a402d2ca9243f395e9"
-AUTHORITY_SHA256 = "67c125c69550bd39642efb65b8f73fd0e3f05e33a2c1eadc8a202778c824fee5"
+AUTHORITY_COMMIT = "8ea20e121073e7c1fc3ce7a131a4950d7574ce42"
+AUTHORITY_SHA256 = "88de3d5afa9df20ab9174afbd3281341b7fa1c029eef5102bc1a2f22c1a50235"
 AUTHORITY_RELATIVE_PATH = Path("ci-hub/check_outcome.py")
 
 
