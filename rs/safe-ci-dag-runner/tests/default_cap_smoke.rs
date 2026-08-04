@@ -33,7 +33,7 @@ const DECLARED_DAG: &str = r#"{"steps": [{"group": "mem", "job": "breach-but-dec
 
 /// Run `dag_json` through the built binary under default (boxing-required) `run`; returns
 /// `(exit_code, combined_stdout_stderr)`.
-fn run_dag(label: &str, dag_json: &str) -> (Option<i32>, String) {
+fn run_dag(label: &str, dag_json: &str, small_cap: bool) -> (Option<i32>, String) {
     let bin = env!("CARGO_BIN_EXE_safe-ci-dag-runner");
     let dir = std::env::temp_dir().join(format!("scdr_defcap_{}_{}", label, std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -41,8 +41,16 @@ fn run_dag(label: &str, dag_json: &str) -> (Option<i32>, String) {
     let mut f = std::fs::File::create(&dag).unwrap();
     f.write_all(dag_json.as_bytes()).unwrap();
     drop(f);
+    // --small-default-cap OPTS IN to the SMALL forcing-function caps (default OFF so an active cap
+    // never wedges a concurrent validate on the shared checkout). With the flag we prove the
+    // mechanism enforces; WITHOUT it we prove the default is inert (no wedge).
+    let mut args = vec!["run", "--dag", dag.to_str().unwrap()];
+    if small_cap {
+        args.push("--small-default-cap");
+    }
+    args.extend_from_slice(&["-q", "--no-profile"]);
     let output = Command::new(bin)
-        .args(["run", "--dag", dag.to_str().unwrap(), "-q", "--no-profile"])
+        .args(&args)
         .output()
         .expect("failed to spawn the built binary");
     let combined = format!(
@@ -57,7 +65,7 @@ fn run_dag(label: &str, dag_json: &str) -> (Option<i32>, String) {
 #[test]
 fn small_default_cap_boxes_an_undeclared_step() {
     // Probe with the breach DAG; a code-3 means boxing is unavailable here -> skip loudly.
-    let (breach_code, breach_out) = run_dag("breach", BREACH_DAG);
+    let (breach_code, breach_out) = run_dag("breach", BREACH_DAG, true);
     if breach_code == Some(3) {
         eprintln!(
             "SKIP small_default_cap_boxes_an_undeclared_step: cgroup boxing unavailable (need \
@@ -80,7 +88,7 @@ fn small_default_cap_boxes_an_undeclared_step() {
     );
 
     // B: an UNDECLARED step UNDER the default passes -> the cap does not kill everything.
-    let (compliant_code, compliant_out) = run_dag("compliant", COMPLIANT_DAG);
+    let (compliant_code, compliant_out) = run_dag("compliant", COMPLIANT_DAG, true);
     assert_eq!(
         compliant_code,
         Some(0),
@@ -90,11 +98,38 @@ fn small_default_cap_boxes_an_undeclared_step() {
 
     // C: the SAME 1.4GiB allocation passes when the step declares a 4 GiB cap -> it was the 1 GiB
     // *default* (not an ambient/outer limit) that killed A.
-    let (declared_code, declared_out) = run_dag("declared", DECLARED_DAG);
+    let (declared_code, declared_out) = run_dag("declared", DECLARED_DAG, true);
     assert_eq!(
         declared_code,
         Some(0),
         "1.4GiB step declaring hard_mem_max 4GiB must escape the default and PASS; got \
          {declared_code:?}\n{declared_out}"
+    );
+}
+
+/// Fleet-safety guard: with the caps at their DEFAULT (OFF, i.e. WITHOUT `--small-default-cap`),
+/// the SAME undeclared 1.4 GiB step that gets OOM-killed under the opt-in must PASS. This is the
+/// regression fence against re-wedging concurrent validates on the shared canonical checkout — the
+/// exact reason the mechanism lands opt-in rather than active-by-default.
+#[test]
+fn default_off_does_not_box_an_undeclared_step() {
+    let (code, out) = run_dag("defaultoff", BREACH_DAG, false);
+    if code == Some(3) {
+        eprintln!(
+            "SKIP default_off_does_not_box_an_undeclared_step: cgroup boxing unavailable. \
+             Details:\n{out}"
+        );
+        return;
+    }
+    assert_eq!(
+        code,
+        Some(0),
+        "with the SMALL default cap OFF (no --small-default-cap), an undeclared 1.4GiB step must \
+         NOT be capped and must PASS — an active default here would wedge the fleet; got \
+         {code:?}\n{out}"
+    );
+    assert!(
+        !out.contains("OOM-KILLED") && !out.contains("MEMORY CAP HIT"),
+        "no inner memory cap must fire when the default is OFF:\n{out}"
     );
 }

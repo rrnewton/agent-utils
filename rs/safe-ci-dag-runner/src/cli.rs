@@ -325,6 +325,7 @@ struct RunArgs {
     keep_going: bool,
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
+    small_default_cap: bool,
     verbosity: i64,
     quiet: bool,
 }
@@ -347,6 +348,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         keep_going: false,
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
+        small_default_cap: false,
         verbosity: 1,
         quiet: false,
     };
@@ -410,6 +412,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             ),
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
+            "--small-default-cap" => a.small_default_cap = true,
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
             other => {
@@ -1435,7 +1438,23 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             mem_budget,
         )
     });
-    let applied = apply_plan_to_config(cfg, &plan);
+    let mut applied = apply_plan_to_config(cfg, &plan);
+    // Opt-in --small-default-cap: turn ON the SMALL forcing-function caps for THIS run only. They
+    // are OFF by default so an active cap never wedges a concurrent validate on the shared checkout;
+    // this flag supplies the 1-core / 1-GiB / 10-s floor to steps that DECLARE NOTHING (an explicit
+    // per-step hint still wins via the effective_* helpers). Announce it so its use is visible in logs.
+    if a.small_default_cap {
+        applied.default_step_mem_cap_bytes = Some(crate::model::DEFAULT_SMALL_MEM_CAP_BYTES);
+        applied.default_step_cpu_count = Some(crate::model::DEFAULT_SMALL_CPU_COUNT);
+        applied.default_step_cpu_timeout = crate::model::DEFAULT_SMALL_CPU_TIMEOUT;
+        eprintln!(
+            "{PROG}: --small-default-cap: undeclared steps boxed to the SMALL default floor \
+             (mem {} B / {} core / {} s CPU); declared per-step hints still win",
+            crate::model::DEFAULT_SMALL_MEM_CAP_BYTES,
+            crate::model::DEFAULT_SMALL_CPU_COUNT,
+            crate::model::DEFAULT_SMALL_CPU_TIMEOUT,
+        );
+    }
     let cfg: &DagConfig = &applied;
     if a.show_plan {
         print!("{}", plan_to_text(&plan));
