@@ -31,7 +31,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cgroup::{
-    apply_core_box, install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups,
+    apply_core_box, enable_outer_oom_group, expected_outer_memory_max_bytes,
+    install_scope_teardown, is_in_scope, outer_memory_max_bytes, reexec_in_scope,
+    verify_scope_limits, CgroupManager, Cgroups,
 };
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
@@ -510,6 +512,22 @@ fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<Boxed
         return Ok(None);
     }
     if is_in_scope() {
+        let expected_memory_max = expected_outer_memory_max_bytes();
+        if expected_memory_max
+            .is_none_or(|cap| !enable_outer_oom_group() || !verify_scope_limits(cap))
+        {
+            let msg = "outer scope MemoryMax/MemorySwapMax/memory.oom.group readback failed; \
+                       the run is not safely contained";
+            if allow_failure {
+                eprintln!(
+                    "{PROG}: warning: {msg}; running best-effort UNBOXED \
+                     (--allow-cgroup-failure)."
+                );
+                return Ok(None);
+            }
+            eprintln!("{PROG}: ERROR: {msg}.");
+            return Err(3);
+        }
         let mgr = Cgroups::new();
         if mgr.enabled() {
             install_scope_teardown();
@@ -541,7 +559,14 @@ fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<Boxed
     }
     // Default: boxing is required -> re-exec into a transient systemd --user scope (never returns
     // on success).
-    let reexeced_or_skipped = reexec_in_scope(None, None);
+    let Some(outer_memory_max) = outer_memory_max_bytes() else {
+        eprintln!(
+            "{PROG}: ERROR: cannot derive a positive outer MemoryMax from MemAvailable/\
+             $SAFE_CI_OUTER_MEMORY_MAX_BYTES; refusing an unbounded run."
+        );
+        return Err(3);
+    };
+    let reexeced_or_skipped = reexec_in_scope(Some(outer_memory_max), None);
     let detail = if reexeced_or_skipped {
         "boxing was skipped (e.g. CI without a systemd --user scope)"
     } else {

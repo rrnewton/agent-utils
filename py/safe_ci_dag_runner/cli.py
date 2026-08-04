@@ -1285,6 +1285,26 @@ def _resolve_cgroup_manager(
 
     naming = cg.DEFAULT_NAMING
     if os.environ.get(naming.env_in_scope) == "1":
+        expected_memory_max = cg.expected_outer_memory_max_bytes()
+        controls_ok = (
+            expected_memory_max is not None
+            and cg.enable_outer_oom_group(naming=naming)
+            and cg.verify_scope_limits(expected_memory_max, None, naming=naming)
+        )
+        if not controls_ok:
+            msg = (
+                "outer scope MemoryMax/MemorySwapMax/memory.oom.group readback failed; "
+                "the run is not safely contained"
+            )
+            if allow_failure:
+                print(
+                    f"{PROG}: warning: {msg}; running best-effort UNBOXED "
+                    "(--allow-cgroup-failure).",
+                    file=sys.stderr,
+                )
+                return None, 0
+            print(f"{PROG}: ERROR: {msg}.", file=sys.stderr)
+            return None, 3
         manager = cg.Cgroups(naming)
         if manager.enabled:
             cg.install_scope_teardown(naming=naming)
@@ -1323,7 +1343,15 @@ def _resolve_cgroup_manager(
     # validate.sh), not just in Actions where boxing is skipped.
     _main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__main__.py")
     argv = [sys.executable, _main_py, *sys.argv[1:]]
-    reexeced_or_skipped = cg.reexec_in_scope(argv, memory_max=None)
+    outer_memory_max = cg.outer_memory_max_bytes()
+    if outer_memory_max is None:
+        print(
+            f"{PROG}: ERROR: cannot derive a positive outer MemoryMax from MemAvailable/"
+            f"${cg.OUTER_MEMORY_MAX_ENV}; refusing an unbounded run.",
+            file=sys.stderr,
+        )
+        return None, 3
+    reexeced_or_skipped = cg.reexec_in_scope(argv, memory_max=outer_memory_max)
     # Only reached when NO exec happened (execvp on success never returns).
     detail = (
         "boxing was skipped (e.g. CI without a systemd --user scope)"

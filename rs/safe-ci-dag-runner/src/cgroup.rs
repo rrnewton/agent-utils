@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
-use crate::sizing::cpu_count;
+use crate::sizing::{cpu_count, mem_available_bytes};
 
 /// cgroup-v2 unified hierarchy mount point (Linux-only, matching the target).
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
@@ -36,6 +36,10 @@ const UNIT_PREFIX: &str = "safe-ci";
 const ENV_IN_SCOPE: &str = "SAFE_CI_IN_SCOPE";
 /// Env var carrying the outer scope unit name to the in-scope child.
 const ENV_SCOPE_UNIT: &str = "SAFE_CI_SCOPE_UNIT";
+/// Optional caller override that may tighten, but never widen, the derived outer cap.
+const OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_OUTER_MEMORY_MAX_BYTES";
+/// Exact cap carried across the systemd re-exec for in-scope readback.
+const EXPECTED_OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES";
 /// Child cgroup the runner vacates into (cgroup-v2 "no internal processes" rule).
 const SUPERVISOR: &str = "supervisor";
 /// Per-step child cgroup directory prefix (also the normal-exit backstop scan key).
@@ -44,6 +48,8 @@ const STEP_PREFIX: &str = "step-";
 const LOG_PREFIX: &str = "[safe-ci]";
 /// Fraction of WHOLE-SYSTEM CPU the shared aggregate slice may use (leaves ~10% headroom).
 const DEFAULT_CPU_BUDGET_FRACTION: f64 = 0.90;
+/// Generous last-resort run boundary, leaving memory for neighbours and the OS.
+const DEFAULT_MEMORY_BUDGET_FRACTION: f64 = 0.90;
 
 /// Per-step containment: create, cap, measure, and tear down a child cgroup per step.
 ///
@@ -161,6 +167,40 @@ fn in_scope() -> bool {
     std::env::var(ENV_IN_SCOPE).ok().as_deref() == Some("1")
 }
 
+/// Generous outer-scope cap derived from current non-swap availability.
+///
+/// Per-step limits remain the precise controls. This boundary exists to keep a
+/// runaway whole run from reaching the host-global OOM killer. The environment
+/// override can tighten the cap for a constrained host or mutation test, but
+/// cannot widen the derived 90%-of-MemAvailable boundary.
+pub fn outer_memory_max_bytes() -> Option<i64> {
+    let available = mem_available_bytes()?;
+    if available <= 0 {
+        return None;
+    }
+    let derived = ((available as f64) * DEFAULT_MEMORY_BUDGET_FRACTION) as i64;
+    let requested = match std::env::var(OUTER_MEMORY_MAX_ENV) {
+        Ok(raw) => {
+            let value: i64 = raw.parse().ok()?;
+            if value <= 0 {
+                return None;
+            }
+            Some(value)
+        }
+        Err(_) => None,
+    };
+    Some(requested.map_or(derived, |value| value.min(derived)).max(1))
+}
+
+/// Cap the parent requested, carried into the re-exec'd scope.
+pub fn expected_outer_memory_max_bytes() -> Option<i64> {
+    let value: i64 = std::env::var(EXPECTED_OUTER_MEMORY_MAX_ENV)
+        .ok()?
+        .parse()
+        .ok()?;
+    (value > 0).then_some(value)
+}
+
 /// Whether this process is already running inside the managed cgroup scope (the re-exec set the
 /// `SAFE_CI_IN_SCOPE` sentinel). The CLI checks this to decide whether to re-exec.
 pub fn is_in_scope() -> bool {
@@ -224,6 +264,14 @@ pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool 
     if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
         return true;
     }
+    let memory_max = memory_max.or_else(outer_memory_max_bytes);
+    if memory_max.is_none() {
+        eprintln!(
+            "{LOG_PREFIX} ERROR: cannot derive a positive outer MemoryMax; refusing an \
+             unbounded scope."
+        );
+        return false;
+    }
     if !systemd_scope_available() {
         eprintln!(
             "{LOG_PREFIX} ERROR: systemd --user scope is unavailable; refusing advisory-only \
@@ -271,6 +319,10 @@ pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool 
     ));
     args.push(format!("--setenv={ENV_IN_SCOPE}=1"));
     args.push(format!("--setenv={ENV_SCOPE_UNIT}={unit}.scope"));
+    args.push(format!(
+        "--setenv={EXPECTED_OUTER_MEMORY_MAX_ENV}={}",
+        memory_max.map_or_else(String::new, |value| value.to_string())
+    ));
     args.push("--".into());
 
     match std::env::current_exe() {
@@ -309,6 +361,72 @@ fn scope_cgroup_from_self() -> Option<PathBuf> {
         return Some(mine);
     }
     None
+}
+
+/// Verify that every requested outer control took effect in cgroup v2.
+///
+/// A successful systemd property write is not proof of enforcement. The
+/// re-exec'd child reads the kernel files and refuses containment unless the
+/// numeric cap, swap disable, and group-OOM bit all match.
+pub fn verify_scope_limits(expected_memory_max: i64) -> bool {
+    let Some(scope) = scope_cgroup_from_self() else {
+        eprintln!("{LOG_PREFIX} ERROR: outer cgroup limit audit unavailable: scope not found");
+        return false;
+    };
+    verify_scope_limits_at(&scope, expected_memory_max)
+}
+
+fn verify_scope_limits_at(scope: &Path, expected_memory_max: i64) -> bool {
+    let memory_max = read_trim(scope, "memory.max");
+    let memory_swap_max = read_trim(scope, "memory.swap.max");
+    let memory_oom_group = read_trim(scope, "memory.oom.group");
+    let memory_ok = memory_max
+        .as_deref()
+        .and_then(|value| value.parse::<i64>().ok())
+        .is_some_and(|actual| actual <= expected_memory_max && expected_memory_max - actual < 4096);
+    let swap_ok = memory_swap_max.as_deref() == Some("0");
+    let oom_group_ok = memory_oom_group.as_deref() == Some("1");
+    eprintln!(
+        "{LOG_PREFIX} outer cgroup audit: memory.max={} ({}), memory.swap.max={} ({}), \
+         memory.oom.group={} ({})",
+        memory_max.as_deref().unwrap_or("UNREADABLE"),
+        if memory_ok { "bound" } else { "MISMATCH" },
+        memory_swap_max.as_deref().unwrap_or("UNREADABLE"),
+        if swap_ok { "disabled" } else { "MISMATCH" },
+        memory_oom_group.as_deref().unwrap_or("UNREADABLE"),
+        if oom_group_ok { "enabled" } else { "MISMATCH" },
+    );
+    memory_ok && swap_ok && oom_group_ok
+}
+
+/// Write and read back `memory.oom.group=1` on the outer scope.
+///
+/// The systemd version on supported hosts may reject `MemoryOOMGroup=` as a
+/// unit property, so the scoped child writes cgroup v2 directly. The write is
+/// not trusted until the kernel file reads back as `1`.
+pub fn enable_outer_oom_group() -> bool {
+    let Some(scope) = scope_cgroup_from_self() else {
+        warn("outer memory.oom.group: scope not found");
+        return false;
+    };
+    enable_outer_oom_group_at(&scope)
+}
+
+fn enable_outer_oom_group_at(scope: &Path) -> bool {
+    let control = scope.join("memory.oom.group");
+    if let Err(error) = fs::write(&control, "1") {
+        warn(&format!("outer memory.oom.group=1 write failed ({error})"));
+        return false;
+    }
+    let actual = read_trim(scope, "memory.oom.group");
+    if actual.as_deref() != Some("1") {
+        warn(&format!(
+            "outer memory.oom.group readback mismatch: {}",
+            actual.as_deref().unwrap_or("UNREADABLE")
+        ));
+        return false;
+    }
+    true
 }
 
 // --------------------------------------------------------------------------- //
@@ -900,6 +1018,14 @@ impl CgroupManager for Cgroups {
 mod tests {
     use super::*;
 
+    fn temp_scope(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("safe-ci-cgroup-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     #[test]
     fn sanitize_makes_safe_names() {
         assert_eq!(sanitize("build.app"), "step-build.app");
@@ -922,5 +1048,29 @@ mod tests {
     #[test]
     fn cpu_quota_percent_floor_is_one_core() {
         assert!(cpu_quota_percent(0.90) >= 100);
+    }
+
+    #[test]
+    fn outer_oom_group_write_is_read_back() {
+        let scope = temp_scope("oom-group");
+        fs::write(scope.join("memory.oom.group"), "0").unwrap();
+        assert!(enable_outer_oom_group_at(&scope));
+        assert_eq!(
+            fs::read_to_string(scope.join("memory.oom.group")).unwrap(),
+            "1"
+        );
+        fs::remove_dir_all(scope).unwrap();
+    }
+
+    #[test]
+    fn outer_scope_audit_requires_group_oom() {
+        let scope = temp_scope("audit");
+        fs::write(scope.join("memory.max"), "104857600").unwrap();
+        fs::write(scope.join("memory.swap.max"), "0").unwrap();
+        fs::write(scope.join("memory.oom.group"), "1").unwrap();
+        assert!(verify_scope_limits_at(&scope, 104857600));
+        fs::write(scope.join("memory.oom.group"), "0").unwrap();
+        assert!(!verify_scope_limits_at(&scope, 104857600));
+        fs::remove_dir_all(scope).unwrap();
     }
 }

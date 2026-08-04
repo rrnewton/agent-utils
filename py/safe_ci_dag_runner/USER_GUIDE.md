@@ -893,7 +893,8 @@ cfg = DagConfig(steps=(Step("build", "app", "compile", "echo build && sleep 0.1"
 #   - On that second pass the SAFE_CI_IN_SCOPE sentinel is set, so reexec_in_scope() returns
 #     True (anti-recursion) and execution falls through to here.
 #   - It returns False only when a --user scope is unavailable or the exec failed.
-# Pass memory_max=<bytes> and/or cpu_count=<n> to cap the whole run's outer box.
+# memory_max=None derives a generous 90%-of-MemAvailable outer cap; pass a
+# smaller byte count to tighten it. cpu_count=<n> adds an outer CPU quota.
 if not reexec_in_scope(sys.argv, memory_max=None, skip_in_ci=False):
     sys.exit("refusing to run without cgroup enforcement (no delegated cgroup-v2 scope)")
 
@@ -911,7 +912,8 @@ python3 boxed_run.py
 `reexec_in_scope` defaults to `skip_in_ci=True`, which returns `True` **without** re-execing when
 `CI` or `GITHUB_ACTIONS` is set (so a plain CI run is not boxed); pass `skip_in_ci=False`, as above,
 to force boxing even under CI. Its other keyword arguments: `memory_max` (outer `MemoryMax` in bytes;
-swap is always disabled regardless), `cpu_count` (outer `CPUQuota`), `naming` (a `ScopeNaming` value
+`None` derives 90% of current non-swap `MemAvailable`; swap is always disabled regardless),
+`cpu_count` (outer `CPUQuota`), `naming` (a `ScopeNaming` value
 to brand the scope/slice/log-prefix), and `use_aggregate_slice` (share one CPU cap across concurrent
 runs).
 
@@ -920,8 +922,9 @@ runs).
 `Cgroups().enabled is True` is the one-line "boxing is live" signal, and the recipe above prints it.
 For a fuller audit of the outer box after the re-exec, call
 `verify_scope_limits(expected_memory_max, expected_cpu_count)` — it reads back the scope's
-`memory.max`, `memory.swap.max`, and `cpu.max` and prints `bound`/`MISMATCH` evidence, returning
-`True` only when the requested limits actually reached cgroup-v2.
+`memory.max`, `memory.swap.max`, `memory.oom.group`, and `cpu.max` and prints
+`bound`/`MISMATCH` evidence, returning `True` only when every requested limit actually reached
+cgroup-v2. The CLI performs this audit automatically and refuses a containment claim on mismatch.
 
 When boxing is active, each step's inner memory cap comes from its hint (`hard_mem_max_bytes`, else
 `rss_baseline_bytes` × `mem_cap_factor`) and its inner CPU cap from `preferred_inner_jobs`; a step

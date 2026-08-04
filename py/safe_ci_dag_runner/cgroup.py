@@ -73,7 +73,7 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
-from safe_ci_dag_runner.sizing import derive_build_jobs
+from safe_ci_dag_runner.sizing import derive_build_jobs, mem_available_bytes
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
@@ -81,6 +81,18 @@ CGROUP_ROOT = Path("/sys/fs/cgroup")
 #: ~10% headroom for SSH, the coordinator, and the OS so the box stays
 #: responsive even when concurrent runs saturate their budget.
 DEFAULT_CPU_BUDGET_FRACTION = 0.90
+
+#: Fraction of currently allocatable, non-swap memory granted to one outer run
+#: scope. This is deliberately generous: per-step caps remain the precise
+#: controls, while the outer cap is the last-resort boundary that keeps a
+#: runaway run from reaching the host-global OOM killer.
+DEFAULT_MEMORY_BUDGET_FRACTION = 0.90
+
+#: Optional caller override used by containment tests and constrained hosts.
+#: It may only TIGHTEN the derived cap, never widen it.
+OUTER_MEMORY_MAX_ENV = "SAFE_CI_OUTER_MEMORY_MAX_BYTES"
+#: Exact cap carried across the systemd re-exec for in-scope readback.
+EXPECTED_OUTER_MEMORY_MAX_ENV = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES"
 
 #: Per-step child cgroup directory prefix (also the scan key for the
 #: normal-exit backstop). cgroup-v2 directory names may not contain '/'.
@@ -155,6 +167,39 @@ def _fmt_bytes(n: int) -> str:
             return f"{value:.1f} {unit}"
         value /= 1024.0
     return f"{n} B"
+
+
+def outer_memory_max_bytes() -> int | None:
+    """Generous outer-scope cap derived from current non-swap availability.
+
+    The outer scope is a correctness boundary, not a per-step sizing model: it
+    gets 90% of ``MemAvailable`` so the coordinator, neighbours, and kernel keep
+    headroom. ``SAFE_CI_OUTER_MEMORY_MAX_BYTES`` can tighten this for a smaller
+    host or a mutation test, but cannot widen the derived boundary.
+    """
+    available = mem_available_bytes()
+    if available is None or available <= 0:
+        return None
+    derived = max(1, int(available * DEFAULT_MEMORY_BUDGET_FRACTION))
+    raw = os.environ.get(OUTER_MEMORY_MAX_ENV)
+    if not raw:
+        return derived
+    try:
+        requested = int(raw)
+    except ValueError:
+        return None
+    if requested <= 0:
+        return None
+    return min(derived, requested)
+
+
+def expected_outer_memory_max_bytes() -> int | None:
+    """Cap the parent requested, carried into the re-exec'd scope."""
+    try:
+        value = int(os.environ.get(EXPECTED_OUTER_MEMORY_MAX_ENV, ""))
+    except ValueError:
+        return None
+    return value if value > 0 else None
 
 
 # --------------------------------------------------------------------------- #
@@ -515,6 +560,10 @@ def enter_delegated_scope(
     base = _delegated_cgroup_base(_my_cgroup_path())
     if base is None:
         return False, "delegated cgroupfs became unavailable"
+    if memory_max is None:
+        memory_max = outer_memory_max_bytes()
+    if memory_max is None:
+        return False, "could not derive a positive outer MemoryMax"
     child = base / f"{naming.unit_prefix}-{os.getpid()}"
     try:
         child.mkdir()
@@ -522,8 +571,7 @@ def enter_delegated_scope(
         # may choose swap-heavy cgroups even when the kernel did not record a
         # cgroup OOM event.
         (child / "memory.swap.max").write_text("0")
-        if memory_max is not None:
-            (child / "memory.max").write_text(str(memory_max))
+        (child / "memory.max").write_text(str(memory_max))
         # Keep hard caps only. Soft reclaim throttling would mark a legitimately
         # long run as memory-pressure-heavy on some hosts.
         (child / "memory.high").write_text("max")
@@ -546,6 +594,7 @@ def enter_delegated_scope(
         (child / "cgroup.procs").write_text(str(os.getpid()))
         os.environ[naming.env_in_scope] = "1"
         os.environ[naming.env_direct_cgroup] = str(child)
+        os.environ[EXPECTED_OUTER_MEMORY_MAX_ENV] = str(memory_max)
         return True, f"entered delegated cgroup {child}"
     except OSError as exc:
         try:
@@ -592,6 +641,14 @@ def reexec_in_scope(
         return True  # already re-exec'd into the scope (anti-recursion)
     if skip_in_ci and (os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS")):
         return True
+    if memory_max is None:
+        memory_max = outer_memory_max_bytes()
+    if memory_max is None:
+        sys.stderr.write(
+            f"{naming.log_prefix} ERROR: cannot derive a positive outer MemoryMax; "
+            "refusing an unbounded scope.\n"
+        )
+        return False
     if not systemd_scope_available():
         sys.stderr.write(f"{naming.log_prefix} ERROR: systemd --user scope is unavailable; "
                          "refusing advisory-only containment.\n")
@@ -600,7 +657,10 @@ def reexec_in_scope(
     unit = f"{naming.unit_prefix}-{os.getpid()}"
     # Swaplessness is independent of the optional RAM hard cap (a 40 GB runaway
     # swapping into a smaller RAM still thrashes the host).
-    props = ["-p", "Delegate=yes", "-p", "MemorySwapMax=0"]
+    props = [
+        "-p", "Delegate=yes",
+        "-p", "MemorySwapMax=0",
+    ]
     if cpu_count is not None:
         props += ["-p", f"CPUQuota={cpu_count * 100}%"]
         print(f"{naming.log_prefix} per-run CPU cap: CPUQuota={cpu_count * 100}% "
@@ -633,6 +693,7 @@ def reexec_in_scope(
            f"--setenv=CARGO_BUILD_JOBS={derive_build_jobs(cpu_count, memory_max)}",
            f"--setenv={naming.env_in_scope}=1",
            f"--setenv={naming.env_scope_unit}={unit}.scope",
+           f"--setenv={EXPECTED_OUTER_MEMORY_MAX_ENV}={memory_max or ''}",
            "--", *argv]
     print(f"{naming.log_prefix} re-exec inside transient systemd scope {unit}.scope "
           "(two-level cgroup; full-descendant cleanup on exit)…")
@@ -811,6 +872,7 @@ def verify_scope_limits(
 
     memory_max = _read_cgroup_value(scope, "memory.max")
     memory_swap_max = _read_cgroup_value(scope, "memory.swap.max")
+    memory_oom_group = _read_cgroup_value(scope, "memory.oom.group")
     cpu_max = _read_cgroup_value(scope, "cpu.max")
     if expected_memory_max is None:
         memory_ok = memory_max == "max"
@@ -825,6 +887,7 @@ def verify_scope_limits(
         except (OSError, ValueError):
             memory_ok = False
     swap_ok = memory_swap_max == "0"
+    oom_group_ok = memory_oom_group == "1"
     cpu_ok = True
     if expected_cpu_count is not None:
         try:
@@ -836,9 +899,37 @@ def verify_scope_limits(
     print(f"{naming.log_prefix} outer cgroup audit: memory.max={memory_max or 'UNREADABLE'} "
           f"({'bound' if memory_ok else 'MISMATCH'}), "
           f"memory.swap.max={memory_swap_max or 'UNREADABLE'} "
-          f"({'disabled' if swap_ok else 'MISMATCH'}), cpu.max={cpu_max or 'UNREADABLE'} "
+          f"({'disabled' if swap_ok else 'MISMATCH'}), "
+          f"memory.oom.group={memory_oom_group or 'UNREADABLE'} "
+          f"({'enabled' if oom_group_ok else 'MISMATCH'}), "
+          f"cpu.max={cpu_max or 'UNREADABLE'} "
           f"({'bound' if cpu_ok else 'MISMATCH'})")
-    return memory_ok and swap_ok and cpu_ok
+    return memory_ok and swap_ok and oom_group_ok and cpu_ok
+
+
+def enable_outer_oom_group(naming: ScopeNaming = DEFAULT_NAMING) -> bool:
+    """Write and read back ``memory.oom.group=1`` on the outer scope.
+
+    Older systemd versions on supported hosts reject the ``MemoryOOMGroup=``
+    unit property, so the re-exec'd scoped process performs the cgroup-v2 write
+    directly. A successful write is not trusted until the kernel file reads
+    back as ``1``.
+    """
+    scope = scope_cgroup_from_self(naming)
+    if scope is None:
+        _warn(naming, "outer memory.oom.group: scope not found")
+        return False
+    control = scope / "memory.oom.group"
+    try:
+        control.write_text("1")
+    except OSError as exc:
+        _warn(naming, f"outer memory.oom.group=1 write failed ({exc})")
+        return False
+    actual = _read_cgroup_value(scope, "memory.oom.group")
+    if actual != "1":
+        _warn(naming, f"outer memory.oom.group readback mismatch: {actual or 'UNREADABLE'}")
+        return False
+    return True
 
 
 def _quota_matches(cpu_max: str | None, expected_cpu_count: int) -> bool:
