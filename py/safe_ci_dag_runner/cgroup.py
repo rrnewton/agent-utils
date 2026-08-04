@@ -531,8 +531,10 @@ def enter_delegated_scope(
         # oom.group must not abort an otherwise-valid boxed scope.
         try:
             (child / "memory.oom.group").write_text("1")
-        except OSError:
-            pass
+        except OSError as exc:
+            _warn(naming, f"job cgroup: could not set memory.oom.group ({exc}); an OOM in this "
+                  "scope may kill a single process instead of the whole job "
+                  "(mis-attributed blast radius)")
         quota = cpu_count * 100 if cpu_count is not None else cpu_quota_percent()
         (child / "cpu.max").write_text(f"{quota * 1000} 100000")
         # Scope-wide build-job default, derived from THIS granted quota + memory cap, so a

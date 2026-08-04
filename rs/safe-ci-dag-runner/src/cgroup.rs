@@ -467,8 +467,15 @@ impl CgroupManager for Cgroups {
         // kills one victim process inside whichever cgroup it OOMs: a capped step is left half-dead,
         // and a runaway escalating past its own cap to a shared ancestor gets a victim chosen by
         // badness across ALL steps — so the kill can land on an INNOCENT NEIGHBOUR and be attributed
-        // to the wrong PR. Best-effort: a kernel without oom.group must not drop the caps above.
-        let _ = fs::write(child.join("memory.oom.group"), "1");
+        // to the wrong PR. Best-effort: a kernel without oom.group must not drop the caps above —
+        // but a FAILED write must not pass silently, or the step OOM lands on one victim with no
+        // trace of why. Mirrors the Python per-step site so the engines stay at parity.
+        if let Err(e) = fs::write(child.join("memory.oom.group"), "1") {
+            warn(&format!(
+                "step {tag}: could not set memory.oom.group ({e}); an OOM may kill a single \
+                 process instead of the whole step (mis-attributed blast radius)"
+            ));
+        }
         if let Some(m) = mem_max {
             if let Err(e) = fs::write(child.join("memory.max"), m.to_string()) {
                 warn(&format!(
