@@ -15,6 +15,16 @@ pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
 /// when the step declares `preferred_inner_jobs`. Mirrors Python's `DEFAULT_JOBS_FLAG`.
 pub const DEFAULT_JOBS_FLAG: &str = "-j";
 
+/// Deliberately SMALL default caps for a step that DECLARES NOTHING — the "forcing function".
+/// An undeclared step is boxed into a tight 1-core / 1-GiB / 10-s-CPU floor, so a real step
+/// immediately hits the cap and must DECLARE its true needs, generating per-node resource
+/// metadata EMPIRICALLY (from measured breaches) instead of by guessing. Each applies ONLY
+/// when the step leaves the matching hint unset; an explicit hint wins. Mirror Python's
+/// `DEFAULT_SMALL_*` constants.
+pub const DEFAULT_SMALL_MEM_CAP_BYTES: i64 = 1024i64.pow(3); // 1 GiB inner memory.max
+pub const DEFAULT_SMALL_CPU_COUNT: i64 = 1; // 1-core cpu.max
+pub const DEFAULT_SMALL_CPU_TIMEOUT: i64 = 10; // 10 s CPU-time budget
+
 /// How a step uses the machine, used for scheduling decisions.
 ///
 /// The serde/string values (`"cpu-bound"`, `"latency-bound"`, `"light"`) are load-bearing:
@@ -173,6 +183,24 @@ pub fn preferred_inner_jobs(step: &Step, experiment_override: Option<i64>) -> Op
     experiment_override.or(step.hint.preferred_inner_jobs)
 }
 
+/// CPU-time budget (seconds) in effect for a step: its declared `cpu_timeout` (>0) wins;
+/// otherwise the DAG's SMALL default. Both 0 means the guard is disabled. Mirrors Python's
+/// `effective_cpu_timeout`.
+pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
+    if step.cpu_timeout > 0 {
+        step.cpu_timeout
+    } else {
+        default_cpu_timeout
+    }
+}
+
+/// Core cap (cgroup `cpu.max`) in effect for a step: its declared `preferred_inner_jobs` wins;
+/// otherwise the DAG's SMALL default. Bounds cpu.max ONLY, never the command's inner `-j` flag
+/// (which stays keyed to the declared width). Mirrors Python's `effective_cpu_count`.
+pub fn effective_cpu_count(step: &Step, default_cpu_count: Option<i64>) -> Option<i64> {
+    step.hint.preferred_inner_jobs.or(default_cpu_count)
+}
+
 /// Map a Unix signal number to its name (e.g. `9 -> "SIGKILL"`), matching the names Python's
 /// `signal.Signals(n).name` produces for the common signals; unknown numbers fall back to
 /// `"signal N"` exactly like the Python `ValueError` branch.
@@ -282,6 +310,16 @@ pub struct DagConfig {
     pub default_step_timeout: i64,
     /// Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     pub default_jobs_flag: String,
+    /// Deliberately SMALL default inner memory.max (bytes) for a step that declares NO memory
+    /// hint (the forcing function; see `DEFAULT_SMALL_MEM_CAP_BYTES`). `None` disables it.
+    pub default_step_mem_cap_bytes: Option<i64>,
+    /// Deliberately SMALL default core cap (cgroup cpu.max) for a step that declares no inner
+    /// width (see `DEFAULT_SMALL_CPU_COUNT`). `None` disables it. Bounds cpu.max only, never
+    /// the command's `-j` flag.
+    pub default_step_cpu_count: Option<i64>,
+    /// Deliberately SMALL default CPU-time budget (seconds) for a step whose `cpu_timeout` is
+    /// unset (see `DEFAULT_SMALL_CPU_TIMEOUT`). `0` disables it.
+    pub default_step_cpu_timeout: i64,
 }
 
 impl Default for DagConfig {
@@ -295,6 +333,9 @@ impl Default for DagConfig {
             outer_mem_safety_factor: 1.0,
             default_step_timeout: DEFAULT_STEP_TIMEOUT,
             default_jobs_flag: DEFAULT_JOBS_FLAG.to_string(),
+            default_step_mem_cap_bytes: Some(DEFAULT_SMALL_MEM_CAP_BYTES),
+            default_step_cpu_count: Some(DEFAULT_SMALL_CPU_COUNT),
+            default_step_cpu_timeout: DEFAULT_SMALL_CPU_TIMEOUT,
         }
     }
 }
