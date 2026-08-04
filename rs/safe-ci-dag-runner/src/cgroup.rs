@@ -23,6 +23,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
 
+use crate::capabilities::is_enforced;
 use crate::sizing::cpu_count;
 
 /// cgroup-v2 unified hierarchy mount point (Linux-only, matching the target).
@@ -469,7 +470,9 @@ impl CgroupManager for Cgroups {
         // badness across ALL steps — so the kill can land on an INNOCENT NEIGHBOUR and be attributed
         // to the wrong PR. Best-effort: a kernel without oom.group must not drop the caps above.
         let _ = fs::write(child.join("memory.oom.group"), "1");
-        if let Some(m) = mem_max {
+        // memory_max guard: write the per-step inner memory.max cap only while the capability is
+        // enforced (derived from the same registry the manifest is, so advertised == enforced).
+        if let Some(m) = mem_max.filter(|_| is_enforced("memory_max")) {
             if let Err(e) = fs::write(child.join("memory.max"), m.to_string()) {
                 warn(&format!(
                     "step {tag}: could not apply inner memory cap memory.max={m} ({e}); step runs \

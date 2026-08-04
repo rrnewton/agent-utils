@@ -12,7 +12,9 @@
 //! Cgroup boxing is environment-dependent, so the differential exercises the un-boxed core
 //! (`--allow-cgroup-failure`) while a dedicated smoke test proves boxing caps memory.
 
+pub mod admission;
 pub mod ambient;
+pub mod capabilities;
 pub mod cgroup;
 pub mod cli;
 pub mod estimates;
@@ -26,9 +28,13 @@ pub mod summary;
 pub mod sync;
 pub mod viz;
 
+pub use admission::{scan_live_holders, solo_validate_refusal, Holder};
 pub use ambient::{
     ambient_bucket, attribute_external_cores, capture_ambient_snapshot, AmbientBucket,
     AmbientSnapshot,
+};
+pub use capabilities::{
+    capability_count, enforcement_manifest, is_enforced, Capability, ENFORCEMENT_REGISTRY,
 };
 pub use cgroup::{install_scope_teardown, reexec_in_scope, CgroupManager, Cgroups};
 pub use estimates::{
@@ -63,17 +69,7 @@ pub const PROG: &str = "safe-ci-dag-runner";
 /// Crate version, sourced from Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Machine-readable manifest of the enforcement guards THIS engine implements, emitted verbatim by
-/// the `capabilities` subcommand. Each engine declares its own truth; the py-vs-rs differential
-/// asserts the two manifests are BYTE-IDENTICAL, so any enforcement guard present in one build but
-/// missing from the other is a cross-check failure (the recurrence guard for the historical
-/// Rust-vs-Python `cpu_timeout` gap). Keys are sorted; values reflect real behavior:
-///   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
-///   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
-///   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
-///   pids_guard    per-step PID/thread ceiling (plumbed in both, enforced in neither → false)
-///   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
-/// The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
-/// anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
-pub const ENFORCEMENT_CAPABILITIES: &str =
-    "{\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"wall_timeout\":true}";
+// The enforcement manifest is no longer a hand-maintained literal: it is DERIVED from
+// [`capabilities::ENFORCEMENT_REGISTRY`] via [`capabilities::enforcement_manifest`], and every guard
+// site consults [`capabilities::is_enforced`], so the advertised manifest and the code that enforces
+// it cannot silently diverge. See the [`capabilities`] module.

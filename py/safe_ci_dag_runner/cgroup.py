@@ -72,6 +72,7 @@ from pathlib import Path
 from types import FrameType
 from typing import TYPE_CHECKING
 
+from safe_ci_dag_runner.capabilities import is_enforced
 from safe_ci_dag_runner.sizing import derive_build_jobs
 
 CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -1062,7 +1063,9 @@ class Cgroups:
         except OSError as exc:
             _warn(self._naming, f"step {tag}: could not set memory.oom.group ({exc}); an OOM may "
                   "kill a single process instead of the whole step (mis-attributed blast radius)")
-        if mem_max:
+        # memory_max guard: write the per-step inner memory.max cap only while the capability is
+        # enforced (derived from the same registry the manifest is, so advertised == enforced).
+        if mem_max and is_enforced("memory_max"):
             try:
                 (child / "memory.max").write_text(str(int(mem_max)))
             except OSError as exc:

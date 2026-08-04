@@ -24,7 +24,21 @@ from safe_ci_dag_runner.ambient import (
     ambient_bucket,
     capture_ambient_snapshot,
 )
+from safe_ci_dag_runner.admission import (
+    Holder,
+    acquire as acquire_box,
+    release as release_box,
+    scan_live_holders,
+    solo_validate_refusal,
+)
 from safe_ci_dag_runner.analyze import summarize
+from safe_ci_dag_runner.capabilities import (
+    ENFORCEMENT_REGISTRY,
+    Capability,
+    capability_count,
+    enforcement_manifest,
+    is_enforced,
+)
 from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroups
 from safe_ci_dag_runner.estimates import (
     DEFAULT_MIN_SAMPLES,
@@ -90,26 +104,29 @@ from safe_ci_dag_runner.viz import to_ascii, to_dot
 __version__: str = "0.11.0"
 
 #: Machine-readable manifest of the enforcement guards THIS engine implements, emitted verbatim by
-#: the ``capabilities`` subcommand. Each engine declares its own truth; the py-vs-rs differential
-#: asserts the two manifests are BYTE-IDENTICAL, so any enforcement guard present in one build but
-#: missing from the other is a cross-check failure (the recurrence guard for the historical
-#: Rust-vs-Python ``cpu_timeout`` gap). Keys are sorted; values reflect real behavior:
-#:   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
-#:   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
-#:   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
-#:   pids_guard    per-step PID/thread ceiling (plumbed in both, enforced in neither -> false)
-#:   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
-#: The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
-#: anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
-#: MUST stay byte-identical to Rust's ``ENFORCEMENT_CAPABILITIES`` (lib.rs).
-ENFORCEMENT_CAPABILITIES: str = (
-    '{"cpu_timeout":true,"memory_max":true,"oom_detection":true,'
-    '"pids_guard":false,"wall_timeout":true}'
-)
+#: the ``capabilities`` subcommand. It is DERIVED from :data:`ENFORCEMENT_REGISTRY` (the single
+#: source of truth in ``capabilities.py``) via :func:`enforcement_manifest`, NOT a hand-maintained
+#: literal: every guard site consults :func:`is_enforced`, so the advertised manifest and the code
+#: that enforces it cannot silently diverge. The py-vs-rs differential asserts the two engines'
+#: manifests are BYTE-IDENTICAL (the recurrence guard for the historical Rust-vs-Python
+#: ``cpu_timeout`` gap) and reports N = :func:`capability_count`.
+ENFORCEMENT_CAPABILITIES: str = enforcement_manifest()
 
 __all__ = [
     "__version__",
     "ENFORCEMENT_CAPABILITIES",
+    # enforcement-capability registry (derived manifest, source of truth)
+    "Capability",
+    "ENFORCEMENT_REGISTRY",
+    "enforcement_manifest",
+    "is_enforced",
+    "capability_count",
+    # resource-exclusivity admission (solo_validate)
+    "Holder",
+    "scan_live_holders",
+    "solo_validate_refusal",
+    "acquire_box",
+    "release_box",
     # DAG model
     "Step",
     "StepClass",

@@ -125,6 +125,8 @@ class Report:
     json_byte_identical: int = 0
     yaml_isomorphic: int = 0
     scalar_parity: int = 0
+    #: N = the number of enforcement capabilities both engines agree on (reported explicitly).
+    capabilities_n: int = 0
 
     def ok(self, _label: str) -> None:
         self.checks += 1
@@ -1744,12 +1746,129 @@ def compare_invocations(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok(f"invocation/{inv.name}")
 
 
+def _manifests_identical(a: str, b: str) -> bool:
+    """Byte-identity predicate the capabilities cross-check keys on. A capability present in one
+    engine and absent (or differently-valued) in the other makes this False -> a `cross` FAILURE."""
+    return a == b
+
+
+def compare_capabilities_manifest(py: list[str], rs: list[str], rep: Report) -> None:
+    """DELIVERABLE 3 — capability cross-check, both directions, N stated.
+
+    POSITIVE: the two engines' enforcement manifests are byte-identical, carry N > 0 capabilities,
+    and both advertise ``solo_validate`` (the exclusivity capability). N is recorded and printed.
+
+    NEGATIVE: a PLANTED divergence (a capability present in one manifest, dropped from the other)
+    must make the byte-identity predicate FALSE — proving a real discrepancy would be a test failure
+    rather than being silently tolerated.
+    """
+    po = run(py, ("capabilities",))
+    ro = run(rs, ("capabilities",))
+    py_manifest = po.stdout.strip()
+    rs_manifest = ro.stdout.strip()
+
+    try:
+        py_caps = json.loads(py_manifest)
+        rs_caps = json.loads(rs_manifest)
+    except json.JSONDecodeError as exc:
+        rep.bad("capabilities/parse", f"manifest is not valid JSON ({exc})")
+        return
+
+    # POSITIVE: identical, non-empty, and carrying the exclusivity capability in BOTH.
+    if not _manifests_identical(py_manifest, rs_manifest):
+        rep.bad(
+            "capabilities/byte-identical",
+            f"manifests differ\n--- py ---\n{py_manifest}\n--- rs ---\n{rs_manifest}",
+        )
+    elif len(py_caps) == 0:
+        rep.bad("capabilities/count", "manifest declares ZERO capabilities (N=0)")
+    elif "solo_validate" not in py_caps or "solo_validate" not in rs_caps:
+        rep.bad(
+            "capabilities/solo_validate",
+            "the resource-exclusivity capability 'solo_validate' is missing from a manifest",
+        )
+    else:
+        rep.capabilities_n = len(py_caps)
+        rep.ok("capabilities/byte-identical")
+
+    # NEGATIVE: plant a divergence (drop one capability from the rs side) and confirm the identity
+    # predicate the cross-check keys on REJECTS it. If this predicate accepted a divergent manifest,
+    # the whole capabilities cross-check would be inert.
+    if py_caps:
+        victim = sorted(py_caps)[0]
+        planted = {k: v for k, v in rs_caps.items() if k != victim}
+        planted_manifest = json.dumps(planted, separators=(",", ":"))
+        if _manifests_identical(py_manifest, planted_manifest):
+            rep.bad(
+                "capabilities/negative",
+                f"planting a dropped capability ({victim!r}) did NOT make the manifests differ; "
+                "the byte-identity cross-check is inert",
+            )
+        else:
+            rep.ok("capabilities/negative")
+
+
+def compare_admission(py: list[str], rs: list[str], rep: Report) -> None:
+    """DELIVERABLE 3 — resource-exclusivity admission cross-check, both directions.
+
+    POSITIVE (admit): with an EMPTY holders dir, a ``validate`` run is admitted and the noop DAG
+    passes (exit 0) in BOTH engines, and they agree.
+
+    NEGATIVE (refuse): with a LIVE benchmark holder planted, a ``validate`` run is REFUSED (exit 4)
+    in BOTH engines, and they agree. The live holder is a ``sleep`` process this harness spawns and
+    kills (its own child), so no unrelated process is signalled.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "noop.json")
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"steps": [{"group": "g", "job": "j", "cmd": "true"}]}))
+        holders = os.path.join(tmp, "holders")
+        os.makedirs(holders, exist_ok=True)
+        base = (
+            "run", "--dag", dag_path, "-q", ACF, NOPROF, NOFB,
+            "--box-holders-dir", holders,
+        )
+
+        # POSITIVE: empty holders -> admit + pass (exit 0), engines agree.
+        po = run(py, (*base, "--exclusivity-role", "validate"))
+        ro = run(rs, (*base, "--exclusivity-role", "validate"))
+        if po.returncode != ro.returncode:
+            rep.bad("admission/positive", f"exit py={po.returncode} rs={ro.returncode}")
+        elif po.returncode != 0:
+            rep.bad("admission/positive", f"validate NOT admitted on a free box (exit {po.returncode})")
+        else:
+            rep.ok("admission/positive")
+
+        # NEGATIVE: a live foreign holder -> refuse (exit 4), engines agree.
+        child = subprocess.Popen(["sleep", "120"])
+        try:
+            with open(os.path.join(holders, f"benchmark.{child.pid}.holder"), "w", encoding="utf-8") as fh:
+                fh.write(f"role=benchmark\npid={child.pid}\n")
+            po = run(py, (*base, "--exclusivity-role", "validate"))
+            ro = run(rs, (*base, "--exclusivity-role", "validate"))
+            if po.returncode != ro.returncode:
+                rep.bad("admission/negative", f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != 4:
+                rep.bad(
+                    "admission/negative",
+                    f"validate NOT refused (exit 4) while a live benchmark holds the box "
+                    f"(got {po.returncode})",
+                )
+            else:
+                rep.ok("admission/negative")
+        finally:
+            child.kill()
+            child.wait()
+
+
 def compare(tool: str, rand_count: int, seed: int) -> int:
     py = py_command()
     rs = rs_command(tool)
     rep = Report()
 
     compare_invocations(py, rs, rep)
+    compare_capabilities_manifest(py, rs, rep)
+    compare_admission(py, rs, rep)
     fixtures = representative_fixtures() + randomized_fixtures(rand_count, seed)
     for fx in fixtures:
         compare_fixture(py, rs, fx, rep)
@@ -1784,7 +1903,9 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
         f"({len(examples)} shipped JSON examples static-only; "
         f"{len(yaml_paths)} YAML fixtures isomorphic to JSON; "
         f"json byte-identical: {rep.json_byte_identical}, yaml isomorphic: {rep.yaml_isomorphic}, "
-        f"scalar-resolution parity cases: {rep.scalar_parity})"
+        f"scalar-resolution parity cases: {rep.scalar_parity}; "
+        f"enforcement capabilities agreed (N): {rep.capabilities_n}, "
+        f"incl. solo_validate exclusivity + admission refuse/admit both directions)"
     )
     return 0
 

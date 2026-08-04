@@ -30,6 +30,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::admission;
+use crate::capabilities::enforcement_manifest;
 use crate::cgroup::{install_scope_teardown, is_in_scope, reexec_in_scope, CgroupManager, Cgroups};
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
@@ -44,7 +46,7 @@ use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sync::{self, SyncBackend};
 use crate::viz::{to_ascii, to_dot};
-use crate::{ENFORCEMENT_CAPABILITIES, PROG, VERSION};
+use crate::{PROG, VERSION};
 
 /// Environment variable overriding the default profile-store location (Feature D). An explicit
 /// `--perf-dir` still wins over this; `--no-profile` disables logging entirely.
@@ -321,6 +323,8 @@ struct RunArgs {
     profile_sync_direction: String,
     keep_going: bool,
     allow_cgroup_failure: bool,
+    exclusivity_role: String,
+    box_holders_dir: Option<String>,
     verbosity: i64,
     quiet: bool,
 }
@@ -341,6 +345,8 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         profile_sync_direction: "both".to_string(),
         keep_going: false,
         allow_cgroup_failure: false,
+        exclusivity_role: "none".to_string(),
+        box_holders_dir: None,
         verbosity: 1,
         quiet: false,
     };
@@ -396,6 +402,16 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                     .to_string(),
             ),
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
+            "--exclusivity-role" => {
+                let v = take_value(inline, &mut i)?;
+                if !matches!(v.as_str(), "none" | "validate" | "benchmark") {
+                    return Err(format!(
+                        "--exclusivity-role: invalid value '{v}' (none|validate|benchmark)"
+                    ));
+                }
+                a.exclusivity_role = v;
+            }
+            "--box-holders-dir" => a.box_holders_dir = Some(take_value(inline, &mut i)?),
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
             other => {
@@ -1326,7 +1342,50 @@ fn cmd_plan(a: &PlanArgs) -> i32 {
     0
 }
 
+/// Resource-exclusivity admission gate (solo_validate) wrapping the actual run.
+///
+/// When `--exclusivity-role` is set, REFUSE ADMISSION (exit 4) if a live competing holder holds the
+/// box, otherwise ACQUIRE a holder for the duration of the run and RELEASE it on exit. `none`
+/// (default) leaves the run unchanged. Mirrors the Python `_run` gate.
 fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
+    let mut holder: Option<std::path::PathBuf> = None;
+    if a.exclusivity_role != "none" {
+        let dir = match a.box_holders_dir.as_deref() {
+            Some(d) => d,
+            None => {
+                eprintln!(
+                    "{PROG}: run: --exclusivity-role {} requires --box-holders-dir",
+                    a.exclusivity_role
+                );
+                return 2;
+            }
+        };
+        let dir = Path::new(dir);
+        let self_pid = std::process::id() as i64;
+        let live = admission::scan_live_holders(dir, Some(self_pid));
+        if let Some(reason) = admission::solo_validate_refusal(&a.exclusivity_role, &live) {
+            eprintln!("{PROG}: run: {reason}");
+            return 4;
+        }
+        match admission::acquire(dir, &a.exclusivity_role, self_pid) {
+            Ok(p) => holder = Some(p),
+            Err(e) => {
+                eprintln!(
+                    "{PROG}: run: could not acquire box holder in {}: {e}",
+                    dir.display()
+                );
+                return 2;
+            }
+        }
+    }
+    let code = cmd_run_admitted(cfg, a, c);
+    if let Some(p) = holder {
+        admission::release(&p);
+    }
+    code
+}
+
+fn cmd_run_admitted(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so
     // a bad tag fails fast (exit 2) without needing a systemd scope.
     let filtered = if let Some(only) = a.only.as_deref() {
@@ -1506,9 +1565,10 @@ pub fn run(argv: &[String]) -> i32 {
             0
         }
         "capabilities" => {
-            // Machine-readable enforcement manifest; byte-identical to the Python build and
-            // cross-checked, so an enforcement guard in one build but not the other fails `cross`.
-            println!("{ENFORCEMENT_CAPABILITIES}");
+            // Machine-readable enforcement manifest, DERIVED from the enforcement registry (not a
+            // literal); byte-identical to the Python build and cross-checked, so an enforcement
+            // guard in one build but not the other fails `cross`.
+            println!("{}", enforcement_manifest());
             0
         }
         "--userguide" => {

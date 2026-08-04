@@ -50,6 +50,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 
+from safe_ci_dag_runner.capabilities import is_enforced
 from safe_ci_dag_runner.ambient import (
     AmbientSnapshot,
     PsiReading,
@@ -433,7 +434,7 @@ class Runner:
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
                     thread_peak = count if thread_peak is None else max(thread_peak, count)
-                if step.cpu_timeout > 0 and not cpu_timed_out:
+                if is_enforced("cpu_timeout") and step.cpu_timeout > 0 and not cpu_timed_out:
                     cs = self.cgroups.cpu_stats(step.tag)
                     if cs is not None:
                         cpu_used_s = cs.get("usage_usec", 0) / 1_000_000
@@ -448,8 +449,12 @@ class Runner:
         monitor = threading.Thread(target=_monitor, daemon=True)
         reader.start()
         monitor.start()
+        # wall_timeout guard: a per-step wall-clock ceiling, active only while the capability is
+        # enforced (None => wait forever, i.e. the guard is inert). Derived from the same registry
+        # the manifest is, so advertised and enforced behavior cannot diverge.
+        wall_deadline = step.timeout if is_enforced("wall_timeout") else None
         try:
-            proc.wait(timeout=step.timeout)
+            proc.wait(timeout=wall_deadline)
         except subprocess.TimeoutExpired:
             # Genuine hang: reap the step's whole process group now (safe because
             # start_new_session gave it its own group; reap guards the runner's group).
@@ -469,7 +474,7 @@ class Runner:
         reap(proc, self.cgroups, step.tag)
 
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
-        oom = self.cgroups.oom_kills(step.tag)
+        oom = self.cgroups.oom_kills(step.tag) if is_enforced("oom_detection") else 0
         peak = self.cgroups.peak_bytes(step.tag)
         cpu_stats = self.cgroups.cpu_stats(step.tag)
         step_pressure_end = _psi_reading(self.cgroups.cpu_pressure(step.tag)) if boxed else None

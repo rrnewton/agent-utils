@@ -33,6 +33,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ambient::{capture_ambient_snapshot, PsiReading};
+use crate::capabilities::is_enforced;
 use crate::cgroup::CgroupManager;
 use crate::model::{
     command_with_inner_jobs, preferred_inner_jobs, step_classification, DagConfig, RunResult, Step,
@@ -563,7 +564,13 @@ fn run_step(ctx: StepCtx) {
         let cpu_flag = Arc::clone(&cpu_exceeded);
         let cg = cgroups.clone();
         let t = tag.clone();
-        let cpu_timeout = step.cpu_timeout;
+        // cpu_timeout guard: enforce the per-step CPU budget only while the capability is enforced
+        // (0 => inert). Derived from the same registry the manifest is, so advertised == enforced.
+        let cpu_timeout = if is_enforced("cpu_timeout") {
+            step.cpu_timeout
+        } else {
+            0
+        };
         let mpid = pid;
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
@@ -601,13 +608,16 @@ fn run_step(ctx: StepCtx) {
         None
     };
 
-    // Wait for the child, enforcing the per-step timeout by polling.
+    // Wait for the child, enforcing the per-step wall-clock timeout by polling — only while the
+    // wall_timeout capability is enforced (derived from the same registry the manifest is, so
+    // advertised == enforced; when off the poll never trips and the step waits indefinitely).
     let mut timed_out = false;
+    let wall_timeout_on = is_enforced("wall_timeout");
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) => {
-                if start.elapsed().as_secs() as i64 >= step.timeout {
+                if wall_timeout_on && start.elapsed().as_secs() as i64 >= step.timeout {
                     timed_out = true;
                     reap(&cgroups, &tag, pid);
                     break child.wait().unwrap_or_else(|_| {
@@ -637,8 +647,17 @@ fn run_step(ctx: StepCtx) {
     }
 
     // Read the step's cgroup measurements BEFORE cleanup() removes the child cgroup.
+    // oom_detection guard: read the OOM-kill count only while the capability is enforced (0 => the
+    // OOM signal is not attributed). Derived from the same registry the manifest is.
     let (oom, peak, cpu_stats) = match &cgroups {
-        Some(cg) if cg.enabled() => (cg.oom_kills(&tag), cg.peak_bytes(&tag), cg.cpu_stats(&tag)),
+        Some(cg) if cg.enabled() => {
+            let oom = if is_enforced("oom_detection") {
+                cg.oom_kills(&tag)
+            } else {
+                0
+            };
+            (oom, cg.peak_bytes(&tag), cg.cpu_stats(&tag))
+        }
         _ => (0, None, None),
     };
     let step_pressure_end = if boxed {

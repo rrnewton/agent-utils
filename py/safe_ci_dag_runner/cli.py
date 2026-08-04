@@ -30,9 +30,16 @@ from collections.abc import Mapping, Sequence
 from importlib.resources import files
 from pathlib import Path
 
-from safe_ci_dag_runner import ENFORCEMENT_CAPABILITIES, __version__
+from safe_ci_dag_runner import __version__
 from safe_ci_dag_runner import summary as summarylib
 from safe_ci_dag_runner import sync as synclib
+from safe_ci_dag_runner.admission import (
+    acquire as acquire_box,
+    release as release_box,
+    scan_live_holders,
+    solo_validate_refusal,
+)
+from safe_ci_dag_runner.capabilities import enforcement_manifest
 from safe_ci_dag_runner.estimates import (
     Plan,
     Planner,
@@ -371,6 +378,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="downgrade to a best-effort UNBOXED run (with a visible warning) instead of erroring "
         "when two-level cgroup-v2 + systemd --user scope boxing cannot be established",
+    )
+    run_p.add_argument(
+        "--exclusivity-role",
+        choices=["none", "validate", "benchmark"],
+        default="none",
+        help="resource-exclusivity admission role for THIS invocation (solo_validate capability). "
+        "'validate' demands SOLO possession of the box: it is REFUSED ADMISSION (exit 4) while "
+        "another validate OR a benchmark harness holds the box; 'benchmark' is refused while a "
+        "validate holds it; 'none' (default) disables the gate. Requires --box-holders-dir.",
+    )
+    run_p.add_argument(
+        "--box-holders-dir",
+        metavar="DIR",
+        default=None,
+        help="shared directory of box-holder files that back --exclusivity-role admission. While "
+        "admitted, this run advertises its own holder here and removes it on exit.",
     )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
@@ -1351,6 +1374,37 @@ def _cmd_plan(ns: argparse.Namespace) -> int:
 
 
 def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
+    """Resource-exclusivity admission gate (solo_validate) wrapping the actual run.
+
+    When ``--exclusivity-role`` is set, REFUSE ADMISSION (exit 4) if a live competing holder holds
+    the box, otherwise ACQUIRE a holder for the duration of the run and RELEASE it on exit. ``none``
+    (default) leaves the run unchanged.
+    """
+    role = str(getattr(ns, "exclusivity_role", "none"))
+    holders_raw = ns.box_holders_dir if isinstance(ns.box_holders_dir, str) and ns.box_holders_dir else None
+    holder_path: Path | None = None
+    if role != "none":
+        if holders_raw is None:
+            print(
+                f"{PROG}: run: --exclusivity-role {role} requires --box-holders-dir",
+                file=sys.stderr,
+            )
+            return 2
+        holders_dir = Path(holders_raw)
+        live = scan_live_holders(holders_dir, exclude_pid=os.getpid())
+        reason = solo_validate_refusal(role, live)
+        if reason is not None:
+            print(f"{PROG}: run: {reason}", file=sys.stderr)
+            return 4
+        holder_path = acquire_box(holders_dir, role)
+    try:
+        return _run_admitted(cfg, ns, c)
+    finally:
+        if holder_path is not None:
+            release_box(holder_path)
+
+
+def _run_admitted(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # Feature A: --only runs EXACTLY the named step(s). Validate/filter BEFORE cgroup bring-up so a
     # bad tag fails fast (exit 2) without needing a systemd scope.
     only_raw = ns.only if isinstance(ns.only, str) else None
@@ -1477,9 +1531,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_quickstart(c))
         return 0
     if command == "capabilities":
-        # Machine-readable enforcement manifest; byte-identical to the Rust build and cross-checked,
-        # so an enforcement guard in one build but not the other fails `cross`.
-        print(ENFORCEMENT_CAPABILITIES)
+        # Machine-readable enforcement manifest, DERIVED from the enforcement registry (not a
+        # literal); byte-identical to the Rust build and cross-checked, so an enforcement guard in
+        # one build but not the other fails `cross`.
+        print(enforcement_manifest())
         return 0
     if command == "sweep":
         return _cmd_sweep(ns, c)
