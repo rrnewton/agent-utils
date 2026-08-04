@@ -367,11 +367,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="on a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps)",
     )
     run_p.add_argument(
-        "--cgroups",
-        action="store_true",
-        help="(deprecated no-op; cgroup-v2 boxing is now ON by default) accepted for compatibility",
-    )
-    run_p.add_argument(
         "--allow-cgroup-failure",
         action="store_true",
         help="downgrade to a best-effort UNBOXED run (with a visible warning) instead of erroring "
@@ -1454,7 +1449,18 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    ns = parser.parse_args(list(argv) if argv is not None else None)
+    raw = list(argv) if argv is not None else list(sys.argv[1:])
+    # --cgroups has been REMOVED (cgroup-v2 boxing is ON by default). Fail LOUDLY rather than
+    # silently accepting a dead flag; per-node resource limits are DAG fields (cpu_timeout,
+    # memory, pids). Kept in parity with the Rust build's parser hard-error.
+    if any(a == "--cgroups" or a.startswith("--cgroups=") for a in raw):
+        print(
+            f"{PROG}: error: --cgroups has been removed (cgroup-v2 boxing is ON by default); "
+            "drop the flag. Per-node resource limits are DAG fields (cpu_timeout, memory, pids).",
+            file=sys.stderr,
+        )
+        return 2
+    ns = parser.parse_args(raw)
     c = Palette(_color_enabled(sys.stdout))
 
     if bool(ns.userguide):

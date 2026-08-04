@@ -328,7 +328,6 @@ Global: `--version`, `-h/--help`. Running with no command prints help and exits 
 | `--no-profile`       | Disable the default auto-logging profile store (do not append CSVs anywhere). |
 | `-k, --keep-going`   | On a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps). |
 | `--allow-cgroup-failure` | Opt out of the on-by-default boxing requirement: instead of erroring (exit `3`) when cgroup-v2 + a systemd `--user` scope are unavailable, run the steps **un-boxed** with a visible warning. Needed on laptops, most CI runners, and non-Linux hosts. |
-| `--cgroups`          | Deprecated no-op, accepted for backward compatibility (cgroup-v2 boxing is now ON by default). |
 | `-v`                 | Verbose: stream each step's child output live as it runs.                          |
 | `-q, --quiet`        | Quieter: suppress the per-step PASS summaries (failures are always shown).         |
 
@@ -503,8 +502,9 @@ Stated honestly:
   boxing needs a Linux host with cgroup-v2 and a working systemd `--user` scope; where that is
   unavailable (laptops, most CI runners, macOS) a bare `run` **errors with exit 3** rather than
   silently running unprotected, and `--allow-cgroup-failure` downgrades to the safe `NoopCgroups`
-  stand-in (no boxing; teardown falls back to a process-group kill) with a visible warning. The
-  deprecated `--cgroups` flag is now an accepted no-op. (The Python *library* entry point
+  stand-in (no boxing; teardown falls back to a process-group kill) with a visible warning. The old
+  opt-in `--cgroups` flag has been removed — boxing is ON by default, so passing it now errors (exit
+  2). (The Python *library* entry point
   `run_dag(cgroups=None)` still defaults to `NoopCgroups`; it is the *CLI* that boxes by default —
   see the USER_GUIDE for enabling boxing from the API via `reexec_in_scope` + `Cgroups`.)
 - **Memory-aware `-j` is wired into the CLI.** Pass `run --max-mem 8G` to have the runner pick the
@@ -524,7 +524,7 @@ Stated honestly:
   randomized `cross/differential.py` harness in CI. The Rust `run` **also boxes each step in a
   cgroup-v2 sandbox by default** (identical `--allow-cgroup-failure` opt-out and exit-3 behavior) and
   **also writes per-step + whole-run perf CSVs via `--perf-dir`**; the earlier Python-only gap for
-  Linux cgroup boxing and perf logging has been closed. `--cgroups` is a deprecated no-op in both.
+  Linux cgroup boxing and perf logging has been closed.
 
 ## See also
 
