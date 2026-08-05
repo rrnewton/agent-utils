@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    >
+    <title>Agent Team Timeline</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true"></div>
+        <div>
+          <h1>Agent Team Timeline</h1>
+          <p id="dataset-meta" class="dataset-meta">Loading timeline…</p>
+        </div>
+      </div>
+
+      <div class="controls" aria-label="Timeline controls">
+        <label class="control-field">
+          <span>Team</span>
+          <select id="team-filter" data-testid="team-filter" aria-label="Filter by team">
+            <option value="">All teams</option>
+          </select>
+        </label>
+        <label class="control-field search-field">
+          <span>Search</span>
+          <input
+            id="search"
+            data-testid="search"
+            type="search"
+            placeholder="Agent, phase, message…"
+            autocomplete="off"
+          >
+        </label>
+        <button id="fit" data-testid="fit" class="button button-primary" type="button">
+          Fit timeline
+        </button>
+        <details id="summary-menu" class="summary-menu">
+          <summary>Summary files</summary>
+          <div id="summary-files" class="summary-files" aria-label="Summary files"></div>
+        </details>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section
+        class="timeline-card"
+        data-testid="timeline"
+        tabindex="0"
+        aria-label="Agent activity timeline"
+        aria-keyshortcuts="+ - ArrowLeft ArrowRight Home"
+      >
+        <div class="timeline-toolbar">
+          <div id="view-range" class="view-range">—</div>
+          <div class="legend" aria-label="Agent state legend">
+            <span><i class="legend-dot state-active"></i>Active</span>
+            <span><i class="legend-dot state-tool"></i>Tool</span>
+            <span><i class="legend-dot state-waiting"></i>Waiting</span>
+            <span><i class="legend-dot state-idle"></i>Idle</span>
+            <span><i class="legend-dot state-blocked"></i>Blocked</span>
+          </div>
+          <div class="interaction-hint">
+            Wheel axis or Ctrl+wheel to zoom · Drag / ← → to pan
+          </div>
+        </div>
+
+        <div id="rollup-row" class="rollup-row" data-testid="rollups">
+          <div class="rollup-label" aria-hidden="true">
+            <span>DAY</span>
+            <span>WEEK</span>
+            <span>MONTH</span>
+            <span>QUARTER</span>
+          </div>
+          <div id="rollup-track" class="rollup-track"></div>
+        </div>
+
+        <svg id="time-axis" class="time-axis" aria-hidden="true"></svg>
+        <div
+          id="timeline-scroll"
+          class="timeline-scroll"
+          tabindex="0"
+          aria-label="Scrollable agent tracks"
+        >
+          <svg
+            id="timeline-svg"
+            class="timeline-svg"
+            role="group"
+            aria-label="Timeline tracks for coordinator and subagents"
+          ></svg>
+          <div id="empty-state" class="empty-state" hidden>No tracks match the current filters.</div>
+        </div>
+      </section>
+    </main>
+
+    <footer id="stats" class="stats-bar" data-testid="stats" aria-label="Visible-range statistics">
+      <div class="stats-range">
+        <span class="stats-kicker">VISIBLE RANGE</span>
+        <strong id="stats-range-label">—</strong>
+      </div>
+      <div id="stats-values" class="stats-values"></div>
+    </footer>
+
+    <div id="tooltip" class="tooltip" data-testid="tooltip" role="tooltip" hidden>
+      <strong id="tooltip-title"></strong>
+      <p id="tooltip-body"></p>
+      <div id="tooltip-stats" class="tooltip-stats"></div>
+    </div>
+
+    <div id="modal" class="modal-backdrop" data-testid="modal" hidden>
+      <section
+        class="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-title"
+      >
+        <header class="modal-header">
+          <div>
+            <p id="modal-eyebrow" class="modal-eyebrow"></p>
+            <h2 id="modal-title">Details</h2>
+          </div>
+          <button id="modal-close" class="icon-button" type="button" aria-label="Close details">×</button>
+        </header>
+        <div id="modal-summary" class="modal-summary"></div>
+        <nav
+          id="modal-tabs"
+          class="modal-tabs"
+          data-testid="tabs"
+          role="tablist"
+          aria-label="Detail views"
+        ></nav>
+        <div id="modal-content" class="modal-content"></div>
+      </section>
+    </div>
+
+    <div id="load-error" class="load-error" role="alert" hidden></div>
+    <script src="app.js" defer></script>
+  </body>
+</html>

@@ -21,7 +21,7 @@
 #     exact path are always visible in logs.
 #
 # The resolved tool name is this script's invocation basename (the wired symlinks
-# `safe-ci-dag-runner` / `pr-landing-planner` / `tick-hub` all point here).
+# `safe-ci-dag-runner` / `pr-landing-planner` / `tick-hub` / `agent-team-timeline` all point here).
 set -euo pipefail
 
 # Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent
@@ -31,7 +31,7 @@ ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 
 TOOL="$(basename "$0")"
 if [[ "$TOOL" == "engine-resolver" ]]; then
-    echo "engine-resolver: invoke via a tool symlink (safe-ci-dag-runner|pr-landing-planner|tick-hub), not directly" >&2
+    echo "engine-resolver: invoke via a tool symlink (safe-ci-dag-runner|pr-landing-planner|tick-hub|agent-team-timeline), not directly" >&2
     exit 2
 fi
 

@@ -1,5 +1,5 @@
 # `make` just runs ./setup (both python and rust), per repo convention.
-.PHONY: all both py rs check check-deps test fmt clean
+.PHONY: all both py rs check check-deps mypy test fmt clean
 
 all: both
 
@@ -12,9 +12,15 @@ py:
 rs:
 	./setup rs
 
+# One fast repository-wide Python typing gate. `--strict` is repeated on the command line so the
+# contract stays visible even if a local config is reorganized; check_no_any rejects the escape
+# hatch of importing/referencing typing.Any at a dynamic boundary instead of narrowing to object.
+mypy:
+	python3 -m mypy --config-file py/pyproject.toml --strict --disallow-any-explicit --disallow-any-decorated .
+	python3 scripts/check_no_any.py .
+
 # Lint/typecheck gates (what CI runs).
-check: check-deps
-	cd py && python3 -m mypy .
+check: check-deps mypy
 	cargo clippy --release --workspace --manifest-path rs/Cargo.toml -- -D warnings
 
 # Stdlib-only smoke check: every console entrypoint must start cleanly (--help / --version /

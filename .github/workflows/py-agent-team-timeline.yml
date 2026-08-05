@@ -1,0 +1,45 @@
+name: py-agent-team-timeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/agent_team_timeline/**'
+      - 'py/tests/test_timeline_*.py'
+      - 'common/docs/agent-team-timeline/**'
+      - 'scripts/embed_userguides.py'
+      - '.github/workflows/py-agent-team-timeline.yml'
+  pull_request:
+    paths:
+      - 'py/pyproject.toml'
+      - 'py/agent_team_timeline/**'
+      - 'py/tests/test_timeline_*.py'
+      - 'common/docs/agent-team-timeline/**'
+      - 'scripts/embed_userguides.py'
+      - '.github/workflows/py-agent-team-timeline.yml'
+
+jobs:
+  py:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test tooling
+        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
+      - name: Embedded user guide in sync
+        working-directory: .
+        run: python scripts/embed_userguides.py --check
+      - name: mypy
+        run: python -m mypy .
+      - name: tests
+        run: python -m pytest -q tests/test_timeline_*.py
+      - name: dependency-free CLI smoke
+        run: |
+          python -m agent_team_timeline --version
+          python -m agent_team_timeline quickstart > /dev/null

@@ -31,6 +31,8 @@ jobs:
         run: cargo fmt --all --manifest-path rs/Cargo.toml -- --check
       - name: build both implementations
         run: make both
+      - name: global strict Python typing (no typing.Any)
+        run: make mypy
       - name: repository checks
         run: make check
       - name: repository tests

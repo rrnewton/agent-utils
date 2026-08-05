@@ -15,6 +15,8 @@ by `<tool> --userguide`). This keeps exactly one guide and one skill per tool, b
   HEALTH/ACTION/NOTE/ERROR lines.
 - `pr-landing-planner/SKILL.md` — conflict-graph + CI-aware advisory landing planner: classifies each
   red CI, partitions PRs into parallel-safe groups, and recommends a per-PR action.
+- `agent-team-timeline/SKILL.md` — archive and visualize coordinator/subagent work with cached
+  phrase-to-quarter summaries, interaction edges, and real-time visible-range statistics.
 
 ## Linking a skill into an agent
 
@@ -26,6 +28,7 @@ tool skills you want into that directory so they auto-trigger:
 mkdir -p .claude/skills
 ln -s /path/to/agent-utils/skills/safe-ci-dag-runner .claude/skills/safe-ci-dag-runner
 ln -s /path/to/agent-utils/skills/tick-hub          .claude/skills/tick-hub
+ln -s /path/to/agent-utils/skills/agent-team-timeline .claude/skills/agent-team-timeline
 ```
 
 Because each skill points at `<tool> --userguide` (the embedded guide) rather than copying it, the

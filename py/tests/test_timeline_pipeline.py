@@ -1,0 +1,454 @@
+from __future__ import annotations
+
+import json
+import threading
+import urllib.request
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+from agent_team_timeline.archive import narrow_json, write_json_if_changed
+from agent_team_timeline.model import (
+    Agent,
+    Edge,
+    Event,
+    SourceSnapshot,
+    TeamData,
+    ToolCall,
+    Turn,
+    source_digest,
+)
+from agent_team_timeline.periods import Period, periods_for_range
+from agent_team_timeline.phases import PhaseStats, PhaseWindow, build_phases
+from agent_team_timeline.pipeline import (
+    IngestReport,
+    _rollup_jobs_for_level,
+    build_archive,
+    load_archived_team,
+    record_run,
+    summarize_archive,
+)
+from agent_team_timeline.server import make_server
+from agent_team_timeline.summarize import SummaryResult
+
+
+ROOT = "00000000-0000-0000-0000-000000000001"
+CHILD = "00000000-0000-0000-0000-000000000002"
+START = 1_775_000_000_000
+
+
+def _event(
+    event_id: str,
+    thread: str,
+    offset: int,
+    kind: str,
+    text: str | None,
+    *,
+    phase: str | None = None,
+) -> Event:
+    return Event(
+        event_id=event_id,
+        thread_id=thread,
+        turn_id="turn-" + thread[-1],
+        timestamp_ms=START + offset,
+        kind=kind,
+        role="user" if kind == "user_prompt" else "assistant",
+        phase=phase,
+        text=text,
+        content_availability="plaintext" if text else "none",
+        encrypted_content=None,
+        author=None,
+        recipient=None,
+        source_line=1,
+    )
+
+
+def _team(extra_root_text: str = "") -> TeamData:
+    events = (
+        _event(
+            "prompt-1",
+            ROOT,
+            1_000,
+            "user_prompt",
+            "Investigate the safe-landing protocol and keep exact-head validation terminology.",
+        ),
+        _event(
+            "root-response",
+            ROOT,
+            3_000,
+            "assistant_message",
+            "The coordinator assigned a focused safe-landing audit. " + extra_root_text,
+        ),
+        _event(
+            "child-update",
+            CHILD,
+            8_000,
+            "assistant_message",
+            "Found that exact-head validation was not bound to the release receipt.",
+        ),
+        _event(
+            "child-final",
+            CHILD,
+            18_000,
+            "assistant_message",
+            "Added receipt binding and proved six negative cases plus two positive cases.",
+            phase="final_answer",
+        ),
+        _event(
+            "root-final",
+            ROOT,
+            22_000,
+            "assistant_message",
+            "Receipt binding is complete with eight focused cases passing.",
+        ),
+    )
+    return TeamData(
+        team_slug="codex-test",
+        provider="codex",
+        root_thread_id=ROOT,
+        display_timezone="America/New_York",
+        sources=(SourceSnapshot("root.jsonl", ROOT, 100, 1, "a" * 64, 100, 10),),
+        agents=(
+            Agent(ROOT, None, "/root", None, None, 0, START, START + 23_000, "completed", "root"),
+            Agent(
+                CHILD,
+                ROOT,
+                "/root/release_receipt_audit",
+                "Ada",
+                None,
+                1,
+                START + 5_000,
+                START + 19_000,
+                "completed",
+                "child",
+            ),
+        ),
+        turns=(
+            Turn("turn-1", ROOT, START, START + 23_000, "completed", 10, None, None),
+            Turn("turn-2", CHILD, START + 5_000, START + 19_000, "completed", 10, None, None),
+        ),
+        events=events,
+        tool_calls=(
+            ToolCall(
+                "tool-1",
+                "item-1",
+                CHILD,
+                "turn-2",
+                "exec",
+                None,
+                START + 10_000,
+                START + 12_000,
+                "completed",
+                None,
+                None,
+                (("bash", 2), ("git", 1)),
+                2,
+            ),
+        ),
+        edges=(
+            Edge(
+                "spawn-1",
+                "spawn-1",
+                ROOT,
+                CHILD,
+                "spawn",
+                START + 5_000,
+                None,
+                "encrypted",
+                "gAAAA-test",
+                3,
+            ),
+        ),
+    )
+
+
+def _write_team(archive: Path, team: TeamData) -> None:
+    write_json_if_changed(
+        archive / "teams" / team.team_slug / "raw" / "team.json",
+        narrow_json(team.to_json_obj()),
+    )
+
+
+def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    first = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    built = build_archive(tmp_path, team.team_slug)
+
+    assert first.cache_misses >= 5  # phases plus day/week/month/quarter super-summaries
+    assert built["agents"] == 2
+    assert (tmp_path / "index.html").is_file()
+    assert (tmp_path / "Makefile").read_text(encoding="utf-8").startswith(".PHONY: serve")
+    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    assert len(timeline["agents"]) == 2
+    assert timeline["source_digest"] == source_digest(team)
+    assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
+    assert any(edge["kind"] == "result" for edge in timeline["edges"])
+    assert timeline["events"].count(
+        {"agent_id": CHILD, "at_ms": START + 10_000, "kind": "tool_call"}
+    ) == 3
+    detail_path = tmp_path / timeline["phases"][0]["detail_path"]
+    assert detail_path.is_file()
+
+    second = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    rebuilt = build_archive(tmp_path, team.team_slug)
+    assert second.cache_misses == 0
+    assert second.cache_hits == first.phases + first.rollups
+    assert second.files_changed == 0
+    assert rebuilt["files_changed"] == 0
+
+
+def test_every_completed_subagent_turn_gets_a_result_edge(tmp_path: Path) -> None:
+    team = _team()
+    second_final = _event(
+        "child-final-again",
+        CHILD,
+        19_000,
+        "assistant_message",
+        "A resumed follow-up independently confirmed the receipt binding.",
+        phase="final_answer",
+    )
+    updated = replace(team, events=team.events + (second_final,))
+    _write_team(tmp_path, updated)
+    summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
+    build_archive(tmp_path, updated.team_slug)
+    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
+    assert {edge["id"] for edge in result_edges} == {
+        "result-child-final",
+        "result-child-final-again",
+    }
+
+
+def test_team_slug_and_archived_identity_cannot_escape_archive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="team slug"):
+        load_archived_team(tmp_path, "../../outside")
+
+    team = replace(_team(), team_slug="other-team")
+    target = tmp_path / "teams" / "codex-test" / "raw" / "team.json"
+    write_json_if_changed(target, narrow_json(team.to_json_obj()))
+    with pytest.raises(ValueError, match="does not match requested"):
+        load_archived_team(tmp_path, "codex-test")
+
+
+def test_build_refuses_to_clobber_non_archive_directory(tmp_path: Path) -> None:
+    project = tmp_path / "real-project"
+    project.mkdir()
+    readme = project / "README.md"
+    makefile = project / "Makefile"
+    readme.write_text("valuable project readme\n", encoding="utf-8")
+    makefile.write_text("all:\n\t@true\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refusing non-empty non-archive"):
+        build_archive(project, "codex-test")
+    assert readme.read_text(encoding="utf-8") == "valuable project readme\n"
+    assert makefile.read_text(encoding="utf-8") == "all:\n\t@true\n"
+
+
+def test_build_only_run_preserves_source_digest_and_team_history(tmp_path: Path) -> None:
+    ingest = IngestReport(
+        team_slug="codex-test",
+        source_digest="a" * 64,
+        sources=1,
+        source_bytes=10,
+        agents=1,
+        events=2,
+        tool_calls=3,
+        edges=1,
+        files_changed=1,
+    )
+    record_run(
+        tmp_path,
+        ("agent-team-timeline", "refresh"),
+        "2026-08-05T00:00:00Z",
+        "completed",
+        "codex-test",
+        ingest,
+        None,
+        None,
+    )
+    record_run(
+        tmp_path,
+        ("agent-team-timeline", "build"),
+        "2026-08-05T01:00:00Z",
+        "completed",
+        "other-team",
+        None,
+        None,
+        {"files_changed": 0},
+    )
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["latest_source_digest"] == "a" * 64
+    assert manifest["teams"] == ["codex-test", "other-team"]
+    assert manifest["run_count"] == 2
+
+
+def _two_day_team(child_result: str) -> TeamData:
+    base = _team()
+    changed_events = tuple(
+        replace(event, text=child_result) if event.event_id == "child-final" else event
+        for event in base.events
+    )
+    day = 26 * 60 * 60 * 1000
+    later_events = (
+        _event("day-two-prompt", ROOT, day, "user_prompt", "Verify the archived report."),
+        _event(
+            "day-two-response",
+            ROOT,
+            day + 2_000,
+            "assistant_message",
+            "The archived report remains verified.",
+        ),
+    )
+    agents = tuple(
+        replace(agent, ended_at_ms=START + day + 3_000)
+        if agent.thread_id == ROOT
+        else agent
+        for agent in base.agents
+    )
+    return replace(base, agents=agents, events=changed_events + later_events)
+
+
+def _daily_hashes(archive: Path) -> list[str]:
+    paths = sorted(
+        (archive / "teams" / "codex-test" / "summary_data" / "rollups" / "daily").glob(
+            "*.json"
+        )
+    )
+    return [json.loads(path.read_text(encoding="utf-8"))["summary"]["input_hash"] for path in paths]
+
+
+def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) -> None:
+    first_team = _two_day_team(
+        "Implemented alpha receipt binding; 101 focused tests passed and released the benchmark."
+    )
+    _write_team(tmp_path, first_team)
+    summarize_archive(tmp_path, first_team.team_slug, "heuristic", "test-model")
+    first = _daily_hashes(tmp_path)
+    assert len(first) >= 2
+
+    changed_team = _two_day_team(
+        "Implemented beta scheduler isolation; 909 focused tests passed and released the benchmark."
+    )
+    _write_team(tmp_path, changed_team)
+    summarize_archive(tmp_path, changed_team.team_slug, "heuristic", "test-model")
+    second = _daily_hashes(tmp_path)
+    assert first[0] != second[0]
+    assert first[1] != second[1]
+
+
+def test_only_changed_window_and_rollups_invalidate(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    first = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    changed = _team("A new root-cause sentence changes only the coordinator window.")
+    _write_team(tmp_path, changed)
+    second = summarize_archive(tmp_path, changed.team_slug, "heuristic", "test-model")
+    assert 0 < second.cache_misses < first.cache_misses
+    assert second.cache_hits > 0
+
+
+def test_cross_spawn_context_reaches_child_phase() -> None:
+    team = _team()
+    child_phase = next(phase for phase in build_phases(team) if phase.agent_id == CHILD)
+    assert "safe-landing protocol" in child_phase.prior_context
+    assert "exact-head validation" in child_phase.prior_context
+
+
+def test_spanning_tool_is_not_repeated_before_later_phase_boundary() -> None:
+    team = _team()
+    long_tool = replace(
+        team.tool_calls[0],
+        started_at_ms=START + 10_000,
+        ended_at_ms=START + 40 * 60 * 1000,
+    )
+    later = _event(
+        "later-child-update",
+        CHILD,
+        35 * 60 * 1000,
+        "assistant_message",
+        "The long validation command is still running.",
+    )
+    updated = replace(team, events=team.events + (later,), tool_calls=(long_tool,))
+    for phase in build_phases(updated):
+        assert all(phase.start_ms <= entry.at_ms < phase.end_ms for entry in phase.transcript)
+
+
+def _rollup_result(key: str, phrase: str) -> SummaryResult:
+    return SummaryResult(key, phrase, phrase, (), "test", "v1", key, "now")
+
+
+def test_monthly_rollup_excludes_cross_boundary_week_summary() -> None:
+    team = _team()
+    month = Period("monthly", "month", "Month", 100, 300, "month.md", False)
+    crossing = Period("weekly", "cross", "Cross", 50, 150, "cross.md", False)
+    contained = Period("weekly", "inside", "Inside", 150, 250, "inside.md", False)
+    stats = PhaseStats(0, 0, 0, 0)
+
+    def phase(key: str, start: int) -> PhaseWindow:
+        return PhaseWindow(
+            key,
+            key,
+            ROOT,
+            "Coordinator",
+            start,
+            start + 10,
+            stats,
+            (),
+            key,
+            "",
+            (),
+        )
+
+    boundary_start = phase("boundary-start", 110)
+    covered = phase("covered", 160)
+    boundary_end = phase("boundary-end", 260)
+    phase_results = {
+        item.summary_key: _rollup_result(item.summary_key, item.summary_key.upper())
+        for item in (boundary_start, covered, boundary_end)
+    }
+    lower_results = {
+        "cross:weekly": _rollup_result("cross", "CROSS_WEEK"),
+        "inside:weekly": _rollup_result("inside", "CONTAINED_WEEK"),
+    }
+    job = _rollup_jobs_for_level(
+        team,
+        (month,),
+        (boundary_start, covered, boundary_end),
+        phase_results,
+        (crossing, contained),
+        lower_results,
+        (),
+        (),
+    )[0]
+    assert "CROSS_WEEK" not in job.transcript
+    assert "CONTAINED_WEEK" in job.transcript
+    assert "BOUNDARY-START" in job.transcript
+    assert "BOUNDARY-END" in job.transcript
+    assert "COVERED" not in job.transcript
+
+
+def test_calendar_periods_use_local_dst_boundaries() -> None:
+    # 2026-03-08 is the US spring-forward day: local midnight-to-midnight is 23 hours.
+    first_ms = 1_772_946_000_000  # 2026-03-08T05:00:00Z == midnight EST
+    last_ms = first_ms + 22 * 60 * 60 * 1000
+    periods = periods_for_range(first_ms, last_ms, "America/New_York", "dst-test")
+    daily = next(period for period in periods if period.kind == "daily")
+    assert daily.end_ms - daily.start_ms == 23 * 60 * 60 * 1000
+
+
+def test_loopback_server_serves_json_with_safe_headers(tmp_path: Path) -> None:
+    (tmp_path / "index.html").write_text("ok", encoding="utf-8")
+    server = make_server(tmp_path, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = int(server.server_address[1])
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as response:
+            assert response.read() == b"ok"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
