@@ -980,6 +980,10 @@ def _root_overview_input(team: TeamData) -> _ProjectOverviewInput:
             if event.thread_id == team.root_thread_id
             and event.kind in {"user_prompt", "assistant_message"}
             and event.text
+            and (
+                team.window_end_ms is None
+                or event.timestamp_ms < team.window_end_ms
+            )
         ),
         key=lambda event: (event.timestamp_ms, event.event_id),
     )
@@ -1057,7 +1061,14 @@ def _definition_evidence(
 ) -> tuple[_GlossaryEvidence, ...]:
     result: list[_GlossaryEvidence] = []
     for event in sorted(team.events, key=lambda item: (item.timestamp_ms, item.event_id)):
-        if not event.text or term.term not in event.text:
+        if (
+            not event.text
+            or term.term not in event.text
+            or (
+                team.window_end_ms is not None
+                and event.timestamp_ms >= team.window_end_ms
+            )
+        ):
             continue
         result.append(
             _GlossaryEvidence(

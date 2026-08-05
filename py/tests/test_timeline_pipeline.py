@@ -33,6 +33,9 @@ from agent_team_timeline.phases import PhaseStats, PhaseWindow, build_phases
 from agent_team_timeline.pipeline import (
     IngestReport,
     _agent_name_jobs,
+    _definition_evidence,
+    _glossary_terms,
+    _root_overview_input,
     _rollup_jobs_for_level,
     build_archive,
     load_archived_team,
@@ -181,6 +184,35 @@ def _write_team(archive: Path, team: TeamData) -> None:
         archive / "teams" / team.team_slug / "raw" / "team.json",
         narrow_json(team.to_json_obj()),
     )
+
+
+def test_knowledge_evidence_keeps_prior_context_but_excludes_post_window_events() -> None:
+    team = _team()
+    future = _event(
+        "future-root",
+        ROOT,
+        40_000,
+        "assistant_message",
+        "FUTURE_ONLY_MARKER discussed exact-head after the selected day.",
+    )
+    bounded = replace(
+        team,
+        events=team.events + (future,),
+        window_start_ms=START + 7_000,
+        window_end_ms=START + 30_000,
+    )
+
+    overview = _root_overview_input(bounded)
+    exact_head = next(term for term in _glossary_terms(bounded) if term.term == "exact-head")
+    evidence = _definition_evidence(bounded, exact_head)
+
+    assert "prompt-1" in overview.event_ids
+    assert "future-root" not in overview.event_ids
+    assert "Investigate the safe-landing protocol" in overview.transcript
+    assert "FUTURE_ONLY_MARKER" not in overview.transcript
+    assert evidence
+    assert all(item.event_id != "future-root" for item in evidence)
+    assert all("FUTURE_ONLY_MARKER" not in item.context for item in evidence)
 
 
 def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path) -> None:
