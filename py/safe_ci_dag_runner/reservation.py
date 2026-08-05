@@ -13,7 +13,7 @@ maps each reserved core to its holder. Every acquire runs under an exclusive
 lock, so it observes every prior live reservation and picks from the FREE-and-
 UNHELD set only. The caller NEVER picks a core itself.
 
-Design invariants (each has a test in ``tests/test_reservation.py``):
+Design invariants:
 
   * DISJOINT under concurrency — two acquires that overlap in time get disjoint
     core sets. The exclusive ``flock`` is held across the whole
@@ -346,8 +346,8 @@ class reserve_cores:
 
         with reserve_cores(1, tag="ptrace-bench") as cores:
             # HARD-pin the whole tree via a transient scope's cgroup cpuset.
-            # (sched_setaffinity is ESCAPABLE — a child can widen its own mask;
-            #  mutation-verified 2026-08-04. Use AllowedCPUs, not affinity.)
+            # (sched_setaffinity is escapable because a child can widen its own
+            #  mask. Use AllowedCPUs, not process affinity.)
             subprocess.run(["systemd-run", "--user", "--scope", "--collect",
                             f"-pAllowedCPUs={','.join(map(str, cores))}",
                             "--", *benchmark_cmd])

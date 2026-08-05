@@ -1,14 +1,9 @@
-# Planner design: a measured-curve moldable allocator for safe-ci-dag-runner
+# CPA planner specification for safe-ci-dag-runner
 
-Status: IMPLEMENTED in v0.8.0 as `--planner cpa` (this document is both the design rationale and
-the specification the implementation follows). It grounds the choice of algorithm in the scheduling
-literature, then specifies the algorithm precisely enough that the Python and Rust builds implement
-it identically (the cross-differential compares the resulting plan — chosen widths, order, makespan
-lower bound + modeled makespan, and stop reason — byte-for-byte). Everything the allocator consumes
-(measured speedup curves, the critical-path list scheduler, the memory and named-resource models)
-shipped in v0.7.0; the allocator that decides each step's inner-parallelism width, the runtime
-core-budget dispatch gate, and the modeled-makespan reporting are the v0.8.0 additions. Section 5
-below is the authoritative spec; where the shipped code refines a detail, the section notes it.
+The `--planner cpa` mode uses measured speedup curves to allocate each step's inner-parallelism
+width. This document gives the scheduling rationale and the authoritative algorithm. The behavioral
+differential compares the implementations' chosen widths, order, makespan lower bound, modeled
+makespan, and stop reason byte-for-byte.
 
 ## 1. The problem, in plain language
 
@@ -35,33 +30,29 @@ last step finishing — subject to four constraints that all coexist on the one 
    should not oversubscribe the machine. `P` comes from `container_core_budget()` (the cgroup
    `cpu.max` quota ÷ period, else `nproc`).
 3. **Per-step memory caps.** Each step has a modeled peak memory footprint; the worst-case sum over
-   any set of steps that can co-run must fit a RAM budget. This is the existing reachable-concurrent-set
-   memory model in `sizing.py` (`schedulable_peak_mem_bytes`), and a CPU-bound step's cap *grows* with
+   any set of steps that can co-run must fit a RAM budget. The reachable-concurrent-set model
+   (`schedulable_peak_mem_bytes`) accounts for a CPU-bound step's cap growing with
    its width (`step_mem_cap_for_inner_jobs`), so **widening a step costs memory**.
 4. **Named scarce-resource semaphores.** Arbitrary caller-named capacities in `DagConfig.resource_caps`
    (e.g. `{"browser": 1}`) bound how many demanders co-run — which in turn bounds the *achievable*
    concurrency and therefore how much of `P` can actually be kept busy.
 
-What v0.7.0 already has:
+The planner composes three parts:
 
-- **The measured curves.** `estimates.load_step_speedups()` reads the profile store and produces, per
+- **Measured curves.** `load_step_speedups` reads the profile store and produces, per
   step, a `StepSpeedup` with one `SpeedupLevel` per measured width — carrying the robust
   (contention-discounted, outlier-trimmed) `wall_s`, the **total CPU-seconds** `cpu_s = user_s + sys_s`
   (a *work-conservation* signal), `effective_cores`, `throttled_s`, and the `speedup` versus the
   smallest measured width. It also computes a **per-step** `recommended_inner_jobs` — the best width
   before that one step's own diminishing-returns knee.
-- **The list scheduler.** `scheduler.py`'s `Runner` is a greedy ready-set list scheduler: it launches
+- **The list scheduler.** `Runner` is a greedy ready-set list scheduler: it launches
   every ready step (deps met, memory + named resources free, under `-j`) in a caller-supplied
   dispatch order, and `--planner critical-path` supplies a *critical-path-first* order (highest
   bottom-level first). This is exactly the "list-scheduling" back half of a two-phase moldable
   scheduler.
-- **The memory + resource models.** As above.
-
-**The missing piece — this document's subject — is the ALLOCATOR**: the phase that picks each step's
-width `p_i` to minimize whole-DAG makespan, *then* hands those widths (and the resulting
-allocation-aware ordering) to the existing list scheduler. Today `p_i` is either a static DAG hint or
-each step's *isolated* per-step knee; neither reasons about the DAG as a whole or about steps sharing
-the one machine.
+- **The allocator.** It picks each step's width `p_i` to minimize whole-DAG makespan, then hands those
+  widths and the allocation-aware ordering to the list scheduler. Unlike an isolated per-step knee,
+  the allocation accounts for the DAG and for steps sharing one machine.
 
 ## 2. The makespan lower bound that drives everything
 
@@ -79,7 +70,7 @@ So `T >= max(T_CP, A/P)`. Brent's theorem is the matching upper direction: a gre
 achieves `T <= T_1/P + T_inf` — within a factor ~2 of the max of the two terms (Graham's `2 - 1/P`
 list-scheduling guarantee is the same phenomenon).
 
-This inequality is the *entire* reason a moldable allocator is subtle, and why the recommended
+This inequality is the *entire* reason a moldable allocator is subtle, and why the implemented
 algorithm has the shape it does:
 
 - Widening one step (raising `p_i`) **shrinks `T_i(p_i)`**, which can shorten `T_CP` — good, *if that
@@ -111,9 +102,8 @@ a set of real, robust, contention-discounted points at the widths we have actual
 (`SpeedupLevel.wall_s`), plus the total-work signal `cpu_s`. The literature's analytic models exist
 to *approximate* exactly the object we have empirically. This is our single biggest deviation from
 the textbook (see §6) and it is a strength: the concavity, the knee location, and the
-work-conservation break are observed, not assumed. Amdahl/Downey remain useful as (a) a sanity check
-on the shape of a measured curve and (b) a fallback prior for a step with too few samples to have a
-measured curve.
+work-conservation break are observed, not assumed. Amdahl and Downey remain useful as sanity checks
+on measured-curve shape; the allocator does not synthesize missing measurements from either model.
 
 ### 3.2 The area/critical-path allocation lineage
 
@@ -135,8 +125,8 @@ measured curve.
   processor (`T_CP > T_A`, with `T_A = A/P`), pick the task **on the current critical path** whose
   extra processor helps most and give it one more; recompute; repeat until `T_CP <= T_A`. Then
   list-schedule. CPA is O(cheap) and needs no makespan guess — it just walks to the balance point of
-  the two-term bound. **This is the closest published match to our problem and the basis of our
-  recommendation.**
+  the two-term bound. **This is the closest published match to our problem and the basis of the
+  implementation.**
 - **Bansal, Kumar & Singh (2006, Parallel Computing), "An improved two-step algorithm for task and
   data parallel scheduling in distributed memory machines" — MCPA (Modified CPA).** MCPA fixes CPA's
   main blind spot: CPA can over-allocate a critical-path task even when its *siblings* (tasks that
@@ -173,31 +163,29 @@ The order literature is where our existing `--planner` lives:
   reduces to the same bottom-level/upward-rank idea we already use. We cite HEFT to explain *why we do
   not adopt it wholesale*: its core contribution does not apply to a single homogeneous machine.
 
-## 4. Recommended algorithm
+## 4. Implemented algorithm
 
-**Adopt a CPA-style critical-path / area-balancing moldable allocator, driven by our measured
-`T_i(p)` curves, feeding the existing critical-path list scheduler, with the memory caps, named-
-resource semaphores, and the total core budget `P` as hard constraints on allocation.**
+The planner uses a **CPA-style critical-path / area-balancing moldable allocator**, driven by measured
+`T_i(p)` curves. It feeds the critical-path list scheduler, with memory caps, named-resource
+semaphores, and the total core budget `P` as hard constraints on allocation.
 
-Concretely, the next planner is a **two-phase** design (Turek-Wolf-Yu / Ludwig-Tiwari structure):
+It has two phases (the Turek-Wolf-Yu / Ludwig-Tiwari structure):
 
-- **Phase 1 — allocation (new):** a CPA/MCPA-derived gradient loop picks each step's width `p_i`,
+- **Phase 1 — allocation:** a CPA/MCPA-derived gradient loop picks each step's width `p_i`,
   snapping to the widths we have actually measured, balancing `T_CP` against `A/P` and stopping at
   each step's work-conservation knee or when a constraint binds.
-- **Phase 2 — list scheduling (exists):** recompute bottom-levels using the *allocated* weights
+- **Phase 2 — list scheduling:** recompute bottom-levels using the *allocated* weights
   `T_i(p_i)`, order ready steps by bottom-level (our `critical-path` planner), and dispatch under the
-  memory, named-resource, and (new) core-budget gates.
+  memory, named-resource, and core-budget gates.
 
 ### Why this over the alternatives
 
-- **vs. v0.7.0's per-step greedy-knee.** The current `recommended_inner_jobs` optimizes each step *in
-  isolation* — best wall before *its own* knee, capped at `P`. That is a fine default for one step but
-  is **DAG-blind and machine-blind**: it will happily push a plateau-ish step toward `P` even when the
-  step is off the critical path (those cores buy no makespan) and even when three such steps co-run
-  and collectively demand `3P` cores. The CPA allocator spends cores where they shorten the *whole-DAG*
-  critical path and refuses to oversubscribe the shared machine. (The per-step knee stays as the
-  fallback for steps with no usable curve, and as the per-step *upper bound* the allocator never
-  exceeds — see §5.)
+- **vs. per-step greedy-knee.** `recommended_inner_jobs` optimizes each step *in isolation* — best
+  wall before its own knee, capped at `P`. That is a useful choice for one step but is DAG-blind and
+  machine-blind: an off-path scaling step can receive a wide allocation that does not shorten the
+  makespan, and independently chosen widths can collectively exceed `P`. CPA spends cores where they
+  shorten the whole-DAG critical path. The measured knee remains the upper bound when a curve exists;
+  a curveless step stays rigid at its configured hint or one core (see §5).
 - **vs. pure two-phase (Turek-Wolf-Yu / Ludwig-Tiwari).** Their guarantees assume **independent**
   tasks; our DAG has precedence, so the bound does not transfer, and their allotment search (binary-
   search a makespan, solve a knapsack-like allotment) is heavier and assumes analytic work functions.
@@ -205,20 +193,18 @@ Concretely, the next planner is a **two-phase** design (Turek-Wolf-Yu / Ludwig-T
   O(cheap) allocation loop that reads straight off our measured curves. We keep their architecture and
   drop their independence assumption.
 - **vs. MCPA in full.** MCPA's concurrency-awareness is genuinely useful at small `P`, but the full
-  level-by-level machinery adds state and is harder to make bit-for-bit deterministic across two
-  languages. We take its **key insight** — never allocate more cores to a step than can be used given
+  level-by-level machinery adds state and complicates deterministic implementations. The planner
+  takes its **key insight** — never allocate more cores to a step than can be used given
   what co-runs — via the core-budget gate and a concurrency-aware per-step cap, while keeping CPA's
-  simpler global CP/area loop as the deterministic base. Full MCPA level-balancing is a noted future
-  refinement.
+  simpler global CP/area loop as the deterministic base.
 - **vs. Jansen-Zhang / Jansen FPTAS.** Constant-factor-optimal but LP-based, complex, and reliant on
   analytic monotone work functions — overkill for tens-of-steps CI DAGs and hard to make deterministic
   and dependency-light. We cite them as the theory that says our objective is the right one.
 
 ## 5. Algorithm specification
 
-This section is precise enough to implement identically in `py/` and `rs/`. All arithmetic and all
-tie-breaks are specified so the two builds agree bit-for-bit (the cross-differential compares plan
-output byte-for-byte).
+All arithmetic and tie-breaks are specified so both implementations agree bit-for-bit. The
+behavioral differential compares plan output byte-for-byte.
 
 ### 5.1 Inputs
 
@@ -236,14 +222,14 @@ output byte-for-byte).
 
 For each step `i`, define its **admissible width set** `W_i`:
 
-- If `i` has a measured curve, `W_i = { level.inner_jobs for level in speedup.levels }`, but
-  **truncated at the step's work-conservation knee** exactly as `_build_step_speedup` already computes
-  it: never admit a width beyond `speedup.recommended_inner_jobs`. This reuses the existing knee
-  (marginal wall gain `>= 1.15x` AND total-CPU-seconds growth `<= 1.5x` AND `<= P`) so the allocator
-  cannot push a step past the point where extra cores stop conserving work. Also drop any width `> P`.
-- If `i` has **no** measured curve, `W_i = { w_i }` where `w_i` is the step's `preferred_inner_jobs`
-  hint (or `1`). The step is effectively rigid; the allocator will not widen it (no data to justify
-  it).
+- If `i` has a measured curve, begin with the measured widths no greater than
+  `speedup.recommended_inner_jobs`, then keep those no greater than `P`. This reuses the
+  work-conservation knee (marginal wall gain `>= 1.15x` and total-CPU-seconds growth `<= 1.5x`) so
+  the allocator cannot widen past the useful measurements. If every measured width exceeds `P`,
+  retain only the narrowest knee-admissible measurement rather than inventing a point.
+- If `i` has **no** measured curve, `W_i = { w_i }`, where `w_i` is the positive
+  `preferred_inner_jobs` hint (or `1`) capped at `P`. The step is rigid because no data justifies
+  widening it.
 
 Define the **measured wall** `T_i(p)` for `p in W_i` as that level's `wall_s`; for a curveless step,
 `T_i(w_i) = est[i]`. `T_i` is only ever evaluated at admissible widths — **no interpolation or
@@ -290,9 +276,7 @@ constraints:
    the curve, so we use it).
 3. **Constraint filter — a candidate is admissible only if widening it keeps every constraint
    satisfied** (see §5.6). If widening `i` would violate a constraint, `i` is dropped from the
-   candidate set this iteration (it may still be widened later if freeing elsewhere makes room — but
-   because area is monotone increasing, in practice a violated core/memory constraint stays violated,
-   which is what makes the loop terminate).
+   candidate set. Since widths only grow, a core- or memory-blocked widening remains blocked.
 4. **Pick and apply.** Choose the admissible candidate with the **greatest `gain`**; break ties by
    **smallest tag** (ascending, matching the existing critical-path tie-break). Set `p_i := next(p_i)`.
 5. **Recompute** §5.4 and loop.
@@ -301,17 +285,16 @@ constraints:
 
 A tentative widening `p_i -> next(p_i)` is rejected unless **all** hold:
 
-- **Total core budget.** The step's own width must not exceed `P`: `next(p_i) <= P`. (Cross-step
-  oversubscription is handled at dispatch, §5.7, but no single step may exceed the whole machine.)
+- **Total core budget.** A tentative wider point must not exceed `P`: `next(p_i) <= P`. The only
+  possible wider-than-`P` allocation is the single measured fallback described in §5.2; it is never
+  widened further and runs alone.
 - **Per-step memory cap grows with width.** Recompute the DAG's worst-case concurrent footprint with
   the tentative width using the existing `schedulable_peak_mem_bytes` /
   `step_mem_cap_for_inner_jobs` (a CPU-bound step's cap scales `~ cap * p / 4`). Reject if the new
   worst-case footprint exceeds `mem_budget`. This is the point where "widening costs memory" enters:
   a CPU-bound step on the critical path may be *memory-blocked* from widening even though cores are
-  free. (v0.8.0 note: the shipped allocator reads each step's DAG-declared `rss_baseline_bytes` for
-  this check — the same baselines `sizing.py` always consumed. `mem_budget` comes from `--max-mem`;
-  absent, the memory constraint is off. Feeding store-*learned* peak baselines into the allocation
-  memory model is a scoped follow-on.)
+  free. The allocator reads each step's DAG-declared `rss_baseline_bytes` for this check.
+  `mem_budget` comes from `--max-mem`; absent, the memory constraint is off.
 - **Named-resource feasibility is unchanged by width** (widths do not change `hint.resources`), so
   named-resource caps never *block a widening* — but they *do* shape the area term's realizability:
   see §5.7.
@@ -320,83 +303,69 @@ A tentative widening `p_i -> next(p_i)` is rejected unless **all** hold:
 
 ### 5.7 Handing allotments to the list scheduler (phase 2)
 
-The allocator outputs `p_i` per step. Wiring into the existing runner:
+The allocator outputs `p_i` per step and passes the result to the runner:
 
 1. **Bake widths in.** Produce a `DagConfig` copy whose each `Step.hint.preferred_inner_jobs = p_i`
    (analogous to `apply_plan_to_config`). This flows through `command_with_inner_jobs` (the `-j`
    flag actually handed to the step) and through `step_mem_cap_for_inner_jobs` (the memory cap).
-2. **Order.** Compute the dispatch order with `--planner critical-path` using the *allocated* weights
-   `T_i(p_i)` (not the p=1 or hint weights). Highest weighted bottom-level first, ties by tag.
-3. **Add a core-budget gate to the runner (new, MCPA's insight).** Introduce cores as a first-class
+2. **Order.** Compute the same order as the critical-path planner, using the *allocated* weights
+   `T_i(p_i)` rather than the width-one or hinted weights. Highest weighted bottom-level first, ties
+   by tag.
+3. **Apply the core-budget gate (MCPA's insight).** Treat cores as a first-class
    capacity dimension alongside the named-resource semaphores: treat `P` as a built-in `"cpu"` cap and
-   each step's demand as `p_i`. The ready-set loop then launches a ready step only if
-   `sum(p_j for j running) + p_i <= P`, exactly mirroring `_res_free` / `_acquire` / `_release`. This
-   closes the loop between the allocator's `A/P` assumption and runtime: the machine is never
-   oversubscribed, so measured curves (gathered boxed, one step's cores to itself) stay predictive.
+   each step's demand as `p_i`. The ready-set loop launches a ready step only if
+   `sum(p_j for j running) + p_i <= P`. A wider-than-budget fallback may launch only when no other
+   step is running, which prevents deadlock while preserving serialization. This closes the loop
+   between the allocator's `A/P` assumption and runtime for ordinary admissible widths.
    Named-resource caps continue to gate co-running independently; together they bound the achievable
    concurrency the area term assumes.
 
 The result: cores flow to the steps that shorten the whole-DAG critical path and *scale* (per the
 measured curve), steps that plateau keep their cores small, memory-heavy steps are throttled by the
-RAM budget, and the machine is never oversubscribed.
+RAM budget, and concurrent allocated widths stay within the core budget.
 
 ### 5.8 Stop conditions (any one ends the loop)
 
 - **Balance reached:** `T_CP <= T_A`. The critical path no longer dominates; further widening only
-  grows area. (CPA's native termination.) The shipped code reports this stop reason as `balanced`.
+  grows area. (CPA's native termination.) The planner reports this stop reason as `balanced`.
 - **No admissible candidate:** every critical-path step is already at its knee-truncated max width, at
   `P`, or blocked by the memory budget. Additional cores cannot help the current critical path. The
-  shipped code distinguishes three sub-cases in the reported stop reason: `knee-exhausted` (no
+  planner distinguishes three sub-cases in the reported stop reason: `knee-exhausted` (no
   critical-path step has any wider admissible width left — including the per-step `P` cap, which is
   enforced by construction via the `W_i` truncation in §5.2), and `mem-capped` / `core-capped` (a
   wider width exists but every candidate was rejected by the memory budget / the core cap this
   iteration). Because §5.2 truncates `W_i` to widths `<= P`, `core-capped` is a defensive backstop
   that does not arise in practice; the P-cap surfaces as `knee-exhausted`.
-- **Fixed-point safety net:** if an iteration applies no change, stop (reported `fixed-point`). Guards
-  against any tie/rounding corner making the loop spin.
+- **Fixed-point safety net:** if the bounded loop ever exhausts without another classified stop,
+  report `fixed-point`.
 
 Because every applied step strictly increases some `p_i` within a finite `W_i`, and area is monotone
 non-decreasing, the loop runs at most `sum_i (|W_i| - 1)` iterations — trivially bounded for CI DAGs.
 
-### 5.9 Determinism (Python/Rust bit-for-bit parity)
+### 5.9 Cross-implementation determinism
 
-The cross-differential (`cross/differential.py`) compares plan output byte-for-byte, so the allocator
-must be deterministic and identical across builds:
+The behavioral differential compares plan output byte-for-byte, so the allocator must be
+deterministic and identical across implementations:
 
-- **Compare gains at fixed precision.** Compute `gain(i)` and compare the `T_CP > T_A` condition using
-  the SAME fixed-precision convention the plan JSON already uses (`_fmt_secs` — fixed 3 decimals): reduce
-  each compared quantity to its rounded-to-3-decimals form (or scaled-integer millis) before
-  comparing, so no float-representation difference between languages can flip a `>` or a tie. This
-  mirrors the existing `estimates.py` discipline (integer-rank percentiles, fixed-precision JSON).
-- **Total tie-break order.** When two candidates have equal rounded `gain`, pick the smallest tag
-  (ascending). Reuse the existing `_neg_key` / `(-bottom_level, tag)` convention so ordering is total
-  and matches the critical-path planner.
-- **Canonical iteration order.** Iterate steps in `cfg` registration order when building any
-  intermediate list, so accumulation order (and thus any floating add order for `A`) is identical
-  across builds.
+- **Canonical floating-point operations.** Compute `gain(i)`, `T_CP`, and `T_A` with the same IEEE-754
+  operations in the same order. Plan output formats seconds to three decimals, but comparisons use
+  the unrounded values.
+- **Total tie-break order.** When two candidates have equal `gain`, pick the smallest tag. Critical
+  path and dispatch ordering use the equivalent `(-bottom_level, tag)` order.
+- **Canonical iteration order.** Iterate steps in `cfg` registration order for the area sum and use
+  a tag-ascending scan that keeps the first maximum for the gradient tie-break.
 - **Integer core arithmetic.** `delta_cores`, `P`, and the core-budget gate are pure integers.
 
-**Realized mechanism (v0.8.0).** The shipped allocator meets the bit-for-bit requirement the same
-way the rest of this codebase does: it performs the SAME floating-point operations in the SAME
-canonical order (cfg registration order for the area sum; the shared `_bottom_levels` /
-`_critical_path` for the weighted CP; a tag-ascending scan that keeps the first maximum for the
-gradient tie-break) in both languages, so every `>`/`<=`/max/min comparison sees bit-identical IEEE-754
-values and cannot diverge. Widths, `P`, and the core-budget gate are pure integer arithmetic. The
-cross-differential (`compare_cpa_planner`) proves the resulting plan JSON/text — including the chosen
-widths, the area/critical-path/lower-bound/modeled-makespan numbers (emitted as fixed-3-decimal
-strings via `_fmt_secs`), and the stop reason — is byte-identical py-vs-rs. (Pre-rounding each
-compared quantity to 3 decimals, floated as an alternative above, proved unnecessary given identical
-op order; the differential is the guarantee.)
+The differential checks the resulting plan JSON and text, including chosen widths, area,
+critical-path length, lower bound, modeled makespan, and stop reason.
 
 The modeled makespan reported alongside the lower bound is a deterministic greedy list-schedule of
 the allocated widths (§5.7's phase-2 dispatch, simulated): it respects the DAG dependencies AND the
 core budget, so it is provably `>=` the `max(T_CP, area/P)` lower bound, and the plan asserts this.
 
-Expose the chosen widths and the loop's stopping reason in `plan`/`--show-plan` output (a new column
-`alloc_inner_jobs` and a one-line `allocator (cpa): <stop-reason>; P=<N> cores; critical-path=…s,
-area/P=…s, lower-bound=…s, modeled-makespan=…s`), plus a machine-readable `allocation` object in the
-plan JSON, so an operator (or a CI-optimizing agent) can see *why* each width was chosen — matching
-the existing "show the estimate source" philosophy.
+The `plan` and `--show-plan` output includes `alloc_inner_jobs` and the allocator's stop reason,
+core budget, critical-path length, area term, lower bound, and modeled makespan. Plan JSON exposes
+the same information in its `allocation` object.
 
 ## 6. Our deviations from the textbook
 
@@ -404,13 +373,13 @@ the existing "show the estimate source" philosophy.
    Downey-shaped, monotone, concave). We read `T_i(p)` from the **measured** profile store. We
    therefore (a) evaluate `T_i` only at measured widths — no interpolation/extrapolation, so an
    allocation is always backed by a real measurement; and (b) get the knee and the work-conservation
-   break *observed*, not assumed. Analytic models survive only as the fallback prior for a step with
-   too few samples.
+   break *observed*, not assumed. A step with too few samples remains rigid instead of receiving a
+   synthetic curve.
 2. **Single machine, inner-jobs, cgroup-boxed — not a distributed multiprocessor.** The "processors"
    a task receives are inner `-j` threads inside one machine's cgroup CPU budget, not nodes of a
    cluster. There is no data-redistribution or communication cost term (the classic CPA/mixed-parallel
    concern); the only cross-step coupling is **shared CPU, RAM, and named semaphores** on the one box.
-   This is why we add the runtime core-budget gate (§5.7) rather than assuming a perfect packing.
+   The runtime core-budget gate (§5.7) handles packing rather than assuming it is perfect.
 3. **Two extra constraint classes the textbook omits.** Standard moldable scheduling constrains only
    processors. We additionally constrain **per-step memory** (and, crucially, memory that *grows with
    width* for CPU-bound steps) and **named scarce-resource semaphores**. Both can *block a widening*
@@ -422,26 +391,20 @@ the existing "show the estimate source" philosophy.
    degrades the whole DAG. This efficiency guard is enforced by construction (knee-truncated admissible
    widths, §5.2) and is not part of classical CPA.
 5. **Determinism as a hard requirement.** The classical algorithms are described over reals with
-   arbitrary tie-breaking. We require **bit-for-bit** identical decisions in two languages, so every
-   comparison is at fixed precision with a total tag tie-break (§5.9).
+   arbitrary tie-breaking. Both implementations require **bit-for-bit** identical decisions, so
+   operations use canonical ordering and a total tag tie-break (§5.9).
 
-## 7. Testing and rollout
+## 7. Verification contract
 
-- **Cross-differential.** Add fixtures with multi-width measured curves (a scaling step on the
-  critical path, a plateau step off it, a memory-heavy CPU-bound step) and assert the allocator's
-  chosen widths, order, and stop-reason are byte-identical py/rs. Extend `cross/differential.py`'s
-  `plan --format json` comparison to cover the new `alloc_inner_jobs` field.
-- **Unit tests (both builds).** (a) balance point reached on a linear-scaling chain; (b) a plateau
-  step is *not* widened; (c) a memory-heavy step is core-free-but-memory-blocked; (d) the core-budget
-  gate prevents oversubscription at dispatch; (e) a curveless step stays rigid; (f) idempotence
-  (running the allocator twice yields the same widths).
-- **Directional benchmark.** On a real DAG (e.g. deepscry's `validate`), compare makespan under
-  greedy-lpt vs. per-step-knee vs. the CPA allocator; expect the allocator to win when the DAG has a
-  scaling step on a long critical path and contended cores. This is a directional inner-loop
-  measurement, not a definitive quiet-machine benchmark.
-- **Backward compatibility.** Gate behind a planner/allocator flag; the default stays the current
-  behavior until the allocator is validated. `--no-profile-feedback` disables it (no curves => nothing
-  to allocate).
+- **Behavioral differential.** Multi-width fixtures cover a scaling critical-path step, an off-path
+  plateau, and a memory-heavy step. The harness compares widths, order, modeled values, and stop
+  reason across implementations.
+- **Unit tests.** Tests cover a balanced linear chain, plateau avoidance, memory-blocked widening,
+  the dispatch core gate, rigid curveless steps, and allocator idempotence.
+- **Directional benchmarks.** Representative caller-owned DAGs can compare `greedy-lpt`, per-step
+  knee allocation, and CPA under controlled resource contention.
+- **Selection.** `cpa` is explicit; the default remains `greedy-lpt`. `--no-profile-feedback`
+  removes measured curves, so curveless steps remain rigid.
 
 ## 8. References
 
@@ -482,19 +445,15 @@ Load-bearing citations; web-confirmed where noted.
     scheduling in distributed memory machines." *Parallel Computing*, 32(10):759–774. (**MCPA** —
     concurrency-aware CPA; web-confirmed.)
 
-## 9. Where this lives in the code
+## 9. Implementation map
 
-- Curves: `estimates.load_step_speedups()` → `StepSpeedup` / `SpeedupLevel` (knee = `_build_step_speedup`,
-  guards `_SPEEDUP_MIN_MARGINAL_GAIN = 1.15`, `_SPEEDUP_MAX_WORK_GROWTH = 1.5`).
-- Order + bottom-levels: `estimates._bottom_levels`, `_critical_path`, `_plan_order`
-  (`Planner.CRITICAL_PATH`).
-- Memory: `sizing.schedulable_peak_mem_bytes`, `step_mem_cap_for_inner_jobs`, `jobs_for_budget`.
-- Core budget: `profile_enrich.container_core_budget()`.
-- Named resources + the ready-set loop the core-budget gate extends: `scheduler.Runner`
-  (`_res_free` / `_acquire` / `_release`).
-- Baking widths in for phase 2: mirror `estimates.apply_plan_to_config`.
+- Curves: `load_step_speedups`, `StepSpeedup`, `SpeedupLevel`, and `_build_step_speedup`.
+- Order and bottom-levels: `_bottom_levels`, `_critical_path`, `_plan_order`, and
+  `Planner.CRITICAL_PATH`.
+- Memory: `schedulable_peak_mem_bytes`, `step_mem_cap_for_inner_jobs`, and `jobs_for_budget`.
+- Core budget: `container_core_budget`.
+- Named resources and dispatch: `Runner`, `_res_free`, `_acquire`, and `_release`.
+- Allocation and phase-two configuration: `allocate_widths`, `build_plan`, and
+  `apply_plan_to_config`.
 
-The allocator is a new pure function (call it `allocate_widths(cfg, speedups, est, P, mem_budget)
--> Mapping[tag, int]`) added alongside `build_plan`, with a matching Rust implementation and a
-cross-differential fixture — the same py/rs + differential discipline every other feature in this
-repo follows.
+The behavioral differential supplies the cross-implementation contract for this map.

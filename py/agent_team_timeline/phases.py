@@ -14,12 +14,16 @@ from agent_team_timeline.summarize import SummaryJob
 
 @dataclass(frozen=True)
 class PhaseStats:
+    """Activity counts collected for one or more timeline phases."""
+
     user_prompts: int
     agent_responses: int
     inter_agent_messages: int
     tool_calls: int
 
     def to_mapping(self) -> dict[str, int]:
+        """Return the counters keyed by their stable archive field names."""
+
         return {
             "user_prompts": self.user_prompts,
             "agent_responses": self.agent_responses,
@@ -30,31 +34,43 @@ class PhaseStats:
 
 @dataclass(frozen=True)
 class StateSegment:
+    """A contiguous interval with one derived agent activity state."""
+
     start_ms: int
     end_ms: int
     kind: str
 
     def to_json_obj(self) -> dict[str, object]:
+        """Return the state segment as a JSON-serializable object."""
+
         return {"start_ms": self.start_ms, "end_ms": self.end_ms, "kind": self.kind}
 
 
 @dataclass(frozen=True)
 class TranscriptTool:
+    """A tool name and its collapsed invocation count in a transcript entry."""
+
     name: str
     count: int
 
     def to_json_obj(self) -> dict[str, object]:
+        """Return the collapsed tool count as a JSON-serializable object."""
+
         return {"name": self.name, "count": self.count}
 
 
 @dataclass(frozen=True)
 class TranscriptEntry:
+    """One timeline transcript item with any adjacent tool calls."""
+
     at_ms: int
     role: str
     text: str
     tools: tuple[TranscriptTool, ...]
 
     def to_json_obj(self) -> dict[str, object]:
+        """Return the transcript entry as a JSON-serializable object."""
+
         return {
             "at_ms": self.at_ms,
             "role": self.role,
@@ -65,6 +81,8 @@ class TranscriptEntry:
 
 @dataclass(frozen=True)
 class PhaseWindow:
+    """A bounded agent-work interval and the material needed to summarize it."""
+
     phase_id: str
     summary_key: str
     agent_id: str
@@ -416,6 +434,8 @@ def build_phases(
 def summary_jobs_for_phases(
     team: TeamData, phases: Sequence[PhaseWindow], glossary: str
 ) -> tuple[SummaryJob, ...]:
+    """Create deterministic summary jobs for the supplied phase windows."""
+
     return tuple(
         SummaryJob(
             key=phase.summary_key,
@@ -433,6 +453,8 @@ def summary_jobs_for_phases(
 
 
 def aggregate_stats(phases: Sequence[PhaseWindow]) -> PhaseStats:
+    """Sum activity counters across *phases*."""
+
     return PhaseStats(
         user_prompts=sum(phase.stats.user_prompts for phase in phases),
         agent_responses=sum(phase.stats.agent_responses for phase in phases),

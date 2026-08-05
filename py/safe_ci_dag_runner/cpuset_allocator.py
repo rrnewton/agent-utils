@@ -422,6 +422,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the CPU-set allocator command and return its process status."""
     parser = _build_parser()
     actual = list(argv) if argv is not None else sys.argv[1:]
     if not actual:

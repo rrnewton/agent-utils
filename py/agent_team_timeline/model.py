@@ -24,6 +24,8 @@ class SourceSnapshot:
     line_count: int
 
     def to_json_obj(self) -> JsonObject:
+        """Return the snapshot as a JSON-serializable object."""
+
         return {
             "path": self.path,
             "thread_id": self.thread_id,
@@ -51,6 +53,8 @@ class Agent:
     source_path: str
 
     def to_json_obj(self) -> JsonObject:
+        """Return the agent record as a JSON-serializable object."""
+
         return {
             "thread_id": self.thread_id,
             "parent_thread_id": self.parent_thread_id,
@@ -79,6 +83,8 @@ class Turn:
     last_agent_message: str | None
 
     def to_json_obj(self) -> JsonObject:
+        """Return the turn as a JSON-serializable object."""
+
         return {
             "turn_id": self.turn_id,
             "thread_id": self.thread_id,
@@ -110,6 +116,8 @@ class Event:
     source_line: int
 
     def to_json_obj(self) -> JsonObject:
+        """Return the event as a JSON-serializable object."""
+
         return {
             "event_id": self.event_id,
             "thread_id": self.thread_id,
@@ -146,6 +154,8 @@ class ToolCall:
     source_line: int
 
     def to_json_obj(self) -> JsonObject:
+        """Return the tool call as a JSON-serializable object."""
+
         nested: list[JsonObject] = [
             {"name": name, "count": count} for name, count in self.nested_tools
         ]
@@ -182,6 +192,8 @@ class Edge:
     source_line: int
 
     def to_json_obj(self) -> JsonObject:
+        """Return the interaction edge as a JSON-serializable object."""
+
         return {
             "edge_id": self.edge_id,
             "call_id": self.call_id,
@@ -212,6 +224,8 @@ class TeamData:
     edges: tuple[Edge, ...]
 
     def to_json_obj(self) -> JsonObject:
+        """Return the complete team snapshot as a JSON-serializable object."""
+
         return {
             "team_slug": self.team_slug,
             "provider": self.provider,

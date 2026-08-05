@@ -31,6 +31,7 @@ class SubprocessGateRunner:
         self.timeout = timeout
 
     def run(self, cmd: str) -> GateResult:
+        """Execute ``cmd`` and return its captured completion or launch/timeout error."""
         try:
             proc = subprocess.Popen(
                 ["bash", "-c", cmd],
@@ -77,6 +78,7 @@ class GlobFileAgeProbe:
     """Report the age of the newest file matching a glob, relative to ``now``."""
 
     def newest_age_secs(self, pattern: str, now: int) -> Optional[int]:
+        """Return the nonnegative age of the newest match, or ``None`` if unavailable."""
         matches = glob.glob(pattern)
         if not matches:
             return None

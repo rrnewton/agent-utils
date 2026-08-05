@@ -1,39 +1,21 @@
-"""Pluggable UPLOAD + DOWNLOAD of the mergeable profile SUMMARY — the piece that closes the
-profiling feedback loop on EPHEMERAL CI.
+"""Download and publish mergeable profile summaries through pluggable storage backends.
 
-On a persistent dev box the profile store accumulates across runs, so the planner's learned
-estimates improve over time. On ephemeral CI each runner starts with an EMPTY store, so nothing is
-ever fed back. This module gives the runner a way to DOWNLOAD the accumulated summary at start
-(seeding the planner with the fleet's history) and UPLOAD this run's contribution at the end, behind
-a small pluggable :class:`SyncBackend` protocol — the same "code against an abstraction, not a
-concrete store" pattern as :class:`~safe_ci_dag_runner.protocols.CgroupManager` /
-:class:`~safe_ci_dag_runner.protocols.MetricsSink`.
+The planner learns estimates from accumulated profile data. A :class:`SyncBackend` can load the
+current summary before a run and merge the run's contribution afterward. Each summary is scoped to
+one ``(machine_id, container_class)`` identity so measurements from unlike runners remain separate.
 
 Backends
 --------
-* :class:`LocalDirBackend` — a directory on the local filesystem (``local:<dir>``). The baseline:
-  fully testable, and an atomic read-merge-write under an ``flock`` so concurrent local runs do not
-  lose contributions.
-* :class:`GitBranchBackend` — a dedicated git branch (``git:<url>#<branch>[#<subdir>]``). The ATOMIC
-  REFERENCE backend: fetch the data branch, merge the downloaded summary with this run's delta,
-  commit, and push with RETRY-ON-CONFLICT (a rejected push re-fetches the new tip and re-merges the
-  SAME delta, never clobbering a concurrent contributor). This gives correct concurrent
-  read-modify-write.
+* :class:`LocalDirBackend` — a directory on the local filesystem (``local:<dir>``), with atomic
+  read-merge-write under ``flock``.
+* :class:`GitBranchBackend` — a dedicated git branch (``git:<url>#<branch>[#<subdir>]``), with
+  retry-on-conflict for concurrent publishers.
 * :class:`GitHubArtifactsBackend` — GitHub Actions artifacts (``github-artifacts:<name>[#<repo>]``).
   Downloads the latest summary artifact via the ``gh`` CLI, merges, and stages the merged summary
-  for the workflow's ``upload-artifact`` step. There is NO atomic read-modify-write here: two
+  for the workflow's ``upload-artifact`` step. There is no atomic read-modify-write here: two
   runners finishing concurrently each download the same "latest" and one upload wins, so a
-  contribution can occasionally be dropped. That is ACCEPTABLE for a statistical summary (the next
-  run re-contributes), and is documented so an operator can choose the git-branch backend when exact
-  accounting matters.
-* :class:`S3Backend` — a documented STUB (``s3:<bucket>[/<prefix>]``). The protocol seam is clean;
-  a real S3/R2 client is a scoped follow-on (it would mirror the non-atomic artifacts model, or add
-  a compare-and-swap on an object version for atomicity). It raises a clear error rather than
-  half-working.
-
-Each backend is scoped, like the CSV store, to ONE ``(machine_id, container_class)`` identity: the
-summary object it reads/writes is named per identity, so a heterogeneous fleet keeps one summary per
-homogeneous runner class and merges only within a class.
+  contribution can occasionally be dropped. Choose the git-branch backend when exact accounting
+  matters.
 """
 
 from __future__ import annotations
@@ -62,7 +44,6 @@ __all__ = [
     "LocalDirBackend",
     "GitBranchBackend",
     "GitHubArtifactsBackend",
-    "S3Backend",
     "parse_backend",
     "summary_object_name",
 ]
@@ -129,12 +110,14 @@ class LocalDirBackend:
         self.root = Path(root)
 
     def describe(self) -> str:
+        """Return the local-directory backend label used in logs."""
         return f"local:{self.root}"
 
     def _path(self, machine_id: str, container_class: str) -> Path:
         return self.root / summary_object_name(machine_id, container_class)
 
     def download(self, machine_id: str, container_class: str) -> Summary:
+        """Load one identity's summary, or return an empty summary when absent."""
         path = self._path(machine_id, container_class)
         if not path.is_file():
             return summarylib.empty(machine_id, container_class)
@@ -150,6 +133,7 @@ class LocalDirBackend:
         reservoir_cap: int = DEFAULT_RESERVOIR_K,
         max_buckets: int = DEFAULT_MAX_BUCKETS,
     ) -> Summary:
+        """Atomically merge and persist ``delta`` under an exclusive file lock."""
         try:
             self.root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -197,8 +181,9 @@ def _run_git(
 
 
 class GitBranchBackend:
-    """Store the summary on a dedicated git branch (``git:<url>#<branch>[#<subdir>]``) — the ATOMIC
-    reference backend.
+    """Store the summary atomically on a dedicated git branch.
+
+    The specification format is ``git:<url>#<branch>[#<subdir>]``.
 
     ``publish`` does a correct concurrent read-modify-write: it works in a private throwaway checkout
     per attempt, fetches the branch, merges the remote summary with this run's ``delta``, commits,
@@ -227,6 +212,7 @@ class GitBranchBackend:
         self._before_push = before_push
 
     def describe(self) -> str:
+        """Return the remote branch and optional subdirectory used by this backend."""
         loc = self.branch if self.subdir == "." else f"{self.branch}#{self.subdir}"
         return f"git-branch:{self.url}#{loc}"
 
@@ -262,6 +248,7 @@ class GitBranchBackend:
         return proc.returncode == 0
 
     def download(self, machine_id: str, container_class: str) -> Summary:
+        """Fetch and decode one identity's summary from the configured branch."""
         work = self._fresh_checkout()
         try:
             if not self._fetch_branch(work):
@@ -286,6 +273,7 @@ class GitBranchBackend:
         reservoir_cap: int = DEFAULT_RESERVOIR_K,
         max_buckets: int = DEFAULT_MAX_BUCKETS,
     ) -> Summary:
+        """Merge and push ``delta``, retrying when another publisher advances the branch."""
         rel = self._rel(delta.machine_id, delta.container_class)
         last_err = ""
         for attempt in range(self.retries):
@@ -388,9 +376,11 @@ class GitHubArtifactsBackend:
         self.timeout = timeout
 
     def describe(self) -> str:
+        """Return the artifact name and optional repository used by this backend."""
         return f"github-artifacts:{self.name}" + (f"#{self.repo}" if self.repo else "")
 
     def staging_path(self, machine_id: str, container_class: str) -> Path:
+        """Return the local upload-staging path for one identity's summary."""
         return self.staging_dir / summary_object_name(machine_id, container_class)
 
     def _gh(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
@@ -434,6 +424,7 @@ class GitHubArtifactsBackend:
         return self.repo
 
     def download(self, machine_id: str, container_class: str) -> Summary:
+        """Download the newest live matching artifact for one runner identity."""
         repo = self._require_repo()
         listing = self._gh(["api", f"repos/{repo}/actions/artifacts", "--paginate"])
         if listing.returncode != 0:
@@ -476,6 +467,7 @@ class GitHubArtifactsBackend:
         reservoir_cap: int = DEFAULT_RESERVOIR_K,
         max_buckets: int = DEFAULT_MAX_BUCKETS,
     ) -> Summary:
+        """Merge ``delta`` and write the result to the workflow upload-staging directory."""
         base = self.download(delta.machine_id, delta.container_class)
         merged = summarylib.merge(base, delta, reservoir_cap=reservoir_cap, max_buckets=max_buckets)
         path = self.staging_path(delta.machine_id, delta.container_class)
@@ -485,46 +477,6 @@ class GitHubArtifactsBackend:
         except OSError as exc:
             raise SyncError(f"github-artifacts backend: staging write failed: {exc}") from exc
         return merged
-
-
-# --------------------------------------------------------------------------- S3 / R2 stub
-
-
-class S3Backend:
-    """A DOCUMENTED STUB for object-store (S3 / Cloudflare R2) sync (``s3:<bucket>[/<prefix>]``).
-
-    The protocol seam is deliberately clean so a real client drops in here; a production version
-    would either mirror the non-atomic artifacts model (get-latest / merge / put) or add a
-    compare-and-swap on the object's version id for atomic read-modify-write. It is NOT half-built —
-    it raises a clear error pointing at the follow-on rather than silently pretending to sync."""
-
-    def __init__(self, bucket: str, prefix: str = "") -> None:
-        self.bucket = bucket
-        self.prefix = prefix.strip("/")
-
-    def describe(self) -> str:
-        loc = self.bucket if not self.prefix else f"{self.bucket}/{self.prefix}"
-        return f"s3:{loc} (stub)"
-
-    def _unimplemented(self) -> SyncError:
-        return SyncError(
-            "s3/r2 backend is a documented follow-on stub — not yet implemented. Use "
-            "'local:<dir>' or 'git:<url>#<branch>' today. See safe_ci_dag_runner.sync.S3Backend for "
-            "the protocol seam a real client would fill (get-latest / merge / put, optionally with a "
-            "version-id compare-and-swap for atomic read-modify-write)."
-        )
-
-    def download(self, machine_id: str, container_class: str) -> Summary:
-        raise self._unimplemented()
-
-    def publish(
-        self,
-        delta: Summary,
-        *,
-        reservoir_cap: int = DEFAULT_RESERVOIR_K,
-        max_buckets: int = DEFAULT_MAX_BUCKETS,
-    ) -> Summary:
-        raise self._unimplemented()
 
 
 # --------------------------------------------------------------------------- spec parsing
@@ -538,14 +490,13 @@ def parse_backend(spec: str) -> SyncBackend:
         local:<dir>                        # LocalDirBackend
         git:<url>#<branch>[#<subdir>]      # GitBranchBackend (atomic RMW)
         github-artifacts:<name>[#<repo>]   # GitHubArtifactsBackend (non-atomic)
-        s3:<bucket>[/<prefix>]             # S3Backend (documented stub)
 
-    Raises :class:`SyncError` on an unknown scheme or a malformed spec (No Silent Failure)."""
+    Raises :class:`SyncError` on an unknown scheme or malformed specification."""
     scheme, sep, rest = spec.partition(":")
     if not sep:
         raise SyncError(
             f"invalid --profile-sync spec {spec!r}: expected '<scheme>:<...>' "
-            "(local:, git:, github-artifacts:, s3:)"
+            "(local:, git:, github-artifacts:)"
         )
     if scheme == "local":
         if not rest:
@@ -565,12 +516,7 @@ def parse_backend(spec: str) -> SyncBackend:
                 "invalid github-artifacts spec: expected 'github-artifacts:<name>[#<owner/repo>]'"
             )
         return GitHubArtifactsBackend(name, repo or None)
-    if scheme == "s3":
-        if not rest:
-            raise SyncError("invalid s3 spec: expected 's3:<bucket>[/<prefix>]'")
-        bucket, _, prefix = rest.partition("/")
-        return S3Backend(bucket, prefix)
     raise SyncError(
         f"unknown --profile-sync scheme {scheme!r}: supported schemes are "
-        "local:, git:, github-artifacts:, s3:"
+        "local:, git:, github-artifacts:"
     )

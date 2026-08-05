@@ -4,6 +4,9 @@ An independent reviewer attacked safety decisions, fixture and evidence schemas,
 priority hooks, randomized graphs, public documentation, and both distribution
 artifacts.
 
+This review record entered the repository with implementation commit
+`5ef91c55036227b5dc2997ef069784f337b4cc5e`.
+
 ## Findings resolved
 
 1. Required or changes-requested review could still produce `land-now`. Required,
@@ -34,8 +37,6 @@ artifacts.
   missing public documentation.
 - Strict type checking passed for the planner and differential harness.
 - Differential: 150/150 checks with 100 randomized fixtures and seed `731942`.
-- An additional hostile corpus of 242 malformed mutations and 100 valid random
-  graphs produced no parity divergence.
 - Both isolated wheel and registry-package checks passed.
 
 Reproduce the extended differential with:

@@ -11,6 +11,7 @@
 // * [`to_ascii`] emits a compact topological-layer view for a glance in the terminal.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Write as _;
 
 use crate::model::{step_classification, DagConfig, Step};
 
@@ -231,12 +232,10 @@ pub fn to_ascii(cfg: &DagConfig, selected: Option<&HashSet<String>>) -> String {
         sorted_steps.sort_by_key(|a| a.tag());
         for step in sorted_steps {
             let tag = step.tag();
-            let res: String = step
-                .hint
-                .resources
-                .iter()
-                .map(|(k, v)| format!(" {{{k}:{v}}}"))
-                .collect();
+            let mut res = String::new();
+            for (key, value) in &step.hint.resources {
+                write!(&mut res, " {{{key}:{value}}}").expect("writing to a String cannot fail");
+            }
             let mut step_deps = deps[&tag].clone();
             step_deps.sort();
             let dep = if step_deps.is_empty() {

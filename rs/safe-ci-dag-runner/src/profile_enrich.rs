@@ -23,10 +23,9 @@ use crate::perflog::nproc;
 
 const USEC: f64 = 1_000_000.0;
 
-// The effective core count of the cgroup/container/machine the run is boxed in: the cgroup-v2 CPU
-// quota (`/sys/fs/cgroup/cpu.max` `quota period` -> rounded `quota/period`) when bounded, else the
-// affinity width [`perflog::nproc`]. This is the NUMBER an ambient (un-`-j`-capped) step's
-// effective parallelism resolves to. Mirrors Python's `container_core_budget`.
+/// Return the effective core budget of the current cgroup or process affinity.
+///
+/// A finite cgroup-v2 CPU quota takes precedence and is rounded to a positive whole-core count.
 pub fn container_core_budget() -> i64 {
     if let Ok(text) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
         let mut parts = text.split_whitespace();
@@ -41,9 +40,9 @@ pub fn container_core_budget() -> i64 {
     nproc()
 }
 
-// Resolve a step's recorded `inner_jobs` to a NUMBER: an explicit `-j` width verbatim, else the
-// container's core budget (never the old `"ambient"` string). Mirrors Python's
-// `resolve_effective_inner_jobs`.
+/// Resolve an optional step width to a concrete positive-environment budget.
+///
+/// An explicit width is returned unchanged; otherwise the current container core budget is used.
 pub fn resolve_effective_inner_jobs(inner_jobs: Option<i64>) -> i64 {
     inner_jobs.unwrap_or_else(container_core_budget)
 }
@@ -70,9 +69,10 @@ fn psi_columns(
     }
 }
 
-// Build the rich per-step profile columns from one step's cgroup + ambient measurements. Only
-// columns whose inputs are present are returned; the writer fills the rest blank (they are part of
-// [`crate::perflog::STEP_PROFILE_COLUMNS`]). Mirrors Python's `step_enrichment_columns`.
+/// Build rich profile columns from one step's cgroup and ambient measurements.
+///
+/// Only columns whose inputs are available are returned; the profile writer leaves the remaining
+/// fields in [`crate::perflog::STEP_PROFILE_COLUMNS`] empty.
 #[allow(clippy::too_many_arguments)]
 pub fn step_enrichment_columns(
     elapsed_s: f64,

@@ -1,35 +1,29 @@
 # agent-utils skills
 
-Thin, agent-facing skills for the `agent-utils` tools. Each `skills/<tool>/SKILL.md` is a short
-dispatch pointer: a one-line description of the tool plus the three canonical ways to get usage —
-`<tool> quickstart`, `<tool> --help`, and `<tool> --userguide`. The skills deliberately do NOT
-duplicate the user guide; they point at the CLI. Shared templates plus edition fragments generate
-the guide embedded into each distribution and printed by `<tool> --userguide`.
+These skills help an agent harness discover the repository's tools without copying their manuals.
+Each tool skill points to the installed command's quickstart, help, and embedded user guide. The
+`pr-landing-operations` skill is a companion process guide for authorized repository operators.
 
 ## Available skills
 
-- `safe-ci-dag-runner/SKILL.md` — run a DAG of CI/build steps under cgroup boxing with memory-aware
-  concurrency and learned-estimate planning.
-- `tick-hub/SKILL.md` — one scheduled tick funnels many cadenced reminders into machine-readable
-  HEALTH/ACTION/NOTE/ERROR lines.
-- `pr-landing-planner/SKILL.md` — conflict-graph + CI-aware advisory landing planner: classifies each
-  red CI, partitions PRs into parallel-safe groups, and recommends a per-PR action.
-- `agent-team-timeline/SKILL.md` — archive and visualize coordinator/subagent work with cached
-  phrase-to-quarter summaries, interaction edges, and real-time visible-range statistics.
+- `safe-ci-dag-runner` — schedule a dependency graph under CPU, memory, and named-resource limits.
+- `tick-hub` — evaluate recurring reminders and health checks from one scheduled tick.
+- `pr-landing-planner` — produce an advisory, machine-readable PR landing plan.
+- `pr-landing-operations` — validate and execute an authorized landing plan safely.
+- `agent-team-timeline` — archive and visualize coordinator and subagent activity.
 
-## Linking a skill into an agent
+## Install in an agent harness
 
-Agent harnesses (e.g. Claude Code) discover skills under a `.claude/skills/` directory. Symlink the
-tool skills you want into that directory so they auto-trigger:
+Link the desired directory into the skill directory configured by your harness:
 
 ```sh
-# From the agent's project root (adjust the path to your agent-utils checkout):
-mkdir -p .claude/skills
-ln -s /path/to/agent-utils/skills/safe-ci-dag-runner .claude/skills/safe-ci-dag-runner
-ln -s /path/to/agent-utils/skills/tick-hub          .claude/skills/tick-hub
-ln -s /path/to/agent-utils/skills/agent-team-timeline .claude/skills/agent-team-timeline
+ln -s /path/to/agent-utils/skills/safe-ci-dag-runner /path/to/agent-skills/safe-ci-dag-runner
+ln -s /path/to/agent-utils/skills/tick-hub /path/to/agent-skills/tick-hub
+ln -s /path/to/agent-utils/skills/pr-landing-planner /path/to/agent-skills/pr-landing-planner
+ln -s /path/to/agent-utils/skills/pr-landing-operations /path/to/agent-skills/pr-landing-operations
+ln -s /path/to/agent-utils/skills/agent-team-timeline /path/to/agent-skills/agent-team-timeline
 ```
 
-Because each skill points at `<tool> --userguide` (the embedded guide) rather than copying it, the
-skill stays tiny and never drifts from the tool's actual documentation. Prerequisite: the tool must
-be on `PATH` (via `pip install` / `cargo install`, or the repo's `./bin` after `./setup`).
+Tool commands must be on `PATH`. From a source checkout, `./setup` creates repository-local
+dispatchers under `./bin`. Landing operations additionally require authorization from the consuming
+repository's own rules.

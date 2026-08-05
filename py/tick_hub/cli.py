@@ -58,18 +58,23 @@ class Palette:
         return f"\033[{code}m{text}\033[0m" if self.enabled else text
 
     def bold(self, text: str) -> str:
+        """Render ``text`` with bold emphasis when colors are enabled."""
         return self._wrap("1", text)
 
     def dim(self, text: str) -> str:
+        """Render ``text`` with dim emphasis when colors are enabled."""
         return self._wrap("2", text)
 
     def green(self, text: str) -> str:
+        """Render ``text`` in green when colors are enabled."""
         return self._wrap("32", text)
 
     def yellow(self, text: str) -> str:
+        """Render ``text`` in yellow when colors are enabled."""
         return self._wrap("33", text)
 
     def cyan(self, text: str) -> str:
+        """Render ``text`` in cyan when colors are enabled."""
         return self._wrap("36", text)
 
 
@@ -267,6 +272,7 @@ def _positive_i64_arg(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the complete command-line argument parser."""
     c = Palette(_color_enabled(sys.stdout))
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -470,6 +476,7 @@ def _cmd_config_render(ns: argparse.Namespace, command: str, c: Palette) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line application and return its process status."""
     parser = build_parser()
     ns = parser.parse_args(list(argv) if argv is not None else None)
     c = Palette(_color_enabled(sys.stdout))

@@ -2,10 +2,11 @@
 """Build, inspect, and smoke every independently published Python tool.
 
 The check is intentionally artifact-first. Each project is copied out of the
-working tree, built as a wheel with package-index access disabled, installed
-alone into a fresh virtual environment without dependencies, and started with
-socket access blocked. This catches source-tree success that masks missing
-modules, leaked sibling packages, import-time networking, or omitted resources.
+working tree, built as both a wheel and source distribution with package-index
+access disabled, rebuilt from that source archive, installed alone into a fresh
+virtual environment without dependencies, and started with socket access
+blocked. This catches source-tree success that masks missing modules, leaked
+sibling packages, import-time networking, or omitted resources.
 
 The build environment must already provide the PEP 517 backend named by each
 project. No backend or runtime dependency is downloaded by this script.
@@ -22,9 +23,11 @@ import importlib.metadata
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import tarfile
 import venv
 import zipfile
 from dataclasses import dataclass
@@ -42,6 +45,7 @@ class Project:
     package: str
     commands: tuple[str, ...]
     resources: tuple[str, ...]
+    required_dependencies: tuple[str, ...]
 
 
 PROJECTS: tuple[Project, ...] = (
@@ -51,6 +55,7 @@ PROJECTS: tuple[Project, ...] = (
         package="safe_ci_dag_runner",
         commands=("safe-ci-dag-runner", "cpuset-alloc"),
         resources=("README.md", "USER_GUIDE.md", "py.typed"),
+        required_dependencies=("pyyaml",),
     ),
     Project(
         directory="tick_hub",
@@ -65,6 +70,7 @@ PROJECTS: tuple[Project, ...] = (
             "examples/tick-hub-ops.yaml",
             "examples/tick-hub-state.yaml",
         ),
+        required_dependencies=("pyyaml",),
     ),
     Project(
         directory="pr_landing_planner",
@@ -79,6 +85,25 @@ PROJECTS: tuple[Project, ...] = (
             "examples/pr-landing-demo.yaml",
             "check_outcome.py",
         ),
+        required_dependencies=("pyyaml",),
+    ),
+    Project(
+        directory="agent_team_timeline",
+        distribution="agent-team-timeline",
+        package="agent_team_timeline",
+        commands=("agent-team-timeline",),
+        resources=(
+            "README.md",
+            "USER_GUIDE.md",
+            "py.typed",
+            "static/index.html",
+            "static/app.js",
+            "static/style.css",
+            "static/vendor/README.md",
+            "static/vendor/markdown-it-15.0.0.min.js",
+            "static/vendor/markdown-it-LICENSE.txt",
+        ),
+        required_dependencies=(),
     ),
 )
 
@@ -96,6 +121,22 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"(?:^|[ (`])(?:py|rs|scripts|cross)/", re.IGNORECASE | re.MULTILINE),
     ),
     ("unexpanded template syntax", re.compile(r"\{\{|\}\}")),
+    (
+        "development-history language",
+        re.compile(
+            r"\b(?:prototype|roadmap|formerly|previously|planned|not yet|legacy|historical|"
+            r"predates?|follow-on|stub)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "implementation-provenance language",
+        re.compile(
+            r"\b(?:ported|parity|cross-language|both builds?)\b|"
+            r"\b(?:direct|generic|typed)?\s*port of\b",
+            re.IGNORECASE,
+        ),
+    ),
 )
 _REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 _PUBLIC_SCAN_IGNORED = {"__pycache__", "build", "dist"}
@@ -159,7 +200,12 @@ def _check_public_docstrings() -> None:
             for node in _public_doc_nodes(tree):
                 docstring = ast.get_docstring(node, clean=False)
                 if docstring is None:
-                    continue
+                    name = getattr(node, "name", "<module>")
+                    line = getattr(node, "lineno", 1)
+                    raise CheckError(
+                        f"{project.distribution}: public API {relative}:{line} "
+                        f"({name}) has no docstring"
+                    )
                 errors = _doc_violations(project, docstring)
                 if errors:
                     name = getattr(node, "name", "<module>")
@@ -183,13 +229,13 @@ def _require_build_backend() -> None:
         setuptools_version = importlib.metadata.version("setuptools")
     except (ImportError, importlib.metadata.PackageNotFoundError) as exc:
         raise CheckError(
-            "setuptools.build_meta is unavailable; install setuptools>=68 in the "
+            "setuptools.build_meta is unavailable; install setuptools>=77 in the "
             "interpreter running this offline package check"
         ) from exc
     major_match = re.match(r"([0-9]+)", setuptools_version)
-    if major_match is None or int(major_match.group(1)) < 68:
+    if major_match is None or int(major_match.group(1)) < 77:
         raise CheckError(
-            f"setuptools {setuptools_version!r} is too old; this repository requires setuptools>=68"
+            f"setuptools {setuptools_version!r} is too old; this repository requires setuptools>=77"
         )
 
 
@@ -265,6 +311,12 @@ def _copy_project(project: Project, destination: Path) -> Path:
     manifest = source / "pyproject.toml"
     if not manifest.is_file():
         raise CheckError(f"{source}: missing pyproject.toml")
+    for relative in ("README.md", "USER_GUIDE.md", "LICENSE"):
+        linked = source / relative
+        if not linked.is_symlink() or not linked.resolve().is_file():
+            raise CheckError(
+                f"{project.distribution}: source {relative} must be a valid authoritative symlink"
+            )
     manifest_text = manifest.read_text(encoding="utf-8")
     foreign = _FOREIGN_DOC_TERMS.search(manifest_text)
     if foreign is not None:
@@ -283,8 +335,7 @@ def _copy_project(project: Project, destination: Path) -> Path:
     return target
 
 
-def _build_wheel(project: Project, build_root: Path, wheel_root: Path) -> Path:
-    source = _copy_project(project, build_root)
+def _build_wheel(project: Project, source: Path, wheel_root: Path) -> Path:
     before = set(wheel_root.glob("*.whl"))
     _run(
         [
@@ -306,6 +357,71 @@ def _build_wheel(project: Project, build_root: Path, wheel_root: Path) -> Path:
             f"{project.distribution}: expected exactly one wheel, found {sorted(created)}"
         )
     return created.pop()
+
+
+def _build_sdist(project: Project, source: Path, sdist_root: Path) -> Path:
+    before = set(sdist_root.glob("*.tar.gz"))
+    code = (
+        "import sys; from setuptools.build_meta import build_sdist; "
+        "print(build_sdist(sys.argv[1]))"
+    )
+    _run(
+        [sys.executable, "-c", code, str(sdist_root)],
+        env=_offline_env(),
+        cwd=source,
+    )
+    created = set(sdist_root.glob("*.tar.gz")) - before
+    if len(created) != 1:
+        raise CheckError(
+            f"{project.distribution}: expected exactly one sdist, found {sorted(created)}"
+        )
+    return created.pop()
+
+
+def _inspect_sdist(project: Project, source: Path, archive: Path) -> None:
+    with tarfile.open(archive, mode="r:gz") as package:
+        members = package.getmembers()
+        links = sorted(member.name for member in members if member.issym() or member.islnk())
+        if links:
+            raise CheckError(
+                f"{project.distribution}: sdist contains repository links instead of files: {links}"
+            )
+        roots = {member.name.split("/", 1)[0] for member in members if member.name}
+        if len(roots) != 1:
+            raise CheckError(f"{project.distribution}: sdist has unexpected roots {sorted(roots)}")
+        prefix = f"{next(iter(roots))}/"
+        by_name = {member.name: member for member in members}
+        expected = {
+            f"{prefix}pyproject.toml",
+            f"{prefix}PKG-INFO",
+            f"{prefix}LICENSE",
+            *(f"{prefix}{resource}" for resource in project.resources),
+        }
+        for path in source.rglob("*.py"):
+            relative = path.relative_to(source)
+            if any(
+                part in _PUBLIC_SCAN_IGNORED or part.endswith(".egg-info")
+                for part in relative.parts
+            ):
+                continue
+            expected.add(f"{prefix}{relative.as_posix()}")
+        missing = sorted(expected - set(by_name))
+        if missing:
+            raise CheckError(f"{project.distribution}: sdist is missing {missing}")
+        for document in ("LICENSE", "README.md", "USER_GUIDE.md"):
+            name = f"{prefix}{document}"
+            member = by_name[name]
+            if not member.isfile():
+                raise CheckError(f"{project.distribution}: sdist {document} is not a regular file")
+            extracted = package.extractfile(member)
+            if extracted is None:
+                raise CheckError(f"{project.distribution}: could not read sdist {document}")
+            artifact_bytes = extracted.read()
+            source_bytes = (source / document).read_bytes()
+            if artifact_bytes != source_bytes:
+                raise CheckError(
+                    f"{project.distribution}: sdist {document} differs from its authoritative source"
+                )
 
 
 def _metadata(archive: _WheelArchive) -> tuple[str, _WheelMetadata]:
@@ -340,6 +456,16 @@ def _entry_points(archive: _WheelArchive, dist_info: str) -> dict[str, str]:
 def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        linked_members = sorted(
+            info.filename
+            for info in archive.infolist()
+            if stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK
+        )
+        if linked_members:
+            raise CheckError(
+                f"{project.distribution}: wheel contains repository links instead of files: "
+                f"{linked_members}"
+            )
         dist_info, metadata = _metadata(archive)
 
         actual_name = metadata.name
@@ -358,8 +484,23 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
 
         requirements = list(metadata.requirements)
         requirement_names = {_requirement_name(requirement) for requirement in requirements}
-        if "pyyaml" not in requirement_names:
-            raise CheckError(f"{project.distribution}: PyYAML is used but not declared: {requirements}")
+        runtime_requirement_names = {
+            _requirement_name(requirement)
+            for requirement in requirements
+            if "extra ==" not in requirement.lower()
+        }
+        missing_requirements = sorted(
+            set(project.required_dependencies) - runtime_requirement_names
+        )
+        unexpected_requirements = sorted(
+            runtime_requirement_names - set(project.required_dependencies)
+        )
+        if missing_requirements or unexpected_requirements:
+            raise CheckError(
+                f"{project.distribution}: runtime dependencies "
+                f"{sorted(runtime_requirement_names)}, "
+                f"expected {sorted(project.required_dependencies)}"
+            )
         sibling_requirements = sorted(
             sibling.distribution
             for sibling in PROJECTS
@@ -398,6 +539,32 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
             if path not in names:
                 raise CheckError(f"{project.distribution}: wheel is missing {path}")
 
+        source_package = PY_ROOT / project.directory
+        source_modules: dict[str, Path] = {}
+        for source_path in source_package.rglob("*.py"):
+            relative = source_path.relative_to(source_package)
+            if any(
+                part in _PUBLIC_SCAN_IGNORED or part.endswith(".egg-info")
+                for part in relative.parts
+            ):
+                continue
+            source_modules[f"{package_prefix}{relative.as_posix()}"] = source_path
+        missing_modules = sorted(set(source_modules) - names)
+        if missing_modules:
+            raise CheckError(
+                f"{project.distribution}: wheel is missing source modules {missing_modules}"
+            )
+        changed_modules = sorted(
+            path
+            for path, source_path in source_modules.items()
+            if archive.read(path) != source_path.read_bytes()
+        )
+        if changed_modules:
+            raise CheckError(
+                f"{project.distribution}: wheel modules differ from differential-tested source: "
+                f"{changed_modules}"
+            )
+
         documents: dict[str, str] = {}
         for document in ("README.md", "USER_GUIDE.md"):
             path = f"{package_prefix}{document}"
@@ -405,7 +572,7 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
             source_text = (PY_ROOT / project.directory / document).read_text(encoding="utf-8")
             if artifact_text != source_text:
                 raise CheckError(
-                    f"{project.distribution}: wheel {document} differs from its generated source"
+                    f"{project.distribution}: wheel {document} differs from its authoritative source"
                 )
             errors = _doc_violations(project, artifact_text)
             if errors:
@@ -440,6 +607,11 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
         ]
         if not license_paths:
             raise CheckError(f"{project.distribution}: wheel contains no license file")
+        authoritative_license = (REPO_ROOT / "LICENSE").read_bytes()
+        if not any(archive.read(path) == authoritative_license for path in license_paths):
+            raise CheckError(
+                f"{project.distribution}: wheel license differs from the authoritative license"
+            )
         return version, documents["USER_GUIDE.md"]
 
 
@@ -543,9 +715,9 @@ def _smoke_wheel(
         executable = bindir / command
         if not executable.is_file():
             raise CheckError(f"{project.distribution}: installed command missing: {executable}")
-        invocations: list[list[str]] = [["--help"]]
+        invocations: list[list[str]] = [["--help"], ["--version"]]
         if command != "cpuset-alloc":
-            invocations.extend([["--version"], ["--userguide"]])
+            invocations.append(["--userguide"])
         for command_args in invocations:
             result = _run(
                 [str(executable), *command_args], env=env, cwd=run_root, timeout=30
@@ -575,19 +747,34 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix="agent-utils-python-packages-") as raw:
             root = Path(raw)
             build_root = root / "sources"
-            wheel_root = root / "wheels"
+            source_wheel_root = root / "source-wheels"
+            sdist_root = root / "sdists"
+            sdist_wheel_root = root / "sdist-wheels"
             smoke_root = root / "venvs"
             build_root.mkdir()
-            wheel_root.mkdir()
+            source_wheel_root.mkdir()
+            sdist_root.mkdir()
+            sdist_wheel_root.mkdir()
             smoke_root.mkdir()
 
             for project in PROJECTS:
-                wheel = _build_wheel(project, build_root, wheel_root)
-                version, userguide = _inspect_wheel(project, wheel)
-                _smoke_wheel(project, wheel, version, userguide, smoke_root)
+                source = _copy_project(project, build_root)
+                source_wheel = _build_wheel(project, source, source_wheel_root)
+                source_result = _inspect_wheel(project, source_wheel)
+                sdist = _build_sdist(project, source, sdist_root)
+                _inspect_sdist(project, source, sdist)
+                sdist_wheel = _build_wheel(project, sdist, sdist_wheel_root)
+                sdist_result = _inspect_wheel(project, sdist_wheel)
+                if sdist_result != source_result:
+                    raise CheckError(
+                        f"{project.distribution}: source and sdist wheels disagree: "
+                        f"{source_result!r} != {sdist_result!r}"
+                    )
+                version, userguide = sdist_result
+                _smoke_wheel(project, sdist_wheel, version, userguide, smoke_root)
                 print(
                     f"check_python_packages: ok {project.distribution} {version} "
-                    f"({', '.join(project.commands)})"
+                    f"wheel + sdist ({', '.join(project.commands)})"
                 )
     except (
         CheckError,
@@ -595,6 +782,7 @@ def main() -> int:
         UnicodeError,
         configparser.Error,
         subprocess.SubprocessError,
+        tarfile.TarError,
         zipfile.BadZipFile,
     ) as exc:
         print(f"check_python_packages: FAIL: {exc}", file=sys.stderr)

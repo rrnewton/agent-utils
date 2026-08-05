@@ -1,6 +1,6 @@
 //! Always-on perf logging for a DAG run: whole-run window + per-step profile CSVs.
 //!
-//! Rust port of `perflog.py`, matching its on-disk SCHEMA:
+//! The stable on-disk schema contains:
 //! * [`CSV_COLUMNS`] — one whole-run summary row per run, in `<output_dir>/<machine_id>.csv`.
 //! * [`STEP_PROFILE_COLUMNS`] — per-step measurement rows, in
 //!   `<output_dir>/step_profiles_<machine_id>_<container_class>.csv`, widened per run with any
@@ -38,14 +38,10 @@ pub const CSV_COLUMNS: [&str; 15] = [
     "jobs",
 ];
 
-// Standard per-step profile columns (dynamic `cpu.*` keys are appended per run AFTER these).
-//
-// The trailing block (from `effective_cores` on) is the rich PARALLEL-SPEEDUP enrichment,
-// captured UNDER cgroup boxing and left BLANK when unavailable, exactly like the Python build.
-// Column NAMES mirror DeepScry's `validate_perflog` `STEP_PROFILE_COLUMNS` so a later schema
-// unification is a rename, not a redesign. This MUST stay byte-for-byte identical to
-// `perflog.STEP_PROFILE_COLUMNS` in the Python build (the cross differential compares the CSV
-// header).
+/// Standard per-step profile columns, in stable append-only order.
+///
+/// Dynamic `cpu.*` keys follow these columns. Parallel-speedup fields remain empty when the
+/// corresponding cgroup measurement is unavailable.
 pub const STEP_PROFILE_COLUMNS: [&str; 49] = [
     "timestamp",
     "machine_id",
@@ -132,15 +128,11 @@ pub fn machine_id() -> String {
     }
 }
 
-// Cores this run could actually use: the CPU-affinity width, matching Python's
-// `len(os.sched_getaffinity(0))`. Read from `/proc/self/status` `Cpus_allowed_list` (the same mask
-// `sched_getaffinity` reports) and DELIBERATELY NOT clamped to the cgroup CPU quota, so the two
-// builds agree on this value — and hence on the step-profile filename's `container_class` segment
-// and the whole-run `nproc` column — on every host, including cgroup-boxed CI where the quota is
-// narrower than the affinity width. (`available_parallelism()` WOULD clamp to the cgroup quota and
-// so silently diverge from Python on a boxed host; the quota is captured separately by
-// `container_class()` via `cpu.max`.) Falls back to `available_parallelism`, then the logical CPU
-// count.
+/// Return the process CPU-affinity width.
+///
+/// The value is deliberately not clamped to a cgroup quota; quota information is represented
+/// separately by [`container_class`]. If the affinity mask is unavailable, this falls back to the
+/// runtime's available or logical processor count.
 pub fn nproc() -> i64 {
     if let Some(n) = affinity_width() {
         return n;

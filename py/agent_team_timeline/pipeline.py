@@ -141,6 +141,8 @@ def _ensure_archive(archive: Path, team_slug: str, *, create: bool) -> None:
 
 @dataclass(frozen=True)
 class IngestReport:
+    """Counts and source identity produced by one archive ingest."""
+
     team_slug: str
     source_digest: str
     sources: int
@@ -152,6 +154,8 @@ class IngestReport:
     files_changed: int
 
     def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return the ingest report as a JSON-serializable object."""
+
         return {
             "team_slug": self.team_slug,
             "source_digest": self.source_digest,
@@ -167,6 +171,8 @@ class IngestReport:
 
 @dataclass(frozen=True)
 class SummarizeReport:
+    """Cache, backend, and output counts from one summarization run."""
+
     phases: int
     rollups: int
     agent_names: int
@@ -177,6 +183,8 @@ class SummarizeReport:
     files_changed: int
 
     def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return the summarization report as a JSON-serializable object."""
+
         return {
             "phases": self.phases,
             "rollups": self.rollups,
@@ -190,6 +198,8 @@ class SummarizeReport:
 
 
 def utc_now() -> str:
+    """Return the current UTC time in ISO 8601 form."""
+
     return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
@@ -413,6 +423,8 @@ def ingest_codex(
 
 
 def load_archived_team(archive: Path, team_slug: str) -> TeamData:
+    """Load and validate the normalized team snapshot stored in *archive*."""
+
     _ensure_archive(archive, team_slug, create=False)
     path = _raw_team_path(archive, team_slug)
     if not path.is_file():

@@ -28,3 +28,6 @@ path = "src/main.rs"
 [lib]
 name = "tick_hub"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

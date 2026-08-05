@@ -19,15 +19,14 @@ python3 cross/differential.py --tool pr-landing-planner --random 100 --seed 8675
 python3 cross/differential.py --tool cpuset-alloc
 ```
 
-The default tool is `safe-ci-dag-runner` so the historical pre-push command
-remains valid.
+When `--tool` is omitted, the harness checks `safe-ci-dag-runner`.
 
 ## What is compared
 
 | Tool | Differential contract |
 |---|---|
-| `safe-ci-dag-runner` | Canonical DAG listing, visualization, JSON, YAML loading, validation failures, plan and summary data, selection, argument forwarding, stress reports, resource sizing, run outcomes, profile-store schema, CLI surface, and enforcement-capability manifest. |
-| `cpuset-alloc` | CLI surface, version, durable-ledger status and reclaim JSON, malformed and boundary arguments, reservation behavior, and hard-pin fail-closed behavior. |
+| `safe-ci-dag-runner` | Canonical DAG listing, visualization, JSON, YAML loading, validation failures, plan and summary data, selection, successful parallel-speedup sweeps, argument forwarding, stress reports, resource sizing, run outcomes, profile-store schema, CLI surface, and enforcement-capability manifest. |
+| `cpuset-alloc` | CLI surface, version, durable-ledger status and reclaim JSON, malformed and boundary arguments, reservation behavior, mutation self-test verdicts, and hard-pin fail-closed behavior. |
 | `tick-hub` | Strict JSON/YAML config loading, canonical emission, cadence state, reminder gates, freshness output, flush transitions, CLI failures, numeric boundaries, malformed documents, and randomized tick configurations. |
 | `pr-landing-planner` | Fixture collection, graphs, clusters, status and plan output in every format, exact-head/base validation, approval and gate safety decisions, ordering/conflict groups, malformed evidence, numeric boundaries, and randomized PR graphs. |
 
@@ -37,7 +36,7 @@ checked structurally instead. Concurrent scheduler traces can complete in a
 different order, so the harness compares their deterministic final outcome and
 report rather than timing-dependent progress lines.
 
-The harness also asks each installed edition for its embedded user guide and
+The harness also asks each implementation for its embedded user guide and
 checks that the page is complete and does not mention the sibling language or
 package manager. Artifact-level wheel and crate checks live in
 `scripts/check_python_packages.py` and `scripts/check_rust_packages.py`.
@@ -58,6 +57,6 @@ behavior.
 ## Fixtures and reproducibility
 
 `cross/yaml_fixtures/` contains YAML scalar, quoting, block-text, duplicate-key,
-and numeric edge cases. The harness also consumes shipped examples where they
+and numeric edge cases. The harness also consumes bundled examples where they
 form useful paired fixtures. Random cases are generated from `--seed`; a failed
 seed and case index can therefore be replayed exactly.

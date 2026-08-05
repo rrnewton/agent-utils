@@ -37,7 +37,10 @@ class PriorityProvider(Protocol):
 
     last_error: str | None
 
-    def priority(self, pr_number: int, labels: Sequence[str]) -> int: ...
+    def priority(self, pr_number: int, labels: Sequence[str]) -> int:
+        """Return the landing priority for one pull request; lower values are more urgent."""
+
+        ...
 
 
 class NonePriority:
@@ -46,6 +49,8 @@ class NonePriority:
     last_error: str | None = None
 
     def priority(self, pr_number: int, labels: Sequence[str]) -> int:
+        """Return equal priority for every pull request."""
+
         return 0
 
 
@@ -60,6 +65,8 @@ class LabelPriority:
         self.last_error: str | None = None
 
     def priority(self, pr_number: int, labels: Sequence[str]) -> int:
+        """Return the most urgent matching label priority, or the configured default."""
+
         best: int | None = None
         for label in labels:
             match = self._regex.match(label)
@@ -101,6 +108,8 @@ class CommandPriority:
         self.last_error: str | None = None
 
     def priority(self, pr_number: int, labels: Sequence[str]) -> int:
+        """Run the configured command and return its priority or the configured default."""
+
         rendered = self._cmd.replace("{pr}", str(pr_number))
         argv = [*self._wrapper, "bash", "-c", rendered]
         try:

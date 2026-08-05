@@ -23,9 +23,9 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   compared under ``--keep-going`` so they are deterministic (the default eager-exit path
   races on which in-flight step is cancelled first, so only its exit code is compared).
 * ``--only`` selection (Feature A) agrees: running EXACTLY one named step matches on exit code
-  and counts, and an unknown ``--only`` tag exits 2 on both builds. (The ``sweep`` timing table
-  and the ``--profile`` table are NOT byte-compared — runtimes legitimately differ across the two
-  languages.)
+  and counts, and an unknown ``--only`` tag exits 2 on both builds. A successful ``sweep`` must
+  produce the same width rows and table schema; measured timing cells and the ``--profile`` table
+  are not byte-compared because runtimes legitimately differ.
 * The memory-aware ``-j`` decision and modeled footprint from ``--max-mem`` match.
 * The auto-logging profile STORE (Feature D) has an identical on-disk schema across builds: an
   unboxed run under each build (into separate ``--perf-dir`` dirs) writes the SAME set of CSV
@@ -1598,6 +1598,53 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
                 rep.ok(label)
 
 
+def _sweep_widths(text: str) -> set[int]:
+    """Return widths from well-formed six-column sweep result rows."""
+
+    widths: set[int] = set()
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) != 6 or not fields[0].isdigit():
+            continue
+        try:
+            float(fields[1])
+            float(fields[2])
+            float(fields[3])
+            if fields[4] != "-":
+                int(fields[4])
+            float(fields[5].removesuffix("x"))
+        except ValueError:
+            continue
+        widths.add(int(fields[0]))
+    return widths
+
+
+def compare_sweep_success(py: list[str], rs: list[str], rep: Report) -> None:
+    """Exercise a successful sweep and compare its deterministic table structure."""
+
+    with tempfile.TemporaryDirectory(prefix="sweep-success-cross-") as tmp:
+        path = os.path.join(tmp, "dag.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"steps": [{"group": "g", "job": "j", "cmd": "true"}]}, handle)
+        args = ("sweep", "--dag", path, "--step", "g.j", "--jobs", "1..2", NOPROF, ACF)
+        po = run(py, args)
+        ro = run(rs, args)
+        header = "jobs  wall_s  user_s  sys_s  rss_hwm  speedup(vs j1)"
+        if (
+            po.returncode == ro.returncode == 0
+            and header in po.stdout
+            and header in ro.stdout
+            and _sweep_widths(po.stdout) == _sweep_widths(ro.stdout) == {1, 2}
+        ):
+            rep.ok("sweep:successful-table")
+        else:
+            rep.bad(
+                "sweep:successful-table",
+                f"py={po.returncode}:{po.stdout!r}:{po.stderr!r}\n"
+                f"rs={ro.returncode}:{ro.stdout!r}:{ro.stderr!r}",
+            )
+
+
 def _summary_sync_case(
     py: list[str],
     rs: list[str],
@@ -2016,6 +2063,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_speedup_model(py, rs, rep)
     compare_cpa_planner(py, rs, rep)
     compare_summary_sync(py, rs, rep)
+    compare_sweep_success(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
     compare_args_stress(py, rs, rep)
     compare_pin_run(py, rs, rep)
@@ -2156,6 +2204,27 @@ def compare_cpuset_alloc() -> int:
                 )
             else:
                 rep.ok(f"schema:{engine}/{' '.join(args) or 'no-args'}")
+
+    selftest_args = ("selftest", "--cores", "1", "--sample-s", "0")
+    py_selftest = run(py, selftest_args)
+    rs_selftest = run(rs, selftest_args)
+    py_ok, py_value = _parsed_json(py_selftest.stdout)
+    rs_ok, rs_value = _parsed_json(rs_selftest.stdout)
+    py_verdict = py_value.get("verdict") if py_ok and isinstance(py_value, dict) else None
+    rs_verdict = rs_value.get("verdict") if rs_ok and isinstance(rs_value, dict) else None
+    if (
+        py_selftest.returncode == rs_selftest.returncode
+        and py_selftest.returncode in (0, 1, 3)
+        and py_verdict == rs_verdict
+        and isinstance(py_verdict, str)
+    ):
+        rep.ok("selftest:mutation-verdict")
+    else:
+        rep.bad(
+            "selftest:mutation-verdict",
+            f"py={py_selftest.returncode}:{py_value!r}; "
+            f"rs={rs_selftest.returncode}:{rs_value!r}",
+        )
 
     with tempfile.TemporaryDirectory(prefix="cpuset-cross-") as tmp:
         py_ledger = os.path.join(tmp, "py.json")

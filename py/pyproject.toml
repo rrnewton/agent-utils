@@ -1,7 +1,7 @@
 # Shared repository-development configuration.
 #
 # This file intentionally has no [build-system] or [project] table: py/ is a
-# source workspace, not a mixed publishable distribution. Each paired public
+# source workspace, not a mixed publishable distribution. Each public
 # tool has its own pyproject.toml beside its import package.
 
 [tool.mypy]

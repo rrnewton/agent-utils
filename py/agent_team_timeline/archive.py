@@ -84,32 +84,44 @@ def narrow_json(raw: object, where: str = "JSON") -> JsonValue:
 
 
 def as_object(value: JsonValue, where: str) -> dict[str, JsonValue]:
+    """Return *value* as a JSON object or raise a contextual error."""
+
     if not isinstance(value, dict):
         raise ValueError(f"{where}: expected an object")
     return value
 
 
 def as_array(value: JsonValue, where: str) -> list[JsonValue]:
+    """Return *value* as a JSON array or raise a contextual error."""
+
     if not isinstance(value, list):
         raise ValueError(f"{where}: expected an array")
     return value
 
 
 def as_string(value: JsonValue, where: str) -> str:
+    """Return *value* as a string or raise a contextual error."""
+
     if not isinstance(value, str):
         raise ValueError(f"{where}: expected a string")
     return value
 
 
 def as_int(value: JsonValue, where: str) -> int:
+    """Return *value* as a non-boolean integer or raise a contextual error."""
+
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{where}: expected an integer")
     return value
 
 
 def string_map(values: Mapping[str, str]) -> dict[str, JsonValue]:
+    """Widen a string mapping to the recursive JSON value type."""
+
     return {key: value for key, value in values.items()}
 
 
 def json_sequence(values: Sequence[JsonValue]) -> list[JsonValue]:
+    """Copy a sequence into a mutable JSON array."""
+
     return list(values)

@@ -51,3 +51,6 @@ path = "src/bin/cpuset_alloc.rs"
 [lib]
 name = "safe_ci_dag_runner"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

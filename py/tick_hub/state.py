@@ -74,6 +74,7 @@ class OpsState:
 
     @classmethod
     def from_obj(cls, d: object) -> "OpsState":
+        """Validate a decoded mapping and construct an operations state."""
         if not isinstance(d, dict):
             raise StateError("ops-state file must contain a top-level mapping")
         obj: dict[str, object] = {str(k): v for k, v in d.items()}
@@ -127,6 +128,7 @@ class OpsState:
 
     @classmethod
     def load(cls, path: str) -> "OpsState":
+        """Read and parse an operations-state YAML file."""
         with open(path, encoding="utf-8") as fh:
             return cls.from_yaml(fh.read())
 

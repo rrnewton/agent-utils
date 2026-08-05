@@ -29,7 +29,9 @@ class GateResult:
 class GateRunner(Protocol):
     """Runs a reminder's gate command and reports its exit code + stdout."""
 
-    def run(self, cmd: str) -> GateResult: ...
+    def run(self, cmd: str) -> GateResult:
+        """Run ``cmd`` and return its captured result."""
+        ...
 
 
 class FileAgeProbe(Protocol):
@@ -37,4 +39,6 @@ class FileAgeProbe(Protocol):
 
     Returns ``None`` when nothing matches (so the caller can report ``missing``)."""
 
-    def newest_age_secs(self, pattern: str, now: int) -> Optional[int]: ...
+    def newest_age_secs(self, pattern: str, now: int) -> Optional[int]:
+        """Return the newest matching file's age, or ``None`` when no match is usable."""
+        ...

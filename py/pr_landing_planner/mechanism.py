@@ -1,26 +1,9 @@
-"""The three-stage mechanism pipeline: DERIVE (mechanical) -> CLASSIFY (into a stable enum) -> the
-graph layer CLUSTERs on the ENUM VALUE, not the raw string.
+"""Normalize derived identifiers into stable mechanism categories for conflict analysis.
 
-Why this shape (owner refinement 2026-08-04): deriving mechanism identifiers straight from a diff is
-EXACT but not NORMALISED. The same mechanism shows up under different spellings —
-``concurrency.cancel-in-progress`` in a workflow, ``CANCEL_IN_PROGRESS`` as an env var,
-``cancel_in_progress`` as a constant: mechanically three strings, semantically one mechanism.
-Clustering on raw identifiers puts them in three buckets and MISSES the exact collision the tool
-exists to catch. So a classifier maps derived strings into a stable :class:`Mechanism` enum, and the
-graph layer clusters on the enum value.
-
-The classifier is RECOGNITION, not RECALL: it is handed concrete derived strings and answers "which
-known mechanism is this, or is it new?" — it is never asked to remember a vocabulary. Crucially,
-``classify`` can return ``None`` (UNCLASSIFIED): a classifier that always returns a known value is
-worse than useless — it would silently merge distinct mechanisms (manufacturing false conflicts) or
-force-fit a genuinely new one (hiding a real one). UNCLASSIFIED is a VALID output and the signal that
-the enum needs a new member; the graph layer surfaces those candidates loudly.
-
-The recognition table is deterministic so the planner stays pure, network-free, and batch-friendly
-(it runs across every open/abandoned PR at no per-string cost). "Agent-assisted" means an agent
-maintains the table OFFLINE: shown the loud UNCLASSIFIED candidates, it recognises each as an
-existing member (add an alias) or a new one (add an enum member + seed aliases). Recall drifts;
-recognition against concrete strings does not.
+The same mechanism can appear under several spellings, such as
+``concurrency.cancel-in-progress`` and ``CANCEL_IN_PROGRESS``. Classification maps those concrete
+identifiers to :class:`Mechanism` values before the graph groups related pull requests. Unknown
+identifiers remain unclassified so callers can review them without false matches.
 """
 
 from __future__ import annotations
@@ -34,6 +17,8 @@ from enum import Enum
 #: by adding a member here (plus its aliases below) after an UNCLASSIFIED candidate is recognised as
 #: genuinely new. The ``value`` is the canonical string emitted in every output.
 class Mechanism(Enum):
+    """Canonical mechanism categories used to group semantic overlaps."""
+
     CANCEL_IN_PROGRESS = "cancel-in-progress"
     PR_AUTO_TRIGGER = "pr-auto-trigger"
     DAG_SCHEDULER_WIDTH = "dag-scheduler-width"

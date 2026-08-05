@@ -76,6 +76,8 @@ class FlakySignature:
                     ) from exc
 
     def matches(self, check: CheckRun) -> bool:
+        """Return whether *check* satisfies every configured regular expression."""
+
         name_ok = True
         text_ok = True
         if self.name_regex:
@@ -226,7 +228,7 @@ def _is_flaky(check: CheckRun, signatures: Sequence[FlakySignature]) -> bool:
 def classify_pr(checks: Sequence[CheckRun], cfg: ClassifyConfig) -> CiVerdict:
     """Refine a PR's rollup into a :class:`CiVerdict` (raw state + a :class:`RedClass` when red-ish).
 
-    Precedence for a red PR (each grounded in a real incident):
+    Precedence for a red PR:
 
     1. the gate check shows the *never-ran* signature -> ``RUNNER_OUTAGE``;
     2. the ONLY reds are benign "still queued" gate messages -> ``EVALUATE_ONCE_RACE`` (as pending);

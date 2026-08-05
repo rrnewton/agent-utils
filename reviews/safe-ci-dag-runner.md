@@ -6,6 +6,9 @@ Reviewed both package implementations of `safe-ci-dag-runner` and `cpuset-alloc`
 on tree-wide CPU containment, the shared reservation ledger, CLI failure behavior, stress-mode
 sizing, standalone package documentation, and live cross-implementation interoperability.
 
+This review record entered the repository with implementation commit
+`5ef91c55036227b5dc2997ef069784f337b4cc5e`.
+
 ## Adversarial findings and resolutions
 
 1. **Process affinity was not tree containment.** A wrapped child could call
@@ -44,14 +47,13 @@ sizing, standalone package documentation, and live cross-implementation interope
 ## Cross-implementation evidence
 
 - `python3 cross/differential.py --tool cpuset-alloc`
-  - **30/30 checks passed**.
+  - **31/31 checks passed**.
   - Includes Python-to-Rust and Rust-to-Python live ownership of one shared ledger, disjoint core
-    assignments under overlap, identical shared schema, exact release to an empty ledger, signal
-    status, invalid inputs, wrapped help, and clean missing-executable failure.
+    assignments under overlap, identical shared schema, exact release to an empty ledger, mutation
+    self-test verdicts, signal status, invalid inputs, wrapped help, and clean missing-executable
+    failure.
 - `python3 cross/differential.py --tool safe-ci-dag-runner`
-  - Default seed/count completed with **402 checks passed across 41 fixtures**.
-  - Focused rebuilt-binary runs also passed at `--random 0` (216 checks) and `--random 1`
-    (223 checks).
+  - Default seed/count completed with **403 checks passed across 41 fixtures**.
 - `python3 -m mypy cross/differential.py`
   - No issues.
 
@@ -64,10 +66,10 @@ an observed result rather than a harness-level side effect.
 - Python: **85 passed** across reservation, allocator, CLI, cgroup ownership/exact-set, and build
   job-cap tests; the final allocator/reservation/cgroup subset passed **33 tests** after executable
   preflight hardening.
-- Rust: the full safe package suite passed **85 unit tests plus all integration tests**; the final
-  library run passed **86 tests** after hidden-probe routing and executable preflight coverage.
-- `python3 scripts/embed_userguides.py --check`: all 12 generated package documents current and
-  standalone.
+- Rust: the full safe package suite passed **85 unit tests plus 8 integration tests**, including
+  live cgroup memory, CPU-time, core-box, and default-containment tests.
+- `python3 scripts/embed_userguides.py --check`: all 12 rendered paired documents and two
+  single-language package documents are current and standalone through exact checked links.
 - Isolated wheel/crate artifact checks passed for all packages, including entry points, embedded
   resources, licenses, offline startup, and foreign-documentation checks.
 

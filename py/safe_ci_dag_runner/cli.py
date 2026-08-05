@@ -91,21 +91,27 @@ class Palette:
         return f"\033[{code}m{text}\033[0m" if self.enabled else text
 
     def bold(self, text: str) -> str:
+        """Render ``text`` with bold emphasis when colors are enabled."""
         return self._wrap("1", text)
 
     def dim(self, text: str) -> str:
+        """Render ``text`` with dim emphasis when colors are enabled."""
         return self._wrap("2", text)
 
     def green(self, text: str) -> str:
+        """Render ``text`` in green when colors are enabled."""
         return self._wrap("32", text)
 
     def red(self, text: str) -> str:
+        """Render ``text`` in bold red when colors are enabled."""
         return self._wrap("1;31", text)
 
     def yellow(self, text: str) -> str:
+        """Render ``text`` in yellow when colors are enabled."""
         return self._wrap("33", text)
 
     def cyan(self, text: str) -> str:
+        """Render ``text`` in cyan when colors are enabled."""
         return self._wrap("36", text)
 
 
@@ -280,6 +286,7 @@ def _positive_int(raw: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the complete command-line argument parser."""
     c = Palette(_color_enabled(sys.stdout))
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -406,7 +413,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="close the profiling feedback loop on EPHEMERAL CI: DOWNLOAD+merge the shared, "
         "constant-sized profile summary at start (seeding the planner) and merge-in this run's "
         "samples + UPLOAD at end. BACKEND is 'local:<dir>', 'git:<url>#<branch>[#<subdir>]' "
-        "(atomic), 'github-artifacts:<name>[#<owner/repo>]' (non-atomic), or 's3:<bucket>' (stub). "
+        "(atomic), or 'github-artifacts:<name>[#<owner/repo>]' (non-atomic). "
         "Independent of --perf-dir (the local CSV store still writes as usual).",
     )
     run_p.add_argument(
@@ -1885,6 +1892,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line application and return its process status."""
     parser = build_parser()
     raw = list(argv) if argv is not None else list(sys.argv[1:])
     # --cgroups has been REMOVED (cgroup-v2 boxing is ON by default). Fail LOUDLY rather than

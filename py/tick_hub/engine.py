@@ -59,6 +59,7 @@ def parse_kv_lines(text: str) -> dict[str, str]:
 
 
 def evaluate_health(hc: HealthCheck, probe: FileAgeProbe, now: int) -> str:
+    """Evaluate one freshness check and return its formatted health record."""
     age = probe.newest_age_secs(hc.glob, now)
     if age is None:
         status = HEALTH_STATUS_MISSING

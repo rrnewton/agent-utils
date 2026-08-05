@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 
 @dataclass(frozen=True)
 class Period:
+    """One timezone-aware calendar interval and its archive output path."""
+
     kind: str
     key: str
     label: str
@@ -136,6 +138,8 @@ def periods_for_range(
 
 
 def period_heading(period: Period, display_timezone: str) -> str:
+    """Format a human-readable heading for *period* in the display timezone."""
+
     zone = ZoneInfo(display_timezone)
     start = datetime.fromtimestamp(period.start_ms / 1000, tz=timezone.utc).astimezone(zone)
     end = datetime.fromtimestamp(period.end_ms / 1000, tz=timezone.utc).astimezone(zone)

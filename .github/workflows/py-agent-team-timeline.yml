@@ -33,7 +33,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install test tooling
-        run: python -m pip install --upgrade mypy pytest pyyaml types-PyYAML
+        run: python -m pip install --upgrade 'setuptools>=77' mypy pytest pyyaml types-PyYAML
       - name: Embedded user guide in sync
         working-directory: .
         run: python scripts/embed_userguides.py --check
@@ -47,3 +47,6 @@ jobs:
         run: |
           python -m agent_team_timeline --version
           python -m agent_team_timeline quickstart > /dev/null
+      - name: standalone wheel and sdist
+        working-directory: .
+        run: python scripts/check_python_packages.py

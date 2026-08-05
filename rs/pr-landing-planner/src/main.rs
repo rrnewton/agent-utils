@@ -1,3 +1,5 @@
+//! CLI entry point for `pr-landing-planner`.
+
 #![forbid(unsafe_code)]
 
 fn main() {

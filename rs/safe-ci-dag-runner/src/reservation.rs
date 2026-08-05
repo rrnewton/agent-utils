@@ -403,8 +403,7 @@ mod tests {
         let path = temp_ledger("sample-window");
         for sample_s in [-1.0, f64::NAN, f64::INFINITY] {
             let error = acquire(1, "unit", sample_s, Some(&path), &HashSet::new())
-                .err()
-                .expect("invalid sample window must be rejected");
+                .expect_err("invalid sample window must be rejected");
             assert!(error.contains("sample_s must be finite and >= 0"));
         }
     }

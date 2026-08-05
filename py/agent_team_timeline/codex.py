@@ -48,6 +48,8 @@ class CodexSourceCopy:
     updated_at: str
 
     def to_json_obj(self) -> dict[str, object]:
+        """Return the copied-source record as a JSON-serializable object."""
+
         return {
             "source_path": self.source_path,
             "original_path": self.original_path,
@@ -61,6 +63,8 @@ class CodexSourceCopy:
 
     @classmethod
     def from_json_obj(cls, raw: Mapping[str, object], where: str) -> CodexSourceCopy:
+        """Parse and validate a copied-source record from a JSON object."""
+
         source_path = _string(raw.get("source_path"))
         original_path = _string(raw.get("original_path"))
         snapshot_path = _string(raw.get("snapshot_path"))

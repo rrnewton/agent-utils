@@ -1,8 +1,8 @@
-# Related work
+# Agent team timeline related work
 
 Research checked 2026-08-05 against project repositories, source code, release metadata, and
 package registries. The longer Gemini report that prompted this review is preserved in
-[`ai_docs/gemini_related_work_research.md`](ai_docs/gemini_related_work_research.md).
+[`research/agent-team-timeline-comparative-analysis.md`](research/agent-team-timeline-comparative-analysis.md).
 
 ## Direct answer
 

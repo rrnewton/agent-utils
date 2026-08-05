@@ -40,21 +40,21 @@ def test_parse_backend_dispatch() -> None:
     assert isinstance(sync.parse_backend("git:/tmp/repo#data"), sync.GitBranchBackend)
     assert isinstance(sync.parse_backend("git:/tmp/repo#data#sub/dir"), sync.GitBranchBackend)
     assert isinstance(sync.parse_backend("github-artifacts:sum#o/r"), sync.GitHubArtifactsBackend)
-    assert isinstance(sync.parse_backend("s3:bucket/prefix"), sync.S3Backend)
 
 
 def test_parse_backend_rejects_bad_specs() -> None:
-    for spec in ("", "nonsense", "local:", "git:/tmp/repo", "git:#branch", "s3:", "bogus:x"):
+    for spec in (
+        "",
+        "nonsense",
+        "local:",
+        "git:/tmp/repo",
+        "git:#branch",
+        "s3:",
+        "s3:bucket/prefix",
+        "bogus:x",
+    ):
         with pytest.raises(sync.SyncError):
             sync.parse_backend(spec)
-
-
-def test_s3_backend_is_a_loud_stub() -> None:
-    backend = sync.parse_backend("s3:bucket/prefix")
-    with pytest.raises(sync.SyncError):
-        backend.download(MID, CC)
-    with pytest.raises(sync.SyncError):
-        backend.publish(_delta("g.a", 1.0))
 
 
 def test_select_latest_artifact() -> None:

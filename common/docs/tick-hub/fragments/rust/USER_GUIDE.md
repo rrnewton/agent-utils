@@ -4,7 +4,8 @@
 cargo install tick-hub
 ```
 
-For library use, declare the dependency and import the crate as `tick_hub`:
+Rust 1.85 or newer is required. For library use, declare the dependency and
+import the crate as `tick_hub`:
 
 ```toml
 [dependencies]

@@ -199,10 +199,14 @@ class PrNode:
 
     @property
     def size(self) -> int:
+        """Return the total added and deleted line count."""
+
         return self.additions + self.deletions
 
     @property
     def base_conflicting(self) -> bool:
+        """Return whether the pull request conflicts with its target base."""
+
         return bool(self.base_conflict_paths) or self.mergeable == "CONFLICTING"
 
 
@@ -260,10 +264,14 @@ class Cluster:
 
     @property
     def size(self) -> int:
+        """Return the number of pull requests in this conflict cluster."""
+
         return len(self.members)
 
     @property
     def rebases_avoided(self) -> int:
+        """Return the serial rebase count avoided by landing the cluster as a stack."""
+
         return max(0, self.size - 1)
 
 

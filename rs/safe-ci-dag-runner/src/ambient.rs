@@ -1,8 +1,7 @@
 //! Ambient host-load capture: pure `/proc` readers plus a quiet/moderate/busy verdict.
 //!
-//! Rust port of `ambient.py`. Everything here reads only `/proc` and `os` counters; nothing
-//! writes, forks, or touches cgroupfs. The `ambient_bucket` cut-offs are a cross-language parity
-//! contract and are preserved verbatim in the named constants below.
+//! Everything here reads only `/proc` and process counters; nothing writes, forks, or touches
+//! cgroupfs. The [`ambient_bucket`] thresholds form a stable profile-classification contract.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,16 +25,19 @@ const QUIET_CO_TENANTS: i64 = 2;
 // Fallback USER_HZ when `sysconf(SC_CLK_TCK)` is unavailable (matches Python's `or 100`).
 const DEFAULT_CLK_TCK: i64 = 100;
 
-/// The three-level ambient-load verdict (the string value is the parity key).
+/// Three-level ambient-load verdict recorded in execution profiles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmbientBucket {
+    /// The host has little observable competing work.
     Quiet,
+    /// The host has some competing work but is below the busy thresholds.
     Moderate,
+    /// The host exceeds at least one contention threshold.
     Busy,
 }
 
 impl AmbientBucket {
-    // Canonical string form matching Python's `AmbientBucket` literals.
+    /// Return the canonical lowercase value used in profile records.
     pub fn value(self) -> &'static str {
         match self {
             AmbientBucket::Quiet => "quiet",
@@ -48,7 +50,9 @@ impl AmbientBucket {
 /// One Pressure-Stall-Information `some` line (`avg10` / `avg60` fractions).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PsiReading {
+    /// Percentage of wall time stalled during the previous ten seconds.
     pub avg10: f64,
+    /// Percentage of wall time stalled during the previous sixty seconds.
     pub avg60: f64,
 }
 
@@ -57,10 +61,15 @@ pub struct PsiReading {
 pub struct AmbientSnapshot {
     /// System-wide non-idle CPU jiffies (`/proc/stat` `cpu` line), or `None` when unreadable.
     pub busy_jiffies: Option<i64>,
+    /// One-minute system load average.
     pub load1: f64,
+    /// Five-minute system load average.
     pub load5: f64,
+    /// CPU pressure-stall sample, when available.
     pub cpu_psi: Option<PsiReading>,
+    /// Memory pressure-stall sample, when available.
     pub memory_psi: Option<PsiReading>,
+    /// I/O pressure-stall sample, when available.
     pub io_psi: Option<PsiReading>,
     /// Count of matching build processes running OUTSIDE this run's cgroup scope.
     pub co_tenants: i64,
@@ -101,7 +110,7 @@ pub fn read_loadavg() -> (f64, f64, f64) {
 /// System-wide non-idle CPU jiffies from `/proc/stat`'s first `cpu` line.
 ///
 /// `busy = total - idle - iowait` (idle is field 3, iowait field 4 after `cpu`). `None` on any
-/// read/parse error, matching `host_busy_jiffies` in ambient.py.
+/// read or parse error.
 pub fn host_busy_jiffies(stat_path: &Path) -> Option<i64> {
     let text = fs::read_to_string(stat_path).ok()?;
     let first = text.lines().next()?;
@@ -141,8 +150,7 @@ pub fn read_pressure(path: &Path) -> Option<PsiReading> {
 }
 
 /// Count build processes whose `comm` is in `build_process_names` and that run OUTSIDE this
-/// run's cgroup scope (`scope_marker` absent from `/proc/<pid>/cgroup`). Generic port of
-/// `count_external_build_processes`.
+/// run's cgroup scope (`scope_marker` absent from `/proc/<pid>/cgroup`).
 pub fn count_external_build_processes(
     build_process_names: &[&str],
     scope_marker: Option<&str>,
@@ -182,7 +190,7 @@ pub fn count_external_build_processes(
     count
 }
 
-/// Take one snapshot of current host load (typed port of `capture_ambient_snapshot`).
+/// Capture one typed snapshot of current host load.
 pub fn capture_ambient_snapshot(
     build_process_names: &[&str],
     scope_marker: Option<&str>,
@@ -199,8 +207,9 @@ pub fn capture_ambient_snapshot(
     }
 }
 
-/// Estimate how many CPU cores OTHER tenants burned during a step window (port of the
-/// arithmetic in `attribute_external_cores`). Returns `0.0` for a non-positive `elapsed_s`.
+/// Estimate how many CPU cores other tenants used during a step window.
+///
+/// Returns `0.0` for a non-positive `elapsed_s`.
 pub fn attribute_external_cores(
     busy_jiffies_start: Option<i64>,
     busy_jiffies_end: Option<i64>,
@@ -218,8 +227,9 @@ pub fn attribute_external_cores(
     external_cpu_s / elapsed_s
 }
 
-/// Classify host load as quiet / moderate / busy. Thresholds preserved EXACTLY (parity with
-/// `ambient_bucket` in ambient.py). A missing PSI reading contributes `avg10` 0.0.
+/// Classify host load as quiet, moderate, or busy using the stable profile thresholds.
+///
+/// A missing PSI reading contributes an `avg10` value of zero.
 pub fn ambient_bucket(external_cores: f64, snapshot: &AmbientSnapshot) -> AmbientBucket {
     let max_avg10 = [snapshot.cpu_psi, snapshot.memory_psi, snapshot.io_psi]
         .into_iter()

@@ -93,6 +93,7 @@ class Step:
 
     @property
     def tag(self) -> str:
+        """Return the stable ``group.job`` identifier for this step."""
         return f"{self.group}.{self.job}"
 
 
@@ -185,7 +186,7 @@ def step_failure_reason(
 ) -> str:
     """Describe a failed step without conflating an external signal with an OOM.
 
-    Precedence (load-bearing for cross-language parity):
+    Failure causes use this precedence:
     OOM > CPU-timeout > timeout > pids-guard > detail-capture-failure > signal > exit code.
 
     CPU-timeout is reported ahead of the wall timeout because it is the more specific
@@ -253,4 +254,5 @@ class DagConfig:
     default_step_cpu_timeout: int = DEFAULT_SMALL_CPU_TIMEOUT
 
     def by_tag(self) -> dict[str, Step]:
+        """Index configured steps by their stable tags."""
         return {step.tag: step for step in self.steps}

@@ -42,13 +42,13 @@ Build a version-controllable, multi-resolution website from an agent team's appe
 1. Ingest, summarize only cache misses, and build the site:
 
    {PROG} refresh \\
-     --root-session SESSION_UUID --team codex-hermit \\
-     --output ./agent-team-timeline/codex-hermit \\
+     --root-session SESSION_UUID --team example-team \\
+     --output ./timelines/example-team \\
      --timezone America/New_York --model {DEFAULT_MODEL}
 
 2. Open it locally:
 
-   cd ./agent-team-timeline/codex-hermit
+   cd ./timelines/example-team
    make serve
    # http://127.0.0.1:8765/
 
@@ -66,7 +66,7 @@ def _path(raw: str) -> Path:
 
 def _add_archive(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", required=True, help="version-controllable archive directory")
-    parser.add_argument("--team", required=True, help="stable team slug, for example codex-hermit")
+    parser.add_argument("--team", required=True, help="stable team slug, for example example-team")
 
 
 def _add_ingest(parser: argparse.ArgumentParser) -> None:
@@ -206,6 +206,8 @@ def _inspect(archive: Path) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line interface and return its process exit status."""
+
     args = list(argv) if argv is not None else sys.argv[1:]
     parser = _parser()
     ns = parser.parse_args(args)

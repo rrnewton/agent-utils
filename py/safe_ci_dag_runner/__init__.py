@@ -1,20 +1,21 @@
-"""safe-ci-dag-runner: safely run a DAG of CI/build steps.
+"""Model, plan, visualize, and execute DAGs of CI/build steps.
 
 Define your graph as :class:`Step` values (each carrying a :class:`ResourceHint`) in a
 :class:`DagConfig`, then call :func:`run_dag`. The runner gives you:
 
-* two-level cgroup CPU/memory boxing with fast, zombie-free teardown (Linux cgroup-v2),
 * memory-aware concurrency (largest ``-j`` that fits a RAM budget),
-* always-on per-step + whole-run CPU/mem/ambient-load logging,
+* optional per-step containment and measurement through injected protocols,
 * Graphviz + ASCII DAG visualization.
 
-Containment and metrics are pluggable via the :class:`CgroupManager` / :class:`MetricsSink`
-protocols; use :class:`NoopCgroups` on non-Linux / when you don't want boxing.
+The command-line application establishes its Linux cgroup scope before invoking the scheduler.
+Library calls to :func:`run_dag` are uncontained unless the caller supplies an enabled
+:class:`CgroupManager`; passing no manager is an explicit process-group-only execution path.
+Metrics are likewise opt-in through :class:`MetricsSink`.
 
     from safe_ci_dag_runner import Step, ResourceHint, DagConfig, run_dag, to_ascii
     cfg = DagConfig(steps=(Step("build", "app", "compile", "make build"),))
     print(to_ascii(cfg))
-    result = run_dag(cfg, jobs=4)   # RunResult; result.ok is the overall pass/fail
+    result = run_dag(cfg, jobs=4)   # uncontained library execution
 """
 
 from __future__ import annotations

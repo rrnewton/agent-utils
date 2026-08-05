@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,12 +8,12 @@ version = "0.1.0"
 description = "Produce advisory pull-request landing plans from conflicts, CI health, and freshness."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license-files = ["LICENSE"]
+license = "MIT"
 authors = [{ name = "Ryan Newton" }]
 keywords = ["git", "github", "pull-request", "ci", "merge"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
 ]
 dependencies = ["PyYAML>=6"]

@@ -22,9 +22,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$ROOT/$(basename -- "${BASH_SOURCE[0]}")"
 cd "$ROOT"
 
-# Render each tool's package README and embedded guide from a shared template plus an edition
-# fragment. Run for BOTH editions regardless of the py/rs/both selection so every distributable
-# artifact stays current. Idempotent when templates and fragments are unchanged.
+# Render each paired tool's README and embedded guide from a shared template plus an edition
+# fragment, then verify package-tree links to the authoritative documents. Run regardless of the
+# py/rs/both selection so every distributable artifact stays current.
 embed_userguides() {
   echo "==> [docs] render standalone package docs from shared templates + edition fragments"
   command -v python3 >/dev/null || { echo "docs: python3 not found (needed to embed guides)" >&2; return 1; }
@@ -58,8 +58,8 @@ setup_py() {
       [ -L "$entrypoint" ] || chmod +x "$entrypoint"
     done
   fi
-  # Smoke-check that every entrypoint starts cleanly with zero optional deps (stdlib-only; catches
-  # an optional dependency imported at module scope taking down `--help` on a bare host).
+  # Smoke-check that every entrypoint starts without third-party imports. This catches a runtime
+  # dependency imported at module scope taking down `--help` on a minimal host.
   echo "==> [py] check-deps (dependency-free entrypoint smoke test)"
   python3 "$ROOT/scripts/check_deps.py"
   echo "==> [py] ok"

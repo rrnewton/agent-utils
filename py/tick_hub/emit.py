@@ -47,10 +47,12 @@ def format_action(skill: str, fields: Mapping[str, str], title: str) -> str:
 
 
 def format_note(text: str) -> str:
+    """Format an informational ``NOTE`` record."""
     return f"NOTE: {text}"
 
 
 def format_error(text: str) -> str:
+    """Format an operational ``ERROR`` record."""
     return f"ERROR: {text}"
 
 

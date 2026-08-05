@@ -26,3 +26,6 @@ path = "src/main.rs"
 [lib]
 name = "pr_landing_planner"
 path = "src/lib.rs"
+
+[lints]
+workspace = true

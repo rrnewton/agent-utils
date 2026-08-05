@@ -12,12 +12,16 @@ from zoneinfo import ZoneInfo
 
 @dataclass(frozen=True)
 class TermSource:
+    """Timestamped text considered for terminology extraction."""
+
     at_ms: int
     text: str
 
 
 @dataclass(frozen=True)
 class GlossaryTerm:
+    """A detected term with its first context and occurrence metadata."""
+
     term: str
     introduced_at_ms: int
     occurrences: int

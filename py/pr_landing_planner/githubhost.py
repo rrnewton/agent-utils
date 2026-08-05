@@ -124,6 +124,8 @@ class GitHubHost:
         return [*self._wrapper, *cmd]
 
     def list_open_prs(self, repo: str, base: str | None) -> tuple[RawPr, ...]:
+        """List open pull requests and attach each request's latest check rollup."""
+
         # One cheap list for the light metadata (no rollup -> no GraphQL 504 on a large open set)...
         proc = _run(
             self._net(
@@ -220,6 +222,8 @@ class GitHubHost:
         return rollups
 
     def prefetch_refs(self, refspecs: Sequence[tuple[str, str]]) -> dict[str, str]:
+        """Fetch all requested refs in one operation and return their object IDs by destination."""
+
         # ONE `git fetch` for every (source, dest) — a single remote round-trip instead of a per-PR
         # fan-out. Measured cost of the two shapes (2026-08-04, warm, 25 hermit PR heads into a local
         # rrnewton/hermit clone): N separate `git fetch` = 21.5 s wall / 14.3 s sys (≈0.86 s/PR, almost
@@ -240,6 +244,8 @@ class GitHubHost:
         return resolved
 
     def merge_tree(self, left: str, right: str) -> tuple[str, ...]:
+        """Return paths that conflict when merging the two object IDs."""
+
         proc = _run(
             ["git", "merge-tree", "--write-tree", "--name-only", "--messages", left, right],
             cwd=self._git_dir,
@@ -257,6 +263,8 @@ class GitHubHost:
         return tuple(sorted(set(paths)))
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return whether *ancestor* is reachable from *descendant*."""
+
         proc = _run(
             ["git", "merge-base", "--is-ancestor", ancestor, descendant],
             cwd=self._git_dir,
@@ -265,6 +273,8 @@ class GitHubHost:
         return proc.returncode == 0
 
     def changed_files(self, base_sha: str, head_sha: str) -> frozenset[str]:
+        """Return paths changed between the base and head object IDs."""
+
         merge_base = _run(
             ["git", "merge-base", base_sha, head_sha], cwd=self._git_dir
         ).stdout.strip()
@@ -274,6 +284,8 @@ class GitHubHost:
         return frozenset(line for line in out.splitlines() if line)
 
     def commits_behind(self, head_sha: str, base_sha: str) -> int:
+        """Return how many commits *head_sha* is behind *base_sha*."""
+
         out = _run(
             ["git", "rev-list", "--count", f"{head_sha}..{base_sha}"], cwd=self._git_dir
         ).stdout.strip()

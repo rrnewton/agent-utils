@@ -4,6 +4,8 @@
 cargo install safe-ci-dag-runner
 ```
 
+Rust 1.85 or newer is required.
+
 The crate installs the `safe-ci-dag-runner` and `cpuset-alloc` binaries. Add it
 as a library dependency when the model or planning engine belongs inside an
 application:

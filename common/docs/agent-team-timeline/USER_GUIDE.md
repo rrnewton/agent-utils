@@ -1,16 +1,16 @@
 # agent-team-timeline user guide
 
 `agent-team-timeline` turns a noisy coordinator/subagent transcript into a durable hierarchy of
-summaries and a Perfetto-inspired local website. It answers both “what was happening at 02:13?” and
+summaries and a zoomable local website. It answers both “what was happening at 02:13?” and
 “what did this team accomplish this month?” without throwing away the underlying messages.
 
-The first importer supports Codex multi-agent rollouts. The archive and browser schema are
-provider-neutral so Claude, ORC, and Gas Town importers can be added without changing the site.
+The Codex importer reads multi-agent rollouts. The archive and browser schema keep provider-specific
+input details separate from the generated timeline.
 
 ## What the site shows
 
 - Packed lanes are the default: non-overlapping agent lifetimes share the first available lane, so
-  a long run does not grow one row per historical agent. “Per-agent tracks” restores the full
+  a long run does not grow one row per completed agent. “Per-agent tracks” restores the full
   fork-tree view when that is more useful.
 - Every agent has a hindsight short name based on its completed work, ancestor context, official
   coordinator path, role, and nickname. The short name is primary; hover, search, and detail views
@@ -33,8 +33,8 @@ provider-neutral so Claude, ORC, and Gas Town importers can be added without cha
   active agents for the visible time range.
 - Daily, weekly, monthly, and quarterly markers link the visible range to long-term summaries.
 - Explicit GitHub pull-request URLs and `owner/repository#number` references become safe links in
-  work summaries and transcripts. Ambiguous naked `#number` text stays plain unless a future
-  importer supplies repository context for that exact message.
+  work summaries and transcripts. Ambiguous naked `#number` text stays plain unless importer input
+  supplies repository context for that exact message.
 
 The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
 bundle renders summary headings, lists, tables, blockquotes, links, and code with raw HTML disabled.
@@ -44,13 +44,11 @@ dependency and remains usable when copied offline.
 ## Install
 
 ```bash
-pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"
+python3 -m pip install agent-team-timeline
 ```
 
 Python 3.10+ is required. Summarization uses an installed `codex` CLI by default; ingestion,
 formatting, serving, and the deterministic `heuristic` backend use only the Python standard library.
-
-From a source checkout, run `./setup py`, then use `./bin/agent-team-timeline`.
 
 ## Find the coordinator session
 
@@ -75,8 +73,8 @@ lineage `session_id`; no list of child files is needed.
 agent-team-timeline refresh \
   --sessions-root ~/.codex/sessions \
   --root-session 019fcfe7-0f68-7301-8aab-c2f90a7026c7 \
-  --team codex-hermit \
-  --output ~/work/dev-hermit/agent-team-timeline/codex-hermit \
+  --team example-team \
+  --output ./timelines/example-team \
   --timezone America/New_York \
   --backend codex \
   --model gpt-5.6-sol \
@@ -92,7 +90,7 @@ receipt under `runs/` and updates `manifest.json` with the latest run and source
 Every output archive includes its own launcher:
 
 ```bash
-cd ~/work/dev-hermit/agent-team-timeline/codex-hermit
+cd ./timelines/example-team
 make serve                 # http://127.0.0.1:8765/
 make open                  # also ask Python to open the browser
 PORT=9000 make serve
@@ -101,7 +99,7 @@ PORT=9000 make serve
 Or use the installed command:
 
 ```bash
-agent-team-timeline serve --output ./codex-hermit --port 8765 --open
+agent-team-timeline serve --output ./timelines/example-team --port 8765 --open
 ```
 
 Do not open `index.html` directly with `file://`; browsers block its JSON fetch. The launcher uses
@@ -115,7 +113,7 @@ The separation is a hard cost-control boundary, not just an implementation detai
 
 ```bash
 agent-team-timeline ingest \
-  --root-session SESSION_UUID --team codex-hermit --output ./codex-hermit
+  --root-session SESSION_UUID --team example-team --output ./timelines/example-team
 ```
 
 Ingestion follows the whole session lineage, removes forked-history duplicates, joins tool calls to
@@ -128,7 +126,7 @@ condensed transcript and statistics.
 
 ```bash
 agent-team-timeline summarize \
-  --team codex-hermit --output ./codex-hermit \
+  --team example-team --output ./timelines/example-team \
   --backend codex --model gpt-5.6-sol
 ```
 
@@ -157,7 +155,7 @@ For offline development or tests:
 
 ```bash
 agent-team-timeline summarize \
-  --team codex-hermit --output ./codex-hermit \
+  --team example-team --output ./timelines/example-team \
   --backend heuristic --model deterministic-local
 ```
 
@@ -167,14 +165,14 @@ pipeline without network or token use. Its cache keys are distinct from Codex su
 ### 3. Build — guaranteed zero model calls
 
 ```bash
-agent-team-timeline build --team codex-hermit --output ./codex-hermit
+agent-team-timeline build --team example-team --output ./timelines/example-team
 ```
 
 `build` reads normalized JSON and structured summary data, then regenerates every Markdown, detail
 JSON, and website file. Identical bytes are not rewritten. Use it freely after CSS, layout, or
 Markdown formatting changes. Because those presentation files live at the output root, the tool
-refuses to use a non-empty directory unless it already contains its archive marker (or a recognized
-legacy `teams/<slug>/raw/team.json`); a mistaken `--output` cannot replace another project's
+refuses to use a non-empty directory unless it already contains its archive marker or a recognized
+existing `teams/<slug>/raw/team.json`; a mistaken `--output` cannot replace another project's
 README or Makefile.
 
 ## Summary hierarchy
@@ -204,7 +202,7 @@ the user's original subsystem/workstream names across spawn boundaries.
 An archive is ordinary text designed for version control:
 
 ```text
-codex-hermit/
+example-team/
 ├── .agent-team-timeline.json
 ├── index.html, app.js, style.css
 ├── vendor/markdown-it-15.0.0.min.js  # pinned offline Markdown renderer + license
@@ -214,7 +212,7 @@ codex-hermit/
 ├── data/
 │   ├── timeline.json
 │   └── details/<phase-id>.json
-└── teams/codex-hermit/
+└── teams/example-team/
     ├── source_snapshots/             # gitignored verbatim complete-line rollout copies
     │   └── 2026/08/04/rollout-....jsonl
     ├── raw/
@@ -271,18 +269,17 @@ spawn time. The importer finds the child's first incoming task message and treat
 context only. Counting every raw line would otherwise duplicate much of the coordinator history and
 create false activity spikes.
 
-Codex currently persists spawn instructions, follow-up prompts, and mid-turn collaboration messages
+Codex persists spawn instructions, follow-up prompts, and mid-turn collaboration messages
 as encrypted `gAAAA...` content in both sender and receiver rollouts. An offline exporter cannot
 decrypt it. The archive preserves the availability state and ciphertext in normalized message data;
 the UI clearly says the exact body is unavailable and shows an inferred paragraph from the receiving
 agent's subsequent work. Automatic final answers and each agent's own commentary/final response are
-plaintext. Exact click-through for encrypted instructions requires a future runtime export hook that
-captures plaintext before encryption.
+plaintext; encrypted instruction bodies remain unavailable to the archive.
 
 ## Inspect and troubleshoot
 
 ```bash
-agent-team-timeline inspect --output ./codex-hermit
+agent-team-timeline inspect --output ./timelines/example-team
 ```
 
 This prints track/phase/edge/event/rollup counts and the current manifest.
@@ -305,11 +302,8 @@ Treat the archive like the source logs. The bundled server binds to `127.0.0.1`,
 external scripts, and transcript text is inserted with safe DOM text APIs rather than interpreted as
 HTML. Review repository visibility before committing an archive.
 
-## Current scope
+## Supported inputs and deployment boundaries
 
-- Codex provider: implemented.
-- Multiple teams: the website schema and team filter are ready; one refresh currently writes one
-  team archive. Merging team indexes is a follow-up.
-- Claude, ORC, Gas Town importers: planned; their adapters should emit the same provider-neutral
-  agents/turns/events/tools/edges model.
-- Hosted serving: deliberately deferred. The local archive is complete and portable first.
+- Input is a Codex coordinator rollout and all descendants discovered from its lineage.
+- One refresh writes one team archive; each archive is independently portable.
+- Serving is local and loopback-only; the generated archive contains all browser assets.

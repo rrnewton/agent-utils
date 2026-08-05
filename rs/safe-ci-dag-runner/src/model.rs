@@ -10,11 +10,10 @@
 
 use std::collections::BTreeMap;
 
-// Default per-step timeout (seconds); mirrors Python's `DEFAULT_STEP_TIMEOUT`.
+/// Default wall-clock timeout for one step, in seconds.
 pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
 
-// Default template for the inner-parallelism (concurrency) flag appended to a step's command
-// when the step declares `preferred_inner_jobs`. Mirrors Python's `DEFAULT_JOBS_FLAG`.
+/// Default command-line template for a step's inner-job width.
 pub const DEFAULT_JOBS_FLAG: &str = "-j";
 
 // Deliberately SMALL default caps for a step that DECLARES NOTHING — the "forcing function".
@@ -23,24 +22,27 @@ pub const DEFAULT_JOBS_FLAG: &str = "-j";
 // metadata EMPIRICALLY (from measured breaches) instead of by guessing. Each applies ONLY
 // when the step leaves the matching hint unset; an explicit hint wins. Mirror Python's
 // `DEFAULT_SMALL_*` constants.
+/// Default one-gibibyte memory cap applied to a step with no declared memory need.
 pub const DEFAULT_SMALL_MEM_CAP_BYTES: i64 = 1024i64.pow(3); // 1 GiB inner memory.max
+/// Default one-core limit applied to a step with no declared width.
 pub const DEFAULT_SMALL_CPU_COUNT: i64 = 1; // 1-core cpu.max
+/// Default CPU-time limit applied to a step with no declared budget, in seconds.
 pub const DEFAULT_SMALL_CPU_TIMEOUT: i64 = 10; // 10 s CPU-time budget
 
-// How a step uses the machine, used for scheduling decisions.
-//
-// The serde/string values (`"cpu-bound"`, `"latency-bound"`, `"light"`) are load-bearing:
-// they appear verbatim in JSON, `list`, `ascii`, and `dot` output and must match Python.
+/// How a step uses the machine for scheduling purposes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StepClass {
+    /// Throughput scales primarily with CPU allocation.
     CpuBound,
+    /// Completion is latency-sensitive rather than throughput-oriented.
     LatencyBound,
+    /// The step has no special CPU or latency classification.
     #[default]
     Light,
 }
 
 impl StepClass {
-    // The canonical string form (matches Python's `StepClass.<X>.value`).
+    /// Return the canonical serialized value.
     pub fn value(self) -> &'static str {
         match self {
             StepClass::CpuBound => "cpu-bound",
@@ -76,18 +78,24 @@ pub struct ResourceHint {
     pub rss_baseline_bytes: Option<i64>,
     /// Explicit hard per-step memory cap (bytes); overrides the derived cap when set.
     pub hard_mem_max_bytes: Option<i64>,
+    /// Scheduling classification for the step.
     pub classification: StepClass,
     /// Internal parallelism width for the step's own command (e.g. a build's `-j`).
     pub preferred_inner_jobs: Option<i64>,
+    /// Effective CPU concurrency measured for the preferred width.
     pub measured_effective_cores: Option<f64>,
+    /// Measured CPU utilization as a fraction of one allocated-width interval.
     pub measured_cpu_utilization: Option<f64>,
 }
 
 /// One node in the DAG: a shell command plus its dependencies and resource hint.
 #[derive(Debug, Clone)]
 pub struct Step {
+    /// Namespace component of the unique step tag.
     pub group: String,
+    /// Job component of the unique step tag.
     pub job: String,
+    /// Short human-readable label shown in command output.
     pub desc: String,
     /// Optional long-form documentation for this node (default empty). Unlike `desc` — a short
     /// label shown by `list`/`run` — `description` is free-form prose (often multi-line, e.g. a
@@ -97,17 +105,21 @@ pub struct Step {
     pub cmd: String,
     /// Tags (`"group.job"`) this step depends on.
     pub deps: Vec<String>,
+    /// Environment variables added to the step process.
     pub env: BTreeMap<String, String>,
+    /// Resource and scheduling metadata for this step.
     pub hint: ResourceHint,
     /// Skipped when networking is disabled.
     pub networkonly: bool,
     /// Selected only by an engine-only subset preset.
     pub engine_only: bool,
+    /// Wall-clock timeout in seconds.
     pub timeout: i64,
     // CPU-time budget in seconds (user+system, from the step's cgroup `cpu.stat`). `0` disables
     // the CPU-time guard, leaving only the wall `timeout`. CPU time is immune to machine load, so
     // this can be set far tighter than a load-tolerant wall timeout without flaking. Mirrors
     // Python's `Step.cpu_timeout`; both runners enforce it identically under cgroup boxing.
+    /// User-plus-system CPU-time timeout in seconds; zero disables the guard.
     pub cpu_timeout: i64,
     /// Template for the inner-parallelism flag appended to `cmd` when this step declares
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
@@ -122,13 +134,10 @@ impl Step {
     }
 }
 
-// Render an inner-parallelism (concurrency) flag from a template and a job count.
-//
-// Byte-for-byte identical to Python's `render_jobs_flag`. Three forms:
-// * template contains `%d` -> substitute (no auto-space): `"-j%d"` -> `"-j4"`.
-// * template ends with `=` -> concatenate (no space): `"--jobs="` -> `"--jobs=4"`.
-// * otherwise -> space-separated: `"--num-threads"` -> `"--num-threads 4"`, default `"-j"` ->
-//   `"-j 4"`.
+/// Render an inner-parallelism flag from a template and worker count.
+///
+/// A `%d` placeholder is substituted directly, a template ending in `=` is concatenated directly,
+/// and every other template is separated from the count by one space.
 pub fn render_jobs_flag(template: &str, inner_jobs: i64) -> String {
     if template.contains("%d") {
         return template.replace("%d", &inner_jobs.to_string());
@@ -145,11 +154,9 @@ pub fn effective_jobs_flag<'a>(step: &'a Step, default_jobs_flag: &'a str) -> &'
     step.jobs_flag.as_deref().unwrap_or(default_jobs_flag)
 }
 
-// The step's shell command with its inner-parallelism flag appended, when applicable.
-//
-// Appends `<rendered-flag>` (see [`render_jobs_flag`]) when `inner_jobs` is set and the
-// effective template is non-empty; a `None` `inner_jobs` or an empty template leaves the
-// command unchanged. Mirrors Python's `command_with_inner_jobs`.
+/// Return a step command with its effective inner-job flag appended when requested.
+///
+/// A missing width or empty effective template leaves the command unchanged.
 pub fn command_with_inner_jobs(
     step: &Step,
     default_jobs_flag: &str,
@@ -168,8 +175,7 @@ pub fn command_with_inner_jobs(
     }
 }
 
-// A step's class: an explicit non-default hint wins; a browser-resource step is
-// latency-bound; otherwise light. (Mirrors DeepScry's `step_class`.)
+/// Resolve a step's scheduling class from its explicit hint and resource demands.
 pub fn step_classification(step: &Step) -> StepClass {
     if step.hint.classification != StepClass::Light {
         return step.hint.classification;
@@ -185,9 +191,9 @@ pub fn preferred_inner_jobs(step: &Step, experiment_override: Option<i64>) -> Op
     experiment_override.or(step.hint.preferred_inner_jobs)
 }
 
-// CPU-time budget (seconds) in effect for a step: its declared `cpu_timeout` (>0) wins;
-// otherwise the DAG's SMALL default. Both 0 means the guard is disabled. Mirrors Python's
-// `effective_cpu_timeout`.
+/// Resolve the step CPU-time budget, preferring a positive per-step declaration.
+///
+/// A zero result disables the CPU-time guard.
 pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
     if step.cpu_timeout > 0 {
         step.cpu_timeout
@@ -196,9 +202,9 @@ pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
     }
 }
 
-// Core cap (cgroup `cpu.max`) in effect for a step: its declared `preferred_inner_jobs` wins;
-// otherwise the DAG's SMALL default. Bounds cpu.max ONLY, never the command's inner `-j` flag
-// (which stays keyed to the declared width). Mirrors Python's `effective_cpu_count`.
+/// Resolve the step's cgroup core cap from its preferred width or the DAG default.
+///
+/// This value bounds CPU allocation only; it does not independently alter the command line.
 pub fn effective_cpu_count(step: &Step, default_cpu_count: Option<i64>) -> Option<i64> {
     step.hint.preferred_inner_jobs.or(default_cpu_count)
 }
@@ -243,7 +249,7 @@ fn signal_name(sig: i64) -> String {
 
 /// Describe a failed step without conflating an external signal with an OOM.
 ///
-/// Precedence (load-bearing for cross-language parity):
+/// Failure-reason precedence is:
 /// OOM > CPU-timeout > timeout > pids-guard > detail-capture-failure > signal > exit code.
 ///
 /// A negative `returncode` means the child received a Unix signal; that must never be
@@ -291,17 +297,16 @@ pub fn step_failure_reason(
     }
 }
 
-// A whole DAG plus caller policy.
-//
-// `steps` is the graph; `resource_caps` bounds concurrent scarce-resource demand. The
-// memory-model tunables mirror DeepScry's outer-cap behavior and can be left at their
-// defaults.
+/// A complete step graph and its scheduling, memory, and containment policy.
 #[derive(Debug, Clone)]
 pub struct DagConfig {
+    /// Steps in deterministic declaration order.
     pub steps: Vec<Step>,
     // Optional long-form documentation for the WHOLE DAG (default empty). Free-form prose
     // describing the pipeline as a whole; never affects scheduling.
+    /// Optional long-form description of the whole DAG.
     pub description: String,
+    /// Maximum concurrent capacity for each named scarce resource.
     pub resource_caps: BTreeMap<String, i64>,
     /// Multiplier from a step's measured RSS baseline to its inner memory cap (headroom).
     pub mem_cap_factor: f64,
@@ -309,6 +314,7 @@ pub struct DagConfig {
     pub mem_cap_floor_bytes: i64,
     /// Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.
     pub outer_mem_safety_factor: f64,
+    /// Default wall-clock timeout for steps, in seconds.
     pub default_step_timeout: i64,
     /// Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     pub default_jobs_flag: String,
@@ -347,7 +353,7 @@ impl Default for DagConfig {
 }
 
 impl DagConfig {
-    // Map each step tag to a reference to the step (mirrors Python's `by_tag`).
+    /// Index the steps by their unique fully qualified tags.
     pub fn by_tag(&self) -> BTreeMap<String, &Step> {
         self.steps.iter().map(|s| (s.tag(), s)).collect()
     }

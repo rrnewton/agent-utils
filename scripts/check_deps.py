@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Verify every Python console entrypoint starts cleanly with ZERO optional dependencies.
+"""Verify every Python console entrypoint starts cleanly without third-party imports.
 
-The Python tools in this tree declare only PyYAML as a runtime dependency, and it is OPTIONAL:
-`--help`, `--version`, usage errors, and every JSON-only path must work without it. This check runs
+The YAML-capable tools declare PyYAML as a runtime dependency, while the timeline tool is
+stdlib-only. Regardless, `--help`, `--version`, usage errors, and every JSON-only path must work
+without PyYAML. This check runs
 each entrypoint's dependency-free invocations with the ambient interpreter and fails loudly if any
 of them crashes, dumps a Python traceback, or leaks a raw ``ModuleNotFoundError`` — the class of bug
-where an optional dependency is imported at module scope and takes down `--help` on a bare host.
+where a third-party dependency is imported at module scope and takes down `--help` on a bare host.
 
 It is intentionally stdlib-only so it runs in the SAME bare runtime environment where the tools are
 invoked (no mypy/pytest/PyYAML needed). ``make check-deps`` runs it; ``./setup py`` runs it too.
@@ -17,7 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Console-script entrypoints declared in py/pyproject.toml ([project.scripts]).
+# Console-script modules declared by the independent package manifests.
 ENTRYPOINT_MODULES = [
     "safe_ci_dag_runner",
     "tick_hub",
@@ -25,7 +26,7 @@ ENTRYPOINT_MODULES = [
     "agent_team_timeline",
 ]
 
-# Invocations that MUST succeed with no optional dependencies installed.
+# Invocations that MUST succeed without importing third-party dependencies.
 DEPFREE_ARGS: list[list[str]] = [["--help"], ["--version"], []]
 
 # Force `import yaml` to fail even if PyYAML happens to be installed, so this check reflects the
@@ -80,7 +81,7 @@ def main() -> int:
             print(f"  - {f}", file=sys.stderr)
         return 1
 
-    # Informational: report whether the optional dependency is present in this environment.
+    # Informational: report whether the YAML dependency is present in this environment.
     try:
         import yaml  # noqa: F401
 

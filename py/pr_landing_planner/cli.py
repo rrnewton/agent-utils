@@ -90,24 +90,38 @@ class Palette:
         return f"\033[{code}m{text}\033[0m" if self.enabled else text
 
     def bold(self, text: str) -> str:
+        """Render *text* in bold when color output is enabled."""
+
         return self._wrap("1", text)
 
     def dim(self, text: str) -> str:
+        """Render *text* dimly when color output is enabled."""
+
         return self._wrap("2", text)
 
     def red(self, text: str) -> str:
+        """Render *text* in red when color output is enabled."""
+
         return self._wrap("31", text)
 
     def green(self, text: str) -> str:
+        """Render *text* in green when color output is enabled."""
+
         return self._wrap("32", text)
 
     def yellow(self, text: str) -> str:
+        """Render *text* in yellow when color output is enabled."""
+
         return self._wrap("33", text)
 
     def cyan(self, text: str) -> str:
+        """Render *text* in cyan when color output is enabled."""
+
         return self._wrap("36", text)
 
     def style(self, name: str, text: str) -> str:
+        """Apply a named palette style, leaving text unchanged for unknown names."""
+
         fn = {
             "bold": self.bold,
             "dim": self.dim,
@@ -428,6 +442,8 @@ def _add_collect_flags(sp: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line parser without parsing process arguments."""
+
     c = Palette(_color_enabled(sys.stdout))
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -647,6 +663,8 @@ def _cmd_status(ns: argparse.Namespace, c: Palette) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line interface and return its process exit status."""
+
     parser = build_parser()
     ns = parser.parse_args(list(argv) if argv is not None else None)
     c = Palette(_color_enabled(sys.stdout))

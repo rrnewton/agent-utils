@@ -83,14 +83,20 @@ class SummaryRunStats:
 
     @property
     def cache_hits(self) -> int:
+        """Return the number of jobs served from cache."""
+
         return self.hits
 
     @property
     def cache_misses(self) -> int:
+        """Return the number of jobs that required generation."""
+
         return self.misses
 
     @property
     def backend_batches(self) -> int:
+        """Return the number of generation batches sent to the backend."""
+
         return self.batches
 
 

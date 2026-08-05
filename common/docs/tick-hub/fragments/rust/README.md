@@ -4,6 +4,8 @@
 cargo install tick-hub
 ```
 
+Rust 1.85 or newer is required.
+
 Add the crate as a dependency to embed the deterministic engine:
 
 ```toml

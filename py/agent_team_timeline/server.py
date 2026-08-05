@@ -13,12 +13,16 @@ class QuietHandler(http.server.SimpleHTTPRequestHandler):
     """A static handler that adds safe defaults and keeps routine requests quiet."""
 
     def end_headers(self) -> None:
+        """Add browser-safety and no-cache headers to the response."""
+
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Cache-Control", "no-cache")
         super().end_headers()
 
     def log_message(self, format: str, *args: object) -> None:
+        """Suppress routine index requests while retaining other request logs."""
+
         if self.command != "GET" or self.path not in ("/", "/index.html"):
             super().log_message(format, *args)
 

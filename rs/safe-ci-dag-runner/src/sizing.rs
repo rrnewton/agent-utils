@@ -12,12 +12,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::model::{step_classification, DagConfig, Step, StepClass, DEFAULT_SMALL_MEM_CAP_BYTES};
 
-// Inner-cgroup MemoryMax for a step. An explicit hard cap wins; otherwise `factor x` the RSS
-// baseline. When the step declares NEITHER (uncharacterized), fall back to `default_cap_bytes`
-// — the SMALL forcing-function default the scheduler passes from
-// `DagConfig::default_step_mem_cap_bytes` — or `None` when no default is supplied (the -j sizing
-// model passes `None`, so an uncharacterized step stays excluded from the footprint sum, matching
-// Python's falsy `if base` guard). Mirrors Python's `step_mem_cap_bytes`.
+/// Resolve the inner-cgroup memory cap for a step.
+///
+/// An explicit hard cap wins. Otherwise the RSS baseline is multiplied by `mem_cap_factor`; a step
+/// with neither value receives `default_cap_bytes` when supplied.
 pub fn step_mem_cap_bytes(
     step: &Step,
     mem_cap_factor: f64,
@@ -139,10 +137,9 @@ pub fn schedulable_peak_mem_bytes(
     })
 }
 
-// Like [`schedulable_peak_mem_bytes`] but with a PER-STEP width map (a step absent from the map
-// falls back to `inner_jobs = None`). The CPA allocator uses this so a step widened on the
-// critical path is charged its own scaled memory cap while its siblings keep theirs
-// (PLANNER_DESIGN.md §5.6). Mirrors the Python `schedulable_peak_mem_bytes(..., widths=...)`.
+/// Compute peak schedulable memory using a separate inner-job width for each step.
+///
+/// A step absent from `widths` is evaluated without an explicit inner-job width.
 pub fn schedulable_peak_mem_bytes_widths(
     cfg: &DagConfig,
     jobs: i64,
@@ -244,24 +241,13 @@ pub fn jobs_for_budget(cfg: &DagConfig, budget: i64) -> (i64, i64) {
     (best, jobs_footprint_bytes(cfg, best, None))
 }
 
-// Worst-case peak RSS of ONE compile/link job, used to bound build parallelism by the
-// memory a boxed scope actually grants. DERIVED from a measured footprint, never guessed:
-// hermit#1584's `build.dbi_release` OOM-killed at the 8.0 GiB cap under j=32 (`memory.events`
-// `oom_kill=2`) yet is stable at j8 (dag-mem-caps-pinned-jobs-fix #1583), i.e. ~8.0 GiB / 8
-// ~= 1.0 GiB is the largest per-job footprint that still fits. Single source (mirrors
-// Python `PER_BUILD_JOB_MEM_BYTES`) so the `-j` a cap implies is never re-derived at a second
-// site.
+/// Conservative peak resident-memory allowance for one build worker.
 pub const PER_BUILD_JOB_MEM_BYTES: i64 = 1024 * 1024 * 1024;
 
-// Bounded `CARGO_BUILD_JOBS` for a boxed command, carrying its `-j` WITH the caps.
-//
-// Cargo (and the `NUM_JOBS` it exports to build scripts) otherwise auto-detects parallelism
-// from the effective CPU quota, so an unpinned step under a wide scope quota computes
-// `NUM_JOBS=<all-granted-cores>` (observed 284) and OOM-races the linker. Derive the job count
-// where the quota is granted: `jobs = min(granted_cores, mem_cap / PER_BUILD_JOB_MEM_BYTES)`.
-// `cpu_count` is the granted cores (a step's inner `cpu.max`, or the scope's effective quota
-// for an unpinned step); `mem_max_bytes` is the co-located memory cap. Always `>= 1`. Mirrors
-// Python `derive_build_jobs` byte-for-byte.
+/// Derive a positive build-worker count from co-located CPU and memory limits.
+///
+/// The result is the smaller of granted cores and the number of conservative per-worker memory
+/// allowances that fit the cap. Missing limits fall back to the host CPU count.
 pub fn derive_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> i64 {
     let cores = match cpu_count {
         Some(c) if c > 0 => c,
@@ -277,11 +263,9 @@ pub fn derive_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> 
     jobs.max(1)
 }
 
-// Number of logical CPUs, matching Python's `os.cpu_count()` (online, affinity-independent).
-//
-// Read from `/sys/devices/system/cpu/online` (the same set `sysconf(_SC_NPROCESSORS_ONLN)`
-// reports), so the chosen `-j` agrees with the Python build. Falls back to
-// `available_parallelism`, then 4.
+/// Return the online logical CPU count, independent of process affinity.
+///
+/// Reads the Linux online-CPU range first, then falls back to runtime parallelism and finally four.
 pub fn cpu_count() -> i64 {
     if let Ok(text) = std::fs::read_to_string("/sys/devices/system/cpu/online") {
         if let Some(n) = count_cpu_ranges(text.trim()) {
@@ -330,11 +314,10 @@ pub(crate) fn count_cpu_ranges(spec: &str) -> Option<i64> {
     }
 }
 
-// Parse `'8G'` / `'4096M'` / `'2048K'` / `'12345'` (bytes) into an int, or `None` if bad.
-//
-// Mirrors the Python regex `\s*(\d+(?:\.\d+)?)\s*([KkMmGgTt]?)([Bb]?)\s*` fullmatch: optional
-// surrounding and mid whitespace, a decimal number, an optional size unit, and an optional
-// trailing `B`/`b`.
+/// Parse a non-negative byte-size string with an optional binary `K`, `M`, `G`, or `T` suffix.
+///
+/// Decimal quantities, surrounding whitespace, and an optional trailing `B` are accepted. Invalid
+/// or overflowing values return `None`.
 pub fn parse_size(spec: &str) -> Option<i64> {
     if spec.is_empty() {
         return None;

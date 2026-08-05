@@ -22,18 +22,23 @@ Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not
 need this source tree or knowledge of the sibling implementation.
 
-`agent-team-timeline` is a concurrently developed Python prototype for
-reconstructing coordinator/subagent histories as a local interactive timeline.
-It is intentionally outside the paired packaging and parity contract until its
-design settles; this work does not attempt a premature port.
+## Python-only tool
+
+| Command | Purpose | Python distribution |
+|---|---|---|
+| `agent-team-timeline` | Build durable, zoomable local timelines from coordinator and subagent transcripts. | `agent-team-timeline` |
+
+`agent-team-timeline` is independently installable and follows the same package
+documentation and artifact checks. It is the explicit exception to the
+two-language implementation and behavioral-differential contract.
 
 ## Repository layout
 
 ```text
-common/docs/       documentation templates, edition fragments, and prototype guides
+common/docs/       authoritative documentation sources and rendered editions
 cross/             behavioral differential harnesses and shared fixtures
 examples/          runnable DAG examples
-py/                Python distributions and source tools
+py/                independently publishable Python distributions
 rs/                independently publishable Rust crates
 scripts/           documentation, package, and dependency contract checks
 skills/            thin agent-facing command discovery files
@@ -47,9 +52,11 @@ common/docs/<tool>/USER_GUIDE.template.md
 common/docs/<tool>/fragments/{python,rust}/{README,USER_GUIDE}.md
 ```
 
-It writes the package README and embedded user guide. Check mode verifies exact
-generated content and rejects package pages that leak sibling-language,
-source-tree, or unrelated-project references:
+It writes authoritative rendered editions under `common/docs/`; package trees
+link to those files. Package builders dereference the links into ordinary files,
+so every installed artifact is self-contained. Check mode verifies the exact
+rendered content, link topology, and absence of sibling-language, source-tree,
+unrelated-project, or development-history references:
 
 ```sh
 python3 scripts/embed_userguides.py

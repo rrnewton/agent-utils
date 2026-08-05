@@ -100,8 +100,7 @@ class ProcessInfo:
     """One parsed ``ps aux`` row: the fields a matcher needs, computed once.
 
     ``ps aux`` columns are ``USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND``; the
-    command (column 11) is kept intact by splitting at most 10 times, matching the reference
-    parser exactly.
+    command (column 11) is kept intact by splitting at most 10 times.
     """
 
     #: The original, unmodified ``ps`` line.
@@ -148,7 +147,7 @@ class ProcessInfo:
         Scoped by the process's REAL working directory (``/proc/<pid>/cwd``) so a tool run
         in a *sibling* checkout — same command tokens, different cwd — is not falsely
         flagged (which would needlessly serialize independent runs). When the real cwd is
-        unavailable, FAIL SAFE to the reference command-line substring scope
+        unavailable, fail safe to the command-line substring scope
         (``current_dir in cmd``) — never widened to global, never crashing.
         """
         real_cwd = self.cwd()
@@ -157,11 +156,7 @@ class ProcessInfo:
         return current_dir in self.cmd
 
     def describe(self, label: str) -> str:
-        """Render a conflict description in the reference ``<label> (PID <pid>): <cmd>`` form.
-
-        The command line is truncated to 100 characters, matching the original output so
-        downstream logs and tests read identically.
-        """
+        """Render ``<label> (PID <pid>): <cmd>`` with the command truncated to 100 characters."""
         return f"{label} (PID {self.pid}): {self.cmd[:100]}"
 
 
@@ -214,13 +209,12 @@ class ExecutableMatcher:
 class SubstringMatcher:
     """Flag a process by required/excluded command-line substrings, optionally dir-scoped.
 
-    Generalizes the reference binary / ``validate.py`` rules. A process matches when every
-    string in ``require_all`` is present, at least one string in ``require_any`` is present
+    A process matches when every string in ``require_all`` is present, at least one string in
+    ``require_any`` is present
     (when that tuple is non-empty), and no string in ``exclude_any`` is present. When
     ``require_current_dir`` is set, the command line must additionally contain
-    ``current_dir`` (the original's cheap in-line scope; use :class:`ExecutableMatcher` for
-    real-cwd scoping). ``exclude_any`` lets a caller carve out launcher/shell processes the
-    way the original excluded shell interpreters from the browser check.
+    ``current_dir``. Use :class:`ExecutableMatcher` when real-working-directory scoping is
+    required. ``exclude_any`` lets a caller carve out launcher or shell processes.
     """
 
     label: str

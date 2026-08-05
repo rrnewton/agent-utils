@@ -4,6 +4,8 @@
 cargo install pr-landing-planner
 ```
 
+Rust 1.85 or newer is required.
+
 Add the crate as a dependency when planning belongs inside an application:
 
 ```toml

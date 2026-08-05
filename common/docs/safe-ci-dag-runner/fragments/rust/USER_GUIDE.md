@@ -4,8 +4,8 @@
 cargo install safe-ci-dag-runner
 ```
 
-The crate installs both binaries. For library use, declare the dependency and
-import the crate as `safe_ci_dag_runner`:
+Rust 1.85 or newer is required. The crate installs both binaries. For library
+use, declare the dependency and import the crate as `safe_ci_dag_runner`:
 
 ```toml
 [dependencies]
@@ -24,5 +24,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Public modules cover containment, CPU reservations, resource sizing, profile
 summaries, deterministic planning, scheduling, serialization, and
-visualization. Enforced containment requires Linux with cgroup v2 and a
-delegated systemd user scope.
+visualization. The `run_dag` function is the explicit uncontained scheduler;
+`run_dag_boxed` and the console command establish containment. Enforced
+containment requires Linux with cgroup v2 and a delegated systemd user scope.

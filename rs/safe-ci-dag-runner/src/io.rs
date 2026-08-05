@@ -31,7 +31,7 @@ use crate::model::{
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
 
-// Raised when a DAG JSON document is malformed (mirrors Python's `DagJsonError`).
+/// Error returned when a DAG document violates the interchange schema.
 #[derive(Debug, Clone)]
 pub struct DagJsonError(pub String);
 
@@ -269,8 +269,7 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
     })
 }
 
-// Parse a DAG JSON document into a [`DagConfig`]. Returns [`DagJsonError`] on any malformed
-// field, mirroring the Python `dag_from_json` strictness.
+/// Parse a JSON DAG document with strict field and type validation.
 pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
     let raw: Value = serde_json::from_str(text).map_err(|e| err(format!("invalid JSON: {e}")))?;
     dag_from_value(&raw)
@@ -647,8 +646,9 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push('}');
 }
 
-// Serialize a [`DagConfig`] to canonical, deterministic JSON (2-space indent), byte-identical
-// to Python's `dag_to_json` for ASCII input. No trailing newline (the CLI's print adds one).
+/// Serialize a DAG configuration to canonical two-space-indented JSON.
+///
+/// The returned string has no trailing newline.
 pub fn dag_to_json(cfg: &DagConfig) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -694,12 +694,10 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
     s
 }
 
-// Serialize a [`DagConfig`] to a YAML document.
-//
-// YAML byte-output need NOT match the Python build (only YAML *loading* is isomorphic across the
-// two languages); the emitted document round-trips back through [`dag_from_yaml`] to an identical
-// `DagConfig`. Implemented by re-parsing the canonical JSON into a value tree — a single source of
-// truth for the field set shared with [`dag_to_json`] — and dumping that tree as YAML.
+/// Serialize a DAG configuration to a YAML document.
+///
+/// The result round-trips through [`dag_from_yaml`] to an equivalent configuration. Serialization
+/// uses the canonical JSON value tree so both formats expose the same fields.
 pub fn dag_to_yaml(cfg: &DagConfig) -> String {
     let json = dag_to_json(cfg);
     // Canonical JSON produced by dag_to_json is always valid, and a plain JSON value tree always

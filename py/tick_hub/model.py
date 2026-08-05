@@ -120,4 +120,5 @@ class TickConfig:
     description: str = ""
 
     def by_name(self) -> dict[str, Reminder]:
+        """Index reminders by their configured names."""
         return {r.name: r for r in self.reminders}

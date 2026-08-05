@@ -4,8 +4,6 @@
 //! then emits a stable line protocol (`HEALTH:`, `ACTION:`, `NOTE:`, and `ERROR:`). The engine is
 //! side-effect free apart from explicitly injected [`GateRunner`] and [`FileAgeProbe`] boundaries.
 
-#![deny(missing_docs)]
-
 pub mod cadence;
 pub mod cli;
 pub mod emit;

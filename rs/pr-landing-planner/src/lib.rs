@@ -3,7 +3,6 @@
 //! The planner is advisory: no API in this crate arms, refires, lands, or merges a pull request.
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 pub mod classify;
 pub mod cli;

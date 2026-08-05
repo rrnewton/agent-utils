@@ -49,7 +49,8 @@ def test_embed_check_reports_both_staleness_and_lint(
     destination.write_text("{{UNKNOWN}}\ntick-hub\n", encoding="utf-8")
     monkeypatch.setattr(docs, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(docs, "RENDERS", (item,))
-    monkeypatch.setattr(docs, "DIRECT_COPIES", ())
+    monkeypatch.setattr(docs, "STANDALONE_DOCUMENTS", ())
+    monkeypatch.setattr(docs, "PACKAGE_LINKS", ())
 
     stale, lint_errors = docs.check()
 
@@ -80,12 +81,53 @@ def test_embed_prevalidates_every_input_before_writing(
     second_template.write_text("{{DISTRIBUTION}}\n", encoding="utf-8")
     monkeypatch.setattr(docs, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(docs, "RENDERS", (first, second))
-    monkeypatch.setattr(docs, "DIRECT_COPIES", ())
+    monkeypatch.setattr(docs, "STANDALONE_DOCUMENTS", ())
+    monkeypatch.setattr(docs, "PACKAGE_LINKS", ())
 
     with pytest.raises(FileNotFoundError, match="fragment missing"):
         docs.generate()
 
     assert first_destination.read_text(encoding="utf-8") == "leave me alone\n"
+
+
+def test_embed_check_rejects_regular_copy_and_wrong_link_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docs = _load_script("embed_userguides")
+    link = docs.PackageLink("package/README.md", "common/README.md")
+    wanted = tmp_path / link.target
+    destination = tmp_path / link.destination
+    wanted.parent.mkdir(parents=True)
+    destination.parent.mkdir(parents=True)
+    wanted.write_text("authoritative\n", encoding="utf-8")
+    destination.write_text("authoritative\n", encoding="utf-8")
+    monkeypatch.setattr(docs, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(docs, "RENDERS", ())
+    monkeypatch.setattr(docs, "STANDALONE_DOCUMENTS", ())
+    monkeypatch.setattr(docs, "PACKAGE_LINKS", (link,))
+
+    stale, lint_errors = docs.check()
+    assert stale == [link.destination]
+    assert lint_errors == []
+
+    destination.unlink()
+    destination.symlink_to("../wrong/README.md")
+    stale, _ = docs.check()
+    assert stale == [link.destination]
+
+    destination.unlink()
+    destination.symlink_to(link.relative_target)
+    assert docs.check() == ([], [])
+
+
+def test_package_docs_and_licenses_are_authoritative_links() -> None:
+    docs = _load_script("embed_userguides")
+
+    assert len(docs.PACKAGE_LINKS) == 21
+    for link in docs.PACKAGE_LINKS:
+        destination = REPO_ROOT / link.destination
+        assert destination.is_symlink(), link.destination
+        assert docs._link_is_current(link), link.destination
 
 
 def test_artifact_doc_linters_reject_suite_language_sibling_and_template_leaks() -> None:

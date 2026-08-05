@@ -38,7 +38,8 @@ CRATES: tuple[Crate, ...] = (
 )
 
 _FOREIGN_DOC_TERMS = re.compile(
-    r"\bpython(?:[0-9]+(?:\.[0-9]+)*)?\b|\b(?:pip|pypi)\b|(?:^|[ (`])py/",
+    r"\bpython(?:[0-9]+(?:\.[0-9]+)*)?\b|\b(?:pip|pypi)\b|"
+    r"\b[A-Za-z_][A-Za-z0-9_]*\.py\b|(?:^|[ (`])py/",
     re.IGNORECASE | re.MULTILINE,
 )
 _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -51,6 +52,22 @@ _COMMON_DOC_TERMS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"(?:^|[ (`])(?:py|rs|scripts|cross)/", re.IGNORECASE | re.MULTILINE),
     ),
     ("unexpanded template syntax", re.compile(r"\{\{|\}\}")),
+    (
+        "development-history language",
+        re.compile(
+            r"\b(?:prototype|roadmap|formerly|previously|planned|not yet|legacy|historical|"
+            r"predates?|follow-on|stub)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "implementation-provenance language",
+        re.compile(
+            r"\b(?:ported|parity|cross-language|both builds?)\b|"
+            r"\b(?:direct|generic|typed)?\s*port of\b",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 
@@ -83,6 +100,25 @@ def _check_public_rustdoc() -> None:
                     in_block_doc = False
 
 
+def _check_missing_docs() -> None:
+    """Ask rustc to reject every undocumented public library item."""
+
+    env = dict(os.environ)
+    existing = env.get("RUSTFLAGS", "").strip()
+    env["RUSTFLAGS"] = f"{existing} -D missing-docs".strip()
+    _run(
+        [
+            "cargo",
+            "check",
+            "--locked",
+            "--offline",
+            "--workspace",
+            "--lib",
+            "--manifest-path",
+            str(RS_ROOT / "Cargo.toml"),
+        ],
+        env=env,
+    )
 def _doc_violations(crate: Crate, text: str) -> list[str]:
     errors: list[str] = []
     foreign = _FOREIGN_DOC_TERMS.search(text)
@@ -132,6 +168,12 @@ def _run(
 
 def _metadata(crate: Crate) -> tuple[str, set[str], set[str]]:
     manifest = RS_ROOT / crate.name / "Cargo.toml"
+    for relative in ("README.md", "src/embedded_userguide.md", "LICENSE"):
+        linked = RS_ROOT / crate.name / relative
+        if not linked.is_symlink() or not linked.resolve().is_file():
+            raise CheckError(
+                f"{crate.name}: source {relative} must be a valid authoritative symlink"
+            )
     result = _run(
         [
             "cargo",
@@ -217,6 +259,30 @@ def _inspect(crate: Crate, version: str, archive: Path) -> str:
         missing = sorted(required - names)
         if missing:
             raise CheckError(f"{crate.name}: registry archive is missing {missing}")
+        members = {member.name: member for member in package.getmembers()}
+        non_files = sorted(name for name in required if not members[name].isfile())
+        if non_files:
+            raise CheckError(
+                f"{crate.name}: registry archive contains links instead of files: {non_files}"
+            )
+        source_root = RS_ROOT / crate.name
+        source_modules = {
+            f"{prefix}{path.relative_to(source_root).as_posix()}": path
+            for path in (source_root / "src").rglob("*.rs")
+        }
+        missing_modules = sorted(set(source_modules) - names)
+        if missing_modules:
+            raise CheckError(f"{crate.name}: registry archive is missing {missing_modules}")
+        changed_modules: list[str] = []
+        for name, source_path in source_modules.items():
+            member = package.extractfile(name)
+            if member is None or member.read() != source_path.read_bytes():
+                changed_modules.append(name)
+        if changed_modules:
+            raise CheckError(
+                f"{crate.name}: registry modules differ from differential-tested source: "
+                f"{sorted(changed_modules)}"
+            )
 
         manifest_member = package.extractfile(f"{prefix}Cargo.toml.orig")
         if manifest_member is None:
@@ -246,6 +312,11 @@ def _inspect(crate: Crate, version: str, archive: Path) -> str:
                     f"{crate.name}: {relative} is not standalone: {'; '.join(errors)}"
                 )
             documents[relative] = text
+        license_member = package.extractfile(f"{prefix}LICENSE")
+        if license_member is None:
+            raise CheckError(f"{crate.name}: could not read LICENSE from registry archive")
+        if license_member.read() != (REPO_ROOT / "LICENSE").read_bytes():
+            raise CheckError(f"{crate.name}: registry LICENSE differs from the authoritative license")
         return documents["src/embedded_userguide.md"]
 
 
@@ -261,9 +332,9 @@ def _smoke(crate: Crate, version: str, userguide: str, target_root: Path) -> Non
         executable = bindir / f"{binary}{suffix}"
         if not executable.is_file():
             raise CheckError(f"{crate.name}: verified binary is missing: {executable}")
-        invocations = [("--help",)]
+        invocations = [("--help",), ("--version",)]
         if binary != "cpuset-alloc":
-            invocations.extend([("--version",), ("--userguide",)])
+            invocations.append(("--userguide",))
         for args in invocations:
             result = _run(
                 [str(executable), *args],
@@ -283,6 +354,7 @@ def _smoke(crate: Crate, version: str, userguide: str, target_root: Path) -> Non
 def main() -> int:
     try:
         _check_public_rustdoc()
+        _check_missing_docs()
         index_text = (RS_ROOT / "README.md").read_text(encoding="utf-8")
         index_match = _FOREIGN_DOC_TERMS.search(index_text)
         if index_match is not None:

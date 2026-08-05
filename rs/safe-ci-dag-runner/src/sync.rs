@@ -12,9 +12,7 @@
 // Backends: [`LocalDirBackend`] (`local:<dir>`), [`GitBranchBackend`]
 // (`git:<url>#<branch>[#<subdir>]`, the ATOMIC reference with retry-on-conflict RMW),
 // [`GitHubArtifactsBackend`] (`github-artifacts:<name>[#<owner/repo>]`, NON-atomic — a concurrent
-// contribution can occasionally be dropped, acceptable for a statistical summary), and
-// [`S3Backend`] (`s3:<bucket>[/<prefix>]`, a documented STUB — the protocol seam is clean, a real
-// S3/R2 client is a scoped follow-on).
+// contribution can occasionally be dropped, acceptable for a statistical summary).
 //
 // Each backend is scoped, like the CSV store, to ONE `(machine_id, container_class)` identity (the
 // summary object it reads/writes is named per identity), so a heterogeneous fleet keeps one summary
@@ -52,8 +50,7 @@ pub fn summary_object_name(machine_id: &str, container_class: &str) -> String {
     format!("summary_{machine_id}_{container_class}.json")
 }
 
-// Download + upload of the mergeable summary, behind one pluggable seam. Mirrors Python's
-// `SyncBackend` protocol.
+/// Persistence boundary for downloading and publishing mergeable profile summaries.
 pub trait SyncBackend {
     /// A short human label for logs (No Silent Failure: the caller prints where it synced).
     fn describe(&self) -> String;
@@ -78,6 +75,7 @@ pub struct LocalDirBackend {
 }
 
 impl LocalDirBackend {
+    /// Create a backend rooted at `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -179,11 +177,10 @@ impl Drop for LockFile {
 
 type BeforePush = Box<dyn Fn(usize) + Send + Sync>;
 
-// Store the summary on a dedicated git branch (`git:<url>#<branch>[#<subdir>]`) — the ATOMIC
-// reference backend. `publish` works in a private throwaway checkout per attempt, fetches the
-// branch, merges the remote summary with this run's `delta`, commits, and pushes; a REJECTED push
-// retries from a fresh fetch of the NEW tip and re-merges the SAME delta (no clobber, no
-// double-count). Mirrors Python's `GitBranchBackend`.
+/// Atomic summary backend stored on a dedicated Git branch.
+///
+/// Publishing uses a private checkout and retries rejected pushes from a newly fetched tip, merging
+/// the same delta on each attempt rather than overwriting concurrent contributions.
 pub struct GitBranchBackend {
     url: String,
     branch: String,
@@ -193,6 +190,7 @@ pub struct GitBranchBackend {
 }
 
 impl GitBranchBackend {
+    /// Create a Git-branch backend for a repository URL, branch, and optional summary subdirectory.
     pub fn new(
         url: impl Into<String>,
         branch: impl Into<String>,
@@ -371,11 +369,10 @@ fn unique_tmp_dir(prefix: &str) -> Result<PathBuf, SyncError> {
 
 // --------------------------------------------------------------------------- github actions artifacts
 
-// Store the summary as a GitHub Actions artifact (`github-artifacts:<name>[#<owner/repo>]`).
-// Downloads the latest summary artifact via the `gh` CLI and merges it; `publish` writes the merged
-// summary to a local staging file for the workflow's `actions/upload-artifact` step (GitHub has no
-// in-run artifact write API). NON-ATOMIC by design — see the module docs. Mirrors Python's
-// `GitHubArtifactsBackend`.
+/// Non-atomic summary backend staged through GitHub Actions artifacts.
+///
+/// Downloads use the `gh` command. Publishing writes a merged summary to a local staging file for
+/// a workflow artifact-upload step.
 pub struct GitHubArtifactsBackend {
     name: String,
     repo: Option<String>,
@@ -383,6 +380,7 @@ pub struct GitHubArtifactsBackend {
 }
 
 impl GitHubArtifactsBackend {
+    /// Create an artifact backend, inferring the repository from the environment when omitted.
     pub fn new(name: impl Into<String>, repo: Option<String>) -> Self {
         let repo = repo.or_else(|| std::env::var("GITHUB_REPOSITORY").ok());
         Self {
@@ -520,8 +518,7 @@ impl SyncBackend for GitHubArtifactsBackend {
     }
 }
 
-// Pick the most-recently-created, non-expired artifact whose `name` matches. Pure (unit-testable
-// without a live runner). Mirrors Python's `_select_latest_artifact`.
+/// Select the newest non-expired artifact with an exact matching name.
 pub fn select_latest_artifact<'a>(
     artifacts: &'a [serde_json::Value],
     name: &str,
@@ -548,66 +545,19 @@ pub fn select_latest_artifact<'a>(
     best
 }
 
-// --------------------------------------------------------------------------- s3 / r2 stub
-
-// A DOCUMENTED STUB for object-store (S3 / Cloudflare R2) sync (`s3:<bucket>[/<prefix>]`). The
-// protocol seam is clean; a real client is a scoped follow-on. Raises a clear error rather than
-// pretending to sync. Mirrors Python's `S3Backend`.
-pub struct S3Backend {
-    bucket: String,
-    prefix: String,
-}
-
-impl S3Backend {
-    pub fn new(bucket: impl Into<String>, prefix: impl Into<String>) -> Self {
-        let p: String = prefix.into();
-        Self {
-            bucket: bucket.into(),
-            prefix: p.trim_matches('/').to_string(),
-        }
-    }
-
-    fn unimplemented<T>(&self) -> Result<T, SyncError> {
-        err(
-            "s3/r2 backend is a documented follow-on stub — not yet implemented. Use \
-             'local:<dir>' or 'git:<url>#<branch>' today. The SyncBackend seam is where a real \
-             client (get-latest / merge / put, optionally with a version-id compare-and-swap for \
-             atomic read-modify-write) drops in."
-                .to_string(),
-        )
-    }
-}
-
-impl SyncBackend for S3Backend {
-    fn describe(&self) -> String {
-        if self.prefix.is_empty() {
-            format!("s3:{} (stub)", self.bucket)
-        } else {
-            format!("s3:{}/{} (stub)", self.bucket, self.prefix)
-        }
-    }
-
-    fn download(&self, _machine_id: &str, _container_class: &str) -> Result<Summary, SyncError> {
-        self.unimplemented()
-    }
-
-    fn publish(&self, _delta: &Summary, _cap: usize, _max: usize) -> Result<Summary, SyncError> {
-        self.unimplemented()
-    }
-}
-
 // --------------------------------------------------------------------------- spec parsing
 
-// Construct a [`SyncBackend`] from a `--profile-sync` spec (mirrors Python's `parse_backend`)::
-//
-//   local:<dir> | git:<url>#<branch>[#<subdir>] | github-artifacts:<name>[#<repo>] | s3:<bucket>[/<prefix>]
+/// Parse a `--profile-sync` specification into a concrete backend.
+///
+/// Supported forms are `local:<dir>`, `git:<url>#<branch>[#<subdir>]`, and
+/// `github-artifacts:<name>[#<repo>]`.
 pub fn parse_backend(spec: &str) -> Result<Box<dyn SyncBackend>, SyncError> {
     let (scheme, rest) = match spec.split_once(':') {
         Some(x) => x,
         None => {
             return err(format!(
                 "invalid --profile-sync spec {spec:?}: expected '<scheme>:<...>' \
-                 (local:, git:, github-artifacts:, s3:)"
+                 (local:, git:, github-artifacts:)"
             ))
         }
     };
@@ -645,19 +595,9 @@ pub fn parse_backend(spec: &str) -> Result<Box<dyn SyncBackend>, SyncError> {
             }
             Ok(Box::new(GitHubArtifactsBackend::new(name, repo)))
         }
-        "s3" => {
-            if rest.is_empty() {
-                return err("invalid s3 spec: expected 's3:<bucket>[/<prefix>]'".to_string());
-            }
-            let (bucket, prefix) = match rest.split_once('/') {
-                Some((b, p)) => (b, p),
-                None => (rest, ""),
-            };
-            Ok(Box::new(S3Backend::new(bucket, prefix)))
-        }
         other => err(format!(
             "unknown --profile-sync scheme {other:?}: supported schemes are \
-             local:, git:, github-artifacts:, s3:"
+             local:, git:, github-artifacts:"
         )),
     }
 }
@@ -719,7 +659,6 @@ mod tests {
         assert!(parse_backend("git:/tmp/repo#data").is_ok());
         assert!(parse_backend("git:/tmp/repo#data#sub/dir").is_ok());
         assert!(parse_backend("github-artifacts:sum#o/r").is_ok());
-        assert!(parse_backend("s3:bucket/prefix").is_ok());
         for spec in [
             "",
             "nonsense",
@@ -727,19 +666,11 @@ mod tests {
             "git:/tmp/repo",
             "git:#branch",
             "s3:",
+            "s3:bucket/prefix",
             "bogus:x",
         ] {
             assert!(parse_backend(spec).is_err(), "{spec} should be rejected");
         }
-    }
-
-    #[test]
-    fn s3_backend_is_a_loud_stub() {
-        let b = parse_backend("s3:bucket/prefix").unwrap();
-        assert!(b.download(MID, CC).is_err());
-        assert!(b
-            .publish(&delta("g.a", 1.0), DEFAULT_RESERVOIR_K, DEFAULT_MAX_BUCKETS)
-            .is_err());
     }
 
     #[test]

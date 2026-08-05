@@ -148,7 +148,6 @@ class RunWindow(Protocol):
     Obtained from :meth:`MetricsSink.start_run_window` before the DAG runs. Starting the
     window captures baseline counters (wall clock, child-process CPU rusage, system-wide
     busy jiffies); :meth:`finish` computes the deltas and appends a single summary row.
-    Ported from ``validate_perflog.PerfWindow`` (``start`` / ``finish``).
     """
 
     def finish(
@@ -174,15 +173,14 @@ class RunWindow(Protocol):
 class MetricsSink(Protocol):
     """Durable recording of per-step and whole-run measurements.
 
-    Carries the fixed run context (e.g. project directory, git SHA, machine id) as
-    construction state, so the scheduler passes only the varying per-call data. Ported
-    from the ``validate_perflog`` sink surface (``append_step_profiles`` + the ``PerfWindow``
-    whole-run window API). A file-backed sink writes CSVs; a stub sink records nothing.
+    Carries the fixed run context (for example project directory, commit identifier, and machine
+    identity) as construction state, so the scheduler passes only varying per-call data. A
+    file-backed sink writes CSVs; a no-op sink records nothing.
     """
 
     def start_run_window(self) -> RunWindow:
         """Open (and start) the whole-run measurement bracket. Call once, immediately
-        before the DAG runs; :meth:`RunWindow.finish` closes it after. A stub sink returns
+        before the DAG runs; :meth:`RunWindow.finish` closes it after. A no-op sink returns
         a window whose ``finish`` is a no-op returning ``None``.
         """
         ...

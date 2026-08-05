@@ -24,6 +24,8 @@ make check
 make test
 python3 -m mypy cross/differential.py
 python3 cross/differential.py --tool safe-ci-dag-runner
+make cross
+make check-packages
 ```
 
 A PR is allowed only for one of these explicit reasons:

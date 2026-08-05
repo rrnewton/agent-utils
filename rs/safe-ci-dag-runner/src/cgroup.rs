@@ -53,11 +53,10 @@ const DEFAULT_CPU_BUDGET_FRACTION: f64 = 0.90;
 /// Generous last-resort run boundary, leaving memory for neighbours and the OS.
 const DEFAULT_MEMORY_BUDGET_FRACTION: f64 = 0.90;
 
-// Per-step containment: create, cap, measure, and tear down a child cgroup per step.
-//
-// The object-safe Rust analogue of Python's `CgroupManager` protocol; a single manager is
-// shared across the run (behind an `Arc`). Every method is `&self` (state lives on cgroupfs,
-// so no interior mutability is needed).
+/// Per-step containment operations used by the scheduler.
+///
+/// A single manager is shared across a run. Implementations create, cap, measure, and tear down
+/// one child cgroup per step while keeping host-specific state outside the scheduler.
 pub trait CgroupManager: Send + Sync {
     /// Whether per-step containment is actually usable on this host.
     fn enabled(&self) -> bool;
@@ -252,13 +251,11 @@ fn ensure_aggregate_slice(fraction: f64) -> bool {
     matches!((start, set), (Ok(a), Ok(b)) if a.status.success() && b.status.success())
 }
 
-// Re-exec this process inside a transient `systemd-run --user --scope` (a delegated cgroup).
-//
-// On success `exec` REPLACES this process and never returns. The bool return distinguishes the
-// non-exec paths, matching Python's `reexec_in_scope`:
-// * `true`  — already in-scope (anti-recursion) or intentionally skipped in CI: proceed.
-// * `false` — systemd scope unavailable or the exec failed: the caller must refuse to run
-//   advisory-only (No Silent Failure — the reason is on stderr).
+/// Re-execute this process inside a delegated transient user scope.
+///
+/// A successful `exec` replaces the process and does not return. A `true` return means the process
+/// was already in scope or scope setup is intentionally skipped in CI. A `false` return means the
+/// caller must refuse to continue because the requested containment could not be established.
 pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool {
     if in_scope() {
         return true;

@@ -4,8 +4,9 @@
 cargo install pr-landing-planner
 ```
 
-Live collection also requires `gh` and `git` on `PATH`. For library use,
-declare the dependency and import it as `pr_landing_planner`:
+Rust 1.85 or newer is required. Live collection also requires `gh` and `git` on
+`PATH`. For library use, declare the dependency and import it as
+`pr_landing_planner`:
 
 ```toml
 [dependencies]

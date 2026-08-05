@@ -11,15 +11,15 @@ comments and multi-line block-scalar descriptions. `--dag` auto-detects the form
 (`.yaml`/`.yml` → YAML, else JSON), so you can point `run`/`list`/`ascii`/`dot`/`json`/`yaml` at
 either file. See `02-diamond.yaml` for what a literate DAG looks like.
 
-Run any of them with either build (they behave identically — that parity is enforced by
-`cross/differential.py`):
+Run an example with the installed command:
 
 ```sh
-# Python (no build needed):
-python3 -m safe_ci_dag_runner run --dag examples/01-linear-chain.json --allow-cgroup-failure
-# or, once installed / built:
 safe-ci-dag-runner run --dag examples/01-linear-chain.json --allow-cgroup-failure
 ```
+
+From a source checkout, run `./setup` first and use
+`./bin/safe-ci-dag-runner` in place of the installed command. The repository's
+behavioral differential runs the same examples against both implementations.
 
 **Why `--allow-cgroup-failure`?** Boxing each step in its own Linux cgroup-v2 sandbox is this
 tool's whole point, so `run` **boxes by default**: it re-execs the run inside a transient
@@ -83,9 +83,8 @@ two e2e steps run one-after-another even though both are ready — while the ord
 (which needs no browser) runs alongside whichever e2e step currently holds the browser.
 
 `browser` here is just a **name you chose** — the caps are arbitrary caller-defined strings, not a
-built-in. It models any scarce thing that cannot be shared concurrently (in DeepScry it serializes
-Playwright/browser end-to-end tests, which grab fixed ports and a display). You could equally cap
-`"gpu"`, `"db"`, or `"licenses"`.
+built-in. It can serialize browser end-to-end tests that share fixed ports or a display. You could
+equally cap `"gpu"`, `"db"`, or `"licenses"`.
 
 ```sh
 safe-ci-dag-runner run --dag examples/03-scarce-resource-browser.json --allow-cgroup-failure
@@ -164,6 +163,5 @@ host with a systemd user session to get real per-step boxing, which also fills i
 
 ## See also
 
-- `common/docs/safe-ci-dag-runner/README.template.md` — the shared tool overview.
-- `safe-ci-dag-runner --userguide` — the complete installed reference for your edition.
+- `safe-ci-dag-runner --userguide` — the complete installed reference.
 - `safe-ci-dag-runner quickstart` — the same getting-started tour from the command line.

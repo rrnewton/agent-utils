@@ -608,7 +608,8 @@ def run_dag(
     :param jobs: outer scheduler fan-out (``-j``); clamped to at least 1.
     :param cgroups: per-step containment manager, or ``None`` for the no-containment path
         (a :class:`_NoopCgroupManager` is substituted; teardown falls back to process-group
-        kill). A present-but-disabled manager triggers a visible degraded-enforcement warning.
+        kill). The function does not establish an outer cgroup scope itself. A
+        present-but-disabled manager triggers a visible degraded-enforcement warning.
     :param metrics: durable measurement sink, or ``None`` for no recording.
     :param keep_going: on a failure, let already-running steps finish instead of eager-cancelling
         them; the scheduler still stops launching new steps (it does NOT run every still-runnable
@@ -623,8 +624,7 @@ def run_dag(
     sink: MetricsSink = metrics if metrics is not None else _NoopMetricsSink()
     manager: CgroupManager = cgroups if cgroups is not None else _NoopCgroupManager()
     if cgroups is not None and not cgroups.enabled:
-        # No Silent Failure: DeepScry silently collapses a disabled manager to "no cgroups";
-        # make the degraded enforcement visible instead.
+        # A supplied manager represents requested containment, so expose degraded enforcement.
         _warn(
             "per-step cgroup manager is present but disabled; containment is DEGRADED "
             "(falling back to process-group kill for teardown, no inner memory/CPU caps)."

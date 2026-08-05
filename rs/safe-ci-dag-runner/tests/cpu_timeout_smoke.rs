@@ -1,15 +1,8 @@
-// Integration smoke test: prove the Rust `run`'s cgroup boxing actually ENFORCES a per-step
-// CPU-time budget, at parity with the Python runner.
-//
-// `cpu_timeout` is a load-invariant per-step ceiling on consumed user+system CPU (read from the
-// step's cgroup `cpu.stat` `usage_usec`). This test runs the built binary on a DAG whose single
-// step busy-loops forever with a tiny `cpu_timeout`; under real two-level cgroup-v2 boxing the
-// monitor thread reaps the step once it burns past its budget, so the run fails with a
-// `CPU-TIMEOUT` reason well before its (much larger) wall `timeout`.
-//
-// Like the memory OOM smoke test, cgroup boxing is environment-dependent. When boxing genuinely
-// cannot be established the default `run` exits 3; this test then prints a LOUD, explicit skip
-// notice (never a silent skip) and returns.
+//! Integration smoke test for enforcement of a per-step CPU-time budget.
+//!
+//! `cpu_timeout` is a load-invariant ceiling on consumed user and system CPU. The test runs a
+//! busy-looping step and requires the cgroup monitor to reap it as a `CPU-TIMEOUT` before its much
+//! larger wall timeout. Hosts without delegated cgroup support report an explicit skip.
 
 use std::io::Write;
 use std::process::Command;

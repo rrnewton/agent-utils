@@ -57,13 +57,16 @@ fn err<T>(msg: String) -> Result<T, SummaryError> {
     Err(SummaryError(msg))
 }
 
-// A bounded, mergeable profile summary for ONE `(machine_id, container_class)` identity. Mirrors
-// Python's `Summary`.
+/// A bounded, mergeable profile summary for one machine and container-class identity.
 #[derive(Debug, Clone)]
 pub struct Summary {
+    /// On-disk schema version.
     pub version: i64,
+    /// Stable machine identifier used to select compatible samples.
     pub machine_id: String,
+    /// Stable CPU-affinity and quota class used to select compatible samples.
     pub container_class: String,
+    /// Bounded sample reservoirs keyed by step tag and inner-job width.
     pub buckets: HashMap<BucketKey, Vec<Sample>>,
 }
 
@@ -164,7 +167,7 @@ pub fn empty(machine_id: &str, container_class: &str) -> Summary {
     }
 }
 
-// Build a bounded summary from raw profile `rows`. Mirrors Python's `summary_from_rows`.
+/// Build a bounded summary from raw profile rows.
 pub fn summary_from_rows(
     rows: &[HashMap<String, String>],
     machine_id: &str,
@@ -207,9 +210,10 @@ pub fn summary_from_store(
     }
 }
 
-// Merge two same-identity summaries: union each bucket's reservoirs and subsample back to
-// `reservoir_cap` by the content-derived stable order. Deterministic, COMMUTATIVE, ASSOCIATIVE.
-// Errors on an identity mismatch. Mirrors Python's `merge`.
+/// Merge two summaries with the same identity into bounded sample reservoirs.
+///
+/// The operation is deterministic, commutative, and associative. An identity mismatch returns an
+/// error rather than combining incompatible measurements.
 pub fn merge(
     a: &Summary,
     b: &Summary,
@@ -261,9 +265,10 @@ pub fn merge_all(
 
 // --------------------------------------------------------------------------- serialization
 
-// Canonical, byte-identical (py<->rs) JSON for a summary (2-space indent). Buckets sorted by
-// `(step, inner_jobs)`; samples in canonical content order; floats as fixed 3-decimal strings.
-// Mirrors Python's `to_json`.
+/// Serialize a summary to canonical two-space-indented JSON.
+///
+/// Buckets and samples use stable content order, and floating-point values use fixed three-decimal
+/// strings.
 pub fn to_json(summary: &Summary) -> String {
     let mut lines: Vec<String> = vec![
         "{".to_string(),
@@ -394,8 +399,7 @@ fn opt_int(
     }
 }
 
-// Parse a canonical summary document (strict narrowing; unknown version / malformed shape rejected).
-// Mirrors Python's `from_json`.
+/// Parse a canonical summary document with strict shape and version validation.
 pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
     let raw: Value = serde_json::from_str(text)
         .map_err(|e| SummaryError(format!("invalid summary JSON: {e}")))?;
@@ -455,8 +459,7 @@ pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
 
 // --------------------------------------------------------------------------- estimate recompute
 
-// Recompute per-step duration + memory estimates from a summary's reservoirs (same estimator core
-// as the CSV reader). Mirrors Python's `step_samples_from_summary`.
+/// Recompute per-step duration and memory estimates from summary reservoirs.
 pub fn step_samples_from_summary(summary: &Summary) -> HashMap<String, StepSamples> {
     step_samples_from_buckets(&summary.buckets)
 }
@@ -471,8 +474,7 @@ pub fn step_speedups_from_summary(
     step_speedups_from_buckets(&summary.buckets, budget)
 }
 
-// `(bucket_count, total_samples, max_bucket_samples)` — the bounded-size witness. Mirrors
-// Python's `summary_stats`.
+/// Return `(bucket_count, total_samples, largest_bucket_samples)`.
 pub fn summary_stats(summary: &Summary) -> (usize, usize, usize) {
     let bucket_count = summary.buckets.len();
     let total: usize = summary.buckets.values().map(|v| v.len()).sum();

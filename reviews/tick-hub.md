@@ -3,6 +3,9 @@
 An agent that did not author the initial port reviewed both implementations,
 their public docs, and their independently built packages.
 
+This review record entered the repository with implementation commit
+`5ef91c55036227b5dc2997ef069784f337b4cc5e`.
+
 ## Findings resolved
 
 1. Malformed or reserved YAML state could leak a parser traceback. Both paths

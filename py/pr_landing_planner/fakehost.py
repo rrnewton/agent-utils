@@ -203,9 +203,13 @@ class FakeHost:
 
     # --- VcsHost protocol -------------------------------------------------
     def list_open_prs(self, repo: str, base: str | None) -> tuple[RawPr, ...]:
+        """Return fixture PRs in their declared order."""
+
         return tuple(p.raw for p in self._prs)
 
     def prefetch_refs(self, refspecs: Sequence[tuple[str, str]]) -> dict[str, str]:
+        """Resolve requested fixture refs to their deterministic object IDs."""
+
         return {dest: self._resolve_source(source) for source, dest in refspecs}
 
     def _resolve_source(self, source: str) -> str:
@@ -222,6 +226,8 @@ class FakeHost:
         raise FixtureError(f"prefetch_refs: unrecognized source ref {source!r}")
 
     def merge_tree(self, left: str, right: str) -> tuple[str, ...]:
+        """Return fixture conflict paths for two object IDs."""
+
         left_pr = self._number_by_sha.get(left)
         right_pr = self._number_by_sha.get(right)
         left_base = left in self._base_ref_by_sha
@@ -235,6 +241,8 @@ class FakeHost:
         return ()
 
     def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Return whether the fixture declares the requested ancestry relation."""
+
         a = self._number_by_sha.get(ancestor)
         d = self._number_by_sha.get(descendant)
         if a is None or d is None:
@@ -242,10 +250,14 @@ class FakeHost:
         return (a, d) in self._ancestry
 
     def changed_files(self, base_sha: str, head_sha: str) -> frozenset[str]:
+        """Return the fixture's changed-file set for *head_sha*."""
+
         number = self._number_by_sha.get(head_sha)
         return self._by_number[number].changed_files if number is not None else frozenset()
 
     def commits_behind(self, head_sha: str, base_sha: str) -> int:
+        """Return the fixture's base-behind count for *head_sha*."""
+
         number = self._number_by_sha.get(head_sha)
         return self._by_number[number].commits_behind if number is not None else 0
 

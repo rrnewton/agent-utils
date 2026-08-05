@@ -98,6 +98,7 @@ class Planner(Enum):
 
     @classmethod
     def from_value(cls, text: str) -> "Planner | None":
+        """Return the planner named by ``text``, or ``None`` for an unknown value."""
         for planner in cls:
             if planner.value == text:
                 return planner
@@ -162,10 +163,8 @@ class Sample:
 def feedback_identity() -> tuple[str, str]:
     """The ``(machine_id, container_class)`` the feedback reader selects the store file by.
 
-    Derived from the current host (so a run learns from this machine's own history), unless the
-    :data:`MACHINE_ID_ENV` / :data:`CONTAINER_CLASS_ENV` overrides are set. Both builds resolve
-    this identically (the underlying :func:`perflog.machine_id` / :func:`perflog.container_class`
-    are already cross-checked to agree)."""
+    Values come from the current host unless :data:`MACHINE_ID_ENV` or
+    :data:`CONTAINER_CLASS_ENV` supplies an override."""
     machine_id = os.environ.get(MACHINE_ID_ENV) or perflog.machine_id()
     container_class = os.environ.get(CONTAINER_CLASS_ENV) or perflog.container_class()
     return machine_id, container_class
@@ -379,9 +378,9 @@ def sample_from_row(row: Mapping[str, str], affinity_width: int | None) -> Sampl
     The SINGLE extraction path: both the CSV readers (:func:`load_step_samples` /
     :func:`load_step_speedups`) and the mergeable summary
     (:func:`safe_ci_dag_runner.summary.summary_from_rows`) go through here, so a summary built from
-    a store yields byte-identical estimates to reading the store directly. A cell that fails the
-    strict cross-language parse (:func:`_parse_float` / :func:`_parse_int`) becomes ``None`` for that
-    field (never coerced); a negative value is dropped exactly as the direct readers drop it."""
+    a store yields the same estimates as reading the store directly. A cell that fails strict
+    numeric parsing becomes ``None`` for that field rather than being coerced; negative values are
+    discarded by both readers."""
     elapsed = _parse_float(row.get("elapsed_s"))
     elapsed_s = elapsed if (elapsed is not None and elapsed >= 0.0) else None
     user = _parse_float(row.get("user_s"))
@@ -728,6 +727,7 @@ class Plan:
     allocation: "Allocation | None" = None
 
     def by_tag(self) -> dict[str, PlanEntry]:
+        """Index plan entries by their step tags."""
         return {entry.tag: entry for entry in self.entries}
 
 
@@ -1297,10 +1297,10 @@ def _allocation_to_json(alloc: "Allocation | None") -> str:
 
 
 def plan_to_json(plan: Plan) -> str:
-    """Canonical, machine-readable plan JSON (2-space indent), byte-identical across builds.
+    """Return canonical, machine-readable plan JSON with two-space indentation.
 
-    Computed floats are emitted as fixed-3-decimal STRINGS (not JSON numbers), so parity does not
-    depend on float ``repr`` — only on the shared fixed-precision formatting. Steps are listed in
+    Computed floats are emitted as fixed-three-decimal strings rather than JSON numbers, so output
+    does not depend on platform float representation. Steps are listed in
     dispatch order. ``alloc_inner_jobs`` (per step) and the top-level ``allocation`` object are
     ``null`` for the non-allocating planners and populated under ``--planner cpa``."""
     by_tag = plan.by_tag()

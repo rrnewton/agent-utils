@@ -5,9 +5,9 @@ description: Build an idempotent, zoomable coordinator/subagent timeline with ca
 
 # agent-team-timeline
 
-Normalize Codex team rollouts into durable JSON/Markdown and a self-contained local SVG website.
-The model-spending summary stage is separated from token-free formatting, and content-addressed
-caches make refreshes incremental.
+Turn coordinator and subagent rollouts into durable JSON/Markdown and a self-contained local SVG
+website. The model-spending summary stage is separated from token-free formatting, and
+content-addressed caches make refreshes incremental.
 
 The CLI is the source of truth:
 

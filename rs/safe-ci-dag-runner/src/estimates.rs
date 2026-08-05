@@ -26,10 +26,9 @@ use crate::model::{DagConfig, ResourceHint, Step};
 use crate::perflog::{container_class, machine_id, parse_csv_line};
 use crate::sizing::schedulable_peak_mem_bytes_widths;
 
-// Environment overrides for the feedback identity (mirrors the Python constants). Let a test (or
-// a caller pinning heterogeneous-but-equivalent runners) force the
-// `step_profiles_<machine>_<container>.csv` the reader loads.
+/// Environment variable that overrides the machine component of the feedback identity.
 pub const MACHINE_ID_ENV: &str = "SAFE_CI_DAG_RUNNER_MACHINE_ID";
+/// Environment variable that overrides the container-class component of the feedback identity.
 pub const CONTAINER_CLASS_ENV: &str = "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS";
 
 /// Minimum recorded samples before the store overrides the DAG hint for a step.
@@ -51,17 +50,20 @@ const CONTENTION_PCT_COLUMNS: [&str; 3] =
 /// Which scheduling planner to use for dispatch ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Planner {
+    /// Dispatch longest estimated steps first, breaking ties by tag.
     GreedyLpt,
+    /// Dispatch by decreasing dependency-graph bottom level.
     CriticalPath,
     // CPA (Radulescu & van Gemund 2001): a two-phase moldable allocator that first picks each
     // step's inner-jobs width by balancing the critical path against the per-core area over the
     // MEASURED speedup curves, then list-schedules by critical-path order at the allocated widths.
     // See `common/docs/safe-ci-dag-runner/PLANNER_DESIGN.md`.
+    /// Allocate measured parallel widths before critical-path list scheduling.
     Cpa,
 }
 
 impl Planner {
-    // The canonical string form (matches the Python `Planner.<X>.value`).
+    /// Return the canonical command-line and serialized value.
     pub fn value(self) -> &'static str {
         match self {
             Planner::GreedyLpt => "greedy-lpt",
@@ -84,23 +86,33 @@ impl Planner {
 /// Aggregated store estimates for ONE step, from its recorded samples.
 #[derive(Debug, Clone)]
 pub struct StepSamples {
+    /// Fully qualified step tag.
     pub step: String,
+    /// Number of profile rows aggregated for the step.
     pub samples: i64,
+    /// Robust contention-adjusted wall-time estimate in seconds.
     pub est_duration_s: Option<f64>,
+    /// Robust high-water resident-memory estimate in bytes.
     pub rss_estimate_bytes: Option<i64>,
 }
 
-// ONE recorded per-step measurement reduced to exactly the fields the estimator + speedup model
-// consume — the atom of the mergeable profile summary ([`crate::summary`]). Mirrors Python's
-// `Sample`. `elapsed_s` (raw wall) + `contention` are kept separately (the intrinsic wall the
-// estimator medians is `elapsed_s * (1 - contention)`; see [`Sample::intrinsic_s`]).
+/// One recorded step measurement reduced to the fields consumed by the estimators.
+///
+/// Raw wall time and contention remain separate so [`Sample::intrinsic_s`] can calculate the
+/// uncontended duration used by robust aggregation.
 #[derive(Debug, Clone)]
 pub struct Sample {
+    /// Observed wall time in seconds, when recorded.
     pub elapsed_s: Option<f64>,
+    /// Clamped fraction of the sample attributed to ambient contention.
     pub contention: f64,
+    /// Total user plus system CPU time in seconds, when recorded.
     pub cpu_s: Option<f64>,
+    /// Observed average CPU concurrency, when recorded.
     pub effective_cores: Option<f64>,
+    /// Cgroup CPU throttling time in seconds, when recorded.
     pub throttled_s: Option<f64>,
+    /// Peak resident memory in bytes, when recorded.
     pub peak_bytes: Option<i64>,
 }
 
@@ -112,14 +124,13 @@ impl Sample {
     }
 }
 
-// The bucket key for the mergeable summary + the shared aggregation core: `(step, inner_jobs)`.
-// `inner_jobs` is `0` for a row whose `inner_jobs` cell is absent / unparseable / non-positive
-// (such rows still count toward [`step_samples_from_buckets`] but are excluded from
-// [`step_speedups_from_buckets`]). Mirrors Python's `BucketKey`.
+/// Aggregation key containing a step tag and its inner-job width.
+///
+/// Width zero represents a missing, invalid, or non-positive recorded width. Such samples still
+/// contribute to step estimates but are excluded from speedup-curve fitting.
 pub type BucketKey = (String, i64);
 
-// Reduce one raw profile row to the [`Sample`] the estimator consumes — the SINGLE extraction path
-// shared by the CSV readers and the summary builder (mirrors Python's `sample_from_row`).
+/// Reduce one raw profile row to the normalized sample consumed by all estimators.
 pub fn sample_from_row(row: &HashMap<String, String>, affinity: Option<i64>) -> Sample {
     let elapsed_s = parse_float(row.get("elapsed_s")).filter(|e| *e >= 0.0);
     let cpu_s = match (
@@ -147,8 +158,9 @@ fn row_inner_jobs(row: &HashMap<String, String>) -> i64 {
     }
 }
 
-// Group raw profile `rows` into per-`(step, inner_jobs)` sample lists (UNCAPPED). A row with no
-// `step` cell is skipped. Mirrors Python's `bucketize_rows`.
+/// Group raw profile rows into uncapped per-step, per-width sample lists.
+///
+/// Rows without a non-empty `step` cell are ignored.
 pub fn bucketize_rows(
     rows: &[HashMap<String, String>],
     affinity: Option<i64>,
@@ -168,9 +180,7 @@ pub fn bucketize_rows(
     buckets
 }
 
-// Aggregate per-`(step, inner_jobs)` sample buckets into per-step robust estimates (across ALL of a
-// step's widths). The shared core behind [`load_step_samples`] and the summary reader. Mirrors
-// Python's `step_samples_from_buckets`.
+/// Aggregate sample buckets into robust per-step estimates across every recorded width.
 pub fn step_samples_from_buckets(
     buckets: &HashMap<BucketKey, Vec<Sample>>,
 ) -> HashMap<String, StepSamples> {
@@ -206,7 +216,7 @@ pub fn step_samples_from_buckets(
 }
 
 /// The `(machine_id, container_class)` the feedback reader selects the store file by: the current
-/// host's, unless the env overrides are set. Both builds resolve this identically.
+/// host's identity unless the corresponding environment overrides are set.
 pub fn feedback_identity() -> (String, String) {
     let mid = std::env::var(MACHINE_ID_ENV)
         .ok()
@@ -396,9 +406,9 @@ pub(crate) fn load_store(
     Some((rows, affinity))
 }
 
-// Read the per-step profile CSV for `(machine_id, container_class)` under `profile_dir` and
-// aggregate the samples per step into robust estimates. Returns `{}` when the file is absent
-// (the caller then falls back to DAG hints). Mirrors Python's `load_step_samples`.
+/// Load and aggregate profile samples for one machine and container class.
+///
+/// Returns an empty map when the corresponding profile file is absent.
 pub fn load_step_samples(
     profile_dir: &Path,
     machine_id: &str,
@@ -422,26 +432,37 @@ const SPEEDUP_MAX_WORK_GROWTH: f64 = 1.5;
 /// A step needs at least this many DISTINCT inner_jobs levels (with wall data) to model a curve.
 const SPEEDUP_MIN_LEVELS: usize = 2;
 
-// One measured point on a step's speedup curve. Mirrors Python's `SpeedupLevel`.
+/// One measured point on a step's parallel speedup curve.
 #[derive(Debug, Clone)]
 pub struct SpeedupLevel {
+    /// Inner worker width used by the samples.
     pub inner_jobs: i64,
+    /// Number of wall-time samples contributing to this level.
     pub samples: i64,
+    /// Robust contention-adjusted wall time in seconds.
     pub wall_s: f64,
+    /// Robust total CPU time in seconds, when available.
     pub cpu_s: Option<f64>,
+    /// Robust observed CPU concurrency, when available.
     pub effective_cores: Option<f64>,
+    /// Robust throttling time in seconds, when available.
     pub throttled_s: Option<f64>,
+    /// Wall-time speedup relative to the narrowest measured level.
     pub speedup: f64,
 }
 
-// A step's fitted speedup curve across inner_jobs widths plus the recommended width. Mirrors
-// Python's `StepSpeedup`.
+/// A fitted step speedup curve and its recommended worker width.
 #[derive(Debug, Clone)]
 pub struct StepSpeedup {
+    /// Fully qualified step tag.
     pub step: String,
+    /// Narrowest measured inner-job width.
     pub baseline_inner_jobs: i64,
+    /// Widest measured width before the scaling knee or configured core limit.
     pub recommended_inner_jobs: i64,
+    /// Effective CPU concurrency measured at the recommended width.
     pub measured_effective_cores: Option<f64>,
+    /// Curve levels ordered by increasing inner-job width.
     pub levels: Vec<SpeedupLevel>,
 }
 
@@ -506,12 +527,11 @@ fn build_step_speedup(
     }
 }
 
-// Model each step's PARALLEL-SPEEDUP curve from its samples ACROSS inner_jobs widths. Mirrors
-// Python's `load_step_speedups`: groups by `(step, inner_jobs)`, derives a robust
-// contention-discounted wall plus the work-conservation signal (median `user_s`+`sys_s`),
-// `effective_cores`, and `throttled_s` per width, then fits the curve and a recommended width
-// (best wall within the knee and the machine's core budget, the affinity width from
-// `container_class`). Only steps with at least [`SPEEDUP_MIN_LEVELS`] widths get a model.
+/// Load and fit parallel speedup curves from a profile store.
+///
+/// Only steps with enough distinct positive widths receive a model. The recommended width remains
+/// within both the measured scaling knee and the machine core budget encoded by the container
+/// class.
 pub fn load_step_speedups(
     profile_dir: &Path,
     machine_id: &str,
@@ -524,9 +544,7 @@ pub fn load_step_speedups(
     step_speedups_from_buckets(&bucketize_rows(&rows, affinity), affinity)
 }
 
-// Fit each step's PARALLEL-SPEEDUP curve from per-`(step, inner_jobs)` sample buckets. The shared
-// core behind [`load_step_speedups`] and the summary reader. Mirrors Python's
-// `step_speedups_from_buckets`.
+/// Fit parallel speedup curves from normalized per-step, per-width buckets.
 pub fn step_speedups_from_buckets(
     buckets: &HashMap<BucketKey, Vec<Sample>>,
     core_budget: Option<i64>,
@@ -596,12 +614,19 @@ pub fn step_speedups_from_buckets(
 /// The resolved estimate + planner metadata for one step (what the plan display shows).
 #[derive(Debug, Clone)]
 pub struct PlanEntry {
+    /// Fully qualified step tag.
     pub tag: String,
+    /// Resolved step duration in seconds.
     pub est_duration_s: f64,
+    /// Source label for the duration estimate.
     pub est_source: String,
+    /// Resolved resident-memory estimate in bytes.
     pub rss_estimate_bytes: Option<i64>,
+    /// Source label for the memory estimate.
     pub rss_source: String,
+    /// Longest estimated path from this step to a sink, in seconds.
     pub bottom_level_s: f64,
+    /// Number of stored profile samples for this step.
     pub samples: i64,
     /// The learned parallel-speedup curve for this step, or `None` when the store has fewer than
     /// two inner_jobs widths for it.
@@ -612,29 +637,37 @@ pub struct PlanEntry {
     pub alloc_inner_jobs: Option<i64>,
 }
 
-// The CPA allocator's whole-DAG summary (`--planner cpa` only). Records the core budget it
-// balanced against, the area and critical-path terms, the makespan LOWER BOUND `max(T_CP, area/P)`
-// (Graham/Brent), the achieved MODELED makespan (a deterministic greedy list-schedule of the
-// allocated widths, always `>=` the lower bound), and WHY the gradient loop stopped. Mirrors
-// Python's `Allocation`. See `PLANNER_DESIGN.md` §5.8-5.9.
+/// Whole-DAG metrics produced by the parallel-width allocator.
 #[derive(Debug, Clone)]
 pub struct Allocation {
+    /// Total core budget used by allocation and simulation.
     pub core_budget: i64,
+    /// Sum of allocated width multiplied by modeled wall time.
     pub area_s: f64,
+    /// Work-area lower bound, `area_s / core_budget`.
     pub area_bound_s: f64,
+    /// Modeled duration of the allocated critical path.
     pub critical_path_s: f64,
+    /// Maximum of the work-area and critical-path lower bounds.
     pub lower_bound_s: f64,
+    /// Makespan from deterministic list-schedule simulation.
     pub modeled_makespan_s: f64,
+    /// Stable reason the allocation loop stopped widening steps.
     pub stop_reason: String,
 }
 
 /// A complete plan: per-step resolved estimates, the dispatch order, and the critical path.
 #[derive(Debug, Clone)]
 pub struct Plan {
+    /// Planner used to produce this result.
     pub planner: Planner,
+    /// Deterministic dispatch order of fully qualified step tags.
     pub order: Vec<String>,
+    /// Fully qualified tags on the estimated critical path.
     pub critical_path: Vec<String>,
+    /// Estimated critical-path duration in seconds.
     pub critical_path_length_s: f64,
+    /// Per-step estimates and allocation metadata.
     pub entries: Vec<PlanEntry>,
     /// The CPA allocator summary (`--planner cpa` only), else `None`.
     pub allocation: Option<Allocation>,
@@ -1014,9 +1047,10 @@ fn cpa_allocate(
     (widths, admissible, wall, stop_reason)
 }
 
-// The pure CPA allocator: pick each step's inner-jobs width to balance the critical path against
-// the per-core area over the measured speedup curves, subject to `P` and the RAM budget. Mirrors
-// Python's `allocate_widths`. See PLANNER_DESIGN.md.
+/// Allocate an inner-job width to every step using measured speedup curves.
+///
+/// The allocator balances critical-path reduction against total work while respecting the core
+/// and optional memory budgets.
 pub fn allocate_widths(
     cfg: &DagConfig,
     speedups: &HashMap<String, StepSpeedup>,
@@ -1188,13 +1222,10 @@ fn build_cpa_plan(
     }
 }
 
-// Resolve every step's estimate and build the plan for `planner` (mirrors Python's `build_plan`).
-//
-// `speedups` (from [`load_step_speedups`]) attaches each step's learned parallel-speedup curve for
-// the plan display. For `Planner::Cpa` it also DRIVES the allocator: each step's inner-jobs width
-// is chosen by [`allocate_widths`] over those curves, the dispatch order is the critical-path order
-// at the allocated weights `T_i(p_i)`, and an [`Allocation`] summary is attached. `core_budget`
-// (`P`) and `mem_budget` bound the allocation; the other planners ignore them.
+/// Resolve estimates and build a complete execution plan.
+///
+/// Speedup curves are attached for display. Under [`Planner::Cpa`] they also drive width allocation
+/// within the supplied core and memory budgets; the other planners use only dispatch ordering.
 pub fn build_plan(
     cfg: &DagConfig,
     store_samples: &HashMap<String, StepSamples>,
@@ -1255,10 +1286,10 @@ pub fn build_plan(
     }
 }
 
-// Return a copy of `cfg` whose per-step hints carry the plan's resolved estimates. `rss` is
-// overridden ONLY when the store won (mirrors Python's `apply_plan_to_config`). For a CPA plan
-// each step also gets `preferred_inner_jobs = alloc_inner_jobs` — the width the allocator chose —
-// so the step's command runs with that `-j` and its memory cap scales to that width.
+/// Return a configuration whose resource hints contain a plan's resolved estimates.
+///
+/// Stored memory replaces the original hint only when it was selected as the estimate source.
+/// Allocating plans also install each chosen inner-job width as the preferred width.
 pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
     let by_tag = plan.by_tag();
     let mut new_cfg = cfg.clone();
@@ -1393,10 +1424,10 @@ fn allocation_to_json(alloc: &Option<Allocation>) -> String {
     )
 }
 
-// Canonical, machine-readable plan JSON (2-space indent), byte-identical to Python's
-// `plan_to_json`. Computed floats are emitted as fixed-3-decimal STRINGS. `alloc_inner_jobs` (per
-// step) and the top-level `allocation` object are `null` for the non-allocating planners and
-// populated under `--planner cpa`.
+/// Serialize a plan to canonical two-space-indented JSON.
+///
+/// Computed floating-point values are fixed-three-decimal strings. Allocation fields are `null`
+/// for planners that do not allocate parallel widths.
 pub fn plan_to_json(plan: &Plan) -> String {
     let by_tag = plan.by_tag();
     let mut parts: Vec<String> = vec![
@@ -1451,7 +1482,7 @@ pub fn plan_to_json(plan: &Plan) -> String {
     parts.join("\n")
 }
 
-// A compact, human-readable plan for the terminal, byte-identical to Python's `plan_to_text`.
+/// Render a compact, deterministic plan table for a terminal.
 pub fn plan_to_text(plan: &Plan) -> String {
     let by_tag = plan.by_tag();
     let is_cpa = plan.allocation.is_some();

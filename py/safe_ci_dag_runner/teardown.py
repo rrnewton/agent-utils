@@ -189,11 +189,9 @@ def current_cgroup_path() -> Path | None:
 def outer_scope_cgroup(*, supervisor_name: str = "supervisor") -> Path | None:
     """Resolve the OUTER run scope's cgroup from this process's own cgroup, no shell-out.
 
-    Generic port of ``validate_cgroup.scope_cgroup_from_self``. When the runner lives in a
-    ``<scope>/<supervisor_name>`` child, the scope is the parent; if this process is already
-    at a ``*.scope`` leaf, that leaf IS the scope. Returns ``None`` when not inside a scope
-    (the caller then knows there is no outer scope to tear down — a visible ``None``, not a
-    silent skip).
+    When the runner lives in a ``<scope>/<supervisor_name>`` child, the scope is the parent; if this
+    process is already at a ``*.scope`` leaf, that leaf is the scope. Returns ``None`` when the
+    process is not inside a recognizable scope.
     """
     mine = current_cgroup_path()
     if mine is None:
@@ -206,7 +204,7 @@ def outer_scope_cgroup(*, supervisor_name: str = "supervisor") -> Path | None:
 
 
 # --------------------------------------------------------------------------------------
-# Signal-handler installer  (ports validate.py _install_scope_teardown)
+# Signal-handler installer
 # --------------------------------------------------------------------------------------
 
 
@@ -219,10 +217,9 @@ def install_scope_teardown(
 ) -> bool:
     """Install a SIGINT/SIGTERM handler that tears down the WHOLE outer scope, then exits.
 
-    Ports ``validate.py._install_scope_teardown``. THE GAP THIS CLOSES: killing only the
-    runner process leaves ``setsid``-escapee orphans (servers, browsers) alive in the scope
-    cgroup — killpg and systemd ``--collect`` both miss them. On signal we instead SIGKILL
-    the entire scope subtree atomically.
+    Killing only the runner process can leave ``setsid``-escapee orphans (servers or browsers)
+    alive in the scope cgroup because killpg and systemd ``--collect`` can miss them. On signal,
+    the handler instead SIGKILLs the entire scope subtree atomically.
 
     Provide EITHER a ``systemd_unit`` (a ``systemd --user`` transient scope, torn down with
     :func:`stop_systemd_scope`) OR a ``scope_cgroup`` path (a directly-delegated cgroup,
@@ -423,9 +420,8 @@ def stop_leftover_scopes(
 ) -> int:
     """Stop leftover ``systemd --user`` transient scopes that belong to ``cwd``.
 
-    Generic port of ``kill_zombie_processes.stop_my_validate_scopes``. A ``systemctl stop``
-    kills a scope's WHOLE cgroup including ``setsid`` escapees the per-PID scan misses.
-    CROSS-CHECKOUT SAFE: a scope is stopped only when one of its processes has a
+    A ``systemctl stop`` kills a scope's whole cgroup, including ``setsid`` escapees that a per-PID
+    scan misses. A scope is stopped only when one of its processes has a
     ``/proc/<pid>/cwd`` within ``cwd`` (walked RECURSIVELY, since cgroup-v2 ``cgroup.procs``
     is per-cgroup and a live orphan may sit in a per-step child cgroup while the scope's own
     ``cgroup.procs`` is empty); a concurrent scope rooted elsewhere is left untouched.

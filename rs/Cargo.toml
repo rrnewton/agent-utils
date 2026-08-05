@@ -4,7 +4,10 @@ members = ["safe-ci-dag-runner", "tick-hub", "pr-landing-planner"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/rrnewton/agent-utils"
 authors = ["Ryan Newton"]
+
+[workspace.lints.rust]
+missing_docs = "deny"

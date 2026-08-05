@@ -123,7 +123,7 @@ def outer_memory_max_bytes() -> int | None:
     The outer scope is a correctness boundary, not a per-step sizing model: it
     gets 90% of ``MemAvailable`` so the coordinator, neighbours, and kernel keep
     headroom. ``SAFE_CI_OUTER_MEMORY_MAX_BYTES`` can tighten this for a smaller
-    host or a mutation test, but cannot widen the derived boundary.
+    host or container, but cannot widen the derived boundary.
     """
     available = mem_available_bytes()
     if available is None or available <= 0:
@@ -1010,10 +1010,8 @@ def pick_least_busy_free_cores(
 
     Reads the allowed set (``sched_getaffinity``), samples per-CPU idle jiffies
     from ``/proc/stat`` over ``sample_s`` seconds, and returns the ``k`` cores
-    with the highest idle fraction — never a fixed core id, per the standing
-    benchmark rule (a fixed core may be busy). ``k`` is clamped to
-    ``[1, len(allowed)]``. Verified recipe (task
-    ``runner-cpu-affinity-single-core-runs``, 2026-08-04).
+    with the highest idle fraction rather than assuming a fixed core is free.
+    ``k`` is clamped to ``[1, len(allowed)]``.
 
     ``exclude`` removes cores already HELD by a concurrent reservation BEFORE
     ranking, so the least-busy heuristic (which prevents over-use) is composed
@@ -1167,9 +1165,8 @@ class Cgroups:
       * :meth:`kill` SIGKILLs the step's whole subtree (setsid-proof).
       * :meth:`cleanup` removes the now-empty child cgroup dir (best-effort).
 
-    Ported from ``validate_cgroup.StepCgroups``. Per No Silent Failure, every
-    best-effort cgroupfs write that would drop a requested cap now emits a
-    visible warning via :func:`_warn` instead of swallowing the ``OSError``.
+    Every best-effort cgroupfs write that would drop a requested cap emits a visible warning via
+    :func:`_warn` instead of swallowing the ``OSError``.
     """
 
     def __init__(self, naming: ScopeNaming = DEFAULT_NAMING) -> None:
@@ -1463,30 +1460,39 @@ class NoopCgroups:
         mem_max: int | None = None,
         cpu_count: int | None = None,
     ) -> str:
+        """Return ``cmd`` unchanged because containment is disabled."""
         return cmd
 
     def kill(self, tag: str) -> bool:
+        """Report that no cgroup subtree was available to kill."""
         return False
 
     def cleanup(self, tag: str) -> None:
+        """Perform no cleanup because no child cgroup was created."""
         return None
 
     def oom_kills(self, tag: str) -> int:
+        """Return zero because no cgroup OOM counter is available."""
         return 0
 
     def peak_bytes(self, tag: str) -> int | None:
+        """Return ``None`` because no cgroup memory peak is available."""
         return None
 
     def cpu_stats(self, tag: str) -> Mapping[str, int] | None:
+        """Return ``None`` because no cgroup CPU counters are available."""
         return None
 
     def cpu_pressure(self, tag: str) -> Mapping[str, float] | None:
+        """Return ``None`` because no cgroup pressure data is available."""
         return None
 
     def thread_count(self, tag: str) -> int | None:
+        """Return ``None`` because no cgroup thread count is available."""
         return None
 
     def kill_all_remaining(self) -> int:
+        """Return zero because this manager owns no child cgroups."""
         return 0
 
 

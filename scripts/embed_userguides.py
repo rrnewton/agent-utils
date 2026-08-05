@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Render standalone package documentation from shared templates.
+"""Render and link standalone package documentation from shared sources.
 
 Each tool keeps language-neutral prose in ``common/docs/<tool>/*.template.md``
 and distribution-specific prose in ``common/docs/<tool>/fragments/<language>/``.
-The rendered README and user guide live inside each distributable package so
-they survive installation.  Generated files are committed artifacts; edit the
-templates or fragments, then run this script.
+Rendered README and user-guide files live under ``common/docs``.  Package trees
+link to those committed artifacts; package builders dereference the links so
+installed wheels and crates remain self-contained.  Edit templates, fragments,
+or a single-language source document, then run this script.
 
 Usage:
   python3 scripts/embed_userguides.py
@@ -15,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from collections.abc import Sequence
@@ -55,14 +57,29 @@ def _renders() -> tuple[Render, ...]:
     for tool, py_package, rust_crate in TOOLS:
         rendered.extend(
             (
-                Render(tool, "README", "python", f"py/{py_package}/README.md"),
-                Render(tool, "USER_GUIDE", "python", f"py/{py_package}/USER_GUIDE.md"),
-                Render(tool, "README", "rust", f"rs/{rust_crate}/README.md"),
+                Render(
+                    tool,
+                    "README",
+                    "python",
+                    f"common/docs/{tool}/rendered/python/README.md",
+                ),
+                Render(
+                    tool,
+                    "USER_GUIDE",
+                    "python",
+                    f"common/docs/{tool}/rendered/python/USER_GUIDE.md",
+                ),
+                Render(
+                    tool,
+                    "README",
+                    "rust",
+                    f"common/docs/{tool}/rendered/rust/README.md",
+                ),
                 Render(
                     tool,
                     "USER_GUIDE",
                     "rust",
-                    f"rs/{rust_crate}/src/embedded_userguide.md",
+                    f"common/docs/{tool}/rendered/rust/USER_GUIDE.md",
                 ),
             )
         )
@@ -80,6 +97,22 @@ COMMON_FORBIDDEN: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("source-tree docs path", re.compile(r"common/docs/", re.IGNORECASE)),
     ("source-tree script", re.compile(r"scripts/embed_userguides\.py", re.IGNORECASE)),
     ("internal incident identifier", re.compile(r"\bds-[a-z0-9]+\b", re.IGNORECASE)),
+    (
+        "development-history language",
+        re.compile(
+            r"\b(?:prototype|roadmap|formerly|previously|planned|not yet|legacy|historical|"
+            r"predates?|follow-on|stub)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "implementation-provenance language",
+        re.compile(
+            r"\b(?:ported|parity|cross-language|both builds?)\b|"
+            r"\b(?:direct|generic|typed)?\s*port of\b",
+            re.IGNORECASE,
+        ),
+    ),
 )
 
 LANGUAGE_FORBIDDEN: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
@@ -103,22 +136,85 @@ LANGUAGE_FORBIDDEN: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
 
 
 @dataclass(frozen=True)
-class DirectCopy:
-    """One prototype guide copied verbatim outside the paired-doc contract."""
+class StandaloneDocument:
+    """One authoritative single-language document that must remain standalone."""
 
+    tool: str
+    document: str
+    language: str
     source: str
+
+
+@dataclass(frozen=True)
+class PackageLink:
+    """One repository symlink from a package tree to an authoritative file."""
+
     destination: str
+    target: str
+
+    @property
+    def relative_target(self) -> str:
+        return os.path.relpath(self.target, start=str(Path(self.destination).parent))
 
 
-# agent-team-timeline is being developed concurrently and is deliberately not
-# yet part of the Python/Rust template and standalone-package contract. Keep its
-# existing single-source guide synchronized without pretending it is paired.
-DIRECT_COPIES: tuple[DirectCopy, ...] = (
-    DirectCopy(
+STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
+    StandaloneDocument(
+        tool="agent-team-timeline",
+        document="README",
+        language="python",
+        source="common/docs/agent-team-timeline/README.md",
+    ),
+    StandaloneDocument(
+        tool="agent-team-timeline",
+        document="USER_GUIDE",
+        language="python",
         source="common/docs/agent-team-timeline/USER_GUIDE.md",
-        destination="py/agent_team_timeline/USER_GUIDE.md",
     ),
 )
+
+
+def _package_links() -> tuple[PackageLink, ...]:
+    links: list[PackageLink] = []
+    for tool, py_package, rust_crate in TOOLS:
+        links.extend(
+            (
+                PackageLink(
+                    f"py/{py_package}/README.md",
+                    f"common/docs/{tool}/rendered/python/README.md",
+                ),
+                PackageLink(
+                    f"py/{py_package}/USER_GUIDE.md",
+                    f"common/docs/{tool}/rendered/python/USER_GUIDE.md",
+                ),
+                PackageLink(
+                    f"rs/{rust_crate}/README.md",
+                    f"common/docs/{tool}/rendered/rust/README.md",
+                ),
+                PackageLink(
+                    f"rs/{rust_crate}/src/embedded_userguide.md",
+                    f"common/docs/{tool}/rendered/rust/USER_GUIDE.md",
+                ),
+                PackageLink(f"py/{py_package}/LICENSE", "LICENSE"),
+                PackageLink(f"rs/{rust_crate}/LICENSE", "LICENSE"),
+            )
+        )
+    links.extend(
+        (
+            PackageLink(
+                "py/agent_team_timeline/README.md",
+                "common/docs/agent-team-timeline/README.md",
+            ),
+            PackageLink(
+                "py/agent_team_timeline/USER_GUIDE.md",
+                "common/docs/agent-team-timeline/USER_GUIDE.md",
+            ),
+            PackageLink("py/agent_team_timeline/LICENSE", "LICENSE"),
+        )
+    )
+    return tuple(links)
+
+
+PACKAGE_LINKS = _package_links()
 
 
 def _read(relative: str) -> str:
@@ -141,7 +237,7 @@ def _render(item: Render) -> str:
     return template.replace(PLACEHOLDER, fragment).rstrip() + "\n"
 
 
-def _lint(item: Render, text: str) -> list[str]:
+def _lint(item: Render | StandaloneDocument, text: str) -> list[str]:
     errors: list[str] = []
     template_match = UNEXPANDED_TEMPLATE.search(text)
     if template_match is not None:
@@ -178,32 +274,58 @@ def _expected() -> tuple[tuple[Render, str], ...]:
     return tuple(expected)
 
 
-def _direct_expected() -> tuple[tuple[DirectCopy, str], ...]:
-    expected: list[tuple[DirectCopy, str]] = []
-    for item in DIRECT_COPIES:
+def _standalone_expected() -> tuple[tuple[StandaloneDocument, str], ...]:
+    expected: list[tuple[StandaloneDocument, str]] = []
+    for item in STANDALONE_DOCUMENTS:
         source = REPO_ROOT / item.source
         if not source.is_file():
             raise FileNotFoundError(f"documentation source missing: {item.source}")
-        expected.append((item, source.read_text(encoding="utf-8")))
+        text = source.read_text(encoding="utf-8")
+        errors = _lint(item, text)
+        if errors:
+            details = "\n".join(f"  - {error}" for error in errors)
+            raise ValueError(f"{item.source} is not standalone:\n{details}")
+        expected.append((item, text))
     return tuple(expected)
+
+
+def _replace_with_link(item: PackageLink) -> None:
+    destination = REPO_ROOT / item.destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink() and os.readlink(destination) == item.relative_target:
+        return
+    if destination.exists() or destination.is_symlink():
+        if destination.is_dir() and not destination.is_symlink():
+            raise IsADirectoryError(f"package link destination is a directory: {item.destination}")
+        destination.unlink()
+    destination.symlink_to(item.relative_target)
+
+
+def _link_is_current(item: PackageLink) -> bool:
+    destination = REPO_ROOT / item.destination
+    target = REPO_ROOT / item.target
+    return (
+        destination.is_symlink()
+        and os.readlink(destination) == item.relative_target
+        and target.is_file()
+        and destination.resolve() == target.resolve()
+    )
 
 
 def generate() -> list[str]:
     """Render every package document and return the written paths."""
 
     rendered = _expected()
-    copied = _direct_expected()
+    _standalone_expected()
     written: list[str] = []
-    for item, text in rendered:
-        destination = REPO_ROOT / item.destination
+    for render, text in rendered:
+        destination = REPO_ROOT / render.destination
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(text, encoding="utf-8")
-        written.append(item.destination)
-    for copy, text in copied:
-        destination = REPO_ROOT / copy.destination
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(text, encoding="utf-8")
-        written.append(copy.destination)
+        written.append(render.destination)
+    for link in PACKAGE_LINKS:
+        _replace_with_link(link)
+        written.append(link.destination)
     return written
 
 
@@ -212,20 +334,20 @@ def check() -> tuple[list[str], list[str]]:
 
     stale: list[str] = []
     lint_errors: list[str] = []
-    for item, wanted in _expected():
-        destination = REPO_ROOT / item.destination
-        if not destination.is_file():
-            stale.append(item.destination)
+    for render, wanted in _expected():
+        destination = REPO_ROOT / render.destination
+        if not destination.is_file() or destination.is_symlink():
+            stale.append(render.destination)
             continue
         actual = destination.read_text(encoding="utf-8")
         if actual != wanted:
-            stale.append(item.destination)
-        for error in _lint(item, actual):
-            lint_errors.append(f"{item.destination}: {error}")
-    for copy, wanted in _direct_expected():
-        destination = REPO_ROOT / copy.destination
-        if not destination.is_file() or destination.read_text(encoding="utf-8") != wanted:
-            stale.append(copy.destination)
+            stale.append(render.destination)
+        for error in _lint(render, actual):
+            lint_errors.append(f"{render.destination}: {error}")
+    _standalone_expected()
+    for link in PACKAGE_LINKS:
+        if not _link_is_current(link):
+            stale.append(link.destination)
     return stale, lint_errors
 
 
@@ -254,8 +376,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         print(f"  {error}", file=sys.stderr)
                 return 1
             print(
-                f"embed_userguides: {len(RENDERS)} paired package documents are current and "
-                f"standalone; {len(DIRECT_COPIES)} prototype guide is current"
+                f"embed_userguides: {len(RENDERS)} paired documents and "
+                f"{len(STANDALONE_DOCUMENTS)} single-language documents are current, standalone, "
+                f"and linked through {len(PACKAGE_LINKS)} package paths"
             )
             return 0
 
@@ -264,7 +387,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"embed_userguides: {error}", file=sys.stderr)
         return 1
 
-    print(f"embed_userguides: rendered {len(written)} document(s):")
+    print(f"embed_userguides: refreshed {len(written)} rendered files and package links:")
     for path in written:
         print(f"  {path}")
     return 0

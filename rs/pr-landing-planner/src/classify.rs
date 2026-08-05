@@ -291,34 +291,8 @@ pub fn select_latest_checks(raw: &Value, head_sha: &str) -> Vec<Value> {
             );
             continue;
         };
-        if candidate_key > previous.recency {
-            latest.insert(
-                key,
-                SelectedCheck {
-                    recency: candidate_key,
-                    index,
-                    check: obj.clone(),
-                },
-            );
-        } else if candidate_key == previous.recency {
-            if outcome_identity(&previous.check) != outcome_identity(obj) {
-                latest.insert(
-                    key,
-                    SelectedCheck {
-                        recency: candidate_key,
-                        index: previous.index.max(index),
-                        check: json!({
-                            "name": context,
-                            "status": "AMBIGUOUS",
-                            "conclusion": "",
-                            "_selectionError": "duplicate check context has equal ordering identity and contrary verdicts",
-                        })
-                        .as_object()
-                        .expect("object literal")
-                        .clone(),
-                    },
-                );
-            } else if index > previous.index {
+        match candidate_key.cmp(&previous.recency) {
+            std::cmp::Ordering::Greater => {
                 latest.insert(
                     key,
                     SelectedCheck {
@@ -328,6 +302,36 @@ pub fn select_latest_checks(raw: &Value, head_sha: &str) -> Vec<Value> {
                     },
                 );
             }
+            std::cmp::Ordering::Equal => {
+                if outcome_identity(&previous.check) != outcome_identity(obj) {
+                    latest.insert(
+                        key,
+                        SelectedCheck {
+                            recency: candidate_key,
+                            index: previous.index.max(index),
+                            check: json!({
+                                "name": context,
+                                "status": "AMBIGUOUS",
+                                "conclusion": "",
+                                "_selectionError": "duplicate check context has equal ordering identity and contrary verdicts",
+                            })
+                            .as_object()
+                            .expect("object literal")
+                            .clone(),
+                        },
+                    );
+                } else if index > previous.index {
+                    latest.insert(
+                        key,
+                        SelectedCheck {
+                            recency: candidate_key,
+                            index,
+                            check: obj.clone(),
+                        },
+                    );
+                }
+            }
+            std::cmp::Ordering::Less => {}
         }
     }
     order
