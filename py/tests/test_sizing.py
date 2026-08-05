@@ -92,3 +92,47 @@ def test_jobs_for_budget_monotonic_and_at_least_one() -> None:
     assert jobs_for_budget(cfg, 6 * GIB) == (1, 4 * GIB)
     # a budget below even -j1 still returns 1 (a WAIT/abort decision for the caller).
     assert jobs_for_budget(cfg, 1 * GIB)[0] == 1
+
+
+def test_stress_copy_footprint_sums_declared_and_default_charges() -> None:
+    # Per-copy footprint sums each step's cap: a declared hard cap verbatim, an rss_baseline
+    # scaled by mem_cap_factor, and an UNDECLARED step charged the SMALL default (1 GiB).
+    from safe_ci_dag_runner.model import DEFAULT_SMALL_MEM_CAP_BYTES, DagConfig, ResourceHint, Step
+    from safe_ci_dag_runner.sizing import stress_copy_footprint_bytes
+
+    cfg = DagConfig(
+        steps=(
+            Step("g", "hard", "d", "true", hint=ResourceHint(hard_mem_max_bytes=2 * 1024**3)),
+            Step("g", "base", "d", "true", hint=ResourceHint(rss_baseline_bytes=1024**3)),
+            Step("g", "bare", "d", "true"),  # undeclared -> SMALL default charge
+        ),
+        mem_cap_factor=1.25,
+    )
+    got = stress_copy_footprint_bytes(cfg)
+    expected = (2 * 1024**3) + int(1024**3 * 1.25) + DEFAULT_SMALL_MEM_CAP_BYTES
+    assert got == expected
+
+
+def test_stress_copy_footprint_single_node_is_that_node_cap() -> None:
+    from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
+    from safe_ci_dag_runner.sizing import stress_copy_footprint_bytes
+
+    cfg = DagConfig(
+        steps=(Step("dbi", "file_metadata", "d", "true",
+                    hint=ResourceHint(hard_mem_max_bytes=3 * 1024**3)),)
+    )
+    assert stress_copy_footprint_bytes(cfg) == 3 * 1024**3
+
+
+def test_box_mem_budget_is_min_of_readable_signals() -> None:
+    # On any Linux host with /proc/meminfo, the budget is a positive int no larger than
+    # MemAvailable (the min-of-signals rule never returns MORE than the free-memory signal).
+    from safe_ci_dag_runner.sizing import box_mem_budget_bytes, mem_available_bytes
+
+    budget = box_mem_budget_bytes()
+    avail = mem_available_bytes()
+    if budget is None:
+        return  # host without the cgroup/proc files: nothing to assert
+    assert budget > 0
+    if avail is not None:
+        assert budget <= avail

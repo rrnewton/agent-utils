@@ -61,7 +61,7 @@ from safe_ci_dag_runner.model import (
     step_classification,
 )
 from safe_ci_dag_runner.profile_enrich import container_core_budget
-from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink
+from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink, StepOutcome
 from safe_ci_dag_runner.scheduler import run_dag
 from safe_ci_dag_runner.sizing import jobs_for_budget, parse_size
 from safe_ci_dag_runner.viz import to_ascii, to_dot
@@ -132,6 +132,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} run --dag dag.json')}               {c.dim('# run it; exit 0 iff all steps pass')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --profile')}     {c.dim('# ...and print a per-step profile table')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --only build.app')} {c.dim('# run EXACTLY one step (not its deps)')}\n"
+        f"  {ex(f'{PROG} run --dag dag.json --only dbi.file_metadata --stress 10')} {c.dim('# 10 parallel copies; prints the pass/fail RATIO')}\n"
         f"  {ex(f'{PROG} plan --dag dag.json --planner critical-path')} {c.dim('# show learned estimates + the plan')}\n"
         f"  {ex(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')} {c.dim('# parallel-speedup study')}\n"
         f"  {ex(f'{PROG} ascii --dag dag.json')}             {c.dim('# quick ASCII view of the graph')}\n"
@@ -320,6 +321,31 @@ def build_parser() -> argparse.ArgumentParser:
         "Dependency edges to steps OUTSIDE the selection are dropped (their outputs are assumed "
         "already present) - this is for profiling/experimenting on a step in isolation; it does "
         "NOT run the step's dependencies. Errors if a named tag does not exist.",
+    )
+    run_p.add_argument(
+        "--args",
+        default=None,
+        metavar="STRING",
+        help="forward these extra args to the test runner INSIDE a step. A step DECLARES that it "
+        "accepts passthrough by placing the reserved token '{args}' in its cmd (it also picks the "
+        "position); this STRING is substituted there verbatim (shell syntax, quote once). Use the "
+        "--args=... form when the string starts with '-' (e.g. --args='-k test_xyz --verbose'). "
+        "Combine with --only to scope a step down to one test case, then --stress N to multiply "
+        "it. Errors if no selected step declares '{args}'. A declared step with no --args runs "
+        "with the token removed.",
+    )
+    run_p.add_argument(
+        "--stress",
+        type=int,
+        default=None,
+        metavar="N",
+        help="STRESS mode: duplicate every selected step N times and run the copies IN PARALLEL "
+        "(combine with --only to stress a single suspect node, e.g. --only dbi.file_metadata). "
+        "Reports the per-copy PASS/FAIL RATIO (e.g. '7/10 passed') and which copies failed - the "
+        "ratio is the finding, so this implies --keep-going (every copy runs to a verdict). Cores "
+        "are plentiful, memory is the binding constraint: N is capped by the box memory budget "
+        "(N x per-copy footprint must fit) and an over-large N is REFUSED LOUDLY rather than "
+        "silently OOMing sibling work.",
     )
     run_p.add_argument(
         "--perf-dir",
@@ -904,6 +930,156 @@ def _filter_only(cfg: DagConfig, tags: Sequence[str]) -> DagConfig:
         if step.tag in selected
     )
     return dataclasses.replace(cfg, steps=new_steps)
+
+
+# --------------------------------------------------------------------------- --args passthrough
+#: Reserved token a step places in its ``cmd`` to DECLARE it accepts CLI passthrough args (and to
+#: pick WHERE they go). ``--args STRING`` is substituted here verbatim; a declared step run without
+#: ``--args`` has the token removed so it stays runnable. A plain string in the existing ``cmd``
+#: field, so DAGs round-trip byte-identically across the Python/Rust builds (no schema change).
+ARGS_PLACEHOLDER = "{args}"
+
+
+class _ArgsError(Exception):
+    """``--args`` was given but no selected step declares the ``{args}`` placeholder."""
+
+
+def _apply_passthrough_args(cfg: DagConfig, args: str | None) -> DagConfig:
+    """Forward ``--args`` into every selected step that DECLARES the ``{args}`` placeholder.
+
+    A step opts in by putting ``{args}`` in its ``cmd`` (the declaration, and the exact position).
+    Given ``--args STRING`` the token is replaced verbatim (shell syntax, quoted once by the user);
+    with no ``--args`` the token is removed so the declared step still runs. Steps without the token
+    are untouched. Raises :class:`_ArgsError` when ``--args`` is given but NO step declares it, so a
+    forwarded selection is never silently dropped (No Silent Failure)."""
+    replacement = args if args is not None else ""
+    any_declared = any(ARGS_PLACEHOLDER in step.cmd for step in cfg.steps)
+    if args is not None and not any_declared:
+        raise _ArgsError(
+            f"--args was given but no selected step declares the {ARGS_PLACEHOLDER!r} placeholder "
+            "in its cmd. Add {args} to the step's cmd where the extra args should go, or scope the "
+            "selection (--only) to a step that accepts them."
+        )
+    if not any_declared:
+        return cfg  # nothing to substitute; leave the DAG byte-identical
+    new_steps = tuple(
+        dataclasses.replace(step, cmd=step.cmd.replace(ARGS_PLACEHOLDER, replacement).strip())
+        if ARGS_PLACEHOLDER in step.cmd
+        else step
+        for step in cfg.steps
+    )
+    return dataclasses.replace(cfg, steps=new_steps)
+
+
+# --------------------------------------------------------------------------- --stress fan-out
+def _stress_suffix(index: int, count: int) -> str:
+    """Zero-padded copy suffix, e.g. copy 3 of 10 -> ``"#03"``. The width tracks ``count`` so the
+    copy tags sort lexicographically in copy order."""
+    width = len(str(count))
+    return f"#{index:0{width}d}"
+
+
+def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
+    """Return a DAG with every step of ``cfg`` DUPLICATED into ``n`` independent copies (shards).
+
+    Each shard is a full clone of the selected graph with a distinct ``#NN`` copy suffix appended
+    to every job (so tags stay unique and parseable) and its intra-shard dependency edges rewired
+    to the same shard's copies. Shards share no edges, so the scheduler runs all copies
+    concurrently (subject to ``-j`` and the shared ``resource_caps``). ``n <= 1`` is a no-op."""
+    if n <= 1:
+        return cfg
+    new_steps: list[Step] = []
+    for index in range(1, n + 1):
+        suffix = _stress_suffix(index, n)
+        for step in cfg.steps:
+            new_steps.append(
+                dataclasses.replace(
+                    step,
+                    job=f"{step.job}{suffix}",
+                    deps=[f"{dep}{suffix}" for dep in step.deps],
+                )
+            )
+    return dataclasses.replace(cfg, steps=tuple(new_steps))
+
+
+def _stress_guard(cfg: DagConfig, n: int) -> int:
+    """Derive the memory-safe ``--stress`` ceiling and REFUSE LOUDLY when ``n`` exceeds it.
+
+    ``cfg`` is the SELECTED (pre-expansion) graph, so its footprint is one copy's. ``n`` copies run
+    concurrently, so ``n x per-copy footprint`` must fit the box memory budget (the min of the
+    cgroup ``memory.max`` cap and ``MemAvailable``). Returns 0 to proceed, or 2 to abort the run
+    (bad usage). When the budget cannot be read, it warns loudly and proceeds (No Silent Failure)
+    rather than blocking a host without the cgroup/proc files."""
+    from safe_ci_dag_runner.sizing import box_mem_budget_bytes, stress_copy_footprint_bytes
+
+    footprint = stress_copy_footprint_bytes(cfg)
+    budget = box_mem_budget_bytes()
+    if budget is None:
+        print(
+            f"{PROG}: --stress {n}: WARNING could not read the box memory budget "
+            f"(cgroup memory.max / MemAvailable); proceeding UNCHECKED with "
+            f"{n} x {_human_bytes(footprint)}/copy = {_human_bytes(n * footprint)}. "
+            "Watch for OOM.",
+            file=sys.stderr,
+        )
+        return 0
+    max_safe = budget // footprint
+    if n > max_safe:
+        print(
+            f"{PROG}: --stress {n}: REFUSED — {n} parallel copies would exceed the box memory "
+            "budget.\n"
+            f"  requested copies:   {n}\n"
+            f"  per-copy footprint: {_human_bytes(footprint)}\n"
+            f"  total needed:       {_human_bytes(n * footprint)}\n"
+            f"  box memory budget:  {_human_bytes(budget)} (min of cgroup memory.max + MemAvailable)\n"
+            f"  max safe --stress:  {max_safe}\n"
+            f"Re-run with --stress <= {max_safe} (cores are plentiful; memory is the binding "
+            "constraint), or lower the per-copy footprint via a tighter per-step rss_baseline_bytes "
+            "/ hard_mem_max_bytes hint.",
+            file=sys.stderr,
+        )
+        return 2
+    print(
+        f"{PROG}: --stress {n}: OK — {n} x {_human_bytes(footprint)}/copy = "
+        f"{_human_bytes(n * footprint)} fits the box memory budget {_human_bytes(budget)} "
+        f"(max safe {max_safe}); running copies in PARALLEL.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def _print_stress_report(rows: Sequence[StepOutcome], n: int, c: Palette) -> None:
+    """Print the per-copy PASS/FAIL RATIO for a ``--stress`` run — the ratio IS the finding.
+
+    Copies are grouped back to their original (base) step tag by stripping the ``#NN`` suffix;
+    each group reports ``passed/total`` and names the copies that FAILED (and any that were
+    ABORTED before finishing, so a collapsed ratio is never mistaken for all-pass)."""
+    groups: dict[str, list[tuple[str, StepOutcome]]] = {}
+    for outcome in rows:
+        base, sep, idx = outcome.tag.rpartition("#")
+        if not sep:
+            base, idx = outcome.tag, ""
+        groups.setdefault(base, []).append((idx, outcome))
+
+    print(c.bold(f"stress results ({n} parallel copies per step):"))
+    for base, items in groups.items():
+        items.sort(key=lambda pair: pair[0])
+        total = len(items)
+        passed = sum(1 for _, o in items if o.ok)
+        failed = [idx for idx, o in items if not o.ok and not o.aborted]
+        aborted = [idx for idx, o in items if o.aborted]
+        ratio = f"{passed}/{total} passed"
+        line = c.green(ratio) if passed == total else c.red(ratio)
+        detail = ""
+        if failed:
+            detail += " — " + c.red(
+                f"{len(failed)} FAILED: " + ", ".join(f"#{i}" for i in failed)
+            )
+        if aborted:
+            detail += " — " + c.yellow(
+                f"{len(aborted)} aborted: " + ", ".join(f"#{i}" for i in aborted)
+            )
+        print(f"  {base}: {line}{detail}")
 
 
 # --------------------------------------------------------------------------- table rendering
@@ -1526,6 +1702,30 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             print(f"{PROG}: {exc}", file=sys.stderr)
             return 2
 
+    # Feature: --args — forward extra args into the selected step(s) that declare the {args}
+    # placeholder (scope a step down to specific test case(s)). Applied BEFORE --stress so the
+    # scoped command is what gets duplicated.
+    try:
+        cfg = _apply_passthrough_args(cfg, ns.args if isinstance(ns.args, str) else None)
+    except _ArgsError as exc:
+        print(f"{PROG}: run: {exc}", file=sys.stderr)
+        return 2
+
+    # Feature: --stress N — duplicate the selected step(s) N times and run the copies in PARALLEL,
+    # reporting the per-copy ratio. Derive the memory-safe N ceiling and REFUSE LOUDLY when the
+    # requested N would exceed the box memory budget, BEFORE any cgroup bring-up / re-exec (so a
+    # too-large N fails fast without needing a systemd scope).
+    stress_n = int(ns.stress) if getattr(ns, "stress", None) is not None else 1
+    if stress_n < 1:
+        print(f"{PROG}: run: --stress N must be >= 1 (got {stress_n})", file=sys.stderr)
+        return 2
+    stress_active = stress_n > 1
+    if stress_active:
+        code = _stress_guard(cfg, stress_n)
+        if code != 0:
+            return code
+        cfg = _expand_stress(cfg, stress_n)
+
     cgroups, code = _resolve_cgroup_manager(
         bool(ns.allow_cgroup_failure), bool(getattr(ns, "unsafe_no_cgroups", False))
     )
@@ -1617,12 +1817,16 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
         metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
 
+    # --stress implies --keep-going: a failing copy must NOT eager-cancel its siblings, or the
+    # per-copy ratio (the whole point) collapses to a single early failure. With cores plentiful
+    # (default -j = CPU count) all copies launch together, so keep_going lets every copy finish.
+    keep_going = bool(ns.keep_going) or stress_active
     result = run_dag(
         cfg,
         jobs=jobs,
         cgroups=cgroups,
         metrics=metrics,
-        keep_going=bool(ns.keep_going),
+        keep_going=keep_going,
         verbosity=verbosity,
         order=list(plan.order),
         core_budget=core_budget,
@@ -1640,6 +1844,9 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         _report_profile_written(perf_dir, source)
     if do_upload and backend is not None:
         _sync_upload(backend, result.step_profile_rows)
+    # --stress: print the per-copy PASS/FAIL ratio (the finding) to stdout.
+    if stress_active:
+        _print_stress_report(result.outcomes, stress_n, c)
     # Feature C: --profile prints a per-step profile table to stdout.
     if bool(ns.profile):
         _print_profile_table(result.step_profile_rows, c)

@@ -556,3 +556,174 @@ def test_cores_flag_constrains_the_whole_run_tree() -> None:
             "without --cores the step must see the ambient (>1) CPU count, proving the box (not "
             f"nproc) is what changes it; got rc={nproc.returncode}\n{ncombined}"
         )
+
+
+# --------------------------------------------------------------------------- --stress
+def _one_step_dag(tmp: str, cmd: str = "true") -> str:
+    path = Path(tmp) / "dag.json"
+    path.write_text(
+        '{"steps": [{"group": "g", "job": "j", "cmd": "%s"}]}' % cmd, encoding="utf-8"
+    )
+    return str(path)
+
+
+def test_stress_reports_ratio_all_pass() -> None:
+    # --stress N duplicates the step N times, runs the copies in parallel, and prints the
+    # per-copy PASS/FAIL ratio (the finding). A passing step gives N/N.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _one_step_dag(tmp, "true")
+        rc, out, err = _capture(["run", "--dag", dag, "--stress", "3", "-q", _ACF])
+        assert rc == 0
+        assert "stress results (3 parallel copies per step):" in out
+        assert "g.j: 3/3 passed" in out
+        # All 3 copies actually ran (the run summary counts every copy).
+        assert "3 passed, 0 failed" in err
+        # The memory-safe OK line names the derivation.
+        assert "--stress 3: OK" in err and "max safe" in err
+
+
+def test_stress_single_node_via_only() -> None:
+    # The common case: stress ONE suspect node selected with --only (its deps are dropped).
+    dag = (
+        '{"steps": ['
+        '{"group": "build", "job": "app", "cmd": "true"},'
+        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+        rc, out, err = _capture(
+            ["run", "--dag", str(path), "--only", "test.unit", "--stress", "4", "-q", _ACF]
+        )
+        assert rc == 0
+        assert "test.unit: 4/4 passed" in out
+        # Only the selected node was stressed (build.app was not run).
+        assert "build.app" not in out
+        assert "4 passed, 0 failed" in err
+
+
+def test_stress_lists_failing_copies() -> None:
+    # A failing step fails every copy; --stress reports the ratio AND names the failed copies
+    # (it implies --keep-going, so a failure does NOT eager-cancel the siblings' verdicts).
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _one_step_dag(tmp, "false")
+        rc, out, _ = _capture(["run", "--dag", dag, "--stress", "3", "-q", _ACF])
+        assert rc == 1
+        assert "g.j: 0/3 passed" in out
+        assert "3 FAILED: #1, #2, #3" in out
+
+
+def test_stress_refuses_when_exceeds_box_memory() -> None:
+    # A step whose per-copy footprint is enormous makes even a small N exceed the box budget:
+    # the run REFUSES LOUDLY (exit 2) rather than silently OOMing sibling work.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = Path(tmp) / "dag.json"
+        # 500 TiB per-copy hard cap — larger than any real box budget.
+        dag.write_text(
+            '{"steps": [{"group": "g", "job": "j", "cmd": "true",'
+            ' "hint": {"hard_mem_max_bytes": 549755813888000}}]}',
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(["run", "--dag", str(dag), "--stress", "2", "-q", _ACF])
+        assert rc == 2
+        assert "REFUSED" in err
+        assert "per-copy footprint" in err
+        assert "max safe --stress" in err
+
+
+def test_stress_n_must_be_positive() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _one_step_dag(tmp, "true")
+        rc, _, err = _capture(["run", "--dag", dag, "--stress", "0", "-q", _ACF])
+        assert rc == 2
+        assert "--stress N must be >= 1" in err
+
+
+def test_expand_stress_replicates_steps_and_rewires_deps() -> None:
+    # Unit test of the fan-out: N shards, distinct #NN suffixes, intra-shard deps rewired.
+    from safe_ci_dag_runner.cli import _expand_stress
+    from safe_ci_dag_runner.io import dag_from_json
+
+    cfg = dag_from_json(
+        '{"steps": ['
+        '{"group": "build", "job": "app", "cmd": "true"},'
+        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
+        "]}"
+    )
+    expanded = _expand_stress(cfg, 3)
+    tags = sorted(s.tag for s in expanded.steps)
+    assert tags == [
+        "build.app#1", "build.app#2", "build.app#3",
+        "test.unit#1", "test.unit#2", "test.unit#3",
+    ]
+    by_tag = expanded.by_tag()
+    # Each shard's test depends on the SAME shard's build, not a cross-shard build.
+    assert by_tag["test.unit#2"].deps == ["build.app#2"]
+    # n <= 1 is a no-op.
+    assert _expand_stress(cfg, 1).steps == cfg.steps
+
+
+# --------------------------------------------------------------------------- --args passthrough
+def test_args_passthrough_substitutes_placeholder() -> None:
+    # A step DECLARES it accepts args via the {args} token; --args is forwarded there verbatim.
+    # The command echoes its args, so the captured detail proves substitution happened.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = Path(tmp) / "dag.json"
+        dag.write_text(
+            '{"steps": [{"group": "t", "job": "unit",'
+            ' "cmd": "echo GOT: {args}; test \\"{args}\\" = \\"-k foo\\""}]}',
+            encoding="utf-8",
+        )
+        # -v (not -q) so the passing step's one-line summary is printed.
+        # Value starts with '-', so the --args=VALUE form is required (argparse).
+        rc, out, err = _capture(
+            ["run", "--dag", str(dag), "--args=-k foo", _ACF]
+        )
+        assert rc == 0, err
+        assert "GOT: -k foo" in out
+
+
+def test_args_passthrough_errors_when_no_step_declares() -> None:
+    # --args given but no selected step has {args}: refuse loudly (never silently drop the args).
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _one_step_dag(tmp, "true")
+        rc, _, err = _capture(["run", "--dag", dag, "--args=-k foo", "-q", _ACF])
+        assert rc == 2
+        assert "no selected step declares" in err
+
+
+def test_args_declared_but_not_passed_removes_token() -> None:
+    # A step declaring {args} but run WITHOUT --args has the token removed so it still runs.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = Path(tmp) / "dag.json"
+        dag.write_text(
+            '{"steps": [{"group": "t", "job": "unit", "cmd": "echo done {args}"}]}',
+            encoding="utf-8",
+        )
+        rc, out, err = _capture(["run", "--dag", str(dag), _ACF])
+        assert rc == 0, err
+        assert "done" in out
+        assert "{args}" not in out
+
+
+def test_args_composes_with_only_and_stress() -> None:
+    # The full owner scenario: scope to one node (--only), pass a specific test case (--args),
+    # multiply it (--stress). All three compose; the per-copy ratio is reported.
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = Path(tmp) / "dag.json"
+        dag.write_text(
+            '{"steps": ['
+            '{"group": "build", "job": "app", "cmd": "true"},'
+            '{"group": "dbi", "job": "file_metadata",'
+            ' "cmd": "test \\"{args}\\" = \\"--case xyz\\"", "deps": ["build.app"]}'
+            "]}",
+            encoding="utf-8",
+        )
+        rc, out, err = _capture(
+            ["run", "--dag", str(dag), "--only", "dbi.file_metadata",
+             "--args=--case xyz", "--stress", "5", "-q", _ACF]
+        )
+        assert rc == 0, err
+        assert "dbi.file_metadata: 5/5 passed" in out
+        assert "build.app" not in out

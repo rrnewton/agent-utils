@@ -14,7 +14,13 @@ import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from safe_ci_dag_runner.model import DagConfig, Step, StepClass, step_classification
+from safe_ci_dag_runner.model import (
+    DEFAULT_SMALL_MEM_CAP_BYTES,
+    DagConfig,
+    Step,
+    StepClass,
+    step_classification,
+)
 
 
 def step_mem_cap_bytes(
@@ -198,3 +204,60 @@ def mem_available_bytes() -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+#: cgroup-v2 unified memory limit for the whole run's container/machine.
+_MEMORY_MAX_PATH = Path("/sys/fs/cgroup/memory.max")
+
+
+def cgroup_mem_max_bytes() -> int | None:
+    """The cgroup-v2 ``memory.max`` cap (bytes) of the container the run is boxed in, or ``None``
+    when it is unbounded (``max``) or unreadable. This is the HARD ceiling the kernel enforces on
+    the whole boxed subtree, so it bounds how many concurrent copies can coexist before the OOM
+    killer fires."""
+    try:
+        raw = _MEMORY_MAX_PATH.read_text().strip()
+    except OSError:
+        return None
+    if raw == "max":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def box_mem_budget_bytes() -> int | None:
+    """The memory budget (bytes) a stress fan-out must fit inside, or ``None`` when it cannot be
+    determined.
+
+    Takes the MINIMUM of the readable signals — the cgroup ``memory.max`` hard cap (what the
+    kernel will OOM-kill above) and ``/proc/meminfo`` ``MemAvailable`` (headroom actually free
+    right now, which respects sibling agents on a shared box). The minimum is deliberately
+    conservative: exceeding EITHER risks an OOM, so the smaller wins."""
+    signals = [b for b in (cgroup_mem_max_bytes(), mem_available_bytes()) if b is not None]
+    return min(signals) if signals else None
+
+
+def stress_copy_footprint_bytes(
+    cfg: DagConfig, *, default_step_bytes: int = DEFAULT_SMALL_MEM_CAP_BYTES
+) -> int:
+    """Conservative worst-case memory footprint (bytes) of ONE copy (shard) of ``cfg``, used to
+    derive the safe ``--stress`` fan-out.
+
+    Sums each step's per-step inner memory cap (``step_mem_cap_bytes`` — an explicit
+    ``hard_mem_max_bytes`` wins, else ``mem_cap_factor x rss_baseline_bytes``); a step that
+    DECLARES NO memory is charged ``default_step_bytes`` (the SMALL 1-GiB forcing-function
+    default the rest of the package uses). Summing every step (rather than the reachable
+    concurrent set) is a deliberate UPPER BOUND: it never under-charges, so the derived ceiling
+    errs toward refusing rather than OOMing sibling agents. For the common single-node stress
+    (``--only dbi.file_metadata --stress N``) the sum is exactly that one node's cap."""
+    total = 0
+    for step in cfg.steps:
+        if step.engine_only:
+            continue
+        cap = step_mem_cap_bytes(
+            step, mem_cap_factor=cfg.mem_cap_factor, default_cap_bytes=default_step_bytes
+        )
+        total += cap if cap is not None else default_step_bytes
+    return max(total, default_step_bytes)
