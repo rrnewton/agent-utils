@@ -795,8 +795,8 @@ def load_artifact_catalog(
     """Load mechanical artifact data, accepting pre-artifact archives as empty.
 
     Existing summary caches remain valid because artifact extraction is independent of model
-    inputs. Re-running ingest creates the catalog from source snapshots; until then, a legacy
-    archive builds with an empty catalog rather than demanding summary regeneration.
+    inputs. Re-running ingest creates the catalog from source snapshots; until then, an archive
+    without a catalog builds with an empty one rather than demanding summary regeneration.
     """
 
     archived_team = team if team is not None else load_archived_team(archive, team_slug)
