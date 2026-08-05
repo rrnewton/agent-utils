@@ -31,6 +31,7 @@ const agents = [
     official_leaf: "root",
     short_name: "Hermit coordinator",
     nickname: "Coordinator",
+    lifetime_summary: "Coordinated the parser, continuous-integration, and documentation work into one verified result.",
     start_ms: BASE_MS,
     end_ms: BASE_MS + 100 * minute,
     status: "complete"
@@ -40,11 +41,12 @@ const agents = [
     team: "codex-hermit",
     parent_id: "coordinator",
     depth: 1,
-    path: "/root/parser_audit",
-    official_name: "/root/parser_audit",
+    path: "/root/transcript_auditor/owner_turn_miner/plugin_layout_audit/parser_boundary_regression_audit",
+    official_name: "/root/transcript_auditor/owner_turn_miner/plugin_layout_audit/parser_boundary_regression_audit",
     official_leaf: "parser_audit",
     short_name: "Parser audit",
     nickname: "Ada",
+    lifetime_summary: "Found the malformed-input parser boundary, repaired it, and verified the focused regression tests.",
     start_ms: BASE_MS + 5 * minute,
     end_ms: BASE_MS + 30 * minute,
     status: "complete"
@@ -59,6 +61,7 @@ const agents = [
     official_leaf: "ci_audit",
     short_name: "CI audit",
     nickname: "Turing",
+    lifetime_summary: "Verified that continuous integration exercises the repaired parser boundary in every required job.",
     start_ms: BASE_MS + 10 * minute,
     end_ms: BASE_MS + 40 * minute,
     status: "complete"
@@ -73,6 +76,7 @@ const agents = [
     official_leaf: "docs_audit",
     short_name: "Documentation audit",
     nickname: "Curie",
+    lifetime_summary: "Updated the operator guide to explain the repaired malformed-input behavior.",
     start_ms: BASE_MS + 30 * minute,
     end_ms: BASE_MS + 50 * minute,
     status: "complete"

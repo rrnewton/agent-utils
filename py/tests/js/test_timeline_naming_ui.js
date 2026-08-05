@@ -47,6 +47,7 @@ function functionSource(name) {
 
 const names = [
   "text",
+  "number",
   "lowerSearchText",
   "agentOfficialLeaf",
   "agentShortName",
@@ -54,8 +55,11 @@ const names = [
   "namesEqual",
   "agentSecondaryName",
   "agentAccessibleName",
+  "agentLifetimeSummary",
+  "frontEllipsize",
   "truncateLabel",
   "fitAgentSecondaryName",
+  "agentTooltipIdentity",
   "agentSearchText"
 ];
 const context = {};
@@ -69,6 +73,7 @@ const agent = {
   official_name: "/root/transcript_auditor/owner_turn_miner/plugin_layout_audit/budget_overlap_audit",
   official_leaf: "budget_overlap_audit",
   nickname: "overlap-checker",
+  lifetime_summary: "Audited overlapping CPU and wall-clock budgets, then verified exact-head release receipts.",
   label: "legacy label",
   status: "complete"
 };
@@ -80,11 +85,19 @@ assert.match(context.agentSecondaryName(agent), /coordinator: overlap-checker/);
 assert.match(context.agentAccessibleName(agent), /Short name: Budget overlap audit/);
 assert.match(context.agentAccessibleName(agent), /Official name: \/root\/transcript_auditor/);
 assert.match(context.agentAccessibleName(agent), /Coordinator nickname: overlap-checker/);
+assert.match(context.agentAccessibleName(agent), /Lifetime summary: Audited overlapping CPU/);
+
+const tooltipIdentity = context.agentTooltipIdentity(agent, true);
+assert.doesNotMatch(tooltipIdentity, /Short name:/);
+assert.match(tooltipIdentity, /^Official: ….*budget_overlap_audit/m);
+assert.match(tooltipIdentity, /Coordinator nickname: overlap-checker/);
+assert.match(tooltipIdentity, /Audited overlapping CPU and wall-clock budgets/);
 
 const searchText = context.agentSearchText(agent);
 assert.ok(searchText.includes("budget overlap audit"), "short name must be searchable");
 assert.ok(searchText.includes("plugin_layout_audit"), "full official path must be searchable");
 assert.ok(searchText.includes("overlap-checker"), "coordinator nickname must be searchable");
+assert.ok(searchText.includes("wall-clock budgets"), "lifetime summary must be searchable");
 
 assert.strictEqual(
   context.truncateLabel(agent.official_name, 1000, true),

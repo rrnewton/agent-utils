@@ -10,6 +10,7 @@ import sys
 import pytest
 
 from agent_team_timeline.naming import (
+    PROMPT_VERSION,
     AgentNameError,
     AgentNameJob,
     _PendingName,
@@ -69,12 +70,17 @@ def _entry(
     short_name: str = "CPU budget audit",
     *,
     rationale: str = "The completed work was an audit of CPU budget semantics.",
+    lifetime_summary: str = (
+        "The agent separated CPU-time limits from wall-clock throughput checks and "
+        "verified that each release receipt referred to the exact tested revision."
+    ),
 ) -> dict[str, object]:
     return {
         "key": job.key,
         "thread_id": job.thread_id,
         "short_name": short_name,
         "rationale": rationale,
+        "lifetime_summary": lifetime_summary,
     }
 
 
@@ -103,6 +109,9 @@ def test_prompt_contains_hindsight_summary_ancestor_context_and_official_paths()
     assert '"coordinator_nickname": "Beauvoir"' in prompt
     assert "with hindsight" in prompt
     assert "cross one or more spawn edges" in prompt
+    assert "one to three sentences" in prompt
+    assert "substantive work and outcomes" in prompt
+    assert PROMPT_VERSION.endswith("-v2")
 
 
 def test_root_is_always_exact_coordinator(tmp_path: Path) -> None:
@@ -126,8 +135,56 @@ def test_root_is_always_exact_coordinator(tmp_path: Path) -> None:
 
 def test_valid_model_output_is_strictly_decoded() -> None:
     job = _job()
-    parsed = _parse([job], [_entry(job)])
-    assert parsed == {job.key: "CPU budget audit"}
+    entry = _entry(job)
+    results = _parse_backend_output(
+        json.dumps({"names": [entry]}),
+        [_pending(job)],
+        "gpt-test",
+        "2026-08-05T12:00:00Z",
+    )
+    assert results[job.key].short_name == "CPU budget audit"
+    assert results[job.key].lifetime_summary == entry["lifetime_summary"]
+
+
+@pytest.mark.parametrize(
+    "lifetime_summary, message",
+    [
+        ("", "must not be empty"),
+        ("x" * 801, "exceeds 800 characters"),
+    ],
+)
+def test_model_lifetime_summary_validation(
+    lifetime_summary: str, message: str
+) -> None:
+    job = _job()
+    with pytest.raises(AgentNameError, match=message):
+        _parse([job], [_entry(job, lifetime_summary=lifetime_summary)])
+
+
+def test_model_lifetime_summary_whitespace_is_canonicalized_without_retry() -> None:
+    job = _job()
+    results = _parse_backend_output(
+        json.dumps(
+            {
+                "names": [
+                    _entry(
+                        job,
+                        lifetime_summary=(
+                            "The agent repaired the parser.\n\n"
+                            "  Focused tests   verified the fix."
+                        ),
+                    )
+                ]
+            }
+        ),
+        [_pending(job)],
+        "gpt-test",
+        "2026-08-05T12:00:00Z",
+    )
+
+    assert results[job.key].lifetime_summary == (
+        "The agent repaired the parser. Focused tests verified the fix."
+    )
 
 
 @pytest.mark.parametrize(
@@ -212,6 +269,48 @@ def test_heuristic_uses_only_nested_official_leaf(tmp_path: Path) -> None:
     assert result.short_name == "Budget overlap audit"
     assert "budget_overlap_audit" in result.rationale
     assert "transcript auditor" not in result.short_name.lower()
+    assert "separated Hermit CPU-second budgets" in result.lifetime_summary
+
+
+def test_pre_lifetime_cache_version_is_regenerated_once(tmp_path: Path) -> None:
+    job = _job()
+    cache = tmp_path / "cache"
+    input_hash = _input_hash(job, "heuristic", "offline")
+    pending = _PendingName(job, input_hash, cache / f"{input_hash}.json")
+    pending.cache_path.parent.mkdir(parents=True)
+    pending.cache_path.write_text(
+        json.dumps(
+            {
+                "cache_version": 2,
+                "backend": "heuristic",
+                "usage_receipt_id": "legacy-receipt",
+                "result": {
+                    "thread_id": job.thread_id,
+                    "short_name": "CPU budget audit",
+                    "rationale": "Legacy name without a lifetime summary.",
+                    "model": "offline",
+                    "prompt_version": PROMPT_VERSION,
+                    "input_hash": pending.input_hash,
+                    "generated_at": "2026-08-05T12:00:00Z",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first, first_stats = name_agents(
+        [job], cache, backend="heuristic", model="offline"
+    )
+    second, second_stats = name_agents(
+        [job], cache, backend="heuristic", model="offline"
+    )
+
+    assert first_stats.hits == 0 and first_stats.misses == 1
+    assert second_stats.hits == 1 and second_stats.misses == 0
+    assert first[job.thread_id].lifetime_summary == second[job.thread_id].lifetime_summary
+    migrated = json.loads(pending.cache_path.read_text(encoding="utf-8"))
+    assert migrated["cache_version"] == 3
+    assert migrated["result"]["lifetime_summary"]
 
 
 def test_codex_naming_records_tokens_model_and_reasoning_effort(tmp_path: Path) -> None:
@@ -236,6 +335,7 @@ names = [{
     "thread_id": job["thread_id"],
     "short_name": "CPU budget audit",
     "rationale": "The completed work audited CPU budget semantics.",
+    "lifetime_summary": "The agent audited CPU budget semantics and verified exact receipts.",
 } for job in jobs]
 output = Path(args[args.index("--output-last-message") + 1])
 output.write_text(json.dumps({"names": names}), encoding="utf-8")

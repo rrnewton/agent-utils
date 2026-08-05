@@ -141,6 +141,22 @@ test("packed lane labels list their agents and empty background clears selection
   await expect(lane).toHaveAttribute("aria-expanded", "false");
 });
 
+test("agent lifetime hover shows the hindsight summary and tail-truncated official path", async function ({ page }) {
+  const lifetime = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+  await expect(lifetime).toHaveAttribute(
+    "aria-label",
+    /\/root\/transcript_auditor\/owner_turn_miner\/plugin_layout_audit\/parser_boundary_regression_audit/
+  );
+  await lifetime.hover({ position: { x: 4, y: 4 } });
+  const tooltip = page.getByTestId("tooltip");
+  await expect(tooltip).toBeVisible();
+  await expect(page.locator("#tooltip-title")).toHaveText("Parser audit");
+  await expect(page.locator("#tooltip-body")).not.toContainText("Short name:");
+  await expect(page.locator("#tooltip-body")).toContainText("Official: …");
+  await expect(page.locator("#tooltip-body")).toContainText("parser_boundary_regression_audit");
+  await expect(page.locator("#tooltip-body")).toContainText("Found the malformed-input parser boundary");
+});
+
 test("the phase context menu can zoom exactly to the work phase", async function ({ page }) {
   const timeline = await requireContract(
     page.locator('[data-testid="timeline"][data-view-start-ms][data-view-end-ms]'),

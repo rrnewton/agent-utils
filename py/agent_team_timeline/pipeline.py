@@ -923,7 +923,7 @@ def _agent_name_json(
     job: AgentNameJob, result: AgentNameResult
 ) -> dict[str, JsonValue]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "agent": {
             "thread_id": job.thread_id,
             "official_path": job.official_path,
@@ -936,6 +936,7 @@ def _agent_name_json(
             "thread_id": result.thread_id,
             "short_name": result.short_name,
             "rationale": result.rationale,
+            "lifetime_summary": result.lifetime_summary,
             "model": result.model,
             "prompt_version": result.prompt_version,
             "input_hash": result.input_hash,
@@ -988,8 +989,11 @@ def _load_agent_names(
                 f"missing hindsight name for {agent.agent_path}; run `agent-team-timeline summarize`"
             )
         root = as_object(read_json(path), str(path))
-        if root.get("schema_version") != 1:
-            raise ValueError(f"unsupported agent-name schema at {path}")
+        if root.get("schema_version") != 2:
+            raise ValueError(
+                f"unsupported agent-name schema at {path}; run summarize to generate "
+                "hindsight lifetime summaries"
+            )
         identity = as_object(root.get("agent"), f"{path}.agent")
         recorded_thread = _nonempty_string(
             identity.get("thread_id"), f"{path}.agent.thread_id"
@@ -1016,6 +1020,10 @@ def _load_agent_names(
             ),
             rationale=_nonempty_string(
                 raw_name.get("rationale"), f"{path}.name.rationale"
+            ),
+            lifetime_summary=_nonempty_string(
+                raw_name.get("lifetime_summary"),
+                f"{path}.name.lifetime_summary",
             ),
             model=_nonempty_string(raw_name.get("model"), f"{path}.name.model"),
             prompt_version=_nonempty_string(

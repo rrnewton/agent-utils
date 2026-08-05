@@ -13,8 +13,8 @@ web server.
 
 - Real-time coordinator and nested-agent tracks with spawn, message, and result edges.
 - Active, tool-running, waiting, idle, and blocked intervals inside work phases.
-- Hindsight short names grounded in completed work while retaining official paths and coordinator
-  nicknames.
+- Hindsight short names and lifetime summaries grounded in completed work while retaining official
+  paths and coordinator nicknames.
 - Phrase, paragraph, cultivated work-summary, condensed-transcript, and rendered Markdown views.
 - Separate technical and newcomer-oriented plain-language summaries for every day, week, month,
   and quarter, with an in-modal audience switch.

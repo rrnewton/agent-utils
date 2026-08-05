@@ -77,6 +77,7 @@ def _agent_identity_obj(agent: Agent, name: AgentNameResult) -> dict[str, object
         "official_leaf": _official_leaf(agent),
         "coordinator_nickname": agent.nickname or "",
         "naming_rationale": name.rationale,
+        "lifetime_summary": name.lifetime_summary,
         "naming_model": name.model,
         "naming_input_hash": name.input_hash,
     }
@@ -194,12 +195,18 @@ def _agent_markdown(
         f"Coordinator nickname: `{agent.nickname or 'none'}`  ",
         f"Naming rationale: {name.rationale}",
         "",
+        "## Lifetime summary",
+        "",
+        name.lifetime_summary,
+        "",
+        "## Work phases",
+        "",
     ]
     for phase in phases:
         result = summaries[phase.summary_key]
         lines.extend(
             [
-                f"## {_local_time(phase.start_ms, team.display_timezone)} — {result.phrase}",
+                f"### {_local_time(phase.start_ms, team.display_timezone)} — {result.phrase}",
                 "",
                 result.paragraph,
                 "",
@@ -707,6 +714,7 @@ def render_archive(
                 "official_leaf": _official_leaf(agent),
                 "nickname": agent.nickname or "",
                 "naming_rationale": track_name.rationale,
+                "lifetime_summary": track_name.lifetime_summary,
                 "depth": agent.depth,
                 "start_ms": track_start,
                 "end_ms": min(track_end, end_ms),

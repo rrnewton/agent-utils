@@ -222,6 +222,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert child_track["official_name"] == "/root/release_receipt_audit"
     assert child_track["official_leaf"] == "release_receipt_audit"
     assert child_track["nickname"] == "Ada"
+    assert "receipt binding" in child_track["lifetime_summary"]
     assert timeline["source_digest"] == source_digest(team)
     assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
     assert any(edge["kind"] == "result" for edge in timeline["edges"])
@@ -261,8 +262,20 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         / f"{CHILD}.json"
     )
     name_record = json.loads(name_path.read_text(encoding="utf-8"))
+    assert name_record["schema_version"] == 2
     assert name_record["agent"]["official_path"] == "/root/release_receipt_audit"
     assert name_record["name"]["short_name"] == "Release receipt audit"
+    assert "receipt binding" in name_record["name"]["lifetime_summary"]
+    agent_markdown = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summaries"
+        / "agents"
+        / f"{CHILD}.md"
+    ).read_text(encoding="utf-8")
+    assert "## Lifetime summary" in agent_markdown
+    assert name_record["name"]["lifetime_summary"] in agent_markdown
 
     second = summarize_archive(
         tmp_path,

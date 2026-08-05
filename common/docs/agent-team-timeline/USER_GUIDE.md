@@ -16,7 +16,9 @@ do not require site changes.
   fork-tree view when that is more useful.
 - Every agent has a hindsight short name based on its completed work, ancestor context, official
   coordinator path, role, and nickname. The short name is primary; hover, search, and detail views
-  retain the full official path and coordinator nickname. Nested descendants are not depth-limited.
+  retain the full official path and coordinator nickname. The same hindsight pass writes a concise
+  lifetime paragraph from all of the agent's work phases; hover shows that paragraph without another
+  model call. Nested descendants are not depth-limited.
 - A whole spawned interval is an **agent lifetime**; each summarized sub-block is a **work phase**.
   Work-phase boxes carry a short phrase at useful zoom levels. Their bottom strip distinguishes active,
   tool-running, waiting, idle, and explicitly blocked time.
@@ -209,12 +211,15 @@ on disk. Each batch is committed only after every response in that batch validat
 strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
 batches remain reusable.
 
-After phase summaries exist, a separate hindsight pass names every agent. It sees the agent's
+After phase summaries exist, a separate hindsight pass names every agent and writes its lifetime
+paragraph in the same response. It sees the agent's
 official path, coordinator nickname and role, arbitrary-depth parent path, cross-spawn ancestor
 context, and the complete set of phase summaries describing what the agent ultimately did. This
 means a reused or misleading coordinator name does not become the permanent UI label. Naming has a
 separate content-addressed cache, so only an agent whose summarized work or context changed is sent
-back to the model. The whole summarize transaction holds the archive writer lock, preventing two
+back to the model. Archives created before lifetime summaries incur one naming-only cache miss per
+agent (batched normally); phase and calendar summaries remain cache hits. Later unchanged runs are
+all-hit again. The whole summarize transaction holds the archive writer lock, preventing two
 simultaneous refreshes from buying the same cache miss.
 
 Every backend batch writes an immutable usage receipt with its model, reasoning effort, input,
@@ -312,7 +317,7 @@ example-team/
     ├── summary_data/
     │   ├── cache/<content-hash>.json
     │   ├── name_cache/<content-hash>.json
-    │   ├── agents/<thread-id>.json   # selected hindsight name + provenance
+    │   ├── agents/<thread-id>.json   # hindsight name, lifetime summary + provenance
     │   ├── phases/<phase-id>.json
     │   ├── rollups/{daily,weekly,monthly,quarterly}/... # both structured audiences
     │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata

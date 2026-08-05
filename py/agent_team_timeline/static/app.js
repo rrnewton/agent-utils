@@ -680,7 +680,26 @@
     if (nickname) {
       parts.push("Coordinator nickname: " + nickname);
     }
+    if (text(agent.lifetime_summary)) {
+      parts.push("Lifetime summary: " + text(agent.lifetime_summary));
+    }
     return parts.join(". ");
+  }
+
+  function agentLifetimeSummary(agent) {
+    return text(
+      agent.lifetime_summary,
+      "No lifetime summary is available; regenerate this archive's summaries."
+    );
+  }
+
+  function frontEllipsize(value, maximumCharacters) {
+    var content = text(value);
+    var maximum = Math.max(2, Math.floor(number(maximumCharacters, 2)));
+    if (content.length <= maximum) {
+      return content;
+    }
+    return "…" + content.slice(-(maximum - 1));
   }
 
   function truncateLabel(value, width, preserveTail) {
@@ -711,15 +730,18 @@
     return truncateLabel(full, width, true);
   }
 
-  function agentTooltipIdentity(agent) {
-    var lines = ["Short name: " + agentShortName(agent)];
+  function agentTooltipIdentity(agent, includeLifetimeSummary) {
+    var lines = [];
     var officialName = agentOfficialName(agent);
     var nickname = text(agent.nickname);
     if (officialName) {
-      lines.push("Official: " + officialName);
+      lines.push("Official: " + frontEllipsize(officialName, 64));
     }
     if (nickname && !namesEqual(nickname, officialName)) {
       lines.push("Coordinator nickname: " + nickname);
+    }
+    if (includeLifetimeSummary) {
+      lines.push("", agentLifetimeSummary(agent));
     }
     return lines.join("\n");
   }
@@ -734,6 +756,7 @@
       agent.official_leaf,
       agent.label,
       agent.nickname,
+      agent.lifetime_summary,
       agent.status
     ]);
   }
@@ -1527,7 +1550,7 @@
         event,
         text(phase.phrase, "Agent phase") + " · " + agentShortName(agent),
         text(phase.paragraph, "No paragraph summary available.") +
-          "\n\n" + agentTooltipIdentity(agent),
+          "\n\n" + agentTooltipIdentity(agent, false),
         formatStatsInline(phase.stats)
       );
     });
@@ -1636,7 +1659,7 @@
       showTooltip(
         event,
         shortName,
-        agentTooltipIdentity(agent),
+        agentTooltipIdentity(agent, true),
         (depth === 0 ? "Coordinator" : "Hierarchy depth " + depth) + " · " + status
       );
     });
@@ -1751,7 +1774,7 @@
       showTooltip(
         event,
         agentShortName(agent),
-        agentTooltipIdentity(agent),
+        agentTooltipIdentity(agent, true),
         "Agent lifetime · " + formatRange(start, end)
       );
     });

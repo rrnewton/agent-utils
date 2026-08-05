@@ -38,11 +38,12 @@ from agent_team_timeline.token_usage import (
 )
 
 
-PROMPT_VERSION: Final = "agent-team-timeline-agent-name-v1"
-_CACHE_VERSION: Final = 2
+PROMPT_VERSION: Final = "agent-team-timeline-agent-name-v2"
+_CACHE_VERSION: Final = 3
 _MAX_NAME_LENGTH: Final = 48
 _MIN_NAME_WORDS: Final = 2
 _MAX_NAME_WORDS: Final = 5
+_MAX_LIFETIME_SUMMARY_LENGTH: Final = 800
 
 
 class AgentNameError(RuntimeError):
@@ -74,11 +75,12 @@ class AgentNameJob:
 
 @dataclass(frozen=True)
 class AgentNameResult:
-    """A compact display name plus reproducibility metadata."""
+    """A compact display name, lifetime summary, and reproducibility metadata."""
 
     thread_id: str
     short_name: str
     rationale: str
+    lifetime_summary: str
     model: str
     prompt_version: str
     input_hash: str
@@ -184,6 +186,11 @@ def build_agent_name_prompt(jobs: Sequence[AgentNameJob]) -> str:
         "agent unless they are part of a specific established project term. Do not include the "
         "full path in short_name. Use consistent terminology across the batch.\n\n"
         "Write a brief rationale stating which work or established term determined the name. "
+        "Also write lifetime_summary as a concise paragraph of one to three sentences describing "
+        "the agent's substantive work and outcomes across its complete lifetime. Prefer concrete "
+        "content over coordination mechanics, opaque phase labels, or bare pull-request numbers. "
+        "Use the user's established terminology, explain what changed or was learned, and do not "
+        "invent details. Keep lifetime_summary on one line. "
         "Include exactly one name for every supplied key and no other keys; copy key and "
         "thread_id exactly. Do not invent work that is absent from the source material.\n\n"
         f"Prompt version: {PROMPT_VERSION}\n"
@@ -203,7 +210,13 @@ def _output_schema() -> dict[str, JsonValue]:
     item: dict[str, JsonValue] = {
         "type": "object",
         "additionalProperties": False,
-        "required": ["key", "thread_id", "short_name", "rationale"],
+        "required": [
+            "key",
+            "thread_id",
+            "short_name",
+            "rationale",
+            "lifetime_summary",
+        ],
         "properties": {
             "key": {"type": "string", "minLength": 1},
             "thread_id": {"type": "string", "minLength": 1},
@@ -213,6 +226,11 @@ def _output_schema() -> dict[str, JsonValue]:
                 "maxLength": _MAX_NAME_LENGTH,
             },
             "rationale": {"type": "string", "minLength": 1},
+            "lifetime_summary": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": _MAX_LIFETIME_SUMMARY_LENGTH,
+            },
         },
     }
     return {
@@ -300,6 +318,17 @@ def _validate_short_name(name: str, job: AgentNameJob, where: str) -> str:
     return name
 
 
+def _validate_lifetime_summary(summary: str, where: str) -> str:
+    normalized = _SPACE_RE.sub(" ", summary).strip()
+    if not normalized:
+        raise AgentNameError(f"{where}: must not be empty")
+    if len(normalized) > _MAX_LIFETIME_SUMMARY_LENGTH:
+        raise AgentNameError(
+            f"{where}: exceeds {_MAX_LIFETIME_SUMMARY_LENGTH} characters"
+        )
+    return normalized
+
+
 def _parse_backend_output(
     text: str,
     pending: Sequence[_PendingName],
@@ -314,7 +343,11 @@ def _parse_backend_output(
     for index, raw_name in enumerate(_array(root["names"], "codex output.names")):
         where = f"codex output.names[{index}]"
         item = _object(raw_name, where)
-        _require_keys(item, {"key", "thread_id", "short_name", "rationale"}, where)
+        _require_keys(
+            item,
+            {"key", "thread_id", "short_name", "rationale", "lifetime_summary"},
+            where,
+        )
         key = _string(item["key"], where + ".key")
         if key not in expected:
             raise AgentNameError(f"{where}.key: unexpected key {key!r}")
@@ -333,10 +366,15 @@ def _parse_backend_output(
             where + ".short_name",
         )
         rationale = _string(item["rationale"], where + ".rationale")
+        lifetime_summary = _validate_lifetime_summary(
+            _string(item["lifetime_summary"], where + ".lifetime_summary"),
+            where + ".lifetime_summary",
+        )
         results[key] = AgentNameResult(
             thread_id=thread_id,
             short_name=short_name,
             rationale=rationale,
+            lifetime_summary=lifetime_summary,
             model=model,
             prompt_version=PROMPT_VERSION,
             input_hash=pending_item.input_hash,
@@ -353,6 +391,7 @@ def _result_json(result: AgentNameResult) -> dict[str, JsonValue]:
         "thread_id": result.thread_id,
         "short_name": result.short_name,
         "rationale": result.rationale,
+        "lifetime_summary": result.lifetime_summary,
         "model": result.model,
         "prompt_version": result.prompt_version,
         "input_hash": result.input_hash,
@@ -379,22 +418,16 @@ def _load_cache(
     try:
         root = _object(read_json(pending.cache_path), "agent name cache")
         version = _integer(root.get("cache_version"), "agent name cache.cache_version")
-        if version == 1:
-            _require_keys(
-                root, {"cache_version", "backend", "result"}, "agent name cache"
-            )
-            usage_receipt_id: str | None = None
-        elif version == _CACHE_VERSION:
-            _require_keys(
-                root,
-                {"cache_version", "backend", "usage_receipt_id", "result"},
-                "agent name cache",
-            )
-            usage_receipt_id = _string(
-                root["usage_receipt_id"], "agent name cache.usage_receipt_id"
-            )
-        else:
+        if version != _CACHE_VERSION:
             return None
+        _require_keys(
+            root,
+            {"cache_version", "backend", "usage_receipt_id", "result"},
+            "agent name cache",
+        )
+        usage_receipt_id = _string(
+            root["usage_receipt_id"], "agent name cache.usage_receipt_id"
+        )
         if _string(root["backend"], "agent name cache.backend") != backend:
             return None
         raw = _object(root["result"], "agent name cache.result")
@@ -402,6 +435,7 @@ def _load_cache(
             "thread_id",
             "short_name",
             "rationale",
+            "lifetime_summary",
             "model",
             "prompt_version",
             "input_hash",
@@ -415,6 +449,13 @@ def _load_cache(
             "agent name cache.result.short_name",
         )
         rationale = _string(raw["rationale"], "agent name cache.result.rationale")
+        lifetime_summary = _validate_lifetime_summary(
+            _string(
+                raw["lifetime_summary"],
+                "agent name cache.result.lifetime_summary",
+            ),
+            "agent name cache.result.lifetime_summary",
+        )
         cached_model = _string(raw["model"], "agent name cache.result.model")
         prompt_version = _string(
             raw["prompt_version"], "agent name cache.result.prompt_version"
@@ -435,6 +476,7 @@ def _load_cache(
                 thread_id=thread_id,
                 short_name=short_name,
                 rationale=rationale,
+                lifetime_summary=lifetime_summary,
                 model=cached_model,
                 prompt_version=prompt_version,
                 input_hash=input_hash,
@@ -526,10 +568,22 @@ def _heuristic_result(
             f"Normalized the official leaf {leaf!r}; the hindsight work summary remains "
             "available for a model-backed naming pass."
         )
+    lifetime_source = re.sub(
+        r"(?m)^\[\d+\]\s+[^:\n]{1,120}:\s*",
+        "",
+        pending.job.work_summary,
+    )
+    if not lifetime_source.strip():
+        lifetime_source = "No substantive work summary was available for this agent lifetime."
+    lifetime_summary = _validate_lifetime_summary(
+        _shorten(_one_line(lifetime_source), _MAX_LIFETIME_SUMMARY_LENGTH),
+        f"heuristic lifetime summary for {pending.job.key!r}",
+    )
     return AgentNameResult(
         thread_id=pending.job.thread_id,
         short_name=short_name,
         rationale=rationale,
+        lifetime_summary=lifetime_summary,
         model=model,
         prompt_version=PROMPT_VERSION,
         input_hash=pending.input_hash,
