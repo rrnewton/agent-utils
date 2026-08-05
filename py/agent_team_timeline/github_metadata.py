@@ -189,16 +189,24 @@ class PullRequestMetadataCache:
             self.put(record)
 
     def get(self, key: PullRequestKey) -> PullRequestMetadata | None:
+        """Return the cached record for ``key``, if present."""
+
         return self._records.get(key)
 
     def put(self, record: PullRequestMetadata) -> None:
+        """Insert or replace one record by its validated key."""
+
         self._records[record.key] = record
 
     @property
     def records(self) -> tuple[PullRequestMetadata, ...]:
+        """Return every record in deterministic key order."""
+
         return tuple(self._records[key] for key in sorted(self._records))
 
     def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return the complete versioned cache as a JSON-compatible object."""
+
         records: dict[str, JsonValue] = {
             record.key.cache_key: record.to_json_obj() for record in self.records
         }
@@ -206,6 +214,8 @@ class PullRequestMetadataCache:
 
     @classmethod
     def from_json_obj(cls, value: object) -> PullRequestMetadataCache:
+        """Validate and load a complete versioned cache object."""
+
         root = _object(value, "GitHub metadata cache")
         _exact_keys(root, {"schema_version", "records"}, "GitHub metadata cache")
         version = _integer(
@@ -285,6 +295,8 @@ class StandardLibraryHttpTransport:
     def get(
         self, *, url: str, headers: Mapping[str, str], timeout_seconds: float
     ) -> HttpResponse:
+        """Fetch one bounded response from the exact GitHub pull endpoint."""
+
         path = _validate_api_url(url)
         connection = http.client.HTTPSConnection(
             "api.github.com", timeout=timeout_seconds

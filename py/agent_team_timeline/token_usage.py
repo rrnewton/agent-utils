@@ -2,7 +2,7 @@
 
 Codex's JSON event stream reports token counts on the final ``turn.completed``
 event.  This module keeps parsing and persistence independent from summary
-content so cache hits can report the historical generation cost without
+content so cache hits can report the original generation cost without
 pretending those tokens were spent again.
 """
 
@@ -73,6 +73,8 @@ class TokenUsage:
         )
 
     def to_json(self) -> dict[str, JsonValue]:
+        """Return the token counters as a JSON-compatible object."""
+
         return {
             "input_tokens": self.input_tokens,
             "cached_input_tokens": self.cached_input_tokens,
@@ -84,6 +86,8 @@ class TokenUsage:
 
     @classmethod
     def from_json(cls, value: JsonValue, where: str) -> TokenUsage:
+        """Validate and load token counters from a JSON value."""
+
         obj = as_object(value, where)
         expected = {
             "input_tokens",
@@ -132,6 +136,8 @@ class BatchUsageReceipt:
     error: str | None
 
     def to_json(self) -> dict[str, JsonValue]:
+        """Return this immutable batch receipt as a JSON-compatible object."""
+
         usage: JsonValue = self.usage.to_json() if self.usage is not None else None
         return {
             "schema_version": USAGE_SCHEMA_VERSION,
@@ -161,6 +167,8 @@ class BatchUsageReceipt:
         usage: TokenUsage | None,
         error: str | None,
     ) -> BatchUsageReceipt:
+        """Create a content-addressed receipt from one backend attempt."""
+
         identity: JsonValue = {
             "schema_version": USAGE_SCHEMA_VERSION,
             "backend": backend,
@@ -189,6 +197,8 @@ class BatchUsageReceipt:
 
     @classmethod
     def from_json(cls, value: JsonValue, where: str) -> BatchUsageReceipt:
+        """Validate and load one immutable batch receipt."""
+
         obj = as_object(value, where)
         expected = {
             "schema_version",
@@ -319,12 +329,16 @@ def parse_codex_jsonl_usage(text: str) -> TokenUsage | None:
 
 
 def write_batch_receipt(root: Path, receipt: BatchUsageReceipt) -> Path:
+    """Persist one batch receipt and return its path."""
+
     path = root / "receipts" / f"{receipt.receipt_id}.json"
     write_json_if_changed(path, receipt.to_json())
     return path
 
 
 def load_batch_receipt(root: Path, receipt_id: str) -> BatchUsageReceipt | None:
+    """Load one receipt, returning ``None`` when it is absent or invalid."""
+
     path = root / "receipts" / f"{receipt_id}.json"
     try:
         return BatchUsageReceipt.from_json(read_json(path), str(path))
