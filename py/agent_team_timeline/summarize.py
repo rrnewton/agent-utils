@@ -25,10 +25,18 @@ from agent_team_timeline.archive import (
     read_json,
     write_json_if_changed,
 )
+from agent_team_timeline.token_usage import (
+    BatchUsageReceipt,
+    TokenUsage,
+    load_batch_receipt,
+    parse_codex_jsonl_usage,
+    write_batch_receipt,
+    write_usage_run_receipt,
+)
 
 
 PROMPT_VERSION: Final = "agent-team-timeline-summary-v1"
-_CACHE_VERSION: Final = 1
+_CACHE_VERSION: Final = 2
 _PHRASE_LIMIT: Final = 80
 
 
@@ -80,6 +88,12 @@ class SummaryRunStats:
     hits: int
     misses: int
     batches: int
+    newly_spent_usage: TokenUsage = TokenUsage()
+    newly_spent_unknown_receipts: int = 0
+    artifact_generation_usage: TokenUsage = TokenUsage()
+    artifact_generation_unknown_receipts: int = 0
+    unknown_legacy_artifacts: int = 0
+    usage_run_path: Path | None = None
 
     @property
     def cache_hits(self) -> int:
@@ -105,6 +119,18 @@ class _PendingJob:
     job: SummaryJob
     input_hash: str
     cache_path: Path
+
+
+@dataclass(frozen=True)
+class _ResolvedSummary:
+    result: SummaryResult
+    usage_receipt_id: str | None
+
+
+@dataclass(frozen=True)
+class _GeneratedBatch:
+    results: Mapping[str, SummaryResult]
+    receipt: BatchUsageReceipt
 
 
 def _validate_job(job: SummaryJob) -> None:
@@ -144,13 +170,20 @@ def _job_json(job: SummaryJob) -> dict[str, JsonValue]:
     }
 
 
-def _input_hash(job: SummaryJob, backend: str, model: str) -> str:
+def _input_hash(
+    job: SummaryJob,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+) -> str:
     payload: dict[str, JsonValue] = {
         "backend": backend,
         "model": model,
         "prompt_version": PROMPT_VERSION,
         "job": _job_json(job),
     }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     return content_hash(canonical_json(payload))
 
 
@@ -363,23 +396,38 @@ def _result_json(result: SummaryResult) -> dict[str, JsonValue]:
     }
 
 
-def _cache_json(result: SummaryResult, backend: str) -> dict[str, JsonValue]:
+def _cache_json(
+    result: SummaryResult, backend: str, usage_receipt_id: str
+) -> dict[str, JsonValue]:
     return {
         "cache_version": _CACHE_VERSION,
         "backend": backend,
+        "usage_receipt_id": usage_receipt_id,
         "result": _result_json(result),
     }
 
 
 def _load_cache(
     pending: _PendingJob, backend: str, model: str
-) -> SummaryResult | None:
+) -> _ResolvedSummary | None:
     if not pending.cache_path.is_file():
         return None
     try:
         root = _object(read_json(pending.cache_path), "summary cache")
-        _require_keys(root, {"cache_version", "backend", "result"}, "summary cache")
-        if _integer(root["cache_version"], "summary cache.cache_version") != _CACHE_VERSION:
+        version = _integer(root.get("cache_version"), "summary cache.cache_version")
+        if version == 1:
+            _require_keys(root, {"cache_version", "backend", "result"}, "summary cache")
+            usage_receipt_id: str | None = None
+        elif version == _CACHE_VERSION:
+            _require_keys(
+                root,
+                {"cache_version", "backend", "usage_receipt_id", "result"},
+                "summary cache",
+            )
+            usage_receipt_id = _string(
+                root["usage_receipt_id"], "summary cache.usage_receipt_id"
+            )
+        else:
             return None
         if _string(root["backend"], "summary cache.backend") != backend:
             return None
@@ -418,15 +466,18 @@ def _load_cache(
         bullets = _parse_bullets(
             raw_result["work_summary"], pending.job, "summary cache.result.work_summary"
         )
-        return SummaryResult(
-            key=key,
-            phrase=phrase,
-            paragraph=paragraph,
-            work_summary=bullets,
-            model=cached_model,
-            prompt_version=prompt_version,
-            input_hash=input_hash,
-            generated_at=generated_at,
+        return _ResolvedSummary(
+            result=SummaryResult(
+                key=key,
+                phrase=phrase,
+                paragraph=paragraph,
+                work_summary=bullets,
+                model=cached_model,
+                prompt_version=prompt_version,
+                input_hash=input_hash,
+                generated_at=generated_at,
+            ),
+            usage_receipt_id=usage_receipt_id,
         )
     except (OSError, ValueError, SummaryError):
         # A partial/manual/old cache is a miss, never an excuse to return unvalidated data.
@@ -555,8 +606,11 @@ def _heuristic_batch(
 
 
 def _codex_batch(
-    pending: Sequence[_PendingJob], model: str, codex_command: Sequence[str]
-) -> dict[str, SummaryResult]:
+    pending: Sequence[_PendingJob],
+    model: str,
+    reasoning_effort: str | None,
+    codex_command: Sequence[str],
+) -> tuple[dict[str, SummaryResult], TokenUsage | None]:
     if not codex_command:
         raise SummaryError("codex command must not be empty")
     with tempfile.TemporaryDirectory(prefix="agent-team-timeline-summary-") as raw_dir:
@@ -564,21 +618,25 @@ def _codex_batch(
         schema_path = work_dir / "output-schema.json"
         output_path = work_dir / "last-message.json"
         schema_path.write_text(canonical_json(_output_schema()), encoding="utf-8")
-        command = [
-            *codex_command,
-            "exec",
+        command = [*codex_command, "exec"]
+        if reasoning_effort is not None:
+            command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+        command.extend(
+            [
             "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
             "--model",
             model,
+            "--json",
             "--output-schema",
             str(schema_path),
             "--output-last-message",
             str(output_path),
             "-",
-        ]
+            ]
+        )
         try:
             completed = subprocess.run(
                 command,
@@ -600,11 +658,69 @@ def _codex_batch(
             output = output_path.read_text(encoding="utf-8")
         except OSError as error:
             raise SummaryError("codex summary batch produced no output message") from error
-        return _parse_backend_output(output, pending, model, _utc_now())
+        try:
+            usage = parse_codex_jsonl_usage(completed.stdout)
+        except ValueError as error:
+            raise SummaryError(f"codex summary batch reported invalid usage: {error}") from error
+        return _parse_backend_output(output, pending, model, _utc_now()), usage
 
 
 def _chunks(values: Sequence[_PendingJob], size: int) -> list[tuple[_PendingJob, ...]]:
     return [tuple(values[index : index + size]) for index in range(0, len(values), size)]
+
+
+def _usage_root(cache_dir: Path) -> Path:
+    return cache_dir / "_usage"
+
+
+def _run_backend_batch(
+    batch: Sequence[_PendingJob],
+    *,
+    cache_dir: Path,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None,
+    codex_command: Sequence[str],
+) -> _GeneratedBatch:
+    """Run one batch and persist a receipt even when the backend call fails."""
+
+    started_at = _utc_now()
+    input_hashes = tuple(item.input_hash for item in batch)
+    try:
+        if backend == "heuristic":
+            results = _heuristic_batch(batch, model)
+            usage: TokenUsage | None = TokenUsage()
+        else:
+            results, usage = _codex_batch(
+                batch, model, reasoning_effort, codex_command
+            )
+    except SummaryError as error:
+        receipt = BatchUsageReceipt.create(
+            backend=backend,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            status="failed",
+            started_at=started_at,
+            completed_at=_utc_now(),
+            input_hashes=input_hashes,
+            usage=None,
+            error=_shorten(_one_line(str(error)), 500),
+        )
+        write_batch_receipt(_usage_root(cache_dir), receipt)
+        raise
+    receipt = BatchUsageReceipt.create(
+        backend=backend,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        status="completed",
+        started_at=started_at,
+        completed_at=_utc_now(),
+        input_hashes=input_hashes,
+        usage=usage,
+        error=None,
+    )
+    write_batch_receipt(_usage_root(cache_dir), receipt)
+    return _GeneratedBatch(results=results, receipt=receipt)
 
 
 def summarize_jobs(
@@ -615,13 +731,18 @@ def summarize_jobs(
     max_workers: int = 3,
     batch_size: int = 6,
     codex_command: Sequence[str] = ("codex",),
+    reasoning_effort: str | None = None,
 ) -> tuple[dict[str, SummaryResult], SummaryRunStats]:
     """Return summaries, consulting immutable content-addressed cache entries first."""
+
+    run_started_at = _utc_now()
 
     if backend not in {"codex", "heuristic"}:
         raise SummaryError(f"unsupported summary backend {backend!r}")
     if not model.strip():
         raise SummaryError("summary model must not be empty")
+    if reasoning_effort is not None and not reasoning_effort.strip():
+        raise SummaryError("summary reasoning effort must not be empty")
     if max_workers < 1:
         raise SummaryError("max_workers must be at least 1")
     if batch_size < 1:
@@ -629,6 +750,7 @@ def summarize_jobs(
 
     seen_keys: set[str] = set()
     resolved: dict[str, SummaryResult] = {}
+    receipt_by_key: dict[str, str | None] = {}
     pending: list[_PendingJob] = []
     hits = 0
     for job in jobs:
@@ -636,7 +758,7 @@ def summarize_jobs(
         if job.key in seen_keys:
             raise SummaryError(f"duplicate summary job key {job.key!r}")
         seen_keys.add(job.key)
-        input_hash = _input_hash(job, backend, model)
+        input_hash = _input_hash(job, backend, model, reasoning_effort)
         item = _PendingJob(
             job=job,
             input_hash=input_hash,
@@ -646,42 +768,65 @@ def summarize_jobs(
         if cached is None:
             pending.append(item)
         else:
-            resolved[job.key] = cached
+            resolved[job.key] = cached.result
+            receipt_by_key[job.key] = cached.usage_receipt_id
             hits += 1
 
     batches = _chunks(pending, batch_size)
     generated: dict[str, SummaryResult] = {}
+    generated_receipt_by_key: dict[str, str] = {}
+    new_receipts: list[BatchUsageReceipt] = []
 
     def publish_batch(
-        batch: Sequence[_PendingJob], batch_results: Mapping[str, SummaryResult]
+        batch: Sequence[_PendingJob], batch_result: _GeneratedBatch
     ) -> None:
         # Cache names are content-addressed and backend batches have already passed strict
         # shape/key/range validation. Preserve successful expensive work immediately so an
         # independent later batch failure does not spend those tokens again on the retry.
         for item in batch:
-            result = batch_results.get(item.job.key)
+            result = batch_result.results.get(item.job.key)
             if result is None:
                 raise SummaryError(f"summary backend omitted job {item.job.key!r}")
-            write_json_if_changed(item.cache_path, _cache_json(result, backend))
+            write_json_if_changed(
+                item.cache_path,
+                _cache_json(result, backend, batch_result.receipt.receipt_id),
+            )
+            generated_receipt_by_key[item.job.key] = batch_result.receipt.receipt_id
+        new_receipts.append(batch_result.receipt)
 
     if backend == "heuristic":
         for batch in batches:
-            batch_results = _heuristic_batch(batch, model)
-            publish_batch(batch, batch_results)
-            generated.update(batch_results)
+            batch_result = _run_backend_batch(
+                batch,
+                cache_dir=cache_dir,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                codex_command=codex_command,
+            )
+            publish_batch(batch, batch_result)
+            generated.update(batch_result.results)
     elif batches:
         command = tuple(codex_command)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(_codex_batch, batch, model, command): batch
+                executor.submit(
+                    _run_backend_batch,
+                    batch,
+                    cache_dir=cache_dir,
+                    backend=backend,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    codex_command=command,
+                ): batch
                 for batch in batches
             }
             first_error: SummaryError | None = None
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    batch_results = future.result()
-                    publish_batch(futures[future], batch_results)
-                    generated.update(batch_results)
+                    batch_result = future.result()
+                    publish_batch(futures[future], batch_result)
+                    generated.update(batch_result.results)
                 except concurrent.futures.CancelledError:
                     continue
                 except SummaryError as error:
@@ -704,12 +849,56 @@ def summarize_jobs(
         if result is None:
             raise SummaryError(f"summary backend omitted job {item.job.key!r}")
         resolved[item.job.key] = result
+        receipt_by_key[item.job.key] = generated_receipt_by_key[item.job.key]
 
     ordered = {job.key: resolved[job.key] for job in jobs}
+    artifact_receipt_ids = sorted(
+        {
+            receipt_id
+            for receipt_id in receipt_by_key.values()
+            if receipt_id is not None
+        }
+    )
+    artifact_receipts: list[BatchUsageReceipt] = []
+    unreadable_artifact_receipt_ids: list[str] = []
+    for receipt_id in artifact_receipt_ids:
+        receipt = load_batch_receipt(_usage_root(cache_dir), receipt_id)
+        if receipt is None:
+            unreadable_artifact_receipt_ids.append(receipt_id)
+        else:
+            artifact_receipts.append(receipt)
+    unknown_legacy_artifacts = sum(
+        1 for receipt_id in receipt_by_key.values() if receipt_id is None
+    )
+    accounting = write_usage_run_receipt(
+        _usage_root(cache_dir),
+        started_at=run_started_at,
+        completed_at=_utc_now(),
+        backend=backend,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        job_count=len(jobs),
+        hits=hits,
+        misses=len(pending),
+        new_receipts=tuple(sorted(new_receipts, key=lambda item: item.receipt_id)),
+        artifact_receipts=tuple(
+            sorted(artifact_receipts, key=lambda item: item.receipt_id)
+        ),
+        unreadable_artifact_receipt_ids=tuple(unreadable_artifact_receipt_ids),
+        unknown_legacy_artifacts=unknown_legacy_artifacts,
+    )
     return ordered, SummaryRunStats(
         hits=hits,
         misses=len(pending),
         batches=len(batches),
+        newly_spent_usage=accounting.newly_spent_usage,
+        newly_spent_unknown_receipts=accounting.newly_spent_unknown_receipts,
+        artifact_generation_usage=accounting.artifact_generation_usage,
+        artifact_generation_unknown_receipts=(
+            accounting.artifact_generation_unknown_receipts
+        ),
+        unknown_legacy_artifacts=unknown_legacy_artifacts,
+        usage_run_path=accounting.path,
     )
 
 

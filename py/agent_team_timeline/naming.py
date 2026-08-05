@@ -28,10 +28,18 @@ from agent_team_timeline.archive import (
     write_json_if_changed,
 )
 from agent_team_timeline.summarize import SummaryRunStats
+from agent_team_timeline.token_usage import (
+    BatchUsageReceipt,
+    TokenUsage,
+    load_batch_receipt,
+    parse_codex_jsonl_usage,
+    write_batch_receipt,
+    write_usage_run_receipt,
+)
 
 
 PROMPT_VERSION: Final = "agent-team-timeline-agent-name-v1"
-_CACHE_VERSION: Final = 1
+_CACHE_VERSION: Final = 2
 _MAX_NAME_LENGTH: Final = 48
 _MIN_NAME_WORDS: Final = 2
 _MAX_NAME_WORDS: Final = 5
@@ -76,6 +84,18 @@ class _PendingName:
     cache_path: Path
 
 
+@dataclass(frozen=True)
+class _ResolvedName:
+    result: AgentNameResult
+    usage_receipt_id: str | None
+
+
+@dataclass(frozen=True)
+class _GeneratedNameBatch:
+    results: Mapping[str, AgentNameResult]
+    receipt: BatchUsageReceipt
+
+
 def _validate_job(job: AgentNameJob) -> None:
     if not job.key.strip():
         raise AgentNameError("agent name job key must not be empty")
@@ -118,13 +138,20 @@ def _job_json(job: AgentNameJob) -> dict[str, JsonValue]:
     }
 
 
-def _input_hash(job: AgentNameJob, backend: str, model: str) -> str:
+def _input_hash(
+    job: AgentNameJob,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+) -> str:
     payload: dict[str, JsonValue] = {
         "backend": backend,
         "model": model,
         "prompt_version": PROMPT_VERSION,
         "job": _job_json(job),
     }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
     return content_hash(canonical_json(payload))
 
 
@@ -325,23 +352,40 @@ def _result_json(result: AgentNameResult) -> dict[str, JsonValue]:
     }
 
 
-def _cache_json(result: AgentNameResult, backend: str) -> dict[str, JsonValue]:
+def _cache_json(
+    result: AgentNameResult, backend: str, usage_receipt_id: str
+) -> dict[str, JsonValue]:
     return {
         "cache_version": _CACHE_VERSION,
         "backend": backend,
+        "usage_receipt_id": usage_receipt_id,
         "result": _result_json(result),
     }
 
 
 def _load_cache(
     pending: _PendingName, backend: str, model: str
-) -> AgentNameResult | None:
+) -> _ResolvedName | None:
     if not pending.cache_path.is_file():
         return None
     try:
         root = _object(read_json(pending.cache_path), "agent name cache")
-        _require_keys(root, {"cache_version", "backend", "result"}, "agent name cache")
-        if _integer(root["cache_version"], "agent name cache.cache_version") != _CACHE_VERSION:
+        version = _integer(root.get("cache_version"), "agent name cache.cache_version")
+        if version == 1:
+            _require_keys(
+                root, {"cache_version", "backend", "result"}, "agent name cache"
+            )
+            usage_receipt_id: str | None = None
+        elif version == _CACHE_VERSION:
+            _require_keys(
+                root,
+                {"cache_version", "backend", "usage_receipt_id", "result"},
+                "agent name cache",
+            )
+            usage_receipt_id = _string(
+                root["usage_receipt_id"], "agent name cache.usage_receipt_id"
+            )
+        else:
             return None
         if _string(root["backend"], "agent name cache.backend") != backend:
             return None
@@ -378,14 +422,17 @@ def _load_cache(
             or input_hash != pending.input_hash
         ):
             return None
-        return AgentNameResult(
-            thread_id=thread_id,
-            short_name=short_name,
-            rationale=rationale,
-            model=cached_model,
-            prompt_version=prompt_version,
-            input_hash=input_hash,
-            generated_at=generated_at,
+        return _ResolvedName(
+            result=AgentNameResult(
+                thread_id=thread_id,
+                short_name=short_name,
+                rationale=rationale,
+                model=cached_model,
+                prompt_version=prompt_version,
+                input_hash=input_hash,
+                generated_at=generated_at,
+            ),
+            usage_receipt_id=usage_receipt_id,
         )
     except (OSError, ValueError, AgentNameError):
         return None
@@ -492,8 +539,11 @@ def _heuristic_batch(
 
 
 def _codex_batch(
-    pending: Sequence[_PendingName], model: str, codex_command: Sequence[str]
-) -> dict[str, AgentNameResult]:
+    pending: Sequence[_PendingName],
+    model: str,
+    reasoning_effort: str | None,
+    codex_command: Sequence[str],
+) -> tuple[dict[str, AgentNameResult], TokenUsage | None]:
     if not codex_command:
         raise AgentNameError("codex command must not be empty")
     with tempfile.TemporaryDirectory(prefix="agent-team-timeline-name-") as raw_dir:
@@ -501,21 +551,25 @@ def _codex_batch(
         schema_path = work_dir / "output-schema.json"
         output_path = work_dir / "last-message.json"
         schema_path.write_text(canonical_json(_output_schema()), encoding="utf-8")
-        command = [
-            *codex_command,
-            "exec",
+        command = [*codex_command, "exec"]
+        if reasoning_effort is not None:
+            command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+        command.extend(
+            [
             "--ephemeral",
             "--skip-git-repo-check",
             "--sandbox",
             "read-only",
             "--model",
             model,
+            "--json",
             "--output-schema",
             str(schema_path),
             "--output-last-message",
             str(output_path),
             "-",
-        ]
+            ]
+        )
         try:
             completed = subprocess.run(
                 command,
@@ -537,13 +591,71 @@ def _codex_batch(
             output = output_path.read_text(encoding="utf-8")
         except OSError as error:
             raise AgentNameError("codex naming batch produced no output message") from error
-        return _parse_backend_output(output, pending, model, _utc_now())
+        try:
+            usage = parse_codex_jsonl_usage(completed.stdout)
+        except ValueError as error:
+            raise AgentNameError(
+                f"codex naming batch reported invalid usage: {error}"
+            ) from error
+        return _parse_backend_output(output, pending, model, _utc_now()), usage
 
 
 def _chunks(
     values: Sequence[_PendingName], size: int
 ) -> list[tuple[_PendingName, ...]]:
     return [tuple(values[index : index + size]) for index in range(0, len(values), size)]
+
+
+def _usage_root(cache_dir: Path) -> Path:
+    return cache_dir / "_usage"
+
+
+def _run_backend_batch(
+    batch: Sequence[_PendingName],
+    *,
+    cache_dir: Path,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None,
+    codex_command: Sequence[str],
+) -> _GeneratedNameBatch:
+    started_at = _utc_now()
+    input_hashes = tuple(item.input_hash for item in batch)
+    try:
+        if backend == "heuristic":
+            results = _heuristic_batch(batch, model)
+            usage: TokenUsage | None = TokenUsage()
+        else:
+            results, usage = _codex_batch(
+                batch, model, reasoning_effort, codex_command
+            )
+    except AgentNameError as error:
+        receipt = BatchUsageReceipt.create(
+            backend=backend,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            status="failed",
+            started_at=started_at,
+            completed_at=_utc_now(),
+            input_hashes=input_hashes,
+            usage=None,
+            error=_shorten(_one_line(str(error)), 500),
+        )
+        write_batch_receipt(_usage_root(cache_dir), receipt)
+        raise
+    receipt = BatchUsageReceipt.create(
+        backend=backend,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        status="completed",
+        started_at=started_at,
+        completed_at=_utc_now(),
+        input_hashes=input_hashes,
+        usage=usage,
+        error=None,
+    )
+    write_batch_receipt(_usage_root(cache_dir), receipt)
+    return _GeneratedNameBatch(results=results, receipt=receipt)
 
 
 def name_agents(
@@ -554,13 +666,18 @@ def name_agents(
     max_workers: int = 3,
     batch_size: int = 12,
     codex_command: Sequence[str] = ("codex",),
+    reasoning_effort: str | None = None,
 ) -> tuple[dict[str, AgentNameResult], SummaryRunStats]:
     """Name agents after their summary pass, reusing immutable validated cache entries."""
+
+    run_started_at = _utc_now()
 
     if backend not in {"codex", "heuristic"}:
         raise AgentNameError(f"unsupported agent naming backend {backend!r}")
     if not model.strip():
         raise AgentNameError("agent naming model must not be empty")
+    if reasoning_effort is not None and not reasoning_effort.strip():
+        raise AgentNameError("agent naming reasoning effort must not be empty")
     if max_workers < 1:
         raise AgentNameError("max_workers must be at least 1")
     if batch_size < 1:
@@ -569,6 +686,7 @@ def name_agents(
     seen_keys: set[str] = set()
     seen_threads: set[str] = set()
     resolved: dict[str, AgentNameResult] = {}
+    receipt_by_thread: dict[str, str | None] = {}
     pending: list[_PendingName] = []
     hits = 0
     for job in jobs:
@@ -579,7 +697,7 @@ def name_agents(
             raise AgentNameError(f"duplicate agent name thread id {job.thread_id!r}")
         seen_keys.add(job.key)
         seen_threads.add(job.thread_id)
-        input_hash = _input_hash(job, backend, model)
+        input_hash = _input_hash(job, backend, model, reasoning_effort)
         item = _PendingName(
             job=job,
             input_hash=input_hash,
@@ -589,39 +707,62 @@ def name_agents(
         if cached is None:
             pending.append(item)
         else:
-            resolved[job.thread_id] = cached
+            resolved[job.thread_id] = cached.result
+            receipt_by_thread[job.thread_id] = cached.usage_receipt_id
             hits += 1
 
     batches = _chunks(pending, batch_size)
     generated: dict[str, AgentNameResult] = {}
+    generated_receipt_by_key: dict[str, str] = {}
+    new_receipts: list[BatchUsageReceipt] = []
 
     def publish_batch(
-        batch: Sequence[_PendingName], batch_results: Mapping[str, AgentNameResult]
+        batch: Sequence[_PendingName], batch_result: _GeneratedNameBatch
     ) -> None:
         for item in batch:
-            result = batch_results.get(item.job.key)
+            result = batch_result.results.get(item.job.key)
             if result is None:
                 raise AgentNameError(f"agent naming backend omitted job {item.job.key!r}")
-            write_json_if_changed(item.cache_path, _cache_json(result, backend))
+            write_json_if_changed(
+                item.cache_path,
+                _cache_json(result, backend, batch_result.receipt.receipt_id),
+            )
+            generated_receipt_by_key[item.job.key] = batch_result.receipt.receipt_id
+        new_receipts.append(batch_result.receipt)
 
     if backend == "heuristic":
         for batch in batches:
-            batch_results = _heuristic_batch(batch, model)
-            publish_batch(batch, batch_results)
-            generated.update(batch_results)
+            batch_result = _run_backend_batch(
+                batch,
+                cache_dir=cache_dir,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                codex_command=codex_command,
+            )
+            publish_batch(batch, batch_result)
+            generated.update(batch_result.results)
     elif batches:
         command = tuple(codex_command)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
-                executor.submit(_codex_batch, batch, model, command): batch
+                executor.submit(
+                    _run_backend_batch,
+                    batch,
+                    cache_dir=cache_dir,
+                    backend=backend,
+                    model=model,
+                    reasoning_effort=reasoning_effort,
+                    codex_command=command,
+                ): batch
                 for batch in batches
             }
             first_error: AgentNameError | None = None
             for future in concurrent.futures.as_completed(futures):
                 try:
-                    batch_results = future.result()
-                    publish_batch(futures[future], batch_results)
-                    generated.update(batch_results)
+                    batch_result = future.result()
+                    publish_batch(futures[future], batch_result)
+                    generated.update(batch_result.results)
                 except concurrent.futures.CancelledError:
                     continue
                 except AgentNameError as error:
@@ -646,12 +787,56 @@ def name_agents(
         if result is None:
             raise AgentNameError(f"agent naming backend omitted job {item.job.key!r}")
         resolved[item.job.thread_id] = result
+        receipt_by_thread[item.job.thread_id] = generated_receipt_by_key[item.job.key]
 
     ordered = {job.thread_id: resolved[job.thread_id] for job in jobs}
+    artifact_receipt_ids = sorted(
+        {
+            receipt_id
+            for receipt_id in receipt_by_thread.values()
+            if receipt_id is not None
+        }
+    )
+    artifact_receipts: list[BatchUsageReceipt] = []
+    unreadable_artifact_receipt_ids: list[str] = []
+    for receipt_id in artifact_receipt_ids:
+        receipt = load_batch_receipt(_usage_root(cache_dir), receipt_id)
+        if receipt is None:
+            unreadable_artifact_receipt_ids.append(receipt_id)
+        else:
+            artifact_receipts.append(receipt)
+    unknown_legacy_artifacts = sum(
+        1 for receipt_id in receipt_by_thread.values() if receipt_id is None
+    )
+    accounting = write_usage_run_receipt(
+        _usage_root(cache_dir),
+        started_at=run_started_at,
+        completed_at=_utc_now(),
+        backend=backend,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        job_count=len(jobs),
+        hits=hits,
+        misses=len(pending),
+        new_receipts=tuple(sorted(new_receipts, key=lambda item: item.receipt_id)),
+        artifact_receipts=tuple(
+            sorted(artifact_receipts, key=lambda item: item.receipt_id)
+        ),
+        unreadable_artifact_receipt_ids=tuple(unreadable_artifact_receipt_ids),
+        unknown_legacy_artifacts=unknown_legacy_artifacts,
+    )
     return ordered, SummaryRunStats(
         hits=hits,
         misses=len(pending),
         batches=len(batches),
+        newly_spent_usage=accounting.newly_spent_usage,
+        newly_spent_unknown_receipts=accounting.newly_spent_unknown_receipts,
+        artifact_generation_usage=accounting.artifact_generation_usage,
+        artifact_generation_unknown_receipts=(
+            accounting.artifact_generation_unknown_receipts
+        ),
+        unknown_legacy_artifacts=unknown_legacy_artifacts,
+        usage_run_path=accounting.path,
     )
 
 

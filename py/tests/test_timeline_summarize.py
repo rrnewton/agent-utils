@@ -20,6 +20,7 @@ from agent_team_timeline.summarize import (
     build_summary_prompt,
     summarize_jobs,
 )
+from agent_team_timeline.token_usage import TokenUsage
 
 
 def _job(
@@ -83,6 +84,9 @@ def test_clean_runs_have_deterministic_fingerprints(tmp_path: Path) -> None:
     assert first[job.key].phrase == second[job.key].phrase
     assert first[job.key].paragraph == second[job.key].paragraph
     assert first[job.key].work_summary == second[job.key].work_summary
+    assert _input_hash(job, "codex", "same-model", "high") != _input_hash(
+        job, "codex", "same-model", "xhigh"
+    )
 
 
 def test_changing_one_job_invalidates_only_that_job(tmp_path: Path) -> None:
@@ -130,7 +134,7 @@ args = sys.argv[1:]
 assert args[0] == "exec"
 for required in (
     "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only",
-    "--model", "--output-schema", "--output-last-message", "-",
+    "--model", "--json", "--output-schema", "--output-last-message", "-",
 ):
     assert required in args
 assert Path.cwd().name.startswith("agent-team-timeline-summary-")
@@ -157,6 +161,16 @@ with Path(os.environ["FAKE_CODEX_LOG"]).open("a", encoding="utf-8") as handle:
     handle.write("CALL\\n")
     handle.write(prompt)
     handle.write("PROMPT_END\\n")
+print(json.dumps({
+    "type": "turn.completed",
+    "usage": {
+        "input_tokens": 100,
+        "cached_input_tokens": 40,
+        "cache_write_input_tokens": 5,
+        "output_tokens": 20,
+        "reasoning_output_tokens": 7,
+    },
+}))
 """,
         encoding="utf-8",
     )
@@ -180,7 +194,26 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
         batch_size=2,
         codex_command=(sys.executable, str(fake)),
     )
-    assert stats == type(stats)(hits=0, misses=3, batches=2)
+    assert stats.hits == 0
+    assert stats.misses == 3
+    assert stats.batches == 2
+    assert stats.newly_spent_usage == TokenUsage(
+        input_tokens=200,
+        cached_input_tokens=80,
+        cache_write_input_tokens=10,
+        output_tokens=40,
+        reasoning_output_tokens=14,
+    )
+    assert stats.newly_spent_usage.total_tokens == 240
+    assert stats.newly_spent_unknown_receipts == 0
+    assert stats.artifact_generation_usage == stats.newly_spent_usage
+    assert stats.artifact_generation_unknown_receipts == 0
+    assert stats.unknown_legacy_artifacts == 0
+    assert stats.usage_run_path is not None
+    run = json.loads(stats.usage_run_path.read_text(encoding="utf-8"))
+    assert run["model"] == "gpt-test"
+    assert run["newly_spent_usage"]["total_tokens"] == 240
+    assert len(run["batch_receipt_ids"]) == 2
     assert list(results) == [job.key for job in jobs]
     assert results["agent-a"].phrase == "Built agent-a"
     assert results["agent-a"].work_summary[0].at_ms == jobs[0].start_ms
@@ -200,6 +233,10 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
     )
     assert cached_stats.hits == 3
     assert cached_stats.batches == 0
+    assert cached_stats.newly_spent_usage == TokenUsage()
+    assert cached_stats.newly_spent_unknown_receipts == 0
+    assert cached_stats.artifact_generation_usage == stats.artifact_generation_usage
+    assert cached_stats.artifact_generation_unknown_receipts == 0
     assert log.read_text(encoding="utf-8") == log_text
 
 
@@ -218,6 +255,28 @@ def test_corrupt_cache_is_ignored_and_regenerated(tmp_path: Path) -> None:
     assert "transcript indexing" in results[job.key].paragraph
     assert cache_file.read_text(encoding="utf-8").startswith("{")
     json.loads(cache_file.read_text(encoding="utf-8"))
+
+
+def test_legacy_cache_is_a_hit_with_explicitly_unknown_historical_cost(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    job = _job("agent-a")
+    original, _ = summarize_jobs([job], cache, backend="heuristic", model="offline")
+    cache_file = next(cache.glob("*.json"))
+    raw = json.loads(cache_file.read_text(encoding="utf-8"))
+    raw["cache_version"] = 1
+    del raw["usage_receipt_id"]
+    cache_file.write_text(json.dumps(raw), encoding="utf-8")
+
+    reused, stats = summarize_jobs(
+        [job], cache, backend="heuristic", model="offline"
+    )
+    assert reused == original
+    assert stats.hits == 1
+    assert stats.misses == 0
+    assert stats.newly_spent_usage == TokenUsage()
+    assert stats.unknown_legacy_artifacts == 1
 
 
 def test_backend_failure_is_concise_and_preserves_existing_cache(tmp_path: Path) -> None:
@@ -242,6 +301,12 @@ def test_backend_failure_is_concise_and_preserves_existing_cache(tmp_path: Path)
         )
     assert len(str(caught.value)) < 300
     assert cache_file.read_bytes() == original
+    receipt_paths = list((cache / "_usage" / "receipts").glob("*.json"))
+    assert len(receipt_paths) == 1
+    receipt = json.loads(receipt_paths[0].read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert receipt["model"] == "gpt-test"
+    assert receipt["usage"] is None
 
 
 def test_failed_invocation_keeps_independently_validated_batch(tmp_path: Path) -> None:

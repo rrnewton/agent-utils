@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -17,6 +18,7 @@ from agent_team_timeline.naming import (
     build_agent_name_prompt,
     name_agents,
 )
+from agent_team_timeline.token_usage import TokenUsage
 
 
 def _job(
@@ -210,6 +212,80 @@ def test_heuristic_uses_only_nested_official_leaf(tmp_path: Path) -> None:
     assert result.short_name == "Budget overlap audit"
     assert "budget_overlap_audit" in result.rationale
     assert "transcript auditor" not in result.short_name.lower()
+
+
+def test_codex_naming_records_tokens_model_and_reasoning_effort(tmp_path: Path) -> None:
+    fake = tmp_path / "fake_naming_codex.py"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+assert args[0] == "exec"
+assert "--json" in args
+assert 'model_reasoning_effort="high"' in args
+prompt = sys.stdin.read()
+payload = prompt.split("BEGIN_AGENT_NAME_JOBS_JSON\\n", 1)[1].split(
+    "END_AGENT_NAME_JOBS_JSON", 1
+)[0]
+jobs = json.loads(payload)
+names = [{
+    "key": job["key"],
+    "thread_id": job["thread_id"],
+    "short_name": "CPU budget audit",
+    "rationale": "The completed work audited CPU budget semantics.",
+} for job in jobs]
+output = Path(args[args.index("--output-last-message") + 1])
+output.write_text(json.dumps({"names": names}), encoding="utf-8")
+print(json.dumps({
+    "type": "turn.completed",
+    "usage": {
+        "input_tokens": 90,
+        "cached_input_tokens": 30,
+        "cache_write_input_tokens": 4,
+        "output_tokens": 18,
+        "reasoning_output_tokens": 6,
+    },
+}))
+""",
+        encoding="utf-8",
+    )
+    cache = tmp_path / "cache"
+    jobs = [_job()]
+    _, first = name_agents(
+        jobs,
+        cache,
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+        reasoning_effort="high",
+    )
+    assert first.newly_spent_usage == TokenUsage(
+        input_tokens=90,
+        cached_input_tokens=30,
+        cache_write_input_tokens=4,
+        output_tokens=18,
+        reasoning_output_tokens=6,
+    )
+    assert first.usage_run_path is not None
+    run = json.loads(first.usage_run_path.read_text(encoding="utf-8"))
+    assert run["model"] == "gpt-test"
+    assert run["reasoning_effort"] == "high"
+
+    _, second = name_agents(
+        jobs,
+        cache,
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+        reasoning_effort="high",
+    )
+    assert second.newly_spent_usage == TokenUsage()
+    assert second.artifact_generation_usage == first.artifact_generation_usage
 
 
 @pytest.mark.parametrize(
