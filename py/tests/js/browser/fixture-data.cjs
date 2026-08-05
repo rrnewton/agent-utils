@@ -43,6 +43,10 @@ const ROLLUP_RANGES = [
 ];
 const FIRST_DAY_ACTIVITY_START_MS = BASE_MS;
 const LATEST_ACTIVITY_END_MS = BASE_MS + 100 * minute;
+const PHASE_A2_ACTIVITY_START_MS = BASE_MS + 27 * minute;
+const PHASE_A2_ACTIVITY_END_MS = BASE_MS + 29 * minute;
+const AGENT_A_ACTIVITY_START_MS = BASE_MS + 5 * minute;
+const AGENT_A_ACTIVITY_END_MS = PHASE_A2_ACTIVITY_END_MS;
 const ROLLUP_EXPECTED_RANGES = [
   { start_ms: FIRST_DAY_ACTIVITY_START_MS, end_ms: ROLLUP_RANGES[0].end_ms },
   { start_ms: ROLLUP_RANGES[1].start_ms, end_ms: LATEST_ACTIVITY_END_MS },
@@ -104,7 +108,7 @@ const agents = [
     short_name: "Parser audit",
     nickname: "Ada",
     lifetime_summary: "Found the malformed-input parser boundary, repaired it, and verified the focused regression tests.",
-    start_ms: BASE_MS + 5 * minute,
+    start_ms: BASE_MS + 2 * minute,
     end_ms: BASE_MS + 30 * minute,
     status: "complete",
     artifact_ids: ASSOCIATED_ARTIFACT_IDS,
@@ -182,12 +186,16 @@ const phases = [
     id: "phase-a-2",
     agent_id: "agent-a",
     start_ms: BASE_MS + 26 * minute,
-    end_ms: BASE_MS + 29 * minute,
+    end_ms: BASE_MS + 30 * minute,
     phrase: "Verify parser fix",
     paragraph: "Confirmed the repaired parser behavior against the focused regression case.",
     detail_path: "details/phase-a-2.json",
     stats: stats({ tool_calls: 1 }),
-    states: [state("active", 26, 29)]
+    states: [
+      state("idle", 26, 27),
+      state("active", 27, 29),
+      state("idle", 29, 30)
+    ]
   },
   {
     id: "phase-b-1",
@@ -569,9 +577,13 @@ module.exports = {
   BASE_MS: BASE_MS,
   DATA_START_MS: DATA_START_MS,
   DATA_END_MS: DATA_END_MS,
+  AGENT_A_ACTIVITY_START_MS: AGENT_A_ACTIVITY_START_MS,
+  AGENT_A_ACTIVITY_END_MS: AGENT_A_ACTIVITY_END_MS,
   FIRST_DAY_ACTIVITY_START_MS: FIRST_DAY_ACTIVITY_START_MS,
   PHASE_A_START_MS: BASE_MS + 10 * minute,
   PHASE_A_END_MS: BASE_MS + 25 * minute,
+  PHASE_A2_ACTIVITY_START_MS: PHASE_A2_ACTIVITY_START_MS,
+  PHASE_A2_ACTIVITY_END_MS: PHASE_A2_ACTIVITY_END_MS,
   ROLLUP_RANGES: ROLLUP_RANGES,
   ROLLUP_EXPECTED_RANGES: ROLLUP_EXPECTED_RANGES,
   AGENT_COUNT: agents.length,

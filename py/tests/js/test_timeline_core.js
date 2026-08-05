@@ -87,7 +87,7 @@ assert.deepStrictEqual(
 
 const activityStart = springForwardDay.end_ms - 42 * 60 * 1000;
 assert.deepStrictEqual(
-  core.rollupActivityRange(
+  core.activityRangeWithin(
     springForwardDay,
     {
       range: {
@@ -136,7 +136,7 @@ assert.deepStrictEqual(
 
 const sourceRollup = { start_ms: 100_000, end_ms: 200_000 };
 assert.deepStrictEqual(
-  core.rollupActivityRange(
+  core.activityRangeWithin(
     sourceRollup,
     {
       range: { start_ms: 100_000, end_ms: 200_000 },
@@ -157,7 +157,7 @@ assert.deepStrictEqual(
   "events, edge endpoints, non-idle states, and unsegmented phases define activity"
 );
 assert.deepStrictEqual(
-  core.rollupActivityRange(
+  core.activityRangeWithin(
     sourceRollup,
     {
       range: { start_ms: 90_000, end_ms: 180_000 },
@@ -171,7 +171,7 @@ assert.deepStrictEqual(
   "minimum point padding stays inside the selected rollup"
 );
 assert.deepStrictEqual(
-  core.rollupActivityRange(
+  core.activityRangeWithin(
     sourceRollup,
     {
       range: { start_ms: 120_000, end_ms: 180_000 },
@@ -183,6 +183,85 @@ assert.deepStrictEqual(
   ),
   { start_ms: 120_000, end_ms: 180_000 },
   "a rollup without activity falls back to its intersection with the data range"
+);
+
+const focusedPhase = {
+  id: "focus",
+  agent_id: "selected",
+  start_ms: 100_000,
+  end_ms: 200_000,
+  states: [
+    { kind: "idle", start_ms: 100_000, end_ms: 120_000 },
+    { kind: "active", start_ms: 120_000, end_ms: 160_000 },
+    { kind: "idle", start_ms: 160_000, end_ms: 200_000 }
+  ]
+};
+const scopedData = {
+  range: { start_ms: 0, end_ms: 300_000 },
+  agents: [{ id: "selected", start_ms: 50_000, end_ms: 250_000 }],
+  phases: [
+    focusedPhase,
+    {
+      id: "overlapping",
+      agent_id: "selected",
+      start_ms: 100_000,
+      end_ms: 200_000,
+      states: [{ kind: "tool", start_ms: 100_000, end_ms: 200_000 }]
+    },
+    {
+      id: "followup",
+      agent_id: "selected",
+      start_ms: 210_000,
+      end_ms: 230_000,
+      states: [{ kind: "active", start_ms: 215_000, end_ms: 220_000 }]
+    },
+    {
+      id: "unrelated",
+      agent_id: "other",
+      start_ms: 50_000,
+      end_ms: 250_000,
+      states: [{ kind: "active", start_ms: 50_000, end_ms: 250_000 }]
+    }
+  ],
+  events: [
+    { agent_id: "selected", at_ms: 80_000 },
+    { agent_id: "selected", at_ms: 130_000 },
+    { agent_id: "other", at_ms: 105_000 }
+  ],
+  edges: [
+    {
+      source_id: "other",
+      target_id: "selected",
+      source_ms: 60_000,
+      target_ms: 90_000
+    },
+    {
+      source_id: "selected",
+      target_id: "other",
+      source_ms: 225_000,
+      target_ms: 245_000
+    }
+  ]
+};
+assert.deepStrictEqual(
+  core.activityRangeWithin(
+    focusedPhase,
+    scopedData,
+    1000,
+    { agent_id: "selected", phase_id: "focus" }
+  ),
+  { start_ms: 120_000, end_ms: 160_000 },
+  "phase activity excludes its idle margins and overlapping unrelated work"
+);
+assert.deepStrictEqual(
+  core.activityRangeWithin(
+    { start_ms: 50_000, end_ms: 250_000 },
+    scopedData,
+    1000,
+    { agent_id: "selected" }
+  ),
+  { start_ms: 80_000, end_ms: 225_001 },
+  "agent activity uses only its phases, events, and own side of message edges"
 );
 
 const packed = core.packLifetimes([

@@ -1564,15 +1564,34 @@
     setView(safeStart, safeEnd);
   }
 
+  function zoomToActivityRange(bounds, scope) {
+    var activityRange = timelineCore.activityRangeWithin(
+      bounds,
+      app.data,
+      MIN_VIEW_MS,
+      scope
+    );
+    zoomToRange(
+      activityRange ? activityRange.start_ms : bounds.start_ms,
+      activityRange ? activityRange.end_ms : bounds.end_ms
+    );
+  }
+
   function phaseContextMenu(event, phase, agent) {
+    var agentScope = { agent_id: text(agent.id) };
     showContextMenu(event, text(phase.phrase, "Work phase"), [
       {
         label: "Zoom to work phase",
-        run: function () { zoomToRange(phase.start_ms, phase.end_ms); }
+        run: function () {
+          zoomToActivityRange(phase, {
+            agent_id: agentScope.agent_id,
+            phase_id: text(phase.id)
+          });
+        }
       },
       {
         label: "Zoom to agent lifetime",
-        run: function () { zoomToRange(agent.start_ms, agent.end_ms); }
+        run: function () { zoomToActivityRange(agent, agentScope); }
       }
     ]);
   }
@@ -1581,7 +1600,9 @@
     showContextMenu(event, agentShortName(agent), [
       {
         label: "Zoom to agent lifetime",
-        run: function () { zoomToRange(agent.start_ms, agent.end_ms); }
+        run: function () {
+          zoomToActivityRange(agent, { agent_id: text(agent.id) });
+        }
       }
     ]);
   }
@@ -2195,15 +2216,7 @@
           {
             label: "Zoom to " + rangeName,
             run: function () {
-              var activityRange = timelineCore.rollupActivityRange(
-                rollup,
-                app.data,
-                MIN_VIEW_MS
-              );
-              zoomToRange(
-                activityRange ? activityRange.start_ms : start,
-                activityRange ? activityRange.end_ms : end
-              );
+              zoomToActivityRange(rollup, null);
             }
           }
         ]);

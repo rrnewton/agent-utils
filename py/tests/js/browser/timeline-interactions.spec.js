@@ -2,11 +2,15 @@
 
 const { test, expect } = require("@playwright/test");
 const {
+  AGENT_A_ACTIVITY_END_MS,
+  AGENT_A_ACTIVITY_START_MS,
   AGENT_COUNT,
   DATA_END_MS,
   DATA_START_MS,
   PHASE_A_START_MS,
   PHASE_A_END_MS,
+  PHASE_A2_ACTIVITY_END_MS,
+  PHASE_A2_ACTIVITY_START_MS,
   ROLLUP_EXPECTED_RANGES,
   ROLLUP_RANGES,
   TIMELINE
@@ -215,6 +219,53 @@ test("the phase context menu can zoom exactly to the work phase", async function
     return Math.abs(view.start - PHASE_A_START_MS) <= 1 &&
       Math.abs(view.end - PHASE_A_END_MS) <= 1;
   }).toBeTruthy();
+});
+
+test("phase and agent zoom actions trim scoped idle margins and unrelated work", async function ({ page }) {
+  const timeline = page.getByTestId("timeline");
+  const menu = page.getByTestId("timeline-context-menu");
+  const fit = page.getByTestId("fit");
+  const phase = page.locator(secondPhaseSelector);
+  const lifetime = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+
+  await phase.click({ button: "right" });
+  await menu.getByRole("menuitem", { name: "Zoom to work phase", exact: true }).click();
+  await expect.poll(async function () {
+    const view = await readView(timeline);
+    return [view.start, view.end];
+  }).toEqual([PHASE_A2_ACTIVITY_START_MS, PHASE_A2_ACTIVITY_END_MS]);
+
+  await fit.click();
+  await phase.click({ button: "right" });
+  await menu.getByRole("menuitem", { name: "Zoom to agent lifetime", exact: true }).click();
+  await expect.poll(async function () {
+    const view = await readView(timeline);
+    return [view.start, view.end];
+  }).toEqual([AGENT_A_ACTIVITY_START_MS, AGENT_A_ACTIVITY_END_MS]);
+
+  await fit.click();
+  await lifetime.dispatchEvent("contextmenu", {
+    button: 2,
+    clientX: 200,
+    clientY: 300
+  });
+  await expect(page.locator("#context-menu-title")).toHaveText("Parser audit");
+  await menu.getByRole("menuitem", { name: "Zoom to agent lifetime", exact: true }).click();
+  await expect.poll(async function () {
+    const view = await readView(timeline);
+    return [view.start, view.end];
+  }).toEqual([AGENT_A_ACTIVITY_START_MS, AGENT_A_ACTIVITY_END_MS]);
+
+  const selectedPhase = TIMELINE.phases.find(function (item) {
+    return item.id === "phase-a-2";
+  });
+  const selectedAgent = TIMELINE.agents.find(function (item) {
+    return item.id === "agent-a";
+  });
+  expect(selectedPhase.start_ms).toBeLessThan(PHASE_A2_ACTIVITY_START_MS);
+  expect(selectedPhase.end_ms).toBeGreaterThan(PHASE_A2_ACTIVITY_END_MS);
+  expect(selectedAgent.start_ms).toBeLessThan(AGENT_A_ACTIVITY_START_MS);
+  expect(selectedAgent.end_ms).toBeGreaterThan(AGENT_A_ACTIVITY_END_MS);
 });
 
 test("rollup context menus trim empty calendar time without crossing the selected range", async function ({ page }) {

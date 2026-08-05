@@ -36,7 +36,8 @@ do not require site changes.
 - Single-clicking a day, week, month, or quarter selects it; double-click opens rendered Markdown
   with **Technical** and **Plain Language** tabs. The latter introduces the project and explains
   specialized terms for a newcomer. Right-clicking a rollup, agent lifetime, or work phase offers
-  range-appropriate zoom-to-fit actions. Horizontal trackpad gestures pan the time axis.
+  range-appropriate zoom-to-fit actions that trim empty leading and trailing time without leaving
+  the selected range. Horizontal trackpad gestures pan the time axis.
 - The fixed footer recomputes user prompts, agent responses, inter-agent messages, tool calls, and
   active agents for the visible time range.
 - Daily, weekly, monthly, and quarterly markers link the visible range to long-term summaries.
