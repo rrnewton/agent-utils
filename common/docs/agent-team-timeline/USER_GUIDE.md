@@ -78,6 +78,7 @@ agent-team-timeline refresh \
   --timezone America/New_York \
   --backend codex \
   --model gpt-5.6-sol \
+  --reasoning-effort xhigh \
   --summary-workers 3 \
   --name-batch-size 12
 ```
@@ -127,7 +128,7 @@ condensed transcript and statistics.
 ```bash
 agent-team-timeline summarize \
   --team example-team --output ./timelines/example-team \
-  --backend codex --model gpt-5.6-sol
+  --backend codex --model gpt-5.6-sol --reasoning-effort xhigh
 ```
 
 Each stable time window gets a content-addressed cache key over:
@@ -150,6 +151,14 @@ means a reused or misleading coordinator name does not become the permanent UI l
 separate content-addressed cache, so only an agent whose summarized work or context changed is sent
 back to the model. The whole summarize transaction holds the archive writer lock, preventing two
 simultaneous refreshes from buying the same cache miss.
+
+Every backend batch writes an immutable usage receipt with its model, reasoning effort, input,
+cached-input, cache-write-input, output, reasoning-output, and total token counts. Cache records
+link to that receipt. The command prints both tokens newly spent by this run and the deduplicated
+historical generation cost of all returned artifacts; an all-hit rerun therefore reports zero new
+tokens without losing the original cost. Older cache entries remain valid and are reported
+explicitly as having unknown historical usage rather than being regenerated or counted as zero.
+Aggregate accounting and receipt paths are also retained in the top-level `runs/*.json` metadata.
 
 For offline development or tests:
 
@@ -174,6 +183,21 @@ Markdown formatting changes. Because those presentation files live at the output
 refuses to use a non-empty directory unless it already contains its archive marker or a recognized
 existing `teams/<slug>/raw/team.json`; a mistaken `--output` cannot replace another project's
 README or Makefile.
+
+### 4. Optional GitHub pull metadata — conditional and cached
+
+```bash
+agent-team-timeline github-metadata \
+  --team example-team --output ./timelines/example-team
+```
+
+This scans only evidenced pull links, conditionally fetches their title, state, branches, author,
+and a bounded body excerpt, then rebuilds the detail JSON. Public repositories need no token. For
+private repositories, set `GH_TOKEN` or `GITHUB_TOKEN`, or name another environment variable with
+`--github-token-env`; credentials are request-only and never enter the cache. ETags make unchanged
+reruns byte-stable. `refresh --github-metadata` performs the same optional step after its normal
+build. Successful records are saved individually, so a rate limit or unavailable repository cannot
+discard metadata already fetched.
 
 ## Summary hierarchy
 
@@ -204,7 +228,7 @@ An archive is ordinary text designed for version control:
 ```text
 example-team/
 ├── .agent-team-timeline.json
-├── index.html, app.js, style.css
+├── index.html, timeline-core.js, app.js, style.css
 ├── vendor/markdown-it-15.0.0.min.js  # pinned offline Markdown renderer + license
 ├── Makefile, serve.py, README.md
 ├── manifest.json
@@ -226,6 +250,7 @@ example-team/
     │   ├── agents/<thread-id>.json   # selected hindsight name + provenance
     │   ├── phases/<phase-id>.json
     │   ├── rollups/{daily,weekly,monthly,quarterly}/...
+    │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata
     │   └── glossary.json
     └── summaries/
         ├── agents/<thread-id>.md

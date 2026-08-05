@@ -205,6 +205,31 @@
           reference.title,
           text(reference.repository, "GitHub") + " pull request #" + formatCount(reference.number)
         );
+        if (text(reference.title)) {
+          var state = reference.draft
+            ? "Draft"
+            : (text(reference.merged_at) ? "Merged" : text(reference.state, "Unknown state"));
+          var branch = text(reference.base_ref) && text(reference.head_label)
+            ? text(reference.base_ref) + " ← " + text(reference.head_label)
+            : "";
+          link.setAttribute(
+            "aria-label",
+            text(reference.repository, "GitHub") + " pull request #" +
+              formatCount(reference.number) + ": " + text(reference.title)
+          );
+          link.addEventListener("pointerenter", function (event) {
+            showTooltip(
+              event,
+              text(reference.title),
+              text(reference.body_excerpt, "No pull request description available.") +
+                (branch ? "\n\n" + branch : ""),
+              state + " · " + text(reference.repository) +
+                (text(reference.author) ? " · @" + text(reference.author) : "")
+            );
+          });
+          link.addEventListener("pointermove", positionTooltip);
+          link.addEventListener("pointerleave", hideTooltip);
+        }
         container.appendChild(link);
         cursor = end;
       });

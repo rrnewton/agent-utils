@@ -13,6 +13,7 @@ from pathlib import Path
 from agent_team_timeline import __version__
 from agent_team_timeline.archive import as_array, as_object, read_json
 from agent_team_timeline.codex import CodexParseError
+from agent_team_timeline.github_enrich import PullMetadataReport, enrich_pull_request_metadata
 from agent_team_timeline.naming import AgentNameError
 from agent_team_timeline.pipeline import (
     IngestReport,
@@ -25,9 +26,13 @@ from agent_team_timeline.pipeline import (
 )
 from agent_team_timeline.server import serve
 from agent_team_timeline.summarize import SummaryError
+from agent_team_timeline.token_usage import TokenUsage
 
 PROG = "agent-team-timeline"
 DEFAULT_MODEL = os.environ.get("AGENT_TEAM_TIMELINE_MODEL", "gpt-5.6-sol")
+DEFAULT_REASONING_EFFORT = os.environ.get(
+    "AGENT_TEAM_TIMELINE_REASONING_EFFORT", "xhigh"
+)
 
 
 def _load_userguide() -> str:
@@ -90,6 +95,14 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
         help="summary backend (heuristic is deterministic/offline)",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Codex model name")
+    parser.add_argument(
+        "--reasoning-effort",
+        default=DEFAULT_REASONING_EFFORT,
+        help=(
+            "Codex reasoning effort, recorded in cache provenance "
+            "(default: %(default)s)"
+        ),
+    )
     parser.add_argument("--summary-workers", type=int, default=3)
     parser.add_argument("--summary-batch-size", type=int, default=6)
     parser.add_argument(
@@ -103,6 +116,20 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--transcript-chars", type=int, default=30000)
     parser.add_argument(
         "--codex-command", default="codex", help="Codex executable (primarily for testing/wrappers)"
+    )
+
+
+def _add_github_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--github-token-env",
+        default="",
+        help="environment variable containing an optional GitHub token; the token is never stored",
+    )
+    parser.add_argument(
+        "--github-timeout",
+        type=float,
+        default=15.0,
+        help="per-request GitHub API timeout in seconds (default: %(default)s)",
     )
 
 
@@ -135,7 +162,22 @@ def _parser() -> argparse.ArgumentParser:
     refresh = sub.add_parser("refresh", help="idempotent ingest + summarize + build")
     _add_ingest(refresh)
     _add_summary(refresh)
+    refresh.add_argument(
+        "--github-metadata",
+        action="store_true",
+        help="conditionally cache titles for evidenced GitHub pull links after the build",
+    )
+    _add_github_options(refresh)
     refresh.set_defaults(handler="refresh")
+
+    github = sub.add_parser(
+        "github-metadata",
+        help="conditionally cache GitHub pull titles, then rebuild the site",
+    )
+    _add_archive(github)
+    github.add_argument("--phase-minutes", type=int, default=30)
+    _add_github_options(github)
+    github.set_defaults(handler="github-metadata")
 
     serve_parser = sub.add_parser("serve", help="serve a built archive on localhost")
     serve_parser.add_argument("--output", required=True, help="built archive directory")
@@ -162,6 +204,7 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
         context_chars=int(ns.context_chars),
         transcript_chars=int(ns.transcript_chars),
         codex_command=(str(ns.codex_command),),
+        reasoning_effort=str(ns.reasoning_effort),
     )
 
 
@@ -179,6 +222,57 @@ def _print_summaries(report: SummarizeReport) -> None:
         f"{report.rollups} calendar rollups; "
         f"cache {report.cache_hits} hit / {report.cache_misses} miss in "
         f"{report.backend_batches} backend batch(es); {report.glossary_terms} glossary terms"
+    )
+    print(
+        _usage_line(
+            "tokens newly spent",
+            report.newly_spent_usage,
+            report.newly_spent_unknown_receipts,
+        )
+    )
+    print(
+        _usage_line(
+            "tokens behind returned cached artifacts",
+            report.artifact_generation_usage,
+            report.artifact_generation_unknown_receipts,
+        )
+    )
+    if report.unknown_legacy_artifacts:
+        print(
+            "token accounting: "
+            f"{report.unknown_legacy_artifacts} legacy artifact(s) have no usage receipt"
+        )
+
+
+def _usage_line(label: str, usage: TokenUsage, unknown_receipts: int) -> str:
+    return (
+        f"{label}: input={usage.input_tokens}, "
+        f"cached_input={usage.cached_input_tokens}, "
+        f"cache_write_input={usage.cache_write_input_tokens}, "
+        f"output={usage.output_tokens}, "
+        f"reasoning_output={usage.reasoning_output_tokens}, "
+        f"total={usage.total_tokens}; unknown_receipts={unknown_receipts}"
+    )
+
+
+def _github_token(ns: argparse.Namespace) -> str | None:
+    requested = str(ns.github_token_env).strip()
+    if requested:
+        value = os.environ.get(requested)
+        if not value:
+            raise ValueError(
+                f"GitHub token environment variable {requested!r} is unset or empty"
+            )
+        return value
+    return os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
+
+
+def _print_github_metadata(report: PullMetadataReport) -> None:
+    print(
+        f"github metadata: {report.references} evidenced references / "
+        f"{report.distinct_pulls} distinct pulls; {report.fetched} fetched, "
+        f"{report.not_modified} unchanged, {len(report.failures)} failed; "
+        f"cache {report.cache_path}"
     )
 
 
@@ -260,6 +354,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{build_report['edges']} edges, {build_report['summary_files']} Markdown files; "
                 f"{build_report['files_changed']} presentation files changed"
             )
+        wants_github = handler == "github-metadata" or (
+            handler == "refresh" and bool(ns.github_metadata)
+        )
+        if wants_github:
+            github_report = enrich_pull_request_metadata(
+                archive,
+                team_slug,
+                token=_github_token(ns),
+                timeout_seconds=float(ns.github_timeout),
+            )
+            _print_github_metadata(github_report)
+            build_report = build_archive(
+                archive, team_slug, phase_minutes=int(ns.phase_minutes)
+            )
+            print(
+                f"rebuild: {build_report['files_changed']} presentation files changed "
+                "after GitHub metadata"
+            )
+            if github_report.failures:
+                raise ValueError(
+                    "GitHub metadata refresh had failures (successful records were retained): "
+                    + "; ".join(github_report.failures)
+                )
         run_path = record_run(
             archive,
             command,

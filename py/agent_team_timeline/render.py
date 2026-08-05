@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
 from agent_team_timeline.github_refs import find_pull_request_references
+from agent_team_timeline.github_metadata import PullRequestKey, PullRequestMetadata
 from agent_team_timeline.model import Agent, Edge, Event, TeamData, Turn, source_digest
 from agent_team_timeline.naming import AgentNameResult
 from agent_team_timeline.periods import Period, period_heading
@@ -423,9 +424,15 @@ finally:
 '''
 
 
-def _pull_request_references(text: str) -> list[dict[str, object]]:
-    return [
-        {
+def _pull_request_references(
+    text: str, metadata: Mapping[PullRequestKey, PullRequestMetadata]
+) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for reference in find_pull_request_references(text):
+        key = PullRequestKey(
+            reference.link.repository.slug, reference.link.number
+        )
+        item: dict[str, object] = {
             "start": reference.start,
             "end": reference.end,
             "text": reference.text,
@@ -434,13 +441,30 @@ def _pull_request_references(text: str) -> list[dict[str, object]]:
             "number": reference.link.number,
             "url": reference.link.url,
         }
-        for reference in find_pull_request_references(text)
-    ]
+        pull = metadata.get(key)
+        if pull is not None:
+            item.update(
+                {
+                    "title": pull.title,
+                    "state": pull.state,
+                    "draft": pull.draft,
+                    "merged_at": pull.merged_at,
+                    "body_excerpt": pull.body_excerpt,
+                    "base_ref": pull.base_ref,
+                    "head_label": pull.head_label,
+                    "author": pull.author,
+                    "updated_at": pull.updated_at,
+                }
+            )
+        result.append(item)
+    return result
 
 
-def _transcript_entry_obj(entry: TranscriptEntry) -> dict[str, object]:
+def _transcript_entry_obj(
+    entry: TranscriptEntry, metadata: Mapping[PullRequestKey, PullRequestMetadata]
+) -> dict[str, object]:
     result = entry.to_json_obj()
-    result["pull_requests"] = _pull_request_references(entry.text)
+    result["pull_requests"] = _pull_request_references(entry.text, metadata)
     return result
 
 
@@ -454,6 +478,7 @@ def render_archive(
     rollup_stats: Mapping[str, PhaseStats],
     glossary_terms: Sequence[GlossaryTerm],
     agent_names: Mapping[str, AgentNameResult],
+    pull_request_metadata: Mapping[PullRequestKey, PullRequestMetadata],
 ) -> dict[str, int]:
     """Regenerate all presentation files without invoking a summary backend."""
 
@@ -481,11 +506,16 @@ def render_archive(
                 {
                     "at_ms": item.at_ms,
                     "text": item.text,
-                    "pull_requests": _pull_request_references(item.text),
+                    "pull_requests": _pull_request_references(
+                        item.text, pull_request_metadata
+                    ),
                 }
                 for item in summary.work_summary
             ],
-            "transcript": [_transcript_entry_obj(entry) for entry in phase.transcript],
+            "transcript": [
+                _transcript_entry_obj(entry, pull_request_metadata)
+                for entry in phase.transcript
+            ],
             "raw_summary_path": raw_path,
             "agent": _agent_identity_obj(agent, phase_agent_name),
         }

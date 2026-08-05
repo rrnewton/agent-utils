@@ -37,6 +37,8 @@ from agent_team_timeline.naming import (
     AgentNameResult,
     name_agents,
 )
+from agent_team_timeline.github_metadata import load_pull_request_metadata_cache
+from agent_team_timeline.github_enrich import pull_metadata_path
 from agent_team_timeline.periods import Period, periods_for_range
 from agent_team_timeline.phases import (
     PhaseStats,
@@ -52,6 +54,7 @@ from agent_team_timeline.summarize import (
     WorkBullet,
     summarize_jobs,
 )
+from agent_team_timeline.token_usage import TokenUsage
 from agent_team_timeline.terminology import (
     GlossaryTerm,
     TermSource,
@@ -173,6 +176,9 @@ class IngestReport:
 class SummarizeReport:
     """Cache, backend, and output counts from one summarization run."""
 
+    backend: str
+    model: str
+    reasoning_effort: str | None
     phases: int
     rollups: int
     agent_names: int
@@ -180,12 +186,21 @@ class SummarizeReport:
     cache_hits: int
     cache_misses: int
     backend_batches: int
+    newly_spent_usage: TokenUsage
+    newly_spent_unknown_receipts: int
+    artifact_generation_usage: TokenUsage
+    artifact_generation_unknown_receipts: int
+    unknown_legacy_artifacts: int
+    usage_run_paths: tuple[str, ...]
     files_changed: int
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the summarization report as a JSON-serializable object."""
 
         return {
+            "backend": self.backend,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
             "phases": self.phases,
             "rollups": self.rollups,
             "agent_names": self.agent_names,
@@ -193,6 +208,14 @@ class SummarizeReport:
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "backend_batches": self.backend_batches,
+            "newly_spent_usage": self.newly_spent_usage.to_json(),
+            "newly_spent_unknown_receipts": self.newly_spent_unknown_receipts,
+            "artifact_generation_usage": self.artifact_generation_usage.to_json(),
+            "artifact_generation_unknown_receipts": (
+                self.artifact_generation_unknown_receipts
+            ),
+            "unknown_legacy_artifacts": self.unknown_legacy_artifacts,
+            "usage_run_paths": list(self.usage_run_paths),
             "files_changed": self.files_changed,
         }
 
@@ -786,10 +809,26 @@ def _rollup_jobs_for_level(
 
 
 def _accumulate_stats(stats: Sequence[SummaryRunStats]) -> SummaryRunStats:
+    newly_spent = TokenUsage()
+    artifact_generation = TokenUsage()
+    for item in stats:
+        newly_spent += item.newly_spent_usage
+        artifact_generation += item.artifact_generation_usage
     return SummaryRunStats(
         hits=sum(item.hits for item in stats),
         misses=sum(item.misses for item in stats),
         batches=sum(item.batches for item in stats),
+        newly_spent_usage=newly_spent,
+        newly_spent_unknown_receipts=sum(
+            item.newly_spent_unknown_receipts for item in stats
+        ),
+        artifact_generation_usage=artifact_generation,
+        artifact_generation_unknown_receipts=sum(
+            item.artifact_generation_unknown_receipts for item in stats
+        ),
+        unknown_legacy_artifacts=sum(
+            item.unknown_legacy_artifacts for item in stats
+        ),
     )
 
 
@@ -806,6 +845,7 @@ def _summarize_archive_locked(
     context_chars: int = 16_000,
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
+    reasoning_effort: str | None = None,
 ) -> SummarizeReport:
     """Fill only missing/changed structured summaries; never format the website."""
 
@@ -826,6 +866,7 @@ def _summarize_archive_locked(
         max_workers=max_workers,
         batch_size=batch_size,
         codex_command=codex_command,
+        reasoning_effort=reasoning_effort,
     )
     changed = _write_phase_data(archive, team_slug, phases, phase_results)
     name_jobs = _agent_name_jobs(team, phases, phase_results)
@@ -837,6 +878,7 @@ def _summarize_archive_locked(
         max_workers=max_workers,
         batch_size=name_batch_size,
         codex_command=codex_command,
+        reasoning_effort=reasoning_effort,
     )
     changed += _write_agent_name_data(
         archive, team_slug, name_jobs, agent_names
@@ -879,6 +921,7 @@ def _summarize_archive_locked(
                 max_workers=max_workers,
                 batch_size=batch_size,
                 codex_command=codex_command,
+                reasoning_effort=reasoning_effort,
             )
             backend_stats.append(stats)
             result = results[jobs[0].key]
@@ -927,6 +970,9 @@ def _summarize_archive_locked(
     )
     combined = _accumulate_stats(backend_stats)
     return SummarizeReport(
+        backend=backend,
+        model=model,
+        reasoning_effort=reasoning_effort,
         phases=len(phases),
         rollups=len(periods),
         agent_names=len(agent_names),
@@ -934,6 +980,18 @@ def _summarize_archive_locked(
         cache_hits=combined.hits,
         cache_misses=combined.misses,
         backend_batches=combined.batches,
+        newly_spent_usage=combined.newly_spent_usage,
+        newly_spent_unknown_receipts=combined.newly_spent_unknown_receipts,
+        artifact_generation_usage=combined.artifact_generation_usage,
+        artifact_generation_unknown_receipts=(
+            combined.artifact_generation_unknown_receipts
+        ),
+        unknown_legacy_artifacts=combined.unknown_legacy_artifacts,
+        usage_run_paths=tuple(
+            str(item.usage_run_path.relative_to(archive))
+            for item in backend_stats
+            if item.usage_run_path is not None
+        ),
         files_changed=changed,
     )
 
@@ -951,6 +1009,7 @@ def summarize_archive(
     context_chars: int = 16_000,
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
+    reasoning_effort: str | None = None,
 ) -> SummarizeReport:
     """Fill structured summaries/names while serializing token-spending cache misses."""
 
@@ -967,6 +1026,7 @@ def summarize_archive(
             context_chars=context_chars,
             transcript_chars=transcript_chars,
             codex_command=codex_command,
+            reasoning_effort=reasoning_effort,
         )
 
 
@@ -1031,6 +1091,10 @@ def build_archive(
         rollup_results[key] = _summary_from_json(obj.get("summary"), str(path))
         rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
     terms = _load_glossary(archive, team_slug)
+    pull_cache = load_pull_request_metadata_cache(
+        pull_metadata_path(archive, team_slug)
+    )
+    pull_metadata = {record.key: record for record in pull_cache.records}
     return render_archive(
         archive,
         team,
@@ -1041,6 +1105,7 @@ def build_archive(
         rollup_stats,
         terms,
         agent_names,
+        pull_metadata,
     )
 
 

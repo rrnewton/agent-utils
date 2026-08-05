@@ -10,6 +10,13 @@ from pathlib import Path
 import pytest
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed
+from agent_team_timeline.github_enrich import pull_metadata_path
+from agent_team_timeline.github_metadata import (
+    PullRequestKey,
+    PullRequestMetadata,
+    PullRequestMetadataCache,
+    save_pull_request_metadata_cache,
+)
 from agent_team_timeline.model import (
     Agent,
     Edge,
@@ -177,11 +184,26 @@ def _write_team(archive: Path, team: TeamData) -> None:
 def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)
-    first = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    first = summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "test-model",
+        reasoning_effort="high",
+    )
     built = build_archive(tmp_path, team.team_slug)
 
     assert first.agent_names == 2
     assert first.cache_misses == first.phases + first.rollups + first.agent_names
+    assert first.backend == "heuristic"
+    assert first.model == "test-model"
+    assert first.reasoning_effort == "high"
+    assert first.newly_spent_usage.total_tokens == 0
+    assert first.newly_spent_unknown_receipts == 0
+    assert first.artifact_generation_unknown_receipts == 0
+    assert first.unknown_legacy_artifacts == 0
+    assert len(first.usage_run_paths) == first.rollups + 2
+    assert all((tmp_path / path).is_file() for path in first.usage_run_paths)
     assert built["agents"] == 2
     assert (tmp_path / "index.html").is_file()
     assert (tmp_path / "timeline-core.js").is_file()
@@ -220,12 +242,35 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert name_record["agent"]["official_path"] == "/root/release_receipt_audit"
     assert name_record["name"]["short_name"] == "Release receipt audit"
 
-    second = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    second = summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "test-model",
+        reasoning_effort="high",
+    )
     rebuilt = build_archive(tmp_path, team.team_slug)
     assert second.cache_misses == 0
     assert second.cache_hits == first.phases + first.rollups + first.agent_names
     assert second.files_changed == 0
+    assert second.newly_spent_usage.total_tokens == 0
+    assert second.artifact_generation_usage == first.artifact_generation_usage
     assert rebuilt["files_changed"] == 0
+
+    run_path = record_run(
+        tmp_path,
+        ("agent-team-timeline", "summarize"),
+        "2026-08-05T00:00:00Z",
+        "completed",
+        team.team_slug,
+        None,
+        second,
+        None,
+    )
+    run = json.loads(run_path.read_text(encoding="utf-8"))
+    assert run["summaries"]["reasoning_effort"] == "high"
+    assert run["summaries"]["newly_spent_usage"]["total_tokens"] == 0
+    assert run["summaries"]["usage_run_paths"] == list(second.usage_run_paths)
 
 
 def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path) -> None:
@@ -258,6 +303,38 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
         for reference in references
     )
     assert all(reference["text"] != "#7" for reference in references)
+
+    pull = PullRequestMetadata(
+        key=PullRequestKey("rrnewton/dev-hermit", 38),
+        title="Repair archive refresh",
+        state="closed",
+        draft=False,
+        merged_at="2026-08-05T10:00:00Z",
+        body_excerpt="Makes refresh append-safe.",
+        base_ref="main",
+        head_label="rrnewton:archive-refresh",
+        author="rrnewton",
+        updated_at="2026-08-05T10:00:00Z",
+        etag='W/"pull-38"',
+        fetched_at="2026-08-05T11:00:00Z",
+    )
+    save_pull_request_metadata_cache(
+        pull_metadata_path(tmp_path, team.team_slug),
+        PullRequestMetadataCache((pull,)),
+    )
+    build_archive(tmp_path, team.team_slug)
+    enriched_details = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "data" / "details").glob("*.json")
+    ]
+    enriched_entry = next(
+        transcript_entry
+        for detail in enriched_details
+        for transcript_entry in detail["transcript"]
+        if "dev-hermit/pull/38" in transcript_entry["text"]
+    )
+    assert enriched_entry["pull_requests"][0]["title"] == "Repair archive refresh"
+    assert enriched_entry["pull_requests"][0]["merged_at"] == "2026-08-05T10:00:00Z"
 
 
 def test_every_completed_subagent_turn_gets_a_result_edge(tmp_path: Path) -> None:
