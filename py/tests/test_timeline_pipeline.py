@@ -215,6 +215,25 @@ def test_knowledge_evidence_keeps_prior_context_but_excludes_post_window_events(
     assert all("FUTURE_ONLY_MARKER" not in item.context for item in evidence)
 
 
+def test_unversioned_legacy_glossary_is_regenerated(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    glossary_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "glossary.json"
+    )
+    write_json_if_changed(glossary_path, narrow_json({"terms": []}))
+
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+
+    glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
+    assert glossary["schema_version"] == 3
+    assert glossary["project_overview_epoch_id"].startswith("knowledge-")
+
+
 def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)

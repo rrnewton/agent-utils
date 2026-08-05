@@ -1372,6 +1372,8 @@ def _frozen_project_overview_input(
     if not path.is_file():
         return None
     obj = as_object(read_json(path), str(path))
+    if "schema_version" not in obj:
+        return None
     version = as_int(obj.get("schema_version"), f"{path}.schema_version")
     if version != _PROJECT_OVERVIEW_SCHEMA_VERSION:
         # Older schemas did not have enough immutable provenance to distinguish append-only
@@ -1447,6 +1449,8 @@ def _frozen_term_knowledge(
     if not path.is_file():
         return None, {}
     obj = as_object(read_json(path), str(path))
+    if "schema_version" not in obj:
+        return None, {}
     version = as_int(obj.get("schema_version"), f"{path}.schema_version")
     if version != _GLOSSARY_SCHEMA_VERSION:
         return None, {}
