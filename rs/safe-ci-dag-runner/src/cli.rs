@@ -165,8 +165,9 @@ fn quickstart(c: &Palette) -> String {
     let k = |s: &str| c.cyan(s);
     format!(
         "{banner}\n\n\
-{i1}\n  pip install \"git+https://github.com/rrnewton/agent-utils#subdirectory=py\"\n  \
-(or build the Rust binary: cargo build --release)\n\n\
+{i1}\n  cargo build --release --manifest-path rs/Cargo.toml\n  \
+# then invoke the built binary (also linked at rs/bin/safe-ci-dag-runner):\n  \
+rs/target/release/safe-ci-dag-runner --help\n\n\
 {i2}  {deps_note}\n  Save as dag.json:\n  {{\n    \"resource_caps\": {{\"browser\": 1}},\n    \"steps\": [\n      \
 {{\"group\": \"build\", \"job\": \"app\", \"desc\": \"compile\", \"cmd\": \"echo build && sleep 0.2\"}},\n      \
 {{\"group\": \"test\",  \"job\": \"unit\", \"desc\": \"unit tests\", \"cmd\": \"echo test && sleep 0.2\",\n        \"deps\": [\"build.app\"]}},\n      \
@@ -247,6 +248,130 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         perfdir = k("run --perf-dir DIR"),
         note = h("Note"),
         exits = h("Exit codes"),
+    )
+}
+
+// --------------------------------------------------------------------------- per-subcommand help
+
+/// Does this argument list request help (`-h`/`--help`)? The dispatcher checks this at the START of
+/// each subcommand — before argument parsing — so `--help` prints a usage page and exits 0 instead of
+/// tripping the unknown-argument arm.
+fn wants_help(rest: &[String]) -> bool {
+    rest.iter().any(|a| a == "-h" || a == "--help")
+}
+
+/// Render a per-subcommand help page: a usage line, a one-line summary, then each accepted flag with
+/// a ONE-LINE description. Mirrors the Python argparse per-subcommand help.
+fn render_subcommand_help(c: &Palette, usage: &str, summary: &str, flags: &[(&str, &str)]) -> String {
+    let width = flags.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
+    let mut out = format!("{} {PROG} {usage}\n\n{summary}\n\n{}\n", c.bold("usage"), c.bold("options"));
+    for (flag, desc) in flags {
+        let padded = format!("{flag:<width$}");
+        out.push_str(&format!("  {}  {desc}\n", c.cyan(&padded)));
+    }
+    out
+}
+
+fn run_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "run --dag FILE [options]",
+        "Run a DAG (exit 0 iff every step passes). Boxed per-step with cgroup-v2 by default.",
+        &[
+            ("--dag FILE", "DAG file to run ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
+            ("-j, --jobs N", "max concurrent steps (default: CPU count); a bare -jN also works"),
+            ("--cores/--cpuset/--pin K", "CPU PINNING (cpuset/affinity), OPT-IN and OFF BY DEFAULT: pin the WHOLE run tree to K least-busy FREE cores (K=1 => sequential). For BENCHMARKS, not CI. Aliases: --cpuset, --pin"),
+            ("--max-mem SPEC", "RAM budget (e.g. 8G): pick the largest -j whose modeled footprint fits (ignored with --jobs)"),
+            ("--only TAG[,TAG...]", "run EXACTLY the named step(s); dependency edges outside the selection are dropped"),
+            ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
+            ("--no-profile", "disable the default auto-logging profile store for this run"),
+            ("--profile", "after the run, print a per-step profile (timing/memory) table"),
+            ("--planner NAME", "dispatch-ordering planner: greedy-lpt (default) | critical-path | cpa"),
+            ("--show-plan", "before running, print the scheduled plan"),
+            ("--no-profile-feedback", "do NOT read the profile store to refine time/RAM estimates"),
+            ("--profile-sync BACKEND", "download+upload the shared profile summary (for ephemeral CI)"),
+            ("--profile-sync-direction D", "both (default) | download | upload"),
+            ("-k, --keep-going", "on failure, let running steps finish (stop launching new ones)"),
+            ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
+            ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
+            ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
+            ("-v", "stream child output (repeatable)"),
+            ("-q, --quiet", "quieter output"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn sweep_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "sweep --dag FILE --step TAG --jobs RANGE [options]",
+        "Parallel-speedup sweep of ONE step across inner -j widths (wall/user/sys/rss + speedup table).",
+        &[
+            ("--dag FILE", "DAG file ('-' = stdin) [required]"),
+            ("--step TAG", "the single group.job step to sweep [required]"),
+            ("--jobs RANGE", "inner widths: LO..HI or a bare N (= 1..N) [required]"),
+            ("--repeat K", "run each width K times and keep the fastest (default: 1)"),
+            ("--perf-dir DIR", "write the sweep's resource-usage CSVs into DIR"),
+            ("--no-profile", "disable the default auto-logging profile store"),
+            ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning"),
+            ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
+            ("-v", "stream child output (repeatable)"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn plan_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "plan --dag FILE [options]",
+        "Show learned estimates + the scheduled order. Does NOT run anything.",
+        &[
+            ("--dag FILE", "DAG file ('-' = stdin) [required]"),
+            ("--planner NAME", "greedy-lpt (default) | critical-path | cpa"),
+            ("--max-mem SPEC", "RAM budget (e.g. 8G) used by the cpa planner"),
+            ("--format FORMAT", "text (default) | json"),
+            ("--perf-dir DIR", "read the profile store from DIR"),
+            ("--no-profile-feedback", "do NOT read the profile store to refine estimates"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn simple_help(c: &Palette, command: &str) -> String {
+    let summary = match command {
+        "list" => "List the steps (tag, classification, dependencies).",
+        "ascii" => "Draw the DAG as ASCII art.",
+        "dot" => "Emit Graphviz DOT (pipe to `dot -Tsvg`).",
+        "json" => "Re-emit the DAG as canonical JSON.",
+        "yaml" => "Re-emit the DAG as YAML.",
+        _ => "Read a DAG and emit it.",
+    };
+    let usage = format!("{command} --dag FILE");
+    render_subcommand_help(
+        c,
+        &usage,
+        summary,
+        &[
+            ("--dag FILE", "DAG file to read ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn summary_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "summary <action> [options]",
+        "Build / merge / plan / stats the mergeable profile summary.",
+        &[
+            ("build", "build a summary from a profile store (--perf-dir DIR, --out FILE, --reservoir-cap N)"),
+            ("merge", "merge summary FILEs into one (--out FILE, --reservoir-cap N)"),
+            ("plan", "plan a summary sync from a backend spec"),
+            ("stats", "print bucket/sample stats for a summary FILE"),
+            ("-h, --help", "show this help and exit"),
+        ],
     )
 }
 
@@ -381,11 +506,12 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                         .map_err(|_| format!("--jobs: invalid int value: '{v}'"))?,
                 );
             }
-            "--cores" => {
+            // `--cpuset`/`--pin` are discoverable aliases for `--cores` (identical semantics).
+            "--cores" | "--cpuset" | "--pin" => {
                 let v = take_value(inline, &mut i)?;
                 a.cores = Some(
                     v.parse::<i64>()
-                        .map_err(|_| format!("--cores: invalid int value: '{v}'"))?,
+                        .map_err(|_| format!("{key}: invalid int value: '{v}'"))?,
                 );
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
@@ -1600,6 +1726,10 @@ pub fn run(argv: &[String]) -> i32 {
             0
         }
         "run" => {
+            if wants_help(rest) {
+                print!("{}", run_help(&c));
+                return 0;
+            }
             let a = match parse_run_args(rest) {
                 Ok(a) => a,
                 Err(msg) => {
@@ -1624,6 +1754,10 @@ pub fn run(argv: &[String]) -> i32 {
             cmd_run(&cfg, &a, &c)
         }
         "sweep" => {
+            if wants_help(rest) {
+                print!("{}", sweep_help(&c));
+                return 0;
+            }
             let a = match parse_sweep_args(rest) {
                 Ok(a) => a,
                 Err(msg) => {
@@ -1634,6 +1768,10 @@ pub fn run(argv: &[String]) -> i32 {
             cmd_sweep(&a, &c)
         }
         "plan" => {
+            if wants_help(rest) {
+                print!("{}", plan_help(&c));
+                return 0;
+            }
             let a = match parse_plan_args(rest) {
                 Ok(a) => a,
                 Err(msg) => {
@@ -1643,8 +1781,18 @@ pub fn run(argv: &[String]) -> i32 {
             };
             cmd_plan(&a)
         }
-        "summary" => cmd_summary(rest),
+        "summary" => {
+            if wants_help(rest) {
+                print!("{}", summary_help(&c));
+                return 0;
+            }
+            cmd_summary(rest)
+        }
         "list" | "ascii" | "dot" | "json" | "yaml" => {
+            if wants_help(rest) {
+                print!("{}", simple_help(&c, command));
+                return 0;
+            }
             let dag_arg = match parse_simple_dag(rest) {
                 Ok(Some(d)) => d,
                 Ok(None) => {

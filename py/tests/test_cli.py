@@ -44,6 +44,66 @@ def test_quickstart_is_self_contained() -> None:
         assert marker in out
 
 
+def _capture_help(args: list[str]) -> tuple[int, str, str]:
+    """Capture a subcommand's --help, which argparse emits via SystemExit(0)."""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        with pytest.raises(SystemExit) as exc:
+            main(args)
+    code = exc.value.code if isinstance(exc.value.code, int) else 0
+    return code, out.getvalue(), err.getvalue()
+
+
+def test_run_help_lists_flags_and_cores_pinning() -> None:
+    """`run --help` exits 0, lists its flags, and surfaces --cores CPU pinning discoverably."""
+    code, out, _ = _capture_help(["run", "--help"])
+    assert code == 0
+    for flag in ("--dag", "--jobs", "--cores", "--only", "--planner", "--keep-going"):
+        assert flag in out, flag
+    # Discoverable pinning aliases + intent keywords (greppable).
+    assert "--cpuset" in out and "--pin" in out
+    # argparse line-wraps help, so collapse whitespace before substring checks.
+    low = " ".join(out.lower().split())
+    assert "pinning" in low or "cpuset" in low or "affinity" in low
+    assert "opt-in" in low and "off by default" in low
+
+
+def test_run_help_has_no_rust_binary_mention() -> None:
+    """The Python help must describe the PYTHON tool only - no Rust binary / cargo."""
+    _, out, _ = _capture_help(["run", "--help"])
+    low = out.lower()
+    assert "cargo" not in low
+    assert "rs/target" not in low
+    assert "rust binary" not in low
+
+
+@pytest.mark.parametrize(
+    ("sub", "expected"),
+    [
+        ("sweep", "--step"),
+        ("plan", "--planner"),
+        ("list", "--dag"),
+        ("ascii", "--dag"),
+        ("json", "--dag"),
+        ("yaml", "--dag"),
+    ],
+)
+def test_subcommand_help_exits_zero_and_lists_flags(sub: str, expected: str) -> None:
+    code, out, _ = _capture_help([sub, "--help"])
+    assert code == 0
+    assert expected in out
+
+
+def test_python_quickstart_mentions_python_install_only() -> None:
+    """The Python quickstart install step must mention pip, never cargo/the Rust binary."""
+    rc, out, _ = _capture(["quickstart"])
+    assert rc == 0
+    low = out.lower()
+    assert "pip install" in low
+    assert "cargo" not in low
+    assert "rs/target" not in low
+
+
 def test_userguide_prints_embedded_guide() -> None:
     """`--userguide` prints the full embedded guide VERBATIM (byte-for-byte, no coloring)."""
     rc, out, _ = _capture(["--userguide"])

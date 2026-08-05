@@ -297,14 +297,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("-j", "--jobs", type=int, default=None, help="max concurrent steps (default: CPU count)")
     run_p.add_argument(
         "--cores",
+        "--cpuset",
+        "--pin",
         type=int,
         default=None,
         metavar="K",
-        help="constrain the WHOLE run process tree (all steps + descendants, native/non-hermit "
-        "included) to K least-busy FREE cores; K=1 forces sequential execution for "
+        help="CPU PINNING (cpuset/affinity), OPT-IN and OFF BY DEFAULT: constrain the WHOLE run "
+        "process tree (all steps + descendants, native/non-hermit included) to K least-busy FREE "
+        "cores. Intended for BENCHMARKS, not CI. K=1 forces sequential execution for "
         "gVisor/backend-perf measurement. Never pins a fixed core id (picks the K least-busy of "
         "this process's allowed set). Uses a cgroup cpuset where the controller is delegated, "
-        "else sched_setaffinity; the active mechanism is logged. Absent = today's behavior.",
+        "else sched_setaffinity; the active mechanism is logged. Aliases: --cpuset, --pin. "
+        "Absent = today's behavior.",
     )
     run_p.add_argument(
         "--max-mem",
