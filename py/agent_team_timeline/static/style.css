@@ -710,7 +710,7 @@ h1 {
   stroke-width: 1.35;
   opacity: 0.22;
 }
-.edge-result { color: var(--green); stroke: var(--green); stroke-width: 1.7; }
+.edge-result { color: var(--green); stroke: var(--green); stroke-width: 3.25; }
 .edge-other { color: var(--blue); stroke: var(--blue); stroke-width: 1.3; }
 
 .rollup-marker.is-selected {

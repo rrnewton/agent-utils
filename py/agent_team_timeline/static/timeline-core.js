@@ -128,7 +128,10 @@
   /** Return hidden/normal/dimmed/highlighted for one structural or detailed edge. */
   function edgeDisplayState(edge, selection, showGlobalDetailed, showHighlightedDetailed) {
     var kind = string(edge.kind).toLowerCase();
-    var structural = kind === "spawn";
+    // Spawns and final results are the fork and join of one delegated turn. Keep both
+    // visible as structural context; only intermediate message traffic obeys the
+    // detailed-edge toggles.
+    var structural = kind === "spawn" || kind === "result";
     var highlighted = edgeTouchesSelection(edge, selection);
     if (structural) {
       if (!selection) {

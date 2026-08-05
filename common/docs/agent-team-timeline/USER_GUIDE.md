@@ -22,9 +22,10 @@ do not require site changes.
 - A whole spawned interval is an **agent lifetime**; each summarized sub-block is a **work phase**.
   Work-phase boxes carry a short phrase at useful zoom levels. Their bottom strip distinguishes active,
   tool-running, waiting, idle, and explicitly blocked time.
-- Thick curved edges are spawns and remain visible for structure. Detailed message and result edges
-  are hidden globally by default and appear for the selected agent or work phase; both behaviors
-  have toolbar toggles.
+- Thick curved edges are structural forks (parent-to-child spawns) and joins (terminal
+  child-to-parent results), so both remain visible. Detailed intermediate message edges are hidden
+  globally by default and appear for the selected agent or work phase; both detailed-message
+  behaviors have toolbar toggles.
 - Hovering a phase or edge shows its paragraph summary and statistics.
 - Single-clicking selects an agent; a later single click on the same work phase narrows selection to
   that phase. Clicking a different phase selects that phase directly; clicking the selected phase

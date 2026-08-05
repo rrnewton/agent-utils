@@ -71,6 +71,14 @@ const inPhase = {
   source_ms: 15,
   target_ms: 15
 };
+const result = {
+  id: "result",
+  kind: "result",
+  source_id: "agent-a",
+  target_id: "parent",
+  source_ms: 20,
+  target_ms: 20
+};
 const outOfPhase = {
   id: "message-out",
   kind: "message",
@@ -87,6 +95,21 @@ const phaseSelection = {
   end_ms: 20
 };
 assert.strictEqual(core.edgeDisplayState(spawn, null, false, true), "normal");
+assert.strictEqual(
+  core.edgeDisplayState(result, null, false, false),
+  "normal",
+  "the terminal child-to-parent join remains visible when detailed edges are off"
+);
+assert.strictEqual(
+  core.edgeDisplayState(result, phaseSelection, false, false),
+  "highlighted",
+  "the structural join highlights without the highlighted-detailed toggle"
+);
+assert.strictEqual(
+  core.edgeDisplayState(result, { kind: "agent", agent_id: "unrelated" }, false, false),
+  "dimmed",
+  "an unrelated structural join dims instead of disappearing"
+);
 assert.strictEqual(core.edgeDisplayState(inPhase, null, false, true), "hidden");
 assert.strictEqual(core.edgeDisplayState(inPhase, phaseSelection, false, true), "highlighted");
 assert.strictEqual(core.edgeDisplayState(outOfPhase, phaseSelection, false, true), "hidden");

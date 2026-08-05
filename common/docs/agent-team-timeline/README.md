@@ -11,7 +11,8 @@ web server.
 
 ## What it provides
 
-- Real-time coordinator and nested-agent tracks with spawn, message, and result edges.
+- Real-time coordinator and nested-agent tracks with structural spawn/result fork-join edges and
+  optional detailed intermediate messages.
 - Active, tool-running, waiting, idle, and blocked intervals inside work phases.
 - Hindsight short names and lifetime summaries grounded in completed work while retaining official
   paths and coordinator nicknames.

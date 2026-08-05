@@ -201,6 +201,36 @@ test("packed tracks are the default and per-agent tracks remain available", asyn
   await expect(svg).toHaveAttribute("data-lane-count", String(AGENT_COUNT));
 });
 
+test("fork and join edges stay structural while intermediate messages are detailed", async function ({ page }) {
+  const spawn = page.locator('.edge-group[data-edge-id="spawn-a"]');
+  const result = page.locator('.edge-group[data-edge-id="result-a"]');
+  const message = page.locator('.edge-group[data-edge-id="message-a"]');
+  const globalDetailed = page.locator("#show-global-messages");
+
+  await expect(globalDetailed).not.toBeChecked();
+  await expect(spawn).toHaveCount(1);
+  await expect(spawn).toHaveAttribute("data-edge-state", "normal");
+  await expect(result).toHaveCount(1);
+  await expect(result).toHaveAttribute("data-edge-state", "normal");
+  await expect(message).toHaveCount(0);
+
+  const spawnWidth = await spawn.locator(".edge-visible").evaluate(function (element) {
+    return Number.parseFloat(window.getComputedStyle(element).strokeWidth);
+  });
+  const resultWidth = await result.locator(".edge-visible").evaluate(function (element) {
+    return Number.parseFloat(window.getComputedStyle(element).strokeWidth);
+  });
+  expect(resultWidth).toBe(spawnWidth);
+
+  await globalDetailed.check();
+  await expect(message).toHaveCount(1);
+  await expect(message).toHaveAttribute("data-edge-state", "normal");
+  const messageWidth = await message.locator(".edge-visible").evaluate(function (element) {
+    return Number.parseFloat(window.getComputedStyle(element).strokeWidth);
+  });
+  expect(messageWidth).toBeLessThan(resultWidth);
+});
+
 test("full-transcript role filters support user-only, none, and all", async function ({ page }) {
   await page.locator(phaseSelector).dblclick();
   await expect(page.getByTestId("modal")).toBeVisible();
