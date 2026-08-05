@@ -244,10 +244,12 @@ primary. Render one project and one host as, for example,
 in a tooltip/menu. A project may have several teams and hosts; a team may touch
 several projects. Do not encode either relationship as a single field on `TeamData`.
 
-Timezone is display preference, not source identity. Store UTC instants and archive
-calendar timezone as today, but let the browser default to its resolved IANA timezone
-unless the user has explicitly selected and persisted another timezone. A stale
-archive generation timezone should not silently override that browser preference.
+Timezone is display preference, not source identity. Store UTC instants together
+with the archive's explicit IANA display timezone, and render that timezone
+consistently in every browser. The CLI defaults new archives to
+`America/New_York`; a future user-facing selector may deliberately persist a
+different choice, but the browser's ambient timezone must not silently override
+the archive.
 
 ## Security and privacy
 
