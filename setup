@@ -50,7 +50,14 @@ setup_py() {
     return 1
   fi
   ( cd py && python3 -m mypy . )
-  [ -d py/bin ] && chmod +x py/bin/* 2>/dev/null || true
+  # Symlink entrypoints do not need their targets chmodded. Following those
+  # links dirties tracked package modules every time setup runs.
+  if [ -d py/bin ]; then
+    for entrypoint in py/bin/*; do
+      [ -e "$entrypoint" ] || continue
+      [ -L "$entrypoint" ] || chmod +x "$entrypoint"
+    done
+  fi
   # Smoke-check that every entrypoint starts cleanly with zero optional deps (stdlib-only; catches
   # an optional dependency imported at module scope taking down `--help` on a bare host).
   echo "==> [py] check-deps (dependency-free entrypoint smoke test)"
