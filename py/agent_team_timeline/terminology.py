@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
 from collections.abc import Sequence
@@ -27,6 +28,7 @@ class GlossaryTerm:
     occurrences: int
     context: str
     week: str
+    term_id: str
 
 
 _BACKTICK = re.compile(r"`([^`\n]{2,80})`")
@@ -34,6 +36,7 @@ _SLUG = re.compile(r"(?<![\w/])[a-z][a-z0-9]+(?:-[a-z0-9]+){1,5}(?![\w/])")
 _ACRONYM = re.compile(r"(?<!\w)[A-Z][A-Z0-9]{1,8}(?!\w)")
 _SPACE = re.compile(r"\s+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
+_ID_SEPARATOR = re.compile(r"[^a-z0-9]+")
 _STOP = frozenset(
     {
         "AGENTS",
@@ -62,6 +65,23 @@ def _week(at_ms: int, display_timezone: str) -> str:
     )
     year, number, _ = local.isocalendar()
     return f"{year}-W{number:02d}"
+
+
+def glossary_term_id(term: str) -> str:
+    """Return a stable URL-safe ID for an exact glossary name.
+
+    The readable prefix is cosmetic; the digest makes punctuation/case collisions deterministic
+    and keeps links stable even when terms normalize to the same ASCII slug.
+    """
+
+    clean = term.strip()
+    if not clean:
+        raise ValueError("glossary term must not be empty")
+    slug = _ID_SEPARATOR.sub("-", clean.casefold()).strip("-")[:48].rstrip("-")
+    if not slug:
+        slug = "term"
+    digest = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:12]
+    return f"term-{slug}-{digest}"
 
 
 def _context(text: str, term: str) -> str:
@@ -123,6 +143,7 @@ def scan_terminology(
             occurrences=occurrences[term],
             context=first[term][1],
             week=_week(first[term][0], display_timezone),
+            term_id=glossary_term_id(term),
         )
         for term in eligible[:limit]
     )
@@ -156,6 +177,7 @@ def glossary_markdown(team_slug: str, week: str, terms: Sequence[GlossaryTerm]) 
             [
                 f"## {term.term}",
                 "",
+                f"Stable glossary ID: `{term.term_id}`  ",
                 f"Introduced {instant.isoformat().replace('+00:00', 'Z')}; "
                 f"seen {term.occurrences} time(s).",
                 "",
@@ -164,3 +186,43 @@ def glossary_markdown(team_slug: str, week: str, terms: Sequence[GlossaryTerm]) 
             ]
         )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def glossary_catalog_markdown(team_slug: str, terms: Sequence[GlossaryTerm]) -> str:
+    """Render a discoverable all-time glossary catalog for one team."""
+
+    lines = [
+        f"# {team_slug} project glossary",
+        "",
+        "These evidence-backed terms are ordered by first appearance. In the website, recognized",
+        "uses of an exact term link to its stable `#glossary/<term-id>` entry.",
+        "",
+    ]
+    if not terms:
+        lines.append("_No stable project terms have been detected yet._")
+    for term in terms:
+        instant = datetime.fromtimestamp(term.introduced_at_ms / 1000, tz=timezone.utc)
+        lines.extend(
+            [
+                f"## {term.term}",
+                "",
+                f"Stable glossary ID: `{term.term_id}`  ",
+                f"Introduced {instant.isoformat().replace('+00:00', 'Z')} in {term.week}; "
+                f"seen {term.occurrences} time(s).",
+                "",
+                f"> {term.context}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+__all__ = [
+    "GlossaryTerm",
+    "TermSource",
+    "glossary_catalog_markdown",
+    "glossary_markdown",
+    "glossary_prompt_text",
+    "glossary_term_id",
+    "scan_terminology",
+]

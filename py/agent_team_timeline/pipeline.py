@@ -72,6 +72,7 @@ from agent_team_timeline.terminology import (
     GlossaryTerm,
     TermSource,
     glossary_prompt_text,
+    glossary_term_id,
     scan_terminology,
 )
 from agent_team_timeline.window import DateWindow, apply_date_window
@@ -1270,6 +1271,7 @@ def _summarize_archive_locked(
                 "occurrences": term.occurrences,
                 "context": term.context,
                 "week": term.week,
+                "term_id": term.term_id,
             }
             for term in terms
         ]
@@ -1362,13 +1364,26 @@ def _load_glossary(archive: Path, team_slug: str) -> tuple[GlossaryTerm, ...]:
     result: list[GlossaryTerm] = []
     for raw in as_array(obj.get("terms"), f"{path}.terms"):
         item = as_object(raw, f"{path}.terms[]")
+        term = as_string(item.get("term"), "term")
+        expected_id = glossary_term_id(term)
+        raw_id = item.get("term_id")
+        term_id = (
+            expected_id
+            if raw_id is None
+            else as_string(raw_id, f"{path}.terms[].term_id")
+        )
+        if term_id != expected_id:
+            raise ValueError(
+                f"{path}: glossary ID {term_id!r} does not match term {term!r}"
+            )
         result.append(
             GlossaryTerm(
-                term=as_string(item.get("term"), "term"),
+                term=term,
                 introduced_at_ms=as_int(item.get("introduced_at_ms"), "introduced_at_ms"),
                 occurrences=as_int(item.get("occurrences"), "occurrences"),
                 context=as_string(item.get("context"), "context"),
                 week=as_string(item.get("week"), "week"),
+                term_id=term_id,
             )
         )
     return tuple(result)
