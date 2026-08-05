@@ -50,30 +50,145 @@ _ACRONYM = re.compile(r"(?<!\w)[A-Z][A-Z0-9]{1,8}(?!\w)")
 _SPACE = re.compile(r"\s+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 _ID_SEPARATOR = re.compile(r"[^a-z0-9]+")
-_STOP = frozenset(
+_SHELL_OPTION = re.compile(r"(?:^|\s)--?[A-Za-z0-9]")
+_SHELL_OPERATOR = re.compile(r"(?:&&|\|\||[|;$])")
+_ALWAYS_STOP = frozenset(
     {
-        "AGENTS",
-        "API",
-        "CLI",
         "EDT",
         "EST",
-        "IF",
-        "JSON",
-        "JSONL",
-        "MVP",
-        "NOT",
-        "OR",
-        "PARENT",
         "PDT",
         "PST",
-        "SAME",
-        "THEN",
-        "TODO",
         "UTC",
-        "URL",
-        "YAML",
         "github",
         "origin-main",
+    }
+)
+_UPPERCASE_PROSE = frozenset(
+    {
+        "AGENTS",
+        "ALL",
+        "ALSO",
+        "AND",
+        "API",
+        "ARE",
+        "AS",
+        "AT",
+        "BE",
+        "BEFORE",
+        "BUT",
+        "BY",
+        "CAN",
+        "CURRENT",
+        "CLI",
+        "DID",
+        "DO",
+        "DOES",
+        "DONE",
+        "EACH",
+        "ELSE",
+        "EXCEPT",
+        "FOR",
+        "FROM",
+        "FULL",
+        "HAS",
+        "HAVE",
+        "HERE",
+        "HOW",
+        "IF",
+        "IN",
+        "INTO",
+        "IS",
+        "IT",
+        "JUST",
+        "JSON",
+        "JSONL",
+        "KEEP",
+        "LIKE",
+        "MAY",
+        "MAYBE",
+        "MORE",
+        "MVP",
+        "MUST",
+        "NEW",
+        "NO",
+        "NOT",
+        "NOW",
+        "OF",
+        "ON",
+        "ONLY",
+        "OR",
+        "OTHER",
+        "OUR",
+        "OUT",
+        "PARENT",
+        "SAME",
+        "SHOULD",
+        "SO",
+        "SOME",
+        "STATS",
+        "TEXT",
+        "THAN",
+        "THAT",
+        "THE",
+        "THEIR",
+        "THEN",
+        "THERE",
+        "THESE",
+        "THEY",
+        "THIS",
+        "TO",
+        "TODO",
+        "UP",
+        "URL",
+        "USE",
+        "USER",
+        "USING",
+        "VERBATIM",
+        "VERY",
+        "WANT",
+        "WAS",
+        "WE",
+        "WHAT",
+        "WHEN",
+        "WHERE",
+        "WHICH",
+        "WHILE",
+        "WHO",
+        "WHY",
+        "WILL",
+        "WITH",
+        "WITHOUT",
+        "WORK",
+        "WOULD",
+        "YES",
+        "YOU",
+        "YOUR",
+        "YAML",
+    }
+)
+_COMMAND_HEADS = frozenset(
+    {
+        "bash",
+        "cargo",
+        "cd",
+        "curl",
+        "find",
+        "gh",
+        "git",
+        "grep",
+        "make",
+        "node",
+        "npm",
+        "pip",
+        "pip3",
+        "python",
+        "python3",
+        "rg",
+        "sh",
+        "sqlite3",
+        "ssh",
+        "tg",
+        "wget",
     }
 )
 
@@ -114,18 +229,63 @@ def _context(text: str, term: str) -> str:
     return clean[max(0, pos - 100) : pos + len(term) + 180].strip()
 
 
-def _candidates(text: str) -> set[str]:
-    found = {match.group(1).strip() for match in _BACKTICK.finditer(text)}
-    found.update(match.group(0) for match in _SLUG.finditer(text))
-    found.update(match.group(0) for match in _ACRONYM.finditer(text))
-    return {
-        term
-        for term in found
-        if term not in _STOP
-        and 2 <= len(term) <= 80
-        and " " not in term.strip("`/")[:1]
-        and not term.isdigit()
-    }
+def _operational_literal(value: str) -> bool:
+    clean = value.strip()
+    lowered = clean.casefold()
+    first_word = lowered.split(maxsplit=1)[0] if lowered else ""
+    return (
+        not clean
+        or clean.startswith(("/", "~/", "./", "../", "-"))
+        or "/" in clean
+        or "\\" in clean
+        or lowered.startswith(("http:", "https:", "file:", "ssh:"))
+        or lowered.endswith((".db", ".sqlite", ".sqlite3"))
+        or first_word in _COMMAND_HEADS
+        or _SHELL_OPTION.search(clean) is not None
+        or _SHELL_OPERATOR.search(clean) is not None
+        or any(character in clean for character in "<>[]{}")
+    )
+
+
+def _explicit_candidates(text: str) -> tuple[set[str], list[tuple[int, int]]]:
+    accepted: set[str] = set()
+    spans: list[tuple[int, int]] = []
+    for match in _BACKTICK.finditer(text):
+        spans.append(match.span())
+        term = match.group(1).strip()
+        if (
+            2 <= len(term) <= 80
+            and term not in _ALWAYS_STOP
+            and not term.isdigit()
+            and not _operational_literal(term)
+        ):
+            accepted.add(term)
+    return accepted, spans
+
+
+def _mask_spans(text: str, spans: Sequence[tuple[int, int]]) -> str:
+    characters = list(text)
+    for start, end in spans:
+        characters[start:end] = " " * (end - start)
+    return "".join(characters)
+
+
+def _candidates(text: str) -> tuple[set[str], set[str]]:
+    explicit, spans = _explicit_candidates(text)
+    prose = _mask_spans(text, spans)
+    found = set(explicit)
+    found.update(
+        match.group(0)
+        for match in _SLUG.finditer(prose)
+        if match.group(0) not in _ALWAYS_STOP
+    )
+    found.update(
+        match.group(0)
+        for match in _ACRONYM.finditer(prose)
+        if match.group(0) not in _ALWAYS_STOP
+        and match.group(0) not in _UPPERCASE_PROSE
+    )
+    return {term for term in found if 2 <= len(term) <= 80 and not term.isdigit()}, explicit
 
 
 def scan_terminology(
@@ -142,20 +302,23 @@ def scan_terminology(
     first: dict[str, tuple[int, str]] = {}
     eligible_at: dict[str, int] = {}
     for source in sorted(sources, key=lambda item: (item.at_ms, item.text)):
-        backticked = {match.group(1).strip() for match in _BACKTICK.finditer(source.text)}
-        for term in _candidates(source.text):
+        candidates, explicit = _candidates(source.text)
+        for term in candidates:
             occurrences[term] += 1
             if term not in first:
                 first[term] = (source.at_ms, _context(source.text, term))
             if (
-                term in backticked
+                term in explicit
                 or "-" in term
                 or occurrences[term] >= 2
             ):
                 eligible_at.setdefault(term, source.at_ms)
 
-    eligible = list(eligible_at)
-    eligible.sort(key=lambda term: (first[term][0], term.casefold()))
+    selected = sorted(
+        eligible_at,
+        key=lambda term: (eligible_at[term], first[term][0], term.casefold()),
+    )[:limit]
+    selected.sort(key=lambda term: (first[term][0], term.casefold()))
     return tuple(
         GlossaryTerm(
             term=term,
@@ -166,7 +329,7 @@ def scan_terminology(
             term_id=glossary_term_id(term),
             available_at_ms=eligible_at[term],
         )
-        for term in eligible[:limit]
+        for term in selected
     )
 
 

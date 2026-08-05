@@ -20,7 +20,8 @@ web server.
 - Separate technical and newcomer-oriented plain-language summaries for every day, week, month,
   and quarter, with an in-modal audience switch.
 - A durable newcomer project overview and model-backed glossary definitions, each bounded by
-  retained source evidence, with stable links from recognized terms.
+  immutable retained source evidence, with append-stable availability and verified links from
+  recognized terms.
 - A linked site title grounded in structured repository metadata, with durable multi-project and
   multi-host identity plus explicit provenance.
 - Content-addressed model caches, append-only raw-log snapshots, and immutable run receipts.

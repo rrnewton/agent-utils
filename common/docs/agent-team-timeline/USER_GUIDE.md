@@ -52,9 +52,11 @@ do not require site changes.
   quoted first-use evidence that constrained it.
 
 The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
-bundle renders summary headings, lists, tables, blockquotes, links, and code with raw HTML disabled.
-It is vendored into every archive, so the generated directory has no CDN or runtime package-manager
-dependency and remains usable when copied offline.
+bundle renders summary headings, lists, tables, blockquotes, and code with raw HTML disabled.
+Markdown links, images, autolinks, and linkification are suppressed; after rendering, the UI adds
+only schema-validated glossary, pull-request, and work-artifact links. It is vendored into every
+archive, so the generated directory has no CDN or runtime package-manager dependency and remains
+usable when copied offline.
 
 ## Install
 
@@ -211,7 +213,7 @@ Each stable time window gets a content-addressed cache key over:
 
 - its transcript input;
 - the substantial ancestor/coordinator scroll-back window;
-- only glossary terms introduced by that point in history;
+- only glossary terms available by that point in history;
 - model, backend, prompt version, and summary schema.
 
 Every calendar period has two distinct jobs and cache identities. The technical summary remains
@@ -222,19 +224,30 @@ and treats work-management identifiers as supplementary evidence. Both jobs have
 receipts and are included in the command's exact token accounting.
 
 Before those calendar jobs, one separately cached knowledge pass reads up to 48,000 characters of
-early root conversation and creates a durable newcomer project overview. A second batched pass sees
-that overview plus up to six retained source occurrences for each deterministic glossary term. It
-must either write a concise definition supported by those occurrences or explicitly return
-`Insufficient evidence`; acronym expansions and relationships cannot be guessed. Only supported
-definitions enter plain-language rollup prompts. Technical rollups and phase summaries keep their
-existing cache identities. The overview, definitions, source event IDs, evidence excerpts, model,
-prompt version, input hash, and generation time are persisted under `summary_data/`, and all of
+early root conversation and creates a durable newcomer project overview. Its first successful run
+records an immutable source cutoff plus event IDs and a context digest, without copying the raw
+48,000-character transcript into version-controlled `summary_data/`. A second batched pass sees
+that overview plus up to six retained source occurrences for each deterministic glossary term.
+Each term freezes that first evidence set and records when the term became eligible for summaries;
+a later second occurrence therefore cannot rewrite or evict terms from an already completed day.
+Both passes exclude the half-open archive end boundary. Mutation or truncation of retained evidence fails
+before any model call, while ordinary events appended beyond the recorded cutoff reuse the exact
+overview and definition cache keys.
+
+Knowledge jobs must either write a concise evidence-supported result or explicitly return
+`Insufficient evidence`; acronym expansions and relationships cannot be guessed. URLs, Markdown
+links, images, and link targets are rejected from generated knowledge. Only supported definitions
+enter plain-language rollup prompts, and only for periods at or after their availability timestamp.
+The overview, definitions, source event IDs, evidence excerpts, immutable epoch/cutoff metadata,
+model, prompt version, input hash, and generation time are persisted under `summary_data/`; all of
 their backend receipts are included in the same exact token accounting.
 
-Unchanged keys are never sent to the model again. New later terminology does not invalidate older
-windows. A changed live window creates a new cache record while the previous valuable record remains
-on disk. Each batch is committed only after every response in that batch validates against the
-strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
+Unchanged keys are never sent to the model again. Term candidates are capped by eligibility time,
+not first mention, and command lines, paths, database filenames, and unquoted uppercase prose are
+excluded before they can consume definition tokens. New later terminology does not invalidate
+older windows. A changed live window creates a new cache record while the previous valuable record
+remains on disk. Each batch is committed only after every response in that batch validates against
+the strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
 batches remain reusable.
 
 After phase summaries exist, a separate hindsight pass names every agent and writes its lifetime
@@ -355,10 +368,10 @@ example-team/
     │   ├── name_cache/<content-hash>.json
     │   ├── agents/<thread-id>.json   # hindsight name, lifetime summary + provenance
     │   ├── phases/<phase-id>.json
-    │   ├── project_overview.json     # bounded early/root evidence + generated overview
+    │   ├── project_overview.json     # immutable evidence epoch + generated overview
     │   ├── rollups/{daily,weekly,monthly,quarterly}/... # both structured audiences
     │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata
-    │   └── glossary.json             # definitions + evidence + model provenance
+    │   └── glossary.json             # frozen definitions, availability + provenance
     └── summaries/
         ├── agents/<thread-id>.md
         ├── phases/<phase-id>.md

@@ -86,3 +86,63 @@ def test_uppercase_prose_is_not_mistaken_for_project_acronyms() -> None:
 
     assert names.isdisjoint(noise.split())
     assert names.issuperset(real.split())
+
+
+def test_operational_backticks_do_not_leak_nested_terms() -> None:
+    sources = (
+        TermSource(
+            1_775_000_000_000,
+            "Use `tg --db hermit`, `tg --help`, `agents_v17.db`, "
+            "`~/.orc/sessions/<session-id>/`, and `~/temp/orc_transcripts/`. "
+            "Keep `safe-ci-dag-runner`, `conversation_state`, `Node.js`, and `ALL`. "
+            "The prose says ALL work is ready. KVM PMU IPC CI.",
+        ),
+        TermSource(
+            1_775_000_001_000,
+            "ALL commands remain operational details. KVM PMU IPC CI.",
+        ),
+    )
+
+    names = {term.term for term in scan_terminology(sources, "America/New_York")}
+
+    assert names.issuperset(
+        {"safe-ci-dag-runner", "conversation_state", "Node.js", "ALL", "KVM", "PMU", "IPC", "CI"}
+    )
+    assert names.isdisjoint(
+        {
+            "tg --db hermit",
+            "tg --help",
+            "agents_v17.db",
+            "~/.orc/sessions/<session-id>/",
+            "~/temp/orc_transcripts/",
+            "session-id",
+        }
+    )
+
+
+def test_term_cap_is_selected_by_eligibility_not_first_mention() -> None:
+    terms = scan_terminology(
+        (
+            TermSource(100, "EARLY appears once but is not eligible yet."),
+            TermSource(200, "Use stable-one and stable-two."),
+            TermSource(300, "EARLY now appears a second time."),
+        ),
+        "America/New_York",
+        limit=2,
+    )
+
+    assert [term.term for term in terms] == ["stable-one", "stable-two"]
+
+
+def test_unquoted_second_occurrence_sets_summary_availability() -> None:
+    terms = scan_terminology(
+        (
+            TermSource(100, "DBI appears once."),
+            TermSource(300, "DBI appears again."),
+        ),
+        "America/New_York",
+    )
+
+    dbi = next(term for term in terms if term.term == "DBI")
+    assert dbi.introduced_at_ms == 100
+    assert dbi.summary_available_at_ms == 300
