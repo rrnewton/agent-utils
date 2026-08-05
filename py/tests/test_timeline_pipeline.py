@@ -191,7 +191,7 @@ def test_knowledge_evidence_keeps_prior_context_but_excludes_post_window_events(
     future = _event(
         "future-root",
         ROOT,
-        40_000,
+        30_000,
         "assistant_message",
         "FUTURE_ONLY_MARKER discussed exact-head after the selected day.",
     )
@@ -302,7 +302,11 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
             / "project_overview.json"
         ).read_text(encoding="utf-8")
     )
-    assert overview_record["schema_version"] == 1
+    assert overview_record["schema_version"] == 2
+    assert overview_record["knowledge_epoch"]["cutoff_reason"] == (
+        "first-summary-source-frontier"
+    )
+    assert overview_record["source"]["transcript"]
     assert overview_record["summary"]["prompt_version"].endswith(
         "project-overview-v1"
     )
@@ -316,7 +320,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
             / "glossary.json"
         ).read_text(encoding="utf-8")
     )
-    assert glossary_record["schema_version"] == 2
+    assert glossary_record["schema_version"] == 3
     assert glossary_record["project_overview_input_hash"] == overview_record["summary"][
         "input_hash"
     ]
@@ -324,6 +328,8 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         item["definition_status"] == "insufficient-evidence"
         and item["definition"].startswith("Insufficient evidence:")
         and item["evidence"]
+        and item["available_at_ms"] >= item["introduced_at_ms"]
+        and item["definition_epoch_id"].startswith("definition-")
         for item in glossary_record["terms"]
     )
     assert timeline["glossary_path"].endswith("codex-test-glossary.md")
@@ -395,6 +401,119 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert run["summaries"]["reasoning_effort"] == "high"
     assert run["summaries"]["newly_spent_usage"]["total_tokens"] == 0
     assert run["summaries"]["usage_run_paths"] == list(second.usage_run_paths)
+
+
+def test_append_catchup_keeps_completed_historical_knowledge_jobs_stable(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+
+    daily_dir = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "rollups"
+        / "daily"
+    )
+    original_daily_path = next(daily_dir.glob("*.json"))
+    original_daily = json.loads(original_daily_path.read_text(encoding="utf-8"))
+    overview_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "project_overview.json"
+    )
+    glossary_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "glossary.json"
+    )
+    original_overview = json.loads(overview_path.read_text(encoding="utf-8"))
+    original_glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
+    original_definitions = {
+        item["term_id"]: item["definition_summary"]["input_hash"]
+        for item in original_glossary["terms"]
+    }
+
+    later_offset = 2 * 24 * 60 * 60 * 1000
+    late_events = (
+        _event(
+            "late-dbi-first",
+            ROOT,
+            later_offset,
+            "user_prompt",
+            "Investigate DBI behavior without changing earlier summaries.",
+        ),
+        _event(
+            "late-dbi-second",
+            ROOT,
+            later_offset + 1_000,
+            "user_prompt",
+            "Use DBI consistently in this newly active workstream.",
+        ),
+        _event(
+            "late-dbi-response",
+            ROOT,
+            later_offset + 2_000,
+            "assistant_message",
+            "DBI work belongs only to the later calendar period.",
+        ),
+    )
+    later_end = START + later_offset + 3_000
+    updated_agents = tuple(
+        replace(agent, ended_at_ms=later_end)
+        if agent.thread_id == ROOT
+        else agent
+        for agent in team.agents
+    )
+    updated_turns = tuple(
+        replace(turn, ended_at_ms=later_end)
+        if turn.thread_id == ROOT
+        else turn
+        for turn in team.turns
+    )
+    appended = replace(
+        team,
+        agents=updated_agents,
+        turns=updated_turns,
+        events=team.events + late_events,
+    )
+    _write_team(tmp_path, appended)
+
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+
+    refreshed_daily = json.loads(original_daily_path.read_text(encoding="utf-8"))
+    refreshed_overview = json.loads(overview_path.read_text(encoding="utf-8"))
+    refreshed_glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
+    refreshed_definitions = {
+        item["term_id"]: item["definition_summary"]["input_hash"]
+        for item in refreshed_glossary["terms"]
+    }
+    dbi = next(item for item in refreshed_glossary["terms"] if item["term"] == "DBI")
+
+    assert refreshed_daily["technical_summary"]["input_hash"] == (
+        original_daily["technical_summary"]["input_hash"]
+    )
+    assert refreshed_daily["plain_language_summary"]["input_hash"] == (
+        original_daily["plain_language_summary"]["input_hash"]
+    )
+    assert refreshed_overview["knowledge_epoch"] == original_overview["knowledge_epoch"]
+    assert refreshed_overview["source"] == original_overview["source"]
+    assert refreshed_overview["summary"]["input_hash"] == (
+        original_overview["summary"]["input_hash"]
+    )
+    assert all(
+        refreshed_definitions[term_id] == input_hash
+        for term_id, input_hash in original_definitions.items()
+    )
+    assert dbi["available_at_ms"] == START + later_offset + 1_000
+    assert dbi["available_at_ms"] >= original_daily["end_ms"]
 
 
 def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:

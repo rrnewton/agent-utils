@@ -847,6 +847,7 @@ def render_archive(
             "id": term.term_id,
             "term": term.term,
             "introduced_at_ms": term.introduced_at_ms,
+            "available_at_ms": term.summary_available_at_ms,
             "occurrences": term.occurrences,
             "context": term.context,
             "definition": term.definition,

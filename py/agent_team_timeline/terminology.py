@@ -31,6 +31,17 @@ class GlossaryTerm:
     term_id: str
     definition: str = ""
     definition_status: str = "unavailable"
+    available_at_ms: int | None = None
+
+    @property
+    def summary_available_at_ms(self) -> int:
+        """Return when this term may first affect cached chronological summaries."""
+
+        return (
+            self.introduced_at_ms
+            if self.available_at_ms is None
+            else self.available_at_ms
+        )
 
 
 _BACKTICK = re.compile(r"`([^`\n]{2,80})`")
@@ -129,20 +140,21 @@ def scan_terminology(
 
     occurrences: dict[str, int] = defaultdict(int)
     first: dict[str, tuple[int, str]] = {}
-    explicit: set[str] = set()
+    eligible_at: dict[str, int] = {}
     for source in sorted(sources, key=lambda item: (item.at_ms, item.text)):
         backticked = {match.group(1).strip() for match in _BACKTICK.finditer(source.text)}
-        explicit.update(backticked)
         for term in _candidates(source.text):
             occurrences[term] += 1
             if term not in first:
                 first[term] = (source.at_ms, _context(source.text, term))
+            if (
+                term in backticked
+                or "-" in term
+                or occurrences[term] >= 2
+            ):
+                eligible_at.setdefault(term, source.at_ms)
 
-    eligible = [
-        term
-        for term, count in occurrences.items()
-        if count >= 2 or term in explicit or "-" in term
-    ]
+    eligible = list(eligible_at)
     eligible.sort(key=lambda term: (first[term][0], term.casefold()))
     return tuple(
         GlossaryTerm(
@@ -152,6 +164,7 @@ def scan_terminology(
             context=first[term][1],
             week=_week(first[term][0], display_timezone),
             term_id=glossary_term_id(term),
+            available_at_ms=eligible_at[term],
         )
         for term in eligible[:limit]
     )
