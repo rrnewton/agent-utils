@@ -43,6 +43,35 @@ test.beforeEach(async function ({ page }) {
   await expect(page.locator(phaseSelector)).toBeVisible();
 });
 
+test("the header identifies the project, execution host, and archive timezone", async function ({ page }) {
+  const heading = page.locator("#site-title");
+  await expect(heading).toHaveText("Agent Timeline: dev-hermit, devbig014");
+  await expect(heading.getByRole("link", { name: "dev-hermit" })).toHaveAttribute(
+    "href",
+    "https://github.com/rrnewton/dev-hermit"
+  );
+  await expect(heading.getByRole("link", { name: "dev-hermit" })).toHaveAttribute(
+    "rel",
+    "noopener noreferrer"
+  );
+  await expect(page).toHaveTitle("Agent Timeline: dev-hermit, devbig014");
+  await expect(page.locator("#dataset-meta")).toContainText(
+    "display America/New_York (explicit)"
+  );
+
+  const details = page.locator("#site-identity-details");
+  await details.locator("summary").click();
+  await expect(details).toHaveAttribute("open", "");
+  await expect(page.locator("#site-identity-list")).toContainText(
+    "devbig014.example.com"
+  );
+  await expect(page.locator("#site-identity-list")).toContainText(
+    "from session metadata"
+  );
+  await expect(page.locator("#site-identity-list")).toContainText("agent-utils");
+  await expect(page.locator("#site-identity-list")).toContainText("hermit");
+});
+
 test("a horizontal trackpad gesture pans the zoomed timeline", async function ({ page }) {
   const timeline = await requireContract(
     page.locator('[data-testid="timeline"][data-view-start-ms][data-view-end-ms]'),
@@ -288,8 +317,9 @@ test("full-transcript role filters support user-only, none, and all", async func
     page.locator('[data-testid="transcript-role-filters"]'),
     "transcript role filters are not implemented yet"
   );
-  const entries = await requireContract(
-    page.locator(".transcript-entry[data-role]"),
+  const entries = page.locator(".transcript-entry[data-role]");
+  await requireContract(
+    entries,
     "transcript entries do not expose normalized data-role values yet"
   );
   expect(await entries.count()).toBe(5);

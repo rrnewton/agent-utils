@@ -45,6 +45,9 @@
 
   var dom = {
     card: document.querySelector(".timeline-card"),
+    siteTitle: byId("site-title"),
+    identityDetails: byId("site-identity-details"),
+    identityList: byId("site-identity-list"),
     meta: byId("dataset-meta"),
     teamFilter: byId("team-filter"),
     search: byId("search"),
@@ -112,7 +115,8 @@
     detailRequest: 0,
     modalRestoreFocus: null,
     laneMenuAnchor: null,
-    timezone: undefined
+    timezone: "UTC",
+    timezoneStatus: "archive fallback"
   };
 
   var timelineCore = window.AgentTimelineCore;
@@ -379,22 +383,23 @@
   function installTimezone(value) {
     var candidate = text(value);
     if (!candidate) {
-      app.timezone = undefined;
+      app.timezone = "UTC";
+      app.timezoneStatus = "archive timezone missing; using UTC";
       return;
     }
     try {
       new Intl.DateTimeFormat(undefined, { timeZone: candidate }).format(new Date());
       app.timezone = candidate;
+      app.timezoneStatus = "archive";
     } catch (_error) {
-      app.timezone = undefined;
+      app.timezone = "UTC";
+      app.timezoneStatus = "archive timezone unsupported; using UTC";
     }
   }
 
   function dateFormatter(options) {
     var settings = Object.assign({}, options);
-    if (app.timezone) {
-      settings.timeZone = app.timezone;
-    }
+    settings.timeZone = app.timezone;
     return new Intl.DateTimeFormat(undefined, settings);
   }
 
@@ -449,6 +454,7 @@
       schema_version: raw.schema_version,
       generated_at: text(raw.generated_at),
       display_timezone: text(raw.display_timezone),
+      display_timezone_source: text(raw.display_timezone_source, "legacy_team_data"),
       range: raw.range && typeof raw.range === "object" ? raw.range : {},
       teams: array(raw.teams),
       agents: array(raw.agents),
@@ -499,6 +505,182 @@
       return "schema unknown";
     }
     return "schema " + String(value);
+  }
+
+  function safeRepositoryUrl(value) {
+    var raw = text(value);
+    if (!raw) {
+      return "";
+    }
+    try {
+      var parsed = new URL(raw);
+      return parsed.protocol === "https:" || parsed.protocol === "http:" ? parsed.href : "";
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function identitySourceLabel(value) {
+    var source = text(value);
+    if (source === "explicit") {
+      return "explicit";
+    }
+    if (source === "session_metadata") {
+      return "from session metadata";
+    }
+    return source.replace(/_/g, " ");
+  }
+
+  function aggregatedSiteIdentity(teams) {
+    var projectsByKey = new Map();
+    var projectOrder = [];
+    var hostsByKey = new Map();
+    var hostOrder = [];
+    teams.forEach(function (team) {
+      if (!team || typeof team !== "object") {
+        return;
+      }
+      array(team.projects).forEach(function (project) {
+        if (!project || typeof project !== "object") {
+          return;
+        }
+        var label = text(project.label);
+        var repositoryUrl = safeRepositoryUrl(project.repository_url);
+        if (!label) {
+          return;
+        }
+        var key = repositoryUrl || "label:" + label.toLowerCase();
+        if (!projectsByKey.has(key)) {
+          projectOrder.push(key);
+        }
+        var prior = projectsByKey.get(key);
+        projectsByKey.set(key, {
+          label: label,
+          repository_url: repositoryUrl,
+          primary: project.primary === true || Boolean(prior && prior.primary),
+          source: text(project.source)
+        });
+      });
+      array(team.hosts).forEach(function (host) {
+        if (!host || typeof host !== "object") {
+          return;
+        }
+        var hostname = text(host.hostname);
+        var key = hostname.toLowerCase();
+        if (!hostname || hostsByKey.has(key)) {
+          return;
+        }
+        hostOrder.push(key);
+        hostsByKey.set(key, {
+          hostname: hostname,
+          source: text(host.source)
+        });
+      });
+    });
+    var projects = projectOrder.map(function (key) { return projectsByKey.get(key); });
+    projects.sort(function (left, right) {
+      return Number(right.primary) - Number(left.primary);
+    });
+    return {
+      projects: projects,
+      hosts: hostOrder.map(function (key) { return hostsByKey.get(key); })
+    };
+  }
+
+  function projectNode(project) {
+    if (project.repository_url) {
+      var link = htmlElement("a", "", project.label);
+      link.href = project.repository_url;
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      return link;
+    }
+    return htmlElement("span", "", project.label);
+  }
+
+  function renderSiteIdentity(data) {
+    var identity = aggregatedSiteIdentity(data.teams);
+    var primaryProjects = identity.projects.filter(function (project) {
+      return project.primary;
+    });
+    var titleProject = identity.projects.length === 1
+      ? identity.projects[0]
+      : (primaryProjects.length === 1 ? primaryProjects[0] : null);
+    var projectSummary;
+    var projectVisible;
+    if (titleProject) {
+      projectSummary = projectNode(titleProject);
+      projectVisible = titleProject.label;
+    } else if (identity.projects.length > 1) {
+      projectSummary = htmlElement("span", "", "multi-repo");
+      projectVisible = "multi-repo";
+    } else {
+      var fallback = data.teams.length === 1 && data.teams[0]
+        ? text(data.teams[0].label, text(data.teams[0].slug, "unknown project"))
+        : (data.teams.length > 1 ? "multi-team" : "unknown project");
+      projectSummary = htmlElement("span", "", fallback);
+      projectVisible = fallback;
+    }
+    var children = [document.createTextNode("Agent Timeline: "), projectSummary];
+    var hostVisible = "";
+    if (identity.hosts.length === 1) {
+      hostVisible = identity.hosts[0].hostname.split(".")[0];
+    } else if (identity.hosts.length > 1) {
+      hostVisible = "multi-host";
+    }
+    if (hostVisible) {
+      children.push(document.createTextNode(", " + hostVisible));
+    }
+    dom.siteTitle.replaceChildren.apply(dom.siteTitle, children);
+    var visibleTitle = "Agent Timeline: " + projectVisible + (hostVisible ? ", " + hostVisible : "");
+    document.title = visibleTitle;
+
+    var fullLines = [];
+    if (identity.projects.length) {
+      fullLines.push(
+        "Projects: " + identity.projects.map(function (project) {
+          return project.label + (project.repository_url ? " (" + project.repository_url + ")" : "");
+        }).join(", ")
+      );
+    }
+    if (identity.hosts.length) {
+      fullLines.push("Hosts: " + identity.hosts.map(function (host) {
+        return host.hostname;
+      }).join(", "));
+    }
+    dom.siteTitle.title = fullLines.join("\n");
+    dom.siteTitle.setAttribute("aria-label", visibleTitle + (fullLines.length ? ". " + fullLines.join(". ") : ""));
+
+    var detailChildren = [];
+    if (identity.projects.length) {
+      detailChildren.push(htmlElement("h2", "", "Projects / repositories"));
+      var projectList = htmlElement("ul");
+      identity.projects.forEach(function (project) {
+        var item = htmlElement("li");
+        item.appendChild(projectNode(project));
+        var source = identitySourceLabel(project.source);
+        if (source) {
+          item.appendChild(htmlElement("span", "site-identity-source", "(" + source + ")"));
+        }
+        projectList.appendChild(item);
+      });
+      detailChildren.push(projectList);
+    }
+    if (identity.hosts.length) {
+      detailChildren.push(htmlElement("h2", "", "Execution hosts"));
+      var hostList = htmlElement("ul");
+      identity.hosts.forEach(function (host) {
+        var item = htmlElement("li", "", host.hostname);
+        var source = identitySourceLabel(host.source);
+        if (source) {
+          item.appendChild(htmlElement("span", "site-identity-source", "(" + source + ")"));
+        }
+        hostList.appendChild(item);
+      });
+      detailChildren.push(hostList);
+    }
+    dom.identityList.replaceChildren.apply(dom.identityList, detailChildren);
+    dom.identityDetails.hidden = detailChildren.length === 0;
   }
 
   function initializeData(raw) {
@@ -562,12 +744,16 @@
     });
     dom.glossaryOpen.hidden = !data.glossary.length && !data.glossary_path;
 
+    renderSiteIdentity(data);
     populateTeamFilter();
     populateSummaryFiles();
     var generated = data.generated_at ? "generated " + data.generated_at : "generation time unknown";
-    var timezone = app.timezone || "browser local time";
+    var timezone = app.timezone;
+    var timezoneSource = text(data.display_timezone_source).replace(/_/g, " ");
     dom.meta.textContent =
-      dataVersionLabel(data.schema_version) + " · " + generated + " · display " + timezone;
+      dataVersionLabel(data.schema_version) + " · " + generated + " · display " + timezone +
+      (timezoneSource ? " (" + timezoneSource + ")" : "") +
+      (app.timezoneStatus === "archive" ? "" : " · " + app.timezoneStatus);
     scheduleRender();
     openGlossaryFromHash();
   }
@@ -1017,7 +1203,7 @@
     dom.axis.replaceChildren.apply(dom.axis, children);
     dom.viewRange.textContent =
       formatRange(app.viewStart, app.viewEnd) +
-      " · " + (app.timezone || "browser local") +
+      " · " + app.timezone +
       " · " + formatDuration(span);
   }
 

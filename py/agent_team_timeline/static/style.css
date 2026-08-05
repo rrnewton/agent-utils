@@ -94,6 +94,104 @@ summary:focus-visible,
   gap: 12px;
 }
 
+.brand-copy {
+  min-width: 0;
+}
+
+.site-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+#site-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#site-title a {
+  color: var(--cyan);
+  text-decoration: none;
+}
+
+#site-title a:hover {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.site-identity-details {
+  position: relative;
+}
+
+.site-identity-details > summary {
+  width: 18px;
+  height: 18px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: 0;
+  list-style: none;
+}
+
+.site-identity-details > summary::before {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  place-items: center;
+  content: "i";
+  font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.site-identity-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.site-identity-list {
+  position: absolute;
+  top: 25px;
+  left: 0;
+  z-index: 80;
+  min-width: 280px;
+  max-width: min(520px, 75vw);
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #111a27;
+  box-shadow: 0 14px 34px rgb(0 0 0 / 45%);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.site-identity-list h2 {
+  margin: 6px 0 3px;
+  color: var(--text-muted);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.site-identity-list h2:first-child {
+  margin-top: 0;
+}
+
+.site-identity-list ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.site-identity-list a {
+  color: var(--cyan);
+  overflow-wrap: anywhere;
+}
+
+.site-identity-source {
+  margin-left: 5px;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
 .brand-mark {
   width: 28px;
   height: 28px;

@@ -50,6 +50,9 @@ def _root_bytes(*, incomplete_tail: bytes = b"") -> bytes:
                 "session_id": ROOT,
                 "timestamp": _iso(1_000),
                 "cwd": "/work/project",
+                "git": {
+                    "repository_url": "git@github.com:rrnewton/dev-hermit.git"
+                },
                 "source": "cli",
             },
         ),
@@ -191,6 +194,25 @@ def test_ingest_copies_complete_lines_then_parses_the_backup(tmp_path: Path) -> 
     )
     assert [event.text for event in parsed.events] == ["Root done"]
     assert manifest["source_root"] == str(sessions.resolve())
+    identity = json.loads(
+        (
+            archive
+            / "teams"
+            / "codex-test"
+            / "raw"
+            / "site-identity.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert identity["projects"] == [
+        {
+            "label": "dev-hermit",
+            "repository_url": "https://github.com/rrnewton/dev-hermit",
+            "primary": True,
+            "source": "session_metadata",
+        }
+    ]
+    assert identity["display_timezone"] == "UTC"
+    assert identity["display_timezone_source"] == "api"
 
     _, repeat = ingest_codex(archive, sessions, ROOT, "codex-test", "UTC")
     assert repeat.files_changed == 0

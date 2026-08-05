@@ -33,6 +33,7 @@ from agent_team_timeline.artifacts import (
 from agent_team_timeline.codex import (
     CodexParseError,
     CodexSourceCopy,
+    codex_identity_metadata,
     load_codex_team,
     snapshot_codex_lineage,
 )
@@ -51,6 +52,15 @@ from agent_team_timeline.naming import (
 )
 from agent_team_timeline.github_metadata import load_pull_request_metadata_cache
 from agent_team_timeline.github_enrich import pull_metadata_path
+from agent_team_timeline.identity import (
+    HostIdentity,
+    IdentityOverrides,
+    ProjectIdentity,
+    SiteIdentity,
+    infer_structured_identity,
+    merge_site_identity,
+    site_identity_from_json_obj,
+)
 from agent_team_timeline.orc import (
     OrcParseError,
     OrcSourceCopy,
@@ -322,6 +332,71 @@ def _source_manifest_path(archive: Path, team_slug: str) -> Path:
     return archive / "teams" / team_slug / "raw" / "source-manifest.json"
 
 
+def _site_identity_path(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "raw" / "site-identity.json"
+
+
+def load_site_identity(
+    archive: Path, team: TeamData, *, required: bool = False
+) -> SiteIdentity:
+    """Load standalone site identity, with a team-data fallback when absent."""
+
+    path = _site_identity_path(archive, team.team_slug)
+    if not path.is_file():
+        if required:
+            raise ValueError(f"missing site identity at {path}")
+        return SiteIdentity(
+            team_slug=team.team_slug,
+            projects=(),
+            hosts=(),
+            display_timezone=team.display_timezone,
+            display_timezone_source="legacy_team_data",
+        )
+    identity = site_identity_from_json_obj(read_json(path), str(path))
+    if identity.team_slug != team.team_slug:
+        raise ValueError(
+            f"site identity team {identity.team_slug!r} does not match {team.team_slug!r}"
+        )
+    if identity.display_timezone != team.display_timezone:
+        raise ValueError(
+            "site identity display timezone differs from normalized team data; rerun ingest"
+        )
+    return identity
+
+
+def _record_site_identity(
+    archive: Path,
+    team: TeamData,
+    inferred: tuple[tuple[ProjectIdentity, ...], tuple[HostIdentity, ...]],
+    overrides: IdentityOverrides | None,
+) -> int:
+    """Merge durable identity evidence and atomically update its standalone record."""
+
+    path = _site_identity_path(archive, team.team_slug)
+    previous = (
+        site_identity_from_json_obj(read_json(path), str(path))
+        if path.is_file()
+        else None
+    )
+    if previous is not None and previous.team_slug != team.team_slug:
+        raise ValueError(
+            f"site identity team {previous.team_slug!r} does not match {team.team_slug!r}"
+        )
+    selected = overrides or IdentityOverrides()
+    identity = merge_site_identity(
+        team.team_slug,
+        team.display_timezone,
+        selected.display_timezone_source,
+        inferred[0],
+        inferred[1],
+        selected.projects,
+        selected.hosts,
+        previous,
+    )
+    return int(_write_json_durable(path, narrow_json(identity.to_json_obj())))
+
+
 def _ensure_source_snapshots_ignored(archive: Path) -> bool:
     path = archive / ".gitignore"
     required = (f"/{_ARCHIVE_LOCK}", "/teams/*/source_snapshots/")
@@ -505,6 +580,7 @@ def _ingest_codex_locked(
     team_slug: str,
     display_timezone: str,
     date_window: DateWindow | None,
+    identity_overrides: IdentityOverrides | None,
 ) -> tuple[TeamData, IngestReport]:
     """Normalize one complete Codex lineage and write canonical raw JSON."""
 
@@ -539,6 +615,14 @@ def _ingest_codex_locked(
         raise CodexParseError(
             "parsed source set differs from the just-validated source snapshot manifest"
         )
+    changed += _record_site_identity(
+        archive,
+        team,
+        infer_structured_identity(
+            codex_identity_metadata(snapshot_root, allowed_sources, root_thread_id)
+        ),
+        identity_overrides,
+    )
     source_manifest: dict[str, object] = {
         "schema_version": 1,
         "provider": "codex",
@@ -563,6 +647,7 @@ def ingest_codex(
     team_slug: str,
     display_timezone: str,
     date_window: DateWindow | None = None,
+    identity_overrides: IdentityOverrides | None = None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Codex lineage as one serialized raw-data transaction."""
 
@@ -574,6 +659,7 @@ def ingest_codex(
             team_slug,
             display_timezone,
             date_window,
+            identity_overrides,
         )
 
 
@@ -583,6 +669,7 @@ def _ingest_claude_locked(
     team_slug: str,
     display_timezone: str,
     date_window: DateWindow | None,
+    identity_overrides: IdentityOverrides | None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Claude coordinator lineage."""
 
@@ -617,6 +704,9 @@ def _ingest_claude_locked(
         raise ClaudeParseError(
             "parsed source set differs from the just-validated source snapshot manifest"
         )
+    changed += _record_site_identity(
+        archive, team, ((), ()), identity_overrides
+    )
     source_manifest: dict[str, object] = {
         "schema_version": 1,
         "provider": "claude",
@@ -641,6 +731,7 @@ def ingest_claude(
     team_slug: str,
     display_timezone: str,
     date_window: DateWindow | None = None,
+    identity_overrides: IdentityOverrides | None = None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Claude lineage as one serialized transaction."""
 
@@ -651,6 +742,7 @@ def ingest_claude(
             team_slug,
             display_timezone,
             date_window,
+            identity_overrides,
         )
 
 
@@ -696,6 +788,7 @@ def _ingest_orc_locked(
     team_slug: str,
     display_timezone: str,
     date_window: DateWindow | None,
+    identity_overrides: IdentityOverrides | None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Orc coordinator lineage."""
 
@@ -731,6 +824,9 @@ def _ingest_orc_locked(
         raise OrcParseError(
             "parsed source set differs from the validated Orc source snapshots"
         )
+    changed += _record_site_identity(
+        archive, team, ((), ()), identity_overrides
+    )
     source_manifest: dict[str, object] = {
         "schema_version": 1,
         "provider": "orc",
@@ -756,6 +852,7 @@ def ingest_orc(
     team_slug: str,
     display_timezone: str,
     date_window: DateWindow | None = None,
+    identity_overrides: IdentityOverrides | None = None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Orc lineage as a serialized raw-data transaction."""
 
@@ -767,6 +864,7 @@ def ingest_orc(
             team_slug,
             display_timezone,
             date_window,
+            identity_overrides,
         )
 
 
@@ -1541,6 +1639,7 @@ def build_archive(
         pull_metadata_path(archive, team_slug)
     )
     pull_metadata = {record.key: record for record in pull_cache.records}
+    site_identity = load_site_identity(archive, team)
     return render_archive(
         archive,
         team,
@@ -1554,6 +1653,7 @@ def build_archive(
         agent_names,
         pull_metadata,
         artifact_catalog,
+        site_identity,
     )
 
 

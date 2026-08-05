@@ -419,6 +419,37 @@ def _first_snapshot_metadata(
     return _mapping(record.get("payload"))
 
 
+def codex_identity_metadata(
+    snapshot_root: Path,
+    source_paths: Sequence[str],
+    root_thread_id: str,
+) -> tuple[Mapping[str, object], ...]:
+    """Return structured session metadata, root first, for identity inference.
+
+    The source paths have already been copied into the archive, but this helper still applies the
+    snapshot path and metadata validation used by the transcript parser. Free-form transcript text
+    is deliberately excluded from identity inference.
+    """
+
+    records: list[Mapping[str, object]] = []
+    for source_path in source_paths:
+        metadata = _first_snapshot_metadata(snapshot_root, source_path)
+        if metadata is None:
+            raise CodexParseError(
+                f"source snapshot lacks valid session metadata: {source_path!r}"
+            )
+        records.append(metadata)
+    return tuple(
+        sorted(
+            records,
+            key=lambda item: (
+                0 if _string(item.get("id")) == root_thread_id else 1,
+                _string(item.get("id")) or "",
+            ),
+        )
+    )
+
+
 def _read_at(parent_fd: int, name: str, display_path: Path) -> bytes | None:
     try:
         metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1397,6 +1428,7 @@ __all__ = [
     "CodexParseError",
     "CodexSnapshotResult",
     "CodexSourceCopy",
+    "codex_identity_metadata",
     "load_codex_team",
     "snapshot_codex_lineage",
 ]

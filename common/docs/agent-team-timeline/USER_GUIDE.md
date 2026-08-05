@@ -98,6 +98,8 @@ agent-team-timeline refresh \
   --team example-team \
   --output ./timelines/example-team \
   --timezone America/New_York \
+  --project example-project=https://github.com/example/example-project \
+  --source-host build-host-01 \
   --backend codex \
   --model gpt-5.6-sol \
   --reasoning-effort xhigh \
@@ -107,6 +109,16 @@ agent-team-timeline refresh \
 
 `refresh` is exactly `ingest`, then `summarize`, then `build`. It records a new immutable JSON run
 receipt under `runs/` and updates `manifest.json` with the latest run and source digest.
+
+The upper-left site title identifies what the archive contains. `--project LABEL=REPOSITORY_URL`
+and `--source-host HOSTNAME` are repeatable; the first explicit project is the primary title link,
+while secondary repositories and full hostnames remain available from the adjacent identity
+disclosure. A combined dataset with no single primary uses the compact `multi-repo` label; more
+than one execution host uses `multi-host`. Codex ingestion also reads `cwd`,
+`git.repository_url`, and structured hostname fields
+from session metadata. It never guesses identity from free-form prompt or response prose. Explicit
+values and later structured discoveries are accumulated rather than discarding already recorded
+projects or hosts. Orc backups commonly lack host metadata, so pass `--source-host` for them.
 
 For Claude Code, use the provider-specific source selector; the remaining summary and build options
 are identical:
@@ -285,7 +297,11 @@ verbatim messages + condensed tools
 
 Each level keeps a phrase, a paragraph, and timestamped substantive work bullets. Calendar
 boundaries are computed in `--timezone`, including daylight-saving transitions. UTC instants remain
-canonical in JSON; the chosen IANA timezone controls labels and day/week membership.
+canonical in JSON; the chosen IANA timezone controls labels and day/week membership. That choice is
+stored in `raw/site-identity.json` with its provenance and is used by the browser independently of
+the browser or web-server machine's local timezone. Archives without that file retain the
+timezone in normalized team data; malformed or missing browser data falls back visibly to UTC,
+never silently to ambient browser time.
 
 The terminology scan runs before phase summarization. It records terms in introduction order by ISO
 week, keeps the source sentence as evidence, and supplies the chronological subset to each model
@@ -312,6 +328,7 @@ example-team/
     │   └── 2026/08/04/rollout-....jsonl
     ├── raw/
     │   ├── team.json
+    │   ├── site-identity.json        # projects, repositories, hosts, archive timezone
     │   ├── source-manifest.json      # versioned path/byte/hash/update provenance
     │   ├── source-snapshot.json
     │   └── messages/<thread-id>.json

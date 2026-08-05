@@ -17,6 +17,7 @@ from agent_team_timeline.github_metadata import (
     PullRequestMetadataCache,
     save_pull_request_metadata_cache,
 )
+from agent_team_timeline.identity import HostIdentity, ProjectIdentity, SiteIdentity
 from agent_team_timeline.model import (
     Agent,
     Edge,
@@ -224,6 +225,9 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert child_track["nickname"] == "Ada"
     assert "receipt binding" in child_track["lifetime_summary"]
     assert timeline["source_digest"] == source_digest(team)
+    assert timeline["display_timezone_source"] == "legacy_team_data"
+    assert timeline["teams"][0]["projects"] == []
+    assert timeline["teams"][0]["hosts"] == []
     assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
     assert any(edge["kind"] == "result" for edge in timeline["edges"])
     rollup = timeline["rollups"][0]
@@ -306,6 +310,45 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert run["summaries"]["reasoning_effort"] == "high"
     assert run["summaries"]["newly_spent_usage"]["total_tokens"] == 0
     assert run["summaries"]["usage_run_paths"] == list(second.usage_run_paths)
+
+
+def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    identity = SiteIdentity(
+        team.team_slug,
+        (
+            ProjectIdentity(
+                "dev-hermit",
+                "https://github.com/rrnewton/dev-hermit",
+                True,
+                "session_metadata",
+            ),
+        ),
+        (HostIdentity("devbig014", "explicit"),),
+        team.display_timezone,
+        "explicit",
+    )
+    write_json_if_changed(
+        tmp_path / "teams" / team.team_slug / "raw" / "site-identity.json",
+        narrow_json(identity.to_json_obj()),
+    )
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    build_archive(tmp_path, team.team_slug)
+
+    timeline = json.loads(
+        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert timeline["display_timezone"] == "America/New_York"
+    assert timeline["display_timezone_source"] == "explicit"
+    assert timeline["teams"] == [
+        {
+            "slug": team.team_slug,
+            "label": team.team_slug,
+            "projects": [identity.projects[0].to_json_obj()],
+            "hosts": [identity.hosts[0].to_json_obj()],
+        }
+    ]
 
 
 def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path) -> None:

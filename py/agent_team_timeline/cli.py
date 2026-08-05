@@ -15,6 +15,7 @@ from agent_team_timeline.archive import as_array, as_object, read_json
 from agent_team_timeline.claude import ClaudeParseError
 from agent_team_timeline.codex import CodexParseError
 from agent_team_timeline.github_enrich import PullMetadataReport, enrich_pull_request_metadata
+from agent_team_timeline.identity import IdentityOverrides, parse_identity_overrides
 from agent_team_timeline.naming import AgentNameError
 from agent_team_timeline.orc import OrcParseError
 from agent_team_timeline.pipeline import (
@@ -95,6 +96,26 @@ def _add_date_window(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_site_identity(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--project",
+        action="append",
+        default=[],
+        metavar="LABEL=REPOSITORY_URL",
+        help=(
+            "project/repository identity; repeat for multi-repo work (the first is primary); "
+            "Codex git metadata is used when omitted"
+        ),
+    )
+    parser.add_argument(
+        "--source-host",
+        action="append",
+        default=[],
+        metavar="HOSTNAME",
+        help="execution hostname captured by the source data; repeat for multi-host work",
+    )
+
+
 def _add_ingest(parser: argparse.ArgumentParser) -> None:
     _add_archive(parser)
     parser.add_argument(
@@ -102,6 +123,7 @@ def _add_ingest(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--root-session", required=True, help="coordinator thread UUID")
     _add_date_window(parser)
+    _add_site_identity(parser)
 
 
 def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
@@ -112,6 +134,7 @@ def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
         help="Claude coordinator JSONL; nested subagents are discovered beside it",
     )
     _add_date_window(parser)
+    _add_site_identity(parser)
 
 
 def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
@@ -123,6 +146,7 @@ def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--root-session", required=True, help="Orc coordinator session UUID")
     _add_date_window(parser)
+    _add_site_identity(parser)
 
 
 def _add_summary(parser: argparse.ArgumentParser) -> None:
@@ -284,6 +308,31 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
     )
 
 
+def _identity_overrides(
+    ns: argparse.Namespace, command_args: Sequence[str]
+) -> IdentityOverrides:
+    raw_projects: object = getattr(ns, "project", [])
+    raw_hosts: object = getattr(ns, "source_host", [])
+    if not isinstance(raw_projects, list) or not all(
+        isinstance(item, str) for item in raw_projects
+    ):
+        raise ValueError("--project values must be strings")
+    if not isinstance(raw_hosts, list) or not all(
+        isinstance(item, str) for item in raw_hosts
+    ):
+        raise ValueError("--source-host values must be strings")
+    projects, hosts = parse_identity_overrides(raw_projects, raw_hosts)
+    timezone_explicit = any(
+        item == "--timezone" or item.startswith("--timezone=")
+        for item in command_args
+    )
+    return IdentityOverrides(
+        projects,
+        hosts,
+        "explicit" if timezone_explicit else "default",
+    )
+
+
 def _print_ingest(report: IngestReport) -> None:
     print(
         f"ingest: {report.agents} agents, {report.events} messages/events, "
@@ -418,6 +467,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "refresh_orc",
         )
         if handler in ingest_handlers:
+            identity_overrides = _identity_overrides(ns, args)
             date_window = parse_date_window(
                 str(ns.start_date) if ns.start_date is not None else None,
                 str(ns.end_date) if ns.end_date is not None else None,
@@ -430,6 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     team_slug,
                     str(ns.timezone),
                     date_window,
+                    identity_overrides,
                 )
             elif handler in ("ingest_orc", "refresh_orc"):
                 _, ingest_report = ingest_orc(
@@ -439,6 +490,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     team_slug,
                     str(ns.timezone),
                     date_window,
+                    identity_overrides,
                 )
             else:
                 _, ingest_report = ingest_codex(
@@ -448,6 +500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     team_slug,
                     str(ns.timezone),
                     date_window,
+                    identity_overrides,
                 )
             _print_ingest(ingest_report)
         refresh_handlers = ("refresh", "refresh_claude", "refresh_orc")

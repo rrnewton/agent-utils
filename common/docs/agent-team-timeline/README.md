@@ -20,6 +20,8 @@ web server.
 - Separate technical and newcomer-oriented plain-language summaries for every day, week, month,
   and quarter, with an in-modal audience switch.
 - A discoverable project glossary with stable, source-validated links from recognized terms.
+- A linked site title grounded in structured repository metadata, with durable multi-project and
+  multi-host identity plus explicit provenance.
 - Content-addressed model caches, append-only raw-log snapshots, and immutable run receipts.
 - A self-contained static website served by a built-in loopback server, with no CDN dependency.
 
@@ -34,7 +36,9 @@ agent-team-timeline refresh \
   --root-session SESSION_UUID \
   --team example-team \
   --output ./timelines/example-team \
-  --timezone America/New_York
+  --timezone America/New_York \
+  --project example-project=https://github.com/example/example-project \
+  --source-host build-host-01
 
 cd ./timelines/example-team
 make serve
@@ -43,7 +47,9 @@ make serve
 Use `refresh-claude --session-file SESSION.jsonl` for a Claude lineage or
 `refresh-orc --source-root PROJECT --root-session SESSION_UUID` for an Orc SQLite lineage. All
 three refresh commands accept inclusive `--start-date` and exclusive `--end-date` local-calendar
-bounds.
+bounds. `--project LABEL=URL` and `--source-host HOSTNAME` are repeatable; the first explicit
+project is primary. Codex archives infer repository labels and links from structured session
+metadata when no override is needed.
 
 Every archive includes its launcher, static site, normalized message JSON, cached summary data,
 rendered Markdown, source provenance, and run metadata. Repeating `summarize` on unchanged input

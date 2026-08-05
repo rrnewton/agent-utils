@@ -15,6 +15,7 @@ from agent_team_timeline.artifacts import (
     output_artifact_ids_for_range,
 )
 from agent_team_timeline.github_refs import find_pull_request_references
+from agent_team_timeline.identity import SiteIdentity
 from agent_team_timeline.github_metadata import PullRequestKey, PullRequestMetadata
 from agent_team_timeline.model import Agent, Edge, Event, TeamData, Turn, source_digest
 from agent_team_timeline.naming import AgentNameResult
@@ -534,6 +535,7 @@ def render_archive(
     agent_names: Mapping[str, AgentNameResult],
     pull_request_metadata: Mapping[PullRequestKey, PullRequestMetadata],
     artifact_catalog: ArtifactCatalog,
+    site_identity: SiteIdentity,
 ) -> dict[str, int]:
     """Regenerate all presentation files without invoking a summary backend."""
 
@@ -854,8 +856,16 @@ def render_archive(
         "generated_at": _iso(latest_ms),
         "source_digest": source_digest(team),
         "display_timezone": team.display_timezone,
+        "display_timezone_source": site_identity.display_timezone_source,
         "range": {"start_ms": start_ms, "end_ms": end_ms},
-        "teams": [{"slug": team.team_slug, "label": team.team_slug}],
+        "teams": [
+            {
+                "slug": team.team_slug,
+                "label": team.team_slug,
+                "projects": [item.to_json_obj() for item in site_identity.projects],
+                "hosts": [item.to_json_obj() for item in site_identity.hosts],
+            }
+        ],
         "agents": agent_objs,
         "phases": phase_objs,
         "edges": edge_objs,

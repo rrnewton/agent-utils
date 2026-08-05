@@ -57,6 +57,14 @@ assert.ok(
 assert.match(app, /#glossary\/" \+ match\.id/);
 assert.match(app, /glossary entry has an invalid stable target/);
 assert.match(index, /id="glossary-open"/);
+assert.match(index, /id="site-title"/);
+assert.match(index, /id="site-identity-details"/);
+assert.match(app, /Agent Timeline: /);
+assert.doesNotMatch(
+  app,
+  /browser local/,
+  "timeline labels must use the archive timezone rather than ambient browser time"
+);
 assert.ok(
   app.indexOf("window.location.href,\n      preferredBase") >= 0,
   "archive-root paths must be tried before detail-relative fallbacks"

@@ -205,11 +205,36 @@ const timeline = {
   generated_at: "2026-03-09T17:40:00Z",
   source_digest: "playwright-fixture",
   display_timezone: "America/New_York",
+  display_timezone_source: "explicit",
   range: {
     start_ms: DATA_START_MS,
     end_ms: DATA_END_MS
   },
-  teams: [{ slug: "codex-hermit", label: "Codex Hermit" }],
+  teams: [{
+    slug: "codex-hermit",
+    label: "Codex Hermit",
+    projects: [
+      {
+        label: "dev-hermit",
+        repository_url: "https://github.com/rrnewton/dev-hermit",
+        primary: true,
+        source: "session_metadata"
+      },
+      {
+        label: "agent-utils",
+        repository_url: "https://github.com/rrnewton/agent-utils",
+        primary: false,
+        source: "session_metadata"
+      },
+      {
+        label: "hermit",
+        repository_url: "https://github.com/facebookexperimental/hermit",
+        primary: false,
+        source: "session_metadata"
+      }
+    ],
+    hosts: [{ hostname: "devbig014.example.com", source: "explicit" }]
+  }],
   agents: agents,
   phases: phases,
   edges: [
