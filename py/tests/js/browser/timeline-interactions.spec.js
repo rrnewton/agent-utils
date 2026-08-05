@@ -162,3 +162,31 @@ test("full-transcript role filters support user-only, none, and all", async func
   await filters.getByRole("button", { name: /select all/i }).click();
   await expect(page.locator(".transcript-entry[data-role]:visible")).toHaveCount(5);
 });
+
+test("rollups switch audiences and verified glossary terms open stable entries", async function ({ page }) {
+  const daily = page.locator(".rollup-marker.rollup-daily").first();
+  await daily.dblclick();
+  await expect(page.getByTestId("modal")).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Technical" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Plain Language" })).toBeVisible();
+  await expect(page.locator("#modal-content")).toContainText("technical summary");
+
+  await page.getByRole("tab", { name: "Plain Language" }).click();
+  await expect(page.locator("#modal-content")).toContainText("plain-language summary");
+  const term = page.locator(
+    '.glossary-term-link[data-glossary-id="term-malformed-input-123456789abc"]'
+  ).first();
+  await expect(term).toHaveAttribute(
+    "href",
+    "#glossary/term-malformed-input-123456789abc"
+  );
+  await term.click();
+  await expect(page.locator("#modal-title")).toHaveText("malformed-input");
+  await expect(page).toHaveURL(/#glossary\/term-malformed-input-123456789abc$/);
+  await expect(page.locator("#modal-content")).toContainText("required structure");
+
+  await page.locator("#modal-close").click();
+  await page.getByTestId("glossary-open").click();
+  await expect(page.locator("#modal-title")).toHaveText("Project glossary");
+  await expect(page.locator("#modal-content")).toContainText("Data that does not satisfy");
+});

@@ -27,15 +27,20 @@ do not require site changes.
   that phase. Double-click opens three views: the cultivated Agent Work Summary, the full
   prompt/response transcript with tool use condensed to one line and role filters, and its rendered
   Markdown summary.
-- Single-clicking a day, week, month, or quarter selects it; double-click opens its rendered
-  Markdown summary. Right-clicking a rollup, agent lifetime, or work phase offers range-appropriate
-  zoom-to-fit actions. Horizontal trackpad gestures pan the time axis.
+- Single-clicking a day, week, month, or quarter selects it; double-click opens rendered Markdown
+  with **Technical** and **Plain Language** tabs. The latter introduces the project and explains
+  specialized terms for a newcomer. Right-clicking a rollup, agent lifetime, or work phase offers
+  range-appropriate zoom-to-fit actions. Horizontal trackpad gestures pan the time axis.
 - The fixed footer recomputes user prompts, agent responses, inter-agent messages, tool calls, and
   active agents for the visible time range.
 - Daily, weekly, monthly, and quarterly markers link the visible range to long-term summaries.
 - Explicit GitHub pull-request URLs and `owner/repository#number` references become safe links in
   work summaries and transcripts. Ambiguous naked `#number` text stays plain unless importer input
   supplies repository context for that exact message.
+- **Project glossary** opens the all-time terminology catalog. Exact, known glossary names in
+  rendered summaries become links such as `#glossary/term-name-digest`. The renderer creates links
+  only from IDs present in `timeline.json` and rejects duplicate or malformed targets, so model
+  output cannot create a hallucinated glossary destination.
 
 The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
 bundle renders summary headings, lists, tables, blockquotes, links, and code with raw HTML disabled.
@@ -188,6 +193,13 @@ Each stable time window gets a content-addressed cache key over:
 - only glossary terms introduced by that point in history;
 - model, backend, prompt version, and summary schema.
 
+Every calendar period has two distinct jobs and cache identities. The technical summary remains
+content-led and must explain what a pull request, task, or phase changed instead of using its number
+as an opaque referent. The plain-language summary is separately generated for a reader unfamiliar
+with the project: it introduces the product from supplied evidence, explains specialized terms,
+and treats work-management identifiers as supplementary evidence. Both jobs have independent batch
+receipts and are included in the command's exact token accounting.
+
 Unchanged keys are never sent to the model again. New later terminology does not invalidate older
 windows. A changed live window creates a new cache record while the previous valuable record remains
 on disk. Each batch is committed only after every response in that batch validates against the
@@ -256,10 +268,10 @@ The pipeline performs real multilevel reduction:
 ```text
 verbatim messages + condensed tools
   -> fixed, append-stable agent phases
-     -> daily summaries
-        -> weekly summaries of daily summaries
-           -> monthly summaries of weekly summaries
-              -> quarterly summaries of monthly summaries
+     -> daily technical + plain-language summaries
+        -> weekly technical + plain-language summaries
+           -> monthly technical + plain-language summaries
+              -> quarterly technical + plain-language summaries
 ```
 
 Each level keeps a phrase, a paragraph, and timestamped substantive work bullets. Calendar
@@ -299,17 +311,19 @@ example-team/
     │   ├── name_cache/<content-hash>.json
     │   ├── agents/<thread-id>.json   # selected hindsight name + provenance
     │   ├── phases/<phase-id>.json
-    │   ├── rollups/{daily,weekly,monthly,quarterly}/...
+    │   ├── rollups/{daily,weekly,monthly,quarterly}/... # both structured audiences
     │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata
     │   └── glossary.json
     └── summaries/
         ├── agents/<thread-id>.md
         ├── phases/<phase-id>.md
         ├── daily/<ISO-week>/YYYY-MM-DD-<team>-daily.md
+        ├── daily/<ISO-week>/YYYY-MM-DD-<team>-daily-plain-language.md
         ├── weekly/<year>/YYYY-Www-<team>-weekly.md
         ├── monthly/<year>/YYYY-MM-<team>-monthly.md
         ├── quarterly/<year>/YYYY-Qn-<team>-quarterly.md
-        └── glossary/<year>/YYYY-Www-<team>-glossary.md
+        ├── glossary/<year>/YYYY-Www-<team>-glossary.md
+        └── glossary/<team>-glossary.md             # all-time catalog
 ```
 
 `summary_data/cache/` is valuable generated data: keep it under version control if the archive is

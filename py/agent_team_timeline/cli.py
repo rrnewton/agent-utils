@@ -295,7 +295,7 @@ def _print_ingest(report: IngestReport) -> None:
 def _print_summaries(report: SummarizeReport) -> None:
     print(
         f"summarize: {report.phases} phases + {report.agent_names} hindsight agent names + "
-        f"{report.rollups} calendar rollups; "
+        f"{report.rollups} calendar periods × 2 summary audiences; "
         f"cache {report.cache_hits} hit / {report.cache_misses} miss in "
         f"{report.backend_batches} backend batch(es); {report.glossary_terms} glossary terms"
     )

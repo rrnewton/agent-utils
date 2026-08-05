@@ -16,7 +16,9 @@ web server.
 - Hindsight short names grounded in completed work while retaining official paths and coordinator
   nicknames.
 - Phrase, paragraph, cultivated work-summary, condensed-transcript, and rendered Markdown views.
-- Daily, weekly, monthly, and quarterly summaries.
+- Separate technical and newcomer-oriented plain-language summaries for every day, week, month,
+  and quarter, with an in-modal audience switch.
+- A discoverable project glossary with stable, source-validated links from recognized terms.
 - Content-addressed model caches, append-only raw-log snapshots, and immutable run receipts.
 - A self-contained static website served by a built-in loopback server, with no CDN dependency.
 

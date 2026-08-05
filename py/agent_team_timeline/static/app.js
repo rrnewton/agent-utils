@@ -49,6 +49,7 @@
     teamFilter: byId("team-filter"),
     search: byId("search"),
     fit: byId("fit"),
+    glossaryOpen: byId("glossary-open"),
     summaryMenu: byId("summary-menu"),
     summaryFiles: byId("summary-files"),
     perAgentTracks: byId("per-agent-tracks"),
@@ -93,6 +94,7 @@
     phasesByAgent: new Map(),
     agentsById: new Map(),
     teamBySlug: new Map(),
+    glossaryById: new Map(),
     axisTicks: [],
     selectedTeam: "",
     query: "",
@@ -163,7 +165,96 @@
       ? markdownRenderer.renderInline(text(source))
       : markdownRenderer.render(text(source));
     secureMarkdownLinks(container);
+    linkKnownGlossaryTerms(container);
     return container;
+  }
+
+  function glossaryId(value) {
+    var candidate = text(value);
+    return /^term-[a-z0-9-]+$/.test(candidate) ? candidate : "";
+  }
+
+  function glossaryBoundaryCharacter(value) {
+    return Boolean(value) && /[A-Za-z0-9_]/.test(value);
+  }
+
+  function glossaryMatches(value) {
+    var candidates = [];
+    app.glossaryById.forEach(function (entry, id) {
+      var term = text(entry.term);
+      if (!term) {
+        return;
+      }
+      var from = 0;
+      while (from < value.length) {
+        var start = value.indexOf(term, from);
+        if (start < 0) {
+          break;
+        }
+        var end = start + term.length;
+        var before = start > 0 ? value.charAt(start - 1) : "";
+        var after = end < value.length ? value.charAt(end) : "";
+        if (!(glossaryBoundaryCharacter(term.charAt(0)) && glossaryBoundaryCharacter(before)) &&
+            !(glossaryBoundaryCharacter(term.charAt(term.length - 1)) &&
+              glossaryBoundaryCharacter(after))) {
+          candidates.push({ start: start, end: end, id: id, entry: entry });
+        }
+        from = start + Math.max(1, term.length);
+      }
+    });
+    candidates.sort(function (left, right) {
+      return left.start - right.start ||
+        (right.end - right.start) - (left.end - left.start) ||
+        left.id.localeCompare(right.id);
+    });
+    var accepted = [];
+    var cursor = 0;
+    candidates.forEach(function (candidate) {
+      if (candidate.start >= cursor) {
+        accepted.push(candidate);
+        cursor = candidate.end;
+      }
+    });
+    return accepted;
+  }
+
+  function linkKnownGlossaryTerms(container) {
+    if (!app.glossaryById.size || !document.createTreeWalker) {
+      return;
+    }
+    var walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    var nodes = [];
+    var current;
+    while ((current = walker.nextNode())) {
+      var parent = current.parentElement;
+      if (parent && !parent.closest("a, button, code, pre, script, style, textarea")) {
+        nodes.push(current);
+      }
+    }
+    nodes.forEach(function (node) {
+      var value = node.nodeValue || "";
+      var matches = glossaryMatches(value);
+      if (!matches.length || !node.parentNode) {
+        return;
+      }
+      var fragment = document.createDocumentFragment();
+      var cursor = 0;
+      matches.forEach(function (match) {
+        fragment.appendChild(document.createTextNode(value.slice(cursor, match.start)));
+        var link = htmlElement("a", "glossary-term-link", value.slice(match.start, match.end));
+        link.href = "#glossary/" + match.id;
+        link.title = text(match.entry.context, "Open project glossary entry");
+        link.dataset.glossaryId = match.id;
+        link.addEventListener("click", function (event) {
+          event.preventDefault();
+          openGlossaryEntry(match.entry, true);
+        });
+        fragment.appendChild(link);
+        cursor = match.end;
+      });
+      fragment.appendChild(document.createTextNode(value.slice(cursor)));
+      node.parentNode.replaceChild(fragment, node);
+    });
   }
 
   function safePullRequestUrl(value) {
@@ -232,8 +323,9 @@
         }
         container.appendChild(link);
         cursor = end;
-      });
+    });
     container.appendChild(document.createTextNode(content.slice(cursor)));
+    linkKnownGlossaryTerms(container);
     return container;
   }
 
@@ -359,7 +451,9 @@
       edges: array(raw.edges),
       events: array(raw.events),
       rollups: array(raw.rollups),
-      summary_files: array(raw.summary_files)
+      summary_files: array(raw.summary_files),
+      glossary: array(raw.glossary),
+      glossary_path: text(raw.glossary_path)
     };
 
     var inferredStart = Infinity;
@@ -411,6 +505,7 @@
     app.agentsById.clear();
     app.teamBySlug.clear();
     app.phasesByAgent.clear();
+    app.glossaryById.clear();
 
     data.teams.forEach(function (team) {
       if (team && typeof team === "object") {
@@ -441,6 +536,23 @@
         return number(left.start_ms, 0) - number(right.start_ms, 0);
       });
     });
+    var glossaryTerms = new Set();
+    data.glossary.forEach(function (entry) {
+      if (!entry || typeof entry !== "object") {
+        throw new Error("glossary entries must be objects");
+      }
+      var id = glossaryId(entry.id);
+      var term = text(entry.term);
+      if (!id || !term || text(entry.url) !== "#glossary/" + id) {
+        throw new Error("glossary entry has an invalid stable target");
+      }
+      if (app.glossaryById.has(id) || glossaryTerms.has(term)) {
+        throw new Error("glossary contains a duplicate ID or exact term");
+      }
+      app.glossaryById.set(id, entry);
+      glossaryTerms.add(term);
+    });
+    dom.glossaryOpen.hidden = !data.glossary.length && !data.glossary_path;
 
     populateTeamFilter();
     populateSummaryFiles();
@@ -449,6 +561,7 @@
     dom.meta.textContent =
       dataVersionLabel(data.schema_version) + " · " + generated + " · display " + timezone;
     scheduleRender();
+    openGlossaryFromHash();
   }
 
   function populateTeamFilter() {
@@ -1699,11 +1812,7 @@
       });
       button.addEventListener("dblclick", function (event) {
         event.preventDefault();
-        openMarkdownModal({
-          eyebrow: kind + " rollup · " + formatRange(start, end),
-          title: text(rollup.label, kind + " summary"),
-          path: text(rollup.path)
-        });
+        openRollupModal(rollup, kind, start, end);
       });
       button.addEventListener("contextmenu", function (event) {
         var rangeName = {
@@ -2632,6 +2741,126 @@
     }
   }
 
+  function setGlossaryHash(id) {
+    var suffix = id ? "/" + id : "";
+    window.history.pushState(null, "", "#glossary" + suffix);
+  }
+
+  function openGlossaryEntry(entry, updateLocation) {
+    var id = glossaryId(entry && entry.id);
+    if (!id || app.glossaryById.get(id) !== entry) {
+      return;
+    }
+    app.detailRequest += 1;
+    if (updateLocation) {
+      setGlossaryHash(id);
+    }
+    openModalBase(
+      "Project glossary · " + text(entry.week, "term"),
+      text(entry.term, "Glossary entry"),
+      "",
+      null
+    );
+    var metadata = htmlElement("div", "glossary-entry-meta");
+    metadata.appendChild(
+      htmlElement("span", "", formatCount(entry.occurrences) + " source occurrence(s)")
+    );
+    if (Number.isFinite(number(entry.introduced_at_ms, NaN))) {
+      metadata.appendChild(
+        htmlElement("span", "", "Introduced " + formatFullTime(number(entry.introduced_at_ms, 0)))
+      );
+    }
+    var permalink = htmlElement("a", "glossary-permalink", "Permanent glossary link");
+    permalink.href = "#glossary/" + id;
+    metadata.appendChild(permalink);
+    dom.modalContent.replaceChildren(
+      metadata,
+      markdownElement(
+        "## Source-backed explanation\n\n" + text(entry.context, "No source context was retained."),
+        "glossary-entry",
+        false
+      )
+    );
+  }
+
+  function openGlossaryCatalog(updateLocation) {
+    if (updateLocation) {
+      setGlossaryHash("");
+    }
+    var path = text(app.data && app.data.glossary_path);
+    if (path) {
+      openMarkdownModal({
+        eyebrow: "Project terminology",
+        title: "Project glossary",
+        path: path
+      });
+      return;
+    }
+    openModalBase("Project terminology", "Project glossary", "", null);
+    var list = htmlElement("div", "glossary-list");
+    app.glossaryById.forEach(function (entry) {
+      var link = htmlElement("a", "glossary-term-link", text(entry.term));
+      link.href = "#glossary/" + glossaryId(entry.id);
+      link.addEventListener("click", function (event) {
+        event.preventDefault();
+        openGlossaryEntry(entry, true);
+      });
+      list.appendChild(link);
+    });
+    dom.modalContent.replaceChildren(list);
+  }
+
+  function openGlossaryFromHash() {
+    if (!app.data || !window.location.hash.startsWith("#glossary")) {
+      return;
+    }
+    var prefix = "#glossary/";
+    if (!window.location.hash.startsWith(prefix)) {
+      openGlossaryCatalog(false);
+      return;
+    }
+    var encoded = window.location.hash.slice(prefix.length);
+    var id;
+    try {
+      id = decodeURIComponent(encoded);
+    } catch (_error) {
+      return;
+    }
+    var entry = app.glossaryById.get(glossaryId(id));
+    if (entry) {
+      openGlossaryEntry(entry, false);
+    }
+  }
+
+  function openRollupModal(rollup, kind, start, end) {
+    app.detailRequest += 1;
+    openModalBase(
+      kind + " rollup · " + formatRange(start, end),
+      text(rollup.label, kind + " summary"),
+      "",
+      null
+    );
+    var technicalPath = text(rollup.technical_path, text(rollup.path));
+    var plainPath = text(rollup.plain_language_path);
+    var tabs = [
+      {
+        label: "Technical",
+        render: function (container) {
+          return renderRawSummary(container, technicalPath, "");
+        }
+      }
+    ];
+    if (plainPath) {
+      tabs.push({
+        label: "Plain Language",
+        render: function (container) {
+          return renderRawSummary(container, plainPath, "");
+        }
+      });
+    }
+    activateTabs(tabs, 0);
+  }
+
   function showLoadError(error) {
     var message = error instanceof Error ? error.message : String(error);
     dom.meta.textContent = "Timeline could not be loaded";
@@ -2670,6 +2899,9 @@
   });
 
   dom.fit.addEventListener("click", fitTimeline);
+  dom.glossaryOpen.addEventListener("click", function () {
+    openGlossaryCatalog(true);
+  });
   dom.perAgentTracks.addEventListener("change", function () {
     app.perAgentTracks = dom.perAgentTracks.checked;
     dom.scroll.scrollTop = 0;
@@ -2693,6 +2925,7 @@
   dom.svg.addEventListener("pointercancel", endPan);
   dom.scroll.addEventListener("scroll", scheduleRender, { passive: true });
   dom.scroll.addEventListener("keydown", keyboardScrollTracks);
+  window.addEventListener("hashchange", openGlossaryFromHash);
 
   dom.modalClose.addEventListener("click", closeModal);
   dom.modalBackdrop.addEventListener("click", function (event) {

@@ -47,6 +47,16 @@ const app = fs.readFileSync(path.join(staticRoot, "app.js"), "utf8");
 assert.match(app, /markdownit\(\{[\s\S]*html: false/);
 assert.match(app, /markdownElement\(loaded\.content, "markdown-document", false\)/);
 assert.match(app, /label: "Markdown Summary"/);
+assert.match(app, /label: "Technical"/);
+assert.match(app, /label: "Plain Language"/);
+assert.match(app, /linkKnownGlossaryTerms\(container\)/);
+assert.ok(
+  (app.match(/linkKnownGlossaryTerms\(container\)/g) || []).length >= 2,
+  "glossary links must cover rendered Markdown and structured summary text"
+);
+assert.match(app, /#glossary\/" \+ match\.id/);
+assert.match(app, /glossary entry has an invalid stable target/);
+assert.match(index, /id="glossary-open"/);
 assert.ok(
   app.indexOf("window.location.href,\n      preferredBase") >= 0,
   "archive-root paths must be tried before detail-relative fallbacks"

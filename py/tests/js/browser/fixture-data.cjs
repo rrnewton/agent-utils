@@ -188,16 +188,32 @@ const timeline = {
       label: "Aug 05",
       start_ms: BASE_MS,
       end_ms: BASE_MS + 60 * minute,
-      path: "summaries/daily/2026-08-05.md"
+      path: "summaries/daily/2026-08-05.md",
+      technical_path: "summaries/daily/2026-08-05.md",
+      plain_language_path: "summaries/daily/2026-08-05-plain-language.md"
     },
     {
       kind: "weekly",
       label: "2026-W32",
       start_ms: BASE_MS,
       end_ms: BASE_MS + 100 * minute,
-      path: "summaries/weekly/2026-W32.md"
+      path: "summaries/weekly/2026-W32.md",
+      technical_path: "summaries/weekly/2026-W32.md",
+      plain_language_path: "summaries/weekly/2026-W32-plain-language.md"
     }
   ],
+  glossary: [
+    {
+      id: "term-malformed-input-123456789abc",
+      term: "malformed-input",
+      introduced_at_ms: BASE_MS + minute,
+      occurrences: 4,
+      context: "Malformed input is data that does not satisfy the parser's required structure.",
+      week: "2026-W32",
+      url: "#glossary/term-malformed-input-123456789abc"
+    }
+  ],
+  glossary_path: "summaries/glossary/codex-hermit-glossary.md",
   summary_files: [
     {
       kind: "daily",
@@ -310,11 +326,23 @@ const virtualFiles = new Map([
   }],
   ["/summaries/daily/2026-08-05.md", {
     contentType: "text/markdown; charset=utf-8",
-    body: "# August 5\n\nThe team repaired and verified the parser boundary.\n"
+    body: "# August 5 technical summary\n\nThe team repaired the malformed-input parser boundary.\n"
+  }],
+  ["/summaries/daily/2026-08-05-plain-language.md", {
+    contentType: "text/markdown; charset=utf-8",
+    body: "# August 5 plain-language summary\n\nThe parser now safely rejects malformed-input records.\n"
   }],
   ["/summaries/weekly/2026-W32.md", {
     contentType: "text/markdown; charset=utf-8",
     body: "# Week 32\n\nParser and CI work advanced together.\n"
+  }],
+  ["/summaries/weekly/2026-W32-plain-language.md", {
+    contentType: "text/markdown; charset=utf-8",
+    body: "# Week 32 in plain language\n\nThe team made invalid data safer to handle.\n"
+  }],
+  ["/summaries/glossary/codex-hermit-glossary.md", {
+    contentType: "text/markdown; charset=utf-8",
+    body: "# Project glossary\n\n## malformed-input\n\nData that does not satisfy the parser structure.\n"
   }]
 ]);
 
