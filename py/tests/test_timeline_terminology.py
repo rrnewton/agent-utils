@@ -70,3 +70,19 @@ def test_plain_language_context_excludes_unsupported_definitions() -> None:
     assert "Hermit runs guest software deterministically" in context
     assert "exact-head" in context
     assert "DBI" not in context
+
+
+def test_uppercase_prose_is_not_mistaken_for_project_acronyms() -> None:
+    noise = "THEN SAME PARENT NOT IF OR"
+    real = "KVM PMU IPC CI"
+    terms = scan_terminology(
+        (
+            TermSource(1_775_000_000_000, f"{noise}. The system uses {real}."),
+            TermSource(1_775_000_001_000, f"{noise}. Tests cover {real}."),
+        ),
+        "America/New_York",
+    )
+    names = {term.term for term in terms}
+
+    assert names.isdisjoint(noise.split())
+    assert names.issuperset(real.split())
