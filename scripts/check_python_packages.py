@@ -98,6 +98,7 @@ PROJECTS: tuple[Project, ...] = (
             "py.typed",
             "static/index.html",
             "static/app.js",
+            "static/timeline-core.js",
             "static/style.css",
             "static/vendor/README.md",
             "static/vendor/markdown-it-15.0.0.min.js",

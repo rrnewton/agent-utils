@@ -52,6 +52,6 @@ documents, and 21 exact package links. Artifact checks cover four wheels, four s
 rebuilt from sdists, and three registry crates. The repository CI additionally runs the full test,
 strict typing, formatting, Clippy, Python 3.10, and Rust 1.85 contracts.
 
-The completion run on Python 3.12 and Rust 1.96 passed 445 Python tests, 166 Rust tests, and 596
+The completion run on Python 3.12 and Rust 1.96 passed 466 Python tests, 166 Rust tests, and 596
 paired behavioral checks. The same 166 Rust tests and all three registry-package checks also passed
 under Rust 1.85.
