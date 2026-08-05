@@ -671,7 +671,7 @@ def _codex_batch(
             )
         try:
             output = output_path.read_text(encoding="utf-8")
-        except OSError as error:
+        except (OSError, UnicodeError) as error:
             raise _CodexBatchError(
                 "codex summary batch produced no output message", usage
             ) from error
