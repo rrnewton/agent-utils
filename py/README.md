@@ -10,6 +10,10 @@ own version and documentation, and only the console commands that belong to it.
 | `tick-hub` | `tick_hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr_landing_planner` | `pr-landing-planner` | Produce an advisory, conflict-aware pull-request landing plan. |
 
+`agent_team_timeline` is also present as an in-flight source tool. It is not yet
+part of the independently published distribution contract above; run it from a
+checkout with `python3 -m agent_team_timeline` while its interface settles.
+
 Install a tool from its project directory during development:
 
 ```sh
@@ -28,7 +32,8 @@ python3 -m mypy .
 python3 -m pytest -q
 ```
 
-Run `python3 scripts/check_python_packages.py` to build each wheel in isolation,
-inspect its contents, install it without dependency or network access, and smoke
-all of its declared commands. The invoking interpreter must already provide
-`setuptools>=68`; the offline check never downloads its build backend.
+Run `make check-python-packages` from the repository root to build each wheel in
+isolation, inspect its contents, install it without dependency or network
+access, and smoke all of its declared commands. The invoking interpreter must
+already provide `setuptools>=68`; the offline check never downloads its build
+backend.

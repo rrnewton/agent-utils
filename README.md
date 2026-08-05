@@ -74,6 +74,8 @@ make check
 make test
 python3 -m mypy cross/differential.py
 python3 cross/differential.py --tool safe-ci-dag-runner
+make cross
+make check-packages
 ```
 
 The differential harness runs matching commands over valid, invalid, boundary,

@@ -16,9 +16,9 @@ The standard reproducibility entry points are:
 
 ```sh
 python3 scripts/embed_userguides.py --check
-python3 scripts/check_python_packages.py
-python3 scripts/check_rust_packages.py
-python3 cross/differential.py --tool all
+make check-python-packages
+make check-rust-packages
+make cross
 ```
 
 Randomized differentials always record their fixture count and seed so a failed

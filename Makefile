@@ -1,5 +1,6 @@
 # `make` just runs ./setup (both python and rust), per repo convention.
-.PHONY: all both py rs check check-deps mypy test fmt clean
+.PHONY: all both py rs check check-deps mypy test cross check-packages \
+	check-python-packages check-rust-packages fmt clean
 
 all: both
 
@@ -32,6 +33,19 @@ check-deps:
 test:
 	cd py && python3 -m pytest -q
 	cargo test --release --workspace --manifest-path rs/Cargo.toml
+
+# Cross-language observable behavior for every paired command.
+cross:
+	python3 cross/differential.py --tool all
+
+# Build and smoke the artifacts users actually install, one distribution at a time.
+check-python-packages:
+	python3 scripts/check_python_packages.py
+
+check-rust-packages:
+	python3 scripts/check_rust_packages.py
+
+check-packages: check-python-packages check-rust-packages
 
 fmt:
 	cargo fmt --manifest-path rs/Cargo.toml

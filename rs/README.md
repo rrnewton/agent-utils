@@ -26,5 +26,5 @@ cargo test --workspace --manifest-path rs/Cargo.toml
 cargo clippy --workspace --all-targets --manifest-path rs/Cargo.toml -- -D warnings
 ```
 
-Run `./scripts/check_rust_packages.py` from the repository root to build, inspect,
-and smoke the registry archive for each crate independently.
+Run `make check-rust-packages` from the repository root to build, inspect, and
+smoke the registry archive for each crate independently.
