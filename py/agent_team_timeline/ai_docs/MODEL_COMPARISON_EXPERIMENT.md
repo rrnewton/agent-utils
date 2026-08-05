@@ -73,9 +73,9 @@ total a second time.
 
 | Attempt | Artifact directory |
 |---|---|
-| Deterministic heuristic | `~/temp/codex-hermit-timeline-heuristic-controlled` |
+| Deterministic heuristic | `~/temp/07_codex-hermit-controlled-heuristic` |
 | Luna (incomplete) | `~/temp/codex-hermit-timeline-luna` |
-| Sol control | `~/temp/codex-hermit-timeline-sol` |
+| Sol control | `~/temp/04_codex-hermit-controlled-sol` |
 
 | Attempt | Completed receipts | Failed receipts | Successful artifact total | Failed-call overhead | All recorded spend | Result |
 |---|---:|---:|---:|---:|---:|---|
@@ -110,7 +110,7 @@ batches, zero newly spent tokens, and a subsequent build changed zero files.
 
 ## Plain-language feature extension
 
-`~/temp/codex-hermit-timeline-sol-plain-language` was copied from the controlled
+`~/temp/05_codex-hermit-sol-feature-complete` was copied from the controlled
 Sol output and then updated by a later pipeline revision. It uses the same
 source digest and model, but it is **not another model arm** and is not strictly
 comparable to the controlled run: the technical rollup prompt changed and five
@@ -152,7 +152,7 @@ superiority, because no other model produced the same plain-language jobs.
 
 ## Why the Orc number is separate
 
-The Orc artifact is `~/temp/orc-hermit-2026-07-21-sol`. It summarizes a
+The Orc artifact is `~/temp/06_orc-hermit-day1-sol`. It summarizes a
 different provider snapshot and date window with different transcript density,
 lineage, prompts, and pipeline features. Its imported backing data contained
 1,413 agent incarnations, 42,761 events, and 24,593 outer tool calls; the
