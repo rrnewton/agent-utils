@@ -222,6 +222,8 @@ class TeamData:
     events: tuple[Event, ...]
     tool_calls: tuple[ToolCall, ...]
     edges: tuple[Edge, ...]
+    window_start_ms: int | None = None
+    window_end_ms: int | None = None
 
     def to_json_obj(self) -> JsonObject:
         """Return the complete team snapshot as a JSON-serializable object."""
@@ -237,6 +239,8 @@ class TeamData:
             "events": [item.to_json_obj() for item in self.events],
             "tool_calls": [item.to_json_obj() for item in self.tool_calls],
             "edges": [item.to_json_obj() for item in self.edges],
+            "window_start_ms": self.window_start_ms,
+            "window_end_ms": self.window_end_ms,
         }
 
 

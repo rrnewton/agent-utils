@@ -14,7 +14,12 @@ from agent_team_timeline.github_metadata import PullRequestKey, PullRequestMetad
 from agent_team_timeline.model import Agent, Edge, Event, TeamData, Turn, source_digest
 from agent_team_timeline.naming import AgentNameResult
 from agent_team_timeline.periods import Period, period_heading
-from agent_team_timeline.phases import PhaseStats, PhaseWindow, TranscriptEntry
+from agent_team_timeline.phases import (
+    PhaseStats,
+    PhaseWindow,
+    TranscriptEntry,
+    phase_agent_ids,
+)
 from agent_team_timeline.summarize import SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_markdown
 
@@ -198,16 +203,24 @@ def _agent_markdown(
 
 def _time_range(team: TeamData, phases: Sequence[PhaseWindow]) -> tuple[int, int]:
     values: list[int] = []
-    values.extend(agent.started_at_ms for agent in team.agents)
-    values.extend(event.timestamp_ms for event in team.events)
     values.extend(phase.start_ms for phase in phases)
     values.extend(phase.end_ms for phase in phases)
+    if team.window_start_ms is not None:
+        values.append(team.window_start_ms)
+    if team.window_end_ms is not None:
+        values.append(team.window_end_ms)
     if not values:
         now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
         return now - 1000, now
-    start = min(values)
-    end = max(values)
+    start = team.window_start_ms if team.window_start_ms is not None else min(values)
+    end = team.window_end_ms if team.window_end_ms is not None else max(values)
     return start, max(start + 1000, end)
+
+
+def _in_window(team: TeamData, timestamp_ms: int) -> bool:
+    if team.window_start_ms is not None and timestamp_ms < team.window_start_ms:
+        return False
+    return team.window_end_ms is None or timestamp_ms < team.window_end_ms
 
 
 def _summary_for_agent_at(
@@ -282,7 +295,11 @@ def _result_edge_objs(
 ) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     for agent in team.agents:
-        if agent.parent_thread_id is None or agent.parent_thread_id not in agents:
+        if (
+            agent.thread_id not in agents
+            or agent.parent_thread_id is None
+            or agent.parent_thread_id not in agents
+        ):
             continue
         finals = [
             event
@@ -293,6 +310,8 @@ def _result_edge_objs(
             and event.text
         ]
         for final in sorted(finals, key=lambda event: (event.timestamp_ms, event.event_id)):
+            if not _in_window(team, final.timestamp_ms):
+                continue
             target_id = _result_target(team, agent, final)
             if target_id is None or target_id not in agents:
                 continue
@@ -363,14 +382,24 @@ def _event_turn(turns: Sequence[Turn], event: Event) -> Turn | None:
     )
 
 
-def _event_objs(team: TeamData) -> list[dict[str, object]]:
+def _event_objs(
+    team: TeamData, visible_agent_ids: frozenset[str]
+) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     for event in team.events:
-        if event.kind in ("user_prompt", "assistant_message", "inter_agent_message"):
+        if (
+            event.thread_id in visible_agent_ids
+            and _in_window(team, event.timestamp_ms)
+            and event.kind in ("user_prompt", "assistant_message", "inter_agent_message")
+        ):
             result.append(
                 {"at_ms": event.timestamp_ms, "agent_id": event.thread_id, "kind": event.kind}
             )
     for tool in team.tool_calls:
+        if tool.thread_id not in visible_agent_ids or not _in_window(
+            team, tool.started_at_ms
+        ):
+            continue
         count = sum(value for _, value in tool.nested_tools) or 1
         result.extend(
             {"at_ms": tool.started_at_ms, "agent_id": tool.thread_id, "kind": "tool_call"}
@@ -485,6 +514,7 @@ def render_archive(
     changed = 0
     phase_paths: dict[str, str] = {}
     agents_by_id = {agent.thread_id: agent for agent in team.agents}
+    visible_agent_ids = phase_agent_ids(team, phases)
     for phase in phases:
         summary = phase_summaries[phase.summary_key]
         agent = agents_by_id[phase.agent_id]
@@ -614,12 +644,25 @@ def render_archive(
         )
 
     start_ms, end_ms = _time_range(team, phases)
-    latest_ms = max((event.timestamp_ms for event in team.events), default=end_ms)
+    latest_ms = max(
+        (
+            event.timestamp_ms
+            for event in team.events
+            if event.thread_id in visible_agent_ids
+            and _in_window(team, event.timestamp_ms)
+        ),
+        default=end_ms,
+    )
     agent_objs: list[dict[str, object]] = []
     for agent in team.agents:
+        if agent.thread_id not in visible_agent_ids:
+            continue
         own = phases_by_agent.get(agent.thread_id, [])
         own_end = max((phase.end_ms for phase in own), default=agent.ended_at_ms or end_ms)
         track_name = _agent_name(agent, agent_names)
+        track_start = max(agent.started_at_ms, start_ms)
+        track_end = min(max(agent.ended_at_ms or own_end, own_end), end_ms)
+        track_end = max(track_start + 1000, track_end)
         agent_objs.append(
             {
                 "id": agent.thread_id,
@@ -633,8 +676,8 @@ def render_archive(
                 "nickname": agent.nickname or "",
                 "naming_rationale": track_name.rationale,
                 "depth": agent.depth,
-                "start_ms": agent.started_at_ms,
-                "end_ms": max(agent.ended_at_ms or own_end, own_end),
+                "start_ms": track_start,
+                "end_ms": min(track_end, end_ms),
                 "status": agent.status,
             }
         )
@@ -655,14 +698,35 @@ def render_archive(
     edge_objs = [
         value
         for edge in team.edges
+        if edge.from_thread_id in visible_agent_ids
+        and edge.to_thread_id in visible_agent_ids
+        and _in_window(team, edge.timestamp_ms)
         for value in [
-            _edge_obj(edge, agents_by_id, phases, phase_summaries, agent_names)
+            _edge_obj(
+                edge,
+                {
+                    agent_id: agent
+                    for agent_id, agent in agents_by_id.items()
+                    if agent_id in visible_agent_ids
+                },
+                phases,
+                phase_summaries,
+                agent_names,
+            )
         ]
         if value is not None
     ]
     edge_objs.extend(
         _result_edge_objs(
-            team, agents_by_id, phases, phase_summaries, agent_names
+            team,
+            {
+                agent_id: agent
+                for agent_id, agent in agents_by_id.items()
+                if agent_id in visible_agent_ids
+            },
+            phases,
+            phase_summaries,
+            agent_names,
         )
     )
     edge_objs.sort(
@@ -691,7 +755,7 @@ def render_archive(
         "agents": agent_objs,
         "phases": phase_objs,
         "edges": edge_objs,
-        "events": _event_objs(team),
+        "events": _event_objs(team, visible_agent_ids),
         "rollups": rollup_objs,
         "summary_files": summary_files,
     }
@@ -701,7 +765,7 @@ def render_archive(
     return {
         "files_changed": changed,
         "phases": len(phases),
-        "agents": len(team.agents),
+        "agents": len(visible_agent_ids),
         "edges": len(edge_objs),
         "summary_files": len(summary_files),
     }

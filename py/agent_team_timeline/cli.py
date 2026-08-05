@@ -27,6 +27,7 @@ from agent_team_timeline.pipeline import (
 from agent_team_timeline.server import serve
 from agent_team_timeline.summarize import SummaryError
 from agent_team_timeline.token_usage import TokenUsage
+from agent_team_timeline.window import parse_date_window
 
 PROG = "agent-team-timeline"
 DEFAULT_MODEL = os.environ.get("AGENT_TEAM_TIMELINE_MODEL", "gpt-5.6-sol")
@@ -84,6 +85,14 @@ def _add_ingest(parser: argparse.ArgumentParser) -> None:
         "--timezone",
         default="America/New_York",
         help="IANA display/calendar timezone (UTC instants remain canonical)",
+    )
+    parser.add_argument(
+        "--start-date",
+        help="first local calendar date to include (YYYY-MM-DD, inclusive)",
+    )
+    parser.add_argument(
+        "--end-date",
+        help="local calendar boundary to stop at (YYYY-MM-DD, exclusive)",
     )
 
 
@@ -334,12 +343,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     build_report: dict[str, int] | None = None
     try:
         if handler in ("ingest", "refresh"):
+            date_window = parse_date_window(
+                str(ns.start_date) if ns.start_date is not None else None,
+                str(ns.end_date) if ns.end_date is not None else None,
+                str(ns.timezone),
+            )
             _, ingest_report = ingest_codex(
                 archive,
                 _path(str(ns.sessions_root)),
                 str(ns.root_session),
                 team_slug,
                 str(ns.timezone),
+                date_window,
             )
             _print_ingest(ingest_report)
         if handler in ("summarize", "refresh"):

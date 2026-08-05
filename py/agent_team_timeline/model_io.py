@@ -192,6 +192,10 @@ def team_from_json_obj(value: object) -> TeamData:
         events=events,
         tool_calls=tuple(tools),
         edges=edges,
+        window_start_ms=_optional_integer(
+            root.get("window_start_ms"), "team.window_start_ms"
+        ),
+        window_end_ms=_optional_integer(root.get("window_end_ms"), "team.window_end_ms"),
     )
 
 

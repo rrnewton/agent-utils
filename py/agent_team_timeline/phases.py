@@ -335,6 +335,30 @@ def _prior_context(team: TeamData, agent: Agent, start_ms: int, max_chars: int) 
     return text[-max_chars:]
 
 
+def _in_window(team: TeamData, timestamp_ms: int) -> bool:
+    if team.window_start_ms is not None and timestamp_ms < team.window_start_ms:
+        return False
+    return team.window_end_ms is None or timestamp_ms < team.window_end_ms
+
+
+def phase_agent_ids(
+    team: TeamData, phases: Sequence[PhaseWindow]
+) -> frozenset[str]:
+    """Return agents with in-window work plus their available lineage ancestors."""
+
+    by_id = {agent.thread_id: agent for agent in team.agents}
+    selected = {phase.agent_id for phase in phases}
+    pending = list(selected)
+    while pending:
+        current = by_id.get(pending.pop())
+        if current is None or current.parent_thread_id is None:
+            continue
+        if current.parent_thread_id in by_id and current.parent_thread_id not in selected:
+            selected.add(current.parent_thread_id)
+            pending.append(current.parent_thread_id)
+    return frozenset(selected)
+
+
 def build_phases(
     team: TeamData,
     *,
@@ -360,17 +384,25 @@ def build_phases(
     result: list[PhaseWindow] = []
     for agent in team.agents:
         end_ms = _thread_end(team, agent)
+        if team.window_end_ms is not None:
+            end_ms = min(end_ms, team.window_end_ms)
         own_events = events_by_thread.get(agent.thread_id, [])
         own_tools = tools_by_thread.get(agent.thread_id, [])
         activity_times = [
-            event.timestamp_ms for event in own_events if event.kind in _TEXT_KINDS
-        ] + [tool.started_at_ms for tool in own_tools]
+            event.timestamp_ms
+            for event in own_events
+            if event.kind in _TEXT_KINDS and _in_window(team, event.timestamp_ms)
+        ] + [tool.started_at_ms for tool in own_tools if _in_window(team, tool.started_at_ms)]
         if not activity_times:
-            activity_times = [agent.started_at_ms]
+            continue
         bucket_starts = sorted({(at_ms // window_ms) * window_ms for at_ms in activity_times})
         blocked = _blocked_ranges(own_events, end_ms)
         for bucket in bucket_starts:
-            start_ms = max(agent.started_at_ms, bucket)
+            start_ms = max(
+                agent.started_at_ms,
+                bucket,
+                team.window_start_ms if team.window_start_ms is not None else agent.started_at_ms,
+            )
             phase_end = min(end_ms, bucket + window_ms)
             if phase_end <= start_ms:
                 phase_end = start_ms + 1000

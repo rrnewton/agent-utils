@@ -45,6 +45,7 @@ from agent_team_timeline.phases import (
     PhaseWindow,
     aggregate_stats,
     build_phases,
+    phase_agent_ids,
 )
 from agent_team_timeline.render import render_archive
 from agent_team_timeline.summarize import (
@@ -61,6 +62,7 @@ from agent_team_timeline.terminology import (
     glossary_prompt_text,
     scan_terminology,
 )
+from agent_team_timeline.window import DateWindow, apply_date_window
 
 
 _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -297,7 +299,10 @@ def _ensure_source_snapshots_ignored(archive: Path) -> bool:
 
 
 def _load_source_manifest(
-    archive: Path, team_slug: str, root_thread_id: str
+    archive: Path,
+    team_slug: str,
+    root_thread_id: str,
+    date_window: DateWindow | None,
 ) -> tuple[CodexSourceCopy, ...]:
     path = _source_manifest_path(archive, team_slug)
     if not path.is_file():
@@ -309,6 +314,13 @@ def _load_source_manifest(
     if recorded_root != root_thread_id:
         raise CodexParseError(
             f"source manifest belongs to root {recorded_root!r}, not {root_thread_id!r}"
+        )
+    expected_window: object = (
+        date_window.to_json_obj() if date_window is not None else None
+    )
+    if obj.get("date_window") != expected_window:
+        raise CodexParseError(
+            "archive date window differs from this ingest; choose a new output directory"
         )
     raw_sources = as_array(obj.get("sources"), f"{path}: sources")
     result: list[CodexSourceCopy] = []
@@ -324,12 +336,15 @@ def _ingest_codex_locked(
     root_thread_id: str,
     team_slug: str,
     display_timezone: str,
+    date_window: DateWindow | None,
 ) -> tuple[TeamData, IngestReport]:
     """Normalize one complete Codex lineage and write canonical raw JSON."""
 
     _ensure_archive(archive, team_slug, create=True)
     changed = int(_ensure_source_snapshots_ignored(archive))
-    previous_sources = _load_source_manifest(archive, team_slug, root_thread_id)
+    previous_sources = _load_source_manifest(
+        archive, team_slug, root_thread_id, date_window
+    )
     snapshot_root = _source_snapshot_root(archive, team_slug)
     source_copies = snapshot_codex_lineage(
         sessions_root,
@@ -342,12 +357,15 @@ def _ingest_codex_locked(
     # Parsing deliberately starts only after the original logs have been closed. Everything from
     # this point onward consumes the archive-local, newline-complete backup.
     allowed_sources = tuple(source.snapshot_path for source in source_copies.sources)
-    team = load_codex_team(
-        snapshot_root,
-        root_thread_id,
-        team_slug,
-        display_timezone,
-        source_paths=allowed_sources,
+    team = apply_date_window(
+        load_codex_team(
+            snapshot_root,
+            root_thread_id,
+            team_slug,
+            display_timezone,
+            source_paths=allowed_sources,
+        ),
+        date_window,
     )
     if tuple(sorted(source.path for source in team.sources)) != tuple(sorted(allowed_sources)):
         raise CodexParseError(
@@ -359,6 +377,7 @@ def _ingest_codex_locked(
         "root_thread_id": root_thread_id,
         "source_root": str(sessions_root.resolve()),
         "snapshot_root": f"teams/{team_slug}/source_snapshots",
+        "date_window": date_window.to_json_obj() if date_window is not None else None,
         "sources": [source.to_json_obj() for source in source_copies.sources],
     }
     changed += int(
@@ -403,6 +422,7 @@ def _ingest_codex_locked(
         "root_thread_id": team.root_thread_id,
         "team_slug": team.team_slug,
         "display_timezone": team.display_timezone,
+        "date_window": date_window.to_json_obj() if date_window is not None else None,
         "source_digest": source_digest(team),
         "sources": [source.to_json_obj() for source in team.sources],
     }
@@ -432,6 +452,7 @@ def ingest_codex(
     root_thread_id: str,
     team_slug: str,
     display_timezone: str,
+    date_window: DateWindow | None = None,
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Codex lineage as one serialized raw-data transaction."""
 
@@ -442,6 +463,7 @@ def ingest_codex(
             root_thread_id,
             team_slug,
             display_timezone,
+            date_window,
         )
 
 
@@ -468,7 +490,10 @@ def _glossary_terms(team: TeamData) -> tuple[GlossaryTerm, ...]:
     sources = [
         TermSource(event.timestamp_ms, event.text or "")
         for event in team.events
-        if event.thread_id == team.root_thread_id and event.kind == "user_prompt" and event.text
+        if event.thread_id == team.root_thread_id
+        and event.kind == "user_prompt"
+        and event.text
+        and (team.window_end_ms is None or event.timestamp_ms < team.window_end_ms)
     ]
     return scan_terminology(sources, team.display_timezone)
 
@@ -584,7 +609,10 @@ def _agent_name_jobs(
     for phase in phases:
         phases_by_agent.setdefault(phase.agent_id, []).append(phase)
     jobs: list[AgentNameJob] = []
+    selected_ids = phase_agent_ids(team, phases)
     for agent in team.agents:
+        if agent.thread_id not in selected_ids:
+            continue
         own_phases = sorted(
             phases_by_agent.get(agent.thread_id, []),
             key=lambda phase: (phase.start_ms, phase.phase_id),
@@ -673,10 +701,12 @@ def _nonempty_string(value: JsonValue, where: str) -> str:
 
 
 def _load_agent_names(
-    archive: Path, team: TeamData
+    archive: Path, team: TeamData, selected_ids: frozenset[str]
 ) -> dict[str, AgentNameResult]:
     results: dict[str, AgentNameResult] = {}
     for agent in team.agents:
+        if agent.thread_id not in selected_ids:
+            continue
         path = (
             _summary_root(archive, team.team_slug)
             / "agents"
@@ -832,6 +862,22 @@ def _accumulate_stats(stats: Sequence[SummaryRunStats]) -> SummaryRunStats:
     )
 
 
+def _period_range(
+    team: TeamData, phases: Sequence[PhaseWindow]
+) -> tuple[int, int]:
+    """Return an inclusive range for calendar rollups from half-open phase/window bounds."""
+
+    phase_start = min((phase.start_ms for phase in phases), default=None)
+    phase_end = max((phase.end_ms for phase in phases), default=None)
+    start_ms = team.window_start_ms if team.window_start_ms is not None else phase_start
+    end_ms = team.window_end_ms if team.window_end_ms is not None else phase_end
+    if start_ms is None or end_ms is None:
+        raise ValueError("selected timeline range contains no activity and lacks both date bounds")
+    if end_ms <= start_ms:
+        raise ValueError("selected timeline range is empty")
+    return start_ms, end_ms - 1
+
+
 def _summarize_archive_locked(
     archive: Path,
     team_slug: str,
@@ -884,8 +930,7 @@ def _summarize_archive_locked(
         archive, team_slug, name_jobs, agent_names
     )
 
-    start_ms = min((phase.start_ms for phase in phases), default=0)
-    end_ms = max((phase.end_ms for phase in phases), default=start_ms)
+    start_ms, end_ms = _period_range(team, phases)
     periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
     by_kind = {
         kind: [period for period in periods if period.kind == kind]
@@ -1071,9 +1116,8 @@ def build_archive(
     team = load_archived_team(archive, team_slug)
     phases = build_phases(team, phase_minutes=phase_minutes)
     phase_results = _load_phase_summaries(archive, team_slug, phases)
-    agent_names = _load_agent_names(archive, team)
-    start_ms = min((phase.start_ms for phase in phases), default=0)
-    end_ms = max((phase.end_ms for phase in phases), default=start_ms)
+    agent_names = _load_agent_names(archive, team, phase_agent_ids(team, phases))
+    start_ms, end_ms = _period_range(team, phases)
     periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
     rollup_results: dict[str, SummaryResult] = {}
     rollup_stats: dict[str, PhaseStats] = {}
