@@ -124,8 +124,10 @@ def test_public_api_docs_are_standalone_without_banning_native_package_terms() -
 def test_package_indexes_name_real_check_commands() -> None:
     python_index = (REPO_ROOT / "py" / "README.md").read_text(encoding="utf-8")
     rust_index = (REPO_ROOT / "rs" / "README.md").read_text(encoding="utf-8")
+    makefile = (REPO_ROOT / "Makefile").read_text(encoding="utf-8")
 
-    assert "python3 scripts/check_python_packages.py" in python_index
-    assert "./scripts/check_rust_packages.py" in rust_index
+    assert "make check-python-packages" in python_index
+    assert "make check-rust-packages" in rust_index
+    assert "check-python-packages:" in makefile
+    assert "check-rust-packages:" in makefile
     assert "python" not in rust_index.lower()
-    assert "make check-packages" not in rust_index

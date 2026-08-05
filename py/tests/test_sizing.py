@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
 from safe_ci_dag_runner.sizing import (
     PER_BUILD_JOB_MEM_BYTES,
@@ -125,14 +127,19 @@ def test_stress_copy_footprint_single_node_is_that_node_cap() -> None:
 
 
 def test_box_mem_budget_is_min_of_readable_signals() -> None:
-    # On any Linux host with /proc/meminfo, the budget is a positive int no larger than
-    # MemAvailable (the min-of-signals rule never returns MORE than the free-memory signal).
-    from safe_ci_dag_runner.sizing import box_mem_budget_bytes, mem_available_bytes
+    # Use one deterministic snapshot. Comparing the function's MemAvailable read
+    # to a later live /proc read races with other processes on the host.
+    import safe_ci_dag_runner.sizing as sizing
 
-    budget = box_mem_budget_bytes()
-    avail = mem_available_bytes()
-    if budget is None:
-        return  # host without the cgroup/proc files: nothing to assert
-    assert budget > 0
-    if avail is not None:
-        assert budget <= avail
+    cases = (
+        (8 * GIB, 6 * GIB, 6 * GIB),
+        (8 * GIB, None, 8 * GIB),
+        (None, 6 * GIB, 6 * GIB),
+        (None, None, None),
+    )
+    for cgroup_limit, available, expected in cases:
+        with (
+            patch.object(sizing, "cgroup_mem_max_bytes", return_value=cgroup_limit),
+            patch.object(sizing, "mem_available_bytes", return_value=available),
+        ):
+            assert sizing.box_mem_budget_bytes() == expected
