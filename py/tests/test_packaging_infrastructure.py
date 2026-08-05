@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import zipfile
 from pathlib import Path
 from types import ModuleType
 
@@ -146,6 +147,74 @@ def test_artifact_doc_linters_reject_suite_language_sibling_and_template_leaks()
         assert any("foreign" in error for error in errors)
         assert any("sibling package" in error for error in errors)
         assert any("template" in error for error in errors)
+
+
+def test_wheel_rejects_present_but_corrupted_declared_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    python_check = _load_script("check_python_packages")
+    repo_root = tmp_path / "repo"
+    py_root = repo_root / "py"
+    source = py_root / "asset_demo"
+    (source / "static").mkdir(parents=True)
+
+    readme = "# Asset demo\n"
+    userguide = "# Asset demo user guide\n"
+    (repo_root / "LICENSE").write_text("test license\n", encoding="utf-8")
+    (source / "__init__.py").write_text('"""Asset demo package."""\n', encoding="utf-8")
+    (source / "README.md").write_text(readme, encoding="utf-8")
+    (source / "USER_GUIDE.md").write_text(userguide, encoding="utf-8")
+    (source / "py.typed").write_bytes(b"")
+    trusted_core = b"globalThis.TimelineCore = {trusted: true};\n"
+    (source / "static" / "timeline-core.js").write_bytes(trusted_core)
+
+    project = python_check.Project(
+        directory="asset_demo",
+        distribution="asset-demo",
+        package="asset_demo",
+        commands=("asset-demo",),
+        resources=("README.md", "USER_GUIDE.md", "py.typed", "static/timeline-core.js"),
+        required_dependencies=(),
+    )
+    monkeypatch.setattr(python_check, "REPO_ROOT", repo_root)
+    monkeypatch.setattr(python_check, "PY_ROOT", py_root)
+    monkeypatch.setattr(python_check, "PROJECTS", (project,))
+
+    wheel = tmp_path / "asset_demo-1.0-py3-none-any.whl"
+    dist_info = "asset_demo-1.0.dist-info"
+    package_prefix = "asset_demo/"
+    with zipfile.ZipFile(wheel, mode="w") as archive:
+        archive.writestr(
+            f"{dist_info}/METADATA",
+            "Metadata-Version: 2.4\n"
+            "Name: asset-demo\n"
+            "Version: 1.0\n"
+            "Requires-Python: >=3.10\n"
+            "Description-Content-Type: text/markdown\n"
+            f"\n{readme}",
+        )
+        archive.writestr(
+            f"{dist_info}/entry_points.txt",
+            "[console_scripts]\nasset-demo = asset_demo.cli:main\n",
+        )
+        archive.writestr(f"{dist_info}/licenses/LICENSE", b"test license\n")
+        archive.writestr(f"{package_prefix}__init__.py", b'"""Asset demo package."""\n')
+        archive.writestr(f"{package_prefix}README.md", readme)
+        archive.writestr(f"{package_prefix}USER_GUIDE.md", userguide)
+        archive.writestr(f"{package_prefix}py.typed", b"")
+        # This member's presence satisfied the old checker even though its payload is corrupt.
+        archive.writestr(
+            f"{package_prefix}static/timeline-core.js",
+            b"globalThis.TimelineCore = {trusted: false};\n",
+        )
+
+    with zipfile.ZipFile(wheel) as archive:
+        assert f"{package_prefix}static/timeline-core.js" in archive.namelist()
+    with pytest.raises(
+        python_check.CheckError,
+        match=r"wheel static/timeline-core\.js differs from its authoritative source",
+    ):
+        python_check._inspect_wheel(project, wheel)
 
 
 def test_public_api_docs_are_standalone_without_banning_native_package_terms() -> None:

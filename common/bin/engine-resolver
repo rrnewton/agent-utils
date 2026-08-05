@@ -1,16 +1,11 @@
 #!/usr/bin/env bash
-# TRACKED, deterministic engine resolver for agent-utils tools.
+# TRACKED, deterministic engine resolver for repository-local tool commands.
 #
-# Why this exists
-# ---------------
-# Several agent-utils tools ship two implementations: a TRACKED Python entrypoint
-# (`py/bin/<tool>`, a versioned symlink into the package) and, for `safe-ci-dag-runner`, an
-# UNTRACKED Rust build artifact (`rs/bin/<tool>` / `rs/target/release/<tool>`, produced by
-# `./setup rs`). The old `./setup both` wired the top-level `./bin` symlink straight at `rs/bin`,
-# so `./agent-utils/bin/<tool>` silently ran whatever Rust binary was last built — an UNTRACKED,
-# possibly STALE artifact silently beating the tracked entrypoint, with nothing logging which
-# engine actually ran. That is exactly how a Rust runner missing an enforcement guard (the
-# historical `cpu_timeout` gap) can run in production unnoticed.
+# The paired commands (`safe-ci-dag-runner`, `cpuset-alloc`, `tick-hub`, and
+# `pr-landing-planner`) have a tracked Python entrypoint under `py/bin` and may have an untracked,
+# locally built Rust binary under `rs/bin`. `agent-team-timeline` is intentionally Python-only.
+# Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
+# one consistent command surface after any setup mode.
 #
 # Contract enforced here
 # ----------------------
@@ -20,8 +15,9 @@
 #   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
 #     exact path are always visible in logs.
 #
-# The resolved tool name is this script's invocation basename (the wired symlinks
-# `safe-ci-dag-runner` / `pr-landing-planner` / `tick-hub` / `agent-team-timeline` all point here).
+# The resolved tool name is this script's invocation basename. The tracked links for
+# `safe-ci-dag-runner`, `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, and
+# `agent-team-timeline` all point here.
 set -euo pipefail
 
 # Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent
@@ -31,7 +27,7 @@ ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 
 TOOL="$(basename "$0")"
 if [[ "$TOOL" == "engine-resolver" ]]; then
-    echo "engine-resolver: invoke via a tool symlink (safe-ci-dag-runner|pr-landing-planner|tick-hub|agent-team-timeline), not directly" >&2
+    echo "engine-resolver: invoke via a tool symlink (safe-ci-dag-runner|cpuset-alloc|pr-landing-planner|tick-hub|agent-team-timeline), not directly" >&2
     exit 2
 fi
 

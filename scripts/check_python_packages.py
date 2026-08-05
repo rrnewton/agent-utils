@@ -168,6 +168,15 @@ class _WheelMetadata:
     description: str
 
 
+@dataclass(frozen=True)
+class _WheelInspection:
+    """Installer-visible wheel data that direct and sdist builds must share."""
+
+    version: str
+    userguide: str
+    resources: tuple[tuple[str, bytes], ...]
+
+
 def _public_doc_nodes(tree: ast.Module) -> list[_PublicDocNode]:
     nodes: list[_PublicDocNode] = [tree]
 
@@ -243,6 +252,20 @@ def _require_build_backend() -> None:
 def _requirement_name(requirement: str) -> str:
     match = _REQUIREMENT_NAME.match(requirement)
     return _normalized_distribution(match.group(1)) if match is not None else ""
+
+
+def _source_resources(project: Project, source: Path) -> tuple[tuple[str, bytes], ...]:
+    """Read declared resources, following authoritative repository symlinks."""
+
+    resources: list[tuple[str, bytes]] = []
+    for relative in project.resources:
+        path = source / relative
+        if not path.is_file():
+            raise CheckError(
+                f"{project.distribution}: declared source resource is missing: {relative}"
+            )
+        resources.append((relative, path.read_bytes()))
+    return tuple(resources)
 
 
 def _doc_violations(project: Project, text: str) -> list[str]:
@@ -380,6 +403,7 @@ def _build_sdist(project: Project, source: Path, sdist_root: Path) -> Path:
 
 
 def _inspect_sdist(project: Project, source: Path, archive: Path) -> None:
+    source_resources = _source_resources(project, source)
     with tarfile.open(archive, mode="r:gz") as package:
         members = package.getmembers()
         links = sorted(member.name for member in members if member.issym() or member.islnk())
@@ -409,19 +433,24 @@ def _inspect_sdist(project: Project, source: Path, archive: Path) -> None:
         missing = sorted(expected - set(by_name))
         if missing:
             raise CheckError(f"{project.distribution}: sdist is missing {missing}")
-        for document in ("LICENSE", "README.md", "USER_GUIDE.md"):
-            name = f"{prefix}{document}"
+        source_artifacts = (("LICENSE", (source / "LICENSE").read_bytes()), *source_resources)
+        for artifact_relative, source_bytes in source_artifacts:
+            name = f"{prefix}{artifact_relative}"
             member = by_name[name]
             if not member.isfile():
-                raise CheckError(f"{project.distribution}: sdist {document} is not a regular file")
+                raise CheckError(
+                    f"{project.distribution}: sdist {artifact_relative} is not a regular file"
+                )
             extracted = package.extractfile(member)
             if extracted is None:
-                raise CheckError(f"{project.distribution}: could not read sdist {document}")
+                raise CheckError(
+                    f"{project.distribution}: could not read sdist {artifact_relative}"
+                )
             artifact_bytes = extracted.read()
-            source_bytes = (source / document).read_bytes()
             if artifact_bytes != source_bytes:
                 raise CheckError(
-                    f"{project.distribution}: sdist {document} differs from its authoritative source"
+                    f"{project.distribution}: sdist {artifact_relative} differs from its "
+                    "authoritative source"
                 )
 
 
@@ -454,7 +483,7 @@ def _entry_points(archive: _WheelArchive, dist_info: str) -> dict[str, str]:
     return dict(parser.items("console_scripts")) if parser.has_section("console_scripts") else {}
 
 
-def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
+def _inspect_wheel(project: Project, wheel: Path) -> _WheelInspection:
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
         linked_members = sorted(
@@ -535,12 +564,20 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
                 )
 
         package_prefix = f"{project.package}/"
-        for resource in project.resources:
+        artifact_resources: list[tuple[str, bytes]] = []
+        source_package = PY_ROOT / project.directory
+        for resource, source_bytes in _source_resources(project, source_package):
             path = f"{package_prefix}{resource}"
             if path not in names:
                 raise CheckError(f"{project.distribution}: wheel is missing {path}")
+            artifact_bytes = archive.read(path)
+            if artifact_bytes != source_bytes:
+                raise CheckError(
+                    f"{project.distribution}: wheel {resource} differs from its "
+                    "authoritative source"
+                )
+            artifact_resources.append((resource, artifact_bytes))
 
-        source_package = PY_ROOT / project.directory
         source_modules: dict[str, Path] = {}
         for source_path in source_package.rglob("*.py"):
             relative = source_path.relative_to(source_package)
@@ -613,7 +650,11 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
             raise CheckError(
                 f"{project.distribution}: wheel license differs from the authoritative license"
             )
-        return version, documents["USER_GUIDE.md"]
+        return _WheelInspection(
+            version=version,
+            userguide=documents["USER_GUIDE.md"],
+            resources=tuple(artifact_resources),
+        )
 
 
 _SITE_CUSTOMIZE = '''\
@@ -768,11 +809,17 @@ def main() -> int:
                 sdist_result = _inspect_wheel(project, sdist_wheel)
                 if sdist_result != source_result:
                     raise CheckError(
-                        f"{project.distribution}: source and sdist wheels disagree: "
-                        f"{source_result!r} != {sdist_result!r}"
+                        f"{project.distribution}: source and sdist wheels disagree in "
+                        "version, user guide, or declared resource bytes"
                     )
-                version, userguide = sdist_result
-                _smoke_wheel(project, sdist_wheel, version, userguide, smoke_root)
+                version = sdist_result.version
+                _smoke_wheel(
+                    project,
+                    sdist_wheel,
+                    version,
+                    sdist_result.userguide,
+                    smoke_root,
+                )
                 print(
                     f"check_python_packages: ok {project.distribution} {version} "
                     f"wheel + sdist ({', '.join(project.commands)})"

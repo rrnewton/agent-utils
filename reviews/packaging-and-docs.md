@@ -13,6 +13,11 @@ reviewed baseline `3de72236cb33929fc5a0be3014d7a354f2c5938a` from separate persp
 The auditors reported the gaps below before implementation. Release validation runs on Linux
 x86-64 with the declared Python 3.10 and Rust 1.85 minimums also exercised in CI.
 
+A second three-way, read-only audit of published completion candidate
+`6ddd9bca7cbed6387a407a0ac7760626e9be2dcb` challenged the finished package surface, parity
+claims, and artifact checks. It found the final gaps recorded in items 8–10; each now has an
+executable regression check.
+
 ## Findings resolved
 
 1. `agent-team-timeline` was source-only and documented a broken aggregate install. It now has an
@@ -37,6 +42,16 @@ x86-64 with the declared Python 3.10 and Rust 1.85 minimums also exercised in CI
 7. Package checks did not prove that differential-tested code was what users installed. Wheel and
    crate inspection now compares every packaged source module byte-for-byte with the checked source;
    artifact startup also verifies installed origin and absence of sibling packages.
+8. Declared non-Python resources were checked only for presence. Every declared wheel and sdist
+   resource is now byte-compared with its authoritative source, direct and sdist-rebuilt wheels must
+   agree, and a deliberately corrupted `timeline-core.js` wheel proves the check fails closed.
+9. The repository dispatcher and dependency smoke test omitted the packaged `cpuset-alloc` companion
+   command. `./bin/cpuset-alloc` now shares the tracked resolver, and all five Python entry-point
+   modules receive the dependency-free startup probes.
+10. An unused `safe_ci_dag_runner.analyze` module exposed an undeclared Python-only `main()` and
+    public API. The supported portable `summary` command already owns that job, so the orphan surface
+    was removed. A manifest-derived test now rejects any public `main()` not backed by a declared
+    console entry point.
 
 ## Executable evidence
 
@@ -52,6 +67,6 @@ documents, and 21 exact package links. Artifact checks cover four wheels, four s
 rebuilt from sdists, and three registry crates. The repository CI additionally runs the full test,
 strict typing, formatting, Clippy, Python 3.10, and Rust 1.85 contracts.
 
-The completion run on Python 3.12 and Rust 1.96 passed 466 Python tests, 166 Rust tests, and 596
-paired behavioral checks. The same 166 Rust tests and all three registry-package checks also passed
+The completion run on Python 3.12 and Rust 1.96 passed 470 Python tests, 168 Rust tests, and 604
+paired behavioral checks. The same 168 Rust tests and all three registry-package checks also passed
 under Rust 1.85.

@@ -1821,6 +1821,24 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         "plan": ("--dag", "--planner", "--max-mem", "--format", "--perf-dir", "--no-profile-feedback"),
         "pin-run": ("--cores", "--tag"),
     }
+    summary_action_contracts: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+        "build": (
+            ("--perf-dir", "--out", "--reservoir-cap"),
+            ("--summary", "--dag", "--planner", "--max-mem", "--format"),
+        ),
+        "merge": (
+            ("FILE", "--out", "--reservoir-cap"),
+            ("--perf-dir", "--summary", "--dag", "--planner", "--max-mem", "--format"),
+        ),
+        "plan": (
+            ("--summary", "--dag", "--planner", "--max-mem", "--format"),
+            ("--perf-dir", "--out", "--reservoir-cap"),
+        ),
+        "stats": (
+            ("FILE",),
+            ("--perf-dir", "--out", "--reservoir-cap", "--summary", "--dag", "--planner"),
+        ),
+    }
     top_commands = (
         "run", "sweep", "plan", "list", "ascii", "dot", "json", "yaml", "summary",
         "pin-run", "quickstart", "capabilities",
@@ -1845,6 +1863,28 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
                 )
             else:
                 rep.ok(f"cli-schema:{engine}/{subcommand}")
+        for action, (required, forbidden) in summary_action_contracts.items():
+            outcome = run(command, ("summary", action, "--help"))
+            missing = [flag for flag in required if flag not in outcome.stdout]
+            unexpected = [flag for flag in forbidden if flag in outcome.stdout]
+            action_usage = f"summary {action}"
+            generic = "summary <action>" in outcome.stdout
+            if (
+                outcome.returncode != 0
+                or missing
+                or unexpected
+                or action_usage not in outcome.stdout
+                or generic
+            ):
+                rep.bad(
+                    f"cli-schema:{engine}/summary-{action}",
+                    f"exit={outcome.returncode}; missing flags={missing}; "
+                    f"unexpected flags={unexpected}; "
+                    f"action usage present={action_usage in outcome.stdout}; "
+                    f"generic={generic}\n{outcome.stdout}",
+                )
+            else:
+                rep.ok(f"cli-schema:{engine}/summary-{action}")
     po = run(py, ("run", "--da", "missing.json"))
     ro = run(rs, ("run", "--da", "missing.json"))
     if po.returncode == ro.returncode == 2:

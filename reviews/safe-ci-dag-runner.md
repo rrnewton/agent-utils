@@ -43,6 +43,10 @@ This review record entered the repository with implementation commit
    module-level documentation, public docstrings/rustdoc, and quickstarts are now standalone.
    The package checks reject sibling-language, unrelated-project, repository-path, and template
    leakage. The Rust crate archive also includes its license.
+10. **Nested summary help advertised the wrong action.** Rust intercepted every
+    `summary <action> --help` request with the generic summary page, hiding real plan flags and
+    showing unrelated build flags. Both engines now expose action-specific build, merge, plan, and
+    stats contracts; the differential requires the right flags and rejects cross-action leakage.
 
 ## Cross-implementation evidence
 
@@ -53,7 +57,7 @@ This review record entered the repository with implementation commit
     self-test verdicts, signal status, invalid inputs, wrapped help, and clean missing-executable
     failure.
 - `python3 cross/differential.py --tool safe-ci-dag-runner`
-  - Default seed/count completed with **403 checks passed across 41 fixtures**.
+  - Default seed/count completed with **411 checks passed across 41 fixtures**.
 - `python3 -m mypy cross/differential.py`
   - No issues.
 
@@ -66,7 +70,7 @@ an observed result rather than a harness-level side effect.
 - Python: **85 passed** across reservation, allocator, CLI, cgroup ownership/exact-set, and build
   job-cap tests; the final allocator/reservation/cgroup subset passed **33 tests** after executable
   preflight hardening.
-- Rust: the full safe package suite passed **85 unit tests plus 8 integration tests**, including
+- Rust: the full safe package suite passed **87 unit tests plus 8 integration tests**, including
   live cgroup memory, CPU-time, core-box, and default-containment tests.
 - `python3 scripts/embed_userguides.py --check`: all 12 rendered paired documents and two
   single-language package documents are current and standalone through exact checked links.

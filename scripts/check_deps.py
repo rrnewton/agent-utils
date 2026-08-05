@@ -18,9 +18,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Console-script modules declared by the independent package manifests.
+# Modules behind every Python console command, including companion commands from a distribution.
 ENTRYPOINT_MODULES = [
     "safe_ci_dag_runner",
+    "safe_ci_dag_runner.cpuset_allocator",
     "tick_hub",
     "pr_landing_planner",
     "agent_team_timeline",

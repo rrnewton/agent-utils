@@ -425,6 +425,91 @@ fn summary_help(c: &Palette) -> String {
     )
 }
 
+fn summary_build_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "summary build [options]",
+        "Build a summary JSON from a profile store for the current runner identity.",
+        &[
+            (
+                "--perf-dir DIR",
+                "read the profile-store CSV from DIR (otherwise use the configured default store)",
+            ),
+            ("--out FILE", "write JSON to FILE instead of stdout"),
+            (
+                "--reservoir-cap K",
+                "maximum samples retained per (step, inner_jobs) bucket",
+            ),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn summary_merge_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "summary merge FILE [FILE ...] [options]",
+        "Merge two or more summary JSON files into one order-independent summary.",
+        &[
+            ("FILE [FILE ...]", "summary JSON files to merge [required]"),
+            ("--out FILE", "write JSON to FILE instead of stdout"),
+            (
+                "--reservoir-cap K",
+                "maximum samples retained per bucket after the merge",
+            ),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn summary_plan_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "summary plan --summary FILE --dag FILE [options]",
+        "Build a DAG plan from a portable profile summary.",
+        &[
+            ("--summary FILE", "summary JSON file [required]"),
+            (
+                "--dag FILE",
+                "DAG file ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]",
+            ),
+            (
+                "--planner NAME",
+                "greedy-lpt (default) | critical-path | cpa",
+            ),
+            ("--max-mem SPEC", "RAM budget used by the cpa planner"),
+            ("--format FORMAT", "text (default) | json"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn summary_stats_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "summary stats FILE",
+        "Print bucket and sample counts for one summary JSON file.",
+        &[
+            ("FILE", "summary JSON file [required]"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn requested_summary_help(c: &Palette, rest: &[String]) -> Option<String> {
+    if !wants_help(rest) {
+        return None;
+    }
+    match rest.first().map(String::as_str) {
+        Some("build") => Some(summary_build_help(c)),
+        Some("merge") => Some(summary_merge_help(c)),
+        Some("plan") => Some(summary_plan_help(c)),
+        Some("stats") => Some(summary_stats_help(c)),
+        Some("-h") | Some("--help") | None => Some(summary_help(c)),
+        Some(_) => None,
+    }
+}
+
 fn pin_run_help(c: &Palette) -> String {
     render_subcommand_help(
         c,
@@ -2163,8 +2248,8 @@ pub fn run(argv: &[String]) -> i32 {
             cmd_plan(&a)
         }
         "summary" => {
-            if wants_help(rest) {
-                print!("{}", summary_help(&c));
+            if let Some(help) = requested_summary_help(&c, rest) {
+                print!("{help}");
                 return 0;
             }
             cmd_summary(rest)
@@ -2524,5 +2609,60 @@ mod tests {
         for flag in ["--args", "--stress", "--cores", "--profile-sync"] {
             assert!(help.contains(flag), "missing {flag} from run help");
         }
+    }
+
+    #[test]
+    fn summary_action_help_exposes_only_the_action_contract() {
+        let palette = Palette { enabled: false };
+        let cases = [
+            (
+                summary_build_help(&palette),
+                "summary build",
+                &["--perf-dir", "--out", "--reservoir-cap"][..],
+                &["--summary", "--dag"][..],
+            ),
+            (
+                summary_merge_help(&palette),
+                "summary merge",
+                &["FILE [FILE ...]", "--out", "--reservoir-cap"][..],
+                &["--perf-dir", "--summary", "--dag"][..],
+            ),
+            (
+                summary_plan_help(&palette),
+                "summary plan",
+                &["--summary", "--dag", "--planner", "--max-mem", "--format"][..],
+                &["--perf-dir", "--out", "--reservoir-cap"][..],
+            ),
+            (
+                summary_stats_help(&palette),
+                "summary stats",
+                &["FILE"][..],
+                &["--perf-dir", "--out", "--summary", "--dag"][..],
+            ),
+        ];
+        for (help, usage, required, forbidden) in cases {
+            assert!(help.contains(usage), "missing action usage {usage}");
+            for token in required {
+                assert!(help.contains(token), "missing {token} from {usage} help");
+            }
+            for token in forbidden {
+                assert!(!help.contains(token), "unexpected {token} in {usage} help");
+            }
+        }
+    }
+
+    #[test]
+    fn nested_summary_help_routes_by_action() {
+        let palette = Palette { enabled: false };
+        for action in ["build", "merge", "plan", "stats"] {
+            let args = vec![action.to_string(), "--help".to_string()];
+            let help = requested_summary_help(&palette, &args).expect("help requested");
+            assert!(help.contains(&format!("summary {action}")));
+            assert!(!help.contains("summary <action>"));
+        }
+        let top = vec!["--help".to_string()];
+        assert!(requested_summary_help(&palette, &top)
+            .expect("top-level summary help")
+            .contains("summary <action>"));
     }
 }
