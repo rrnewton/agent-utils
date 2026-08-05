@@ -184,12 +184,14 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert first.cache_misses == first.phases + first.rollups + first.agent_names
     assert built["agents"] == 2
     assert (tmp_path / "index.html").is_file()
+    assert (tmp_path / "timeline-core.js").is_file()
     markdown_bundle = tmp_path / "vendor" / "markdown-it-15.0.0.min.js"
     assert hashlib.sha256(markdown_bundle.read_bytes()).hexdigest() == (
         "8d0f6aca8f4de3321b6d07e03286176c59ec19b7b84abb6eb31f0fa795e83abc"
     )
     index_text = (tmp_path / "index.html").read_text(encoding="utf-8")
-    assert index_text.index("markdown-it-15.0.0.min.js") < index_text.index("app.js")
+    assert index_text.index("markdown-it-15.0.0.min.js") < index_text.index("timeline-core.js")
+    assert index_text.index("timeline-core.js") < index_text.index("app.js")
     assert (tmp_path / "Makefile").read_text(encoding="utf-8").startswith(".PHONY: serve")
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
     assert len(timeline["agents"]) == 2

@@ -66,8 +66,19 @@
             <span><i class="legend-dot state-idle"></i>Idle</span>
             <span><i class="legend-dot state-blocked"></i>Blocked</span>
           </div>
-          <div class="interaction-hint">
-            Wheel axis or Ctrl+wheel to zoom · Drag / ← → to pan
+          <div class="view-options" aria-label="Timeline display options">
+            <label class="toggle-control" title="Use one dedicated row for every agent">
+              <input id="per-agent-tracks" type="checkbox">
+              <span>Per-agent tracks</span>
+            </label>
+            <label class="toggle-control" title="Show detailed message and result edges everywhere">
+              <input id="show-global-messages" type="checkbox">
+              <span>Detailed messages (global)</span>
+            </label>
+            <label class="toggle-control" title="Show detailed edges connected to the highlighted item">
+              <input id="show-highlighted-messages" type="checkbox" checked>
+              <span>Detailed messages (highlighted)</span>
+            </label>
           </div>
         </div>
 
@@ -139,8 +150,21 @@
       </section>
     </div>
 
+    <div
+      id="timeline-context-menu"
+      class="context-menu"
+      data-testid="timeline-context-menu"
+      role="menu"
+      aria-labelledby="context-menu-title"
+      hidden
+    >
+      <div id="context-menu-title" class="context-menu-title"></div>
+      <div id="context-menu-actions" class="context-menu-actions"></div>
+    </div>
+
     <div id="load-error" class="load-error" role="alert" hidden></div>
     <script src="vendor/markdown-it-15.0.0.min.js" defer></script>
+    <script src="timeline-core.js" defer></script>
     <script src="app.js" defer></script>
   </body>
 </html>

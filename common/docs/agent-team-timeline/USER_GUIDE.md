@@ -9,19 +9,29 @@ provider-neutral so Claude, ORC, and Gas Town importers can be added without cha
 
 ## What the site shows
 
-- The coordinator is the first track; descendants follow in fork-tree order.
-- Every track has a hindsight short name based on its completed work, ancestor context, official
+- Packed lanes are the default: non-overlapping agent lifetimes share the first available lane, so
+  a long run does not grow one row per historical agent. “Per-agent tracks” restores the full
+  fork-tree view when that is more useful.
+- Every agent has a hindsight short name based on its completed work, ancestor context, official
   coordinator path, role, and nickname. The short name is primary; hover, search, and detail views
   retain the full official path and coordinator nickname. Nested descendants are not depth-limited.
-- Phase boxes carry a short phrase at useful zoom levels. Their bottom strip distinguishes active,
+- A whole spawned interval is an **agent lifetime**; each summarized sub-block is a **work phase**.
+  Work-phase boxes carry a short phrase at useful zoom levels. Their bottom strip distinguishes active,
   tool-running, waiting, idle, and explicitly blocked time.
-- Thick curved edges are spawns; smaller edges are later messages and returned results.
+- Thick curved edges are spawns and remain visible for structure. Detailed message and result edges
+  are hidden globally by default and appear for the selected agent or work phase; both behaviors
+  have toolbar toggles.
 - Hovering a phase or edge shows its paragraph summary and statistics.
-- Clicking a phase opens three views: the cultivated Agent Work Summary, the full prompt/response
-  transcript with tool use condensed to one line, and its rendered Markdown summary.
+- Single-clicking selects an agent; a later single click on the same work phase narrows selection to
+  that phase. Double-click opens three views: the cultivated Agent Work Summary, the full
+  prompt/response transcript with tool use condensed to one line and role filters, and its rendered
+  Markdown summary.
+- Single-clicking a day, week, month, or quarter selects it; double-click opens its rendered
+  Markdown summary. Right-clicking a rollup, agent lifetime, or work phase offers range-appropriate
+  zoom-to-fit actions. Horizontal trackpad gestures pan the time axis.
 - The fixed footer recomputes user prompts, agent responses, inter-agent messages, tool calls, and
   active agents for the visible time range.
-- Daily, weekly, monthly, and quarterly markers open the corresponding rendered Markdown summary.
+- Daily, weekly, monthly, and quarterly markers link the visible range to long-term summaries.
 
 The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
 bundle renders summary headings, lists, tables, blockquotes, links, and code with raw HTML disabled.

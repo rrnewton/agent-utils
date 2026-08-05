@@ -506,7 +506,7 @@ def render_archive(
         )
 
     static_root = files("agent_team_timeline") / "static"
-    for asset_name in ("index.html", "app.js", "style.css"):
+    for asset_name in ("index.html", "timeline-core.js", "app.js", "style.css"):
         text = (static_root / asset_name).read_text(encoding="utf-8")
         changed += int(write_text_if_changed(archive / asset_name, text))
     vendor_root = static_root / "vendor"

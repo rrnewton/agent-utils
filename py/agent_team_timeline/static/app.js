@@ -6,6 +6,9 @@
   var ROW_HEIGHT = 54;
   var PHASE_TOP = 7;
   var PHASE_HEIGHT = 38;
+  var COMPACT_PHASE_TOP = 16;
+  var COMPACT_PHASE_HEIGHT = 31;
+  var COMPACT_LABEL_WIDTH = 72;
   var STATE_HEIGHT = 6;
   var MIN_VIEW_MS = 1000;
   var PHASE_COLORS = [
@@ -48,6 +51,9 @@
     fit: byId("fit"),
     summaryMenu: byId("summary-menu"),
     summaryFiles: byId("summary-files"),
+    perAgentTracks: byId("per-agent-tracks"),
+    showGlobalMessages: byId("show-global-messages"),
+    showHighlightedMessages: byId("show-highlighted-messages"),
     viewRange: byId("view-range"),
     rollupRow: byId("rollup-row"),
     rollupTrack: byId("rollup-track"),
@@ -68,6 +74,9 @@
     modalSummary: byId("modal-summary"),
     modalTabs: byId("modal-tabs"),
     modalContent: byId("modal-content"),
+    contextMenu: byId("timeline-context-menu"),
+    contextMenuTitle: byId("context-menu-title"),
+    contextMenuActions: byId("context-menu-actions"),
     loadError: byId("load-error")
   };
 
@@ -79,6 +88,7 @@
     labelWidth: 238,
     chartWidth: 762,
     rows: [],
+    laneCount: 0,
     rowByAgent: new Map(),
     phasesByAgent: new Map(),
     agentsById: new Map(),
@@ -86,6 +96,10 @@
     axisTicks: [],
     selectedTeam: "",
     query: "",
+    perAgentTracks: false,
+    showGlobalMessages: false,
+    showHighlightedMessages: true,
+    selection: null,
     drag: null,
     suppressClickUntil: 0,
     renderQueued: false,
@@ -93,6 +107,8 @@
     modalRestoreFocus: null,
     timezone: undefined
   };
+
+  var timelineCore = window.AgentTimelineCore;
 
   var markdownRenderer = typeof window.markdownit === "function"
     ? window.markdownit({
@@ -673,20 +689,55 @@
 
     app.rows = rows;
     app.rowByAgent.clear();
+    var packed = null;
+    if (!app.perAgentTracks && timelineCore) {
+      packed = timelineCore.packLifetimes(rows.map(function (row, inputIndex) {
+        var agent = row.agent;
+        return {
+          id: text(agent.id),
+          start_ms: number(agent.start_ms, app.data.range.start_ms),
+          end_ms: number(agent.end_ms, app.data.range.end_ms),
+          official_name: agentOfficialName(agent),
+          input_index: inputIndex,
+          dedicated: !text(agent.parent_id)
+        };
+      }));
+    }
     rows.forEach(function (row, index) {
-      row.index = index;
+      var agentId = text(row.agent.id);
+      row.index = packed ? number(packed.lane_by_id[agentId], index) : index;
       app.rowByAgent.set(text(row.agent.id), row);
     });
+    app.laneCount = packed ? number(packed.lane_count, rows.length) : rows.length;
   }
 
   function measure() {
     var measured = Math.round(dom.axis.getBoundingClientRect().width || dom.card.clientWidth || 1000);
     app.width = Math.max(280, measured);
     var cssWidth = parseFloat(
-      getComputedStyle(document.documentElement).getPropertyValue("--label-width")
+      getComputedStyle(dom.card).getPropertyValue("--label-width")
     );
     app.labelWidth = Number.isFinite(cssWidth) ? cssWidth : 238;
     app.chartWidth = Math.max(1, app.width - app.labelWidth);
+  }
+
+  function configureTrackMode() {
+    dom.card.classList.toggle("per-agent-mode", app.perAgentTracks);
+    dom.card.classList.toggle("packed-mode", !app.perAgentTracks);
+    if (app.perAgentTracks) {
+      dom.card.style.removeProperty("--label-width");
+    } else {
+      dom.card.style.setProperty("--label-width", COMPACT_LABEL_WIDTH + "px");
+    }
+    dom.svg.setAttribute("data-track-mode", app.perAgentTracks ? "per-agent" : "packed");
+  }
+
+  function phaseTop() {
+    return app.perAgentTracks ? PHASE_TOP : COMPACT_PHASE_TOP;
+  }
+
+  function phaseHeight() {
+    return app.perAgentTracks ? PHASE_HEIGHT : COMPACT_PHASE_HEIGHT;
   }
 
   function timeToX(milliseconds) {
@@ -737,7 +788,7 @@
     }));
     children.push(svgElement("text", {
       x: 14, y: 21, class: "axis-title"
-    }, "AGENT TRACKS"));
+    }, app.perAgentTracks ? "AGENT TRACKS" : "PACKED LANES"));
     var span = app.viewEnd - app.viewStart;
     app.axisTicks.forEach(function (tick) {
       var x = timeToX(tick);
@@ -790,7 +841,7 @@
       x: app.labelWidth,
       y: 0,
       width: app.chartWidth,
-      height: Math.max(1, app.rows.length * ROW_HEIGHT)
+      height: Math.max(1, app.laneCount * ROW_HEIGHT)
     }));
     defs.appendChild(clip);
     Object.keys(EDGE_COLORS).forEach(function (kind) {
@@ -825,7 +876,7 @@
     var bottom = dom.scroll.scrollTop + dom.scroll.clientHeight + ROW_HEIGHT * 2;
     return {
       first: Math.max(0, Math.floor(top / ROW_HEIGHT)),
-      last: Math.min(app.rows.length - 1, Math.ceil(bottom / ROW_HEIGHT)),
+      last: Math.min(app.laneCount - 1, Math.ceil(bottom / ROW_HEIGHT)),
       top: top,
       bottom: bottom
     };
@@ -836,6 +887,17 @@
     var bend = Math.max(20, Math.abs(x2 - x1) * 0.42);
     var control1 = x1 + direction * bend;
     var control2 = x2 - direction * bend;
+    if (Math.abs(x2 - x1) < 32 && Math.abs(y2 - y1) > 2) {
+      var verticalDirection = y2 > y1 ? 1 : -1;
+      var hookDirection = x1 + 34 < app.width ? 1 : -1;
+      var hookX = x1 + hookDirection * 28;
+      var approachY = y2 - verticalDirection * 9;
+      return "M " + x1.toFixed(2) + " " + y1.toFixed(2) +
+        " C " + hookX.toFixed(2) + " " + y1.toFixed(2) +
+        ", " + hookX.toFixed(2) + " " + approachY.toFixed(2) +
+        ", " + x2.toFixed(2) + " " + approachY.toFixed(2) +
+        " L " + x2.toFixed(2) + " " + y2.toFixed(2);
+    }
     if (Math.abs(x2 - x1) < 32) {
       control1 = x1 + direction * 28;
       control2 = x2 + direction * 28;
@@ -871,6 +933,146 @@
     return lines.join("\n");
   }
 
+  function selectedAgentId() {
+    if (!app.selection) {
+      return "";
+    }
+    if (app.selection.kind === "agent" || app.selection.kind === "phase") {
+      return text(app.selection.agent_id);
+    }
+    return "";
+  }
+
+  function agentsAreImmediateFamily(leftId, rightId) {
+    var left = app.agentsById.get(leftId);
+    var right = app.agentsById.get(rightId);
+    return Boolean(
+      left && right &&
+      (text(left.parent_id) === rightId || text(right.parent_id) === leftId)
+    );
+  }
+
+  function selectionClass(agentId, phase) {
+    var selection = app.selection;
+    if (!selection) {
+      return "";
+    }
+    if (selection.kind === "rollup") {
+      if (!phase) {
+        return "";
+      }
+      return rangesOverlap(
+        number(phase.start_ms, 0),
+        number(phase.end_ms, 0),
+        number(selection.start_ms, 0),
+        number(selection.end_ms, 0)
+      ) ? " is-selected" : " is-dimmed";
+    }
+    if (selection.kind === "edge") {
+      if (agentId === text(selection.source_id) || agentId === text(selection.target_id)) {
+        return " is-related";
+      }
+      return " is-dimmed";
+    }
+    var selectedId = selectedAgentId();
+    if (agentId === selectedId) {
+      if (selection.kind === "phase") {
+        if (!phase) {
+          return " is-related";
+        }
+        return text(phase.id) === text(selection.phase_id) ? " is-selected" : " is-dimmed";
+      }
+      return " is-selected";
+    }
+    if (agentsAreImmediateFamily(agentId, selectedId)) {
+      return " is-related";
+    }
+    return " is-dimmed";
+  }
+
+  function setSelection(selection) {
+    app.selection = selection;
+    hideContextMenu();
+    scheduleRender();
+  }
+
+  function selectAgent(agent) {
+    setSelection({ kind: "agent", agent_id: text(agent.id) });
+  }
+
+  function selectPhase(phase) {
+    var agentId = text(phase.agent_id);
+    var next = timelineCore
+      ? timelineCore.nextPhaseSelection(
+          app.selection,
+          agentId,
+          text(phase.id),
+          number(phase.start_ms, 0),
+          number(phase.end_ms, 0)
+        )
+      : { kind: "agent", agent_id: agentId };
+    setSelection(next);
+  }
+
+  function hideContextMenu() {
+    dom.contextMenu.hidden = true;
+    dom.contextMenuActions.replaceChildren();
+  }
+
+  function showContextMenu(event, title, actions) {
+    event.preventDefault();
+    event.stopPropagation();
+    hideTooltip();
+    dom.contextMenuTitle.textContent = title;
+    var buttons = actions.map(function (action) {
+      var button = htmlElement("button", "context-menu-action", action.label);
+      button.type = "button";
+      button.setAttribute("role", "menuitem");
+      button.addEventListener("click", function () {
+        hideContextMenu();
+        action.run();
+      });
+      return button;
+    });
+    dom.contextMenuActions.replaceChildren.apply(dom.contextMenuActions, buttons);
+    dom.contextMenu.hidden = false;
+    var menuWidth = Math.max(180, dom.contextMenu.offsetWidth);
+    var menuHeight = dom.contextMenu.offsetHeight;
+    dom.contextMenu.style.left = clamp(event.clientX, 8, window.innerWidth - menuWidth - 8) + "px";
+    dom.contextMenu.style.top = clamp(event.clientY, 8, window.innerHeight - menuHeight - 8) + "px";
+    if (buttons[0]) {
+      buttons[0].focus();
+    }
+  }
+
+  function zoomToRange(start, end) {
+    var safeStart = number(start, app.viewStart);
+    var safeEnd = Math.max(safeStart + 1, number(end, app.viewEnd));
+    setView(safeStart, safeEnd);
+  }
+
+  function phaseContextMenu(event, phase, agent) {
+    showContextMenu(event, text(phase.phrase, "Work phase"), [
+      {
+        label: "Zoom to work phase",
+        run: function () { zoomToRange(phase.start_ms, phase.end_ms); }
+      },
+      {
+        label: "Zoom to agent lifetime",
+        run: function () { zoomToRange(agent.start_ms, agent.end_ms); }
+      }
+    ]);
+  }
+
+  function agentContextMenu(event, agent) {
+    showContextMenu(event, agentShortName(agent), [
+      {
+        label: "Zoom to agent lifetime",
+        run: function () { zoomToRange(agent.start_ms, agent.end_ms); }
+      }
+    ]);
+  }
+
   function renderEdge(edge, layer, bounds, bufferStart, bufferEnd) {
     var sourceRow = app.rowByAgent.get(text(edge.source_id));
     var targetRow = app.rowByAgent.get(text(edge.target_id));
@@ -898,12 +1100,24 @@
     var x1 = timeToX(sourceTime);
     var x2 = timeToX(targetTime);
     var kind = edgeKind(edge.kind);
+    var displayState = timelineCore
+      ? timelineCore.edgeDisplayState(
+          edge,
+          app.selection,
+          app.showGlobalMessages,
+          app.showHighlightedMessages
+        )
+      : "normal";
+    if (displayState === "hidden") {
+      return;
+    }
     var pathData = edgePath(x1, y1, x2, y2);
     var group = svgElement("g", {
-      class: "edge-group",
+      class: "edge-group edge-state-" + displayState,
       tabindex: "0",
       role: "button",
       "data-edge-id": text(edge.id),
+      "data-edge-state": displayState,
       "aria-label": text(edge.phrase, kind + " interaction") + ". " + edgeRouteDetail(edge)
     });
     var visible = svgElement("path", {
@@ -924,16 +1138,35 @@
     });
     group.addEventListener("pointermove", positionTooltip);
     group.addEventListener("pointerleave", hideTooltip);
-    group.addEventListener("click", function () {
-      if (Date.now() < app.suppressClickUntil) {
+    group.addEventListener("click", function (event) {
+      if (Date.now() < app.suppressClickUntil || event.detail !== 1) {
         return;
       }
+      event.stopPropagation();
+      setSelection({
+        kind: "edge",
+        edge_id: text(edge.id),
+        source_id: text(edge.source_id),
+        target_id: text(edge.target_id)
+      });
+    });
+    group.addEventListener("dblclick", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
       openEdgeModal(edge);
     });
     group.addEventListener("keydown", function (event) {
-      if (event.key === "Enter" || event.key === " ") {
+      if (event.key === "Enter") {
         event.preventDefault();
         openEdgeModal(edge);
+      } else if (event.key === " ") {
+        event.preventDefault();
+        setSelection({
+          kind: "edge",
+          edge_id: text(edge.id),
+          source_id: text(edge.source_id),
+          target_id: text(edge.target_id)
+        });
       }
     });
     layer.appendChild(group);
@@ -973,22 +1206,27 @@
     var clippedEnd = Math.min(end, app.viewEnd);
     var x = timeToX(clippedStart);
     var width = Math.max(2, timeToX(clippedEnd) - x);
-    var y = row.index * ROW_HEIGHT + PHASE_TOP;
+    var phaseBlockHeight = phaseHeight();
+    var y = row.index * ROW_HEIGHT + phaseTop();
     var agentId = text(phase.agent_id);
     var agent = row.agent;
     var group = svgElement("g", {
-      class: "phase-group",
+      class: "phase-group" + selectionClass(agentId, phase),
       tabindex: "0",
       role: "button",
       "data-phase-id": text(phase.id),
       "data-agent-id": agentId,
+      "data-start-ms": String(start),
+      "data-end-ms": String(end),
+      "aria-pressed": app.selection && app.selection.kind === "phase" &&
+        text(app.selection.phase_id) === text(phase.id) ? "true" : "false",
       "aria-label": text(phase.phrase, "Agent phase") + ". " + agentAccessibleName(agent)
     });
     group.appendChild(svgElement("rect", {
       x: x,
       y: y,
       width: width,
-      height: PHASE_HEIGHT,
+      height: phaseBlockHeight,
       rx: 4,
       class: "phase-block",
       fill: phaseColor(agentId)
@@ -1007,7 +1245,7 @@
       var kind = stateKind(state.kind);
       group.appendChild(svgElement("rect", {
         x: stripX,
-        y: y + PHASE_HEIGHT - STATE_HEIGHT,
+        y: y + phaseBlockHeight - STATE_HEIGHT,
         width: stripWidth,
         height: STATE_HEIGHT,
         class: "state-strip",
@@ -1034,16 +1272,28 @@
     });
     group.addEventListener("pointermove", positionTooltip);
     group.addEventListener("pointerleave", hideTooltip);
-    group.addEventListener("click", function () {
-      if (Date.now() < app.suppressClickUntil) {
+    group.addEventListener("click", function (event) {
+      if (Date.now() < app.suppressClickUntil || event.detail !== 1) {
         return;
       }
+      event.stopPropagation();
+      selectPhase(phase);
+    });
+    group.addEventListener("dblclick", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
       openPhaseModal(phase, row.agent);
     });
+    group.addEventListener("contextmenu", function (event) {
+      phaseContextMenu(event, phase, row.agent);
+    });
     group.addEventListener("keydown", function (event) {
-      if (event.key === "Enter" || event.key === " ") {
+      if (event.key === "Enter") {
         event.preventDefault();
         openPhaseModal(phase, row.agent);
+      } else if (event.key === " ") {
+        event.preventDefault();
+        selectPhase(phase);
       }
     });
     layer.appendChild(group);
@@ -1061,8 +1311,10 @@
     var textWidth = Math.max(0, app.labelWidth - textX - 8);
     var secondaryName = fitAgentSecondaryName(agent, textWidth);
     var labelGroup = svgElement("g", {
-      class: "agent-label-group",
-      role: "img",
+      class: "agent-label-group" + selectionClass(text(agent.id), null),
+      role: "button",
+      tabindex: "0",
+      "data-agent-id": text(agent.id),
       "aria-label": agentAccessibleName(agent) +
         ". Hierarchy depth: " + depth + ". Status: " + text(agent.status, "unknown")
     });
@@ -1129,14 +1381,113 @@
     });
     labelGroup.addEventListener("pointermove", positionTooltip);
     labelGroup.addEventListener("pointerleave", hideTooltip);
+    labelGroup.addEventListener("click", function (event) {
+      if (event.detail !== 1 || Date.now() < app.suppressClickUntil) {
+        return;
+      }
+      event.stopPropagation();
+      selectAgent(agent);
+    });
+    labelGroup.addEventListener("contextmenu", function (event) {
+      agentContextMenu(event, agent);
+    });
+    labelGroup.addEventListener("keydown", function (event) {
+      if (event.key === " ") {
+        event.preventDefault();
+        selectAgent(agent);
+      }
+    });
     layer.appendChild(labelGroup);
   }
 
+  function renderLaneLabel(index, layer) {
+    var y = index * ROW_HEIGHT;
+    layer.appendChild(svgElement("text", {
+      x: 12,
+      y: y + 28,
+      class: "lane-label"
+    }, index === 0 ? "COORD" : "LANE " + index));
+  }
+
+  function renderAgentLifetime(row, layer) {
+    var agent = row.agent;
+    var start = number(agent.start_ms, app.data.range.start_ms);
+    var end = number(agent.end_ms, app.data.range.end_ms);
+    if (!rangesOverlap(start, end, app.viewStart, app.viewEnd)) {
+      return;
+    }
+    var clippedStart = Math.max(start, app.viewStart);
+    var clippedEnd = Math.min(end, app.viewEnd);
+    var x = timeToX(clippedStart);
+    var width = Math.max(2, timeToX(clippedEnd) - x);
+    var y = row.index * ROW_HEIGHT;
+    var group = svgElement("g", {
+      class: "agent-lifetime-group" + selectionClass(text(agent.id), null),
+      role: "button",
+      tabindex: "0",
+      "data-agent-id": text(agent.id),
+      "data-start-ms": String(start),
+      "data-end-ms": String(end),
+      "aria-label": "Agent lifetime: " + agentAccessibleName(agent)
+    });
+    group.appendChild(svgElement("rect", {
+      x: x,
+      y: y + 2,
+      width: width,
+      height: ROW_HEIGHT - 5,
+      rx: 3,
+      class: "agent-lifetime-hit"
+    }));
+    group.appendChild(svgElement("rect", {
+      x: x,
+      y: y + ROW_HEIGHT / 2 - 2,
+      width: width,
+      height: 4,
+      rx: 2,
+      class: "lifetime-line"
+    }));
+    if (!app.perAgentTracks && width >= 22) {
+      group.appendChild(svgElement("text", {
+        x: x + 4,
+        y: y + 12,
+        class: "agent-inline-name"
+      }, truncatePhrase(agentShortName(agent), width)));
+    }
+    group.addEventListener("pointerenter", function (event) {
+      showTooltip(
+        event,
+        agentShortName(agent),
+        agentTooltipIdentity(agent),
+        "Agent lifetime · " + formatRange(start, end)
+      );
+    });
+    group.addEventListener("pointermove", positionTooltip);
+    group.addEventListener("pointerleave", hideTooltip);
+    group.addEventListener("click", function (event) {
+      if (event.detail !== 1 || Date.now() < app.suppressClickUntil) {
+        return;
+      }
+      event.stopPropagation();
+      selectAgent(agent);
+    });
+    group.addEventListener("contextmenu", function (event) {
+      agentContextMenu(event, agent);
+    });
+    group.addEventListener("keydown", function (event) {
+      if (event.key === " ") {
+        event.preventDefault();
+        selectAgent(agent);
+      }
+    });
+    layer.appendChild(group);
+  }
+
   function renderTracks() {
-    var totalHeight = Math.max(dom.scroll.clientHeight, app.rows.length * ROW_HEIGHT, 1);
+    var totalHeight = Math.max(dom.scroll.clientHeight, app.laneCount * ROW_HEIGHT, 1);
     dom.svg.setAttribute("viewBox", "0 0 " + app.width + " " + totalHeight);
     dom.svg.setAttribute("width", String(app.width));
     dom.svg.setAttribute("height", String(totalHeight));
+    dom.svg.setAttribute("data-lane-count", String(app.laneCount));
     dom.svg.replaceChildren();
     addDefs(dom.svg);
     dom.empty.hidden = app.rows.length > 0;
@@ -1150,9 +1501,10 @@
     var gridLayer = svgElement("g", { "clip-path": "url(#chart-clip)" });
     var contentLayer = svgElement("g", { "clip-path": "url(#chart-clip)" });
     var edgeLayer = svgElement("g");
+    var lifetimeLayer = svgElement("g");
     var phaseLayer = svgElement("g");
     var labelLayer = svgElement("g");
-    contentLayer.append(edgeLayer, phaseLayer);
+    contentLayer.append(edgeLayer, lifetimeLayer, phaseLayer);
 
     for (var index = bounds.first; index <= bounds.last; index += 1) {
       var y = index * ROW_HEIGHT;
@@ -1192,30 +1544,23 @@
       }
     });
 
-    for (var rowIndex = bounds.first; rowIndex <= bounds.last; rowIndex += 1) {
-      var row = app.rows[rowIndex];
-      if (!row) {
-        continue;
-      }
+    var visibleRows = app.rows.filter(function (row) {
+      return row.index >= bounds.first && row.index <= bounds.last;
+    });
+    visibleRows.forEach(function (row) {
       var agent = row.agent;
-      var agentStart = number(agent.start_ms, app.data.range.start_ms);
-      var agentEnd = number(agent.end_ms, app.data.range.end_ms);
-      if (rangesOverlap(agentStart, agentEnd, app.viewStart, app.viewEnd)) {
-        var lifeStart = Math.max(agentStart, app.viewStart);
-        var lifeEnd = Math.min(agentEnd, app.viewEnd);
-        phaseLayer.appendChild(svgElement("rect", {
-          x: timeToX(lifeStart),
-          y: row.index * ROW_HEIGHT + ROW_HEIGHT / 2 - 2,
-          width: Math.max(1, timeToX(lifeEnd) - timeToX(lifeStart)),
-          height: 4,
-          rx: 2,
-          class: "lifetime-line"
-        }));
-      }
+      renderAgentLifetime(row, lifetimeLayer);
       (app.phasesByAgent.get(text(agent.id)) || []).forEach(function (phase) {
         renderPhase(phase, row, phaseLayer, bufferStart, bufferEnd);
       });
-      renderTrackLabel(row, labelLayer);
+      if (app.perAgentTracks) {
+        renderTrackLabel(row, labelLayer);
+      }
+    });
+    if (!app.perAgentTracks) {
+      for (var laneIndex = bounds.first; laneIndex <= bounds.last; laneIndex += 1) {
+        renderLaneLabel(laneIndex, labelLayer);
+      }
     }
     labelLayer.appendChild(svgElement("rect", {
       x: app.labelWidth - 1,
@@ -1251,7 +1596,12 @@
         ["daily", "weekly", "monthly", "quarterly"],
         "daily"
       );
-      var button = htmlElement("button", "rollup-marker rollup-" + kind);
+      var selected = app.selection && app.selection.kind === "rollup" &&
+        text(app.selection.path) === text(rollup.path);
+      var button = htmlElement(
+        "button",
+        "rollup-marker rollup-" + kind + (selected ? " is-selected" : "")
+      );
       button.type = "button";
       button.style.left = left.toFixed(2) + "px";
       button.style.width = width.toFixed(2) + "px";
@@ -1261,12 +1611,42 @@
         kind + " summary: " + text(rollup.label, formatRange(start, end))
       );
       button.title = text(rollup.label, kind + " summary");
-      button.addEventListener("click", function () {
+      button.dataset.startMs = String(start);
+      button.dataset.endMs = String(end);
+      button.dataset.rollupKind = kind;
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+      button.addEventListener("click", function (event) {
+        if (event.detail !== 1) {
+          return;
+        }
+        setSelection({
+          kind: "rollup",
+          path: text(rollup.path),
+          start_ms: start,
+          end_ms: end
+        });
+      });
+      button.addEventListener("dblclick", function (event) {
+        event.preventDefault();
         openMarkdownModal({
           eyebrow: kind + " rollup · " + formatRange(start, end),
           title: text(rollup.label, kind + " summary"),
           path: text(rollup.path)
         });
+      });
+      button.addEventListener("contextmenu", function (event) {
+        var rangeName = {
+          daily: "day",
+          weekly: "week",
+          monthly: "month",
+          quarterly: "quarter"
+        }[kind] || "summary range";
+        showContextMenu(event, text(rollup.label, kind + " summary"), [
+          {
+            label: "Zoom to " + rangeName,
+            run: function () { zoomToRange(start, end); }
+          }
+        ]);
       });
       children.push(button);
     });
@@ -1366,8 +1746,27 @@
     if (!app.data) {
       return;
     }
+    configureTrackMode();
     measure();
     buildRows();
+    dom.card.dataset.viewStartMs = String(app.viewStart);
+    dom.card.dataset.viewEndMs = String(app.viewEnd);
+    dom.card.dataset.trackMode = app.perAgentTracks ? "per-agent" : "packed";
+    if (app.selection) {
+      dom.card.dataset.selectionScope = text(app.selection.kind);
+    } else {
+      dom.card.removeAttribute("data-selection-scope");
+    }
+    if (app.selection && (app.selection.kind === "agent" || app.selection.kind === "phase")) {
+      dom.card.dataset.selectedAgentId = text(app.selection.agent_id);
+    } else {
+      dom.card.removeAttribute("data-selected-agent-id");
+    }
+    if (app.selection && app.selection.kind === "phase") {
+      dom.card.dataset.selectedPhaseId = text(app.selection.phase_id);
+    } else {
+      dom.card.removeAttribute("data-selected-phase-id");
+    }
     renderAxis();
     renderRollups();
     renderTracks();
@@ -1410,8 +1809,26 @@
     setView(app.data.range.start_ms, app.data.range.end_ms);
   }
 
+  function panTimelineByPixels(pixels) {
+    var span = app.viewEnd - app.viewStart;
+    var shift = (pixels / Math.max(1, app.chartWidth)) * span;
+    setView(app.viewStart + shift, app.viewEnd + shift);
+  }
+
   function wheelZoom(event) {
     if (!app.data) {
+      return;
+    }
+    var horizontalDelta = event.shiftKey && Math.abs(event.deltaX) < 1
+      ? event.deltaY
+      : event.deltaX;
+    var horizontalGesture = Math.abs(horizontalDelta) > 1 &&
+      (event.shiftKey || Math.abs(horizontalDelta) >= Math.abs(event.deltaY) * 0.55);
+    if (!event.ctrlKey && !event.metaKey && horizontalGesture) {
+      event.preventDefault();
+      hideTooltip();
+      hideContextMenu();
+      panTimelineByPixels(horizontalDelta);
       return;
     }
     var needsVerticalScroll =
@@ -1424,6 +1841,7 @@
     }
     event.preventDefault();
     hideTooltip();
+    hideContextMenu();
     var rect = event.currentTarget.getBoundingClientRect();
     var ratio;
     if (event.currentTarget === dom.rollupTrack) {
@@ -1867,15 +2285,18 @@
   }
 
   function roleClass(role) {
-    var normalized = normalizeKind(
+    return "transcript-entry-" + transcriptRole(role);
+  }
+
+  function transcriptRole(role) {
+    return normalizeKind(
       role,
       ["user", "assistant", "agent", "system", "tool"],
       "other"
     );
-    return "transcript-entry-" + normalized;
   }
 
-  function renderTranscript(container, transcript) {
+  function renderTranscript(container, transcript, selectedRoles) {
     var entries = array(transcript);
     if (!entries.length) {
       container.appendChild(
@@ -1883,25 +2304,96 @@
       );
       return;
     }
-    var list = htmlElement("div", "transcript-list");
+    var roles = [];
     entries.forEach(function (entry) {
-      var role = text(entry.role, "unknown");
-      var card = htmlElement("article", "transcript-entry " + roleClass(role));
-      var header = htmlElement("header", "transcript-entry-head");
-      header.append(
-        htmlElement("span", "transcript-role", role),
-        htmlElement("time", "entry-time", formatFullTime(number(entry.at_ms, NaN)))
-      );
-      card.appendChild(header);
-      var condensed = toolsLine(entry.tools);
-      if (condensed) {
-        card.appendChild(htmlElement("div", "tool-condensation", condensed));
-      } else {
-        card.appendChild(htmlElement("div", "entry-text", text(entry.text, "")));
+      var role = transcriptRole(entry.role);
+      if (roles.indexOf(role) < 0) {
+        roles.push(role);
       }
-      list.appendChild(card);
     });
-    container.appendChild(list);
+    var roleOrder = ["user", "assistant", "agent", "tool", "system", "other"];
+    roles.sort(function (left, right) {
+      return roleOrder.indexOf(left) - roleOrder.indexOf(right);
+    });
+    var activeRoles = selectedRoles || new Set(roles);
+    if (!selectedRoles) {
+      roles.forEach(function (role) { activeRoles.add(role); });
+    }
+    var controls = htmlElement("div", "transcript-filters");
+    controls.setAttribute("aria-label", "Transcript message filters");
+    controls.dataset.testid = "transcript-role-filters";
+    var shortcuts = htmlElement("div", "transcript-filter-shortcuts");
+    var choices = htmlElement("div", "transcript-filter-roles");
+    var list = htmlElement("div", "transcript-list");
+    function renderEntries() {
+      var cards = [];
+      entries.forEach(function (entry) {
+        var normalizedRole = transcriptRole(entry.role);
+        if (!activeRoles.has(normalizedRole)) {
+          return;
+        }
+        var roleLabel = text(entry.role, "unknown");
+        var card = htmlElement("article", "transcript-entry " + roleClass(roleLabel));
+        card.dataset.role = normalizedRole;
+        var header = htmlElement("header", "transcript-entry-head");
+        header.append(
+          htmlElement("span", "transcript-role", roleLabel),
+          htmlElement("time", "entry-time", formatFullTime(number(entry.at_ms, NaN)))
+        );
+        card.appendChild(header);
+        var condensed = toolsLine(entry.tools);
+        if (condensed) {
+          card.appendChild(htmlElement("div", "tool-condensation", condensed));
+        } else {
+          card.appendChild(htmlElement("div", "entry-text", text(entry.text, "")));
+        }
+        cards.push(card);
+      });
+      if (!cards.length) {
+        cards.push(htmlElement("div", "empty-message", "No transcript messages match these filters."));
+      }
+      list.replaceChildren.apply(list, cards);
+      choices.querySelectorAll("input[data-role]").forEach(function (checkbox) {
+        checkbox.checked = activeRoles.has(checkbox.dataset.role);
+      });
+    }
+    function shortcut(label, update) {
+      var button = htmlElement("button", "transcript-filter-button", label);
+      button.type = "button";
+      button.addEventListener("click", function () {
+        update();
+        renderEntries();
+      });
+      shortcuts.appendChild(button);
+    }
+    shortcut("User only", function () {
+      activeRoles.clear();
+      activeRoles.add("user");
+    });
+    shortcut("Select all", function () {
+      roles.forEach(function (role) { activeRoles.add(role); });
+    });
+    shortcut("Select none", function () { activeRoles.clear(); });
+    roles.forEach(function (role) {
+      var label = htmlElement("label", "transcript-filter-choice");
+      var checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.dataset.role = role;
+      checkbox.checked = activeRoles.has(role);
+      checkbox.addEventListener("change", function () {
+        if (checkbox.checked) {
+          activeRoles.add(role);
+        } else {
+          activeRoles.delete(role);
+        }
+        renderEntries();
+      });
+      label.append(checkbox, document.createTextNode(role));
+      choices.appendChild(label);
+    });
+    controls.append(shortcuts, choices);
+    container.append(controls, list);
+    renderEntries();
   }
 
   async function renderRawSummary(container, path, detailUrl) {
@@ -1939,6 +2431,9 @@
     dom.modalEyebrow.title = agentAccessibleName(agent);
     setModalSummary(paragraph, stats);
     showModalAgentIdentity(agent);
+    var transcriptRoles = new Set(array(detail.transcript).map(function (entry) {
+      return transcriptRole(entry.role);
+    }));
     activateTabs([
       {
         label: "Agent Work Summary",
@@ -1949,7 +2444,7 @@
       {
         label: "Full Transcript",
         render: function (container) {
-          renderTranscript(container, detail.transcript);
+          renderTranscript(container, detail.transcript, transcriptRoles);
         }
       },
       {
@@ -2096,6 +2591,19 @@
   });
 
   dom.fit.addEventListener("click", fitTimeline);
+  dom.perAgentTracks.addEventListener("change", function () {
+    app.perAgentTracks = dom.perAgentTracks.checked;
+    dom.scroll.scrollTop = 0;
+    scheduleRender();
+  });
+  dom.showGlobalMessages.addEventListener("change", function () {
+    app.showGlobalMessages = dom.showGlobalMessages.checked;
+    scheduleRender();
+  });
+  dom.showHighlightedMessages.addEventListener("change", function () {
+    app.showHighlightedMessages = dom.showHighlightedMessages.checked;
+    scheduleRender();
+  });
   dom.card.addEventListener("keydown", keyboardNavigate);
   dom.svg.addEventListener("wheel", wheelZoom, { passive: false });
   dom.axis.addEventListener("wheel", wheelZoom, { passive: false });
@@ -2115,7 +2623,13 @@
   });
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
-      closeModal();
+      if (!dom.contextMenu.hidden) {
+        hideContextMenu();
+      } else if (!dom.modalBackdrop.hidden) {
+        closeModal();
+      } else if (app.selection) {
+        setSelection(null);
+      }
       dom.summaryMenu.open = false;
     }
     if (!dom.modalBackdrop.hidden && event.key === "Tab") {
@@ -2136,6 +2650,12 @@
       }
     }
   });
+  document.addEventListener("pointerdown", function (event) {
+    if (!dom.contextMenu.hidden && !dom.contextMenu.contains(event.target)) {
+      hideContextMenu();
+    }
+  });
+  window.addEventListener("blur", hideContextMenu);
 
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(scheduleRender).observe(dom.card);
