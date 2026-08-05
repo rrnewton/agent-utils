@@ -29,118 +29,16 @@ map or readiness table by hand.
    recognition table in `pr_landing_planner/mechanism.py` offline). An edge requests coordinator
    review; it does not claim the two PRs have opposing intent.
 6. Use `assigned_agent`, the ordered decisions, and the conflict-safe groups to dispatch the batch.
-7. Treat adversarial review as the default for every PR. Review evidence is SHA-bound: before
-   trusting a `passed-review-*` label, resolve the SHA named by the corresponding review evidence
-   and require it to equal the current PR head. A bare label, missing reviewed SHA, or approval for
-   an earlier head is not approval of the current code. Only a documented process exemption may
-   skip review; missing or stale review evidence is not approval.
+7. Treat adversarial review as the default for every PR. Supply exact-head review evidence; a bare
+   `passed-review-*` label is not evidence. The execution doctrine defines final-head review binding.
 8. For a policy-changing PR, inspect the rationale date and compare it with the current policy before
    dispatch. A rationale that predates the policy it would change requires coordinator review.
 
-The planner is advisory. For Hermit, execute an approved landing through the tracked landing executor,
-which owns serialization and fresh-base checks. It must merge with `--rebase`, never `--admin`, then
-fetch the destination and prove the landed commit is its ancestor. A GitHub API `MERGED` flag is not
-landing evidence.
-
-## Large-backlog and coalesced landing
-
-Local validation is the main landing driver. GitHub CI is an independent supplement, not a 40-minute
-inner loop and not a reason to postpone evidence the local producer can generate now.
-
-### Produce a qualifying local record
-
-On the measured Meta agent sandbox, bare `./validate.sh` exits 3 in about nine seconds because
-BpfJailer denies cgroup creation. That is admission refusal, not a test result. Run the exact checkout
-in a detached user scope instead:
-
-```bash
-systemd-run --user --unit=validate-<pr>-<sha> \
-  --working-directory=<checkout> --collect \
-  /bin/bash -c 'exec env PR_NUMBER=<pr> with-proxy ./validate.sh > <durable-log> 2>&1'
-```
-
-This is not an unboxed bypass: systemd grants the cgroup scope and the validation remains boxed. The
-detached unit survives agent recycling. Use a unique unit and durable log, record both, and stop it
-explicitly with `systemctl --user stop <unit>` (or the repository wrapper); killing the watching agent
-does not stop the run.
-
-Read duration before interpreting the log. On this lane, about 9 seconds means admission refusal,
-about 137 seconds means a build/lint failure, and roughly 400–700 seconds means a real full run. These
-ranges classify where to look; the receipt remains the authority.
-
-`result=pass` alone is not a green. A qualifying Hermit receipt satisfies all of:
-
-```text
-result=pass AND profile=full AND checks=6 AND executed_tests>0 AND exact tested SHA
-```
-
-The current six-check count belongs to the current full profile and must move with that profile when
-its declared gate count changes. A two-check `portable-strict-compat-only` row can also say `pass` and
-often lands in the ledger first; it is not a full green. A feature/filter configuration can execute
-zero tests and still print success; missing or zero execution is NO-RESULT. Select by exact SHA,
-profile, coverage, and nonzero execution before ordering records by recency.
-
-Treat **soft green** only as a scheduling signal: no known product failure and enough evidence to
-admit a PR to a chosen batch. It never authorizes landing by itself. **Hard green** is the qualifying
-exact-head full receipt above (or the repository's authoritative equivalent), with required review
-resolved. State which one is being cited; never write only “green”.
-
-### Choose serial or coalesced landing
-
-A receipt is SHA-keyed. Rebasing changes the SHA and destroys its authority. Finalize the complete
-rebase wave first, then validate each resulting final head exactly once. Never interleave
-rebase -> validate -> rebase -> validate: the second rebase discards the first receipt, which is how
-a queue of genuinely green PRs can produce zero landable heads. N serial landings otherwise pay for
-N rebases and N exact-head validations. For a large conflict-free backlog, a coordinator-approved
-staging branch can reduce that to one integration update and one full validation:
-
-1. Fetch fresh and create the staging branch from **current main**, never from a stale green anchor;
-   the latter silently reverts everything landed after the anchor.
-2. Merge every ready, conflict-free PR into staging. Skip conflicts instead of resolving them inside
-   the batch; conflict resolution changes the reviewed change and returns that PR to individual work.
-3. Validate the combined exact staging head once. If main moves, update staging before validation;
-   never claim the old receipt for the new head.
-4. Land the staging change under the normal lock and protection rules.
-
-Review signatures have the same identity constraint as receipts. A rebase, amend, conflict
-resolution, or follow-up commit changes the head and invalidates prior review authority even when a
-`passed-review-*` label remains attached. Before landing, compare the current head with the exact SHA
-recorded by each required reviewer. If they differ (or no reviewed SHA is recorded), re-run review at
-the final head; never treat the label alone as evidence. For example, an approval of commit A cannot
-authorize a current head A+B+C whose additional scheduler commits were never examined.
-
-Merging staging does not close the constituent PRs. GitHub recognizes commit lineage, not content
-equivalence. After a fresh fetch, close only a constituent whose original head satisfies
-`git merge-base --is-ancestor <pr-head> refs/remotes/origin/main` with rc=0. A non-ancestral head is
-not proven landed; closing it can silently bury dropped work. This conservative constituent check is
-distinct from proof of the staging/direct merge itself: that proof uses `mergeCommit.oid` plus
-`git merge-base --is-ancestor <merge-oid> refs/remotes/origin/main` after fetching the named branch.
-The API `MERGED` flag, successful `gh pr merge` exit, mergeability query, and clean dry-run are not
-landing evidence.
-
-### Serialize evidence and verification
-
-Never batch local validates concurrently. Contention has triggered `detcore_misc` livelock and written
-false reds; because recorded reds are not automatically retried, an operator-created false red can
-permanently condemn a healthy PR. Hold the validation lock and derive any future safe width from a
-solo run's measured CPU and memory footprint, not host core count.
-
-Serialize merge operations too. Concurrent stale-base `--rebase --admin` merges orphaned already
-merged work by replaying incompatible views of main. `--admin` is forbidden regardless; hold one
-landing lock, fetch fresh before each merge, and ancestry-verify afterward.
-
-Speculative landing is limited to CI-irrelevant diffs and owner-requested tooling fixes. Its contract
-is binding: arm local validation and GitHub CI on the landed commit immediately, in parallel, and act
-as soon as either reports. A speculative land without armed verification is a process violation, not
-a shortcut.
-
-During implementation, reproduce and iterate on the single failing test locally. Never put full CI in
-the edit/test inner loop. Use full local validation as post-hoc confirmation, and run local validation
-and GitHub CI in parallel rather than serially.
-
-The planner must expose the conflict-safe groups and evidence class needed for this choice. The
-coordinator owns the decision to coalesce because integration changes the meaning of per-PR evidence
-and closure; the planner never creates or merges the staging branch.
+The planner is advisory. It stops after producing conflict-safe groups and evidence classes. Use
+[PR landing operations](../pr-landing-operations/SKILL.md) to decide and execute rebases, validation,
+coalescing, review refresh, merges, and ancestry proof. The consuming workspace's
+[`AGENTS.md`](https://github.com/rrnewton/dev-hermit/blob/main/AGENTS.md) remains the authorization,
+review, and repository-policy authority; neither skill may weaken it.
 
 ## Commands
 
