@@ -17,6 +17,182 @@
     return typeof value === "string" ? value : "";
   }
 
+  /**
+   * Calendar rollups can extend beyond the first/last recorded event. Include those
+   * valid calendar bounds in the domain users may navigate without changing the
+   * initially fitted event-data range.
+   */
+  function navigableRange(dataRange, rawRollups) {
+    var source = dataRange && typeof dataRange === "object" ? dataRange : {};
+    var start = finite(source.start_ms, 0);
+    var end = finite(source.end_ms, start + 1);
+    if (end <= start) {
+      end = start + 1;
+    }
+    var supportedKinds = ["daily", "weekly", "monthly", "quarterly"];
+    var rollups = Array.isArray(rawRollups) ? rawRollups : [];
+    rollups.forEach(function (rollup) {
+      if (!rollup || supportedKinds.indexOf(string(rollup.kind).toLowerCase()) < 0) {
+        return;
+      }
+      var rollupStart = finite(rollup.start_ms, NaN);
+      var rollupEnd = finite(rollup.end_ms, NaN);
+      if (!Number.isFinite(rollupStart) || !Number.isFinite(rollupEnd) ||
+          rollupEnd <= rollupStart) {
+        return;
+      }
+      start = Math.min(start, rollupStart);
+      end = Math.max(end, rollupEnd);
+    });
+    return { start_ms: start, end_ms: end };
+  }
+
+  /** Fit a requested view into a navigable domain while preserving its span. */
+  function boundedViewRange(startMs, endMs, domain, minimumSpanMs) {
+    var source = domain && typeof domain === "object" ? domain : {};
+    var domainStart = finite(source.start_ms, 0);
+    var domainEnd = finite(source.end_ms, domainStart + 1);
+    if (domainEnd <= domainStart) {
+      domainEnd = domainStart + 1;
+    }
+    var domainSpan = domainEnd - domainStart;
+    var minimum = Math.min(
+      domainSpan,
+      Math.max(1, finite(minimumSpanMs, 1))
+    );
+    var requestedStart = finite(startMs, domainStart);
+    var requestedEnd = finite(endMs, requestedStart + minimum);
+    var span = Math.min(domainSpan, Math.max(minimum, requestedEnd - requestedStart));
+    var start = Math.max(domainStart, requestedStart);
+    if (start + span > domainEnd) {
+      start = domainEnd - span;
+    }
+    return { start_ms: start, end_ms: start + span };
+  }
+
+  function minimumRangeWithin(startMs, endMs, boundsStart, boundsEnd, minimumSpanMs) {
+    var boundsSpan = boundsEnd - boundsStart;
+    var minimum = Math.min(boundsSpan, Math.max(1, finite(minimumSpanMs, 1)));
+    var span = endMs - startMs;
+    if (span >= minimum) {
+      return { start_ms: startMs, end_ms: endMs };
+    }
+    var missing = minimum - Math.max(0, span);
+    var start = Math.max(boundsStart, startMs - Math.floor(missing / 2));
+    var end = start + minimum;
+    if (end > boundsEnd) {
+      end = boundsEnd;
+      start = end - minimum;
+    }
+    return { start_ms: start, end_ms: end };
+  }
+
+  /**
+   * Find meaningful work inside one half-open calendar rollup. Agent lifetimes and
+   * idle state merely describe lane occupancy, so they do not make a range active.
+   */
+  function rollupActivityRange(rollup, data, minimumSpanMs) {
+    var rollupStart = finite(rollup && rollup.start_ms, NaN);
+    var rollupEnd = finite(rollup && rollup.end_ms, NaN);
+    if (!Number.isFinite(rollupStart) || !Number.isFinite(rollupEnd) ||
+        rollupEnd <= rollupStart) {
+      return null;
+    }
+    var source = data && typeof data === "object" ? data : {};
+    var extentStart = Infinity;
+    var extentEnd = -Infinity;
+
+    function addInterval(startValue, endValue) {
+      var start = finite(startValue, NaN);
+      var end = finite(endValue, NaN);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        return false;
+      }
+      var clippedStart = Math.max(rollupStart, start);
+      var clippedEnd = Math.min(rollupEnd, end);
+      if (clippedEnd <= clippedStart) {
+        return true;
+      }
+      extentStart = Math.min(extentStart, clippedStart);
+      extentEnd = Math.max(extentEnd, clippedEnd);
+      return true;
+    }
+
+    function addPoint(value) {
+      var at = finite(value, NaN);
+      if (!Number.isFinite(at) || at < rollupStart || at >= rollupEnd) {
+        return;
+      }
+      extentStart = Math.min(extentStart, at);
+      extentEnd = Math.max(extentEnd, Math.min(rollupEnd, at + 1));
+    }
+
+    (Array.isArray(source.phases) ? source.phases : []).forEach(function (phase) {
+      if (!phase || typeof phase !== "object") {
+        return;
+      }
+      var states = Array.isArray(phase.states) ? phase.states : [];
+      var hasValidState = false;
+      states.forEach(function (state) {
+        if (!state || typeof state !== "object") {
+          return;
+        }
+        var stateStart = finite(state.start_ms, NaN);
+        var stateEnd = finite(state.end_ms, NaN);
+        if (!Number.isFinite(stateStart) || !Number.isFinite(stateEnd) ||
+            stateEnd <= stateStart) {
+          return;
+        }
+        hasValidState = true;
+        if (string(state.kind).toLowerCase() !== "idle") {
+          addInterval(stateStart, stateEnd);
+        }
+      });
+      if (!hasValidState) {
+        addInterval(phase.start_ms, phase.end_ms);
+      }
+    });
+
+    (Array.isArray(source.events) ? source.events : []).forEach(function (event) {
+      if (event && typeof event === "object") {
+        addPoint(event.at_ms);
+      }
+    });
+    (Array.isArray(source.edges) ? source.edges : []).forEach(function (edge) {
+      if (edge && typeof edge === "object") {
+        addPoint(edge.source_ms);
+        addPoint(edge.target_ms);
+      }
+    });
+
+    if (!Number.isFinite(extentStart) || !Number.isFinite(extentEnd)) {
+      var dataRange = source.range && typeof source.range === "object"
+        ? source.range
+        : {};
+      var dataStart = finite(dataRange.start_ms, NaN);
+      var dataEnd = finite(dataRange.end_ms, NaN);
+      if (Number.isFinite(dataStart) && Number.isFinite(dataEnd)) {
+        var fallbackStart = Math.max(rollupStart, dataStart);
+        var fallbackEnd = Math.min(rollupEnd, dataEnd);
+        if (fallbackEnd > fallbackStart) {
+          extentStart = fallbackStart;
+          extentEnd = fallbackEnd;
+        }
+      }
+    }
+    if (!Number.isFinite(extentStart) || !Number.isFinite(extentEnd)) {
+      extentStart = rollupStart;
+      extentEnd = rollupEnd;
+    }
+    return minimumRangeWithin(
+      extentStart,
+      extentEnd,
+      rollupStart,
+      rollupEnd,
+      minimumSpanMs
+    );
+  }
+
   function compareLifetime(left, right) {
     return finite(left.start_ms, 0) - finite(right.start_ms, 0) ||
       finite(left.end_ms, finite(left.start_ms, 0)) -
@@ -149,9 +325,12 @@
   }
 
   return {
+    boundedViewRange: boundedViewRange,
     edgeDisplayState: edgeDisplayState,
     edgeTouchesSelection: edgeTouchesSelection,
+    navigableRange: navigableRange,
     nextPhaseSelection: nextPhaseSelection,
-    packLifetimes: packLifetimes
+    packLifetimes: packLifetimes,
+    rollupActivityRange: rollupActivityRange
   };
 });

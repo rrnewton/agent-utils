@@ -88,6 +88,7 @@
     data: null,
     viewStart: 0,
     viewEnd: 1,
+    navigationRange: { start_ms: 0, end_ms: 1 },
     width: 1000,
     labelWidth: 238,
     chartWidth: 762,
@@ -504,6 +505,9 @@
     var data = normalizeData(raw);
     app.data = data;
     installTimezone(data.display_timezone);
+    app.navigationRange = timelineCore
+      ? timelineCore.navigableRange(data.range, data.rollups)
+      : data.range;
     app.viewStart = data.range.start_ms;
     app.viewEnd = data.range.end_ms;
     app.agentsById.clear();
@@ -1957,7 +1961,17 @@
         showContextMenu(event, text(rollup.label, kind + " summary"), [
           {
             label: "Zoom to " + rangeName,
-            run: function () { zoomToRange(start, end); }
+            run: function () {
+              var activityRange = timelineCore.rollupActivityRange(
+                rollup,
+                app.data,
+                MIN_VIEW_MS
+              );
+              zoomToRange(
+                activityRange ? activityRange.start_ms : start,
+                activityRange ? activityRange.end_ms : end
+              );
+            }
           }
         ]);
       });
@@ -2098,20 +2112,14 @@
     if (!app.data || !Number.isFinite(start) || !Number.isFinite(end)) {
       return;
     }
-    var fullStart = app.data.range.start_ms;
-    var fullEnd = app.data.range.end_ms;
-    var fullSpan = Math.max(1, fullEnd - fullStart);
-    var minimum = Math.min(MIN_VIEW_MS, fullSpan);
-    var span = clamp(end - start, minimum, fullSpan);
-    var nextStart = start;
-    if (nextStart < fullStart) {
-      nextStart = fullStart;
-    }
-    if (nextStart + span > fullEnd) {
-      nextStart = fullEnd - span;
-    }
-    app.viewStart = nextStart;
-    app.viewEnd = nextStart + span;
+    var next = timelineCore.boundedViewRange(
+      start,
+      end,
+      app.navigationRange,
+      MIN_VIEW_MS
+    );
+    app.viewStart = next.start_ms;
+    app.viewEnd = next.end_ms;
     scheduleRender();
   }
 
@@ -2165,7 +2173,7 @@
     }
     var oldSpan = app.viewEnd - app.viewStart;
     var scale = Math.exp(clamp(event.deltaY, -500, 500) * 0.0016);
-    var fullSpan = app.data.range.end_ms - app.data.range.start_ms;
+    var fullSpan = app.navigationRange.end_ms - app.navigationRange.start_ms;
     var newSpan = clamp(oldSpan * scale, Math.min(MIN_VIEW_MS, fullSpan), fullSpan);
     var anchor = app.viewStart + ratio * oldSpan;
     var start = anchor - ratio * newSpan;

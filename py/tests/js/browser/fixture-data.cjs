@@ -1,7 +1,55 @@
 "use strict";
 
-const BASE_MS = Date.UTC(2026, 7, 5, 16, 0, 0);
+const BASE_MS = Date.UTC(2026, 2, 9, 3, 15, 0);
 const minute = 60 * 1000;
+const DATA_START_MS = Date.UTC(2026, 2, 9, 3, 10, 54);
+const DATA_END_MS = Date.UTC(2026, 2, 9, 20, 28, 31);
+const ROLLUP_RANGES = [
+  {
+    kind: "daily",
+    label: "Sun Mar 8",
+    start_ms: Date.UTC(2026, 2, 8, 5),
+    end_ms: Date.UTC(2026, 2, 9, 4),
+    path: "summaries/daily/2026-03-08.md"
+  },
+  {
+    kind: "daily",
+    label: "Mon Mar 9 · partial",
+    start_ms: Date.UTC(2026, 2, 9, 4),
+    end_ms: Date.UTC(2026, 2, 10, 4),
+    path: "summaries/daily/2026-03-09.md"
+  },
+  {
+    kind: "weekly",
+    label: "2026-W11",
+    start_ms: Date.UTC(2026, 2, 9, 4),
+    end_ms: Date.UTC(2026, 2, 16, 4),
+    path: "summaries/weekly/2026-W11.md"
+  },
+  {
+    kind: "monthly",
+    label: "March 2026",
+    start_ms: Date.UTC(2026, 2, 1, 5),
+    end_ms: Date.UTC(2026, 3, 1, 4),
+    path: "summaries/monthly/2026-03.md"
+  },
+  {
+    kind: "quarterly",
+    label: "2026 Q1",
+    start_ms: Date.UTC(2026, 0, 1, 5),
+    end_ms: Date.UTC(2026, 3, 1, 4),
+    path: "summaries/quarterly/2026-Q1.md"
+  }
+];
+const FIRST_DAY_ACTIVITY_START_MS = BASE_MS;
+const LATEST_ACTIVITY_END_MS = BASE_MS + 100 * minute;
+const ROLLUP_EXPECTED_RANGES = [
+  { start_ms: FIRST_DAY_ACTIVITY_START_MS, end_ms: ROLLUP_RANGES[0].end_ms },
+  { start_ms: ROLLUP_RANGES[1].start_ms, end_ms: LATEST_ACTIVITY_END_MS },
+  { start_ms: ROLLUP_RANGES[2].start_ms, end_ms: LATEST_ACTIVITY_END_MS },
+  { start_ms: FIRST_DAY_ACTIVITY_START_MS, end_ms: LATEST_ACTIVITY_END_MS },
+  { start_ms: FIRST_DAY_ACTIVITY_START_MS, end_ms: LATEST_ACTIVITY_END_MS }
+];
 
 function stats(overrides) {
   return Object.assign({
@@ -32,7 +80,7 @@ const agents = [
     short_name: "Hermit coordinator",
     nickname: "Coordinator",
     lifetime_summary: "Coordinated the parser, continuous-integration, and documentation work into one verified result.",
-    start_ms: BASE_MS,
+    start_ms: DATA_START_MS,
     end_ms: BASE_MS + 100 * minute,
     status: "complete"
   },
@@ -87,13 +135,20 @@ const phases = [
   {
     id: "phase-root",
     agent_id: "coordinator",
-    start_ms: BASE_MS,
+    start_ms: DATA_START_MS,
     end_ms: BASE_MS + 100 * minute,
     phrase: "Coordinate Hermit work",
     paragraph: "Spawned focused audits and integrated their findings.",
     detail_path: "details/phase-root.json",
     stats: stats({ user_prompts: 2, agent_responses: 4 }),
-    states: [state("active", 0, 100)]
+    states: [
+      { kind: "idle", start_ms: DATA_START_MS, end_ms: FIRST_DAY_ACTIVITY_START_MS },
+      {
+        kind: "active",
+        start_ms: FIRST_DAY_ACTIVITY_START_MS,
+        end_ms: LATEST_ACTIVITY_END_MS
+      }
+    ]
   },
   {
     id: "phase-a-1",
@@ -147,12 +202,12 @@ const phases = [
 
 const timeline = {
   schema_version: 1,
-  generated_at: "2026-08-05T17:40:00Z",
+  generated_at: "2026-03-09T17:40:00Z",
   source_digest: "playwright-fixture",
   display_timezone: "America/New_York",
   range: {
-    start_ms: BASE_MS,
-    end_ms: BASE_MS + 100 * minute
+    start_ms: DATA_START_MS,
+    end_ms: DATA_END_MS
   },
   teams: [{ slug: "codex-hermit", label: "Codex Hermit" }],
   agents: agents,
@@ -197,26 +252,12 @@ const timeline = {
     { agent_id: "agent-a", at_ms: BASE_MS + 16 * minute, kind: "tool_call" },
     { agent_id: "agent-a", at_ms: BASE_MS + 24 * minute, kind: "agent_response" }
   ],
-  rollups: [
-    {
-      kind: "daily",
-      label: "Aug 05",
-      start_ms: BASE_MS,
-      end_ms: BASE_MS + 60 * minute,
-      path: "summaries/daily/2026-08-05.md",
-      technical_path: "summaries/daily/2026-08-05.md",
-      plain_language_path: "summaries/daily/2026-08-05-plain-language.md"
-    },
-    {
-      kind: "weekly",
-      label: "2026-W32",
-      start_ms: BASE_MS,
-      end_ms: BASE_MS + 100 * minute,
-      path: "summaries/weekly/2026-W32.md",
-      technical_path: "summaries/weekly/2026-W32.md",
-      plain_language_path: "summaries/weekly/2026-W32-plain-language.md"
-    }
-  ],
+  rollups: ROLLUP_RANGES.map(function (rollup) {
+    return Object.assign({}, rollup, {
+      technical_path: rollup.path,
+      plain_language_path: rollup.path.replace(/\.md$/, "-plain-language.md")
+    });
+  }),
   glossary: [
     {
       id: "term-malformed-input-123456789abc",
@@ -224,7 +265,7 @@ const timeline = {
       introduced_at_ms: BASE_MS + minute,
       occurrences: 4,
       context: "Malformed input is data that does not satisfy the parser's required structure.",
-      week: "2026-W32",
+      week: "2026-W11",
       url: "#glossary/term-malformed-input-123456789abc"
     }
   ],
@@ -232,15 +273,15 @@ const timeline = {
   summary_files: [
     {
       kind: "daily",
-      period: "2026-08-05",
-      label: "Wednesday, August 5",
-      path: "summaries/daily/2026-08-05.md"
+      period: "2026-03-09",
+      label: "Monday, March 9",
+      path: "summaries/daily/2026-03-09.md"
     },
     {
       kind: "weekly",
-      period: "2026-W32",
-      label: "Week 32",
-      path: "summaries/weekly/2026-W32.md"
+      period: "2026-W11",
+      label: "Week 11",
+      path: "summaries/weekly/2026-W11.md"
     }
   ]
 };
@@ -343,21 +384,29 @@ const virtualFiles = new Map([
     contentType: "text/markdown; charset=utf-8",
     body: "# Parser audit\n\nThe malformed-input boundary is now covered.\n"
   }],
-  ["/summaries/daily/2026-08-05.md", {
+  ["/summaries/daily/2026-03-09.md", {
     contentType: "text/markdown; charset=utf-8",
-    body: "# August 5 technical summary\n\nThe team repaired the malformed-input parser boundary.\n"
+    body: "# March 9 technical summary\n\nThe team repaired the malformed-input parser boundary.\n"
   }],
-  ["/summaries/daily/2026-08-05-plain-language.md", {
+  ["/summaries/daily/2026-03-09-plain-language.md", {
     contentType: "text/markdown; charset=utf-8",
-    body: "# August 5 plain-language summary\n\nThe parser now safely rejects malformed-input records.\n"
+    body: "# March 9 plain-language summary\n\nThe parser now safely rejects malformed-input records.\n"
   }],
-  ["/summaries/weekly/2026-W32.md", {
+  ["/summaries/daily/2026-03-08.md", {
     contentType: "text/markdown; charset=utf-8",
-    body: "# Week 32\n\nParser and CI work advanced together.\n"
+    body: "# March 8 technical summary\n\nThe team began tracing the malformed-input parser boundary.\n"
   }],
-  ["/summaries/weekly/2026-W32-plain-language.md", {
+  ["/summaries/daily/2026-03-08-plain-language.md", {
     contentType: "text/markdown; charset=utf-8",
-    body: "# Week 32 in plain language\n\nThe team made invalid data safer to handle.\n"
+    body: "# March 8 plain-language summary\n\nThe team began investigating malformed-input parser data.\n"
+  }],
+  ["/summaries/weekly/2026-W11.md", {
+    contentType: "text/markdown; charset=utf-8",
+    body: "# Week 11\n\nParser and CI work advanced together.\n"
+  }],
+  ["/summaries/weekly/2026-W11-plain-language.md", {
+    contentType: "text/markdown; charset=utf-8",
+    body: "# Week 11 in plain language\n\nThe team made invalid data safer to handle.\n"
   }],
   ["/summaries/glossary/codex-hermit-glossary.md", {
     contentType: "text/markdown; charset=utf-8",
@@ -367,8 +416,13 @@ const virtualFiles = new Map([
 
 module.exports = {
   BASE_MS: BASE_MS,
+  DATA_START_MS: DATA_START_MS,
+  DATA_END_MS: DATA_END_MS,
+  FIRST_DAY_ACTIVITY_START_MS: FIRST_DAY_ACTIVITY_START_MS,
   PHASE_A_START_MS: BASE_MS + 10 * minute,
   PHASE_A_END_MS: BASE_MS + 25 * minute,
+  ROLLUP_RANGES: ROLLUP_RANGES,
+  ROLLUP_EXPECTED_RANGES: ROLLUP_EXPECTED_RANGES,
   AGENT_COUNT: agents.length,
   virtualFiles: virtualFiles
 };

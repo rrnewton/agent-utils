@@ -3,8 +3,12 @@
 const { test, expect } = require("@playwright/test");
 const {
   AGENT_COUNT,
+  DATA_END_MS,
+  DATA_START_MS,
   PHASE_A_START_MS,
-  PHASE_A_END_MS
+  PHASE_A_END_MS,
+  ROLLUP_EXPECTED_RANGES,
+  ROLLUP_RANGES
 } = require("./fixture-data.cjs");
 
 const phaseSelector = '[data-phase-id="phase-a-1"]';
@@ -181,6 +185,51 @@ test("the phase context menu can zoom exactly to the work phase", async function
     return Math.abs(view.start - PHASE_A_START_MS) <= 1 &&
       Math.abs(view.end - PHASE_A_END_MS) <= 1;
   }).toBeTruthy();
+});
+
+test("rollup context menus trim empty calendar time without crossing the selected range", async function ({ page }) {
+  const timeline = page.getByTestId("timeline");
+  const menu = page.getByTestId("timeline-context-menu");
+  const actionNames = {
+    daily: "Zoom to day",
+    weekly: "Zoom to week",
+    monthly: "Zoom to month",
+    quarterly: "Zoom to quarter"
+  };
+  expect(ROLLUP_RANGES[0].end_ms - ROLLUP_RANGES[0].start_ms).toBe(
+    23 * 60 * 60 * 1000
+  );
+
+  for (const [index, rollup] of ROLLUP_RANGES.entries()) {
+    await page.getByTestId("fit").click();
+    await expect.poll(async function () {
+      const view = await readView(timeline);
+      return [view.start, view.end];
+    }).toEqual([DATA_START_MS, DATA_END_MS]);
+
+    const marker = page.locator(
+      '.rollup-marker.rollup-' + rollup.kind +
+      '[data-start-ms="' + rollup.start_ms + '"]'
+    );
+    await expect(marker).toBeVisible();
+    await marker.click({ button: "right" });
+    await expect(menu).toBeVisible();
+    await expect(page.locator("#context-menu-title")).toHaveText(rollup.label);
+    await expect(timeline).not.toHaveAttribute("data-selection-scope");
+    await menu.getByRole("menuitem", { name: actionNames[rollup.kind], exact: true }).click();
+
+    await expect.poll(async function () {
+      const view = await readView(timeline);
+      return [view.start, view.end];
+    }).toEqual([
+      ROLLUP_EXPECTED_RANGES[index].start_ms,
+      ROLLUP_EXPECTED_RANGES[index].end_ms
+    ]);
+
+    const view = await readView(timeline);
+    expect(view.start).toBeGreaterThanOrEqual(rollup.start_ms);
+    expect(view.end).toBeLessThanOrEqual(rollup.end_ms);
+  }
 });
 
 test("packed tracks are the default and per-agent tracks remain available", async function ({ page }) {
