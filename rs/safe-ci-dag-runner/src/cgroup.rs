@@ -664,7 +664,7 @@ pub fn apply_specific_cores(cores: &[usize], label: &str) -> Option<(String, Vec
             ));
             return None;
         };
-        if try_cgroup_cpuset(&scope, &cores) {
+        if try_cgroup_cpuset(&scope, cores) {
             eprintln!(
                 "{LOG_PREFIX} core box: constrained to {want} core(s) {cores:?} via cgroup cpuset"
             );

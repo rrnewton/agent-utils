@@ -331,7 +331,7 @@ fn probe_hard_pin(cores: &[usize]) -> Value {
     let Some(inner) = stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
-        .last()
+        .next_back()
     else {
         return serde_json::json!({
             "verdict": "ERROR",
