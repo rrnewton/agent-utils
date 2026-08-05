@@ -22,6 +22,8 @@ class SourceSnapshot:
     sha256: str
     complete_bytes: int
     line_count: int
+    working_directory: str | None = None
+    repository_url: str | None = None
 
     def to_json_obj(self) -> JsonObject:
         """Return the snapshot as a JSON-serializable object."""
@@ -34,6 +36,8 @@ class SourceSnapshot:
             "sha256": self.sha256,
             "complete_bytes": self.complete_bytes,
             "line_count": self.line_count,
+            "working_directory": self.working_directory,
+            "repository_url": self.repository_url,
         }
 
 

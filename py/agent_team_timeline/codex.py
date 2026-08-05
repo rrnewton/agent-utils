@@ -793,6 +793,8 @@ def _read_rollout(
         sha256=hashlib.sha256(data).hexdigest(),
         complete_bytes=complete_bytes,
         line_count=len(raw_lines),
+        working_directory=_string(metadata.get("cwd")),
+        repository_url=_string(_mapping(metadata.get("git")).get("repository_url")),
     )
     canonical = _canonical_records(records, metadata, root_thread_id)
     return _Rollout(

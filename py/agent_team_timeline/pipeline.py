@@ -24,6 +24,12 @@ from agent_team_timeline.archive import (
     write_json_if_changed,
     write_text_if_changed,
 )
+from agent_team_timeline.artifacts import (
+    ArtifactCatalog,
+    artifact_catalog_from_json,
+    canonical_repository_url,
+    extract_artifacts,
+)
 from agent_team_timeline.codex import (
     CodexParseError,
     CodexSourceCopy,
@@ -172,6 +178,8 @@ class IngestReport:
     tool_calls: int
     edges: int
     files_changed: int
+    artifacts: int = 0
+    projects: int = 0
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return the ingest report as a JSON-serializable object."""
@@ -186,6 +194,8 @@ class IngestReport:
             "tool_calls": self.tool_calls,
             "edges": self.edges,
             "files_changed": self.files_changed,
+            "artifacts": self.artifacts,
+            "projects": self.projects,
         }
 
 
@@ -276,12 +286,25 @@ def _archive_team(team: TeamData) -> TeamData:
         replace(tool, input_text=None, output_text=None)
         for tool in team.tool_calls
     )
-    return replace(team, tool_calls=tools)
+    sources = tuple(
+        replace(
+            source,
+            working_directory=None,
+            repository_url=canonical_repository_url(source.repository_url),
+        )
+        for source in team.sources
+    )
+    return replace(team, sources=sources, tool_calls=tools)
 
 
 def _raw_team_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
     return archive / "teams" / team_slug / "raw" / "team.json"
+
+
+def _artifact_catalog_path(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "raw" / "artifacts.json"
 
 
 def _summary_root(archive: Path, team_slug: str) -> Path:
@@ -391,6 +414,13 @@ def _write_ingested_team(
     """Write provider-neutral normalized data after a provider snapshot is durable."""
 
     changed = files_changed
+    artifact_catalog = extract_artifacts(team)
+    changed += int(
+        _write_json_durable(
+            _artifact_catalog_path(archive, team_slug),
+            narrow_json(artifact_catalog.to_json_obj()),
+        )
+    )
     archived = _archive_team(team)
     _validate_archive_id(archived.root_thread_id, "root thread id")
     for agent in archived.agents:
@@ -444,7 +474,7 @@ def _write_ingested_team(
         "display_timezone": team.display_timezone,
         "date_window": date_window.to_json_obj() if date_window is not None else None,
         "source_digest": digest,
-        "sources": [source.to_json_obj() for source in team.sources],
+        "sources": [source.to_json_obj() for source in archived.sources],
     }
     changed += int(
         _write_json_durable(
@@ -462,6 +492,8 @@ def _write_ingested_team(
         tool_calls=len(team.tool_calls),
         edges=len(team.edges),
         files_changed=changed,
+        artifacts=len(artifact_catalog.artifacts),
+        projects=len(artifact_catalog.projects),
     )
     return archived, report
 
@@ -755,6 +787,29 @@ def load_archived_team(archive: Path, team_slug: str) -> TeamData:
     for agent in team.agents:
         _validate_archive_id(agent.thread_id, "thread id")
     return team
+
+
+def load_artifact_catalog(
+    archive: Path, team_slug: str, team: TeamData | None = None
+) -> ArtifactCatalog:
+    """Load mechanical artifact data, accepting pre-artifact archives as empty.
+
+    Existing summary caches remain valid because artifact extraction is independent of model
+    inputs. Re-running ingest creates the catalog from source snapshots; until then, a legacy
+    archive builds with an empty catalog rather than demanding summary regeneration.
+    """
+
+    archived_team = team if team is not None else load_archived_team(archive, team_slug)
+    path = _artifact_catalog_path(archive, team_slug)
+    if not path.is_file():
+        return ArtifactCatalog(source_digest(archived_team), (), ())
+    catalog = artifact_catalog_from_json(read_json(path))
+    expected_digest = source_digest(archived_team)
+    if catalog.source_digest != expected_digest:
+        raise ValueError(
+            f"stale artifact catalog for {team_slug!r}; rerun ingest before building"
+        )
+    return catalog
 
 
 def _glossary_terms(team: TeamData) -> tuple[GlossaryTerm, ...]:

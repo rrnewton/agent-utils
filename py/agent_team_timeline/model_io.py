@@ -76,6 +76,12 @@ def team_from_json_obj(value: object) -> TeamData:
             sha256=_string(item.get("sha256"), "source.sha256"),
             complete_bytes=_integer(item.get("complete_bytes"), "source.complete_bytes"),
             line_count=_integer(item.get("line_count"), "source.line_count"),
+            working_directory=_optional_string(
+                item.get("working_directory"), "source.working_directory"
+            ),
+            repository_url=_optional_string(
+                item.get("repository_url"), "source.repository_url"
+            ),
         )
         for item in _items(root, "sources")
     )
