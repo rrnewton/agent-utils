@@ -308,7 +308,6 @@ def _require_keys(
 
 def _parse_bullets(value: JsonValue, job: SummaryJob, where: str) -> tuple[WorkBullet, ...]:
     bullets: list[WorkBullet] = []
-    previous_ms: int | None = None
     for index, raw_bullet in enumerate(_array(value, where)):
         item_where = f"{where}[{index}]"
         bullet = _object(raw_bullet, item_where)
@@ -316,12 +315,12 @@ def _parse_bullets(value: JsonValue, job: SummaryJob, where: str) -> tuple[WorkB
         at_ms = _integer(bullet["at_ms"], item_where + ".at_ms")
         if at_ms < job.start_ms or at_ms > job.end_ms:
             raise SummaryError(f"{item_where}.at_ms: outside the summary interval")
-        if previous_ms is not None and at_ms < previous_ms:
-            raise SummaryError(f"{where}: bullets are not chronological")
-        previous_ms = at_ms
         text = _string(bullet["text"], item_where + ".text")
         bullets.append(WorkBullet(at_ms=at_ms, text=text))
-    return tuple(bullets)
+    # Structured-output models occasionally return otherwise-valid bullets out of order. Stable
+    # canonicalization is lossless and avoids spending another full backend batch merely to
+    # repair ordering; equal timestamps retain the model's original order.
+    return tuple(sorted(bullets, key=lambda item: item.at_ms))
 
 
 def _decode_json(text: str, where: str) -> JsonValue:

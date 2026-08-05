@@ -460,6 +460,57 @@ def test_backend_output_is_strictly_narrowed(
         )
 
 
+def test_backend_bullets_are_stably_canonicalized_by_timestamp(tmp_path: Path) -> None:
+    job = _job("agent-a")
+    later_ms = job.start_ms + 30_000
+    same_ms = job.start_ms + 10_000
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "Ordered archival work",
+                "paragraph": "The valid work items are normalized without another model call.",
+                "work_summary": [
+                    {"at_ms": later_ms, "text": "Finished validation."},
+                    {"at_ms": same_ms, "text": "Started the implementation."},
+                    {"at_ms": same_ms, "text": "Added focused tests."},
+                ],
+            }
+        ]
+    }
+
+    result = _parse_backend_output(
+        json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+    )[job.key]
+
+    assert [(item.at_ms, item.text) for item in result.work_summary] == [
+        (same_ms, "Started the implementation."),
+        (same_ms, "Added focused tests."),
+        (later_ms, "Finished validation."),
+    ]
+
+
+def test_backend_bullet_outside_interval_remains_a_hard_failure(tmp_path: Path) -> None:
+    job = _job("agent-a")
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "Invalid timestamp",
+                "paragraph": "This output must not enter the archive.",
+                "work_summary": [
+                    {"at_ms": job.end_ms + 1, "text": "Outside the interval."},
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(SummaryError, match="outside the summary interval"):
+        _parse_backend_output(
+            json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+        )
+
+
 def test_valid_backend_output_is_narrowed_to_frozen_types(tmp_path: Path) -> None:
     job = _job("agent-a")
     payload = {
