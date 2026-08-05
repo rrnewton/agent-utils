@@ -64,7 +64,7 @@
     };
   }
 
-  /** First click selects an agent; a later single click on the same phase toggles granularity. */
+  /** First click selects an agent; repeated phase clicks toggle only that same phase. */
   function nextPhaseSelection(current, agentId, phaseId, startMs, endMs) {
     var agent = string(agentId);
     var phase = string(phaseId);
@@ -80,6 +80,15 @@
     if (current && current.kind === "phase" &&
         current.agent_id === agent && current.phase_id === phase) {
       return { kind: "agent", agent_id: agent };
+    }
+    if (current && current.kind === "phase" && current.agent_id === agent) {
+      return {
+        kind: "phase",
+        agent_id: agent,
+        phase_id: phase,
+        start_ms: finite(startMs, 0),
+        end_ms: finite(endMs, finite(startMs, 0))
+      };
     }
     return { kind: "agent", agent_id: agent };
   }

@@ -34,6 +34,24 @@ assert.deepStrictEqual(selection, {
   start_ms: 10,
   end_ms: 20
 });
+selection = core.nextPhaseSelection(selection, "agent-a", "phase-2", 21, 30);
+assert.deepStrictEqual(selection, {
+  kind: "phase",
+  agent_id: "agent-a",
+  phase_id: "phase-2",
+  start_ms: 21,
+  end_ms: 30
+}, "a different phase on the selected agent becomes the phase selection");
+selection = core.nextPhaseSelection(selection, "agent-a", "phase-2", 21, 30);
+assert.deepStrictEqual(selection, { kind: "agent", agent_id: "agent-a" });
+selection = core.nextPhaseSelection(selection, "agent-a", "phase-1", 10, 20);
+assert.deepStrictEqual(selection, {
+  kind: "phase",
+  agent_id: "agent-a",
+  phase_id: "phase-1",
+  start_ms: 10,
+  end_ms: 20
+});
 selection = core.nextPhaseSelection(selection, "agent-a", "phase-1", 10, 20);
 assert.deepStrictEqual(selection, { kind: "agent", agent_id: "agent-a" });
 

@@ -78,6 +78,9 @@
     contextMenu: byId("timeline-context-menu"),
     contextMenuTitle: byId("context-menu-title"),
     contextMenuActions: byId("context-menu-actions"),
+    laneMenu: byId("lane-agent-menu"),
+    laneMenuTitle: byId("lane-agent-menu-title"),
+    laneMenuActions: byId("lane-agent-menu-actions"),
     loadError: byId("load-error")
   };
 
@@ -107,6 +110,7 @@
     renderQueued: false,
     detailRequest: 0,
     modalRestoreFocus: null,
+    laneMenuAnchor: null,
     timezone: undefined
   };
 
@@ -1177,6 +1181,7 @@
   function setSelection(selection) {
     app.selection = selection;
     hideContextMenu();
+    hideLaneAgentMenu(false);
     scheduleRender();
   }
 
@@ -1203,10 +1208,82 @@
     dom.contextMenuActions.replaceChildren();
   }
 
+  function hideLaneAgentMenu(restoreFocus) {
+    var anchor = app.laneMenuAnchor;
+    dom.laneMenu.hidden = true;
+    dom.laneMenuActions.replaceChildren();
+    app.laneMenuAnchor = null;
+    if (anchor && anchor.isConnected) {
+      anchor.setAttribute("aria-expanded", "false");
+      if (restoreFocus) {
+        anchor.focus();
+      }
+    }
+  }
+
+  function showLaneAgentMenu(event, laneIndex, anchor) {
+    event.preventDefault();
+    event.stopPropagation();
+    hideTooltip();
+    hideContextMenu();
+    hideLaneAgentMenu(false);
+    var laneAgents = app.rows
+      .filter(function (row) { return row.index === laneIndex; })
+      .map(function (row) { return row.agent; })
+      .sort(function (left, right) {
+        return number(left.start_ms, 0) - number(right.start_ms, 0) ||
+          compareAgents(left, right);
+      });
+    if (!laneAgents.length) {
+      return;
+    }
+    var laneName = laneIndex === 0 ? "Coordinator lane" : "Lane " + laneIndex;
+    dom.laneMenuTitle.textContent = laneName + " · " + laneAgents.length +
+      (laneAgents.length === 1 ? " agent" : " agents");
+    var buttons = laneAgents.map(function (agent) {
+      var button = htmlElement("button", "lane-agent-menu-action");
+      button.type = "button";
+      button.setAttribute("role", "menuitem");
+      button.setAttribute("aria-label", "Select " + agentAccessibleName(agent));
+      button.title = agentAccessibleName(agent);
+      button.append(
+        htmlElement("span", "lane-agent-menu-name", agentShortName(agent)),
+        htmlElement(
+          "span",
+          "lane-agent-menu-official",
+          truncateLabel(agentOfficialName(agent), 270, true)
+        )
+      );
+      button.addEventListener("click", function () {
+        hideLaneAgentMenu(false);
+        selectAgent(agent);
+      });
+      return button;
+    });
+    dom.laneMenuActions.replaceChildren.apply(dom.laneMenuActions, buttons);
+    app.laneMenuAnchor = anchor;
+    anchor.setAttribute("aria-expanded", "true");
+    dom.laneMenu.hidden = false;
+    var anchorBox = anchor.getBoundingClientRect();
+    var menuWidth = dom.laneMenu.offsetWidth;
+    var menuHeight = dom.laneMenu.offsetHeight;
+    var left = clamp(anchorBox.left, 8, window.innerWidth - menuWidth - 8);
+    var top = anchorBox.bottom + 4;
+    if (top + menuHeight > window.innerHeight - 8) {
+      top = Math.max(8, anchorBox.top - menuHeight - 4);
+    }
+    dom.laneMenu.style.left = left + "px";
+    dom.laneMenu.style.top = top + "px";
+    if (buttons[0]) {
+      buttons[0].focus();
+    }
+  }
+
   function showContextMenu(event, title, actions) {
     event.preventDefault();
     event.stopPropagation();
     hideTooltip();
+    hideLaneAgentMenu(false);
     dom.contextMenuTitle.textContent = title;
     var buttons = actions.map(function (action) {
       var button = htmlElement("button", "context-menu-action", action.label);
@@ -1586,11 +1663,44 @@
 
   function renderLaneLabel(index, layer) {
     var y = index * ROW_HEIGHT;
-    layer.appendChild(svgElement("text", {
+    var count = app.rows.filter(function (row) { return row.index === index; }).length;
+    var displayName = index === 0 ? "COORD" : "LANE " + index;
+    var accessibleName = index === 0 ? "Coordinator lane" : "Lane " + index;
+    var group = svgElement("g", {
+      class: "lane-label-group",
+      role: "button",
+      tabindex: "0",
+      "data-lane-index": String(index),
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      "aria-label": accessibleName + ", " + count +
+        (count === 1 ? " named agent" : " named agents")
+    });
+    group.appendChild(svgElement("rect", {
+      x: 0,
+      y: y,
+      width: app.labelWidth,
+      height: ROW_HEIGHT,
+      class: "lane-label-hit"
+    }));
+    group.appendChild(svgElement("text", {
       x: 12,
       y: y + 28,
       class: "lane-label"
-    }, index === 0 ? "COORD" : "LANE " + index));
+    }, displayName));
+    group.addEventListener("click", function (event) {
+      if (event.detail !== 1 || Date.now() < app.suppressClickUntil) {
+        return;
+      }
+      showLaneAgentMenu(event, index, group);
+    });
+    group.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        showLaneAgentMenu(event, index, group);
+      }
+    });
+    layer.appendChild(group);
   }
 
   function renderAgentLifetime(row, layer) {
@@ -2089,6 +2199,16 @@
     }
     app.drag = null;
     dom.svg.classList.remove("is-panning");
+  }
+
+  function clearSelectionFromEmptyTrack(event) {
+    if (!app.selection || event.detail !== 1 || Date.now() < app.suppressClickUntil) {
+      return;
+    }
+    var target = event.target;
+    if (target instanceof Element && target.classList.contains("track-row")) {
+      setSelection(null);
+    }
   }
 
   function keyboardNavigate(event) {
@@ -2923,6 +3043,7 @@
   dom.svg.addEventListener("pointermove", continuePan);
   dom.svg.addEventListener("pointerup", endPan);
   dom.svg.addEventListener("pointercancel", endPan);
+  dom.svg.addEventListener("click", clearSelectionFromEmptyTrack);
   dom.scroll.addEventListener("scroll", scheduleRender, { passive: true });
   dom.scroll.addEventListener("keydown", keyboardScrollTracks);
   window.addEventListener("hashchange", openGlossaryFromHash);
@@ -2935,7 +3056,9 @@
   });
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
-      if (!dom.contextMenu.hidden) {
+      if (!dom.laneMenu.hidden) {
+        hideLaneAgentMenu(true);
+      } else if (!dom.contextMenu.hidden) {
         hideContextMenu();
       } else if (!dom.modalBackdrop.hidden) {
         closeModal();
@@ -2966,8 +3089,16 @@
     if (!dom.contextMenu.hidden && !dom.contextMenu.contains(event.target)) {
       hideContextMenu();
     }
+    if (!dom.laneMenu.hidden && !dom.laneMenu.contains(event.target) &&
+        event.target !== app.laneMenuAnchor &&
+        !(app.laneMenuAnchor && app.laneMenuAnchor.contains(event.target))) {
+      hideLaneAgentMenu(false);
+    }
   });
-  window.addEventListener("blur", hideContextMenu);
+  window.addEventListener("blur", function () {
+    hideContextMenu();
+    hideLaneAgentMenu(false);
+  });
 
   if (typeof ResizeObserver === "function") {
     new ResizeObserver(scheduleRender).observe(dom.card);

@@ -107,6 +107,17 @@ const phases = [
     ]
   },
   {
+    id: "phase-a-2",
+    agent_id: "agent-a",
+    start_ms: BASE_MS + 26 * minute,
+    end_ms: BASE_MS + 29 * minute,
+    phrase: "Verify parser fix",
+    paragraph: "Confirmed the repaired parser behavior against the focused regression case.",
+    detail_path: "details/phase-a-2.json",
+    stats: stats({ tool_calls: 1 }),
+    states: [state("active", 26, 29)]
+  },
+  {
     id: "phase-b-1",
     agent_id: "agent-b",
     start_ms: BASE_MS + 12 * minute,
@@ -312,13 +323,17 @@ const virtualFiles = new Map([
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(phaseADetail)
   }],
-  ["/details/phase-b-1.json", {
+  ["/details/phase-a-2.json", {
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(simpleDetail(phases[2]))
   }],
-  ["/details/phase-c-1.json", {
+  ["/details/phase-b-1.json", {
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(simpleDetail(phases[3]))
+  }],
+  ["/details/phase-c-1.json", {
+    contentType: "application/json; charset=utf-8",
+    body: JSON.stringify(simpleDetail(phases[4]))
   }],
   ["/summaries/phases/phase-a-1.md", {
     contentType: "text/markdown; charset=utf-8",

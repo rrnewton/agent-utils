@@ -11,7 +11,8 @@ do not require site changes.
 ## What the site shows
 
 - Packed lanes are the default: non-overlapping agent lifetimes share the first available lane, so
-  a long run does not grow one row per completed agent. “Per-agent tracks” restores the full
+  a long run does not grow one row per completed agent. Click a packed lane label to list every
+  named agent assigned to that lane and select one directly. “Per-agent tracks” restores the full
   fork-tree view when that is more useful.
 - Every agent has a hindsight short name based on its completed work, ancestor context, official
   coordinator path, role, and nickname. The short name is primary; hover, search, and detail views
@@ -24,7 +25,9 @@ do not require site changes.
   have toolbar toggles.
 - Hovering a phase or edge shows its paragraph summary and statistics.
 - Single-clicking selects an agent; a later single click on the same work phase narrows selection to
-  that phase. Double-click opens three views: the cultivated Agent Work Summary, the full
+  that phase. Clicking a different phase selects that phase directly; clicking the selected phase
+  again returns to the whole-agent selection. Click empty track background (or press Escape) to
+  clear selection. Double-click opens three views: the cultivated Agent Work Summary, the full
   prompt/response transcript with tool use condensed to one line and role filters, and its rendered
   Markdown summary.
 - Single-clicking a day, week, month, or quarter selects it; double-click opens rendered Markdown

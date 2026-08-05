@@ -8,6 +8,7 @@ const {
 } = require("./fixture-data.cjs");
 
 const phaseSelector = '[data-phase-id="phase-a-1"]';
+const secondPhaseSelector = '[data-phase-id="phase-a-2"]';
 
 async function requireContract(locator, reason) {
   test.skip((await locator.count()) === 0, reason);
@@ -90,6 +91,54 @@ test("single clicks select and a double click opens phase detail", async functio
   await phase.dblclick();
   await expect(modal).toBeVisible();
   await expect(page.locator("#modal-title")).toContainText("Audit parser invariants");
+});
+
+test("different work phases select directly while the same phase toggles scope", async function ({ page }) {
+  const timeline = page.getByTestId("timeline");
+  const firstPhase = page.locator(phaseSelector);
+  const secondPhase = page.locator(secondPhaseSelector);
+
+  await firstPhase.click();
+  await page.waitForTimeout(600);
+  await firstPhase.click();
+  await expect(timeline).toHaveAttribute("data-selected-phase-id", "phase-a-1");
+
+  await page.waitForTimeout(600);
+  await secondPhase.click();
+  await expect(timeline).toHaveAttribute("data-selection-scope", "phase");
+  await expect(timeline).toHaveAttribute("data-selected-phase-id", "phase-a-2");
+
+  await page.waitForTimeout(600);
+  await secondPhase.click();
+  await expect(timeline).toHaveAttribute("data-selection-scope", "agent");
+  await expect(timeline).not.toHaveAttribute("data-selected-phase-id");
+});
+
+test("packed lane labels list their agents and empty background clears selection", async function ({ page }) {
+  const timeline = page.getByTestId("timeline");
+  const lane = page.locator('[data-lane-index="1"]');
+  await expect(lane).toHaveAttribute("aria-label", /2 named agents/);
+  await lane.click();
+
+  const menu = page.getByTestId("lane-agent-menu");
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: /Parser audit/ })).toBeVisible();
+  await expect(menu.getByRole("menuitem", { name: /Documentation audit/ })).toBeVisible();
+  await menu.getByRole("menuitem", { name: /Documentation audit/ }).click();
+  await expect(menu).toBeHidden();
+  await expect(timeline).toHaveAttribute("data-selected-agent-id", "agent-c");
+
+  const svg = page.locator("#timeline-svg");
+  const box = await svg.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.click(box.x + box.width - 12, box.y + 54 + 27);
+  await expect(timeline).not.toHaveAttribute("data-selection-scope");
+
+  await lane.click();
+  await expect(menu).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  await expect(lane).toHaveAttribute("aria-expanded", "false");
 });
 
 test("the phase context menu can zoom exactly to the work phase", async function ({ page }) {
