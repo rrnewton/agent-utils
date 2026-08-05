@@ -194,7 +194,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     built = build_archive(tmp_path, team.team_slug)
 
     assert first.agent_names == 2
-    assert first.cache_misses == first.phases + first.rollups + first.agent_names
+    assert first.cache_misses == first.phases + (2 * first.rollups) + first.agent_names
     assert first.backend == "heuristic"
     assert first.model == "test-model"
     assert first.reasoning_effort == "high"
@@ -202,7 +202,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert first.newly_spent_unknown_receipts == 0
     assert first.artifact_generation_unknown_receipts == 0
     assert first.unknown_legacy_artifacts == 0
-    assert len(first.usage_run_paths) == first.rollups + 2
+    assert len(first.usage_run_paths) == (2 * first.rollups) + 2
     assert all((tmp_path / path).is_file() for path in first.usage_run_paths)
     assert built["agents"] == 2
     assert (tmp_path / "index.html").is_file()
@@ -225,6 +225,28 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert timeline["source_digest"] == source_digest(team)
     assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
     assert any(edge["kind"] == "result" for edge in timeline["edges"])
+    rollup = timeline["rollups"][0]
+    assert (tmp_path / rollup["technical_path"]).is_file()
+    assert (tmp_path / rollup["plain_language_path"]).is_file()
+    assert "plain-language summary" in (tmp_path / rollup["plain_language_path"]).read_text(
+        encoding="utf-8"
+    )
+    rollup_record = json.loads(
+        next(
+            (tmp_path / "teams" / team.team_slug / "summary_data" / "rollups").rglob(
+                "*.json"
+            )
+        ).read_text(encoding="utf-8")
+    )
+    assert rollup_record["schema_version"] == 2
+    assert rollup_record["technical_summary"]["prompt_version"].endswith(
+        "technical-rollup-v2"
+    )
+    assert rollup_record["plain_language_summary"]["prompt_version"].endswith(
+        "plain-rollup-v1"
+    )
+    assert timeline["glossary_path"].endswith("codex-test-glossary.md")
+    assert all(item["url"] == "#glossary/" + item["id"] for item in timeline["glossary"])
     assert timeline["events"].count(
         {"agent_id": CHILD, "at_ms": START + 10_000, "kind": "tool_call"}
     ) == 3
@@ -251,7 +273,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     )
     rebuilt = build_archive(tmp_path, team.team_slug)
     assert second.cache_misses == 0
-    assert second.cache_hits == first.phases + first.rollups + first.agent_names
+    assert second.cache_hits == first.phases + (2 * first.rollups) + first.agent_names
     assert second.files_changed == 0
     assert second.newly_spent_usage.total_tokens == 0
     assert second.artifact_generation_usage == first.artifact_generation_usage
@@ -576,7 +598,24 @@ def _daily_hashes(archive: Path) -> list[str]:
             "*.json"
         )
     )
-    return [json.loads(path.read_text(encoding="utf-8"))["summary"]["input_hash"] for path in paths]
+    return [
+        json.loads(path.read_text(encoding="utf-8"))["technical_summary"]["input_hash"]
+        for path in paths
+    ]
+
+
+def _daily_plain_hashes(archive: Path) -> list[str]:
+    paths = sorted(
+        (archive / "teams" / "codex-test" / "summary_data" / "rollups" / "daily").glob(
+            "*.json"
+        )
+    )
+    return [
+        json.loads(path.read_text(encoding="utf-8"))["plain_language_summary"][
+            "input_hash"
+        ]
+        for path in paths
+    ]
 
 
 def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) -> None:
@@ -586,7 +625,9 @@ def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) ->
     _write_team(tmp_path, first_team)
     summarize_archive(tmp_path, first_team.team_slug, "heuristic", "test-model")
     first = _daily_hashes(tmp_path)
+    first_plain = _daily_plain_hashes(tmp_path)
     assert len(first) >= 2
+    assert len(first_plain) == len(first)
 
     changed_team = _two_day_team(
         "Implemented beta scheduler isolation; 909 focused tests passed and released the benchmark."
@@ -594,8 +635,11 @@ def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) ->
     _write_team(tmp_path, changed_team)
     summarize_archive(tmp_path, changed_team.team_slug, "heuristic", "test-model")
     second = _daily_hashes(tmp_path)
+    second_plain = _daily_plain_hashes(tmp_path)
     assert first[0] != second[0]
     assert first[1] != second[1]
+    assert first_plain[0] != second_plain[0]
+    assert first_plain[1] != second_plain[1]
 
 
 def test_only_changed_window_and_rollups_invalidate(tmp_path: Path) -> None:

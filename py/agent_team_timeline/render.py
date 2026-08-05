@@ -21,7 +21,11 @@ from agent_team_timeline.phases import (
     phase_agent_ids,
 )
 from agent_team_timeline.summarize import SummaryResult
-from agent_team_timeline.terminology import GlossaryTerm, glossary_markdown
+from agent_team_timeline.terminology import (
+    GlossaryTerm,
+    glossary_catalog_markdown,
+    glossary_markdown,
+)
 
 
 def _iso(at_ms: int) -> str:
@@ -132,9 +136,11 @@ def _rollup_markdown(
     period: Period,
     summary: SummaryResult,
     stats: PhaseStats,
+    audience: str,
 ) -> str:
     lines = [
-        f"# {period_heading(period, team.display_timezone)} {team.team_slug} {period.kind} summary",
+        f"# {period_heading(period, team.display_timezone)} {team.team_slug} "
+        f"{period.kind} {audience} summary",
         "",
         f"> **{summary.phrase}.** {summary.paragraph}",
         "",
@@ -165,6 +171,12 @@ def _rollup_markdown(
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _plain_language_path(period: Period) -> str:
+    if not period.relative_path.endswith(".md"):
+        raise ValueError(f"rollup Markdown path lacks .md suffix: {period.relative_path}")
+    return period.relative_path[:-3] + "-plain-language.md"
 
 
 def _agent_markdown(
@@ -504,6 +516,7 @@ def render_archive(
     phase_summaries: Mapping[str, SummaryResult],
     periods: Sequence[Period],
     rollup_summaries: Mapping[str, SummaryResult],
+    plain_rollup_summaries: Mapping[str, SummaryResult],
     rollup_stats: Mapping[str, PhaseStats],
     glossary_terms: Sequence[GlossaryTerm],
     agent_names: Mapping[str, AgentNameResult],
@@ -573,12 +586,22 @@ def render_archive(
         )
 
     for period in periods:
-        summary = rollup_summaries[period.key + ":" + period.kind]
-        stats = rollup_stats[period.key + ":" + period.kind]
+        period_key = period.key + ":" + period.kind
+        summary = rollup_summaries[period_key]
+        plain_summary = plain_rollup_summaries[period_key]
+        stats = rollup_stats[period_key]
         changed += int(
             write_text_if_changed(
                 archive / period.relative_path,
-                _rollup_markdown(team, period, summary, stats),
+                _rollup_markdown(team, period, summary, stats, "technical"),
+            )
+        )
+        changed += int(
+            write_text_if_changed(
+                archive / _plain_language_path(period),
+                _rollup_markdown(
+                    team, period, plain_summary, stats, "plain-language"
+                ),
             )
         )
 
@@ -591,6 +614,15 @@ def render_archive(
                 archive / path, glossary_markdown(team.team_slug, week, glossary_terms)
             )
         )
+    glossary_catalog_path = (
+        f"teams/{team.team_slug}/summaries/glossary/{team.team_slug}-glossary.md"
+    )
+    changed += int(
+        write_text_if_changed(
+            archive / glossary_catalog_path,
+            glossary_catalog_markdown(team.team_slug, glossary_terms),
+        )
+    )
 
     static_root = files("agent_team_timeline") / "static"
     for asset_name in ("index.html", "timeline-core.js", "app.js", "style.css"):
@@ -742,8 +774,22 @@ def render_archive(
             "start_ms": period.start_ms,
             "end_ms": period.end_ms,
             "path": period.relative_path,
+            "technical_path": period.relative_path,
+            "plain_language_path": _plain_language_path(period),
         }
         for period in periods
+    ]
+    glossary_objs = [
+        {
+            "id": term.term_id,
+            "term": term.term,
+            "introduced_at_ms": term.introduced_at_ms,
+            "occurrences": term.occurrences,
+            "context": term.context,
+            "week": term.week,
+            "url": f"#glossary/{term.term_id}",
+        }
+        for term in glossary_terms
     ]
     timeline: dict[str, object] = {
         "schema_version": 1,
@@ -757,6 +803,8 @@ def render_archive(
         "edges": edge_objs,
         "events": _event_objs(team, visible_agent_ids),
         "rollups": rollup_objs,
+        "glossary": glossary_objs,
+        "glossary_path": glossary_catalog_path,
         "summary_files": summary_files,
     }
     changed += int(

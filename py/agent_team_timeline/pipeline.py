@@ -61,9 +61,11 @@ from agent_team_timeline.phases import (
 )
 from agent_team_timeline.render import render_archive
 from agent_team_timeline.summarize import (
+    PLAIN_LANGUAGE_ROLLUP_STYLE,
     SummaryJob,
     SummaryResult,
     SummaryRunStats,
+    TECHNICAL_ROLLUP_STYLE,
     WorkBullet,
     summarize_jobs,
 )
@@ -218,6 +220,8 @@ class SummarizeReport:
             "reasoning_effort": self.reasoning_effort,
             "phases": self.phases,
             "rollups": self.rollups,
+            "plain_language_rollups": self.rollups,
+            "rollup_summary_artifacts": self.rollups * 2,
             "agent_names": self.agent_names,
             "glossary_terms": self.glossary_terms,
             "cache_hits": self.cache_hits,
@@ -1039,6 +1043,7 @@ def _rollup_jobs_for_level(
     lower_results: Mapping[str, SummaryResult],
     completed_same_level: Sequence[tuple[Period, SummaryResult]],
     terms: Sequence[GlossaryTerm],
+    summary_style: str = TECHNICAL_ROLLUP_STYLE,
 ) -> tuple[SummaryJob, ...]:
     jobs: list[SummaryJob] = []
     for period in periods:
@@ -1087,11 +1092,16 @@ def _rollup_jobs_for_level(
             _result_line(result, item.label, item.start_ms) for item, result in prior
         )
         stats = aggregate_stats(own_phases)
+        plain_language = summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE
+        key_prefix = "rollup-plain" if plain_language else "rollup"
+        audience = "Plain-language" if plain_language else "Technical"
         jobs.append(
             SummaryJob(
-                key=f"rollup:{period.kind}:{period.key}",
+                key=f"{key_prefix}:{period.kind}:{period.key}",
                 team_slug=team.team_slug,
-                agent_label=f"{period.kind.title()} super-summary · {period.label}",
+                agent_label=(
+                    f"{audience} {period.kind} super-summary · {period.label}"
+                ),
                 start_ms=period.start_ms,
                 end_ms=period.end_ms,
                 prior_context=prior_context,
@@ -1100,6 +1110,7 @@ def _rollup_jobs_for_level(
                     [term for term in terms if term.introduced_at_ms < period.end_ms]
                 ),
                 stats=stats.to_mapping(),
+                summary_style=summary_style,
             )
         )
     return tuple(jobs)
@@ -1204,12 +1215,15 @@ def _summarize_archive_locked(
         for kind in ("daily", "weekly", "monthly", "quarterly")
     }
     all_results: dict[str, SummaryResult] = {}
+    all_plain_results: dict[str, SummaryResult] = {}
     backend_stats: list[SummaryRunStats] = [phase_stats, name_stats]
     previous_periods: list[Period] = []
     previous_results: dict[str, SummaryResult] = {}
+    previous_plain_results: dict[str, SummaryResult] = {}
     for kind in ("daily", "weekly", "monthly", "quarterly"):
         current = by_kind[kind]
         completed: list[tuple[Period, SummaryResult]] = []
+        completed_plain: list[tuple[Period, SummaryResult]] = []
         # Same-level context is an intentional chronology dependency: day N reads up to ten
         # earlier daily summaries (and likewise for weeks/months/quarters). Generate those jobs
         # one at a time so the actual prior summaries—not empty placeholders—enter the next
@@ -1224,6 +1238,7 @@ def _summarize_archive_locked(
                 previous_results,
                 completed,
                 terms,
+                TECHNICAL_ROLLUP_STYLE,
             )
             results, stats = summarize_jobs(
                 jobs,
@@ -1239,20 +1254,52 @@ def _summarize_archive_locked(
             result = results[jobs[0].key]
             all_results[_period_key(period)] = result
             completed.append((period, result))
+            plain_jobs = _rollup_jobs_for_level(
+                team,
+                (period,),
+                phases,
+                phase_results,
+                previous_periods,
+                previous_plain_results,
+                completed_plain,
+                terms,
+                PLAIN_LANGUAGE_ROLLUP_STYLE,
+            )
+            plain_results, plain_stats = summarize_jobs(
+                plain_jobs,
+                cache,
+                backend,
+                model,
+                max_workers=max_workers,
+                batch_size=batch_size,
+                codex_command=codex_command,
+                reasoning_effort=reasoning_effort,
+            )
+            backend_stats.append(plain_stats)
+            plain_result = plain_results[plain_jobs[0].key]
+            all_plain_results[_period_key(period)] = plain_result
+            completed_plain.append((period, plain_result))
         previous_periods = current
         previous_results = {
             _period_key(period): all_results[_period_key(period)] for period in current
         }
+        previous_plain_results = {
+            _period_key(period): all_plain_results[_period_key(period)]
+            for period in current
+        }
 
     for period in periods:
         result = all_results[_period_key(period)]
+        plain_result = all_plain_results[_period_key(period)]
         obj: dict[str, JsonValue] = {
+            "schema_version": 2,
             "kind": period.kind,
             "key": period.key,
             "start_ms": period.start_ms,
             "end_ms": period.end_ms,
             "partial": period.partial,
-            "summary": _summary_json(result),
+            "technical_summary": _summary_json(result),
+            "plain_language_summary": _summary_json(plain_result),
         }
         changed += int(
             write_json_if_changed(
@@ -1401,6 +1448,7 @@ def build_archive(
     start_ms, end_ms = _period_range(team, phases)
     periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
     rollup_results: dict[str, SummaryResult] = {}
+    plain_rollup_results: dict[str, SummaryResult] = {}
     rollup_stats: dict[str, PhaseStats] = {}
     for period in periods:
         path = (
@@ -1412,8 +1460,17 @@ def build_archive(
         if not path.is_file():
             raise ValueError(f"missing {period.kind} summary {period.key}; run summarize")
         obj = as_object(read_json(path), str(path))
+        if obj.get("schema_version") != 2:
+            raise ValueError(
+                f"{path}: rollup lacks a plain-language summary; run summarize"
+            )
         key = _period_key(period)
-        rollup_results[key] = _summary_from_json(obj.get("summary"), str(path))
+        rollup_results[key] = _summary_from_json(
+            obj.get("technical_summary"), f"{path}.technical_summary"
+        )
+        plain_rollup_results[key] = _summary_from_json(
+            obj.get("plain_language_summary"), f"{path}.plain_language_summary"
+        )
         rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
     terms = _load_glossary(archive, team_slug)
     pull_cache = load_pull_request_metadata_cache(
@@ -1427,6 +1484,7 @@ def build_archive(
         phase_results,
         periods,
         rollup_results,
+        plain_rollup_results,
         rollup_stats,
         terms,
         agent_names,
