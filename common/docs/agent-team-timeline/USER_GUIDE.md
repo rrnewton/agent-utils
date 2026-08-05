@@ -4,8 +4,9 @@
 summaries and a zoomable local website. It answers both “what was happening at 02:13?” and
 “what did this team accomplish this month?” without throwing away the underlying messages.
 
-The Codex importer reads multi-agent rollouts. The archive and browser schema keep provider-specific
-input details separate from the generated timeline.
+The importers support Codex multi-agent rollouts and Claude Code coordinator lineages. The archive
+and browser schema is provider-neutral so ORC and Gas Town importers can be added without changing
+the site.
 
 ## What the site shows
 
@@ -67,6 +68,12 @@ rg -l -m1 '"cwd":"/path/to/project"' ~/.codex/sessions/2026/08/05 \
 Pass the coordinator `payload.id` to `--root-session`. Descendants are discovered by their stable
 lineage `session_id`; no list of child files is needed.
 
+Claude Code root sessions live under `~/.claude/projects/<encoded-project>/` as
+`<session-uuid>.jsonl`. Pass that file to `--session-file`; the importer discovers nested
+`<session-uuid>/subagents/agent-*.jsonl` files and their metadata sidecars recursively. It reads
+assistant text, user prompts, tool calls/results, Agent spawns, and SendMessage edges while omitting
+private thinking blocks.
+
 ## End-to-end refresh
 
 ```bash
@@ -85,6 +92,22 @@ agent-team-timeline refresh \
 
 `refresh` is exactly `ingest`, then `summarize`, then `build`. It records a new immutable JSON run
 receipt under `runs/` and updates `manifest.json` with the latest run and source digest.
+
+For Claude Code, use the provider-specific source selector; the remaining summary and build options
+are identical:
+
+```bash
+agent-team-timeline refresh-claude \
+  --session-file ~/.claude/projects/PROJECT/SESSION_UUID.jsonl \
+  --team claude-project --output ./claude-project \
+  --timezone America/New_York \
+  --start-date 2026-07-31 --end-date 2026-08-03 \
+  --backend heuristic --model deterministic-local
+```
+
+`--start-date` is inclusive and `--end-date` is exclusive in `--timezone`. Earlier transcript
+context remains available to phase summarization, but the website, statistics, naming, and calendar
+rollups are bounded to the requested dates. Reuse the same bounds when refreshing an archive.
 
 ### Start the website
 
@@ -122,6 +145,9 @@ their completions, and writes canonical UTC timestamps. Verbatim user/assistant 
 retained. Bulky tool stdout, command bodies, and patches stay in the authoritative Codex JSONL;
 the archive stores their name, interval, status, and nested tool counts, which is enough for the
 condensed transcript and statistics.
+
+Use `ingest-claude --session-file FILE` for a Claude lineage. Like Codex ingestion, it is offline and
+does not invoke a model.
 
 ### 2. Summarize — the only token-spending stage
 
@@ -283,6 +309,19 @@ interrupted run are not silently adopted. Snapshot traversal and replacement rej
 roots, directories, and targets, and durable replacements fsync both file content and its parent
 directory before the transaction proceeds.
 
+## Claude source semantics and limitations
+
+Claude root and subagent JSONL files remain on disk across context compaction. The importer copies
+their newline-complete prefixes plus immutable subagent metadata sidecars before parsing. Reruns
+accept unchanged files, monotonic JSONL appends, and newly discovered descendants; disappearance,
+truncation, prefix rewrites, or metadata changes fail without replacing the prior validated copy.
+
+Subagent metadata supplies spawn depth, parent agent ID, role, description, and the spawning Agent
+tool-use ID. That supports nested lineages and links the exact spawn prompt to its child. If metadata
+is absent, the importer falls back to the root parent and the source agent ID rather than inventing
+lineage. Turn boundaries are reconstructed heuristically from timestamped user messages because
+Claude logs do not expose the same explicit turn lifecycle records as Codex.
+
 ## Codex source semantics and limitations
 
 Codex disk logs are append-only across context compaction: old user, assistant, and tool records are
@@ -329,6 +368,10 @@ HTML. Review repository visibility before committing an archive.
 
 ## Supported inputs and deployment boundaries
 
-- Input is a Codex coordinator rollout and all descendants discovered from its lineage.
-- One refresh writes one team archive; each archive is independently portable.
-- Serving is local and loopback-only; the generated archive contains all browser assets.
+- Codex provider: implemented.
+- Claude Code provider: implemented, including nested subagents and bounded local-date archives.
+- Multiple teams: the website schema and team filter are ready; one refresh currently writes one
+  team archive. Merging team indexes is a follow-up.
+- ORC and Gas Town importers: planned; their adapters should emit the same provider-neutral
+  agents/turns/events/tools/edges model.
+- Hosted serving: deliberately deferred. The local archive is complete and portable first.

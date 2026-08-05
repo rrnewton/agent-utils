@@ -30,6 +30,12 @@ from agent_team_timeline.codex import (
     load_codex_team,
     snapshot_codex_lineage,
 )
+from agent_team_timeline.claude import (
+    ClaudeParseError,
+    ClaudeSourceCopy,
+    load_claude_team,
+    snapshot_claude_lineage,
+)
 from agent_team_timeline.model import TeamData, ToolCall, source_digest
 from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.naming import (
@@ -330,6 +336,125 @@ def _load_source_manifest(
     return tuple(result)
 
 
+def _load_claude_source_manifest(
+    archive: Path,
+    team_slug: str,
+    root_thread_id: str,
+    date_window: DateWindow | None,
+) -> tuple[ClaudeSourceCopy, ...]:
+    path = _source_manifest_path(archive, team_slug)
+    if not path.is_file():
+        return ()
+    obj = as_object(read_json(path), str(path))
+    if obj.get("schema_version") != 1 or obj.get("provider") != "claude":
+        raise ClaudeParseError(f"invalid Claude source manifest at {path}")
+    recorded_root = as_string(obj.get("root_thread_id"), f"{path}: root_thread_id")
+    if recorded_root != root_thread_id:
+        raise ClaudeParseError(
+            f"source manifest belongs to root {recorded_root!r}, not {root_thread_id!r}"
+        )
+    expected_window: object = (
+        date_window.to_json_obj() if date_window is not None else None
+    )
+    if obj.get("date_window") != expected_window:
+        raise ClaudeParseError(
+            "archive date window differs from this ingest; choose a new output directory"
+        )
+    raw_sources = as_array(obj.get("sources"), f"{path}: sources")
+    result: list[ClaudeSourceCopy] = []
+    for index, raw_source in enumerate(raw_sources):
+        source = as_object(raw_source, f"{path}: sources[{index}]")
+        result.append(
+            ClaudeSourceCopy.from_json_obj(source, f"{path}: sources[{index}]")
+        )
+    return tuple(result)
+
+
+def _write_ingested_team(
+    archive: Path,
+    team_slug: str,
+    team: TeamData,
+    date_window: DateWindow | None,
+    files_changed: int,
+) -> tuple[TeamData, IngestReport]:
+    """Write provider-neutral normalized data after a provider snapshot is durable."""
+
+    changed = files_changed
+    archived = _archive_team(team)
+    _validate_archive_id(archived.root_thread_id, "root thread id")
+    for agent in archived.agents:
+        _validate_archive_id(agent.thread_id, "thread id")
+    changed += int(
+        _write_json_durable(
+            _raw_team_path(archive, team_slug), narrow_json(archived.to_json_obj())
+        )
+    )
+    by_thread = {agent.thread_id: agent for agent in archived.agents}
+    for thread_id, agent in by_thread.items():
+        obj: dict[str, object] = {
+            "agent": agent.to_json_obj(),
+            "turns": [
+                turn.to_json_obj()
+                for turn in archived.turns
+                if turn.thread_id == thread_id
+            ],
+            "messages": [
+                event.to_json_obj()
+                for event in archived.events
+                if event.thread_id == thread_id
+            ],
+            "tools": [
+                tool.to_json_obj()
+                for tool in archived.tool_calls
+                if tool.thread_id == thread_id
+            ],
+            "edges": [
+                edge.to_json_obj()
+                for edge in archived.edges
+                if edge.from_thread_id == thread_id or edge.to_thread_id == thread_id
+            ],
+        }
+        changed += int(
+            _write_json_durable(
+                archive
+                / "teams"
+                / team_slug
+                / "raw"
+                / "messages"
+                / f"{thread_id}.json",
+                narrow_json(obj),
+            )
+        )
+    digest = source_digest(team)
+    snapshot: dict[str, object] = {
+        "provider": team.provider,
+        "root_thread_id": team.root_thread_id,
+        "team_slug": team.team_slug,
+        "display_timezone": team.display_timezone,
+        "date_window": date_window.to_json_obj() if date_window is not None else None,
+        "source_digest": digest,
+        "sources": [source.to_json_obj() for source in team.sources],
+    }
+    changed += int(
+        _write_json_durable(
+            archive / "teams" / team_slug / "raw" / "source-snapshot.json",
+            narrow_json(snapshot),
+        )
+    )
+    report = IngestReport(
+        team_slug=team_slug,
+        source_digest=digest,
+        sources=len(team.sources),
+        source_bytes=sum(source.complete_bytes for source in team.sources),
+        agents=len(team.agents),
+        events=len(team.events),
+        tool_calls=len(team.tool_calls),
+        edges=len(team.edges),
+        files_changed=changed,
+    )
+    return archived, report
+
+
 def _ingest_codex_locked(
     archive: Path,
     sessions_root: Path,
@@ -385,65 +510,7 @@ def _ingest_codex_locked(
             _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
         )
     )
-    archived = _archive_team(team)
-    _validate_archive_id(archived.root_thread_id, "root thread id")
-    for agent in archived.agents:
-        _validate_archive_id(agent.thread_id, "thread id")
-    changed += int(
-        _write_json_durable(
-            _raw_team_path(archive, team_slug), narrow_json(archived.to_json_obj())
-        )
-    )
-    by_thread = {agent.thread_id: agent for agent in archived.agents}
-    for thread_id, agent in by_thread.items():
-        obj: dict[str, object] = {
-            "agent": agent.to_json_obj(),
-            "turns": [turn.to_json_obj() for turn in archived.turns if turn.thread_id == thread_id],
-            "messages": [
-                event.to_json_obj() for event in archived.events if event.thread_id == thread_id
-            ],
-            "tools": [
-                tool.to_json_obj() for tool in archived.tool_calls if tool.thread_id == thread_id
-            ],
-            "edges": [
-                edge.to_json_obj()
-                for edge in archived.edges
-                if edge.from_thread_id == thread_id or edge.to_thread_id == thread_id
-            ],
-        }
-        changed += int(
-            _write_json_durable(
-                archive / "teams" / team_slug / "raw" / "messages" / f"{thread_id}.json",
-                narrow_json(obj),
-            )
-        )
-    snapshot: dict[str, object] = {
-        "provider": team.provider,
-        "root_thread_id": team.root_thread_id,
-        "team_slug": team.team_slug,
-        "display_timezone": team.display_timezone,
-        "date_window": date_window.to_json_obj() if date_window is not None else None,
-        "source_digest": source_digest(team),
-        "sources": [source.to_json_obj() for source in team.sources],
-    }
-    changed += int(
-        _write_json_durable(
-            archive / "teams" / team_slug / "raw" / "source-snapshot.json",
-            narrow_json(snapshot),
-        )
-    )
-    report = IngestReport(
-        team_slug=team_slug,
-        source_digest=source_digest(team),
-        sources=len(team.sources),
-        source_bytes=sum(source.complete_bytes for source in team.sources),
-        agents=len(team.agents),
-        events=len(team.events),
-        tool_calls=len(team.tool_calls),
-        edges=len(team.edges),
-        files_changed=changed,
-    )
-    return archived, report
+    return _write_ingested_team(archive, team_slug, team, date_window, changed)
 
 
 def ingest_codex(
@@ -461,6 +528,83 @@ def ingest_codex(
             archive,
             sessions_root,
             root_thread_id,
+            team_slug,
+            display_timezone,
+            date_window,
+        )
+
+
+def _ingest_claude_locked(
+    archive: Path,
+    session_file: Path,
+    team_slug: str,
+    display_timezone: str,
+    date_window: DateWindow | None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Claude coordinator lineage."""
+
+    root_thread_id = session_file.stem
+    _ensure_archive(archive, team_slug, create=True)
+    changed = int(_ensure_source_snapshots_ignored(archive))
+    previous_sources = _load_claude_source_manifest(
+        archive, team_slug, root_thread_id, date_window
+    )
+    snapshot_root = _source_snapshot_root(archive, team_slug)
+    source_copies = snapshot_claude_lineage(
+        session_file,
+        snapshot_root,
+        previous_sources,
+        utc_now(),
+    )
+    changed += source_copies.files_changed
+    allowed_sources = tuple(source.snapshot_path for source in source_copies.sources)
+    snapshot_session = snapshot_root / session_file.name
+    team = apply_date_window(
+        load_claude_team(
+            snapshot_session,
+            team_slug,
+            display_timezone,
+            source_paths=allowed_sources,
+        ),
+        date_window,
+    )
+    if tuple(sorted(source.path for source in team.sources)) != tuple(
+        sorted(allowed_sources)
+    ):
+        raise ClaudeParseError(
+            "parsed source set differs from the just-validated source snapshot manifest"
+        )
+    source_manifest: dict[str, object] = {
+        "schema_version": 1,
+        "provider": "claude",
+        "root_thread_id": root_thread_id,
+        "source_root": str(session_file.parent.resolve()),
+        "root_session_file": str(session_file.resolve()),
+        "snapshot_root": f"teams/{team_slug}/source_snapshots",
+        "date_window": date_window.to_json_obj() if date_window is not None else None,
+        "sources": [source.to_json_obj() for source in source_copies.sources],
+    }
+    changed += int(
+        _write_json_durable(
+            _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
+        )
+    )
+    return _write_ingested_team(archive, team_slug, team, date_window, changed)
+
+
+def ingest_claude(
+    archive: Path,
+    session_file: Path,
+    team_slug: str,
+    display_timezone: str,
+    date_window: DateWindow | None = None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Claude lineage as one serialized transaction."""
+
+    with _archive_writer_lock(archive):
+        return _ingest_claude_locked(
+            archive,
+            session_file,
             team_slug,
             display_timezone,
             date_window,
@@ -1231,6 +1375,7 @@ __all__ = [
     "IngestReport",
     "SummarizeReport",
     "build_archive",
+    "ingest_claude",
     "ingest_codex",
     "load_archived_team",
     "record_run",

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from agent_team_timeline import __version__
 from agent_team_timeline.archive import as_array, as_object, read_json
+from agent_team_timeline.claude import ClaudeParseError
 from agent_team_timeline.codex import CodexParseError
 from agent_team_timeline.github_enrich import PullMetadataReport, enrich_pull_request_metadata
 from agent_team_timeline.naming import AgentNameError
@@ -19,6 +20,7 @@ from agent_team_timeline.pipeline import (
     IngestReport,
     SummarizeReport,
     build_archive,
+    ingest_claude,
     ingest_codex,
     record_run,
     summarize_archive,
@@ -75,12 +77,7 @@ def _add_archive(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--team", required=True, help="stable team slug, for example example-team")
 
 
-def _add_ingest(parser: argparse.ArgumentParser) -> None:
-    _add_archive(parser)
-    parser.add_argument(
-        "--sessions-root", default="~/.codex/sessions", help="Codex rollout tree (default: %(default)s)"
-    )
-    parser.add_argument("--root-session", required=True, help="coordinator thread UUID")
+def _add_date_window(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--timezone",
         default="America/New_York",
@@ -94,6 +91,25 @@ def _add_ingest(parser: argparse.ArgumentParser) -> None:
         "--end-date",
         help="local calendar boundary to stop at (YYYY-MM-DD, exclusive)",
     )
+
+
+def _add_ingest(parser: argparse.ArgumentParser) -> None:
+    _add_archive(parser)
+    parser.add_argument(
+        "--sessions-root", default="~/.codex/sessions", help="Codex rollout tree (default: %(default)s)"
+    )
+    parser.add_argument("--root-session", required=True, help="coordinator thread UUID")
+    _add_date_window(parser)
+
+
+def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
+    _add_archive(parser)
+    parser.add_argument(
+        "--session-file",
+        required=True,
+        help="Claude coordinator JSONL; nested subagents are discovered beside it",
+    )
+    _add_date_window(parser)
 
 
 def _add_summary(parser: argparse.ArgumentParser) -> None:
@@ -158,6 +174,12 @@ def _parser() -> argparse.ArgumentParser:
     _add_ingest(ingest)
     ingest.set_defaults(handler="ingest")
 
+    ingest_claude_parser = sub.add_parser(
+        "ingest-claude", help="normalize Claude logs; do not call a model"
+    )
+    _add_claude_ingest(ingest_claude_parser)
+    ingest_claude_parser.set_defaults(handler="ingest_claude")
+
     summarize = sub.add_parser("summarize", help="fill structured summary cache misses")
     _add_archive(summarize)
     _add_summary(summarize)
@@ -187,6 +209,13 @@ def _parser() -> argparse.ArgumentParser:
     github.add_argument("--phase-minutes", type=int, default=30)
     _add_github_options(github)
     github.set_defaults(handler="github-metadata")
+
+    refresh_claude = sub.add_parser(
+        "refresh-claude", help="idempotent Claude ingest + summarize + build"
+    )
+    _add_claude_ingest(refresh_claude)
+    _add_summary(refresh_claude)
+    refresh_claude.set_defaults(handler="refresh_claude")
 
     serve_parser = sub.add_parser("serve", help="serve a built archive on localhost")
     serve_parser.add_argument("--output", required=True, help="built archive directory")
@@ -342,25 +371,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary_report: SummarizeReport | None = None
     build_report: dict[str, int] | None = None
     try:
-        if handler in ("ingest", "refresh"):
+        if handler in ("ingest", "refresh", "ingest_claude", "refresh_claude"):
             date_window = parse_date_window(
                 str(ns.start_date) if ns.start_date is not None else None,
                 str(ns.end_date) if ns.end_date is not None else None,
                 str(ns.timezone),
             )
-            _, ingest_report = ingest_codex(
-                archive,
-                _path(str(ns.sessions_root)),
-                str(ns.root_session),
-                team_slug,
-                str(ns.timezone),
-                date_window,
-            )
+            if handler in ("ingest_claude", "refresh_claude"):
+                _, ingest_report = ingest_claude(
+                    archive,
+                    _path(str(ns.session_file)),
+                    team_slug,
+                    str(ns.timezone),
+                    date_window,
+                )
+            else:
+                _, ingest_report = ingest_codex(
+                    archive,
+                    _path(str(ns.sessions_root)),
+                    str(ns.root_session),
+                    team_slug,
+                    str(ns.timezone),
+                    date_window,
+                )
             _print_ingest(ingest_report)
-        if handler in ("summarize", "refresh"):
+        if handler in ("summarize", "refresh", "refresh_claude"):
             summary_report = _summary_call(ns)
             _print_summaries(summary_report)
-        if handler in ("build", "refresh"):
+        if handler in ("build", "refresh", "refresh_claude"):
             build_report = build_archive(
                 archive, team_slug, phase_minutes=int(ns.phase_minutes)
             )
@@ -406,7 +444,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if build_report is not None:
             print(f"open: cd {archive} && make serve")
         return 0
-    except (AgentNameError, CodexParseError, SummaryError, OSError, ValueError) as error:
+    except (
+        AgentNameError,
+        ClaudeParseError,
+        CodexParseError,
+        SummaryError,
+        OSError,
+        ValueError,
+    ) as error:
         try:
             run_path = record_run(
                 archive,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 
@@ -14,6 +15,9 @@ from agent_team_timeline.claude import (
     load_claude_team,
     snapshot_claude_lineage,
 )
+from agent_team_timeline.cli import main
+from agent_team_timeline.pipeline import ingest_claude
+from agent_team_timeline.window import parse_date_window
 
 
 SESSION_ID = "11111111-1111-4111-8111-111111111111"
@@ -193,3 +197,87 @@ def test_source_copy_json_validation_rejects_identity_change(tmp_path: Path) -> 
     value["thread_id"] = "../different"
     with pytest.raises(ClaudeParseError, match="unsafe thread id"):
         ClaudeSourceCopy.from_json_obj(value, "source")
+
+
+def test_pipeline_snapshots_claude_and_reuses_unchanged_archive(tmp_path: Path) -> None:
+    live = tmp_path / "live"
+    shutil.copytree(FIXTURE_ROOT, live)
+    archive = tmp_path / "archive"
+    window = parse_date_window("2026-01-02", "2026-01-03", "UTC")
+
+    team, first = ingest_claude(
+        archive,
+        _session(live),
+        "claude-fixture",
+        "UTC",
+        window,
+    )
+    _, second = ingest_claude(
+        archive,
+        _session(live),
+        "claude-fixture",
+        "UTC",
+        window,
+    )
+
+    assert team.provider == "claude"
+    assert team.window_start_ms == DAY_TWO_MS
+    assert team.window_end_ms == DAY_THREE_MS
+    assert any(event.timestamp_ms < DAY_TWO_MS for event in team.events)
+    assert first.sources == 5
+    assert second.files_changed == 0
+    assert (archive / ".gitignore").read_text(encoding="utf-8").splitlines() == [
+        "/.agent-team-timeline.lock",
+        "/teams/*/source_snapshots/",
+    ]
+    manifest = json.loads(
+        (
+            archive
+            / "teams"
+            / "claude-fixture"
+            / "raw"
+            / "source-manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["provider"] == "claude"
+    assert manifest["root_thread_id"] == SESSION_ID
+    assert manifest["date_window"]["start_date"] == "2026-01-02"
+    assert (
+        archive
+        / "teams"
+        / "claude-fixture"
+        / "source_snapshots"
+        / f"{SESSION_ID}.jsonl"
+    ).is_file()
+
+
+def test_cli_exposes_bounded_claude_ingest(tmp_path: Path) -> None:
+    archive = tmp_path / "archive"
+
+    status = main(
+        (
+            "ingest-claude",
+            "--session-file",
+            str(_session()),
+            "--team",
+            "claude-fixture",
+            "--output",
+            str(archive),
+            "--timezone",
+            "UTC",
+            "--start-date",
+            "2026-01-02",
+            "--end-date",
+            "2026-01-03",
+        )
+    )
+
+    assert status == 0
+    raw = json.loads(
+        (
+            archive / "teams" / "claude-fixture" / "raw" / "team.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert raw["provider"] == "claude"
+    assert raw["window_start_ms"] == DAY_TWO_MS
+    assert raw["window_end_ms"] == DAY_THREE_MS
