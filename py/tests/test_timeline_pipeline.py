@@ -23,6 +23,7 @@ from agent_team_timeline.periods import Period, periods_for_range
 from agent_team_timeline.phases import PhaseStats, PhaseWindow, build_phases
 from agent_team_timeline.pipeline import (
     IngestReport,
+    _agent_name_jobs,
     _rollup_jobs_for_level,
     build_archive,
     load_archived_team,
@@ -176,12 +177,18 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     first = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
     built = build_archive(tmp_path, team.team_slug)
 
-    assert first.cache_misses >= 5  # phases plus day/week/month/quarter super-summaries
+    assert first.agent_names == 2
+    assert first.cache_misses == first.phases + first.rollups + first.agent_names
     assert built["agents"] == 2
     assert (tmp_path / "index.html").is_file()
     assert (tmp_path / "Makefile").read_text(encoding="utf-8").startswith(".PHONY: serve")
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
     assert len(timeline["agents"]) == 2
+    child_track = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
+    assert child_track["short_name"] == "Release receipt audit"
+    assert child_track["official_name"] == "/root/release_receipt_audit"
+    assert child_track["official_leaf"] == "release_receipt_audit"
+    assert child_track["nickname"] == "Ada"
     assert timeline["source_digest"] == source_digest(team)
     assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
     assert any(edge["kind"] == "result" for edge in timeline["edges"])
@@ -190,11 +197,22 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     ) == 3
     detail_path = tmp_path / timeline["phases"][0]["detail_path"]
     assert detail_path.is_file()
+    name_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "agents"
+        / f"{CHILD}.json"
+    )
+    name_record = json.loads(name_path.read_text(encoding="utf-8"))
+    assert name_record["agent"]["official_path"] == "/root/release_receipt_audit"
+    assert name_record["name"]["short_name"] == "Release receipt audit"
 
     second = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
     rebuilt = build_archive(tmp_path, team.team_slug)
     assert second.cache_misses == 0
-    assert second.cache_hits == first.phases + first.rollups
+    assert second.cache_hits == first.phases + first.rollups + first.agent_names
     assert second.files_changed == 0
     assert rebuilt["files_changed"] == 0
 
@@ -354,6 +372,33 @@ def test_cross_spawn_context_reaches_child_phase() -> None:
     child_phase = next(phase for phase in build_phases(team) if phase.agent_id == CHILD)
     assert "safe-landing protocol" in child_phase.prior_context
     assert "exact-head validation" in child_phase.prior_context
+
+
+def test_hindsight_name_job_combines_phase_summary_with_parent_context() -> None:
+    team = _team()
+    phases = build_phases(team)
+    results = {
+        phase.summary_key: SummaryResult(
+            key=phase.summary_key,
+            phrase="Receipt binding audit",
+            paragraph="Verified exact-head release receipt binding with eight focused cases.",
+            work_summary=(),
+            model="test-model",
+            prompt_version="test-prompt",
+            input_hash="a" * 64,
+            generated_at="2026-08-05T00:00:00Z",
+        )
+        for phase in phases
+    }
+
+    jobs = _agent_name_jobs(team, phases, results)
+    child = next(job for job in jobs if job.thread_id == CHILD)
+
+    assert child.official_path == "/root/release_receipt_audit"
+    assert child.parent_official_path == "/root"
+    assert child.depth == 1
+    assert "safe-landing protocol" in child.prior_context
+    assert "exact-head release receipt binding" in child.work_summary
 
 
 def test_spanning_tool_is_not_repeated_before_later_phase_boundary() -> None:

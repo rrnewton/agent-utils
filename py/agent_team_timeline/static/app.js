@@ -387,11 +387,114 @@
       .toLocaleLowerCase();
   }
 
+  function agentOfficialLeaf(agent) {
+    var explicit = text(agent.official_leaf);
+    if (explicit) {
+      return explicit;
+    }
+    var official = text(agent.official_name, text(agent.path));
+    var parts = official.split("/").filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : official;
+  }
+
+  function agentShortName(agent) {
+    return text(
+      agent.short_name,
+      text(
+        agent.nickname,
+        text(agent.label, text(agentOfficialLeaf(agent), text(agent.id, "Unknown agent")))
+      )
+    );
+  }
+
+  function agentOfficialName(agent) {
+    return text(
+      agent.official_name,
+      text(agent.path, text(agent.official_leaf, text(agent.nickname, text(agent.id))))
+    );
+  }
+
+  function namesEqual(left, right) {
+    return Boolean(left) && Boolean(right) &&
+      left.toLocaleLowerCase() === right.toLocaleLowerCase();
+  }
+
+  function agentSecondaryName(agent) {
+    var shortName = agentShortName(agent);
+    var officialName = agentOfficialName(agent);
+    var nickname = text(agent.nickname);
+    var parts = [];
+    if (officialName && !namesEqual(officialName, shortName)) {
+      parts.push(officialName);
+    }
+    if (nickname && !namesEqual(nickname, officialName)) {
+      parts.push("coordinator: " + nickname);
+    }
+    return parts.join(" · ");
+  }
+
+  function agentAccessibleName(agent) {
+    var parts = ["Short name: " + agentShortName(agent)];
+    var officialName = agentOfficialName(agent);
+    var nickname = text(agent.nickname);
+    if (officialName) {
+      parts.push("Official name: " + officialName);
+    }
+    if (nickname) {
+      parts.push("Coordinator nickname: " + nickname);
+    }
+    return parts.join(". ");
+  }
+
+  function truncateLabel(value, width, preserveTail) {
+    var content = text(value);
+    var characterWidth = preserveTail ? 5.25 : 6.1;
+    var maximum = Math.max(0, Math.floor(width / characterWidth));
+    if (content.length <= maximum) {
+      return content;
+    }
+    if (maximum < 5) {
+      return "";
+    }
+    if (preserveTail) {
+      return "…" + content.slice(-(maximum - 1));
+    }
+    return content.slice(0, maximum - 1).trimEnd() + "…";
+  }
+
+  function fitAgentSecondaryName(agent, width) {
+    var full = agentSecondaryName(agent);
+    if (!full || full.length * 5.25 <= width) {
+      return full;
+    }
+    var officialName = agentOfficialName(agent);
+    if (officialName && !namesEqual(officialName, agentShortName(agent))) {
+      return truncateLabel(officialName, width, true);
+    }
+    return truncateLabel(full, width, true);
+  }
+
+  function agentTooltipIdentity(agent) {
+    var lines = ["Short name: " + agentShortName(agent)];
+    var officialName = agentOfficialName(agent);
+    var nickname = text(agent.nickname);
+    if (officialName) {
+      lines.push("Official: " + officialName);
+    }
+    if (nickname && !namesEqual(nickname, officialName)) {
+      lines.push("Coordinator nickname: " + nickname);
+    }
+    return lines.join("\n");
+  }
+
   function agentSearchText(agent) {
     return lowerSearchText([
       agent.id,
       agent.team,
       agent.path,
+      agent.short_name,
+      agent.official_name,
+      agent.official_leaf,
       agent.label,
       agent.nickname,
       agent.status
@@ -403,12 +506,22 @@
   }
 
   function edgeSearchText(edge) {
-    return lowerSearchText([edge.id, edge.kind, edge.phrase, edge.paragraph, edge.full_text]);
+    var source = app.agentsById.get(text(edge.source_id));
+    var target = app.agentsById.get(text(edge.target_id));
+    return lowerSearchText([
+      edge.id,
+      edge.kind,
+      edge.phrase,
+      edge.paragraph,
+      edge.full_text,
+      source ? agentSearchText(source) : "",
+      target ? agentSearchText(target) : ""
+    ]);
   }
 
   function compareAgents(left, right) {
-    var leftPath = text(left.path);
-    var rightPath = text(right.path);
+    var leftPath = agentOfficialName(left);
+    var rightPath = agentOfficialName(right);
     if (leftPath && rightPath && leftPath !== rightPath) {
       return leftPath.localeCompare(rightPath, undefined, { numeric: true });
     }
@@ -416,7 +529,7 @@
     if (startDifference) {
       return startDifference;
     }
-    return text(left.label, text(left.id)).localeCompare(text(right.label, text(right.id)));
+    return agentShortName(left).localeCompare(agentShortName(right));
   }
 
   function buildRows() {
@@ -700,6 +813,31 @@
       ", " + x2.toFixed(2) + " " + y2.toFixed(2);
   }
 
+  function edgeAgent(edge, side) {
+    return app.agentsById.get(text(edge[side + "_id"]));
+  }
+
+  function edgeRouteShort(edge) {
+    var source = edgeAgent(edge, "source");
+    var target = edgeAgent(edge, "target");
+    var sourceName = source ? agentShortName(source) : text(edge.source_id, "Unknown source");
+    var targetName = target ? agentShortName(target) : text(edge.target_id, "Unknown target");
+    return sourceName + " → " + targetName;
+  }
+
+  function edgeRouteDetail(edge) {
+    var source = edgeAgent(edge, "source");
+    var target = edgeAgent(edge, "target");
+    var lines = ["Route: " + edgeRouteShort(edge)];
+    if (source) {
+      lines.push("From — " + agentAccessibleName(source));
+    }
+    if (target) {
+      lines.push("To — " + agentAccessibleName(target));
+    }
+    return lines.join("\n");
+  }
+
   function renderEdge(edge, layer, bounds, bufferStart, bufferEnd) {
     var sourceRow = app.rowByAgent.get(text(edge.source_id));
     var targetRow = app.rowByAgent.get(text(edge.target_id));
@@ -733,7 +871,7 @@
       tabindex: "0",
       role: "button",
       "data-edge-id": text(edge.id),
-      "aria-label": text(edge.phrase, kind + " interaction")
+      "aria-label": text(edge.phrase, kind + " interaction") + ". " + edgeRouteDetail(edge)
     });
     var visible = svgElement("path", {
       d: pathData,
@@ -745,9 +883,10 @@
     group.addEventListener("pointerenter", function (event) {
       showTooltip(
         event,
-        text(edge.phrase, kind + " interaction"),
-        text(edge.paragraph, text(edge.content_status, "No paragraph summary available.")),
-        ""
+        text(edge.phrase, kind + " interaction") + " · " + edgeRouteShort(edge),
+        text(edge.paragraph, text(edge.content_status, "No paragraph summary available.")) +
+          "\n\n" + edgeRouteDetail(edge),
+        text(edge.kind, kind) + " interaction"
       );
     });
     group.addEventListener("pointermove", positionTooltip);
@@ -803,13 +942,14 @@
     var width = Math.max(2, timeToX(clippedEnd) - x);
     var y = row.index * ROW_HEIGHT + PHASE_TOP;
     var agentId = text(phase.agent_id);
+    var agent = row.agent;
     var group = svgElement("g", {
       class: "phase-group",
       tabindex: "0",
       role: "button",
       "data-phase-id": text(phase.id),
       "data-agent-id": agentId,
-      "aria-label": text(phase.phrase, "Agent phase")
+      "aria-label": text(phase.phrase, "Agent phase") + ". " + agentAccessibleName(agent)
     });
     group.appendChild(svgElement("rect", {
       x: x,
@@ -853,8 +993,9 @@
     group.addEventListener("pointerenter", function (event) {
       showTooltip(
         event,
-        text(phase.phrase, "Agent phase"),
-        text(phase.paragraph, "No paragraph summary available."),
+        text(phase.phrase, "Agent phase") + " · " + agentShortName(agent),
+        text(phase.paragraph, "No paragraph summary available.") +
+          "\n\n" + agentTooltipIdentity(agent),
         formatStatsInline(phase.stats)
       );
     });
@@ -879,51 +1020,83 @@
     var agent = row.agent;
     var y = row.index * ROW_HEIGHT;
     var depth = Math.max(0, row.treeDepth);
-    var indent = 15 + Math.min(depth, 8) * 17;
+    var maximumIndent = Math.max(15, app.labelWidth - 72);
+    var indent = Math.min(15 + depth * 17, maximumIndent);
     var color = phaseColor(text(agent.id));
+    var shortName = agentShortName(agent);
+    var textX = indent + 13;
+    var textWidth = Math.max(0, app.labelWidth - textX - 8);
+    var secondaryName = fitAgentSecondaryName(agent, textWidth);
+    var labelGroup = svgElement("g", {
+      class: "agent-label-group",
+      role: "img",
+      "aria-label": agentAccessibleName(agent) +
+        ". Hierarchy depth: " + depth + ". Status: " + text(agent.status, "unknown")
+    });
+    labelGroup.appendChild(svgElement("title", null, agentAccessibleName(agent)));
+    labelGroup.appendChild(svgElement("rect", {
+      x: 0,
+      y: y,
+      width: app.labelWidth,
+      height: ROW_HEIGHT,
+      class: "agent-label-hit"
+    }));
 
     if (depth > 0) {
       var branchX = indent - 10;
-      layer.appendChild(svgElement("path", {
+      labelGroup.appendChild(svgElement("path", {
         d: "M " + branchX + " " + y +
           " L " + branchX + " " + (y + ROW_HEIGHT / 2) +
           " L " + (indent - 2) + " " + (y + ROW_HEIGHT / 2),
         class: "hierarchy-line"
       }));
     }
-    layer.appendChild(svgElement("circle", {
+    labelGroup.appendChild(svgElement("circle", {
       cx: indent + 2,
-      cy: y + 22,
+      cy: y + 20,
       r: depth === 0 ? 5 : 4,
       class: "agent-dot",
       fill: color
     }));
-    var label = text(agent.nickname, text(agent.label, text(agent.id, "Unknown agent")));
-    layer.appendChild(svgElement("text", {
-      x: indent + 13,
-      y: y + 21,
+    labelGroup.appendChild(svgElement("text", {
+      x: textX,
+      y: y + 17,
       class: "track-label" + (depth === 0 ? " track-label-coordinator" : "")
-    }, label));
+    }, truncateLabel(shortName, textWidth, false)));
+
+    if (secondaryName) {
+      labelGroup.appendChild(svgElement("text", {
+        x: textX,
+        y: y + 31,
+        class: "track-official"
+      }, secondaryName));
+    }
 
     var status = text(agent.status, "unknown");
     var team = text(agent.team);
-    var meta = (depth === 0 ? "COORDINATOR" : "SUBAGENT") + " · " + status;
-    layer.appendChild(svgElement("text", {
-      x: indent + 13,
-      y: y + 36,
-      class: "track-meta"
-    }, meta));
+    var meta = (depth === 0 ? "COORDINATOR" : "L" + depth + " SUBAGENT") + " · " + status;
     if (team) {
       var teamLabel = app.teamBySlug.has(team)
         ? text(app.teamBySlug.get(team).label, team)
         : team;
-      layer.appendChild(svgElement("text", {
-        x: app.labelWidth - 8,
-        y: y + 16,
-        class: "team-label",
-        "text-anchor": "end"
-      }, teamLabel));
+      meta += " · " + teamLabel;
     }
+    labelGroup.appendChild(svgElement("text", {
+      x: textX,
+      y: y + 45,
+      class: "track-meta"
+    }, truncateLabel(meta, textWidth, false)));
+    labelGroup.addEventListener("pointerenter", function (event) {
+      showTooltip(
+        event,
+        shortName,
+        agentTooltipIdentity(agent),
+        (depth === 0 ? "Coordinator" : "Hierarchy depth " + depth) + " · " + status
+      );
+    });
+    labelGroup.addEventListener("pointermove", positionTooltip);
+    labelGroup.addEventListener("pointerleave", hideTooltip);
+    layer.appendChild(labelGroup);
   }
 
   function renderTracks() {
@@ -1402,12 +1575,62 @@
     dom.modalSummary.hidden = children.length === 0;
   }
 
+  function agentIdentityNode(agent, prefix) {
+    var container = htmlElement("div", "modal-agent-identity");
+    var heading = htmlElement("div", "modal-agent-heading");
+    if (prefix) {
+      heading.appendChild(htmlElement("span", "modal-agent-prefix", prefix));
+    }
+    heading.appendChild(htmlElement("strong", "modal-agent-short", agentShortName(agent)));
+    container.appendChild(heading);
+
+    var officialName = agentOfficialName(agent);
+    if (officialName) {
+      container.appendChild(
+        htmlElement("div", "modal-agent-official", "Official: " + officialName)
+      );
+    }
+    var nickname = text(agent.nickname);
+    if (nickname && !namesEqual(nickname, officialName)) {
+      container.appendChild(
+        htmlElement("div", "modal-agent-nickname", "Coordinator nickname: " + nickname)
+      );
+    }
+    container.setAttribute("aria-label", agentAccessibleName(agent));
+    return container;
+  }
+
+  function showModalAgentIdentity(agent) {
+    dom.modalSummary.prepend(agentIdentityNode(agent, "AGENT"));
+    dom.modalSummary.hidden = false;
+  }
+
+  function showModalEdgeRoute(edge) {
+    var route = htmlElement("div", "modal-edge-route");
+    var source = edgeAgent(edge, "source");
+    var target = edgeAgent(edge, "target");
+    if (source) {
+      route.appendChild(agentIdentityNode(source, "FROM"));
+    }
+    route.appendChild(htmlElement("span", "modal-route-arrow", "→"));
+    if (target) {
+      route.appendChild(agentIdentityNode(target, "TO"));
+    }
+    if (!source && !target) {
+      route.replaceChildren(htmlElement("div", "modal-agent-official", edgeRouteShort(edge)));
+    }
+    route.setAttribute("aria-label", edgeRouteDetail(edge));
+    dom.modalSummary.prepend(route);
+    dom.modalSummary.hidden = false;
+  }
+
   function openModalBase(eyebrow, title, paragraph, stats) {
     hideTooltip();
     var activeElement = document.activeElement;
     app.modalRestoreFocus =
       activeElement && typeof activeElement.focus === "function" ? activeElement : null;
     dom.modalEyebrow.textContent = eyebrow;
+    dom.modalEyebrow.removeAttribute("title");
     dom.modalTitle.textContent = title;
     setModalSummary(paragraph, stats);
     dom.modalTabs.replaceChildren();
@@ -1672,9 +1895,11 @@
       : (phase.stats || {});
     dom.modalTitle.textContent = phrase;
     dom.modalEyebrow.textContent =
-      text(agent.nickname, text(agent.label, text(agent.id, "Agent"))) +
+      agentShortName(agent) +
       " · " + formatRange(number(phase.start_ms, 0), number(phase.end_ms, 0));
+    dom.modalEyebrow.title = agentAccessibleName(agent);
     setModalSummary(paragraph, stats);
+    showModalAgentIdentity(agent);
     activateTabs([
       {
         label: "Agent Work Summary",
@@ -1707,11 +1932,13 @@
   async function openPhaseModal(phase, agent) {
     var request = ++app.detailRequest;
     openModalBase(
-      text(agent.nickname, text(agent.label, "Agent")) + " · phase",
+      agentShortName(agent) + " · phase",
       text(phase.phrase, "Agent phase"),
       text(phase.paragraph),
       phase.stats || {}
     );
+    dom.modalEyebrow.title = agentAccessibleName(agent);
+    showModalAgentIdentity(agent);
     showLoading(dom.modalContent, "Loading phase transcript and summaries…");
     var path = text(phase.detail_path);
     if (!path) {
@@ -1747,6 +1974,8 @@
       text(edge.paragraph),
       null
     );
+    dom.modalEyebrow.title = edgeRouteDetail(edge);
+    showModalEdgeRoute(edge);
     dom.modalTabs.hidden = true;
     var content = htmlElement("div", "edge-detail");
     var fullText = text(edge.full_text);

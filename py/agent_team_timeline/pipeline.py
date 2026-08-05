@@ -32,6 +32,11 @@ from agent_team_timeline.codex import (
 )
 from agent_team_timeline.model import TeamData, ToolCall, source_digest
 from agent_team_timeline.model_io import team_from_json_obj
+from agent_team_timeline.naming import (
+    AgentNameJob,
+    AgentNameResult,
+    name_agents,
+)
 from agent_team_timeline.periods import Period, periods_for_range
 from agent_team_timeline.phases import (
     PhaseStats,
@@ -164,6 +169,7 @@ class IngestReport:
 class SummarizeReport:
     phases: int
     rollups: int
+    agent_names: int
     glossary_terms: int
     cache_hits: int
     cache_misses: int
@@ -174,6 +180,7 @@ class SummarizeReport:
         return {
             "phases": self.phases,
             "rollups": self.rollups,
+            "agent_names": self.agent_names,
             "glossary_terms": self.glossary_terms,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
@@ -530,6 +537,167 @@ def _result_line(result: SummaryResult, label: str, at_ms: int) -> str:
     return f"[{at_ms}] {label}: {result.phrase}. {result.paragraph} {bullets}".strip()
 
 
+def _agent_name_jobs(
+    team: TeamData,
+    phases: Sequence[PhaseWindow],
+    phase_results: Mapping[str, SummaryResult],
+) -> tuple[AgentNameJob, ...]:
+    """Build hindsight naming inputs after all phase-level work has been summarized."""
+
+    agents_by_id = {agent.thread_id: agent for agent in team.agents}
+    phases_by_agent: dict[str, list[PhaseWindow]] = {}
+    for phase in phases:
+        phases_by_agent.setdefault(phase.agent_id, []).append(phase)
+    jobs: list[AgentNameJob] = []
+    for agent in team.agents:
+        own_phases = sorted(
+            phases_by_agent.get(agent.thread_id, []),
+            key=lambda phase: (phase.start_ms, phase.phase_id),
+        )
+        work_lines: list[str] = []
+        for phase in own_phases:
+            result = phase_results[phase.summary_key]
+            work_lines.append(
+                _result_line(result, phase.agent_label, phase.start_ms)
+            )
+        parent = (
+            agents_by_id.get(agent.parent_thread_id)
+            if agent.parent_thread_id is not None
+            else None
+        )
+        jobs.append(
+            AgentNameJob(
+                key=f"agent-name:{agent.thread_id}",
+                thread_id=agent.thread_id,
+                official_path=agent.agent_path,
+                coordinator_nickname=agent.nickname,
+                role=agent.role,
+                depth=agent.depth,
+                parent_official_path=parent.agent_path if parent is not None else None,
+                prior_context=own_phases[0].prior_context if own_phases else "",
+                work_summary=(
+                    "\n\n".join(work_lines)
+                    if work_lines
+                    else "No substantive phase summary was available for this thread."
+                ),
+            )
+        )
+    return tuple(jobs)
+
+
+def _agent_name_json(
+    job: AgentNameJob, result: AgentNameResult
+) -> dict[str, JsonValue]:
+    return {
+        "schema_version": 1,
+        "agent": {
+            "thread_id": job.thread_id,
+            "official_path": job.official_path,
+            "coordinator_nickname": job.coordinator_nickname,
+            "role": job.role,
+            "depth": job.depth,
+            "parent_official_path": job.parent_official_path,
+        },
+        "name": {
+            "thread_id": result.thread_id,
+            "short_name": result.short_name,
+            "rationale": result.rationale,
+            "model": result.model,
+            "prompt_version": result.prompt_version,
+            "input_hash": result.input_hash,
+            "generated_at": result.generated_at,
+        },
+    }
+
+
+def _write_agent_name_data(
+    archive: Path,
+    team_slug: str,
+    jobs: Sequence[AgentNameJob],
+    results: Mapping[str, AgentNameResult],
+) -> int:
+    changed = 0
+    for job in jobs:
+        result = results[job.thread_id]
+        changed += int(
+            write_json_if_changed(
+                _summary_root(archive, team_slug)
+                / "agents"
+                / f"{job.thread_id}.json",
+                _agent_name_json(job, result),
+            )
+        )
+    return changed
+
+
+def _nonempty_string(value: JsonValue, where: str) -> str:
+    result = as_string(value, where).strip()
+    if not result:
+        raise ValueError(f"{where}: must not be empty")
+    return result
+
+
+def _load_agent_names(
+    archive: Path, team: TeamData
+) -> dict[str, AgentNameResult]:
+    results: dict[str, AgentNameResult] = {}
+    for agent in team.agents:
+        path = (
+            _summary_root(archive, team.team_slug)
+            / "agents"
+            / f"{agent.thread_id}.json"
+        )
+        if not path.is_file():
+            raise ValueError(
+                f"missing hindsight name for {agent.agent_path}; run `agent-team-timeline summarize`"
+            )
+        root = as_object(read_json(path), str(path))
+        if root.get("schema_version") != 1:
+            raise ValueError(f"unsupported agent-name schema at {path}")
+        identity = as_object(root.get("agent"), f"{path}.agent")
+        recorded_thread = _nonempty_string(
+            identity.get("thread_id"), f"{path}.agent.thread_id"
+        )
+        recorded_path = _nonempty_string(
+            identity.get("official_path"), f"{path}.agent.official_path"
+        )
+        recorded_depth = as_int(identity.get("depth"), f"{path}.agent.depth")
+        if (
+            recorded_thread != agent.thread_id
+            or recorded_path != agent.agent_path
+            or recorded_depth != agent.depth
+        ):
+            raise ValueError(
+                f"stale hindsight name metadata for {agent.agent_path}; run summarize"
+            )
+        raw_name = as_object(root.get("name"), f"{path}.name")
+        result = AgentNameResult(
+            thread_id=_nonempty_string(
+                raw_name.get("thread_id"), f"{path}.name.thread_id"
+            ),
+            short_name=_nonempty_string(
+                raw_name.get("short_name"), f"{path}.name.short_name"
+            ),
+            rationale=_nonempty_string(
+                raw_name.get("rationale"), f"{path}.name.rationale"
+            ),
+            model=_nonempty_string(raw_name.get("model"), f"{path}.name.model"),
+            prompt_version=_nonempty_string(
+                raw_name.get("prompt_version"), f"{path}.name.prompt_version"
+            ),
+            input_hash=_nonempty_string(
+                raw_name.get("input_hash"), f"{path}.name.input_hash"
+            ),
+            generated_at=_nonempty_string(
+                raw_name.get("generated_at"), f"{path}.name.generated_at"
+            ),
+        )
+        if result.thread_id != agent.thread_id:
+            raise ValueError(f"agent-name result thread mismatch at {path}")
+        results[agent.thread_id] = result
+    return results
+
+
 def _rollup_jobs_for_level(
     team: TeamData,
     periods: Sequence[Period],
@@ -613,7 +781,7 @@ def _accumulate_stats(stats: Sequence[SummaryRunStats]) -> SummaryRunStats:
     )
 
 
-def summarize_archive(
+def _summarize_archive_locked(
     archive: Path,
     team_slug: str,
     backend: str,
@@ -621,6 +789,7 @@ def summarize_archive(
     *,
     max_workers: int = 3,
     batch_size: int = 6,
+    name_batch_size: int = 12,
     phase_minutes: int = 30,
     context_chars: int = 16_000,
     transcript_chars: int = 30_000,
@@ -647,6 +816,19 @@ def summarize_archive(
         codex_command=codex_command,
     )
     changed = _write_phase_data(archive, team_slug, phases, phase_results)
+    name_jobs = _agent_name_jobs(team, phases, phase_results)
+    agent_names, name_stats = name_agents(
+        name_jobs,
+        _summary_root(archive, team_slug) / "name_cache",
+        backend,
+        model,
+        max_workers=max_workers,
+        batch_size=name_batch_size,
+        codex_command=codex_command,
+    )
+    changed += _write_agent_name_data(
+        archive, team_slug, name_jobs, agent_names
+    )
 
     start_ms = min((phase.start_ms for phase in phases), default=0)
     end_ms = max((phase.end_ms for phase in phases), default=start_ms)
@@ -656,7 +838,7 @@ def summarize_archive(
         for kind in ("daily", "weekly", "monthly", "quarterly")
     }
     all_results: dict[str, SummaryResult] = {}
-    backend_stats: list[SummaryRunStats] = [phase_stats]
+    backend_stats: list[SummaryRunStats] = [phase_stats, name_stats]
     previous_periods: list[Period] = []
     previous_results: dict[str, SummaryResult] = {}
     for kind in ("daily", "weekly", "monthly", "quarterly"):
@@ -735,12 +917,45 @@ def summarize_archive(
     return SummarizeReport(
         phases=len(phases),
         rollups=len(periods),
+        agent_names=len(agent_names),
         glossary_terms=len(terms),
         cache_hits=combined.hits,
         cache_misses=combined.misses,
         backend_batches=combined.batches,
         files_changed=changed,
     )
+
+
+def summarize_archive(
+    archive: Path,
+    team_slug: str,
+    backend: str,
+    model: str,
+    *,
+    max_workers: int = 3,
+    batch_size: int = 6,
+    name_batch_size: int = 12,
+    phase_minutes: int = 30,
+    context_chars: int = 16_000,
+    transcript_chars: int = 30_000,
+    codex_command: Sequence[str] = ("codex",),
+) -> SummarizeReport:
+    """Fill structured summaries/names while serializing token-spending cache misses."""
+
+    with _archive_writer_lock(archive):
+        return _summarize_archive_locked(
+            archive,
+            team_slug,
+            backend,
+            model,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            name_batch_size=name_batch_size,
+            phase_minutes=phase_minutes,
+            context_chars=context_chars,
+            transcript_chars=transcript_chars,
+            codex_command=codex_command,
+        )
 
 
 def _load_phase_summaries(
@@ -784,6 +999,7 @@ def build_archive(
     team = load_archived_team(archive, team_slug)
     phases = build_phases(team, phase_minutes=phase_minutes)
     phase_results = _load_phase_summaries(archive, team_slug, phases)
+    agent_names = _load_agent_names(archive, team)
     start_ms = min((phase.start_ms for phase in phases), default=0)
     end_ms = max((phase.end_ms for phase in phases), default=start_ms)
     periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
@@ -812,6 +1028,7 @@ def build_archive(
         rollup_results,
         rollup_stats,
         terms,
+        agent_names,
     )
 
 

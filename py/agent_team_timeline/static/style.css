@@ -456,6 +456,7 @@ h1 {
 
 .axis-label,
 .track-label,
+.track-official,
 .track-meta,
 .phase-label,
 .team-label {
@@ -508,6 +509,15 @@ h1 {
   shape-rendering: crispEdges;
 }
 
+.agent-label-group {
+  cursor: help;
+}
+
+.agent-label-hit {
+  fill: transparent;
+  pointer-events: all;
+}
+
 .agent-dot {
   stroke: #0d121b;
   stroke-width: 2;
@@ -523,9 +533,14 @@ h1 {
   font-weight: 720;
 }
 
+.track-official {
+  fill: #8998ae;
+  font: 8px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .track-meta {
-  fill: #68778e;
-  font: 9px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  fill: #5f6e84;
+  font: 8px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 .team-label {
@@ -781,6 +796,64 @@ h1 {
   font-size: 12px;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.modal-agent-identity {
+  min-width: 0;
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  padding: 7px 9px;
+  border: 1px solid #303c50;
+  border-radius: 5px;
+  background: #171f2d;
+}
+
+.modal-agent-heading {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.modal-agent-prefix {
+  flex: 0 0 auto;
+  color: #718097;
+  font: 8px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.1em;
+}
+
+.modal-agent-short {
+  min-width: 0;
+  overflow: hidden;
+  color: #e7f4ff;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-agent-official,
+.modal-agent-nickname {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #8e9db3;
+  font: 9px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.modal-agent-nickname {
+  color: #75869e;
+}
+
+.modal-edge-route {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+}
+
+.modal-route-arrow {
+  color: var(--cyan);
+  font-size: 18px;
 }
 
 .modal-stats {
@@ -1092,6 +1165,15 @@ h1 {
   .modal {
     width: 98vw;
     height: 94vh;
+  }
+
+  .modal-edge-route {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .modal-route-arrow {
+    justify-self: center;
+    transform: rotate(90deg);
   }
 }
 

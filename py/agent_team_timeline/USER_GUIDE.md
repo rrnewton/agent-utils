@@ -10,6 +10,9 @@ provider-neutral so Claude, ORC, and Gas Town importers can be added without cha
 ## What the site shows
 
 - The coordinator is the first track; descendants follow in fork-tree order.
+- Every track has a hindsight short name based on its completed work, ancestor context, official
+  coordinator path, role, and nickname. The short name is primary; hover, search, and detail views
+  retain the full official path and coordinator nickname. Nested descendants are not depth-limited.
 - Phase boxes carry a short phrase at useful zoom levels. Their bottom strip distinguishes active,
   tool-running, waiting, idle, and explicitly blocked time.
 - Thick curved edges are spawns; smaller edges are later messages and returned results.
@@ -62,7 +65,8 @@ agent-team-timeline refresh \
   --timezone America/New_York \
   --backend codex \
   --model gpt-5.6-sol \
-  --summary-workers 3
+  --summary-workers 3 \
+  --name-batch-size 12
 ```
 
 `refresh` is exactly `ingest`, then `summarize`, then `build`. It records a new immutable JSON run
@@ -125,6 +129,14 @@ windows. A changed live window creates a new cache record while the previous val
 on disk. Each batch is committed only after every response in that batch validates against the
 strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
 batches remain reusable.
+
+After phase summaries exist, a separate hindsight pass names every agent. It sees the agent's
+official path, coordinator nickname and role, arbitrary-depth parent path, cross-spawn ancestor
+context, and the complete set of phase summaries describing what the agent ultimately did. This
+means a reused or misleading coordinator name does not become the permanent UI label. Naming has a
+separate content-addressed cache, so only an agent whose summarized work or context changed is sent
+back to the model. The whole summarize transaction holds the archive writer lock, preventing two
+simultaneous refreshes from buying the same cache miss.
 
 For offline development or tests:
 
@@ -196,6 +208,8 @@ codex-hermit/
     │   └── messages/<thread-id>.json
     ├── summary_data/
     │   ├── cache/<content-hash>.json
+    │   ├── name_cache/<content-hash>.json
+    │   ├── agents/<thread-id>.json   # selected hindsight name + provenance
     │   ├── phases/<phase-id>.json
     │   ├── rollups/{daily,weekly,monthly,quarterly}/...
     │   └── glossary.json

@@ -13,6 +13,7 @@ from pathlib import Path
 from agent_team_timeline import __version__
 from agent_team_timeline.archive import as_array, as_object, read_json
 from agent_team_timeline.codex import CodexParseError
+from agent_team_timeline.naming import AgentNameError
 from agent_team_timeline.pipeline import (
     IngestReport,
     SummarizeReport,
@@ -91,6 +92,12 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Codex model name")
     parser.add_argument("--summary-workers", type=int, default=3)
     parser.add_argument("--summary-batch-size", type=int, default=6)
+    parser.add_argument(
+        "--name-batch-size",
+        type=int,
+        default=12,
+        help="agents per hindsight-naming model call",
+    )
     parser.add_argument("--phase-minutes", type=int, default=30)
     parser.add_argument("--context-chars", type=int, default=16000)
     parser.add_argument("--transcript-chars", type=int, default=30000)
@@ -150,6 +157,7 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
         str(ns.model),
         max_workers=int(ns.summary_workers),
         batch_size=int(ns.summary_batch_size),
+        name_batch_size=int(ns.name_batch_size),
         phase_minutes=int(ns.phase_minutes),
         context_chars=int(ns.context_chars),
         transcript_chars=int(ns.transcript_chars),
@@ -167,7 +175,8 @@ def _print_ingest(report: IngestReport) -> None:
 
 def _print_summaries(report: SummarizeReport) -> None:
     print(
-        f"summarize: {report.phases} phases + {report.rollups} calendar rollups; "
+        f"summarize: {report.phases} phases + {report.agent_names} hindsight agent names + "
+        f"{report.rollups} calendar rollups; "
         f"cache {report.cache_hits} hit / {report.cache_misses} miss in "
         f"{report.backend_batches} backend batch(es); {report.glossary_terms} glossary terms"
     )
@@ -263,7 +272,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if build_report is not None:
             print(f"open: cd {archive} && make serve")
         return 0
-    except (CodexParseError, SummaryError, OSError, ValueError) as error:
+    except (AgentNameError, CodexParseError, SummaryError, OSError, ValueError) as error:
         try:
             run_path = record_run(
                 archive,

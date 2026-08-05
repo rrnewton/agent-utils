@@ -10,8 +10,9 @@ from zoneinfo import ZoneInfo
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
 from agent_team_timeline.model import Agent, Edge, Event, TeamData, source_digest
+from agent_team_timeline.naming import AgentNameResult
 from agent_team_timeline.periods import Period, period_heading
-from agent_team_timeline.phases import PhaseStats, PhaseWindow, agent_label
+from agent_team_timeline.phases import PhaseStats, PhaseWindow
 from agent_team_timeline.summarize import SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_markdown
 
@@ -45,15 +46,45 @@ def _summary_obj(result: SummaryResult) -> dict[str, object]:
     }
 
 
+def _agent_name(
+    agent: Agent, names: Mapping[str, AgentNameResult]
+) -> AgentNameResult:
+    try:
+        return names[agent.thread_id]
+    except KeyError as error:
+        raise ValueError(f"missing hindsight name for agent {agent.agent_path}") from error
+
+
+def _official_leaf(agent: Agent) -> str:
+    return agent.agent_path.rstrip("/").rsplit("/", 1)[-1] or "root"
+
+
+def _agent_identity_obj(agent: Agent, name: AgentNameResult) -> dict[str, object]:
+    return {
+        "short_name": name.short_name,
+        "official_name": agent.agent_path,
+        "official_leaf": _official_leaf(agent),
+        "coordinator_nickname": agent.nickname or "",
+        "naming_rationale": name.rationale,
+        "naming_model": name.model,
+        "naming_input_hash": name.input_hash,
+    }
+
+
 def _phase_markdown(
-    team: TeamData, phase: PhaseWindow, summary: SummaryResult
+    team: TeamData,
+    agent: Agent,
+    name: AgentNameResult,
+    phase: PhaseWindow,
+    summary: SummaryResult,
 ) -> str:
     stats = phase.stats
     lines = [
         f"# {summary.phrase}",
         "",
         f"Team: `{team.team_slug}`  ",
-        f"Agent: `{phase.agent_label}`  ",
+        f"Agent: `{name.short_name}`  ",
+        f"Official agent path: `{agent.agent_path}`  ",
         f"Window: {_local_time(phase.start_ms, team.display_timezone)} to "
         f"{_local_time(phase.end_ms, team.display_timezone)}",
         "",
@@ -132,13 +163,17 @@ def _rollup_markdown(
 def _agent_markdown(
     team: TeamData,
     agent: Agent,
+    name: AgentNameResult,
     phases: Sequence[PhaseWindow],
     summaries: Mapping[str, SummaryResult],
 ) -> str:
     lines = [
-        f"# {agent_label(agent)}",
+        f"# {name.short_name}",
         "",
-        f"Team: `{team.team_slug}` · thread `{agent.thread_id}` · path `{agent.agent_path}`",
+        f"Team: `{team.team_slug}` · thread `{agent.thread_id}`  ",
+        f"Official path: `{agent.agent_path}`  ",
+        f"Coordinator nickname: `{agent.nickname or 'none'}`  ",
+        f"Naming rationale: {name.rationale}",
         "",
     ]
     for phase in phases:
@@ -195,6 +230,7 @@ def _edge_obj(
     agents: Mapping[str, Agent],
     phases: Sequence[PhaseWindow],
     summaries: Mapping[str, SummaryResult],
+    names: Mapping[str, AgentNameResult],
 ) -> dict[str, object] | None:
     target = agents.get(edge.to_thread_id)
     if target is None or edge.from_thread_id not in agents:
@@ -206,7 +242,7 @@ def _edge_obj(
         "message": "Message to",
         "interrupt": "Interrupt",
     }.get(readable_kind, readable_kind.replace("_", " ").title())
-    phrase = f"{action} {agent_label(target)}"
+    phrase = f"{action} {_agent_name(target, names).short_name}"
     paragraph = summary.paragraph if summary is not None else phrase
     full_text = edge.message_text or ""
     status = ""
@@ -240,6 +276,7 @@ def _result_edge_objs(
     agents: Mapping[str, Agent],
     phases: Sequence[PhaseWindow],
     summaries: Mapping[str, SummaryResult],
+    names: Mapping[str, AgentNameResult],
 ) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     for agent in team.agents:
@@ -265,7 +302,7 @@ def _result_edge_objs(
                     "source_ms": final.timestamp_ms,
                     "target_ms": final.timestamp_ms,
                     "kind": "result",
-                    "phrase": f"{agent_label(agent)} reports results",
+                    "phrase": f"{_agent_name(agent, names).short_name} reports results",
                     "paragraph": summary.paragraph if summary else (final.text or "")[:500],
                     "full_text": final.text or "",
                     "content_status": "",
@@ -344,18 +381,25 @@ def render_archive(
     rollup_summaries: Mapping[str, SummaryResult],
     rollup_stats: Mapping[str, PhaseStats],
     glossary_terms: Sequence[GlossaryTerm],
+    agent_names: Mapping[str, AgentNameResult],
 ) -> dict[str, int]:
     """Regenerate all presentation files without invoking a summary backend."""
 
     changed = 0
     phase_paths: dict[str, str] = {}
+    agents_by_id = {agent.thread_id: agent for agent in team.agents}
     for phase in phases:
         summary = phase_summaries[phase.summary_key]
+        agent = agents_by_id[phase.agent_id]
+        phase_agent_name = _agent_name(agent, agent_names)
         raw_path = f"teams/{team.team_slug}/summaries/phases/{phase.phase_id}.md"
         detail_path = f"data/details/{phase.phase_id}.json"
         phase_paths[phase.phase_id] = detail_path
         changed += int(
-            write_text_if_changed(archive / raw_path, _phase_markdown(team, phase, summary))
+            write_text_if_changed(
+                archive / raw_path,
+                _phase_markdown(team, agent, phase_agent_name, phase, summary),
+            )
         )
         detail: dict[str, object] = {
             "phrase": summary.phrase,
@@ -366,6 +410,7 @@ def render_archive(
             ],
             "transcript": [entry.to_json_obj() for entry in phase.transcript],
             "raw_summary_path": raw_path,
+            "agent": _agent_identity_obj(agent, phase_agent_name),
         }
         changed += int(write_json_if_changed(archive / detail_path, narrow_json(detail)))
 
@@ -380,7 +425,13 @@ def render_archive(
         changed += int(
             write_text_if_changed(
                 archive / agent_path,
-                _agent_markdown(team, agent, own, phase_summaries),
+                _agent_markdown(
+                    team,
+                    agent,
+                    _agent_name(agent, agent_names),
+                    own,
+                    phase_summaries,
+                ),
             )
         )
 
@@ -405,9 +456,9 @@ def render_archive(
         )
 
     static_root = files("agent_team_timeline") / "static"
-    for name in ("index.html", "app.js", "style.css"):
-        text = (static_root / name).read_text(encoding="utf-8")
-        changed += int(write_text_if_changed(archive / name, text))
+    for asset_name in ("index.html", "app.js", "style.css"):
+        text = (static_root / asset_name).read_text(encoding="utf-8")
+        changed += int(write_text_if_changed(archive / asset_name, text))
     changed += int(write_text_if_changed(archive / "serve.py", _standalone_server(), executable=True))
     changed += int(
         write_text_if_changed(
@@ -447,19 +498,23 @@ def render_archive(
 
     start_ms, end_ms = _time_range(team, phases)
     latest_ms = max((event.timestamp_ms for event in team.events), default=end_ms)
-    agents_by_id = {agent.thread_id: agent for agent in team.agents}
     agent_objs: list[dict[str, object]] = []
     for agent in team.agents:
         own = phases_by_agent.get(agent.thread_id, [])
         own_end = max((phase.end_ms for phase in own), default=agent.ended_at_ms or end_ms)
+        track_name = _agent_name(agent, agent_names)
         agent_objs.append(
             {
                 "id": agent.thread_id,
                 "team": team.team_slug,
                 "parent_id": agent.parent_thread_id,
                 "path": agent.agent_path,
-                "label": agent_label(agent),
+                "label": track_name.short_name,
+                "short_name": track_name.short_name,
+                "official_name": agent.agent_path,
+                "official_leaf": _official_leaf(agent),
                 "nickname": agent.nickname or "",
+                "naming_rationale": track_name.rationale,
                 "depth": agent.depth,
                 "start_ms": agent.started_at_ms,
                 "end_ms": max(agent.ended_at_ms or own_end, own_end),
@@ -483,10 +538,16 @@ def render_archive(
     edge_objs = [
         value
         for edge in team.edges
-        for value in [_edge_obj(edge, agents_by_id, phases, phase_summaries)]
+        for value in [
+            _edge_obj(edge, agents_by_id, phases, phase_summaries, agent_names)
+        ]
         if value is not None
     ]
-    edge_objs.extend(_result_edge_objs(team, agents_by_id, phases, phase_summaries))
+    edge_objs.extend(
+        _result_edge_objs(
+            team, agents_by_id, phases, phase_summaries, agent_names
+        )
+    )
     edge_objs.sort(
         key=lambda item: (
             _object_int(item.get("source_ms")),
