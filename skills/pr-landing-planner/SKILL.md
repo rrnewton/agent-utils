@@ -29,8 +29,11 @@ map or readiness table by hand.
    recognition table in `pr_landing_planner/mechanism.py` offline). An edge requests coordinator
    review; it does not claim the two PRs have opposing intent.
 6. Use `assigned_agent`, the ordered decisions, and the conflict-safe groups to dispatch the batch.
-7. Treat adversarial review as the default for every PR. Only a documented process exemption may
-   skip it; missing review evidence is not approval.
+7. Treat adversarial review as the default for every PR. Review evidence is SHA-bound: before
+   trusting a `passed-review-*` label, resolve the SHA named by the corresponding review evidence
+   and require it to equal the current PR head. A bare label, missing reviewed SHA, or approval for
+   an earlier head is not approval of the current code. Only a documented process exemption may
+   skip review; missing or stale review evidence is not approval.
 8. For a policy-changing PR, inspect the rationale date and compare it with the current policy before
    dispatch. A rationale that predates the policy it would change requires coordinator review.
 
@@ -84,8 +87,11 @@ resolved. State which one is being cited; never write only “green”.
 
 ### Choose serial or coalesced landing
 
-A receipt is SHA-keyed. Rebasing changes the SHA and destroys its authority, so N serial landings pay
-for N rebases and N exact-head validations. For a large conflict-free backlog, a coordinator-approved
+A receipt is SHA-keyed. Rebasing changes the SHA and destroys its authority. Finalize the complete
+rebase wave first, then validate each resulting final head exactly once. Never interleave
+rebase -> validate -> rebase -> validate: the second rebase discards the first receipt, which is how
+a queue of genuinely green PRs can produce zero landable heads. N serial landings otherwise pay for
+N rebases and N exact-head validations. For a large conflict-free backlog, a coordinator-approved
 staging branch can reduce that to one integration update and one full validation:
 
 1. Fetch fresh and create the staging branch from **current main**, never from a stale green anchor;
@@ -95,6 +101,13 @@ staging branch can reduce that to one integration update and one full validation
 3. Validate the combined exact staging head once. If main moves, update staging before validation;
    never claim the old receipt for the new head.
 4. Land the staging change under the normal lock and protection rules.
+
+Review signatures have the same identity constraint as receipts. A rebase, amend, conflict
+resolution, or follow-up commit changes the head and invalidates prior review authority even when a
+`passed-review-*` label remains attached. Before landing, compare the current head with the exact SHA
+recorded by each required reviewer. If they differ (or no reviewed SHA is recorded), re-run review at
+the final head; never treat the label alone as evidence. For example, an approval of commit A cannot
+authorize a current head A+B+C whose additional scheduler commits were never examined.
 
 Merging staging does not close the constituent PRs. GitHub recognizes commit lineage, not content
 equivalence. After a fresh fetch, close only a constituent whose original head satisfies
