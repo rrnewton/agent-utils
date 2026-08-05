@@ -9,7 +9,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
-from agent_team_timeline.model import Agent, Edge, Event, TeamData, source_digest
+from agent_team_timeline.model import Agent, Edge, Event, TeamData, Turn, source_digest
 from agent_team_timeline.naming import AgentNameResult
 from agent_team_timeline.periods import Period, period_heading
 from agent_team_timeline.phases import PhaseStats, PhaseWindow
@@ -291,6 +291,9 @@ def _result_edge_objs(
             and event.text
         ]
         for final in sorted(finals, key=lambda event: (event.timestamp_ms, event.event_id)):
+            target_id = _result_target(team, agent, final)
+            if target_id is None or target_id not in agents:
+                continue
             summary = _summary_for_agent_at(
                 agent.thread_id, final.timestamp_ms, phases, summaries
             )
@@ -298,7 +301,7 @@ def _result_edge_objs(
                 {
                     "id": f"result-{final.event_id}",
                     "source_id": agent.thread_id,
-                    "target_id": agent.parent_thread_id,
+                    "target_id": target_id,
                     "source_ms": final.timestamp_ms,
                     "target_ms": final.timestamp_ms,
                     "kind": "result",
@@ -309,6 +312,53 @@ def _result_edge_objs(
                 }
             )
     return result
+
+
+def _result_target(team: TeamData, agent: Agent, final: Event) -> str | None:
+    """Resolve the coordinator that initiated the turn producing ``final``.
+
+    ``parent_thread_id`` records immutable spawn lineage, not necessarily the coordinator that
+    later reuses a completed agent thread. Codex records a resumed turn start at whole-second
+    precision and its triggering ``followup_task`` activity at millisecond precision, so match
+    within a small clock-resolution window. An unmatched result retains the lineage-parent
+    fallback used by older archives.
+    """
+
+    turn = _event_turn(team.turns, final)
+    if turn is None:
+        return agent.parent_thread_id
+    trigger_slop_ms = 2_000
+    triggers = [
+        edge
+        for edge in team.edges
+        if edge.to_thread_id == agent.thread_id
+        and edge.kind in ("spawn", "followup")
+        and abs(edge.timestamp_ms - turn.started_at_ms) <= trigger_slop_ms
+    ]
+    if not triggers:
+        return agent.parent_thread_id
+    trigger = min(
+        triggers,
+        key=lambda edge: (
+            abs(edge.timestamp_ms - turn.started_at_ms),
+            edge.timestamp_ms,
+            edge.edge_id,
+        ),
+    )
+    return trigger.from_thread_id
+
+
+def _event_turn(turns: Sequence[Turn], event: Event) -> Turn | None:
+    if event.turn_id is None:
+        return None
+    return next(
+        (
+            turn
+            for turn in turns
+            if turn.thread_id == event.thread_id and turn.turn_id == event.turn_id
+        ),
+        None,
+    )
 
 
 def _event_objs(team: TeamData) -> list[dict[str, object]]:

@@ -31,12 +31,14 @@ from agent_team_timeline.pipeline import (
     record_run,
     summarize_archive,
 )
+from agent_team_timeline.render import _result_target
 from agent_team_timeline.server import make_server
 from agent_team_timeline.summarize import SummaryResult
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
 CHILD = "00000000-0000-0000-0000-000000000002"
+NESTED = "00000000-0000-0000-0000-000000000003"
 START = 1_775_000_000_000
 
 
@@ -244,6 +246,128 @@ def test_every_completed_subagent_turn_gets_a_result_edge(tmp_path: Path) -> Non
         "result-child-final",
         "result-child-final-again",
     }
+
+
+def test_resumed_nested_agent_reports_to_turn_initiator_not_finished_parent(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    nested_initial = replace(
+        _event(
+            "nested-initial-final",
+            NESTED,
+            11_000,
+            "assistant_message",
+            "The nested agent completed its initial audit for its parent.",
+            phase="final_answer",
+        ),
+        turn_id="nested-initial",
+    )
+    nested_resumed = replace(
+        _event(
+            "nested-resumed-final",
+            NESTED,
+            28_000,
+            "assistant_message",
+            "The root coordinator resumed the nested agent after its parent finished.",
+            phase="final_answer",
+        ),
+        turn_id="nested-resumed",
+    )
+    agents = (
+        replace(team.agents[0], ended_at_ms=START + 30_000),
+        team.agents[1],
+        Agent(
+            NESTED,
+            CHILD,
+            "/root/release_receipt_audit/nested_review",
+            "Emmy",
+            None,
+            2,
+            START + 6_000,
+            START + 29_000,
+            "completed",
+            "nested",
+        ),
+    )
+    turns = team.turns + (
+        Turn(
+            "nested-initial",
+            NESTED,
+            START + 6_000,
+            START + 12_000,
+            "completed",
+            10,
+            None,
+            None,
+        ),
+        Turn(
+            "nested-resumed",
+            NESTED,
+            START + 24_000,
+            START + 29_000,
+            "completed",
+            10,
+            None,
+            None,
+        ),
+    )
+    edges = team.edges + (
+        Edge(
+            "spawn-nested",
+            "spawn-nested",
+            CHILD,
+            NESTED,
+            "spawn",
+            START + 6_400,
+            None,
+            "encrypted",
+            "gAAAA-nested",
+            4,
+        ),
+        Edge(
+            "resume-nested",
+            "resume-nested",
+            ROOT,
+            NESTED,
+            "followup",
+            START + 24_600,
+            None,
+            "encrypted",
+            "gAAAA-resume",
+            5,
+        ),
+    )
+    updated = replace(
+        team,
+        agents=agents,
+        turns=turns,
+        events=team.events + (nested_initial, nested_resumed),
+        edges=edges,
+    )
+    _write_team(tmp_path, updated)
+    summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
+    build_archive(tmp_path, updated.team_slug)
+
+    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    result_targets = {
+        edge["id"]: edge["target_id"]
+        for edge in timeline["edges"]
+        if edge["kind"] == "result"
+    }
+    assert result_targets["result-nested-initial-final"] == CHILD
+    assert result_targets["result-nested-resumed-final"] == ROOT
+    nested_track = next(agent for agent in timeline["agents"] if agent["id"] == NESTED)
+    assert nested_track["parent_id"] == CHILD
+    assert nested_track["end_ms"] > team.agents[1].ended_at_ms
+
+
+def test_unmatched_result_falls_back_to_lineage_parent() -> None:
+    team = replace(_team(), edges=())
+    child = next(agent for agent in team.agents if agent.thread_id == CHILD)
+    final = next(event for event in team.events if event.event_id == "child-final")
+
+    assert _result_target(team, child, final) == ROOT
 
 
 def test_team_slug_and_archived_identity_cannot_escape_archive(tmp_path: Path) -> None:
