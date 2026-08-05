@@ -252,15 +252,13 @@ class DagConfig:
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
     # --- Deliberately SMALL default caps applied to a step that DECLARES NOTHING ---
     # The forcing function (see the module-level DEFAULT_SMALL_* constants): an undeclared step is
-    # boxed into a tight floor so it must declare its real needs. Landed OFF by default (opt-in via
-    # the runner's `--small-default-cap` flag, which sets these fields to the DEFAULT_SMALL_* values):
-    # an ACTIVE cap on the shared canonical checkout would WEDGE every undeclared step in a concurrent
-    # validate run. Each applies ONLY when the step leaves the matching hint unset (an explicit hint
-    # wins). Migration to an always-on default happens only AFTER per-node declarations are derived
-    # from measured breaches — do not flip-and-wedge.
-    default_step_mem_cap_bytes: int | None = None
-    default_step_cpu_count: int | None = None
-    default_step_cpu_timeout: int = 0
+    # boxed into a tight floor so it must declare its real needs. These are active by default; the
+    # declarations-first migration has supplied measured budgets for nodes that exceed the floor.
+    # Each applies ONLY when the step leaves the matching hint unset (an explicit hint wins).
+    # `--unsafe-no-cgroups` is the deliberately loud escape hatch for an unboxed run.
+    default_step_mem_cap_bytes: int | None = DEFAULT_SMALL_MEM_CAP_BYTES
+    default_step_cpu_count: int | None = DEFAULT_SMALL_CPU_COUNT
+    default_step_cpu_timeout: int = DEFAULT_SMALL_CPU_TIMEOUT
 
     def by_tag(self) -> dict[str, Step]:
         return {step.tag: step for step in self.steps}

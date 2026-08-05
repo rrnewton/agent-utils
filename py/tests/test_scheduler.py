@@ -5,7 +5,14 @@ from __future__ import annotations
 import os
 import tempfile
 
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
+from safe_ci_dag_runner.model import (
+    DEFAULT_SMALL_CPU_COUNT,
+    DEFAULT_SMALL_CPU_TIMEOUT,
+    DEFAULT_SMALL_MEM_CAP_BYTES,
+    DagConfig,
+    ResourceHint,
+    Step,
+)
 from safe_ci_dag_runner.scheduler import run_dag
 
 
@@ -26,6 +33,13 @@ def _step(
         deps=list(deps or []),
         hint=ResourceHint(resources=dict(resources or {}), est_duration_s=est),
     )
+
+
+def test_default_config_enables_small_forcing_caps() -> None:
+    cfg = DagConfig(steps=())
+    assert cfg.default_step_mem_cap_bytes == DEFAULT_SMALL_MEM_CAP_BYTES
+    assert cfg.default_step_cpu_count == DEFAULT_SMALL_CPU_COUNT
+    assert cfg.default_step_cpu_timeout == DEFAULT_SMALL_CPU_TIMEOUT
 
 
 def test_simple_dag_all_pass_respects_deps() -> None:

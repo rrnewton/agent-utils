@@ -114,13 +114,12 @@ runs unboxed **even where boxing is available**, with no per-step memory/CPU/pid
 `unsafe` is deliberate friction — its use is logged loudly as a reviewable audit signal — so reach
 for it only when you have a specific reason not to box, not as a way to quiet a boxing error.
 
-`--small-default-cap` is the *forcing function* for undeclared steps: when set, a step that declares
-**no** memory/CPU hint is boxed into a deliberately tight floor (1 GiB `memory.max` / 1-core `cpu.max`
-/ 10 s CPU budget), so a real step hits the cap immediately and must **declare its true needs** —
-generating per-node resource metadata empirically instead of by guessing. An explicit per-step hint
-always wins. It is **OFF by default** (opt-in): an *active* default cap on a shared checkout would
-wedge every undeclared step in a concurrent run, so the always-on migration happens only after per-node
-declarations are derived from measured breaches. Its use is announced on stderr.
+The *forcing function* is ON by default: a step that declares **no** memory/CPU hint is boxed into a
+deliberately tight floor (1 GiB `memory.max` / 1-core `cpu.max` / 10 s CPU budget), so a real step
+hits the cap immediately and must **declare its true needs** — generating per-node resource metadata
+empirically instead of by guessing. An explicit per-step hint always wins. `--unsafe-no-cgroups` is
+the deliberately loud opt-out. `--small-default-cap` remains as a compatibility flag that reasserts
+the already-active defaults and announces that it is redundant.
 
 **Metrics sink.** An optional pluggable destination for durable measurements: one whole-run summary
 row (wall time, CPU contention split, cores) and per-step rows (CPU, memory peak, threads, ambient

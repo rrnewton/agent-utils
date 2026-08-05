@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import subprocess
 import sys
 import tempfile
@@ -382,6 +383,64 @@ def test_boxed_run_enforces_cpu_timeout() -> None:
         assert "CPU-TIMEOUT" in combined, (
             "expected a CPU-TIMEOUT report proving the per-step CPU-time budget fired "
             f"(not the wall TIMEOUT):\n{combined}"
+        )
+
+
+def test_default_small_cpu_cap_is_enforced_and_allows_compliant_work() -> None:
+    # Plant both sides of the forcing default through the real cgroup path. Each command first
+    # reads its own cpu.max, so a pass/failure cannot be attributed to merely configuring the
+    # model without applying the one-core quota in the kernel.
+    import os
+
+    command = (
+        "python3 -c 'import pathlib,time; "
+        "cg=next(x.split(\":\",2)[2].strip() for x in open(\"/proc/self/cgroup\") "
+        "if x.startswith(\"0::\")); "
+        "quota=pathlib.Path(\"/sys/fs/cgroup\"+cg+\"/cpu.max\").read_text().strip(); "
+        "assert quota==\"100000 100000\",quota; "
+        "start=time.process_time(); exec(\"while time.process_time()-start < {seconds}: pass\")'"
+    )
+
+    def run_cpu_burn(tmp: str, label: str, seconds: int) -> subprocess.CompletedProcess[str]:
+        dag = (
+            '{"steps": [{"group": "cpu", "job": "' + label + '", '
+            '"desc": "undeclared one-core CPU burn", "cmd": '
+            + json.dumps(command.format(seconds=seconds))
+            + "}]}"
+        )
+        path = Path(tmp) / f"{label}.json"
+        path.write_text(dag, encoding="utf-8")
+        env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
+        return subprocess.run(
+            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(path),
+             "-q", "--no-profile"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        compliant = run_cpu_burn(tmp, "compliant-default", 1)
+        if compliant.returncode == 3:
+            pytest.skip(
+                "cgroup boxing unavailable (need cgroup-v2 + a working systemd --user scope); "
+                f"cannot verify default CPU caps here. Details:\n{compliant.stderr}"
+            )
+        compliant_output = compliant.stdout + compliant.stderr
+        assert compliant.returncode == 0, (
+            "an undeclared workload below the 10-second default must pass after reading back "
+            f"the one-core kernel quota; got {compliant.returncode}\n{compliant_output}"
+        )
+
+        breach = run_cpu_burn(tmp, "breach-default", 12)
+        breach_output = breach.stdout + breach.stderr
+        assert breach.returncode == 1, (
+            "an undeclared workload exceeding 10 CPU-seconds must fail; "
+            f"got {breach.returncode}\n{breach_output}"
+        )
+        assert "CPU-TIMEOUT >10s cpu" in breach_output, (
+            "expected the named default CPU-time cap, not a generic process failure:\n"
+            f"{breach_output}"
         )
 
 

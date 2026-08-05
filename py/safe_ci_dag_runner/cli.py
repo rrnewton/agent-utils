@@ -401,9 +401,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument(
         "--small-default-cap",
         action="store_true",
-        help="OPT IN to the SMALL forcing-function caps (1 core / 1 GiB / 10 s CPU) for steps that "
-        "DECLARE NOTHING. OFF by default: an active cap on the shared canonical checkout would wedge "
-        "every undeclared step in a concurrent validate run. An explicit per-step hint still wins.",
+        help="compatibility flag that explicitly reasserts the default SMALL forcing-function caps "
+        "(1 core / 1 GiB / 10 s CPU) for steps that DECLARE NOTHING. The caps are already ON by "
+        "default; an explicit per-step hint still wins.",
     )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
@@ -1588,10 +1588,8 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
         )
     cfg = apply_plan_to_config(cfg, plan)
-    # Opt-in --small-default-cap: turn ON the SMALL forcing-function caps for THIS run only. They are
-    # OFF by default so an active cap never wedges a concurrent validate on the shared checkout; this
-    # supplies the 1-core / 1-GiB / 10-s floor to steps that DECLARE NOTHING (an explicit per-step
-    # hint still wins via the effective_* helpers). Announce it so its use is visible in logs.
+    # Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
+    # the same values so older callers keep working and announce that the flag is now redundant.
     if bool(getattr(ns, "small_default_cap", False)):
         cfg = dataclasses.replace(
             cfg,
@@ -1600,7 +1598,8 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             default_step_cpu_timeout=DEFAULT_SMALL_CPU_TIMEOUT,
         )
         print(
-            f"{PROG}: --small-default-cap: undeclared steps boxed to the SMALL default floor "
+            f"{PROG}: --small-default-cap is redundant (SMALL defaults are already active): "
+            f"undeclared steps are boxed to "
             f"(mem {DEFAULT_SMALL_MEM_CAP_BYTES} B / {DEFAULT_SMALL_CPU_COUNT} core / "
             f"{DEFAULT_SMALL_CPU_TIMEOUT} s CPU); declared per-step hints still win",
             file=sys.stderr,

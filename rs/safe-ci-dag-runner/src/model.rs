@@ -333,16 +333,13 @@ impl Default for DagConfig {
             outer_mem_safety_factor: 1.0,
             default_step_timeout: DEFAULT_STEP_TIMEOUT,
             default_jobs_flag: DEFAULT_JOBS_FLAG.to_string(),
-            // Default OFF (opt-in). The SMALL forcing-function caps WEDGE the fleet when active on
-            // the shared canonical checkout: every undeclared step in a concurrent validate run
-            // would be boxed to 1 core / 1 GiB / 10 s CPU. So they land DISABLED by default and are
-            // turned on per-run via `--small-default-cap` (see cli). The DEFAULT_SMALL_* consts are
-            // retained as the values that flag applies. Migration to an always-on default happens
-            // only AFTER per-node declarations are derived from measured breaches (do not
-            // flip-and-wedge).
-            default_step_mem_cap_bytes: None,
-            default_step_cpu_count: None,
-            default_step_cpu_timeout: 0,
+            // The SMALL forcing-function caps are active by default. The declarations-first
+            // migration supplied measured budgets for nodes that exceed the floor; an explicit
+            // per-step declaration still wins. `--unsafe-no-cgroups` is the deliberately loud
+            // escape hatch for an unboxed run.
+            default_step_mem_cap_bytes: Some(DEFAULT_SMALL_MEM_CAP_BYTES),
+            default_step_cpu_count: Some(DEFAULT_SMALL_CPU_COUNT),
+            default_step_cpu_timeout: DEFAULT_SMALL_CPU_TIMEOUT,
         }
     }
 }
@@ -466,6 +463,17 @@ pub struct RunResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_config_enables_small_forcing_caps() {
+        let cfg = DagConfig::default();
+        assert_eq!(
+            cfg.default_step_mem_cap_bytes,
+            Some(DEFAULT_SMALL_MEM_CAP_BYTES)
+        );
+        assert_eq!(cfg.default_step_cpu_count, Some(DEFAULT_SMALL_CPU_COUNT));
+        assert_eq!(cfg.default_step_cpu_timeout, DEFAULT_SMALL_CPU_TIMEOUT);
+    }
 
     #[test]
     fn classification_browser_promotes_to_latency() {
