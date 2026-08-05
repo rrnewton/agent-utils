@@ -262,9 +262,18 @@ fn wants_help(rest: &[String]) -> bool {
 
 /// Render a per-subcommand help page: a usage line, a one-line summary, then each accepted flag with
 /// a ONE-LINE description. Mirrors the Python argparse per-subcommand help.
-fn render_subcommand_help(c: &Palette, usage: &str, summary: &str, flags: &[(&str, &str)]) -> String {
+fn render_subcommand_help(
+    c: &Palette,
+    usage: &str,
+    summary: &str,
+    flags: &[(&str, &str)],
+) -> String {
     let width = flags.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
-    let mut out = format!("{} {PROG} {usage}\n\n{summary}\n\n{}\n", c.bold("usage"), c.bold("options"));
+    let mut out = format!(
+        "{} {PROG} {usage}\n\n{summary}\n\n{}\n",
+        c.bold("usage"),
+        c.bold("options")
+    );
     for (flag, desc) in flags {
         let padded = format!("{flag:<width$}");
         out.push_str(&format!("  {}  {desc}\n", c.cyan(&padded)));
@@ -329,11 +338,20 @@ fn plan_help(c: &Palette) -> String {
         "Show learned estimates + the scheduled order. Does NOT run anything.",
         &[
             ("--dag FILE", "DAG file ('-' = stdin) [required]"),
-            ("--planner NAME", "greedy-lpt (default) | critical-path | cpa"),
-            ("--max-mem SPEC", "RAM budget (e.g. 8G) used by the cpa planner"),
+            (
+                "--planner NAME",
+                "greedy-lpt (default) | critical-path | cpa",
+            ),
+            (
+                "--max-mem SPEC",
+                "RAM budget (e.g. 8G) used by the cpa planner",
+            ),
             ("--format FORMAT", "text (default) | json"),
             ("--perf-dir DIR", "read the profile store from DIR"),
-            ("--no-profile-feedback", "do NOT read the profile store to refine estimates"),
+            (
+                "--no-profile-feedback",
+                "do NOT read the profile store to refine estimates",
+            ),
             ("-h, --help", "show this help and exit"),
         ],
     )
@@ -354,7 +372,10 @@ fn simple_help(c: &Palette, command: &str) -> String {
         &usage,
         summary,
         &[
-            ("--dag FILE", "DAG file to read ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
+            (
+                "--dag FILE",
+                "DAG file to read ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]",
+            ),
             ("-h, --help", "show this help and exit"),
         ],
     )
