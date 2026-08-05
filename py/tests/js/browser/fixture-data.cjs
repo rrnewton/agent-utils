@@ -50,6 +50,15 @@ const ROLLUP_EXPECTED_RANGES = [
   { start_ms: FIRST_DAY_ACTIVITY_START_MS, end_ms: LATEST_ACTIVITY_END_MS },
   { start_ms: FIRST_DAY_ACTIVITY_START_MS, end_ms: LATEST_ACTIVITY_END_MS }
 ];
+const OUTPUT_ARTIFACT_ID = "artifact-pr38";
+const REFERENCE_ARTIFACT_ID = "artifact-issue41";
+const UNSAFE_ARTIFACT_ID = "artifact-unsafe-link";
+const ASSOCIATED_ARTIFACT_IDS = [
+  OUTPUT_ARTIFACT_ID,
+  REFERENCE_ARTIFACT_ID,
+  OUTPUT_ARTIFACT_ID,
+  UNSAFE_ARTIFACT_ID
+];
 
 function stats(overrides) {
   return Object.assign({
@@ -97,7 +106,9 @@ const agents = [
     lifetime_summary: "Found the malformed-input parser boundary, repaired it, and verified the focused regression tests.",
     start_ms: BASE_MS + 5 * minute,
     end_ms: BASE_MS + 30 * minute,
-    status: "complete"
+    status: "complete",
+    artifact_ids: ASSOCIATED_ARTIFACT_IDS,
+    output_artifact_ids: [OUTPUT_ARTIFACT_ID, OUTPUT_ARTIFACT_ID]
   },
   {
     id: "agent-b",
@@ -158,6 +169,8 @@ const phases = [
     phrase: "Audit parser invariants",
     paragraph: "Found and tested the parser boundary that caused the regression.",
     detail_path: "details/phase-a-1.json",
+    artifact_ids: ASSOCIATED_ARTIFACT_IDS,
+    output_artifact_ids: [OUTPUT_ARTIFACT_ID, OUTPUT_ARTIFACT_ID],
     stats: stats({ tool_calls: 3 }),
     states: [
       state("active", 10, 15),
@@ -280,7 +293,9 @@ const timeline = {
   rollups: ROLLUP_RANGES.map(function (rollup) {
     return Object.assign({}, rollup, {
       technical_path: rollup.path,
-      plain_language_path: rollup.path.replace(/\.md$/, "-plain-language.md")
+      plain_language_path: rollup.path.replace(/\.md$/, "-plain-language.md"),
+      artifact_ids: ASSOCIATED_ARTIFACT_IDS,
+      output_artifact_ids: [OUTPUT_ARTIFACT_ID, OUTPUT_ARTIFACT_ID]
     });
   }),
   glossary: [
@@ -294,6 +309,7 @@ const timeline = {
       url: "#glossary/term-malformed-input-123456789abc"
     }
   ],
+  artifact_catalog_path: "data/artifacts.json",
   glossary_path: "summaries/glossary/codex-hermit-glossary.md",
   summary_files: [
     {
@@ -366,7 +382,9 @@ const phaseADetail = {
       text: "Focused tests completed successfully."
     }
   ],
-  raw_summary_path: "summaries/phases/phase-a-1.md"
+  raw_summary_path: "summaries/phases/phase-a-1.md",
+  artifact_ids: ASSOCIATED_ARTIFACT_IDS,
+  output_artifact_ids: [OUTPUT_ARTIFACT_ID, OUTPUT_ARTIFACT_ID]
 };
 
 function simpleDetail(phase) {
@@ -380,10 +398,118 @@ function simpleDetail(phase) {
   };
 }
 
+const artifactCatalog = {
+  schema_version: 1,
+  extractor_version: "work-artifacts-v1",
+  source_digest: "playwright-fixture",
+  artifacts: [
+    {
+      artifact_id: OUTPUT_ARTIFACT_ID,
+      kind: "pull_request",
+      locator: pullUrl,
+      url: pullUrl,
+      label: "rrnewton/dev-hermit PR #38",
+      title: "Repair malformed-input handling",
+      external_id: "38",
+      project_url: "https://github.com/rrnewton/dev-hermit",
+      project_slug: "rrnewton/dev-hermit",
+      producer_thread_id: "agent-a",
+      produced_at_ms: BASE_MS + 12 * minute,
+      evidence: [
+        {
+          evidence_id: "evidence-pr38-produced",
+          source_kind: "tool_output",
+          source_id: "call-pr38",
+          source_line: 73,
+          thread_id: "agent-a",
+          turn_id: "turn-a-1",
+          timestamp_ms: BASE_MS + 12 * minute,
+          relation: "produced",
+          action: "created_pull_request",
+          confidence: "high",
+          matched_text: pullUrl,
+          extractor: "work-artifacts-v1"
+        }
+      ]
+    },
+    {
+      artifact_id: REFERENCE_ARTIFACT_ID,
+      kind: "issue",
+      locator: "https://github.com/rrnewton/dev-hermit/issues/41",
+      url: "https://github.com/rrnewton/dev-hermit/issues/41",
+      label: "rrnewton/dev-hermit issue #41",
+      title: "Harden malformed-input diagnostics",
+      external_id: "41",
+      project_url: "https://github.com/rrnewton/dev-hermit",
+      project_slug: "rrnewton/dev-hermit",
+      producer_thread_id: null,
+      produced_at_ms: null,
+      evidence: [
+        {
+          evidence_id: "evidence-issue41-reference",
+          source_kind: "event_text",
+          source_id: "event-issue41",
+          source_line: 81,
+          thread_id: "agent-a",
+          turn_id: "turn-a-1",
+          timestamp_ms: BASE_MS + 14 * minute,
+          relation: "referenced",
+          action: "mentioned",
+          confidence: "high",
+          matched_text: "https://github.com/rrnewton/dev-hermit/issues/41",
+          extractor: "work-artifacts-v1"
+        }
+      ]
+    },
+    {
+      artifact_id: UNSAFE_ARTIFACT_ID,
+      kind: "url",
+      locator: "unsafe-fixture",
+      url: "javascript:alert('artifact fixture')",
+      label: "Unsafe transcript link",
+      title: null,
+      external_id: null,
+      project_url: null,
+      project_slug: null,
+      producer_thread_id: null,
+      produced_at_ms: null,
+      evidence: [
+        {
+          evidence_id: "evidence-unsafe-reference",
+          source_kind: "event_text",
+          source_id: "event-unsafe",
+          source_line: 82,
+          thread_id: "agent-a",
+          turn_id: "turn-a-1",
+          timestamp_ms: BASE_MS + 15 * minute,
+          relation: "referenced",
+          action: "mentioned",
+          confidence: "medium",
+          matched_text: "unsafe fixture",
+          extractor: "work-artifacts-v1"
+        }
+      ]
+    }
+  ],
+  projects: [
+    {
+      project_id: "project-dev-hermit",
+      host: "github.com",
+      slug: "rrnewton/dev-hermit",
+      url: "https://github.com/rrnewton/dev-hermit",
+      evidence_ids: ["evidence-pr38-produced"]
+    }
+  ]
+};
+
 const virtualFiles = new Map([
   ["/data/timeline.json", {
     contentType: "application/json; charset=utf-8",
     body: JSON.stringify(timeline)
+  }],
+  ["/data/artifacts.json", {
+    contentType: "application/json; charset=utf-8",
+    body: JSON.stringify(artifactCatalog)
   }],
   ["/details/phase-root.json", {
     contentType: "application/json; charset=utf-8",
@@ -449,5 +575,6 @@ module.exports = {
   ROLLUP_RANGES: ROLLUP_RANGES,
   ROLLUP_EXPECTED_RANGES: ROLLUP_EXPECTED_RANGES,
   AGENT_COUNT: agents.length,
+  TIMELINE: timeline,
   virtualFiles: virtualFiles
 };

@@ -1242,6 +1242,209 @@ h1 {
   color: #f199a1;
 }
 
+.artifact-section + .artifact-section {
+  margin-top: 24px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.artifact-section-title,
+.agent-lifetime-section-title {
+  margin: 0 0 10px;
+  color: #dce8f7;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.artifact-section-empty {
+  margin: 0;
+  padding: 12px;
+  border: 1px dashed #344157;
+  border-radius: 6px;
+  color: #7f8da2;
+  font-size: 11px;
+}
+
+.artifact-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr));
+  gap: 10px;
+}
+
+.artifact-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #334159;
+  border-radius: 7px;
+  background: linear-gradient(145deg, #151e2c, #121925);
+  box-shadow: 0 7px 20px rgb(0 0 0 / 12%);
+}
+
+.artifact-card[data-artifact-role="output"] {
+  border-left: 3px solid var(--green);
+}
+
+.artifact-card[data-artifact-role="reference"] {
+  border-left: 3px solid var(--blue);
+}
+
+.artifact-card-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-bottom: 8px;
+}
+
+.artifact-kind,
+.artifact-relation {
+  padding: 2px 6px;
+  border: 1px solid #3b4a61;
+  border-radius: 999px;
+  color: #9eadc1;
+  font: 8px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.artifact-relation-produced,
+.artifact-relation-published,
+.artifact-relation-output {
+  border-color: rgb(59 201 131 / 45%);
+  background: rgb(59 201 131 / 8%);
+  color: #78dbaa;
+}
+
+.artifact-relation-updated {
+  border-color: rgb(231 173 67 / 45%);
+  background: rgb(231 173 67 / 8%);
+  color: #e9bd6c;
+}
+
+.artifact-relation-referenced {
+  border-color: rgb(93 143 244 / 45%);
+  background: rgb(93 143 244 / 8%);
+  color: #8eb1f7;
+}
+
+.artifact-primary-link {
+  display: block;
+  color: #dff7ff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  text-decoration-color: rgb(75 198 232 / 55%);
+  text-underline-offset: 3px;
+}
+
+a.artifact-primary-link:hover,
+a.artifact-primary-link:focus-visible {
+  color: #a7ebff;
+  text-decoration-color: currentcolor;
+}
+
+.artifact-link-disabled {
+  color: #a8b3c2;
+  text-decoration: none;
+}
+
+.artifact-title {
+  margin-top: 5px;
+  color: #bcc9da;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.artifact-project,
+.artifact-evidence {
+  margin-top: 8px;
+  color: #7f8fa6;
+  font: 9px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.artifact-project-link {
+  color: #78cfe9;
+  text-underline-offset: 2px;
+}
+
+.artifact-evidence-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.artifact-phase-link {
+  max-width: 100%;
+  padding: 4px 7px;
+  overflow: hidden;
+  border: 1px solid #3c4b62;
+  border-radius: 4px;
+  background: #1b2636;
+  color: #b8c9de;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.artifact-phase-link:hover,
+.artifact-phase-link:focus-visible {
+  border-color: #5c7896;
+  color: #ecf7ff;
+}
+
+.artifact-catalog-warning {
+  margin-bottom: 12px;
+  padding: 9px 11px;
+  border: 1px solid rgb(231 173 67 / 38%);
+  border-radius: 5px;
+  background: rgb(231 173 67 / 7%);
+  color: #d7b877;
+  font-size: 10px;
+}
+
+.agent-lifetime-phase-list {
+  display: grid;
+  gap: 8px;
+}
+
+.agent-lifetime-phase {
+  display: grid;
+  grid-template-columns: minmax(130px, auto) minmax(160px, 0.6fr) minmax(220px, 1fr);
+  align-items: baseline;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid #303e54;
+  border-radius: 6px;
+  background: #141d2a;
+  color: #c6d2e2;
+  text-align: left;
+}
+
+.agent-lifetime-phase:hover,
+.agent-lifetime-phase:focus-visible {
+  border-color: #4b647f;
+  background: #182435;
+}
+
+.agent-lifetime-phase-time {
+  color: #7689a2;
+  font: 9px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.agent-lifetime-phase-title {
+  color: #e1edf9;
+  font-size: 11px;
+}
+
+.agent-lifetime-phase-summary {
+  color: #9aa9bc;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
 .work-summary-list {
   display: grid;
   gap: 0;
@@ -1701,6 +1904,11 @@ h1 {
   .modal-route-arrow {
     justify-self: center;
     transform: rotate(90deg);
+  }
+
+  .agent-lifetime-phase {
+    grid-template-columns: 1fr;
+    gap: 4px;
   }
 }
 

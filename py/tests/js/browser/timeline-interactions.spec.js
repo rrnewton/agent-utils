@@ -8,7 +8,8 @@ const {
   PHASE_A_START_MS,
   PHASE_A_END_MS,
   ROLLUP_EXPECTED_RANGES,
-  ROLLUP_RANGES
+  ROLLUP_RANGES,
+  TIMELINE
 } = require("./fixture-data.cjs");
 
 const phaseSelector = '[data-phase-id="phase-a-1"]';
@@ -363,4 +364,84 @@ test("rollups switch audiences and verified glossary terms open stable entries",
   await page.getByTestId("glossary-open").click();
   await expect(page.locator("#modal-title")).toHaveText("Project glossary");
   await expect(page.locator("#modal-content")).toContainText("Data that does not satisfy");
+});
+
+test("artifact outputs and references stay distinct across phase, rollup, and agent views", async function ({ page }) {
+  await page.locator(phaseSelector).dblclick();
+  await expect(page.getByTestId("modal")).toBeVisible();
+  await page.getByRole("tab", { name: "Artifacts (3)" }).click();
+
+  const outputs = page.locator('[data-artifact-section="outputs"]');
+  const references = page.locator('[data-artifact-section="references"]');
+  await expect(outputs.locator(".artifact-card")).toHaveCount(1);
+  await expect(references.locator(".artifact-card")).toHaveCount(2);
+  await expect(outputs).toContainText("Produced");
+  await expect(references).toContainText("Referenced");
+
+  const pullRequest = outputs.locator('[data-artifact-id="artifact-pr38"] .artifact-primary-link');
+  await expect(pullRequest).toHaveAttribute(
+    "href",
+    "https://github.com/rrnewton/dev-hermit/pull/38"
+  );
+  await expect(pullRequest).toHaveAttribute("target", "_blank");
+  await expect(pullRequest).toHaveAttribute("rel", "noopener noreferrer");
+  await expect(outputs.locator(".artifact-project-link")).toHaveText("rrnewton/dev-hermit");
+
+  const unsafeCard = references.locator('[data-artifact-id="artifact-unsafe-link"]');
+  await expect(unsafeCard.locator("a.artifact-primary-link")).toHaveCount(0);
+  await expect(unsafeCard.locator(".artifact-link-disabled")).toHaveText("Unsafe transcript link");
+  await expect(page.locator('.artifact-phase-link[data-phase-id="phase-a-1"]')).toHaveCount(3);
+
+  await page.locator("#modal-close").click();
+  await page.locator(".rollup-marker.rollup-daily").first().dblclick();
+  await page.getByRole("tab", { name: "Artifacts (3)" }).click();
+  await expect(page.locator('[data-artifact-section="outputs"] .artifact-card')).toHaveCount(1);
+  await page.locator('.artifact-phase-link[data-phase-id="phase-a-1"]').first().click();
+  await expect(page.locator("#modal-title")).toHaveText("Audit parser invariants");
+
+  await page.locator("#modal-close").click();
+  await page.locator('.agent-lifetime-group[data-agent-id="agent-a"]').dispatchEvent(
+    "dblclick",
+    { detail: 2 }
+  );
+  await expect(page.locator("#modal-title")).toHaveText("Parser audit");
+  await expect(page.getByRole("tab", { name: "Work Phases" })).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Artifacts (3)" })).toBeVisible();
+  await page.getByRole("tab", { name: "Artifacts (3)" }).click();
+  await expect(page.locator('[data-artifact-section="references"] .artifact-card')).toHaveCount(2);
+});
+
+test("legacy archives do not request or require an artifact catalog", async function ({ page }) {
+  const legacy = JSON.parse(JSON.stringify(TIMELINE));
+  delete legacy.artifact_catalog_path;
+  [legacy.agents, legacy.phases, legacy.rollups].forEach(function (items) {
+    items.forEach(function (item) {
+      delete item.artifact_ids;
+      delete item.output_artifact_ids;
+    });
+  });
+  let artifactRequests = 0;
+  page.on("request", function (request) {
+    if (new URL(request.url()).pathname === "/data/artifacts.json") {
+      artifactRequests += 1;
+    }
+  });
+  await page.route("**/data/timeline.json", function (route) {
+    return route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(legacy)
+    });
+  });
+  await page.reload();
+  await expect(page.locator("#dataset-meta")).not.toContainText("Loading timeline");
+  await expect(page.locator("#load-error")).toBeHidden();
+  await expect(page.locator(phaseSelector)).toBeVisible();
+  expect(artifactRequests).toBe(0);
+
+  await page.locator('.agent-lifetime-group[data-agent-id="agent-a"]').dispatchEvent(
+    "dblclick",
+    { detail: 2 }
+  );
+  await expect(page.locator("#modal-title")).toHaveText("Parser audit");
+  await expect(page.getByRole("tab", { name: /Artifacts/ })).toHaveCount(0);
 });

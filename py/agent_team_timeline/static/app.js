@@ -102,6 +102,9 @@
     agentsById: new Map(),
     teamBySlug: new Map(),
     glossaryById: new Map(),
+    artifactsById: new Map(),
+    artifactCatalogState: "legacy",
+    artifactCatalogError: "",
     axisTicks: [],
     selectedTeam: "",
     query: "",
@@ -464,7 +467,8 @@
       rollups: array(raw.rollups),
       summary_files: array(raw.summary_files),
       glossary: array(raw.glossary),
-      glossary_path: text(raw.glossary_path)
+      glossary_path: text(raw.glossary_path),
+      artifact_catalog_path: text(raw.artifact_catalog_path)
     };
 
     var inferredStart = Infinity;
@@ -498,6 +502,41 @@
     }
     normalized.range = { start_ms: start, end_ms: end };
     return normalized;
+  }
+
+  async function loadArtifactCatalog(data) {
+    app.artifactsById.clear();
+    app.artifactCatalogError = "";
+    var path = text(data && data.artifact_catalog_path);
+    if (!path) {
+      app.artifactCatalogState = "legacy";
+      return;
+    }
+    app.artifactCatalogState = "loading";
+    try {
+      var loaded = await fetchPath(path, "json");
+      var catalog = loaded.content;
+      if (!catalog || typeof catalog !== "object" ||
+          number(catalog.schema_version, NaN) !== 1 ||
+          !Array.isArray(catalog.artifacts)) {
+        throw new Error("Artifact catalog is not a supported schema-1 catalog.");
+      }
+      catalog.artifacts.forEach(function (artifact) {
+        if (!artifact || typeof artifact !== "object") {
+          throw new Error("Artifact catalog entries must be objects.");
+        }
+        var id = text(artifact.artifact_id);
+        if (!/^artifact-[a-z0-9-]+$/.test(id) || app.artifactsById.has(id)) {
+          throw new Error("Artifact catalog contains an invalid or duplicate ID.");
+        }
+        app.artifactsById.set(id, artifact);
+      });
+      app.artifactCatalogState = "ready";
+    } catch (error) {
+      app.artifactsById.clear();
+      app.artifactCatalogState = "error";
+      app.artifactCatalogError = error instanceof Error ? error.message : String(error);
+    }
   }
 
   function dataVersionLabel(value) {
@@ -1977,11 +2016,19 @@
       event.stopPropagation();
       selectAgent(agent);
     });
+    group.addEventListener("dblclick", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      openAgentLifetimeModal(agent);
+    });
     group.addEventListener("contextmenu", function (event) {
       agentContextMenu(event, agent);
     });
     group.addEventListener("keydown", function (event) {
-      if (event.key === " ") {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        openAgentLifetimeModal(agent);
+      } else if (event.key === " ") {
         event.preventDefault();
         selectAgent(agent);
       }
@@ -2760,6 +2807,338 @@
     return link;
   }
 
+  function uniqueArtifactIds(value) {
+    var seen = new Set();
+    var result = [];
+    array(value).forEach(function (rawId) {
+      var id = text(rawId);
+      if (/^artifact-[a-z0-9-]+$/.test(id) && !seen.has(id)) {
+        seen.add(id);
+        result.push(id);
+      }
+    });
+    return result;
+  }
+
+  function artifactAssociation(owner, fallback) {
+    var source = owner && typeof owner === "object" ? owner : {};
+    var backup = fallback && typeof fallback === "object" ? fallback : {};
+    var allIds = uniqueArtifactIds(
+      Array.isArray(source.artifact_ids) ? source.artifact_ids : backup.artifact_ids
+    );
+    var outputIds = uniqueArtifactIds(
+      Array.isArray(source.output_artifact_ids)
+        ? source.output_artifact_ids
+        : backup.output_artifact_ids
+    );
+    var allSet = new Set(allIds);
+    outputIds.forEach(function (id) {
+      if (!allSet.has(id)) {
+        allSet.add(id);
+        allIds.push(id);
+      }
+    });
+    var outputSet = new Set(outputIds);
+    return {
+      all: allIds,
+      outputs: allIds.filter(function (id) { return outputSet.has(id); }),
+      references: allIds.filter(function (id) { return !outputSet.has(id); })
+    };
+  }
+
+  function safeArtifactTarget(value) {
+    var raw = text(value).trim();
+    if (!raw || raw.startsWith("//")) {
+      return null;
+    }
+    try {
+      var url = new URL(raw, window.location.href);
+      if (url.username || url.password) {
+        return null;
+      }
+      var sameOrigin = url.origin === window.location.origin;
+      if ((!sameOrigin && url.protocol !== "https:") ||
+          (sameOrigin && url.protocol !== "http:" && url.protocol !== "https:")) {
+        return null;
+      }
+      return { href: url.href, external: !sameOrigin };
+    } catch (_error) {
+      return null;
+    }
+  }
+
+  function artifactLink(url, label, className) {
+    var target = safeArtifactTarget(url);
+    if (!target) {
+      return htmlElement("span", (className || "") + " artifact-link-disabled", label);
+    }
+    var link = htmlElement("a", className || "", label);
+    link.href = target.href;
+    link.dataset.linkScope = target.external ? "external" : "internal";
+    if (target.external) {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    }
+    return link;
+  }
+
+  function artifactKindLabel(value) {
+    var labels = {
+      build_artifact: "Build artifact",
+      commit: "Commit",
+      diff: "Diff",
+      gist: "Gist",
+      issue: "Issue",
+      merge_request: "Merge request",
+      paste: "Paste",
+      pull_request: "Pull request",
+      repository: "Repository",
+      task: "Task",
+      uploaded_file: "Uploaded file",
+      url: "Link"
+    };
+    return labels[text(value)] || "Artifact";
+  }
+
+  function artifactRelationLabel(value, output) {
+    var labels = {
+      produced: "Produced",
+      published: "Published",
+      updated: "Updated",
+      referenced: "Referenced"
+    };
+    return labels[text(value)] || (output ? "Output" : "Referenced");
+  }
+
+  function artifactEvidence(artifact, context) {
+    var records = array(artifact && artifact.evidence);
+    if (!context || typeof context !== "object") {
+      return records;
+    }
+    var start = number(context.start_ms, -Infinity);
+    var end = number(context.end_ms, Infinity);
+    var agentId = text(context.agent_id);
+    return records.filter(function (evidence) {
+      var at = number(evidence && evidence.timestamp_ms, NaN);
+      return Number.isFinite(at) && at >= start && at < end &&
+        (!agentId || text(evidence.thread_id) === agentId);
+    });
+  }
+
+  function artifactRelations(artifact, context, output) {
+    var outputRelations = new Set(["produced", "published", "updated"]);
+    var seen = new Set();
+    var result = [];
+    artifactEvidence(artifact, context).forEach(function (evidence) {
+      var relation = text(evidence.relation);
+      if ((output && outputRelations.has(relation)) ||
+          (!output && relation === "referenced")) {
+        if (!seen.has(relation)) {
+          seen.add(relation);
+          result.push(relation);
+        }
+      }
+    });
+    return result.length ? result : [output ? "output" : "referenced"];
+  }
+
+  function phaseForArtifactEvidence(evidence) {
+    var at = number(evidence && evidence.timestamp_ms, NaN);
+    var agentId = text(evidence && evidence.thread_id);
+    if (!Number.isFinite(at) || !agentId) {
+      return null;
+    }
+    var phases = app.phasesByAgent.get(agentId) || [];
+    for (var index = 0; index < phases.length; index += 1) {
+      var phase = phases[index];
+      if (at >= number(phase.start_ms, Infinity) && at < number(phase.end_ms, -Infinity)) {
+        return phase;
+      }
+    }
+    return null;
+  }
+
+  function artifactEvidenceLinks(artifact, context) {
+    var container = htmlElement("div", "artifact-evidence-links");
+    var seen = new Set();
+    artifactEvidence(artifact, context).forEach(function (evidence) {
+      var phase = phaseForArtifactEvidence(evidence);
+      if (!phase || seen.has(text(phase.id))) {
+        return;
+      }
+      var agent = app.agentsById.get(text(phase.agent_id));
+      if (!agent) {
+        return;
+      }
+      seen.add(text(phase.id));
+      var button = htmlElement(
+        "button",
+        "artifact-phase-link",
+        agentShortName(agent) + " · " + text(phase.phrase, "Work phase")
+      );
+      button.type = "button";
+      button.dataset.phaseId = text(phase.id);
+      button.addEventListener("click", function () {
+        openPhaseModal(phase, agent);
+      });
+      container.appendChild(button);
+    });
+    return container;
+  }
+
+  function artifactCard(artifact, output, context) {
+    var id = text(artifact.artifact_id);
+    var card = htmlElement("article", "artifact-card");
+    card.dataset.artifactId = id;
+    card.dataset.artifactRole = output ? "output" : "reference";
+
+    var heading = htmlElement("div", "artifact-card-heading");
+    heading.appendChild(htmlElement("span", "artifact-kind", artifactKindLabel(artifact.kind)));
+    artifactRelations(artifact, context, output).forEach(function (relation) {
+      var badge = htmlElement(
+        "span",
+        "artifact-relation artifact-relation-" + normalizeKind(
+          relation,
+          ["produced", "published", "updated", "referenced", "output"],
+          output ? "output" : "referenced"
+        ),
+        artifactRelationLabel(relation, output)
+      );
+      heading.appendChild(badge);
+    });
+    card.appendChild(heading);
+
+    var label = text(artifact.label, text(artifact.title, artifactKindLabel(artifact.kind)));
+    card.appendChild(artifactLink(artifact.url, label, "artifact-primary-link"));
+    var title = text(artifact.title);
+    if (title && title !== label) {
+      card.appendChild(htmlElement("div", "artifact-title", title));
+    }
+
+    var projectLabel = text(artifact.project_slug);
+    if (projectLabel) {
+      var project = htmlElement("div", "artifact-project");
+      project.append(
+        document.createTextNode("Project: "),
+        artifactLink(artifact.project_url, projectLabel, "artifact-project-link")
+      );
+      card.appendChild(project);
+    }
+
+    var evidence = artifactEvidence(artifact, context);
+    if (evidence.length) {
+      var actions = [];
+      var seenActions = new Set();
+      evidence.forEach(function (record) {
+        var action = text(record.action).replace(/_/g, " ");
+        if (action && !seenActions.has(action)) {
+          seenActions.add(action);
+          actions.push(action);
+        }
+      });
+      var firstAt = Math.min.apply(null, evidence.map(function (record) {
+        return number(record.timestamp_ms, Infinity);
+      }));
+      var evidenceText = formatCount(evidence.length) +
+        (evidence.length === 1 ? " evidence record" : " evidence records");
+      if (Number.isFinite(firstAt)) {
+        evidenceText += " · " + formatFullTime(firstAt);
+      }
+      if (actions.length) {
+        evidenceText += " · " + actions.join(", ");
+      }
+      card.appendChild(htmlElement("div", "artifact-evidence", evidenceText));
+      var phaseLinks = artifactEvidenceLinks(artifact, context);
+      if (phaseLinks.childElementCount) {
+        card.appendChild(phaseLinks);
+      }
+    }
+    return card;
+  }
+
+  function artifactSection(title, role, ids, output, context) {
+    var section = htmlElement("section", "artifact-section");
+    section.dataset.artifactSection = role;
+    section.appendChild(
+      htmlElement("h3", "artifact-section-title", title + " (" + formatCount(ids.length) + ")")
+    );
+    var cards = [];
+    ids.forEach(function (id) {
+      var artifact = app.artifactsById.get(id);
+      if (artifact) {
+        cards.push(artifactCard(artifact, output, context));
+      }
+    });
+    if (cards.length) {
+      var grid = htmlElement("div", "artifact-grid");
+      grid.replaceChildren.apply(grid, cards);
+      section.appendChild(grid);
+    } else {
+      section.appendChild(htmlElement(
+        "p",
+        "artifact-section-empty",
+        output
+          ? "No output-changing artifact evidence was captured in this range."
+          : "No separately referenced artifacts were captured in this range."
+      ));
+    }
+    return section;
+  }
+
+  function renderArtifacts(container, owner, fallback, context) {
+    var association = artifactAssociation(owner, fallback);
+    container.dataset.artifactCount = String(association.all.length);
+    if (app.artifactCatalogState === "error") {
+      container.appendChild(htmlElement(
+        "div",
+        "artifact-catalog-warning",
+        "Artifact links are unavailable: " + app.artifactCatalogError
+      ));
+    }
+    if (!association.all.length) {
+      container.appendChild(htmlElement(
+        "div",
+        "empty-message",
+        "No evidence-backed work artifacts were associated with this range."
+      ));
+      return;
+    }
+    container.append(
+      artifactSection("Work outputs", "outputs", association.outputs, true, context),
+      artifactSection(
+        "Referenced artifacts",
+        "references",
+        association.references,
+        false,
+        context
+      )
+    );
+    var knownCount = association.all.filter(function (id) {
+      return app.artifactsById.has(id);
+    }).length;
+    if (knownCount < association.all.length && app.artifactCatalogState !== "error") {
+      container.appendChild(htmlElement(
+        "div",
+        "artifact-catalog-warning",
+        formatCount(association.all.length - knownCount) +
+          " associated artifact record(s) were not present in this catalog."
+      ));
+    }
+  }
+
+  function artifactTab(owner, fallback, context) {
+    var count = artifactAssociation(owner, fallback).all.length;
+    if (!count) {
+      return null;
+    }
+    return {
+      label: "Artifacts (" + formatCount(count) + ")",
+      render: function (container) {
+        renderArtifacts(container, owner, fallback, context);
+      }
+    };
+  }
+
   function renderWorkSummary(container, entries) {
     var items = array(entries);
     if (!items.length) {
@@ -2943,6 +3322,73 @@
     };
   }
 
+  function renderAgentLifetimeOverview(container, agent) {
+    var phases = app.phasesByAgent.get(text(agent.id)) || [];
+    container.appendChild(
+      htmlElement("h3", "agent-lifetime-section-title", "Work phases (" +
+        formatCount(phases.length) + ")")
+    );
+    if (!phases.length) {
+      container.appendChild(htmlElement(
+        "div",
+        "empty-message",
+        "No summarized work phases were retained for this agent."
+      ));
+      return;
+    }
+    var list = htmlElement("div", "agent-lifetime-phase-list");
+    phases.forEach(function (phase) {
+      var button = htmlElement("button", "agent-lifetime-phase");
+      button.type = "button";
+      button.dataset.phaseId = text(phase.id);
+      button.append(
+        htmlElement(
+          "time",
+          "agent-lifetime-phase-time",
+          formatRange(number(phase.start_ms, 0), number(phase.end_ms, 0))
+        ),
+        htmlElement("strong", "agent-lifetime-phase-title", text(phase.phrase, "Work phase")),
+        htmlElement("span", "agent-lifetime-phase-summary", text(phase.paragraph))
+      );
+      button.addEventListener("click", function () {
+        openPhaseModal(phase, agent);
+      });
+      list.appendChild(button);
+    });
+    container.appendChild(list);
+  }
+
+  function openAgentLifetimeModal(agent) {
+    app.detailRequest += 1;
+    var start = number(agent.start_ms, app.data.range.start_ms);
+    var end = number(agent.end_ms, app.data.range.end_ms);
+    openModalBase(
+      "Agent lifetime · " + formatRange(start, end),
+      agentShortName(agent),
+      agentLifetimeSummary(agent),
+      null
+    );
+    dom.modalEyebrow.title = agentAccessibleName(agent);
+    showModalAgentIdentity(agent);
+    var tabs = [
+      {
+        label: "Work Phases",
+        render: function (container) {
+          renderAgentLifetimeOverview(container, agent);
+        }
+      }
+    ];
+    var artifacts = artifactTab(agent, null, {
+      start_ms: start,
+      end_ms: end,
+      agent_id: agent.id
+    });
+    if (artifacts) {
+      tabs.push(artifacts);
+    }
+    activateTabs(tabs, 0);
+  }
+
   function showPhaseDetail(detail, phase, agent, detailUrl) {
     var phrase = text(detail.phrase, text(phase.phrase, "Agent phase"));
     var paragraph = text(detail.paragraph, text(phase.paragraph));
@@ -2959,7 +3405,7 @@
     var transcriptRoles = new Set(array(detail.transcript).map(function (entry) {
       return transcriptRole(entry.role);
     }));
-    activateTabs([
+    var tabs = [
       {
         label: "Agent Work Summary",
         render: function (container) {
@@ -2985,7 +3431,16 @@
           return renderRawSummary(container, path, detailUrl);
         }
       }
-    ], 0);
+    ];
+    var artifacts = artifactTab(detail, phase, {
+      start_ms: phase.start_ms,
+      end_ms: phase.end_ms,
+      agent_id: phase.agent_id
+    });
+    if (artifacts) {
+      tabs.splice(tabs.length - 1, 0, artifacts);
+    }
+    activateTabs(tabs, 0);
   }
 
   async function openPhaseModal(phase, agent) {
@@ -3195,6 +3650,13 @@
         }
       });
     }
+    var artifacts = artifactTab(rollup, null, {
+      start_ms: start,
+      end_ms: end
+    });
+    if (artifacts) {
+      tabs.push(artifacts);
+    }
     activateTabs(tabs, 0);
   }
 
@@ -3217,7 +3679,9 @@
         throw new Error("HTTP " + response.status + " " + response.statusText);
       }
       var raw = await response.json();
-      initializeData(raw);
+      var data = normalizeData(raw);
+      await loadArtifactCatalog(data);
+      initializeData(data);
     } catch (error) {
       showLoadError(error);
     }
