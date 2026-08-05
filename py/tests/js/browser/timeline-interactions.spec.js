@@ -149,6 +149,8 @@ test("full-transcript role filters support user-only, none, and all", async func
     "transcript entries do not expose normalized data-role values yet"
   );
   expect(await entries.count()).toBe(5);
+  const pullRequest = page.locator('.pr-reference[href="https://github.com/rrnewton/dev-hermit/pull/38"]');
+  await expect(pullRequest).toHaveAttribute("title", "Repair malformed-input handling");
 
   await filters.getByRole("button", { name: /user only/i }).click();
   await expect(page.locator('.transcript-entry[data-role="user"]:visible')).toHaveCount(1);
@@ -160,4 +162,3 @@ test("full-transcript role filters support user-only, none, and all", async func
   await filters.getByRole("button", { name: /select all/i }).click();
   await expect(page.locator(".transcript-entry[data-role]:visible")).toHaveCount(5);
 });
-

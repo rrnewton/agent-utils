@@ -166,6 +166,52 @@
     return container;
   }
 
+  function safePullRequestUrl(value) {
+    try {
+      var url = new URL(text(value));
+      if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "github.com" ||
+          url.username || url.password || !/^\/[^/]+\/[^/]+\/pull\/[1-9][0-9]*\/?$/.test(url.pathname)) {
+        return "";
+      }
+      return url.href;
+    } catch (_error) {
+      return "";
+    }
+  }
+
+  function referenceTextElement(source, references, className) {
+    var content = text(source);
+    var container = htmlElement("span", className || "");
+    var cursor = 0;
+    array(references)
+      .slice()
+      .sort(function (left, right) {
+        return number(left.start, 0) - number(right.start, 0);
+      })
+      .forEach(function (reference) {
+        var start = number(reference.start, -1);
+        var end = number(reference.end, -1);
+        var url = safePullRequestUrl(reference.url);
+        if (!Number.isInteger(start) || !Number.isInteger(end) || start < cursor ||
+            end <= start || end > content.length || !url) {
+          return;
+        }
+        container.appendChild(document.createTextNode(content.slice(cursor, start)));
+        var link = htmlElement("a", "pr-reference", content.slice(start, end));
+        link.href = url;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        link.title = text(
+          reference.title,
+          text(reference.repository, "GitHub") + " pull request #" + formatCount(reference.number)
+        );
+        container.appendChild(link);
+        cursor = end;
+      });
+    container.appendChild(document.createTextNode(content.slice(cursor)));
+    return container;
+  }
+
   function svgElement(tag, attributes, content) {
     var element = document.createElementNS(SVG_NS, tag);
     if (attributes) {
@@ -2256,11 +2302,17 @@
       var item = htmlElement("li", "work-summary-item");
       item.append(
         htmlElement("time", "entry-time", formatFullTime(number(entry.at_ms, NaN))),
-        markdownElement(
-          text(entry.text, "No summary text."),
-          "entry-text",
-          true
-        )
+        array(entry.pull_requests).length
+          ? referenceTextElement(
+              text(entry.text, "No summary text."),
+              entry.pull_requests,
+              "entry-text"
+            )
+          : markdownElement(
+              text(entry.text, "No summary text."),
+              "entry-text",
+              true
+            )
       );
       list.appendChild(item);
     });
@@ -2345,7 +2397,9 @@
         if (condensed) {
           card.appendChild(htmlElement("div", "tool-condensation", condensed));
         } else {
-          card.appendChild(htmlElement("div", "entry-text", text(entry.text, "")));
+          card.appendChild(
+            referenceTextElement(text(entry.text, ""), entry.pull_requests, "entry-text")
+          );
         }
         cards.push(card);
       });

@@ -32,6 +32,9 @@ provider-neutral so Claude, ORC, and Gas Town importers can be added without cha
 - The fixed footer recomputes user prompts, agent responses, inter-agent messages, tool calls, and
   active agents for the visible time range.
 - Daily, weekly, monthly, and quarterly markers link the visible range to long-term summaries.
+- Explicit GitHub pull-request URLs and `owner/repository#number` references become safe links in
+  work summaries and transcripts. Ambiguous naked `#number` text stays plain unless a future
+  importer supplies repository context for that exact message.
 
 The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
 bundle renders summary headings, lists, tables, blockquotes, links, and code with raw HTML disabled.

@@ -214,6 +214,9 @@ const timeline = {
   ]
 };
 
+const pullUrl = "https://github.com/rrnewton/dev-hermit/pull/38";
+const pullText = "I will trace the malformed-input path for " + pullUrl + ".";
+
 const phaseADetail = {
   phrase: "Audit parser invariants",
   paragraph: "Found and tested the parser boundary that caused the regression.",
@@ -237,7 +240,17 @@ const phaseADetail = {
     {
       role: "assistant",
       at_ms: BASE_MS + 11 * minute,
-      text: "I will trace the malformed-input path and add a focused test."
+      text: pullText,
+      pull_requests: [{
+        start: pullText.indexOf(pullUrl),
+        end: pullText.indexOf(pullUrl) + pullUrl.length,
+        text: pullUrl,
+        kind: "explicit_url",
+        repository: "rrnewton/dev-hermit",
+        number: 38,
+        url: pullUrl,
+        title: "Repair malformed-input handling"
+      }]
     },
     {
       role: "tool",
@@ -312,4 +325,3 @@ module.exports = {
   AGENT_COUNT: agents.length,
   virtualFiles: virtualFiles
 };
-

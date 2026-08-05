@@ -1098,6 +1098,19 @@ h1 {
   white-space: pre-wrap;
 }
 
+.pr-reference {
+  color: #79cfee;
+  text-decoration-color: rgb(121 207 238 / 55%);
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+.pr-reference:hover,
+.pr-reference:focus-visible {
+  color: #b8efff;
+  text-decoration-style: solid;
+}
+
 .transcript-list {
   display: grid;
   gap: 12px;

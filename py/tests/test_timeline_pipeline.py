@@ -228,6 +228,38 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert rebuilt["files_changed"] == 0
 
 
+def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path) -> None:
+    team = _team(
+        "Reviewed https://github.com/rrnewton/dev-hermit/pull/38 and "
+        "sched-ext/scx#3668; naked #7 is ambiguous."
+    )
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    build_archive(tmp_path, team.team_slug)
+
+    detail_objects = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "data" / "details").glob("*.json")
+    ]
+    entry = next(
+        transcript_entry
+        for detail in detail_objects
+        for transcript_entry in detail["transcript"]
+        if "dev-hermit/pull/38" in transcript_entry["text"]
+    )
+    references = entry["pull_requests"]
+    assert [reference["repository"] for reference in references] == [
+        "rrnewton/dev-hermit",
+        "sched-ext/scx",
+    ]
+    assert [reference["number"] for reference in references] == [38, 3668]
+    assert all(
+        entry["text"][reference["start"] : reference["end"]] == reference["text"]
+        for reference in references
+    )
+    assert all(reference["text"] != "#7" for reference in references)
+
+
 def test_every_completed_subagent_turn_gets_a_result_edge(tmp_path: Path) -> None:
     team = _team()
     second_final = _event(

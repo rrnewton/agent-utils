@@ -9,10 +9,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
+from agent_team_timeline.github_refs import find_pull_request_references
 from agent_team_timeline.model import Agent, Edge, Event, TeamData, Turn, source_digest
 from agent_team_timeline.naming import AgentNameResult
 from agent_team_timeline.periods import Period, period_heading
-from agent_team_timeline.phases import PhaseStats, PhaseWindow
+from agent_team_timeline.phases import PhaseStats, PhaseWindow, TranscriptEntry
 from agent_team_timeline.summarize import SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_markdown
 
@@ -422,6 +423,27 @@ finally:
 '''
 
 
+def _pull_request_references(text: str) -> list[dict[str, object]]:
+    return [
+        {
+            "start": reference.start,
+            "end": reference.end,
+            "text": reference.text,
+            "kind": reference.kind.value,
+            "repository": reference.link.repository.slug,
+            "number": reference.link.number,
+            "url": reference.link.url,
+        }
+        for reference in find_pull_request_references(text)
+    ]
+
+
+def _transcript_entry_obj(entry: TranscriptEntry) -> dict[str, object]:
+    result = entry.to_json_obj()
+    result["pull_requests"] = _pull_request_references(entry.text)
+    return result
+
+
 def render_archive(
     archive: Path,
     team: TeamData,
@@ -456,9 +478,14 @@ def render_archive(
             "paragraph": summary.paragraph,
             "stats": phase.stats.to_mapping(),
             "work_summary": [
-                {"at_ms": item.at_ms, "text": item.text} for item in summary.work_summary
+                {
+                    "at_ms": item.at_ms,
+                    "text": item.text,
+                    "pull_requests": _pull_request_references(item.text),
+                }
+                for item in summary.work_summary
             ],
-            "transcript": [entry.to_json_obj() for entry in phase.transcript],
+            "transcript": [_transcript_entry_obj(entry) for entry in phase.transcript],
             "raw_summary_path": raw_path,
             "agent": _agent_identity_obj(agent, phase_agent_name),
         }
