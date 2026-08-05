@@ -47,6 +47,11 @@ This review record entered the repository with implementation commit
     `summary <action> --help` request with the generic summary page, hiding real plan flags and
     showing unrelated build flags. Both engines now expose action-specific build, merge, plan, and
     stats contracts; the differential requires the right flags and rejects cross-action leakage.
+11. **Summary action schemas were displayed but not enforced.** Rust discarded unexpected
+    positionals and silently defaulted malformed reservoir caps, planner names, and output formats.
+    Both editions now enforce the same positive signed-64 ASCII cap grammar and action arity, reject
+    missing or invalid values, preserve `--` and empty-assignment behavior, and describe planning
+    from summary JSON plus a DAG. Adversarial differentials exercise every failure and edge case.
 
 ## Cross-implementation evidence
 
@@ -57,7 +62,7 @@ This review record entered the repository with implementation commit
     self-test verdicts, signal status, invalid inputs, wrapped help, and clean missing-executable
     failure.
 - `python3 cross/differential.py --tool safe-ci-dag-runner`
-  - Default seed/count completed with **411 checks passed across 41 fixtures**.
+  - Default seed/count completed with **434 checks passed across 41 fixtures**.
 - `python3 -m mypy cross/differential.py`
   - No issues.
 
@@ -67,10 +72,9 @@ an observed result rather than a harness-level side effect.
 
 ## Focused test evidence
 
-- Python: **85 passed** across reservation, allocator, CLI, cgroup ownership/exact-set, and build
-  job-cap tests; the final allocator/reservation/cgroup subset passed **33 tests** after executable
-  preflight hardening.
-- Rust: the full safe package suite passed **87 unit tests plus 8 integration tests**, including
+- Python: reservation, allocator, CLI schema, cgroup ownership/exact-set, analysis compatibility,
+  and build job-cap tests pass within the 559-test repository suite.
+- Rust: the full safe package suite passed **88 unit tests plus 8 integration tests**, including
   live cgroup memory, CPU-time, core-box, and default-containment tests.
 - `python3 scripts/embed_userguides.py --check`: all 12 rendered paired documents and two
   single-language package documents are current and standalone through exact checked links.

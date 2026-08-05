@@ -1692,9 +1692,44 @@ def _summary_sync_case(
             return
         rep.ok(f"summary-build:{label}")
 
+        fallback_extra = dict(extra)
+        fallback_extra["SAFE_CI_DAG_RUNNER_PROFILE_DIR"] = store
+        empty_assignments = ("summary", "build", "--perf-dir=", "--out=")
+        empty_py = run(py, empty_assignments, fallback_extra)
+        empty_rs = run(rs, empty_assignments, fallback_extra)
+        if (
+            empty_py.returncode == empty_rs.returncode == 0
+            and empty_py.stdout == empty_rs.stdout == pb.stdout
+            and not empty_py.stderr
+            and not empty_rs.stderr
+        ):
+            rep.ok(f"summary-build-empty-assignment:{label}")
+        else:
+            rep.bad(
+                f"summary-build-empty-assignment:{label}",
+                f"py={empty_py.returncode}:{empty_py.stdout!r}:{empty_py.stderr!r}\n"
+                f"rs={empty_rs.returncode}:{empty_rs.stdout!r}:{empty_rs.stderr!r}",
+            )
+
         s_path = os.path.join(tmp, "summary.json")
         with open(s_path, "w") as fh:
             fh.write(pb.stdout)
+
+        # A single input is a valid identity merge in both editions. Keep this aligned with the
+        # `FILE [FILE ...]` action schema and its "one or more" help text.
+        single_args = ("summary", "merge", "--", s_path)
+        single_py, single_rs = run(py, single_args), run(rs, single_args)
+        if (
+            single_py.returncode == single_rs.returncode == 0
+            and single_py.stdout == single_rs.stdout == pb.stdout
+        ):
+            rep.ok(f"summary-merge-single-delimited:{label}")
+        else:
+            rep.bad(
+                f"summary-merge-single-delimited:{label}",
+                f"py={single_py.returncode}:{single_py.stdout!r}:{single_py.stderr!r}\n"
+                f"rs={single_rs.returncode}:{single_rs.stdout!r}:{single_rs.stderr!r}",
+            )
 
         # 2) summary plan (from the summary) == plan --perf-dir (from the store), per build + cross.
         for fmt in ("text", "json"):
@@ -1839,6 +1874,10 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             ("--perf-dir", "--out", "--reservoir-cap", "--summary", "--dag", "--planner"),
         ),
     }
+    summary_top_phrases = (
+        "build a plan from a summary json and dag",
+        "merge one or more summary json files",
+    )
     top_commands = (
         "run", "sweep", "plan", "list", "ascii", "dot", "json", "yaml", "summary",
         "pin-run", "quickstart", "capabilities",
@@ -1853,6 +1892,20 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             )
         else:
             rep.ok(f"cli-schema:{engine}/commands")
+        summary_top = run(command, ("summary", "--help"))
+        normalized_summary_top = " ".join(summary_top.stdout.lower().split())
+        missing_summary_phrases = [
+            phrase for phrase in summary_top_phrases if phrase not in normalized_summary_top
+        ]
+        stale_backend_claim = "plan a summary sync from a backend spec" in normalized_summary_top
+        if summary_top.returncode != 0 or missing_summary_phrases or stale_backend_claim:
+            rep.bad(
+                f"cli-schema:{engine}/summary-top",
+                f"exit={summary_top.returncode}; missing={missing_summary_phrases}; "
+                f"stale backend claim={stale_backend_claim}\n{summary_top.stdout}",
+            )
+        else:
+            rep.ok(f"cli-schema:{engine}/summary-top")
         for subcommand, flags in command_flags.items():
             outcome = run(command, (subcommand, "--help"))
             missing = [flag for flag in flags if flag not in outcome.stdout]
@@ -1885,6 +1938,84 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
                 )
             else:
                 rep.ok(f"cli-schema:{engine}/summary-{action}")
+    summary_invalid_invocations: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("build-unexpected-positional", ("summary", "build", "unexpected")),
+        (
+            "plan-unexpected-positional",
+            (
+                "summary",
+                "plan",
+                "unexpected",
+                "--summary",
+                "missing-summary.json",
+                "--dag",
+                "missing-dag.json",
+            ),
+        ),
+        ("stats-extra-file", ("summary", "stats", "one.json", "two.json")),
+        ("merge-missing-file", ("summary", "merge")),
+        ("build-cap-malformed", ("summary", "build", "--reservoir-cap", "nope")),
+        ("build-cap-underscore", ("summary", "build", "--reservoir-cap", "1_0")),
+        ("build-cap-leading-space", ("summary", "build", "--reservoir-cap", " 10")),
+        ("build-cap-trailing-space", ("summary", "build", "--reservoir-cap", "10 ")),
+        ("build-cap-unicode-digits", ("summary", "build", "--reservoir-cap", "١٠")),
+        ("build-cap-zero", ("summary", "build", "--reservoir-cap", "0")),
+        (
+            "build-cap-out-of-i64-range",
+            ("summary", "build", "--reservoir-cap", "9223372036854775808"),
+        ),
+        (
+            "merge-cap-negative",
+            ("summary", "merge", "missing.json", "--reservoir-cap", "-1"),
+        ),
+        (
+            "plan-bad-planner",
+            (
+                "summary",
+                "plan",
+                "--summary",
+                "missing-summary.json",
+                "--dag",
+                "missing-dag.json",
+                "--planner",
+                "unknown",
+            ),
+        ),
+        (
+            "plan-bad-format",
+            (
+                "summary",
+                "plan",
+                "--summary",
+                "missing-summary.json",
+                "--dag",
+                "missing-dag.json",
+                "--format",
+                "xml",
+            ),
+        ),
+        ("build-missing-value", ("summary", "build", "--perf-dir")),
+        (
+            "build-delimited-positional",
+            ("summary", "build", "--", "--looks-like-an-option"),
+        ),
+        (
+            "plan-missing-value-before-flag",
+            ("summary", "plan", "--summary", "--dag", "missing-dag.json"),
+        ),
+    )
+    for label, args in summary_invalid_invocations:
+        po, ro = run(py, args), run(rs, args)
+        if (
+            po.returncode == ro.returncode == 2
+            and not po.stdout
+            and not ro.stdout
+            and po.stderr
+            and ro.stderr
+        ):
+            rep.ok(f"cli-schema:summary-invalid/{label}")
+        else:
+            rep.bad(f"cli-schema:summary-invalid/{label}", f"py={po}\nrs={ro}")
     po = run(py, ("run", "--da", "missing.json"))
     ro = run(rs, ("run", "--da", "missing.json"))
     if po.returncode == ro.returncode == 2:

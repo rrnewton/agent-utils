@@ -417,8 +417,8 @@ fn summary_help(c: &Palette) -> String {
         "Build / merge / plan / stats the mergeable profile summary.",
         &[
             ("build", "build a summary from a profile store (--perf-dir DIR, --out FILE, --reservoir-cap N)"),
-            ("merge", "merge summary FILEs into one (--out FILE, --reservoir-cap N)"),
-            ("plan", "plan a summary sync from a backend spec"),
+            ("merge", "merge one or more summary JSON files (--out FILE, --reservoir-cap N)"),
+            ("plan", "build a plan from a summary JSON and DAG"),
             ("stats", "print bucket/sample stats for a summary FILE"),
             ("-h, --help", "show this help and exit"),
         ],
@@ -449,7 +449,7 @@ fn summary_merge_help(c: &Palette) -> String {
     render_subcommand_help(
         c,
         "summary merge FILE [FILE ...] [options]",
-        "Merge two or more summary JSON files into one order-independent summary.",
+        "Merge one or more summary JSON files into one order-independent summary.",
         &[
             ("FILE [FILE ...]", "summary JSON files to merge [required]"),
             ("--out FILE", "write JSON to FILE instead of stdout"),
@@ -2345,6 +2345,10 @@ fn parse_flags(
     let mut i = 0;
     while i < rest.len() {
         let arg = &rest[i];
+        if arg == "--" {
+            positional.extend_from_slice(&rest[i + 1..]);
+            break;
+        }
         if let Some(key) = arg.strip_prefix("--") {
             let (k, inline) = match key.split_once('=') {
                 Some((k, v)) => (k.to_string(), Some(v.to_string())),
@@ -2355,9 +2359,13 @@ fn parse_flags(
                     Some(v) => v,
                     None => {
                         i += 1;
-                        rest.get(i)
-                            .cloned()
-                            .ok_or_else(|| format!("the argument --{k} requires a value"))?
+                        let value = rest
+                            .get(i)
+                            .ok_or_else(|| format!("the argument --{k} requires a value"))?;
+                        if value.starts_with("--") {
+                            return Err(format!("the argument --{k} requires a value"));
+                        }
+                        value.clone()
                     }
                 };
                 flags.insert(k, v);
@@ -2370,6 +2378,28 @@ fn parse_flags(
         i += 1;
     }
     Ok((flags, positional))
+}
+
+fn summary_reservoir_cap(flags: &HashMap<String, String>) -> Result<usize, String> {
+    let Some(raw) = flags.get("reservoir-cap") else {
+        return Ok(DEFAULT_RESERVOIR_K);
+    };
+    let value = raw
+        .parse::<i64>()
+        .map_err(|_| format!("argument --reservoir-cap: invalid positive integer: '{raw}'"))?;
+    if value < 1 {
+        return Err("argument --reservoir-cap: must be >= 1".to_string());
+    }
+    usize::try_from(value)
+        .map_err(|_| "argument --reservoir-cap: outside the supported range".to_string())
+}
+
+fn reject_summary_positionals(positionals: &[String]) -> Result<(), String> {
+    if positionals.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("unrecognized arguments: {}", positionals.join(" ")))
+    }
 }
 
 fn write_or_print(text: &str, out: Option<&String>) -> i32 {
@@ -2389,24 +2419,38 @@ fn write_or_print(text: &str, out: Option<&String>) -> i32 {
 }
 
 fn cmd_summary_build(args: &[String]) -> i32 {
-    let (flags, _pos) = match parse_flags(args, &["perf-dir", "out", "reservoir-cap"]) {
+    let (flags, positionals) = match parse_flags(args, &["perf-dir", "out", "reservoir-cap"]) {
         Ok(x) => x,
         Err(e) => {
             eprintln!("{PROG} summary build: error: {e}");
             return 2;
         }
     };
-    let cap = flags
-        .get("reservoir-cap")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_RESERVOIR_K);
-    let feedback_dir = resolve_feedback_dir(flags.get("perf-dir").map(|s| s.as_str()), false);
+    if let Err(error) = reject_summary_positionals(&positionals) {
+        eprintln!("{PROG} summary build: error: {error}");
+        return 2;
+    }
+    let cap = match summary_reservoir_cap(&flags) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{PROG} summary build: error: {error}");
+            return 2;
+        }
+    };
+    let perf_dir = flags
+        .get("perf-dir")
+        .map(String::as_str)
+        .filter(|value| !value.is_empty());
+    let feedback_dir = resolve_feedback_dir(perf_dir, false);
     let (mid, cc) = feedback_identity();
     let summary = match feedback_dir {
         Some(dir) => summary::summary_from_store(Path::new(&dir), &mid, &cc, cap),
         None => summary::empty(&mid, &cc),
     };
-    write_or_print(&summary::to_json(&summary), flags.get("out"))
+    write_or_print(
+        &summary::to_json(&summary),
+        flags.get("out").filter(|value| !value.is_empty()),
+    )
 }
 
 fn cmd_summary_merge(args: &[String]) -> i32 {
@@ -2417,14 +2461,17 @@ fn cmd_summary_merge(args: &[String]) -> i32 {
             return 2;
         }
     };
+    let cap = match summary_reservoir_cap(&flags) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{PROG} summary merge: error: {error}");
+            return 2;
+        }
+    };
     if files.is_empty() {
         eprintln!("{PROG}: summary merge: need at least one file");
         return 2;
     }
-    let cap = flags
-        .get("reservoir-cap")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_RESERVOIR_K);
     let mut summaries: Vec<Summary> = Vec::with_capacity(files.len());
     for file in &files {
         match std::fs::read_to_string(file) {
@@ -2449,7 +2496,10 @@ fn cmd_summary_merge(args: &[String]) -> i32 {
         cap,
         DEFAULT_MAX_BUCKETS,
     ) {
-        Ok(merged) => write_or_print(&summary::to_json(&merged), flags.get("out")),
+        Ok(merged) => write_or_print(
+            &summary::to_json(&merged),
+            flags.get("out").filter(|value| !value.is_empty()),
+        ),
         Err(e) => {
             eprintln!("{PROG}: summary merge: {e}");
             2
@@ -2458,11 +2508,35 @@ fn cmd_summary_merge(args: &[String]) -> i32 {
 }
 
 fn cmd_summary_plan(args: &[String]) -> i32 {
-    let (flags, _pos) = match parse_flags(args, &["summary", "dag", "planner", "max-mem", "format"])
-    {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("{PROG} summary plan: error: {e}");
+    let (flags, positionals) =
+        match parse_flags(args, &["summary", "dag", "planner", "max-mem", "format"]) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("{PROG} summary plan: error: {e}");
+                return 2;
+            }
+        };
+    if let Err(error) = reject_summary_positionals(&positionals) {
+        eprintln!("{PROG} summary plan: error: {error}");
+        return 2;
+    }
+    let planner = match flags.get("planner") {
+        Some(raw) => match Planner::from_value(raw) {
+            Some(value) => value,
+            None => {
+                eprintln!(
+                    "{PROG} summary plan: error: argument --planner: invalid choice: '{raw}' "
+                );
+                return 2;
+            }
+        },
+        None => Planner::GreedyLpt,
+    };
+    let output_format = match flags.get("format").map(String::as_str) {
+        None | Some("text") => "text",
+        Some("json") => "json",
+        Some(raw) => {
+            eprintln!("{PROG} summary plan: error: argument --format: invalid choice: '{raw}'");
             return 2;
         }
     };
@@ -2500,13 +2574,9 @@ fn cmd_summary_plan(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let planner = flags
-        .get("planner")
-        .and_then(|p| Planner::from_value(p))
-        .unwrap_or(Planner::GreedyLpt);
     let (core_budget, mem_budget) = cpa_budgets(planner, flags.get("max-mem").map(|s| s.as_str()));
     let plan = build_plan_from_summary(&cfg, &summary, planner, core_budget, mem_budget);
-    if flags.get("format").map(|s| s.as_str()) == Some("json") {
+    if output_format == "json" {
         println!("{}", plan_to_json(&plan));
     } else {
         print!("{}", plan_to_text(&plan));
@@ -2522,10 +2592,17 @@ fn cmd_summary_stats(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let file = match files.first() {
-        Some(f) => f,
-        None => {
+    let file = match files.as_slice() {
+        [file] => file,
+        [] => {
             eprintln!("{PROG} summary stats: error: a summary FILE is required");
+            return 2;
+        }
+        [_, extra @ ..] => {
+            eprintln!(
+                "{PROG} summary stats: error: unrecognized arguments: {}",
+                extra.join(" ")
+            );
             return 2;
         }
     };
@@ -2661,8 +2738,59 @@ mod tests {
             assert!(!help.contains("summary <action>"));
         }
         let top = vec!["--help".to_string()];
-        assert!(requested_summary_help(&palette, &top)
-            .expect("top-level summary help")
-            .contains("summary <action>"));
+        let top_help = requested_summary_help(&palette, &top).expect("top-level summary help");
+        assert!(top_help.contains("summary <action>"));
+        assert!(top_help.contains("build a plan from a summary JSON and DAG"));
+        assert!(top_help.contains("merge one or more summary JSON files"));
+        assert!(!top_help.contains("plan a summary sync from a backend spec"));
+    }
+
+    #[test]
+    fn summary_action_schemas_reject_invalid_invocations() {
+        let cases = [
+            vec!["summary", "build", "unexpected"],
+            vec![
+                "summary",
+                "plan",
+                "unexpected",
+                "--summary",
+                "missing-summary.json",
+                "--dag",
+                "missing-dag.json",
+            ],
+            vec!["summary", "stats", "one.json", "two.json"],
+            vec!["summary", "merge"],
+            vec!["summary", "build", "--reservoir-cap", "nope"],
+            vec!["summary", "build", "--reservoir-cap", "0"],
+            vec!["summary", "build", "--reservoir-cap", "9223372036854775808"],
+            vec!["summary", "merge", "missing.json", "--reservoir-cap", "-1"],
+            vec![
+                "summary",
+                "plan",
+                "--summary",
+                "missing-summary.json",
+                "--dag",
+                "missing-dag.json",
+                "--planner",
+                "unknown",
+            ],
+            vec![
+                "summary",
+                "plan",
+                "--summary",
+                "missing-summary.json",
+                "--dag",
+                "missing-dag.json",
+                "--format",
+                "xml",
+            ],
+            vec!["summary", "build", "--perf-dir"],
+            vec!["summary", "build", "--", "--looks-like-an-option"],
+            vec!["summary", "plan", "--summary", "--dag", "missing-dag.json"],
+        ];
+        for raw in cases {
+            let args: Vec<String> = raw.into_iter().map(str::to_string).collect();
+            assert_eq!(run(&args), 2, "accepted invalid invocation: {args:?}");
+        }
     }
 }

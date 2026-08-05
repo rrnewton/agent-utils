@@ -25,6 +25,7 @@ from safe_ci_dag_runner.ambient import (
     ambient_bucket,
     capture_ambient_snapshot,
 )
+from safe_ci_dag_runner.analyze import summarize
 from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroups
 from safe_ci_dag_runner.estimates import (
     DEFAULT_MIN_SAMPLES,
@@ -155,6 +156,8 @@ __all__ = [
     # visualization
     "to_dot",
     "to_ascii",
+    # profile analysis library helper (not a console command)
+    "summarize",
     # profile-store feedback + planner
     "Planner",
     "StepSamples",

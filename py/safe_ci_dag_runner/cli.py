@@ -285,6 +285,16 @@ def _positive_int(raw: str) -> int:
     return value
 
 
+def _positive_i64(raw: str) -> int:
+    digits = raw[1:] if raw[:1] in {"+", "-"} else raw
+    if not digits or not digits.isascii() or not digits.isdigit():
+        raise argparse.ArgumentTypeError(f"invalid integer: {raw!r}")
+    value = _positive_int(raw)
+    if value > 2**63 - 1:
+        raise argparse.ArgumentTypeError("must be <= 9223372036854775807")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the complete command-line argument parser."""
     c = Palette(_color_enabled(sys.stdout))
@@ -595,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     sb_build.add_argument("--out", metavar="FILE", default=None, help="write JSON here (else stdout)")
     sb_build.add_argument(
         "--reservoir-cap",
-        type=int,
+        type=_positive_i64,
         default=DEFAULT_RESERVOIR_K,
         metavar="K",
         help=f"max samples kept per (step, inner_jobs) bucket (default {DEFAULT_RESERVOIR_K})",
@@ -604,19 +614,19 @@ def build_parser() -> argparse.ArgumentParser:
     sb_merge = summary_sub.add_parser(
         "merge",
         allow_abbrev=False,
-        help="merge two or more summary JSON files into one (order-independent) on stdout",
+        help="merge one or more summary JSON files into one (order-independent) on stdout",
     )
     sb_merge.add_argument("files", nargs="+", metavar="FILE", help="summary JSON files to merge")
     sb_merge.add_argument("--out", metavar="FILE", default=None, help="write JSON here (else stdout)")
     sb_merge.add_argument(
-        "--reservoir-cap", type=int, default=DEFAULT_RESERVOIR_K, metavar="K",
+        "--reservoir-cap", type=_positive_i64, default=DEFAULT_RESERVOIR_K, metavar="K",
         help=f"max samples per bucket after merge (default {DEFAULT_RESERVOIR_K})",
     )
 
     sb_plan = summary_sub.add_parser(
         "plan",
         allow_abbrev=False,
-        help="build a plan from a summary JSON (same output as `plan`, fed by the summary)",
+        help="build a plan from a summary JSON and DAG",
     )
     sb_plan.add_argument("--summary", required=True, metavar="FILE", help="summary JSON file")
     sb_plan.add_argument(
@@ -1621,7 +1631,7 @@ def _cmd_summary_build(ns: argparse.Namespace) -> int:
 
 
 def _cmd_summary_merge(ns: argparse.Namespace) -> int:
-    """Merge two or more summary JSON files (order-independent) into one on stdout / --out."""
+    """Merge one or more summary JSON files (order-independent) into one on stdout / --out."""
     files = list(ns.files)
     try:
         summaries = [

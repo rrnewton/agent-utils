@@ -15,8 +15,13 @@ x86-64 with the declared Python 3.10 and Rust 1.85 minimums also exercised in CI
 
 A second three-way, read-only audit of published completion candidate
 `6ddd9bca7cbed6387a407a0ac7760626e9be2dcb` challenged the finished package surface, parity
-claims, and artifact checks. It found the final gaps recorded in items 8–10; each now has an
+claims, and artifact checks. It found the gaps recorded in items 8–10; each now has an
 executable regression check.
+
+Cross-review of published follow-up `e703d82ac7c5d2667f8164f3d9a7bc9bdd06c253` then caught a
+too-broad API removal and summary action schemas that Rust advertised but did not enforce. The
+public library helper is preserved as described in item 10; strict CLI parity is recorded in the
+safe-runner review.
 
 ## Findings resolved
 
@@ -48,9 +53,10 @@ executable regression check.
 9. The repository dispatcher and dependency smoke test omitted the packaged `cpuset-alloc` companion
    command. `./bin/cpuset-alloc` now shares the tracked resolver, and all five Python entry-point
    modules receive the dependency-free startup probes.
-10. An unused `safe_ci_dag_runner.analyze` module exposed an undeclared Python-only `main()` and
-    public API. The supported portable `summary` command already owns that job, so the orphan surface
-    was removed. A manifest-derived test now rejects any public `main()` not backed by a declared
+10. `safe_ci_dag_runner.analyze` mixed a stable public `summarize` library helper with an undeclared
+    Python-only `main()`. Removing the module would break the package API, so the helper remains
+    documented and re-exported while only the CLI-shaped surface was retired. A compatibility test
+    pins the helper, and a manifest-derived test rejects any public `main()` not backed by a declared
     console entry point.
 
 ## Executable evidence
@@ -67,6 +73,6 @@ documents, and 21 exact package links. Artifact checks cover four wheels, four s
 rebuilt from sdists, and three registry crates. The repository CI additionally runs the full test,
 strict typing, formatting, Clippy, Python 3.10, and Rust 1.85 contracts.
 
-The completion run on Python 3.12 and Rust 1.96 passed 470 Python tests, 168 Rust tests, and 604
-paired behavioral checks. The same 168 Rust tests and all three registry-package checks also passed
+The completion run on Python 3.12 and Rust 1.96 passed 559 Python tests, 169 Rust tests, and 627
+paired behavioral checks. The same 169 Rust tests and all three registry-package checks also passed
 under Rust 1.85.

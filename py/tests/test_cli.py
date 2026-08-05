@@ -106,6 +106,71 @@ def test_subcommand_help_exits_zero_and_lists_flags(sub: str, expected: str) -> 
     assert expected in out
 
 
+def test_summary_top_help_describes_local_plan_and_single_input_merge() -> None:
+    code, out, _ = _capture_help(["summary", "--help"])
+    normalized = " ".join(out.lower().split())
+
+    assert code == 0
+    assert "build a plan from a summary json and dag" in normalized
+    assert "merge one or more summary json files" in normalized
+    assert "plan a summary sync from a backend spec" not in normalized
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["summary", "build", "unexpected"],
+        [
+            "summary",
+            "plan",
+            "unexpected",
+            "--summary",
+            "missing-summary.json",
+            "--dag",
+            "missing-dag.json",
+        ],
+        ["summary", "stats", "one.json", "two.json"],
+        ["summary", "merge"],
+        ["summary", "build", "--reservoir-cap", "nope"],
+        ["summary", "build", "--reservoir-cap", "1_0"],
+        ["summary", "build", "--reservoir-cap", " 10"],
+        ["summary", "build", "--reservoir-cap", "10 "],
+        ["summary", "build", "--reservoir-cap", "١٠"],
+        ["summary", "build", "--reservoir-cap", "0"],
+        ["summary", "build", "--reservoir-cap", "9223372036854775808"],
+        ["summary", "merge", "missing.json", "--reservoir-cap", "-1"],
+        [
+            "summary",
+            "plan",
+            "--summary",
+            "missing-summary.json",
+            "--dag",
+            "missing-dag.json",
+            "--planner",
+            "unknown",
+        ],
+        [
+            "summary",
+            "plan",
+            "--summary",
+            "missing-summary.json",
+            "--dag",
+            "missing-dag.json",
+            "--format",
+            "xml",
+        ],
+        ["summary", "build", "--perf-dir"],
+        ["summary", "build", "--", "--looks-like-an-option"],
+        ["summary", "plan", "--summary", "--dag", "missing-dag.json"],
+    ],
+)
+def test_summary_action_schema_rejects_invalid_invocations(args: list[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main(args)
+
+    assert raised.value.code == 2
+
+
 def test_python_quickstart_mentions_python_install_only() -> None:
     """The Python quickstart install step must mention pip, never cargo/the Rust binary."""
     rc, out, _ = _capture(["quickstart"])
