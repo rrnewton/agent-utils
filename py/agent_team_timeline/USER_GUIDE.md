@@ -187,8 +187,11 @@ codex-hermit/
 │   ├── timeline.json
 │   └── details/<phase-id>.json
 └── teams/codex-hermit/
+    ├── source_snapshots/             # gitignored verbatim complete-line rollout copies
+    │   └── 2026/08/04/rollout-....jsonl
     ├── raw/
     │   ├── team.json
+    │   ├── source-manifest.json      # versioned path/byte/hash/update provenance
     │   ├── source-snapshot.json
     │   └── messages/<thread-id>.json
     ├── summary_data/
@@ -210,6 +213,22 @@ codex-hermit/
 versioned. It is what prevents a future refresh from buying the same summary twice. Run receipts are
 append-only and make the last attempted/completed refresh, model work, cache hits, source size, and
 source digest auditable.
+
+Ingest first copies every newline-complete rollout in the selected lineage into
+`teams/<team>/source_snapshots/`; all parsing after that point uses these copies rather than the live
+Codex files. The generated root `.gitignore` excludes the potentially large copies, while
+`raw/source-manifest.json` remains versionable and records each original path, copied byte count,
+SHA-256 digest, line count, and last snapshot update. Reruns permit only exact reuse, an append to an
+existing prefix, or a newly discovered child rollout. A disappeared file, shorter complete prefix,
+or rewritten prefix fails the ingest before replacing any prior snapshot. An incomplete trailing
+JSONL line is left for the next run.
+
+The snapshot, manifest, and normalized `team.json` update run under an archive-local Linux file
+lock, so concurrent refreshes cannot publish an older validated copy over a newer one. Parsing is
+restricted to the exact paths in that refresh's validated source set; leftover files from an
+interrupted run are not silently adopted. Snapshot traversal and replacement reject symlinked
+roots, directories, and targets, and durable replacements fsync both file content and its parent
+directory before the transaction proceeds.
 
 ## Codex source semantics and limitations
 

@@ -6,10 +6,14 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import errno
 import hashlib
 import json
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath
 import re
+import secrets
+import stat
 from zoneinfo import ZoneInfo
 
 from agent_team_timeline.model import (
@@ -28,6 +32,80 @@ _NESTED_TOOL_RE = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 class CodexParseError(ValueError):
     """A selected Codex rollout is malformed or the requested lineage is absent."""
+
+
+@dataclass(frozen=True)
+class CodexSourceCopy:
+    """One append-only rollout copy and its versioned provenance record."""
+
+    source_path: str
+    original_path: str
+    snapshot_path: str
+    thread_id: str
+    copied_bytes: int
+    line_count: int
+    sha256: str
+    updated_at: str
+
+    def to_json_obj(self) -> dict[str, object]:
+        return {
+            "source_path": self.source_path,
+            "original_path": self.original_path,
+            "snapshot_path": self.snapshot_path,
+            "thread_id": self.thread_id,
+            "copied_bytes": self.copied_bytes,
+            "line_count": self.line_count,
+            "sha256": self.sha256,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_json_obj(cls, raw: Mapping[str, object], where: str) -> CodexSourceCopy:
+        source_path = _string(raw.get("source_path"))
+        original_path = _string(raw.get("original_path"))
+        snapshot_path = _string(raw.get("snapshot_path"))
+        thread_id = _string(raw.get("thread_id"))
+        copied_bytes = _integer(raw.get("copied_bytes"))
+        line_count = _integer(raw.get("line_count"))
+        sha256 = _string(raw.get("sha256"))
+        updated_at = _string(raw.get("updated_at"))
+        if (
+            source_path is None
+            or original_path is None
+            or snapshot_path is None
+            or thread_id is None
+            or copied_bytes is None
+            or copied_bytes < 0
+            or line_count is None
+            or line_count < 0
+            or sha256 is None
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            or updated_at is None
+        ):
+            raise CodexParseError(f"{where}: malformed source-copy record")
+        _safe_snapshot_relative(source_path)
+        if snapshot_path != source_path:
+            raise CodexParseError(
+                f"{where}: snapshot_path must match the safe relative source_path"
+            )
+        return cls(
+            source_path,
+            original_path,
+            snapshot_path,
+            thread_id,
+            copied_bytes,
+            line_count,
+            sha256,
+            updated_at,
+        )
+
+
+@dataclass(frozen=True)
+class CodexSnapshotResult:
+    """Result of copying a lineage into an archive-local source directory."""
+
+    sources: tuple[CodexSourceCopy, ...]
+    files_changed: int
 
 
 @dataclass(frozen=True)
@@ -94,6 +172,13 @@ class _Activity:
     timestamp_ms: int
     payload: Mapping[str, object]
     source_line: int
+
+
+@dataclass(frozen=True)
+class _PendingCopy:
+    source: CodexSourceCopy
+    complete: bytes
+    baseline: bytes | None
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -184,6 +269,219 @@ def _relative_path(path: Path, sessions_root: Path) -> str:
         return str(path)
 
 
+def _safe_snapshot_relative(source_path: str) -> PurePosixPath:
+    relative = PurePosixPath(source_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in ("", ".", "..") for part in relative.parts)
+    ):
+        raise CodexParseError(f"unsafe source snapshot path {source_path!r}")
+    return relative
+
+
+def _snapshot_target(snapshot_root: Path, source_path: str) -> Path:
+    relative = _safe_snapshot_relative(source_path)
+    return snapshot_root.joinpath(*relative.parts)
+
+
+def _complete_prefix(data: bytes) -> bytes:
+    if data.endswith(b"\n"):
+        return data
+    newline = data.rfind(b"\n")
+    return data[: newline + 1] if newline >= 0 else b""
+
+
+def _open_directory_no_symlinks(path: Path, *, create: bool) -> int | None:
+    """Open an absolute directory path component-by-component without following symlinks."""
+
+    absolute = path.absolute()
+    parts = absolute.parts
+    if not parts:
+        raise CodexParseError(f"invalid empty snapshot directory path: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        current = os.open(parts[0], flags)
+    except OSError as exc:
+        raise CodexParseError(f"cannot open snapshot path root {parts[0]}: {exc}") from exc
+    try:
+        for part in parts[1:]:
+            if create:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise CodexParseError(
+                        f"cannot create snapshot directory component {part!r}: {exc}"
+                    ) from exc
+            try:
+                following = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    os.close(current)
+                    current = -1
+                    return None
+                raise
+            except OSError as exc:
+                message = (
+                    "symlink or non-directory"
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR)
+                    else "invalid"
+                )
+                raise CodexParseError(
+                    f"{message} snapshot directory component {part!r} in {absolute}: {exc}"
+                ) from exc
+            os.close(current)
+            current = following
+        result = current
+        current = -1
+        return result
+    finally:
+        if current >= 0:
+            os.close(current)
+
+
+def _open_snapshot_file(
+    snapshot_root: Path, source_path: str
+) -> tuple[int, os.stat_result] | None:
+    relative = _safe_snapshot_relative(source_path)
+    parent = snapshot_root.joinpath(*relative.parts[:-1])
+    parent_fd = _open_directory_no_symlinks(parent, create=False)
+    if parent_fd is None:
+        return None
+    name = relative.parts[-1]
+    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise CodexParseError(
+                f"source snapshot target must not be a symlink: {snapshot_root / relative}"
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CodexParseError(
+                f"source snapshot target is not a regular file: {snapshot_root / relative}"
+            )
+        try:
+            file_fd = os.open(
+                name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+        except OSError as exc:
+            raise CodexParseError(
+                f"cannot safely open source snapshot {snapshot_root / relative}: {exc}"
+            ) from exc
+        opened = os.fstat(file_fd)
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            os.close(file_fd)
+            raise CodexParseError(
+                f"source snapshot changed while opening: {snapshot_root / relative}"
+            )
+        return file_fd, opened
+    finally:
+        os.close(parent_fd)
+
+
+def _read_snapshot_file(
+    snapshot_root: Path, source_path: str
+) -> tuple[bytes, os.stat_result] | None:
+    opened = _open_snapshot_file(snapshot_root, source_path)
+    if opened is None:
+        return None
+    file_fd, metadata = opened
+    with os.fdopen(file_fd, "rb") as handle:
+        return handle.read(), metadata
+
+
+def _first_snapshot_metadata(
+    snapshot_root: Path, source_path: str
+) -> dict[str, object] | None:
+    opened = _open_snapshot_file(snapshot_root, source_path)
+    if opened is None:
+        return None
+    file_fd, _ = opened
+    with os.fdopen(file_fd, "rb") as handle:
+        line = handle.readline()
+    if not line:
+        return None
+    try:
+        value: object = json.loads(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    record = _mapping(value)
+    if record.get("type") != "session_meta":
+        return None
+    return _mapping(record.get("payload"))
+
+
+def _read_at(parent_fd: int, name: str, display_path: Path) -> bytes | None:
+    try:
+        metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise CodexParseError(f"source snapshot target must not be a symlink: {display_path}")
+    if not stat.S_ISREG(metadata.st_mode):
+        raise CodexParseError(f"source snapshot target is not a regular file: {display_path}")
+    try:
+        file_fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise CodexParseError(f"cannot safely open source snapshot {display_path}: {exc}") from exc
+    with os.fdopen(file_fd, "rb") as handle:
+        return handle.read()
+
+
+def _write_snapshot_file(
+    snapshot_root: Path,
+    source_path: str,
+    data: bytes,
+    expected: bytes | None,
+) -> bool:
+    relative = _safe_snapshot_relative(source_path)
+    parent = snapshot_root.joinpath(*relative.parts[:-1])
+    parent_fd = _open_directory_no_symlinks(parent, create=True)
+    if parent_fd is None:  # create=True always returns a descriptor
+        raise CodexParseError(f"cannot create source snapshot parent for {source_path!r}")
+    name = relative.parts[-1]
+    display_path = snapshot_root / relative
+    temporary = f".{name}.{os.getpid()}.{secrets.token_hex(8)}"
+    try:
+        current = _read_at(parent_fd, name, display_path)
+        if current != expected:
+            raise CodexParseError(
+                f"source snapshot changed after validation: {display_path}"
+            )
+        if current == data:
+            return False
+        temp_fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            with os.fdopen(temp_fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(
+                temporary,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        return True
+    finally:
+        os.close(parent_fd)
+
+
 def _first_metadata(path: Path) -> dict[str, object] | None:
     try:
         with path.open("rb") as source:
@@ -200,6 +498,178 @@ def _first_metadata(path: Path) -> dict[str, object] | None:
     if record.get("type") != "session_meta":
         return None
     return _mapping(record.get("payload"))
+
+
+def _discover_codex_lineage(
+    sessions_root: Path,
+    root_thread_id: str,
+    *,
+    exclude_root: Path | None = None,
+) -> tuple[tuple[Path, Mapping[str, object]], ...]:
+    candidates: list[tuple[Path, Mapping[str, object]]] = []
+    excluded = exclude_root.resolve() if exclude_root is not None else None
+    try:
+        paths = sorted(sessions_root.rglob("rollout-*.jsonl"))
+    except OSError as exc:
+        raise CodexParseError(f"cannot scan Codex sessions root {sessions_root}: {exc}") from exc
+    for path in paths:
+        if excluded is not None:
+            try:
+                path.resolve().relative_to(excluded)
+            except ValueError:
+                pass
+            else:
+                continue
+        metadata = _first_metadata(path)
+        if metadata is None:
+            continue
+        thread_id = _string(metadata.get("id"))
+        session_id = _string(metadata.get("session_id"))
+        if thread_id == root_thread_id or session_id == root_thread_id:
+            candidates.append((path, metadata))
+    return tuple(candidates)
+
+
+def snapshot_codex_lineage(
+    sessions_root: Path,
+    root_thread_id: str,
+    snapshot_root: Path,
+    previous_sources: Sequence[CodexSourceCopy],
+    updated_at: str,
+) -> CodexSnapshotResult:
+    """Copy the newline-complete lineage into *snapshot_root* after monotonic checks.
+
+    Every source is validated before any destination is replaced. A disappeared, shortened, or
+    rewritten rollout therefore leaves all prior snapshots untouched. Destinations are replaced
+    atomically only when a complete JSONL line has been appended.
+    """
+
+    previous_by_path: dict[str, CodexSourceCopy] = {}
+    for source in previous_sources:
+        if source.source_path in previous_by_path:
+            raise CodexParseError(
+                f"source manifest contains duplicate path {source.source_path!r}"
+            )
+        previous_by_path[source.source_path] = source
+
+    candidates = _discover_codex_lineage(
+        sessions_root, root_thread_id, exclude_root=snapshot_root
+    )
+    candidate_paths: dict[str, tuple[Path, Mapping[str, object]]] = {}
+    for path, metadata in candidates:
+        try:
+            relative = path.relative_to(sessions_root).as_posix()
+        except ValueError as exc:
+            raise CodexParseError(
+                f"rollout {path} is outside sessions root {sessions_root}"
+            ) from exc
+        _safe_snapshot_relative(relative)
+        if relative in candidate_paths:
+            raise CodexParseError(f"duplicate Codex source path {relative!r}")
+        candidate_paths[relative] = (path, metadata)
+
+    missing = sorted(set(previous_by_path) - set(candidate_paths))
+    if missing:
+        rendered = ", ".join(repr(path) for path in missing[:3])
+        suffix = " ..." if len(missing) > 3 else ""
+        raise CodexParseError(
+            "append-only source violation: previously observed rollout disappeared: "
+            f"{rendered}{suffix}"
+        )
+    if not candidate_paths:
+        raise CodexParseError(f"Codex root thread {root_thread_id!r} was not found")
+
+    pending: list[_PendingCopy] = []
+    for source_path in sorted(candidate_paths):
+        path, metadata = candidate_paths[source_path]
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise CodexParseError(f"cannot read rollout {path}: {exc}") from exc
+        complete = _complete_prefix(data)
+        if not complete:
+            raise CodexParseError(f"rollout {path} has no newline-complete metadata record")
+        copied_record = _parse_json_object(
+            complete.split(b"\n", 1)[0], f"{path}: copied metadata"
+        )
+        if copied_record.get("type") != "session_meta":
+            raise CodexParseError(f"rollout {path} copied prefix lacks session metadata")
+        copied_metadata = _mapping(copied_record.get("payload"))
+        if copied_metadata != _mapping(metadata):
+            raise CodexParseError(
+                f"rollout {path} metadata changed between discovery and snapshot read"
+            )
+        thread_id = _string(copied_metadata.get("id"))
+        if thread_id is None:
+            raise CodexParseError(f"rollout {path} metadata lacks a thread id")
+
+        target = _snapshot_target(snapshot_root, source_path)
+        previous = previous_by_path.get(source_path)
+        opened_snapshot = _read_snapshot_file(snapshot_root, source_path)
+        existing = opened_snapshot[0] if opened_snapshot is not None else None
+        if previous is not None:
+            if previous.thread_id != thread_id:
+                raise CodexParseError(
+                    "append-only source violation: thread identity changed for "
+                    f"{source_path!r}"
+                )
+            if existing is None:
+                raise CodexParseError(
+                    f"source snapshot for previously observed rollout is missing: {target}"
+                )
+            if len(existing) < previous.copied_bytes:
+                raise CodexParseError(
+                    f"source snapshot is shorter than its manifest record: {target}"
+                )
+            previous_prefix = existing[: previous.copied_bytes]
+            if hashlib.sha256(previous_prefix).hexdigest() != previous.sha256:
+                raise CodexParseError(
+                    f"source snapshot does not match its manifest record: {target}"
+                )
+
+        baseline = existing or b""
+        if len(complete) < len(baseline):
+            raise CodexParseError(
+                "append-only source violation: newline-complete prefix shrank for "
+                f"{source_path!r} ({len(baseline)} -> {len(complete)} bytes)"
+            )
+        if complete[: len(baseline)] != baseline:
+            raise CodexParseError(
+                "append-only source violation: existing prefix was rewritten for "
+                f"{source_path!r}"
+            )
+
+        content_changed = complete != baseline
+        manifest_advanced = previous is None or len(complete) != previous.copied_bytes
+        source_updated_at = (
+            updated_at
+            if content_changed or manifest_advanced or previous is None
+            else previous.updated_at
+        )
+        source = CodexSourceCopy(
+            source_path=source_path,
+            original_path=str(path.resolve()),
+            snapshot_path=source_path,
+            thread_id=thread_id,
+            copied_bytes=len(complete),
+            line_count=complete.count(b"\n"),
+            sha256=hashlib.sha256(complete).hexdigest(),
+            updated_at=source_updated_at,
+        )
+        pending.append(_PendingCopy(source, complete, existing))
+
+    changed = sum(
+        int(
+            _write_snapshot_file(
+                snapshot_root,
+                item.source.snapshot_path,
+                item.complete,
+                item.baseline,
+            )
+        )
+        for item in pending
+    )
+    return CodexSnapshotResult(tuple(item.source for item in pending), changed)
 
 
 def _content(payload: Mapping[str, object]) -> tuple[str | None, str | None, str]:
@@ -283,20 +753,26 @@ def _canonical_records(
 
 
 def _read_rollout(
-    path: Path, sessions_root: Path, metadata: Mapping[str, object], root_thread_id: str
+    path: Path,
+    sessions_root: Path,
+    metadata: Mapping[str, object],
+    root_thread_id: str,
+    secure_source_path: str | None = None,
 ) -> _Rollout:
-    try:
-        data = path.read_bytes()
-        stat = path.stat()
-    except OSError as exc:
-        raise CodexParseError(f"cannot read rollout {path}: {exc}") from exc
-
-    if data.endswith(b"\n"):
-        complete_bytes = len(data)
+    if secure_source_path is not None:
+        opened = _read_snapshot_file(sessions_root, secure_source_path)
+        if opened is None:
+            raise CodexParseError(f"source snapshot disappeared before parsing: {path}")
+        data, file_stat = opened
     else:
-        newline = data.rfind(b"\n")
-        complete_bytes = newline + 1 if newline >= 0 else 0
-    complete = data[:complete_bytes]
+        try:
+            data = path.read_bytes()
+            file_stat = path.stat()
+        except OSError as exc:
+            raise CodexParseError(f"cannot read rollout {path}: {exc}") from exc
+
+    complete = _complete_prefix(data)
+    complete_bytes = len(complete)
     raw_lines = complete.splitlines()
     records: list[_Record] = []
     for line_number, raw_line in enumerate(raw_lines, start=1):
@@ -309,7 +785,7 @@ def _read_rollout(
         path=source_path,
         thread_id=thread_id,
         size_bytes=len(data),
-        mtime_ns=stat.st_mtime_ns,
+        mtime_ns=file_stat.st_mtime_ns,
         sha256=hashlib.sha256(data).hexdigest(),
         complete_bytes=complete_bytes,
         line_count=len(raw_lines),
@@ -446,30 +922,63 @@ def load_codex_team(
     root_thread_id: str,
     team_slug: str,
     display_timezone: str,
+    source_paths: Sequence[str] | None = None,
 ) -> TeamData:
     """Load one Codex root and every rollout belonging to its session lineage.
 
-    The importer consumes only newline-complete records. Forked parent-history prefixes and
-    duplicate UI message events are deliberately excluded from canonical transcript data.
+    The importer consumes only newline-complete records. When *source_paths* is supplied, only
+    those safe relative paths are opened, without following symlinks; unrelated files beneath the
+    root cannot enter the parse. Forked parent-history prefixes and duplicate UI message events are
+    deliberately excluded from canonical transcript data.
     """
 
     ZoneInfo(display_timezone)  # validate now; conversion remains a presentation concern
-    candidates: list[tuple[Path, Mapping[str, object]]] = []
-    for path in sorted(sessions_root.rglob("rollout-*.jsonl")):
-        metadata = _first_metadata(path)
-        if metadata is None:
-            continue
-        thread_id = _string(metadata.get("id"))
-        session_id = _string(metadata.get("session_id"))
-        if thread_id == root_thread_id or session_id == root_thread_id:
-            candidates.append((path, metadata))
+    secure_paths: dict[Path, str] = {}
+    if source_paths is None:
+        candidates = _discover_codex_lineage(sessions_root, root_thread_id)
+    else:
+        seen: set[str] = set()
+        explicit: list[tuple[Path, Mapping[str, object]]] = []
+        for source_path in source_paths:
+            if source_path in seen:
+                raise CodexParseError(f"duplicate explicit source path {source_path!r}")
+            seen.add(source_path)
+            path = _snapshot_target(sessions_root, source_path)
+            metadata = _first_snapshot_metadata(sessions_root, source_path)
+            if metadata is None:
+                raise CodexParseError(
+                    f"explicit source snapshot lacks valid session metadata: {source_path!r}"
+                )
+            thread_id = _string(metadata.get("id"))
+            session_id = _string(metadata.get("session_id"))
+            if thread_id != root_thread_id and session_id != root_thread_id:
+                raise CodexParseError(
+                    f"explicit source snapshot is outside root lineage: {source_path!r}"
+                )
+            explicit.append((path, metadata))
+            secure_paths[path] = source_path
+        candidates = tuple(explicit)
     if not candidates:
         raise CodexParseError(f"Codex root thread {root_thread_id!r} was not found")
 
     rollouts = tuple(
-        _read_rollout(path, sessions_root, metadata, root_thread_id)
+        _read_rollout(
+            path,
+            sessions_root,
+            metadata,
+            root_thread_id,
+            secure_paths.get(path),
+        )
         for path, metadata in candidates
     )
+    if source_paths is not None:
+        expected = set(source_paths)
+        parsed = {rollout.source_path for rollout in rollouts}
+        if parsed != expected:
+            raise CodexParseError(
+                "parsed source set does not match the validated source manifest: "
+                f"expected {sorted(expected)!r}, parsed {sorted(parsed)!r}"
+            )
     seeds: dict[str, _AgentSeed] = {}
     for rollout in rollouts:
         seed = _agent_seed(rollout, root_thread_id)
@@ -878,4 +1387,10 @@ def load_codex_team(
     )
 
 
-__all__ = ["CodexParseError", "load_codex_team"]
+__all__ = [
+    "CodexParseError",
+    "CodexSnapshotResult",
+    "CodexSourceCopy",
+    "load_codex_team",
+    "snapshot_codex_lineage",
+]

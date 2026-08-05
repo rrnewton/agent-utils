@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import os
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +22,14 @@ from agent_team_timeline.archive import (
     narrow_json,
     read_json,
     write_json_if_changed,
+    write_text_if_changed,
 )
-from agent_team_timeline.codex import load_codex_team
+from agent_team_timeline.codex import (
+    CodexParseError,
+    CodexSourceCopy,
+    load_codex_team,
+    snapshot_codex_lineage,
+)
 from agent_team_timeline.model import TeamData, ToolCall, source_digest
 from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.periods import Period, periods_for_range
@@ -49,6 +58,7 @@ from agent_team_timeline.terminology import (
 _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _ARCHIVE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ARCHIVE_MARKER = ".agent-team-timeline.json"
+_ARCHIVE_LOCK = ".agent-team-timeline.lock"
 
 
 def _validate_team_slug(team_slug: str) -> None:
@@ -61,6 +71,32 @@ def _validate_team_slug(team_slug: str) -> None:
 def _validate_archive_id(value: str, label: str) -> None:
     if _ARCHIVE_ID.fullmatch(value) is None:
         raise ValueError(f"{label} is not a safe archive identifier: {value!r}")
+
+
+@contextmanager
+def _archive_writer_lock(archive: Path) -> Iterator[None]:
+    """Serialize raw archive transactions across processes using Linux ``flock``."""
+
+    if archive.exists() and not archive.is_dir():
+        raise ValueError(f"archive output is not a directory: {archive}")
+    archive.mkdir(parents=True, exist_ok=True)
+    lock_path = archive / _ARCHIVE_LOCK
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as exc:
+        raise ValueError(f"cannot safely open archive writer lock {lock_path}: {exc}") from exc
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _ensure_archive(archive: Path, team_slug: str, *, create: bool) -> None:
@@ -84,7 +120,7 @@ def _ensure_archive(archive: Path, team_slug: str, *, create: bool) -> None:
     if archive.exists():
         if not archive.is_dir():
             raise ValueError(f"archive output is not a directory: {archive}")
-        if any(archive.iterdir()):
+        if any(path.name != _ARCHIVE_LOCK for path in archive.iterdir()):
             raise ValueError(
                 f"refusing non-empty non-archive output directory {archive}; "
                 "choose a new directory"
@@ -150,6 +186,26 @@ def utc_now() -> str:
     return datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _write_json_durable(path: Path, value: JsonValue) -> bool:
+    """Atomically write JSON and persist the replaced directory entry before returning."""
+
+    changed = write_json_if_changed(path, value)
+    if not changed:
+        return False
+    try:
+        parent_fd = os.open(
+            path.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as exc:
+        raise OSError(f"cannot open parent directory for durable JSON write {path}: {exc}") from exc
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return True
+
+
 def _archive_team(team: TeamData) -> TeamData:
     """Keep messages verbatim while dropping bulky tool commands and outputs.
 
@@ -174,7 +230,55 @@ def _summary_root(archive: Path, team_slug: str) -> Path:
     return archive / "teams" / team_slug / "summary_data"
 
 
-def ingest_codex(
+def _source_snapshot_root(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "source_snapshots"
+
+
+def _source_manifest_path(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "raw" / "source-manifest.json"
+
+
+def _ensure_source_snapshots_ignored(archive: Path) -> bool:
+    path = archive / ".gitignore"
+    required = (f"/{_ARCHIVE_LOCK}", "/teams/*/source_snapshots/")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"archive .gitignore is not a file: {path}")
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    existing_lines = set(existing.splitlines())
+    missing = [line for line in required if line not in existing_lines]
+    if not missing:
+        return False
+    prefix = existing
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return write_text_if_changed(path, prefix + "\n".join(missing) + "\n")
+
+
+def _load_source_manifest(
+    archive: Path, team_slug: str, root_thread_id: str
+) -> tuple[CodexSourceCopy, ...]:
+    path = _source_manifest_path(archive, team_slug)
+    if not path.is_file():
+        return ()
+    obj = as_object(read_json(path), str(path))
+    if obj.get("schema_version") != 1 or obj.get("provider") != "codex":
+        raise CodexParseError(f"invalid Codex source manifest at {path}")
+    recorded_root = as_string(obj.get("root_thread_id"), f"{path}: root_thread_id")
+    if recorded_root != root_thread_id:
+        raise CodexParseError(
+            f"source manifest belongs to root {recorded_root!r}, not {root_thread_id!r}"
+        )
+    raw_sources = as_array(obj.get("sources"), f"{path}: sources")
+    result: list[CodexSourceCopy] = []
+    for index, raw_source in enumerate(raw_sources):
+        source = as_object(raw_source, f"{path}: sources[{index}]")
+        result.append(CodexSourceCopy.from_json_obj(source, f"{path}: sources[{index}]"))
+    return tuple(result)
+
+
+def _ingest_codex_locked(
     archive: Path,
     sessions_root: Path,
     root_thread_id: str,
@@ -184,13 +288,50 @@ def ingest_codex(
     """Normalize one complete Codex lineage and write canonical raw JSON."""
 
     _ensure_archive(archive, team_slug, create=True)
-    team = load_codex_team(sessions_root, root_thread_id, team_slug, display_timezone)
+    changed = int(_ensure_source_snapshots_ignored(archive))
+    previous_sources = _load_source_manifest(archive, team_slug, root_thread_id)
+    snapshot_root = _source_snapshot_root(archive, team_slug)
+    source_copies = snapshot_codex_lineage(
+        sessions_root,
+        root_thread_id,
+        snapshot_root,
+        previous_sources,
+        utc_now(),
+    )
+    changed += source_copies.files_changed
+    # Parsing deliberately starts only after the original logs have been closed. Everything from
+    # this point onward consumes the archive-local, newline-complete backup.
+    allowed_sources = tuple(source.snapshot_path for source in source_copies.sources)
+    team = load_codex_team(
+        snapshot_root,
+        root_thread_id,
+        team_slug,
+        display_timezone,
+        source_paths=allowed_sources,
+    )
+    if tuple(sorted(source.path for source in team.sources)) != tuple(sorted(allowed_sources)):
+        raise CodexParseError(
+            "parsed source set differs from the just-validated source snapshot manifest"
+        )
+    source_manifest: dict[str, object] = {
+        "schema_version": 1,
+        "provider": "codex",
+        "root_thread_id": root_thread_id,
+        "source_root": str(sessions_root.resolve()),
+        "snapshot_root": f"teams/{team_slug}/source_snapshots",
+        "sources": [source.to_json_obj() for source in source_copies.sources],
+    }
+    changed += int(
+        _write_json_durable(
+            _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
+        )
+    )
     archived = _archive_team(team)
     _validate_archive_id(archived.root_thread_id, "root thread id")
     for agent in archived.agents:
         _validate_archive_id(agent.thread_id, "thread id")
-    changed = int(
-        write_json_if_changed(
+    changed += int(
+        _write_json_durable(
             _raw_team_path(archive, team_slug), narrow_json(archived.to_json_obj())
         )
     )
@@ -212,7 +353,7 @@ def ingest_codex(
             ],
         }
         changed += int(
-            write_json_if_changed(
+            _write_json_durable(
                 archive / "teams" / team_slug / "raw" / "messages" / f"{thread_id}.json",
                 narrow_json(obj),
             )
@@ -226,7 +367,7 @@ def ingest_codex(
         "sources": [source.to_json_obj() for source in team.sources],
     }
     changed += int(
-        write_json_if_changed(
+        _write_json_durable(
             archive / "teams" / team_slug / "raw" / "source-snapshot.json",
             narrow_json(snapshot),
         )
@@ -243,6 +384,25 @@ def ingest_codex(
         files_changed=changed,
     )
     return archived, report
+
+
+def ingest_codex(
+    archive: Path,
+    sessions_root: Path,
+    root_thread_id: str,
+    team_slug: str,
+    display_timezone: str,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Codex lineage as one serialized raw-data transaction."""
+
+    with _archive_writer_lock(archive):
+        return _ingest_codex_locked(
+            archive,
+            sessions_root,
+            root_thread_id,
+            team_slug,
+            display_timezone,
+        )
 
 
 def load_archived_team(archive: Path, team_slug: str) -> TeamData:
