@@ -46,7 +46,9 @@ do not require site changes.
 - **Project glossary** opens the all-time terminology catalog. Exact, known glossary names in
   rendered summaries become links such as `#glossary/term-name-digest`. The renderer creates links
   only from IDs present in `timeline.json` and rejects duplicate or malformed targets, so model
-  output cannot create a hallucinated glossary destination.
+  output cannot create a hallucinated glossary destination. The catalog begins with one durable
+  newcomer project overview; every term shows its model-backed definition separately from the
+  quoted first-use evidence that constrained it.
 
 The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
 bundle renders summary headings, lists, tables, blockquotes, links, and code with raw HTML disabled.
@@ -218,6 +220,16 @@ with the project: it introduces the product from supplied evidence, explains spe
 and treats work-management identifiers as supplementary evidence. Both jobs have independent batch
 receipts and are included in the command's exact token accounting.
 
+Before those calendar jobs, one separately cached knowledge pass reads up to 48,000 characters of
+early root conversation and creates a durable newcomer project overview. A second batched pass sees
+that overview plus up to six retained source occurrences for each deterministic glossary term. It
+must either write a concise definition supported by those occurrences or explicitly return
+`Insufficient evidence`; acronym expansions and relationships cannot be guessed. Only supported
+definitions enter plain-language rollup prompts. Technical rollups and phase summaries keep their
+existing cache identities. The overview, definitions, source event IDs, evidence excerpts, model,
+prompt version, input hash, and generation time are persisted under `summary_data/`, and all of
+their backend receipts are included in the same exact token accounting.
+
 Unchanged keys are never sent to the model again. New later terminology does not invalidate older
 windows. A changed live window creates a new cache record while the previous valuable record remains
 on disk. Each batch is committed only after every response in that batch validates against the
@@ -252,7 +264,9 @@ agent-team-timeline summarize \
 ```
 
 The heuristic backend is intentionally less capable, but exercises the complete cache and rendering
-pipeline without network or token use. Its cache keys are distinct from Codex summaries.
+pipeline without network or token use. It labels the overview and definitions as insufficient
+evidence and retains first-use context instead of pretending to synthesize model-quality
+explanations. Its cache keys are distinct from Codex summaries.
 
 ### 3. Build — guaranteed zero model calls
 
@@ -288,7 +302,8 @@ The pipeline performs real multilevel reduction:
 
 ```text
 verbatim messages + condensed tools
-  -> fixed, append-stable agent phases
+     -> fixed, append-stable agent phases
+     -> durable project overview + evidence-bounded glossary definitions
      -> daily technical + plain-language summaries
         -> weekly technical + plain-language summaries
            -> monthly technical + plain-language summaries
@@ -304,9 +319,11 @@ timezone in normalized team data; malformed or missing browser data falls back v
 never silently to ambient browser time.
 
 The terminology scan runs before phase summarization. It records terms in introduction order by ISO
-week, keeps the source sentence as evidence, and supplies the chronological subset to each model
-call. This discourages agents from inventing opaque “phase 2 / wave 9 / option B” labels and carries
-the user's original subsystem/workstream names across spawn boundaries.
+week, keeps the source sentence as first-use evidence, and supplies the chronological subset to each
+phase and technical-rollup call. After phase summarization, the evidence-bounded definition pass
+adds explanations for newcomer rollups without changing those earlier cache identities. This
+discourages agents from inventing opaque “phase 2 / wave 9 / option B” labels and carries the user's
+original subsystem/workstream names across spawn boundaries.
 
 ## On-disk format
 
@@ -337,9 +354,10 @@ example-team/
     │   ├── name_cache/<content-hash>.json
     │   ├── agents/<thread-id>.json   # hindsight name, lifetime summary + provenance
     │   ├── phases/<phase-id>.json
+    │   ├── project_overview.json     # bounded early/root evidence + generated overview
     │   ├── rollups/{daily,weekly,monthly,quarterly}/... # both structured audiences
     │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata
-    │   └── glossary.json
+    │   └── glossary.json             # definitions + evidence + model provenance
     └── summaries/
         ├── agents/<thread-id>.md
         ├── phases/<phase-id>.md

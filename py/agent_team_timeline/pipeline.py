@@ -43,7 +43,7 @@ from agent_team_timeline.claude import (
     load_claude_team,
     snapshot_claude_lineage,
 )
-from agent_team_timeline.model import TeamData, ToolCall, source_digest
+from agent_team_timeline.model import Event, TeamData, ToolCall, source_digest
 from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.naming import (
     AgentNameJob,
@@ -77,7 +77,11 @@ from agent_team_timeline.phases import (
 )
 from agent_team_timeline.render import render_archive
 from agent_team_timeline.summarize import (
+    GLOSSARY_DEFINITION_PROMPT_VERSION,
+    GLOSSARY_DEFINITION_STYLE,
     PLAIN_LANGUAGE_ROLLUP_STYLE,
+    PROJECT_OVERVIEW_PROMPT_VERSION,
+    PROJECT_OVERVIEW_STYLE,
     SummaryJob,
     SummaryResult,
     SummaryRunStats,
@@ -91,6 +95,7 @@ from agent_team_timeline.terminology import (
     TermSource,
     glossary_prompt_text,
     glossary_term_id,
+    plain_language_context_text,
     scan_terminology,
 )
 from agent_team_timeline.window import DateWindow, apply_date_window
@@ -100,6 +105,10 @@ _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _ARCHIVE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ARCHIVE_MARKER = ".agent-team-timeline.json"
 _ARCHIVE_LOCK = ".agent-team-timeline.lock"
+_PROJECT_OVERVIEW_SCHEMA_VERSION = 1
+_GLOSSARY_SCHEMA_VERSION = 2
+_OVERVIEW_CONTEXT_CHARS = 48_000
+_TERM_EVIDENCE_LIMIT = 6
 
 
 def _validate_team_slug(team_slug: str) -> None:
@@ -220,6 +229,8 @@ class SummarizeReport:
     rollups: int
     agent_names: int
     glossary_terms: int
+    project_overviews: int
+    glossary_definitions: int
     cache_hits: int
     cache_misses: int
     backend_batches: int
@@ -244,6 +255,8 @@ class SummarizeReport:
             "rollup_summary_artifacts": self.rollups * 2,
             "agent_names": self.agent_names,
             "glossary_terms": self.glossary_terms,
+            "project_overviews": self.project_overviews,
+            "glossary_definitions": self.glossary_definitions,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "backend_batches": self.backend_batches,
@@ -922,6 +935,185 @@ def _glossary_terms(team: TeamData) -> tuple[GlossaryTerm, ...]:
     return scan_terminology(sources, team.display_timezone)
 
 
+@dataclass(frozen=True)
+class _ProjectOverviewInput:
+    """Bounded early/root evidence used by the durable project-overview job."""
+
+    start_ms: int
+    end_ms: int
+    transcript: str
+    event_ids: tuple[str, ...]
+    context_sha256: str
+
+
+@dataclass(frozen=True)
+class _GlossaryEvidence:
+    """One bounded source occurrence supplied to a glossary-definition job."""
+
+    event_id: str
+    thread_id: str
+    at_ms: int
+    kind: str
+    context: str
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return stable provenance for the structured glossary artifact."""
+
+        return {
+            "event_id": self.event_id,
+            "thread_id": self.thread_id,
+            "at_ms": self.at_ms,
+            "kind": self.kind,
+            "context": self.context,
+        }
+
+
+def _one_line(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
+def _root_overview_input(team: TeamData) -> _ProjectOverviewInput:
+    events = sorted(
+        (
+            event
+            for event in team.events
+            if event.thread_id == team.root_thread_id
+            and event.kind in {"user_prompt", "assistant_message"}
+            and event.text
+        ),
+        key=lambda event: (event.timestamp_ms, event.event_id),
+    )
+    parts: list[str] = []
+    event_ids: list[str] = []
+    used = 0
+    retained: list[Event] = []
+    for event in events:
+        assert event.text is not None
+        prefix = f"[{event.timestamp_ms}] {event.kind}: "
+        remaining = _OVERVIEW_CONTEXT_CHARS - used
+        if remaining <= len(prefix):
+            break
+        line = prefix + _one_line(event.text)
+        excerpt = line[:remaining]
+        if excerpt:
+            parts.append(excerpt)
+            event_ids.append(event.event_id)
+            retained.append(event)
+            used += len(excerpt) + 2
+        if len(excerpt) < len(line) or used >= _OVERVIEW_CONTEXT_CHARS:
+            break
+    if retained:
+        start_ms = retained[0].timestamp_ms
+        end_ms = retained[-1].timestamp_ms
+    else:
+        fallback = team.window_start_ms
+        if fallback is None:
+            fallback = min((event.timestamp_ms for event in team.events), default=0)
+        start_ms = fallback
+        end_ms = fallback
+        parts.append("No root user or assistant transcript text was retained.")
+    transcript = "\n\n".join(parts)
+    return _ProjectOverviewInput(
+        start_ms=start_ms,
+        end_ms=end_ms,
+        transcript=transcript,
+        event_ids=tuple(event_ids),
+        context_sha256=hashlib.sha256(transcript.encode("utf-8")).hexdigest(),
+    )
+
+
+def _project_overview_job(
+    team: TeamData, source: _ProjectOverviewInput
+) -> SummaryJob:
+    return SummaryJob(
+        key=f"project-overview:{team.team_slug}",
+        team_slug=team.team_slug,
+        agent_label=f"{team.team_slug} project overview",
+        start_ms=source.start_ms,
+        end_ms=source.end_ms,
+        prior_context="",
+        transcript=source.transcript,
+        glossary="",
+        stats={
+            "source_events": len(source.event_ids),
+            "source_characters": len(source.transcript),
+        },
+        summary_style=PROJECT_OVERVIEW_STYLE,
+    )
+
+
+def _term_context(text: str, term: str) -> str:
+    clean = _one_line(text)
+    position = clean.find(term)
+    if position < 0:
+        return clean[:520]
+    start = max(0, position - 180)
+    end = min(len(clean), position + len(term) + 320)
+    return clean[start:end].strip()
+
+
+def _definition_evidence(
+    team: TeamData, term: GlossaryTerm
+) -> tuple[_GlossaryEvidence, ...]:
+    result: list[_GlossaryEvidence] = []
+    for event in sorted(team.events, key=lambda item: (item.timestamp_ms, item.event_id)):
+        if not event.text or term.term not in event.text:
+            continue
+        result.append(
+            _GlossaryEvidence(
+                event_id=event.event_id,
+                thread_id=event.thread_id,
+                at_ms=event.timestamp_ms,
+                kind=event.kind,
+                context=_term_context(event.text, term.term),
+            )
+        )
+        if len(result) == _TERM_EVIDENCE_LIMIT:
+            break
+    return tuple(result)
+
+
+def _glossary_definition_job(
+    team: TeamData,
+    term: GlossaryTerm,
+    evidence: Sequence[_GlossaryEvidence],
+    project_overview: SummaryResult,
+) -> SummaryJob:
+    transcript_lines = [f"Glossary term (exact spelling): {term.term}", "Source occurrences:"]
+    transcript_lines.extend(
+        f"- [{item.at_ms}] {item.kind} in {item.thread_id}: {item.context}"
+        for item in evidence
+    )
+    if not evidence:
+        transcript_lines.append("- No retained source occurrence was found.")
+    start_ms = evidence[0].at_ms if evidence else term.introduced_at_ms
+    end_ms = evidence[-1].at_ms if evidence else term.introduced_at_ms
+    return SummaryJob(
+        key=f"glossary-definition:{term.term_id}",
+        team_slug=team.team_slug,
+        agent_label=f"Glossary definition · {term.term}",
+        start_ms=start_ms,
+        end_ms=end_ms,
+        prior_context=(
+            "Durable source-bounded project overview:\n" + project_overview.paragraph
+        ),
+        transcript="\n".join(transcript_lines),
+        glossary=f"Exact glossary name: {term.term}",
+        stats={"source_occurrences": len(evidence)},
+        summary_style=GLOSSARY_DEFINITION_STYLE,
+    )
+
+
+def _definition_status(summary: SummaryResult) -> str:
+    if summary.phrase == "Definition supported":
+        return "supported"
+    if summary.phrase == "Insufficient evidence":
+        return "insufficient-evidence"
+    raise ValueError(
+        f"glossary definition {summary.key!r} has invalid evidence status {summary.phrase!r}"
+    )
+
+
 def _phase_jobs(
     team: TeamData, phases: Sequence[PhaseWindow], terms: Sequence[GlossaryTerm]
 ) -> tuple[SummaryJob, ...]:
@@ -959,14 +1151,50 @@ def _summary_json(summary: SummaryResult) -> dict[str, JsonValue]:
     }
 
 
+def _require_exact_keys(
+    obj: Mapping[str, JsonValue], expected: set[str], where: str
+) -> None:
+    actual = set(obj)
+    if actual == expected:
+        return
+    missing = sorted(expected - actual)
+    extra = sorted(actual - expected)
+    details: list[str] = []
+    if missing:
+        details.append("missing " + ", ".join(missing))
+    if extra:
+        details.append("extra " + ", ".join(extra))
+    raise ValueError(f"{where}: schema mismatch ({'; '.join(details)})")
+
+
 def _summary_from_json(value: JsonValue, where: str) -> SummaryResult:
     obj = as_object(value, where)
+    _require_exact_keys(
+        obj,
+        {
+            "key",
+            "phrase",
+            "paragraph",
+            "work_summary",
+            "model",
+            "prompt_version",
+            "input_hash",
+            "generated_at",
+        },
+        where,
+    )
+    raw_bullets = as_array(obj.get("work_summary"), f"{where}.work_summary")
+    for index, raw_bullet in enumerate(raw_bullets):
+        bullet = as_object(raw_bullet, f"{where}.work_summary[{index}]")
+        _require_exact_keys(
+            bullet, {"at_ms", "text"}, f"{where}.work_summary[{index}]"
+        )
     bullets = tuple(
         WorkBullet(
             at_ms=as_int(as_object(item, f"{where}.work_summary[]").get("at_ms"), "at_ms"),
             text=as_string(as_object(item, f"{where}.work_summary[]").get("text"), "text"),
         )
-        for item in as_array(obj.get("work_summary"), f"{where}.work_summary")
+        for item in raw_bullets
     )
     return SummaryResult(
         key=as_string(obj.get("key"), f"{where}.key"),
@@ -977,6 +1205,59 @@ def _summary_from_json(value: JsonValue, where: str) -> SummaryResult:
         prompt_version=as_string(obj.get("prompt_version"), f"{where}.prompt_version"),
         input_hash=as_string(obj.get("input_hash"), f"{where}.input_hash"),
         generated_at=as_string(obj.get("generated_at"), f"{where}.generated_at"),
+    )
+
+
+def _validate_project_overview(summary: SummaryResult, where: str) -> None:
+    if summary.prompt_version != PROJECT_OVERVIEW_PROMPT_VERSION:
+        raise ValueError(
+            f"{where}: project overview prompt version is stale; run summarize"
+        )
+    if summary.phrase not in {"Project overview supported", "Insufficient evidence"}:
+        raise ValueError(f"{where}: invalid project-overview evidence status")
+    if summary.work_summary:
+        raise ValueError(f"{where}: project overview must not contain work bullets")
+    if summary.phrase == "Insufficient evidence" and not summary.paragraph.startswith(
+        "Insufficient evidence:"
+    ):
+        raise ValueError(f"{where}: insufficient overview lacks an evidence limit")
+
+
+def _validate_glossary_definition(summary: SummaryResult, where: str) -> None:
+    if summary.prompt_version != GLOSSARY_DEFINITION_PROMPT_VERSION:
+        raise ValueError(
+            f"{where}: glossary definition prompt version is stale; run summarize"
+        )
+    _definition_status(summary)
+    if summary.work_summary:
+        raise ValueError(f"{where}: glossary definition must not contain work bullets")
+    if summary.phrase == "Insufficient evidence" and not summary.paragraph.startswith(
+        "Insufficient evidence:"
+    ):
+        raise ValueError(f"{where}: insufficient definition lacks an evidence limit")
+
+
+def _write_project_overview_data(
+    archive: Path,
+    team_slug: str,
+    source: _ProjectOverviewInput,
+    summary: SummaryResult,
+) -> int:
+    obj: dict[str, JsonValue] = {
+        "schema_version": _PROJECT_OVERVIEW_SCHEMA_VERSION,
+        "style": PROJECT_OVERVIEW_STYLE,
+        "source": {
+            "event_ids": list(source.event_ids),
+            "start_ms": source.start_ms,
+            "end_ms": source.end_ms,
+            "context_sha256": source.context_sha256,
+        },
+        "summary": _summary_json(summary),
+    }
+    return int(
+        write_json_if_changed(
+            _summary_root(archive, team_slug) / "project_overview.json", obj
+        )
     )
 
 
@@ -1205,6 +1486,7 @@ def _rollup_jobs_for_level(
     completed_same_level: Sequence[tuple[Period, SummaryResult]],
     terms: Sequence[GlossaryTerm],
     summary_style: str = TECHNICAL_ROLLUP_STYLE,
+    project_overview: str = "",
 ) -> tuple[SummaryJob, ...]:
     jobs: list[SummaryJob] = []
     for period in periods:
@@ -1256,6 +1538,14 @@ def _rollup_jobs_for_level(
         plain_language = summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE
         key_prefix = "rollup-plain" if plain_language else "rollup"
         audience = "Plain-language" if plain_language else "Technical"
+        glossary = glossary_prompt_text(
+            [term for term in terms if term.introduced_at_ms < period.end_ms]
+        )
+        if plain_language:
+            glossary = plain_language_context_text(
+                project_overview,
+                [term for term in terms if term.introduced_at_ms < period.end_ms],
+            )
         jobs.append(
             SummaryJob(
                 key=f"{key_prefix}:{period.kind}:{period.key}",
@@ -1267,9 +1557,7 @@ def _rollup_jobs_for_level(
                 end_ms=period.end_ms,
                 prior_context=prior_context,
                 transcript=transcript,
-                glossary=glossary_prompt_text(
-                    [term for term in terms if term.introduced_at_ms < period.end_ms]
-                ),
+                glossary=glossary,
                 stats=stats.to_mapping(),
                 summary_style=summary_style,
             )
@@ -1368,6 +1656,60 @@ def _summarize_archive_locked(
     changed += _write_agent_name_data(
         archive, team_slug, name_jobs, agent_names
     )
+    overview_source = _root_overview_input(team)
+    overview_job = _project_overview_job(team, overview_source)
+    overview_results, overview_stats = summarize_jobs(
+        (overview_job,),
+        cache,
+        backend,
+        model,
+        max_workers=max_workers,
+        batch_size=batch_size,
+        codex_command=codex_command,
+        reasoning_effort=reasoning_effort,
+    )
+    project_overview = overview_results[overview_job.key]
+    _validate_project_overview(project_overview, "generated project overview")
+    changed += _write_project_overview_data(
+        archive, team_slug, overview_source, project_overview
+    )
+    evidence_by_term = {
+        term.term_id: _definition_evidence(team, term) for term in terms
+    }
+    definition_jobs = tuple(
+        _glossary_definition_job(
+            team, term, evidence_by_term[term.term_id], project_overview
+        )
+        for term in terms
+    )
+    if definition_jobs:
+        definition_results, definition_stats = summarize_jobs(
+            definition_jobs,
+            cache,
+            backend,
+            model,
+            max_workers=max_workers,
+            batch_size=batch_size,
+            codex_command=codex_command,
+            reasoning_effort=reasoning_effort,
+        )
+    else:
+        definition_results = {}
+        definition_stats = SummaryRunStats(hits=0, misses=0, batches=0)
+    for key, definition in definition_results.items():
+        _validate_glossary_definition(definition, f"generated {key}")
+    enriched_terms: tuple[GlossaryTerm, ...] = tuple(
+        replace(
+            term,
+            definition=definition_results[
+                f"glossary-definition:{term.term_id}"
+            ].paragraph,
+            definition_status=_definition_status(
+                definition_results[f"glossary-definition:{term.term_id}"]
+            ),
+        )
+        for term in terms
+    )
 
     start_ms, end_ms = _period_range(team, phases)
     periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
@@ -1377,7 +1719,13 @@ def _summarize_archive_locked(
     }
     all_results: dict[str, SummaryResult] = {}
     all_plain_results: dict[str, SummaryResult] = {}
-    backend_stats: list[SummaryRunStats] = [phase_stats, name_stats]
+    backend_stats: list[SummaryRunStats] = [
+        phase_stats,
+        name_stats,
+        overview_stats,
+    ]
+    if definition_jobs:
+        backend_stats.append(definition_stats)
     previous_periods: list[Period] = []
     previous_results: dict[str, SummaryResult] = {}
     previous_plain_results: dict[str, SummaryResult] = {}
@@ -1423,8 +1771,9 @@ def _summarize_archive_locked(
                 previous_periods,
                 previous_plain_results,
                 completed_plain,
-                terms,
+                enriched_terms,
                 PLAIN_LANGUAGE_ROLLUP_STYLE,
+                project_overview.paragraph,
             )
             plain_results, plain_stats = summarize_jobs(
                 plain_jobs,
@@ -1472,6 +1821,8 @@ def _summarize_archive_locked(
             )
         )
     glossary_obj: dict[str, JsonValue] = {
+        "schema_version": _GLOSSARY_SCHEMA_VERSION,
+        "project_overview_input_hash": project_overview.input_hash,
         "terms": [
             {
                 "term": term.term,
@@ -1480,8 +1831,17 @@ def _summarize_archive_locked(
                 "context": term.context,
                 "week": term.week,
                 "term_id": term.term_id,
+                "definition": term.definition,
+                "definition_status": term.definition_status,
+                "definition_summary": _summary_json(
+                    definition_results[f"glossary-definition:{term.term_id}"]
+                ),
+                "evidence": [
+                    item.to_json_obj()
+                    for item in evidence_by_term[term.term_id]
+                ],
             }
-            for term in terms
+            for term in enriched_terms
         ]
     }
     changed += int(
@@ -1498,6 +1858,8 @@ def _summarize_archive_locked(
         rollups=len(periods),
         agent_names=len(agent_names),
         glossary_terms=len(terms),
+        project_overviews=1,
+        glossary_definitions=len(definition_jobs),
         cache_hits=combined.hits,
         cache_misses=combined.misses,
         backend_batches=combined.batches,
@@ -1566,32 +1928,144 @@ def _load_phase_summaries(
     return result
 
 
-def _load_glossary(archive: Path, team_slug: str) -> tuple[GlossaryTerm, ...]:
-    path = _summary_root(archive, team_slug) / "glossary.json"
+def _load_project_overview(
+    archive: Path, team: TeamData
+) -> SummaryResult:
+    path = _summary_root(archive, team.team_slug) / "project_overview.json"
+    if not path.is_file():
+        raise ValueError(f"missing project overview at {path}; run summarize")
     obj = as_object(read_json(path), str(path))
+    _require_exact_keys(
+        obj, {"schema_version", "style", "source", "summary"}, str(path)
+    )
+    if as_int(obj.get("schema_version"), f"{path}.schema_version") != (
+        _PROJECT_OVERVIEW_SCHEMA_VERSION
+    ):
+        raise ValueError(f"{path}: unsupported project-overview schema; run summarize")
+    if as_string(obj.get("style"), f"{path}.style") != PROJECT_OVERVIEW_STYLE:
+        raise ValueError(f"{path}: invalid project-overview style")
+    source = as_object(obj.get("source"), f"{path}.source")
+    _require_exact_keys(
+        source,
+        {"event_ids", "start_ms", "end_ms", "context_sha256"},
+        f"{path}.source",
+    )
+    event_ids = tuple(
+        as_string(item, f"{path}.source.event_ids[]")
+        for item in as_array(source.get("event_ids"), f"{path}.source.event_ids")
+    )
+    context_sha256 = as_string(
+        source.get("context_sha256"), f"{path}.source.context_sha256"
+    )
+    current = _root_overview_input(team)
+    if (
+        event_ids != current.event_ids
+        or as_int(source.get("start_ms"), f"{path}.source.start_ms")
+        != current.start_ms
+        or as_int(source.get("end_ms"), f"{path}.source.end_ms") != current.end_ms
+        or context_sha256 != current.context_sha256
+    ):
+        raise ValueError(f"{path}: project-overview evidence is stale; run summarize")
+    summary = _summary_from_json(obj.get("summary"), f"{path}.summary")
+    _validate_project_overview(summary, f"{path}.summary")
+    return summary
+
+
+def _load_glossary(
+    archive: Path, team_slug: str, project_overview: SummaryResult
+) -> tuple[GlossaryTerm, ...]:
+    path = _summary_root(archive, team_slug) / "glossary.json"
+    if not path.is_file():
+        raise ValueError(f"missing glossary at {path}; run summarize")
+    obj = as_object(read_json(path), str(path))
+    _require_exact_keys(
+        obj,
+        {"schema_version", "project_overview_input_hash", "terms"},
+        str(path),
+    )
+    if as_int(obj.get("schema_version"), f"{path}.schema_version") != (
+        _GLOSSARY_SCHEMA_VERSION
+    ):
+        raise ValueError(f"{path}: unsupported glossary schema; run summarize")
+    if as_string(
+        obj.get("project_overview_input_hash"),
+        f"{path}.project_overview_input_hash",
+    ) != project_overview.input_hash:
+        raise ValueError(f"{path}: glossary used a stale project overview; run summarize")
     result: list[GlossaryTerm] = []
-    for raw in as_array(obj.get("terms"), f"{path}.terms"):
-        item = as_object(raw, f"{path}.terms[]")
-        term = as_string(item.get("term"), "term")
-        expected_id = glossary_term_id(term)
-        raw_id = item.get("term_id")
-        term_id = (
-            expected_id
-            if raw_id is None
-            else as_string(raw_id, f"{path}.terms[].term_id")
+    for index, raw in enumerate(as_array(obj.get("terms"), f"{path}.terms")):
+        where = f"{path}.terms[{index}]"
+        item = as_object(raw, where)
+        _require_exact_keys(
+            item,
+            {
+                "term",
+                "introduced_at_ms",
+                "occurrences",
+                "context",
+                "week",
+                "term_id",
+                "definition",
+                "definition_status",
+                "definition_summary",
+                "evidence",
+            },
+            where,
         )
+        term = as_string(item.get("term"), f"{where}.term")
+        expected_id = glossary_term_id(term)
+        term_id = as_string(item.get("term_id"), f"{where}.term_id")
         if term_id != expected_id:
             raise ValueError(
                 f"{path}: glossary ID {term_id!r} does not match term {term!r}"
             )
+        definition = as_string(item.get("definition"), f"{where}.definition")
+        definition_status = as_string(
+            item.get("definition_status"), f"{where}.definition_status"
+        )
+        if definition_status not in {"supported", "insufficient-evidence"}:
+            raise ValueError(f"{where}: invalid definition status")
+        definition_summary = _summary_from_json(
+            item.get("definition_summary"), f"{where}.definition_summary"
+        )
+        _validate_glossary_definition(
+            definition_summary, f"{where}.definition_summary"
+        )
+        if (
+            definition_summary.key != f"glossary-definition:{term_id}"
+            or definition_summary.paragraph != definition
+            or _definition_status(definition_summary) != definition_status
+        ):
+            raise ValueError(f"{where}: definition provenance does not match entry")
+        for evidence_index, raw_evidence in enumerate(
+            as_array(item.get("evidence"), f"{where}.evidence")
+        ):
+            evidence_where = f"{where}.evidence[{evidence_index}]"
+            evidence = as_object(raw_evidence, evidence_where)
+            _require_exact_keys(
+                evidence,
+                {"event_id", "thread_id", "at_ms", "kind", "context"},
+                evidence_where,
+            )
+            as_string(evidence.get("event_id"), f"{evidence_where}.event_id")
+            as_string(evidence.get("thread_id"), f"{evidence_where}.thread_id")
+            as_int(evidence.get("at_ms"), f"{evidence_where}.at_ms")
+            as_string(evidence.get("kind"), f"{evidence_where}.kind")
+            as_string(evidence.get("context"), f"{evidence_where}.context")
         result.append(
             GlossaryTerm(
                 term=term,
-                introduced_at_ms=as_int(item.get("introduced_at_ms"), "introduced_at_ms"),
-                occurrences=as_int(item.get("occurrences"), "occurrences"),
-                context=as_string(item.get("context"), "context"),
-                week=as_string(item.get("week"), "week"),
+                introduced_at_ms=as_int(
+                    item.get("introduced_at_ms"), f"{where}.introduced_at_ms"
+                ),
+                occurrences=as_int(
+                    item.get("occurrences"), f"{where}.occurrences"
+                ),
+                context=as_string(item.get("context"), f"{where}.context"),
+                week=as_string(item.get("week"), f"{where}.week"),
                 term_id=term_id,
+                definition=definition,
+                definition_status=definition_status,
             )
         )
     return tuple(result)
@@ -1606,6 +2080,7 @@ def build_archive(
     phases = build_phases(team, phase_minutes=phase_minutes)
     phase_results = _load_phase_summaries(archive, team_slug, phases)
     agent_names = _load_agent_names(archive, team, phase_agent_ids(team, phases))
+    project_overview = _load_project_overview(archive, team)
     start_ms, end_ms = _period_range(team, phases)
     periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
     rollup_results: dict[str, SummaryResult] = {}
@@ -1633,7 +2108,7 @@ def build_archive(
             obj.get("plain_language_summary"), f"{path}.plain_language_summary"
         )
         rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
-    terms = _load_glossary(archive, team_slug)
+    terms = _load_glossary(archive, team_slug, project_overview)
     artifact_catalog = load_artifact_catalog(archive, team_slug, team)
     pull_cache = load_pull_request_metadata_cache(
         pull_metadata_path(archive, team_slug)
@@ -1650,6 +2125,7 @@ def build_archive(
         plain_rollup_results,
         rollup_stats,
         terms,
+        project_overview,
         agent_names,
         pull_metadata,
         artifact_catalog,

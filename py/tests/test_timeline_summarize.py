@@ -219,14 +219,27 @@ payload_text = prompt.split("BEGIN_JOBS_JSON\\n", 1)[1].split("END_JOBS_JSON", 1
 jobs = json.loads(payload_text)
 summaries = []
 for job in jobs:
-    summaries.append({
-        "key": job["key"],
-        "phrase": "Built " + job["key"],
-        "paragraph": "Implemented durable summary output for " + job["agent_label"] + ".",
-        "work_summary": [{
+    style = job.get("summary_style", "phase")
+    if style == "project-overview":
+        phrase = "Project overview supported"
+        paragraph = "Hermit runs guest software in a controlled, repeatable environment."
+        work_summary = []
+    elif style == "glossary-definition":
+        phrase = "Definition supported"
+        paragraph = "exact-head is a project check that keeps a release bound to one revision."
+        work_summary = []
+    else:
+        phrase = "Built " + job["key"]
+        paragraph = "Implemented durable summary output for " + job["agent_label"] + "."
+        work_summary = [{
             "at_ms": job["start_ms"],
             "text": "Implemented durable summary output.",
-        }],
+        }]
+    summaries.append({
+        "key": job["key"],
+        "phrase": phrase,
+        "paragraph": paragraph,
+        "work_summary": work_summary,
     })
 output_path = Path(args[args.index("--output-last-message") + 1])
 output_path.write_text(json.dumps({"summaries": summaries}), encoding="utf-8")
@@ -311,6 +324,53 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
     assert cached_stats.artifact_generation_usage == stats.artifact_generation_usage
     assert cached_stats.artifact_generation_unknown_receipts == 0
     assert log.read_text(encoding="utf-8") == log_text
+
+
+def test_codex_backend_caches_model_backed_knowledge_with_usage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake_codex.py"
+    log = tmp_path / "calls.log"
+    _write_fake_codex(fake)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    overview = replace(_job("overview"), summary_style=PROJECT_OVERVIEW_STYLE)
+    definition = replace(
+        _job("definition"), summary_style=GLOSSARY_DEFINITION_STYLE
+    )
+
+    overview_results, overview_stats = summarize_jobs(
+        [overview],
+        tmp_path / "cache",
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+    )
+    definition_results, definition_stats = summarize_jobs(
+        [definition],
+        tmp_path / "cache",
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+    )
+
+    assert overview_results["overview"].phrase == "Project overview supported"
+    assert definition_results["definition"].phrase == "Definition supported"
+    assert overview_stats.newly_spent_usage.total_tokens == 120
+    assert definition_stats.newly_spent_usage.total_tokens == 120
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 2
+
+    _, cached = summarize_jobs(
+        [definition],
+        tmp_path / "cache",
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+    )
+    assert cached.hits == 1
+    assert cached.newly_spent_usage == TokenUsage()
 
 
 def test_corrupt_cache_is_ignored_and_regenerated(tmp_path: Path) -> None:

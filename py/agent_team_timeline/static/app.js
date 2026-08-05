@@ -255,7 +255,7 @@
         fragment.appendChild(document.createTextNode(value.slice(cursor, match.start)));
         var link = htmlElement("a", "glossary-term-link", value.slice(match.start, match.end));
         link.href = "#glossary/" + match.id;
-        link.title = text(match.entry.context, "Open project glossary entry");
+        link.title = text(match.entry.definition, text(match.entry.context, "Open project glossary entry"));
         link.dataset.glossaryId = match.id;
         link.addEventListener("click", function (event) {
           event.preventDefault();
@@ -3568,7 +3568,10 @@
     dom.modalContent.replaceChildren(
       metadata,
       markdownElement(
-        "## Source-backed explanation\n\n" + text(entry.context, "No source context was retained."),
+        "## Definition\n\n" +
+          text(entry.definition, "No model-backed definition is available.") +
+          "\n\n## First-use evidence\n\n> " +
+          text(entry.context, "No source context was retained."),
         "glossary-entry",
         false
       )

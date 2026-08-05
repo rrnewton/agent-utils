@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from agent_team_timeline.terminology import (
+    GlossaryTerm,
     TermSource,
     glossary_catalog_markdown,
     glossary_term_id,
+    plain_language_context_text,
     scan_terminology,
 )
 
@@ -34,3 +36,37 @@ def test_scanned_terms_and_catalog_carry_the_same_stable_ids() -> None:
     assert exact.term_id == glossary_term_id(exact.term)
     assert exact.term_id in catalog
     assert "# codex-test project glossary" in catalog
+    assert "## Project overview" in catalog
+    assert "### Definition" in catalog
+    assert "### First-use evidence" in catalog
+
+
+def test_plain_language_context_excludes_unsupported_definitions() -> None:
+    supported = GlossaryTerm(
+        term="exact-head",
+        introduced_at_ms=1,
+        occurrences=2,
+        context="The exact-head check binds a release to one revision.",
+        week="2026-W31",
+        term_id=glossary_term_id("exact-head"),
+        definition="A release check that requires the tested and landed revision to match.",
+        definition_status="supported",
+    )
+    unsupported = GlossaryTerm(
+        term="DBI",
+        introduced_at_ms=2,
+        occurrences=2,
+        context="DBI remained blocked.",
+        week="2026-W31",
+        term_id=glossary_term_id("DBI"),
+        definition="Insufficient evidence: the source never expands DBI.",
+        definition_status="insufficient-evidence",
+    )
+
+    context = plain_language_context_text(
+        "Hermit runs guest software deterministically.", (supported, unsupported)
+    )
+
+    assert "Hermit runs guest software deterministically" in context
+    assert "exact-head" in context
+    assert "DBI" not in context

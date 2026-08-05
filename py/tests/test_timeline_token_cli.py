@@ -20,6 +20,8 @@ def _report() -> SummarizeReport:
         rollups=1,
         agent_names=2,
         glossary_terms=3,
+        project_overviews=1,
+        glossary_definitions=3,
         cache_hits=1,
         cache_misses=6,
         backend_batches=2,

@@ -532,6 +532,7 @@ def render_archive(
     plain_rollup_summaries: Mapping[str, SummaryResult],
     rollup_stats: Mapping[str, PhaseStats],
     glossary_terms: Sequence[GlossaryTerm],
+    project_overview: SummaryResult,
     agent_names: Mapping[str, AgentNameResult],
     pull_request_metadata: Mapping[PullRequestKey, PullRequestMetadata],
     artifact_catalog: ArtifactCatalog,
@@ -643,7 +644,9 @@ def render_archive(
     changed += int(
         write_text_if_changed(
             archive / glossary_catalog_path,
-            glossary_catalog_markdown(team.team_slug, glossary_terms),
+            glossary_catalog_markdown(
+                team.team_slug, glossary_terms, project_overview.paragraph
+            ),
         )
     )
 
@@ -846,6 +849,8 @@ def render_archive(
             "introduced_at_ms": term.introduced_at_ms,
             "occurrences": term.occurrences,
             "context": term.context,
+            "definition": term.definition,
+            "definition_status": term.definition_status,
             "week": term.week,
             "url": f"#glossary/{term.term_id}",
         }
@@ -873,6 +878,17 @@ def render_archive(
         "rollups": rollup_objs,
         "glossary": glossary_objs,
         "glossary_path": glossary_catalog_path,
+        "project_overview": {
+            "text": project_overview.paragraph,
+            "evidence_status": (
+                "supported"
+                if project_overview.phrase == "Project overview supported"
+                else "insufficient-evidence"
+            ),
+            "model": project_overview.model,
+            "prompt_version": project_overview.prompt_version,
+            "input_hash": project_overview.input_hash,
+        },
         "summary_files": summary_files,
         "artifact_catalog_path": "data/artifacts.json",
         "projects": [project.to_json_obj() for project in artifact_catalog.projects],

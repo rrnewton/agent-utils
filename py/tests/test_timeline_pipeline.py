@@ -41,7 +41,8 @@ from agent_team_timeline.pipeline import (
 )
 from agent_team_timeline.render import _result_target
 from agent_team_timeline.server import make_server
-from agent_team_timeline.summarize import SummaryResult
+from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
+from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
@@ -195,7 +196,15 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     built = build_archive(tmp_path, team.team_slug)
 
     assert first.agent_names == 2
-    assert first.cache_misses == first.phases + (2 * first.rollups) + first.agent_names
+    assert first.project_overviews == 1
+    assert first.glossary_definitions == first.glossary_terms
+    assert first.cache_misses == (
+        first.phases
+        + (2 * first.rollups)
+        + first.agent_names
+        + first.project_overviews
+        + first.glossary_definitions
+    )
     assert first.backend == "heuristic"
     assert first.model == "test-model"
     assert first.reasoning_effort == "high"
@@ -203,7 +212,9 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert first.newly_spent_unknown_receipts == 0
     assert first.artifact_generation_unknown_receipts == 0
     assert first.unknown_legacy_artifacts == 0
-    assert len(first.usage_run_paths) == (2 * first.rollups) + 2
+    assert len(first.usage_run_paths) == (
+        (2 * first.rollups) + 3 + int(first.glossary_definitions > 0)
+    )
     assert all((tmp_path / path).is_file() for path in first.usage_run_paths)
     assert built["agents"] == 2
     assert (tmp_path / "index.html").is_file()
@@ -248,10 +259,52 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         "technical-rollup-v2"
     )
     assert rollup_record["plain_language_summary"]["prompt_version"].endswith(
-        "plain-rollup-v1"
+        "plain-rollup-v2"
+    )
+    overview_record = json.loads(
+        (
+            tmp_path
+            / "teams"
+            / team.team_slug
+            / "summary_data"
+            / "project_overview.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert overview_record["schema_version"] == 1
+    assert overview_record["summary"]["prompt_version"].endswith(
+        "project-overview-v1"
+    )
+    assert overview_record["summary"]["phrase"] == "Insufficient evidence"
+    glossary_record = json.loads(
+        (
+            tmp_path
+            / "teams"
+            / team.team_slug
+            / "summary_data"
+            / "glossary.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert glossary_record["schema_version"] == 2
+    assert glossary_record["project_overview_input_hash"] == overview_record["summary"][
+        "input_hash"
+    ]
+    assert all(
+        item["definition_status"] == "insufficient-evidence"
+        and item["definition"].startswith("Insufficient evidence:")
+        and item["evidence"]
+        for item in glossary_record["terms"]
     )
     assert timeline["glossary_path"].endswith("codex-test-glossary.md")
     assert all(item["url"] == "#glossary/" + item["id"] for item in timeline["glossary"])
+    assert all("definition" in item for item in timeline["glossary"])
+    assert timeline["project_overview"]["evidence_status"] == "insufficient-evidence"
+    glossary_catalog = tmp_path / timeline["glossary_path"]
+    catalog_text = glossary_catalog.read_text(encoding="utf-8")
+    assert catalog_text.index("## Project overview") < catalog_text.index(
+        "## Project terms"
+    )
+    assert "### Definition" in catalog_text
+    assert "### First-use evidence" in catalog_text
     assert timeline["events"].count(
         {"agent_id": CHILD, "at_ms": START + 10_000, "kind": "tool_call"}
     ) == 3
@@ -290,7 +343,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     )
     rebuilt = build_archive(tmp_path, team.team_slug)
     assert second.cache_misses == 0
-    assert second.cache_hits == first.phases + (2 * first.rollups) + first.agent_names
+    assert second.cache_hits == first.cache_misses
     assert second.files_changed == 0
     assert second.newly_spent_usage.total_tokens == 0
     assert second.artifact_generation_usage == first.artifact_generation_usage
@@ -814,6 +867,97 @@ def test_monthly_rollup_excludes_cross_boundary_week_summary() -> None:
     assert "BOUNDARY-START" in job.transcript
     assert "BOUNDARY-END" in job.transcript
     assert "COVERED" not in job.transcript
+
+
+def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
+    team = _team()
+    period = Period("daily", "day", "Day", START, START + 30_000, "day.md", False)
+    phases = build_phases(team)
+    phase_results = {
+        phase.summary_key: _rollup_result(phase.summary_key, phase.summary_key)
+        for phase in phases
+    }
+    supported = GlossaryTerm(
+        "exact-head",
+        START,
+        2,
+        "First-use evidence for exact-head.",
+        "2026-W13",
+        glossary_term_id("exact-head"),
+        "A release check that requires one exact revision.",
+        "supported",
+    )
+    unsupported = GlossaryTerm(
+        "DBI",
+        START,
+        2,
+        "DBI first-use evidence.",
+        "2026-W13",
+        glossary_term_id("DBI"),
+        "Insufficient evidence: DBI was never expanded.",
+        "insufficient-evidence",
+    )
+
+    technical = _rollup_jobs_for_level(
+        team,
+        (period,),
+        phases,
+        phase_results,
+        (),
+        {},
+        (),
+        (supported, unsupported),
+    )[0]
+    plain = _rollup_jobs_for_level(
+        team,
+        (period,),
+        phases,
+        phase_results,
+        (),
+        {},
+        (),
+        (supported, unsupported),
+        PLAIN_LANGUAGE_ROLLUP_STYLE,
+        "Hermit runs guest software in a repeatable environment.",
+    )[0]
+    without_definitions = tuple(
+        replace(term, definition="", definition_status="unavailable")
+        for term in (supported, unsupported)
+    )
+    technical_without_definitions = _rollup_jobs_for_level(
+        team,
+        (period,),
+        phases,
+        phase_results,
+        (),
+        {},
+        (),
+        without_definitions,
+    )[0]
+
+    assert technical.glossary == technical_without_definitions.glossary
+    assert "Hermit runs guest software" in plain.glossary
+    assert "A release check that requires one exact revision" in plain.glossary
+    assert "DBI" not in plain.glossary
+
+
+def test_build_rejects_pre_definition_glossary_schema(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    glossary_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "glossary.json"
+    )
+    glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
+    glossary["schema_version"] = 1
+    glossary_path.write_text(json.dumps(glossary), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported glossary schema; run summarize"):
+        build_archive(tmp_path, team.team_slug)
 
 
 def test_calendar_periods_use_local_dst_boundaries() -> None:

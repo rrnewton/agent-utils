@@ -19,7 +19,8 @@ web server.
 - Phrase, paragraph, cultivated work-summary, condensed-transcript, and rendered Markdown views.
 - Separate technical and newcomer-oriented plain-language summaries for every day, week, month,
   and quarter, with an in-modal audience switch.
-- A discoverable project glossary with stable, source-validated links from recognized terms.
+- A durable newcomer project overview and model-backed glossary definitions, each bounded by
+  retained source evidence, with stable links from recognized terms.
 - A linked site title grounded in structured repository metadata, with durable multi-project and
   multi-host identity plus explicit provenance.
 - Content-addressed model caches, append-only raw-log snapshots, and immutable run receipts.

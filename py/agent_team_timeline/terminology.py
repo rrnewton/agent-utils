@@ -21,7 +21,7 @@ class TermSource:
 
 @dataclass(frozen=True)
 class GlossaryTerm:
-    """A detected term with its first context and occurrence metadata."""
+    """A detected term, stable identity, and optional evidence-bounded definition."""
 
     term: str
     introduced_at_ms: int
@@ -29,6 +29,8 @@ class GlossaryTerm:
     context: str
     week: str
     term_id: str
+    definition: str = ""
+    definition_status: str = "unavailable"
 
 
 _BACKTICK = re.compile(r"`([^`\n]{2,80})`")
@@ -158,14 +160,35 @@ def glossary_prompt_text(terms: Sequence[GlossaryTerm]) -> str:
     return "\n".join(lines)
 
 
+def plain_language_context_text(
+    project_overview: str, terms: Sequence[GlossaryTerm]
+) -> str:
+    """Render overview and only supported definitions for newcomer rollup prompts."""
+
+    lines = ["Durable project overview (source-bounded):", project_overview.strip()]
+    supported = [term for term in terms if term.definition_status == "supported"]
+    lines.extend(["", "Evidence-backed project terminology definitions:"])
+    if supported:
+        lines.extend(f"- {term.term}: {term.definition}" for term in supported)
+    else:
+        lines.append("- No model-backed glossary definitions are supported by current evidence.")
+    return "\n".join(lines)
+
+
+def _definition_text(term: GlossaryTerm) -> str:
+    if term.definition:
+        return term.definition
+    return "No model-backed definition is available; consult the first-use evidence below."
+
+
 def glossary_markdown(team_slug: str, week: str, terms: Sequence[GlossaryTerm]) -> str:
     """Render one raw, version-controllable weekly glossary file."""
 
     lines = [
         f"# {week} {team_slug} terminology",
         "",
-        "Terms are ordered by first appearance. The quoted context is source evidence used to keep",
-        "later summaries aligned with the user's and coordinator's vocabulary.",
+        "Terms are ordered by first appearance. Definitions are generated only from retained",
+        "source occurrences; first-use evidence is shown separately.",
         "",
     ]
     matching = [term for term in terms if term.week == week]
@@ -181,6 +204,12 @@ def glossary_markdown(team_slug: str, week: str, terms: Sequence[GlossaryTerm]) 
                 f"Introduced {instant.isoformat().replace('+00:00', 'Z')}; "
                 f"seen {term.occurrences} time(s).",
                 "",
+                "### Definition",
+                "",
+                _definition_text(term),
+                "",
+                "### First-use evidence",
+                "",
                 f"> {term.context}",
                 "",
             ]
@@ -188,14 +217,24 @@ def glossary_markdown(team_slug: str, week: str, terms: Sequence[GlossaryTerm]) 
     return "\n".join(lines).rstrip() + "\n"
 
 
-def glossary_catalog_markdown(team_slug: str, terms: Sequence[GlossaryTerm]) -> str:
+def glossary_catalog_markdown(
+    team_slug: str, terms: Sequence[GlossaryTerm], project_overview: str = ""
+) -> str:
     """Render a discoverable all-time glossary catalog for one team."""
 
     lines = [
         f"# {team_slug} project glossary",
         "",
-        "These evidence-backed terms are ordered by first appearance. In the website, recognized",
-        "uses of an exact term link to its stable `#glossary/<term-id>` entry.",
+        "## Project overview",
+        "",
+        project_overview.strip()
+        or "No model-backed project overview is available for this archive.",
+        "",
+        "## Project terms",
+        "",
+        "These source-bounded terms are ordered by first appearance. In the website, recognized",
+        "uses of an exact term link to its stable `#glossary/<term-id>` entry. Definitions and",
+        "their first-use evidence are deliberately separate.",
         "",
     ]
     if not terms:
@@ -209,6 +248,12 @@ def glossary_catalog_markdown(team_slug: str, terms: Sequence[GlossaryTerm]) -> 
                 f"Stable glossary ID: `{term.term_id}`  ",
                 f"Introduced {instant.isoformat().replace('+00:00', 'Z')} in {term.week}; "
                 f"seen {term.occurrences} time(s).",
+                "",
+                "### Definition",
+                "",
+                _definition_text(term),
+                "",
+                "### First-use evidence",
                 "",
                 f"> {term.context}",
                 "",
@@ -224,5 +269,6 @@ __all__ = [
     "glossary_markdown",
     "glossary_prompt_text",
     "glossary_term_id",
+    "plain_language_context_text",
     "scan_terminology",
 ]
