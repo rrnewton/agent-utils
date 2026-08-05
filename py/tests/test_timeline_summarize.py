@@ -11,9 +11,11 @@ from pathlib import Path
 import pytest
 
 from agent_team_timeline.summarize import (
+    PLAIN_LANGUAGE_ROLLUP_STYLE,
     PROMPT_VERSION,
     SummaryError,
     SummaryJob,
+    TECHNICAL_ROLLUP_STYLE,
     _PendingJob,
     _input_hash,
     _parse_backend_output,
@@ -120,6 +122,31 @@ def test_prompt_contains_full_context_glossary_and_terminology_rules() -> None:
     assert "phase 2" in prompt and "descriptive workstream" in prompt
     assert "Do not call tools" in prompt
     assert PROMPT_VERSION in prompt
+
+
+def test_rollup_prompts_have_distinct_content_led_audience_contracts() -> None:
+    technical = replace(_job("technical"), summary_style=TECHNICAL_ROLLUP_STYLE)
+    plain = replace(_job("plain"), summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE)
+
+    technical_prompt = build_summary_prompt([technical])
+    plain_prompt = build_summary_prompt([plain])
+
+    assert "technical summary" in technical_prompt
+    assert "opaque referent" in technical_prompt
+    assert "interested newcomer" in plain_prompt
+    assert "what the project or product is" in plain_prompt
+    assert "do not invent Markdown links or glossary entries" in plain_prompt
+    assert _input_hash(technical, "codex", "same-model") != _input_hash(
+        plain, "codex", "same-model"
+    )
+
+
+def test_one_backend_batch_cannot_mix_summary_audiences() -> None:
+    technical = replace(_job("technical"), summary_style=TECHNICAL_ROLLUP_STYLE)
+    plain = replace(_job("plain"), summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE)
+
+    with pytest.raises(SummaryError, match="cannot mix summary styles"):
+        build_summary_prompt([technical, plain])
 
 
 def _write_fake_codex(path: Path) -> None:
