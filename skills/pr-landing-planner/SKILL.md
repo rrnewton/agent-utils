@@ -41,35 +41,89 @@ landing evidence.
 
 ## Large-backlog and coalesced landing
 
-Choose serial landing or a coordinator-approved staging branch from the measured cost, not from PR
-count alone:
+Local validation is the main landing driver. GitHub CI is an independent supplement, not a 40-minute
+inner loop and not a reason to postpone evidence the local producer can generate now.
 
-1. A validation receipt is SHA-keyed. Rebasing a PR changes that SHA and invalidates the receipt, so
-   serial landing pays rebase plus exact-head validation once per PR. A staging branch can integrate
-   N compatible PRs, rebase the integration once, and run one full validation. Record that arithmetic
-   before choosing the mode; do not spend N validations when one integration receipt proves the same
-   combined tree.
-2. `result=pass` alone is not a green. A qualifying Hermit full receipt carries `profile=full`, the
-   complete declared gate count (currently `checks=6`), nonzero executed tests, and the exact tested
-   SHA. A two-check partial profile can also say `pass` and may be the newest ledger row; it is not a
-   full green. Consumers must select by profile and coverage before ordering by recency.
-3. Treat **soft green** only as a scheduling signal: no known product failure and enough evidence to
-   admit a PR to the chosen batch. It never authorizes landing by itself. **Hard green** is the
-   qualifying exact-head full receipt above (or the repository's authoritative equivalent), with
-   required review resolved. State which one is being cited; never write only “green”.
-4. Merging a staging PR does not close its constituent PRs. GitHub recognizes commit lineage, not
-   content equivalence. Track the constituent set explicitly and disposition each PR after the staging
-   commit is ancestry-confirmed; do not infer closure from the staging merge.
-5. Landing evidence is `mergeCommit.oid` plus `git merge-base --is-ancestor <oid>
-   refs/remotes/origin/main` after a fresh fetch of the named destination. A PR head, API `MERGED`
-   flag, successful `gh pr merge` exit, mergeability query, or clean dry-run is not landing evidence.
-6. Duration is a diagnostic classifier, not a verdict. On the measured Hermit lane, about 9 seconds
-   indicates admission refusal, about 137 seconds indicates a build/lint failure, and roughly
-   400–700 seconds indicates a real full run. Inspect the recorded profile and gate counts rather than
-   promoting these ranges into authorization.
-7. Serialize merge operations. Concurrent stale-base `--rebase --admin` merges orphaned already
-   merged work by replaying incompatible views of main. `--admin` is forbidden regardless; the
-   executor must hold one landing lock, fetch fresh before each merge, and ancestry-verify afterward.
+### Produce a qualifying local record
+
+On the measured Meta agent sandbox, bare `./validate.sh` exits 3 in about nine seconds because
+BpfJailer denies cgroup creation. That is admission refusal, not a test result. Run the exact checkout
+in a detached user scope instead:
+
+```bash
+systemd-run --user --unit=validate-<pr>-<sha> \
+  --working-directory=<checkout> --collect \
+  /bin/bash -c 'exec env PR_NUMBER=<pr> with-proxy ./validate.sh > <durable-log> 2>&1'
+```
+
+This is not an unboxed bypass: systemd grants the cgroup scope and the validation remains boxed. The
+detached unit survives agent recycling. Use a unique unit and durable log, record both, and stop it
+explicitly with `systemctl --user stop <unit>` (or the repository wrapper); killing the watching agent
+does not stop the run.
+
+Read duration before interpreting the log. On this lane, about 9 seconds means admission refusal,
+about 137 seconds means a build/lint failure, and roughly 400–700 seconds means a real full run. These
+ranges classify where to look; the receipt remains the authority.
+
+`result=pass` alone is not a green. A qualifying Hermit receipt satisfies all of:
+
+```text
+result=pass AND profile=full AND checks=6 AND executed_tests>0 AND exact tested SHA
+```
+
+The current six-check count belongs to the current full profile and must move with that profile when
+its declared gate count changes. A two-check `portable-strict-compat-only` row can also say `pass` and
+often lands in the ledger first; it is not a full green. A feature/filter configuration can execute
+zero tests and still print success; missing or zero execution is NO-RESULT. Select by exact SHA,
+profile, coverage, and nonzero execution before ordering records by recency.
+
+Treat **soft green** only as a scheduling signal: no known product failure and enough evidence to
+admit a PR to a chosen batch. It never authorizes landing by itself. **Hard green** is the qualifying
+exact-head full receipt above (or the repository's authoritative equivalent), with required review
+resolved. State which one is being cited; never write only “green”.
+
+### Choose serial or coalesced landing
+
+A receipt is SHA-keyed. Rebasing changes the SHA and destroys its authority, so N serial landings pay
+for N rebases and N exact-head validations. For a large conflict-free backlog, a coordinator-approved
+staging branch can reduce that to one integration update and one full validation:
+
+1. Fetch fresh and create the staging branch from **current main**, never from a stale green anchor;
+   the latter silently reverts everything landed after the anchor.
+2. Merge every ready, conflict-free PR into staging. Skip conflicts instead of resolving them inside
+   the batch; conflict resolution changes the reviewed change and returns that PR to individual work.
+3. Validate the combined exact staging head once. If main moves, update staging before validation;
+   never claim the old receipt for the new head.
+4. Land the staging change under the normal lock and protection rules.
+
+Merging staging does not close the constituent PRs. GitHub recognizes commit lineage, not content
+equivalence. After a fresh fetch, close only a constituent whose original head satisfies
+`git merge-base --is-ancestor <pr-head> refs/remotes/origin/main` with rc=0. A non-ancestral head is
+not proven landed; closing it can silently bury dropped work. This conservative constituent check is
+distinct from proof of the staging/direct merge itself: that proof uses `mergeCommit.oid` plus
+`git merge-base --is-ancestor <merge-oid> refs/remotes/origin/main` after fetching the named branch.
+The API `MERGED` flag, successful `gh pr merge` exit, mergeability query, and clean dry-run are not
+landing evidence.
+
+### Serialize evidence and verification
+
+Never batch local validates concurrently. Contention has triggered `detcore_misc` livelock and written
+false reds; because recorded reds are not automatically retried, an operator-created false red can
+permanently condemn a healthy PR. Hold the validation lock and derive any future safe width from a
+solo run's measured CPU and memory footprint, not host core count.
+
+Serialize merge operations too. Concurrent stale-base `--rebase --admin` merges orphaned already
+merged work by replaying incompatible views of main. `--admin` is forbidden regardless; hold one
+landing lock, fetch fresh before each merge, and ancestry-verify afterward.
+
+Speculative landing is limited to CI-irrelevant diffs and owner-requested tooling fixes. Its contract
+is binding: arm local validation and GitHub CI on the landed commit immediately, in parallel, and act
+as soon as either reports. A speculative land without armed verification is a process violation, not
+a shortcut.
+
+During implementation, reproduce and iterate on the single failing test locally. Never put full CI in
+the edit/test inner loop. Use full local validation as post-hoc confirmation, and run local validation
+and GitHub CI in parallel rather than serially.
 
 The planner must expose the conflict-safe groups and evidence class needed for this choice. The
 coordinator owns the decision to coalesce because integration changes the meaning of per-PR evidence
