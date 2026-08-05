@@ -53,6 +53,8 @@ class OrcSourceCopy:
     captured_at: str
 
     def to_json_obj(self) -> dict[str, object]:
+        """Return this validated source-copy record as a JSON object."""
+
         return {
             "source_path": self.source_path,
             "snapshot_path": self.snapshot_path,
@@ -73,6 +75,8 @@ class OrcSourceCopy:
     def from_json_obj(
         cls, raw: Mapping[str, object], where: str
     ) -> OrcSourceCopy:
+        """Validate and decode one source-copy record from archive JSON."""
+
         source_path = _required_string(raw.get("source_path"), f"{where}.source_path")
         snapshot_path = _required_string(
             raw.get("snapshot_path"), f"{where}.snapshot_path"
@@ -127,6 +131,8 @@ class OrcSourceCopy:
 
 @dataclass(frozen=True)
 class OrcSnapshotResult:
+    """Summary of source copies retained by one snapshot pass."""
+
     sources: tuple[OrcSourceCopy, ...]
     files_changed: int
 
@@ -883,13 +889,13 @@ def _task_records(
                 thread_id=spawn.thread_id,
                 turn_id=turn_id,
                 timestamp_ms=timestamp_ms,
-                kind="assistant_message",
-                role="assistant",
+                kind="inter_agent_message",
+                role="agent",
                 phase=None,
                 text=text,
                 content_availability="plaintext",
                 encrypted_content=None,
-                author=owner,
+                author=spawn.thread_id,
                 recipient=coordinator_id,
                 source_line=note_id,
             )
@@ -1054,7 +1060,7 @@ def load_orc_team(
     filtered_events = tuple(
         event for event in normalized_events if event.thread_id in agent_ids
     )
-    edges = tuple(
+    edges = [
         Edge(
             edge_id=f"orc-spawn-{spawn.thread_id}",
             call_id=f"orc-spawn-{spawn.source_line}",
@@ -1071,6 +1077,24 @@ def load_orc_team(
             all_spawns, key=lambda item: (item.timestamp_ms, item.thread_id)
         )
         if spawn.parent_thread_id in agent_ids
+    ]
+    edges.extend(
+        Edge(
+            edge_id=f"orc-message-{event.event_id}",
+            call_id=event.event_id,
+            from_thread_id=event.thread_id,
+            to_thread_id=event.recipient,
+            kind="message",
+            timestamp_ms=event.timestamp_ms,
+            message_text=event.text,
+            content_availability=event.content_availability,
+            encrypted_content=event.encrypted_content,
+            source_line=event.source_line,
+        )
+        for event in task_events
+        if event.thread_id in agent_ids
+        and event.recipient is not None
+        and event.recipient in agent_ids
     )
     source_snapshots = tuple(
         SourceSnapshot(
@@ -1096,7 +1120,7 @@ def load_orc_team(
         tool_calls=tuple(
             sorted(tools, key=lambda item: (item.started_at_ms, item.call_id))
         ),
-        edges=edges,
+        edges=tuple(sorted(edges, key=lambda item: (item.timestamp_ms, item.edge_id))),
     )
 
 

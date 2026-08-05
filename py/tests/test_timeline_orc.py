@@ -266,6 +266,10 @@ def test_snapshot_and_parse_orc_lineage_read_only_and_idempotently(
         event for event in team.events if "Second incarnation" in (event.text or "")
     )
     assert first_event.thread_id != second_event.thread_id
+    assert first_event.kind == "inter_agent_message"
+    assert first_event.phase is None
+    assert first_event.author == first_event.thread_id
+    assert first_event.recipient == ROOT
     tools = team.tool_calls
     assert len(tools) == 1
     assert tools[0].nested_tools == (("readFile", 2), ("sendAgent", 1))
@@ -290,6 +294,7 @@ def test_window_excludes_exact_end_but_retains_pre_window_spawn_context(
     assert "Exactly at exclusive end" not in transcript
     assert "Outside the half-open window" not in transcript
     assert any(agent.started_at_ms < window.start_ms for agent in team.agents)
+    assert sum(phase.stats.inter_agent_messages for phase in phases) == 2
 
 
 def test_rewritten_task_note_prefix_is_rejected(tmp_path: Path) -> None:
@@ -344,6 +349,8 @@ def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> Non
     archive = tmp_path / "archive"
     window = parse_date_window("2026-07-21", "2026-07-22", "America/New_York")
     assert window is not None
+    assert window.start_ms is not None
+    assert window.end_ms is not None
 
     team, first = ingest_orc(
         archive,
@@ -377,6 +384,20 @@ def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> Non
         "end_ms": window.end_ms,
     }
     assert len(timeline["rollups"]) == 4
+    message_edges = [edge for edge in timeline["edges"] if edge["kind"] == "message"]
+    assert len(message_edges) == 2
+    assert {
+        (edge["source_id"], edge["target_id"])
+        for edge in message_edges
+    } == {
+        (event.thread_id, ROOT)
+        for event in team.events
+        if event.kind == "inter_agent_message"
+        and window.start_ms <= event.timestamp_ms < window.end_ms
+    }
+    assert [event["kind"] for event in timeline["events"]].count(
+        "inter_agent_message"
+    ) == 2
     manifest = json.loads(
         (archive / "teams" / "orc-test" / "raw" / "source-manifest.json").read_text(
             encoding="utf-8"

@@ -341,13 +341,27 @@ def _in_window(team: TeamData, timestamp_ms: int) -> bool:
     return team.window_end_ms is None or timestamp_ms < team.window_end_ms
 
 
+def _agent_overlaps_window(team: TeamData, agent: Agent) -> bool:
+    """Return whether an agent's lifetime intersects the selected half-open range."""
+
+    if team.window_end_ms is not None and agent.started_at_ms >= team.window_end_ms:
+        return False
+    if team.window_start_ms is None or agent.ended_at_ms is None:
+        return True
+    effective_end = max(agent.ended_at_ms, agent.started_at_ms + 1)
+    return effective_end > team.window_start_ms
+
+
 def phase_agent_ids(
     team: TeamData, phases: Sequence[PhaseWindow]
 ) -> frozenset[str]:
-    """Return agents with in-window work plus their available lineage ancestors."""
+    """Return agents alive in the window plus their available lineage ancestors."""
 
     by_id = {agent.thread_id: agent for agent in team.agents}
-    selected = {phase.agent_id for phase in phases}
+    selected = {
+        agent.thread_id for agent in team.agents if _agent_overlaps_window(team, agent)
+    }
+    selected.update(phase.agent_id for phase in phases)
     pending = list(selected)
     while pending:
         current = by_id.get(pending.pop())

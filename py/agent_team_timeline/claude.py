@@ -44,6 +44,8 @@ class ClaudeSourceCopy:
     updated_at: str
 
     def to_json_obj(self) -> dict[str, object]:
+        """Return this validated source-copy record as a JSON object."""
+
         return {
             "source_path": self.source_path,
             "original_path": self.original_path,
@@ -59,6 +61,8 @@ class ClaudeSourceCopy:
     def from_json_obj(
         cls, raw: Mapping[str, object], where: str
     ) -> ClaudeSourceCopy:
+        """Validate and decode one source-copy record from archive JSON."""
+
         source_path = _required_string(raw.get("source_path"), where + ".source_path")
         original_path = _required_string(
             raw.get("original_path"), where + ".original_path"
@@ -776,6 +780,79 @@ def load_claude_team(
             agent_meta.agent_type if agent_meta is not None else None
         )
 
+    # Subagent transcript files present parent instructions as user records and
+    # completed work as assistant records. Normalize both sides of that route so
+    # archive statistics count only root-thread prompts as human input.
+    routed_events: list[Event] = []
+    for event in all_events:
+        parent = parent_by_agent.get(event.thread_id)
+        if parent is None:
+            routed_events.append(event)
+        elif event.kind == "user_prompt":
+            routed_events.append(
+                replace(
+                    event,
+                    kind="inter_agent_message",
+                    role=None,
+                    phase="instruction",
+                    author=parent,
+                    recipient=event.thread_id,
+                )
+            )
+        elif event.kind == "assistant_message" and event.phase == "final_answer":
+            routed_events.append(
+                replace(
+                    event,
+                    kind="inter_agent_message",
+                    role=None,
+                    author=event.thread_id,
+                    recipient=parent,
+                )
+            )
+        else:
+            routed_events.append(event)
+    for tool in tool_builders:
+        if tool.name != "SendMessage":
+            continue
+        recipient = _optional_string(
+            tool.input_object.get("recipient")
+        ) or _optional_string(tool.input_object.get("to"))
+        message = _optional_string(
+            tool.input_object.get("message")
+        ) or _optional_string(tool.input_object.get("prompt"))
+        if recipient not in records_by_thread or message is None:
+            continue
+        already_recorded = any(
+            event.kind == "inter_agent_message"
+            and event.author == tool.thread_id
+            and event.recipient == recipient
+            and (event.text or "").strip() == message.strip()
+            and abs(event.timestamp_ms - tool.started_at_ms) <= 5_000
+            for event in routed_events
+        )
+        if already_recorded:
+            continue
+        routed_events.append(
+            Event(
+                event_id=f"claude-message-{tool.call_id}",
+                thread_id=tool.thread_id,
+                turn_id=_turn_id(
+                    turns_by_thread.get(tool.thread_id, ()), tool.started_at_ms
+                ),
+                timestamp_ms=tool.started_at_ms,
+                kind="inter_agent_message",
+                role=None,
+                phase="instruction",
+                text=message,
+                content_availability="plain",
+                encrypted_content=None,
+                author=tool.thread_id,
+                recipient=recipient,
+                source_line=tool.source_line,
+            )
+        )
+    all_events = routed_events
+
     raw_activity: dict[str, list[int]] = {thread_id: [] for thread_id in records_by_thread}
     for event in all_events:
         raw_activity[event.thread_id].append(event.timestamp_ms)
@@ -832,7 +909,9 @@ def load_claude_team(
             inherited = start_ms if start_ms is not None else 0
             times = [inherited]
         original_start = min(times)
-        original_end = max(times)
+        # Agent lifetimes are half-open. Include activity at the final observed
+        # millisecond instead of clipping the terminal event out of its phase.
+        original_end = max(times) + 1
         clipped_start = max(original_start, start_ms) if start_ms is not None else original_start
         clipped_end = min(original_end, end_ms) if end_ms is not None else original_end
         if clipped_end <= clipped_start:

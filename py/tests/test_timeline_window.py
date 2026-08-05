@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed
-from agent_team_timeline.model import Agent, Event, SourceSnapshot, TeamData
+from agent_team_timeline.model import Agent, Edge, Event, SourceSnapshot, TeamData
 from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.phases import build_phases
 from agent_team_timeline.pipeline import build_archive, summarize_archive
@@ -16,6 +17,10 @@ from agent_team_timeline.window import apply_date_window, parse_date_window
 
 ROOT = "root-thread"
 OUTSIDE = "outside-thread"
+SILENT = "silent-crossing-thread"
+QUIET_CROSSING = "quiet-full-window-crossing"
+ENDED_AT_START = "ended-at-window-start"
+STARTED_AT_END = "started-at-window-end"
 
 
 def _ms(value: str) -> int:
@@ -145,6 +150,103 @@ def test_built_site_uses_exact_window_and_only_selected_agents(tmp_path: Path) -
     assert [rollup["kind"] for rollup in timeline["rollups"]].count("daily") == 1
     daily = next(rollup for rollup in timeline["rollups"] if rollup["kind"] == "daily")
     assert "partial" not in daily["label"]
+
+
+def test_built_site_keeps_silent_agent_whose_lifetime_overlaps_window(
+    tmp_path: Path,
+) -> None:
+    window = parse_date_window("2026-07-21", "2026-07-22", "America/New_York")
+    assert window is not None
+    assert window.start_ms is not None
+    assert window.end_ms is not None
+    base = _team()
+    spawn_at = window.start_ms + 1_000
+    crossing = Agent(
+        SILENT,
+        ROOT,
+        "/root/silent-crossing",
+        None,
+        "worker",
+        1,
+        spawn_at,
+        window.end_ms + 1_000,
+        "active",
+        "silent",
+    )
+    quiet_crossing = Agent(
+        QUIET_CROSSING,
+        ROOT,
+        "/root/quiet-full-window-crossing",
+        None,
+        "worker",
+        1,
+        window.start_ms - 1_000,
+        window.end_ms + 1_000,
+        "active",
+        "quiet-crossing",
+    )
+    ended_at_start = Agent(
+        ENDED_AT_START,
+        ROOT,
+        "/root/ended-at-start",
+        None,
+        "worker",
+        1,
+        window.start_ms - 1_000,
+        window.start_ms,
+        "completed",
+        "before",
+    )
+    started_at_end = Agent(
+        STARTED_AT_END,
+        ROOT,
+        "/root/started-at-end",
+        None,
+        "worker",
+        1,
+        window.end_ms,
+        window.end_ms + 1_000,
+        "active",
+        "after",
+    )
+    spawn = Edge(
+        "spawn-silent",
+        "call-silent",
+        ROOT,
+        SILENT,
+        "spawn",
+        spawn_at,
+        "Continue across midnight",
+        "plaintext",
+        None,
+        1,
+    )
+    team = apply_date_window(
+        replace(
+            base,
+            agents=base.agents
+            + (crossing, quiet_crossing, ended_at_start, started_at_end),
+            edges=(spawn,),
+        ),
+        window,
+    )
+    raw_path = tmp_path / "teams" / team.team_slug / "raw" / "team.json"
+    write_json_if_changed(raw_path, narrow_json(team.to_json_obj()))
+
+    report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    built = build_archive(tmp_path, team.team_slug)
+    timeline = json.loads(
+        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+
+    assert report.agent_names == 3
+    assert built["agents"] == 3
+    assert {agent["id"] for agent in timeline["agents"]} == {
+        ROOT,
+        SILENT,
+        QUIET_CROSSING,
+    }
+    assert [edge["id"] for edge in timeline["edges"]] == ["spawn-silent"]
 
 
 def test_team_json_round_trip_keeps_window_fields() -> None:

@@ -344,19 +344,23 @@ Subagent metadata supplies spawn depth, parent agent ID, role, description, and 
 tool-use ID. That supports nested lineages and links the exact spawn prompt to its child. If metadata
 is absent, the importer falls back to the root parent and the source agent ID rather than inventing
 lineage. Turn boundaries are reconstructed heuristically from timestamped user messages because
-Claude logs do not expose the same explicit turn lifecycle records as Codex.
+Claude logs do not expose the same explicit turn lifecycle records as Codex. Text prompts in a
+subagent log are counted as parent-to-child messages rather than human prompts, and a subagent's
+final response is counted as a child-to-parent message while still driving its result edge.
 
 ## Orc source semantics and limitations
 
 Orc's append-only content blocks are authoritative for coordinator conversation and tool execution.
 Conversation state supplies agent spawn records. Task notes are joined to their recorded author or
 owner and mapped to the latest matching agent incarnation at that time; this is the best available
-historical attribution when the task database does not retain owner changes per note. Reused names
-become separate incarnation IDs while the official name remains visible.
+attribution when the task database does not retain owner changes per note. Reused names
+become separate incarnation IDs while the official name remains visible. Each nonempty task note is
+shown once as a worker-to-coordinator message; notes are not labeled terminal results because they
+can represent incremental progress.
 
 Some Orc installations discover nested coordinator sessions without persisting a parent identifier.
 The importer preserves nested lineage when that field exists and does not invent a parent when it is
-absent. Historical agent-close timestamps are also not always persisted, so a lifetime ends at its
+absent. Agent-close timestamps are also not always persisted, so a lifetime ends at its
 last attributed activity or at the next reuse of the same official name.
 
 ## Codex source semantics and limitations

@@ -305,7 +305,7 @@ def _result_edge_objs(
             event
             for event in team.events
             if event.thread_id == agent.thread_id
-            and event.kind == "assistant_message"
+            and event.kind in ("assistant_message", "inter_agent_message")
             and event.phase == "final_answer"
             and event.text
         ]

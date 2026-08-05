@@ -16,7 +16,12 @@ from agent_team_timeline.claude import (
     snapshot_claude_lineage,
 )
 from agent_team_timeline.cli import main
-from agent_team_timeline.pipeline import ingest_claude
+from agent_team_timeline.phases import aggregate_stats, build_phases
+from agent_team_timeline.pipeline import (
+    build_archive,
+    ingest_claude,
+    summarize_archive,
+)
 from agent_team_timeline.window import parse_date_window
 
 
@@ -86,6 +91,26 @@ def test_loads_provider_neutral_nested_team_and_joins_tools() -> None:
     assert "private reasoning" not in "\n".join(
         event.text or "" for event in team.events
     )
+    stats = aggregate_stats(build_phases(team))
+    assert stats.user_prompts == 2
+    assert stats.agent_responses == 2
+    assert stats.inter_agent_messages == 5
+    child_instruction = next(
+        event
+        for event in team.events
+        if event.thread_id == "a-child" and event.phase == "instruction"
+    )
+    assert child_instruction.kind == "inter_agent_message"
+    assert child_instruction.author == SESSION_ID
+    assert child_instruction.recipient == "a-child"
+    child_result = next(
+        event
+        for event in team.events
+        if event.thread_id == "a-child" and event.phase == "final_answer"
+    )
+    assert child_result.kind == "inter_agent_message"
+    assert child_result.author == "a-child"
+    assert child_result.recipient == SESSION_ID
 
 
 def test_half_open_window_clips_activity_and_retains_ancestors() -> None:
@@ -121,6 +146,48 @@ def test_trailing_incomplete_json_is_ignored(tmp_path: Path) -> None:
 
     assert len(team.agents) == 3
     assert team.sources[0].complete_bytes < team.sources[0].size_bytes
+
+
+def test_send_message_deduplicates_matching_received_child_prompt(
+    tmp_path: Path,
+) -> None:
+    copied = tmp_path / "claude"
+    shutil.copytree(FIXTURE_ROOT, copied)
+    child = (
+        copied
+        / SESSION_ID
+        / "subagents"
+        / "agent-a-child.jsonl"
+    )
+    received = {
+        "type": "user",
+        "uuid": "child-user-resumed",
+        "parentUuid": "child-final-1",
+        "sessionId": SESSION_ID,
+        "isSidechain": True,
+        "agentId": "a-child",
+        "timestamp": "2026-01-02T10:00:02.500Z",
+        "message": {
+            "role": "user",
+            "content": "Please send the final evidence.",
+        },
+    }
+    with child.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(received, separators=(",", ":")) + "\n")
+
+    team = load_claude_team(_session(copied), "claude-deduplicated", "UTC")
+    routed = [
+        event
+        for event in team.events
+        if event.kind == "inter_agent_message"
+        and event.author == SESSION_ID
+        and event.recipient == "a-child"
+        and event.text == "Please send the final evidence."
+    ]
+
+    assert len(routed) == 1
+    assert routed[0].thread_id == "a-child"
+    assert aggregate_stats(build_phases(team)).inter_agent_messages == 5
 
 
 def test_complete_malformed_record_is_rejected(tmp_path: Path) -> None:
@@ -249,6 +316,20 @@ def test_pipeline_snapshots_claude_and_reuses_unchanged_archive(tmp_path: Path) 
         / "source_snapshots"
         / f"{SESSION_ID}.jsonl"
     ).is_file()
+    summarize_archive(archive, "claude-fixture", "heuristic", "fixture")
+    build_archive(archive, "claude-fixture")
+    timeline = json.loads(
+        (archive / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
+    assert {
+        (edge["source_id"], edge["target_id"])
+        for edge in result_edges
+    } == {("a-child", SESSION_ID), ("a-nested", "a-child")}
+    event_kinds = [event["kind"] for event in timeline["events"]]
+    assert event_kinds.count("user_prompt") == 1
+    assert event_kinds.count("assistant_message") == 1
+    assert event_kinds.count("inter_agent_message") == 4
 
 
 def test_cli_exposes_bounded_claude_ingest(tmp_path: Path) -> None:
