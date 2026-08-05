@@ -38,10 +38,22 @@ from agent_team_timeline.token_usage import (
 PROMPT_VERSION: Final = "agent-team-timeline-summary-v1"
 TECHNICAL_ROLLUP_STYLE: Final = "technical-rollup"
 PLAIN_LANGUAGE_ROLLUP_STYLE: Final = "plain-language-rollup"
+PROJECT_OVERVIEW_STYLE: Final = "project-overview"
+GLOSSARY_DEFINITION_STYLE: Final = "glossary-definition"
 _TECHNICAL_ROLLUP_PROMPT_VERSION: Final = "agent-team-timeline-technical-rollup-v2"
-_PLAIN_LANGUAGE_ROLLUP_PROMPT_VERSION: Final = "agent-team-timeline-plain-rollup-v1"
+_PLAIN_LANGUAGE_ROLLUP_PROMPT_VERSION: Final = "agent-team-timeline-plain-rollup-v2"
+PROJECT_OVERVIEW_PROMPT_VERSION: Final = "agent-team-timeline-project-overview-v1"
+GLOSSARY_DEFINITION_PROMPT_VERSION: Final = (
+    "agent-team-timeline-glossary-definition-v1"
+)
 _SUMMARY_STYLES: Final = frozenset(
-    {"phase", TECHNICAL_ROLLUP_STYLE, PLAIN_LANGUAGE_ROLLUP_STYLE}
+    {
+        "phase",
+        TECHNICAL_ROLLUP_STYLE,
+        PLAIN_LANGUAGE_ROLLUP_STYLE,
+        PROJECT_OVERVIEW_STYLE,
+        GLOSSARY_DEFINITION_STYLE,
+    }
 )
 _CACHE_VERSION: Final = 2
 _PHRASE_LIMIT: Final = 80
@@ -178,6 +190,10 @@ def _prompt_version(job: SummaryJob) -> str:
         return _TECHNICAL_ROLLUP_PROMPT_VERSION
     if job.summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE:
         return _PLAIN_LANGUAGE_ROLLUP_PROMPT_VERSION
+    if job.summary_style == PROJECT_OVERVIEW_STYLE:
+        return PROJECT_OVERVIEW_PROMPT_VERSION
+    if job.summary_style == GLOSSARY_DEFINITION_STYLE:
+        return GLOSSARY_DEFINITION_PROMPT_VERSION
     return PROMPT_VERSION
 
 
@@ -278,6 +294,28 @@ def build_summary_prompt(jobs: Sequence[SummaryJob]) -> str:
             "the identifier as supplementary evidence. Expand locally coined shorthand unless the "
             "glossary defines it. Use exact glossary names when applicable so the renderer can link "
             "verified terms, but do not invent Markdown links or glossary entries.\n\n"
+        )
+    elif style == PROJECT_OVERVIEW_STYLE:
+        audience = (
+            "Knowledge contract: produce one durable project overview for a newcomer, based only "
+            "on the quoted early/root transcript. Describe what the project or product is, its "
+            "purpose, and only the central architecture needed to understand later work. Do not "
+            "turn this into a progress report and do not infer facts that the evidence does not "
+            "state. Set phrase to exactly 'Project overview supported' when the evidence supports "
+            "a useful overview, otherwise exactly 'Insufficient evidence'. When evidence is "
+            "insufficient, paragraph must begin 'Insufficient evidence:' and say what is missing. "
+            "work_summary must be an empty array.\n\n"
+        )
+    elif style == GLOSSARY_DEFINITION_STYLE:
+        audience = (
+            "Knowledge contract: define the single named glossary term for a newcomer using only "
+            "the supplied project overview and quoted source occurrences. State what the term "
+            "means in this project and why it matters in one or two concise sentences. Never "
+            "guess an acronym expansion, implementation detail, relationship, or purpose. Set "
+            "phrase to exactly 'Definition supported' when the evidence supports a definition, "
+            "otherwise exactly 'Insufficient evidence'. When evidence is insufficient, paragraph "
+            "must begin 'Insufficient evidence:' and identify the limit without inventing an "
+            "explanation. work_summary must be an empty array.\n\n"
         )
     else:
         audience = ""
@@ -431,6 +469,36 @@ def _parse_backend_output(
         paragraph = _string(summary["paragraph"], where + ".paragraph")
         item = expected[key]
         bullets = _parse_bullets(summary["work_summary"], item.job, where + ".work_summary")
+        if item.job.summary_style == PROJECT_OVERVIEW_STYLE:
+            if phrase not in {"Project overview supported", "Insufficient evidence"}:
+                raise SummaryError(
+                    f"{where}.phrase: invalid project-overview evidence status"
+                )
+            if bullets:
+                raise SummaryError(
+                    f"{where}.work_summary: project overview must not contain bullets"
+                )
+            if phrase == "Insufficient evidence" and not paragraph.startswith(
+                "Insufficient evidence:"
+            ):
+                raise SummaryError(
+                    f"{where}.paragraph: insufficient overview must name its evidence limit"
+                )
+        elif item.job.summary_style == GLOSSARY_DEFINITION_STYLE:
+            if phrase not in {"Definition supported", "Insufficient evidence"}:
+                raise SummaryError(
+                    f"{where}.phrase: invalid glossary-definition evidence status"
+                )
+            if bullets:
+                raise SummaryError(
+                    f"{where}.work_summary: glossary definition must not contain bullets"
+                )
+            if phrase == "Insufficient evidence" and not paragraph.startswith(
+                "Insufficient evidence:"
+            ):
+                raise SummaryError(
+                    f"{where}.paragraph: insufficient definition must name its evidence limit"
+                )
         results[key] = SummaryResult(
             key=key,
             phrase=phrase,
@@ -631,6 +699,34 @@ def _heuristic_sentences(transcript: str) -> list[str]:
 
 
 def _heuristic_result(pending: _PendingJob, model: str, generated_at: str) -> SummaryResult:
+    if pending.job.summary_style in {
+        PROJECT_OVERVIEW_STYLE,
+        GLOSSARY_DEFINITION_STYLE,
+    }:
+        selected = _heuristic_sentences(pending.job.transcript)
+        first_context = (
+            _shorten(selected[0], 520)
+            if selected
+            else "no usable source sentence was retained"
+        )
+        subject = (
+            "project overview"
+            if pending.job.summary_style == PROJECT_OVERVIEW_STYLE
+            else "glossary definition"
+        )
+        return SummaryResult(
+            key=pending.job.key,
+            phrase="Insufficient evidence",
+            paragraph=(
+                f"Insufficient evidence: the zero-token heuristic cannot safely synthesize a "
+                f"{subject}; first source context: {first_context}"
+            ),
+            work_summary=(),
+            model=model,
+            prompt_version=_prompt_version(pending.job),
+            input_hash=pending.input_hash,
+            generated_at=generated_at,
+        )
     selected = _heuristic_sentences(pending.job.transcript)
     if selected:
         phrase = _shorten(selected[0], _PHRASE_LIMIT)
@@ -990,8 +1086,12 @@ def summarize_jobs(
 
 
 __all__ = [
+    "GLOSSARY_DEFINITION_PROMPT_VERSION",
+    "GLOSSARY_DEFINITION_STYLE",
     "PLAIN_LANGUAGE_ROLLUP_STYLE",
     "PROMPT_VERSION",
+    "PROJECT_OVERVIEW_PROMPT_VERSION",
+    "PROJECT_OVERVIEW_STYLE",
     "SummaryError",
     "SummaryJob",
     "SummaryResult",

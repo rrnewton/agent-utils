@@ -11,8 +11,12 @@ from pathlib import Path
 import pytest
 
 from agent_team_timeline.summarize import (
+    GLOSSARY_DEFINITION_PROMPT_VERSION,
+    GLOSSARY_DEFINITION_STYLE,
     PLAIN_LANGUAGE_ROLLUP_STYLE,
     PROMPT_VERSION,
+    PROJECT_OVERVIEW_PROMPT_VERSION,
+    PROJECT_OVERVIEW_STYLE,
     SummaryError,
     SummaryJob,
     TECHNICAL_ROLLUP_STYLE,
@@ -139,6 +143,48 @@ def test_rollup_prompts_have_distinct_content_led_audience_contracts() -> None:
     assert _input_hash(technical, "codex", "same-model") != _input_hash(
         plain, "codex", "same-model"
     )
+    assert "agent-team-timeline-plain-rollup-v2" in plain_prompt
+
+
+def test_knowledge_prompts_are_evidence_bounded_and_have_distinct_cache_ids() -> None:
+    overview = replace(_job("overview"), summary_style=PROJECT_OVERVIEW_STYLE)
+    definition = replace(
+        _job("definition"), summary_style=GLOSSARY_DEFINITION_STYLE
+    )
+
+    overview_prompt = build_summary_prompt([overview])
+    definition_prompt = build_summary_prompt([definition])
+
+    assert PROJECT_OVERVIEW_PROMPT_VERSION in overview_prompt
+    assert "durable project overview" in overview_prompt
+    assert "do not infer facts" in overview_prompt
+    assert GLOSSARY_DEFINITION_PROMPT_VERSION in definition_prompt
+    assert "Never guess an acronym expansion" in definition_prompt
+    assert "Insufficient evidence:" in definition_prompt
+    assert _input_hash(overview, "codex", "same-model") != _input_hash(
+        definition, "codex", "same-model"
+    )
+
+
+@pytest.mark.parametrize(
+    "style",
+    [PROJECT_OVERVIEW_STYLE, GLOSSARY_DEFINITION_STYLE],
+)
+def test_heuristic_knowledge_results_are_honest_context_only(
+    tmp_path: Path, style: str
+) -> None:
+    job = replace(_job("knowledge"), summary_style=style)
+
+    results, stats = summarize_jobs(
+        [job], tmp_path / "cache", backend="heuristic", model="offline"
+    )
+
+    result = results[job.key]
+    assert result.phrase == "Insufficient evidence"
+    assert result.paragraph.startswith("Insufficient evidence:")
+    assert "first source context:" in result.paragraph
+    assert result.work_summary == ()
+    assert stats.newly_spent_usage == TokenUsage()
 
 
 def test_one_backend_batch_cannot_mix_summary_audiences() -> None:
