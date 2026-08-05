@@ -1536,6 +1536,7 @@ def build_archive(
         )
         rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
     terms = _load_glossary(archive, team_slug)
+    artifact_catalog = load_artifact_catalog(archive, team_slug, team)
     pull_cache = load_pull_request_metadata_cache(
         pull_metadata_path(archive, team_slug)
     )
@@ -1552,6 +1553,7 @@ def build_archive(
         terms,
         agent_names,
         pull_metadata,
+        artifact_catalog,
     )
 
 

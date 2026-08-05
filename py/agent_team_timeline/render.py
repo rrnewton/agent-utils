@@ -9,6 +9,11 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
+from agent_team_timeline.artifacts import (
+    ArtifactCatalog,
+    artifact_ids_for_range,
+    output_artifact_ids_for_range,
+)
 from agent_team_timeline.github_refs import find_pull_request_references
 from agent_team_timeline.github_metadata import PullRequestKey, PullRequestMetadata
 from agent_team_timeline.model import Agent, Edge, Event, TeamData, Turn, source_digest
@@ -528,6 +533,7 @@ def render_archive(
     glossary_terms: Sequence[GlossaryTerm],
     agent_names: Mapping[str, AgentNameResult],
     pull_request_metadata: Mapping[PullRequestKey, PullRequestMetadata],
+    artifact_catalog: ArtifactCatalog,
 ) -> dict[str, int]:
     """Regenerate all presentation files without invoking a summary backend."""
 
@@ -542,6 +548,12 @@ def render_archive(
         raw_path = f"teams/{team.team_slug}/summaries/phases/{phase.phase_id}.md"
         detail_path = f"data/details/{phase.phase_id}.json"
         phase_paths[phase.phase_id] = detail_path
+        artifact_ids = artifact_ids_for_range(
+            artifact_catalog, phase.start_ms, phase.end_ms, phase.agent_id
+        )
+        output_artifact_ids = output_artifact_ids_for_range(
+            artifact_catalog, phase.start_ms, phase.end_ms, phase.agent_id
+        )
         changed += int(
             write_text_if_changed(
                 archive / raw_path,
@@ -568,6 +580,8 @@ def render_archive(
             ],
             "raw_summary_path": raw_path,
             "agent": _agent_identity_obj(agent, phase_agent_name),
+            "artifact_ids": list(artifact_ids),
+            "output_artifact_ids": list(output_artifact_ids),
         }
         changed += int(write_json_if_changed(archive / detail_path, narrow_json(detail)))
 
@@ -719,6 +733,16 @@ def render_archive(
                 "start_ms": track_start,
                 "end_ms": min(track_end, end_ms),
                 "status": agent.status,
+                "artifact_ids": list(
+                    artifact_ids_for_range(
+                        artifact_catalog, track_start, track_end, agent.thread_id
+                    )
+                ),
+                "output_artifact_ids": list(
+                    output_artifact_ids_for_range(
+                        artifact_catalog, track_start, track_end, agent.thread_id
+                    )
+                ),
             }
         )
     phase_objs = [
@@ -732,6 +756,22 @@ def render_archive(
             "detail_path": phase_paths[phase.phase_id],
             "stats": phase.stats.to_mapping(),
             "states": [state.to_json_obj() for state in phase.states],
+            "artifact_ids": list(
+                artifact_ids_for_range(
+                    artifact_catalog,
+                    phase.start_ms,
+                    phase.end_ms,
+                    phase.agent_id,
+                )
+            ),
+            "output_artifact_ids": list(
+                output_artifact_ids_for_range(
+                    artifact_catalog,
+                    phase.start_ms,
+                    phase.end_ms,
+                    phase.agent_id,
+                )
+            ),
         }
         for phase in phases
     ]
@@ -784,6 +824,16 @@ def render_archive(
             "path": period.relative_path,
             "technical_path": period.relative_path,
             "plain_language_path": _plain_language_path(period),
+            "artifact_ids": list(
+                artifact_ids_for_range(
+                    artifact_catalog, period.start_ms, period.end_ms
+                )
+            ),
+            "output_artifact_ids": list(
+                output_artifact_ids_for_range(
+                    artifact_catalog, period.start_ms, period.end_ms
+                )
+            ),
         }
         for period in periods
     ]
@@ -814,7 +864,15 @@ def render_archive(
         "glossary": glossary_objs,
         "glossary_path": glossary_catalog_path,
         "summary_files": summary_files,
+        "artifact_catalog_path": "data/artifacts.json",
+        "projects": [project.to_json_obj() for project in artifact_catalog.projects],
     }
+    changed += int(
+        write_json_if_changed(
+            archive / "data" / "artifacts.json",
+            narrow_json(artifact_catalog.to_json_obj()),
+        )
+    )
     changed += int(
         write_json_if_changed(archive / "data" / "timeline.json", narrow_json(timeline))
     )
@@ -824,6 +882,8 @@ def render_archive(
         "agents": len(visible_agent_ids),
         "edges": len(edge_objs),
         "summary_files": len(summary_files),
+        "artifacts": len(artifact_catalog.artifacts),
+        "projects": len(artifact_catalog.projects),
     }
 
 

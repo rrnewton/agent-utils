@@ -18,7 +18,12 @@ from agent_team_timeline.artifacts import (
     output_artifact_ids_for_range,
 )
 from agent_team_timeline.model import Agent, Event, SourceSnapshot, TeamData, ToolCall
-from agent_team_timeline.pipeline import _write_ingested_team, load_artifact_catalog
+from agent_team_timeline.pipeline import (
+    _write_ingested_team,
+    build_archive,
+    load_artifact_catalog,
+    summarize_archive,
+)
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
@@ -344,6 +349,58 @@ def test_ingest_writes_catalog_before_redacting_tool_payloads(tmp_path: Path) ->
     catalog = load_artifact_catalog(tmp_path, team.team_slug, archived)
     assert any(item.external_id == "55" for item in catalog.artifacts)
     assert artifact_catalog_from_json(read_json(catalog_path)) == catalog
+
+
+def test_build_associates_catalog_with_phase_agent_and_rollups(tmp_path: Path) -> None:
+    team = _team(
+        tools=(
+            _tool(
+                "pr",
+                10_000,
+                "with-proxy gh pr create -R rrnewton/example --title Fix --body body",
+                REPOSITORY + "/pull/56",
+            ),
+        )
+    )
+    _, report = _write_ingested_team(tmp_path, team.team_slug, team, None, 0)
+    assert report.artifacts >= 2
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+
+    first = build_archive(tmp_path, team.team_slug)
+    second = build_archive(tmp_path, team.team_slug)
+
+    catalog = json.loads(
+        (tmp_path / "data" / "artifacts.json").read_text(encoding="utf-8")
+    )
+    pull = next(
+        item
+        for item in catalog["artifacts"]
+        if item["kind"] == ArtifactKind.PULL_REQUEST.value
+        and item["external_id"] == "56"
+    )
+    artifact_id = pull["artifact_id"]
+    timeline = json.loads(
+        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert timeline["artifact_catalog_path"] == "data/artifacts.json"
+    assert [project["url"] for project in timeline["projects"]] == [REPOSITORY]
+    phase = next(
+        item
+        for item in timeline["phases"]
+        if artifact_id in item["output_artifact_ids"]
+    )
+    detail = json.loads(
+        (tmp_path / phase["detail_path"]).read_text(encoding="utf-8")
+    )
+    assert artifact_id in detail["artifact_ids"]
+    assert artifact_id in detail["output_artifact_ids"]
+    assert artifact_id in timeline["agents"][0]["output_artifact_ids"]
+    assert all(
+        artifact_id in rollup["output_artifact_ids"] for rollup in timeline["rollups"]
+    )
+    assert first["artifacts"] == len(catalog["artifacts"])
+    assert first["projects"] == 1
+    assert second["files_changed"] == 0
 
 
 def test_legacy_archive_gets_empty_catalog_without_summary_migration(
