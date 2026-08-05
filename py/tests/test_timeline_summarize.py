@@ -296,17 +296,71 @@ def test_backend_failure_is_concise_and_preserves_existing_cache(tmp_path: Path)
             codex_command=(
                 sys.executable,
                 "-c",
-                "import sys; sys.stderr.write('boom'); sys.exit(7)",
+                (
+                    "import json,sys; "
+                    "print(json.dumps({'type':'turn.completed','usage':{"
+                    "'input_tokens':31,'cached_input_tokens':11,'output_tokens':7}})); "
+                    "sys.stderr.write('boom'); sys.exit(7)"
+                ),
             ),
         )
     assert len(str(caught.value)) < 300
+    assert "failed usage receipt:" in str(caught.value)
     assert cache_file.read_bytes() == original
     receipt_paths = list((cache / "_usage" / "receipts").glob("*.json"))
     assert len(receipt_paths) == 1
     receipt = json.loads(receipt_paths[0].read_text(encoding="utf-8"))
     assert receipt["status"] == "failed"
     assert receipt["model"] == "gpt-test"
-    assert receipt["usage"] is None
+    assert receipt["usage"] == {
+        "input_tokens": 31,
+        "cached_input_tokens": 11,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 7,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 38,
+    }
+
+
+def test_invalid_model_output_preserves_terminal_usage_receipt(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    job = _job("agent-a")
+    backend = """
+import json
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+output = Path(args[args.index("--output-last-message") + 1])
+output.write_text("not valid structured JSON", encoding="utf-8")
+print(json.dumps({
+    "type": "turn.completed",
+    "usage": {
+        "input_tokens": 53,
+        "cached_input_tokens": 17,
+        "output_tokens": 9,
+    },
+}))
+"""
+    with pytest.raises(SummaryError, match="failed usage receipt:") as caught:
+        summarize_jobs(
+            [job],
+            cache,
+            backend="codex",
+            model="gpt-test",
+            codex_command=(sys.executable, "-c", backend),
+        )
+
+    receipt_paths = list((cache / "_usage" / "receipts").glob("*.json"))
+    assert len(receipt_paths) == 1
+    receipt_path = receipt_paths[0]
+    assert f"failed usage receipt: {receipt_path}" in str(caught.value)
+    assert receipt_path.is_file()
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert receipt["usage"]["input_tokens"] == 53
+    assert receipt["usage"]["output_tokens"] == 9
+    assert receipt["usage"]["total_tokens"] == 62
 
 
 def test_failed_invocation_keeps_independently_validated_batch(tmp_path: Path) -> None:

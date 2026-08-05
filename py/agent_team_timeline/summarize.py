@@ -44,6 +44,14 @@ class SummaryError(RuntimeError):
     """A summary backend or its strictly validated output failed."""
 
 
+class _CodexBatchError(SummaryError):
+    """A failed Codex invocation with any terminal usage it already reported."""
+
+    def __init__(self, message: str, usage: TokenUsage | None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
 @dataclass(frozen=True)
 class SummaryJob:
     """One transcript interval plus the terminology and history needed to summarize it."""
@@ -648,21 +656,30 @@ def _codex_batch(
             )
         except OSError as error:
             raise SummaryError(f"could not start codex backend: {error}") from error
+        try:
+            usage = parse_codex_jsonl_usage(completed.stdout)
+        except ValueError as error:
+            raise SummaryError(
+                f"codex summary batch reported invalid usage: {error}"
+            ) from error
         if completed.returncode != 0:
             detail = _one_line(completed.stderr or completed.stdout)
             suffix = f": {_shorten(detail, 240)}" if detail else ""
-            raise SummaryError(
-                f"codex summary batch failed with exit {completed.returncode}{suffix}"
+            raise _CodexBatchError(
+                f"codex summary batch failed with exit {completed.returncode}{suffix}",
+                usage,
             )
         try:
             output = output_path.read_text(encoding="utf-8")
         except OSError as error:
-            raise SummaryError("codex summary batch produced no output message") from error
+            raise _CodexBatchError(
+                "codex summary batch produced no output message", usage
+            ) from error
         try:
-            usage = parse_codex_jsonl_usage(completed.stdout)
-        except ValueError as error:
-            raise SummaryError(f"codex summary batch reported invalid usage: {error}") from error
-        return _parse_backend_output(output, pending, model, _utc_now()), usage
+            results = _parse_backend_output(output, pending, model, _utc_now())
+        except SummaryError as error:
+            raise _CodexBatchError(str(error), usage) from error
+        return results, usage
 
 
 def _chunks(values: Sequence[_PendingJob], size: int) -> list[tuple[_PendingJob, ...]]:
@@ -695,6 +712,7 @@ def _run_backend_batch(
                 batch, model, reasoning_effort, codex_command
             )
     except SummaryError as error:
+        usage = error.usage if isinstance(error, _CodexBatchError) else None
         receipt = BatchUsageReceipt.create(
             backend=backend,
             model=model,
@@ -703,11 +721,13 @@ def _run_backend_batch(
             started_at=started_at,
             completed_at=_utc_now(),
             input_hashes=input_hashes,
-            usage=None,
+            usage=usage,
             error=_shorten(_one_line(str(error)), 500),
         )
-        write_batch_receipt(_usage_root(cache_dir), receipt)
-        raise
+        receipt_path = write_batch_receipt(_usage_root(cache_dir), receipt)
+        raise SummaryError(
+            f"{error} (failed usage receipt: {receipt_path})"
+        ) from error
     receipt = BatchUsageReceipt.create(
         backend=backend,
         model=model,

@@ -44,8 +44,42 @@ def test_parse_codex_jsonl_usage_ignores_banner_and_uses_completed_turn() -> Non
     assert usage.total_tokens == 10_636
 
 
+def test_parse_installed_codex_usage_with_only_guaranteed_fields() -> None:
+    output = json.dumps(
+        {
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 10_631,
+                "cached_input_tokens": 7_424,
+                "output_tokens": 5,
+            },
+        }
+    )
+    assert parse_codex_jsonl_usage(output) == TokenUsage(
+        input_tokens=10_631,
+        cached_input_tokens=7_424,
+        output_tokens=5,
+    )
+
+
 def test_absent_completed_turn_is_explicitly_unknown() -> None:
     assert parse_codex_jsonl_usage('{"type":"turn.started"}\n') is None
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ("input_tokens", "cached_input_tokens", "output_tokens"),
+)
+def test_installed_codex_required_usage_fields_remain_strict(missing: str) -> None:
+    usage = {
+        "input_tokens": 10,
+        "cached_input_tokens": 4,
+        "output_tokens": 2,
+    }
+    del usage[missing]
+    output = json.dumps({"type": "turn.completed", "usage": usage})
+    with pytest.raises(ValueError, match=missing):
+        parse_codex_jsonl_usage(output)
 
 
 def test_invalid_completed_usage_is_rejected() -> None:

@@ -49,6 +49,14 @@ class AgentNameError(RuntimeError):
     """A naming job, backend, or cached result failed strict validation."""
 
 
+class _CodexNameBatchError(AgentNameError):
+    """A failed Codex invocation with any terminal usage it already reported."""
+
+    def __init__(self, message: str, usage: TokenUsage | None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
 @dataclass(frozen=True)
 class AgentNameJob:
     """One agent's provenance, ancestor context, and hindsight work summary."""
@@ -581,23 +589,30 @@ def _codex_batch(
             )
         except OSError as error:
             raise AgentNameError(f"could not start codex naming backend: {error}") from error
-        if completed.returncode != 0:
-            detail = _shorten(_one_line(completed.stderr or completed.stdout), 240)
-            suffix = f": {detail}" if detail else ""
-            raise AgentNameError(
-                f"codex naming batch failed with exit {completed.returncode}{suffix}"
-            )
-        try:
-            output = output_path.read_text(encoding="utf-8")
-        except OSError as error:
-            raise AgentNameError("codex naming batch produced no output message") from error
         try:
             usage = parse_codex_jsonl_usage(completed.stdout)
         except ValueError as error:
             raise AgentNameError(
                 f"codex naming batch reported invalid usage: {error}"
             ) from error
-        return _parse_backend_output(output, pending, model, _utc_now()), usage
+        if completed.returncode != 0:
+            detail = _shorten(_one_line(completed.stderr or completed.stdout), 240)
+            suffix = f": {detail}" if detail else ""
+            raise _CodexNameBatchError(
+                f"codex naming batch failed with exit {completed.returncode}{suffix}",
+                usage,
+            )
+        try:
+            output = output_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise _CodexNameBatchError(
+                "codex naming batch produced no output message", usage
+            ) from error
+        try:
+            results = _parse_backend_output(output, pending, model, _utc_now())
+        except AgentNameError as error:
+            raise _CodexNameBatchError(str(error), usage) from error
+        return results, usage
 
 
 def _chunks(
@@ -630,6 +645,7 @@ def _run_backend_batch(
                 batch, model, reasoning_effort, codex_command
             )
     except AgentNameError as error:
+        usage = error.usage if isinstance(error, _CodexNameBatchError) else None
         receipt = BatchUsageReceipt.create(
             backend=backend,
             model=model,
@@ -638,11 +654,13 @@ def _run_backend_batch(
             started_at=started_at,
             completed_at=_utc_now(),
             input_hashes=input_hashes,
-            usage=None,
+            usage=usage,
             error=_shorten(_one_line(str(error)), 500),
         )
-        write_batch_receipt(_usage_root(cache_dir), receipt)
-        raise
+        receipt_path = write_batch_receipt(_usage_root(cache_dir), receipt)
+        raise AgentNameError(
+            f"{error} (failed usage receipt: {receipt_path})"
+        ) from error
     receipt = BatchUsageReceipt.create(
         backend=backend,
         model=model,

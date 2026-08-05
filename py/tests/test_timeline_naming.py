@@ -288,6 +288,34 @@ print(json.dumps({
     assert second.artifact_generation_usage == first.artifact_generation_usage
 
 
+def test_failed_codex_naming_preserves_terminal_usage_receipt(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    backend = (
+        "import json,sys; "
+        "print(json.dumps({'type':'turn.completed','usage':{"
+        "'input_tokens':41,'cached_input_tokens':13,'output_tokens':8}})); "
+        "sys.stderr.write('naming failed'); sys.exit(9)"
+    )
+    with pytest.raises(AgentNameError, match="failed usage receipt:") as caught:
+        name_agents(
+            [_job()],
+            cache,
+            backend="codex",
+            model="gpt-test",
+            codex_command=(sys.executable, "-c", backend),
+        )
+
+    receipt_paths = list((cache / "_usage" / "receipts").glob("*.json"))
+    assert len(receipt_paths) == 1
+    receipt_path = receipt_paths[0]
+    assert f"failed usage receipt: {receipt_path}" in str(caught.value)
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["status"] == "failed"
+    assert receipt["usage"]["input_tokens"] == 41
+    assert receipt["usage"]["output_tokens"] == 8
+    assert receipt["usage"]["total_tokens"] == 49
+
+
 @pytest.mark.parametrize(
     "raw",
     [

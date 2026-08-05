@@ -295,16 +295,24 @@ def parse_codex_jsonl_usage(text: str) -> TokenUsage | None:
                 usage_obj.get("cached_input_tokens"),
                 "turn.completed.usage.cached_input_tokens",
             ),
-            cache_write_input_tokens=as_int(
-                usage_obj.get("cache_write_input_tokens"),
-                "turn.completed.usage.cache_write_input_tokens",
+            cache_write_input_tokens=(
+                as_int(
+                    usage_obj.get("cache_write_input_tokens"),
+                    "turn.completed.usage.cache_write_input_tokens",
+                )
+                if "cache_write_input_tokens" in usage_obj
+                else 0
             ),
             output_tokens=as_int(
                 usage_obj.get("output_tokens"), "turn.completed.usage.output_tokens"
             ),
-            reasoning_output_tokens=as_int(
-                usage_obj.get("reasoning_output_tokens"),
-                "turn.completed.usage.reasoning_output_tokens",
+            reasoning_output_tokens=(
+                as_int(
+                    usage_obj.get("reasoning_output_tokens"),
+                    "turn.completed.usage.reasoning_output_tokens",
+                )
+                if "reasoning_output_tokens" in usage_obj
+                else 0
             ),
         )
     return found
