@@ -29,6 +29,7 @@ import venv
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PY_ROOT = REPO_ROOT / "py"
@@ -104,6 +105,25 @@ _PublicDocNode = ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunction
 
 class CheckError(RuntimeError):
     """One package failed its artifact contract."""
+
+
+class _WheelArchive(Protocol):
+    """The small, stable archive surface used by wheel inspection."""
+
+    def namelist(self) -> list[str]: ...
+
+    def read(self, name: str) -> bytes: ...
+
+
+@dataclass(frozen=True)
+class _WheelMetadata:
+    """The normalized metadata fields the artifact contract consumes."""
+
+    name: str
+    version: str
+    requires_python: str
+    requirements: tuple[str, ...]
+    description: str
 
 
 def _public_doc_nodes(tree: ast.Module) -> list[_PublicDocNode]:
@@ -288,7 +308,7 @@ def _build_wheel(project: Project, build_root: Path, wheel_root: Path) -> Path:
     return created.pop()
 
 
-def _metadata(archive: zipfile.ZipFile) -> tuple[str, email.message.EmailMessage]:
+def _metadata(archive: _WheelArchive) -> tuple[str, _WheelMetadata]:
     paths = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
     if len(paths) != 1:
         raise CheckError(f"wheel has {len(paths)} METADATA files (expected one)")
@@ -296,10 +316,17 @@ def _metadata(archive: zipfile.ZipFile) -> tuple[str, email.message.EmailMessage
     parsed = email.parser.BytesParser(policy=email.policy.default).parsebytes(raw)
     if not isinstance(parsed, email.message.EmailMessage):
         raise CheckError("could not parse wheel METADATA")
-    return paths[0].removesuffix("METADATA"), parsed
+    metadata = _WheelMetadata(
+        name=str(parsed.get("Name", "")),
+        version=str(parsed.get("Version", "")),
+        requires_python=str(parsed.get("Requires-Python", "")),
+        requirements=tuple(str(value) for value in parsed.get_all("Requires-Dist", [])),
+        description=parsed.get_content(),
+    )
+    return paths[0].removesuffix("METADATA"), metadata
 
 
-def _entry_points(archive: zipfile.ZipFile, dist_info: str) -> dict[str, str]:
+def _entry_points(archive: _WheelArchive, dist_info: str) -> dict[str, str]:
     path = f"{dist_info}entry_points.txt"
     try:
         text = archive.read(path).decode("utf-8")
@@ -315,21 +342,21 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
         names = set(archive.namelist())
         dist_info, metadata = _metadata(archive)
 
-        actual_name = str(metadata.get("Name", ""))
+        actual_name = metadata.name
         if _normalized_distribution(actual_name) != _normalized_distribution(
             project.distribution
         ):
             raise CheckError(
                 f"{wheel.name}: metadata name {actual_name!r}, expected {project.distribution!r}"
             )
-        version = str(metadata.get("Version", ""))
+        version = metadata.version
         if not version:
             raise CheckError(f"{project.distribution}: empty metadata version")
-        requires_python = str(metadata.get("Requires-Python", ""))
+        requires_python = metadata.requires_python
         if not requires_python:
             raise CheckError(f"{project.distribution}: metadata has no Requires-Python")
 
-        requirements = [str(value) for value in metadata.get_all("Requires-Dist", [])]
+        requirements = list(metadata.requirements)
         requirement_names = {_requirement_name(requirement) for requirement in requirements}
         if "pyyaml" not in requirement_names:
             raise CheckError(f"{project.distribution}: PyYAML is used but not declared: {requirements}")
@@ -345,8 +372,7 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
                 f"{sibling_requirements}"
             )
 
-        description = metadata.get_content()
-        description_errors = _doc_violations(project, description)
+        description_errors = _doc_violations(project, metadata.description)
         if description_errors:
             raise CheckError(
                 f"{project.distribution}: wheel metadata README is not standalone: "
@@ -388,7 +414,7 @@ def _inspect_wheel(project: Project, wheel: Path) -> tuple[str, str]:
                     f"{'; '.join(errors)}"
                 )
             documents[document] = artifact_text
-        if description != documents["README.md"]:
+        if metadata.description != documents["README.md"]:
             raise CheckError(
                 f"{project.distribution}: metadata long description differs from packaged README.md"
             )
