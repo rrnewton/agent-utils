@@ -94,6 +94,15 @@
     timezone: undefined
   };
 
+  var markdownRenderer = typeof window.markdownit === "function"
+    ? window.markdownit({
+        html: false,
+        linkify: true,
+        typographer: false,
+        breaks: false
+      })
+    : null;
+
   function array(value) {
     return Array.isArray(value) ? value : [];
   }
@@ -115,6 +124,30 @@
       element.textContent = String(content);
     }
     return element;
+  }
+
+  function secureMarkdownLinks(container) {
+    container.querySelectorAll("a[href]").forEach(function (link) {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    });
+  }
+
+  function markdownElement(source, className, inline) {
+    var container = htmlElement(
+      inline ? "span" : "article",
+      (className ? className + " " : "") + "rendered-markdown"
+    );
+    if (!markdownRenderer) {
+      container.textContent = text(source);
+      container.classList.add("markdown-fallback");
+      return container;
+    }
+    container.innerHTML = inline
+      ? markdownRenderer.renderInline(text(source))
+      : markdownRenderer.render(text(source));
+    secureMarkdownLinks(container);
+    return container;
   }
 
   function svgElement(tag, attributes, content) {
@@ -1566,7 +1599,7 @@
   function setModalSummary(paragraph, stats) {
     var children = [];
     if (paragraph) {
-      children.push(htmlElement("div", "modal-paragraph", paragraph));
+      children.push(markdownElement(paragraph, "modal-paragraph", true));
     }
     if (stats && typeof stats === "object") {
       children.push(modalStats(stats));
@@ -1730,8 +1763,8 @@
       throw new Error("No file path was recorded for this item.");
     }
     var bases = [
-      preferredBase,
       window.location.href,
+      preferredBase,
       new URL(DATA_URL, window.location.href).href
     ].filter(Boolean);
     var candidates = [];
@@ -1805,7 +1838,11 @@
       var item = htmlElement("li", "work-summary-item");
       item.append(
         htmlElement("time", "entry-time", formatFullTime(number(entry.at_ms, NaN))),
-        htmlElement("div", "entry-text", text(entry.text, "No summary text."))
+        markdownElement(
+          text(entry.text, "No summary text."),
+          "entry-text",
+          true
+        )
       );
       list.appendChild(item);
     });
@@ -1871,9 +1908,11 @@
     showLoading(container, "Loading raw summary…");
     var loaded = await fetchPath(path, "text", detailUrl);
     var toolbar = htmlElement("div", "raw-summary-toolbar");
-    toolbar.appendChild(linkForUrl(loaded.url, "Open raw file"));
-    var pre = htmlElement("pre", "raw-summary", loaded.content);
-    container.replaceChildren(toolbar, pre);
+    toolbar.appendChild(linkForUrl(loaded.url, "Open Markdown file"));
+    container.replaceChildren(
+      toolbar,
+      markdownElement(loaded.content, "markdown-document", false)
+    );
   }
 
   function phaseFallbackDetail(phase) {
@@ -1914,7 +1953,7 @@
         }
       },
       {
-        label: "Raw Summary",
+        label: "Markdown Summary",
         render: function (container) {
           var path = text(detail.raw_summary_path);
           if (!path) {
@@ -2007,10 +2046,10 @@
         return;
       }
       var toolbar = htmlElement("div", "raw-summary-toolbar");
-      toolbar.appendChild(linkForUrl(loaded.url, "Open raw file"));
+      toolbar.appendChild(linkForUrl(loaded.url, "Open Markdown file"));
       dom.modalContent.replaceChildren(
         toolbar,
-        htmlElement("pre", "raw-summary", loaded.content)
+        markdownElement(loaded.content, "markdown-document", false)
       );
     } catch (error) {
       if (request === app.detailRequest && !dom.modalBackdrop.hidden) {

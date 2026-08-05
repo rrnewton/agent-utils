@@ -459,6 +459,16 @@ def render_archive(
     for asset_name in ("index.html", "app.js", "style.css"):
         text = (static_root / asset_name).read_text(encoding="utf-8")
         changed += int(write_text_if_changed(archive / asset_name, text))
+    vendor_root = static_root / "vendor"
+    for vendor_name in (
+        "README.md",
+        "markdown-it-15.0.0.min.js",
+        "markdown-it-LICENSE.txt",
+    ):
+        text = (vendor_root / vendor_name).read_text(encoding="utf-8")
+        changed += int(
+            write_text_if_changed(archive / "vendor" / vendor_name, text)
+        )
     changed += int(write_text_if_changed(archive / "serve.py", _standalone_server(), executable=True))
     changed += int(
         write_text_if_changed(

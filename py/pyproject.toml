@@ -49,7 +49,16 @@ include = ["safe_ci_dag_runner*", "tick_hub*", "pr_landing_planner*", "agent_tea
 safe_ci_dag_runner = ["py.typed", "USER_GUIDE.md"]
 tick_hub = ["py.typed", "USER_GUIDE.md"]
 pr_landing_planner = ["py.typed", "USER_GUIDE.md", "examples/*.yaml"]
-agent_team_timeline = ["py.typed", "USER_GUIDE.md", "static/*.html", "static/*.js", "static/*.css"]
+agent_team_timeline = [
+  "py.typed",
+  "USER_GUIDE.md",
+  "static/*.html",
+  "static/*.js",
+  "static/*.css",
+  "static/vendor/*.js",
+  "static/vendor/*.txt",
+  "static/vendor/*.md",
+]
 
 # mypy: strict, and no explicit `Any` allowed in our own annotations. Dynamic parser/library
 # boundaries are assigned directly to `object` and narrowed. The repository-wide `make mypy` also

@@ -18,13 +18,15 @@ provider-neutral so Claude, ORC, and Gas Town importers can be added without cha
 - Thick curved edges are spawns; smaller edges are later messages and returned results.
 - Hovering a phase or edge shows its paragraph summary and statistics.
 - Clicking a phase opens three views: the cultivated Agent Work Summary, the full prompt/response
-  transcript with tool use condensed to one line, and its raw Markdown summary.
+  transcript with tool use condensed to one line, and its rendered Markdown summary.
 - The fixed footer recomputes user prompts, agent responses, inter-agent messages, tool calls, and
   active agents for the visible time range.
-- Daily, weekly, monthly, and quarterly markers open the corresponding raw Markdown summary.
+- Daily, weekly, monthly, and quarterly markers open the corresponding rendered Markdown summary.
 
-The browser is dependency-free SVG/HTML/CSS/JavaScript. The generated directory has no CDN or
-package-manager dependency and remains usable when copied offline.
+The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
+bundle renders summary headings, lists, tables, blockquotes, links, and code with raw HTML disabled.
+It is vendored into every archive, so the generated directory has no CDN or runtime package-manager
+dependency and remains usable when copied offline.
 
 ## Install
 
@@ -192,6 +194,7 @@ An archive is ordinary text designed for version control:
 codex-hermit/
 ├── .agent-team-timeline.json
 ├── index.html, app.js, style.css
+├── vendor/markdown-it-15.0.0.min.js  # pinned offline Markdown renderer + license
 ├── Makefile, serve.py, README.md
 ├── manifest.json
 ├── runs/<timestamp>-<hash>.json
