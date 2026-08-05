@@ -36,26 +36,30 @@ the repository stop command; killing the watching agent neither stops the run no
 ledger write.
 
 Read duration before interpreting the log. On the measured lane, about 9 seconds means admission
-refusal, about 137 seconds means a build/lint failure, and roughly 400-700 seconds means a real full
-run. These ranges classify where to look; the receipt remains the authority.
+refusal, about 137 seconds often points to the build/lint stage, and roughly 400-700 seconds means
+substantial execution. These ranges only classify where to look; they do not prove failure or full
+coverage. The named-node receipt evidence remains the authority.
 
-`result=pass` and `checks=6` are not enough. A qualifying Hermit receipt requires all of:
+`result=pass`, a full check count, and an aggregate test count are not coverage evidence. A
+qualifying Hermit green requires all of:
 
 ```text
-result=pass AND profile=full AND checks=<current full-profile count>
-AND exact tested SHA AND executed_tests passes the current full-profile plausibility predicate
+result=pass AND profile=full AND exact tested SHA
+AND coverage.planned_test_nodes > 0
+AND coverage.zero_executed_nodes == []
+AND coverage.absent_nodes == []
 ```
 
-Nonzero execution is necessary but not sufficient: a six-check row that executed only one test is a
-NO-RESULT, not a green. Use the shared receipt authority's current plausibility floor rather than
-copying a numeric threshold into this skill. A two-check `portable-strict-compat-only` row can also
-say `pass` and often lands first; it is not a full green. Select by exact SHA, profile, declared
-coverage, plausible execution, and zero failures before ordering records by recency.
+Never classify completeness from `executed_tests`, filtered-test totals, or a numeric band. Commit
+`ee303899` produced eight legitimate partial passes at `executed_tests=427`; each correctly remained
+outside full green because only 4 of 19 planned test nodes executed and 15 were absent. A two-check
+`portable-strict-compat-only` row can likewise say `pass` and often lands first; it is not a full
+green. Select by exact SHA, profile, and per-node coverage before ordering records by recency.
 
-The canonical contrast is `17b59fc6 fail 6chk 1470s tests=760` versus
-`98573d14 fail 6chk 83s tests=1`. The first is a genuine red after substantial execution; the
-second is a no-result even though both rows report all six checks. Check count alone does not prove
-that the intended corpus ran.
+Classify a red only from `gates[]`: name the failing DAG node and cite that node's `exit_code`.
+Aggregate counts do not establish failure or truncation. A run that executes nothing may be an
+explicit `no_result`, but pre-classifier rows without named-node evidence remain unresolved until
+reclassified; do not coerce them into failures.
 
 Treat **soft green** only as a scheduling signal: no known product failure and enough evidence to
 admit a PR to a chosen batch. It never authorizes landing by itself. **Hard green** is the qualifying
