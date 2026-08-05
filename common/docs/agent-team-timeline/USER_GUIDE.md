@@ -155,9 +155,9 @@ simultaneous refreshes from buying the same cache miss.
 Every backend batch writes an immutable usage receipt with its model, reasoning effort, input,
 cached-input, cache-write-input, output, reasoning-output, and total token counts. Cache records
 link to that receipt. The command prints both tokens newly spent by this run and the deduplicated
-historical generation cost of all returned artifacts; an all-hit rerun therefore reports zero new
+original generation cost of all returned artifacts; an all-hit rerun therefore reports zero new
 tokens without losing the original cost. Older cache entries remain valid and are reported
-explicitly as having unknown historical usage rather than being regenerated or counted as zero.
+explicitly as having unknown original usage rather than being regenerated or counted as zero.
 Aggregate accounting and receipt paths are also retained in the top-level `runs/*.json` metadata.
 
 For offline development or tests:
