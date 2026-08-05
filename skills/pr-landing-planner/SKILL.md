@@ -39,6 +39,42 @@ which owns serialization and fresh-base checks. It must merge with `--rebase`, n
 fetch the destination and prove the landed commit is its ancestor. A GitHub API `MERGED` flag is not
 landing evidence.
 
+## Large-backlog and coalesced landing
+
+Choose serial landing or a coordinator-approved staging branch from the measured cost, not from PR
+count alone:
+
+1. A validation receipt is SHA-keyed. Rebasing a PR changes that SHA and invalidates the receipt, so
+   serial landing pays rebase plus exact-head validation once per PR. A staging branch can integrate
+   N compatible PRs, rebase the integration once, and run one full validation. Record that arithmetic
+   before choosing the mode; do not spend N validations when one integration receipt proves the same
+   combined tree.
+2. `result=pass` alone is not a green. A qualifying Hermit full receipt carries `profile=full`, the
+   complete declared gate count (currently `checks=6`), nonzero executed tests, and the exact tested
+   SHA. A two-check partial profile can also say `pass` and may be the newest ledger row; it is not a
+   full green. Consumers must select by profile and coverage before ordering by recency.
+3. Treat **soft green** only as a scheduling signal: no known product failure and enough evidence to
+   admit a PR to the chosen batch. It never authorizes landing by itself. **Hard green** is the
+   qualifying exact-head full receipt above (or the repository's authoritative equivalent), with
+   required review resolved. State which one is being cited; never write only “green”.
+4. Merging a staging PR does not close its constituent PRs. GitHub recognizes commit lineage, not
+   content equivalence. Track the constituent set explicitly and disposition each PR after the staging
+   commit is ancestry-confirmed; do not infer closure from the staging merge.
+5. Landing evidence is `mergeCommit.oid` plus `git merge-base --is-ancestor <oid>
+   refs/remotes/origin/main` after a fresh fetch of the named destination. A PR head, API `MERGED`
+   flag, successful `gh pr merge` exit, mergeability query, or clean dry-run is not landing evidence.
+6. Duration is a diagnostic classifier, not a verdict. On the measured Hermit lane, about 9 seconds
+   indicates admission refusal, about 137 seconds indicates a build/lint failure, and roughly
+   400–700 seconds indicates a real full run. Inspect the recorded profile and gate counts rather than
+   promoting these ranges into authorization.
+7. Serialize merge operations. Concurrent stale-base `--rebase --admin` merges orphaned already
+   merged work by replaying incompatible views of main. `--admin` is forbidden regardless; the
+   executor must hold one landing lock, fetch fresh before each merge, and ancestry-verify afterward.
+
+The planner must expose the conflict-safe groups and evidence class needed for this choice. The
+coordinator owns the decision to coalesce because integration changes the meaning of per-PR evidence
+and closure; the planner never creates or merges the staging branch.
+
 ## Commands
 
 - `pr-landing-planner plan --repo OWNER/NAME --base BASE --git-dir /path/to/clone --net-wrapper with-proxy --landing-context context.json --format json`
