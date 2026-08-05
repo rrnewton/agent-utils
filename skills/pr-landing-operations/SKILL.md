@@ -1,6 +1,6 @@
 ---
 name: pr-landing-operations
-description: Coordinator doctrine for deciding and executing PR landings at scale: exact-head validation and review, drain ordering, coalescing, serialized merges, speculative lands, and ancestry proof. Use after pr-landing-planner emits a plan; this skill may drive mutations, while the planner never does and the consuming workspace AGENTS.md remains the authorization authority.
+description: "Coordinator doctrine for deciding and executing PR landings at scale: exact-head validation and review, drain ordering, coalescing, serialized merges, speculative lands, and ancestry proof. Use after pr-landing-planner emits a plan; this skill may drive mutations, while the planner never does and the consuming workspace AGENTS.md remains the authorization authority."
 ---
 
 # PR landing operations
@@ -52,6 +52,11 @@ copying a numeric threshold into this skill. A two-check `portable-strict-compat
 say `pass` and often lands first; it is not a full green. Select by exact SHA, profile, declared
 coverage, plausible execution, and zero failures before ordering records by recency.
 
+The canonical contrast is `17b59fc6 fail 6chk 1470s tests=760` versus
+`98573d14 fail 6chk 83s tests=1`. The first is a genuine red after substantial execution; the
+second is a no-result even though both rows report all six checks. Check count alone does not prove
+that the intended corpus ran.
+
 Treat **soft green** only as a scheduling signal: no known product failure and enough evidence to
 admit a PR to a chosen batch. It never authorizes landing by itself. **Hard green** is the qualifying
 exact-head full receipt above (or the repository's authoritative equivalent), with exact-head review
@@ -63,7 +68,9 @@ A receipt is SHA-keyed. Rebasing changes the SHA and destroys its authority. Reb
 wave to its final heads first, then validate each final head exactly once. Never interleave
 rebase -> validate -> rebase -> validate: the second rebase discards the first receipt. That
 circularity can turn a queue of truly green PRs into zero landable heads. A serial drain otherwise
-pays N rebases and N exact-head validations.
+pays N rebases and N exact-head validations. In the measured drain, 65 of 131 PRs were landable once
+rebased; interleaving landing and validation would have invalidated the evidence for the remaining
+heads after every main advance.
 
 A review signature is SHA-bound too. Before trusting `passed-review-*`, dereference the corresponding
 review evidence and require its reviewed SHA to equal the current PR head. A bare label, a review
