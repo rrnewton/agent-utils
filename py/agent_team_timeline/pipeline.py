@@ -87,6 +87,7 @@ from agent_team_timeline.summarize import (
     SummaryRunStats,
     TECHNICAL_ROLLUP_STYLE,
     WorkBullet,
+    knowledge_text_has_link,
     summarize_jobs,
 )
 from agent_team_timeline.token_usage import TokenUsage
@@ -105,7 +106,7 @@ _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _ARCHIVE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ARCHIVE_MARKER = ".agent-team-timeline.json"
 _ARCHIVE_LOCK = ".agent-team-timeline.lock"
-_PROJECT_OVERVIEW_SCHEMA_VERSION = 2
+_PROJECT_OVERVIEW_SCHEMA_VERSION = 3
 _GLOSSARY_SCHEMA_VERSION = 3
 _OVERVIEW_CONTEXT_CHARS = 48_000
 _TERM_EVIDENCE_LIMIT = 6
@@ -1054,8 +1055,15 @@ def _root_overview_input(
         end_ms = retained[-1].timestamp_ms
     else:
         fallback = team.window_start_ms
-        if fallback is None:
-            fallback = min((event.timestamp_ms for event in team.events), default=0)
+        if fallback is None or fallback >= selected_epoch.cutoff_ms:
+            fallback = min(
+                (
+                    event.timestamp_ms
+                    for event in team.events
+                    if event.timestamp_ms < selected_epoch.cutoff_ms
+                ),
+                default=max(0, selected_epoch.cutoff_ms - 1),
+            )
         start_ms = fallback
         end_ms = fallback
         parts.append("No root user or assistant transcript text was retained.")
@@ -1297,6 +1305,8 @@ def _validate_project_overview(summary: SummaryResult, where: str) -> None:
         "Insufficient evidence:"
     ):
         raise ValueError(f"{where}: insufficient overview lacks an evidence limit")
+    if knowledge_text_has_link(summary.paragraph):
+        raise ValueError(f"{where}: project overview contains an unverified link")
 
 
 def _validate_glossary_definition(summary: SummaryResult, where: str) -> None:
@@ -1311,6 +1321,8 @@ def _validate_glossary_definition(summary: SummaryResult, where: str) -> None:
         "Insufficient evidence:"
     ):
         raise ValueError(f"{where}: insufficient definition lacks an evidence limit")
+    if knowledge_text_has_link(summary.paragraph):
+        raise ValueError(f"{where}: glossary definition contains an unverified link")
 
 
 def _write_project_overview_data(
@@ -1328,7 +1340,6 @@ def _write_project_overview_data(
             "start_ms": source.start_ms,
             "end_ms": source.end_ms,
             "context_sha256": source.context_sha256,
-            "transcript": source.transcript,
         },
         "summary": _summary_json(summary),
     }
@@ -1363,8 +1374,8 @@ def _frozen_project_overview_input(
     obj = as_object(read_json(path), str(path))
     version = as_int(obj.get("schema_version"), f"{path}.schema_version")
     if version != _PROJECT_OVERVIEW_SCHEMA_VERSION:
-        # Schema 1 did not retain the exact transcript or a source frontier, so it cannot be
-        # reused safely after an append or for a bounded date window.
+        # Older schemas did not have enough immutable provenance to distinguish append-only
+        # growth from a historical mutation.
         return None
     _require_exact_keys(
         obj,
@@ -1381,32 +1392,31 @@ def _frozen_project_overview_input(
     source = as_object(obj.get("source"), f"{path}.source")
     _require_exact_keys(
         source,
-        {"event_ids", "start_ms", "end_ms", "context_sha256", "transcript"},
+        {"event_ids", "start_ms", "end_ms", "context_sha256"},
         f"{path}.source",
     )
-    transcript = as_string(source.get("transcript"), f"{path}.source.transcript")
-    expected_sha256 = as_string(
-        source.get("context_sha256"), f"{path}.source.context_sha256"
-    )
-    actual_sha256 = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
-    if actual_sha256 != expected_sha256:
-        raise ValueError(f"{path}.source: transcript digest mismatch")
     event_ids = tuple(
         as_string(item, f"{path}.source.event_ids[]")
         for item in as_array(source.get("event_ids"), f"{path}.source.event_ids")
     )
     start_ms = as_int(source.get("start_ms"), f"{path}.source.start_ms")
     end_ms = as_int(source.get("end_ms"), f"{path}.source.end_ms")
+    expected_sha256 = as_string(
+        source.get("context_sha256"), f"{path}.source.context_sha256"
+    )
     if end_ms < start_ms or end_ms >= epoch.cutoff_ms:
         raise ValueError(f"{path}.source: timestamps escape the knowledge epoch")
-    return _ProjectOverviewInput(
-        epoch=epoch,
-        start_ms=start_ms,
-        end_ms=end_ms,
-        transcript=transcript,
-        event_ids=event_ids,
-        context_sha256=actual_sha256,
-    )
+    current = _root_overview_input(team, epoch)
+    if (
+        current.event_ids != event_ids
+        or current.start_ms != start_ms
+        or current.end_ms != end_ms
+        or current.context_sha256 != expected_sha256
+    ):
+        raise ValueError(
+            f"{path}.source: frozen overview evidence was mutated or truncated"
+        )
+    return current
 
 
 def _glossary_evidence_from_json(
@@ -1458,16 +1468,37 @@ def _frozen_term_knowledge(
     observed_through_ms = as_int(
         obj.get("observed_through_ms"), f"{path}.observed_through_ms"
     )
-    if (
-        recorded_project_epoch != project_epoch_id
-        or observed_through_ms > current_cutoff_ms
-    ):
+    if recorded_project_epoch != project_epoch_id:
         return None, {}
+    if observed_through_ms > current_cutoff_ms:
+        raise ValueError(f"{path}: knowledge source frontier moved backwards")
     result: dict[str, _TermKnowledge] = {}
     for index, raw_term in enumerate(as_array(obj.get("terms"), f"{path}.terms")):
         where = f"{path}.terms[{index}]"
         term = as_object(raw_term, where)
+        _require_exact_keys(
+            term,
+            {
+                "term",
+                "introduced_at_ms",
+                "occurrences",
+                "context",
+                "week",
+                "term_id",
+                "available_at_ms",
+                "definition",
+                "definition_status",
+                "definition_cutoff_ms",
+                "definition_epoch_id",
+                "definition_summary",
+                "evidence",
+            },
+            where,
+        )
+        term_name = as_string(term.get("term"), f"{where}.term")
         term_id = as_string(term.get("term_id"), f"{where}.term_id")
+        if term_id != glossary_term_id(term_name):
+            raise ValueError(f"{where}.term_id: does not match the exact term")
         available_at_ms = as_int(
             term.get("available_at_ms"), f"{where}.available_at_ms"
         )
@@ -1478,7 +1509,7 @@ def _frozen_term_knowledge(
             term.get("definition_epoch_id"), f"{where}.definition_epoch_id"
         )
         if definition_cutoff_ms > current_cutoff_ms:
-            continue
+            raise ValueError(f"{where}: definition source frontier moved backwards")
         evidence = tuple(
             _glossary_evidence_from_json(item, f"{where}.evidence[{evidence_index}]")
             for evidence_index, item in enumerate(
@@ -1495,6 +1526,24 @@ def _frozen_term_knowledge(
         )
         if definition_epoch_id != expected_epoch_id:
             raise ValueError(f"{where}.definition_epoch_id: provenance mismatch")
+        current_evidence = _definition_evidence(
+            team,
+            GlossaryTerm(
+                term=term_name,
+                introduced_at_ms=0,
+                occurrences=0,
+                context="",
+                week="",
+                term_id=term_id,
+            ),
+            cutoff_ms=definition_cutoff_ms,
+        )
+        if current_evidence != evidence:
+            raise ValueError(
+                f"{where}.evidence: frozen source was mutated or truncated"
+            )
+        if term_id in result:
+            raise ValueError(f"{where}.term_id: duplicate glossary term")
         result[term_id] = _TermKnowledge(
             evidence=evidence,
             available_at_ms=available_at_ms,
@@ -1878,50 +1927,11 @@ def _summarize_archive_locked(
     )
     terms = _glossary_terms(team)
     cache = _summary_root(archive, team_slug) / "cache"
-    phase_results, phase_stats = summarize_jobs(
-        _phase_jobs(team, phases, terms),
-        cache,
-        backend,
-        model,
-        max_workers=max_workers,
-        batch_size=batch_size,
-        codex_command=codex_command,
-        reasoning_effort=reasoning_effort,
-    )
-    changed = _write_phase_data(archive, team_slug, phases, phase_results)
-    name_jobs = _agent_name_jobs(team, phases, phase_results)
-    agent_names, name_stats = name_agents(
-        name_jobs,
-        _summary_root(archive, team_slug) / "name_cache",
-        backend,
-        model,
-        max_workers=max_workers,
-        batch_size=name_batch_size,
-        codex_command=codex_command,
-        reasoning_effort=reasoning_effort,
-    )
-    changed += _write_agent_name_data(
-        archive, team_slug, name_jobs, agent_names
-    )
+    # Validate immutable knowledge provenance before any backend invocation. A historical source
+    # mutation must fail closed without spending tokens on summaries that cannot be published.
     overview_source = _frozen_project_overview_input(archive, team)
     if overview_source is None:
         overview_source = _root_overview_input(team)
-    overview_job = _project_overview_job(team, overview_source)
-    overview_results, overview_stats = summarize_jobs(
-        (overview_job,),
-        cache,
-        backend,
-        model,
-        max_workers=max_workers,
-        batch_size=batch_size,
-        codex_command=codex_command,
-        reasoning_effort=reasoning_effort,
-    )
-    project_overview = overview_results[overview_job.key]
-    _validate_project_overview(project_overview, "generated project overview")
-    changed += _write_project_overview_data(
-        archive, team_slug, overview_source, project_overview
-    )
     observation_epoch = _current_knowledge_epoch(team)
     previous_observed_through, frozen_knowledge = _frozen_term_knowledge(
         archive,
@@ -1956,6 +1966,47 @@ def _summarize_archive_locked(
         term_id: knowledge.evidence
         for term_id, knowledge in knowledge_by_term.items()
     }
+    phase_results, phase_stats = summarize_jobs(
+        _phase_jobs(team, phases, terms),
+        cache,
+        backend,
+        model,
+        max_workers=max_workers,
+        batch_size=batch_size,
+        codex_command=codex_command,
+        reasoning_effort=reasoning_effort,
+    )
+    changed = _write_phase_data(archive, team_slug, phases, phase_results)
+    name_jobs = _agent_name_jobs(team, phases, phase_results)
+    agent_names, name_stats = name_agents(
+        name_jobs,
+        _summary_root(archive, team_slug) / "name_cache",
+        backend,
+        model,
+        max_workers=max_workers,
+        batch_size=name_batch_size,
+        codex_command=codex_command,
+        reasoning_effort=reasoning_effort,
+    )
+    changed += _write_agent_name_data(
+        archive, team_slug, name_jobs, agent_names
+    )
+    overview_job = _project_overview_job(team, overview_source)
+    overview_results, overview_stats = summarize_jobs(
+        (overview_job,),
+        cache,
+        backend,
+        model,
+        max_workers=max_workers,
+        batch_size=batch_size,
+        codex_command=codex_command,
+        reasoning_effort=reasoning_effort,
+    )
+    project_overview = overview_results[overview_job.key]
+    _validate_project_overview(project_overview, "generated project overview")
+    changed += _write_project_overview_data(
+        archive, team_slug, overview_source, project_overview
+    )
     definition_jobs = tuple(
         _glossary_definition_job(
             team, term, evidence_by_term[term.term_id], project_overview

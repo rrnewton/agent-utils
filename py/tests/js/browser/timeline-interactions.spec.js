@@ -390,6 +390,12 @@ test("full-transcript role filters support user-only, none, and all", async func
 });
 
 test("rollups switch audiences and verified glossary terms open stable entries", async function ({ page }) {
+  const attackerRequests = [];
+  page.on("request", function (request) {
+    if (request.url().startsWith("https://attacker.invalid")) {
+      attackerRequests.push(request.url());
+    }
+  });
   const daily = page.locator(".rollup-marker.rollup-daily").first();
   await daily.dblclick();
   await expect(page.getByTestId("modal")).toBeVisible();
@@ -409,12 +415,24 @@ test("rollups switch audiences and verified glossary terms open stable entries",
   await term.click();
   await expect(page.locator("#modal-title")).toHaveText("malformed-input");
   await expect(page).toHaveURL(/#glossary\/term-malformed-input-123456789abc$/);
-  await expect(page.locator("#modal-content")).toContainText("required structure");
+  await expect(page.locator("#modal-content")).toContainText("inline docs");
+  await expect(page.locator("#modal-content")).toContainText("https://attacker.invalid/bare");
+  await expect(page.locator("#modal-content a[href^='https://attacker.invalid']")).toHaveCount(0);
+  await expect(page.locator("#modal-content a[href^='mailto:']")).toHaveCount(0);
+  await expect(page.locator("#modal-content img")).toHaveCount(0);
+  await expect(
+    page.locator(
+      '#modal-content .glossary-term-link[href="#glossary/term-malformed-input-123456789abc"]'
+    )
+  ).toHaveCount(1);
+  expect(attackerRequests).toEqual([]);
 
   await page.locator("#modal-close").click();
   await page.getByTestId("glossary-open").click();
   await expect(page.locator("#modal-title")).toHaveText("Project glossary");
   await expect(page.locator("#modal-content")).toContainText("Data that does not satisfy");
+  await expect(page.locator("#modal-content a[href^='https://attacker.invalid']")).toHaveCount(0);
+  expect(attackerRequests).toEqual([]);
 });
 
 test("artifact outputs and references stay distinct across phase, rollup, and agent views", async function ({ page }) {

@@ -24,6 +24,7 @@ from agent_team_timeline.summarize import (
     _input_hash,
     _parse_backend_output,
     build_summary_prompt,
+    knowledge_text_has_link,
     summarize_jobs,
 )
 from agent_team_timeline.token_usage import TokenUsage
@@ -161,6 +162,8 @@ def test_knowledge_prompts_are_evidence_bounded_and_have_distinct_cache_ids() ->
     assert GLOSSARY_DEFINITION_PROMPT_VERSION in definition_prompt
     assert "Never guess an acronym expansion" in definition_prompt
     assert "Insufficient evidence:" in definition_prompt
+    assert "Never emit a URL, Markdown link" in overview_prompt
+    assert "Never emit a URL, Markdown link" in definition_prompt
     assert _input_hash(overview, "codex", "same-model") != _input_hash(
         definition, "codex", "same-model"
     )
@@ -182,9 +185,48 @@ def test_heuristic_knowledge_results_are_honest_context_only(
     result = results[job.key]
     assert result.phrase == "Insufficient evidence"
     assert result.paragraph.startswith("Insufficient evidence:")
-    assert "first source context:" in result.paragraph
+    assert "model-backed knowledge pass" in result.paragraph
     assert result.work_summary == ()
     assert stats.newly_spent_usage == TokenUsage()
+
+
+@pytest.mark.parametrize(
+    "value",
+    (
+        "See [project docs](https://example.invalid).",
+        "See https://example.invalid/docs.",
+        "See example.com/docs.",
+        "See #glossary/term-invented.",
+        "![diagram](relative.png)",
+    ),
+)
+def test_generated_knowledge_rejects_unverified_links(value: str) -> None:
+    assert knowledge_text_has_link(value)
+
+
+def test_generated_knowledge_allows_plain_project_identifiers() -> None:
+    assert not knowledge_text_has_link(
+        "Node.js and exact-head are project terms; pull request #123 is supplementary evidence."
+    )
+
+
+def test_backend_cannot_persist_linked_generated_knowledge(tmp_path: Path) -> None:
+    job = replace(_job("overview"), summary_style=PROJECT_OVERVIEW_STYLE)
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "Project overview supported",
+                "paragraph": "Read [invented docs](https://example.invalid) for details.",
+                "work_summary": [],
+            }
+        ]
+    }
+
+    with pytest.raises(SummaryError, match="must not contain links or URLs"):
+        _parse_backend_output(
+            json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+        )
 
 
 def test_one_backend_batch_cannot_mix_summary_audiences() -> None:

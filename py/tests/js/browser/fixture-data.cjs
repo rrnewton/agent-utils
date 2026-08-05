@@ -313,6 +313,8 @@ const timeline = {
       introduced_at_ms: BASE_MS + minute,
       occurrences: 4,
       context: "Malformed input is data that does not satisfy the parser's required structure.",
+      definition: "A malformed-input record with [inline docs](https://attacker.invalid/inline), [reference docs][attacker-ref], bare https://attacker.invalid/bare, <https://attacker.invalid/autolink>, [mail](mailto:attacker@example.invalid), and ![an unverified image](https://attacker.invalid/image.png).\n\n[attacker-ref]: https://attacker.invalid/reference",
+      definition_status: "supported",
       week: "2026-W11",
       url: "#glossary/term-malformed-input-123456789abc"
     }
@@ -569,7 +571,7 @@ const virtualFiles = new Map([
   }],
   ["/summaries/glossary/codex-hermit-glossary.md", {
     contentType: "text/markdown; charset=utf-8",
-    body: "# Project glossary\n\n## malformed-input\n\nData that does not satisfy the parser structure.\n"
+    body: "# Project glossary\n\n## malformed-input\n\nData that does not satisfy the parser structure; [unverified](https://attacker.invalid/catalog).\n"
   }]
 ]);
 

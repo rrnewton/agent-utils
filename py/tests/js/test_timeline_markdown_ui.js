@@ -45,6 +45,15 @@ assert.ok(
 assert.match(index, /<link rel="icon" href="data:,">/);
 const app = fs.readFileSync(path.join(staticRoot, "app.js"), "utf8");
 assert.match(app, /markdownit\(\{[\s\S]*html: false/);
+assert.match(app, /linkify: false/);
+assert.match(app, /renderer\.rules\.link_open/);
+assert.match(app, /renderer\.rules\.image/);
+assert.match(app, /removeUnexpectedMarkdownLinks\(container\)/);
+assert.ok(
+  app.indexOf("removeUnexpectedMarkdownLinks(container)") <
+    app.indexOf("linkKnownGlossaryTerms(container)"),
+  "untrusted Markdown links must be removed before known glossary links are created"
+);
 assert.match(app, /markdownElement\(loaded\.content, "markdown-document", false\)/);
 assert.match(app, /label: "Markdown Summary"/);
 assert.match(app, /label: "Technical"/);

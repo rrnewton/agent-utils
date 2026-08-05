@@ -127,11 +127,19 @@
   var markdownRenderer = typeof window.markdownit === "function"
     ? window.markdownit({
         html: false,
-        linkify: true,
+        linkify: false,
         typographer: false,
         breaks: false
       })
     : null;
+
+  if (markdownRenderer) {
+    markdownRenderer.renderer.rules.link_open = function () { return ""; };
+    markdownRenderer.renderer.rules.link_close = function () { return ""; };
+    markdownRenderer.renderer.rules.image = function (tokens, index) {
+      return markdownRenderer.utils.escapeHtml(text(tokens[index].content));
+    };
+  }
 
   function array(value) {
     return Array.isArray(value) ? value : [];
@@ -156,10 +164,19 @@
     return element;
   }
 
-  function secureMarkdownLinks(container) {
-    container.querySelectorAll("a[href]").forEach(function (link) {
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
+  function removeUnexpectedMarkdownLinks(container) {
+    container.querySelectorAll("a").forEach(function (link) {
+      var parent = link.parentNode;
+      if (!parent) {
+        return;
+      }
+      while (link.firstChild) {
+        parent.insertBefore(link.firstChild, link);
+      }
+      parent.removeChild(link);
+    });
+    container.querySelectorAll("img").forEach(function (image) {
+      image.replaceWith(document.createTextNode(text(image.alt, "[image omitted]")));
     });
   }
 
@@ -176,7 +193,7 @@
     container.innerHTML = inline
       ? markdownRenderer.renderInline(text(source))
       : markdownRenderer.render(text(source));
-    secureMarkdownLinks(container);
+    removeUnexpectedMarkdownLinks(container);
     linkKnownGlossaryTerms(container);
     return container;
   }

@@ -302,13 +302,13 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
             / "project_overview.json"
         ).read_text(encoding="utf-8")
     )
-    assert overview_record["schema_version"] == 2
+    assert overview_record["schema_version"] == 3
     assert overview_record["knowledge_epoch"]["cutoff_reason"] == (
         "first-summary-source-frontier"
     )
-    assert overview_record["source"]["transcript"]
+    assert "transcript" not in overview_record["source"]
     assert overview_record["summary"]["prompt_version"].endswith(
-        "project-overview-v1"
+        "project-overview-v2"
     )
     assert overview_record["summary"]["phrase"] == "Insufficient evidence"
     glossary_record = json.loads(
@@ -514,6 +514,38 @@ def test_append_catchup_keeps_completed_historical_knowledge_jobs_stable(
     )
     assert dbi["available_at_ms"] == START + later_offset + 1_000
     assert dbi["available_at_ms"] >= original_daily["end_ms"]
+
+
+def test_frozen_overview_rejects_historical_source_mutation(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    changed_events = tuple(
+        replace(event, text="Historically rewritten coordinator response.")
+        if event.event_id == "root-response"
+        else event
+        for event in team.events
+    )
+    _write_team(tmp_path, replace(team, events=changed_events))
+
+    with pytest.raises(ValueError, match="overview evidence was mutated or truncated"):
+        summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+
+
+def test_frozen_definition_rejects_historical_source_mutation(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    changed_events = tuple(
+        replace(event, text="Rewritten child evidence no longer names the term.")
+        if event.event_id == "child-update"
+        else event
+        for event in team.events
+    )
+    _write_team(tmp_path, replace(team, events=changed_events))
+
+    with pytest.raises(ValueError, match="frozen source was mutated or truncated"):
+        summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
 
 
 def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
@@ -902,11 +934,33 @@ def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) ->
     assert first_plain[1] != second_plain[1]
 
 
-def test_only_changed_window_and_rollups_invalidate(tmp_path: Path) -> None:
+def test_append_only_changed_window_and_rollups_invalidate(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)
     first = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
-    changed = _team("A new root-cause sentence changes only the coordinator window.")
+    appended_event = _event(
+        "root-followup",
+        ROOT,
+        25_000,
+        "assistant_message",
+        "A new root-cause sentence extends only the coordinator window.",
+    )
+    changed = replace(
+        team,
+        events=team.events + (appended_event,),
+        agents=tuple(
+            replace(agent, ended_at_ms=START + 26_000)
+            if agent.thread_id == ROOT
+            else agent
+            for agent in team.agents
+        ),
+        turns=tuple(
+            replace(turn, ended_at_ms=START + 26_000)
+            if turn.thread_id == ROOT
+            else turn
+            for turn in team.turns
+        ),
+    )
     _write_team(tmp_path, changed)
     second = summarize_archive(tmp_path, changed.team_slug, "heuristic", "test-model")
     assert 0 < second.cache_misses < first.cache_misses

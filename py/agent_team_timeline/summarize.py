@@ -42,9 +42,9 @@ PROJECT_OVERVIEW_STYLE: Final = "project-overview"
 GLOSSARY_DEFINITION_STYLE: Final = "glossary-definition"
 _TECHNICAL_ROLLUP_PROMPT_VERSION: Final = "agent-team-timeline-technical-rollup-v2"
 _PLAIN_LANGUAGE_ROLLUP_PROMPT_VERSION: Final = "agent-team-timeline-plain-rollup-v2"
-PROJECT_OVERVIEW_PROMPT_VERSION: Final = "agent-team-timeline-project-overview-v1"
+PROJECT_OVERVIEW_PROMPT_VERSION: Final = "agent-team-timeline-project-overview-v2"
 GLOSSARY_DEFINITION_PROMPT_VERSION: Final = (
-    "agent-team-timeline-glossary-definition-v1"
+    "agent-team-timeline-glossary-definition-v2"
 )
 _SUMMARY_STYLES: Final = frozenset(
     {
@@ -57,6 +57,12 @@ _SUMMARY_STYLES: Final = frozenset(
 )
 _CACHE_VERSION: Final = 2
 _PHRASE_LIMIT: Final = 80
+_KNOWLEDGE_LINK = re.compile(
+    r"(?:\b(?:https?|ftp|mailto):|\bwww\.|!?\[[^\]\n]*\]\s*(?:\(|\[)|"
+    r"<\s*(?:https?|ftp|mailto):|#glossary/|"
+    r"\b[a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu)(?:/|\b))",
+    re.IGNORECASE,
+)
 
 
 class SummaryError(RuntimeError):
@@ -197,6 +203,12 @@ def _prompt_version(job: SummaryJob) -> str:
     return PROMPT_VERSION
 
 
+def knowledge_text_has_link(value: str) -> bool:
+    """Return whether generated knowledge contains a link or URL-like target."""
+
+    return _KNOWLEDGE_LINK.search(value) is not None
+
+
 def _job_json(job: SummaryJob) -> dict[str, JsonValue]:
     stats: dict[str, JsonValue] = {
         key: value for key, value in sorted(job.stats.items())
@@ -304,7 +316,8 @@ def build_summary_prompt(jobs: Sequence[SummaryJob]) -> str:
             "state. Set phrase to exactly 'Project overview supported' when the evidence supports "
             "a useful overview, otherwise exactly 'Insufficient evidence'. When evidence is "
             "insufficient, paragraph must begin 'Insufficient evidence:' and say what is missing. "
-            "work_summary must be an empty array.\n\n"
+            "Never emit a URL, Markdown link, image, or link target; verified links are added "
+            "mechanically after generation. work_summary must be an empty array.\n\n"
         )
     elif style == GLOSSARY_DEFINITION_STYLE:
         audience = (
@@ -315,7 +328,8 @@ def build_summary_prompt(jobs: Sequence[SummaryJob]) -> str:
             "phrase to exactly 'Definition supported' when the evidence supports a definition, "
             "otherwise exactly 'Insufficient evidence'. When evidence is insufficient, paragraph "
             "must begin 'Insufficient evidence:' and identify the limit without inventing an "
-            "explanation. work_summary must be an empty array.\n\n"
+            "explanation. Never emit a URL, Markdown link, image, or link target; verified links "
+            "are added mechanically after generation. work_summary must be an empty array.\n\n"
         )
     else:
         audience = ""
@@ -484,6 +498,10 @@ def _parse_backend_output(
                 raise SummaryError(
                     f"{where}.paragraph: insufficient overview must name its evidence limit"
                 )
+            if knowledge_text_has_link(paragraph):
+                raise SummaryError(
+                    f"{where}.paragraph: project overview must not contain links or URLs"
+                )
         elif item.job.summary_style == GLOSSARY_DEFINITION_STYLE:
             if phrase not in {"Definition supported", "Insufficient evidence"}:
                 raise SummaryError(
@@ -498,6 +516,10 @@ def _parse_backend_output(
             ):
                 raise SummaryError(
                     f"{where}.paragraph: insufficient definition must name its evidence limit"
+                )
+            if knowledge_text_has_link(paragraph):
+                raise SummaryError(
+                    f"{where}.paragraph: glossary definition must not contain links or URLs"
                 )
         results[key] = SummaryResult(
             key=key,
@@ -703,12 +725,6 @@ def _heuristic_result(pending: _PendingJob, model: str, generated_at: str) -> Su
         PROJECT_OVERVIEW_STYLE,
         GLOSSARY_DEFINITION_STYLE,
     }:
-        selected = _heuristic_sentences(pending.job.transcript)
-        first_context = (
-            _shorten(selected[0], 520)
-            if selected
-            else "no usable source sentence was retained"
-        )
         subject = (
             "project overview"
             if pending.job.summary_style == PROJECT_OVERVIEW_STYLE
@@ -719,7 +735,7 @@ def _heuristic_result(pending: _PendingJob, model: str, generated_at: str) -> Su
             phrase="Insufficient evidence",
             paragraph=(
                 f"Insufficient evidence: the zero-token heuristic cannot safely synthesize a "
-                f"{subject}; first source context: {first_context}"
+                f"{subject}; use a model-backed knowledge pass for a source-bounded result"
             ),
             work_summary=(),
             model=model,
@@ -1099,5 +1115,6 @@ __all__ = [
     "TECHNICAL_ROLLUP_STYLE",
     "WorkBullet",
     "build_summary_prompt",
+    "knowledge_text_has_link",
     "summarize_jobs",
 ]
