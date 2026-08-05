@@ -44,7 +44,7 @@ def _daily(day: date, zone: ZoneInfo, team: str, last_ms: int) -> Period:
             f"teams/{team}/summaries/daily/{week_year}-W{week_number:02d}/"
             f"{key}-{team}-daily.md"
         ),
-        partial=last_ms < _epoch_ms(end),
+        partial=last_ms + 1 < _epoch_ms(end),
     )
 
 
@@ -62,7 +62,7 @@ def _weekly(day: date, zone: ZoneInfo, team: str, last_ms: int) -> Period:
         start_ms=_epoch_ms(start),
         end_ms=_epoch_ms(end),
         relative_path=f"teams/{team}/summaries/weekly/{year}/{key}-{team}-weekly.md",
-        partial=last_ms < _epoch_ms(end),
+        partial=last_ms + 1 < _epoch_ms(end),
     )
 
 
@@ -82,7 +82,7 @@ def _monthly(day: date, zone: ZoneInfo, team: str, last_ms: int) -> Period:
         start_ms=_epoch_ms(start),
         end_ms=_epoch_ms(end),
         relative_path=f"teams/{team}/summaries/monthly/{first.year}/{key}-{team}-monthly.md",
-        partial=last_ms < _epoch_ms(end),
+        partial=last_ms + 1 < _epoch_ms(end),
     )
 
 
@@ -104,7 +104,7 @@ def _quarterly(day: date, zone: ZoneInfo, team: str, last_ms: int) -> Period:
         start_ms=_epoch_ms(start),
         end_ms=_epoch_ms(end),
         relative_path=f"teams/{team}/summaries/quarterly/{day.year}/{key}-{team}-quarterly.md",
-        partial=last_ms < _epoch_ms(end),
+        partial=last_ms + 1 < _epoch_ms(end),
     )
 
 

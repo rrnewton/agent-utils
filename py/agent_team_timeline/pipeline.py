@@ -45,6 +45,12 @@ from agent_team_timeline.naming import (
 )
 from agent_team_timeline.github_metadata import load_pull_request_metadata_cache
 from agent_team_timeline.github_enrich import pull_metadata_path
+from agent_team_timeline.orc import (
+    OrcParseError,
+    OrcSourceCopy,
+    load_orc_team,
+    snapshot_orc_lineage,
+)
 from agent_team_timeline.periods import Period, periods_for_range
 from agent_team_timeline.phases import (
     PhaseStats,
@@ -605,6 +611,122 @@ def ingest_claude(
         return _ingest_claude_locked(
             archive,
             session_file,
+            team_slug,
+            display_timezone,
+            date_window,
+        )
+
+
+def _load_orc_source_manifest(
+    archive: Path,
+    team_slug: str,
+    root_session_id: str,
+    date_window: DateWindow | None,
+) -> tuple[OrcSourceCopy, ...]:
+    path = _source_manifest_path(archive, team_slug)
+    if not path.is_file():
+        return ()
+    obj = as_object(read_json(path), str(path))
+    if obj.get("schema_version") != 1 or obj.get("provider") != "orc":
+        raise OrcParseError(f"invalid Orc source manifest at {path}")
+    recorded_root = as_string(obj.get("root_session_id"), f"{path}: root_session_id")
+    if recorded_root != root_session_id:
+        raise OrcParseError(
+            f"source manifest belongs to root {recorded_root!r}, not {root_session_id!r}"
+        )
+    expected_window: object = (
+        date_window.to_json_obj() if date_window is not None else None
+    )
+    if obj.get("date_window") != expected_window:
+        raise OrcParseError(
+            "archive date window differs from this ingest; choose a new output directory"
+        )
+    result: list[OrcSourceCopy] = []
+    for index, raw_source in enumerate(
+        as_array(obj.get("sources"), f"{path}: sources")
+    ):
+        source = as_object(raw_source, f"{path}: sources[{index}]")
+        result.append(
+            OrcSourceCopy.from_json_obj(source, f"{path}: sources[{index}]")
+        )
+    return tuple(result)
+
+
+def _ingest_orc_locked(
+    archive: Path,
+    source_root: Path,
+    root_session_id: str,
+    team_slug: str,
+    display_timezone: str,
+    date_window: DateWindow | None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Orc coordinator lineage."""
+
+    _ensure_archive(archive, team_slug, create=True)
+    changed = int(_ensure_source_snapshots_ignored(archive))
+    previous_sources = _load_orc_source_manifest(
+        archive, team_slug, root_session_id, date_window
+    )
+    snapshot_root = _source_snapshot_root(archive, team_slug)
+    snapshot = snapshot_orc_lineage(
+        source_root,
+        root_session_id,
+        snapshot_root,
+        previous_sources,
+        utc_now(),
+    )
+    changed += snapshot.files_changed
+    team = apply_date_window(
+        load_orc_team(
+            snapshot_root,
+            root_session_id,
+            team_slug,
+            display_timezone,
+            snapshot.sources,
+        ),
+        date_window,
+    )
+    parsed_paths = tuple(sorted(source.path for source in team.sources))
+    expected_paths = tuple(
+        sorted(source.snapshot_path for source in snapshot.sources)
+    )
+    if parsed_paths != expected_paths:
+        raise OrcParseError(
+            "parsed source set differs from the validated Orc source snapshots"
+        )
+    source_manifest: dict[str, object] = {
+        "schema_version": 1,
+        "provider": "orc",
+        "root_session_id": root_session_id,
+        "source_root": str(source_root.resolve()),
+        "snapshot_root": f"teams/{team_slug}/source_snapshots",
+        "date_window": date_window.to_json_obj() if date_window is not None else None,
+        "sources": [source.to_json_obj() for source in snapshot.sources],
+    }
+    changed += int(
+        _write_json_durable(
+            _source_manifest_path(archive, team_slug),
+            narrow_json(source_manifest),
+        )
+    )
+    return _write_ingested_team(archive, team_slug, team, date_window, changed)
+
+
+def ingest_orc(
+    archive: Path,
+    source_root: Path,
+    root_session_id: str,
+    team_slug: str,
+    display_timezone: str,
+    date_window: DateWindow | None = None,
+) -> tuple[TeamData, IngestReport]:
+    """Snapshot and normalize one Orc lineage as a serialized raw-data transaction."""
+
+    with _archive_writer_lock(archive):
+        return _ingest_orc_locked(
+            archive,
+            source_root,
+            root_session_id,
             team_slug,
             display_timezone,
             date_window,
@@ -1377,6 +1499,7 @@ __all__ = [
     "build_archive",
     "ingest_claude",
     "ingest_codex",
+    "ingest_orc",
     "load_archived_team",
     "record_run",
     "source_digest",

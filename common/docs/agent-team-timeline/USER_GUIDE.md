@@ -4,9 +4,9 @@
 summaries and a zoomable local website. It answers both “what was happening at 02:13?” and
 “what did this team accomplish this month?” without throwing away the underlying messages.
 
-The importers support Codex multi-agent rollouts and Claude Code coordinator lineages. The archive
-and browser schema is provider-neutral so ORC and Gas Town importers can be added without changing
-the site.
+The importers support Codex multi-agent rollouts, Claude Code coordinator lineages, and Orc SQLite
+coordinator/task history. The archive and browser schema is provider-neutral so additional adapters
+do not require site changes.
 
 ## What the site shows
 
@@ -74,6 +74,10 @@ Claude Code root sessions live under `~/.claude/projects/<encoded-project>/` as
 assistant text, user prompts, tool calls/results, Agent spawns, and SendMessage edges while omitting
 private thinking blocks.
 
+For Orc, pass the project directory containing `.orc/` and `.tg/` as `--source-root`. The root
+coordinator UUID names a directory under `.orc/sessions/`; child sessions with an explicit parent
+identifier are followed as nested coordinators.
+
 ## End-to-end refresh
 
 ```bash
@@ -105,9 +109,24 @@ agent-team-timeline refresh-claude \
   --backend heuristic --model deterministic-local
 ```
 
+For one bounded Orc day, use its provider-specific source selector with the same summary and build
+options:
+
+```bash
+agent-team-timeline refresh-orc \
+  --source-root /path/to/project \
+  --root-session SESSION_UUID \
+  --team orc-project --output ./orc-project \
+  --timezone America/New_York \
+  --start-date 2026-07-21 --end-date 2026-07-22 \
+  --backend heuristic --model deterministic-local
+```
+
 `--start-date` is inclusive and `--end-date` is exclusive in `--timezone`. Earlier transcript
 context remains available to phase summarization, but the website, statistics, naming, and calendar
-rollups are bounded to the requested dates. Reuse the same bounds when refreshing an archive.
+rollups are bounded to the requested dates. A daylight-saving boundary may therefore span 23 or 25
+hours. Reuse the same bounds when refreshing an archive; use another output directory for different
+bounds.
 
 ### Start the website
 
@@ -148,6 +167,11 @@ condensed transcript and statistics.
 
 Use `ingest-claude --session-file FILE` for a Claude lineage. Like Codex ingestion, it is offline and
 does not invoke a model.
+
+The Orc equivalent is `ingest-orc --source-root ROOT --root-session UUID`. It opens source
+databases read-only, uses SQLite's online backup API for consistent copies, and parses only those
+archive-local snapshots. Coordinator content blocks provide prompts, responses, and condensed tool
+counts; agent blocks and task notes provide incarnation lifetimes and timestamped work updates.
 
 ### 2. Summarize — the only token-spending stage
 
@@ -322,6 +346,19 @@ is absent, the importer falls back to the root parent and the source agent ID ra
 lineage. Turn boundaries are reconstructed heuristically from timestamped user messages because
 Claude logs do not expose the same explicit turn lifecycle records as Codex.
 
+## Orc source semantics and limitations
+
+Orc's append-only content blocks are authoritative for coordinator conversation and tool execution.
+Conversation state supplies agent spawn records. Task notes are joined to their recorded author or
+owner and mapped to the latest matching agent incarnation at that time; this is the best available
+historical attribution when the task database does not retain owner changes per note. Reused names
+become separate incarnation IDs while the official name remains visible.
+
+Some Orc installations discover nested coordinator sessions without persisting a parent identifier.
+The importer preserves nested lineage when that field exists and does not invent a parent when it is
+absent. Historical agent-close timestamps are also not always persisted, so a lifetime ends at its
+last attributed activity or at the next reuse of the same official name.
+
 ## Codex source semantics and limitations
 
 Codex disk logs are append-only across context compaction: old user, assistant, and tool records are
@@ -370,8 +407,10 @@ HTML. Review repository visibility before committing an archive.
 
 - Codex provider: implemented.
 - Claude Code provider: implemented, including nested subagents and bounded local-date archives.
+- Orc provider: implemented, including read-only SQLite snapshots, agent incarnations, nested
+  coordinators when lineage is recorded, and bounded local-date archives.
 - Multiple teams: the website schema and team filter are ready; one refresh currently writes one
   team archive. Merging team indexes is a follow-up.
-- ORC and Gas Town importers: planned; their adapters should emit the same provider-neutral
+- Additional adapters such as Gas Town should emit the same provider-neutral
   agents/turns/events/tools/edges model.
 - Hosted serving: deliberately deferred. The local archive is complete and portable first.

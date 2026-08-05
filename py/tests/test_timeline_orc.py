@@ -15,6 +15,11 @@ from agent_team_timeline.orc import (
     snapshot_orc_lineage,
 )
 from agent_team_timeline.phases import build_phases
+from agent_team_timeline.pipeline import (
+    build_archive,
+    ingest_orc,
+    summarize_archive,
+)
 from agent_team_timeline.window import apply_date_window, parse_date_window
 
 
@@ -332,3 +337,50 @@ def test_disappeared_task_database_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(OrcParseError, match="task database.*missing"):
         snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+
+
+def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> None:
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    window = parse_date_window("2026-07-21", "2026-07-22", "America/New_York")
+    assert window is not None
+
+    team, first = ingest_orc(
+        archive,
+        source,
+        ROOT,
+        "orc-test",
+        "America/New_York",
+        window,
+    )
+    _, second = ingest_orc(
+        archive,
+        source,
+        ROOT,
+        "orc-test",
+        "America/New_York",
+        window,
+    )
+    summaries = summarize_archive(archive, "orc-test", "heuristic", "fixture")
+    built = build_archive(archive, "orc-test")
+    timeline = json.loads(
+        (archive / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+
+    assert team.provider == "orc"
+    assert first.sources == 3
+    assert second.files_changed == 0
+    assert summaries.cache_misses > 0
+    assert built["agents"] == 4
+    assert timeline["range"] == {
+        "start_ms": window.start_ms,
+        "end_ms": window.end_ms,
+    }
+    assert len(timeline["rollups"]) == 4
+    manifest = json.loads(
+        (archive / "teams" / "orc-test" / "raw" / "source-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["provider"] == "orc"
+    assert manifest["date_window"]["end_date"] == "2026-07-22"

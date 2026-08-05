@@ -1,9 +1,9 @@
 # agent-team-timeline
 
-Build a self-contained, zoomable website from coordinator and subagent transcripts. The Codex
-importer reconstructs the fork/join tree, agent lifetimes, tool/wait/idle intervals, interaction
-edges, and full message views; cached model summaries add phrase, paragraph, daily, weekly,
-monthly, and quarterly levels of detail.
+Build a self-contained, zoomable website from Codex, Claude Code, or Orc coordinator and subagent
+transcripts. Provider importers reconstruct the fork/join tree, agent lifetimes, tool/wait/idle
+intervals, interaction edges, and full message views; cached model summaries add phrase,
+paragraph, daily, weekly, monthly, and quarterly levels of detail.
 
 The generated archive is ordinary JSON and Markdown plus dependency-free HTML/CSS/JavaScript. It
 is designed to be committed, backed up, copied to another machine, and served with Python's built-in
@@ -36,6 +36,11 @@ agent-team-timeline refresh \
 cd ./timelines/example-team
 make serve
 ```
+
+Use `refresh-claude --session-file SESSION.jsonl` for a Claude lineage or
+`refresh-orc --source-root PROJECT --root-session SESSION_UUID` for an Orc SQLite lineage. All
+three refresh commands accept inclusive `--start-date` and exclusive `--end-date` local-calendar
+bounds.
 
 Every archive includes its launcher, static site, normalized message JSON, cached summary data,
 rendered Markdown, source provenance, and run metadata. Repeating `summarize` on unchanged input

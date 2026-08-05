@@ -16,12 +16,14 @@ from agent_team_timeline.claude import ClaudeParseError
 from agent_team_timeline.codex import CodexParseError
 from agent_team_timeline.github_enrich import PullMetadataReport, enrich_pull_request_metadata
 from agent_team_timeline.naming import AgentNameError
+from agent_team_timeline.orc import OrcParseError
 from agent_team_timeline.pipeline import (
     IngestReport,
     SummarizeReport,
     build_archive,
     ingest_claude,
     ingest_codex,
+    ingest_orc,
     record_run,
     summarize_archive,
     utc_now,
@@ -112,6 +114,17 @@ def _add_claude_ingest(parser: argparse.ArgumentParser) -> None:
     _add_date_window(parser)
 
 
+def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
+    _add_archive(parser)
+    parser.add_argument(
+        "--source-root",
+        required=True,
+        help="project root containing Orc .orc/ and task .tg/ directories",
+    )
+    parser.add_argument("--root-session", required=True, help="Orc coordinator session UUID")
+    _add_date_window(parser)
+
+
 def _add_summary(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--backend",
@@ -180,6 +193,12 @@ def _parser() -> argparse.ArgumentParser:
     _add_claude_ingest(ingest_claude_parser)
     ingest_claude_parser.set_defaults(handler="ingest_claude")
 
+    ingest_orc_parser = sub.add_parser(
+        "ingest-orc", help="snapshot and normalize Orc SQLite logs; do not call a model"
+    )
+    _add_orc_ingest(ingest_orc_parser)
+    ingest_orc_parser.set_defaults(handler="ingest_orc")
+
     summarize = sub.add_parser("summarize", help="fill structured summary cache misses")
     _add_archive(summarize)
     _add_summary(summarize)
@@ -215,7 +234,26 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_claude_ingest(refresh_claude)
     _add_summary(refresh_claude)
+    refresh_claude.add_argument(
+        "--github-metadata",
+        action="store_true",
+        help="conditionally cache titles for evidenced GitHub pull links after the build",
+    )
+    _add_github_options(refresh_claude)
     refresh_claude.set_defaults(handler="refresh_claude")
+
+    refresh_orc = sub.add_parser(
+        "refresh-orc", help="idempotent Orc ingest + summarize + build"
+    )
+    _add_orc_ingest(refresh_orc)
+    _add_summary(refresh_orc)
+    refresh_orc.add_argument(
+        "--github-metadata",
+        action="store_true",
+        help="conditionally cache titles for evidenced GitHub pull links after the build",
+    )
+    _add_github_options(refresh_orc)
+    refresh_orc.set_defaults(handler="refresh_orc")
 
     serve_parser = sub.add_parser("serve", help="serve a built archive on localhost")
     serve_parser.add_argument("--output", required=True, help="built archive directory")
@@ -371,7 +409,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary_report: SummarizeReport | None = None
     build_report: dict[str, int] | None = None
     try:
-        if handler in ("ingest", "refresh", "ingest_claude", "refresh_claude"):
+        ingest_handlers = (
+            "ingest",
+            "refresh",
+            "ingest_claude",
+            "refresh_claude",
+            "ingest_orc",
+            "refresh_orc",
+        )
+        if handler in ingest_handlers:
             date_window = parse_date_window(
                 str(ns.start_date) if ns.start_date is not None else None,
                 str(ns.end_date) if ns.end_date is not None else None,
@@ -381,6 +427,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _, ingest_report = ingest_claude(
                     archive,
                     _path(str(ns.session_file)),
+                    team_slug,
+                    str(ns.timezone),
+                    date_window,
+                )
+            elif handler in ("ingest_orc", "refresh_orc"):
+                _, ingest_report = ingest_orc(
+                    archive,
+                    _path(str(ns.source_root)),
+                    str(ns.root_session),
                     team_slug,
                     str(ns.timezone),
                     date_window,
@@ -395,10 +450,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     date_window,
                 )
             _print_ingest(ingest_report)
-        if handler in ("summarize", "refresh", "refresh_claude"):
+        refresh_handlers = ("refresh", "refresh_claude", "refresh_orc")
+        if handler == "summarize" or handler in refresh_handlers:
             summary_report = _summary_call(ns)
             _print_summaries(summary_report)
-        if handler in ("build", "refresh", "refresh_claude"):
+        if handler == "build" or handler in refresh_handlers:
             build_report = build_archive(
                 archive, team_slug, phase_minutes=int(ns.phase_minutes)
             )
@@ -408,7 +464,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{build_report['files_changed']} presentation files changed"
             )
         wants_github = handler == "github-metadata" or (
-            handler == "refresh" and bool(ns.github_metadata)
+            handler in refresh_handlers and bool(ns.github_metadata)
         )
         if wants_github:
             github_report = enrich_pull_request_metadata(
@@ -448,6 +504,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         AgentNameError,
         ClaudeParseError,
         CodexParseError,
+        OrcParseError,
         SummaryError,
         OSError,
         ValueError,

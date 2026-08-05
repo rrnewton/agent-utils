@@ -143,6 +143,8 @@ def test_built_site_uses_exact_window_and_only_selected_agents(tmp_path: Path) -
     assert [agent["id"] for agent in timeline["agents"]] == [ROOT]
     assert all(event["at_ms"] < window.end_ms for event in timeline["events"])
     assert [rollup["kind"] for rollup in timeline["rollups"]].count("daily") == 1
+    daily = next(rollup for rollup in timeline["rollups"] if rollup["kind"] == "daily")
+    assert "partial" not in daily["label"]
 
 
 def test_team_json_round_trip_keeps_window_fields() -> None:
