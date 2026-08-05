@@ -1,22 +1,24 @@
-//! Canonical JSON (de)serialization for a [`DagConfig`].
-//!
-//! Direct port of `py/safe_ci_dag_runner/io.py`. This is the on-disk / interchange form the
-//! CLI loads via `--dag FILE` and the shared fixture format for the cross-language differential
-//! tests. Parsing is STRICT and fails loudly on a malformed document ([`DagJsonError`]), never
-//! silently defaulting a wrong-typed field.
-//!
-//! Serialization ([`dag_to_json`]) is hand-rolled to reproduce Python's
-//! `json.dumps(indent=2, ensure_ascii=False)` byte-for-byte: the fixed non-alphabetical key
-//! order, 2-space indent, inline empty `{}` / `[]`, and float formatting that matches CPython's
-//! `repr(float)` for every finite value — fixed notation (`1.0`, `90.0`, `1.25`, `0.0001`) and
-//! scientific notation alike (`1e+20`, `1e-07`, `1.5e+16`; see [`json_float`], which documents the
-//! single negligible exact-halfway-tie residual). Non-ASCII
-//! characters are emitted as raw UTF-8 on BOTH sides (Python passes `ensure_ascii=False`), and
-//! both escape the same JSON control set (`"`, `\`, `\n`, `\t`, `\r`, `\b`, `\f`, and `\u00XX` for
-//! other code points < 0x20), so the `json` output is byte-identical for every input — including
-//! multi-line / quote / backslash / unicode descriptions. serde_json is built with the
-//! `float_roundtrip` feature so a float literal PARSES to the same `f64` CPython's `json.loads`
-//! produces, which byte-identical re-emission depends on.
+//! Strict JSON and YAML serialization for [`crate::DagConfig`].
+
+// Canonical JSON (de)serialization for a [`DagConfig`].
+//
+// Direct port of `py/safe_ci_dag_runner/io.py`. This is the on-disk / interchange form the
+// CLI loads via `--dag FILE` and the shared fixture format for the cross-language differential
+// tests. Parsing is STRICT and fails loudly on a malformed document ([`DagJsonError`]), never
+// silently defaulting a wrong-typed field.
+//
+// Serialization ([`dag_to_json`]) is hand-rolled to reproduce Python's
+// `json.dumps(indent=2, ensure_ascii=False)` byte-for-byte: the fixed non-alphabetical key
+// order, 2-space indent, inline empty `{}` / `[]`, and float formatting that matches CPython's
+// `repr(float)` for every finite value — fixed notation (`1.0`, `90.0`, `1.25`, `0.0001`) and
+// scientific notation alike (`1e+20`, `1e-07`, `1.5e+16`; see [`json_float`], which documents the
+// single negligible exact-halfway-tie residual). Non-ASCII
+// characters are emitted as raw UTF-8 on BOTH sides (Python passes `ensure_ascii=False`), and
+// both escape the same JSON control set (`"`, `\`, `\n`, `\t`, `\r`, `\b`, `\f`, and `\u00XX` for
+// other code points < 0x20), so the `json` output is byte-identical for every input — including
+// multi-line / quote / backslash / unicode descriptions. serde_json is built with the
+// `float_roundtrip` feature so a float literal PARSES to the same `f64` CPython's `json.loads`
+// produces, which byte-identical re-emission depends on.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -29,7 +31,7 @@ use crate::model::{
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
 
-/// Raised when a DAG JSON document is malformed (mirrors Python's `DagJsonError`).
+// Raised when a DAG JSON document is malformed (mirrors Python's `DagJsonError`).
 #[derive(Debug, Clone)]
 pub struct DagJsonError(pub String);
 
@@ -71,8 +73,8 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
-/// Reject bools masquerading as ints and floats that are not exact integers (Python's
-/// `isinstance(val, bool) or not isinstance(val, int)`).
+// Reject bools masquerading as ints and floats that are not exact integers (Python's
+// `isinstance(val, bool) or not isinstance(val, int)`).
 fn number_as_int(v: &Value) -> Option<i64> {
     match v {
         Value::Bool(_) => None,
@@ -267,8 +269,8 @@ fn hint_from(value: Option<&Value>, where_: &str) -> Result<ResourceHint, DagJso
     })
 }
 
-/// Parse a DAG JSON document into a [`DagConfig`]. Returns [`DagJsonError`] on any malformed
-/// field, mirroring the Python `dag_from_json` strictness.
+// Parse a DAG JSON document into a [`DagConfig`]. Returns [`DagJsonError`] on any malformed
+// field, mirroring the Python `dag_from_json` strictness.
 pub fn dag_from_json(text: &str) -> Result<DagConfig, DagJsonError> {
     let raw: Value = serde_json::from_str(text).map_err(|e| err(format!("invalid JSON: {e}")))?;
     dag_from_value(&raw)
@@ -331,7 +333,7 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
 
 // --------------------------------------------------------------------------- serialization
 
-/// Quote and escape a string the way Python's `json.dumps` does for ASCII input.
+// Quote and escape a string the way Python's `json.dumps` does for ASCII input.
 pub(crate) fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -352,28 +354,28 @@ pub(crate) fn json_str(s: &str) -> String {
     out
 }
 
-/// Format a float exactly like Python's `repr(float)` / `json.dumps` — e.g. `1.0`, `90.0`,
-/// `1.25`, `0.0001`, but also the scientific forms `1e+20`, `1e-07`, `1.5e+16`, `1e+100`.
-///
-/// Rust's default float formatting gives the same shortest round-trip *digits* as CPython, but
-/// `{:?}` formats the exponent differently (`1e20` / `1e-7`, no sign, no zero-pad), which broke
-/// byte-for-byte parity for any float Python renders in scientific notation. This reproduces
-/// CPython's `float_repr`:
-///  * the shortest round-trip digit string (taken from Rust's `{}` / Display, which is shortest and
-///    always fixed-point — `{:e}` is NOT shortest and must not be used),
-///  * fixed vs. scientific chosen by CPython's rule (scientific iff the decimal point position is
-///    `<= -4` or `> 16`),
-///  * a signed, at-least-two-digit exponent (`e+NN` / `e-NN`),
-///  * and a trailing `.0` on any integer-valued float in fixed notation.
-///
-/// This matches CPython for every finite `f64` EXCEPT one negligible residual: when a value is
-/// EXACTLY halfway between two equally-short decimals, CPython rounds the tie to even while Rust's
-/// Display rounds it half-up (e.g. `-887777373534812.25` -> CPython `...812.2`, here `...812.3`).
-/// Detecting an exact tie needs arbitrary-precision arithmetic (a dependency this crate avoids),
-/// and such values are unreachable for realistic config floats; see the pinning unit test.
-///
-/// Non-finite inputs cannot occur (the reader rejects them and the model never holds them); the
-/// guards below are a defensive fallback that never executes on real data.
+// Format a float exactly like Python's `repr(float)` / `json.dumps` — e.g. `1.0`, `90.0`,
+// `1.25`, `0.0001`, but also the scientific forms `1e+20`, `1e-07`, `1.5e+16`, `1e+100`.
+//
+// Rust's default float formatting gives the same shortest round-trip *digits* as CPython, but
+// `{:?}` formats the exponent differently (`1e20` / `1e-7`, no sign, no zero-pad), which broke
+// byte-for-byte parity for any float Python renders in scientific notation. This reproduces
+// CPython's `float_repr`:
+//  * the shortest round-trip digit string (taken from Rust's `{}` / Display, which is shortest and
+//    always fixed-point — `{:e}` is NOT shortest and must not be used),
+//  * fixed vs. scientific chosen by CPython's rule (scientific iff the decimal point position is
+//    `<= -4` or `> 16`),
+//  * a signed, at-least-two-digit exponent (`e+NN` / `e-NN`),
+//  * and a trailing `.0` on any integer-valued float in fixed notation.
+//
+// This matches CPython for every finite `f64` EXCEPT one negligible residual: when a value is
+// EXACTLY halfway between two equally-short decimals, CPython rounds the tie to even while Rust's
+// Display rounds it half-up (e.g. `-887777373534812.25` -> CPython `...812.2`, here `...812.3`).
+// Detecting an exact tie needs arbitrary-precision arithmetic (a dependency this crate avoids),
+// and such values are unreachable for realistic config floats; see the pinning unit test.
+//
+// Non-finite inputs cannot occur (the reader rejects them and the model never holds them); the
+// guards below are a defensive fallback that never executes on real data.
 fn json_float(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -645,8 +647,8 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push('}');
 }
 
-/// Serialize a [`DagConfig`] to canonical, deterministic JSON (2-space indent), byte-identical
-/// to Python's `dag_to_json` for ASCII input. No trailing newline (the CLI's print adds one).
+// Serialize a [`DagConfig`] to canonical, deterministic JSON (2-space indent), byte-identical
+// to Python's `dag_to_json` for ASCII input. No trailing newline (the CLI's print adds one).
 pub fn dag_to_json(cfg: &DagConfig) -> String {
     let mut s = String::new();
     s.push_str("{\n");
@@ -692,12 +694,12 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
     s
 }
 
-/// Serialize a [`DagConfig`] to a YAML document.
-///
-/// YAML byte-output need NOT match the Python build (only YAML *loading* is isomorphic across the
-/// two languages); the emitted document round-trips back through [`dag_from_yaml`] to an identical
-/// `DagConfig`. Implemented by re-parsing the canonical JSON into a value tree — a single source of
-/// truth for the field set shared with [`dag_to_json`] — and dumping that tree as YAML.
+// Serialize a [`DagConfig`] to a YAML document.
+//
+// YAML byte-output need NOT match the Python build (only YAML *loading* is isomorphic across the
+// two languages); the emitted document round-trips back through [`dag_from_yaml`] to an identical
+// `DagConfig`. Implemented by re-parsing the canonical JSON into a value tree — a single source of
+// truth for the field set shared with [`dag_to_json`] — and dumping that tree as YAML.
 pub fn dag_to_yaml(cfg: &DagConfig) -> String {
     let json = dag_to_json(cfg);
     // Canonical JSON produced by dag_to_json is always valid, and a plain JSON value tree always

@@ -1,29 +1,9 @@
-"""Ambient host-load capture: pure ``/proc`` readers plus a quiet/moderate/busy verdict.
+"""Best-effort ambient host-load measurements.
 
-Ported from DeepScry's ``scripts/validate.py`` (the ``_ambient_snapshot`` /
-``_ambient_bucket`` / ``_host_busy_jiffies`` / ``_pressure`` /
-``_external_build_processes`` cluster, ~lines 506-572, plus the external-core
-attribution arithmetic embedded in ``_measurement_profile_row``, ~602-611).
-
-Everything here reads only ``/proc`` and ``os`` counters; nothing writes, forks, or
-touches cgroupfs. Two things carry across languages and MUST stay bit-for-bit
-comparable, so the thresholds live in named constants:
-
-* :func:`ambient_bucket` — the "how loaded is the box right now" verdict. Its exact
-  cut-offs (``busy`` when external cores > 2.0, OR any PSI ``avg10`` >= 20, OR
-  co-tenant builds >= 8) are cross-language-parity-critical and preserved verbatim.
-* :func:`attribute_external_cores` — how much CPU is being burned by *other* tenants,
-  derived from the system-wide busy-jiffies delta minus our own cgroup CPU usage.
-
-DeepScry-specific bits are removed: the co-tenant / external-build detector no longer
-hardcodes ``{"cargo", "rustc", "node"}`` or the ``MTG_VALIDATE_SCOPE_UNIT`` env var.
-The caller injects the build-process command names and the cgroup scope marker.
-
-No Silent Failure note: these are pure best-effort readers. A missing or malformed
-``/proc`` file degrades to an explicit ``None`` (or a documented default), which the
-caller can see and reason about -- it is never a hidden skip. There is no cgroupfs
-*write* here, so the memory.max degraded-enforcement warning strengthening called for
-elsewhere does not apply to this module.
+The module reads Linux ``/proc`` counters, captures pressure and co-tenant activity,
+and classifies a run as quiet, moderate, or busy. Missing or malformed measurements
+produce explicit optional values or documented defaults; the readers never modify
+host state.
 """
 
 from __future__ import annotations
@@ -91,12 +71,7 @@ class PsiReading:
 
 @dataclass(frozen=True)
 class AmbientSnapshot:
-    """One instant of host-wide load, the typed replacement for DeepScry's
-    ``_ambient_snapshot`` dict.
-
-    Captured at a step's start and end so contention can be attributed; the busy-jiffies
-    delta across two snapshots feeds :func:`attribute_external_cores`.
-    """
+    """One instant of host-wide load used to attribute contention around a step."""
 
     #: System-wide non-idle CPU jiffies (``/proc/stat`` ``cpu`` line), or ``None`` when
     #: unreadable. Only meaningful as a delta between two snapshots.
@@ -113,10 +88,9 @@ class AmbientSnapshot:
 
 
 def read_loadavg() -> tuple[float, float, float]:
-    """Return the 1/5/15-minute load averages via ``os.getloadavg``.
+    """Return the 1/5/15-minute load averages via :func:`os.getloadavg`.
 
-    Mirrors DeepScry's ``os.getloadavg()`` call in ``_ambient_snapshot``. Raises
-    ``OSError`` only on platforms that cannot report load (not Linux, the sole target).
+    Raises ``OSError`` on platforms that cannot report load averages.
     """
     load1, load5, load15 = os.getloadavg()
     return load1, load5, load15
@@ -157,12 +131,7 @@ def count_external_build_processes(
     *,
     scope_marker: str | None = None,
 ) -> int:
-    """Count build processes whose ``comm`` is in ``build_process_names`` and that run
-    OUTSIDE this run's cgroup scope.
-
-    Generic port of ``validate._external_build_processes``, which hardcoded
-    ``{"cargo", "rustc", "node"}`` and the ``MTG_VALIDATE_SCOPE_UNIT`` env var. The caller
-    now injects both:
+    """Count named processes running outside this run's cgroup scope.
 
     * ``build_process_names`` -- exact ``/proc/<pid>/comm`` values to count. Kernel
       truncates ``comm`` to 15 bytes, so pass already-truncated names for long binaries.

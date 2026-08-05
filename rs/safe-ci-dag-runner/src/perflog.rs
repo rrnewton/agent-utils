@@ -38,14 +38,14 @@ pub const CSV_COLUMNS: [&str; 15] = [
     "jobs",
 ];
 
-/// Standard per-step profile columns (dynamic `cpu.*` keys are appended per run AFTER these).
-///
-/// The trailing block (from `effective_cores` on) is the rich PARALLEL-SPEEDUP enrichment,
-/// captured UNDER cgroup boxing and left BLANK when unavailable, exactly like the Python build.
-/// Column NAMES mirror DeepScry's `validate_perflog` `STEP_PROFILE_COLUMNS` so a later schema
-/// unification is a rename, not a redesign. This MUST stay byte-for-byte identical to
-/// `perflog.STEP_PROFILE_COLUMNS` in the Python build (the cross differential compares the CSV
-/// header).
+// Standard per-step profile columns (dynamic `cpu.*` keys are appended per run AFTER these).
+//
+// The trailing block (from `effective_cores` on) is the rich PARALLEL-SPEEDUP enrichment,
+// captured UNDER cgroup boxing and left BLANK when unavailable, exactly like the Python build.
+// Column NAMES mirror DeepScry's `validate_perflog` `STEP_PROFILE_COLUMNS` so a later schema
+// unification is a rename, not a redesign. This MUST stay byte-for-byte identical to
+// `perflog.STEP_PROFILE_COLUMNS` in the Python build (the cross differential compares the CSV
+// header).
 pub const STEP_PROFILE_COLUMNS: [&str; 49] = [
     "timestamp",
     "machine_id",
@@ -132,15 +132,15 @@ pub fn machine_id() -> String {
     }
 }
 
-/// Cores this run could actually use: the CPU-affinity width, matching Python's
-/// `len(os.sched_getaffinity(0))`. Read from `/proc/self/status` `Cpus_allowed_list` (the same mask
-/// `sched_getaffinity` reports) and DELIBERATELY NOT clamped to the cgroup CPU quota, so the two
-/// builds agree on this value — and hence on the step-profile filename's `container_class` segment
-/// and the whole-run `nproc` column — on every host, including cgroup-boxed CI where the quota is
-/// narrower than the affinity width. (`available_parallelism()` WOULD clamp to the cgroup quota and
-/// so silently diverge from Python on a boxed host; the quota is captured separately by
-/// `container_class()` via `cpu.max`.) Falls back to `available_parallelism`, then the logical CPU
-/// count.
+// Cores this run could actually use: the CPU-affinity width, matching Python's
+// `len(os.sched_getaffinity(0))`. Read from `/proc/self/status` `Cpus_allowed_list` (the same mask
+// `sched_getaffinity` reports) and DELIBERATELY NOT clamped to the cgroup CPU quota, so the two
+// builds agree on this value — and hence on the step-profile filename's `container_class` segment
+// and the whole-run `nproc` column — on every host, including cgroup-boxed CI where the quota is
+// narrower than the affinity width. (`available_parallelism()` WOULD clamp to the cgroup quota and
+// so silently diverge from Python on a boxed host; the quota is captured separately by
+// `container_class()` via `cpu.max`.) Falls back to `available_parallelism`, then the logical CPU
+// count.
 pub fn nproc() -> i64 {
     if let Some(n) = affinity_width() {
         return n;
@@ -240,8 +240,8 @@ fn clk_tck() -> i64 {
     100
 }
 
-/// ISO-8601 UTC timestamp `YYYY-MM-DDTHH:MM:SS` (Python emits local time; the column value is not
-/// cross-compared, only the schema is, so UTC is fine and dependency-free).
+// ISO-8601 UTC timestamp `YYYY-MM-DDTHH:MM:SS` (Python emits local time; the column value is not
+// cross-compared, only the schema is, so UTC is fine and dependency-free).
 fn timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

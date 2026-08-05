@@ -73,6 +73,8 @@ def test_quickstart_is_self_contained() -> None:
     assert rc == 0
     for marker in ("Install", "output contract", "Reminders", "ops-state", "Exit codes"):
         assert marker in out
+    assert "python3 -m pip install tick-hub" in out
+    assert "agent-utils" not in out and "cargo install" not in out
 
 
 def test_userguide_prints_embedded_guide() -> None:
@@ -137,6 +139,18 @@ def test_tick_flush_persists(tmp_path: Path) -> None:
     assert "persisted" in err
 
 
+def test_tick_flush_failure_is_a_controlled_usage_error(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, "c.yaml", _CONFIG)
+    fired = tmp_path / "fired-dir"
+    fired.mkdir()
+    rc, _, err = _capture(
+        ["tick", "--config", cfg, "--now", "1000", "--fired-state", str(fired), "--flush"]
+    )
+    assert rc == 2
+    assert "cannot persist fired-state" in err
+    assert not (tmp_path / "fired-dir.tmp").exists()
+
+
 def test_tick_actualize_tick_frequency(tmp_path: Path) -> None:
     cfg = _write(tmp_path, "c.yaml", _CONFIG)
     state = _write(tmp_path, "s.yaml", _STATE)
@@ -191,6 +205,55 @@ def test_missing_config_file_exits_2() -> None:
     rc, _, err = _capture(["list", "--config", "/nonexistent/nope.yaml"])
     assert rc == 2
     assert PROG in err
+
+
+@pytest.mark.parametrize("flag", ["--now", "--current-tick-min"])
+def test_tick_numeric_flags_are_signed_i64(flag: str, tmp_path: Path) -> None:
+    cfg = _write(tmp_path, "c.yaml", _CONFIG)
+    with pytest.raises(SystemExit) as raised:
+        main(["tick", "--config", cfg, flag, "9223372036854775808"])
+    assert raised.value.code == 2
+
+
+def test_state_current_tick_numeric_flag_is_signed_i64(tmp_path: Path) -> None:
+    state = _write(tmp_path, "s.yaml", _STATE)
+    with pytest.raises(SystemExit) as raised:
+        main(["state", "--state", state, "--current-tick-min", "-9223372036854775809"])
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("command", "flag", "value"),
+    [
+        ("tick", "--now", "-1"),
+        ("tick", "--current-tick-min", "0"),
+        ("state", "--current-tick-min", "0"),
+    ],
+)
+def test_cli_numeric_flags_respect_domain(
+    command: str, flag: str, value: str, tmp_path: Path
+) -> None:
+    first_flag = "--config" if command == "tick" else "--state"
+    document = _CONFIG if command == "tick" else _STATE
+    path = _write(tmp_path, f"{command}.yaml", document)
+    with pytest.raises(SystemExit) as raised:
+        main([command, first_flag, path, flag, value])
+    assert raised.value.code == 2
+
+
+def test_long_option_abbreviations_are_rejected(tmp_path: Path) -> None:
+    cfg = _write(tmp_path, "c.yaml", _CONFIG)
+    with pytest.raises(SystemExit) as raised:
+        main(["tick", "--conf", cfg, "--now", "0"])
+    assert raised.value.code == 2
+
+
+@pytest.mark.parametrize("value", ["1_0", " 10", "١٠"])
+def test_cli_integer_syntax_is_ascii_decimal(value: str, tmp_path: Path) -> None:
+    cfg = _write(tmp_path, "c.yaml", _CONFIG)
+    with pytest.raises(SystemExit) as raised:
+        main(["tick", "--config", cfg, "--now", value])
+    assert raised.value.code == 2
 
 
 def test_version_via_module() -> None:

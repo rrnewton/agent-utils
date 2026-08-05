@@ -2,9 +2,8 @@
 
 This is the generic analog of a project's per-host ``.ops-state.yaml``. It is small, strict, and
 typed: :class:`OpsState.load` deserializes the YAML into a dataclass where unknown top-level keys,
-missing required fields, and wrong types are HARD errors (:class:`StateError`). ``yaml.safe_load``
-yields ``Any``; it is pinned to ``object`` at the parse boundary and every field re-validated, so no
-``Any`` leaks into the model.
+missing required fields, and wrong types are HARD errors (:class:`StateError`). Parsed YAML is
+pinned to ``object`` at the boundary and every field is re-validated.
 
 Two fields the ENGINE itself understands:
 
@@ -27,6 +26,8 @@ from tick_hub.emit import format_action, format_note
 from tick_hub.yamlcore import _MISSING_YAML_MSG, core_dump, core_load
 
 DEFAULT_TICK_FREQUENCY_MIN = 30
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
 
 _ALLOWED_TOP = {"enabled", "tick_frequency_min", "label", "flags"}
 
@@ -89,6 +90,10 @@ class OpsState:
             raise StateError(f"tick_frequency_min must be an integer (got {tick!r})")
         if tick <= 0:
             raise StateError(f"tick_frequency_min must be positive (got {tick})")
+        if tick > _I64_MAX:
+            raise StateError(
+                f"tick_frequency_min is outside the signed 64-bit range (got {tick})"
+            )
 
         label_raw = obj.get("label")
         if label_raw is not None and not isinstance(label_raw, str):
@@ -99,6 +104,8 @@ class OpsState:
             label_raw.strip() if isinstance(label_raw, str) and label_raw.strip() else None
         )
 
+        if "flags" in obj and obj["flags"] is None:
+            raise StateError("flags must be a mapping (got NoneType)")
         flags = _parse_flags(obj.get("flags"))
         return cls(enabled=enabled, tick_frequency_min=tick, label=label, flags=flags)
 
@@ -106,12 +113,16 @@ class OpsState:
     def from_yaml(cls, text: str) -> "OpsState":
         """Parse an ops-state YAML document (core-schema plain scalars) into an :class:`OpsState`.
 
-        PyYAML is optional; if it is not installed this raises :class:`StateError` with an
-        actionable install hint."""
+        If the declared PyYAML dependency is missing, this raises :class:`StateError` with an
+        actionable repair hint."""
         try:
-            raw = core_load(text)
+            import yaml
         except ModuleNotFoundError as exc:
             raise StateError(_MISSING_YAML_MSG) from exc
+        try:
+            raw = core_load(text)
+        except yaml.YAMLError as exc:
+            raise StateError(f"invalid YAML: {exc}") from exc
         return cls.from_obj(raw)
 
     @classmethod
@@ -121,18 +132,28 @@ class OpsState:
 
     def to_obj(self) -> dict[str, object]:
         """The plain, JSON/YAML-serializable mapping for this state (flags sorted for determinism)."""
-        return {
+        for key in self.flags:
+            if not isinstance(key, str):
+                raise StateError("flags: mapping keys must be strings")
+        candidate: dict[str, object] = {
             "enabled": self.enabled,
             "tick_frequency_min": self.tick_frequency_min,
             "label": self.label,
             "flags": {k: self.flags[k] for k in sorted(self.flags)},
         }
+        validated = type(self).from_obj(candidate)
+        return {
+            "enabled": validated.enabled,
+            "tick_frequency_min": validated.tick_frequency_min,
+            "label": validated.label,
+            "flags": {k: validated.flags[k] for k in sorted(validated.flags)},
+        }
 
     def to_yaml(self) -> str:
         """Serialize to a YAML document that round-trips back through :meth:`from_yaml`.
 
-        PyYAML is optional; if it is not installed this raises :class:`StateError` with an
-        actionable install hint."""
+        If the declared PyYAML dependency is missing, this raises :class:`StateError` with an
+        actionable repair hint."""
         try:
             return core_dump(self.to_obj())
         except ModuleNotFoundError as exc:
@@ -147,10 +168,14 @@ def _parse_flags(value: object) -> dict[str, FlagValue]:
     out: dict[str, FlagValue] = {}
     for key, raw in value.items():
         name = str(key)
+        if name == "<<":
+            raise StateError("flags: mapping key '<<' is reserved and not supported")
         # bool must be checked before int (bool is a subclass of int).
         if isinstance(raw, bool):
             out[name] = raw
         elif isinstance(raw, int):
+            if raw < _I64_MIN or raw > _I64_MAX:
+                raise StateError(f"flags.{name} integer is outside the signed 64-bit range: {raw}")
             out[name] = raw
         elif isinstance(raw, str):
             out[name] = raw

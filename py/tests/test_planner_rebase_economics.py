@@ -1,5 +1,5 @@
 """The plan's rebase/validate economics: clustering avoids rebases AND, because the validate record
-is keyed to the exact head SHA, the SAME count of validate runs (1:1).
+is keyed to the exact head and base SHAs, the SAME count of validate runs (1:1).
 
 A rebase changes a PR's head SHA, which invalidates its locally-validated / clean-validate record and
 forces a fresh validate run. So serial draining of N conflicting PRs is self-defeating: each land
@@ -52,7 +52,7 @@ def test_plan_json_carries_rebase_and_validate_economics() -> None:
     result = assemble_result(_graph((1, 2), numbers=(1, 2, 3)))
     obj = json.loads(render_json(result))
     econ = obj["plan"]["rebase_economics"]
-    assert econ["validate_record_keyed_to"] == "head_sha"
+    assert econ["validate_record_keyed_to"] == "head_sha+base_sha"
     assert econ["rebases_avoided_by_clustering"] == 1
     # 1:1 with rebases: a rebase changes the head SHA, invalidating that PR's validate record.
     assert econ["validate_runs_avoided_by_clustering"] == 1

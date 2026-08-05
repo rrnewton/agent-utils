@@ -1,34 +1,8 @@
-"""Pluggable containment + metrics contracts the scheduler codes against.
+"""Pluggable containment and metrics contracts used by the scheduler.
 
-The scheduler (the port of DeepScry's ``Runner``) never talks to cgroupfs or a CSV
-directly. It talks to two abstractions so a caller can supply a real Linux cgroup-v2
-manager, a no-op stub (locked-down box / CI without delegation), or a fake for tests:
-
-* :class:`CgroupManager` — per-step containment. One object shared across the whole run;
-  each step gets its own child cgroup keyed by its ``Step.tag`` ("group.job").
-* :class:`MetricsSink` — durable recording of per-step and whole-run measurements.
-
-These Protocols were derived by reading exactly which methods DeepScry's ``Runner`` calls
-on ``self.cgroups`` (``scripts/validate.py`` ``Runner._run_step`` / ``_reap`` /
-``run_orchestrator``) and on its perf sink (``scripts/validate_perflog.py``
-``PerfWindow`` + ``append_step_profiles``). The method names and signatures match the
-DeepScry originals so the ported scheduler needs no adapter shim, while carrying zero
-DeepScry/MTG specifics.
-
-Design notes carried over from the reference implementation:
-
-* **Absence vs. disabled.** The scheduler holds a ``CgroupManager | None``. ``None`` means
-  "no containment object at all — fall back to process-group kill (killpg)". A present
-  object whose :attr:`CgroupManager.enabled` is ``False`` means "constructed but this host
-  cannot actually box steps"; every method is then a safe no-op. DeepScry collapses the
-  two at construction (``cgroups = cg if cg.enabled else None``); this contract supports
-  both so a caller may keep a disabled manager around for its metrics reads.
-* **No Silent Failure.** DeepScry's ``StepCgroups.prepare_command`` swallows the
-  ``OSError`` from a failed ``memory.max`` write and runs the step *uncapped* with no
-  warning (only the CPU-cap write fails loudly). The generic contract below REQUIRES an
-  implementation to surface a visible degraded-enforcement warning when it cannot apply a
-  requested inner cap, and REQUIRES the metrics sink to warn (not silently drop) when a
-  recording is skipped. Implementations degrade — they never skip invisibly.
+A :class:`CgroupManager` contains and measures each step, while a :class:`MetricsSink`
+records per-step and whole-run results. Implementations may explicitly report unavailable
+features, but requested enforcement and recording failures must remain visible.
 """
 
 from __future__ import annotations
@@ -56,9 +30,6 @@ class CgroupManager(Protocol):
     scope). Each step is identified by its ``Step.tag`` ("group.job"); the manager lazily
     creates ``step-<tag>`` child cgroups on first :meth:`prepare_command` and reaps them on
     :meth:`kill` / :meth:`cleanup`.
-
-    Ported from ``validate_cgroup.StepCgroups``; every method below is one the DeepScry
-    ``Runner`` actually invokes on ``self.cgroups``.
     """
 
     #: Whether per-step containment is actually usable on this host. ``False`` when the
@@ -95,8 +66,8 @@ class CgroupManager(Protocol):
         * When :attr:`enabled` is ``False`` (or the child cannot be created), returns
           ``cmd`` unchanged so the step still runs under the outer cap / killpg fallback.
 
-        No Silent Failure (generic strengthening of the DeepScry original): if a requested
-        ``mem_max`` cannot be applied (e.g. the ``memory`` controller was not delegated),
+        If a requested ``mem_max`` cannot be applied (for example, because the ``memory``
+        controller was not delegated),
         the implementation MUST emit a visible degraded-enforcement warning. It MAY still
         run the step (outer cap remains the backstop) but MUST NOT skip the cap silently.
         """
@@ -185,8 +156,8 @@ class RunWindow(Protocol):
     ) -> Mapping[str, object] | None:
         """Compute window metrics and record the whole-run row.
 
-        ``result`` is the run outcome as recorded verbatim (DeepScry uses ``"pass"`` /
-        ``"fail"``); ``n_steps`` is the number of steps actually run; ``jobs`` is the
+        ``result`` is the run outcome recorded verbatim; ``n_steps`` is the number of steps
+        actually run; ``jobs`` is the
         effective scheduler fan-out (``-j``). The remaining columns (wall time, our CPU vs
         other/system CPU contention, cores) are derived from the captured baseline.
 
@@ -223,9 +194,8 @@ class MetricsSink(Protocol):
         storage.
 
         Each row is a heterogeneous column→value mapping (``Mapping[str, object]``: strings,
-        ints, floats), schema-owned by the caller/sink, matching DeepScry's
-        ``append_step_profiles`` rows. ``jobs`` is the outer scheduler fan-out stamped onto
-        every row.
+        ints, floats) whose schema is owned by the caller and sink. ``jobs`` is the outer
+        scheduler fan-out stamped onto every row.
 
         Returns a human-readable location descriptor for the recorded rows (a file-backed
         sink returns the CSV path as a string), or ``None`` when recording was skipped
@@ -237,13 +207,7 @@ class MetricsSink(Protocol):
 
 @dataclass(frozen=True)
 class StepOutcome:
-    """Terminal result of one scheduled step — what the scheduler records per tag.
-
-    Bundles what DeepScry's ``Runner`` keeps spread across ``done[tag] = (ok, dur,
-    summary)``, the ``aborted`` set, and the display-time
-    :func:`safe_ci_dag_runner.model.step_failure_reason` call, so the scheduler and the
-    harness/stats layer share one shape.
-    """
+    """Terminal result of one step, including duration, status, and failure details."""
 
     #: The step's ``Step.tag`` ("group.job").
     tag: str

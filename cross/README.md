@@ -1,75 +1,63 @@
-# cross/ — Python-vs-Rust differential tests
+# Behavioral differential tests
 
-Every tool in this repo is implemented twice. `cross/` proves the two implementations behave
-**identically** on the outside.
+`differential.py` runs the independently implemented Python and Rust commands
+against the same representative, adversarial, boundary, and seeded-random
+inputs. A nonzero exit means the observable contracts diverged.
 
-`differential.py` builds a set of **representative** and **randomized** DAG fixtures and runs
-each one through *both* the Python CLI (`python3 -m safe_ci_dag_runner`) and the Rust binary
-(`rs/target/release/safe-ci-dag-runner`, falling back to `rs/bin/…`), then diffs the observable
-results:
-
-| Command | Assertion |
-|---------|-----------|
-| `list`, `ascii`, `dot` | stdout **byte-identical** |
-| `json` | stdout **byte-identical** (both builds emit `ensure_ascii=False` canonical JSON, so the bytes match for every input — including multi-line / quote / backslash / unicode `description` fields) |
-| `run` (default, `-j4`) | same **exit code** (the eager-exit passed/aborted split races on timing, so only the exit code is compared here) |
-| `run` (serial, `-j1`) | same exit code **and** same `passed / failed / aborted / skipped` counts (serial dispatch is a single deterministic LPT sequence, so the counts are fully reproducible) |
-| `--max-mem` sizing | same chosen `-j` and same modeled worst-case footprint |
-| `--only` errors | an unknown `--only` tag exits 2 on both builds |
-| profile store (`--perf-dir`) | an unboxed run under each build writes the **same set of CSV filenames** (so `machine_id` + `container_class` + `nproc` agree), **byte-identical header rows**, and the **same line-ending style** (data rows — timestamps/elapsed/git SHA — legitimately differ and are not compared) |
-| `sweep --jobs` errors | malformed range / not-an-integer specs exit 2 with **byte-identical stderr** |
-| YAML isomorphism | every `.yaml` fixture (under `examples/` and `cross/yaml_fixtures/`) loads in BOTH builds and re-emits **byte-identical canonical JSON**; and each `examples/NAME.{json,yaml}` pair loads to the same DAG |
-| `--version` / `--help` / no-args | same exit code (and `--version` stdout byte-identical) |
-
-## YAML isomorphism fixtures
-
-`cross/yaml_fixtures/` holds adversarial YAML that never runs but must load identically in both
-builds: literal (`|`) and folded (`>`) block scalars and their strip (`-`) variants, the "Norway
-problem" quoted tokens (`no`/`yes`/`on`/`off` must stay strings, not booleans), a quoted
-number-like string, a literal backslash in a block scalar, and unicode. The shipped `examples/*.yaml`
-are exercised the same way, and additionally checked against their `.json` twins.
-
-The Python CLI imports `pyyaml` to load YAML, and the Rust CLI uses `serde_norway` (the maintained
-fork of the archived `serde_yaml`); both deserialize YAML into the same intermediate their JSON path
-uses, so the model is constructed identically regardless of input syntax.
-
-Randomized fixtures are seeded (`--seed`, default 1234; `--random N` controls how many), so a
-failure is reproducible. The randomized DAGs are acyclic (deps only reference earlier steps),
-use fast `true` / `false` / `echo` / short-`sleep` commands, and only demand scarce resources
-that exist in the caps (an unmet demand would hang the run in both builds).
-
-Note on `--keep-going`: it only suppresses the eager-*abort* of already-in-flight steps; on
-any failure BOTH builds set an internal stop flag and launch no new steps, so the counts still
-race at `-j > 1`. That is why deterministic count comparison uses `-j1`.
-
-Exit status is nonzero on any divergence.
-
-Usage:
+Run the complete paired-tool contract:
 
 ```sh
-python cross/differential.py --tool safe-ci-dag-runner
-python cross/differential.py --random 40 --seed 99   # more fixtures, different seed
+python3 cross/differential.py --tool all
 ```
 
-## Cgroup boxing and the differential
+Run one tool, or increase the randomized corpus reproducibly:
 
-Linux cgroup-v2 boxing is **ON by default** in the Python build (it is the tool's primary
-purpose): a bare `run` re-execs inside a transient `systemd-run --user --scope` and caps each
-step in its own child cgroup. When cgroup-v2 + a working systemd `--user` scope are unavailable,
-the default `run` **errors** (exit 3); `--allow-cgroup-failure` downgrades to a best-effort
-UNBOXED run with a visible warning.
+```sh
+python3 cross/differential.py --tool safe-ci-dag-runner
+python3 cross/differential.py --tool tick-hub --random 100 --seed 8675309
+python3 cross/differential.py --tool pr-landing-planner --random 100 --seed 8675309
+python3 cross/differential.py --tool cpuset-alloc
+```
 
-Cgroup behavior is environment-dependent (a CI container may have no delegated cgroup or systemd
-`--user` scope), so it **cannot** be asserted byte-identically here. Every `run` comparison in
-`differential.py` therefore passes **`--allow-cgroup-failure`**, which makes both builds execute
-the same deterministic, environment-independent UNBOXED scheduling core — exactly the observable
-behavior this differential is meant to pin. Boxing itself is proven separately: by the Python
-test suite (`pytest`) and by the Rust boxing smoke test (a step allocating past its cap is
-OOM-killed).
+The default tool is `safe-ci-dag-runner` so the historical pre-push command
+remains valid.
 
-The profile-store **schema** IS cross-checked (see the `profile store` row above): an unboxed run
-under each build writes the same CSV filenames, byte-identical headers, and the same line endings.
-Only the profile-store **data rows** (run-varying timestamps / elapsed / git SHA) and the dynamic
-cgroup `cpu.*` columns (which appear only under boxing) are out of scope for the byte-identical
-differential; the `cpu.*` columns' alphabetical ordering is pinned by each build's own perflog
-tests. Ambient-load bucketing is likewise out of scope.
+## What is compared
+
+| Tool | Differential contract |
+|---|---|
+| `safe-ci-dag-runner` | Canonical DAG listing, visualization, JSON, YAML loading, validation failures, plan and summary data, selection, argument forwarding, stress reports, resource sizing, run outcomes, profile-store schema, CLI surface, and enforcement-capability manifest. |
+| `cpuset-alloc` | CLI surface, version, durable-ledger status and reclaim JSON, malformed and boundary arguments, reservation behavior, and hard-pin fail-closed behavior. |
+| `tick-hub` | Strict JSON/YAML config loading, canonical emission, cadence state, reminder gates, freshness output, flush transitions, CLI failures, numeric boundaries, malformed documents, and randomized tick configurations. |
+| `pr-landing-planner` | Fixture collection, graphs, clusters, status and plan output in every format, exact-head/base validation, approval and gate safety decisions, ordering/conflict groups, malformed evidence, numeric boundaries, and randomized PR graphs. |
+
+Machine-oriented output is compared byte for byte where it is specified as
+canonical. YAML emitters and other intentionally idiomatic text are parsed or
+checked structurally instead. Concurrent scheduler traces can complete in a
+different order, so the harness compares their deterministic final outcome and
+report rather than timing-dependent progress lines.
+
+The harness also asks each installed edition for its embedded user guide and
+checks that the page is complete and does not mention the sibling language or
+package manager. Artifact-level wheel and crate checks live in
+`scripts/check_python_packages.py` and `scripts/check_rust_packages.py`.
+
+## Cgroup and CPU-set checks
+
+Kernel and service-manager capabilities differ across developer machines and
+CI containers. Scheduling-core comparisons therefore opt out of cgroup boxing
+explicitly and exercise the deterministic engine. The language-specific test
+suites cover cgroup file mutation and cleanup with controlled fixtures.
+
+Hard CPU-set wrappers do not degrade to process affinity. When a host cannot
+create and mutation-verify an inescapable subtree scope, both editions must
+refuse to launch the workload with the same operational status. On a capable
+host, the differential additionally verifies successful reserve/apply/release
+behavior.
+
+## Fixtures and reproducibility
+
+`cross/yaml_fixtures/` contains YAML scalar, quoting, block-text, duplicate-key,
+and numeric edge cases. The harness also consumes shipped examples where they
+form useful paired fixtures. Random cases are generated from `--seed`; a failed
+seed and case index can therefore be replayed exactly.

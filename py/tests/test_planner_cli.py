@@ -39,11 +39,33 @@ def test_quickstart_is_self_contained() -> None:
     assert rc == 0
     for marker in ("five red classifications", "Per-PR actions", "Output formats", "Exit codes", "Demo fixture"):
         assert marker in out
+    assert "none,labels,command" in out
+    assert "beads" not in out.lower()
 
 
 def test_quickstart_emit_demo_is_loadable() -> None:
     rc, out, _ = _capture(["quickstart", "--emit-demo"])
     assert rc == 0 and "prs:" in out
+
+
+def test_priority_hook_errors_are_controlled() -> None:
+    rc, out, err = _capture(["plan", "--fixture", DEMO, "--priority-source", "command"])
+    assert rc == 2 and out == ""
+    assert "requires a non-empty command" in err
+
+    rc, out, err = _capture(
+        [
+            "plan",
+            "--fixture",
+            DEMO,
+            "--priority-source",
+            "command",
+            "--priority-cmd",
+            "printf 9223372036854775808",
+        ]
+    )
+    assert rc == 2 and out == ""
+    assert "signed 64-bit ASCII integer" in err
 
 
 def test_userguide_prints_embedded_guide() -> None:
@@ -132,6 +154,7 @@ def test_plan_context_exact_head_bypasses_stale_gate(tmp_path: Path) -> None:
                     {
                         "pr": 942,
                         "head_sha": "sha-942",
+                        "base_sha": "basesha-integration",
                         "validation_evidence": "clean-validate-record",
                         "policy_class": "ci-hygiene",
                         "assigned_agent": "agent-a",

@@ -23,7 +23,7 @@ const BUSY_CO_TENANTS: i64 = 8;
 const QUIET_EXTERNAL_CORES: f64 = 0.5;
 const QUIET_PSI_AVG10: f64 = 5.0;
 const QUIET_CO_TENANTS: i64 = 2;
-/// Fallback USER_HZ when `sysconf(SC_CLK_TCK)` is unavailable (matches Python's `or 100`).
+// Fallback USER_HZ when `sysconf(SC_CLK_TCK)` is unavailable (matches Python's `or 100`).
 const DEFAULT_CLK_TCK: i64 = 100;
 
 /// The three-level ambient-load verdict (the string value is the parity key).
@@ -35,7 +35,7 @@ pub enum AmbientBucket {
 }
 
 impl AmbientBucket {
-    /// Canonical string form matching Python's `AmbientBucket` literals.
+    // Canonical string form matching Python's `AmbientBucket` literals.
     pub fn value(self) -> &'static str {
         match self {
             AmbientBucket::Quiet => "quiet",

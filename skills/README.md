@@ -3,9 +3,8 @@
 Thin, agent-facing skills for the `agent-utils` tools. Each `skills/<tool>/SKILL.md` is a short
 dispatch pointer: a one-line description of the tool plus the three canonical ways to get usage —
 `<tool> quickstart`, `<tool> --help`, and `<tool> --userguide`. The skills deliberately do NOT
-duplicate the user guide; they point at the CLI, which is the single source of truth (the full guide
-lives once at `common/docs/<tool>/USER_GUIDE.md`, is embedded into each package/crate, and is printed
-by `<tool> --userguide`). This keeps exactly one guide and one skill per tool, both DRY.
+duplicate the user guide; they point at the CLI. Shared templates plus edition fragments generate
+the guide embedded into each distribution and printed by `<tool> --userguide`.
 
 ## Available skills
 

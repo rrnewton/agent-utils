@@ -2,10 +2,9 @@
 
 PR listing (and the rollup + labels carried on each :class:`~pr_landing_planner.model.RawPr`) comes
 from a single ``gh pr list --json`` call; the conflict / ancestry / freshness operations are plain
-``git`` against a local clone. A pluggable network wrapper (``--net-wrapper with-proxy``) prefixes
-every ``gh`` / ``git fetch`` so it runs on a proxied host or bare, and ``--gh-cmd`` swaps in a
-wrapper such as ``./scripts/gh_human``. Nothing here is DeepScry-specific: the gate-check name and
-flaky signatures live in the classifier config, not this host.
+``git`` against a local clone. An optional ``--net-wrapper`` prefixes each ``gh`` and ``git fetch``
+command, while ``--gh-cmd`` supports installations that use an authenticated wrapper. Gate-check
+names and flaky signatures live in classifier configuration, not this host.
 """
 
 from __future__ import annotations

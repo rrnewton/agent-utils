@@ -1,44 +1,8 @@
-"""The DAG runner: greedy, memory-/resource-aware, cgroup-boxed step scheduling.
+"""Dependency-aware, resource-aware concurrent DAG execution.
 
-This is the heart of the package — a generic port of DeepScry's ``scripts/validate.py``
-``Runner`` (class body ~L1594-2156, plus the fail-fast / dep-skip / reap helpers) with
-ZERO DeepScry/MTG specifics. The concrete step catalog and every cost/memory/scheduling
-number arrive from the caller via :class:`~safe_ci_dag_runner.model.DagConfig` /
-:class:`~safe_ci_dag_runner.model.ResourceHint`; containment and metrics arrive as the
-:class:`~safe_ci_dag_runner.protocols.CgroupManager` and
-:class:`~safe_ci_dag_runner.protocols.MetricsSink` PROTOCOLS, so this module never imports
-a concrete cgroup or perflog implementation.
-
-Observable scheduling behavior reproduced from the reference (a Rust port MUST match all of
-these — see the accompanying report):
-
-* **Greedy ready-set loop.** A single scheduler loop repeatedly launches every step that is
-  ready (deps satisfied, resources free, under the ``-j`` fan-out) then sleeps briefly; step
-  supervisors run on daemon threads and mutate shared state under one lock.
-* **Dependency gating + dep-FAILURE skip-closure.** A step launches only once every dep is
-  *done and successful*; a step any of whose deps FAILED (or was itself skipped) is never
-  launched — the failure closes transitively over dependents.
-* **Named-resource capacity buckets.** Each step declares scarce-resource demand
-  (``hint.resources``); the runner never lets concurrently-running demand exceed
-  ``cfg.resource_caps``, acquiring on launch and releasing on completion.
-* **Longest-processing-time (LPT) dispatch order.** Ready steps are considered in DESCENDING
-  ``hint.est_duration_s`` (stable, so ties keep registration order), so when a scarce
-  resource frees the heaviest ready step claims it — keeping long steps off the critical-path
-  tail.
-* **Per-step supervision.** One daemon supervisor thread per step runs ``bash -c`` with
-  ``start_new_session=True`` (its own process group/session for whole-tree reaping) plus a
-  daemon stdout-reader thread so an orphan holding the stdout pipe can never wedge the run;
-  the supervisor blocks only on ``proc.wait(timeout=step.timeout)``.
-* **Fail-fast (eager-exit) with ``--keep-going`` override.** The first genuine failure stops
-  the scheduler launching any NEW step. By default it also eager-reaps every in-flight step,
-  labelling those ABORTED (a cancellation) rather than FAILED; ``keep_going`` only suppresses
-  that eager-cancel so already-running steps finish — it does NOT keep launching still-runnable
-  steps.
-* **Failure classification** via :func:`safe_ci_dag_runner.model.step_failure_reason`
-  (OOM > timeout > pids-guard > detail-capture > signal > exit precedence).
-
-Teardown of a step's whole process tree (cgroup-first, then process-group) is delegated to
-:func:`safe_ci_dag_runner.teardown.reap`.
+The scheduler gates on dependencies, named resource capacities, memory, and fan-out;
+orders ready work by estimated duration; and stops launching work after a failure.
+Per-step supervision reaps complete process trees and records structured outcomes.
 """
 
 from __future__ import annotations

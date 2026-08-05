@@ -7,10 +7,10 @@ does exactly that, deterministically, from already-collected data.
 
 Per-PR action assignment (the fusion table):
 
-* held (base-conflict)          -> ``rebase-then-land``
-* held (draft / depends-on-held)-> ``wait``
+* held (base-conflict)          -> ``rebase-then-land`` and revalidate
+* held (draft / review / dependency cycle / depends-on-held) -> ``wait``
 * gate-policy change            -> ``escalate-gate-policy``
-* exact-head local evidence     -> ``land-now`` (or rebase first), without a merge-gate wait
+* exact head/base evidence      -> ``land-now`` (or rebase first), without a merge-gate wait
 * CI runner-outage              -> ``escalate-runner-outage``
 * CI evaluate-once race         -> ``wait`` (benign; treat as pending)
 * CI stale required check       -> ``refire-stale-gate``
@@ -50,12 +50,23 @@ DEFAULT_FRESHNESS_MAX_BEHIND = 0
 
 
 def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
-    if any(r in ("local-base-conflict", "github-base-conflicting") for r in reasons):
-        return PrAction.REBASE_THEN_LAND, f"held: {', '.join(reasons)} — rebase onto base to resolve"
+    if "ordering-cycle" in reasons:
+        return PrAction.WAIT, "held: ordering-cycle (resolve dependency cycle and rerun)"
+    if any(
+        r in ("review-required", "changes-requested")
+        or r.startswith("review-decision-unknown:")
+        for r in reasons
+    ):
+        return PrAction.WAIT, f"held: {', '.join(reasons)}"
     if any(r.startswith("depends-on-held") for r in reasons):
         return PrAction.WAIT, f"held: {', '.join(reasons)}"
     if "draft" in reasons:
         return PrAction.WAIT, "held: draft (mark ready to land)"
+    if any(r in ("local-base-conflict", "github-base-conflicting") for r in reasons):
+        return (
+            PrAction.REBASE_THEN_LAND,
+            f"held: {', '.join(reasons)} — rebase onto base, then revalidate before landing",
+        )
     return PrAction.WAIT, f"held: {', '.join(reasons)}"
 
 
@@ -71,12 +82,12 @@ def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
         if node.commits_behind > freshness_max_behind:
             return (
                 PrAction.REBASE_THEN_LAND,
-                f"{node.validation_evidence.value} at exact head; "
-                f"rebase {node.commits_behind} commit(s) then land without waiting for merge-gate",
+                f"{node.validation_evidence.value} applies to the current head; "
+                f"rebase {node.commits_behind} commit(s), then revalidate the new head before landing",
             )
         return (
             PrAction.LAND_NOW,
-            f"{node.validation_evidence.value} at exact head; no merge-gate wait",
+            f"{node.validation_evidence.value} at exact head and base; no merge-gate wait",
         )
     if red is RedClass.RUNNER_OUTAGE:
         return PrAction.ESCALATE_RUNNER_OUTAGE, ci.detail
@@ -88,11 +99,11 @@ def _ci_action(node: PrNode, freshness_max_behind: int) -> tuple[PrAction, str]:
         return PrAction.REFIRE_CI, ci.detail
     if red is RedClass.REAL:
         return PrAction.HOLD_FIX, ci.detail
+    if not ci.gate_present:
+        return PrAction.REFIRE_CI, "required gate has NO_RESULT (absent); re-dispatch"
+    if not ci.gate_ok:
+        return PrAction.REFIRE_CI, "required gate has NO_RESULT; re-dispatch"
     if ci.raw_state is CiState.NO_RESULT:
-        if not ci.gate_present:
-            return PrAction.REFIRE_CI, "required gate has NO_RESULT (absent); re-dispatch"
-        if not ci.gate_ok:
-            return PrAction.REFIRE_CI, "required gate has NO_RESULT; re-dispatch"
         return PrAction.WAIT, "required gate passed; another CI check has NO_RESULT"
     # GREEN.
     if node.commits_behind > freshness_max_behind:
@@ -136,7 +147,9 @@ def compute_plan(
 
     decisions: list[PrActionDecision] = []
     for node in sorted(nodes, key=lambda n: n.number):
-        if node.number in held_by_number:
+        if node.policy_class is PolicyClass.GATE_POLICY:
+            action, why = _ci_action(node, freshness_max_behind)
+        elif node.number in held_by_number:
             action, why = _held_action(held_by_number[node.number].reasons)
         else:
             action, why = _ci_action(node, freshness_max_behind)
@@ -146,11 +159,48 @@ def compute_plan(
             )
         )
 
+    # A child may be independently green while its open predecessor needs repair, policy review,
+    # or a rebase. Do not call that child landable until every predecessor is itself land-now.
+    by_action = {decision.pr: decision.action for decision in decisions}
+    blockers = sorted(ordering_edges, key=lambda edge: (edge.after, edge.before))
+    changed = True
+    while changed:
+        changed = False
+        updated: list[PrActionDecision] = []
+        for decision in decisions:
+            blocker = next(
+                (
+                    edge.before
+                    for edge in blockers
+                    if edge.after == decision.pr
+                    and by_action.get(edge.before) is not PrAction.LAND_NOW
+                ),
+                None,
+            )
+            if blocker is not None and decision.action in (
+                PrAction.LAND_NOW,
+                PrAction.REBASE_THEN_LAND,
+            ):
+                action = by_action.get(blocker, PrAction.WAIT)
+                replacement = PrActionDecision(
+                    pr=decision.pr,
+                    action=PrAction.WAIT,
+                    why=f"dependency #{blocker} requires {action.value}; wait and rerun",
+                    group=decision.group,
+                )
+                updated.append(replacement)
+                if by_action.get(decision.pr) is not PrAction.WAIT:
+                    by_action[decision.pr] = PrAction.WAIT
+                    changed = True
+            else:
+                updated.append(decision)
+        decisions = updated
+
     land_now = tuple(d.pr for d in decisions if d.action is PrAction.LAND_NOW)
     # Recommended act sequence: flatten the parallel-safe groups (already priority-ranked per layer).
     order = tuple(number for group in groups for number in group)
 
-    # Optional bors-style batch: one conflict-free set of already-green land-now PRs behind one gate.
+    # Optional batch: one conflict- and dependency-free set of land-now root PRs behind one gate.
     batch_prs: tuple[int, ...] = ()
     if batch and land_now:
         conflicts: dict[int, set[int]] = {}
@@ -161,7 +211,12 @@ def compute_plan(
             n.number: (n.priority, n.size, n.created_at, n.number)
             for n in nodes
         }
-        batch_prs = _greedy_conflict_free(land_now, conflicts, rank)
+        ordered_children = {edge.after for edge in ordering_edges}
+        batch_prs = _greedy_conflict_free(
+            tuple(number for number in land_now if number not in ordered_children),
+            conflicts,
+            rank,
+        )
 
     plan = Plan(
         parallel_safe_groups=groups,

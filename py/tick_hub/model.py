@@ -6,10 +6,8 @@ responsibilities as a :class:`TickConfig` — a set of :class:`Reminder` values
 template) plus a set of :class:`HealthCheck` freshness probes — then hands it to
 the engine once per scheduled *tick*.
 
-This is the generic replacement for a project-specific hand-written poll script
-(a wall of ``do_<name>`` functions plus an ``ops.config.sh`` cadence table). The
-engine stays free of any caller-specific reminders, skills, paths, or gates:
-every one of those lives here as data supplied by the caller.
+The engine stays free of caller-specific reminders, handlers, paths, and gates:
+each of those lives here as data supplied by the caller.
 """
 
 from __future__ import annotations

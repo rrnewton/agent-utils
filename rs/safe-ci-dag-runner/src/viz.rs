@@ -1,19 +1,21 @@
-//! Human-readable DAG visualizations: Graphviz DOT and quick ASCII art.
-//!
-//! Pure functions over a [`DagConfig`] — no I/O. Direct port of
-//! `py/safe_ci_dag_runner/viz.py`; the output is BYTE-IDENTICAL to the Python build (same
-//! headers, cluster order, edge lines, ASCII layers) and cross-tested against it.
-//!
-//! * [`to_dot`] emits Graphviz: one cluster per group, solid dependency edges, and a dashed
-//!   edge chain for each cap-1 scarce resource.
-//! * [`to_ascii`] emits a compact topological-layer view for a glance in the terminal.
+//! Human-readable DAG visualizations in Graphviz DOT and ASCII forms.
+
+// Human-readable DAG visualizations: Graphviz DOT and quick ASCII art.
+//
+// Pure functions over a [`DagConfig`] — no I/O. Direct port of
+// `py/safe_ci_dag_runner/viz.py`; the output is BYTE-IDENTICAL to the Python build (same
+// headers, cluster order, edge lines, ASCII layers) and cross-tested against it.
+//
+// * [`to_dot`] emits Graphviz: one cluster per group, solid dependency edges, and a dashed
+//   edge chain for each cap-1 scarce resource.
+// * [`to_ascii`] emits a compact topological-layer view for a glance in the terminal.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::model::{step_classification, DagConfig, Step};
 
-/// Selected steps (all, since the CLI never passes a subset). Kept as a helper to mirror the
-/// Python structure and leave room for a future `--select` flag.
+// Selected steps (all, since the CLI never passes a subset). Kept as a helper to mirror the
+// Python structure and leave room for a future `--select` flag.
 fn selected_steps<'a>(cfg: &'a DagConfig, selected: Option<&HashSet<String>>) -> Vec<&'a Step> {
     cfg.steps
         .iter()
@@ -38,12 +40,12 @@ fn kept_deps(steps: &[&Step]) -> HashMap<String, Vec<String>> {
         .collect()
 }
 
-/// Concise per-node profiling annotation for a DOT label: `\n{est}s, {mb}MB`
-/// (expected wall-seconds and max resident memory in decimal MB, floored).
-///
-/// Returns `""` when the step carries neither a duration nor an RSS estimate, so
-/// undecorated DAGs render exactly as before. Formatting is integer-floored for MB
-/// and fixed one-decimal for seconds so the Rust and Python builds stay byte-identical.
+// Concise per-node profiling annotation for a DOT label: `\n{est}s, {mb}MB`
+// (expected wall-seconds and max resident memory in decimal MB, floored).
+//
+// Returns `""` when the step carries neither a duration nor an RSS estimate, so
+// undecorated DAGs render exactly as before. Formatting is integer-floored for MB
+// and fixed one-decimal for seconds so the Rust and Python builds stay byte-identical.
 fn profile_suffix(step: &Step) -> String {
     let est = step.hint.est_duration_s;
     let rss = step.hint.rss_baseline_bytes;

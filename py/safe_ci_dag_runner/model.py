@@ -1,10 +1,7 @@
-"""Core DAG vocabulary for safe-ci-dag-runner.
+"""Core DAG configuration, step, resource, and result types.
 
-Pure data + pure helpers, no I/O. A caller describes their build/test graph as a set of
-:class:`Step` values (each carrying a :class:`ResourceHint`) bundled in a
-:class:`DagConfig`, then hands it to the runner. This is the generic replacement for a
-project-specific ``build_registry()`` plus the per-step cost / memory / scheduling
-constant tables that a project like DeepScry keeps inline.
+The module contains pure data and helpers; callers provide the graph and its resource
+hints, then pass a :class:`DagConfig` to the scheduler.
 """
 
 from __future__ import annotations
@@ -41,13 +38,10 @@ class StepClass(Enum):
 
 @dataclass(frozen=True)
 class ResourceHint:
-    """Per-step scheduling knowledge: scarce-resource demand, cost estimate, memory.
+    """Optional per-step resource demand, duration, parallelism, and memory hints.
 
-    Every field is optional. With none supplied the runner falls back to a fixed
-    concurrency with no memory model; supplying them enables memory-aware ``-j`` sizing
-    and longest-processing-time dispatch ordering. This folds what a project like DeepScry
-    keeps in separate global tag-keyed tables (duration hints, RSS baselines, memory caps,
-    scheduling profiles) onto the step itself.
+    Estimates enable memory-aware concurrency and longest-processing-time dispatch;
+    scarce-resource demands constrain which steps may run together.
     """
 
     # Scarce-resource DEMAND for this step, e.g. {"browser": 1}. The runner never lets the
@@ -145,8 +139,7 @@ def command_with_inner_jobs(
 
 
 def step_classification(step: Step) -> StepClass:
-    """A step's class: an explicit non-default hint wins; a browser-resource step is
-    latency-bound; otherwise light. (Mirrors DeepScry's ``step_class``.)"""
+    """Return the explicit class, infer latency-bound browser work, or default to light."""
     if step.hint.classification is not StepClass.LIGHT:
         return step.hint.classification
     if "browser" in step.hint.resources:
@@ -228,11 +221,10 @@ def step_failure_reason(
 
 @dataclass(frozen=True)
 class DagConfig:
-    """A whole DAG plus caller policy.
+    """A complete step graph plus scheduling and containment policy.
 
-    ``steps`` is the graph; ``resource_caps`` bounds concurrent scarce-resource demand
-    (e.g. {"browser": 2, "net": 1}). The memory-model tunables mirror DeepScry's outer-cap
-    behavior and can be left at their defaults.
+    ``resource_caps`` bounds concurrent scarce-resource demand. Memory and CPU policy
+    fields have conservative defaults and may be overridden per workload.
     """
 
     steps: tuple[Step, ...]

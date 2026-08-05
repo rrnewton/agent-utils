@@ -1,17 +1,19 @@
-//! Per-step measurement ENRICHMENT: fold a step's cgroup + ambient deltas into the rich
-//! profile-row columns the parallel-speedup model reads back (Rust port of
-//! `py/safe_ci_dag_runner/profile_enrich.py`).
-//!
-//! The column NAMES mirror DeepScry's `scripts/validate_perflog.py` `STEP_PROFILE_COLUMNS`
-//! (`effective_cores`, `quota_utilization_pct`, `throttled_s`, `external_cpu_s`/`external_cores`,
-//! `co_tenants_*`, `ambient_bucket`, `load*`, host/step PSI), so a later schema unification is a
-//! RENAME, not a redesign. Everything is best-effort and captured UNDER cgroup boxing; an
-//! unavailable measurement simply leaves its column out of the returned row and the writer records
-//! it blank (No Silent Failure).
-//!
-//! These are WRITER columns whose exact numeric values legitimately differ per host/run, so they
-//! are NOT byte-compared across the Python and Rust builds (only the CSV schema is). The READER
-//! that consumes them (`estimates::load_step_speedups`) IS cross-checked byte-identical.
+//! Per-step measurement enrichment from cgroup and ambient-load observations.
+
+// Per-step measurement ENRICHMENT: fold a step's cgroup + ambient deltas into the rich
+// profile-row columns the parallel-speedup model reads back (Rust port of
+// `py/safe_ci_dag_runner/profile_enrich.py`).
+//
+// The column NAMES mirror DeepScry's `scripts/validate_perflog.py` `STEP_PROFILE_COLUMNS`
+// (`effective_cores`, `quota_utilization_pct`, `throttled_s`, `external_cpu_s`/`external_cores`,
+// `co_tenants_*`, `ambient_bucket`, `load*`, host/step PSI), so a later schema unification is a
+// RENAME, not a redesign. Everything is best-effort and captured UNDER cgroup boxing; an
+// unavailable measurement simply leaves its column out of the returned row and the writer records
+// it blank (No Silent Failure).
+//
+// These are WRITER columns whose exact numeric values legitimately differ per host/run, so they
+// are NOT byte-compared across the Python and Rust builds (only the CSV schema is). The READER
+// that consumes them (`estimates::load_step_speedups`) IS cross-checked byte-identical.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,10 +23,10 @@ use crate::perflog::nproc;
 
 const USEC: f64 = 1_000_000.0;
 
-/// The effective core count of the cgroup/container/machine the run is boxed in: the cgroup-v2 CPU
-/// quota (`/sys/fs/cgroup/cpu.max` `quota period` -> rounded `quota/period`) when bounded, else the
-/// affinity width [`perflog::nproc`]. This is the NUMBER an ambient (un-`-j`-capped) step's
-/// effective parallelism resolves to. Mirrors Python's `container_core_budget`.
+// The effective core count of the cgroup/container/machine the run is boxed in: the cgroup-v2 CPU
+// quota (`/sys/fs/cgroup/cpu.max` `quota period` -> rounded `quota/period`) when bounded, else the
+// affinity width [`perflog::nproc`]. This is the NUMBER an ambient (un-`-j`-capped) step's
+// effective parallelism resolves to. Mirrors Python's `container_core_budget`.
 pub fn container_core_budget() -> i64 {
     if let Ok(text) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
         let mut parts = text.split_whitespace();
@@ -39,9 +41,9 @@ pub fn container_core_budget() -> i64 {
     nproc()
 }
 
-/// Resolve a step's recorded `inner_jobs` to a NUMBER: an explicit `-j` width verbatim, else the
-/// container's core budget (never the old `"ambient"` string). Mirrors Python's
-/// `resolve_effective_inner_jobs`.
+// Resolve a step's recorded `inner_jobs` to a NUMBER: an explicit `-j` width verbatim, else the
+// container's core budget (never the old `"ambient"` string). Mirrors Python's
+// `resolve_effective_inner_jobs`.
 pub fn resolve_effective_inner_jobs(inner_jobs: Option<i64>) -> i64 {
     inner_jobs.unwrap_or_else(container_core_budget)
 }
@@ -68,9 +70,9 @@ fn psi_columns(
     }
 }
 
-/// Build the rich per-step profile columns from one step's cgroup + ambient measurements. Only
-/// columns whose inputs are present are returned; the writer fills the rest blank (they are part of
-/// [`crate::perflog::STEP_PROFILE_COLUMNS`]). Mirrors Python's `step_enrichment_columns`.
+// Build the rich per-step profile columns from one step's cgroup + ambient measurements. Only
+// columns whose inputs are present are returned; the writer fills the rest blank (they are part of
+// [`crate::perflog::STEP_PROFILE_COLUMNS`]). Mirrors Python's `step_enrichment_columns`.
 #[allow(clippy::too_many_arguments)]
 pub fn step_enrichment_columns(
     elapsed_s: f64,

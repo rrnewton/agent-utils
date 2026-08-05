@@ -203,3 +203,15 @@ def test_parse_kv_lines() -> None:
 def test_render_emit_note_interpolates() -> None:
     line = render_emit(Emit(EmitKind.NOTE, title="hi {who}"), {"who": "there"})
     assert line == "NOTE: hi there"
+
+
+def test_static_fields_interpolate_static_and_captured_values() -> None:
+    emit = Emit(
+        EmitKind.ACTION,
+        title="{copy}/{live}",
+        skill="triage",
+        fields={"base": "7", "copy": "{base}", "live": "{count}"},
+    )
+    assert render_emit(emit, {"count": "3"}) == (
+        'ACTION: triage base=7 copy=7 live=3 count=3 title="7/3"'
+    )

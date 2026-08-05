@@ -1,33 +1,13 @@
-"""``cpuset-alloc`` — a STATEFUL cpuset allocator for benchmarks.
+"""Stateful, hard process-tree CPU allocation for benchmark isolation.
 
-Pins a whole process tree (a benchmark command AND all its children — including a
-NON-hermit native run, or a hermit ptrace tracer+tracee) to a set of RESERVED CPU
-cores, so two concurrent benchmarks never land on the same core and contaminate
-each other's timing. This is the apples-to-apples-comparison primitive: pinning a
-native run and a hermit run to the SAME single-core box separates INSTRUMENTATION
-cost from SEQUENTIALIZATION cost (hermit sequentializes threads; native does not).
+The allocator combines a durable, ``flock``-serialized reservation ledger with
+a transient systemd scope whose ``AllowedCPUs`` property creates a cgroup cpuset
+bound. Concurrent callers receive disjoint cores, crashed holders are reclaimed,
+and a command is launched only after an escape mutation proves that descendants
+cannot leave the reserved set. Process affinity alone is deliberately rejected
+because a descendant can replace an inherited affinity mask.
 
-Two layers, deliberately separated:
-
-  * STATE — :mod:`safe_ci_dag_runner.reservation` is the durable, ``flock``-serialized
-    core→holder ledger. ``acquire(K)`` hands out K DISJOINT cores under concurrency,
-    reclaims cores whose holder crashed (dead-holder sweep), and releases on exit.
-    The caller NEVER picks WHICH core — the allocator picks (the standing rule).
-
-  * ENFORCEMENT — the pin is a HARD, inescapable, tree-wide cgroup ``cpuset.cpus``
-    bound, applied by launching the command inside a transient
-    ``systemd-run --user --scope -p AllowedCPUs=<reserved-set>``. This is the ONLY
-    mechanism mutation-verified to hold in the 3pai agent sandbox: the agent's own
-    scope delegates only ``io memory pids`` (no ``cpuset``), but a ``systemd --user``
-    transient scope lands under ``app.slice`` where ``cpuset`` IS delegated, so
-    systemd writes ``cpuset.cpus`` there. ``sched_setaffinity``/``taskset`` is NOT
-    used: it is escapable — a child can widen its own affinity back onto an excluded
-    core (mutation-verified 2026-08-04, experiments/cpuset-pin-mechanism-mutation-
-    verified_20260804/). ``selftest`` re-runs that escape mutation and refuses to
-    bless a soft bound.
-
-Every pin records ``{cores: [...], count: K}`` — an assignment without WHICH cores
-and HOW MANY is unqualified.
+Every successful pin reports both the exact core IDs and their count.
 
 CLI::
 
@@ -41,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -55,8 +36,40 @@ if __name__ == "__main__" and __package__ in (None, ""):  # pragma: no cover
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from safe_ci_dag_runner import reservation
+from safe_ci_dag_runner import __version__
 
 PROG = "cpuset-alloc"
+
+
+def _positive_int(raw: str) -> int:
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid integer: {raw!r}") from exc
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return value
+
+
+def _nonnegative_finite_float(raw: str) -> float:
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid number: {raw!r}") from exc
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError("must be finite and >= 0")
+    return value
+
+
+def _wrapped_returncode(returncode: int) -> int:
+    """Map a signal-terminated child to the conventional shell status."""
+    return 128 - returncode if returncode < 0 else returncode
+
+
+def _executable_available(command: str) -> bool:
+    if os.sep in command:
+        return os.path.isfile(command) and os.access(command, os.X_OK)
+    return shutil.which(command) is not None
 
 
 def _cpulist(cores: Sequence[int]) -> str:
@@ -76,6 +89,7 @@ def _systemd_run_available() -> bool:
             ["systemd-run", "--user", "--scope", "--quiet", "--collect", "true"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,
             timeout=15,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -108,19 +122,17 @@ def _scope_argv(cores: Sequence[int], cmd: Sequence[str], *, tag: str = "") -> l
     return argv
 
 
-def cmd_run(args: argparse.Namespace) -> int:
-    """``run --cores K -- CMD``: reserve K disjoint cores, then run CMD's whole
-    tree HARD-pinned to them, releasing the reservation on exit (success or
-    failure). Exit code == CMD's."""
-    cmd: list[str] = list(args.argv_rest)
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
-    if not cmd:
-        print(f"{PROG}: run: no command given (use `-- CMD ARGS...`)", file=sys.stderr)
-        return 2
+def _run_reserved_hard(
+    cores: Sequence[int], cmd: Sequence[str], *, tag: str = "", prog: str = PROG
+) -> int:
+    """Run ``cmd`` in a mutation-verified AllowedCPUs scope over reserved cores."""
+    if not cmd or not _executable_available(cmd[0]):
+        missing = cmd[0] if cmd else "<empty>"
+        print(f"{prog}: executable not found or not executable: {missing}", file=sys.stderr)
+        return 3
     if not _systemd_run_available():
         print(
-            f"{PROG}: run: `systemd-run --user --scope` is unavailable here, so a HARD "
+            f"{prog}: `systemd-run --user --scope` is unavailable here, so a HARD "
             "cpuset pin cannot be applied. Refusing to run un-pinned (a soft "
             "sched_setaffinity bound is escapable and would silently contaminate the "
             "benchmark). Run on a host with a systemd user session.",
@@ -128,31 +140,45 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return 3
 
-    with reservation.reserve_cores(
-        args.cores, tag=args.tag, sample_s=args.sample_s
-    ) as cores:
-        probe = _probe_hard_pin(cores)
-        if probe.get("verdict") != "HARD":
-            print(
-                f"{PROG}: run: reserved cores could not be mutation-verified as a HARD "
-                f"tree-wide pin; refusing to run: {json.dumps(probe, sort_keys=True)}",
-                file=sys.stderr,
-            )
-            return 3
-        # CONDITION CARRIED WITH THE VALUE: which cores, and how many.
-        assignment = {"cores": cores, "count": len(cores)}
+    probe = _probe_hard_pin(cores)
+    if probe.get("verdict") != "HARD":
         print(
-            f"{PROG}: reserved {json.dumps(assignment)}; "
-            f"running whole tree pinned via AllowedCPUs={_cpulist(cores)}",
+            f"{prog}: reserved cores could not be mutation-verified as a HARD "
+            f"tree-wide pin; refusing to run: {json.dumps(probe, sort_keys=True)}",
             file=sys.stderr,
         )
-        argv = _scope_argv(cores, cmd, tag=args.tag)
-        try:
-            completed = subprocess.run(argv)
-        except OSError as exc:
-            print(f"{PROG}: run: failed to launch scope ({exc})", file=sys.stderr)
-            return 3
-    return completed.returncode
+        return 3
+    assignment = {"cores": list(cores), "count": len(cores)}
+    print(
+        f"{prog}: reserved {json.dumps(assignment, separators=(',', ':'))}; "
+        f"running whole tree pinned via AllowedCPUs={_cpulist(cores)}",
+        file=sys.stderr,
+    )
+    try:
+        completed = subprocess.run(
+            _scope_argv(cores, cmd, tag=tag), start_new_session=True
+        )
+    except OSError as exc:
+        print(f"{prog}: failed to launch scope ({exc})", file=sys.stderr)
+        return 3
+    return _wrapped_returncode(completed.returncode)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """Reserve disjoint cores, run one hard-pinned command tree, then release."""
+    raw: list[str] = list(args.argv_rest)
+    if not raw or raw[0] != "--" or len(raw) == 1:
+        print(f"{PROG}: run: no command given (use `-- CMD ARGS...`)", file=sys.stderr)
+        return 2
+    cmd = raw[1:]
+    try:
+        with reservation.reserve_cores(
+            args.cores, tag=args.tag, sample_s=args.sample_s
+        ) as cores:
+            return _run_reserved_hard(cores, cmd, tag=args.tag, prog=f"{PROG}: run")
+    except (ValueError, reservation.InsufficientCoresError) as exc:
+        print(f"{PROG}: run: {exc}", file=sys.stderr)
+        return 3
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -178,15 +204,13 @@ def cmd_reclaim(args: argparse.Namespace) -> int:
 # selftest — VERIFY BY MUTATION, not by reading back what we wrote.            #
 # --------------------------------------------------------------------------- #
 
-# Inner script run INSIDE the pinned scope. It spawns a child, records the child's
-# allowed CPUs, attempts to ESCAPE the child onto an excluded core, re-reads, then
-# runs `count` busy spinners and reports which cores they actually executed on.
-# Everything is emitted as one JSON line on stdout for the parent to parse.
+# Inner script run inside the pinned scope. It directly attempts the forbidden
+# sched_setaffinity mutation and deterministically verifies every assigned core.
 _SELFTEST_INNER = r"""
 import json, os, subprocess, sys, time
 
 excluded = int(sys.argv[1])
-count = int(sys.argv[2])
+assigned = [int(value) for value in sys.argv[2].split(",") if value]
 
 def allowed_list(pid):
     with open(f"/proc/{pid}/status") as fh:
@@ -196,53 +220,83 @@ def allowed_list(pid):
     return ""
 
 # --- NEGATIVE: a child cannot be moved to an excluded core ---
-child = subprocess.Popen(["sleep", "5"])
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"])
 time.sleep(0.2)
 before = allowed_list(child.pid)
+mutation_attempted = True
+mutation_blocked = False
+mutation_error = ""
 try:
-    subprocess.run(["taskset", "-pc", str(excluded), str(child.pid)],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-except OSError:
-    pass
+    os.sched_setaffinity(child.pid, {excluded})
+except OSError as exc:
+    mutation_blocked = True
+    mutation_error = str(exc)
 after = allowed_list(child.pid)
 child.terminate()
+child.wait()
 
-# --- POSITIVE: spinners actually use the assigned cores (not inertly one) ---
-def spin_and_report():
-    end = time.time() + 0.4
-    x = 0
-    while time.time() < end:
-        x += 1
-    # field 39 (index 38) of /proc/self/stat is the last CPU this task ran on.
-    data = open(f"/proc/{os.getpid()}/stat").read()
-    rest = data[data.rfind(")") + 2:].split()
-    return int(rest[36])  # processor = field 39 -> index 36 after comm split
-
-procs = []
-for _ in range(count):
-    procs.append(subprocess.Popen(
-        [sys.executable, "-c",
-         "import time\nend=time.time()+0.4\nx=0\nwhile time.time()<end:\n x+=1"]))
-# read each spinner's processor while it runs
-used = set()
-time.sleep(0.15)
-for p in procs:
+# --- POSITIVE: every assigned CPU accepts an exact one-CPU affinity ---
+usable = []
+for core in assigned:
     try:
-        data = open(f"/proc/{p.pid}/stat").read()
-        rest = data[data.rfind(")") + 2:].split()
-        used.add(int(rest[36]))
+        os.sched_setaffinity(0, {core})
+        if os.sched_getaffinity(0) == {core}:
+            usable.append(core)
     except OSError:
         pass
-for p in procs:
-    p.wait()
+restore_ok = False
+try:
+    os.sched_setaffinity(0, set(assigned))
+    restore_ok = os.sched_getaffinity(0) == set(assigned)
+except OSError:
+    pass
 
 print(json.dumps({
     "child_allowed_before": before,
     "child_allowed_after": after,
-    "escape_masked": before == after,
-    "positive_cores_used": sorted(used),
+    "mutation_attempted": mutation_attempted,
+    "mutation_blocked": mutation_blocked,
+    "mutation_error": mutation_error,
+    "positive_cores_usable": sorted(usable),
+    "restore_exact": restore_ok,
 }))
 """
+
+
+def _evaluate_probe(
+    cores: Sequence[int], excluded: int, inner: dict[str, object]
+) -> dict[str, object]:
+    """Convert inner mutation evidence into a fail-closed public verdict."""
+    attempted = inner.get("mutation_attempted") is True
+    blocked = inner.get("mutation_blocked") is True
+    unchanged = (
+        isinstance(inner.get("child_allowed_before"), str)
+        and inner.get("child_allowed_before") == inner.get("child_allowed_after")
+    )
+    usable_raw = inner.get("positive_cores_usable", [])
+    usable = (
+        sorted(int(core) for core in usable_raw)
+        if isinstance(usable_raw, list)
+        else []
+    )
+    wanted = sorted(int(core) for core in cores)
+    positive_ok = usable == wanted and inner.get("restore_exact") is True
+    negative_ok = attempted and blocked and unchanged
+    verdict = "HARD" if negative_ok and positive_ok else "SOFT_OR_INERT"
+    return {
+        "verdict": verdict,
+        "cores": list(cores),
+        "count": len(cores),
+        "excluded_core": excluded,
+        "mutation_attempted": attempted,
+        "mutation_blocked": blocked,
+        "negative_escape_masked": negative_ok,
+        "positive_cores_usable": usable,
+        # Retain the earlier public keys while strengthening their meaning.
+        "positive_cores_used": usable,
+        "positive_stayed_in_set": positive_ok,
+        "inner": inner,
+    }
 
 
 def _probe_hard_pin(cores: Sequence[int]) -> dict[str, object]:
@@ -258,10 +312,16 @@ def _probe_hard_pin(cores: Sequence[int]) -> dict[str, object]:
 
     argv = _scope_argv(
         cores,
-        [sys.executable, "-c", _SELFTEST_INNER, str(excluded), str(len(cores))],
+        [sys.executable, "-c", _SELFTEST_INNER, str(excluded), _cpulist(cores)],
     )
     try:
-        completed = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+            timeout=60,
+        )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"verdict": "ERROR", "reason": str(exc)}
 
@@ -281,28 +341,14 @@ def _probe_hard_pin(cores: Sequence[int]) -> dict[str, object]:
             "stderr": completed.stderr.strip(),
         }
 
-    escape_masked = bool(inner.get("escape_masked", False))
-    used_raw = inner.get("positive_cores_used", [])
-    used = [int(core) for core in used_raw] if isinstance(used_raw, list) else []
-    positive_ok = bool(used) and set(used).issubset(set(cores))
-    verdict = "HARD" if (escape_masked and positive_ok) else "SOFT_OR_INERT"
-    return {
-        "verdict": verdict,
-        "cores": list(cores),
-        "count": len(cores),
-        "excluded_core": excluded,
-        "negative_escape_masked": escape_masked,
-        "positive_cores_used": used,
-        "positive_stayed_in_set": positive_ok,
-        "inner": inner,
-    }
+    return _evaluate_probe(cores, excluded, inner)
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
     """``selftest``: reserve K cores, hard-pin a scope onto them, and MUTATE —
     try to escape a pinned child onto a K+1th (excluded) core. A HARD bound masks
-    the escape; a soft bound lets the child move. Also confirm (POSITIVE) the
-    spinners actually run on the assigned cores, not inertly stuck on one. Prints
+    the escape; a soft bound lets the child move. Also confirm that every assigned
+    core accepts an exact single-core affinity and the full set can be restored. Prints
     a verdict carrying ``{cores, count}`` and exits 0 iff the bound is HARD."""
     if not _systemd_run_available():
         print(
@@ -315,41 +361,61 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         )
         return 3
 
-    with reservation.reserve_cores(args.cores, tag="selftest", sample_s=args.sample_s) as cores:
-        result = _probe_hard_pin(cores)
-        print(json.dumps(result, indent=2))
-        verdict = result.get("verdict")
-        if verdict == "HARD":
-            return 0
-        return 1 if verdict == "SOFT_OR_INERT" else 3
+    try:
+        with reservation.reserve_cores(
+            args.cores, tag="selftest", sample_s=args.sample_s
+        ) as cores:
+            result = _probe_hard_pin(cores)
+            print(json.dumps(result, indent=2))
+            verdict = result.get("verdict")
+            if verdict == "HARD":
+                return 0
+            return 1 if verdict == "SOFT_OR_INERT" else 3
+    except (ValueError, reservation.InsufficientCoresError) as exc:
+        print(f"{PROG}: selftest: {exc}", file=sys.stderr)
+        return 3
 
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog=PROG,
+        allow_abbrev=False,
         description="Stateful cpuset allocator: reserve DISJOINT cores and HARD-pin "
         "a process tree to them (systemd AllowedCPUs). For benchmark isolation.",
     )
-    sub = p.add_subparsers(dest="command", metavar="<command>", required=True)
+    p.add_argument("--version", action="version", version=f"{PROG} {__version__}")
+    sub = p.add_subparsers(dest="command", metavar="<command>")
 
-    run_p = sub.add_parser("run", help="reserve K cores and run CMD's whole tree pinned to them")
-    run_p.add_argument("--cores", type=int, required=True, metavar="K", help="how many cores to reserve (allocator picks WHICH)")
+    run_p = sub.add_parser(
+        "run",
+        allow_abbrev=False,
+        help="reserve K cores and run CMD's whole tree pinned to them",
+    )
+    run_p.add_argument("--cores", type=_positive_int, required=True, metavar="K", help="how many cores to reserve (allocator picks WHICH)")
     run_p.add_argument("--tag", default="", help="label for this reservation (debugging)")
-    run_p.add_argument("--sample-s", type=float, default=0.3, help="/proc/stat idle-sampling window (s)")
+    run_p.add_argument("--sample-s", type=_nonnegative_finite_float, default=0.3, help="/proc/stat idle-sampling window (s)")
     run_p.add_argument("argv_rest", nargs=argparse.REMAINDER, metavar="-- CMD [ARGS...]", help="the command to run pinned")
     run_p.set_defaults(func=cmd_run)
 
-    st_p = sub.add_parser("status", help="print live held cores + reservations")
+    st_p = sub.add_parser(
+        "status", allow_abbrev=False, help="print live held cores + reservations"
+    )
     st_p.add_argument("--ledger", default="", help="override ledger path (default: $XDG_RUNTIME_DIR)")
     st_p.set_defaults(func=cmd_status)
 
-    rc_p = sub.add_parser("reclaim", help="sweep dead holders; print reclaimed records")
+    rc_p = sub.add_parser(
+        "reclaim", allow_abbrev=False, help="sweep dead holders; print reclaimed records"
+    )
     rc_p.add_argument("--ledger", default="", help="override ledger path")
     rc_p.set_defaults(func=cmd_reclaim)
 
-    stf_p = sub.add_parser("selftest", help="mutation self-test: is the pin HARD (inescapable)?")
-    stf_p.add_argument("--cores", type=int, default=2, metavar="K", help="cores to reserve for the test (>=2 exercises the positive multi-core check)")
-    stf_p.add_argument("--sample-s", type=float, default=0.3, help="/proc/stat idle-sampling window (s)")
+    stf_p = sub.add_parser(
+        "selftest",
+        allow_abbrev=False,
+        help="mutation self-test: is the pin HARD (inescapable)?",
+    )
+    stf_p.add_argument("--cores", type=_positive_int, default=2, metavar="K", help="cores to reserve for the test (>=2 exercises the positive multi-core check)")
+    stf_p.add_argument("--sample-s", type=_nonnegative_finite_float, default=0.3, help="/proc/stat idle-sampling window (s)")
     stf_p.set_defaults(func=cmd_selftest)
 
     return p
@@ -357,7 +423,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    actual = list(argv) if argv is not None else sys.argv[1:]
+    if not actual:
+        parser.print_help()
+        return 0
+    args = parser.parse_args(actual)
+    if not hasattr(args, "func"):
+        parser.print_help()
+        return 0
     func = args.func
     result = func(args)
     return int(result)

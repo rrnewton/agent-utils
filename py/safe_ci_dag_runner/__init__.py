@@ -87,15 +87,12 @@ from safe_ci_dag_runner.sizing import (
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
-__version__: str = "0.11.0"
+__version__: str = "0.12.0"
 
-#: Machine-readable manifest of the enforcement guards THIS engine implements, emitted verbatim by
-#: the ``capabilities`` subcommand. Each engine declares its own truth; the py-vs-rs differential
-#: asserts the two manifests are BYTE-IDENTICAL, so any enforcement guard present in one build but
-#: missing from the other is a cross-check failure (the recurrence guard for the historical
-#: Rust-vs-Python ``cpu_timeout`` gap). Keys are sorted; values reflect real behavior:
+#: Machine-readable manifest emitted by the ``capabilities`` subcommand. Keys are sorted;
+#: values describe the enforcement guards implemented by this package:
 #:   cpu_affinity  opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores
-#:                 (cgroup cpuset where delegated, else sched_setaffinity; verified + logged)
+#:                 with an exact, verified cgroup cpuset; refuse when unavailable
 #:   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
 #:   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
 #:   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
@@ -103,7 +100,6 @@ __version__: str = "0.11.0"
 #:   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
 #: The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
 #: anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
-#: MUST stay byte-identical to Rust's ``ENFORCEMENT_CAPABILITIES`` (lib.rs).
 ENFORCEMENT_CAPABILITIES: str = (
     '{"cpu_affinity":true,"cpu_timeout":true,"memory_max":true,"oom_detection":true,'
     '"pids_guard":false,"wall_timeout":true}'

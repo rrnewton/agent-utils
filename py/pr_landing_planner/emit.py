@@ -2,12 +2,9 @@
 
 * ``human``   — a readable landing summary (the ``pr_status`` + ``pr_conflict_graph`` views fused).
 * ``json``    — the machine-facing schema (deterministic: 2-space indent, sorted keys).
-* ``actions`` — tick-hub-style line output: a block of bare ``key=value`` summary counts (so a
-  tick-hub reminder's ``capture: true`` gate can lift ``land_now`` / ``stale_gates`` / ``outage``
-  into its emitted line), then loud diagnostic ``ERROR:`` / ``NOTE:`` lines, then one
-  ``ACTION:`` / ``ERROR:`` / ``NOTE:`` line per PR in the recommended order. A coordinator parses the
-  per-PR lines by their leading token; tick-hub captures the summary block. Diagnostics
-  (outage / race / stale-gate) map to LOUD lines (No Silent Failure).
+* ``actions`` — a block of bare ``key=value`` summary counts, then diagnostic ``ERROR:`` / ``NOTE:``
+  lines and one ``ACTION:`` / ``ERROR:`` / ``NOTE:`` line per PR in the recommended order. A
+  coordinator parses per-PR lines by their leading token.
 """
 
 from __future__ import annotations
@@ -31,21 +28,16 @@ from pr_landing_planner.model import (
 #: A colorizer: ``(style_name, text) -> styled_text``. The default (identity) leaves text plain.
 ColorFn = Callable[[str, str], str]
 
-#: Why clustering saves *validate runs*, not just rebases. The locally-validated / clean-validate
-#: record is keyed to the exact head SHA, so a rebase (which changes the head) INVALIDATES it and
-#: forces a fresh validate run. Serial draining rebases every queued PR onto the moved base, so N
-#: serial rebases invalidate N SHA-keyed validate records — self-defeating, because each land
-#: destroys the validation evidence of everything queued behind it. Landing each real-conflict
-#: cluster as ONE stack collapses that to one rebase and one validate per cluster, so the rebases
-#: clustering avoids are ALSO validate runs it avoids (1:1). Single source: reused by every renderer.
+#: Why clustering saves *validate runs*, not just rebases. A clean validation record is keyed to the
+#: exact head and base SHAs. Landing moves the base and rebasing also changes the head, so serial
+#: draining invalidates queued evidence at every step. Landing a real-conflict cluster as one stack
+#: collapses that to one rebase and validation per cluster. Single source: reused by every renderer.
 VALIDATE_ECONOMICS_RATIONALE = (
-    "The locally-validated / clean-validate record is keyed to the exact head SHA, so a rebase "
-    "changes the head and INVALIDATES the record — forcing a fresh validate run. Serial draining "
-    "rebases every queued PR onto the moved base, so N serial rebases invalidate N SHA-keyed "
-    "validate records (self-defeating: each land destroys the validation evidence of everything "
-    "queued behind it). Landing each real-conflict cluster as ONE stack collapses that to one "
-    "rebase and one validate per cluster, so clustering avoids the same count of rebases AND "
-    "validate runs."
+    "The clean-validate record is keyed to the exact head and base SHAs. Landing moves the base, "
+    "and rebasing also changes the head, so serial draining invalidates queued validation evidence "
+    "at every step (self-defeating). Landing each real-conflict cluster as ONE stack collapses that "
+    "to one rebase and one validate per cluster, so clustering avoids the same count of rebases "
+    "AND validate runs."
 )
 
 
@@ -55,7 +47,7 @@ def _rebase_economics(clusters: Sequence[Cluster]) -> dict[str, object]:
     :data:`VALIDATE_ECONOMICS_RATIONALE`). Pure; deterministic."""
     saved = rebases_avoided(clusters)
     return {
-        "validate_record_keyed_to": "head_sha",
+        "validate_record_keyed_to": "head_sha+base_sha",
         "rebases_avoided_by_clustering": saved,
         # 1:1 with rebases: a rebase changes the head SHA, which invalidates that PR's validate record.
         "validate_runs_avoided_by_clustering": saved,
@@ -76,6 +68,7 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "title": node.title,
         "author": node.author,
         "head": node.head_sha,
+        "base_sha": node.base_sha,
         "base_ref": node.base_ref,
         "ci": node.ci.raw_state.value,
         "ci_detail": node.ci.detail,
@@ -89,6 +82,7 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "assigned_agent": node.assigned_agent or None,
         "validation_evidence": node.validation_evidence.value,
         "policy_class": node.policy_class.value,
+        "review_decision": node.review_decision or None,
     }
 
 
@@ -209,7 +203,7 @@ def _pr_action_line(decision: PrActionDecision, node: PrNode | None) -> str:
 
 
 def render_actions(result: PlanResult) -> str:
-    """Render tick-hub-style lines: a capturable summary block, diagnostics, then per-PR lines."""
+    """Render stable summary, diagnostics, and per-PR action lines."""
     by_number = {n.number: n for n in result.graph.nodes}
     lines: list[str] = [f"{key}={value}" for key, value in _summary_counts(result)]
 
@@ -218,12 +212,12 @@ def render_actions(result: PlanResult) -> str:
         prs = ",".join(str(n) for n in diag.outage_prs)
         lines.append(
             f"ERROR: ci-hosted-runner-outage-systemic prs={prs} "
-            f'detail={_quote(f"merge-gate job never ran on {len(diag.outage_prs)} PR(s) (ds-69ih3r)")}'
+            f'detail={_quote(f"merge-gate job never ran on {len(diag.outage_prs)} PR(s)")}'
         )
     for pr in diag.evaluate_once_race:
         lines.append(
             f"NOTE: evaluate-once-race pr={pr} "
-            "(benign gate noise; treat as pending, ds-xdc7m9)"
+            "(benign gate noise; treat as pending)"
         )
     for me in result.graph.mechanism_edges:
         lines.append(
@@ -336,7 +330,7 @@ def render_human(result: PlanResult, color: ColorFn | None = None) -> str:
     _append_diag(lines, "evaluate-once race (benign)", diag.evaluate_once_race)
     _append_diag(lines, "runner-outage", diag.outage_prs)
     if diag.outage_suspected:
-        lines.append(c("red", "  SYSTEMIC RUNNER OUTAGE SUSPECTED — escalate CI (ds-69ih3r)"))
+        lines.append(c("red", "  SYSTEMIC RUNNER OUTAGE SUSPECTED — escalate CI"))
 
     if result.held:
         lines.extend(["", c("bold", "Held PRs:")])
@@ -502,7 +496,7 @@ def render_status_human(
         ]
     )
     if result.diagnostics.outage_suspected:
-        lines.append(c("red", "  SYSTEMIC RUNNER OUTAGE SUSPECTED (ds-69ih3r)"))
+        lines.append(c("red", "  SYSTEMIC RUNNER OUTAGE SUSPECTED"))
     if len(nodes) > warn_threshold:
         lines.append(
             c("yellow", f"  WARNING: {len(nodes)} open PRs exceeds the {warn_threshold} threshold; "

@@ -1,42 +1,8 @@
-"""A constant-sized, MERGEABLE profile SUMMARY that closes the profiling feedback loop on
-EPHEMERAL CI.
+"""Bounded, mergeable summaries of execution profiles.
 
-The problem this solves
------------------------
-The profile store (:mod:`safe_ci_dag_runner.perflog`) auto-logs per-step resource-usage CSVs, and
-the planner (:mod:`safe_ci_dag_runner.estimates`) reads them back to refine each step's duration /
-memory / speedup estimates. That feedback loop is INERT on ephemeral CI: a fresh GitHub runner
-starts with an EMPTY store every run, writes its own CSV, uploads it, and nothing ever downloads
-the accumulated history back — so every run re-learns from zero.
-
-This module is the piece that closes the loop: a bounded, mergeable SUMMARY that a pluggable
-backend (:mod:`safe_ci_dag_runner.sync`) can UPLOAD at end-of-run and DOWNLOAD at start-of-run, so
-the planner is seeded with the whole fleet's history instead of a blank store.
-
-The design
-----------
-* **Bounded, not unbounded raw CSVs.** For each ``(step, inner_jobs)`` bucket the summary keeps a
-  RESERVOIR of up to :data:`DEFAULT_RESERVOIR_K` :class:`~safe_ci_dag_runner.estimates.Sample`
-  records — exactly the fields the estimator + speedup model consume (raw wall + contention, total
-  CPU-seconds, effective cores, throttled seconds, peak bytes). The number of buckets is bounded by
-  the workload structure (distinct steps × widths), and is additionally hard-capped at
-  :data:`DEFAULT_MAX_BUCKETS`, so a summary is genuinely CONSTANT-SIZED: merging N runs never grows
-  it past ``MAX_BUCKETS × RESERVOIR_K`` samples, independent of N.
-* **Deterministic, order-independent MERGE.** ``merge(a, b)`` unions the two summaries' reservoirs
-  per bucket and subsamples back to K by a CONTENT-derived stable order (sort by an FNV-1a hash of
-  each sample's canonical serialization, then take the first K) — NOT an RNG. That makes merge
-  **commutative and associative** and byte-identical across the Python and Rust builds, so two
-  runners merging the same contributions in any order reach the same summary.
-* **Recompute estimates FROM the reservoirs on read.** The planner's estimates are recomputed from
-  the summary's samples via the SAME estimator core the CSV reader uses
-  (:func:`~safe_ci_dag_runner.estimates.step_samples_from_buckets` /
-  :func:`~safe_ci_dag_runner.estimates.step_speedups_from_buckets`), so a summary that has not yet
-  subsampled a bucket yields byte-identical estimates to reading the raw rows.
-
-Cross-language parity (the correctness core): the canonical JSON serialization and the merge are
-byte-identical between the Python and Rust builds — every float is emitted as a fixed 3-decimal
-STRING (like the plan JSON) so parity never depends on float ``repr``, and the subsample hash is a
-hand-rolled FNV-1a over that canonical form. This is asserted by ``cross/differential.py``.
+Each step-width bucket retains a deterministic sample reservoir. Summary merging is
+commutative and associative, so distributed runs can accumulate useful planning history
+without an ever-growing raw profile store.
 """
 
 from __future__ import annotations
@@ -393,8 +359,7 @@ def _sample_from_obj(obj: object, where: str) -> Sample:
 
 
 def from_json(text: str) -> Summary:
-    """Parse a canonical summary document, narrowing strictly (no ``Any`` leaks, matching the Rust
-    reader) and rejecting an unknown ``version`` or a malformed shape (:class:`SummaryError`)."""
+    """Parse a summary strictly, rejecting unknown versions and malformed shapes."""
     try:
         raw: object = json.loads(text, parse_constant=_reject_json_constant)
     except json.JSONDecodeError as exc:

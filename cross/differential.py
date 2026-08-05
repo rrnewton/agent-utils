@@ -61,8 +61,10 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -166,13 +168,20 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
 def run(
     cmd: Sequence[str], args: Sequence[str], extra_env: Mapping[str, str] | None = None
 ) -> Outcome:
-    proc = subprocess.run(
-        [*cmd, *args],
-        capture_output=True,
-        text=True,
-        env=_env(extra_env),
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [*cmd, *args],
+            capture_output=True,
+            text=True,
+            env=_env(extra_env),
+            start_new_session=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+        return Outcome(124, stdout, stderr + "\nTIMEOUT after 120 seconds")
     return Outcome(proc.returncode, proc.stdout, proc.stderr)
 
 
@@ -1709,9 +1718,8 @@ INVOCATIONS: tuple[Invocation, ...] = (
     Invocation("version", ("--version",)),
     Invocation("help", ("--help",)),
     Invocation("noargs", ()),
-    # --userguide prints the EMBEDDED user guide. Both builds embed the SAME single source
-    # (common/docs/safe-ci-dag-runner/USER_GUIDE.md) verbatim, so — unlike quickstart/help, whose
-    # colored wording may differ — the guide bytes are guaranteed identical and ARE cross-checked.
+    # Each installed edition carries a standalone generated guide. Content isolation is checked
+    # separately; language-specific install/API fragments intentionally differ.
     Invocation("userguide", ("--userguide",)),
     # `capabilities` prints each engine's machine-readable enforcement manifest (which guards it
     # actually implements: cpu_timeout, memory_max, oom_detection, pids_guard, wall_timeout). The
@@ -1726,7 +1734,7 @@ INVOCATIONS: tuple[Invocation, ...] = (
 )
 
 #: Invocations whose stdout must be BYTE-IDENTICAL across builds (not just exit-code equal).
-_BYTE_IDENTICAL_INVOCATIONS = frozenset({"version", "userguide", "capabilities"})
+_BYTE_IDENTICAL_INVOCATIONS = frozenset({"version", "capabilities"})
 
 
 def compare_invocations(py: list[str], rs: list[str], rep: Report) -> None:
@@ -1744,12 +1752,255 @@ def compare_invocations(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok(f"invocation/{inv.name}")
 
 
-def compare(tool: str, rand_count: int, seed: int) -> int:
+def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
+    """Require both CLIs to expose the complete supported command/flag inventory.
+
+    Exit-code-only help checks historically allowed one implementation to omit whole features.
+    This semantic schema check is deliberately explicit: a one-sided command or flag is a parity
+    failure even when human-facing wrapping/wording differs.
+    """
+    command_flags: dict[str, tuple[str, ...]] = {
+        "run": (
+            "--dag", "--jobs", "--cores", "--cpuset", "--pin", "--max-mem", "--only",
+            "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
+            "--show-plan", "--no-profile-feedback", "--profile-sync",
+            "--profile-sync-direction", "--keep-going", "--allow-cgroup-failure",
+            "--unsafe-no-cgroups", "--small-default-cap", "--quiet",
+        ),
+        "sweep": (
+            "--dag", "--step", "--jobs", "--repeat", "--perf-dir", "--no-profile",
+            "--allow-cgroup-failure", "--unsafe-no-cgroups",
+        ),
+        "plan": ("--dag", "--planner", "--max-mem", "--format", "--perf-dir", "--no-profile-feedback"),
+        "pin-run": ("--cores", "--tag"),
+    }
+    top_commands = (
+        "run", "sweep", "plan", "list", "ascii", "dot", "json", "yaml", "summary",
+        "pin-run", "quickstart", "capabilities",
+    )
+    for engine, command in (("py", py), ("rs", rs)):
+        top = run(command, ("--help",))
+        missing_commands = [name for name in top_commands if name not in top.stdout]
+        if top.returncode != 0 or missing_commands:
+            rep.bad(
+                f"cli-schema:{engine}/commands",
+                f"exit={top.returncode}; missing commands={missing_commands}\n{top.stdout}",
+            )
+        else:
+            rep.ok(f"cli-schema:{engine}/commands")
+        for subcommand, flags in command_flags.items():
+            outcome = run(command, (subcommand, "--help"))
+            missing = [flag for flag in flags if flag not in outcome.stdout]
+            if outcome.returncode != 0 or missing:
+                rep.bad(
+                    f"cli-schema:{engine}/{subcommand}",
+                    f"exit={outcome.returncode}; missing flags={missing}\n{outcome.stdout}",
+                )
+            else:
+                rep.ok(f"cli-schema:{engine}/{subcommand}")
+    po = run(py, ("run", "--da", "missing.json"))
+    ro = run(rs, ("run", "--da", "missing.json"))
+    if po.returncode == ro.returncode == 2:
+        rep.ok("cli-schema:abbreviation-refused")
+    else:
+        rep.bad("cli-schema:abbreviation-refused", f"py={po.returncode}; rs={ro.returncode}")
+
+
+def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
+    """Cross-check the previously Python-only passthrough and stress surfaces."""
+    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-args-stress-") as td:
+        passthrough_path = os.path.join(td, "passthrough.json")
+        with open(passthrough_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "test",
+                            "job": "unit",
+                            "cmd": 'test "{args}" = "--case xyz"',
+                            "hint": {"hard_mem_max_bytes": 1},
+                        }
+                    ]
+                },
+                handle,
+            )
+        passthrough = (
+            "run", "--dag", passthrough_path, "--args=--case xyz", "--unsafe-no-cgroups",
+            "--no-profile", "-q",
+        )
+        po, ro = run(py, passthrough), run(rs, passthrough)
+        if po.returncode == ro.returncode == 0:
+            rep.ok("args:substitution")
+        else:
+            rep.bad(
+                "args:substitution",
+                f"expected both 0; py={po.returncode} rs={ro.returncode}\npy:{po.stderr}\nrs:{ro.stderr}",
+            )
+
+        invalid_path = os.path.join(td, "no-placeholder.json")
+        with open(invalid_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "test",
+                            "job": "unit",
+                            "cmd": "true",
+                            "hint": {"hard_mem_max_bytes": 1},
+                        }
+                    ]
+                },
+                handle,
+            )
+        invalid = (
+            "run", "--dag", invalid_path, "--args=x", "--unsafe-no-cgroups", "--no-profile", "-q",
+        )
+        po, ro = run(py, invalid), run(rs, invalid)
+        if po.returncode == ro.returncode == 2 and "no selected step declares" in po.stderr and "no selected step declares" in ro.stderr:
+            rep.ok("args:undeclared-refused")
+        else:
+            rep.bad("args:undeclared-refused", f"py={po}\nrs={ro}")
+
+        stress = (
+            "run", "--dag", invalid_path, "--stress", "3", "--unsafe-no-cgroups",
+            "--no-profile", "-q",
+        )
+        po, ro = run(py, stress), run(rs, stress)
+        # Parallel completion lines are intentionally nondeterministic. Compare only the stable
+        # report block instead of requiring the scheduler trace to finish in the same order.
+        def stress_report(stdout: str) -> str:
+            lines = stdout.splitlines()
+            start = next(
+                (index for index, line in enumerate(lines) if line.startswith("stress results (")),
+                len(lines),
+            )
+            return "\n".join(lines[start:])
+
+        py_report, rs_report = stress_report(po.stdout), stress_report(ro.stdout)
+        if (
+            po.returncode == ro.returncode == 0
+            and py_report == rs_report
+            and "3/3 passed" in py_report
+        ):
+            rep.ok("stress:three-pass-ratio")
+        else:
+            rep.bad(
+                "stress:three-pass-ratio",
+                f"py={po.returncode}:{py_report!r}\nrs={ro.returncode}:{rs_report!r}",
+            )
+
+        invalid_stress = (
+            "run", "--dag", invalid_path, "--stress", "0", "--unsafe-no-cgroups", "--no-profile",
+        )
+        po, ro = run(py, invalid_stress), run(rs, invalid_stress)
+        if po.returncode == ro.returncode == 2 and "must be >= 1" in po.stderr and "must be >= 1" in ro.stderr:
+            rep.ok("stress:nonpositive-refused")
+        else:
+            rep.bad("stress:nonpositive-refused", f"py={po}\nrs={ro}")
+
+        oversized_stress = (
+            "run",
+            "--dag",
+            invalid_path,
+            "--stress",
+            "1000000",
+            "--unsafe-no-cgroups",
+            "--no-profile",
+        )
+        po, ro = run(py, oversized_stress), run(rs, oversized_stress)
+        if (
+            po.returncode == ro.returncode == 2
+            and "REFUSED" in po.stderr
+            and "REFUSED" in ro.stderr
+        ):
+            rep.ok("stress:memory-floor-refuses-oversized-fanout")
+        else:
+            rep.bad("stress:memory-floor-refuses-oversized-fanout", f"py={po}\nrs={ro}")
+
+        hard_cores = (
+            "run",
+            "--dag",
+            invalid_path,
+            "--cores",
+            "1",
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "-q",
+        )
+        ledger = {"SAFE_CI_CORE_LEDGER": os.path.join(td, "hard-refusal-ledger.json")}
+        po, ro = run(py, hard_cores, ledger), run(rs, hard_cores, ledger)
+        if (
+            po.returncode == ro.returncode == 3
+            and "hard cgroup cpuset unavailable; refusing to run" in po.stderr
+            and "hard cgroup cpuset unavailable; refusing to run" in ro.stderr
+        ):
+            rep.ok("cores:unboxed-soft-affinity-refused")
+        else:
+            rep.bad("cores:unboxed-soft-affinity-refused", f"py={po}\nrs={ro}")
+
+
+def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
+    """Exercise shared reservation semantics through the paired safe-runner wrapper."""
+    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-pin-") as td:
+        extra = {"SAFE_CI_CORE_LEDGER": os.path.join(td, "ledger.json")}
+        missing = ("pin-run", "--cores", "1")
+        po, ro = run(py, missing, extra), run(rs, missing, extra)
+        if po.returncode == ro.returncode == 2:
+            rep.ok("pin-run:missing-command")
+        else:
+            rep.bad("pin-run:missing-command", f"py={po}\nrs={ro}")
+        invalid = ("pin-run", "--cores", "0", "--", "true")
+        po, ro = run(py, invalid, extra), run(rs, invalid, extra)
+        if po.returncode == ro.returncode == 2 and "must be >= 1" in po.stderr and "must be >= 1" in ro.stderr:
+            rep.ok("pin-run:nonpositive-refused")
+        else:
+            rep.bad("pin-run:nonpositive-refused", f"py={po}\nrs={ro}")
+        valid = ("pin-run", "--cores", "1", "--", "true")
+        po, ro = run(py, valid, extra), run(rs, valid, extra)
+        if po.returncode == ro.returncode == 0:
+            rep.ok("pin-run:reserve-apply-release")
+        elif po.returncode == ro.returncode == 3 and "HARD" in po.stderr and "HARD" in ro.stderr:
+            rep.ok("pin-run:hard-capability-unavailable-refused")
+        else:
+            rep.bad(
+                "pin-run:reserve-apply-release",
+                f"expected both 0; py={po.returncode} rs={ro.returncode}\npy:{po.stderr}\nrs:{ro.stderr}",
+            )
+
+        missing_exec = ("pin-run", "--cores", "1", "--", "/definitely/missing/command")
+        po, ro = run(py, missing_exec, extra), run(rs, missing_exec, extra)
+        if po.returncode == ro.returncode == 3 and "Traceback" not in po.stderr and "panicked" not in ro.stderr:
+            rep.ok("pin-run:missing-executable-clean")
+        else:
+            rep.bad("pin-run:missing-executable-clean", f"py={po}\nrs={ro}")
+
+        signaled = (
+            "pin-run",
+            "--cores",
+            "1",
+            "--",
+            sys.executable,
+            "-c",
+            "import os; os.kill(os.getpid(), 15)",
+        )
+        po, ro = run(py, signaled, extra), run(rs, signaled, extra)
+        if po.returncode == ro.returncode == 143:
+            rep.ok("pin-run:signal-status")
+        elif po.returncode == ro.returncode == 3 and "HARD" in po.stderr and "HARD" in ro.stderr:
+            rep.ok("pin-run:signal-status-hard-capability-unavailable")
+        else:
+            rep.bad("pin-run:signal-status", f"py={po}\nrs={ro}")
+
+
+def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
+    tool = "safe-ci-dag-runner"
     py = py_command()
     rs = rs_command(tool)
     rep = Report()
 
     compare_invocations(py, rs, rep)
+    compare_package_guides(tool, py, rs, rep)
+    compare_cli_schema(py, rs, rep)
     fixtures = representative_fixtures() + randomized_fixtures(rand_count, seed)
     for fx in fixtures:
         compare_fixture(py, rs, fx, rep)
@@ -1766,6 +2017,8 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     compare_cpa_planner(py, rs, rep)
     compare_summary_sync(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
+    compare_args_stress(py, rs, rep)
+    compare_pin_run(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)
 
@@ -1789,16 +2042,1279 @@ def compare(tool: str, rand_count: int, seed: int) -> int:
     return 0
 
 
+def py_command_for(tool: str) -> list[str]:
+    modules = {
+        "safe-ci-dag-runner": "safe_ci_dag_runner",
+        "cpuset-alloc": "safe_ci_dag_runner.cpuset_allocator",
+        "tick-hub": "tick_hub",
+        "pr-landing-planner": "pr_landing_planner",
+    }
+    module = modules.get(tool)
+    if module is None:
+        raise ValueError(f"unknown Python tool {tool!r}")
+    return [sys.executable, "-m", module]
+
+
+def _record_exact(
+    rep: Report,
+    label: str,
+    py: Sequence[str],
+    rs: Sequence[str],
+    args: Sequence[str],
+    extra_env: Mapping[str, str] | None = None,
+    *,
+    expected: int | None = None,
+    compare_stderr: bool = False,
+) -> tuple[Outcome, Outcome]:
+    po = run(py, args, extra_env)
+    ro = run(rs, args, extra_env)
+    if po.returncode != ro.returncode:
+        rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}\npy:{po.stderr}\nrs:{ro.stderr}")
+    elif expected is not None and po.returncode != expected:
+        rep.bad(label, f"expected exit {expected}; both returned {po.returncode}")
+    elif po.stdout != ro.stdout:
+        rep.bad(label, f"stdout differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}")
+    elif compare_stderr and po.stderr != ro.stderr:
+        rep.bad(label, f"stderr differs\n--- py ---\n{po.stderr}\n--- rs ---\n{ro.stderr}")
+    else:
+        rep.ok(label)
+    return po, ro
+
+
+def _record_same_exit(
+    rep: Report,
+    label: str,
+    py: Sequence[str],
+    rs: Sequence[str],
+    args: Sequence[str],
+    expected: int | None = None,
+) -> tuple[Outcome, Outcome]:
+    po = run(py, args)
+    ro = run(rs, args)
+    if po.returncode != ro.returncode:
+        rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}\npy:{po.stderr}\nrs:{ro.stderr}")
+    elif expected is not None and po.returncode != expected:
+        rep.bad(label, f"expected exit {expected}; both returned {po.returncode}")
+    else:
+        rep.ok(label)
+    return po, ro
+
+
+def _parsed_json(text_value: str) -> tuple[bool, object]:
+    try:
+        value: object = json.loads(text_value)
+    except json.JSONDecodeError as exc:
+        return False, str(exc)
+    return True, value
+
+
+def compare_package_guides(
+    tool: str, py: Sequence[str], rs: Sequence[str], rep: Report
+) -> None:
+    """Installed guides may contain language-specific install/API sections, but never leak the
+    other distribution's package manager or language."""
+    pairs = (
+        ("py", py, ("cargo", "crates.io", "rust api", "rs/")),
+        ("rs", rs, ("pip install", "pypi", "python api", "py/")),
+    )
+    for language, command, forbidden in pairs:
+        outcome = run(command, ("--userguide",))
+        lowered = outcome.stdout.lower()
+        leaks = [token for token in forbidden if token in lowered]
+        if outcome.returncode != 0:
+            rep.bad(f"guide:{language}", f"exit={outcome.returncode}: {outcome.stderr}")
+        elif tool not in lowered or len(outcome.stdout) < 500:
+            rep.bad(f"guide:{language}", "guide is missing, truncated, or for the wrong tool")
+        elif leaks:
+            rep.bad(f"guide:{language}", f"cross-language/package-manager references: {leaks}")
+        else:
+            rep.ok(f"guide:{language}")
+
+
+def compare_cpuset_alloc() -> int:
+    tool = "cpuset-alloc"
+    py = py_command_for(tool)
+    rs = rs_command(tool)
+    rep = Report()
+
+    _record_exact(rep, "version", py, rs, ("--version",))
+    for args, required in (
+        ((), ("run", "status", "reclaim", "selftest")),
+        (("--help",), ("run", "status", "reclaim", "selftest")),
+        (("run", "--help"), ("--cores", "--tag", "--sample-s")),
+        (("status", "--help"), ("--ledger",)),
+        (("reclaim", "--help"), ("--ledger",)),
+        (("selftest", "--help"), ("--cores", "--sample-s")),
+    ):
+        for engine, command in (("py", py), ("rs", rs)):
+            outcome = run(command, args)
+            missing = [token for token in required if token not in outcome.stdout]
+            if outcome.returncode != 0 or missing:
+                rep.bad(
+                    f"schema:{engine}/{' '.join(args) or 'no-args'}",
+                    f"exit={outcome.returncode}; missing={missing}\n{outcome.stdout}\n{outcome.stderr}",
+                )
+            else:
+                rep.ok(f"schema:{engine}/{' '.join(args) or 'no-args'}")
+
+    with tempfile.TemporaryDirectory(prefix="cpuset-cross-") as tmp:
+        py_ledger = os.path.join(tmp, "py.json")
+        rs_ledger = os.path.join(tmp, "rs.json")
+        for subcommand in ("status", "reclaim"):
+            po = run(py, (subcommand, "--ledger", py_ledger))
+            ro = run(rs, (subcommand, "--ledger", rs_ledger))
+            p_ok, p_value = _parsed_json(po.stdout)
+            r_ok, r_value = _parsed_json(ro.stdout)
+            if po.returncode == ro.returncode == 0 and p_ok and r_ok and p_value == r_value:
+                rep.ok(f"{subcommand}:empty-ledger")
+            else:
+                rep.bad(
+                    f"{subcommand}:empty-ledger",
+                    f"py={po.returncode}:{p_value!r}; rs={ro.returncode}:{r_value!r}",
+                )
+
+        # A parent-owned record is live from both child processes' perspective.
+        stat_text = open(f"/proc/{os.getpid()}/stat", encoding="utf-8").read()
+        starttime = int(stat_text[stat_text.rfind(")") + 2 :].split()[19])
+        live_payload = {
+            "reservations": [
+                {
+                    "pid": os.getpid(),
+                    "starttime": starttime,
+                    "cores": [7, 3],
+                    "tag": "cross-live",
+                    "ts": 1.25,
+                }
+            ]
+        }
+        for path in (py_ledger, rs_ledger):
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(live_payload, handle)
+        po = run(py, ("status", "--ledger", py_ledger))
+        ro = run(rs, ("status", "--ledger", rs_ledger))
+        p_ok, p_value = _parsed_json(po.stdout)
+        r_ok, r_value = _parsed_json(ro.stdout)
+        if po.returncode == ro.returncode == 0 and p_ok and r_ok and p_value == r_value:
+            rep.ok("status:live-shared-schema")
+        else:
+            rep.bad("status:live-shared-schema", f"py={p_value!r}; rs={r_value!r}")
+
+        dead_payload = {
+            "reservations": [
+                {"pid": 2147483647, "starttime": 1, "cores": [5], "tag": "dead", "ts": 2.5}
+            ]
+        }
+        for path in (py_ledger, rs_ledger):
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(dead_payload, handle)
+        po = run(py, ("reclaim", "--ledger", py_ledger))
+        ro = run(rs, ("reclaim", "--ledger", rs_ledger))
+        p_ok, p_value = _parsed_json(po.stdout)
+        r_ok, r_value = _parsed_json(ro.stdout)
+        if po.returncode == ro.returncode == 0 and p_ok and r_ok and p_value == r_value:
+            rep.ok("reclaim:dead-shared-schema")
+        else:
+            rep.bad("reclaim:dead-shared-schema", f"py={p_value!r}; rs={r_value!r}")
+
+        # Each implementation must be able to observe the other's LIVE reservation, choose a
+        # disjoint core, and leave the shared ledger empty after both wrapped commands exit.
+        if len(os.sched_getaffinity(0)) >= 2:
+            assignment_re = re.compile(r'reserved (\{"cores":\[[^]]*\],"count":\d+\})')
+
+            def reserved_cores(stderr: str) -> set[int] | None:
+                match = assignment_re.search(stderr)
+                if match is None:
+                    return None
+                value: object = json.loads(match.group(1))
+                if not isinstance(value, dict):
+                    return None
+                cores = value.get("cores")
+                if not isinstance(cores, list) or not all(
+                    isinstance(core, int) and not isinstance(core, bool) for core in cores
+                ):
+                    return None
+                return set(cores)
+
+            for label, first, second in (
+                ("py-then-rs", py, rs),
+                ("rs-then-py", rs, py),
+            ):
+                shared_ledger = os.path.join(tmp, f"interop-{label}.json")
+                extra = {"SAFE_CI_CORE_LEDGER": shared_ledger}
+                hold = (
+                    "run",
+                    "--cores",
+                    "1",
+                    "--tag",
+                    label,
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(2)",
+                )
+                first_proc = subprocess.Popen(
+                    [*first, *hold],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=_env(extra),
+                    start_new_session=True,
+                )
+                deadline = time.monotonic() + 10
+                while first_proc.poll() is None and time.monotonic() < deadline:
+                    try:
+                        payload = json.loads(Path(shared_ledger).read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        payload = {}
+                    if isinstance(payload, dict) and payload.get("reservations"):
+                        break
+                    time.sleep(0.02)
+                second_outcome = run(second, hold, extra)
+                try:
+                    first_stdout, first_stderr = first_proc.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    first_proc.kill()
+                    first_stdout, first_stderr = first_proc.communicate()
+                first_outcome = Outcome(
+                    first_proc.returncode or 0,
+                    first_stdout,
+                    first_stderr,
+                )
+                if first_outcome.returncode == second_outcome.returncode == 0:
+                    try:
+                        first_cores = reserved_cores(first_outcome.stderr)
+                        second_cores = reserved_cores(second_outcome.stderr)
+                        final_payload: object = json.loads(
+                            Path(shared_ledger).read_text(encoding="utf-8")
+                        )
+                    except (OSError, TypeError, json.JSONDecodeError):
+                        rep.bad(
+                            f"interop:{label}",
+                            f"could not parse assignments/ledger\nfirst={first_outcome}\n"
+                            f"second={second_outcome}",
+                        )
+                    else:
+                        if (
+                            first_cores is not None
+                            and second_cores is not None
+                            and first_cores
+                            and second_cores
+                            and first_cores.isdisjoint(second_cores)
+                            and final_payload == {"reservations": []}
+                        ):
+                            rep.ok(f"interop:{label}")
+                        else:
+                            rep.bad(
+                                f"interop:{label}",
+                                f"first={first_cores}; second={second_cores}; "
+                                f"final={final_payload!r}",
+                            )
+                elif (
+                    first_outcome.returncode == second_outcome.returncode == 3
+                    and "HARD" in first_outcome.stderr
+                    and "HARD" in second_outcome.stderr
+                ):
+                    rep.ok(f"interop:{label}:hard-capability-unavailable")
+                else:
+                    rep.bad(
+                        f"interop:{label}",
+                        f"first={first_outcome}\nsecond={second_outcome}",
+                    )
+
+    _record_same_exit(rep, "run:missing-command", py, rs, ("run", "--cores", "1"), 2)
+    _record_same_exit(
+        rep,
+        "run:separator-required",
+        py,
+        rs,
+        ("run", "--cores", "1", "true"),
+        2,
+    )
+    invalid_invocations: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("run:nonpositive-cores", ("run", "--cores", "0", "--", "true")),
+        (
+            "run:negative-sample",
+            ("run", "--cores", "1", "--sample-s", "-1", "--", "true"),
+        ),
+        (
+            "run:nonfinite-sample",
+            ("run", "--cores", "1", "--sample-s", "nan", "--", "true"),
+        ),
+        ("selftest:tag-rejected", ("selftest", "--tag", "x")),
+    )
+    for label, invalid_args in invalid_invocations:
+        _record_same_exit(rep, label, py, rs, invalid_args, 2)
+
+    # A wrapped command's own help flag belongs to that command, not the allocator.
+    help_args = ("run", "--cores", "1", "--", "printf", "%s\\n", "--help")
+    po, ro = run(py, help_args), run(rs, help_args)
+    if (
+        po.returncode == ro.returncode == 0
+        and po.stdout.endswith("--help\n")
+        and ro.stdout.endswith("--help\n")
+    ):
+        rep.ok("run:wrapped-help-passthrough")
+    elif (
+        po.returncode == ro.returncode == 3
+        and "HARD" in po.stderr
+        and "HARD" in ro.stderr
+    ):
+        rep.ok("run:wrapped-help-hard-capability-unavailable")
+    else:
+        rep.bad("run:wrapped-help-passthrough", f"py={po}\nrs={ro}")
+
+    missing_exec = ("run", "--cores", "1", "--", "/definitely/missing/command")
+    po, ro = run(py, missing_exec), run(rs, missing_exec)
+    if (
+        po.returncode == ro.returncode == 3
+        and "Traceback" not in po.stderr
+        and "panicked" not in ro.stderr
+    ):
+        rep.ok("run:missing-executable-clean")
+    else:
+        rep.bad("run:missing-executable-clean", f"py={po}\nrs={ro}")
+
+    signaled = (
+        "run",
+        "--cores",
+        "1",
+        "--",
+        sys.executable,
+        "-c",
+        "import os; os.kill(os.getpid(), 15)",
+    )
+    po, ro = run(py, signaled), run(rs, signaled)
+    if po.returncode == ro.returncode == 143:
+        rep.ok("run:signal-status")
+    elif po.returncode == ro.returncode == 3 and "HARD" in po.stderr and "HARD" in ro.stderr:
+        rep.ok("run:signal-status-hard-capability-unavailable")
+    else:
+        rep.bad("run:signal-status", f"py={po}\nrs={ro}")
+    _record_same_exit(rep, "cli:abbreviation-refused", py, rs, ("status", "--ledg", "x"), 2)
+    _record_same_exit(rep, "unknown-command", py, rs, ("not-a-command",), 2)
+
+    if rep.failures:
+        for failure in rep.failures:
+            print(f"DIVERGENCE [{failure}]")
+        print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
+        return 1
+    print(f"cross[{tool}]: OK - {rep.checks} behavioral and ledger-schema checks agree")
+    return 0
+
+
+def compare_tick_hub(rand_count: int, seed: int) -> int:
+    tool = "tick-hub"
+    py = py_command_for(tool)
+    rs = rs_command(tool)
+    rep = Report()
+
+    _record_exact(rep, "version", py, rs, ("--version",))
+    compare_package_guides(tool, py, rs, rep)
+    for engine, command in (("py", py), ("rs", rs)):
+        top = run(command, ("--help",))
+        required = ("tick", "state", "list", "json", "yaml", "quickstart", "--userguide")
+        missing = [token for token in required if token not in top.stdout]
+        if top.returncode != 0 or missing:
+            rep.bad(f"schema:{engine}/commands", f"exit={top.returncode}; missing={missing}")
+        else:
+            rep.ok(f"schema:{engine}/commands")
+        command_flags = {
+            "tick": (
+                "--config",
+                "--state",
+                "--fired-state",
+                "--now",
+                "--current-tick-min",
+                "--flush",
+                "--no-header",
+            ),
+            "state": ("--state", "--current-tick-min"),
+            "list": ("--config",),
+            "json": ("--config",),
+            "yaml": ("--config",),
+        }
+        for subcommand, flags in command_flags.items():
+            outcome = run(command, (subcommand, "--help"))
+            absent = [flag for flag in flags if flag not in outcome.stdout]
+            if outcome.returncode != 0 or absent:
+                rep.bad(
+                    f"schema:{engine}/{subcommand}",
+                    f"exit={outcome.returncode}; missing={absent}\n{outcome.stdout}",
+                )
+            else:
+                rep.ok(f"schema:{engine}/{subcommand}")
+
+    with tempfile.TemporaryDirectory(prefix="tick-hub-cross-") as tmp:
+        watched = os.path.join(tmp, "snapshot.dat")
+        with open(watched, "w", encoding="utf-8") as handle:
+            handle.write("snapshot\n")
+        os.utime(watched, (800, 800))
+        config: dict[str, object] = {
+            "description": "cross-check unicode \u2603",
+            "reminders": [
+                {
+                    "name": "always",
+                    "cadence_secs": 0,
+                    "emit": {
+                        "kind": "action",
+                        "skill": "refresh-cache",
+                        "fields": {"z": "last", "a": "first"},
+                        "title": "refresh {a} {z}",
+                    },
+                },
+                {
+                    "name": "gated",
+                    "cadence_secs": 60,
+                    "gate": {
+                        "cmd": "printf 'count=3\\n'",
+                        "when": "nonempty",
+                        "capture": True,
+                    },
+                    "emit": {
+                        "kind": "action",
+                        "skill": "triage",
+                        "title": "triage {count}",
+                    },
+                },
+                {
+                    "name": "guarded",
+                    "requires_flags": ["ready"],
+                    "emit": {"kind": "note", "title": "guard is enabled"},
+                },
+                {
+                    "name": "not_due",
+                    "cadence_secs": 500,
+                    "emit": {"kind": "note", "title": "must stay quiet"},
+                },
+            ],
+            "health_checks": [
+                {
+                    "name": "snapshot",
+                    "glob": watched,
+                    "threshold_secs": 100,
+                    "detail": "fixture age",
+                },
+                {
+                    "name": "absent",
+                    "glob": os.path.join(tmp, "missing-*"),
+                    "threshold_secs": 1,
+                },
+            ],
+        }
+        json_path = os.path.join(tmp, "config.json")
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(config, handle, ensure_ascii=False)
+        state_path = os.path.join(tmp, "state.yaml")
+        with open(state_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "enabled: true\n"
+                "tick_frequency_min: 30\n"
+                "label: cross-host\n"
+                "flags: {ready: true, count: 2}\n"
+                "_annotation: ignored\n"
+            )
+        fired = "gated=900\nnot_due=900\n"
+        py_fired = os.path.join(tmp, "py-fired")
+        rs_fired = os.path.join(tmp, "rs-fired")
+        for path in (py_fired, rs_fired):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(fired)
+
+        for subcommand in ("json", "list"):
+            _record_exact(rep, f"representative:{subcommand}", py, rs, (subcommand, "--config", json_path))
+        _record_exact(
+            rep,
+            "representative:state",
+            py,
+            rs,
+            ("state", "--state", state_path, "--current-tick-min", "15"),
+        )
+        common_tick = (
+            "tick",
+            "--config",
+            json_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--no-header",
+        )
+        po = run(py, (*common_tick, "--fired-state", py_fired))
+        ro = run(rs, (*common_tick, "--fired-state", rs_fired))
+        if po.returncode == ro.returncode == 0 and po.stdout == ro.stdout:
+            rep.ok("representative:tick")
+        else:
+            rep.bad(
+                "representative:tick",
+                f"py={po.returncode}:{po.stdout!r}\nrs={ro.returncode}:{ro.stdout!r}",
+            )
+
+        po = run(py, (*common_tick, "--fired-state", py_fired, "--flush"))
+        ro = run(rs, (*common_tick, "--fired-state", rs_fired, "--flush"))
+        with open(py_fired, encoding="utf-8") as handle:
+            py_state = handle.read()
+        with open(rs_fired, encoding="utf-8") as handle:
+            rs_state = handle.read()
+        if po.returncode == ro.returncode == 0 and po.stdout == ro.stdout and py_state == rs_state:
+            rep.ok("representative:flush-bytes")
+        else:
+            rep.bad(
+                "representative:flush-bytes",
+                f"exit py={po.returncode} rs={ro.returncode}; stdout_equal={po.stdout == ro.stdout}; "
+                f"state py={py_state!r} rs={rs_state!r}",
+            )
+
+        py_yaml = run(py, ("yaml", "--config", json_path))
+        rs_yaml = run(rs, ("yaml", "--config", json_path))
+        py_yaml_path = os.path.join(tmp, "py.yaml")
+        rs_yaml_path = os.path.join(tmp, "rs.yaml")
+        with open(py_yaml_path, "w", encoding="utf-8") as handle:
+            handle.write(py_yaml.stdout)
+        with open(rs_yaml_path, "w", encoding="utf-8") as handle:
+            handle.write(rs_yaml.stdout)
+        py_roundtrip = run(py, ("json", "--config", py_yaml_path))
+        rs_from_py = run(rs, ("json", "--config", py_yaml_path))
+        py_from_rs = run(py, ("json", "--config", rs_yaml_path))
+        rs_roundtrip = run(rs, ("json", "--config", rs_yaml_path))
+        canonical = run(py, ("json", "--config", json_path)).stdout
+        outputs = (
+            py_roundtrip.stdout,
+            rs_from_py.stdout,
+            py_from_rs.stdout,
+            rs_roundtrip.stdout,
+        )
+        if (
+            py_yaml.returncode == rs_yaml.returncode == 0
+            and all(outcome == canonical for outcome in outputs)
+        ):
+            rep.ok("yaml:bidirectional-isomorphism")
+        else:
+            rep.bad("yaml:bidirectional-isomorphism", "YAML emit/load did not preserve canonical JSON")
+
+        invalid_docs: tuple[tuple[str, str], ...] = (
+            ("unknown.json", '{"unknown": true}'),
+            ("null-list.json", '{"reminders": null}'),
+            (
+                "duplicate-name.json",
+                '{"reminders":[{"name":"r","emit":{"skill":"s"}},{"name":"r","emit":{"skill":"s"}}]}',
+            ),
+            (
+                "duplicate-key.json",
+                '{"reminders":[],"reminders":[]}',
+            ),
+            (
+                "reserved.json",
+                '{"reminders":[{"name":"r","emit":{"skill":"s","fields":{"<<":"x"}}}]}',
+            ),
+            (
+                "negative.json",
+                '{"reminders":[{"name":"r","cadence_secs":-1,"emit":{"skill":"s"}}]}',
+            ),
+            (
+                "overflow.json",
+                '{"reminders":[{"name":"r","cadence_secs":9223372036854775808,"emit":{"skill":"s"}}]}',
+            ),
+            ("duplicate.yaml", "reminders: []\nreminders: []\n"),
+            ("non-string.yaml", "1: value\nreminders: []\n"),
+            ("merge.yaml", "base: &b {description: x}\n<<: *b\nreminders: []\n"),
+            (
+                "nonfinite.yaml",
+                "reminders:\n  - {name: r, gate: .nan, emit: {skill: s}}\n",
+            ),
+        )
+        for name, body in invalid_docs:
+            path = os.path.join(tmp, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            _record_same_exit(rep, f"reject:{name}", py, rs, ("json", "--config", path), 2)
+
+        for value in ("9223372036854775808", "-9223372036854775809"):
+            _record_same_exit(
+                rep,
+                f"cli-i64:{value}",
+                py,
+                rs,
+                ("tick", "--config", json_path, "--now", value),
+                2,
+            )
+        _record_same_exit(
+            rep,
+            "cli-domain:negative-now",
+            py,
+            rs,
+            ("tick", "--config", json_path, "--now", "-1"),
+            2,
+        )
+        _record_same_exit(
+            rep,
+            "cli-domain:zero-current-cadence",
+            py,
+            rs,
+            ("tick", "--config", json_path, "--current-tick-min", "0"),
+            2,
+        )
+        _record_same_exit(
+            rep,
+            "cli:abbreviation-refused",
+            py,
+            rs,
+            ("tick", "--conf", json_path, "--now", "0"),
+            2,
+        )
+        for hostile_integer in ("1_0", " 10", "١٠"):
+            _record_same_exit(
+                rep,
+                f"cli:integer-syntax:{hostile_integer!r}",
+                py,
+                rs,
+                ("tick", "--config", json_path, f"--now={hostile_integer}"),
+                2,
+            )
+
+        rng = random.Random(seed)
+        for index in range(rand_count):
+            reminders: list[object] = []
+            for reminder_index in range(rng.randint(0, 6)):
+                kind = "action" if rng.random() < 0.7 else "note"
+                emit: dict[str, object] = {
+                    "kind": kind,
+                    "title": f"random {index}:{reminder_index} \u2603",
+                }
+                if kind == "action":
+                    emit["skill"] = f"handler-{reminder_index}"
+                    emit["fields"] = {"iteration": str(index)}
+                reminders.append(
+                    {
+                        "name": f"r{reminder_index}",
+                        "cadence_secs": rng.choice((0, 1, 30, 3600)),
+                        "emit": emit,
+                    }
+                )
+            random_config: dict[str, object] = {
+                "description": f"random fixture {index}",
+                "reminders": reminders,
+                "health_checks": [],
+            }
+            path = os.path.join(tmp, f"random-{index}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(random_config, handle, ensure_ascii=False)
+            _record_exact(rep, f"random:{index}/json", py, rs, ("json", "--config", path))
+            _record_exact(
+                rep,
+                f"random:{index}/tick",
+                py,
+                rs,
+                ("tick", "--config", path, "--now", str(index), "--no-header"),
+            )
+
+    if rep.failures:
+        for failure in rep.failures:
+            print(f"DIVERGENCE [{failure}]")
+        print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
+        return 1
+    print(f"cross[{tool}]: OK - {rep.checks} deterministic, randomized, and adversarial checks agree")
+    return 0
+
+
+def compare_pr_landing_planner(rand_count: int, seed: int) -> int:
+    tool = "pr-landing-planner"
+    py = py_command_for(tool)
+    rs = rs_command(tool)
+    rep = Report()
+
+    _record_exact(rep, "version", py, rs, ("--version",))
+    compare_package_guides(tool, py, rs, rep)
+    command_flags = (
+        "--repo",
+        "--base",
+        "--fixture",
+        "--format",
+        "--git-dir",
+        "--prs",
+        "--conflict-detector",
+        "--gate-check",
+        "--landing-context",
+        "--flaky-signatures",
+        "--outage-min-prs",
+        "--freshness-max-behind",
+        "--priority-source",
+        "--batch",
+    )
+    for engine, command in (("py", py), ("rs", rs)):
+        outcome = run(command, ("--help",))
+        commands = ("plan", "graph", "clusters", "status", "quickstart")
+        missing = [token for token in commands if token not in outcome.stdout]
+        if outcome.returncode != 0 or missing:
+            rep.bad(
+                f"schema:{engine}/commands",
+                f"exit={outcome.returncode}; missing={missing}\n{outcome.stdout}",
+            )
+        else:
+            rep.ok(f"schema:{engine}/commands")
+        plan_help = run(command, ("plan", "--help"))
+        missing_flags = [token for token in command_flags if token not in plan_help.stdout]
+        neutral_priority_help = (
+            "command" in plan_help.stdout and "beads" not in plan_help.stdout.lower()
+        )
+        if plan_help.returncode != 0 or missing_flags or not neutral_priority_help:
+            rep.bad(
+                f"schema:{engine}/plan",
+                f"exit={plan_help.returncode}; missing={missing_flags}; "
+                f"neutral_priority_help={neutral_priority_help}\n{plan_help.stdout}",
+            )
+        else:
+            rep.ok(f"schema:{engine}/plan")
+
+    with tempfile.TemporaryDirectory(prefix="planner-cross-") as tmp:
+        fixture: dict[str, object] = {
+            "repo": "OWNER/NAME",
+            "base": "main",
+            "prs": [
+                {
+                    "number": 1,
+                    "title": "green",
+                    "head_ref": "green",
+                    "additions": 4,
+                    "changed_files": ["src/a.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 2,
+                    "title": "behind",
+                    "head_ref": "behind",
+                    "commits_behind": 3,
+                    "changed_files": ["src/b.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 3,
+                    "title": "stale gate",
+                    "head_ref": "stale",
+                    "changed_files": ["src/c.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {
+                            "name": "merge-gate",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "text": "stale",
+                        },
+                    ],
+                },
+                {
+                    "number": 4,
+                    "title": "gate race",
+                    "head_ref": "race",
+                    "changed_files": ["src/d.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "IN_PROGRESS", "conclusion": ""},
+                        {
+                            "name": "merge-gate",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "text": "Full CI still queued; rerun after CI completes",
+                        },
+                    ],
+                },
+                {
+                    "number": 5,
+                    "title": "real failure",
+                    "head_ref": "red",
+                    "changed_files": ["src/e.rs"],
+                    "checks": [
+                        {
+                            "name": "unit",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "text": "assertion",
+                        },
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 6,
+                    "title": "missing required gate",
+                    "head_ref": "missing-gate",
+                    "changed_files": ["src/f.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"}
+                    ],
+                },
+                {
+                    "number": 7,
+                    "title": "neutral required gate",
+                    "head_ref": "neutral-gate",
+                    "changed_files": ["src/g.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "NEUTRAL"},
+                    ],
+                },
+                {
+                    "number": 8,
+                    "title": "non-gate queued words",
+                    "head_ref": "real-queued",
+                    "changed_files": ["src/h.rs"],
+                    "checks": [
+                        {
+                            "name": "unit",
+                            "status": "COMPLETED",
+                            "conclusion": "FAILURE",
+                            "text": "dependency still queued",
+                        },
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 9,
+                    "title": "draft policy change",
+                    "head_ref": "policy",
+                    "is_draft": True,
+                    "changed_files": ["src/i.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 10,
+                    "title": "approval required",
+                    "head_ref": "review-required",
+                    "review_decision": "REVIEW_REQUIRED",
+                    "changed_files": ["src/j.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 11,
+                    "title": "changes requested",
+                    "head_ref": "changes-requested",
+                    "review_decision": "CHANGES_REQUESTED",
+                    "changed_files": ["src/k.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 12,
+                    "title": "green child of broken predecessor",
+                    "head_ref": "child-of-red",
+                    "base_ref": "red",
+                    "changed_files": ["src/l.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 13,
+                    "title": "cycle root",
+                    "head_ref": "cycle-root",
+                    "changed_files": ["src/m.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+                {
+                    "number": 14,
+                    "title": "cycle child",
+                    "head_ref": "cycle-child",
+                    "base_ref": "cycle-root",
+                    "changed_files": ["src/n.rs"],
+                    "checks": [
+                        {"name": "CI", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                        {"name": "merge-gate", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                    ],
+                },
+            ],
+            "conflicts": [{"a": 1, "b": 2, "paths": ["src/shared.rs"]}],
+            "ancestry": [
+                {"before": 1, "after": 3},
+                {"before": 14, "after": 13},
+            ],
+        }
+        fixture_path = os.path.join(tmp, "fixture.json")
+        with open(fixture_path, "w", encoding="utf-8") as handle:
+            json.dump(fixture, handle)
+        context = {
+            "prs": [
+                {
+                    "pr": 9,
+                    "head_sha": "sha-9",
+                    "base_sha": "basesha-main",
+                    "validation_evidence": "clean-validate-record",
+                    "policy_class": "gate-policy",
+                    "assigned_agent": "reviewer",
+                }
+            ]
+        }
+        context_path = os.path.join(tmp, "context.json")
+        with open(context_path, "w", encoding="utf-8") as handle:
+            json.dump(context, handle)
+
+        base_args = ("--fixture", fixture_path, "--landing-context", context_path)
+        for planner_command, formats in (
+            ("plan", ("human", "json", "actions")),
+            ("graph", ("human", "json")),
+            ("clusters", ("human", "json")),
+            ("status", ("human", "json")),
+        ):
+            for output_format in formats:
+                command_extra = ("--batch",) if planner_command == "plan" else ()
+                _record_exact(
+                    rep,
+                    f"representative:{planner_command}/{output_format}",
+                    py,
+                    rs,
+                    (planner_command, *base_args, "--format", output_format, *command_extra),
+                )
+
+        _record_exact(
+            rep,
+            "representative:command-priority",
+            py,
+            rs,
+            (
+                "plan",
+                *base_args,
+                "--format",
+                "json",
+                "--priority-source",
+                "command",
+                "--priority-cmd",
+                "printf '%s' '{pr}'",
+            ),
+            compare_stderr=True,
+        )
+
+        for label, priority_args in (
+            ("missing-command", ("--priority-source", "command")),
+            (
+                "missing-label-capture",
+                ("--priority-source", "labels", "--priority-label-pattern", "^p[0-9]+$"),
+            ),
+            (
+                "overflow-command-output",
+                (
+                    "--priority-source",
+                    "command",
+                    "--priority-cmd",
+                    "printf 9223372036854775808",
+                ),
+            ),
+            (
+                "failed-command",
+                ("--priority-source", "command", "--priority-cmd", "exit 9"),
+            ),
+            (
+                "hook-launch-failure",
+                (
+                    "--priority-source",
+                    "command",
+                    "--priority-cmd",
+                    "printf 1",
+                    "--net-wrapper",
+                    "/definitely/missing-priority-wrapper",
+                ),
+            ),
+        ):
+            _record_exact(
+                rep,
+                f"reject:priority/{label}",
+                py,
+                rs,
+                ("plan", *base_args, *priority_args),
+                expected=2,
+                compare_stderr=True,
+            )
+
+        plan = run(py, ("plan", *base_args, "--format", "json", "--batch"))
+        ok, parsed = _parsed_json(plan.stdout)
+        actions: dict[int, str] = {}
+        if ok and isinstance(parsed, dict):
+            plan_obj = parsed.get("plan")
+            if isinstance(plan_obj, dict):
+                decisions = plan_obj.get("per_pr_actions")
+                if isinstance(decisions, list):
+                    for decision in decisions:
+                        if isinstance(decision, dict):
+                            number = decision.get("pr")
+                            action = decision.get("action")
+                            if isinstance(number, int) and isinstance(action, str):
+                                actions[number] = action
+        expected_actions = {
+            1: "land-now",
+            2: "rebase-then-land",
+            3: "refire-stale-gate",
+            4: "wait",
+            5: "hold-fix",
+            6: "refire-ci",
+            7: "refire-ci",
+            8: "hold-fix",
+            9: "escalate-gate-policy",
+            10: "wait",
+            11: "wait",
+            12: "wait",
+            13: "wait",
+            14: "wait",
+        }
+        if plan.returncode == 0 and all(actions.get(number) == action for number, action in expected_actions.items()):
+            rep.ok("representative:safety-actions")
+        else:
+            rep.bad("representative:safety-actions", f"expected={expected_actions}; got={actions}")
+
+        if ok and isinstance(parsed, dict):
+            nodes = parsed.get("nodes")
+            held = parsed.get("held_prs")
+            plan_obj = parsed.get("plan")
+            node_schema_ok = isinstance(nodes, list) and all(
+                isinstance(node, dict)
+                and "base_sha" in node
+                and "review_decision" in node
+                for node in nodes
+            )
+            held_reasons: dict[int, list[str]] = {}
+            if isinstance(held, list):
+                for item in held:
+                    if not isinstance(item, dict):
+                        continue
+                    number = item.get("pr")
+                    reasons = item.get("reasons")
+                    if (
+                        isinstance(number, int)
+                        and isinstance(reasons, list)
+                        and all(isinstance(reason, str) for reason in reasons)
+                    ):
+                        held_reasons[number] = reasons
+            batch_values = plan_obj.get("batch") if isinstance(plan_obj, dict) else None
+            safety_schema_ok = (
+                node_schema_ok
+                and "review-required" in held_reasons.get(10, [])
+                and "changes-requested" in held_reasons.get(11, [])
+                and "ordering-cycle" in held_reasons.get(13, [])
+                and "ordering-cycle" in held_reasons.get(14, [])
+                and isinstance(batch_values, list)
+                and not any(number in batch_values for number in (12, 13, 14))
+            )
+            if safety_schema_ok:
+                rep.ok("representative:safety-schema")
+            else:
+                rep.bad(
+                    "representative:safety-schema",
+                    f"node_schema={node_schema_ok}; held={held_reasons}; batch={batch_values}",
+                )
+        else:
+            rep.bad("representative:safety-schema", "representative plan was not JSON")
+
+        _record_same_exit(rep, "live:repo-required", py, rs, ("plan",), 2)
+        _record_same_exit(
+            rep,
+            "cli:abbreviation-refused",
+            py,
+            rs,
+            ("plan", "--fixt", fixture_path),
+            2,
+        )
+        _record_same_exit(
+            rep,
+            "fixture:unknown-detector",
+            py,
+            rs,
+            ("plan", "--fixture", fixture_path, "--conflict-detector", "unknown"),
+            2,
+        )
+        invalid_fixtures: tuple[tuple[str, str], ...] = (
+            ("root-array.json", "[]"),
+            ("missing-prs.json", '{"repo":"R","base":"main"}'),
+            ("prs-not-list.json", '{"repo":"R","base":"main","prs":{}}'),
+            ("number-not-int.json", '{"repo":"R","base":"main","prs":[{"number":"one"}]}'),
+            ("malformed.json", "{"),
+            ("malformed.yaml", "prs:\n  - number: [\n"),
+            ("duplicate-key.json", '{"prs":[],"prs":[]}'),
+            ("duplicate-key.yaml", "prs: []\nprs: []\n"),
+            ("merge-key.yaml", "base: &b {repo: R}\n<<: *b\nprs: []\n"),
+            ("duplicate-pr.json", '{"prs":[{"number":1},{"number":1}]}'),
+            ("zero-pr.json", '{"prs":[{"number":0}]}'),
+            ("overflow-pr.json", '{"prs":[{"number":9223372036854775808}]}'),
+            ("negative-behind.json", '{"prs":[{"number":1,"commits_behind":-1}]}'),
+            (
+                "unknown-conflict.json",
+                '{"prs":[{"number":1}],"conflicts":[{"a":1,"b":2}]}',
+            ),
+            (
+                "self-ancestry.json",
+                '{"prs":[{"number":1}],"ancestry":[{"before":1,"after":1}]}',
+            ),
+            ("relations-shape.json", '{"prs":[{"number":1}],"conflicts":{}}'),
+        )
+        for name, body in invalid_fixtures:
+            path = os.path.join(tmp, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            _record_same_exit(rep, f"reject:{name}", py, rs, ("plan", "--fixture", path), 2)
+
+        bad_contexts = (
+            (
+                "head-only-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","validation_evidence":"clean-validate-record"}]}',
+            ),
+            (
+                "stale-base-context.json",
+                '{"prs":[{"pr":1,"head_sha":"sha-1","base_sha":"old-base","validation_evidence":"clean-validate-record"}]}',
+            ),
+        )
+        for name, body in bad_contexts:
+            path = os.path.join(tmp, name)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            _record_same_exit(
+                rep,
+                f"reject:{name}",
+                py,
+                rs,
+                ("plan", "--fixture", fixture_path, "--landing-context", path),
+                2,
+            )
+
+        for flag, value in (
+            ("--outage-min-prs", "-1"),
+            ("--freshness-max-behind", "-1"),
+            ("--freshness-max-behind", "9223372036854775808"),
+            ("--prs", "0"),
+            ("--prs", "9223372036854775808"),
+        ):
+            _record_same_exit(
+                rep,
+                f"reject:cli-domain/{flag}={value}",
+                py,
+                rs,
+                ("plan", "--fixture", fixture_path, flag, value),
+                2,
+            )
+
+        rng = random.Random(seed)
+        conclusions = (
+            ("COMPLETED", "SUCCESS"),
+            ("IN_PROGRESS", ""),
+            ("COMPLETED", "FAILURE"),
+            ("COMPLETED", "CANCELLED"),
+        )
+        for index in range(rand_count):
+            prs: list[object] = []
+            conflicts: list[object] = []
+            count = rng.randint(1, 8)
+            for number in range(1, count + 1):
+                status, conclusion = rng.choice(conclusions)
+                gate_status, gate_conclusion = rng.choice(conclusions)
+                checks: list[object] = [
+                    {
+                        "name": "CI",
+                        "status": status,
+                        "conclusion": conclusion,
+                        "text": "assertion" if conclusion == "FAILURE" else "",
+                    },
+                    {
+                        "name": "merge-gate",
+                        "status": gate_status,
+                        "conclusion": gate_conclusion,
+                        "text": "stale" if gate_conclusion == "FAILURE" else "",
+                    },
+                ]
+                prs.append(
+                    {
+                        "number": number,
+                        "head_ref": f"feature-{number}",
+                        "base_ref": (
+                            f"feature-{number - 1}"
+                            if number > 1 and rng.random() < 0.2
+                            else "main"
+                        ),
+                        "title": f"random {index}/{number}",
+                        "is_draft": rng.random() < 0.1,
+                        "review_decision": rng.choice(("", "APPROVED", "REVIEW_REQUIRED")),
+                        "additions": rng.randint(0, 100),
+                        "deletions": rng.randint(0, 100),
+                        "commits_behind": rng.randint(0, 4),
+                        "labels": [f"priority:{rng.randint(0, 3)}"],
+                        "changed_files": [f"src/{rng.randint(0, 4)}.rs"],
+                        "checks": checks,
+                    }
+                )
+                if number > 1 and rng.random() < 0.25:
+                    conflicts.append(
+                        {"a": rng.randint(1, number - 1), "b": number, "paths": ["src/shared.rs"]}
+                    )
+            random_fixture = {
+                "repo": "R",
+                "base": "main",
+                "prs": prs,
+                "conflicts": conflicts,
+            }
+            path = os.path.join(tmp, f"random-{index}.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(random_fixture, handle)
+            extra: tuple[str, ...] = (
+                "--batch",
+                "--freshness-max-behind",
+                str(rng.randint(0, 3)),
+                "--conflict-detector",
+                rng.choice(("merge-tree", "file-overlap")),
+            )
+            _record_exact(
+                rep,
+                f"random:{index}/plan-json",
+                py,
+                rs,
+                ("plan", "--fixture", path, "--format", "json", *extra),
+            )
+
+    if rep.failures:
+        for failure in rep.failures:
+            print(f"DIVERGENCE [{failure}]")
+        print(f"cross[{tool}]: {len(rep.failures)} divergence(s) out of {rep.checks} checks")
+        return 1
+    print(f"cross[{tool}]: OK - {rep.checks} graph, CI, randomized, and adversarial checks agree")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="py-vs-rs differential tester")
-    parser.add_argument("--tool", default="safe-ci-dag-runner")
+    parser.add_argument(
+        "--tool",
+        default="safe-ci-dag-runner",
+        choices=("safe-ci-dag-runner", "cpuset-alloc", "tick-hub", "pr-landing-planner", "all"),
+    )
     parser.add_argument("--random", type=int, default=24, help="number of randomized fixtures")
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed for randomized fixtures")
     ns = parser.parse_args(list(argv) if argv is not None else None)
     tool = str(ns.tool)
     rand_count = int(ns.random)
     seed = int(ns.seed)
-    return compare(tool, rand_count, seed)
+    if tool == "safe-ci-dag-runner":
+        return compare_safe_ci_dag_runner(rand_count, seed)
+    if tool == "cpuset-alloc":
+        return compare_cpuset_alloc()
+    if tool == "tick-hub":
+        return compare_tick_hub(rand_count, seed)
+    if tool == "pr-landing-planner":
+        return compare_pr_landing_planner(rand_count, seed)
+    results = (
+        compare_safe_ci_dag_runner(rand_count, seed),
+        compare_cpuset_alloc(),
+        compare_tick_hub(rand_count, seed),
+        compare_pr_landing_planner(rand_count, seed),
+    )
+    return 1 if any(results) else 0
 
 
 if __name__ == "__main__":

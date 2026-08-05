@@ -7,7 +7,7 @@ real vs. benign, and in what order should the coordinator act?*
 Everything here is a frozen dataclass or an :class:`enum.Enum`. The interesting work
 (:mod:`pr_landing_planner.graph`, :mod:`pr_landing_planner.classify`, :mod:`pr_landing_planner.plan`,
 :mod:`pr_landing_planner.emit`) is PURE and operates on these values, so it is unit-testable with a
-:class:`pr_landing_planner.fakehost.FakeHost` and byte-stable for a future Rust port. The two
+:class:`pr_landing_planner.fakehost.FakeHost` and stable across implementations. The two
 side-effecting boundaries (talking to a VCS host, running git) live behind the
 :class:`pr_landing_planner.host.VcsHost` protocol.
 """
@@ -18,9 +18,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
-DEFAULT_REPO = "DeepScryAI/DeepScry"
-DEFAULT_BASE = "integration"
-#: The single required merge-gate check most callers gate on (ds-4171 / ds-xdc7m9 semantics).
+DEFAULT_REPO = ""
+DEFAULT_BASE = "main"
+#: The single required merge-gate check most callers gate on.
 DEFAULT_GATE_CHECK = "merge-gate"
 
 
@@ -42,19 +42,19 @@ class CiState(Enum):
 
 
 class RedClass(Enum):
-    """Why a PR's CI is (or looks) red — the headline classification of tool #3.
+    """Why a PR's CI is (or looks) red.
 
-    Grounded in four real failure modes recorded in the DeepScry minibeads:
+    Grounded in common CI failure modes:
 
     * :attr:`REAL` — a genuine regression; hold and dispatch a fix.
     * :attr:`FLAKY` — a red whose check name / message matches a caller-supplied flaky signature; a
       re-fire of CI is expected to clear it.
     * :attr:`STALE_REQUIRED_CHECK` — the underlying CI is green on the head commit but the required
-      gate check froze on a stale result (ds-4171); re-fire the gate, do not treat as a failure.
+      gate check froze on a stale result; re-fire the gate, do not treat as a failure.
     * :attr:`EVALUATE_ONCE_RACE` — the gate fired once while full CI was still queued and exited with
-      a benign "still queued" message (ds-xdc7m9 / ds-96k1wa); this is noise — treat as pending.
+      a benign "still queued" message; this is noise — treat as pending.
     * :attr:`RUNNER_OUTAGE` — the gate job itself never executed (blank runner / BlobNotFound /
-      near-zero duration), typically across many branches (ds-69ih3r); escalate the CI outage.
+      near-zero duration), typically across many branches; escalate the CI outage.
     """
 
     REAL = "real"
@@ -78,7 +78,7 @@ class PrAction(Enum):
 
 
 class ValidationEvidence(Enum):
-    """Evidence that can satisfy a caller's landing precondition at this exact PR head."""
+    """Evidence that can satisfy a caller's landing precondition at exact head/base identities."""
 
     NONE = "none"
     AUTHORITATIVE_CI = "authoritative-ci"

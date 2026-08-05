@@ -124,6 +124,18 @@ def test_transitive_stack_selection_across_base() -> None:
     assert any(e.before == 10 and e.after == 11 for e in graph.ordering_edges)
 
 
+def test_fixture_prs_inherit_declared_base() -> None:
+    fixture: dict[str, object] = {
+        "repo": "R",
+        "base": "release",
+        "prs": [{"number": 10, "head_ref": "candidate"}],
+    }
+    host, repo, base = FakeHost.from_fixture(fixture)
+    graph = collect_graph(host, repo=repo, base=base)
+    assert [node.number for node in graph.nodes] == [10]
+    assert graph.nodes[0].base_ref == "release"
+
+
 def test_unknown_detector_raises() -> None:
     with pytest.raises(ValueError, match="unknown conflict detector"):
         collect_graph(_host(), repo="R", base="integration", conflict_detector="bogus")

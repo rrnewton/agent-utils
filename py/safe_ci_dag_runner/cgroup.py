@@ -1,60 +1,9 @@
-"""Two-level Linux cgroup-v2 containment for the safe-ci DAG runner.
+"""Two-level Linux cgroup-v2 containment for complete runs and individual steps.
 
-This is the generic port of DeepScry's ``scripts/validate_cgroup.py`` — the same
-observable behavior, but with zero project-specific names baked in. All the
-DeepScry specifics (the ``mtg-validate.slice`` name, the ``MTG_VALIDATE_*``
-environment sentinels, the ``[validate]`` log prefix) are lifted into a caller-
-supplied :class:`ScopeNaming` value; nothing about MTG or DeepScry remains.
-
-WHY THIS EXISTS
----------------
-A build/test DAG re-execs itself inside a transient ``systemd-run --user
---scope`` (an OUTER cgroup) so the whole descendant tree is contained. But a
-naive per-step ``killpg`` teardown has empirically-verified gaps (probed on a
-dev box: systemd 255, cgroup v2, user-delegated cpu/memory/pids):
-
-  1. ``killpg`` misses a ``setsid``/double-forked grandchild (an orphan server /
-     ``http.server`` / browser) — the exact zombie / port-collision class this
-     model guards against. ``setsid`` changes only the session/pgid, never
-     cgroup membership, so a per-step ``cgroup.kill`` catches the escapee.
-  2. On NORMAL exit a ``setsid`` orphan left in the OUTER scope keeps the scope
-     ``active running``; ``systemd-run --collect`` does NOT garbage-collect a
-     scope that still has live processes, so the orphan survives the run.
-  3. Nothing STOPS the outer scope on Ctrl-C / ``kill`` of the runner without an
-     explicit signal handler.
-
-THE MODEL (two levels, both real cgroups — NOT sibling scopes)
---------------------------------------------------------------
-A transient ``systemd-run --user --scope`` lands every unit as a SIBLING under
-``app.slice`` — so a naive per-step ``systemd-run --scope`` would NOT be torn
-down by stopping the outer scope (stopping a parent scope does not cascade to a
-sibling child scope). Instead the OUTER scope is a DELEGATED cgroup
-(``-p Delegate=yes``) and genuine CHILD cgroups are managed by hand::
-
-    app.slice/<unit>.scope/          <- outer scope (delegated)
-        ├── supervisor/               <- the runner itself lives here (cgroup-v2
-        │                                "no internal processes": a cgroup with
-        │                                child cgroups may not also hold procs)
-        ├── step-build.release/       <- one child cgroup per step; the step's
-        └── step-net.gui/                bash leader self-moves here FIRST
-
-Per-step teardown is ``echo 1 > step-<tag>/cgroup.kill`` — an atomic SIGKILL of
-the WHOLE subtree, ``setsid`` escapees included. Whole-run teardown is
-``systemctl --user stop <unit>.scope``, which flushes every child cgroup because
-they are genuinely nested.
-
-GRACEFUL DEGRADATION + NO SILENT FAILURE
-----------------------------------------
-Everything here is best-effort: if ``Delegate=yes`` was not granted, the
-delegated cgroup can't be found, or the host has no cgroup v2 / systemd, the
-manager reports ``enabled == False`` and the caller falls back to ``killpg``.
-cgroups are an ADDITIONAL, stronger reaper, never a hard dependency.
-
-However — and this is the deliberate strengthening over the DeepScry original —
-a best-effort cgroupfs write that would drop a requested cap (``memory.max``,
-``memory.swap.max``, controller delegation, ``cgroup.kill``) never fails
-SILENTLY. The original swallowed the ``OSError`` and ran the step uncapped with
-no trace; here every such degradation emits a visible warning via :func:`_warn`.
+A run enters a delegated transient scope and creates one child cgroup per step.
+Per-step limits and ``cgroup.kill`` then apply to the complete descendant tree,
+including children that start new sessions. Unsupported hosts degrade explicitly:
+callers can detect disabled containment, and failed enforcement writes emit warnings.
 """
 
 from __future__ import annotations
@@ -132,9 +81,8 @@ DEFAULT_NAMING = ScopeNaming()
 class CgroupEnforcementKind(str, Enum):
     """A cgroup boundary that can actually constrain a run.
 
-    A ``str``-valued enum (the Python-3.10-compatible equivalent of the
-    ``StrEnum`` the DeepScry original used): members compare equal to their
-    string value, so ``kind.value`` and direct string comparison both work."""
+    Members compare equal to their string values for convenient logging and policy checks.
+    """
 
     USER_SCOPE_QUOTA = "user-scope-quota"
     DELEGATED_CGROUPFS = "delegated-cgroupfs"
@@ -297,6 +245,27 @@ def _cpuset_count(value: str | None) -> int | None:
     except ValueError:
         return None
     return count
+
+
+def _parse_cpuset(value: str | None) -> set[int] | None:
+    """Parse a Linux cpulist, rejecting malformed or overlapping ranges."""
+    if not value:
+        return None
+    cpus: set[int] = set()
+    try:
+        for item in value.split(","):
+            bounds = item.split("-", maxsplit=1)
+            start = int(bounds[0])
+            end = int(bounds[-1])
+            if start < 0 or end < start:
+                return None
+            current = set(range(start, end + 1))
+            if cpus.intersection(current):
+                return None
+            cpus.update(current)
+    except ValueError:
+        return None
+    return cpus
 
 
 def _is_below_root(group: Path) -> bool:
@@ -1025,23 +994,13 @@ def report_current_usage(naming: ScopeNaming = DEFAULT_NAMING) -> bool:
 # --------------------------------------------------------------------------- #
 #
 # The ``--cores K`` feature constrains the WHOLE run process tree to K least-busy
-# FREE cores, for the gVisor / backend-perf methodology (K=1 = sequential box, to
-# separate SEQUENTIALIZATION cost from INSTRUMENTATION cost). It NEVER pins a
-# fixed core id (a fixed core may be busy — the standing benchmark rule): it reads
+# FREE cores. It never pins a fixed core id (a fixed core may be busy): it reads
 # THIS process's allowed set, samples ``/proc/stat`` briefly, and picks the K
 # LEAST-BUSY of them.
 #
-# Two mechanisms, tried in order, both of which cover the whole descendant tree:
-#   1. cgroup cpuset (PRIMARY) — write ``cpuset.cpus`` on the scope cgroup and
-#      VERIFY via ``cpuset.cpus.effective``. Children created under the scope
-#      inherit it. Works on hosts/CI where the ``cpuset`` controller is delegated.
-#   2. ``sched_setaffinity`` (FALLBACK) — a size-K affinity mask on the root
-#      process inherits across fork+execve to every descendant. This is the only
-#      working mechanism where ``cpuset`` is NOT delegated (e.g. the 3pai sandbox,
-#      whose scope exposes only ``io memory pids``). VERIFIED via a
-#      ``sched_getaffinity`` read-back.
-# The active mechanism is LOGGED (No Silent Failure); if NEITHER can constrain the
-# tree to K cores, a warning is emitted and ``apply_core_box`` returns ``None``.
+# The only accepted mechanism is a cgroup cpuset on the containing scope. A root
+# process affinity mask is not containment: a descendant can widen or replace it.
+# If the exact effective cpuset cannot be verified, the operation fails closed.
 
 
 def pick_least_busy_free_cores(
@@ -1095,7 +1054,7 @@ def pick_least_busy_free_cores(
 
 def _cpulist(cores: Sequence[int]) -> str:
     """Render cores as a Linux cpulist (plain comma form; the kernel may re-render
-    it with ranges in ``cpuset.cpus.effective``, which :func:`_cpuset_count`
+    it with ranges in ``cpuset.cpus.effective``, which :func:`_parse_cpuset`
     parses back)."""
     return ",".join(str(c) for c in cores)
 
@@ -1104,18 +1063,19 @@ def _try_cgroup_cpuset(scope: Path, cores: Sequence[int]) -> bool:
     """Write ``cpuset.cpus`` on ``scope`` and VERIFY via ``cpuset.cpus.effective``.
 
     Returns True only when the ``cpuset`` controller is present on the scope AND
-    the effective cpuset count equals ``len(cores)`` after the write (proving the
-    constraint actually took — a proxy read of the flag alone is not evidence). On
+    the effective cpuset is exactly the requested set after the write. Checking
+    only the count is insufficient because a different same-sized set would break
+    collision-free reservations. On
     success, best-effort enables ``+cpuset`` in the scope's ``subtree_control`` so
     per-step child cgroups inherit the constraint."""
     if "cpuset" not in _controller_set(scope, "cgroup.controllers"):
         return False
-    want = len(cores)
+    wanted = set(cores)
     try:
         (scope / "cpuset.cpus").write_text(_cpulist(cores))
     except OSError:
         return False
-    if _cpuset_count(_read_cgroup_value(scope, "cpuset.cpus.effective")) != want:
+    if _parse_cpuset(_read_cgroup_value(scope, "cpuset.cpus.effective")) != wanted:
         return False
     # Verified. Let per-step child cgroups inherit the cpuset constraint.
     try:
@@ -1130,14 +1090,10 @@ def apply_core_box(
 ) -> tuple[str, list[int]] | None:
     """Constrain the WHOLE run process tree to ``k`` least-busy FREE cores.
 
-    Tries the cgroup ``cpuset`` first (works on hosts/CI where it is delegated;
-    children under the scope inherit it), then falls back to
-    ``sched_setaffinity`` (a size-K mask on THIS process inherits across
-    fork+execve to every descendant). Each mechanism is VERIFIED (cpuset via
-    ``cpuset.cpus.effective``; affinity via a ``sched_getaffinity`` read-back)
-    before it is accepted. Returns ``(mechanism, cores)`` and LOGS the active
-    mechanism; returns ``None`` (with a warning) when NEITHER can constrain the
-    tree to ``k`` cores — never silently claims a box that is not real.
+    Requires a cgroup ``cpuset`` on the containing scope and verifies the exact
+    effective set. Returns ``None`` with a warning when hard tree-wide pinning is
+    unavailable. It never falls back to process affinity, which descendants can
+    widen and therefore cannot enforce a reservation.
 
     Call this in the runner BEFORE the scheduler spawns worker threads or forks
     any step: pthreads inherit the creator's affinity and forked steps inherit at
@@ -1161,40 +1117,36 @@ def apply_specific_cores(
 ) -> tuple[str, list[int]] | None:
     """Constrain the WHOLE run tree to an EXPLICIT set of ``cores``.
 
-    Same mechanism + verification as :func:`apply_core_box`, but the caller
-    supplies the cores (e.g. a reservation from the ledger) instead of this
-    function picking them. Returns ``(mechanism, cores)`` on a verified box, else
-    ``None`` with a warning."""
+    The caller supplies the cores (for example, from the reservation ledger).
+    Success requires an exact cgroup ``cpuset.cpus.effective`` match; otherwise
+    this function fails closed with ``None``."""
     cores = list(cores)
     if not cores:
         _warn(naming, f"{label}: empty core set; cannot constrain the run tree")
         return None
     want = len(cores)
 
-    # PRIMARY: cgroup cpuset on the scope (whole subtree inherits; hosts/CI).
-    scope = scope_cgroup_from_self(naming)
+    # A cgroup cpuset is a hard descendant-tree bound. Process affinity is not:
+    # any child may call sched_setaffinity and escape a mask it inherited.
+    owns_scope = (
+        os.environ.get(naming.env_in_scope) == "1"
+        or bool(os.environ.get(naming.env_direct_cgroup))
+    )
+    scope = scope_cgroup_from_self(naming) if owns_scope else None
     if scope is not None and _try_cgroup_cpuset(scope, cores):
-        print(f"{naming.log_prefix} core box: constrained to {want} core(s) "
-              f"{cores} via cgroup cpuset")
-        sys.stdout.flush()
+        print(
+            f"{naming.log_prefix} core box: constrained to {want} core(s) "
+            f"{cores} via cgroup cpuset",
+            file=sys.stderr,
+            flush=True,
+        )
         return "cgroup cpuset", cores
-
-    # FALLBACK: sched_setaffinity (inherits across fork+execve to the whole tree).
-    try:
-        os.sched_setaffinity(0, set(cores))
-        applied = os.sched_getaffinity(0)
-    except OSError as exc:
-        _warn(naming, f"{label}: sched_setaffinity failed ({exc}) and cgroup cpuset "
-              "was unavailable; the run tree is NOT constrained to a core box")
-        return None
-    if len(applied) != want:
-        _warn(naming, f"{label}: sched_setaffinity read-back shows {len(applied)} core(s), "
-              f"expected {want}; the run tree is NOT reliably constrained")
-        return None
-    print(f"{naming.log_prefix} core box: constrained to {want} core(s) "
-          f"{sorted(applied)} via sched_setaffinity")
-    sys.stdout.flush()
-    return "sched_setaffinity", sorted(applied)
+    _warn(
+        naming,
+        f"{label}: exact cgroup cpuset unavailable; refusing a soft process-affinity "
+        "fallback because descendants can escape it",
+    )
+    return None
 
 
 # --------------------------------------------------------------------------- #

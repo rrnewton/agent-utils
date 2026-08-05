@@ -52,6 +52,28 @@ class CollectionError(RuntimeError):
     """Raised when collection cannot produce a trustworthy graph (e.g. a PR moved mid-collection)."""
 
 
+def _validate_pr_identities(prs: Sequence[RawPr], base: str) -> None:
+    if not base:
+        raise CollectionError("base branch must be non-empty")
+    numbers: set[int] = set()
+    head_refs: set[str] = set()
+    for pr in prs:
+        if pr.number <= 0 or pr.number > 2**63 - 1:
+            raise CollectionError(f"invalid PR number {pr.number!r}; expected a positive i64")
+        if pr.number in numbers:
+            raise CollectionError(f"duplicate PR number #{pr.number} in host snapshot")
+        numbers.add(pr.number)
+        if not pr.head_ref or not pr.base_ref or not pr.api_head_sha:
+            raise CollectionError(
+                f"PR #{pr.number} is missing head_ref, base_ref, or API head SHA"
+            )
+        if pr.head_ref in head_refs:
+            raise CollectionError(
+                f"duplicate head ref {pr.head_ref!r} makes dependency ordering ambiguous"
+            )
+        head_refs.add(pr.head_ref)
+
+
 def select_prs(
     prs: Sequence[RawPr], base: str | None, only: frozenset[int] | None
 ) -> tuple[RawPr, ...]:
@@ -126,9 +148,12 @@ def collect_graph(
             f"(want {CONFLICT_DETECTOR_MERGE_TREE}|{CONFLICT_DETECTOR_FILE_OVERLAP})"
         )
     cfg = classify_config if classify_config is not None else ClassifyConfig()
+    cfg.validate()
     provider = priority_provider if priority_provider is not None else NonePriority()
 
-    raw = select_prs(host.list_open_prs(repo, base), base, only)
+    listed = host.list_open_prs(repo, base)
+    _validate_pr_identities(listed, base)
+    raw = select_prs(listed, base, only)
 
     # ONE bulk fetch for the whole planning run, never a per-PR fan-out. Every merge-tree / ancestry
     # probe below is a plain local git command once the objects are present, so the only network cost
@@ -154,8 +179,13 @@ def collect_graph(
 
     nodes: list[PrNode] = []
     for pr in raw:
-        base_sha = resolved[base_dest[pr.base_ref]]
-        head_sha = resolved[pr_dest[pr.number]]
+        try:
+            base_sha = resolved[base_dest[pr.base_ref]]
+            head_sha = resolved[pr_dest[pr.number]]
+        except KeyError as exc:
+            raise CollectionError(f"host did not resolve required ref {exc.args[0]!r}") from exc
+        if not base_sha or not head_sha:
+            raise CollectionError(f"PR #{pr.number} resolved to an empty base or head SHA")
         # Content-identity guard: the head we actually fetched must match the head the API reported at
         # list time, or the graph would be built from a half-updated snapshot.
         if pr.api_head_sha and head_sha != pr.api_head_sha:
@@ -166,6 +196,10 @@ def collect_graph(
         files = host.changed_files(base_sha, head_sha)
         base_conflict = tuple(sorted(host.merge_tree(base_sha, head_sha)))
         behind = host.commits_behind(head_sha, base_sha)
+        if behind < 0:
+            raise CollectionError(
+                f"PR #{pr.number} host returned negative commits-behind value {behind}"
+            )
         verdict = classify_pr(pr.checks, cfg)
         nodes.append(
             PrNode(

@@ -15,11 +15,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    # PyYAML is optional: only the YAML branch of load_fixture_text needs it, and it imports yaml
-    # lazily there. JSON fixtures, `--help`, and `--version` never need the dependency.
+    # PyYAML is declared but imported lazily so JSON fixtures and startup diagnostics remain usable
+    # if an installation is damaged.
     import yaml
 
 from pr_landing_planner.model import CheckRun, RawPr, edge_key
+
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
 
 
 class FixtureError(ValueError):
@@ -27,11 +30,11 @@ class FixtureError(ValueError):
 
 
 # Surfaced (as a FixtureError, so the CLI prints it cleanly) when a YAML fixture is requested but
-# PyYAML is not installed. JSON fixtures need no optional dependency.
+# the declared PyYAML dependency is not installed.
 _MISSING_YAML_MSG = (
-    "loading a YAML fixture requires the optional PyYAML dependency, which is not installed. "
-    "Install it with: python3 -m pip install 'pyyaml>=6'  (or run: agent-utils/setup). "
-    "JSON fixtures need no extra dependency."
+    "loading a YAML fixture requires PyYAML, but that package is not installed. "
+    "Repair this installation with: python3 -m pip install 'pyyaml>=6'. "
+    "JSON fixtures remain available."
 )
 
 
@@ -49,16 +52,37 @@ def _opt_str(m: Mapping[str, object], key: str, default: str) -> str:
     return val if isinstance(val, str) else default
 
 
-def _req_int(m: Mapping[str, object], key: str, where: str) -> int:
+def _req_int(
+    m: Mapping[str, object], key: str, where: str, *, positive: bool = False
+) -> int:
     val = m.get(key)
     if isinstance(val, bool) or not isinstance(val, int):
         raise FixtureError(f"{where}: field {key!r} must be an integer")
+    if not _I64_MIN <= val <= _I64_MAX:
+        raise FixtureError(f"{where}: field {key!r} must fit a signed 64-bit integer")
+    if positive and val <= 0:
+        raise FixtureError(f"{where}: field {key!r} must be a positive integer")
     return val
 
 
-def _opt_int(m: Mapping[str, object], key: str, default: int) -> int:
-    val = m.get(key, default)
-    return val if isinstance(val, int) and not isinstance(val, bool) else default
+def _opt_int(
+    m: Mapping[str, object],
+    key: str,
+    default: int,
+    where: str,
+    *,
+    nonnegative: bool = False,
+) -> int:
+    val = m.get(key)
+    if val is None:
+        return default
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise FixtureError(f"{where}: field {key!r} must be an integer")
+    if not _I64_MIN <= val <= _I64_MAX:
+        raise FixtureError(f"{where}: field {key!r} must fit a signed 64-bit integer")
+    if nonnegative and val < 0:
+        raise FixtureError(f"{where}: field {key!r} must be nonnegative")
+    return val
 
 
 def _opt_bool(m: Mapping[str, object], key: str, default: bool) -> bool:
@@ -81,7 +105,11 @@ def _checks_from(value: object, where: str) -> tuple[CheckRun, ...]:
     out: list[CheckRun] = []
     for i, entry in enumerate(value):
         obj = _as_obj(entry, f"{where}.checks[{i}]")
-        duration = obj.get("duration_secs")
+        duration = (
+            _opt_int(obj, "duration_secs", 0, f"{where}.checks[{i}]", nonnegative=True)
+            if obj.get("duration_secs") is not None
+            else None
+        )
         out.append(
             CheckRun(
                 name=_opt_str(obj, "name", ""),
@@ -89,7 +117,7 @@ def _checks_from(value: object, where: str) -> tuple[CheckRun, ...]:
                 conclusion=_opt_str(obj, "conclusion", "").upper(),
                 text=_opt_str(obj, "text", ""),
                 workflow=_opt_str(obj, "workflow", ""),
-                duration_secs=duration if isinstance(duration, int) and not isinstance(duration, bool) else None,
+                duration_secs=duration,
             )
         )
     return tuple(out)
@@ -106,16 +134,27 @@ class _FakePr:
     commits_behind: int
 
 
-def _fake_pr_from(value: object, where: str) -> _FakePr:
+def _fake_pr_from(value: object, where: str, *, default_base: str) -> _FakePr:
     obj = _as_obj(value, where)
-    number = _req_int(obj, "number", where)
+    number = _req_int(obj, "number", where, positive=True)
     head_sha = _opt_str(obj, "head_sha", f"sha-{number}")
     api_head_sha = _opt_str(obj, "api_head_sha", head_sha)
     fetched_head_sha = _opt_str(obj, "fetched_head_sha", head_sha)
+    head_ref = _opt_str(obj, "head_ref", f"feature-{number}")
+    base_ref = _opt_str(obj, "base_ref", default_base)
+    for field, value in (
+        ("head_ref", head_ref),
+        ("base_ref", base_ref),
+        ("head_sha", head_sha),
+        ("api_head_sha", api_head_sha),
+        ("fetched_head_sha", fetched_head_sha),
+    ):
+        if not value:
+            raise FixtureError(f"{where}: field {field!r} must be a non-empty string")
     raw = RawPr(
         number=number,
-        head_ref=_opt_str(obj, "head_ref", f"feature-{number}"),
-        base_ref=_opt_str(obj, "base_ref", "integration"),
+        head_ref=head_ref,
+        base_ref=base_ref,
         api_head_sha=api_head_sha,
         title=_opt_str(obj, "title", ""),
         author=_opt_str(obj, "author", ""),
@@ -124,8 +163,8 @@ def _fake_pr_from(value: object, where: str) -> _FakePr:
         review_decision=_opt_str(obj, "review_decision", ""),
         created_at=_opt_str(obj, "created_at", ""),
         updated_at=_opt_str(obj, "updated_at", ""),
-        additions=_opt_int(obj, "additions", 0),
-        deletions=_opt_int(obj, "deletions", 0),
+        additions=_opt_int(obj, "additions", 0, where, nonnegative=True),
+        deletions=_opt_int(obj, "deletions", 0, where, nonnegative=True),
         labels=_opt_str_list(obj, "labels"),
         checks=_checks_from(obj.get("checks"), where),
         mechanism_symbols=_opt_str_list(obj, "mechanism_symbols"),
@@ -136,7 +175,7 @@ def _fake_pr_from(value: object, where: str) -> _FakePr:
         fetched_head_sha=fetched_head_sha,
         changed_files=frozenset(_opt_str_list(obj, "changed_files")),
         base_conflict_paths=_opt_str_list(obj, "base_conflict_paths"),
-        commits_behind=_opt_int(obj, "commits_behind", 0),
+        commits_behind=_opt_int(obj, "commits_behind", 0, where, nonnegative=True),
     )
 
 
@@ -216,47 +255,131 @@ class FakeHost:
         """Build a FakeHost from a parsed fixture. Returns ``(host, repo, base)``."""
         doc = _as_obj(raw, "<root>")
         repo = _opt_str(doc, "repo", "owner/repo")
-        base = _opt_str(doc, "base", "integration")
+        base = _opt_str(doc, "base", "main")
+        if not base:
+            raise FixtureError("<root>: field 'base' must be a non-empty string")
         prs_raw = doc.get("prs")
         if not isinstance(prs_raw, list):
             raise FixtureError("<root>: 'prs' must be a list")
-        prs = tuple(_fake_pr_from(entry, f"prs[{i}]") for i, entry in enumerate(prs_raw))
+        prs = tuple(
+            _fake_pr_from(entry, f"prs[{i}]", default_base=base)
+            for i, entry in enumerate(prs_raw)
+        )
+        numbers = [pr.raw.number for pr in prs]
+        if len(set(numbers)) != len(numbers):
+            raise FixtureError("<root>: duplicate PR numbers are not allowed")
+        head_refs = [pr.raw.head_ref for pr in prs]
+        if len(set(head_refs)) != len(head_refs):
+            raise FixtureError("<root>: duplicate PR head_ref values are ambiguous")
+        fixture_shas: dict[str, int] = {}
+        for pr in prs:
+            for sha in (pr.head_sha, pr.fetched_head_sha):
+                owner = fixture_shas.setdefault(sha, pr.raw.number)
+                if owner != pr.raw.number:
+                    raise FixtureError(
+                        f"<root>: commit identity {sha!r} is shared by PR #{owner} and "
+                        f"PR #{pr.raw.number}; fixture host data would be ambiguous"
+                    )
+        number_set = set(numbers)
 
         conflicts: dict[tuple[int, int], tuple[str, ...]] = {}
-        for i, entry in enumerate(_as_list(doc.get("conflicts"))):
+        for i, entry in enumerate(_optional_list(doc, "conflicts")):
             obj = _as_obj(entry, f"conflicts[{i}]")
-            a = _req_int(obj, "a", f"conflicts[{i}]")
-            b = _req_int(obj, "b", f"conflicts[{i}]")
-            conflicts[edge_key(a, b)] = _opt_str_list(obj, "paths") or ("<conflict>",)
+            a = _req_int(obj, "a", f"conflicts[{i}]", positive=True)
+            b = _req_int(obj, "b", f"conflicts[{i}]", positive=True)
+            if a == b:
+                raise FixtureError(f"conflicts[{i}]: self-conflict for PR #{a} is invalid")
+            unknown = sorted({a, b} - number_set)
+            if unknown:
+                raise FixtureError(
+                    f"conflicts[{i}]: unknown PR endpoint(s): "
+                    + ", ".join(f"#{number}" for number in unknown)
+                )
+            key = edge_key(a, b)
+            if key in conflicts:
+                raise FixtureError(f"conflicts[{i}]: duplicate conflict edge {key}")
+            conflicts[key] = _opt_str_list(obj, "paths") or ("<conflict>",)
 
         ancestry: set[tuple[int, int]] = set()
-        for i, entry in enumerate(_as_list(doc.get("ancestry"))):
+        for i, entry in enumerate(_optional_list(doc, "ancestry")):
             obj = _as_obj(entry, f"ancestry[{i}]")
-            ancestry.add((_req_int(obj, "before", f"ancestry[{i}]"), _req_int(obj, "after", f"ancestry[{i}]")))
+            before = _req_int(obj, "before", f"ancestry[{i}]", positive=True)
+            after = _req_int(obj, "after", f"ancestry[{i}]", positive=True)
+            if before == after:
+                raise FixtureError(f"ancestry[{i}]: self-ancestry for PR #{before} is invalid")
+            unknown = sorted({before, after} - number_set)
+            if unknown:
+                raise FixtureError(
+                    f"ancestry[{i}]: unknown PR endpoint(s): "
+                    + ", ".join(f"#{number}" for number in unknown)
+                )
+            edge = (before, after)
+            if edge in ancestry:
+                raise FixtureError(f"ancestry[{i}]: duplicate ancestry edge {edge}")
+            ancestry.add(edge)
 
         base_refs = {p.raw.base_ref for p in prs}
         base_shas = {ref: f"basesha-{ref}" for ref in base_refs}
         return cls(prs, conflicts, frozenset(ancestry), base_shas), repo, base
 
 
-def _as_list(value: object) -> list[object]:
-    return list(value) if isinstance(value, list) else []
+def _optional_list(doc: Mapping[str, object], key: str) -> list[object]:
+    value = doc.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise FixtureError(f"<root>: field {key!r} must be a list")
+    return list(value)
 
 
 def load_fixture_text(text: str, *, as_yaml: bool) -> object:
     """Parse a fixture document from ``text`` (YAML or JSON) into a plain ``object`` (no Any leak).
 
-    PyYAML is optional; a YAML fixture requested without it raises :class:`FixtureError` with an
-    actionable install hint (JSON fixtures work without it)."""
+    If the declared PyYAML dependency is missing, a YAML fixture raises :class:`FixtureError` with
+    an actionable repair hint (JSON fixtures remain available)."""
     if as_yaml:
         try:
             import yaml
         except ModuleNotFoundError as exc:
             raise FixtureError(_MISSING_YAML_MSG) from exc
-        raw: object = yaml.safe_load(text)
-    else:
+
+        class _UniqueKeyLoader(yaml.SafeLoader):
+            pass
+
+        def construct_unique_mapping(
+            loader: yaml.SafeLoader, node: yaml.MappingNode, deep: bool = False
+        ) -> dict[str, object]:
+            mapping: dict[str, object] = {}
+            for key_node, value_node in node.value:
+                key: object = loader.construct_object(key_node, deep=deep)
+                if not isinstance(key, str):
+                    raise FixtureError("invalid YAML fixture: mapping keys must be strings")
+                if key == "<<":
+                    raise FixtureError("invalid YAML fixture: merge keys are not supported")
+                if key in mapping:
+                    raise FixtureError(f"invalid YAML fixture: duplicate key {key!r}")
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        _UniqueKeyLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            construct_unique_mapping,
+        )
         try:
-            raw = json.loads(text)
+            raw: object = yaml.load(text, Loader=_UniqueKeyLoader)
+        except yaml.YAMLError as exc:
+            raise FixtureError(f"invalid YAML fixture: {exc}") from exc
+    else:
+        def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            obj: dict[str, object] = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise FixtureError(f"invalid JSON fixture: duplicate key {key!r}")
+                obj[key] = value
+            return obj
+
+        try:
+            raw = json.loads(text, object_pairs_hook=unique_object)
         except json.JSONDecodeError as exc:
             raise FixtureError(f"invalid JSON fixture: {exc}") from exc
     return raw

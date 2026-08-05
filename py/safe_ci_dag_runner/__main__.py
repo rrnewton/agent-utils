@@ -1,14 +1,5 @@
 #!/usr/bin/env python3
-"""Executable entry point.
-
-Runnable three ways, all equivalent:
-  * `python -m safe_ci_dag_runner`
-  * the installed console script `safe-ci-dag-runner`
-  * directly via the `py/bin/safe-ci-dag-runner` symlink (no install needed)
-
-The last case is why we fix up sys.path here: when this file is executed directly, the
-package's parent dir (py/) may not be importable yet.
-"""
+"""Executable entry point for the console command and ``python -m`` invocation."""
 
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
 """Pure parsing and application of caller-supplied landing context.
 
 GitHub exposes checks and labels, but an external coordinator owns three facts the
-generic planner cannot infer: an exact-head local validation record, the assigned
+generic planner cannot infer: an exact-head/base local validation record, the assigned
 landing agent, and whether a change alters gate policy.  ``--landing-context``
 supplies those facts without baking one project's ledger or task system into this
 package.
@@ -26,10 +26,11 @@ LOCALLY_VALIDATED_LABEL = "locally-validated"
 
 @dataclass(frozen=True)
 class LandingContext:
-    """Caller-owned landing facts for one PR, optionally guarded by exact head SHA."""
+    """Caller-owned landing facts for one PR, guarded by fetched commit identities."""
 
     pr: int
     head_sha: str = ""
+    base_sha: str = ""
     assigned_agent: str = ""
     validation_evidence: ValidationEvidence | None = None
     policy_class: PolicyClass | None = None
@@ -75,14 +76,19 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
             raise ValueError(f"PR #{pr} has unknown policy_class {policy_raw!r}") from exc
 
         head_sha = _str_field(obj, "head_sha")
-        if evidence is ValidationEvidence.CLEAN_VALIDATE_RECORD and not head_sha:
+        base_sha = _str_field(obj, "base_sha")
+        if evidence is ValidationEvidence.CLEAN_VALIDATE_RECORD and (
+            not head_sha or not base_sha
+        ):
             raise ValueError(
-                f"PR #{pr} clean-validate-record evidence requires exact 'head_sha'"
+                f"PR #{pr} clean-validate-record evidence requires exact 'head_sha' "
+                "and 'base_sha'; revalidate and record both fetched identities"
             )
         contexts.append(
             LandingContext(
                 pr=pr,
                 head_sha=head_sha,
+                base_sha=base_sha,
                 assigned_agent=_str_field(obj, "assigned_agent"),
                 validation_evidence=evidence,
                 policy_class=policy,
@@ -118,7 +124,7 @@ def _label_context(node: PrNode) -> PrNode:
         evidence = ValidationEvidence.AUTHORITATIVE_CI
     elif LOCALLY_VALIDATED_LABEL in node.labels:
         # The label is an observable cache hint, not evidence.  Only caller-supplied
-        # exact-head records and authoritative CI can authorize a landing.
+        # exact-identity records and authoritative CI can authorize a landing.
         evidence = ValidationEvidence.LOCALLY_VALIDATED
     else:
         evidence = ValidationEvidence.NONE
@@ -133,7 +139,7 @@ def _label_context(node: PrNode) -> PrNode:
 def apply_landing_context(
     nodes: Sequence[PrNode], contexts: Sequence[LandingContext]
 ) -> tuple[PrNode, ...]:
-    """Apply labels, then exact-head caller context; fail closed on drift or unknown PRs."""
+    """Apply labels, then exact head/base context; fail closed on drift or unknown PRs."""
     by_context = {context.pr: context for context in contexts}
     node_numbers = {node.number for node in nodes}
     unknown = sorted(set(by_context) - node_numbers)
@@ -152,6 +158,11 @@ def apply_landing_context(
             raise ValueError(
                 f"PR #{node.number} landing context is stale: "
                 f"context={context.head_sha}, current={node.head_sha}"
+            )
+        if context.base_sha and context.base_sha != node.base_sha:
+            raise ValueError(
+                f"PR #{node.number} landing context base is stale: "
+                f"context={context.base_sha}, current={node.base_sha}; revalidate"
             )
         out.append(
             replace(

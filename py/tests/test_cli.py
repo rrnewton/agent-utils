@@ -77,6 +77,18 @@ def test_run_help_has_no_rust_binary_mention() -> None:
     assert "rust binary" not in low
 
 
+@pytest.mark.parametrize("command", ["run", "pin-run"])
+def test_core_count_must_be_positive_usage_error(command: str) -> None:
+    argv = [command, "--cores", "0"]
+    if command == "run":
+        argv.extend(["--dag", "missing.json"])
+    else:
+        argv.extend(["--", "true"])
+    with pytest.raises(SystemExit) as raised:
+        main(argv)
+    assert raised.value.code == 2
+
+
 @pytest.mark.parametrize(
     ("sub", "expected"),
     [
@@ -549,73 +561,18 @@ def test_boxed_reexec_via_symlink_imports_package() -> None:
         )
 
 
-def test_cores_flag_constrains_the_whole_run_tree() -> None:
-    # Behavioral parity anchor for the Rust `core_box_smoke.rs`: prove `--cores K` actually
-    # constrains the WHOLE run process tree (the runner AND every step it forks), not just the
-    # runner. The step below is a FORKED descendant of the runner that reads its own
-    # `nproc` (which honors sched-affinity); under `--cores 1` it must see exactly one CPU, so the
-    # step passes iff the size-1 core box was inherited across fork+execve to the whole tree.
-    #
-    # We run with `--allow-cgroup-failure`, so `apply_core_box` still runs (the boxing manager
-    # resolves to a no-op with rc 0) and exercises the `sched_setaffinity` fallback even where no
-    # delegated cpuset scope exists — the mechanism that must work in the 3pai sandbox and on
-    # plain CI. The box is environment-dependent (sched_setaffinity can be denied, or the host may
-    # expose only one CPU), so when the runner does not log that it constrained the tree to 1 core
-    # we skip LOUDLY rather than assert on an environment that cannot pin.
-    import os
-
-    allowed = os.sched_getaffinity(0)
-    if len(allowed) < 2:
-        pytest.skip(
-            f"host exposes only {len(allowed)} allowed CPU(s); a 1-core box is "
-            "indistinguishable from the ambient affinity here"
-        )
-
-    # POSITIVE leg: a forked step that PASSES iff it sees exactly one CPU (whole-tree inheritance).
-    pos_dag = (
-        '{"steps": [{"group": "box", "job": "one", "desc": "step sees exactly 1 CPU",'
-        ' "cmd": "test \\"$(nproc)\\" -eq 1", "timeout": 30}]}'
-    )
-    # NEGATIVE leg: the SAME step WITHOUT --cores must see >1 CPU (proves the box, not nproc, is
-    # what changes the count) — i.e. the constraint is not vacuously always-true.
-    neg_dag = (
-        '{"steps": [{"group": "box", "job": "many", "desc": "step sees >1 CPU unconstrained",'
-        ' "cmd": "test \\"$(nproc)\\" -gt 1", "timeout": 30}]}'
-    )
+def test_cores_flag_refuses_unboxed_soft_affinity() -> None:
+    # `--allow-cgroup-failure` deliberately leaves this process outside an owned runner scope.
+    # `--cores` must therefore fail closed before launching the step; inherited process affinity
+    # is escapable and cannot enforce a collision-free reservation.
     with tempfile.TemporaryDirectory() as tmp:
-        pos = Path(tmp) / "pos.json"
-        pos.write_text(pos_dag, encoding="utf-8")
-        neg = Path(tmp) / "neg.json"
-        neg.write_text(neg_dag, encoding="utf-8")
-        env = dict(os.environ)
-
-        pproc = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(pos),
-             "--cores", "1", "-q", "--no-profile", _ACF],
-            capture_output=True, text=True, env=env,
+        dag = _one_step_dag(tmp, "echo SHOULD_NOT_RUN")
+        rc, out, err = _capture(
+            ["run", "--dag", dag, "--cores", "1", "-q", "--no-profile", _ACF]
         )
-        pcombined = pproc.stdout + pproc.stderr
-        if "core box: constrained to 1 core" not in pcombined:
-            pytest.skip(
-                "the runner could not verify a 1-core box in this environment (neither cgroup "
-                f"cpuset nor sched_setaffinity engaged):\n{pcombined}"
-            )
-        assert pproc.returncode == 0, (
-            "with --cores 1 the forked step must see exactly one CPU (proving the size-1 box was "
-            f"inherited by the whole tree); got rc={pproc.returncode}\n{pcombined}"
-        )
-
-        # Negative control: unconstrained, the same step sees the ambient (>1) CPU count.
-        nproc = subprocess.run(
-            [sys.executable, "-m", "safe_ci_dag_runner", "run", "--dag", str(neg),
-             "-q", "--no-profile", _ACF],
-            capture_output=True, text=True, env=env,
-        )
-        ncombined = nproc.stdout + nproc.stderr
-        assert nproc.returncode == 0, (
-            "without --cores the step must see the ambient (>1) CPU count, proving the box (not "
-            f"nproc) is what changes it; got rc={nproc.returncode}\n{ncombined}"
-        )
+        assert rc == 3
+        assert "SHOULD_NOT_RUN" not in out
+        assert "hard cgroup cpuset unavailable; refusing to run" in err
 
 
 # --------------------------------------------------------------------------- --stress

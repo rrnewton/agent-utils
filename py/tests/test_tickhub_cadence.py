@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tick_hub.cadence import (
     due_reminders,
     is_due,
@@ -62,5 +64,35 @@ def test_fired_state_round_trip(tmp_path: Path) -> None:
 
 def test_fired_state_ignores_garbage_lines(tmp_path: Path) -> None:
     path = tmp_path / "state"
-    path.write_text("# comment\n\nvalid=42\nbad line\nk=notnum\n", encoding="utf-8")
-    assert load_fired_state(path) == {"valid": 42}
+    path.write_text(
+        "# comment\n\nvalid=42\nmax=9223372036854775807\n"
+        "overflow=9223372036854775808\nbad line\nk=notnum\n",
+        encoding="utf-8",
+    )
+    assert load_fired_state(path) == {"valid": 42, "max": 9223372036854775807}
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"": 1},
+        {"bad key": 1},
+        {"bad=key": 1},
+        {"bad": -1},
+        {"bad": 9223372036854775808},
+        {"bad": True},
+    ],
+)
+def test_fired_state_writer_rejects_unreadable_entries(
+    tmp_path: Path, state: dict[str, int]
+) -> None:
+    with pytest.raises(ValueError):
+        persist_fired_state(tmp_path / "state", state)
+
+
+def test_fired_state_writer_cleans_temporary_file_after_rename_failure(tmp_path: Path) -> None:
+    destination = tmp_path / "state"
+    destination.mkdir()
+    with pytest.raises(OSError):
+        persist_fired_state(destination, {"valid": 1})
+    assert not (tmp_path / "state.tmp").exists()

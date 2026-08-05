@@ -1,27 +1,29 @@
-//! The DAG runner: greedy, memory-/resource-aware step scheduling.
-//!
-//! Port of the OBSERVABLE scheduling behavior of `py/safe_ci_dag_runner/scheduler.py` for the
-//! no-boxing default path (Python's `cgroups=None`). Reproduced from the reference:
-//!
-//! * Greedy ready-set loop: each pass launches every ready step (deps satisfied, resources
-//!   free, under the `-j` fan-out, in longest-processing-time order) on its own supervisor
-//!   thread, then sleeps briefly.
-//! * Dependency gating + dep-FAILURE skip-closure (a failed dep transitively skips dependents).
-//! * Named-resource capacity buckets (`hint.resources` vs `cfg.resource_caps`).
-//! * Longest-processing-time (LPT) dispatch order (descending `est_duration_s`, stable).
-//! * Per-step supervision via `bash -c` in its own process group (whole-tree teardown).
-//! * Fail-fast (eager-exit): the first genuine failure stops launching NEW steps; by default it
-//!   also eager-cancels in-flight steps (labelled ABORTED, not FAILED). `keep_going` only
-//!   suppresses that eager-cancel so already-running steps finish — it does NOT keep launching
-//!   still-runnable steps.
-//! * Failure classification via [`crate::model::step_failure_reason`].
-//!
-//! Boxing: when a [`crate::cgroup::CgroupManager`] is supplied (the default `run` path), each
-//! step is wrapped so its bash leader self-moves into a per-step child cgroup with an inner
-//! `memory.max` cap, and teardown writes the step's `cgroup.kill` FIRST (a setsid-proof atomic
-//! SIGKILL of the whole subtree) then killpg as a belt-and-suspenders. Without a manager the
-//! step runs unboxed and teardown is a plain negative-pid `kill(1)` process-group SIGKILL (no
-//! `unsafe`/`libc`). Per-step measurement rows are collected for the perf-log sink either way.
+//! Dependency-aware, resource-aware concurrent DAG execution.
+
+// The DAG runner: greedy, memory-/resource-aware step scheduling.
+//
+// Port of the OBSERVABLE scheduling behavior of `py/safe_ci_dag_runner/scheduler.py` for the
+// no-boxing default path (Python's `cgroups=None`). Reproduced from the reference:
+//
+// * Greedy ready-set loop: each pass launches every ready step (deps satisfied, resources
+//   free, under the `-j` fan-out, in longest-processing-time order) on its own supervisor
+//   thread, then sleeps briefly.
+// * Dependency gating + dep-FAILURE skip-closure (a failed dep transitively skips dependents).
+// * Named-resource capacity buckets (`hint.resources` vs `cfg.resource_caps`).
+// * Longest-processing-time (LPT) dispatch order (descending `est_duration_s`, stable).
+// * Per-step supervision via `bash -c` in its own process group (whole-tree teardown).
+// * Fail-fast (eager-exit): the first genuine failure stops launching NEW steps; by default it
+//   also eager-cancels in-flight steps (labelled ABORTED, not FAILED). `keep_going` only
+//   suppresses that eager-cancel so already-running steps finish — it does NOT keep launching
+//   still-runnable steps.
+// * Failure classification via [`crate::model::step_failure_reason`].
+//
+// Boxing: when a [`crate::cgroup::CgroupManager`] is supplied (the default `run` path), each
+// step is wrapped so its bash leader self-moves into a per-step child cgroup with an inner
+// `memory.max` cap, and teardown writes the step's `cgroup.kill` FIRST (a setsid-proof atomic
+// SIGKILL of the whole subtree) then killpg as a belt-and-suspenders. Without a manager the
+// step runs unboxed and teardown is a plain negative-pid `kill(1)` process-group SIGKILL (no
+// `unsafe`/`libc`). Per-step measurement rows are collected for the perf-log sink either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
@@ -49,12 +51,12 @@ pub type BoxedCgroups = Option<Arc<dyn CgroupManager>>;
 /// Per-step monitor poll interval (seconds) for descendant-thread-peak sampling.
 const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Scheduler idle interval between ready-set sweeps (matches Python's `time.sleep(0.05)`).
+// Scheduler idle interval between ready-set sweeps (matches Python's `time.sleep(0.05)`).
 const LOOP_SLEEP: Duration = Duration::from_millis(50);
 /// Poll interval while a step's supervisor waits for the child (std has no wait-with-timeout).
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
-/// Mutable scheduler state, guarded by one lock (mirrors the Python `Runner`'s single lock).
+// Mutable scheduler state, guarded by one lock (mirrors the Python `Runner`'s single lock).
 struct Shared {
     done: HashMap<String, StepOutcome>,
     running: HashSet<String>,
@@ -113,9 +115,9 @@ fn step_width(step: &Step) -> i64 {
     }
 }
 
-/// True when the step fits the remaining core budget, OR nothing is running (so a step wider than
-/// the whole budget still runs — alone — instead of deadlocking). Inactive (always true) when
-/// `core_budget` is `None` (the non-CPA default). Mirrors Python's `Runner._cores_free`.
+// True when the step fits the remaining core budget, OR nothing is running (so a step wider than
+// the whole budget still runs — alone — instead of deadlocking). Inactive (always true) when
+// `core_budget` is `None` (the non-CPA default). Mirrors Python's `Runner._cores_free`.
 fn cores_free(sh: &Shared, step: &Step, core_budget: Option<i64>) -> bool {
     match core_budget {
         None => true,
@@ -160,9 +162,9 @@ struct Runner {
     default_step_mem_cap_bytes: Option<i64>,
     default_step_cpu_count: Option<i64>,
     default_step_cpu_timeout: i64,
-    /// CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set loop
-    /// never lets the summed inner-jobs width of concurrently-running steps exceed this total core
-    /// budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
+    // CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set loop
+    // never lets the summed inner-jobs width of concurrently-running steps exceed this total core
+    // budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
     core_budget: Option<i64>,
     shared: Arc<Mutex<Shared>>,
 }
@@ -223,8 +225,8 @@ impl Runner {
         }
     }
 
-    /// Tags whose deps FAILED (transitively) so they must never run — a fixpoint closure,
-    /// ported from the Python `Runner._skipped`.
+    // Tags whose deps FAILED (transitively) so they must never run — a fixpoint closure,
+    // ported from the Python `Runner._skipped`.
     fn skipped(&self, sh: &Shared) -> HashSet<String> {
         let mut sk: HashSet<String> = HashSet::new();
         let mut changed = true;
@@ -358,7 +360,7 @@ impl Runner {
     }
 }
 
-/// Read a child pipe to EOF into `buf`; when `stream`, also echo each line tagged.
+// Read a child pipe to EOF into `buf`; when `stream`, also echo each line tagged.
 fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
     buf: Arc<Mutex<Vec<u8>>>,

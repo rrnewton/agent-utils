@@ -1,22 +1,24 @@
-//! A constant-sized, MERGEABLE profile SUMMARY that closes the profiling feedback loop on
-//! EPHEMERAL CI.
-//!
-//! Direct port of `py/safe_ci_dag_runner/summary.py`; the canonical JSON serialization and the
-//! MERGE are BYTE-IDENTICAL to the Python build (cross-tested in `cross/differential.py`) — this is
-//! the correctness core of the sync feature.
-//!
-//! The profile store auto-logs per-step CSVs and the planner reads them back, but that loop is
-//! INERT on ephemeral CI (each runner starts with an empty store). This module is the artifact a
-//! pluggable backend ([`crate::sync`]) uploads at end-of-run and downloads at start-of-run:
-//!
-//! * For each `(step, inner_jobs)` bucket it keeps a RESERVOIR of up to [`DEFAULT_RESERVOIR_K`]
-//!   [`Sample`]s (exactly the fields the estimator + speedup model consume). Bucket count is bounded
-//!   by the workload and hard-capped at [`DEFAULT_MAX_BUCKETS`], so the summary is CONSTANT-SIZED.
-//! * [`merge`] unions two summaries' reservoirs per bucket and subsamples back to K by a
-//!   CONTENT-derived stable order (an FNV-1a hash of each sample's canonical serialization, then take
-//!   the first K) — deterministic, COMMUTATIVE, and ASSOCIATIVE, and identical across builds.
-//! * Estimates are recomputed FROM the reservoirs via the same estimator core the CSV reader uses,
-//!   so a summary that has not subsampled a bucket yields byte-identical estimates to the raw rows.
+//! Bounded, mergeable summaries of execution profiles.
+
+// A constant-sized, MERGEABLE profile SUMMARY that closes the profiling feedback loop on
+// EPHEMERAL CI.
+//
+// Direct port of `py/safe_ci_dag_runner/summary.py`; the canonical JSON serialization and the
+// MERGE are BYTE-IDENTICAL to the Python build (cross-tested in `cross/differential.py`) — this is
+// the correctness core of the sync feature.
+//
+// The profile store auto-logs per-step CSVs and the planner reads them back, but that loop is
+// INERT on ephemeral CI (each runner starts with an empty store). This module is the artifact a
+// pluggable backend ([`crate::sync`]) uploads at end-of-run and downloads at start-of-run:
+//
+// * For each `(step, inner_jobs)` bucket it keeps a RESERVOIR of up to [`DEFAULT_RESERVOIR_K`]
+//   [`Sample`]s (exactly the fields the estimator + speedup model consume). Bucket count is bounded
+//   by the workload and hard-capped at [`DEFAULT_MAX_BUCKETS`], so the summary is CONSTANT-SIZED.
+// * [`merge`] unions two summaries' reservoirs per bucket and subsamples back to K by a
+//   CONTENT-derived stable order (an FNV-1a hash of each sample's canonical serialization, then take
+//   the first K) — deterministic, COMMUTATIVE, and ASSOCIATIVE, and identical across builds.
+// * Estimates are recomputed FROM the reservoirs via the same estimator core the CSV reader uses,
+//   so a summary that has not subsampled a bucket yields byte-identical estimates to the raw rows.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,8 +57,8 @@ fn err<T>(msg: String) -> Result<T, SummaryError> {
     Err(SummaryError(msg))
 }
 
-/// A bounded, mergeable profile summary for ONE `(machine_id, container_class)` identity. Mirrors
-/// Python's `Summary`.
+// A bounded, mergeable profile summary for ONE `(machine_id, container_class)` identity. Mirrors
+// Python's `Summary`.
 #[derive(Debug, Clone)]
 pub struct Summary {
     pub version: i64,
@@ -67,7 +69,7 @@ pub struct Summary {
 
 // --------------------------------------------------------------------------- content hashing
 
-/// FNV-1a 64-bit hash (wrapping arithmetic), identical to the Python build.
+// FNV-1a 64-bit hash (wrapping arithmetic), identical to the Python build.
 fn fnv1a_64(data: &[u8]) -> u64 {
     let mut h = FNV_OFFSET_BASIS;
     for &byte in data {
@@ -83,8 +85,8 @@ fn opt_secs_json(value: Option<f64>) -> String {
     }
 }
 
-/// The canonical one-line JSON object for a sample — used BOTH as the serialized form and the input
-/// to the subsample hash (so they can never drift). Mirrors Python's `_sample_canonical`.
+// The canonical one-line JSON object for a sample — used BOTH as the serialized form and the input
+// to the subsample hash (so they can never drift). Mirrors Python's `_sample_canonical`.
 fn sample_canonical(sample: &Sample) -> String {
     format!(
         "{{\"elapsed_s\": {}, \"contention\": \"{}\", \"cpu_s\": {}, \"effective_cores\": {}, \"throttled_s\": {}, \"peak_bytes\": {}}}",
@@ -100,17 +102,17 @@ fn sample_canonical(sample: &Sample) -> String {
     )
 }
 
-/// The stable content-derived sort key `(fnv_hash, canonical_json)` for a sample. The canonical JSON
-/// is pure ASCII, so Rust's `String` byte order equals Python's code-point order (identical
-/// tie-break). Mirrors Python's `_sample_sort_key`.
+// The stable content-derived sort key `(fnv_hash, canonical_json)` for a sample. The canonical JSON
+// is pure ASCII, so Rust's `String` byte order equals Python's code-point order (identical
+// tie-break). Mirrors Python's `_sample_sort_key`.
 fn sample_sort_key(sample: &Sample) -> (u64, String) {
     let canon = sample_canonical(sample);
     (fnv1a_64(canon.as_bytes()), canon)
 }
 
-/// Return `samples` in canonical content order, optionally truncated to the first `cap`. This is the
-/// deterministic subsample: the smallest-`cap` samples by content hash — a fixed total order on
-/// content, so first-`cap`-of-union is commutative + associative. Mirrors Python's `_ordered`.
+// Return `samples` in canonical content order, optionally truncated to the first `cap`. This is the
+// deterministic subsample: the smallest-`cap` samples by content hash — a fixed total order on
+// content, so first-`cap`-of-union is commutative + associative. Mirrors Python's `_ordered`.
 fn ordered(samples: &[Sample], cap: Option<usize>) -> Vec<Sample> {
     let mut with_keys: Vec<((u64, String), Sample)> = samples
         .iter()
@@ -129,8 +131,8 @@ fn bucket_sort_key(key: &BucketKey) -> (u64, String) {
     (fnv1a_64(canon.as_bytes()), canon)
 }
 
-/// Drop buckets beyond `max_buckets` by the content-derived stable order. A no-op for a normal
-/// workload. Mirrors Python's `_cap_buckets`.
+// Drop buckets beyond `max_buckets` by the content-derived stable order. A no-op for a normal
+// workload. Mirrors Python's `_cap_buckets`.
 fn cap_buckets(
     buckets: HashMap<BucketKey, Vec<Sample>>,
     max_buckets: usize,
@@ -162,7 +164,7 @@ pub fn empty(machine_id: &str, container_class: &str) -> Summary {
     }
 }
 
-/// Build a bounded summary from raw profile `rows`. Mirrors Python's `summary_from_rows`.
+// Build a bounded summary from raw profile `rows`. Mirrors Python's `summary_from_rows`.
 pub fn summary_from_rows(
     rows: &[HashMap<String, String>],
     machine_id: &str,
@@ -205,9 +207,9 @@ pub fn summary_from_store(
     }
 }
 
-/// Merge two same-identity summaries: union each bucket's reservoirs and subsample back to
-/// `reservoir_cap` by the content-derived stable order. Deterministic, COMMUTATIVE, ASSOCIATIVE.
-/// Errors on an identity mismatch. Mirrors Python's `merge`.
+// Merge two same-identity summaries: union each bucket's reservoirs and subsample back to
+// `reservoir_cap` by the content-derived stable order. Deterministic, COMMUTATIVE, ASSOCIATIVE.
+// Errors on an identity mismatch. Mirrors Python's `merge`.
 pub fn merge(
     a: &Summary,
     b: &Summary,
@@ -259,9 +261,9 @@ pub fn merge_all(
 
 // --------------------------------------------------------------------------- serialization
 
-/// Canonical, byte-identical (py<->rs) JSON for a summary (2-space indent). Buckets sorted by
-/// `(step, inner_jobs)`; samples in canonical content order; floats as fixed 3-decimal strings.
-/// Mirrors Python's `to_json`.
+// Canonical, byte-identical (py<->rs) JSON for a summary (2-space indent). Buckets sorted by
+// `(step, inner_jobs)`; samples in canonical content order; floats as fixed 3-decimal strings.
+// Mirrors Python's `to_json`.
 pub fn to_json(summary: &Summary) -> String {
     let mut lines: Vec<String> = vec![
         "{".to_string(),
@@ -392,8 +394,8 @@ fn opt_int(
     }
 }
 
-/// Parse a canonical summary document (strict narrowing; unknown version / malformed shape rejected).
-/// Mirrors Python's `from_json`.
+// Parse a canonical summary document (strict narrowing; unknown version / malformed shape rejected).
+// Mirrors Python's `from_json`.
 pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
     let raw: Value = serde_json::from_str(text)
         .map_err(|e| SummaryError(format!("invalid summary JSON: {e}")))?;
@@ -453,8 +455,8 @@ pub fn from_json(text: &str) -> Result<Summary, SummaryError> {
 
 // --------------------------------------------------------------------------- estimate recompute
 
-/// Recompute per-step duration + memory estimates from a summary's reservoirs (same estimator core
-/// as the CSV reader). Mirrors Python's `step_samples_from_summary`.
+// Recompute per-step duration + memory estimates from a summary's reservoirs (same estimator core
+// as the CSV reader). Mirrors Python's `step_samples_from_summary`.
 pub fn step_samples_from_summary(summary: &Summary) -> HashMap<String, StepSamples> {
     step_samples_from_buckets(&summary.buckets)
 }
@@ -469,8 +471,8 @@ pub fn step_speedups_from_summary(
     step_speedups_from_buckets(&summary.buckets, budget)
 }
 
-/// `(bucket_count, total_samples, max_bucket_samples)` — the bounded-size witness. Mirrors
-/// Python's `summary_stats`.
+// `(bucket_count, total_samples, max_bucket_samples)` — the bounded-size witness. Mirrors
+// Python's `summary_stats`.
 pub fn summary_stats(summary: &Summary) -> (usize, usize, usize) {
     let bucket_count = summary.buckets.len();
     let total: usize = summary.buckets.values().map(|v| v.len()).sum();

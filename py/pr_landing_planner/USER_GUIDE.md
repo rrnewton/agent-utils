@@ -1,269 +1,207 @@
-# pr-landing-planner — user guide
+# pr-landing-planner user guide
 
-`pr-landing-planner` is a **conflict-graph + CI-aware, advisory pull-request landing planner**. Given
-the open pull requests targeting a base branch, it computes — in one shot — which PRs truly conflict,
-which red CI results are real versus benign, exact-head validation evidence, gate-policy disposition,
-assigned agents, mechanism overlaps, freshness, holds, and an ordered action per PR. It is
-**advisory only**: it recommends actions and never mutates a pull request. A landing skill or
-coordinator executes the mutations.
+`pr-landing-planner` fuses pull-request metadata, exact fetched heads, merge
+conflicts, CI evidence, holds, freshness, and semantic overlaps into an
+advisory landing plan. Its outputs are deterministic for a fixed snapshot and
+it performs no repository-host mutations.
 
-It generalizes three predecessor scripts into one host-pluggable tool: DeepScry's `pr_interference.py`
-(the conflict/ordering-graph → batch mechanic), hermit's `pr_conflict_graph.py` (real `git merge-tree`
-conflicts, stacks, held reasoning, the content-identity guard), and hermit's `pr_status.py` (per-PR
-CI/label health). The decisive new capability is the **fusion** none of them did: combining the
-conflict graph with *live* CI health, freshness, and priority into one actionable plan.
-
-Plain-language note: "landing" means merging a PR into the shared base branch (e.g. `integration`). A
-"conflict graph" is a picture of which open PRs collide if merged together. "CI" is the automated
-test/build system. "The gate" is the single required check the host waits on before merging.
-
----
-
-## Install
+## Installation and library use
 
 ```sh
-pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"
+python3 -m pip install pr-landing-planner
 ```
 
-Or, from a checkout, `./setup py` and use `./bin/pr-landing-planner`. It needs `gh` and `git` on
-`PATH` for live runs (not for `--fixture` runs).
+Python 3.10 or newer is required. Installation provides the console command,
+the typed `pr_landing_planner` package, fixtures, and this guide as package
+data. Live collection also requires `gh` and `git` on `PATH`.
 
----
+```python
+from pr_landing_planner import FakeHost, assemble_result, collect_graph, render_json
+from pr_landing_planner.fakehost import load_fixture_text
 
-## Quick start
+fixture = load_fixture_text('{"repo":"owner/repo","prs":[]}', as_yaml=False)
+host, repository, base = FakeHost.from_fixture(fixture)
+graph = collect_graph(host, repo=repository, base=base)
+print(render_json(assemble_result(graph)))
+```
 
-Try it with the bundled fixture — no repo, no network:
+The public API includes typed models, CI classification, graph construction,
+priority providers, deterministic renderers, and the `VcsHost` protocol for
+custom data sources.
+
+## Start with an offline fixture
 
 ```sh
 pr-landing-planner quickstart --emit-demo > demo.yaml
 pr-landing-planner plan --fixture demo.yaml
+pr-landing-planner graph --fixture demo.yaml
+pr-landing-planner status --fixture demo.yaml
 ```
 
-Run against a real repository:
+The emitted demo is a complete JSON/YAML fixture with pull requests, checks,
+heads, changed files, conflicts, and ancestry. Fixture mode is deterministic,
+network-free, and does not archive a plan unless `--archive-dir` is explicit.
+Duplicate mapping keys, nonpositive or overflowing identifiers, duplicate PR
+identities, negative numeric counters, and relations with self/unknown endpoints
+are rejected instead of being silently normalized.
+
+Use fixture mode for evaluation, tests, saved snapshots, and integrations that
+already collect repository-host data.
+
+## Plan a live repository
 
 ```sh
 pr-landing-planner plan \
-  --repo OWNER/NAME --base main --git-dir /path/to/clone \
-  --net-wrapper with-proxy --gh-cmd ./scripts/gh_human \
-  --flaky-signatures flaky-signatures.yaml \
-  --landing-context landing-context.json
+  --repo OWNER/NAME \
+  --base main \
+  --git-dir /path/to/clone
 ```
 
-`gh pr list` supplies the PRs (with the CI rollup + labels); `git merge-tree` finds the real
-conflicts against a local clone.
+`--repo` is required for live runs. The host adapter reads PR metadata with
+`gh`, fetches exact base and PR heads into private local refs, and uses `git
+merge-tree` to detect real conflicts. It does not check out, rebase, push,
+label, refire, or merge anything.
 
----
+Common collection flags include:
 
-## Subcommands
+| Flag | Meaning |
+|---|---|
+| `--base BRANCH` | Target branch; default `main`. |
+| `--prs N,N,...` | Restrict collection to selected PR numbers. |
+| `--git-dir PATH` | Local clone used for fetch and merge analysis. |
+| `--remote NAME` | Remote to fetch; default `origin`. |
+| `--conflict-detector merge-tree` | Exact merge conflict detection; the default. |
+| `--conflict-detector file-overlap` | Faster conservative fallback. |
+| `--net-wrapper PREFIX` | Optional command prefix for host commands. |
+| `--gh-cmd COMMAND` | Alternate `gh` executable or wrapper. |
 
-| Command | What it prints |
-|---------|----------------|
-| `plan` (default) | the full landing plan: parallel-safe groups, land-now set, order, per-PR actions, and diagnostics |
-| `graph` | just the conflict/ordering graph (nodes, real conflicts, file-overlap risks, stacks, held) |
-| `status` | just per-PR CI/label health, with an open-PR-count warning |
-| `quickstart` | a self-contained getting-started tour (add `--emit-demo` to print only the demo fixture) |
-| `--userguide` | this full guide (the complete reference) |
-| `--version`, `-h/--help` | version / colored help |
+Content-identity checks fail closed if the fetched head differs from host
+metadata or if caller evidence names a different fetched head or base.
 
----
+## What the graph means
 
-## The core algorithm
+The planner distinguishes several relationships:
 
-1. **Collect** the open PRs from the host and select those targeting `--base` plus their transitive
-   stacks (and any `--prs` restriction).
-2. **Fetch** the base ref and each PR head, then run the **content-identity guard**: if a fetched head
-   commit differs from the API's reported head, abort with "rerun" so the plan is never built from a
-   half-updated snapshot.
-3. **Build the conflict graph.** `--conflict-detector merge-tree` (default) runs `git merge-tree` on
-   each pair to detect *real* merge conflicts without touching a worktree; `--conflict-detector
-   file-overlap` is a fast, conservative fallback that treats any shared-file pair as a conflict (it
-   over-serializes PRs that share a file but auto-merge cleanly). File-overlap edges are always
-   computed separately as a weaker "semantic-review risk" signal.
-4. **Build ordering edges** from explicit base-branch stacking and from git ancestry (so that when
-   you rebase PR B onto PR A's tip, the next run detects the new ancestry and the pair becomes a
-   satisfied ordering constraint). Ordering edges are transitively reduced; stacks are extracted.
-5. **Classify each PR's CI** (see below), apply exact-head caller context, and compute **freshness**.
-6. **Compute held reasons**: `draft`, `local-base-conflict` (a real merge-tree conflict with the
-   base), `github-base-conflicting`, and `depends-on-held:#N` (propagated transitively).
-7. **Partition** the non-held PRs into **parallel-safe groups**: a greedy independent-set layering
-   over the conflict graph that respects ordering edges. PRs in a group are safe to land / review in
-   parallel.
-8. **Surface mechanism overlaps** from shared `mechanism:<slug>` labels. They request coordinator
-   review but do not prove conflicting intent.
-9. **Assign each PR an action** via the fusion table, ordered priority → diff size → age → PR number.
+- **conflict edges** mean two exact PR heads cannot merge cleanly together;
+- **ordering edges** encode an explicit stack/dependency direction;
+- **file-overlap edges** are informative changed-path intersections;
+- **mechanism-overlap edges** flag changes to the same recognized operational
+  mechanism even when their files differ; and
+- **unclassified mechanism candidates** stay visible instead of being silently
+  forced into the wrong category.
 
-### Landing context
+Parallel-safe groups contain PRs that do not conflict under the chosen model.
+Clusters retain connected conflict sets so a coordinator can reason about
+stacking and avoid needless repeated rebases.
 
-GitHub does not know a caller's local validation ledger, task assignment, or policy classification.
-Pass those facts in a JSON or YAML file. Clean validation evidence is accepted only when guarded by
-the exact current head SHA:
+## CI classification
 
-```json
-{"prs":[{"pr":123,"head_sha":"<40-hex>","validation_evidence":"clean-validate-record","policy_class":"ci-hygiene","assigned_agent":"agent-name"}]}
-```
+The required gate name is caller-configurable with `--gate-check`. Red or
+apparently red states are classified before actions are chosen:
 
-`validation_evidence` is `clean-validate-record`, `locally-validated`, `authoritative-ci`, or `none`.
-`policy_class` is `ci-hygiene`, `gate-policy`, or `unclassified`. Labels can also provide
-`locally-validated`, `agent:<name>`, `landing-policy:<class>`, and `mechanism:<slug>`. The
-`locally-validated` value records that the cache label was observed; it never authorizes landing.
-Only authoritative CI or a caller-supplied `clean-validate-record` bound to the exact head does.
+| Class | Interpretation | Typical recommendation |
+|---|---|---|
+| `real` | A genuine check failure. | `hold-fix` |
+| `flaky` | Matches a supplied check/message signature. | `refire-ci` |
+| `stale-required-check` | Underlying checks passed but the gate is stale. | `refire-stale-gate` |
+| `evaluate-once-race` | The gate evaluated while required work was queued. | `wait` |
+| `runner-outage` | The gate job did not actually execute. | `escalate-runner-outage` |
 
----
-
-## The five red classifications (the headline value)
-
-A naive lander treats every red check as a failure and is wildly wrong — a CI-health analysis of one
-24-hour window found 53% of failures were benign gate noise. This tool instead classifies **why** a
-PR is red, into five modes grounded in real incidents:
-
-| Class | Meaning | Recommended action |
-|-------|---------|--------------------|
-| `real` | a genuine regression | `hold-fix` |
-| `flaky` | a red whose check name/message matches a caller signature | `refire-ci` |
-| `stale-required-check` | the underlying CI is green on the head, but the required gate froze on a stale result (ds-4171) | `refire-stale-gate` |
-| `evaluate-once-race` | the gate fired once while full CI was still queued and exited "still queued" (ds-xdc7m9 / ds-96k1wa) | `wait` (benign; treated as pending) |
-| `runner-outage` | the gate job never actually ran (blank runner / `BlobNotFound` / near-zero duration), usually across many branches (ds-69ih3r) | `escalate-runner-outage` |
-
-Precedence for a red PR: outage → evaluate-once race → stale required check → flaky → real. A systemic
-outage is declared when at least `--outage-min-prs` PRs (default 2) show the gate-never-ran signature.
-
-Nothing project-specific is baked in: the gate-check name (`--gate-check`, default `merge-gate`), the
-flaky signatures (`--flaky-signatures FILE`), and the race/outage markers are all caller config.
-
-### Flaky signatures file
-
-A JSON or YAML file (a top-level list, or `{signatures: [...]}`). Each entry has optional `name_regex`
-and/or `text_regex` (at least one required) and an optional `note`. A red check matches when its name
-matches `name_regex` (if set) AND its message matches `text_regex` (if set):
+Supply flaky signatures as strict JSON or YAML:
 
 ```yaml
-signatures:
-  - name_regex: "wasm-core"
-    note: "known-flaky WASM browser test"
-  - text_regex: "font.*abort|equivalence seed=315"
-    note: "known flaky messages"
+- name_regex: '^integration$'
+  text_regex: 'temporary connection reset'
 ```
 
-Keep this file curated and owned — a stale signature silently masks a real regression.
+```sh
+pr-landing-planner plan \
+  --repo OWNER/NAME \
+  --git-dir /path/to/clone \
+  --flaky-signatures flaky.yaml
+```
 
----
+`--outage-min-prs` controls how many simultaneous outage signatures establish
+a systemic outage.
 
-## Per-PR actions
+## Exact head/base landing context
 
-| Action | When |
-|--------|------|
-| `land-now` | authoritative CI is green, or exact-head local evidence is present; fresh enough to land |
-| `rebase-then-land` | green but more than `--freshness-max-behind` commits behind base, OR held on a base conflict |
-| `refire-stale-gate` | CI green on head; the required gate is stale |
-| `escalate-runner-outage` | the gate job never ran |
-| `escalate-gate-policy` | the PR changes landing/gate policy; validation is not policy approval |
-| `refire-ci` | a flaky red |
-| `hold-fix` | a real red |
-| `wait` | pending, no checks, an evaluate-once race, a draft, or depends-on-held |
-
----
-
-## Priority (ordering)
-
-`--priority-source` selects how the land-now set is ranked (lower priority number = more urgent; ties
-break by diff size, then age, then PR number):
-
-- `none` (default) — every PR is equal; ordering falls back to size then age.
-- `labels` — parse an integer from a label matching `--priority-label-pattern` (default matches `p0`,
-  `p1`, `priority-2`, `priority:3`, …).
-- `beads` — run `--priority-cmd` per PR (with `{pr}` substituted); its stdout's first token is the
-  integer priority. Failures fall back to the default priority (visibly, never silently).
-
----
-
-## Output formats (`--format`)
-
-- `human` (default) — a readable landing summary.
-- `json` — the full machine schema, deterministic (2-space indent, sorted keys). Schema top level:
-  `repository`, `base`, `nodes[]`, `conflict_edges[]`, `file_overlap_edges[]`,
-  `mechanism_overlap_edges[]`, `ordering_edges[]`,
-  `stacks[]`, `held_prs[]`, `plan{parallel_safe_groups, land_now, order, batch, per_pr_actions[]}`,
-  `diagnostics{stale_gates, flaky_reds, real_reds, evaluate_once_race, outage_prs, outage_suspected}`.
-  Each node includes `assigned_agent`, `validation_evidence`, and `policy_class`.
-- `actions` — tick-hub-style line output: a block of bare `key=value` summary counts (so a tick-hub
-  reminder's `capture: true` gate can lift `land_now` / `stale_gates` / `outage` into its emitted
-  line), then loud diagnostic `ERROR:` / `NOTE:` lines, then one `ACTION:` / `ERROR:` / `NOTE:` line
-  per PR in the recommended order. A coordinator parses the per-PR lines by their leading token.
-
-`graph` and `status` accept `--format {human,json}`.
-
----
-
-## Batch mode (`--batch`, off by default)
-
-`--batch` additionally proposes **one green-only, conflict-free batch** to arm behind a single gate
-(bors-style amortization). It is off by default because CI is the scarce resource; enable it when the
-runner pool is idle and the queue is deep. On a batch failure, bisect the batch to find the culprit
-and re-batch the innocents (documented fallback; the planner does not bisect for you).
-
----
-
-## tick-hub integration (Option B — zero tick-hub change)
-
-`pr-landing-planner` is the data source for a PR-landing reminder on a single ops tick. Wire a
-[tick-hub](../tick-hub/USER_GUIDE.md) reminder whose gate runs the planner in `actions` format and
-captures its summary counts, then emits one `ACTION` dispatching your landing skill:
+Some facts belong to the caller rather than the repository host: an assigned
+agent, exact head/base local validation, and whether a PR changes gate policy.
+Provide them with `--landing-context`:
 
 ```yaml
-- name: pr_landing
-  cadence_secs: 1800                 # ~ ops tick interval
-  requires_flags: [ops_in_charge]
-  gate:
-    cmd: "pr-landing-planner plan --format actions --net-wrapper with-proxy --gh-cmd ./scripts/gh_human --git-dir /path/to/clone"
-    when: nonempty
-    capture: true                    # lifts land_now / stale_gates / outage / ... into fields
-  emit:
-    kind: action
-    skill: landing
-    title: "landing: {land_now} ready, {stale_gates} stale-gate, outage={outage}"
+prs:
+  - pr: 42
+    head_sha: 0123456789abcdef
+    base_sha: fedcba9876543210
+    assigned_agent: release-coordinator
+    validation_evidence: clean-validate-record
+    policy_class: ci-hygiene
 ```
 
-The tick's `capture: true` parses the planner's bare `key=value` summary lines; the dispatched
-`landing` skill then re-runs the planner in full (`--format human` or `json`) for the detailed plan.
-The planner's own `ERROR:` (systemic outage) and `NOTE:` (evaluate-once race) lines surface loudly so
-nothing is silently dropped. This requires no change to tick-hub. (An optional tick-hub "pass-through
-emit" mode that forwards the planner's per-PR lines verbatim is a possible future enhancement, not
-needed to ship.)
+Accepted validation evidence is `none`, `authoritative-ci`,
+`locally-validated`, or `clean-validate-record`. A clean validation record must
+name both the exact fetched head and base SHAs. A legacy head-only record is
+rejected with a revalidation instruction. Accepted policy classes are `unclassified`,
+`ci-hygiene`, and `gate-policy`; a gate-policy change is escalated rather than
+treated like routine hygiene. Unknown PRs, duplicate entries, and head drift
+are errors.
 
----
+## Freshness, holds, priority, and batching
 
-## Host pluggability
+`--freshness-max-behind N` recommends a rebase when an otherwise landable PR is
+more than `N` commits behind. Draft state, missing approvals, conflicts,
+ordering constraints, CI state, and policy escalation can hold a PR.
 
-The only side-effecting boundary is the `VcsHost` protocol (list PRs; and per-PR git operations:
-fetch-ref, merge-tree, is-ancestor, changed-files, commits-behind). The shipped implementation is
-`GitHubHost` (`gh` + `git`, honoring `--net-wrapper` and `--gh-cmd`); `FakeHost` backs the
-deterministic tests and the `--fixture` demo. A GitLab / Gerrit host would implement the same
-protocol; the pure core (graph / classify / plan / emit) never changes.
+Priority defaults to deterministic size and age ordering. `--priority-source
+labels` reads a numeric label matching `--priority-label-pattern`; a configured
+`--priority-source command` with `--priority-cmd` can supply an integer priority.
+The command is required and must print exactly one signed 64-bit ASCII integer;
+malformed priority configuration or output stops planning. Ties remain deterministic.
 
-### Fixture format (for `--fixture`)
+`--batch` additionally proposes one green batch containing only dependency-root
+PRs that do not conflict with one another. Ordered children wait for a later
+snapshot. The result is still advisory and never arms a queue.
 
-A JSON or YAML document: `repo`, `base`, a `prs` list (each with `number`, `head_ref`, `base_ref`,
-optional `head_sha` / `api_head_sha` / `fetched_head_sha`, `is_draft`, `mergeable`, `labels`,
-`commits_behind`, `changed_files`, `base_conflict_paths`, and a `checks` list of
-`{name, status, conclusion, text, duration_secs}`), an optional `conflicts` list of `{a, b, paths}`
-(real merge-tree conflicts), and an optional `ancestry` list of `{before, after}`. Setting a PR's
-`fetched_head_sha` different from its `api_head_sha` simulates a mid-collection change to exercise the
-content-identity guard.
+## Output formats and archives
 
----
+```sh
+pr-landing-planner plan --fixture demo.yaml --format human
+pr-landing-planner plan --fixture demo.yaml --format json
+pr-landing-planner plan --fixture demo.yaml --format actions
+```
 
-## Exit codes
+`human` is for terminals. `json` is the complete stable machine schema.
+`actions` emits one line per recommendation for simple automation. Graph,
+cluster, and status views support human and JSON formats.
 
-- `0` — the command ran (the *content* of the plan carries the reds/holds).
-- `2` — bad usage, or a host / fixture error (including the content-identity-guard "rerun" abort).
+Live plans are archived as canonical JSON in an operating-system state
+directory by default. Override it with `--archive-dir DIR` or
+`PR_LANDING_PLANNER_ARCHIVE_DIR`; disable it with `--no-archive`. Archive notes
+go to standard error so standard output remains pure.
 
----
+## Command summary
 
-## Relationship to the predecessors
+| Command | Purpose |
+|---|---|
+| `plan` | Build the fused graph and recommended per-PR actions. |
+| `graph` | Show only conflict and ordering structure. |
+| `clusters` | Group shared conflict sets into stack-landing lanes. |
+| `status` | Show per-PR CI and label health. |
+| `quickstart` | Print an introduction or emit a demo fixture. |
 
-This tool subsumes `pr_interference.py`, `pr_conflict_graph.py`, and `pr_status.py`. Those scripts are
-intentionally NOT retired yet — retiring them (and pointing their callers, e.g. DeepScry's `landing`
-skill, at this tool) is a follow-up once a caller has adopted `pr-landing-planner`.
+All commands support `--help`; the top level supports `--version` and
+`--userguide`.
 
-A Rust port with a `cross/` byte-identical differential (over the pure graph/classify/plan/emit core)
-is a documented follow-up, mirroring how the other agent-utils tools began Python-first.
+## Safety model
+
+Treat every recommendation as a decision aid. The collector's network and Git
+operations are read-only with respect to the repository host, but live mode
+does update private refs in the supplied clone and may write the local plan
+archive. A separate, authorized actor must perform any refire, rebase, label,
+landing, or merge.
+
+## License
+
+MIT

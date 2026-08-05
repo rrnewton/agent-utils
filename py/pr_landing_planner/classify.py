@@ -6,17 +6,16 @@ This module instead classifies WHY a PR is red, into the five real failure modes
 :class:`pr_landing_planner.model.RedClass`:
 
 * ``STALE_REQUIRED_CHECK`` — underlying CI green on the head, but the required gate froze on a stale
-  result (ds-4171) -> refire the gate.
+  result -> refire the gate.
 * ``EVALUATE_ONCE_RACE`` — the gate fired once while full CI was still queued and exited "still
-  queued" (ds-xdc7m9 / ds-96k1wa) -> benign; treat as pending.
+  queued" -> benign; treat as pending.
 * ``RUNNER_OUTAGE`` — the gate job never actually ran (blank runner / BlobNotFound / near-zero
-  duration), usually across many branches (ds-69ih3r) -> escalate.
+  duration), usually across many branches -> escalate.
 * ``FLAKY`` — a red whose check name / message matches a caller-supplied signature -> refire CI.
 * ``REAL`` — anything else -> hold and dispatch a fix.
 
-Everything here is pure and config-driven: nothing DeepScry-specific is baked in — the gate-check
-name, flaky signatures, and the race / outage markers are all :class:`ClassifyConfig` supplied by
-the caller (mirroring tick-hub's "nothing project-specific in the engine" stance).
+Everything here is pure and config-driven: the gate-check name, flaky signatures, and the race /
+outage markers are all :class:`ClassifyConfig` supplied by the caller.
 """
 
 from __future__ import annotations
@@ -25,20 +24,24 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from ci_hub_check_outcome import FAIL_CONCLUSIONS, classify_check, select_latest_checks
+from pr_landing_planner.check_outcome import (
+    FAIL_CONCLUSIONS,
+    classify_check,
+    select_latest_checks,
+)
 from pr_landing_planner.model import CheckRun, CiState, CiVerdict, RedClass
 
 #: Derived from the canonical ci-hub authority; retained as an exported name
 #: for callers that use the failure set in outage signatures.
 FAILED_CONCLUSIONS: frozenset[str] = frozenset(value.upper() for value in FAIL_CONCLUSIONS)
 
-#: Default substrings that identify the benign "evaluate-once race" gate message (ds-xdc7m9).
+#: Default substrings that identify the benign "evaluate-once race" gate message.
 DEFAULT_EVALUATE_ONCE_MARKERS: tuple[str, ...] = (
     "full ci still queued",
     "rerun after ci completes",
     "still queued",
 )
-#: Default substrings / regexes that identify a gate job that never actually ran (ds-69ih3r outage).
+#: Default substrings / regexes that identify a gate job that never actually ran.
 DEFAULT_OUTAGE_MARKERS: tuple[str, ...] = ("blobnotfound", "no runner", "runner not found")
 #: A gate check that concluded in under this many seconds is treated as "never really ran".
 DEFAULT_OUTAGE_MAX_DURATION_SECS = 5
@@ -57,6 +60,20 @@ class FlakySignature:
     name_regex: str = ""
     text_regex: str = ""
     note: str = ""
+
+    def validate(self) -> None:
+        """Reject malformed regular expressions before a planning snapshot is collected."""
+        for field, pattern in (
+            ("name_regex", self.name_regex),
+            ("text_regex", self.text_regex),
+        ):
+            if pattern:
+                try:
+                    re.compile(pattern, re.IGNORECASE)
+                except re.error as exc:
+                    raise ValueError(
+                        f"invalid flaky signature {field} {pattern!r}: {exc}"
+                    ) from exc
 
     def matches(self, check: CheckRun) -> bool:
         name_ok = True
@@ -81,6 +98,15 @@ class ClassifyConfig:
     outage_max_duration_secs: int = DEFAULT_OUTAGE_MAX_DURATION_SECS
     #: Minimum number of PRs showing the gate-never-ran signature to declare a systemic outage.
     outage_min_prs: int = 2
+
+    def validate(self) -> None:
+        """Validate caller-controlled names, regexes, and numeric domains."""
+        if not self.gate_check.strip():
+            raise ValueError("gate check name must be non-empty")
+        if self.outage_max_duration_secs < 0 or self.outage_min_prs < 0:
+            raise ValueError("outage thresholds must be nonnegative")
+        for signature in self.flaky_signatures:
+            signature.validate()
 
 
 # --------------------------------------------------------------------------- rollup parsing
@@ -118,8 +144,6 @@ def parse_rollup(raw: object, *, head_sha: str = "") -> tuple[CheckRun, ...]:
     rather than crashing (a rollup entry that is not a dict is ignored)."""
     checks: list[CheckRun] = []
     for entry in select_latest_checks(raw, head_sha=head_sha):
-        if not isinstance(entry, dict):
-            continue
         item: dict[str, object] = {str(k): v for k, v in entry.items()}
         name = _get_str(item, "name", "context")
         if not name:
@@ -238,7 +262,10 @@ def classify_pr(checks: Sequence[CheckRun], cfg: ClassifyConfig) -> CiVerdict:
         )
 
     # (2) Evaluate-once race: the only reds are benign "still queued" gate messages.
-    if red_checks and all(_is_evaluate_once(c, cfg.evaluate_once_markers) for c in red_checks):
+    if red_checks and all(
+        c.name == cfg.gate_check and _is_evaluate_once(c, cfg.evaluate_once_markers)
+        for c in red_checks
+    ):
         return CiVerdict(
             raw_state, RedClass.EVALUATE_ONCE_RACE, gate_present, gate_ok, False,
             detail="gate evaluated once while full CI was still queued (benign; treat as pending)",
@@ -250,7 +277,7 @@ def classify_pr(checks: Sequence[CheckRun], cfg: ClassifyConfig) -> CiVerdict:
     if gate_is_red and not non_gate_reds and non_gate_state is CiState.PASSED:
         return CiVerdict(
             raw_state, RedClass.STALE_REQUIRED_CHECK, gate_present, gate_ok, False,
-            detail=f"CI green on head; required gate {cfg.gate_check!r} is stale (ds-4171)",
+            detail=f"CI green on head; required gate {cfg.gate_check!r} is stale",
         )
 
     # (4) Flaky: every red check matches a caller signature.

@@ -1,19 +1,21 @@
-//! Two-level Linux cgroup-v2 containment for the DAG runner (Rust port of `cgroup.py`).
-//!
-//! The runner re-execs itself inside a transient `systemd-run --user --scope` (a DELEGATED
-//! outer cgroup), then carves one CHILD cgroup per step under it. Each step's bash leader
-//! self-moves into its child cgroup BEFORE forking any grandchild, so a per-step
-//! `cgroup.kill` SIGKILLs the WHOLE subtree atomically — including `setsid` / double-fork
-//! escapees a process-group kill misses. Per-step `memory.max` (+ `memory.swap.max=0`) makes a
-//! single runaway step OOM-killed at its own cap while the rest of the run and the host survive.
-//!
-//! GRACEFUL DEGRADATION + NO SILENT FAILURE: everything is best-effort, but a best-effort
-//! cgroupfs write that would drop a requested cap never fails silently — it emits a visible
-//! `warn()` on stderr. When cgroup-v2 + a systemd `--user` scope are unavailable the manager
-//! reports `enabled() == false` and the caller falls back to process-group teardown.
-//!
-//! This mirrors the OBSERVABLE behavior of the Python `cgroup.py`; the systemd/cgroupfs
-//! interactions (env sentinels, slice/unit names, the supervisor drain) are kept identical.
+//! Linux cgroup-v2 containment for complete DAG runs and individual steps.
+
+// Two-level Linux cgroup-v2 containment for the DAG runner (Rust port of `cgroup.py`).
+//
+// The runner re-execs itself inside a transient `systemd-run --user --scope` (a DELEGATED
+// outer cgroup), then carves one CHILD cgroup per step under it. Each step's bash leader
+// self-moves into its child cgroup BEFORE forking any grandchild, so a per-step
+// `cgroup.kill` SIGKILLs the WHOLE subtree atomically — including `setsid` / double-fork
+// escapees a process-group kill misses. Per-step `memory.max` (+ `memory.swap.max=0`) makes a
+// single runaway step OOM-killed at its own cap while the rest of the run and the host survive.
+//
+// GRACEFUL DEGRADATION + NO SILENT FAILURE: everything is best-effort, but a best-effort
+// cgroupfs write that would drop a requested cap never fails silently — it emits a visible
+// `warn()` on stderr. When cgroup-v2 + a systemd `--user` scope are unavailable the manager
+// reports `enabled() == false` and the caller falls back to process-group teardown.
+//
+// This mirrors the OBSERVABLE behavior of the Python `cgroup.py`; the systemd/cgroupfs
+// interactions (env sentinels, slice/unit names, the supervisor drain) are kept identical.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -51,11 +53,11 @@ const DEFAULT_CPU_BUDGET_FRACTION: f64 = 0.90;
 /// Generous last-resort run boundary, leaving memory for neighbours and the OS.
 const DEFAULT_MEMORY_BUDGET_FRACTION: f64 = 0.90;
 
-/// Per-step containment: create, cap, measure, and tear down a child cgroup per step.
-///
-/// The object-safe Rust analogue of Python's `CgroupManager` protocol; a single manager is
-/// shared across the run (behind an `Arc`). Every method is `&self` (state lives on cgroupfs,
-/// so no interior mutability is needed).
+// Per-step containment: create, cap, measure, and tear down a child cgroup per step.
+//
+// The object-safe Rust analogue of Python's `CgroupManager` protocol; a single manager is
+// shared across the run (behind an `Arc`). Every method is `&self` (state lives on cgroupfs,
+// so no interior mutability is needed).
 pub trait CgroupManager: Send + Sync {
     /// Whether per-step containment is actually usable on this host.
     fn enabled(&self) -> bool;
@@ -125,9 +127,9 @@ fn read_trim(group: &Path, name: &str) -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
-/// Whole granted cores from a `cpu.max` string (`"<quota> <period>"`), or `None` when
-/// unbounded (`"max ..."`) / unparseable. Floors to >=1 for any positive quota. Mirrors
-/// Python `_cpu_max_cores`.
+// Whole granted cores from a `cpu.max` string (`"<quota> <period>"`), or `None` when
+// unbounded (`"max ..."`) / unparseable. Floors to >=1 for any positive quota. Mirrors
+// Python `_cpu_max_cores`.
 fn cpu_max_cores(value: Option<String>) -> Option<i64> {
     let value = value?;
     let mut parts = value.split_whitespace();
@@ -144,8 +146,8 @@ fn cpu_max_cores(value: Option<String>) -> Option<i64> {
     Some((quota / period).max(1))
 }
 
-/// Byte cap from a `memory.max` string, or `None` when unbounded/unparseable. Mirrors Python
-/// `_memory_max_bytes`.
+// Byte cap from a `memory.max` string, or `None` when unbounded/unparseable. Mirrors Python
+// `_memory_max_bytes`.
 fn memory_max_bytes(value: Option<String>) -> Option<i64> {
     let value = value?;
     if value == "max" {
@@ -250,13 +252,13 @@ fn ensure_aggregate_slice(fraction: f64) -> bool {
     matches!((start, set), (Ok(a), Ok(b)) if a.status.success() && b.status.success())
 }
 
-/// Re-exec this process inside a transient `systemd-run --user --scope` (a delegated cgroup).
-///
-/// On success `exec` REPLACES this process and never returns. The bool return distinguishes the
-/// non-exec paths, matching Python's `reexec_in_scope`:
-/// * `true`  — already in-scope (anti-recursion) or intentionally skipped in CI: proceed.
-/// * `false` — systemd scope unavailable or the exec failed: the caller must refuse to run
-///   advisory-only (No Silent Failure — the reason is on stderr).
+// Re-exec this process inside a transient `systemd-run --user --scope` (a delegated cgroup).
+//
+// On success `exec` REPLACES this process and never returns. The bool return distinguishes the
+// non-exec paths, matching Python's `reexec_in_scope`:
+// * `true`  — already in-scope (anti-recursion) or intentionally skipped in CI: proceed.
+// * `false` — systemd scope unavailable or the exec failed: the caller must refuse to run
+//   advisory-only (No Silent Failure — the reason is on stderr).
 pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool {
     if in_scope() {
         return true;
@@ -433,15 +435,11 @@ fn enable_outer_oom_group_at(scope: &Path) -> bool {
 // Opt-in size-K core box (whole-tree cpuset) — mirror of cgroup.py             //
 // --------------------------------------------------------------------------- //
 //
-// `--cores K` constrains the WHOLE run process tree to K least-busy FREE cores
-// (K=1 = sequential box, for the gVisor / backend-perf methodology). It NEVER
-// pins a fixed core id (the standing benchmark rule — a fixed core may be busy):
+// `--cores K` constrains the whole run process tree to K least-busy free cores.
+// It never pins a fixed core id (a fixed core may be busy):
 // it reads THIS process's allowed set, samples `/proc/stat` briefly, and picks
-// the K LEAST-BUSY of them. Two whole-tree mechanisms, tried in order: a cgroup
-// `cpuset` on the scope (PRIMARY; children inherit; hosts/CI where the controller
-// is delegated), else `sched_setaffinity` (FALLBACK; a size-K mask inherits
-// across fork+execve). Each is VERIFIED before acceptance and the active
-// mechanism is LOGGED (No Silent Failure).
+// the K least-busy of them. Only an exact cgroup cpuset is accepted. A process
+// affinity mask is not containment because a descendant can replace it.
 
 /// Read THIS process's CPU-affinity mask (`sched_getaffinity`) as a sorted core list.
 fn current_affinity() -> Vec<usize> {
@@ -461,23 +459,6 @@ fn current_affinity() -> Vec<usize> {
         }
     }
     cores
-}
-
-/// Set THIS process's CPU-affinity mask (`sched_setaffinity`) to exactly `cores`.
-fn set_affinity(cores: &[usize]) -> std::io::Result<()> {
-    // SAFETY: a zeroed `cpu_set_t` is a valid empty mask; `CPU_SET` sets one in-range bit at a
-    // time. Every `c` comes from `current_affinity()`, so it is < CPU_SETSIZE and representable.
-    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    unsafe { libc::CPU_ZERO(&mut set) };
-    for &c in cores {
-        unsafe { libc::CPU_SET(c, &mut set) };
-    }
-    // SAFETY: `set` is a valid cpu_set_t of the passed size; pid 0 targets this process.
-    let rc = unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) };
-    if rc != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Per-CPU (idle+iowait, total) jiffies snapshot from `/proc/stat` (keyed by cpu id).
@@ -517,39 +498,65 @@ fn proc_stat_snapshot() -> BTreeMap<usize, (u64, u64)> {
     d
 }
 
-/// Count entries in a Linux cpulist such as `0-3,8,10-11` (mirror of `_cpuset_count`).
-fn cpuset_count(value: Option<&str>) -> Option<i64> {
+fn parse_cpuset(value: Option<&str>) -> Option<HashSet<usize>> {
     let value = value?.trim();
     if value.is_empty() {
         return None;
     }
-    let mut count: i64 = 0;
+    let mut cpus = HashSet::new();
     for item in value.split(',') {
         let mut bounds = item.splitn(2, '-');
-        let start: i64 = bounds.next()?.trim().parse().ok()?;
-        let end: i64 = match bounds.next() {
-            Some(e) => e.trim().parse().ok()?,
+        let start: usize = bounds.next()?.trim().parse().ok()?;
+        let end: usize = match bounds.next() {
+            Some(value) => value.trim().parse().ok()?,
             None => start,
         };
         if end < start {
             return None;
         }
-        count += end - start + 1;
+        for core in start..=end {
+            if !cpus.insert(core) {
+                return None;
+            }
+        }
     }
-    Some(count)
+    Some(cpus)
 }
 
 /// Pick `k` LEAST-BUSY cores from THIS process's allowed CPU set (never a fixed id).
 ///
 /// Reads the allowed set (`sched_getaffinity`), samples per-CPU idle jiffies from `/proc/stat`
 /// over `sample_s` seconds, and returns the `k` cores with the highest idle fraction. `k` is
-/// clamped to `[1, len(allowed)]`. Verified recipe (task `runner-cpu-affinity-single-core-runs`).
+/// clamped to `[1, len(allowed)]`.
 pub fn pick_least_busy_free_cores(k: i64, sample_s: f64) -> Vec<usize> {
+    pick_least_busy_free_cores_excluding(k, sample_s, &HashSet::new())
+}
+
+/// Pick least-busy allowed cores while excluding cores held by another reservation.
+///
+/// This is the allocation primitive used by the durable reservation ledger.  Keeping the
+/// exclusion in the same sampled selection path prevents two callers from independently choosing
+/// the same apparently-idle CPUs.
+pub fn pick_least_busy_free_cores_excluding(
+    k: i64,
+    sample_s: f64,
+    exclude: &HashSet<usize>,
+) -> Vec<usize> {
+    if k < 1 || !sample_s.is_finite() || sample_s < 0.0 {
+        return Vec::new();
+    }
     let allowed = current_affinity();
     if allowed.is_empty() {
         return Vec::new();
     }
-    let k = k.clamp(1, allowed.len() as i64) as usize;
+    let available = allowed
+        .iter()
+        .filter(|core| !exclude.contains(core))
+        .count();
+    if available == 0 {
+        return Vec::new();
+    }
+    let k = k.clamp(1, available as i64) as usize;
     let a = proc_stat_snapshot();
     thread::sleep(Duration::from_secs_f64(sample_s));
     let b = proc_stat_snapshot();
@@ -566,7 +573,10 @@ pub fn pick_least_busy_free_cores(k: i64, sample_s: f64) -> Vec<usize> {
             _ => 1.0,
         }
     };
-    let mut ranked: Vec<usize> = allowed.into_iter().filter(|c| b.contains_key(c)).collect();
+    let mut ranked: Vec<usize> = allowed
+        .into_iter()
+        .filter(|c| !exclude.contains(c) && b.contains_key(c))
+        .collect();
     // Descending idle fraction; stable so ties keep ascending core-id order (matches Python).
     ranked.sort_by(|&x, &y| {
         idle_frac(y)
@@ -577,12 +587,12 @@ pub fn pick_least_busy_free_cores(k: i64, sample_s: f64) -> Vec<usize> {
     ranked
 }
 
-/// Write `cpuset.cpus` on `scope` and VERIFY via `cpuset.cpus.effective` (mirror of Python).
-///
-/// Returns true only when the `cpuset` controller is present on the scope AND the effective
-/// cpuset count equals `cores.len()` after the write (proving the constraint took — not just that
-/// the write returned Ok). On success, best-effort enables `+cpuset` in `subtree_control` so
-/// per-step child cgroups inherit it.
+// Write `cpuset.cpus` on `scope` and VERIFY via `cpuset.cpus.effective` (mirror of Python).
+//
+// Returns true only when the `cpuset` controller is present on the scope and the effective set
+// exactly equals `cores` after the write. On success, best-effort enables `+cpuset` in
+// `subtree_control` so
+// per-step child cgroups inherit it.
 fn try_cgroup_cpuset(scope: &Path, cores: &[usize]) -> bool {
     let controllers: HashSet<String> = read_trim(scope, "cgroup.controllers")
         .map(|s| s.split_whitespace().map(String::from).collect())
@@ -598,9 +608,8 @@ fn try_cgroup_cpuset(scope: &Path, cores: &[usize]) -> bool {
     if fs::write(scope.join("cpuset.cpus"), &cpulist).is_err() {
         return false;
     }
-    if cpuset_count(read_trim(scope, "cpuset.cpus.effective").as_deref())
-        != Some(cores.len() as i64)
-    {
+    let wanted: HashSet<usize> = cores.iter().copied().collect();
+    if parse_cpuset(read_trim(scope, "cpuset.cpus.effective").as_deref()) != Some(wanted) {
         return false;
     }
     // Verified. Let per-step child cgroups inherit the cpuset constraint.
@@ -610,17 +619,18 @@ fn try_cgroup_cpuset(scope: &Path, cores: &[usize]) -> bool {
 
 /// Constrain the WHOLE run process tree to `k` least-busy FREE cores.
 ///
-/// Tries the cgroup `cpuset` first (works on hosts/CI where it is delegated; children under the
-/// scope inherit it), then falls back to `sched_setaffinity` (a size-K mask inherits across
-/// fork+execve to every descendant). Each mechanism is VERIFIED (cpuset via `cpuset.cpus.effective`;
-/// affinity via a `sched_getaffinity` read-back) before it is accepted. Returns `(mechanism, cores)`
-/// and LOGS the active mechanism; returns `None` (with a warning) when NEITHER can constrain the
-/// tree to `k` cores — never silently claims a box that is not real.
+/// Requires an exact cgroup `cpuset.cpus.effective` match on this runner's own managed scope.
+/// Returns `None` with a warning when hard tree-wide pinning is unavailable. It never falls back
+/// to process affinity because descendants can replace an inherited affinity mask.
 ///
 /// Call this in the runner BEFORE the scheduler spawns worker threads or forks any step: threads
 /// inherit the creator's affinity and forked steps inherit at fork, so an early application covers
 /// the whole tree.
 pub fn apply_core_box(k: i64) -> Option<(String, Vec<usize>)> {
+    if k < 1 {
+        warn(&format!("--cores {k}: core count must be >= 1"));
+        return None;
+    }
     let cores = pick_least_busy_free_cores(k, 0.3);
     if cores.is_empty() {
         warn(&format!(
@@ -629,39 +639,43 @@ pub fn apply_core_box(k: i64) -> Option<(String, Vec<usize>)> {
         ));
         return None;
     }
+    apply_specific_cores(&cores, &format!("--cores {k}"))
+}
+
+/// Constrain the whole process tree to an exact, caller-reserved core set.
+///
+/// The caller must reserve the cores before calling this function. Success means the exact set is
+/// the effective cpuset of this runner's own managed scope.
+pub fn apply_specific_cores(cores: &[usize], label: &str) -> Option<(String, Vec<usize>)> {
+    if cores.is_empty() {
+        warn(&format!(
+            "{label}: empty core set; cannot constrain the run tree"
+        ));
+        return None;
+    }
     let want = cores.len();
 
-    // PRIMARY: cgroup cpuset on the scope (whole subtree inherits; hosts/CI).
-    if let Some(scope) = scope_cgroup_from_self() {
+    // Only a scope created and marked by this runner may be mutated. An arbitrary ambient .scope
+    // can contain unrelated processes owned by the same user.
+    if in_scope() {
+        let Some(scope) = scope_cgroup_from_self() else {
+            warn(&format!(
+                "{label}: managed runner scope could not be resolved"
+            ));
+            return None;
+        };
         if try_cgroup_cpuset(&scope, &cores) {
             eprintln!(
                 "{LOG_PREFIX} core box: constrained to {want} core(s) {cores:?} via cgroup cpuset"
             );
-            return Some(("cgroup cpuset".to_string(), cores));
+            return Some(("cgroup cpuset".to_string(), cores.to_vec()));
         }
     }
-
-    // FALLBACK: sched_setaffinity (inherits across fork+execve to the whole tree).
-    if let Err(e) = set_affinity(&cores) {
-        warn(&format!(
-            "--cores {k}: sched_setaffinity failed ({e}) and cgroup cpuset was unavailable; the \
-             run tree is NOT constrained to a core box"
-        ));
-        return None;
-    }
-    let applied = current_affinity();
-    if applied.len() != want {
-        warn(&format!(
-            "--cores {k}: sched_setaffinity read-back shows {} core(s), expected {want}; the run \
-             tree is NOT reliably constrained",
-            applied.len()
-        ));
-        return None;
-    }
-    eprintln!(
-        "{LOG_PREFIX} core box: constrained to {want} core(s) {applied:?} via sched_setaffinity"
-    );
-    Some(("sched_setaffinity".to_string(), applied))
+    warn(&format!(
+        "{label}: exact cgroup cpuset unavailable; refusing a soft process-affinity fallback \
+         because descendants can escape it"
+    ));
+    None
 }
 
 /// Install a SIGINT/SIGTERM handler that tears down the WHOLE outer scope, then exits.
@@ -1048,6 +1062,16 @@ mod tests {
     #[test]
     fn cpu_quota_percent_floor_is_one_core() {
         assert!(cpu_quota_percent(0.90) >= 100);
+    }
+
+    #[test]
+    fn cpuset_parser_preserves_exact_identity() {
+        assert_eq!(
+            parse_cpuset(Some("0-2,7")),
+            Some(HashSet::from([0, 1, 2, 7]))
+        );
+        assert_eq!(parse_cpuset(Some("0-2,2")), None);
+        assert_ne!(parse_cpuset(Some("0-1")), parse_cpuset(Some("2-3")));
     }
 
     #[test]

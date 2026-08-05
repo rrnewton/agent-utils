@@ -27,6 +27,7 @@ def _node(
     draft: bool = False,
     base_conflict: tuple[str, ...] = (),
     mergeable: str = "",
+    review_decision: str = "",
     priority: int = 0,
     size: int = 0,
     created_at: str = "",
@@ -41,6 +42,7 @@ def _node(
         is_draft=draft,
         base_conflict_paths=base_conflict,
         mergeable=mergeable,
+        review_decision=review_decision,
         priority=priority,
         additions=size,
         created_at=created_at,
@@ -95,6 +97,31 @@ def test_held_reasons_base_draft_and_transitive() -> None:
     assert "local-base-conflict" in by[2]
     assert "github-base-conflicting" in by[3]
     assert by[4] == ("depends-on-held:#1",)
+
+
+def test_review_decisions_and_ordering_cycles_fail_closed() -> None:
+    review_required = _node(1, review_decision="REVIEW_REQUIRED")
+    changes_requested = _node(2, review_decision="CHANGES_REQUESTED")
+    approved = _node(3, review_decision="APPROVED")
+    cycle_a = _node(4)
+    cycle_b = _node(5)
+    downstream = _node(6)
+    ordering = [
+        OrderingEdge(4, 5, "base-ref"),
+        OrderingEdge(5, 4, "ancestry"),
+        OrderingEdge(5, 6, "base-ref"),
+    ]
+    held = held_reasons(
+        [review_required, changes_requested, approved, cycle_a, cycle_b, downstream],
+        ordering,
+    )
+    by = {item.pr: item.reasons for item in held}
+    assert by[1] == ("review-required",)
+    assert by[2] == ("changes-requested",)
+    assert 3 not in by
+    assert "ordering-cycle" in by[4]
+    assert "ordering-cycle" in by[5]
+    assert by[6] == ("depends-on-held:#5",)
 
 
 def test_partition_respects_conflicts_and_ordering() -> None:

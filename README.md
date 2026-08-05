@@ -1,108 +1,92 @@
 # agent-utils
 
-Small, standalone developer/agent utilities — each implemented **twice**, once in Python and once in
-Rust, with the two implementations kept behaviorally identical by randomized differential tests in
-CI.
+A collection of small, standalone command-line tools for build orchestration
+and repository automation. Every established tool has an independently
+installable Python distribution and Rust crate with the same command name and
+observable behavior.
 
-## Why two implementations?
+The implementations are intentionally independent. Shared fixtures,
+differential tests, isolated package checks, and adversarial reviews catch
+schema, CLI, output, error, and state-transition drift.
 
-- The **Python** version is easy to hack on, ships as a script, and is the reference for behavior.
-- The **Rust** version compiles to a fast, dependency-free static-ish binary suitable for wide reuse
-  (and publishing to crates.io).
-- **CI cross-checks them:** for every tool, a randomized harness feeds identical inputs to both and
-  asserts identical *observable* behavior. A divergence fails the build.
+## Paired tools
 
-The tools are independent — no shared runtime library, no cross-tool dependencies. Each can be built,
-tested, and published on its own.
+| Command | Purpose | Python distribution | Rust crate |
+|---|---|---|---|
+| `safe-ci-dag-runner` | Plan, visualize, and execute resource-aware CI DAGs with Linux cgroup containment and profiling. | `safe-ci-dag-runner` | `safe-ci-dag-runner` |
+| `cpuset-alloc` | Reserve disjoint CPU sets and hard-pin benchmark process trees. | Companion command in `safe-ci-dag-runner` | Companion binary in `safe-ci-dag-runner` |
+| `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
+| `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
 
-## Layout
+Each distribution is independently installable and documented. Its README and
+embedded user guide describe only that edition, so package-index users do not
+need this source tree or knowledge of the sibling implementation.
 
+`agent-team-timeline` is a concurrently developed Python prototype for
+reconstructing coordinator/subagent histories as a local interactive timeline.
+It is intentionally outside the paired packaging and parity contract until its
+design settles; this work does not attempt a premature port.
+
+## Repository layout
+
+```text
+common/docs/       documentation templates, edition fragments, and prototype guides
+cross/             behavioral differential harnesses and shared fixtures
+examples/          runnable DAG examples
+py/                Python distributions and source tools
+rs/                independently publishable Rust crates
+scripts/           documentation, package, and dependency contract checks
+skills/            thin agent-facing command discovery files
 ```
-agent-utils/
-├── setup                     # ./setup [py|rs|both]   (build/typecheck driver)
-├── Makefile                  # `make` == ./setup both
-├── bin/            ->  rs/bin (or py/bin)   # convenience symlink, created by setup
-├── common/                   # language-neutral shared material (single source of truth)
-│   └── docs/<tool>/          #   USER_GUIDE.md (the ONE editable guide) + README.md
-├── examples/                 # small, runnable DAG files (one per core idea), run by either build
-├── skills/                   # thin per-tool agent skills (point at `<tool> --userguide`)
-├── scripts/                  # build helpers (e.g. embed_userguides.py, run by setup)
-├── py/
-│   ├── bin/<tool>            # command entrypoints (shebang symlinks; no build needed)
-│   ├── <tool_pkg>/           # the Python package (mypy strict, zero `Any`); USER_GUIDE.md embedded here
-│   └── pyproject.toml
-├── rs/
-│   ├── bin/<tool>            # compiled release binaries (created by setup; standalone)
-│   ├── Cargo.toml            # workspace
-│   └── <tool>/               # the crate (src/embedded_userguide.md is the include_str! target)
-├── cross/                    # randomized py-vs-rs differential tests
-└── .github/workflows/        # per-tool py / rs / cross / examples workflows, path-filtered
+
+For each paired tool, the shared documentation renderer combines:
+
+```text
+common/docs/<tool>/README.template.md
+common/docs/<tool>/USER_GUIDE.template.md
+common/docs/<tool>/fragments/{python,rust}/{README,USER_GUIDE}.md
 ```
 
-`py/bin/<tool>` and `rs/bin/<tool>` expose the **same command names** (no `-py`/`-rs` suffix). The
-top-level `bin/` symlink points at the Rust binaries when Rust is built, otherwise the Python ones.
-
-## Tools
-
-| Tool | Purpose | Status |
-|------|---------|--------|
-| `safe-ci-dag-runner` | Run a DAG (a dependency graph) of CI/build steps under nested cgroup CPU/memory boxing, with memory-aware concurrency and always-on CPU/mem/ambient-load logging. | ✅ py↔rs parity proven by the `cross/` differential: `list`/`ascii`/`dot`/`json` output is **byte-identical**, and `run`/`sweep` behavior, `--only` selection, `--max-mem` sizing, YAML *loading* (isomorphic to JSON), and the auto-logging profile-store **schema** (filenames + CSV headers + line endings) are all cross-checked identical. (`quickstart`/`--help`/`yaml` are human-facing text whose exact wording may differ between builds — only their structure and the exit codes are guaranteed.) Loads DAGs from **JSON or YAML** (auto-detected by file extension; YAML additionally allows comments + multi-line "literate" descriptions). Both builds box each step in a cgroup-v2 sandbox **by default** (pass `--allow-cgroup-failure` to run un-boxed where cgroups are unavailable). Per-step tooling: `run --only TAG` runs exactly one step, `run --profile` prints a per-step timing/memory table, and `sweep --step TAG --jobs 1..N` is a parallel-speedup study. Every run/sweep **auto-logs** resource-usage CSVs to a default profile store (`./.safe-ci-dag-runner/profiles/`; override with `--perf-dir` / `$SAFE_CI_DAG_RUNNER_PROFILE_DIR`, disable with `--no-profile`). The runner **feeds that store back at plan time** — a contention-discounted median `est_duration_s` and a high-percentile `rss_estimate_bytes` override the DAG hints once enough samples exist — and `--planner {greedy-lpt,critical-path}` selects the dispatch order; the `plan` command (`--format json` byte-identical across builds) / `run --show-plan` show the estimates + schedule and are cross-checked identical. It also models each step's **parallel-speedup curve** (`wall` vs. inner `-j`) from multi-width samples — with total-CPU-seconds growth as a work-conservation knee signal — and surfaces a recommended `inner_jobs`, achieved `effective_cores`, and the curve in the plan (byte-identical across builds); the boxed per-step CSV now records rich `effective_cores` / `throttled_s` / `quota_utilization_pct` / contention (`external_cores`, `co_tenants`, `ambient_bucket`) / host+step PSI columns, and `inner_jobs` is resolved to a number (never `"ambient"`). A speedup-aware co-scheduling allocator that *acts* on the model is a scoped follow-on. **Closes the profiling feedback loop on EPHEMERAL CI** via `--profile-sync <backend>`: a pluggable UPLOAD+DOWNLOAD of a **constant-sized, mergeable** profile summary (a bounded per-`(step, inner_jobs)` reservoir; merge = union + deterministic content-hash subsample, so it is commutative/associative and byte-identical py↔rs), with `local:` / `git:` (atomic retry-on-conflict) / `github-artifacts:` (non-atomic) backends and a documented S3/R2 stub. The `summary` subcommand (`build`/`merge`/`plan`/`stats`) exposes the primitives. |
-| `tick-hub` | A single scheduled *tick* (one cron/loop/timer heartbeat) that funnels many recurring responsibilities — each on its own cadence — and emits a stable, machine-readable `HEALTH`/`ACTION`/`NOTE`/`ERROR` report for a coordinator or automation to dispatch. Reminders, their shell **gates**, and freshness **health checks** are all caller config (JSON or YAML); nothing project-specific is baked into the engine. | 🐍 **Python-first** (mypy `--strict`, zero explicit `Any`). Reminders carry a cadence (`0` = every tick), optional `requires_flags` gating on the typed per-host **ops-state**, an optional shell gate (`success`/`failure`/`nonempty`/`always`, with `key=value` capture interpolated into the emitted line), and an ACTION/NOTE emit template. The due-logic takes an explicit `now` (deterministic tests); per-reminder last-fired epochs persist to a tiny `key=last_fired_epoch` file, written only on `--flush`. YAML *loading* is isomorphic to the JSON schema (YAML-1.2 core scalars, Norway-safe) and ready for the same py↔rs differential the runner has. **Follow-ups:** a Rust port + `cross/` differential, and switching a caller (DeepScry's ops poller) to consume this tool. |
-| `pr-landing-planner` | A conflict-graph + CI-aware, **advisory** pull-request landing planner. It combines real `git merge-tree` conflicts, exact-head validation evidence, `ci-hygiene` versus `gate-policy`, assigned agents, `mechanism:<slug>` overlaps, freshness, holds, and CI diagnosis into deterministic per-PR actions and parallel-safe groups. Local evidence (`locally-validated` or an exact-head clean record) does not wait for a stale merge gate; gate-policy changes escalate even when validated. It NEVER mutates a PR. Subcommands `plan` / `graph` / `status` / `quickstart`; `--format {human,json,actions}`. | 🐍 **Python-first** (mypy `--strict`, zero explicit `Any`). Pure core + pluggable `VcsHost`; `--landing-context` supplies caller-owned exact-head evidence/policy/assignment without baking a project ledger into the engine. Content-identity guards reject PR or evidence drift. |
-| `agent-team-timeline` | Reconstruct a coordinator/subagent fork-join history as a zoomable Perfetto-inspired local website plus raw JSON/Markdown summaries. Tracks show active/tool/wait/idle/blocked time; hover/click drills from phrases to paragraphs, cultivated work bullets, and full messages; visible-range stats and daily/weekly/monthly/quarterly rollups stay pinned to real time. | 🐍 **Python-first**, stdlib runtime and dependency-free SVG site. Codex importer; content-addressed full-model summary cache; separate zero-token build stage; append-only run receipts. Claude/ORC/Gas Town importers and merged multi-team indexes are follow-ups. |
-
-## Building
+It writes the package README and embedded user guide. Check mode verifies exact
+generated content and rejects package pages that leak sibling-language,
+source-tree, or unrelated-project references:
 
 ```sh
-./setup              # build & check both implementations (default)
-./setup py           # Python only: mypy-strict typecheck + wire py/bin
-./setup rs           # Rust only:   cargo build --release -> rs/bin
-./setup rs --clean   # ... then delete rs/target (binaries remain in rs/bin)
-make                 # == ./setup
-make check           # mypy (strict) + cargo clippy -D warnings
-make test            # pytest + cargo test
+python3 scripts/embed_userguides.py
+python3 scripts/embed_userguides.py --check
 ```
 
-On a Meta host, prefix any network step with `with-proxy` (see the `with-proxy` skill): external
-package fetches (crates.io, PyPI) must egress through fwdproxy.
+## Development
 
-## Shared docs (DRY) — the CLI is the single source of truth
+Build both editions:
 
-Each tool's user guide lives **once** under `common/docs/<tool>/USER_GUIDE.md`. That single source is
-*embedded into each distributable unit* so the guide travels with the tool through `pip install` /
-`cargo install` / crates.io, where `common/docs/` is **not** shipped:
+```sh
+make both
+```
 
-- **Python:** `scripts/embed_userguides.py` copies the guide to `py/<pkg>/USER_GUIDE.md`, declared as
-  `package-data` in `pyproject.toml`. The CLI reads it at runtime via `importlib.resources` (a real
-  package resource — not a path outside the package).
-- **Rust:** the same script copies the guide to `rs/<crate>/src/embedded_userguide.md`, baked in with
-  `include_str!`. Keeping it **under `src/`** is what makes the `include_str!` target survive
-  `cargo package` (an include pointing outside the crate would break crates.io packaging).
+Run the repository contract:
 
-`./setup` runs `scripts/embed_userguides.py` on every build, so a fresh checkout always has the
-embedded guides. The embedded copies are **committed derived artifacts** (so CI, which builds/imports
-directly without running `./setup`, has them present); `common/docs/<tool>/USER_GUIDE.md` remains the
-one editable source. Run `scripts/embed_userguides.py --check` to verify they are in sync (CI does).
+```sh
+python3 scripts/embed_userguides.py --check
+cargo fmt --all --manifest-path rs/Cargo.toml -- --check
+make both
+make check
+make test
+python3 -m mypy cross/differential.py
+python3 cross/differential.py --tool safe-ci-dag-runner
+```
 
-Every tool exposes the guide from its own CLI:
+The differential harness runs matching commands over valid, invalid, boundary,
+and randomized inputs. Human-oriented help may use idiomatic wording, while
+machine schemas, normalized results, exit behavior, and state transitions are
+cross-checked as part of the contract. Independent findings and reproducible
+evidence are recorded under [`reviews/`](reviews/README.md).
 
-- `<tool> quickstart` — short in-CLI getting-started tour.
-- `<tool> --help` — commands and flags.
-- `<tool> --userguide` — the full embedded guide (the complete reference). For `safe-ci-dag-runner`,
-  the py and rs builds embed the identical source, so `--userguide` output is **byte-identical**
-  across builds (cross-checked in `cross/differential.py`, alongside `--version`).
+## Package documentation
 
-The README shown on crates.io / PyPI stays in sync via a symlink from `py/README.md` and
-`rs/<crate>/README.md` to `common/docs/<tool>/README.md` (build tooling follows the symlink at
-publish time). Only the runtime **user guide** needs the embed treatment, because it must be readable
-from an *installed* tool.
-
-## Skills (agent-facing)
-
-`skills/<tool>/SKILL.md` are thin, symlinkable agent skills — each a one-line description plus a
-pointer to `<tool> quickstart` / `--help` / `--userguide`. They deliberately do NOT duplicate the
-guide; the CLI is the source of truth. See [`skills/README.md`](skills/README.md) for how to link
-them into an agent's `.claude/skills/`.
+- [Python distributions](py/README.md)
+- [Rust crates](rs/README.md)
+- [Adversarial review evidence](reviews/README.md)
 
 ## License
 

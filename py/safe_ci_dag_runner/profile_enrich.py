@@ -1,25 +1,7 @@
-"""Per-step measurement ENRICHMENT: turn a step's cgroup + ambient deltas into the rich
-profile-row columns the parallel-speedup model reads back.
+"""Enrich per-step profile rows with cgroup and ambient-load measurements.
 
-The scheduler measures each step's cgroup (``cpu.stat``, ``memory.peak``, ``cpu.pressure``) and
-brackets it with two host-load snapshots (:mod:`safe_ci_dag_runner.ambient`). This module is the
-PURE function that folds those raw measurements into the named, self-describing columns the
-profile store records — so the speedup reader (:mod:`safe_ci_dag_runner.estimates`) can later
-learn each step's speedup curve vs. inner ``-j``.
-
-The column NAMES deliberately mirror DeepScry's ``scripts/validate_perflog.py``
-``STEP_PROFILE_COLUMNS`` (``effective_cores``, ``quota_utilization_pct``, ``throttled_s``,
-``external_cpu_s`` / ``external_cores``, ``co_tenants_*``, ``ambient_bucket``, ``load*``, and the
-host/step PSI columns), so a later unification of the two schemas is a RENAME, not a redesign.
-
-Everything here is best-effort and captured UNDER cgroup boxing on Linux: when a measurement is
-unavailable (an un-boxed run, a missing ``/proc`` file) the corresponding column is simply left out
-of the returned row and the writer fills it blank — matching DeepScry's "blank when unavailable"
-posture. No value is ever fabricated (No Silent Failure).
-
-Cross-language note: these are WRITER columns whose exact numeric values legitimately differ per
-host and per run, so they are NOT byte-compared across the Python and Rust builds (only the CSV
-*schema* is). The READER that consumes them (the speedup model) IS cross-checked byte-identical.
+The pure enrichment functions derive effective parallelism, throttling, pressure,
+co-tenant activity, and peak-memory columns without fabricating unavailable values.
 """
 
 from __future__ import annotations

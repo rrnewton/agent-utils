@@ -1,30 +1,8 @@
-"""Fast, zombie-free process/scope teardown for the DAG runner (Linux cgroup-v2).
+"""Fast teardown for step process trees and complete run scopes.
 
-Three distinct teardown surfaces, all ported from DeepScry's validate harness but carrying
-zero DeepScry/MTG specifics (concrete names, scope prefixes, and liveness predicates are
-supplied by the caller):
-
-* :func:`reap` — tear down ONE step's whole process tree. Ported from
-  ``scripts/validate.py`` ``Runner._reap`` (~L1768-1788). Writes the step cgroup's
-  ``cgroup.kill`` FIRST (atomic SIGKILL of the entire subtree, including ``setsid`` /
-  double-fork escapees that changed session/pgid but not cgroup membership), then falls
-  back to ``killpg`` as a belt-and-suspenders for the no-cgroup path.
-* :func:`install_scope_teardown` — a SIGINT/SIGTERM handler that tears down the OUTER scope
-  (the whole run's cgroup) so an aborted run leaves no orphans. Ported from
-  ``scripts/validate.py`` ``_install_scope_teardown`` (~L3134-3191) plus
-  ``scripts/validate_cgroup.py`` ``stop_scope`` / ``kill_scope_cgroup`` (~L582-640,
-  ~L827-862).
-* :func:`reap_external` (and its parts :func:`reap_processes_by_cwd`,
-  :func:`stop_leftover_scopes`) — the external "reap my leftover scopes/PIDs by cwd"
-  reaper, ported from the whole of ``scripts/kill_zombie_processes.py`` but parameterized
-  by ``(cwd, patterns)`` and caller-supplied liveness/protection predicates instead of
-  hardcoded ``deepscry`` / ``validate-`` / ``supervisor`` names.
-
-No Silent Failure (generic strengthening of the originals): where DeepScry silently
-``pass``-es on a failed ``cgroup.kill`` write and thereby degrades teardown to killpg-only
-(which misses ``setsid`` escapees) without a word, this module emits a visible degraded-
-enforcement WARNING on stderr and continues. See the per-function docstrings and the
-report accompanying this port for the exact spots changed.
+The module prefers cgroup-wide termination, falls back to process-group signaling when
+needed, and includes helpers for removing stale scopes and processes associated with a
+working directory. Enforcement degradation is reported visibly.
 """
 
 from __future__ import annotations
@@ -73,10 +51,9 @@ class ProcessGroupLeader(Protocol):
 
     A :class:`subprocess.Popen` satisfies this structurally. The caller MUST have started
     the process with ``start_new_session=True`` so the leader's ``pid`` equals the
-    process-group id (``pgid``); that group id stays valid for ``killpg`` while ANY member
-    is alive, even after the leader itself has been ``wait()``-reaped (which is why we read
-    the stored ``pid`` rather than calling ``os.getpgid`` at reap time — the DeepScry
-    ``Runner`` captures the pgid right after ``Popen`` for exactly this reason).
+    process-group id (``pgid``); that group id stays valid for ``killpg`` while any member
+    is alive, even after the leader itself has been ``wait()``-reaped. Reading the stored
+    ``pid`` therefore remains safe after leader exit.
     """
 
     pid: int
@@ -102,12 +79,10 @@ def reap(
 
     ``process.pid`` is used as the pgid (valid because the caller started the step with
     ``start_new_session=True``); the guard refuses ``pgid <= 1`` and the runner's OWN
-    process group so a reap can never turn into suicide (the historical DeepScry exit-144).
+    process group so a reap can never signal the runner itself.
 
-    No Silent Failure: DeepScry's ``StepCgroups.kill`` returns ``False`` on a failed
-    ``cgroup.kill`` write and the caller ignored it, silently degrading to killpg-only.
-    Here, when containment is ENABLED but the kill write fails, we surface a warning so the
-    operator knows ``setsid`` escapees may have survived; we still run the killpg backstop.
+    When enabled containment cannot perform ``cgroup.kill``, a warning makes the degraded
+    teardown visible before the process-group fallback runs.
     """
     if cgroups is not None and tag is not None and cgroups.enabled:
         if not cgroups.kill(tag):
@@ -403,11 +378,8 @@ def reap_processes_by_cwd(
     """Kill leftover processes that (a) match a command-line ``pattern`` and (b) belong to
     ``cwd``, sparing this process and any PID a caller-supplied ``protect`` predicate keeps.
 
-    Generic port of ``kill_zombie_processes.should_kill_process`` + the kill loop in
-    ``main``: the hardcoded ``deepscry`` / ``cargo`` / ``chromium`` / ``validate.py`` rules
-    become caller-supplied ``patterns``, and the DeepScry-specific "belongs to a live
-    validate cgroup" guard becomes the generic ``protect`` predicate (pass one that returns
-    ``True`` for any PID under a live run so an in-progress run is never reaped).
+    Command patterns and the ``protect`` predicate are caller-supplied. A protection rule
+    should retain every PID belonging to a live run so in-progress work is never reaped.
 
     Returns ``(killed_pids, failed_pids)``. With ``dry_run=True`` nothing is signalled and
     the would-be-killed PIDs are returned in ``killed_pids``.
@@ -538,11 +510,8 @@ def reap_external(
 ) -> ReapSummary:
     """One-call external reap: leftover PIDs by cwd + leftover systemd scopes by cwd.
 
-    Convenience composition of :func:`reap_processes_by_cwd` and (when ``scope_glob`` is
-    given) :func:`stop_leftover_scopes` — the generic equivalent of
-    ``kill_zombie_processes.main``, minus the DeepScry-specific ``.validate.lock`` handling
-    (that lock lifecycle is the caller's concern, not the reaper's). Scope reaping runs
-    only when ``scope_glob`` is provided and ``dry_run`` is off.
+    Composes :func:`reap_processes_by_cwd` with :func:`stop_leftover_scopes`. Scope reaping
+    runs only when ``scope_glob`` is provided and ``dry_run`` is off.
     """
     killed, failed = reap_processes_by_cwd(cwd, patterns, protect=protect, dry_run=dry_run)
     scopes_stopped = 0

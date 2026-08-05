@@ -4,7 +4,7 @@ graph layer CLUSTERs on the ENUM VALUE, not the raw string.
 Why this shape (owner refinement 2026-08-04): deriving mechanism identifiers straight from a diff is
 EXACT but not NORMALISED. The same mechanism shows up under different spellings —
 ``concurrency.cancel-in-progress`` in a workflow, ``CANCEL_IN_PROGRESS`` as an env var,
-``cancel_in_progress`` as a Rust const: mechanically three strings, semantically ONE mechanism.
+``cancel_in_progress`` as a constant: mechanically three strings, semantically one mechanism.
 Clustering on raw identifiers puts them in three buckets and MISSES the exact collision the tool
 exists to catch. So a classifier maps derived strings into a stable :class:`Mechanism` enum, and the
 graph layer clusters on the enum value.

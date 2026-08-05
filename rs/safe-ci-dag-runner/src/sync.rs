@@ -1,22 +1,24 @@
-//! Pluggable UPLOAD + DOWNLOAD of the mergeable profile SUMMARY — the piece that closes the
-//! profiling feedback loop on EPHEMERAL CI.
-//!
-//! Port of `py/safe_ci_dag_runner/sync.py`. On a persistent box the profile store accumulates so the
-//! planner improves over time; on ephemeral CI each runner starts empty, so nothing is fed back.
-//! This module lets the runner DOWNLOAD the accumulated summary at start (seeding the planner) and
-//! UPLOAD this run's contribution at the end, behind a small pluggable [`SyncBackend`] — the same
-//! "code against an abstraction" pattern as the cgroup / metrics protocols.
-//!
-//! Backends: [`LocalDirBackend`] (`local:<dir>`), [`GitBranchBackend`]
-//! (`git:<url>#<branch>[#<subdir>]`, the ATOMIC reference with retry-on-conflict RMW),
-//! [`GitHubArtifactsBackend`] (`github-artifacts:<name>[#<owner/repo>]`, NON-atomic — a concurrent
-//! contribution can occasionally be dropped, acceptable for a statistical summary), and
-//! [`S3Backend`] (`s3:<bucket>[/<prefix>]`, a documented STUB — the protocol seam is clean, a real
-//! S3/R2 client is a scoped follow-on).
-//!
-//! Each backend is scoped, like the CSV store, to ONE `(machine_id, container_class)` identity (the
-//! summary object it reads/writes is named per identity), so a heterogeneous fleet keeps one summary
-//! per homogeneous runner class.
+//! Pluggable persistence backends for mergeable profile summaries.
+
+// Pluggable UPLOAD + DOWNLOAD of the mergeable profile SUMMARY — the piece that closes the
+// profiling feedback loop on EPHEMERAL CI.
+//
+// Port of `py/safe_ci_dag_runner/sync.py`. On a persistent box the profile store accumulates so the
+// planner improves over time; on ephemeral CI each runner starts empty, so nothing is fed back.
+// This module lets the runner DOWNLOAD the accumulated summary at start (seeding the planner) and
+// UPLOAD this run's contribution at the end, behind a small pluggable [`SyncBackend`] — the same
+// "code against an abstraction" pattern as the cgroup / metrics protocols.
+//
+// Backends: [`LocalDirBackend`] (`local:<dir>`), [`GitBranchBackend`]
+// (`git:<url>#<branch>[#<subdir>]`, the ATOMIC reference with retry-on-conflict RMW),
+// [`GitHubArtifactsBackend`] (`github-artifacts:<name>[#<owner/repo>]`, NON-atomic — a concurrent
+// contribution can occasionally be dropped, acceptable for a statistical summary), and
+// [`S3Backend`] (`s3:<bucket>[/<prefix>]`, a documented STUB — the protocol seam is clean, a real
+// S3/R2 client is a scoped follow-on).
+//
+// Each backend is scoped, like the CSV store, to ONE `(machine_id, container_class)` identity (the
+// summary object it reads/writes is named per identity), so a heterogeneous fleet keeps one summary
+// per homogeneous runner class.
 
 use std::fs;
 use std::io::Write;
@@ -50,8 +52,8 @@ pub fn summary_object_name(machine_id: &str, container_class: &str) -> String {
     format!("summary_{machine_id}_{container_class}.json")
 }
 
-/// Download + upload of the mergeable summary, behind one pluggable seam. Mirrors Python's
-/// `SyncBackend` protocol.
+// Download + upload of the mergeable summary, behind one pluggable seam. Mirrors Python's
+// `SyncBackend` protocol.
 pub trait SyncBackend {
     /// A short human label for logs (No Silent Failure: the caller prints where it synced).
     fn describe(&self) -> String;
@@ -177,11 +179,11 @@ impl Drop for LockFile {
 
 type BeforePush = Box<dyn Fn(usize) + Send + Sync>;
 
-/// Store the summary on a dedicated git branch (`git:<url>#<branch>[#<subdir>]`) — the ATOMIC
-/// reference backend. `publish` works in a private throwaway checkout per attempt, fetches the
-/// branch, merges the remote summary with this run's `delta`, commits, and pushes; a REJECTED push
-/// retries from a fresh fetch of the NEW tip and re-merges the SAME delta (no clobber, no
-/// double-count). Mirrors Python's `GitBranchBackend`.
+// Store the summary on a dedicated git branch (`git:<url>#<branch>[#<subdir>]`) — the ATOMIC
+// reference backend. `publish` works in a private throwaway checkout per attempt, fetches the
+// branch, merges the remote summary with this run's `delta`, commits, and pushes; a REJECTED push
+// retries from a fresh fetch of the NEW tip and re-merges the SAME delta (no clobber, no
+// double-count). Mirrors Python's `GitBranchBackend`.
 pub struct GitBranchBackend {
     url: String,
     branch: String,
@@ -369,11 +371,11 @@ fn unique_tmp_dir(prefix: &str) -> Result<PathBuf, SyncError> {
 
 // --------------------------------------------------------------------------- github actions artifacts
 
-/// Store the summary as a GitHub Actions artifact (`github-artifacts:<name>[#<owner/repo>]`).
-/// Downloads the latest summary artifact via the `gh` CLI and merges it; `publish` writes the merged
-/// summary to a local staging file for the workflow's `actions/upload-artifact` step (GitHub has no
-/// in-run artifact write API). NON-ATOMIC by design — see the module docs. Mirrors Python's
-/// `GitHubArtifactsBackend`.
+// Store the summary as a GitHub Actions artifact (`github-artifacts:<name>[#<owner/repo>]`).
+// Downloads the latest summary artifact via the `gh` CLI and merges it; `publish` writes the merged
+// summary to a local staging file for the workflow's `actions/upload-artifact` step (GitHub has no
+// in-run artifact write API). NON-ATOMIC by design — see the module docs. Mirrors Python's
+// `GitHubArtifactsBackend`.
 pub struct GitHubArtifactsBackend {
     name: String,
     repo: Option<String>,
@@ -518,8 +520,8 @@ impl SyncBackend for GitHubArtifactsBackend {
     }
 }
 
-/// Pick the most-recently-created, non-expired artifact whose `name` matches. Pure (unit-testable
-/// without a live runner). Mirrors Python's `_select_latest_artifact`.
+// Pick the most-recently-created, non-expired artifact whose `name` matches. Pure (unit-testable
+// without a live runner). Mirrors Python's `_select_latest_artifact`.
 pub fn select_latest_artifact<'a>(
     artifacts: &'a [serde_json::Value],
     name: &str,
@@ -548,9 +550,9 @@ pub fn select_latest_artifact<'a>(
 
 // --------------------------------------------------------------------------- s3 / r2 stub
 
-/// A DOCUMENTED STUB for object-store (S3 / Cloudflare R2) sync (`s3:<bucket>[/<prefix>]`). The
-/// protocol seam is clean; a real client is a scoped follow-on. Raises a clear error rather than
-/// pretending to sync. Mirrors Python's `S3Backend`.
+// A DOCUMENTED STUB for object-store (S3 / Cloudflare R2) sync (`s3:<bucket>[/<prefix>]`). The
+// protocol seam is clean; a real client is a scoped follow-on. Raises a clear error rather than
+// pretending to sync. Mirrors Python's `S3Backend`.
 pub struct S3Backend {
     bucket: String,
     prefix: String,
@@ -596,9 +598,9 @@ impl SyncBackend for S3Backend {
 
 // --------------------------------------------------------------------------- spec parsing
 
-/// Construct a [`SyncBackend`] from a `--profile-sync` spec (mirrors Python's `parse_backend`)::
-///
-///   local:<dir> | git:<url>#<branch>[#<subdir>] | github-artifacts:<name>[#<repo>] | s3:<bucket>[/<prefix>]
+// Construct a [`SyncBackend`] from a `--profile-sync` spec (mirrors Python's `parse_backend`)::
+//
+//   local:<dir> | git:<url>#<branch>[#<subdir>] | github-artifacts:<name>[#<repo>] | s3:<bucket>[/<prefix>]
 pub fn parse_backend(spec: &str) -> Result<Box<dyn SyncBackend>, SyncError> {
     let (scheme, rest) = match spec.split_once(':') {
         Some(x) => x,

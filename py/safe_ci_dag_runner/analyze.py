@@ -1,22 +1,7 @@
-"""Quiet-bucket per-step scaling summarizer.
+"""Summarize per-step profile rows recorded under comparable ambient load.
 
-Ported from DeepScry's ``scripts/analyze_validate_step_profiles.py`` (and its test
-``scripts/test_analyze_validate_step_profiles.py``), stripped of every DeepScry/MTG
-specific: it reads the generic per-step profile CSV that a
-:class:`safe_ci_dag_runner.protocols.MetricsSink` writes (one row per step per run,
-tagged with the ambient load bucket the run observed) and collapses it into a small
-scaling table.
-
-The whole point is **contention isolation**: a step's wall-clock and effective-core
-numbers are only trustworthy when the box was otherwise idle. Mixing a sample taken on a
-loaded machine into the same median would make a fast step look slow purely because a
-neighbour was eating the cores. So :func:`summarize` filters to a single ambient bucket
-(``"quiet"`` by default) BEFORE aggregating, and only ``ambient="all"`` opts back into the
-unfiltered, contention-blind view.
-
-The column names below are the schema contract with the metrics sink; they are the subset
-of the sink's per-step row that this summary consumes, named here so the summarizer carries
-no dependency on the sink implementation.
+The default quiet-only filter keeps host contention from distorting duration,
+parallelism, and memory estimates. Callers may explicitly request all ambient buckets.
 """
 
 from __future__ import annotations

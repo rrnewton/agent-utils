@@ -39,6 +39,7 @@ from __future__ import annotations
 import atexit
 import fcntl
 import json
+import math
 import os
 import tempfile
 import time
@@ -239,7 +240,12 @@ class Reservation:
             kept = [
                 r
                 for r in records
-                if not (r.pid == self.pid and r.starttime == self.starttime and r.tag == self.tag)
+                if not (
+                    r.pid == self.pid
+                    and r.starttime == self.starttime
+                    and r.tag == self.tag
+                    and r.cores == self.cores
+                )
             ]
             _store(self.ledger, kept)
         self._released = True
@@ -276,6 +282,8 @@ def acquire(
     reasons outside the ledger, e.g. a reserved housekeeping CPU)."""
     if k < 1:
         raise ValueError(f"k must be >= 1, got {k}")
+    if not math.isfinite(sample_s) or sample_s < 0:
+        raise ValueError(f"sample_s must be finite and >= 0, got {sample_s}")
     path = ledger or _default_ledger_path()
     pid = os.getpid()
     starttime = _proc_starttime(pid)

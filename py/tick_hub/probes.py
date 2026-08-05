@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import glob
 import os
+import signal
 import subprocess
 import time
 from typing import Optional
@@ -31,19 +32,45 @@ class SubprocessGateRunner:
 
     def run(self, cmd: str) -> GateResult:
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 ["bash", "-c", cmd],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
+                errors="replace",
+                start_new_session=os.name == "posix",
+            )
+        except OSError as exc:
+            return GateResult(returncode=-1, stdout="", ok=False, error=str(exc))
+        try:
+            stdout, _stderr = proc.communicate(
                 timeout=self.timeout,
             )
         except subprocess.TimeoutExpired:
+            _terminate(proc)
             return GateResult(
                 returncode=-1, stdout="", ok=False, error=f"timed out after {self.timeout}s"
             )
         except OSError as exc:
+            _terminate(proc)
             return GateResult(returncode=-1, stdout="", ok=False, error=str(exc))
-        return GateResult(returncode=proc.returncode, stdout=proc.stdout, ok=True)
+        return GateResult(returncode=proc.returncode, stdout=stdout, ok=True)
+
+
+def _terminate(proc: subprocess.Popen[str]) -> None:
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            proc.kill()
+    else:
+        proc.kill()
+    try:
+        proc.communicate()
+    except OSError:
+        pass
 
 
 class GlobFileAgeProbe:

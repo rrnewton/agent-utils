@@ -104,11 +104,12 @@ def render_emit(emit: Emit, captured: Mapping[str, str]) -> str:
     Captured gate values override matching static fields; then ``{key}`` placeholders in the title
     and in each field value are resolved from the merged set (static fields + captured), so a title
     can reference both a static ``{threshold}`` and a captured ``{count}``."""
-    merged: dict[str, str] = {}
-    for key, value in emit.fields.items():
-        merged[key] = _interpolate(value, captured)
+    merged = dict(emit.fields)
     for key, value in captured.items():
         merged[key] = value
+    for key in emit.fields:
+        if key not in captured:
+            merged[key] = _interpolate(merged[key], merged)
     title = _interpolate(emit.title, merged)
     if emit.kind is EmitKind.NOTE:
         return format_note(title)

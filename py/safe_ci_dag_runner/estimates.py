@@ -1,30 +1,8 @@
-"""Profile-store FEEDBACK: turn recorded per-step samples into planning estimates.
+"""Derive resource estimates and execution plans from recorded step profiles.
 
-This is the *reading* half of the learned-duration profile store (ds-7pzdgm / ds-afzsqf).
-The *writing* half already ships (:mod:`safe_ci_dag_runner.perflog` auto-logs a per-step CSV
-per run). This module reads that store back and derives, for the current
-``(machine_id, container_class)``:
-
-* ``est_duration_s`` — a ROBUST central estimate (contention-discounted MAD-trimmed MEDIAN)
-  of the recorded ``elapsed_s`` for each step, recovering the step's INTRINSIC (uncontended)
-  duration. It is a MEDIAN (not a mean) so a single slow sample cannot drag it, and it is
-  discounted by whatever contention signal the store carries (``pct_other`` / ``external_cores``
-  / a CPU-pressure column / ``co_tenants`` — whichever is present), so a duration measured on a
-  loaded box is corrected back toward the quiet-box value.
-* ``rss_estimate_bytes`` — a ROBUST HIGH-WATER estimate (a high percentile) of the recorded
-  ``peak_bytes`` for the memory model, so one spuriously large sample does not inflate the cap
-  while a genuinely high footprint is still respected.
-
-Sparse / missing data degrades gracefully: a step with no samples (or no parseable column)
-yields ``None`` for that field and the caller falls back to the DAG-authored hint. Nothing here
-raises on a malformed row — an unparseable cell is skipped (never silently coerced to a wrong
-value), matching the No-Silent-Failure posture of the rest of the package.
-
-Determinism note (cross-language parity): every derived number is computed with the SAME
-arithmetic in the Python and Rust builds and the plan is rendered with fixed-precision
-formatting, so ``plan --format json`` is byte-identical across the two builds for a given store
-+ DAG. The percentile uses integer rank arithmetic (no floating ``ceil``) for exactly this
-reason. See ``cross/differential.py``.
+The estimators use robust duration and memory statistics, tolerate sparse profile stores,
+and fall back to DAG-authored hints when no usable samples exist. Planning and rendering
+are deterministic for a fixed store and DAG.
 """
 
 from __future__ import annotations
@@ -718,8 +696,8 @@ class Allocation:
     Records the core budget it balanced against, the resulting area and critical-path terms, the
     makespan LOWER BOUND ``max(T_CP, area/P)`` (Graham/Brent), the achieved MODELED makespan (a
     deterministic greedy list-schedule of the allocated widths), and WHY the gradient loop stopped
-    — so an operator (or a CI-optimizing agent) can see why each width was chosen. See
-    ``common/docs/safe-ci-dag-runner/PLANNER_DESIGN.md`` §5.8-5.9."""
+    — so an operator (or a CI-optimizing agent) can see why each width was chosen. The fields below
+    expose the lower-bound terms, modeled result, and stopping reason directly."""
 
     core_budget: int
     #: Total core-seconds Σ p_i·T_i(p_i) at the allocated widths.

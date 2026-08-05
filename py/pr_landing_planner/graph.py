@@ -3,15 +3,14 @@
 The collection layer (:mod:`pr_landing_planner.collect`, which drives a
 :class:`pr_landing_planner.host.VcsHost`) produces the nodes and the raw conflict / overlap /
 ordering edges. Everything in THIS module is a deterministic function of that data, so it is directly
-unit-testable and is the byte-stable target a future Rust port would cross-check:
+unit-testable and provides a stable contract for every implementation:
 
 * file-overlap edges + the file-overlap conflict FALLBACK (used when merge-tree is disabled),
 * base-ref (explicit stacking) ordering edges,
 * transitive reduction of the ordering DAG + stack extraction,
-* held-PR reasoning (draft / base-conflict / depends-on-held, propagated transitively),
+* held-PR reasoning (draft / review / base-conflict / dependency-cycle, propagated transitively),
 * the parallel-safe partition: a greedy independent-set layering over the real conflict graph that
-  respects ordering edges (our affordable, static-analysis version of bors batching / Zuul parallel
-  states).
+  respects ordering edges.
 """
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ from pr_landing_planner.model import (
 )
 
 #: PRs/tasks may declare the mechanism they change with a ``mechanism:<slug>`` label (owner
-#: convention, dev-hermit AGENTS.md). The slug is ONE derive source, fed through the same classifier
+#: convention). The slug is one derive source, fed through the same classifier
 #: as diff-derived symbols so a label and a raw identifier for the same mechanism normalise together.
 MECHANISM_LABEL_PREFIX = "mechanism:"
 
@@ -211,20 +210,48 @@ def build_stacks(edges: Sequence[OrderingEdge]) -> tuple[tuple[int, ...], ...]:
 def held_reasons(
     nodes: Sequence[PrNode], ordering_edges: Sequence[OrderingEdge]
 ) -> tuple[HeldPr, ...]:
-    """Compute per-PR hold reasons, propagating ``depends-on-held`` transitively up the ordering DAG.
+    """Compute per-PR hold reasons, propagating ``depends-on-held`` through ordering edges.
 
-    Base reasons: ``draft`` (WIP), ``local-base-conflict`` (a real merge-tree conflict with the base),
-    ``github-base-conflicting`` (GitHub's own ``mergeable == CONFLICTING``). Then any PR ordered after
-    a held PR inherits ``depends-on-held:#N`` until fixpoint."""
+    Base reasons include draft state, unresolved review, conflicts with the base, and membership in
+    an ordering cycle. Any PR ordered after a held PR inherits ``depends-on-held:#N`` until
+    fixpoint. Unknown non-empty review decisions fail closed rather than being treated as approval.
+    """
+    adjacency: dict[int, set[int]] = {}
+    for edge in ordering_edges:
+        adjacency.setdefault(edge.before, set()).add(edge.after)
+
+    cycle_nodes: set[int] = set()
+    for start in adjacency:
+        pending = list(adjacency.get(start, ()))
+        seen: set[int] = set()
+        while pending:
+            current = pending.pop()
+            if current == start:
+                cycle_nodes.add(start)
+                break
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(adjacency.get(current, ()))
+
     reasons: dict[int, list[str]] = {}
     for node in nodes:
         node_reasons: list[str] = []
         if node.is_draft:
             node_reasons.append("draft")
+        review = node.review_decision.strip().upper()
+        if review == "REVIEW_REQUIRED":
+            node_reasons.append("review-required")
+        elif review == "CHANGES_REQUESTED":
+            node_reasons.append("changes-requested")
+        elif review and review != "APPROVED":
+            node_reasons.append(f"review-decision-unknown:{review}")
         if node.base_conflict_paths:
             node_reasons.append("local-base-conflict")
         if node.mergeable == "CONFLICTING":
             node_reasons.append("github-base-conflicting")
+        if node.number in cycle_nodes:
+            node_reasons.append("ordering-cycle")
         if node_reasons:
             reasons[node.number] = node_reasons
 

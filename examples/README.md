@@ -164,7 +164,6 @@ host with a systemd user session to get real per-step boxing, which also fills i
 
 ## See also
 
-- `common/docs/safe-ci-dag-runner/README.md` — the tool overview and CLI reference.
-- `common/docs/safe-ci-dag-runner/USER_GUIDE.md` — the full concept guide, the complete JSON/YAML
-  schema, and the YAML isomorphism details.
+- `common/docs/safe-ci-dag-runner/README.template.md` — the shared tool overview.
+- `safe-ci-dag-runner --userguide` — the complete installed reference for your edition.
 - `safe-ci-dag-runner quickstart` — the same getting-started tour from the command line.

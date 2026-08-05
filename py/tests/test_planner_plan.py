@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Sequence
 
 from pr_landing_planner.model import (
@@ -13,7 +14,9 @@ from pr_landing_planner.model import (
     PrAction,
     PrActionDecision,
     PrNode,
+    PolicyClass,
     RedClass,
+    ValidationEvidence,
 )
 from pr_landing_planner.plan import compute_plan
 
@@ -86,6 +89,53 @@ def test_freshness_threshold() -> None:
     assert _action(plan_loose.per_pr_actions, 1) is PrAction.LAND_NOW
 
 
+def test_passing_non_gate_ci_never_lands_without_a_passing_required_gate() -> None:
+    missing = _node(10)
+    missing = dataclasses.replace(
+        missing,
+        ci=CiVerdict(
+            CiState.PASSED,
+            None,
+            gate_present=False,
+            gate_ok=False,
+            gate_missing_run=False,
+        ),
+    )
+    neutral = _node(11)
+    neutral = dataclasses.replace(
+        neutral,
+        ci=CiVerdict(
+            CiState.PASSED,
+            None,
+            gate_present=True,
+            gate_ok=False,
+            gate_missing_run=False,
+        ),
+    )
+    plan, _ = compute_plan([missing, neutral], [], [], [])
+    assert _action(plan.per_pr_actions, 10) is PrAction.REFIRE_CI
+    assert _action(plan.per_pr_actions, 11) is PrAction.REFIRE_CI
+
+
+def test_gate_policy_escalation_precedes_hold_state() -> None:
+    policy = dataclasses.replace(_node(12), policy_class=PolicyClass.GATE_POLICY)
+    plan, _ = compute_plan([policy], [], [], [HeldPr(12, ("draft",))])
+    assert _action(plan.per_pr_actions, 12) is PrAction.ESCALATE_GATE_POLICY
+    assert plan.land_now == ()
+
+
+def test_rebase_invalidates_exact_head_validation_evidence() -> None:
+    validated = dataclasses.replace(
+        _node(13, behind=2),
+        validation_evidence=ValidationEvidence.CLEAN_VALIDATE_RECORD,
+    )
+    plan, _ = compute_plan([validated], [], [], [])
+    decision = plan.per_pr_actions[0]
+    assert decision.action is PrAction.REBASE_THEN_LAND
+    assert "revalidate the new head" in decision.why
+    assert "without waiting" not in decision.why
+
+
 def test_held_actions() -> None:
     nodes = [_node(1), _node(2), _node(3)]
     held = [
@@ -121,6 +171,35 @@ def test_batch_is_conflict_free_green_subset() -> None:
     # #1 and #2 conflict => the batch keeps only one of them plus #3.
     assert 3 in plan.batch
     assert not (1 in plan.batch and 2 in plan.batch)
+
+
+def test_nonlandable_dependency_blocks_child_and_batch_excludes_all_children() -> None:
+    broken_parent = _node(1, state=CiState.RED, red=RedClass.REAL)
+    child = _node(2)
+    plan, _ = compute_plan(
+        [broken_parent, child],
+        [],
+        [OrderingEdge(1, 2, "base-ref")],
+        [],
+        batch=True,
+    )
+    child_decision = next(item for item in plan.per_pr_actions if item.pr == 2)
+    assert child_decision.action is PrAction.WAIT
+    assert "dependency #1 requires hold-fix" in child_decision.why
+    assert 2 not in plan.land_now
+    assert 2 not in plan.batch
+
+    ready_parent = _node(3)
+    ready_child = _node(4)
+    ready, _ = compute_plan(
+        [ready_parent, ready_child],
+        [],
+        [OrderingEdge(3, 4, "base-ref")],
+        [],
+        batch=True,
+    )
+    assert set(ready.land_now) == {3, 4}
+    assert ready.batch == (3,)
 
 
 def test_diagnostics_and_outage_threshold() -> None:

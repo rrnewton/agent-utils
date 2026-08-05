@@ -75,8 +75,8 @@ def test_raw_local_label_is_observed_but_does_not_authorize_landing() -> None:
     assert 1 not in plan.land_now
 
 
-def test_clean_record_requires_and_checks_exact_head() -> None:
-    with pytest.raises(ValueError, match="requires exact 'head_sha'"):
+def test_clean_record_requires_and_checks_exact_head_and_base() -> None:
+    with pytest.raises(ValueError, match="requires exact 'head_sha'.*'base_sha'"):
         parse_landing_context(
             {
                 "prs": [
@@ -91,6 +91,7 @@ def test_clean_record_requires_and_checks_exact_head() -> None:
                 {
                     "pr": 1,
                     "head_sha": "stale-sha",
+                    "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
                 }
             ]
@@ -98,6 +99,21 @@ def test_clean_record_requires_and_checks_exact_head() -> None:
     )
     with pytest.raises(ValueError, match="landing context is stale"):
         apply_landing_context([_node(1)], context)
+
+    stale_base = parse_landing_context(
+        {
+            "prs": [
+                {
+                    "pr": 1,
+                    "head_sha": "sha-1",
+                    "base_sha": "stale-base",
+                    "validation_evidence": "clean-validate-record",
+                }
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="context base is stale.*revalidate"):
+        apply_landing_context([_node(1)], stale_base)
 
 
 def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
@@ -107,6 +123,7 @@ def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
                 {
                     "pr": 1,
                     "head_sha": "sha-1",
+                    "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
                     "policy_class": "ci-hygiene",
                     "assigned_agent": "hermit-ci",
@@ -114,6 +131,7 @@ def test_local_evidence_bypasses_ci_wait_but_gate_policy_escalates() -> None:
                 {
                     "pr": 2,
                     "head_sha": "sha-2",
+                    "base_sha": "base",
                     "validation_evidence": "clean-validate-record",
                     "policy_class": "gate-policy",
                 },

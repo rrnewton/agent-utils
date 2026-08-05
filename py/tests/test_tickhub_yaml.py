@@ -2,8 +2,7 @@
 
 The YAML loader funnels through the same strict narrowing as JSON (a YAML doc and the equivalent
 JSON doc build byte-identical canonical JSON), and plain scalars resolve with YAML-1.2 core-schema
-rules (so the Norway tokens stay strings), matching the maintained Rust YAML parser a future port
-will use.
+rules (so the Norway tokens stay strings) in every implementation.
 """
 
 from __future__ import annotations
@@ -91,4 +90,42 @@ def test_yaml_bad_when_rejected() -> None:
     _expect_error(
         config_from_yaml,
         "reminders:\n  - {name: r, gate: {cmd: c, when: yes}, emit: {skill: s}}\n",
+    )
+
+
+def test_yaml_signed_prefixed_integers_are_numeric_and_string_emission_quotes() -> None:
+    # YAML 1.2 treats signs on base-prefixed integers consistently with serde_norway.
+    _expect_error(
+        config_from_yaml,
+        "reminders:\n  - {name: +0o7, emit: {skill: s}}\n",
+    )
+    cfg = config_from_json(
+        '{"reminders": [{"name": "+0o7", "emit": {"skill": "s"}}]}'
+    )
+    emitted = config_to_yaml(cfg)
+    assert "'+0o7'" in emitted
+    assert config_to_json(config_from_yaml(emitted)) == config_to_json(cfg)
+
+
+def test_yaml_rejects_non_string_and_duplicate_mapping_keys() -> None:
+    _expect_error(config_from_yaml, "1: value\n")
+    _expect_error(config_from_yaml, "description: one\ndescription: two\n")
+    _expect_error(
+        config_from_yaml,
+        "defaults: &defaults {cadence_secs: 1}\n<<: *defaults\nreminders: []\n",
+    )
+    _expect_error(
+        config_from_yaml,
+        "reminders:\n  - {name: r, emit: {skill: s, fields: {\"<<\": value}}}\n",
+    )
+
+
+def test_yaml_rejects_nonfinite_numbers_even_in_nullable_fields() -> None:
+    _expect_error(
+        config_from_yaml,
+        "reminders:\n  - {name: r, gate: .nan, emit: {skill: s}}\n",
+    )
+    _expect_error(
+        config_from_yaml,
+        "reminders:\n  - {name: r, cadence_secs: .inf, emit: {skill: s}}\n",
     )

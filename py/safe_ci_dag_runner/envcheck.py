@@ -1,38 +1,8 @@
-"""Conflicting-process detection for a clean pre-run environment (Linux ``ps``/``/proc``).
+"""Detect conflicting local processes before a run starts.
 
-Ported from DeepScry's ``scripts/check_clean_environment.py``. That script guards a
-validation run by scanning ``ps aux`` for leftover processes that would corrupt or
-serialize the run (a build/test binary from the same checkout, a browser left over from
-an e2e step, a second validate driver, ...). This generic port keeps the *mechanism* —
-process-line parsing, real-cwd scoping via ``/proc``, and the self-ancestor exclusion that
-stops the launching wrapper from flagging itself — but carries **zero** project specifics.
-
-The concrete process-name patterns that count as a conflict are **injected by the
-caller** as :class:`ConflictMatcher` objects, rather than the hardcoded
-``deepscry``/``cargo``/``chromium`` list of the original. Two ready-made, project-neutral
-matchers (:class:`ExecutableMatcher`, :class:`SubstringMatcher`) cover the common shapes;
-a caller with harness-specific exceptions (idle agent runners, lock-owning daemons)
-implements the :class:`ConflictMatcher` protocol directly.
-
-Two pinned exclusions from the original are preserved and belong to *this* module, not to
-any injected pattern:
-
-* **Own wrapper / launcher shell is not a conflict.** The process chain that launched this
-  very check (its ``validate`` driver, the ``make``/shell above it) is skipped by PID via
-  the caller-supplied ``self_ancestors`` set (see :func:`ancestor_pids`). A direct
-  ``python3 validate.py`` run therefore never flags its own launching process (DeepScry
-  ds-1261).
-* **A monitoring shell that merely *mentions* a tool is not a conflict.** Scoping cargo-style
-  matches to the executable's ``argv[0]`` basename (:func:`command_basename`) — not a naive
-  substring of the command line — means a ``bash -c 'while pgrep -f "cargo test"...'``
-  watchdog is not mistaken for a real ``cargo`` process.
-
-No Silent Failure note: :func:`proc_cwd` and :func:`ancestor_pids` swallow ``OSError`` on a
-missing/exited ``/proc`` entry, but this is *documented graceful degradation*, not a silent
-skip — :meth:`ProcessInfo.within_dir` visibly falls back to a command-line substring scope
-when the real cwd is unavailable, so scoping still happens (never silently widened to
-global, never crashed). This file performs no cgroupfs writes, so the cgroup
-degraded-enforcement warning required elsewhere in the port does not arise here.
+Callers provide conflict matchers; this module supplies process parsing, working-directory
+scoping, and ancestor exclusion. Vanished ``/proc`` entries degrade to documented fallback
+behavior instead of widening a check silently.
 """
 
 from __future__ import annotations
@@ -60,11 +30,10 @@ __all__ = [
 def command_basename(cmd: str) -> str:
     """Best-effort basename of ``argv[0]`` from a ``ps`` command string.
 
-    Tolerates shell-quoted argv (``'/path/to/cargo' test ...``) by trying :func:`shlex.split`
+    Tolerates shell-quoted argv (``'/path/to/tool' test ...``) by trying :func:`shlex.split`
     first and falling back to a whitespace split when the line is not valid shell syntax.
-    Returns ``""`` for an empty command. Ported verbatim from the reference
-    ``command_basename`` so an ``ExecutableMatcher`` keys on the real executable, not a
-    substring of the whole line.
+    Returns ``""`` for an empty command. An :class:`ExecutableMatcher` therefore keys on
+    the real executable rather than a substring of the whole line.
     """
     try:
         parts = shlex.split(cmd)
@@ -107,8 +76,8 @@ def ancestor_pids(start_pid: int | None = None) -> set[int]:
     Walk ``/proc/<pid>/stat`` following the PPID field. The set is meant to be passed as the
     ``self_ancestors`` argument to :func:`is_conflicting_process`, excluding the launching
     wrapper/shell chain from the scan so a check invoked directly from a driver script does
-    not flag its own ancestry (DeepScry ds-1261). Linux-only; degrades to just
-    ``{start_pid}`` where ``/proc`` is unavailable.
+    not flag its own ancestry. Linux-only; degrades to ``{start_pid}`` when ``/proc`` is
+    unavailable.
     """
     pids: set[int] = set()
     pid = os.getpid() if start_pid is None else start_pid
@@ -202,10 +171,8 @@ class ConflictMatcher(Protocol):
 
     Return a human-readable conflict description (typically via
     :meth:`ProcessInfo.describe`) when ``proc`` is a conflict for a run rooted at
-    ``current_dir``, or ``None`` when it is not. This is the generic replacement for the
-    original's hardcoded ``deepscry``/``validate.py``/``cargo``/``chromium`` branch cascade:
-    the *catalog* of what counts as a conflict lives entirely in the matchers the caller
-    supplies, keeping this module free of any project specifics.
+    ``current_dir``, or ``None`` when it is not. The caller-supplied matcher catalog is the
+    complete policy for what counts as a conflict.
     """
 
     def __call__(self, proc: ProcessInfo, current_dir: str) -> str | None: ...
@@ -222,11 +189,9 @@ def _contains(cmd: str, needle: str, *, case_insensitive: bool) -> bool:
 class ExecutableMatcher:
     """Flag a process whose ``argv[0]`` basename is ``executable`` and that runs *here*.
 
-    Generalizes the reference cargo rule. Keying on the executable basename (not a
-    command-line substring) is what preserves the pinned "monitoring shell that merely
-    mentions the tool is not a conflict" behavior: a ``bash`` watchdog referencing
-    ``cargo`` has basename ``bash`` and is skipped, while a real ``cargo`` process is
-    caught. ``subcommands`` (when non-empty) additionally requires at least one of the
+    Keying on the executable basename (not a command-line substring) means a monitoring
+    shell that merely mentions the tool is not a conflict. ``subcommands`` (when non-empty)
+    additionally requires at least one of the
     given tokens to appear in the command line (e.g. ``("test", "build")``). The match is
     scoped to ``current_dir`` by real cwd (:meth:`ProcessInfo.within_dir`).
     """

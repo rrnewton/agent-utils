@@ -1,27 +1,7 @@
-"""Canonical JSON and YAML (de)serialization for a :class:`~safe_ci_dag_runner.model.DagConfig`.
+"""Strict JSON and YAML serialization for :class:`DagConfig`.
 
-This is the on-disk / interchange form the CLI loads via ``--dag FILE`` and the shared
-fixture format for cross-language (Python vs Rust) tests. The schema mirrors the dataclasses
-field-for-field. Parsing is STRICT and fails loudly on a malformed document
-(:class:`DagJsonError`), never silently defaulting a wrong-typed field.
-
-YAML (:func:`dag_from_yaml` / :func:`dag_to_yaml`) is ISOMORPHIC to the JSON schema: the parsed
-YAML object is funneled through the SAME strict narrowing as JSON, so both syntaxes build an
-identical model. YAML additionally allows comments and multi-line block scalars (handy for
-``description`` fields), which is why "literate" DAGs are written in YAML.
-
-Example document::
-
-    {
-      "resource_caps": {"browser": 2},
-      "mem_cap_factor": 1.25,
-      "steps": [
-        {"group": "build", "job": "app", "desc": "build", "cmd": "make build",
-         "hint": {"est_duration_s": 90, "classification": "cpu-bound"}},
-        {"group": "test", "job": "unit", "desc": "tests", "cmd": "make test",
-         "deps": ["build.app"]}
-      ]
-    }
+Both input formats narrow through the same schema and reject malformed or wrong-typed
+fields with :class:`DagJsonError`. YAML additionally supports comments and block scalars.
 """
 
 from __future__ import annotations
@@ -33,11 +13,9 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
-    # PyYAML is an OPTIONAL runtime dependency: only the YAML entry points below need it, so it is
-    # imported lazily inside those functions (see _core_loader / _core_dumper / dag_from_yaml /
-    # dag_to_yaml). Importing it here would drag the dependency into every JSON-only path and into
-    # `--help` / `--version`. Under `from __future__ import annotations` every annotation is a
-    # string, so these type-only imports satisfy the checker without a runtime import.
+    # PyYAML is a declared runtime dependency, but it is imported lazily so malformed installations
+    # still retain working JSON paths and actionable `--help` / `--version` output. Under
+    # `from __future__ import annotations` these type-only imports cost nothing at runtime.
     import yaml
     from yaml.nodes import ScalarNode
 
@@ -66,11 +44,11 @@ class DagJsonError(ValueError):
 
 
 # Surfaced (as a DagJsonError, so the CLI prints it cleanly rather than dumping a traceback) when a
-# YAML entry point is reached but PyYAML is not installed. JSON needs no optional dependency.
+# YAML entry point is reached but the declared PyYAML dependency is not installed.
 _MISSING_YAML_MSG = (
-    "reading or writing YAML requires the optional PyYAML dependency, which is not installed. "
-    "Install it with: python3 -m pip install 'pyyaml>=6'  (or run: agent-utils/setup). "
-    "The JSON format needs no extra dependency."
+    "reading or writing YAML requires PyYAML, but that package is not installed. "
+    "Repair this installation with: python3 -m pip install 'pyyaml>=6'. "
+    "The JSON format remains available."
 )
 
 
@@ -337,7 +315,7 @@ def _core_loader() -> type[yaml.SafeLoader]:
     catch-all implicit resolver that REPLACES PyYAML's default YAML-1.1 implicit typing. Quoted and
     block scalars keep the default string tag, so a quoted ``"no"`` stays the string ``"no"`` and a
     plain ``no`` also stays a string — matching serde_norway and never resurrecting the Norway
-    problem. Defining the subclass here (not at module scope) keeps PyYAML an optional dependency.
+    problem. Defining the subclass here avoids importing PyYAML on JSON-only paths.
     """
     global _CORE_LOADER
     if _CORE_LOADER is not None:
@@ -360,16 +338,11 @@ def _core_loader() -> type[yaml.SafeLoader]:
 
 
 def dag_from_yaml(text: str) -> DagConfig:
-    """Parse a DAG YAML document into a :class:`DagConfig`. Raises :class:`DagJsonError`.
+    """Parse a DAG YAML document into a :class:`DagConfig`.
 
-    YAML is ISOMORPHIC to the JSON schema: the parsed object is funneled through the SAME typed
-    narrowing (:func:`_dag_from_obj`) that :func:`dag_from_json` uses, AND plain scalars are
-    resolved with the SAME YAML-1.2 core-schema rules the Rust build (serde_norway) uses (see
-    :func:`_core_loader`), so a given ``.yaml`` builds the identical model — or is rejected — in
-    both builds. The only surface differences are comments and multi-line block scalars.
-
-    PyYAML is an optional dependency; if it is not installed this raises :class:`DagJsonError` with
-    an actionable install hint (JSON works without it).
+    YAML uses the same strict schema as JSON, with YAML 1.2 core scalar resolution.
+    Comments and multi-line block scalars are accepted. Malformed input and a missing
+    declared YAML dependency raise :class:`DagJsonError`.
     """
     try:
         import yaml
@@ -488,13 +461,10 @@ def _dag_to_obj(cfg: DagConfig) -> dict[str, object]:
 
 
 def dag_to_json(cfg: DagConfig) -> str:
-    """Serialize a :class:`DagConfig` to canonical, deterministic JSON (2-space indent).
+    """Serialize a :class:`DagConfig` to deterministic, two-space-indented JSON.
 
-    ``ensure_ascii=False`` emits non-ASCII characters as raw UTF-8 (not ``\\uXXXX`` escapes),
-    which makes this output BYTE-IDENTICAL to the Rust build's hand-rolled serializer for every
-    input — including multi-line, quote/backslash-laden, and unicode descriptions. Both sides
-    still escape the JSON control set (``"``, ``\\``, ``\\n``, ``\\t``, ``\\r``, ``\\b``, ``\\f``,
-    and ``\\u00XX`` for other code points < 0x20) identically.
+    Non-ASCII characters are emitted as UTF-8, while JSON control characters, quotes,
+    and backslashes are escaped according to the JSON specification.
     """
     return json.dumps(_dag_to_obj(cfg), indent=2, ensure_ascii=False)
 
@@ -532,16 +502,10 @@ def _core_dumper() -> type[yaml.SafeDumper]:
 
 
 def dag_to_yaml(cfg: DagConfig) -> str:
-    """Serialize a :class:`DagConfig` to a YAML document.
+    """Serialize a :class:`DagConfig` to round-trippable YAML.
 
-    YAML byte-output need NOT match the Rust build (only YAML *loading* is isomorphic across the
-    two languages); the emitted document round-trips back through :func:`dag_from_yaml` to an
-    identical :class:`DagConfig` — including exotic string values like ``"1e3"`` or ``"0o17"``,
-    which :func:`_core_dumper` force-quotes so the core-schema loader reads them back as strings.
-    Built from the same canonical document dict as :func:`dag_to_json`.
-
-    PyYAML is an optional dependency; if it is not installed this raises :class:`DagJsonError` with
-    an actionable install hint (JSON works without it).
+    Ambiguous scalar-looking strings are quoted so the core-schema loader preserves
+    them as strings. A missing declared YAML dependency raises :class:`DagJsonError`.
     """
     try:
         import yaml

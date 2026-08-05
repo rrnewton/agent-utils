@@ -1,9 +1,7 @@
-"""Memory footprint model + memory-aware ``-j`` selection (pure functions over a DagConfig).
+"""Memory-footprint modeling and safe concurrency selection.
 
-Ports DeepScry's reachable-concurrent-set memory model: rather than a flat per-job RAM
-estimate, it enumerates which steps can actually co-run (no transitive dependency between
-them, and their summed scarce-resource demand fits the caps) and takes the worst-case sum
-of their per-step memory caps. That yields an exact "largest ``-jN`` that fits budget M".
+The model enumerates dependency-compatible and resource-compatible steps that may run
+together, then chooses the largest concurrency that fits the supplied memory budget.
 """
 
 from __future__ import annotations
@@ -86,14 +84,14 @@ def schedulable_peak_mem_bytes(
     """Maximum per-step-cap sum over any scheduler-reachable concurrent set of size <= jobs.
 
     A set is reachable only when no member transitively depends on another and the summed
-    scarce-resource demand fits ``cfg.resource_caps``. Only steps with a memory baseline
-    and that are not engine-only participate (mirrors DeepScry).
+    scarce-resource demand fits ``cfg.resource_caps``. Only non-engine steps with a memory
+    baseline participate.
 
     ``inner_jobs`` applies ONE internal-parallelism width to every step (the ``--max-mem``
     sizing path). ``widths`` instead supplies a PER-STEP width map (a step absent from the map
     falls back to ``inner_jobs``); the CPA allocator uses it so a step widened on the critical
-    path is charged its own scaled memory cap while its siblings keep theirs (PLANNER_DESIGN.md
-    §5.6). Passing both is allowed; ``widths`` wins per tag.
+    path is charged its own scaled memory cap while its siblings keep theirs. Passing both
+    is allowed; ``widths`` wins per tag.
     """
     by_tag = {
         step.tag: step
@@ -159,20 +157,18 @@ PER_BUILD_JOB_MEM_BYTES = 1 * 1024**3
 
 
 def derive_build_jobs(cpu_count: int | None, mem_max_bytes: int | None) -> int:
-    """Bounded ``CARGO_BUILD_JOBS`` for a boxed command, carrying its ``-j`` WITH the caps.
+    """Derive a bounded build-job count from colocated CPU and memory caps.
 
-    Cargo (and the ``NUM_JOBS`` it exports to build scripts) otherwise auto-detects
-    parallelism from the effective CPU quota, so an unpinned step under a wide scope quota
-    computes ``NUM_JOBS=<all-granted-cores>`` (observed 284) and OOM-races the linker. The
-    fix is to derive the job count where the quota is granted:
+    Build tools commonly auto-detect all granted cores without accounting for the memory
+    needed by each concurrent compilation. Keep the parallelism decision with its caps:
 
       jobs = min(granted_cores, mem_cap // PER_BUILD_JOB_MEM_BYTES)
 
     ``cpu_count`` is the granted cores (a step's inner ``cpu.max``, or the scope's effective
     quota for an unpinned step); ``mem_max_bytes`` is the co-located memory cap (the step's
-    ``memory.max`` or the scope's). Either bound alone is insufficient: cores without memory
-    is the 284-job OOM; memory without cores over-subscribes a tiny box. Always ``>= 1`` — a
-    cap too small for even one job is a scheduling decision for the caller, not a ``-j0``."""
+    ``memory.max`` or the scope's). Either bound alone is insufficient. The result is always
+    at least one; rejecting an undersized cap remains the caller's scheduling decision.
+    """
     cores = cpu_count if (cpu_count is not None and cpu_count > 0) else (os.cpu_count() or 1)
     jobs = int(cores)
     if mem_max_bytes is not None and mem_max_bytes > 0:

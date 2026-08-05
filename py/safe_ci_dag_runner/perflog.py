@@ -1,34 +1,8 @@
-"""Always-on perf logging for a DAG run: whole-run window + per-step profile CSVs.
+"""Record whole-run and per-step performance measurements.
 
-Ported from DeepScry's ``scripts/validate_perflog.py`` (ds-1190), stripped of every
-DeepScry/MTG specific. The generic contract:
-
-* :class:`PerfWindow` brackets the whole run and appends ONE row recording how long the
-  run took and *who* was using the CPU during the window. The contention split
-  (``pct_we`` / ``pct_other`` / ``total_busy_pct``) is derived from ``/proc/stat`` sampled
-  at window start and end vs. ``RUSAGE_CHILDREN`` CPU-seconds, so an uncontended run (we
-  had the box) is distinguishable from a contended one (other work ate the cores).
-* :func:`append_step_profiles` appends per-step measurement rows to a
-  machine/container-specific CSV. The header is the standard :data:`STEP_PROFILE_COLUMNS`
-  (run context plus the scheduler's per-step keys) widened with any dynamic per-row keys
-  (e.g. ``cpu.*`` counters); it widens across runs without ever dropping a column.
-* :class:`CsvMetricsSink` is a concrete file-backed implementation of the
-  :class:`~safe_ci_dag_runner.protocols.MetricsSink` protocol wiring the two together.
-
-Key generalization over the DeepScry original: the DeepScry code GUESSES the output
-directory by walking two levels up from the project checkout (``<parent>/validate_perf/``)
-and only writes when that opt-in directory already exists. That heuristic is a
-DeepScry-harness-layout specific and is removed here. The output directory is an EXPLICIT
-constructor / function argument; the caller decides where the data lives. The directory is
-created on demand (``mkdir(parents=True)``); a failure to create or write it is surfaced as
-a visible warning and returns ``None`` (No Silent Failure) rather than being swallowed.
-
-Two further DeepScry specifics dropped: the whole-run ``machine_id().csv`` layout and the
-row context read from DeepScry-named environment variables (``VALIDATE_PROFILE_BASE_SHA``,
-``VALIDATE_CPU_ENFORCEMENT_KIND``, ``RUNNER_NAME``) are replaced by plain constructor
-arguments with neutral defaults.
-
-Linux cgroup-v2 only for :func:`container_class` (matches the DeepScry target).
+The file-backed sink maintains stable CSV schemas, preserves dynamically observed
+measurement columns, and surfaces directory or write failures instead of dropping data
+silently. Linux cgroup measurements are optional and remain blank when unavailable.
 """
 
 from __future__ import annotations
@@ -259,8 +233,8 @@ def append_step_profiles(
     before appending. The file is created on first write. Returns the CSV path, or ``None``
     if the output directory could not be created (a visible warning is emitted).
 
-    ``profile_base_sha`` defaults to ``git_sha``. ``enforcement_kind`` / ``runner_name``
-    are recorded verbatim (neutral defaults replace the DeepScry env-var reads)."""
+    ``profile_base_sha`` defaults to ``git_sha``. ``enforcement_kind`` and ``runner_name``
+    are recorded verbatim."""
     logs_dir = _ensure_dir(output_dir)
     if logs_dir is None:
         return None
@@ -500,8 +474,7 @@ class CsvMetricsSink(MetricsSink):
 
     Carries the fixed run context (explicit output directory, git SHA, machine id, and the
     per-step provenance columns) as construction state; the scheduler passes only the
-    varying per-call data. The output directory is an EXPLICIT argument — the generalization
-    over DeepScry, which guessed it from the checkout layout — and is created on demand."""
+    varying per-call data. The explicit output directory is created on demand."""
 
     def __init__(
         self,

@@ -34,6 +34,12 @@ def _n_cores() -> int:
     return len(os.sched_getaffinity(0))
 
 
+@pytest.mark.parametrize("sample_s", [-1.0, float("nan"), float("inf")])
+def test_acquire_rejects_invalid_sample_window(ledger: Path, sample_s: float) -> None:
+    with pytest.raises(ValueError, match="sample_s must be finite and >= 0"):
+        res.acquire(1, ledger=ledger, sample_s=sample_s)
+
+
 # --------------------------------------------------------------------------- #
 # 1. DISJOINT under concurrency                                               #
 # --------------------------------------------------------------------------- #
@@ -100,6 +106,17 @@ def test_release_is_idempotent(ledger: Path) -> None:
     r.release()
     r.release()  # must not raise or corrupt the ledger
     assert res.held_cores(ledger) == []
+
+
+def test_releasing_one_same_tag_reservation_keeps_the_other(ledger: Path) -> None:
+    if _n_cores() < 2:
+        pytest.skip("need two cores for simultaneous reservations")
+    first = res.acquire(1, tag="same", ledger=ledger, sample_s=0.01)
+    second = res.acquire(1, tag="same", ledger=ledger, sample_s=0.01)
+    assert first.cores != second.cores
+    first.release()
+    assert res.held_cores(ledger) == second.cores
+    second.release()
 
 
 def test_context_manager_releases_on_exception(ledger: Path) -> None:

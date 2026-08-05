@@ -1,21 +1,23 @@
-//! Memory footprint model + memory-aware `-j` selection (pure functions over a [`DagConfig`]).
-//!
-//! Direct port of `py/safe_ci_dag_runner/sizing.py`. Rather than a flat per-job RAM estimate,
-//! it enumerates which steps can actually co-run (no transitive dependency between them, and
-//! their summed scarce-resource demand fits the caps) and takes the worst-case sum of their
-//! per-step memory caps. That yields an exact "largest `-jN` that fits budget M". The chosen
-//! `-j` and footprint MUST equal the Python build's for the same DAG (cross-tested).
+//! Memory-footprint modeling and safe concurrency selection.
+
+// Memory footprint model + memory-aware `-j` selection (pure functions over a [`DagConfig`]).
+//
+// Direct port of `py/safe_ci_dag_runner/sizing.py`. Rather than a flat per-job RAM estimate,
+// it enumerates which steps can actually co-run (no transitive dependency between them, and
+// their summed scarce-resource demand fits the caps) and takes the worst-case sum of their
+// per-step memory caps. That yields an exact "largest `-jN` that fits budget M". The chosen
+// `-j` and footprint MUST equal the Python build's for the same DAG (cross-tested).
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{step_classification, DagConfig, Step, StepClass};
+use crate::model::{step_classification, DagConfig, Step, StepClass, DEFAULT_SMALL_MEM_CAP_BYTES};
 
-/// Inner-cgroup MemoryMax for a step. An explicit hard cap wins; otherwise `factor x` the RSS
-/// baseline. When the step declares NEITHER (uncharacterized), fall back to `default_cap_bytes`
-/// — the SMALL forcing-function default the scheduler passes from
-/// `DagConfig::default_step_mem_cap_bytes` — or `None` when no default is supplied (the -j sizing
-/// model passes `None`, so an uncharacterized step stays excluded from the footprint sum, matching
-/// Python's falsy `if base` guard). Mirrors Python's `step_mem_cap_bytes`.
+// Inner-cgroup MemoryMax for a step. An explicit hard cap wins; otherwise `factor x` the RSS
+// baseline. When the step declares NEITHER (uncharacterized), fall back to `default_cap_bytes`
+// — the SMALL forcing-function default the scheduler passes from
+// `DagConfig::default_step_mem_cap_bytes` — or `None` when no default is supplied (the -j sizing
+// model passes `None`, so an uncharacterized step stays excluded from the footprint sum, matching
+// Python's falsy `if base` guard). Mirrors Python's `step_mem_cap_bytes`.
 pub fn step_mem_cap_bytes(
     step: &Step,
     mem_cap_factor: f64,
@@ -90,8 +92,8 @@ pub fn transitive_deps(steps: &[Step]) -> HashMap<String, HashSet<String>> {
     result
 }
 
-/// Generate all `k`-combinations of the indices `0..n` (in lexicographic order), matching
-/// Python's `itertools.combinations`.
+// Generate all `k`-combinations of the indices `0..n` (in lexicographic order), matching
+// Python's `itertools.combinations`.
 fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
     let mut out: Vec<Vec<usize>> = Vec::new();
     if k == 0 || k > n {
@@ -137,10 +139,10 @@ pub fn schedulable_peak_mem_bytes(
     })
 }
 
-/// Like [`schedulable_peak_mem_bytes`] but with a PER-STEP width map (a step absent from the map
-/// falls back to `inner_jobs = None`). The CPA allocator uses this so a step widened on the
-/// critical path is charged its own scaled memory cap while its siblings keep theirs
-/// (PLANNER_DESIGN.md §5.6). Mirrors the Python `schedulable_peak_mem_bytes(..., widths=...)`.
+// Like [`schedulable_peak_mem_bytes`] but with a PER-STEP width map (a step absent from the map
+// falls back to `inner_jobs = None`). The CPA allocator uses this so a step widened on the
+// critical path is charged its own scaled memory cap while its siblings keep theirs
+// (PLANNER_DESIGN.md §5.6). Mirrors the Python `schedulable_peak_mem_bytes(..., widths=...)`.
 pub fn schedulable_peak_mem_bytes_widths(
     cfg: &DagConfig,
     jobs: i64,
@@ -242,24 +244,24 @@ pub fn jobs_for_budget(cfg: &DagConfig, budget: i64) -> (i64, i64) {
     (best, jobs_footprint_bytes(cfg, best, None))
 }
 
-/// Worst-case peak RSS of ONE compile/link job, used to bound build parallelism by the
-/// memory a boxed scope actually grants. DERIVED from a measured footprint, never guessed:
-/// hermit#1584's `build.dbi_release` OOM-killed at the 8.0 GiB cap under j=32 (`memory.events`
-/// `oom_kill=2`) yet is stable at j8 (dag-mem-caps-pinned-jobs-fix #1583), i.e. ~8.0 GiB / 8
-/// ~= 1.0 GiB is the largest per-job footprint that still fits. Single source (mirrors
-/// Python `PER_BUILD_JOB_MEM_BYTES`) so the `-j` a cap implies is never re-derived at a second
-/// site.
+// Worst-case peak RSS of ONE compile/link job, used to bound build parallelism by the
+// memory a boxed scope actually grants. DERIVED from a measured footprint, never guessed:
+// hermit#1584's `build.dbi_release` OOM-killed at the 8.0 GiB cap under j=32 (`memory.events`
+// `oom_kill=2`) yet is stable at j8 (dag-mem-caps-pinned-jobs-fix #1583), i.e. ~8.0 GiB / 8
+// ~= 1.0 GiB is the largest per-job footprint that still fits. Single source (mirrors
+// Python `PER_BUILD_JOB_MEM_BYTES`) so the `-j` a cap implies is never re-derived at a second
+// site.
 pub const PER_BUILD_JOB_MEM_BYTES: i64 = 1024 * 1024 * 1024;
 
-/// Bounded `CARGO_BUILD_JOBS` for a boxed command, carrying its `-j` WITH the caps.
-///
-/// Cargo (and the `NUM_JOBS` it exports to build scripts) otherwise auto-detects parallelism
-/// from the effective CPU quota, so an unpinned step under a wide scope quota computes
-/// `NUM_JOBS=<all-granted-cores>` (observed 284) and OOM-races the linker. Derive the job count
-/// where the quota is granted: `jobs = min(granted_cores, mem_cap / PER_BUILD_JOB_MEM_BYTES)`.
-/// `cpu_count` is the granted cores (a step's inner `cpu.max`, or the scope's effective quota
-/// for an unpinned step); `mem_max_bytes` is the co-located memory cap. Always `>= 1`. Mirrors
-/// Python `derive_build_jobs` byte-for-byte.
+// Bounded `CARGO_BUILD_JOBS` for a boxed command, carrying its `-j` WITH the caps.
+//
+// Cargo (and the `NUM_JOBS` it exports to build scripts) otherwise auto-detects parallelism
+// from the effective CPU quota, so an unpinned step under a wide scope quota computes
+// `NUM_JOBS=<all-granted-cores>` (observed 284) and OOM-races the linker. Derive the job count
+// where the quota is granted: `jobs = min(granted_cores, mem_cap / PER_BUILD_JOB_MEM_BYTES)`.
+// `cpu_count` is the granted cores (a step's inner `cpu.max`, or the scope's effective quota
+// for an unpinned step); `mem_max_bytes` is the co-located memory cap. Always `>= 1`. Mirrors
+// Python `derive_build_jobs` byte-for-byte.
 pub fn derive_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> i64 {
     let cores = match cpu_count {
         Some(c) if c > 0 => c,
@@ -275,11 +277,11 @@ pub fn derive_build_jobs(cpu_count: Option<i64>, mem_max_bytes: Option<i64>) -> 
     jobs.max(1)
 }
 
-/// Number of logical CPUs, matching Python's `os.cpu_count()` (online, affinity-independent).
-///
-/// Read from `/sys/devices/system/cpu/online` (the same set `sysconf(_SC_NPROCESSORS_ONLN)`
-/// reports), so the chosen `-j` agrees with the Python build. Falls back to
-/// `available_parallelism`, then 4.
+// Number of logical CPUs, matching Python's `os.cpu_count()` (online, affinity-independent).
+//
+// Read from `/sys/devices/system/cpu/online` (the same set `sysconf(_SC_NPROCESSORS_ONLN)`
+// reports), so the chosen `-j` agrees with the Python build. Falls back to
+// `available_parallelism`, then 4.
 pub fn cpu_count() -> i64 {
     if let Ok(text) = std::fs::read_to_string("/sys/devices/system/cpu/online") {
         if let Some(n) = count_cpu_ranges(text.trim()) {
@@ -328,11 +330,11 @@ pub(crate) fn count_cpu_ranges(spec: &str) -> Option<i64> {
     }
 }
 
-/// Parse `'8G'` / `'4096M'` / `'2048K'` / `'12345'` (bytes) into an int, or `None` if bad.
-///
-/// Mirrors the Python regex `\s*(\d+(?:\.\d+)?)\s*([KkMmGgTt]?)([Bb]?)\s*` fullmatch: optional
-/// surrounding and mid whitespace, a decimal number, an optional size unit, and an optional
-/// trailing `B`/`b`.
+// Parse `'8G'` / `'4096M'` / `'2048K'` / `'12345'` (bytes) into an int, or `None` if bad.
+//
+// Mirrors the Python regex `\s*(\d+(?:\.\d+)?)\s*([KkMmGgTt]?)([Bb]?)\s*` fullmatch: optional
+// surrounding and mid whitespace, a decimal number, an optional size unit, and an optional
+// trailing `B`/`b`.
 pub fn parse_size(spec: &str) -> Option<i64> {
     if spec.is_empty() {
         return None;
@@ -418,6 +420,41 @@ pub fn mem_available_bytes() -> Option<i64> {
     None
 }
 
+/// The current cgroup-v2 memory ceiling, or `None` when unbounded/unreadable.
+pub fn cgroup_mem_max_bytes() -> Option<i64> {
+    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
+    let text = raw.trim();
+    if text == "max" {
+        None
+    } else {
+        text.parse().ok()
+    }
+}
+
+/// Conservative memory budget available to a stress fan-out.
+pub fn box_mem_budget_bytes() -> Option<i64> {
+    [cgroup_mem_max_bytes(), mem_available_bytes()]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// Conservative footprint of one complete stress copy.
+///
+/// Every non-engine-only step is charged its full inner cap; undeclared steps receive the same
+/// small default cap used by the scheduler.  Summing the graph is deliberately an upper bound.
+pub fn stress_copy_footprint_bytes(cfg: &DagConfig, default_step_bytes: Option<i64>) -> i64 {
+    let default_step_bytes = default_step_bytes.unwrap_or(DEFAULT_SMALL_MEM_CAP_BYTES);
+    cfg.steps
+        .iter()
+        .filter(|step| !step.engine_only)
+        .map(|step| {
+            step_mem_cap_bytes(step, cfg.mem_cap_factor, Some(default_step_bytes)).unwrap_or(0)
+        })
+        .fold(0i64, i64::saturating_add)
+        .max(default_step_bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,6 +520,26 @@ mod tests {
         assert_eq!(parse_size("nonsense"), None);
         // whitespace + trailing B forms Python's regex accepts.
         assert_eq!(parse_size(" 8 GB "), Some(8 * GIB));
+    }
+
+    #[test]
+    fn stress_footprint_charges_every_step() {
+        let mut value = cfg();
+        value.steps.push(step("g", "E", None, &[], false));
+        assert_eq!(
+            stress_copy_footprint_bytes(&value, Some(GIB)),
+            3 * GIB + 2 * GIB + 4 * GIB + GIB + GIB
+        );
+    }
+
+    #[test]
+    fn stress_footprint_has_the_default_floor() {
+        let mut value = cfg();
+        value.steps.clear();
+        assert_eq!(stress_copy_footprint_bytes(&value, Some(GIB)), GIB);
+        value.steps.push(step("g", "tiny", None, &[], false));
+        value.steps[0].hint.hard_mem_max_bytes = Some(1);
+        assert_eq!(stress_copy_footprint_bytes(&value, Some(GIB)), GIB);
     }
 
     #[test]

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safe-ci-dag-runner"
+version = "0.12.0"
+description = "Run resource-aware CI DAGs with cgroup containment, profiling, and deterministic planning."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Ryan Newton" }]
+keywords = ["ci", "dag", "cgroup", "scheduler", "profiling"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+]
+dependencies = ["PyYAML>=6"]
+
+[project.optional-dependencies]
+dev = ["mypy", "pytest", "types-PyYAML"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+safe-ci-dag-runner = "safe_ci_dag_runner.cli:main"
+cpuset-alloc = "safe_ci_dag_runner.cpuset_allocator:main"
+
+[tool.setuptools]
+packages = ["safe_ci_dag_runner"]
+package-dir = { safe_ci_dag_runner = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+safe_ci_dag_runner = ["py.typed", "README.md", "USER_GUIDE.md"]

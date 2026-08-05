@@ -61,6 +61,47 @@ def test_roundtrip_is_stable() -> None:
     assert back.health_checks[0].glob == "/var/*.sql"
 
 
+def test_direct_models_are_validated_before_serialization() -> None:
+    bad_configs = (
+        TickConfig(
+            reminders=(
+                Reminder("two words", Emit(EmitKind.ACTION, skill="handler")),
+            )
+        ),
+        TickConfig(
+            reminders=(
+                Reminder("same", Emit(EmitKind.ACTION, skill="handler")),
+                Reminder("same", Emit(EmitKind.ACTION, skill="handler")),
+            )
+        ),
+        TickConfig(
+            reminders=(
+                Reminder("negative", Emit(EmitKind.ACTION, skill="handler"), cadence_secs=-1),
+            )
+        ),
+        TickConfig(
+            reminders=(
+                Reminder("blank", Emit(EmitKind.ACTION, skill="   ")),
+            )
+        ),
+        TickConfig(
+            reminders=(
+                Reminder(
+                    "reserved",
+                    Emit(EmitKind.ACTION, skill="handler", fields={"<<": "value"}),
+                ),
+            )
+        ),
+        TickConfig(health_checks=(HealthCheck("", "*", 0),)),
+    )
+    for config in bad_configs:
+        try:
+            config_to_json(config)
+        except TickConfigError:
+            continue
+        raise AssertionError(f"expected direct model to be rejected: {config!r}")
+
+
 def test_minimal_document_defaults() -> None:
     cfg = config_from_json('{"reminders": [{"name": "r", "emit": {"skill": "s"}}]}')
     rem = cfg.reminders[0]
@@ -100,6 +141,26 @@ def test_strict_parse_errors() -> None:
         '{"reminders": [{"name": "r", "gate": {"cmd": "c", "when": "x"}, "emit": {"skill": "s"}}]}',
         '{"health_checks": [{"name": "h"}]}',  # missing glob
         '{"reminders": [{"name": "r", "emit": {"skill": "s", "fields": {"k": 1}}}]}',
+        '{"unknown": true}',
+        '{"reminders": null}',
+        '{"health_checks": null}',
+        '{"reminders": [{"name": "r", "unknown": 1, "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "r", "emit": {"skill": "s", "unknown": 1}}]}',
+        '{"reminders": [{"name": "r", "gate": {"cmd": "true", "unknown": 1}, "emit": {"skill": "s"}}]}',
+        '{"health_checks": [{"name": "h", "glob": "*", "unknown": 1}]}',
+        '{"reminders": [{"name": "", "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "two words", "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "key=value", "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "r", "cadence_secs": -1, "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "r", "requires_flags": null, "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "r", "emit": {"skill": "s", "fields": {"<<": "x"}}}]}',
+        '{"reminders": [{"name": "r", "emit": {"skill": "   "}}]}',
+        '{"health_checks": [{"name": "", "glob": "*"}]}',
+        '{"health_checks": [{"name": "h", "glob": ""}]}',
+        '{"health_checks": [{"name": "h", "glob": "*", "threshold_secs": -1}]}',
+        '{"reminders": [{"name": "r", "emit": {"skill": "s"}}, {"name": "r", "emit": {"skill": "s"}}]}',
+        '{"health_checks": [{"name": "h", "glob": "*"}, {"name": "h", "glob": "*"}]}',
+        '{"description": "a", "description": "b"}',
     ]
     for doc in bad_docs:
         raised = False

@@ -3,8 +3,7 @@
 The two things a tick does that touch the outside world — running a reminder's shell **gate** and
 measuring a health check's **file age** — are expressed as small :class:`typing.Protocol` interfaces
 here. The engine takes them as parameters; production uses the default implementations in
-:mod:`tick_hub.probes`, and tests pass deterministic fakes. This mirrors how the sibling
-safe-ci-dag-runner tool makes containment and metrics pluggable.
+:mod:`tick_hub.probes`, and callers can pass deterministic fakes in tests.
 """
 
 from __future__ import annotations
@@ -17,11 +16,11 @@ from typing import Optional, Protocol
 class GateResult:
     """The outcome of running a reminder's gate command."""
 
-    #: Exit code of the command (``-1`` when it could not be launched at all).
+    #: Exit code of the command (``-1`` when no completed process result exists).
     returncode: int
     #: Captured standard output.
     stdout: str
-    #: True iff the command actually ran (False when it could not be launched).
+    #: True iff the command ran to completion (False on launch failure or timeout).
     ok: bool
     #: Human-readable reason when ``ok`` is False; otherwise ``None``.
     error: Optional[str] = None

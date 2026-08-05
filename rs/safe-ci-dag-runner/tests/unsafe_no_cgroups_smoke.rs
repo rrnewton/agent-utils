@@ -1,10 +1,10 @@
-//! Integration smoke test: prove `--unsafe-no-cgroups` is the DELIBERATE, reviewable opt-out.
-//!
-//! Behavioral parity anchor for the Python `test_unsafe_no_cgroups_deliberately_skips_boxing`.
-//! Unlike `--allow-cgroup-failure` (a capability fallback that TRIES to box and only downgrades
-//! when boxing is unavailable), `--unsafe-no-cgroups` skips scope bring-up entirely and runs
-//! unboxed even where boxing IS available. It must exit 0, emit a LOUD warning naming the flag
-//! (a reviewable audit signal — never a silent skip), and never claim boxing is ACTIVE.
+// Integration smoke test: prove `--unsafe-no-cgroups` is the DELIBERATE, reviewable opt-out.
+//
+// Behavioral parity anchor for the Python `test_unsafe_no_cgroups_deliberately_skips_boxing`.
+// Unlike `--allow-cgroup-failure` (a capability fallback that TRIES to box and only downgrades
+// when boxing is unavailable), `--unsafe-no-cgroups` skips scope bring-up entirely and runs
+// unboxed even where boxing IS available. It must exit 0, emit a LOUD warning naming the flag
+// (a reviewable audit signal — never a silent skip), and never claim boxing is ACTIVE.
 
 use std::io::Write;
 use std::process::Command;

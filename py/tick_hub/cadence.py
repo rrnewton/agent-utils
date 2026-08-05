@@ -17,6 +17,7 @@ from pathlib import Path
 from tick_hub.model import EVERY_TICK, Reminder
 
 _LINE_RE = re.compile(r"^([^=\s]+)=([0-9]+)$")
+_I64_MAX = 2**63 - 1
 
 
 def is_due(name: str, cadence_secs: int, now: int, last_fired: Mapping[str, int]) -> bool:
@@ -56,16 +57,37 @@ def load_fired_state(path: Path) -> dict[str, int]:
             continue
         m = _LINE_RE.match(line)
         if m:
-            state[m.group(1)] = int(m.group(2))
+            epoch = int(m.group(2))
+            if epoch <= _I64_MAX:
+                state[m.group(1)] = epoch
     return state
 
 
 def persist_fired_state(path: Path, state: Mapping[str, int]) -> None:
     """Atomically write the fired-state store (temp file + rename)."""
+    for key, value in state.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or "=" in key
+            or any(char.isspace() for char in key)
+            or isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < 0
+            or value > _I64_MAX
+        ):
+            raise ValueError(f"invalid fired-state entry {key!r}={value!r}")
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     lines = ["# tick-hub fired-state — key=last_fired_epoch (managed by tick-hub)"]
     for key in sorted(state):
         lines.append(f"{key}={state[key]}")
-    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise

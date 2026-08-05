@@ -77,6 +77,26 @@ def test_run_rejects_empty_command(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ca.main(["run", "--cores", "1"]) == 2
 
 
+def test_run_requires_command_separator(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(ca, "_systemd_run_available", lambda: True)
+    assert ca.main(["run", "--cores", "1", "true"]) == 2
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["run", "--cores", "0", "--", "true"],
+        ["run", "--cores", "1", "--sample-s", "-1", "--", "true"],
+        ["run", "--cores", "1", "--sample-s", "nan", "--", "true"],
+        ["selftest", "--tag", "not-supported"],
+    ],
+)
+def test_invalid_options_are_clean_usage_errors(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as raised:
+        ca.main(argv)
+    assert raised.value.code == 2
+
+
 def test_run_refuses_when_allowed_cpus_is_soft_or_inert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -97,6 +117,41 @@ def test_run_refuses_when_allowed_cpus_is_soft_or_inert(
 
     monkeypatch.setattr(subprocess, "run", _no_run)
     assert ca.main(["run", "--cores", "1", "--", "echo", "hi"]) == 3
+
+
+def test_probe_requires_real_mutation_and_every_reserved_core() -> None:
+    base: dict[str, object] = {
+        "child_allowed_before": "2-3",
+        "child_allowed_after": "2-3",
+        "mutation_attempted": True,
+        "mutation_blocked": True,
+        "positive_cores_usable": [2, 3],
+        "restore_exact": True,
+    }
+    assert ca._evaluate_probe([2, 3], 4, base)["verdict"] == "HARD"
+    no_mutation = {**base, "mutation_attempted": False, "mutation_blocked": False}
+    assert ca._evaluate_probe([2, 3], 4, no_mutation)["verdict"] == "SOFT_OR_INERT"
+    partial = {**base, "positive_cores_usable": [2]}
+    assert ca._evaluate_probe([2, 3], 4, partial)["verdict"] == "SOFT_OR_INERT"
+
+
+def test_wrapped_signal_uses_shell_status() -> None:
+    assert ca._wrapped_returncode(-15) == 143
+    assert ca._wrapped_returncode(42) == 42
+
+
+def test_missing_wrapped_executable_is_clean_operational_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert ca._run_reserved_hard([0], ["/definitely/missing/cpuset-command"]) == 3
+    monkeypatch.setattr(ca, "_systemd_run_available", lambda: True)
+    monkeypatch.setattr(ca, "_probe_hard_pin", lambda cores: {"verdict": "HARD"})
+    monkeypatch.setattr(
+        ca,
+        "_scope_argv",
+        lambda cores, cmd, tag="": ["/definitely/missing/cpuset-command"],
+    )
+    assert ca._run_reserved_hard([0], ["true"]) == 3
 
 
 # --------------------------------------------------------------------------- #

@@ -90,6 +90,17 @@ def test_evaluate_once_race_is_benign() -> None:
     assert v.red_class is RedClass.EVALUATE_ONCE_RACE
 
 
+def test_non_gate_failure_with_race_words_remains_real() -> None:
+    verdict = classify_pr(
+        [
+            _check("unit", "FAILURE", text="dependency still queued"),
+            _check("merge-gate", "SUCCESS"),
+        ],
+        CFG,
+    )
+    assert verdict.red_class is RedClass.REAL
+
+
 def test_runner_outage_by_marker_and_duration() -> None:
     v1 = classify_pr(
         [_check("CI", "SUCCESS"), _check("merge-gate", "FAILURE", text="BlobNotFound", duration=3)],

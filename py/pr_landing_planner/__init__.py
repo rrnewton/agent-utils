@@ -2,7 +2,7 @@
 
 Collect the open pull requests targeting a base branch, build the real merge-conflict graph (via
 ``git merge-tree``, with a file-overlap fallback), classify each red CI into one of five failure
-modes (real / flaky / stale-required-check / evaluate-once-race / runner-outage), apply exact-head
+modes (real / flaky / stale-required-check / evaluate-once-race / runner-outage), apply exact-identity
 validation evidence and policy disposition, surface mechanism overlaps, compute freshness and holds,
 partition into parallel-safe groups, and assign each PR a recommended action. It is ADVISORY ONLY —
 it recommends actions and never mutates a pull request.

@@ -1,28 +1,30 @@
-//! Command-line interface for safe-ci-dag-runner.
-//!
-//! Subcommands (matching `py/safe_ci_dag_runner/cli.py`):
-//!   run --dag FILE    run a DAG (exit 0 iff every step passes)
-//!   list --dag FILE   list the steps
-//!   ascii --dag FILE  draw the DAG as ASCII art
-//!   dot --dag FILE    emit Graphviz DOT
-//!   json --dag FILE   re-emit the DAG as canonical JSON
-//!   yaml --dag FILE   re-emit the DAG as YAML
-//!   quickstart        print a self-contained getting-started guide
-//!   --userguide       print the full embedded user guide (the complete reference)
-//!
-//! `--dag FILE` auto-detects the input format by extension: `.yaml`/`.yml` load as YAML (which is
-//! ISOMORPHIC to the JSON schema — same model), everything else as JSON. `--dag -` reads JSON from
-//! stdin.
-//!
-//! `list`, `ascii`, `dot`, and `json` stdout is BYTE-IDENTICAL to the Python build; `--help`,
-//! `quickstart`, and `yaml` wording may differ (YAML byte-output is not cross-identical, only YAML
-//! *loading* is) but the structure and exit codes (0 / 1 / 2 / 3) match.
-//!
-//! Cgroup boxing is ON by default (this tool's primary purpose): `run` re-execs inside a
-//! transient `systemd-run --user --scope` and caps each step in its own child cgroup. When
-//! cgroup-v2 + a working systemd `--user` scope are unavailable the run ERRORS (exit 3);
-//! `--allow-cgroup-failure` downgrades to a best-effort UNBOXED run with a visible warning.
-//! `--perf-dir DIR` writes per-step + whole-run resource-usage CSVs.
+//! Command-line interface for running, inspecting, and visualizing DAGs.
+
+// Command-line interface for safe-ci-dag-runner.
+//
+// Subcommands (matching `py/safe_ci_dag_runner/cli.py`):
+//   run --dag FILE    run a DAG (exit 0 iff every step passes)
+//   list --dag FILE   list the steps
+//   ascii --dag FILE  draw the DAG as ASCII art
+//   dot --dag FILE    emit Graphviz DOT
+//   json --dag FILE   re-emit the DAG as canonical JSON
+//   yaml --dag FILE   re-emit the DAG as YAML
+//   quickstart        print a self-contained getting-started guide
+//   --userguide       print the full embedded user guide (the complete reference)
+//
+// `--dag FILE` auto-detects the input format by extension: `.yaml`/`.yml` load as YAML (which is
+// ISOMORPHIC to the JSON schema — same model), everything else as JSON. `--dag -` reads JSON from
+// stdin.
+//
+// `list`, `ascii`, `dot`, and `json` stdout is BYTE-IDENTICAL to the Python build; `--help`,
+// `quickstart`, and `yaml` wording may differ (YAML byte-output is not cross-identical, only YAML
+// *loading* is) but the structure and exit codes (0 / 1 / 2 / 3) match.
+//
+// Cgroup boxing is ON by default (this tool's primary purpose): `run` re-execs inside a
+// transient `systemd-run --user --scope` and caps each step in its own child cgroup. When
+// cgroup-v2 + a working systemd `--user` scope are unavailable the run ERRORS (exit 3);
+// `--allow-cgroup-failure` downgrades to a best-effort UNBOXED run with a visible warning.
+// `--perf-dir DIR` writes per-step + whole-run resource-usage CSVs.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{IsTerminal, Read};
@@ -31,7 +33,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cgroup::{
-    apply_core_box, enable_outer_oom_group, expected_outer_memory_max_bytes,
+    apply_specific_cores, enable_outer_oom_group, expected_outer_memory_max_bytes,
     install_scope_teardown, is_in_scope, outer_memory_max_bytes, reexec_in_scope,
     verify_scope_limits, CgroupManager, Cgroups,
 };
@@ -40,11 +42,13 @@ use crate::estimates::{
     plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
-use crate::model::{step_classification, DagConfig, Step};
+use crate::model::{step_classification, DagConfig, Step, StepOutcome};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{run_dag_boxed, run_dag_boxed_ordered, BoxedCgroups};
-use crate::sizing::{cpu_count, jobs_for_budget, parse_size};
+use crate::sizing::{
+    box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_copy_footprint_bytes,
+};
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sync::{self, SyncBackend};
 use crate::viz::{to_ascii, to_dot};
@@ -59,11 +63,7 @@ const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
 /// on demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
 const DEFAULT_PROFILE_DIR: &str = ".safe-ci-dag-runner/profiles";
 
-/// The full user guide, embedded at compile time. `scripts/embed_userguides.py` (run by `./setup`)
-/// copies the single source `common/docs/safe-ci-dag-runner/USER_GUIDE.md` to this crate-internal
-/// path; keeping it UNDER `src/` is what makes the `include_str!` target survive `cargo package` /
-/// crates.io (an `include_str!` pointing OUTSIDE the crate would break packaging). The bytes match
-/// the Python build's package-resource copy, so `--userguide` is byte-identical across builds.
+/// The complete user guide embedded in the executable.
 const USERGUIDE: &str = include_str!("embedded_userguide.md");
 
 // --------------------------------------------------------------------------- colors
@@ -133,7 +133,10 @@ fn help_text(c: &Palette) -> String {
          \x20 dot        emit Graphviz DOT (pipe to `dot -Tsvg`)\n\
          \x20 json       re-emit the DAG as canonical JSON\n\
          \x20 yaml       re-emit the DAG as YAML\n\
+         \x20 summary    inspect/build/merge portable profile summaries\n\
+         \x20 pin-run    reserve collision-free cores and run one command\n\
          \x20 quickstart print a self-contained getting-started guide\n\
+         \x20 capabilities print the enforcement-capability manifest\n\
          \x20 --userguide print the full embedded user guide (the complete reference)\n\n\
          {examples}\n\
          \x20 {e1}\n\
@@ -165,9 +168,8 @@ fn quickstart(c: &Palette) -> String {
     let k = |s: &str| c.cyan(s);
     format!(
         "{banner}\n\n\
-{i1}\n  cargo build --release --manifest-path rs/Cargo.toml\n  \
-# then invoke the built binary (also linked at rs/bin/safe-ci-dag-runner):\n  \
-rs/target/release/safe-ci-dag-runner --help\n\n\
+{i1}\n  cargo install safe-ci-dag-runner\n  \
+safe-ci-dag-runner --help\n\n\
 {i2}  {deps_note}\n  Save as dag.json:\n  {{\n    \"resource_caps\": {{\"browser\": 1}},\n    \"steps\": [\n      \
 {{\"group\": \"build\", \"job\": \"app\", \"desc\": \"compile\", \"cmd\": \"echo build && sleep 0.2\"}},\n      \
 {{\"group\": \"test\",  \"job\": \"unit\", \"desc\": \"unit tests\", \"cmd\": \"echo test && sleep 0.2\",\n        \"deps\": [\"build.app\"]}},\n      \
@@ -257,11 +259,36 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
 /// each subcommand — before argument parsing — so `--help` prints a usage page and exits 0 instead of
 /// tripping the unknown-argument arm.
 fn wants_help(rest: &[String]) -> bool {
-    rest.iter().any(|a| a == "-h" || a == "--help")
+    rest.iter()
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| argument == "-h" || argument == "--help")
 }
 
-/// Render a per-subcommand help page: a usage line, a one-line summary, then each accepted flag with
-/// a ONE-LINE description. Mirrors the Python argparse per-subcommand help.
+fn pin_wants_help(rest: &[String]) -> bool {
+    let mut index = 0;
+    while index < rest.len() {
+        let argument = &rest[index];
+        if argument == "--" {
+            return false;
+        }
+        if argument == "-h" || argument == "--help" {
+            return true;
+        }
+        if argument == "--cores" || argument == "--tag" {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with("--cores=") || argument.starts_with("--tag=") {
+            index += 1;
+            continue;
+        }
+        return false;
+    }
+    false
+}
+
+// Render a per-subcommand help page: a usage line, a one-line summary, then each accepted flag with
+// a ONE-LINE description. Mirrors the Python argparse per-subcommand help.
 fn render_subcommand_help(
     c: &Palette,
     usage: &str,
@@ -289,9 +316,11 @@ fn run_help(c: &Palette) -> String {
         &[
             ("--dag FILE", "DAG file to run ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
             ("-j, --jobs N", "max concurrent steps (default: CPU count); a bare -jN also works"),
-            ("--cores/--cpuset/--pin K", "CPU PINNING (cpuset/affinity), OPT-IN and OFF BY DEFAULT: pin the WHOLE run tree to K least-busy FREE cores (K=1 => sequential). For BENCHMARKS, not CI. Aliases: --cpuset, --pin"),
+            ("--cores/--cpuset/--pin K", "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable"),
             ("--max-mem SPEC", "RAM budget (e.g. 8G): pick the largest -j whose modeled footprint fits (ignored with --jobs)"),
             ("--only TAG[,TAG...]", "run EXACTLY the named step(s); dependency edges outside the selection are dropped"),
+            ("--args STRING", "replace the opt-in {args} token in selected step commands"),
+            ("--stress N", "run N parallel copies of every selected step and report pass ratios"),
             ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
             ("--no-profile", "disable the default auto-logging profile store for this run"),
             ("--profile", "after the run, print a per-step profile (timing/memory) table"),
@@ -396,6 +425,23 @@ fn summary_help(c: &Palette) -> String {
     )
 }
 
+fn pin_run_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "pin-run --cores K [--tag STR] -- CMD [ARGS...]",
+        "Reserve disjoint cores, constrain a command subtree to them, and release on exit.",
+        &[
+            (
+                "--cores K",
+                "number of collision-free cores to reserve [required]",
+            ),
+            ("--tag STR", "label stored in the reservation ledger"),
+            ("-- CMD [ARGS...]", "command to execute inside the core box"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
 // --------------------------------------------------------------------------- rendering
 
 fn render_list(cfg: &DagConfig, c: &Palette) -> String {
@@ -462,6 +508,8 @@ struct RunArgs {
     cores: Option<i64>,
     max_mem: Option<String>,
     only: Option<String>,
+    passthrough_args: Option<String>,
+    stress: i64,
     perf_dir: Option<String>,
     no_profile: bool,
     profile: bool,
@@ -485,6 +533,8 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         cores: None,
         max_mem: None,
         only: None,
+        passthrough_args: None,
+        stress: 1,
         perf_dir: None,
         no_profile: false,
         profile: false,
@@ -530,13 +580,23 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             // `--cpuset`/`--pin` are discoverable aliases for `--cores` (identical semantics).
             "--cores" | "--cpuset" | "--pin" => {
                 let v = take_value(inline, &mut i)?;
-                a.cores = Some(
-                    v.parse::<i64>()
-                        .map_err(|_| format!("{key}: invalid int value: '{v}'"))?,
-                );
+                let cores = v
+                    .parse::<i64>()
+                    .map_err(|_| format!("{key}: invalid int value: '{v}'"))?;
+                if cores < 1 {
+                    return Err(format!("{key}: must be >= 1"));
+                }
+                a.cores = Some(cores);
             }
             "--max-mem" => a.max_mem = Some(take_value(inline, &mut i)?),
             "--only" => a.only = Some(take_value(inline, &mut i)?),
+            "--args" => a.passthrough_args = Some(take_value(inline, &mut i)?),
+            "--stress" => {
+                let v = take_value(inline, &mut i)?;
+                a.stress = v
+                    .parse::<i64>()
+                    .map_err(|_| format!("--stress: invalid int value: '{v}'"))?;
+            }
             "--perf-dir" => a.perf_dir = Some(take_value(inline, &mut i)?),
             "--no-profile" => a.no_profile = true,
             "--profile" => a.profile = true,
@@ -581,8 +641,8 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
     Ok(a)
 }
 
-/// Choose the outer scheduler fan-out (`-j`), mirroring Python's `_select_jobs` including the
-/// visible stderr notes (both-given, could-not-parse, and the no-throttle note).
+// Choose the outer scheduler fan-out (`-j`), mirroring Python's `_select_jobs` including the
+// visible stderr notes (both-given, could-not-parse, and the no-throttle note).
 fn select_jobs(cfg: &DagConfig, a: &RunArgs) -> i64 {
     let max_mem = a.max_mem.as_deref().filter(|s| !s.is_empty());
     if let Some(jobs) = a.jobs {
@@ -641,10 +701,10 @@ fn git_sha() -> String {
     }
 }
 
-/// Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose (mirrors the
-/// Python `_resolve_cgroup_manager`). Returns the manager to use (`None` = intentional UNBOXED
-/// run), or an `Err(exit_code)` the caller must return when boxing is required but unavailable.
-/// May re-exec this process into a systemd scope (never returns on success).
+// Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose (mirrors the
+// Python `_resolve_cgroup_manager`). Returns the manager to use (`None` = intentional UNBOXED
+// run), or an `Err(exit_code)` the caller must return when boxing is required but unavailable.
+// May re-exec this process into a systemd scope (never returns on success).
 fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<BoxedCgroups, i32> {
     if unsafe_no_cgroups {
         // Deliberate opt-out (--unsafe-no-cgroups): skip scope bring-up entirely and run unboxed
@@ -760,9 +820,9 @@ fn validate_planner(value: String) -> Result<String, String> {
     }
 }
 
-/// The directory the plan-time FEEDBACK reader loads the profile store from, or `None` when
-/// feedback is off. Independent of `--no-profile` (which governs WRITING). Mirrors Python's
-/// `_resolve_feedback_dir`.
+// The directory the plan-time FEEDBACK reader loads the profile store from, or `None` when
+// feedback is off. Independent of `--no-profile` (which governs WRITING). Mirrors Python's
+// `_resolve_feedback_dir`.
 fn resolve_feedback_dir(perf_dir: Option<&str>, no_feedback: bool) -> Option<String> {
     if no_feedback {
         return None;
@@ -780,9 +840,9 @@ fn resolve_feedback_dir(perf_dir: Option<&str>, no_feedback: bool) -> Option<Str
     Some(DEFAULT_PROFILE_DIR.to_string())
 }
 
-/// Load the profile store (when feedback is on) and build the plan for `planner`. Mirrors Python's
-/// `_build_feedback_plan`. `core_budget` (`P`) and `mem_budget` drive the CPA allocator under
-/// `--planner cpa` and are ignored by the other planners.
+// Load the profile store (when feedback is on) and build the plan for `planner`. Mirrors Python's
+// `_build_feedback_plan`. `core_budget` (`P`) and `mem_budget` drive the CPA allocator under
+// `--planner cpa` and are ignored by the other planners.
 fn build_feedback_plan(
     cfg: &DagConfig,
     feedback_dir: Option<&str>,
@@ -817,8 +877,8 @@ fn build_feedback_plan(
     }
 }
 
-/// Build a plan whose learned estimates come from the mergeable SUMMARY (rather than a CSV store) —
-/// the reader half of the sync feature. Mirrors Python's `_build_plan_from_summary`.
+// Build a plan whose learned estimates come from the mergeable SUMMARY (rather than a CSV store) —
+// the reader half of the sync feature. Mirrors Python's `_build_plan_from_summary`.
 fn build_plan_from_summary(
     cfg: &DagConfig,
     summary: &Summary,
@@ -839,9 +899,9 @@ fn build_plan_from_summary(
     )
 }
 
-/// A summary built from THIS machine's local CSV store (its own not-yet-uploaded history), so a
-/// persistent box's local runs also seed the planner. Empty when feedback is off / the store is
-/// absent. Mirrors Python's `_local_store_summary`.
+// A summary built from THIS machine's local CSV store (its own not-yet-uploaded history), so a
+// persistent box's local runs also seed the planner. Empty when feedback is off / the store is
+// absent. Mirrors Python's `_local_store_summary`.
 fn local_store_summary(feedback_dir: Option<&str>, mid: &str, cc: &str) -> Summary {
     match feedback_dir {
         Some(dir) => summary::summary_from_store(Path::new(dir), mid, cc, DEFAULT_RESERVOIR_K),
@@ -902,9 +962,9 @@ fn sync_seed_plan(
     ))
 }
 
-/// Merge THIS run's per-step samples into the shared summary and publish them. Degrades LOUDLY on
-/// failure (a warning) so the run's exit code is preserved but the skip is never silent. Mirrors
-/// Python's `_sync_upload`.
+// Merge THIS run's per-step samples into the shared summary and publish them. Degrades LOUDLY on
+// failure (a warning) so the run's exit code is preserved but the skip is never silent. Mirrors
+// Python's `_sync_upload`.
 fn sync_upload(backend: &dyn SyncBackend, rows: &[std::collections::BTreeMap<String, String>]) {
     let (mid, cc) = feedback_identity();
     let hash_rows: Vec<std::collections::HashMap<String, String>> = rows
@@ -932,9 +992,9 @@ fn sync_upload(backend: &dyn SyncBackend, rows: &[std::collections::BTreeMap<Str
     }
 }
 
-/// Resolve the `(core_budget, mem_budget)` the CPA allocator balances against, or `(None, None)`
-/// for the non-allocating planners (so they do no cgroup/proc reads). Mirrors Python's
-/// `_cpa_budgets`.
+// Resolve the `(core_budget, mem_budget)` the CPA allocator balances against, or `(None, None)`
+// for the non-allocating planners (so they do no cgroup/proc reads). Mirrors Python's
+// `_cpa_budgets`.
 fn cpa_budgets(planner: Planner, max_mem: Option<&str>) -> (Option<i64>, Option<i64>) {
     if planner != Planner::Cpa {
         return (None, None);
@@ -988,11 +1048,11 @@ fn parse_tag_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Return a DAG containing EXACTLY the named steps (Feature A).
-///
-/// Dependency edges to steps OUTSIDE the selection are dropped (their outputs are assumed
-/// present); edges among selected steps are preserved so a selected sub-graph still runs in the
-/// right order. Registration order is preserved, matching the Python build. `Err` on unknown tag.
+// Return a DAG containing EXACTLY the named steps (Feature A).
+//
+// Dependency edges to steps OUTSIDE the selection are dropped (their outputs are assumed
+// present); edges among selected steps are preserved so a selected sub-graph still runs in the
+// right order. Registration order is preserved, matching the Python build. `Err` on unknown tag.
 fn filter_only(cfg: &DagConfig, tags: &[String]) -> Result<DagConfig, String> {
     let by_tag: HashSet<String> = cfg.steps.iter().map(|s| s.tag()).collect();
     let unknown: Vec<String> = tags
@@ -1026,6 +1086,170 @@ fn filter_only(cfg: &DagConfig, tags: &[String]) -> Result<DagConfig, String> {
         })
         .collect();
     Ok(new_cfg)
+}
+
+// --------------------------------------------------------------------------- --args / --stress
+
+const ARGS_PLACEHOLDER: &str = "{args}";
+
+/// Substitute passthrough arguments only in commands that explicitly opt in with `{args}`.
+fn apply_passthrough_args(cfg: &DagConfig, args: Option<&str>) -> Result<DagConfig, String> {
+    let declared = cfg
+        .steps
+        .iter()
+        .any(|step| step.cmd.contains(ARGS_PLACEHOLDER));
+    if args.is_some() && !declared {
+        return Err(format!(
+            "--args was given but no selected step declares the '{ARGS_PLACEHOLDER}' placeholder \
+             in its cmd. Add {{args}} to the step's cmd where the extra args should go, or scope \
+             the selection (--only) to a step that accepts them."
+        ));
+    }
+    if !declared {
+        return Ok(cfg.clone());
+    }
+    let replacement = args.unwrap_or("");
+    let mut out = cfg.clone();
+    for step in &mut out.steps {
+        if step.cmd.contains(ARGS_PLACEHOLDER) {
+            step.cmd = step
+                .cmd
+                .replace(ARGS_PLACEHOLDER, replacement)
+                .trim()
+                .to_string();
+        }
+    }
+    Ok(out)
+}
+
+fn stress_suffix(index: i64, count: i64) -> String {
+    let width = count.to_string().len();
+    format!("#{index:0width$}")
+}
+
+/// Duplicate a selected graph into independent, dependency-preserving stress shards.
+fn expand_stress(cfg: &DagConfig, n: i64) -> DagConfig {
+    if n <= 1 {
+        return cfg.clone();
+    }
+    let mut out = cfg.clone();
+    out.steps.clear();
+    for index in 1..=n {
+        let suffix = stress_suffix(index, n);
+        for original in &cfg.steps {
+            let mut step = original.clone();
+            step.job.push_str(&suffix);
+            step.deps = step
+                .deps
+                .iter()
+                .map(|dependency| format!("{dependency}{suffix}"))
+                .collect();
+            out.steps.push(step);
+        }
+    }
+    out
+}
+
+fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
+    let footprint = stress_copy_footprint_bytes(cfg, None);
+    let Some(budget) = box_mem_budget_bytes() else {
+        eprintln!(
+            "{PROG}: --stress {n}: WARNING could not read the box memory budget \
+             (cgroup memory.max / MemAvailable); proceeding UNCHECKED with {n} x \
+             {}/copy = {}. Watch for OOM.",
+            human_bytes(Some(footprint)),
+            human_bytes(Some(n.saturating_mul(footprint)))
+        );
+        return 0;
+    };
+    let max_safe = budget / footprint;
+    if n > max_safe {
+        eprintln!(
+            "{PROG}: --stress {n}: REFUSED — {n} parallel copies would exceed the box memory budget.\n\
+             \x20 requested copies:   {n}\n\
+             \x20 per-copy footprint: {}\n\
+             \x20 total needed:       {}\n\
+             \x20 box memory budget:  {} (min of cgroup memory.max + MemAvailable)\n\
+             \x20 max safe --stress:  {max_safe}\n\
+             Re-run with --stress <= {max_safe} (cores are plentiful; memory is the binding \
+             constraint), or lower the per-copy footprint via a tighter per-step \
+             rss_baseline_bytes / hard_mem_max_bytes hint.",
+            human_bytes(Some(footprint)),
+            human_bytes(Some(n.saturating_mul(footprint))),
+            human_bytes(Some(budget)),
+        );
+        return 2;
+    }
+    eprintln!(
+        "{PROG}: --stress {n}: OK — {n} x {}/copy = {} fits the box memory budget {} \
+         (max safe {max_safe}); running copies in PARALLEL.",
+        human_bytes(Some(footprint)),
+        human_bytes(Some(n.saturating_mul(footprint))),
+        human_bytes(Some(budget)),
+    );
+    0
+}
+
+fn print_stress_report(rows: &[StepOutcome], n: i64, c: &Palette) {
+    let mut groups: BTreeMap<String, Vec<(String, &StepOutcome)>> = BTreeMap::new();
+    for outcome in rows {
+        let (base, index) = match outcome.tag.rsplit_once('#') {
+            Some((base, index)) => (base.to_string(), index.to_string()),
+            None => (outcome.tag.clone(), String::new()),
+        };
+        groups.entry(base).or_default().push((index, outcome));
+    }
+    println!(
+        "{}",
+        c.bold(&format!("stress results ({n} parallel copies per step):"))
+    );
+    for (base, mut items) in groups {
+        items.sort_by(|left, right| left.0.cmp(&right.0));
+        let passed = items.iter().filter(|(_, outcome)| outcome.ok).count();
+        let total = items.len();
+        let failed: Vec<String> = items
+            .iter()
+            .filter(|(_, outcome)| !outcome.ok && !outcome.aborted)
+            .map(|(index, _)| index.clone())
+            .collect();
+        let aborted: Vec<String> = items
+            .iter()
+            .filter(|(_, outcome)| outcome.aborted)
+            .map(|(index, _)| index.clone())
+            .collect();
+        let ratio = format!("{passed}/{total} passed");
+        let styled = if passed == total {
+            c.green(&ratio)
+        } else {
+            c.red(&ratio)
+        };
+        let mut detail = String::new();
+        if !failed.is_empty() {
+            detail.push_str(" — ");
+            detail.push_str(&c.red(&format!(
+                "{} FAILED: {}",
+                failed.len(),
+                failed
+                    .iter()
+                    .map(|index| format!("#{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        if !aborted.is_empty() {
+            detail.push_str(" — ");
+            detail.push_str(&c.yellow(&format!(
+                "{} aborted: {}",
+                aborted.len(),
+                aborted
+                    .iter()
+                    .map(|index| format!("#{index}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        println!("  {base}: {styled}{detail}");
+    }
 }
 
 // --------------------------------------------------------------------------- table rendering
@@ -1549,7 +1773,30 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     } else {
         None
     };
-    let cfg: &DagConfig = filtered.as_ref().unwrap_or(cfg);
+    let selected: &DagConfig = filtered.as_ref().unwrap_or(cfg);
+
+    // A command opts into passthrough by carrying the reserved `{args}` token.  Apply this before
+    // stress expansion so every shard receives the same scoped command.
+    let with_args = match apply_passthrough_args(selected, a.passthrough_args.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{PROG}: run: {error}");
+            return 2;
+        }
+    };
+    if a.stress < 1 {
+        eprintln!("{PROG}: run: --stress N must be >= 1 (got {})", a.stress);
+        return 2;
+    }
+    let stress_active = a.stress > 1;
+    if stress_active {
+        let code = stress_guard(&with_args, a.stress);
+        if code != 0 {
+            return code;
+        }
+    }
+    let stressed = expand_stress(&with_args, a.stress);
+    let cfg = &stressed;
 
     // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
     let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups) {
@@ -1557,17 +1804,33 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         Err(code) => return code,
     };
 
-    // Opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores. Apply it HERE,
+    // Opt-in --cores K: constrain the whole run tree to K reserved cores. Apply it here,
     // after the boxing re-exec has settled (the re-exec'd in-scope child re-enters cmd_run and
     // applies it there) and BEFORE the scheduler spawns any worker thread or forks any step —
     // threads inherit the creator's affinity and forked steps inherit at fork, so an early
-    // application covers the whole descendant tree (cgroup cpuset where delegated, else
-    // sched_setaffinity).
+    // application covers the whole descendant tree. Only an exact cgroup cpuset is accepted;
+    // process affinity is escapable and cannot enforce a collision-free reservation.
+    let mut core_reservation = None;
     if let Some(k) = a.cores {
-        apply_core_box(k);
+        match crate::reservation::acquire(k, "run", 0.3, None, &HashSet::new()) {
+            Ok(mut reservation) => {
+                if apply_specific_cores(&reservation.cores, &format!("--cores {k}")).is_none() {
+                    eprintln!(
+                        "{PROG}: --cores {k}: hard cgroup cpuset unavailable; refusing to run"
+                    );
+                    let _ = reservation.release();
+                    return 3;
+                }
+                core_reservation = Some(reservation);
+            }
+            Err(error) => {
+                eprintln!("{PROG}: --cores {k}: reservation failed: {error}");
+                return 3;
+            }
+        }
     }
 
-    // Plan-time profile-store FEEDBACK (ds-7pzdgm / ds-afzsqf): refine each step's est_duration_s
+    // Plan-time profile-store feedback: refine each step's est_duration_s
     // and rss_baseline_bytes from the recorded store, then pick the dispatch order for --planner.
     // The applied cfg (refined hints) feeds both the memory-aware -j sizing and the scheduler.
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
@@ -1643,7 +1906,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let result = run_dag_boxed_ordered(
         cfg,
         jobs,
-        a.keep_going,
+        a.keep_going || stress_active,
         verbosity,
         cgroups,
         Some(plan.order.clone()),
@@ -1693,16 +1956,114 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         }
     }
 
+    if stress_active {
+        print_stress_report(&result.outcomes, a.stress, c);
+    }
+
     // Feature C: --profile prints a per-step profile table to stdout.
     if a.profile {
         print_profile_table(&result.step_profile_rows, c);
     }
 
+    // Keep the reservation live through every child, profile write, and report.  Explicitly drop
+    // it here so long-lived library callers release promptly instead of waiting for process exit.
+    drop(core_reservation);
     if result.ok {
         0
     } else {
         1
     }
+}
+
+fn cmd_pin_run(rest: &[String]) -> i32 {
+    let mut cores: Option<i64> = None;
+    let mut tag = "pin-run".to_string();
+    let mut command: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "--" {
+            command.extend_from_slice(&rest[i + 1..]);
+            break;
+        }
+        let (key, inline) = match arg.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (arg.as_str(), None),
+        };
+        let mut value = |name: &str| -> Result<String, String> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            i += 1;
+            rest.get(i)
+                .cloned()
+                .ok_or_else(|| format!("the argument {name} requires a value"))
+        };
+        match key {
+            "--cores" => {
+                let raw = match value("--cores") {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("{PROG} pin-run: error: {error}");
+                        return 2;
+                    }
+                };
+                cores = match raw.parse::<i64>() {
+                    Ok(value) if value >= 1 => Some(value),
+                    Ok(_) => {
+                        eprintln!("{PROG} pin-run: error: --cores must be >= 1");
+                        return 2;
+                    }
+                    Err(_) => {
+                        eprintln!("{PROG} pin-run: error: --cores: invalid int value: '{raw}'");
+                        return 2;
+                    }
+                };
+            }
+            "--tag" => match value("--tag") {
+                Ok(value) => tag = value,
+                Err(error) => {
+                    eprintln!("{PROG} pin-run: error: {error}");
+                    return 2;
+                }
+            },
+            other if other.starts_with('-') => {
+                eprintln!("{PROG} pin-run: error: unrecognized argument: {other}");
+                return 2;
+            }
+            _ => {
+                command.extend_from_slice(&rest[i..]);
+                break;
+            }
+        }
+        i += 1;
+    }
+    let Some(k) = cores else {
+        eprintln!("{PROG} pin-run: error: the following arguments are required: --cores");
+        return 2;
+    };
+    if command.is_empty() {
+        eprintln!("{PROG}: pin-run: no command given (use '-- CMD [ARGS...]')");
+        return 2;
+    }
+    if tag.is_empty() {
+        tag = "pin-run".to_string();
+    }
+    let mut reservation = match crate::reservation::acquire(k, &tag, 0.3, None, &HashSet::new()) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{PROG}: pin-run: {error}");
+            return 3;
+        }
+    };
+    let code = crate::cpuset_allocator::run_reserved_hard(
+        &reservation.cores,
+        &command,
+        &tag,
+        &format!("{PROG}: pin-run"),
+    );
+    let _ = reservation.release();
+    code
 }
 
 // --------------------------------------------------------------------------- entry
@@ -1741,8 +2102,7 @@ pub fn run(argv: &[String]) -> i32 {
             0
         }
         "--userguide" => {
-            // Write the embedded guide VERBATIM (no added/stripped newline) so it is byte-identical
-            // to the Python build's --userguide and to the single source guide.
+            // Write the edition-specific embedded guide verbatim (no added/stripped newline).
             print!("{USERGUIDE}");
             0
         }
@@ -1809,6 +2169,13 @@ pub fn run(argv: &[String]) -> i32 {
             }
             cmd_summary(rest)
         }
+        "pin-run" => {
+            if pin_wants_help(rest) {
+                print!("{}", pin_run_help(&c));
+                return 0;
+            }
+            cmd_pin_run(rest)
+        }
         "list" | "ascii" | "dot" | "json" | "yaml" => {
             if wants_help(rest) {
                 print!("{}", simple_help(&c, command));
@@ -1858,10 +2225,10 @@ pub fn run(argv: &[String]) -> i32 {
 
 // --------------------------------------------------------------------------- summary subcommand
 
-/// The `summary` subcommand family: build / merge / plan / stats the mergeable profile summary.
-/// These primitives make the summary format inspectable and drivable from a script, and are what the
-/// cross-language differential exercises for byte-identical serialization + merge. Mirrors Python's
-/// `_cmd_summary`.
+// The `summary` subcommand family: build / merge / plan / stats the mergeable profile summary.
+// These primitives make the summary format inspectable and drivable from a script, and are what the
+// cross-language differential exercises for byte-identical serialization + merge. Mirrors Python's
+// `_cmd_summary`.
 fn cmd_summary(rest: &[String]) -> i32 {
     let action = match rest.first() {
         Some(a) => a.as_str(),
@@ -2119,4 +2486,43 @@ fn parse_simple_dag(rest: &[String]) -> Result<Option<String>, String> {
         i += 1;
     }
     Ok(dag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny() -> DagConfig {
+        dag_from_json(
+            r#"{"steps":[{"group":"build","job":"app","cmd":"echo {args}"},{"group":"test","job":"unit","cmd":"true","deps":["build.app"]}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn passthrough_requires_declaration_and_substitutes() {
+        let cfg = tiny();
+        let applied = apply_passthrough_args(&cfg, Some("--case xyz")).unwrap();
+        assert_eq!(applied.steps[0].cmd, "echo --case xyz");
+        let selected = filter_only(&cfg, &["test.unit".to_string()]).unwrap();
+        assert!(apply_passthrough_args(&selected, Some("x")).is_err());
+    }
+
+    #[test]
+    fn stress_rewires_each_shard_internally() {
+        let expanded = expand_stress(&tiny(), 3);
+        assert_eq!(expanded.steps.len(), 6);
+        assert_eq!(expanded.steps[0].tag(), "build.app#1");
+        assert_eq!(expanded.steps[1].deps, vec!["build.app#1"]);
+        assert_eq!(expanded.steps[5].deps, vec!["build.app#3"]);
+    }
+
+    #[test]
+    fn run_help_exposes_every_run_only_surface() {
+        let palette = Palette { enabled: false };
+        let help = run_help(&palette);
+        for flag in ["--args", "--stress", "--cores", "--profile-sync"] {
+            assert!(help.contains(flag), "missing {flag} from run help");
+        }
+    }
 }

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import sys
 from collections.abc import Sequence
@@ -53,6 +54,26 @@ from pr_landing_planner.priority import (
     PriorityProvider,
     make_priority_provider,
 )
+
+_I64_TOKEN = re.compile(r"[+-]?[0-9]+\Z")
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
+
+
+def _i64_arg(value: str) -> int:
+    if _I64_TOKEN.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError(f"expected a signed 64-bit integer, got {value!r}")
+    parsed = int(value)
+    if not _I64_MIN <= parsed <= _I64_MAX:
+        raise argparse.ArgumentTypeError(f"integer outside signed 64-bit range: {value!r}")
+    return parsed
+
+
+def _nonnegative_i64_arg(value: str) -> int:
+    parsed = _i64_arg(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"expected a nonnegative integer, got {value!r}")
+    return parsed
 
 PROG = "pr-landing-planner"
 DEFAULT_WARN_THRESHOLD = 8
@@ -110,7 +131,7 @@ def _banner(c: Palette) -> str:
         f"{c.bold(PROG)} {c.dim('v' + __version__)}\n"
         "A conflict-graph + CI-aware, ADVISORY pull-request landing planner. It builds the real\n"
         "merge-conflict graph over the open PRs, classifies each red CI into one of five failure\n"
-        "modes, exact-head validation evidence, policy disposition, freshness + hold reasons, and\n"
+        "modes, exact head/base validation evidence, policy disposition, freshness + holds, and\n"
         "mechanism overlaps, then recommends a per-PR action. It NEVER mutates a PR."
     )
 
@@ -121,8 +142,8 @@ def _epilog(c: Palette) -> str:
         f"{c.bold('examples')}\n"
         f"  {ex(f'{PROG} quickstart')}                              {c.dim('# get started (model + runnable demo)')}\n"
         f"  {ex(f'{PROG} plan --fixture demo.yaml')}                {c.dim('# a full plan from a fixture (no network)')}\n"
-        f"  {ex(f'{PROG} plan --format actions --net-wrapper with-proxy --gh-cmd ./scripts/gh_human')}\n"
-        f"  {ex(f'{PROG} graph --repo OWNER/NAME --base integration')}   {c.dim('# just the conflict graph')}\n"
+        f"  {ex(f'{PROG} plan --repo OWNER/NAME --git-dir /path/to/clone')} {c.dim('# plan a live repository')}\n"
+        f"  {ex(f'{PROG} graph --repo OWNER/NAME --base main')}          {c.dim('# just the conflict graph')}\n"
         f"  {ex(f'{PROG} status --repo OWNER/NAME')}                {c.dim('# just per-PR CI health')}\n\n"
         f"{c.dim('Advisory only. Nothing project-specific is baked in: the gate-check name, flaky')}\n"
         f"{c.dim('signatures, and priority source are all flags/config.')}"
@@ -141,21 +162,20 @@ def _quickstart(c: Palette) -> str:
     * which reds are REAL vs. benign (flaky / stale gate / evaluate-once race / runner outage),
     * how stale each green PR is (commits behind the base),
     * which PRs are held (draft / base-conflict / depends-on-held), and
-    * exact-head local validation + CI evidence and gate-policy disposition,
+    * exact head/base local validation + CI evidence and gate-policy disposition,
     * shared mechanism tags that require coordinator review, and
     * a recommended per-PR ACTION with an assigned agent, ordered priority -> size -> age.
   It is ADVISORY: it recommends; a landing skill / coordinator executes the mutations.
 
 {h('1. Install')}
-  pip install "git+https://github.com/rrnewton/agent-utils#subdirectory=py"
+  python -m pip install pr-landing-planner
 
 {h('2. Try it with the bundled fixture')}  {c.dim('- no repo, no network')}
   {k(f'{PROG} plan --fixture <(printf %s "$({PROG} quickstart --emit-demo)")')}
   {c.dim('or save the demo fixture below and point --fixture at it.')}
 
 {h('3. Run against a real repo')}
-  {k(f'{PROG} plan --repo OWNER/NAME --base integration --git-dir /path/to/clone \\\\')}
-  {k('       --net-wrapper with-proxy --gh-cmd ./scripts/gh_human')}
+  {k(f'{PROG} plan --repo OWNER/NAME --base main --git-dir /path/to/clone')}
   {c.dim('gh lists the PRs (with CI rollup + labels); git merge-tree finds real conflicts.')}
 
 {h('The five red classifications')}  {c.dim('(the headline value)')}
@@ -172,24 +192,18 @@ def _quickstart(c: Palette) -> str:
 {h('Output formats')}  {c.dim('--format {{human,json,actions}}')}
   human    a readable landing summary (default)
   json     the full machine schema (deterministic; 2-space indent, sorted keys)
-  actions  tick-hub-style lines: a capturable {k('key=value')} summary block, loud ERROR/NOTE
-           diagnostics, then one ACTION/ERROR/NOTE line per PR
+  actions  a stable {k('key=value')} summary block followed by one ACTION/ERROR/NOTE line per PR
 
 {h('Key flags')}
   --conflict-detector {{merge-tree,file-overlap}}   merge-tree (real conflicts) is the default
   --gate-check NAME                               required-check name (default: {DEFAULT_GATE_CHECK})
   --flaky-signatures FILE                         name/text regexes marking a red as flaky
   --freshness-max-behind N                        a green PR >N commits behind => rebase-then-land
-  --priority-source {{none,labels,beads}}           ordering priority (default: none)
-  --batch                                         also propose one green-only conflict-free batch
+  --priority-source {{none,labels,command}}         ordering priority (default: none)
+  --batch                                         also propose one green, conflict/dependency-free batch
   --archive-dir DIR / --no-archive                archive the plan JSON to disk (on by default for
                                                   live runs; path printed as a NOTE on stderr)
-  --landing-context FILE                          exact-head evidence / policy / assigned agent
-
-{h('tick-hub integration (Option B; zero tick-hub change)')}
-  Wire a tick-hub reminder whose gate runs {k(f'{PROG} plan --format actions ...')} with
-  {k('capture: true')}; it lifts {k('land_now / stale_gates / outage')} into an
-  {k('ACTION: landing ...')} line the coordinator dispatches to the landing skill.
+  --landing-context FILE                          exact head/base evidence / policy / assigned agent
 
 {h('Exit codes')}  0 = ok | 2 = bad usage / host or fixture error
 
@@ -199,7 +213,7 @@ def _quickstart(c: Palette) -> str:
 
 #: A small, self-contained fixture used by `quickstart --emit-demo` and the bundled example.
 _DEMO_FIXTURE = """repo: OWNER/NAME
-base: integration
+base: main
 prs:
   - number: 1043
     title: fast, fresh, all green
@@ -220,14 +234,14 @@ prs:
       - {name: CI, status: COMPLETED, conclusion: SUCCESS}
       - {name: merge-gate, status: COMPLETED, conclusion: SUCCESS}
   - number: 942
-    title: CI green, gate stale (ds-4171)
+    title: CI green, gate stale
     head_ref: feat-c
     changed_files: [src/c.rs]
     checks:
       - {name: CI, status: COMPLETED, conclusion: SUCCESS}
       - {name: merge-gate, status: COMPLETED, conclusion: FAILURE, text: stale result}
   - number: 1050
-    title: gate fired while CI queued (ds-xdc7m9)
+    title: gate fired while CI queued
     head_ref: feat-d
     changed_files: [src/d.rs]
     checks:
@@ -249,10 +263,9 @@ conflicts:
 def _load_userguide() -> str:
     """Return the full user guide, read from the guide EMBEDDED IN THIS PACKAGE.
 
-    The guide is a real package resource (``pr_landing_planner/USER_GUIDE.md``, declared as
-    ``package-data``), generated by ``scripts/embed_userguides.py`` from the single source
-    ``common/docs/pr-landing-planner/USER_GUIDE.md``; reading it via ``importlib.resources`` is what
-    makes ``--userguide`` work after ``pip install`` / from a wheel."""
+    The guide is a generated package resource (``pr_landing_planner/USER_GUIDE.md``, declared as
+    ``package-data``). Reading it via ``importlib.resources`` makes ``--userguide`` work from an
+    installed wheel without relying on a source checkout."""
     return (files("pr_landing_planner") / "USER_GUIDE.md").read_text(encoding="utf-8")
 
 
@@ -260,7 +273,13 @@ def _load_userguide() -> str:
 def _only_numbers(prs_arg: str | None) -> frozenset[int] | None:
     if not prs_arg:
         return None
-    return frozenset(int(x.strip()) for x in prs_arg.split(",") if x.strip())
+    try:
+        numbers = frozenset(_i64_arg(x.strip()) for x in prs_arg.split(",") if x.strip())
+    except argparse.ArgumentTypeError as exc:
+        raise ValueError(f"invalid --prs value: {exc}") from exc
+    if any(number <= 0 for number in numbers):
+        raise ValueError("--prs requires positive PR numbers")
+    return numbers
 
 
 def _load_doc(path_arg: str) -> object:
@@ -272,6 +291,8 @@ def _load_doc(path_arg: str) -> object:
 
 def _classify_config(ns: argparse.Namespace) -> ClassifyConfig:
     gate = ns.gate_check if isinstance(ns.gate_check, str) else DEFAULT_GATE_CHECK
+    if not gate.strip():
+        raise ValueError("--gate-check must be non-empty")
     sigs: tuple[FlakySignature, ...] = ()
     flaky_arg = getattr(ns, "flaky_signatures", None)
     if isinstance(flaky_arg, str) and flaky_arg:
@@ -309,6 +330,8 @@ def _build_host(ns: argparse.Namespace) -> tuple[VcsHost, str, str]:
     )
     repo = ns.repo if isinstance(ns.repo, str) else DEFAULT_REPO
     base = ns.base if isinstance(ns.base, str) else DEFAULT_BASE
+    if not repo.strip():
+        raise ValueError("--repo OWNER/NAME is required for live runs (or use --fixture FILE)")
     return gh_host, repo, base
 
 
@@ -320,6 +343,7 @@ def _build_result(ns: argparse.Namespace) -> PlanResult:
         if isinstance(context_arg, str) and context_arg
         else ()
     )
+    priority = _priority_provider(ns)
     graph = collect_graph(
         host,
         repo=repo,
@@ -327,9 +351,11 @@ def _build_result(ns: argparse.Namespace) -> PlanResult:
         only=_only_numbers(ns.prs if isinstance(ns.prs, str) else None),
         conflict_detector=ns.conflict_detector,
         classify_config=_classify_config(ns),
-        priority_provider=_priority_provider(ns),
+        priority_provider=priority,
         landing_context=landing_context,
     )
+    if priority.last_error is not None:
+        raise ValueError(priority.last_error)
     freshness = getattr(ns, "freshness_max_behind", 0)
     batch = bool(getattr(ns, "batch", False))
     outage_min = ns.outage_min_prs if isinstance(ns.outage_min_prs, int) else 2
@@ -347,7 +373,11 @@ class _ColorHelp(argparse.RawDescriptionHelpFormatter):
 
 
 def _add_collect_flags(sp: argparse.ArgumentParser) -> None:
-    sp.add_argument("--repo", default=DEFAULT_REPO, help=f"OWNER/NAME (default: {DEFAULT_REPO})")
+    sp.add_argument(
+        "--repo",
+        default=DEFAULT_REPO,
+        help="OWNER/NAME (required for live runs; omitted with --fixture)",
+    )
     sp.add_argument("--base", default=DEFAULT_BASE, help=f"base branch (default: {DEFAULT_BASE})")
     sp.add_argument("--prs", default=None, help="comma-separated PR numbers to restrict to")
     sp.add_argument("--git-dir", default=".", help="path to a local clone of --repo")
@@ -357,15 +387,15 @@ def _add_collect_flags(sp: argparse.ArgumentParser) -> None:
         default=None,
         metavar="FILE",
         help=(
-            "JSON/YAML exact-head context for validation evidence, policy class, and assigned agent"
+            "JSON/YAML exact head/base context for evidence, policy class, and assigned agent"
         ),
     )
     sp.add_argument(
         "--net-wrapper",
         default="",
-        help="command prefix for gh/git fetch (e.g. 'with-proxy'; empty = none)",
+        help="optional command prefix for gh and git fetch (empty = none)",
     )
-    sp.add_argument("--gh-cmd", default="gh", help="gh wrapper (e.g. ./scripts/gh_human)")
+    sp.add_argument("--gh-cmd", default="gh", help="gh executable or wrapper command")
     sp.add_argument(
         "--conflict-detector",
         choices=["merge-tree", "file-overlap"],
@@ -391,7 +421,7 @@ def _add_collect_flags(sp: argparse.ArgumentParser) -> None:
     )
     sp.add_argument(
         "--outage-min-prs",
-        type=int,
+        type=_nonnegative_i64_arg,
         default=2,
         help="min PRs showing the gate-never-ran signature to declare a systemic outage",
     )
@@ -401,6 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     c = Palette(_color_enabled(sys.stdout))
     parser = argparse.ArgumentParser(
         prog=PROG,
+        allow_abbrev=False,
         formatter_class=_ColorHelp,
         description=_banner(c),
         epilog=_epilog(c),
@@ -413,17 +444,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
-    plan_p = sub.add_parser("plan", help="build the graph + CI/freshness fusion and print the PLAN")
+    plan_p = sub.add_parser(
+        "plan",
+        allow_abbrev=False,
+        help="build the graph + CI/freshness fusion and print the PLAN",
+    )
     _add_collect_flags(plan_p)
     plan_p.add_argument(
         "--freshness-max-behind",
-        type=int,
+        type=_nonnegative_i64_arg,
         default=0,
         help="a green PR more than N commits behind base => rebase-then-land (default: 0)",
     )
     plan_p.add_argument(
         "--priority-source",
-        choices=["none", "labels", "beads"],
+        choices=["none", "labels", "command"],
         default="none",
         help="ordering priority source (default: none => size then age)",
     )
@@ -435,12 +470,12 @@ def build_parser() -> argparse.ArgumentParser:
     plan_p.add_argument(
         "--priority-cmd",
         default="",
-        help="shell command with {pr} that prints an integer priority (for --priority-source beads)",
+        help="required shell command with {pr} that prints one integer (for --priority-source command)",
     )
     plan_p.add_argument(
         "--batch",
         action="store_true",
-        help="also propose one green-only, conflict-free batch (bors mode; off by default)",
+        help="also propose one green, conflict- and dependency-free batch (off by default)",
     )
     plan_p.add_argument(
         "--format", choices=["human", "json", "actions"], default="human", help="output format"
@@ -462,29 +497,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not archive the emitted plan to disk (archiving is on by default for live runs)",
     )
 
-    graph_p = sub.add_parser("graph", help="just the conflict/ordering graph view")
+    graph_p = sub.add_parser(
+        "graph", allow_abbrev=False, help="just the conflict/ordering graph view"
+    )
     _add_collect_flags(graph_p)
     graph_p.add_argument("--format", choices=["human", "json"], default="human", help="output format")
 
     clusters_p = sub.add_parser(
-        "clusters", help="cluster PRs by shared conflict set into stack-land lanes (rebases-avoided)"
+        "clusters",
+        allow_abbrev=False,
+        help="cluster PRs by shared conflict set into stack-land lanes (rebases-avoided)",
     )
     _add_collect_flags(clusters_p)
     clusters_p.add_argument(
         "--format", choices=["human", "json"], default="human", help="output format"
     )
 
-    status_p = sub.add_parser("status", help="just per-PR CI/label health")
+    status_p = sub.add_parser(
+        "status", allow_abbrev=False, help="just per-PR CI/label health"
+    )
     _add_collect_flags(status_p)
     status_p.add_argument("--format", choices=["human", "json"], default="human", help="output format")
     status_p.add_argument(
         "--warn-threshold",
-        type=int,
+        type=_nonnegative_i64_arg,
         default=DEFAULT_WARN_THRESHOLD,
         help=f"warn above this open-PR count (default: {DEFAULT_WARN_THRESHOLD})",
     )
 
-    qs = sub.add_parser("quickstart", help="print a self-contained getting-started guide")
+    qs = sub.add_parser(
+        "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide"
+    )
     qs.add_argument(
         "--emit-demo",
         action="store_true",

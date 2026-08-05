@@ -22,12 +22,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SELF="$ROOT/$(basename -- "${BASH_SOURCE[0]}")"
 cd "$ROOT"
 
-# Embed each tool's user guide INTO its package/crate from the single source
-# common/docs/<tool>/USER_GUIDE.md, so `<tool> --userguide` survives `pip install` / `cargo install`
-# (common/docs/ is NOT shipped). Run for BOTH languages regardless of the py/rs/both selection so a
-# fresh checkout/build always has the embedded guides present. Idempotent: no-op when in sync.
+# Render each tool's package README and embedded guide from a shared template plus an edition
+# fragment. Run for BOTH editions regardless of the py/rs/both selection so every distributable
+# artifact stays current. Idempotent when templates and fragments are unchanged.
 embed_userguides() {
-  echo "==> [docs] embed user guides (single source: common/docs/<tool>/USER_GUIDE.md)"
+  echo "==> [docs] render standalone package docs from shared templates + edition fragments"
   command -v python3 >/dev/null || { echo "docs: python3 not found (needed to embed guides)" >&2; return 1; }
   python3 "$ROOT/scripts/embed_userguides.py"
 }

@@ -30,7 +30,7 @@ _BLOCK_YAML_BOOT = (
     "runpy.run_module(mod, run_name='__main__', alter_sys=True)\n"
 )
 
-# Every console-script entrypoint declared in pyproject.toml ([project.scripts]).
+# The primary ``python -m`` entrypoint for each independently packaged tool.
 ENTRYPOINT_MODULES = ["safe_ci_dag_runner", "tick_hub", "pr_landing_planner"]
 
 # The dependency-free invocations the owner explicitly asked to always work.
@@ -62,6 +62,15 @@ def test_depfree_invocations_never_touch_optional_deps(module: str, flag: str) -
     assert result.returncode == 0, (
         f"{module} {flag!r} exited {result.returncode} (expected 0):\n{combined}"
     )
+
+
+def test_cpuset_companion_help_starts_without_yaml() -> None:
+    """The safe-ci distribution's companion console command is independently startable."""
+    result = _run_blocked("safe_ci_dag_runner.cpuset_allocator", ["--help"])
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    assert "Traceback (most recent call last)" not in combined
+    assert "ModuleNotFoundError" not in combined
 
 
 # (module, argv) pairs that genuinely reach a YAML read/write path; each must degrade to a clean,
