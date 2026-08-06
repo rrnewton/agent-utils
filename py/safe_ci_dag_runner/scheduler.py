@@ -36,6 +36,11 @@ these — see the accompanying report):
   steps.
 * **Failure classification** via :func:`safe_ci_dag_runner.model.step_failure_reason`
   (OOM > timeout > pids-guard > detail-capture > signal > exit precedence).
+* **No Silent Hang.** An UNEXPECTED exception escaping a supervisor thread is recorded as a
+  loud failed outcome naming the exception, never lost. Two independent layers enforce this
+  (:meth:`Runner._supervisor_crash` per thread, :meth:`Runner._dead_supervisors` swept by the
+  ready-set loop); an indefinite hang is the worst failure mode for a CI supervisor because it
+  burns the lane's whole wall budget and produces no diagnostic.
 
 Teardown of a step's whole process tree (cgroup-first, then process-group) is delegated to
 :func:`safe_ci_dag_runner.teardown.reap`.
@@ -48,6 +53,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections.abc import Mapping, Sequence
 
 from safe_ci_dag_runner.ambient import (
@@ -93,6 +99,11 @@ _POST_TIMEOUT_WAIT_S = 10.0
 
 #: Brief join timeout for the daemon reader/monitor threads at step end (seconds).
 _THREAD_JOIN_S = 2.0
+
+#: Prefix of the :attr:`StepOutcome.reason` recorded when a supervisor thread dies from an
+#: unexpected exception. A grep-able, stable marker: this reason means the RUNNER itself is
+#: buggy (not the step's command), so it must never be mistaken for a product failure.
+SUPERVISOR_CRASH_REASON = "SUPERVISOR CRASH"
 
 
 def _warn(message: str) -> None:
@@ -232,6 +243,12 @@ class Runner:
         # tag -> the in-flight step's Popen, so a sibling that FAILS can eager-reap it.
         self.running_procs: dict[str, subprocess.Popen[bytes]] = {}
         self.aborted: set[str] = set()  # tags killed by eager-exit (labelled ABORTED, not FAIL)
+        # tag -> its supervisor thread, registered AFTER start() so is_alive() is meaningful.
+        # Read by _reap_dead_supervisors to detect a thread that vanished without an outcome.
+        self.step_threads: dict[str, threading.Thread] = {}
+        # Tags whose scheduling resources have been given back. Guards _retire so the normal
+        # path and the crash path cannot double-release.
+        self.retired: set[str] = set()
         self.step_profile_rows: list[Mapping[str, object]] = []
         self.failed = False  # a genuine (non-aborted) step failed
         self.stop = False  # stop scheduling new steps after a failure
@@ -277,6 +294,26 @@ class Runner:
         for r, n in step.hint.resources.items():
             self.resource_avail[r] += n
 
+    def _retire(self, step: Step) -> subprocess.Popen[bytes] | None:
+        """Give back everything launching the step consumed — EXACTLY ONCE. Lock MUST be held.
+
+        Idempotent by design: the normal completion path and both crash paths all call it, and
+        whichever gets there first does the work. Without the :attr:`retired` guard a crash
+        *after* a normal release would release twice, drifting ``resource_avail`` above its cap
+        and ``cores_used`` below zero — turning a loud bug into a quiet over-subscription.
+
+        Returns the step's :class:`subprocess.Popen` if one was still registered (so a crash
+        handler can reap an orphaned child), else ``None``.
+        """
+        if step.tag in self.retired:
+            return None
+        self.retired.add(step.tag)
+        self.running.discard(step.tag)
+        proc = self.running_procs.pop(step.tag, None)
+        self._release(step)
+        self.cores_used -= self._step_width(step)
+        return proc
+
     def _skipped(self) -> set[str]:
         """Tags whose deps FAILED (transitively) so they must never run.
 
@@ -303,6 +340,118 @@ class Runner:
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
 
+    # -- No Silent Hang: a supervisor thread must never vanish without an outcome --
+
+    def _record_lost_supervisor(
+        self, step: Step, *, reason: str, detail: str, duration_s: float
+    ) -> None:
+        """Record a loud FAILED outcome for a step whose supervisor never reported one.
+
+        This is the single place both No-Silent-Hang layers converge on. It restores the
+        scheduling invariant the lost thread broke — ``tag`` out of :attr:`running`, resources
+        and cores returned, a terminal entry in :attr:`done` — so the ready-set loop can reach
+        its break condition, and it trips fail-fast because a runner that loses a supervisor
+        has produced no result for that step and cannot be trusted to have produced one for
+        any other.
+
+        A crash in the supervisor's *reporting tail* (after the outcome was already recorded)
+        does not overwrite that outcome, but is still reported loudly and still fails the run:
+        the runner is buggy either way, and swallowing the traceback because the step happened
+        to finish first is exactly the silence this guard exists to remove.
+
+        Must be called WITHOUT the lock held (it emits, and ``_emit`` re-acquires).
+        """
+        with self.lock:
+            already_recorded = step.tag in self.done
+            orphan = self._retire(step)
+            if not already_recorded:
+                self.done[step.tag] = StepOutcome(
+                    tag=step.tag,
+                    ok=False,
+                    duration_s=duration_s,
+                    summary="",
+                    returncode=None,
+                    reason=reason,
+                )
+            self.failed = True
+            self.stop = True
+            # The lost supervisor may have left a live child; reap its whole tree now rather
+            # than leaking it into later steps or the outer-scope backstop.
+            if orphan is not None:
+                reap(orphan, self.cgroups, step.tag)
+            if not self.keep_going:
+                for other, other_proc in list(self.running_procs.items()):
+                    self.aborted.add(other)
+                    reap(other_proc, self.cgroups, other)
+        # Loud, outside the lock. stderr as well as stdout: a captured-stdout caller (verbosity 0)
+        # must still see that the RUNNER broke, not just that a step failed.
+        #
+        # The reporting itself is guarded. Reaching here means the runner is ALREADY in a
+        # state we did not anticipate, so assuming the report cannot also fail would rebuild
+        # the very hole this method closes: an exception escaping here would propagate out of
+        # _supervisor_crash, out of _run_step, and end the thread — losing the diagnostic even
+        # though the scheduling invariant above was restored. stderr is the last resort because
+        # it is the one sink that does not go through the runner's own lock.
+        try:
+            self._emit(
+                f"[{step.tag}] ✗ FAIL   {step.desc} ({round(duration_s)}s, {reason})"
+            )
+            self._emit(f"[{step.tag}] ----- supervisor traceback -----")
+            for line in detail.rstrip("\n").splitlines():
+                self._emit(f"[{step.tag}] {line}")
+            self._emit(f"[{step.tag}] ----- end supervisor traceback -----")
+        except BaseException as report_exc:  # noqa: BLE001 — must not re-lose the thread
+            print(
+                f"[scheduler] ✗ {reason}\n[scheduler] (stdout reporting ALSO failed: "
+                f"{type(report_exc).__name__}: {report_exc})",
+                file=sys.stderr,
+                flush=True,
+            )
+        try:
+            print(f"[scheduler] ✗ {reason}\n{detail}", file=sys.stderr, flush=True)
+        except BaseException:  # noqa: BLE001 — nothing left to report with
+            pass
+
+    def _supervisor_crash(self, step: Step, exc: BaseException, started: float) -> None:
+        """LAYER 1 — an exception escaped :meth:`_run_step_body`.
+
+        Turns the escaping exception into a failed outcome naming it. Catching
+        ``BaseException`` is deliberate: a bare ``SystemExit`` raised on a worker thread also
+        silently ends that thread, which is the same wedge as a ``TypeError``.
+        """
+        detail = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        reason = f"{SUPERVISOR_CRASH_REASON}: {type(exc).__name__}: {exc}"
+        self._record_lost_supervisor(
+            step, reason=reason, detail=detail, duration_s=time.time() - started
+        )
+
+    def _dead_supervisors(self) -> list[Step]:
+        """LAYER 2 (detection half) — launched steps whose thread exited with no outcome.
+
+        Lock MUST be held. The predicate is deliberately ``(thread launched) AND (thread dead)
+        AND (no terminal outcome)`` — NOT "still in :attr:`running`".
+
+        The distinction is load-bearing and was found by mutation, not by reasoning: with
+        layer 1 removed, a ``running``-keyed sweep still hung for the full test deadline on
+        the very case that discovered this defect. That crash happens INSIDE the locked
+        bookkeeping block, after :meth:`_retire` has already cleared :attr:`running` but
+        before :attr:`done` is written — so the tag is in neither set, and a sweep over
+        :attr:`running` cannot see it. Keying on the outcome instead covers both windows.
+
+        No race: a supervisor writes :attr:`done` inside the same critical section that clears
+        :attr:`running`, and layer 1 does the same, so an intermediate state is never
+        observable; and ``Thread.start()`` blocks until the thread is running, with
+        registration into :attr:`step_threads` happening after it, so a just-launched step is
+        never mistaken for a dead one.
+        """
+        return [
+            self.steps[tag]
+            for tag, thread in sorted(self.step_threads.items())
+            if not thread.is_alive() and tag not in self.done
+        ]
+
     def run(self) -> bool:
         """Drive the DAG to completion; returns ``True`` when no genuine failure occurred.
 
@@ -312,10 +461,32 @@ class Runner:
         terminal outcome (done or dep-skipped) OR fail-fast has tripped — the fail-fast clause
         is REQUIRED: once ``stop`` is set, steps whose deps SUCCEEDED are neither launched nor
         counted as skipped, so without it the loop would busy-wait forever.
+
+        Each pass first sweeps for supervisor threads that died without recording an outcome
+        (No Silent Hang layer 2) — the break condition can never be reached while a tag sits in
+        :attr:`running` with no live thread behind it.
         """
         threads: list[threading.Thread] = []
         wall_start = time.time()
         while True:
+            with self.lock:
+                lost = self._dead_supervisors()
+            for step in lost:
+                self._record_lost_supervisor(
+                    step,
+                    reason=(
+                        f"{SUPERVISOR_CRASH_REASON}: supervisor thread exited without "
+                        "recording an outcome"
+                    ),
+                    detail=(
+                        "No traceback is available: the supervisor thread for this step ended "
+                        "while the step was still marked running. This is a RUNNER bug, not a "
+                        "step failure. Detected by the scheduler's dead-supervisor sweep, which "
+                        "means the per-thread exception guard did not fire — investigate "
+                        "Runner._supervisor_crash itself."
+                    ),
+                    duration_s=time.time() - wall_start,
+                )
             with self.lock:
                 skipped = self._skipped()
                 if not self.running and (
@@ -347,6 +518,10 @@ class Runner:
                         target=self._run_step, args=(step,), daemon=True
                     )
                     t.start()
+                    # AFTER start(): Thread.start() blocks until the thread is running, so from
+                    # here is_alive() is True until the supervisor genuinely finishes. Register
+                    # only now, so the layer-2 sweep can never see a not-yet-started thread.
+                    self.step_threads[step.tag] = t
                     threads.append(t)
             time.sleep(_LOOP_SLEEP_S)
         for t in threads:
@@ -355,6 +530,22 @@ class Runner:
         return not self.failed
 
     def _run_step(self, step: Step) -> None:
+        """Supervisor-thread entry point: run the step body under the No-Silent-Hang guard.
+
+        LAYER 1. The body is the real supervisor; this wrapper exists solely so that NO
+        exception can end the thread without a recorded outcome. Before this guard existed, a
+        single unexpected exception (the discovering case: a keyword argument that
+        :meth:`StepOutcome.failed` does not accept) killed the thread with the tag still in
+        :attr:`running`, and the ready-set loop then spun forever — no traceback, no outcome,
+        no exit, until an outer timeout killed the whole run.
+        """
+        started = time.time()
+        try:
+            self._run_step_body(step)
+        except BaseException as exc:  # noqa: BLE001 — losing the thread is strictly worse
+            self._supervisor_crash(step, exc, started)
+
+    def _run_step_body(self, step: Step) -> None:
         """Supervise ONE step: launch, pump stdout, enforce the timeout, reap, classify."""
         self._emit(f"[{step.tag}] ▶ START  {step.desc}")
         env = dict(os.environ)
@@ -430,6 +621,22 @@ class Runner:
         monitor_stop = threading.Event()
         thread_peak: int | None = None
 
+        def _monitor_guarded() -> None:
+            # The monitor is the ONLY enforcer of the per-step CPU-time budget. An exception
+            # here does not hang the run (the supervisor never blocks on this thread), so it
+            # is not the defect above — but it silently disables cpu_timeout enforcement and
+            # thread-peak metrics for the rest of the step, which is the same class of
+            # invisible degradation. Warn; do not fail the step, since the wall timeout is
+            # still a live backstop.
+            try:
+                _monitor()
+            except BaseException as exc:  # noqa: BLE001
+                _warn(
+                    f"step {step.tag}: monitor thread died ({type(exc).__name__}: {exc}); "
+                    "per-step CPU-time enforcement and thread-peak metrics are DISABLED for "
+                    "the remainder of this step (the wall timeout still applies)."
+                )
+
         def _monitor() -> None:
             # Poll the step's cgroup descendant-thread count for a per-step peak (metrics
             # only; a noop/disabled manager returns None and this stays a cheap no-op).
@@ -456,7 +663,7 @@ class Runner:
                             return
 
         reader = threading.Thread(target=_pump, daemon=True)
-        monitor = threading.Thread(target=_monitor, daemon=True)
+        monitor = threading.Thread(target=_monitor_guarded, daemon=True)
         reader.start()
         monitor.start()
         try:
@@ -528,10 +735,7 @@ class Runner:
             )
 
         with self.lock:
-            self.running.discard(step.tag)
-            self.running_procs.pop(step.tag, None)
-            self._release(step)
-            self.cores_used -= self._step_width(step)
+            self._retire(step)
             self.step_profile_rows.append(row)
             was_aborted = step.tag in self.aborted
             if was_aborted:

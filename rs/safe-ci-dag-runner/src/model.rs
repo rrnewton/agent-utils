@@ -384,6 +384,23 @@ impl StepOutcome {
         }
     }
 
+    /// Build the outcome for a step whose SUPERVISOR THREAD died without reporting one.
+    ///
+    /// Not a product failure: `reason` carries the `SUPERVISOR CRASH` marker verbatim so triage
+    /// can tell a runner bug from a step that legitimately failed. `returncode` is `None` because
+    /// no verdict about the child was ever reached.
+    pub fn supervisor_crash(tag: String, duration_s: f64, reason: String) -> Self {
+        StepOutcome {
+            tag,
+            ok: false,
+            duration_s,
+            summary: String::new(),
+            returncode: None,
+            reason,
+            aborted: false,
+        }
+    }
+
     /// Build a failed outcome, deriving `reason` from the shared precedence rule.
     #[allow(clippy::too_many_arguments)]
     pub fn failed(

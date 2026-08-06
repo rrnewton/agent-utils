@@ -74,6 +74,104 @@ struct Shared {
     cores_used: i64,
     /// Accumulated per-step measurement rows (forwarded to a metrics sink after the run).
     step_profile_rows: Vec<ProfileRow>,
+    /// Tags whose scheduling resources have been given back. Guards [`retire`] so the normal
+    /// completion path and the panic path cannot double-release.
+    retired: HashSet<String>,
+}
+
+/// Lock the shared state, RECOVERING from poisoning.
+///
+/// A supervisor that panics while holding this guard poisons the mutex, and `lock().unwrap()`
+/// would then panic in every other thread that touches the state — turning one lost step into a
+/// whole-run cascade whose first cause is buried. The panic path repairs the invariants it broke
+/// (see [`record_lost_supervisor`]), so the state behind a poisoned lock is usable; taking the
+/// inner guard keeps the failure attributable to the step that actually caused it.
+fn lock_shared(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    shared.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Give back everything launching a step consumed — EXACTLY ONCE. Caller holds the guard.
+///
+/// Idempotent: the normal completion path and the panic path both call it, and whichever runs
+/// first does the work. Without the `retired` guard a panic after a normal release would release
+/// twice, drifting `resource_avail` above its cap and `cores_used` below zero.
+fn retire(sh: &mut Shared, step: &Step) -> Option<u32> {
+    let tag = step.tag();
+    if !sh.retired.insert(tag.clone()) {
+        return None;
+    }
+    sh.running.remove(&tag);
+    let pid = sh.running_pids.remove(&tag);
+    release(sh, step);
+    sh.cores_used -= step_width(step);
+    pid
+}
+
+/// Prefix of the `StepOutcome::reason` recorded when a supervisor thread dies. Mirrors the Python
+/// runner's `SUPERVISOR_CRASH_REASON`: this reason means the RUNNER is buggy, not the step.
+pub const SUPERVISOR_CRASH_REASON: &str = "SUPERVISOR CRASH";
+
+/// Record a loud FAILED outcome for a step whose supervisor never reported one.
+///
+/// Restores the scheduling invariant the lost thread broke — tag out of `running`, resources and
+/// cores returned, a terminal entry in `done` — so the ready-set loop can reach its break
+/// condition instead of spinning forever, and trips fail-fast because a runner that loses a
+/// supervisor has produced no result for that step.
+fn record_lost_supervisor(
+    shared: &Mutex<Shared>,
+    cgroups: &BoxedCgroups,
+    step: &Step,
+    keep_going: bool,
+    reason: &str,
+    detail: &str,
+    duration_s: f64,
+) {
+    let tag = step.tag().to_string();
+    {
+        let mut sh = lock_shared(shared);
+        let already_recorded = sh.done.contains_key(&tag);
+        let orphan = retire(&mut sh, step);
+        if !already_recorded {
+            sh.done.insert(
+                tag.clone(),
+                StepOutcome::supervisor_crash(tag.clone(), duration_s, reason.to_string()),
+            );
+        }
+        sh.failed = true;
+        sh.stop = true;
+        if let Some(pid) = orphan {
+            reap(cgroups, &tag, pid);
+        }
+        if !keep_going {
+            let others: Vec<(String, u32)> = sh
+                .running_pids
+                .iter()
+                .map(|(t, p)| (t.clone(), *p))
+                .collect();
+            for (other, pid) in others {
+                sh.aborted.insert(other.clone());
+                reap(cgroups, &other, pid);
+            }
+        }
+    }
+    emit(&format!(
+        "[{tag}] \u{2717} FAIL   {} ({}s, {reason})",
+        step.desc,
+        duration_s.round() as i64
+    ));
+    eprintln!("[scheduler] \u{2717} {reason}\n{detail}");
+}
+
+/// Render a panic payload as text. `panic!` payloads are `&str` or `String` in practice; anything
+/// else still yields a named, non-empty reason rather than an empty one.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// SIGKILL a whole process group by pid (the child is its own group leader via
@@ -219,6 +317,7 @@ impl Runner {
                 stop: false,
                 cores_used: 0,
                 step_profile_rows: Vec::new(),
+                retired: HashSet::new(),
             })),
         }
     }
@@ -249,12 +348,44 @@ impl Runner {
 
     /// Drive the DAG to completion; returns `(ok, wall_seconds)`.
     fn run(&self) -> (bool, f64) {
-        let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
+        // (tag, step, handle) per launched supervisor, so the No-Silent-Hang sweep below can ask
+        // whether a thread finished without recording an outcome.
+        let mut handles: Vec<(String, Step, thread::JoinHandle<()>)> = Vec::new();
         let wall_start = Instant::now();
         loop {
+            // LAYER 2 — dead-supervisor sweep. A supervisor whose thread has finished but left no
+            // terminal outcome has vanished, and the break condition below can never be reached
+            // while that is true. The predicate is (finished) AND (no outcome), NOT "still in
+            // running": the discovering case panics after `retire` has already cleared `running`
+            // but before `done` is written, so the tag would be in neither set.
+            let lost: Vec<Step> = {
+                let sh = lock_shared(&self.shared);
+                handles
+                    .iter()
+                    .filter(|(tag, _, h)| h.is_finished() && !sh.done.contains_key(tag))
+                    .map(|(_, step, _)| step.clone())
+                    .collect()
+            };
+            for step in &lost {
+                record_lost_supervisor(
+                    &self.shared,
+                    &self.cgroups,
+                    step,
+                    self.keep_going,
+                    &format!(
+                        "{SUPERVISOR_CRASH_REASON}: supervisor thread exited without recording \
+                         an outcome"
+                    ),
+                    "The supervisor thread for this step ended while the step had no terminal \
+                     outcome. This is a RUNNER bug, not a step failure. Detected by the \
+                     dead-supervisor sweep, which means the per-thread catch_unwind guard did \
+                     not fire — investigate the guard itself.",
+                    wall_start.elapsed().as_secs_f64(),
+                );
+            }
             let mut launchable: Vec<Step> = Vec::new();
             {
-                let mut sh = self.shared.lock().unwrap();
+                let mut sh = lock_shared(&self.shared);
                 let skipped = self.skipped(&sh);
                 if sh.running.is_empty()
                     && (sh.stop || sh.done.len() + skipped.len() >= self.steps.len())
@@ -302,24 +433,51 @@ impl Runner {
                 let default_step_mem_cap_bytes = self.default_step_mem_cap_bytes;
                 let default_step_cpu_count = self.default_step_cpu_count;
                 let default_step_cpu_timeout = self.default_step_cpu_timeout;
-                handles.push(thread::spawn(move || {
-                    run_step(StepCtx {
-                        step,
-                        shared,
-                        keep_going,
-                        verbosity,
-                        default_jobs_flag,
-                        cgroups,
-                        mem_cap_factor,
-                        default_step_mem_cap_bytes,
-                        default_step_cpu_count,
-                        default_step_cpu_timeout,
-                    });
-                }));
+                let tag = step.tag().to_string();
+                let sweep_step = step.clone();
+                let crash_shared = Arc::clone(&shared);
+                let crash_cgroups = cgroups.clone();
+                let crash_step = step.clone();
+                let handle = thread::spawn(move || {
+                    // LAYER 1 — no panic may end this thread without a recorded outcome. Before
+                    // this guard, a panic left the tag marked running and the ready-set loop spun
+                    // forever: no outcome, no message, no exit.
+                    let started = Instant::now();
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_step(StepCtx {
+                            step,
+                            shared,
+                            keep_going,
+                            verbosity,
+                            default_jobs_flag,
+                            cgroups,
+                            mem_cap_factor,
+                            default_step_mem_cap_bytes,
+                            default_step_cpu_count,
+                            default_step_cpu_timeout,
+                        });
+                    }));
+                    if let Err(payload) = res {
+                        let msg = panic_message(payload.as_ref());
+                        record_lost_supervisor(
+                            &crash_shared,
+                            &crash_cgroups,
+                            &crash_step,
+                            keep_going,
+                            &format!("{SUPERVISOR_CRASH_REASON}: panic: {msg}"),
+                            &format!(
+                                "supervisor thread panicked: {msg}\n(the default panic hook has \
+                                 already printed the panic location and backtrace above)"
+                            ),
+                            started.elapsed().as_secs_f64(),
+                        );
+                    }
+                });
+                handles.push((tag, sweep_step, handle));
             }
             thread::sleep(LOOP_SLEEP);
         }
-        for h in handles {
+        for (_, _, h) in handles {
             let _ = h.join();
         }
         // NORMAL-exit backstop: reap any step cgroup that still has live procs (a setsid orphan a
@@ -335,12 +493,12 @@ impl Runner {
                 }
             }
         }
-        let failed = self.shared.lock().unwrap().failed;
+        let failed = lock_shared(&self.shared).failed;
         (!failed, wall_start.elapsed().as_secs_f64())
     }
 
     fn result(&self, wall: f64) -> RunResult {
-        let sh = self.shared.lock().unwrap();
+        let sh = lock_shared(&self.shared);
         let outcomes: Vec<StepOutcome> = self
             .order
             .iter()
@@ -536,10 +694,10 @@ fn run_step(ctx: StepCtx) {
         Err(e) => {
             // Spawn failure: record a failed outcome so the run does not hang.
             let elapsed = start.elapsed().as_secs_f64();
-            let mut sh = shared.lock().unwrap();
-            sh.running.remove(&tag);
-            sh.running_pids.remove(&tag);
-            release(&mut sh, &step);
+            let mut sh = lock_shared(&shared);
+            // retire() also returns the CPA core budget, which this path previously leaked:
+            // it released the named resources but never decremented `cores_used`.
+            retire(&mut sh, &step);
             let outcome = StepOutcome::failed(
                 tag.clone(),
                 elapsed,
@@ -566,7 +724,7 @@ fn run_step(ctx: StepCtx) {
     };
     let pid = child.id();
     {
-        let mut sh = shared.lock().unwrap();
+        let mut sh = lock_shared(&shared);
         sh.running_pids.insert(tag.clone(), pid);
     }
 
@@ -661,7 +819,17 @@ fn run_step(ctx: StepCtx) {
     reap(&cgroups, &tag, pid);
     monitor_stop.store(true, Ordering::Relaxed);
     if let Some(m) = monitor {
-        let _ = m.join();
+        // The monitor is the ONLY enforcer of the per-step CPU-time budget. A panic there does
+        // not hang the run (nothing blocks on it), so it is not the silent-hang defect — but
+        // discarding the join error would silently disable cpu_timeout enforcement and
+        // thread-peak metrics for the rest of the step. Warn; the wall timeout still applies.
+        if m.join().is_err() {
+            eprintln!(
+                "[scheduler] WARNING: step {tag}: monitor thread panicked; per-step CPU-time \
+                 enforcement and thread-peak metrics were DISABLED for the remainder of this \
+                 step (the wall timeout still applied)."
+            );
+        }
     }
     for r in readers {
         let _ = r.join();
@@ -760,11 +928,8 @@ fn run_step(ctx: StepCtx) {
     }
 
     let (was_aborted, reason) = {
-        let mut sh = shared.lock().unwrap();
-        sh.running.remove(&tag);
-        sh.running_pids.remove(&tag);
-        release(&mut sh, &step);
-        sh.cores_used -= step_width(&step);
+        let mut sh = lock_shared(&shared);
+        retire(&mut sh, &step);
         sh.step_profile_rows.push(row);
         let was_aborted = sh.aborted.contains(&tag);
         let outcome = if was_aborted {
@@ -907,6 +1072,282 @@ pub fn run_dag_boxed_ordered(
     );
     let (_ok, wall) = runner.run();
     runner.result(wall)
+}
+
+#[cfg(test)]
+mod supervisor_crash_tests {
+    //! No Silent Hang: a panic on the step path must FAIL LOUDLY, never wedge the scheduler.
+    //!
+    //! Mirrors `py/tests/test_scheduler_supervisor_crash.py`. Both engines had the identical
+    //! defect: a supervisor that died left its tag marked running (or, in the discovering case,
+    //! recorded in neither `running` nor `done`), and the ready-set loop then spun forever.
+    //!
+    //! Every test is bracketed both ways — a planted panic must produce a `SUPERVISOR CRASH`
+    //! outcome, and the identical DAG with nothing planted must not — because a refusal-only
+    //! test cannot distinguish a working guard from an inert one.
+    use super::*;
+    use crate::model::{DagConfig, ResourceHint};
+    use std::collections::BTreeMap;
+    use std::sync::mpsc;
+
+    /// Any finite bound discriminates: the defect's signature is an UNBOUNDED wait.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    fn one_step(cmd: &str) -> DagConfig {
+        DagConfig {
+            steps: vec![Step {
+                group: "g".into(),
+                job: "A".into(),
+                desc: String::new(),
+                description: String::new(),
+                cmd: cmd.into(),
+                deps: vec![],
+                env: BTreeMap::new(),
+                hint: ResourceHint::default(),
+                networkonly: false,
+                engine_only: false,
+                timeout: 1800,
+                cpu_timeout: 0,
+                jobs_flag: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A `CgroupManager` that panics from ONE chosen method and is otherwise a no-op, so the
+    /// panic originates at a call site the supervisor really makes, on the real thread.
+    struct PanickingCgroups {
+        panic_in: &'static str,
+    }
+
+    impl PanickingCgroups {
+        fn maybe(&self, name: &str) {
+            assert!(
+                self.panic_in != name,
+                "planted supervisor fault in {name}"
+            );
+        }
+    }
+
+    impl CgroupManager for PanickingCgroups {
+        fn enabled(&self) -> bool {
+            // MUST be true: unlike the Python runner, which calls oom_kills/cleanup
+            // unconditionally, the Rust supervisor guards those call sites behind
+            // `cg.enabled()`. A disabled fake never reaches the plant, and the test would pass
+            // vacuously — which is exactly what it did on the first run.
+            true
+        }
+        fn prepare_command(
+            &self,
+            _tag: &str,
+            cmd: &str,
+            _mem_max: Option<i64>,
+            _cpu_count: Option<i64>,
+        ) -> String {
+            self.maybe("prepare_command");
+            cmd.to_string()
+        }
+        fn kill(&self, _tag: &str) -> bool {
+            false
+        }
+        fn cleanup(&self, _tag: &str) {
+            self.maybe("cleanup");
+        }
+        fn oom_kills(&self, _tag: &str) -> i64 {
+            self.maybe("oom_kills");
+            0
+        }
+        fn peak_bytes(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+        fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+            None
+        }
+        fn cpu_pressure(&self, _tag: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+        fn thread_count(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    /// Run a DAG on a worker thread and FAIL (not hang) if it does not finish in time.
+    ///
+    /// The load-bearing assertion of this module: calling `run_dag_boxed` directly would
+    /// reproduce the defect as an infinite hang that wedges the whole test binary, so the
+    /// deadline turns "the scheduler never terminates" into an ordinary failing assertion.
+    fn run_bounded(cfg: DagConfig, cgroups: BoxedCgroups) -> RunResult {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(run_dag_boxed(&cfg, 2, false, 0, cgroups));
+        });
+        rx.recv_timeout(DEADLINE).unwrap_or_else(|_| {
+            panic!(
+                "scheduler HUNG: run_dag did not return within {DEADLINE:?}. This is the \
+                 silent-hang regression — a supervisor died without recording an outcome, so the \
+                 ready-set loop can never reach its break condition."
+            )
+        })
+    }
+
+    fn crashes(res: &RunResult) -> Vec<&StepOutcome> {
+        res.outcomes
+            .iter()
+            .filter(|o| o.reason.starts_with(SUPERVISOR_CRASH_REASON))
+            .collect()
+    }
+
+    // -- NEGATIVE CONTROLS: nothing planted, so the positives below are not vacuous --
+
+    #[test]
+    fn clean_run_records_no_supervisor_crash() {
+        let res = run_bounded(one_step("true"), None);
+        assert!(res.ok);
+        assert!(crashes(&res).is_empty());
+    }
+
+    #[test]
+    fn ordinary_step_failure_is_not_labelled_a_supervisor_crash() {
+        // A non-zero exit is a PRODUCT failure; tarring it with the runner-bug marker would make
+        // the marker useless for triage.
+        let res = run_bounded(one_step("exit 3"), None);
+        assert!(!res.ok);
+        assert!(crashes(&res).is_empty());
+        assert_eq!(res.outcomes[0].returncode, Some(3));
+    }
+
+    // -- LAYER 1: the per-supervisor catch_unwind guard, at three real call sites --
+
+    fn assert_panic_fails_loudly(panic_in: &'static str) {
+        let res = run_bounded(one_step("true"), Some(Arc::new(PanickingCgroups { panic_in })));
+        assert!(!res.ok, "a supervisor panic must fail the run");
+        let found = crashes(&res);
+        assert_eq!(found.len(), 1, "outcomes were {:?}", res.outcomes);
+        assert_eq!(found[0].tag, "g.A");
+        assert!(!found[0].ok);
+        // The reason must NAME the fault; a bare "something went wrong" leaves the operator in
+        // the same position as the silent hang.
+        assert!(
+            found[0].reason.contains(panic_in),
+            "reason did not name the fault: {}",
+            found[0].reason
+        );
+    }
+
+    #[test]
+    fn panic_before_spawn_fails_loudly_instead_of_hanging() {
+        assert_panic_fails_loudly("prepare_command");
+    }
+
+    #[test]
+    fn panic_after_child_exits_fails_loudly_instead_of_hanging() {
+        assert_panic_fails_loudly("oom_kills");
+    }
+
+    #[test]
+    fn panic_during_cleanup_fails_loudly_instead_of_hanging() {
+        assert_panic_fails_loudly("cleanup");
+    }
+
+    #[test]
+    fn panic_under_the_lock_does_not_cascade_via_poisoning() {
+        // Rust-only hazard with no Python counterpart: a panic while the shared guard is held
+        // poisons the mutex, and a bare `lock().unwrap()` would then panic in EVERY other
+        // thread — burying the first cause under a cascade. `lock_shared` recovers the guard.
+        let shared = Arc::new(Mutex::new(Shared {
+            done: HashMap::new(),
+            running: HashSet::new(),
+            running_pids: HashMap::new(),
+            aborted: HashSet::new(),
+            resource_avail: HashMap::new(),
+            failed: false,
+            stop: false,
+            cores_used: 0,
+            step_profile_rows: Vec::new(),
+            retired: HashSet::new(),
+        }));
+        let poisoner = Arc::clone(&shared);
+        let _ = thread::spawn(move || {
+            let mut sh = lock_shared(&poisoner);
+            sh.failed = true;
+            panic!("planted panic while holding the shared guard");
+        })
+        .join();
+        assert!(shared.lock().is_err(), "the plant did not poison the mutex");
+        // The recovering lock still works, and the state written before the panic is intact.
+        assert!(lock_shared(&shared).failed);
+    }
+
+    // -- LAYER 2: the dead-supervisor sweep, and the idempotent retire it depends on --
+
+    #[test]
+    fn retire_is_idempotent() {
+        // Double-release would raise a cap above its declared value — a loud bug turned into
+        // quiet over-subscription.
+        let mut st = one_step("true").steps.remove(0);
+        st.hint.resources.insert("slot".to_string(), 1);
+        let mut sh = Shared {
+            done: HashMap::new(),
+            running: HashSet::from([st.tag()]),
+            running_pids: HashMap::new(),
+            aborted: HashSet::new(),
+            resource_avail: HashMap::from([("slot".to_string(), 0i64)]),
+            failed: false,
+            stop: false,
+            cores_used: 1,
+            step_profile_rows: Vec::new(),
+            retired: HashSet::new(),
+        };
+        retire(&mut sh, &st);
+        retire(&mut sh, &st);
+        retire(&mut sh, &st);
+        assert_eq!(sh.resource_avail.get("slot"), Some(&1));
+        assert_eq!(sh.cores_used, 0);
+        assert!(sh.running.is_empty());
+    }
+
+    #[test]
+    fn panic_releases_resources_exactly_once() {
+        let mut cfg = one_step("true");
+        cfg.steps[0]
+            .hint
+            .resources
+            .insert("slot".to_string(), 1);
+        cfg.resource_caps.insert("slot".to_string(), 1);
+        let res = run_bounded(
+            cfg,
+            Some(Arc::new(PanickingCgroups {
+                panic_in: "oom_kills",
+            })),
+        );
+        assert!(!res.ok);
+        assert_eq!(crashes(&res).len(), 1);
+    }
+
+    #[test]
+    fn sweep_is_inert_on_a_healthy_concurrent_run() {
+        // The other direction: the sweep must not mistake a live or just-launched supervisor for
+        // a dead one. Several concurrent short steps exercise the launch/exit boundary repeatedly.
+        let mut cfg = one_step("sleep 0.05");
+        for i in 1..8 {
+            let mut s = cfg.steps[0].clone();
+            s.job = format!("s{i}");
+            cfg.steps.push(s);
+        }
+        let res = run_bounded(cfg, None);
+        assert!(res.ok, "outcomes were {:?}", res.outcomes);
+        assert!(crashes(&res).is_empty());
+        assert_eq!(res.outcomes.len(), 8);
+    }
+
+    #[test]
+    fn supervisor_crash_marker_is_stable() {
+        // A triage contract shared with the Python engine: pin the text.
+        assert_eq!(SUPERVISOR_CRASH_REASON, "SUPERVISOR CRASH");
+    }
 }
 
 #[cfg(test)]
