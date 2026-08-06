@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "herdr-run"
+version = "0.1.0"
+description = "Run allowlisted commands in a Herdr terminal pane outside an AI agent's sandbox, with real exit codes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Ryan Newton" }]
+keywords = ["agents", "sandbox", "terminal", "herdr", "allowlist"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX",
+]
+# PyYAML is OPTIONAL: it is imported lazily and only when a configuration file is present, so the
+# built-in defaults (and `--help`) work on a bare host with nothing installed.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=6"]
+dev = ["mypy", "pytest", "types-PyYAML"]
+
+[project.urls]
+Repository = "https://github.com/rrnewton/agent-utils"
+Issues = "https://github.com/rrnewton/agent-utils/issues"
+
+[project.scripts]
+herdr-run = "herdr_run.cli:main"
+
+[tool.setuptools]
+packages = ["herdr_run"]
+package-dir = { herdr_run = "." }
+include-package-data = false
+
+[tool.setuptools.package-data]
+herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "examples/*.yaml"]

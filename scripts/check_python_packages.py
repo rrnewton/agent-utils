@@ -106,6 +106,21 @@ PROJECTS: tuple[Project, ...] = (
         ),
         required_dependencies=(),
     ),
+    Project(
+        directory="herdr_run",
+        distribution="herdr-run",
+        package="herdr_run",
+        commands=("herdr-run",),
+        resources=(
+            "README.md",
+            "USER_GUIDE.md",
+            "py.typed",
+            "examples/project.yaml",
+        ),
+        # PyYAML is imported lazily and only when a configuration file exists, so it is an EXTRA
+        # rather than a required dependency: the built-in defaults work on a bare host.
+        required_dependencies=(),
+    ),
 )
 
 _DIST_SEP = re.compile(r"[-_.]+")

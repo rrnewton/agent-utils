@@ -25,6 +25,7 @@ ENTRYPOINT_MODULES = [
     "tick_hub",
     "pr_landing_planner",
     "agent_team_timeline",
+    "herdr_run",
 ]
 
 # Invocations that MUST succeed without importing third-party dependencies.

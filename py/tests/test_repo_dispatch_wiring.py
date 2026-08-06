@@ -17,6 +17,7 @@ RESOLVER_TOOLS = (
     "tick-hub",
     "pr-landing-planner",
     "agent-team-timeline",
+    "herdr-run",
 )
 
 

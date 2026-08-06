@@ -1,0 +1,159 @@
+"""Per-project configuration tests: defaults, discovery, and validation.
+
+The defaults matter as much as the parsing: a project with no config file must still get the
+intended conservative policy, because that is the state most consumers will run in.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+from herdr_run.config import Config, find_config_file, load_config, parse_config
+from herdr_run.errors import ConfigError
+
+
+# --- defaults ------------------------------------------------------------------------------------
+
+
+def test_defaults_match_the_intended_policy() -> None:
+    config = Config()
+    assert config.workspace == "agent-cmds"
+    assert config.tab_name == "{agent}"
+    assert config.allow == ("git", "gh")
+    assert config.prefixes == ("with-proxy",)
+    assert config.readiness == "both"
+
+
+def test_no_config_file_anywhere_yields_defaults(tmp_path: object) -> None:
+    root = str(tmp_path)
+    config = load_config(explicit_path=None, start_dir=root)
+    assert config.source_path is None
+    assert config.allow == ("git", "gh")
+
+
+# --- discovery -----------------------------------------------------------------------------------
+
+
+def test_finds_config_in_an_ancestor_directory(tmp_path: object) -> None:
+    root = str(tmp_path)
+    nested = os.path.join(root, "a", "b", "c")
+    os.makedirs(nested)
+    path = os.path.join(root, ".herdr-run.yaml")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("workspace: from-ancestor\n")
+    assert find_config_file(nested) == path
+
+
+def test_nearest_config_wins(tmp_path: object) -> None:
+    root = str(tmp_path)
+    nested = os.path.join(root, "slot")
+    os.makedirs(nested)
+    for directory, label in ((root, "outer"), (nested, "inner")):
+        with open(os.path.join(directory, ".herdr-run.yaml"), "w", encoding="utf-8") as handle:
+            handle.write(f"workspace: {label}\n")
+    config = load_config(explicit_path=None, start_dir=nested)
+    assert config.workspace == "inner"
+
+
+def test_project_root_is_the_config_directory(tmp_path: object) -> None:
+    root = str(tmp_path)
+    nested = os.path.join(root, "deep", "path")
+    os.makedirs(nested)
+    with open(os.path.join(root, ".herdr-run.yaml"), "w", encoding="utf-8") as handle:
+        handle.write("workspace: x\n")
+    config = load_config(explicit_path=None, start_dir=nested)
+    assert config.project_root == root
+
+
+def test_missing_explicit_path_is_an_error(tmp_path: object) -> None:
+    with pytest.raises(ConfigError, match="not found"):
+        load_config(explicit_path=os.path.join(str(tmp_path), "nope.yaml"), start_dir=str(tmp_path))
+
+
+# --- parsing / validation ---------------------------------------------------------------------------
+
+
+def test_parses_every_supported_key() -> None:
+    document = {
+        "workspace": "cmds",
+        "tab_name": "{project}-{agent}",
+        "cwd": "sub",
+        "allow": ["git"],
+        "prefixes": [],
+        "deny_global": {"git": ["-c"]},
+        "deny_subcommand": {"git": ["daemon"]},
+        "deny_anywhere": ["--upload-pack"],
+        "value_options": {"git": ["-C"]},
+        "spool_dir": "out",
+        "timeout_seconds": 30,
+        "ready_timeout_seconds": 5,
+        "readiness": "process",
+        "prompt_tail": "% ",
+        "shells": ["zsh"],
+        "broker": "systemd-run",
+    }
+    config = parse_config(document, source_path="/tmp/x.yaml", project_root="/tmp")
+    assert config.workspace == "cmds"
+    assert config.allow == ("git",)
+    assert config.prefixes == ()
+    assert config.readiness == "process"
+    assert config.broker == "systemd-run"
+    assert config.timeout_seconds == 30.0
+
+
+def test_empty_document_is_defaults() -> None:
+    config = parse_config(None, source_path="/tmp/x.yaml", project_root="/tmp")
+    assert config.allow == ("git", "gh")
+
+
+def test_unknown_key_is_rejected() -> None:
+    """A typo'd `allowlist:` must not silently fall back to the default allowlist."""
+    with pytest.raises(ConfigError, match="unknown key"):
+        parse_config({"allowlist": ["git"]}, source_path="/tmp/x.yaml", project_root="/tmp")
+
+
+def test_empty_allowlist_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="EMPTY allowlist"):
+        parse_config({"allow": []}, source_path="/tmp/x.yaml", project_root="/tmp")
+
+
+@pytest.mark.parametrize(
+    "document,pattern",
+    [
+        ({"allow": "git"}, "expected an array"),
+        ({"allow": [1, 2]}, "must be a string"),
+        ({"workspace": 42}, "must be a string"),
+        ({"timeout_seconds": "soon"}, "must be a number"),
+        ({"timeout_seconds": -1}, "must not be negative"),
+        ({"readiness": "maybe"}, "must be one of"),
+        ({"broker": "carrier-pigeon"}, "must be one of"),
+        ({"deny_global": ["git"]}, "expected an object"),
+    ],
+)
+def test_malformed_values_are_rejected(document: dict[str, object], pattern: str) -> None:
+    with pytest.raises((ConfigError, TypeError), match=pattern):
+        parse_config(document, source_path="/tmp/x.yaml", project_root="/tmp")
+
+
+def test_null_optional_fields_are_accepted() -> None:
+    config = parse_config(
+        {"cwd": None, "prompt_tail": None}, source_path="/tmp/x.yaml", project_root="/tmp"
+    )
+    assert config.cwd is None
+    assert config.prompt_tail is None
+
+
+# --- the shipped example is a valid config --------------------------------------------------------
+
+
+def test_shipped_example_config_parses() -> None:
+    """The example in the package must stay loadable; a stale example is a broken doc."""
+    yaml = pytest.importorskip("yaml")
+    from importlib.resources import files
+
+    text = (files("herdr_run") / "examples" / "project.yaml").read_text(encoding="utf-8")
+    config = parse_config(yaml.safe_load(text), source_path="example", project_root="/tmp")
+    assert config.workspace == "agent-cmds"
+    assert config.allow == ("git", "gh")

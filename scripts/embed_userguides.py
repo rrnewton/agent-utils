@@ -170,6 +170,18 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         language="python",
         source="common/docs/agent-team-timeline/USER_GUIDE.md",
     ),
+    StandaloneDocument(
+        tool="herdr-run",
+        document="README",
+        language="python",
+        source="common/docs/herdr-run/README.md",
+    ),
+    StandaloneDocument(
+        tool="herdr-run",
+        document="USER_GUIDE",
+        language="python",
+        source="common/docs/herdr-run/USER_GUIDE.md",
+    ),
 )
 
 
@@ -209,6 +221,9 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/agent-team-timeline/USER_GUIDE.md",
             ),
             PackageLink("py/agent_team_timeline/LICENSE", "LICENSE"),
+            PackageLink("py/herdr_run/README.md", "common/docs/herdr-run/README.md"),
+            PackageLink("py/herdr_run/USER_GUIDE.md", "common/docs/herdr-run/USER_GUIDE.md"),
+            PackageLink("py/herdr_run/LICENSE", "LICENSE"),
         )
     )
     return tuple(links)
