@@ -1,4 +1,5 @@
-"""Module entry point for :mod:`agent_team_timeline`."""
+#!/usr/bin/env python3
+"""Executable entry point for the console command and ``python -m`` invocation."""
 
 from __future__ import annotations
 

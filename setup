@@ -50,8 +50,9 @@ setup_py() {
     return 1
   fi
   ( cd py && python3 -m mypy . )
-  # Symlink entrypoints do not need their targets chmodded. Following those
-  # links dirties tracked package modules every time setup runs.
+  # Launcher targets are tracked as executable source files. Do not chmod through
+  # their symlinks here: the repository contract checks the committed modes and
+  # shebangs, and setup must not hide or dirty a broken checkout.
   if [ -d py/bin ]; then
     for entrypoint in py/bin/*; do
       [ -e "$entrypoint" ] || continue

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Stateful, hard process-tree CPU allocation for benchmark isolation.
 
 The allocator combines a durable, ``flock``-serialized reservation ledger with
