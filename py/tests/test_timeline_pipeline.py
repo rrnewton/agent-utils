@@ -258,6 +258,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert first.backend == "heuristic"
     assert first.model == "test-model"
     assert first.reasoning_effort == "high"
+    assert first.service_tier is None
     assert first.newly_spent_usage.total_tokens == 0
     assert first.newly_spent_unknown_receipts == 0
     assert first.artifact_generation_unknown_receipts == 0
@@ -443,6 +444,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     )
     run = json.loads(run_path.read_text(encoding="utf-8"))
     assert run["summaries"]["reasoning_effort"] == "high"
+    assert run["summaries"]["service_tier"] is None
     assert run["summaries"]["newly_spent_usage"]["total_tokens"] == 0
     assert run["summaries"]["usage_run_paths"] == list(second.usage_run_paths)
 

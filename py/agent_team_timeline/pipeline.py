@@ -92,7 +92,7 @@ from agent_team_timeline.summarize import (
     knowledge_text_has_link,
     summarize_jobs,
 )
-from agent_team_timeline.token_usage import TokenUsage
+from agent_team_timeline.token_usage import TokenUsage, resolve_service_tier
 from agent_team_timeline.terminology import (
     GlossaryTerm,
     TermSource,
@@ -228,6 +228,7 @@ class SummarizeReport:
     backend: str
     model: str
     reasoning_effort: str | None
+    service_tier: str | None
     phases: int
     rollups: int
     agent_names: int
@@ -252,6 +253,7 @@ class SummarizeReport:
             "backend": self.backend,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
+            "service_tier": self.service_tier,
             "phases": self.phases,
             "rollups": self.rollups,
             "plain_language_rollups": self.rollups,
@@ -1933,9 +1935,11 @@ def _summarize_archive_locked(
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
     reasoning_effort: str | None = None,
+    service_tier: str | None = None,
 ) -> SummarizeReport:
     """Fill only missing/changed structured summaries; never format the website."""
 
+    service_tier = resolve_service_tier(backend, service_tier)
     team = load_archived_team(archive, team_slug)
     phases = build_phases(
         team,
@@ -1993,6 +1997,7 @@ def _summarize_archive_locked(
         batch_size=batch_size,
         codex_command=codex_command,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
     )
     changed = _write_phase_data(archive, team_slug, phases, phase_results)
     name_jobs = _agent_name_jobs(team, phases, phase_results)
@@ -2005,6 +2010,7 @@ def _summarize_archive_locked(
         batch_size=name_batch_size,
         codex_command=codex_command,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
     )
     changed += _write_agent_name_data(
         archive, team_slug, name_jobs, agent_names
@@ -2019,6 +2025,7 @@ def _summarize_archive_locked(
         batch_size=batch_size,
         codex_command=codex_command,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
     )
     project_overview = overview_results[overview_job.key]
     _validate_project_overview(project_overview, "generated project overview")
@@ -2041,6 +2048,7 @@ def _summarize_archive_locked(
             batch_size=batch_size,
             codex_command=codex_command,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
         )
     else:
         definition_results = {}
@@ -2108,6 +2116,7 @@ def _summarize_archive_locked(
                 batch_size=batch_size,
                 codex_command=codex_command,
                 reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
             )
             backend_stats.append(stats)
             result = results[jobs[0].key]
@@ -2134,6 +2143,7 @@ def _summarize_archive_locked(
                 batch_size=batch_size,
                 codex_command=codex_command,
                 reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
             )
             backend_stats.append(plain_stats)
             plain_result = plain_results[plain_jobs[0].key]
@@ -2216,6 +2226,7 @@ def _summarize_archive_locked(
         backend=backend,
         model=model,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         phases=len(phases),
         rollups=len(periods),
         agent_names=len(agent_names),
@@ -2255,6 +2266,7 @@ def summarize_archive(
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
     reasoning_effort: str | None = None,
+    service_tier: str | None = None,
 ) -> SummarizeReport:
     """Fill structured summaries/names while serializing token-spending cache misses."""
 
@@ -2272,6 +2284,7 @@ def summarize_archive(
             transcript_chars=transcript_chars,
             codex_command=codex_command,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
         )
 
 

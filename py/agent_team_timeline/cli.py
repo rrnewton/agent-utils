@@ -165,6 +165,14 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
             "(default: %(default)s)"
         ),
     )
+    parser.add_argument(
+        "--service-tier",
+        default=None,
+        help=(
+            "Codex service tier; Fast uses 'priority', omission means 'default', "
+            "and the effective value is recorded in cache and run provenance"
+        ),
+    )
     parser.add_argument("--summary-workers", type=int, default=3)
     parser.add_argument("--summary-batch-size", type=int, default=6)
     parser.add_argument(
@@ -292,6 +300,10 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
+    raw_service_tier: object = ns.service_tier
+    service_tier = (
+        None if raw_service_tier is None else str(raw_service_tier)
+    )
     return summarize_archive(
         _path(str(ns.output)),
         str(ns.team),
@@ -305,6 +317,7 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
         transcript_chars=int(ns.transcript_chars),
         codex_command=(str(ns.codex_command),),
         reasoning_effort=str(ns.reasoning_effort),
+        service_tier=service_tier,
     )
 
 
@@ -342,8 +355,10 @@ def _print_ingest(report: IngestReport) -> None:
 
 
 def _print_summaries(report: SummarizeReport) -> None:
+    tier = report.service_tier or "unspecified"
     print(
-        f"summarize: {report.phases} phases + {report.agent_names} hindsight agent names + "
+        f"summarize ({report.backend} / {report.model} / tier={tier}): "
+        f"{report.phases} phases + {report.agent_names} hindsight agent names + "
         f"{report.rollups} calendar periods × 2 summary audiences; "
         f"cache {report.cache_hits} hit / {report.cache_misses} miss in "
         f"{report.backend_batches} backend batch(es); {report.project_overviews} project overview + "

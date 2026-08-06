@@ -63,5 +63,11 @@ corresponding actual total explicitly `UNKNOWN` instead of zero. Repeating `summ
 input uses cached results; repeating `build` only regenerates deterministic presentation files. Use
 `--backend heuristic --model deterministic-local` for an offline pipeline exercise.
 
+Codex's catalog label **Fast** maps to `--service-tier priority`. Codex runs always override the
+child CLI with an effective tier: omission and explicit `default` both mean `default`, while a tier
+is rejected for the offline heuristic backend. The default tier keeps existing summary and
+hindsight-name cache identities; priority receives distinct identities. Effective tiers are
+retained in batch, invocation, and top-level run provenance.
+
 Run `agent-team-timeline quickstart` for the short tour or
 `agent-team-timeline --userguide` for the complete storage, privacy, and rerun contract.

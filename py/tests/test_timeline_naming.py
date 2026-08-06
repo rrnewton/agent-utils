@@ -114,6 +114,50 @@ def test_prompt_contains_hindsight_summary_ancestor_context_and_official_paths()
     assert PROMPT_VERSION.endswith("-v2")
 
 
+def test_service_tier_is_name_cache_identity_provenance() -> None:
+    job = _job()
+    inherited = _input_hash(job, "codex", "gpt-test", "high")
+    explicit_default = _input_hash(
+        job, "codex", "gpt-test", "high", service_tier="default"
+    )
+    priority = _input_hash(
+        job, "codex", "gpt-test", "high", service_tier="priority"
+    )
+    assert inherited == explicit_default
+    assert inherited != priority
+    assert priority != _input_hash(
+        job, "codex", "gpt-test", "high", service_tier="standard"
+    )
+
+
+def test_blank_service_tier_is_rejected_before_name_backend_work(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(AgentNameError, match="service tier must not be empty"):
+        name_agents(
+            [_job()],
+            tmp_path / "cache",
+            backend="heuristic",
+            model="offline",
+            service_tier="  ",
+        )
+
+
+def test_service_tier_is_rejected_for_heuristic_name_backend(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        AgentNameError, match="service tier is only supported by the codex backend"
+    ):
+        name_agents(
+            [_job()],
+            tmp_path / "cache",
+            backend="heuristic",
+            model="offline",
+            service_tier="priority",
+        )
+
+
 def test_root_is_always_exact_coordinator(tmp_path: Path) -> None:
     root = _job(
         "root-name",
@@ -313,11 +357,14 @@ def test_pre_lifetime_cache_version_is_regenerated_once(tmp_path: Path) -> None:
     assert migrated["result"]["lifetime_summary"]
 
 
-def test_codex_naming_records_tokens_model_and_reasoning_effort(tmp_path: Path) -> None:
+def test_codex_naming_records_tokens_model_and_reasoning_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     fake = tmp_path / "fake_naming_codex.py"
     fake.write_text(
         """#!/usr/bin/env python3
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -331,6 +378,8 @@ for required in (
 ):
     assert required in args
 assert 'model_reasoning_effort="high"' in args
+expected_service_tier = os.environ["FAKE_CODEX_SERVICE_TIER"]
+assert f'service_tier="{expected_service_tier}"' in args
 assert Path.cwd().name.startswith("agent-team-timeline-name-")
 repository_check = subprocess.run(
     ["git", "rev-parse", "--is-inside-work-tree"],
@@ -377,6 +426,7 @@ print(json.dumps({
     )
     cache = tmp_path / "cache"
     jobs = [_job()]
+    monkeypatch.setenv("FAKE_CODEX_SERVICE_TIER", "priority")
     _, first = name_agents(
         jobs,
         cache,
@@ -385,6 +435,7 @@ print(json.dumps({
         max_workers=1,
         codex_command=(sys.executable, str(fake)),
         reasoning_effort="high",
+        service_tier="priority",
     )
     assert first.newly_spent_usage == TokenUsage(
         input_tokens=90,
@@ -397,6 +448,7 @@ print(json.dumps({
     run = json.loads(first.usage_run_path.read_text(encoding="utf-8"))
     assert run["model"] == "gpt-test"
     assert run["reasoning_effort"] == "high"
+    assert run["service_tier"] == "priority"
 
     _, second = name_agents(
         jobs,
@@ -406,9 +458,26 @@ print(json.dumps({
         max_workers=1,
         codex_command=(sys.executable, str(fake)),
         reasoning_effort="high",
+        service_tier="priority",
     )
     assert second.newly_spent_usage == TokenUsage()
     assert second.artifact_generation_usage == first.artifact_generation_usage
+
+    monkeypatch.setenv("FAKE_CODEX_SERVICE_TIER", "default")
+    _, default_stats = name_agents(
+        jobs,
+        tmp_path / "default-cache",
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+        reasoning_effort="high",
+    )
+    assert default_stats.usage_run_path is not None
+    default_run = json.loads(
+        default_stats.usage_run_path.read_text(encoding="utf-8")
+    )
+    assert default_run["service_tier"] == "default"
 
 
 def test_failed_codex_naming_preserves_terminal_usage_receipt(tmp_path: Path) -> None:

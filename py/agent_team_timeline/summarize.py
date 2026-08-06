@@ -32,9 +32,11 @@ from agent_team_timeline.codex_workspace import (
 )
 from agent_team_timeline.token_usage import (
     BatchUsageReceipt,
+    DEFAULT_SERVICE_TIER,
     TokenUsage,
     load_batch_receipt,
     parse_codex_jsonl_usage,
+    resolve_service_tier,
     write_batch_receipt,
     write_usage_run_receipt,
 )
@@ -258,6 +260,7 @@ def _input_hash(
     backend: str,
     model: str,
     reasoning_effort: str | None = None,
+    service_tier: str | None = None,
 ) -> str:
     payload: dict[str, JsonValue] = {
         "backend": backend,
@@ -267,6 +270,8 @@ def _input_hash(
     }
     if reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
+    if service_tier not in (None, DEFAULT_SERVICE_TIER):
+        payload["service_tier"] = service_tier
     return content_hash(canonical_json(payload))
 
 
@@ -875,6 +880,7 @@ def _codex_batch(
     pending: Sequence[_PendingJob],
     model: str,
     reasoning_effort: str | None,
+    service_tier: str | None,
     codex_command: Sequence[str],
 ) -> tuple[dict[str, SummaryResult], TokenUsage | None]:
     if not codex_command:
@@ -893,6 +899,8 @@ def _codex_batch(
         command = [*codex_command, "exec"]
         if reasoning_effort is not None:
             command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
+        if service_tier is not None:
+            command.extend(["-c", f"service_tier={json.dumps(service_tier)}"])
         command.extend(
             [
             "--ephemeral",
@@ -961,6 +969,7 @@ def _run_backend_batch(
     backend: str,
     model: str,
     reasoning_effort: str | None,
+    service_tier: str | None,
     codex_command: Sequence[str],
 ) -> _GeneratedBatch:
     """Run one batch and persist a receipt even when the backend call fails."""
@@ -973,7 +982,7 @@ def _run_backend_batch(
             usage: TokenUsage | None = TokenUsage()
         else:
             results, usage = _codex_batch(
-                batch, model, reasoning_effort, codex_command
+                batch, model, reasoning_effort, service_tier, codex_command
             )
     except SummaryError as error:
         usage = error.usage if isinstance(error, _CodexBatchError) else None
@@ -981,6 +990,7 @@ def _run_backend_batch(
             backend=backend,
             model=model,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             status="failed",
             started_at=started_at,
             completed_at=_utc_now(),
@@ -996,6 +1006,7 @@ def _run_backend_batch(
         backend=backend,
         model=model,
         reasoning_effort=reasoning_effort,
+        service_tier=service_tier,
         status="completed",
         started_at=started_at,
         completed_at=_utc_now(),
@@ -1016,6 +1027,7 @@ def summarize_jobs(
     batch_size: int = 6,
     codex_command: Sequence[str] = ("codex",),
     reasoning_effort: str | None = None,
+    service_tier: str | None = None,
 ) -> tuple[dict[str, SummaryResult], SummaryRunStats]:
     """Return summaries, consulting immutable content-addressed cache entries first."""
 
@@ -1027,6 +1039,10 @@ def summarize_jobs(
         raise SummaryError("summary model must not be empty")
     if reasoning_effort is not None and not reasoning_effort.strip():
         raise SummaryError("summary reasoning effort must not be empty")
+    try:
+        effective_service_tier = resolve_service_tier(backend, service_tier)
+    except ValueError as error:
+        raise SummaryError(str(error)) from error
     if max_workers < 1:
         raise SummaryError("max_workers must be at least 1")
     if batch_size < 1:
@@ -1042,7 +1058,9 @@ def summarize_jobs(
         if job.key in seen_keys:
             raise SummaryError(f"duplicate summary job key {job.key!r}")
         seen_keys.add(job.key)
-        input_hash = _input_hash(job, backend, model, reasoning_effort)
+        input_hash = _input_hash(
+            job, backend, model, reasoning_effort, effective_service_tier
+        )
         item = _PendingJob(
             job=job,
             input_hash=input_hash,
@@ -1086,6 +1104,7 @@ def summarize_jobs(
                 backend=backend,
                 model=model,
                 reasoning_effort=reasoning_effort,
+                service_tier=effective_service_tier,
                 codex_command=codex_command,
             )
             publish_batch(batch, batch_result)
@@ -1101,6 +1120,7 @@ def summarize_jobs(
                     backend=backend,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    service_tier=effective_service_tier,
                     codex_command=command,
                 ): batch
                 for batch in batches
@@ -1161,6 +1181,7 @@ def summarize_jobs(
         backend=backend,
         model=model,
         reasoning_effort=reasoning_effort,
+        service_tier=effective_service_tier,
         job_count=len(jobs),
         hits=hits,
         misses=len(pending),

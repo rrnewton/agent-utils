@@ -9,6 +9,7 @@ installed.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shlex
 import sys
@@ -198,27 +199,77 @@ class RunRecord:
 class BatchReceipt:
     """One actual backend attempt from the immutable receipt ledger."""
 
+    team_slug: str
+    schema_version: int
     receipt_id: str
     backend: str
     model: str
     reasoning_effort: str | None
+    service_tier: str | None
     status: str
     started_at: str
     completed_at: str
     usage: Usage | None
 
     @classmethod
-    def from_path(cls, path: Path) -> BatchReceipt:
+    def from_path(cls, path: Path, team_slug: str) -> BatchReceipt:
         """Load one immutable backend-attempt receipt."""
 
         obj = _read_object(path)
         where = str(path)
+        base_expected = {
+            "schema_version",
+            "receipt_id",
+            "backend",
+            "model",
+            "reasoning_effort",
+            "status",
+            "started_at",
+            "completed_at",
+            "input_hashes",
+            "usage",
+            "error",
+        }
+        schema_version = _required_int(obj, "schema_version", where)
+        if schema_version == 1:
+            expected = base_expected
+        elif schema_version == 2:
+            expected = base_expected | {"service_tier"}
+        else:
+            raise ValueError(f"{where}: unsupported schema version {schema_version}")
+        if set(obj) != expected:
+            raise ValueError(f"{where}: expected exactly {sorted(expected)!r}")
+        raw_hashes = obj.get("input_hashes")
+        if not isinstance(raw_hashes, list) or not all(
+            isinstance(item, str) for item in raw_hashes
+        ):
+            raise ValueError(f"{where}.input_hashes: expected an array of strings")
+        _optional_string(obj, "error", where)
+        receipt_id = _required_string(obj, "receipt_id", where)
+        identity: dict[str, JsonValue] = dict(obj)
+        identity.pop("receipt_id")
+        canonical = json.dumps(
+            identity, ensure_ascii=False, indent=2, sort_keys=True
+        ) + "\n"
+        expected_receipt_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        if receipt_id != expected_receipt_id:
+            raise ValueError(f"{where}.receipt_id: content hash mismatch")
         raw_usage = obj.get("usage")
+        service_tier = (
+            None
+            if schema_version == 1
+            else _optional_string(obj, "service_tier", where)
+        )
+        if service_tier is not None and not service_tier.strip():
+            raise ValueError(f"{where}.service_tier: must not be empty")
         return cls(
-            receipt_id=_required_string(obj, "receipt_id", where),
+            team_slug=team_slug,
+            schema_version=schema_version,
+            receipt_id=receipt_id,
             backend=_required_string(obj, "backend", where),
             model=_required_string(obj, "model", where),
             reasoning_effort=_optional_string(obj, "reasoning_effort", where),
+            service_tier=service_tier,
             status=_required_string(obj, "status", where),
             started_at=_required_string(obj, "started_at", where),
             completed_at=_required_string(obj, "completed_at", where),
@@ -285,22 +336,32 @@ def _receipt_paths(archive: Path) -> list[Path]:
 
 
 def _load_receipts(archive: Path) -> tuple[list[BatchReceipt], list[str]]:
-    by_id: dict[str, BatchReceipt] = {}
+    by_id: dict[tuple[str, str], BatchReceipt] = {}
     warnings: list[str] = []
     for path in _receipt_paths(archive):
         try:
-            receipt = BatchReceipt.from_path(path)
+            relative = path.relative_to(archive)
+            if len(relative.parts) < 3 or relative.parts[0] != "teams":
+                raise ValueError("receipt is not beneath teams/<team-slug>")
+            team_slug = relative.parts[1]
+            receipt = BatchReceipt.from_path(path, team_slug)
         except (OSError, ValueError, json.JSONDecodeError) as error:
             warnings.append(
                 f"could not read backend receipt {path.relative_to(archive)}: {error}"
             )
             continue
-        previous = by_id.get(receipt.receipt_id)
+        key = (receipt.team_slug, receipt.receipt_id)
+        previous = by_id.get(key)
         if previous is not None and previous != receipt:
-            warnings.append(f"conflicting duplicate backend receipt {receipt.receipt_id}")
+            warnings.append(
+                f"conflicting duplicate backend receipt {receipt.team_slug}/"
+                f"{receipt.receipt_id}"
+            )
             continue
-        by_id[receipt.receipt_id] = receipt
-    return sorted(by_id.values(), key=lambda item: item.receipt_id), warnings
+        by_id[key] = receipt
+    return sorted(
+        by_id.values(), key=lambda item: (item.team_slug, item.receipt_id)
+    ), warnings
 
 
 _SUMMARIZATION_ACTIONS = frozenset(
@@ -367,14 +428,17 @@ def _associate_receipts(
         matches = [
             run
             for run, run_started, run_completed in windows
-            if run_started <= started and completed <= run_completed
+            if run.team_slug == receipt.team_slug
+            and run_started <= started
+            and completed <= run_completed
         ]
         if len(matches) == 1:
             associated[matches[0].run_id].append(receipt)
             continue
         if len(matches) > 1:
             warnings.append(
-                f"cannot uniquely attribute receipt {receipt.receipt_id}: "
+                f"cannot uniquely attribute receipt {receipt.team_slug}/"
+                f"{receipt.receipt_id}: "
                 f"matches {len(matches)} summarize runs"
             )
         unattributed.append(receipt)
@@ -468,6 +532,47 @@ def _summary_int(
     return default if value is None else value
 
 
+def _summary_nonnegative_int(
+    summary: dict[str, JsonValue], key: str, where: str, default: int = 0
+) -> int:
+    value = _summary_int(summary, key, where, default)
+    if value < 0:
+        raise ValueError(f"{where}.{key}: expected a non-negative integer")
+    return value
+
+
+def _format_run_actual_usage(record: RunRecord, ledger: ReceiptLedger) -> str:
+    if ledger.attempts:
+        return _format_actual_usage(ledger)
+    if record.summaries is None:
+        return (
+            "UNKNOWN (no loadable backend receipts and no successful summary report)"
+        )
+    where = str(record.path) + ".summaries"
+    _summary_nonnegative_int(record.summaries, "cache_hits", where)
+    misses = _summary_nonnegative_int(record.summaries, "cache_misses", where)
+    batches = _summary_nonnegative_int(
+        record.summaries, "backend_batches", where
+    )
+    reported_usage = _summary_usage(
+        record.summaries, "newly_spent_usage", where
+    )
+    reported_unknown = _summary_nonnegative_int(
+        record.summaries, "newly_spent_unknown_receipts", where
+    )
+    if (
+        misses == 0
+        and batches == 0
+        and reported_usage == Usage()
+        and reported_unknown == 0
+    ):
+        return _format_usage(Usage())
+    return (
+        "UNKNOWN (no loadable backend receipts); successful-report cross-check: "
+        + _format_reported_usage(reported_usage, reported_unknown)
+    )
+
+
 def _format_run(
     record: RunRecord,
     archive: Path,
@@ -493,7 +598,7 @@ def _format_run(
                 f"({statuses}); usage known={ledger.known_usage_receipts:,}; "
                 f"usage unknown={ledger.unknown_usage:,}",
                 "      actual model-token spend for this run: "
-                + _format_actual_usage(ledger),
+                + _format_run_actual_usage(record, ledger),
             )
         )
     if record.ingest is not None:
@@ -502,13 +607,23 @@ def _format_run(
         where = str(record.path) + ".summaries"
         backend = _required_string(record.summaries, "backend", where)
         model = _required_string(record.summaries, "model", where)
-        effort = _optional_string(record.summaries, "reasoning_effort", where) or "default"
-        hits = _summary_int(record.summaries, "cache_hits", where)
-        misses = _summary_int(record.summaries, "cache_misses", where)
-        batches = _summary_int(record.summaries, "backend_batches", where)
+        effort = (
+            _optional_string(record.summaries, "reasoning_effort", where)
+            or "unspecified"
+        )
+        service_tier = (
+            _optional_string(record.summaries, "service_tier", where)
+            or "unspecified"
+        )
+        hits = _summary_nonnegative_int(record.summaries, "cache_hits", where)
+        misses = _summary_nonnegative_int(record.summaries, "cache_misses", where)
+        batches = _summary_nonnegative_int(
+            record.summaries, "backend_batches", where
+        )
         lines.extend(
             (
-                f"      summarize: {backend} / {model} / effort={effort}; "
+                f"      summarize: {backend} / {model} / effort={effort} / "
+                f"tier={service_tier}; "
                 f"jobs={hits + misses:,}, cache={hits:,} hit + {misses:,} miss, "
                 f"backend_batches={batches:,}",
                 "      products: "
@@ -529,7 +644,7 @@ def _format_run(
             )
         )
         new_usage = _summary_usage(record.summaries, "newly_spent_usage", where)
-        new_unknown = _summary_int(
+        new_unknown = _summary_nonnegative_int(
             record.summaries, "newly_spent_unknown_receipts", where
         )
         lines.append(
@@ -539,10 +654,10 @@ def _format_run(
         artifact_usage = _summary_usage(
             record.summaries, "artifact_generation_usage", where
         )
-        artifact_unknown = _summary_int(
+        artifact_unknown = _summary_nonnegative_int(
             record.summaries, "artifact_generation_unknown_receipts", where
         )
-        legacy_unknown = _summary_int(
+        legacy_unknown = _summary_nonnegative_int(
             record.summaries, "unknown_legacy_artifacts", where
         )
         artifact_text = _format_reported_usage(artifact_usage, artifact_unknown)
@@ -589,15 +704,22 @@ def render_run_stats(archive: Path) -> str:
         _associate_receipts(runs, receipts)
     )
 
-    model_ledgers: dict[tuple[str, str, str], ReceiptLedger] = {}
+    model_ledgers: dict[
+        tuple[str, str, str | None, str | None], ReceiptLedger
+    ] = {}
     for receipt in receipts:
-        effort = receipt.reasoning_effort or "default"
-        key = (receipt.backend, receipt.model, effort)
+        key = (
+            receipt.backend,
+            receipt.model,
+            receipt.reasoning_effort,
+            receipt.service_tier,
+        )
         model_ledgers[key] = model_ledgers.get(key, ReceiptLedger()).add(receipt)
     receipt_ledger = _receipt_ledger(receipts)
     unattributed_ledger = _receipt_ledger(unattributed_receipts)
 
     logged_usage = Usage()
+    logged_usage_available = False
     logged_unknown = 0
     successful_summary_reports = 0
     for run in runs:
@@ -608,7 +730,8 @@ def render_run_stats(archive: Path) -> str:
         usage = _summary_usage(run.summaries, "newly_spent_usage", where)
         if usage is not None:
             logged_usage += usage
-        logged_unknown += _summary_int(
+            logged_usage_available = True
+        logged_unknown += _summary_nonnegative_int(
             run.summaries, "newly_spent_unknown_receipts", where
         )
 
@@ -634,18 +757,45 @@ def render_run_stats(archive: Path) -> str:
         "Backend receipt ledger (archive-wide actual attempts)",
         f"  Receipts: {len(receipts):,}; usage known={receipt_ledger.known_usage_receipts:,}; "
         f"usage unknown={receipt_ledger.unknown_usage:,}",
-        f"  Actual tokens spent: {_format_actual_usage(receipt_ledger)}",
+        "  Actual tokens spent: "
+        + (
+            "UNKNOWN (no loadable backend receipts)"
+            + (
+                "; successful-report cross-check: "
+                + _format_reported_usage(
+                    logged_usage if logged_usage_available else None,
+                    logged_unknown,
+                )
+                if successful_summary_reports
+                else "; no successful summary report is available"
+            )
+            if receipt_ledger.attempts == 0 and summarization_runs
+            else _format_actual_usage(receipt_ledger)
+        ),
     ]
     if model_ledgers:
-        lines.append("  By backend / model / reasoning effort:")
-        for key in sorted(model_ledgers):
+        lines.append("  By backend / model / reasoning effort / service tier:")
+        for key in sorted(
+            model_ledgers,
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2] is not None,
+                item[2] or "",
+                item[3] is not None,
+                item[3] or "",
+            ),
+        ):
             ledger = model_ledgers[key]
+            effort = key[2] if key[2] is not None else "<unspecified>"
+            service_tier = key[3] if key[3] is not None else "<unspecified>"
             statuses = (
                 f"{ledger.completed:,} completed, {ledger.failed:,} failed, "
                 f"{ledger.other_status:,} other"
             )
             lines.append(
-                f"    {key[0]} / {key[1]} / {key[2]}: attempts={ledger.attempts:,} "
+                f"    {key[0]} / {key[1]} / effort={effort} / tier={service_tier}: "
+                f"attempts={ledger.attempts:,} "
                 f"({statuses}); usage known={ledger.known_usage_receipts:,}; "
                 f"usage unknown={ledger.unknown_usage:,}; actual tokens: "
                 f"{_format_actual_usage(ledger)}"
@@ -665,7 +815,10 @@ def render_run_stats(archive: Path) -> str:
             "Successful summary-report fields (cross-check, not archive totals)",
             "  Reported newly spent: "
             + (
-                _format_reported_usage(logged_usage, logged_unknown)
+                _format_reported_usage(
+                    logged_usage if logged_usage_available else None,
+                    logged_unknown,
+                )
                 if successful_summary_reports
                 else "unavailable (no successful summary reports)"
             ),
@@ -697,8 +850,9 @@ def render_run_stats(archive: Path) -> str:
         (
             "",
             "Notes: cached input is a subset of input; reasoning output is a subset of output.",
-            "Backend receipts are attributed by timestamp; archive writes serialize "
-            "summarize and refresh runs.",
+            "Backend receipts are attributed conservatively by team and timestamp. Summary "
+            "backend sections are lock-serialized, but top-level command windows can overlap "
+            "while waiting; ambiguous receipts remain unattributed.",
             "If any receipt lacks usage, the actual total is UNKNOWN; a known subtotal is "
             "not a complete cost.",
             "Returned-artifact generation cost is provenance, not additional spend, and is not "

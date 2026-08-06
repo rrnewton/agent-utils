@@ -26,7 +26,21 @@ from agent_team_timeline.archive import (
 )
 
 
-USAGE_SCHEMA_VERSION = 1
+USAGE_SCHEMA_VERSION = 2
+_LEGACY_USAGE_SCHEMA_VERSION = 1
+DEFAULT_SERVICE_TIER = "default"
+
+
+def resolve_service_tier(backend: str, service_tier: str | None) -> str | None:
+    """Return the effective tier, rejecting tiers for backends that ignore them."""
+
+    if service_tier is not None and not service_tier.strip():
+        raise ValueError("service tier must not be empty")
+    if backend == "codex":
+        return DEFAULT_SERVICE_TIER if service_tier is None else service_tier
+    if service_tier is not None:
+        raise ValueError("service tier is only supported by the codex backend")
+    return None
 
 
 @dataclass(frozen=True)
@@ -128,19 +142,35 @@ class BatchUsageReceipt:
     backend: str
     model: str
     reasoning_effort: str | None
+    service_tier: str | None
     status: str
     started_at: str
     completed_at: str
     input_hashes: tuple[str, ...]
     usage: TokenUsage | None
     error: str | None
+    schema_version: int = USAGE_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.schema_version not in (
+            _LEGACY_USAGE_SCHEMA_VERSION,
+            USAGE_SCHEMA_VERSION,
+        ):
+            raise ValueError(f"unsupported usage schema version {self.schema_version}")
+        if self.service_tier is not None and not self.service_tier.strip():
+            raise ValueError("service tier must not be empty")
+        if (
+            self.schema_version == _LEGACY_USAGE_SCHEMA_VERSION
+            and self.service_tier is not None
+        ):
+            raise ValueError("schema v1 batch receipts cannot contain a service tier")
 
     def to_json(self) -> dict[str, JsonValue]:
         """Return this immutable batch receipt as a JSON-compatible object."""
 
         usage: JsonValue = self.usage.to_json() if self.usage is not None else None
-        return {
-            "schema_version": USAGE_SCHEMA_VERSION,
+        result: dict[str, JsonValue] = {
+            "schema_version": self.schema_version,
             "receipt_id": self.receipt_id,
             "backend": self.backend,
             "model": self.model,
@@ -152,6 +182,9 @@ class BatchUsageReceipt:
             "usage": usage,
             "error": self.error,
         }
+        if self.schema_version == USAGE_SCHEMA_VERSION:
+            result["service_tier"] = self.service_tier
+        return result
 
     @classmethod
     def create(
@@ -160,6 +193,7 @@ class BatchUsageReceipt:
         backend: str,
         model: str,
         reasoning_effort: str | None,
+        service_tier: str | None = None,
         status: str,
         started_at: str,
         completed_at: str,
@@ -174,6 +208,7 @@ class BatchUsageReceipt:
             "backend": backend,
             "model": model,
             "reasoning_effort": reasoning_effort,
+            "service_tier": service_tier,
             "status": status,
             "started_at": started_at,
             "completed_at": completed_at,
@@ -187,6 +222,7 @@ class BatchUsageReceipt:
             backend=backend,
             model=model,
             reasoning_effort=reasoning_effort,
+            service_tier=service_tier,
             status=status,
             started_at=started_at,
             completed_at=completed_at,
@@ -200,7 +236,7 @@ class BatchUsageReceipt:
         """Validate and load one immutable batch receipt."""
 
         obj = as_object(value, where)
-        expected = {
+        base_expected = {
             "schema_version",
             "receipt_id",
             "backend",
@@ -213,11 +249,15 @@ class BatchUsageReceipt:
             "usage",
             "error",
         }
+        version = as_int(obj.get("schema_version"), f"{where}.schema_version")
+        if version == _LEGACY_USAGE_SCHEMA_VERSION:
+            expected = base_expected
+        elif version == USAGE_SCHEMA_VERSION:
+            expected = base_expected | {"service_tier"}
+        else:
+            raise ValueError(f"{where}: unsupported schema version {version}")
         if set(obj) != expected:
             raise ValueError(f"{where}: expected exactly {sorted(expected)!r}")
-        version = as_int(obj.get("schema_version"), f"{where}.schema_version")
-        if version != USAGE_SCHEMA_VERSION:
-            raise ValueError(f"{where}: unsupported schema version {version}")
         raw_hashes = obj.get("input_hashes")
         if not isinstance(raw_hashes, list):
             raise ValueError(f"{where}.input_hashes: expected an array")
@@ -244,12 +284,18 @@ class BatchUsageReceipt:
                     obj.get("reasoning_effort"), f"{where}.reasoning_effort"
                 )
             ),
+            service_tier=(
+                None
+                if obj.get("service_tier") is None
+                else as_string(obj.get("service_tier"), f"{where}.service_tier")
+            ),
             status=as_string(obj.get("status"), f"{where}.status"),
             started_at=as_string(obj.get("started_at"), f"{where}.started_at"),
             completed_at=as_string(obj.get("completed_at"), f"{where}.completed_at"),
             input_hashes=input_hashes,
             usage=usage,
             error=error,
+            schema_version=version,
         )
         identity: JsonValue = dict(receipt.to_json())
         if isinstance(identity, dict):
@@ -367,6 +413,7 @@ def write_usage_run_receipt(
     backend: str,
     model: str,
     reasoning_effort: str | None,
+    service_tier: str | None = None,
     job_count: int,
     hits: int,
     misses: int,
@@ -377,6 +424,8 @@ def write_usage_run_receipt(
 ) -> UsageRunAccounting:
     """Persist an immutable invocation receipt and return its aggregates."""
 
+    if service_tier is not None and not service_tier.strip():
+        raise ValueError("service tier must not be empty")
     newly_spent_usage, newly_unknown = _sum_receipt_usage(new_receipts)
     artifact_usage, artifact_unknown_known = _sum_receipt_usage(artifact_receipts)
     artifact_unknown = artifact_unknown_known + len(unreadable_artifact_receipt_ids)
@@ -393,6 +442,7 @@ def write_usage_run_receipt(
         "backend": backend,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "service_tier": service_tier,
         "job_count": job_count,
         "cache_hits": hits,
         "cache_misses": misses,
@@ -408,6 +458,7 @@ def write_usage_run_receipt(
         "backend": backend,
         "model": model,
         "reasoning_effort": reasoning_effort,
+        "service_tier": service_tier,
         "job_count": job_count,
         "cache_hits": hits,
         "cache_misses": misses,
@@ -433,10 +484,12 @@ def write_usage_run_receipt(
 
 __all__ = [
     "BatchUsageReceipt",
+    "DEFAULT_SERVICE_TIER",
     "TokenUsage",
     "UsageRunAccounting",
     "load_batch_receipt",
     "parse_codex_jsonl_usage",
+    "resolve_service_tier",
     "write_batch_receipt",
     "write_usage_run_receipt",
 ]

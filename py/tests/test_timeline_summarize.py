@@ -287,6 +287,46 @@ def test_one_backend_batch_cannot_mix_summary_audiences() -> None:
         build_summary_prompt([technical, plain])
 
 
+def test_service_tier_is_cache_identity_provenance() -> None:
+    job = _job("agent-a")
+    inherited = _input_hash(job, "codex", "gpt-test", "high")
+    explicit_default = _input_hash(
+        job, "codex", "gpt-test", "high", service_tier="default"
+    )
+    priority = _input_hash(
+        job, "codex", "gpt-test", "high", service_tier="priority"
+    )
+    assert inherited == explicit_default
+    assert inherited != priority
+    assert priority != _input_hash(
+        job, "codex", "gpt-test", "high", service_tier="standard"
+    )
+
+
+def test_blank_service_tier_is_rejected_before_backend_work(tmp_path: Path) -> None:
+    with pytest.raises(SummaryError, match="service tier must not be empty"):
+        summarize_jobs(
+            [_job("agent-a")],
+            tmp_path / "cache",
+            backend="heuristic",
+            model="offline",
+            service_tier="  ",
+        )
+
+
+def test_service_tier_is_rejected_for_heuristic_backend(tmp_path: Path) -> None:
+    with pytest.raises(
+        SummaryError, match="service tier is only supported by the codex backend"
+    ):
+        summarize_jobs(
+            [_job("agent-a")],
+            tmp_path / "cache",
+            backend="heuristic",
+            model="offline",
+            service_tier="priority",
+        )
+
+
 def _write_fake_codex(path: Path) -> None:
     path.write_text(
         """#!/usr/bin/env python3
@@ -304,6 +344,9 @@ for required in (
     "--model", "--json", "--output-schema", "--output-last-message", "-",
 ):
     assert required in args
+expected_service_tier = os.environ.get("FAKE_CODEX_SERVICE_TIER")
+if expected_service_tier is not None:
+    assert f'service_tier="{expected_service_tier}"' in args
 assert Path.cwd().name.startswith("agent-team-timeline-summary-")
 repository_check = subprocess.run(
     ["git", "rev-parse", "--is-inside-work-tree"],
@@ -379,6 +422,7 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
     log = tmp_path / "calls.log"
     _write_fake_codex(fake)
     monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    monkeypatch.setenv("FAKE_CODEX_SERVICE_TIER", "priority")
     jobs = [_job("agent-a"), _job("agent-b"), _job("agent-c")]
 
     results, stats = summarize_jobs(
@@ -389,6 +433,7 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
         max_workers=1,
         batch_size=2,
         codex_command=(sys.executable, str(fake)),
+        service_tier="priority",
     )
     assert stats.hits == 0
     assert stats.misses == 3
@@ -407,7 +452,9 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
     assert stats.unknown_legacy_artifacts == 0
     assert stats.usage_run_path is not None
     run = json.loads(stats.usage_run_path.read_text(encoding="utf-8"))
+    assert run["schema_version"] == 2
     assert run["model"] == "gpt-test"
+    assert run["service_tier"] == "priority"
     assert run["newly_spent_usage"]["total_tokens"] == 240
     assert len(run["batch_receipt_ids"]) == 2
     assert list(results) == [job.key for job in jobs]
@@ -426,6 +473,7 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
         max_workers=1,
         batch_size=2,
         codex_command=(sys.executable, str(fake)),
+        service_tier="priority",
     )
     assert cached_stats.hits == 3
     assert cached_stats.batches == 0
@@ -434,6 +482,31 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
     assert cached_stats.artifact_generation_usage == stats.artifact_generation_usage
     assert cached_stats.artifact_generation_unknown_receipts == 0
     assert log.read_text(encoding="utf-8") == log_text
+
+    monkeypatch.setenv("FAKE_CODEX_SERVICE_TIER", "default")
+    _, default_stats = summarize_jobs(
+        [jobs[0]],
+        tmp_path / "default-cache",
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        batch_size=2,
+        codex_command=(sys.executable, str(fake)),
+    )
+    assert default_stats.usage_run_path is not None
+    default_run = json.loads(
+        default_stats.usage_run_path.read_text(encoding="utf-8")
+    )
+    assert default_run["service_tier"] == "default"
+    default_receipt_id = default_run["batch_receipt_ids"][0]
+    default_receipt = json.loads(
+        (
+            default_stats.usage_run_path.parent.parent
+            / "receipts"
+            / f"{default_receipt_id}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert default_receipt["service_tier"] == "default"
 
 
 def test_codex_backend_caches_model_backed_knowledge_with_usage(

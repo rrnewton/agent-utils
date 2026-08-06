@@ -16,6 +16,7 @@ def _report() -> SummarizeReport:
         backend="codex",
         model="gpt-5.6-sol",
         reasoning_effort="xhigh",
+        service_tier="priority",
         phases=4,
         rollups=1,
         agent_names=2,
@@ -64,7 +65,7 @@ def test_summary_output_separates_new_spend_from_artifact_cost(
     assert "3 legacy artifact(s) have no usage receipt" in output
 
 
-def test_reasoning_effort_reaches_pipeline(
+def test_reasoning_effort_and_service_tier_reach_pipeline(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     seen: dict[str, object] = {}
@@ -82,6 +83,7 @@ def test_reasoning_effort_reaches_pipeline(
             backend=backend,
             model=model,
             reasoning_effort=kwargs.get("reasoning_effort"),
+            service_tier=kwargs.get("service_tier"),
         )
         return _report()
 
@@ -98,8 +100,15 @@ def test_reasoning_effort_reaches_pipeline(
             "model-under-test",
             "--reasoning-effort",
             "high",
+            "--service-tier",
+            "priority",
         ]
     )
     timeline_cli._summary_call(ns)
     assert seen["model"] == "model-under-test"
     assert seen["reasoning_effort"] == "high"
+    assert seen["service_tier"] == "priority"
+    default_ns = parser.parse_args(
+        ["summarize", "--output", str(tmp_path), "--team", "test-team"]
+    )
+    assert default_ns.service_tier is None

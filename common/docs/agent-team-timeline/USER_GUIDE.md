@@ -108,6 +108,7 @@ agent-team-timeline refresh \
   --backend codex \
   --model gpt-5.6-sol \
   --reasoning-effort xhigh \
+  --service-tier priority \
   --summary-workers 3 \
   --name-batch-size 12
 ```
@@ -207,7 +208,8 @@ counts; agent blocks and task notes provide incarnation lifetimes and timestampe
 ```bash
 agent-team-timeline summarize \
   --team example-team --output ./timelines/example-team \
-  --backend codex --model gpt-5.6-sol --reasoning-effort xhigh
+  --backend codex --model gpt-5.6-sol --reasoning-effort xhigh \
+  --service-tier priority
 ```
 
 Each stable time window gets a content-addressed cache key over:
@@ -215,7 +217,15 @@ Each stable time window gets a content-addressed cache key over:
 - its transcript input;
 - the substantial ancestor/coordinator scroll-back window;
 - only glossary terms available by that point in history;
-- model, backend, prompt version, and summary schema.
+- model, reasoning effort, optional service tier, backend, prompt version, and summary schema.
+
+Codex's catalog label **Fast** maps to the canonical service-tier value `priority`. Passing
+`--service-tier priority` adds `-c service_tier="priority"` to every Codex summary and hindsight
+naming invocation. Omitting the flag and passing `--service-tier default` are the same canonical
+choice: every Codex child receives `-c service_tier="default"`, while its cache hash remains
+compatible with summaries generated before tier support. Priority has a distinct summary and
+hindsight-name cache identity. The effective value appears in immutable batch, invocation, and
+top-level run receipts. A service tier is rejected with the deterministic heuristic backend.
 
 Every calendar period has two distinct jobs and cache identities. The technical summary remains
 content-led and must explain what a pull request, task, or phase changed instead of using its number
@@ -262,22 +272,25 @@ agent (batched normally); phase and calendar summaries remain cache hits. Later 
 all-hit again. The whole summarize transaction holds the archive writer lock, preventing two
 simultaneous refreshes from buying the same cache miss.
 
-Every backend batch writes an immutable usage receipt with its model, reasoning effort, input,
-cached-input, cache-write-input, output, reasoning-output, and total token counts. Cache records
-link to that receipt. The command prints both tokens newly spent by this run and the deduplicated
-original generation cost of all returned artifacts; an all-hit rerun therefore reports zero new
-tokens without losing the original cost. Older cache entries remain valid and are reported
-explicitly as having unknown original usage rather than being regenerated or counted as zero.
+Every backend batch writes an immutable usage receipt with its model, reasoning effort, service
+tier, input, cached-input, cache-write-input, output, reasoning-output, and total token counts.
+Cache records link to that receipt. The command prints both tokens newly spent by this run and the
+deduplicated original generation cost of all returned artifacts; an all-hit rerun therefore
+reports zero new tokens without losing the original cost. Older cache entries remain valid and are
+reported explicitly as having unknown original usage rather than being regenerated or counted as zero.
 Aggregate accounting and receipt paths are also retained in the top-level `runs/*.json` metadata.
 From the archive directory, `make run-stats` formats those top-level records as an oldest-to-newest
 run history, including cache hits/misses, generated products, build counts, newly spent tokens, and
-returned-artifact provenance costs. Backend receipts are also attributed to their serialized
-summarize/refresh invocation by timestamp, so a failed top-level run still shows its completed and
-failed batches and their known token subtotal. If even one attributed receipt lacks usage, the
-actual total is labeled `UNKNOWN` rather than presenting that subtotal as a zero or complete cost.
-The report separately scans the immutable backend receipt ledger and
-groups actual attempts by backend, model, and reasoning effort. This archive-wide ledger includes a
-failed attempt when the backend returned usage before failing; any usage-less receipt remains
+returned-artifact provenance costs. Backend receipts are attributed only when the team matches and
+one top-level summarize/refresh command window contains their timestamps, so a failed run still
+shows its completed and failed batches and their known token subtotal. Concurrent top-level
+windows can overlap while waiting for the summary lock; ambiguous receipts remain unattributed
+rather than being guessed. Receipt schemas and content hashes are validated before a record enters
+the ledger. If even one attributed receipt lacks usage, the actual total is labeled `UNKNOWN`
+rather than presenting that subtotal as a zero or complete cost.
+The report separately scans the immutable backend receipt ledger and groups actual attempts by
+backend, model, reasoning effort, and service tier. This archive-wide ledger includes a failed
+attempt when the backend returned usage before failing; any usage-less receipt remains
 explicitly unknown. Returned-artifact generation cost is never added to new spend.
 
 For offline development or tests:
