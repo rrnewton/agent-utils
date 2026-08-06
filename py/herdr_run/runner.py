@@ -19,7 +19,9 @@ parse as an integer is treated as an incomplete write rather than as a corrupt r
 from __future__ import annotations
 
 import json
+import math
 import os
+import stat
 import time
 import fcntl
 from collections.abc import Callable, Iterator
@@ -28,8 +30,8 @@ from dataclasses import dataclass
 
 from herdr_run.allowlist import Admission, reject_terminal_controls
 from herdr_run.client import HerdrClient
-from herdr_run.config import Config
-from herdr_run.errors import HerdrUnavailable, PaneBusy, RunTimeout
+from herdr_run.config import MAX_TIMEOUT_SECONDS, Config
+from herdr_run.errors import ConfigError, HerdrUnavailable, PaneBusy, RunTimeout
 from herdr_run.readiness import Readiness, assess, infer_prompt_tail
 from herdr_run.retention import prune_runs, runs_root
 from herdr_run.session import Target
@@ -55,6 +57,8 @@ class RunResult:
     exit_code: int
     stdout: str
     stderr: str
+    stdout_bytes: bytes
+    stderr_bytes: bytes
     run_id: str
     spool: SpoolPaths
     target: Target
@@ -83,7 +87,9 @@ def _spool_root(config: Config) -> str:
 
 def _ensure_private_directory(path: str) -> None:
     os.makedirs(path, mode=0o700, exist_ok=True)
-    os.chmod(path, 0o700)
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise NotADirectoryError(f"run spool path is not a real directory: {path}")
 
 
 def _create_private_file(path: str, contents: bytes = b"") -> None:
@@ -133,7 +139,6 @@ def _allocate_spool(config: Config, base_run_id: str) -> tuple[str, SpoolPaths]:
         spool = spool_paths(config, run_id)
         try:
             os.mkdir(spool.directory, mode=0o700)
-            os.chmod(spool.directory, 0o700)
         except FileExistsError:
             continue
         except OSError as exc:
@@ -195,6 +200,7 @@ def wait_ready(
     asynchronously: for a few milliseconds after a previous command is submitted the kernel has not
     yet moved the foreground process group, so a single sample can catch a busy pane looking idle.
     """
+    _validate_timeout(timeout, "readiness timeout")
     deadline = monotonic() + max(timeout, 0.0)
     consecutive = 0
     readings = 0
@@ -274,24 +280,35 @@ def _read_exit_code(path: str) -> int | None:
         return None
 
 
-def _read_text(path: str) -> str:
+def _read_bytes(path: str) -> bytes:
     try:
         with open(path, "rb") as handle:
-            return handle.read().decode("utf-8", errors="replace")
-    except OSError:
+            return handle.read()
+    except OSError as exc:
+        raise HerdrUnavailable(f"cannot read run spool output {path}: {exc}") from exc
+
+
+def _read_text_best_effort(path: str) -> str:
+    try:
+        return _read_bytes(path).decode("utf-8", errors="replace")
+    except HerdrUnavailable:
         return ""
 
 
 def read_output_bytes(result: RunResult) -> tuple[bytes, bytes]:
-    """Read captured stdout/stderr without decoding, for byte-preserving CLI passthrough."""
-    output: list[bytes] = []
-    for path in (result.spool.stdout, result.spool.stderr):
-        try:
-            with open(path, "rb") as handle:
-                output.append(handle.read())
-        except OSError:
-            output.append(b"")
-    return output[0], output[1]
+    """Return the byte-exact stdout/stderr captured with this immutable result."""
+    return result.stdout_bytes, result.stderr_bytes
+
+
+def _validate_timeout(value: float, what: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{what}: must be a number")
+    if not math.isfinite(value):
+        raise ConfigError(f"{what}: must be finite")
+    if value < 0:
+        raise ConfigError(f"{what}: must not be negative")
+    if value > MAX_TIMEOUT_SECONDS:
+        raise ConfigError(f"{what}: must not exceed {MAX_TIMEOUT_SECONDS:g} seconds")
 
 
 def execute(
@@ -311,6 +328,8 @@ def execute(
     home: str | None = None,
 ) -> RunResult:
     """Run ``admission`` in ``target``'s pane and return its real result."""
+    _validate_timeout(ready_timeout, "readiness timeout")
+    _validate_timeout(timeout, "command timeout")
     lock_started = monotonic()
     with _pane_lock(
         target,
@@ -334,13 +353,14 @@ def execute(
         )
 
         base_run_id = make_run_id(agent, now=now(), pid=os.getpid())
-        run_id, spool = _allocate_spool(config, base_run_id)
         # Retention is applied as a side effect of writing a new run, so it cannot silently stop
-        # the way a cron or timer can. It never raises; see :mod:`herdr_run.retention`.
+        # the way a cron or timer can. Prune before allocation so a zero-day window cannot select
+        # the brand-new run itself. It never raises; see :mod:`herdr_run.retention`.
         prune_runs(
             runs_root(config.spool_dir, config.project_root),
             retention_days=config.retention_days,
         )
+        run_id, spool = _allocate_spool(config, base_run_id)
         # Pre-create output files; exit_code deliberately remains absent as the completion signal.
         try:
             for path in (spool.stdout, spool.stderr):
@@ -359,10 +379,14 @@ def execute(
         while True:
             code = _read_exit_code(spool.exit_code)
             if code is not None:
+                stdout_bytes = _read_bytes(spool.stdout)
+                stderr_bytes = _read_bytes(spool.stderr)
                 return RunResult(
                     exit_code=code,
-                    stdout=_read_text(spool.stdout),
-                    stderr=_read_text(spool.stderr),
+                    stdout=stdout_bytes.decode("utf-8", errors="replace"),
+                    stderr=stderr_bytes.decode("utf-8", errors="replace"),
+                    stdout_bytes=stdout_bytes,
+                    stderr_bytes=stderr_bytes,
                     run_id=run_id,
                     spool=spool,
                     target=target,
@@ -380,8 +404,8 @@ def execute(
             f"{target.pane_id} ({target.tab_label}) and was not killed. Partial output is in "
             f"{spool.directory}; the exit code will appear in {spool.exit_code} when it finishes."
         )
-        timed_out.partial_stdout = _read_text(spool.stdout)
-        timed_out.partial_stderr = _read_text(spool.stderr)
+        timed_out.partial_stdout = _read_text_best_effort(spool.stdout)
+        timed_out.partial_stderr = _read_text_best_effort(spool.stderr)
         timed_out.spool_directory = spool.directory
         raise timed_out
 

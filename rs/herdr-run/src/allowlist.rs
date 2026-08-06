@@ -205,6 +205,27 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         .value_options
         .get(&program)
         .map_or(&[][..], Vec::as_slice);
+
+    // Cargo accepts its "global" flags on either side of the subcommand. Check every token first,
+    // including clap's attached/clustered short forms (`-Zfoo`, `-Z=foo`, `-qZfoo`).
+    if program == "cargo" {
+        let cargo_denied = deny_global
+            .iter()
+            .map(String::as_str)
+            .chain(["--config", "-Z"]);
+        for token in args {
+            if let Some(denied) = cargo_denied
+                .clone()
+                .find(|denied| matches_denied_option(token, denied))
+            {
+                return Err(HerdrRunError::refused(format!(
+                    "option {} is denied everywhere for cargo: it can make cargo execute arbitrary code",
+                    python_repr(denied)
+                )));
+            }
+        }
+    }
+
     let mut subcommand = None;
     let mut expect_value = false;
     for token in args {
@@ -219,14 +240,37 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         let (base, has_inline_value) = token
             .split_once('=')
             .map_or((token.as_str(), false), |(name, _)| (name, true));
-        if deny_global.iter().any(|denied| denied == base) {
+        if let Some(denied) = deny_global
+            .iter()
+            .find(|denied| matches_denied_option(token, denied))
+        {
             return Err(HerdrRunError::refused(format!(
                 "global option {} is denied for {program}: it can make {program} execute arbitrary code",
-                python_repr(base)
+                python_repr(denied)
             )));
         }
         if !has_inline_value && value_options.iter().any(|option| option == base) {
             expect_value = true;
+        }
+    }
+    let allowed_subcommands = config.allow_subcommand.get(&program);
+    if program == "cargo" && allowed_subcommands.is_none() {
+        return Err(HerdrRunError::refused(
+            "cargo requires an explicit allow_subcommand entry; omitting its positive list would silently admit compilation-oriented and unknown subcommands",
+        ));
+    }
+    if let Some(allowed) = allowed_subcommands {
+        let Some(candidate) = subcommand.as_deref() else {
+            return Err(HerdrRunError::refused(format!(
+                "{program} requires a subcommand, and only these are allowed: {}",
+                sorted_join(allowed)
+            )));
+        };
+        if !allowed.iter().any(|item| item == candidate) {
+            return Err(HerdrRunError::refused(format!(
+                "subcommand '{program} {candidate}' is not allowlisted. Allowed: {}. {program} compilation-oriented and unknown subcommands are deliberately excluded. Cargo must also be explicitly allowlisted because even dependency commands may execute ambiently configured helpers.",
+                sorted_join(allowed)
+            )));
         }
     }
     if let Some(candidate) = subcommand.as_deref() {
@@ -248,6 +292,27 @@ pub fn admit(command: &str, config: &Config) -> Result<Admission> {
         subcommand,
         rendered,
     })
+}
+
+fn matches_denied_option(token: &str, denied: &str) -> bool {
+    if token == denied
+        || token
+            .strip_prefix(denied)
+            .is_some_and(|rest| rest.starts_with('='))
+    {
+        return true;
+    }
+    let mut denied_chars = denied.chars();
+    let Some('-') = denied_chars.next() else {
+        return false;
+    };
+    let Some(short) = denied_chars.next() else {
+        return false;
+    };
+    if denied_chars.next().is_some() || token.starts_with("--") || !token.starts_with('-') {
+        return false;
+    }
+    token[1..].contains(short)
 }
 
 fn sorted_join(values: &[String]) -> String {
@@ -473,6 +538,7 @@ mod tests {
         assert_eq!(admission.prefix, vec!["with-proxy"]);
         assert_eq!(admission.program, "git");
         assert_eq!(admission.subcommand.as_deref(), Some("log"));
+        assert!(admit("cargo fetch", &config).is_err());
     }
 
     #[test]
@@ -611,6 +677,88 @@ mod tests {
         assert_eq!(admit("cargo fetch", &config).unwrap().program, "cargo");
         assert!(admit("git status", &config).is_err());
         assert!(admit("with-proxy cargo fetch", &config).is_err());
+    }
+
+    #[test]
+    fn cargo_is_disabled_by_default_and_explicit_opt_in_is_fail_closed() {
+        assert!(admit("cargo fetch", &Config::default()).is_err());
+        let mut config = Config::default();
+        config.allow.push("cargo".to_owned());
+        for command in [
+            "cargo fetch",
+            "with-proxy cargo fetch --manifest-path /w/Cargo.toml",
+            "cargo update -p serde",
+            "cargo generate-lockfile",
+            "cargo vendor",
+            "cargo metadata",
+        ] {
+            assert!(admit(command, &config).is_ok(), "{command}");
+        }
+        for command in [
+            "cargo",
+            "cargo build",
+            "cargo test",
+            "cargo run",
+            "cargo bench",
+            "cargo install ripgrep",
+            "cargo rustc",
+            "cargo clippy",
+            "cargo doc",
+            "cargo miri test",
+            "cargo something-new",
+            "with-proxy cargo build",
+            "cargo --config build.rustc-wrapper=/tmp/evil fetch",
+            "cargo --config=build.rustc-wrapper=/tmp/evil fetch",
+            "cargo fetch --config build.rustc-wrapper=/tmp/evil",
+            "cargo fetch --config=build.rustc-wrapper=/tmp/evil",
+            "cargo -Z unstable-options fetch",
+            "cargo -Zunstable-options fetch",
+            "cargo fetch -Z unstable-options",
+            "cargo fetch -Zunstable-options",
+            "cargo fetch -Z=unstable-options",
+            "cargo fetch -qZunstable-options",
+        ] {
+            assert!(admit(command, &config).is_err(), "{command}");
+        }
+    }
+
+    #[test]
+    fn cargo_opt_in_cannot_drop_its_positive_subcommand_policy() {
+        let mut config = Config::default();
+        config.allow.push("cargo".to_owned());
+        config.allow_subcommand.clear();
+        config
+            .allow_subcommand
+            .insert("custom-tool".to_owned(), vec!["inspect".to_owned()]);
+
+        let error = admit("cargo build", &config).unwrap_err();
+        assert!(error
+            .message()
+            .contains("requires an explicit allow_subcommand"));
+    }
+
+    #[test]
+    fn cargo_minimum_injection_denies_cannot_be_removed() {
+        let mut config = Config {
+            allow: vec!["cargo".to_owned()],
+            ..Config::default()
+        };
+        config.deny_global.clear();
+        for command in ["cargo fetch --config=x", "cargo fetch -Zunstable-options"] {
+            let error = admit(command, &config).unwrap_err();
+            assert!(error.message().contains("denied"));
+        }
+    }
+
+    #[test]
+    fn project_can_explicitly_widen_the_cargo_subcommand_policy() {
+        let mut config = Config::default();
+        config.allow.push("cargo".to_owned());
+        config.allow_subcommand.insert(
+            "cargo".to_owned(),
+            vec!["fetch".to_owned(), "build".to_owned()],
+        );
+        assert!(admit("cargo build", &config).is_ok());
     }
 
     #[test]

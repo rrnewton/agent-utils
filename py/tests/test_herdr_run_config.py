@@ -11,6 +11,7 @@ import os
 import pytest
 
 from herdr_run.config import (
+    MAX_RETENTION_DAYS,
     MAX_TIMEOUT_SECONDS,
     Config,
     find_config_file,
@@ -27,9 +28,9 @@ def test_defaults_match_the_intended_policy() -> None:
     config = Config()
     assert config.workspace == "agent-cmds"
     assert config.tab_name == "{agent}"
-    assert config.allow == ("git", "gh", "cargo")
+    assert config.allow == ("git", "gh")
     assert config.prefixes == ("with-proxy",)
-    # cargo is admitted only for network-only subcommands; see the threat model.
+    # Cargo is disabled by default. This limits a project's explicit trust widening.
     assert "build" not in config.allow_subcommand["cargo"]
     assert "fetch" in config.allow_subcommand["cargo"]
     assert config.readiness == "both"
@@ -39,7 +40,7 @@ def test_no_config_file_anywhere_yields_defaults(tmp_path: object) -> None:
     root = str(tmp_path)
     config = load_config(explicit_path=None, start_dir=root)
     assert config.source_path is None
-    assert config.allow == ("git", "gh", "cargo")
+    assert config.allow == ("git", "gh")
 
 
 # --- discovery -----------------------------------------------------------------------------------
@@ -119,7 +120,7 @@ def test_parses_every_supported_key() -> None:
 
 def test_empty_document_is_defaults() -> None:
     config = parse_config(None, source_path="/tmp/x.yaml", project_root="/tmp")
-    assert config.allow == ("git", "gh", "cargo")
+    assert config.allow == ("git", "gh")
 
 
 def test_unknown_key_is_rejected() -> None:
@@ -135,6 +136,18 @@ def test_empty_allowlist_is_rejected() -> None:
         parse_config({"allow": []}, source_path="/tmp/x.yaml", project_root="/tmp")
 
 
+def test_cargo_allow_requires_its_positive_subcommand_map() -> None:
+    with pytest.raises(ConfigError, match="cargo is allowed but has no positive"):
+        parse_config(
+            {
+                "allow": ["git", "cargo"],
+                "allow_subcommand": {"custom-tool": ["inspect"]},
+            },
+            source_path="/tmp/x.yaml",
+            project_root="/tmp",
+        )
+
+
 @pytest.mark.parametrize(
     "document,pattern",
     [
@@ -144,6 +157,10 @@ def test_empty_allowlist_is_rejected() -> None:
         ({"timeout_seconds": "soon"}, "must be a number"),
         ({"timeout_seconds": -1}, "must not be negative"),
         ({"timeout_seconds": MAX_TIMEOUT_SECONDS + 1}, "must not exceed"),
+        ({"retention_days": -1}, "non-negative integer"),
+        ({"retention_days": 1.5}, "non-negative integer"),
+        ({"retention_days": "4"}, "non-negative integer"),
+        ({"retention_days": MAX_RETENTION_DAYS + 1}, "must not exceed"),
         ({"readiness": "maybe"}, "must be one of"),
         ({"broker": "carrier-pigeon"}, "must be one of"),
         ({"deny_global": ["git"]}, "expected an object"),

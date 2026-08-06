@@ -94,6 +94,27 @@ def _split(command: str) -> tuple[str, ...]:
     return tuple(tokens)
 
 
+def _matches_denied_option(token: str, denied: str) -> bool:
+    """Match long ``=value`` and Cargo/clap-style attached short-option forms.
+
+    Cargo accepts global options after its subcommand and accepts ``-Zfoo``, ``-Z=foo``, and
+    clustered forms such as ``-qZfoo``. Looking only at ``token.split("=")[0]`` therefore leaves a
+    policy bypass. Matching a denied one-letter short option anywhere in a short-option cluster is
+    intentionally fail-closed; dependency-oriented Cargo commands have no positional argument for
+    which a leading-dash token containing ``Z`` is required.
+    """
+    if token == denied or token.startswith(f"{denied}="):
+        return True
+    return (
+        len(denied) == 2
+        and denied.startswith("-")
+        and not denied.startswith("--")
+        and token.startswith("-")
+        and not token.startswith("--")
+        and denied[1] in token[1:]
+    )
+
+
 def admit(command: str, config: Config) -> Admission:
     """Admit ``command`` under ``config``, or raise :class:`Refused` explaining exactly why.
 
@@ -145,10 +166,27 @@ def admit(command: str, config: Config) -> Admission:
         if token.split("=", 1)[0] in config.deny_anywhere:
             raise Refused(f"option {token!r} is denied: it names a program for {program} to execute")
 
-    # Global options are the tokens BEFORE the first non-option token; that is where git puts the
-    # config/exec-path switches that turn `git` into an arbitrary-code runner.
+    # Git global options are the tokens BEFORE the first non-option token; that is where git puts
+    # config/exec-path switches that turn it into an arbitrary-code runner. Cargo is scanned across
+    # the full argv below because it accepts global flags after the subcommand too.
     deny_global = config.deny_global.get(program, ())
     value_options = config.value_options.get(program, ())
+
+    # Cargo's "global" flags are accepted on EITHER side of the subcommand. Scan the entire argv
+    # before finding the subcommand so `cargo fetch --config ...` and attached/clustered `-Z` forms
+    # cannot bypass the same checks that reject `cargo --config ... fetch`.
+    if program == "cargo":
+        cargo_denied = tuple(dict.fromkeys((*deny_global, "--config", "-Z")))
+        for token in args:
+            denied = next(
+                (option for option in cargo_denied if _matches_denied_option(token, option)), None
+            )
+            if denied is not None:
+                raise Refused(
+                    f"option {denied!r} is denied everywhere for cargo: it can make cargo execute "
+                    "arbitrary code"
+                )
+
     subcommand: str | None = None
     expect_value = False
     for token in args:
@@ -162,9 +200,12 @@ def admit(command: str, config: Config) -> Admission:
             subcommand = token
             break
         base = token.split("=", 1)[0]
-        if base in deny_global:
+        denied = next(
+            (option for option in deny_global if _matches_denied_option(token, option)), None
+        )
+        if denied is not None:
             raise Refused(
-                f"global option {base!r} is denied for {program}: it can make {program} execute "
+                f"global option {denied!r} is denied for {program}: it can make {program} execute "
                 "arbitrary code"
             )
         if base in value_options and "=" not in token:
@@ -175,6 +216,11 @@ def admit(command: str, config: Config) -> Admission:
     # is what makes `cargo` admissible at all -- `cargo fetch` only downloads, while `cargo build`
     # would execute build scripts from third-party crates OUTSIDE the sandbox.
     allowed_subcommands = config.allow_subcommand.get(program)
+    if program == "cargo" and allowed_subcommands is None:
+        raise Refused(
+            "cargo requires an explicit allow_subcommand entry; omitting its positive list would "
+            "silently admit compilation-oriented and unknown subcommands"
+        )
     if allowed_subcommands is not None:
         if subcommand is None:
             raise Refused(
@@ -185,8 +231,9 @@ def admit(command: str, config: Config) -> Admission:
             raise Refused(
                 f"subcommand '{program} {subcommand}' is not allowlisted. Allowed: "
                 f"{', '.join(sorted(allowed_subcommands))}. "
-                f"{program} subcommands that compile or execute code are deliberately excluded: "
-                "fetch through this tool, then build in-jail with --offline against the warm cache."
+                f"{program} compilation-oriented and unknown subcommands are deliberately "
+                "excluded. Cargo must also be explicitly allowlisted because even dependency "
+                "commands may execute ambiently configured helpers."
             )
 
     if subcommand is not None and subcommand in config.deny_subcommand.get(program, ()):

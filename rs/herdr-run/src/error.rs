@@ -1,6 +1,7 @@
 //! Typed failures and stable process exit codes for `herdr-run`.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 /// Configuration is malformed or cannot be read (`EX_CONFIG`).
 pub const EXIT_CONFIG: i32 = 78;
@@ -50,6 +51,9 @@ impl ErrorKind {
 pub struct HerdrRunError {
     kind: ErrorKind,
     message: String,
+    partial_stdout: String,
+    partial_stderr: String,
+    spool_directory: Option<PathBuf>,
 }
 
 impl HerdrRunError {
@@ -58,6 +62,9 @@ impl HerdrRunError {
         Self {
             kind,
             message: message.into(),
+            partial_stdout: String::new(),
+            partial_stderr: String::new(),
+            spool_directory: None,
         }
     }
 
@@ -86,6 +93,22 @@ impl HerdrRunError {
         Self::new(ErrorKind::Timeout, message)
     }
 
+    /// Construct a launched-command timeout carrying output captured before the deadline.
+    pub fn timeout_with_partial(
+        message: impl Into<String>,
+        partial_stdout: String,
+        partial_stderr: String,
+        spool_directory: PathBuf,
+    ) -> Self {
+        Self {
+            kind: ErrorKind::Timeout,
+            message: message.into(),
+            partial_stdout,
+            partial_stderr,
+            spool_directory: Some(spool_directory),
+        }
+    }
+
     /// Return this failure's stable category.
     #[must_use]
     pub const fn kind(&self) -> ErrorKind {
@@ -102,6 +125,24 @@ impl HerdrRunError {
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
         self.kind.exit_code()
+    }
+
+    /// Return standard output captured before a launched command timed out.
+    #[must_use]
+    pub fn partial_stdout(&self) -> &str {
+        &self.partial_stdout
+    }
+
+    /// Return standard error captured before a launched command timed out.
+    #[must_use]
+    pub fn partial_stderr(&self) -> &str {
+        &self.partial_stderr
+    }
+
+    /// Return the run spool containing a timed-out command's eventual completion evidence.
+    #[must_use]
+    pub fn spool_directory(&self) -> Option<&Path> {
+        self.spool_directory.as_deref()
     }
 }
 
@@ -137,5 +178,23 @@ mod tests {
         assert_eq!(error.exit_code(), EXIT_REFUSED);
         assert_eq!(error.message(), "program 'sh' is not allowlisted");
         assert_eq!(error.to_string(), error.message());
+        assert_eq!(error.partial_stdout(), "");
+        assert_eq!(error.partial_stderr(), "");
+        assert_eq!(error.spool_directory(), None);
+    }
+
+    #[test]
+    fn timeout_context_preserves_partial_output_and_spool() {
+        let error = HerdrRunError::timeout_with_partial(
+            "still running",
+            "partial out\n".to_owned(),
+            "partial err\n".to_owned(),
+            PathBuf::from("/tmp/spool/run"),
+        );
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(error.exit_code(), EXIT_TIMEOUT);
+        assert_eq!(error.partial_stdout(), "partial out\n");
+        assert_eq!(error.partial_stderr(), "partial err\n");
+        assert_eq!(error.spool_directory(), Some(Path::new("/tmp/spool/run")));
     }
 }

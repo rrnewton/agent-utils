@@ -2,7 +2,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
@@ -112,16 +112,20 @@ fn record_at(
     let Some(parent) = path.parent() else {
         return false;
     };
-    if fs::create_dir_all(parent).is_err() {
-        return false;
-    }
-    if fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).is_err() {
+    let mut parent_builder = fs::DirBuilder::new();
+    if parent_builder
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .is_err()
+    {
         return false;
     }
     if let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .open(path)
     {
         if file
@@ -218,5 +222,54 @@ mod tests {
             "d",
             Map::new(),
         ));
+    }
+
+    #[test]
+    fn audit_does_not_chmod_an_existing_parent_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr-audit-existing-parent-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(record(
+            &root.join("audit.jsonl"),
+            "agent",
+            "git status",
+            "DRY-RUN",
+            "fixture",
+            Map::new(),
+        ));
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audit_refuses_a_symlink_instead_of_modifying_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("herdr-audit-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let victim = root.join("victim");
+        fs::write(&victim, b"must survive\n").unwrap();
+        let link = root.join("audit.jsonl");
+        symlink(&victim, &link).unwrap();
+
+        assert!(!record(
+            &link,
+            "agent",
+            "git status",
+            "DRY-RUN",
+            "fixture",
+            Map::new(),
+        ));
+        assert_eq!(fs::read(&victim).unwrap(), b"must survive\n");
+        let _ = fs::remove_dir_all(root);
     }
 }

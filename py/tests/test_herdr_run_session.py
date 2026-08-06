@@ -223,6 +223,21 @@ def test_corrupt_cache_is_ignored_rather_than_fatal(tmp_path: object) -> None:
         assert isinstance(json.load(handle), dict)
 
 
+def test_invalid_utf8_cache_is_ignored_rather_than_escaping(tmp_path: object) -> None:
+    root = str(tmp_path)
+    config = _config(root)
+    path = cache_path(config)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(b"\xff\xfe")
+
+    target = resolve_target(_client(FakeHerdrClient()), config, "agent")
+
+    assert target.from_cache is False
+    with open(path, encoding="utf-8") as handle:
+        assert isinstance(json.load(handle), dict)
+
+
 def test_no_cache_forces_re_resolution(tmp_path: object) -> None:
     root = str(tmp_path)
     fake = FakeHerdrClient()

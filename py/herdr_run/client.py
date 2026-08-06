@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import pwd
+import signal
 import stat
 import subprocess
 import time
@@ -47,6 +48,21 @@ SERVER_UNIT = "herdr-run-server"
 #: its separate configurable timeout in the pane runner.
 CONTROL_TIMEOUT_SECONDS = 30.0
 
+# Linux exposes process IDs through the positive range of its signed ``pid_t``.  Keep this bound
+# explicit so Python's arbitrary-precision integers cannot accept protocol values that the Rust
+# implementation (or a Linux process API) cannot represent.
+_MAX_PROCESS_ID = 2_147_483_647
+
+
+def _get_process_id(mapping: dict[str, object], key: str, what: str) -> int:
+    """Require one positive Linux ``pid_t``-compatible protocol value."""
+    value = get_int(mapping, key, what)
+    if not 1 <= value <= _MAX_PROCESS_ID:
+        raise TypeError(
+            f"{what}: field {key!r} is outside the positive Linux pid_t range"
+        )
+    return value
+
 
 @dataclass(frozen=True)
 class Pane:
@@ -68,17 +84,51 @@ class ProcessInfo:
     foreground: tuple[tuple[int, str, str], ...]
 
 
-def default_runner(command: Sequence[str]) -> "subprocess.CompletedProcess[str]":
-    """Run a command and capture its output. The real runner, replaced by tests."""
-    return subprocess.run(
-        list(command),
+def _bounded_control_command(
+    command: Sequence[str],
+    *,
+    environ: Mapping[str, str] | None = None,
+    timeout: float = CONTROL_TIMEOUT_SECONDS,
+) -> "subprocess.CompletedProcess[str]":
+    """Capture one control command and kill its whole process group on timeout.
+
+    A Herdr or ``systemd-run`` wrapper may itself start helpers which inherit the captured pipes.
+    Giving every control call a fresh session lets the timeout path terminate those descendants as
+    well as the immediate child, then reap the child before returning.  Otherwise a timed-out call
+    could leave an unbounded helper behind or block forever waiting for its inherited pipe ends.
+    """
+    argv = list(command)
+    process = subprocess.Popen(
+        argv,
         text=True,
         encoding="utf-8",
         errors="replace",
-        capture_output=True,
-        check=False,
-        timeout=CONTROL_TIMEOUT_SECONDS,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=None if environ is None else dict(environ),
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # start_new_session=True makes the child's PID its process-group ID.  Kill the group even
+        # when the immediate child happened to exit at the deadline: descendants may still own the
+        # captured pipe ends and are precisely what this cleanup is intended to catch.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        finally:
+            # Reap the immediate child and drain/close both pipes before exposing the timeout.
+            process.kill()
+            process.communicate()
+        raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
+def default_runner(command: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    """Run a command and capture its output. The real runner, replaced by tests."""
+    return _bounded_control_command(command)
 
 
 _PRODUCTION_RUNNER = default_runner
@@ -209,21 +259,12 @@ class HerdrClient:
             environ = dict(self._environ)
             environ.pop("PATH", None)
             environ["HOME"] = self._account_home()
-            return subprocess.run(
-                list(command),
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                check=False,
-                env=environ,
-                timeout=CONTROL_TIMEOUT_SECONDS,
-            )
+            return _bounded_control_command(command, environ=environ)
         except subprocess.TimeoutExpired as exc:
             raise HerdrUnavailable(
                 f"Herdr control command timed out after {CONTROL_TIMEOUT_SECONDS:g} seconds"
             ) from exc
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise HerdrUnavailable(f"cannot invoke Herdr: {exc}") from exc
 
     def _outside_jail(self, command: Sequence[str]) -> list[str]:
@@ -482,15 +523,15 @@ class HerdrClient:
                 process = as_mapping(entry, "foreground process")
                 foreground.append(
                     (
-                        get_int(process, "pid", "foreground process"),
+                        _get_process_id(process, "pid", "foreground process"),
                         opt_str(process, "name") or "",
                         opt_str(process, "cmdline") or "",
                     )
                 )
             parsed = ProcessInfo(
                 pane_id=get_str(info, "pane_id", "pane process-info"),
-                shell_pid=get_int(info, "shell_pid", "pane process-info"),
-                foreground_pgid=get_int(
+                shell_pid=_get_process_id(info, "shell_pid", "pane process-info"),
+                foreground_pgid=_get_process_id(
                     info, "foreground_process_group_id", "pane process-info"
                 ),
                 foreground=tuple(foreground),

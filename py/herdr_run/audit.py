@@ -18,6 +18,8 @@ import os
 import time
 from collections.abc import Callable
 
+from herdr_run.client import _bounded_control_command
+
 __all__ = ["audit_path", "record", "spool_is_ignored", "warn_if_spool_is_tracked"]
 
 
@@ -41,7 +43,7 @@ def spool_is_ignored(project_root: str, spool_dir: str) -> bool | None:
         spool_dir if os.path.isabs(spool_dir) else os.path.join(project_root, spool_dir)
     )
     try:
-        completed = subprocess.run(
+        completed = _bounded_control_command(
             [
                 "git",
                 "-C",
@@ -51,8 +53,6 @@ def spool_is_ignored(project_root: str, spool_dir: str) -> bool | None:
                 "--",
                 os.path.join(root, "probe"),
             ],
-            capture_output=True,
-            check=False,
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
@@ -112,7 +112,6 @@ def record(
     try:
         parent = os.path.dirname(path) or "."
         os.makedirs(parent, mode=0o700, exist_ok=True)
-        os.chmod(parent, 0o700)
         encoded = (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode(
             "utf-8"
         )

@@ -105,13 +105,19 @@ workspace: agent-cmds
 # Tab-label schema. {agent} = invoking agent, {project} = project directory basename.
 tab_name: "{agent}"
 
-# Working directory for commands (relative paths resolve against the project root).
+# Working directory for commands. null = caller's cwd; relative paths use the project root.
 cwd: null
 
 # Cooperative allowlist. Programs that may run. Keep it small.
 allow:
   - git
   - gh
+
+# Optional Cargo trust widening: add `cargo` to `allow` only if the project accepts that even
+# dependency-oriented Cargo commands may execute ambient wrappers/helpers. This fail-closed list
+# then prevents compilation-oriented and unknown subcommands; see Threat model.
+allow_subcommand:
+  cargo: [fetch, update, generate-lockfile, vendor, metadata, tree, search]
 
 # Wrapper programs that may PRECEDE an allowlisted program, never run on their own.
 prefixes:
@@ -120,6 +126,8 @@ prefixes:
 # Defense in depth (see Threat model) — not the boundary.
 deny_global:
   git: ["-c", "--config-env", "--exec-path", "--namespace"]
+  # Cargo accepts these before or after its subcommand; attached forms are also refused.
+  cargo: ["--config", "-Z"]
 deny_subcommand:
   git: ["filter-branch", "daemon", "instaweb"]
   gh:  ["alias", "extension", "ext", "codespace", "cs"]
@@ -129,6 +137,7 @@ deny_anywhere: ["--upload-pack", "--receive-pack"]
 spool_dir: .herdr-run
 
 timeout_seconds: 900          # wait for the command's exit code
+retention_days: 4             # completed run spools older than this are pruned on a later write
 ready_timeout_seconds: 0      # wait for the pane to go idle (0 = refuse immediately)
 
 readiness: both               # 'both' = process signal AND prompt veto; 'process' = drop the veto
@@ -137,8 +146,9 @@ prompt_tail: null             # e.g. "$ ". null = infer from ~/.bashrc / ~/.zshr
 broker: direct                # 'direct' | 'systemd-run' (see Brokering)
 ```
 
-Unknown or duplicate keys, merge keys, non-finite timeouts, control characters, and unsupported tab
-placeholders are hard errors. A typo'd policy key must not silently fall back to defaults.
+Unknown or duplicate keys, merge keys, non-finite/excessive timeouts, fractional/negative retention
+days, retention beyond 365,000 days, control characters, and unsupported tab placeholders are hard
+errors. A typo'd policy key must not silently fall back to defaults.
 
 ---
 
@@ -224,13 +234,29 @@ Raw mode writes `stdout` and `stderr` back without decoding. JSON mode includes 
 `stderr_base64` for byte-exact consumers and readable `stdout`/`stderr` decoded as UTF-8 with invalid
 sequences replaced.
 
-Each run directory holds `command`, `stdout`, `stderr`, `exit_code`, and `meta.json`.
-Spool, run, cache, and account-global lock directories are forced to mode `0700`; command output,
-metadata, cache, and lock files are forced to `0600`, independent of the caller's umask.
+Each run directory holds `command`, `stdout`, `stderr`, `exit_code`, and `meta.json`. Directories the
+tool creates for spool, run, cache, and account-global lock state use mode `0700`; command output,
+metadata, cache, and lock files use `0600`, independent of the caller's umask. A pre-existing
+configured spool directory is never chmoded: only tool-owned children and files are created below
+it, so `spool_dir: .` cannot silently change a project directory's permissions.
 
 If writing `meta.json` fails after a command completes, the failure is warned and recorded when
 possible, `--json` reports `"meta": null`, and the command's output and exit status are still
 returned.
+
+### Retention
+
+Run spools are pruned when a **new run is written**, not by a timer: a scheduled job that silently
+stops is indistinguishable from one that runs and finds nothing to do. A run is eligible only after
+it has a regular, parseable `exit_code` completion marker, and its age is measured from that file's
+mtime. Completed runs older than `retention_days` (four by default) are removed; active, timed-out,
+or incomplete runs are retained even if their directory itself is old.
+
+Scope is enforced rather than trusted: a symlink in the configured root or any ancestor disables
+that prune pass; entry symlinks are skipped; only directories whose lexical and canonical parent is
+the exact runs root are considered; and the root itself is never removed. The **audit log is never
+pruned**: it is a separate best-effort evidence trail, and a record that deletes itself would be
+misleading.
 
 ### Audit log
 
@@ -263,6 +289,15 @@ for "cannot start a second command", whereas re-quoting is the property itself.
 
 Also enforced: the program must be a **bare name** resolved from the pane's `PATH` (so `./git` or
 `/tmp/gh` cannot masquerade), and each wrapper prefix may appear at most once.
+
+**`cargo` is a special case and is not allowed by default.** Even `fetch` and `metadata` can execute
+ambiently configured compiler wrappers, credential providers, or fetch helpers, so calling those
+commands "download only" would overstate the boundary. A project may explicitly add `cargo` to
+`allow` when it accepts that trust widening. The built-in `allow_subcommand` policy then limits the
+opt-in to dependency-oriented commands; `build`, `test`, `run`, `install`, `clippy` and every
+third-party `cargo-*` subcommand remain refused. `--config` and unstable `-Z` flags are refused in
+every argument position, including attached forms. Fetching outside and building in-jail with
+`--offline` can still be operationally useful, but it is not a no-code-execution guarantee.
 
 **What is NOT guaranteed:** anything an allowlisted program can do by itself. `git` writes files,
 runs hooks from the repository being operated on, and honours ambient configuration. `gh`

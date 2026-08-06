@@ -12,9 +12,10 @@ use serde_json::{json, Value};
 
 use crate::allowlist::Admission;
 use crate::client::HerdrApi;
-use crate::config::Config;
+use crate::config::{Config, MAX_TIMEOUT_SECONDS};
 use crate::error::{HerdrRunError, Result};
 use crate::readiness::{assess, infer_prompt_tail, Readiness};
+use crate::retention::{prune_runs, runs_root};
 use crate::session::Target;
 use crate::state::{open_lock_file, pane_lock_path};
 use crate::timefmt;
@@ -92,7 +93,14 @@ fn spool_root(config: &Config) -> PathBuf {
 fn ensure_private_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700).create(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("run spool path is not a real directory: {}", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn create_private_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -153,14 +161,6 @@ fn allocate_spool(config: &Config, base_run_id: &str) -> Result<(String, SpoolPa
         let create = fs::DirBuilder::new().mode(0o700).create(&spool.directory);
         match create {
             Ok(()) => {
-                fs::set_permissions(&spool.directory, fs::Permissions::from_mode(0o700)).map_err(
-                    |error| {
-                        HerdrRunError::unavailable(format!(
-                            "cannot set private mode on run spool {}: {error}",
-                            spool.directory.display()
-                        ))
-                    },
-                )?;
                 return Ok((run_id, spool));
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -177,6 +177,16 @@ fn allocate_spool(config: &Config, base_run_id: &str) -> Result<(String, SpoolPa
     )))
 }
 
+fn apply_retention(config: &Config) {
+    let _ = prune_runs(
+        &runs_root(
+            Path::new(&config.spool_dir),
+            Path::new(&config.project_root),
+        ),
+        config.retention_days,
+    );
+}
+
 /// Poll until readiness holds for two consecutive samples.
 pub fn wait_ready<A: HerdrApi + ?Sized>(
     client: &A,
@@ -185,6 +195,7 @@ pub fn wait_ready<A: HerdrApi + ?Sized>(
     prompt_tail: Option<&str>,
     timeout: f64,
 ) -> Result<Readiness> {
+    validate_timeout(timeout, "readiness timeout")?;
     wait_ready_with(
         client,
         config,
@@ -339,6 +350,8 @@ pub fn execute<A: HerdrApi + ?Sized>(
     ready_timeout: f64,
     timeout: f64,
 ) -> Result<RunResult> {
+    validate_timeout(ready_timeout, "readiness timeout")?;
+    validate_timeout(timeout, "command timeout")?;
     let lock_started = Instant::now();
     let lock = acquire_pane_lock(target, ready_timeout)?;
     let elapsed = lock_started.elapsed().as_secs_f64();
@@ -353,6 +366,10 @@ pub fn execute<A: HerdrApi + ?Sized>(
     )?;
 
     let base_run_id = make_run_id(agent, SystemTime::now(), std::process::id());
+    // Write-triggered retention cannot silently stop the way an external timer can. It remains
+    // best effort so housekeeping can never mask the command that caused this pass. Prune before
+    // allocation so `retention_days: 0` cannot select the brand-new run directory itself.
+    apply_retention(config);
     let (run_id, spool) = allocate_spool(config, &base_run_id)?;
     create_private_file(&spool.stdout, &[]).map_err(|error| spool_error(&spool, error))?;
     create_private_file(&spool.stderr, &[]).map_err(|error| spool_error(&spool, error))?;
@@ -370,8 +387,10 @@ pub fn execute<A: HerdrApi + ?Sized>(
     let deadline = started.checked_add(seconds_duration(timeout));
     loop {
         if let Some(exit_code) = read_exit_code(&spool.exit_code) {
-            let stdout = fs::read(&spool.stdout).unwrap_or_default();
-            let stderr = fs::read(&spool.stderr).unwrap_or_default();
+            let stdout =
+                fs::read(&spool.stdout).map_err(|error| spool_read_error(&spool.stdout, error))?;
+            let stderr =
+                fs::read(&spool.stderr).map_err(|error| spool_read_error(&spool.stderr, error))?;
             let result = RunResult {
                 exit_code,
                 stdout,
@@ -391,20 +410,39 @@ pub fn execute<A: HerdrApi + ?Sized>(
         thread::sleep(Duration::from_millis(250));
     }
     FileExt::unlock(&lock).ok();
-    Err(HerdrRunError::timeout(format!(
+    let message = format!(
         "command did not finish within {}s. It is STILL RUNNING in pane {} ({}) and was not killed. Partial output is in {}; the exit code will appear in {} when it finishes.",
         number_text(timeout),
         target.pane_id,
         target.tab_label,
         spool.directory.display(),
         spool.exit_code.display()
-    )))
+    );
+    Err(timeout_error(&spool, message))
+}
+
+fn timeout_error(spool: &SpoolPaths, message: String) -> HerdrRunError {
+    let stdout = fs::read(&spool.stdout).unwrap_or_default();
+    let stderr = fs::read(&spool.stderr).unwrap_or_default();
+    HerdrRunError::timeout_with_partial(
+        message,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+        spool.directory.clone(),
+    )
 }
 
 fn spool_error(spool: &SpoolPaths, error: std::io::Error) -> HerdrRunError {
     HerdrRunError::unavailable(format!(
         "cannot initialize run spool {}: {error}",
         spool.directory.display()
+    ))
+}
+
+fn spool_read_error(path: &Path, error: std::io::Error) -> HerdrRunError {
+    HerdrRunError::unavailable(format!(
+        "cannot read run spool output {}: {error}",
+        path.display()
     ))
 }
 
@@ -496,6 +534,23 @@ fn seconds_duration(seconds: f64) -> Duration {
         return Duration::MAX;
     }
     Duration::from_secs_f64(seconds)
+}
+
+fn validate_timeout(value: f64, what: &str) -> Result<()> {
+    if !value.is_finite() {
+        return Err(HerdrRunError::config(format!("{what}: must be finite")));
+    }
+    if value < 0.0 {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must not be negative"
+        )));
+    }
+    if value > MAX_TIMEOUT_SECONDS {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must not exceed {MAX_TIMEOUT_SECONDS:.0} seconds"
+        )));
+    }
+    Ok(())
 }
 
 fn number_text(value: f64) -> String {
@@ -635,6 +690,98 @@ mod tests {
     }
 
     #[test]
+    fn public_runtime_apis_reject_invalid_timeouts_before_launch() {
+        let config = Config {
+            allow: vec!["git".to_owned()],
+            ..Config::default()
+        };
+        let admission = admit("git status", &config).unwrap();
+        for timeout in [f64::NAN, f64::INFINITY, -1.0, MAX_TIMEOUT_SECONDS + 1.0] {
+            let ready_error = wait_ready(&FakeApi, &config, &target(), None, timeout).unwrap_err();
+            assert_eq!(ready_error.kind(), crate::error::ErrorKind::Config);
+
+            let command_error = execute(
+                &FakeApi,
+                &config,
+                &target(),
+                &admission,
+                "agent",
+                Path::new("/tmp"),
+                0.0,
+                timeout,
+            )
+            .unwrap_err();
+            assert_eq!(command_error.kind(), crate::error::ErrorKind::Config);
+
+            let readiness_error = execute(
+                &FakeApi,
+                &config,
+                &target(),
+                &admission,
+                "agent",
+                Path::new("/tmp"),
+                timeout,
+                1.0,
+            )
+            .unwrap_err();
+            assert_eq!(readiness_error.kind(), crate::error::ErrorKind::Config);
+        }
+    }
+
+    #[test]
+    fn timeout_context_carries_lossy_partial_output_and_spool_path() {
+        let root =
+            std::env::temp_dir().join(format!("herdr-timeout-context-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let spool = SpoolPaths {
+            directory: root.clone(),
+            stdout: root.join("stdout"),
+            stderr: root.join("stderr"),
+            exit_code: root.join("exit_code"),
+        };
+        fs::write(&spool.stdout, b"partial-out\n\xff").unwrap();
+        fs::write(&spool.stderr, b"partial-err\n").unwrap();
+
+        let error = timeout_error(&spool, "still running".to_owned());
+        assert_eq!(error.kind(), crate::error::ErrorKind::Timeout);
+        assert_eq!(error.partial_stdout(), "partial-out\n\u{fffd}");
+        assert_eq!(error.partial_stderr(), "partial-err\n");
+        assert_eq!(error.spool_directory(), Some(root.as_path()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retention_hook_prunes_old_run_but_preserves_recent_run() {
+        let root =
+            std::env::temp_dir().join(format!("herdr-runner-retention-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let runs = root.join("spool/runs");
+        let old = runs.join("old");
+        let recent = runs.join("recent");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&recent).unwrap();
+        fs::write(old.join("exit_code"), "0\n").unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(9 * 86_400);
+        std::fs::File::open(old.join("exit_code"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        let config = Config {
+            project_root: root.to_string_lossy().into_owned(),
+            spool_dir: "spool".to_owned(),
+            retention_days: 4,
+            ..Config::default()
+        };
+
+        apply_retention(&config);
+        assert!(!old.exists());
+        assert!(recent.is_dir());
+        assert!(runs.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn execution_captures_bytes_exit_and_uses_exclusive_collision_suffix() {
         let root = std::env::temp_dir().join(format!("herdr-runner-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -645,10 +792,12 @@ mod tests {
             ..Config::default()
         };
         let admission = admit("printf '\\377'", &config).expect("admitted");
+        let mut isolated_target = target();
+        isolated_target.pane_id = "p-execution-captures".to_owned();
         let result = execute(
             &FakeApi,
             &config,
-            &target(),
+            &isolated_target,
             &admission,
             "agent",
             &root,
@@ -690,5 +839,49 @@ mod tests {
         assert_ne!(second_id, base);
         assert!(!second.exit_code.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn existing_configured_spool_root_is_never_chmoded() {
+        let root =
+            std::env::temp_dir().join(format!("herdr-spool-existing-root-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let config = Config {
+            project_root: root.to_string_lossy().into_owned(),
+            spool_dir: ".".to_owned(),
+            allow: vec!["printf".to_owned()],
+            ..Config::default()
+        };
+        let admission = admit("printf ok", &config).unwrap();
+
+        let mut isolated_target = target();
+        isolated_target.pane_id = "p-existing-spool-root".to_owned();
+        let result = execute(
+            &FakeApi,
+            &config,
+            &isolated_target,
+            &admission,
+            "agent",
+            &root,
+            0.0,
+            5.0,
+        )
+        .unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(root.join("runs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

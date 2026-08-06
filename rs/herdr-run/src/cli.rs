@@ -66,7 +66,7 @@ where
     match run(args) {
         Ok(code) => code,
         Err(error) => {
-            eprintln!("herdr-run: {error}");
+            let _ = writeln!(io::stderr(), "herdr-run: {error}");
             error.exit_code()
         }
     }
@@ -84,18 +84,6 @@ where
                 .map_err(|_| "arguments must be valid UTF-8".to_owned())
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut option_prefix = raw.iter().take_while(|value| value.as_str() != "--");
-    if option_prefix
-        .clone()
-        .any(|value| value == "--help" || value == "-h")
-    {
-        print_help();
-        return Ok(ParseResult::Exit(0));
-    }
-    if option_prefix.any(|value| value == "--version") {
-        println!("herdr-run {}", env!("CARGO_PKG_VERSION"));
-        return Ok(ParseResult::Exit(0));
-    }
     let mut args = Args::default();
     let mut index = 0;
     let mut options = true;
@@ -108,6 +96,14 @@ where
         }
         if options {
             match token.as_str() {
+                "--help" | "-h" => {
+                    print_help();
+                    return Ok(ParseResult::Exit(0));
+                }
+                "--version" => {
+                    println!("herdr-run {}", env!("CARGO_PKG_VERSION"));
+                    return Ok(ParseResult::Exit(0));
+                }
                 "--no-cache" => args.no_cache = true,
                 "--json" => args.json = true,
                 "--dry-run" => args.dry_run = true,
@@ -117,6 +113,9 @@ where
                         .get(index + 1)
                         .ok_or_else(|| format!("argument {token}: expected one value"))?
                         .clone();
+                    if value.starts_with('-') && value != "-" {
+                        return Err(format!("argument {token}: expected one value"));
+                    }
                     assign_value(&mut args, token, value)?;
                     index += 1;
                 }
@@ -188,12 +187,33 @@ fn run(mut args: Args) -> Result<i32> {
     let config = load_config(args.config.as_deref(), &start)?;
 
     let explicit_agent = args.agent.as_deref().unwrap_or("");
-    let (agent, command) = if !explicit_agent.is_empty() && !positional.is_empty() {
-        (explicit_agent.to_owned(), Some(positional.join(" ")))
-    } else if positional.len() >= 2 {
-        (positional[0].clone(), Some(positional[1..].join(" ")))
+    let (agent, command) = if positional.len() == 2 && explicit_agent.is_empty() {
+        (positional[0].clone(), Some(positional[1].clone()))
     } else if positional.len() == 1 {
-        (default_agent(), Some(positional[0].clone()))
+        (
+            if explicit_agent.is_empty() {
+                default_agent()
+            } else {
+                explicit_agent.to_owned()
+            },
+            Some(positional[0].clone()),
+        )
+    } else if positional.len() > 1 {
+        let agent = if explicit_agent.is_empty() {
+            "<agent>"
+        } else {
+            explicit_agent
+        };
+        let joined = positional.join(" ");
+        let suggested = if explicit_agent.is_empty() {
+            positional[1..].join(" ")
+        } else {
+            joined.clone()
+        };
+        eprintln!(
+            "herdr-run: pass the command as ONE quoted argument, not as separate words.\n  you wrote:  herdr-run {joined}\n  instead:    herdr-run --agent {agent} '{suggested}'\nRe-joining loose words would silently change the quoting of your arguments."
+        );
+        return Ok(2);
     } else {
         (
             if explicit_agent.is_empty() {
@@ -245,6 +265,7 @@ fn default_agent() -> String {
 fn command_config(config: &Config, agent: &str) -> Result<i32> {
     let document = json!({
         "allow": config.allow,
+        "allow_subcommand": config.allow_subcommand,
         "broker": config.broker,
         "cwd": config.cwd,
         "deny_anywhere": config.deny_anywhere,
@@ -255,6 +276,7 @@ fn command_config(config: &Config, agent: &str) -> Result<i32> {
         "prompt_tail": config.prompt_tail,
         "prefixes": config.prefixes,
         "readiness": config.readiness,
+        "retention_days": config.retention_days,
         "ready_timeout_seconds": config.ready_timeout_seconds,
         "shells": config.shells,
         "source": config.source_path.as_deref().unwrap_or("(built-in defaults)"),
@@ -361,7 +383,10 @@ fn run_command(config: &Config, agent: &str, command: &str, args: &Args) -> Resu
         Ok(client) => client,
         Err(error) => return audited_error(&log, agent, command, error),
     };
-    let cwd = resolved_cwd(config, args.cwd.as_deref())?;
+    let cwd = match resolved_cwd(config, args.cwd.as_deref()) {
+        Ok(cwd) => cwd,
+        Err(error) => return audited_error(&log, agent, command, error),
+    };
     let ready_timeout = args.wait_ready.unwrap_or(config.ready_timeout_seconds);
     let timeout = args.timeout.unwrap_or(config.timeout_seconds);
     let target = match resolve_target(&client, config, agent, !args.no_cache) {
@@ -379,6 +404,34 @@ fn run_command(config: &Config, agent: &str, command: &str, args: &Args) -> Resu
         timeout,
     ) {
         Ok(result) => result,
+        Err(error) if error.kind() == ErrorKind::Timeout => {
+            record_audit(
+                &log,
+                agent,
+                command,
+                "RUNTIMEOUT",
+                error.message(),
+                Map::new(),
+            );
+            io::stdout()
+                .write_all(error.partial_stdout().as_bytes())
+                .map_err(|write_error| {
+                    HerdrRunError::new(
+                        ErrorKind::Other,
+                        format!("cannot write partial stdout: {write_error}"),
+                    )
+                })?;
+            io::stderr()
+                .write_all(error.partial_stderr().as_bytes())
+                .map_err(|write_error| {
+                    HerdrRunError::new(
+                        ErrorKind::Other,
+                        format!("cannot write partial stderr: {write_error}"),
+                    )
+                })?;
+            eprintln!("herdr-run: {error}");
+            return Ok(error.exit_code());
+        }
         Err(error) => return audited_error(&log, agent, command, error),
     };
     let (meta, meta_error) = write_meta_best_effort(&result, &admission, config, agent);
@@ -417,15 +470,14 @@ fn run_command(config: &Config, agent: &str, command: &str, args: &Args) -> Resu
 }
 
 fn audited_error(log: &Path, agent: &str, command: &str, error: HerdrRunError) -> Result<i32> {
-    let verdict = match error.kind() {
-        ErrorKind::Config => "CONFIGERROR",
-        ErrorKind::Refused => "REFUSED",
-        ErrorKind::Unavailable => "HERDRUNAVAILABLE",
-        ErrorKind::Busy => "PANEBUSY",
-        ErrorKind::Timeout => "RUNTIMEOUT",
-        ErrorKind::Other => "HERDRRUNERROR",
-    };
-    record_audit(log, agent, command, verdict, error.message(), Map::new());
+    record_audit(
+        log,
+        agent,
+        command,
+        error_verdict(error.kind()),
+        error.message(),
+        Map::new(),
+    );
     eprintln!("herdr-run: {error}");
     Ok(error.exit_code())
 }
@@ -482,7 +534,18 @@ fn command_doctor(config: &Config, agent: &str) -> Result<i32> {
     );
     let admission = match admit(&probe, config) {
         Ok(admission) => admission,
-        Err(error) => return audited_error(&log, agent, &probe, error),
+        Err(error) => {
+            let fields = doctor_error_fields(None);
+            record_audit(
+                &log,
+                agent,
+                &probe,
+                error_verdict(error.kind()),
+                error.message(),
+                fields,
+            );
+            return Err(error);
+        }
     };
     let mut admitted_fields = Map::new();
     admitted_fields.insert("doctor".to_owned(), json!(true));
@@ -504,12 +567,17 @@ fn command_doctor(config: &Config, agent: &str) -> Result<i32> {
     let inside = match bounded_output(&mut inside_command, std::time::Duration::from_secs(120)) {
         Ok(output) => output,
         Err(error) => {
-            return audited_error(
+            let error =
+                HerdrRunError::unavailable(format!("cannot run the in-jail doctor probe: {error}"));
+            record_audit(
                 &log,
                 agent,
                 &probe,
-                HerdrRunError::unavailable(format!("cannot run the in-jail doctor probe: {error}")),
-            )
+                error_verdict(error.kind()),
+                error.message(),
+                doctor_error_fields(None),
+            );
+            return Err(error);
         }
     };
     let inside_code = inside.status.code().unwrap_or(1);
@@ -524,34 +592,29 @@ fn command_doctor(config: &Config, agent: &str) -> Result<i32> {
         println!("           {}", stderr.lines().last().unwrap_or(""));
     }
 
-    let client = match HerdrClient::new(&config.broker) {
-        Ok(client) => client,
-        Err(error) => return audited_error(&log, agent, &probe, error),
-    };
-    let target = match resolve_target(&client, config, agent, true) {
-        Ok(target) => target,
-        Err(error) => return audited_error(&log, agent, &probe, error),
-    };
-    let cwd = match resolved_cwd(config, None) {
-        Ok(cwd) => cwd,
-        Err(error) => return audited_error(&log, agent, &probe, error),
-    };
-    let outside = execute(
-        &client,
-        config,
-        &target,
-        &admission,
-        agent,
-        &cwd,
-        config.ready_timeout_seconds.max(30.0),
-        config.timeout_seconds.min(180.0),
-    );
+    // Every failure after the in-jail half of the diagnosis is a doctor result, not a raw wrapper
+    // exit. Keep construction, target/cwd resolution, and execution in one result so they all
+    // produce the same `[via pane] FAILED` line, final verdict, exit 1, and audit metadata.
+    let outside: Result<_> = (|| {
+        let client = HerdrClient::new(&config.broker)?;
+        let target = resolve_target(&client, config, agent, true)?;
+        let cwd = resolved_cwd(config, None)?;
+        let result = execute(
+            &client,
+            config,
+            &target,
+            &admission,
+            agent,
+            &cwd,
+            config.ready_timeout_seconds.max(30.0),
+            config.timeout_seconds.min(180.0),
+        )?;
+        Ok((target, result))
+    })();
     let outside_code = match outside {
-        Ok(result) => {
+        Ok((target, result)) => {
             let (meta, meta_error) = write_meta_best_effort(&result, &admission, config, agent);
-            let mut fields = Map::new();
-            fields.insert("doctor".to_owned(), json!(true));
-            fields.insert("inside_exit_code".to_owned(), json!(inside_code));
+            let mut fields = doctor_error_fields(Some(inside_code));
             fields.insert("exit_code".to_owned(), json!(result.exit_code));
             fields.insert("run_id".to_owned(), json!(result.run_id));
             fields.insert("pane_id".to_owned(), json!(result.target.pane_id));
@@ -591,18 +654,15 @@ fn command_doctor(config: &Config, agent: &str) -> Result<i32> {
             result.exit_code
         }
         Err(error) => {
-            let verdict = match error.kind() {
-                ErrorKind::Config => "CONFIGERROR",
-                ErrorKind::Refused => "REFUSED",
-                ErrorKind::Unavailable => "HERDRUNAVAILABLE",
-                ErrorKind::Busy => "PANEBUSY",
-                ErrorKind::Timeout => "RUNTIMEOUT",
-                ErrorKind::Other => "HERDRRUNERROR",
-            };
-            let mut fields = Map::new();
-            fields.insert("doctor".to_owned(), json!(true));
-            fields.insert("inside_exit_code".to_owned(), json!(inside_code));
-            record_audit(&log, agent, &probe, verdict, error.message(), fields);
+            let fields = doctor_error_fields(Some(inside_code));
+            record_audit(
+                &log,
+                agent,
+                &probe,
+                error_verdict(error.kind()),
+                error.message(),
+                fields,
+            );
             println!("[via pane] FAILED: {error}");
             -1
         }
@@ -620,10 +680,43 @@ fn command_doctor(config: &Config, agent: &str) -> Result<i32> {
     }
 }
 
+fn error_verdict(kind: ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::Config => "CONFIGERROR",
+        ErrorKind::Refused => "REFUSED",
+        ErrorKind::Unavailable => "HERDRUNAVAILABLE",
+        ErrorKind::Busy => "PANEBUSY",
+        ErrorKind::Timeout => "RUNTIMEOUT",
+        ErrorKind::Other => "HERDRRUNERROR",
+    }
+}
+
+fn doctor_error_fields(inside_exit_code: Option<i32>) -> Map<String, Value> {
+    let mut fields = Map::new();
+    fields.insert("doctor".to_owned(), json!(true));
+    if let Some(code) = inside_exit_code {
+        fields.insert("inside_exit_code".to_owned(), json!(code));
+    }
+    fields
+}
+
 fn resolved_cwd(config: &Config, override_cwd: Option<&str>) -> Result<PathBuf> {
-    let raw = override_cwd
-        .or(config.cwd.as_deref())
-        .unwrap_or(&config.project_root);
+    resolved_cwd_with(config, override_cwd, std::env::current_dir)
+}
+
+fn resolved_cwd_with<F>(
+    config: &Config,
+    override_cwd: Option<&str>,
+    current_dir: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce() -> io::Result<PathBuf>,
+{
+    let Some(raw) = override_cwd.or(config.cwd.as_deref()) else {
+        return current_dir().map_err(|error| {
+            HerdrRunError::config(format!("cannot determine current directory: {error}"))
+        });
+    };
     let path = Path::new(raw);
     let joined = if path.is_absolute() {
         path.to_path_buf()
@@ -695,5 +788,76 @@ mod tests {
         for value in ["nan", "inf", "-1", "1e300"] {
             assert!(parse([OsString::from("--timeout"), OsString::from(value)]).is_err());
         }
+    }
+
+    #[test]
+    fn option_values_cannot_be_stolen_by_help_or_version() {
+        assert!(parse([OsString::from("--agent"), OsString::from("--help")]).is_err());
+        assert!(parse([OsString::from("--cwd"), OsString::from("--version")]).is_err());
+
+        let ParseResult::Args(args) =
+            parse([OsString::from("--"), OsString::from("--help")]).unwrap()
+        else {
+            panic!("help after -- must be command data")
+        };
+        assert_eq!(args.positional, ["--help"]);
+    }
+
+    #[test]
+    fn default_command_cwd_is_the_callers_current_directory() {
+        assert_eq!(
+            resolved_cwd(&Config::default(), None).unwrap(),
+            std::env::current_dir().unwrap()
+        );
+    }
+
+    #[test]
+    fn vanished_caller_cwd_is_a_typed_config_error() {
+        let error = resolved_cwd_with(&Config::default(), None, || {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "caller directory was removed",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Config);
+        assert_eq!(error.exit_code(), 78);
+        assert!(error
+            .message()
+            .contains("cannot determine current directory"));
+    }
+
+    #[test]
+    fn explicit_empty_cwd_means_the_project_root() {
+        let config = Config {
+            project_root: "/project".to_owned(),
+            cwd: Some("configured".to_owned()),
+            ..Config::default()
+        };
+        assert_eq!(
+            resolved_cwd(&config, Some("")).unwrap(),
+            Path::new("/project")
+        );
+    }
+
+    #[test]
+    fn doctor_failures_have_one_verdict_and_metadata_shape() {
+        for kind in [
+            ErrorKind::Config,
+            ErrorKind::Unavailable,
+            ErrorKind::Busy,
+            ErrorKind::Timeout,
+            ErrorKind::Other,
+        ] {
+            assert!(!error_verdict(kind).is_empty());
+            let fields = doctor_error_fields(Some(17));
+            assert_eq!(fields.get("doctor"), Some(&json!(true)));
+            assert_eq!(fields.get("inside_exit_code"), Some(&json!(17)));
+        }
+
+        let refusal = doctor_error_fields(None);
+        assert_eq!(refusal.get("doctor"), Some(&json!(true)));
+        assert!(!refusal.contains_key("inside_exit_code"));
+        assert_eq!(error_verdict(ErrorKind::Refused), "REFUSED");
     }
 }

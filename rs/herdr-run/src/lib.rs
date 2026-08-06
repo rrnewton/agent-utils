@@ -10,6 +10,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod readiness;
+pub mod retention;
 pub mod runner;
 pub mod session;
 

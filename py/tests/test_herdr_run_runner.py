@@ -17,8 +17,8 @@ import pytest
 import herdr_run.state as state
 from herdr_run.allowlist import admit
 from herdr_run.client import HerdrClient
-from herdr_run.config import Config
-from herdr_run.errors import HerdrUnavailable, PaneBusy, RunTimeout
+from herdr_run.config import MAX_TIMEOUT_SECONDS, Config
+from herdr_run.errors import ConfigError, HerdrUnavailable, PaneBusy, RunTimeout
 from herdr_run.runner import (
     RunResult,
     build_shell_command,
@@ -211,6 +211,20 @@ def test_binary_spool_bytes_are_preserved_without_text_decoding(tmp_path: object
         assert handle.read() == stderr
 
 
+def test_existing_configured_spool_root_is_never_chmoded(tmp_path: object) -> None:
+    root = str(tmp_path)
+    os.chmod(root, 0o755)
+    result = cast(
+        RunResult,
+        _run(FakeHerdrClient(), _config(root, spool_dir="."), "echo preserved"),
+    )
+
+    assert result.exit_code == 0
+    assert os.stat(root).st_mode & 0o777 == 0o755
+    assert os.stat(os.path.join(root, "runs")).st_mode & 0o777 == 0o700
+    assert os.stat(result.spool.directory).st_mode & 0o777 == 0o700
+
+
 # --- the shell wrapper ------------------------------------------------------------------------------
 
 
@@ -388,6 +402,45 @@ def test_default_zero_ready_timeout_still_confirms_twice(tmp_path: object) -> No
         _client(fake), config, target, prompt_tail=None, timeout=0.0, poll_interval=0.0
     )
     assert readiness.ready is True
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -1.0, MAX_TIMEOUT_SECONDS + 1])
+def test_public_readiness_api_rejects_invalid_timeouts(
+    tmp_path: object, timeout: float
+) -> None:
+    config = _config(str(tmp_path))
+    fake = FakeHerdrClient()
+    target = resolve_target(_client(fake), config, "agent")
+
+    with pytest.raises(ConfigError):
+        wait_ready(_client(fake), config, target, prompt_tail=None, timeout=timeout)
+
+
+@pytest.mark.parametrize("which", ["ready", "command"])
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), -1.0, MAX_TIMEOUT_SECONDS + 1])
+def test_public_execute_api_rejects_invalid_timeouts_before_launch(
+    tmp_path: object, which: str, timeout: float
+) -> None:
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient()
+    target = resolve_target(_client(fake), config, "agent")
+    ready_timeout = timeout if which == "ready" else 0.0
+    command_timeout = timeout if which == "command" else 1.0
+
+    with pytest.raises(ConfigError):
+        execute(
+            _client(fake),
+            config,
+            target,
+            admit("git status", config),
+            agent="agent",
+            cwd=root,
+            home="/nonexistent",
+            ready_timeout=ready_timeout,
+            timeout=command_timeout,
+        )
+    assert fake.commands == []
 
 
 def test_waits_for_a_pane_that_becomes_free(tmp_path: object) -> None:
@@ -590,11 +643,22 @@ def test_retention_runs_on_write(tmp_path: object) -> None:
     os.makedirs(runs)
     stale = os.path.join(runs, "20260101T000000-old-1")
     os.makedirs(stale)
+    with open(os.path.join(stale, "exit_code"), "w", encoding="utf-8") as handle:
+        handle.write("0\n")
     old = _time.time() - 9 * 86400
+    os.utime(os.path.join(stale, "exit_code"), (old, old))
     os.utime(stale, (old, old))
 
     result = _run(FakeHerdrClient(), config, "echo fresh")
 
     assert result.exit_code == 0  # type: ignore[attr-defined]
     assert not os.path.exists(stale), "writing a new run must prune the stale one"
+    assert os.path.isdir(result.spool.directory)  # type: ignore[attr-defined]
+
+
+def test_zero_day_retention_does_not_delete_the_run_being_created(tmp_path: object) -> None:
+    root = str(tmp_path)
+    result = _run(FakeHerdrClient(), _config(root, retention_days=0), "echo fresh")
+
+    assert result.exit_code == 0  # type: ignore[attr-defined]
     assert os.path.isdir(result.spool.directory)  # type: ignore[attr-defined]

@@ -58,7 +58,7 @@ def _load_cache(path: str, key: str) -> tuple[str, str, str] | None:
     try:
         with open(path, encoding="utf-8") as handle:
             document: object = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     try:
         entries = as_mapping(document, "session cache")
@@ -79,7 +79,6 @@ def _load_cache(path: str, key: str) -> tuple[str, str, str] | None:
 def _store_cache(path: str, key: str, target: Target) -> None:
     parent = os.path.dirname(path)
     os.makedirs(parent, mode=0o700, exist_ok=True)
-    os.chmod(parent, 0o700)
     # Serialize the whole read/modify/write. Without this, two agents resolving different tabs can
     # both read the old document and the later rename silently loses the earlier cache entry.
     flags = (
@@ -102,7 +101,7 @@ def _store_cache(path: str, key: str, target: Target) -> None:
                 existing: object = json.load(handle)
             if isinstance(existing, dict):
                 entries = as_mapping(existing, "session cache")
-        except (OSError, json.JSONDecodeError, TypeError):
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
             entries = {}
         entries[key] = {
             "workspace_id": target.workspace_id,

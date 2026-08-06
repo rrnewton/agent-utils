@@ -8,9 +8,10 @@ this is the one module that removes directories.
 from __future__ import annotations
 
 import os
+import stat
 import time
 
-from herdr_run.retention import RETENTION_DAYS, prune_runs, runs_root
+from herdr_run.retention import MAX_RETENTION_DAYS, RETENTION_DAYS, prune_runs, runs_root
 
 DAY = 86_400
 
@@ -21,8 +22,9 @@ def _plant(root: str, name: str, *, age_days: float) -> str:
     os.makedirs(path, exist_ok=True)
     for leaf in ("stdout", "stderr", "exit_code", "command"):
         with open(os.path.join(path, leaf), "w", encoding="utf-8") as handle:
-            handle.write(f"{leaf} of {name}\n")
+            handle.write("0\n" if leaf == "exit_code" else f"{leaf} of {name}\n")
     stamp = time.time() - age_days * DAY
+    os.utime(os.path.join(path, "exit_code"), (stamp, stamp))
     os.utime(path, (stamp, stamp))
     return path
 
@@ -71,6 +73,49 @@ def test_nothing_is_removed_when_everything_is_fresh(tmp_path: object) -> None:
     assert len(os.listdir(root)) == 4
 
 
+def test_old_incomplete_run_survives_while_old_completed_run_is_removed(
+    tmp_path: object,
+) -> None:
+    root = os.path.join(str(tmp_path), "runs")
+    os.makedirs(root)
+    completed = _plant(root, "completed", age_days=30)
+    active = _plant(root, "active", age_days=30)
+    os.unlink(os.path.join(active, "exit_code"))
+
+    result = prune_runs(root)
+
+    assert not os.path.exists(completed)
+    assert os.path.isdir(active), "a concurrent or timed-out active run must never be pruned"
+    assert result.removed == (completed,)
+    assert result.kept == 1
+
+
+def test_invalid_retention_windows_fail_closed(tmp_path: object) -> None:
+    root = os.path.join(str(tmp_path), "runs")
+    os.makedirs(root)
+    old = _plant(root, "old", age_days=30)
+
+    for invalid in (-1, MAX_RETENTION_DAYS + 1, 10**400):
+        result = prune_runs(root, retention_days=invalid)
+        assert result.removed == ()
+        assert os.path.isdir(old)
+
+
+def test_fifo_completion_marker_cannot_block_retention(tmp_path: object) -> None:
+    root = os.path.join(str(tmp_path), "runs")
+    os.makedirs(root)
+    run = _plant(root, "corrupt", age_days=30)
+    marker = os.path.join(run, "exit_code")
+    os.unlink(marker)
+    os.mkfifo(marker)
+
+    result = prune_runs(root)
+
+    assert os.path.isdir(run)
+    assert stat.S_ISFIFO(os.lstat(marker).st_mode)
+    assert result.kept == 1
+
+
 # --- scope: this module deletes directories, so containment is asserted, not assumed --------------
 
 
@@ -95,6 +140,22 @@ def test_symlinks_are_skipped_never_followed(tmp_path: object) -> None:
     assert os.path.isfile(os.path.join(outside, "keep.txt"))
     assert os.path.islink(link), "the symlink itself is skipped, not deleted"
     assert link in result.skipped
+
+
+def test_symlinked_runs_root_cannot_redefine_deletion_scope(tmp_path: object) -> None:
+    """The configured root itself is untrusted; containment cannot follow it before checking."""
+    base = str(tmp_path)
+    victim = os.path.join(base, "victim")
+    old = _plant(victim, "unrelated-old-directory", age_days=30)
+    linked_root = os.path.join(base, "project", ".herdr-run", "runs")
+    os.makedirs(os.path.dirname(linked_root))
+    os.symlink(victim, linked_root)
+
+    result = prune_runs(linked_root)
+
+    assert result.removed == ()
+    assert os.path.abspath(linked_root) in result.skipped
+    assert os.path.isdir(old)
 
 
 def test_the_runs_root_itself_is_never_removed(tmp_path: object) -> None:

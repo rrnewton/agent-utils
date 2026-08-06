@@ -24,10 +24,11 @@ from collections.abc import Sequence
 from herdr_run import __version__
 from herdr_run.allowlist import Admission, admit
 from herdr_run.audit import audit_path, record, warn_if_spool_is_tracked
-from herdr_run.client import HerdrClient
+from herdr_run.client import HerdrClient, _bounded_control_command
 from herdr_run.config import MAX_TIMEOUT_SECONDS, Config, load_config
 from herdr_run.errors import (
     EXIT_BUSY,
+    ConfigError,
     HerdrRunError,
     HerdrUnavailable,
     Refused,
@@ -133,7 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _load(args: argparse.Namespace, environ: dict[str, str]) -> Config:
-    config = load_config(explicit_path=args.config, start_dir=os.getcwd())
+    try:
+        start_dir = os.getcwd()
+    except OSError as exc:
+        raise ConfigError(f"cannot determine current directory: {exc}") from exc
+    config = load_config(explicit_path=args.config, start_dir=start_dir)
     return config
 
 
@@ -151,9 +156,12 @@ def _resolved_cwd(config: Config, args: argparse.Namespace) -> str:
     the wrong repository answering. "Where the policy lives" and "where the command runs" are
     different questions, and only the first is anchored to the config file.
     """
-    cwd = args.cwd or config.cwd
+    cwd = args.cwd if args.cwd is not None else config.cwd
     if cwd is None:
-        return os.getcwd()
+        try:
+            return os.getcwd()
+        except OSError as exc:
+            raise ConfigError(f"cannot determine current directory: {exc}") from exc
     if not os.path.isabs(cwd):
         cwd = os.path.abspath(os.path.join(config.project_root, cwd))
     return cwd
@@ -174,11 +182,15 @@ def _cmd_config(config: Config, agent: str) -> int:
             key: list(value) for key, value in config.deny_subcommand.items()
         },
         "deny_anywhere": list(config.deny_anywhere),
+        "allow_subcommand": {
+            key: list(value) for key, value in config.allow_subcommand.items()
+        },
         "value_options": {
             key: list(value) for key, value in config.value_options.items()
         },
         "spool_dir": config.spool_dir,
         "timeout_seconds": config.timeout_seconds,
+        "retention_days": config.retention_days,
         "ready_timeout_seconds": config.ready_timeout_seconds,
         "readiness": config.readiness,
         "prompt_tail": config.prompt_tail,
@@ -265,13 +277,8 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
     print()
 
     try:
-        inside = subprocess.run(
+        inside = _bounded_control_command(
             ["/bin/bash", "-lc", prefixed],
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            capture_output=True,
-            check=False,
             timeout=120,
         )
     except (OSError, subprocess.SubprocessError) as exc:
@@ -405,14 +412,14 @@ def _run_command(
         "policy accepted command; target resolution and launch have not yet completed",
         {"rendered": admission.rendered},
     )
-    client = _client(config, environ)
-    cwd = _resolved_cwd(config, args)
     ready_timeout = (
         args.wait_ready if args.wait_ready is not None else config.ready_timeout_seconds
     )
     timeout = args.timeout if args.timeout is not None else config.timeout_seconds
 
     try:
+        client = _client(config, environ)
+        cwd = _resolved_cwd(config, args)
         target = resolve_target(client, config, agent, use_cache=not args.no_cache)
         result = execute(
             client,
@@ -428,9 +435,10 @@ def _run_command(
         # Emit whatever the command managed to print BEFORE reporting the timeout. Dropping it would
         # make a partially-successful run look like one that produced nothing, and a caller cannot
         # distinguish a false empty result from a real one.
-        record(log, agent=agent, command=command, verdict="RUNTIMEOUT", detail=str(exc))
-        sys.stdout.write(exc.partial_stdout)
-        sys.stderr.write(exc.partial_stderr)
+        _record_audit(log, agent, command, "RUNTIMEOUT", str(exc))
+        _emit_raw_output(
+            exc.partial_stdout.encode("utf-8"), exc.partial_stderr.encode("utf-8")
+        )
         print(f"herdr-run: {exc}", file=sys.stderr)
         return exc.exit_code
     except HerdrRunError as exc:
@@ -525,16 +533,22 @@ def _emit_raw_output(stdout_bytes: bytes, stderr_bytes: bytes) -> None:
     """Write each captured byte stream exactly once, without newline or text translation."""
     stdout_buffer = getattr(sys.stdout, "buffer", None)
     stderr_buffer = getattr(sys.stderr, "buffer", None)
-    if stdout_buffer is not None:
-        stdout_buffer.write(stdout_bytes)
-        stdout_buffer.flush()
-    else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
-        sys.stdout.write(stdout_bytes.decode("utf-8", errors="replace"))
-    if stderr_buffer is not None:
-        stderr_buffer.write(stderr_bytes)
-        stderr_buffer.flush()
-    else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
-        sys.stderr.write(stderr_bytes.decode("utf-8", errors="replace"))
+    try:
+        if stdout_buffer is not None:
+            stdout_buffer.write(stdout_bytes)
+            stdout_buffer.flush()
+        else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
+            sys.stdout.write(stdout_bytes.decode("utf-8", errors="replace"))
+    except (OSError, UnicodeError) as exc:
+        raise HerdrRunError(f"cannot write stdout: {exc}") from exc
+    try:
+        if stderr_buffer is not None:
+            stderr_buffer.write(stderr_bytes)
+            stderr_buffer.flush()
+        else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
+            sys.stderr.write(stderr_bytes.decode("utf-8", errors="replace"))
+    except (OSError, UnicodeError) as exc:
+        raise HerdrRunError(f"cannot write stderr: {exc}") from exc
 
 
 def _print_userguide() -> int:
@@ -578,7 +592,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = _load(args, environ)
     except HerdrRunError as exc:
-        print(f"herdr-run: {exc}", file=sys.stderr)
+        _safe_diagnostic(f"herdr-run: {exc}")
         return exc.exit_code
 
     # Agent resolution: --agent wins, then a leading positional when a command follows it, then the
@@ -636,11 +650,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         return _run_command(config, agent, command, args, environ)
     except HerdrRunError as exc:
-        print(f"herdr-run: {exc}", file=sys.stderr)
+        _safe_diagnostic(f"herdr-run: {exc}")
         return exc.exit_code
     except KeyboardInterrupt:  # pragma: no cover - interactive only
-        print("herdr-run: interrupted", file=sys.stderr)
+        _safe_diagnostic("herdr-run: interrupted")
         return 130
+
+
+def _safe_diagnostic(message: str) -> None:
+    """Best-effort stderr diagnostic for paths already handling a broken output stream."""
+    try:
+        print(message, file=sys.stderr)
+    except (OSError, UnicodeError):
+        pass
 
 
 if __name__ == "__main__":  # pragma: no cover

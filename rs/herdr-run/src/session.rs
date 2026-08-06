@@ -7,7 +7,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -284,8 +284,8 @@ fn store_cache(path: &Path, key: &str, target: &Target) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "cache has no parent"))?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let mut parent_builder = fs::DirBuilder::new();
+    parent_builder.recursive(true).mode(0o700).create(parent)?;
     let lock_path = PathBuf::from(format!("{}.lock", path.display()));
     let lock = OpenOptions::new()
         .create(true)

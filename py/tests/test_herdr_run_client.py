@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from collections.abc import Sequence
 
 import pytest
@@ -43,26 +44,59 @@ def test_default_runner_bounds_control_subprocesses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     observed_timeout = 0.0
+    observed_start_new_session = False
 
-    def fake_run(
-        command: list[str],
-        *,
-        text: bool,
-        encoding: str,
-        errors: str,
-        capture_output: bool,
-        check: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal observed_timeout
-        observed_timeout = timeout
-        assert encoding == "utf-8"
-        assert errors == "replace"
-        return _completed(command)
+    class FakeProcess:
+        pid = 123
+        returncode = 0
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+        def communicate(self, *, timeout: float) -> tuple[str, str]:
+            nonlocal observed_timeout
+            observed_timeout = timeout
+            return "", ""
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        nonlocal observed_start_new_session
+        assert command == ["fixture-herdr", "status"]
+        observed_start_new_session = kwargs.get("start_new_session") is True
+        assert kwargs.get("text") is True
+        assert kwargs.get("encoding") == "utf-8"
+        assert kwargs.get("errors") == "replace"
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
     client_module.default_runner(("fixture-herdr", "status"))
     assert observed_timeout == CONTROL_TIMEOUT_SECONDS
+    assert observed_start_new_session is True
+
+
+def test_control_timeout_terminates_descendants(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed-out wrapper must not leave a helper from its process group running."""
+    pid_path = os.path.join(str(tmp_path), "descendant.pid")
+    program = '/usr/bin/sleep 60 & child=$!; printf "%s" "$child" > "$1"; wait'
+    with pytest.raises(subprocess.TimeoutExpired):
+        client_module._bounded_control_command(
+            ("/bin/sh", "-c", program, "timeout-probe", pid_path), timeout=0.5
+        )
+
+    with open(pid_path, encoding="ascii") as handle:
+        descendant_pid = int(handle.read())
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            with open(f"/proc/{descendant_pid}/stat", encoding="ascii") as handle:
+                stat_line = handle.read()
+        except FileNotFoundError:
+            return
+        # A killed grandchild can briefly remain as a zombie until its subreaper collects it. It
+        # is no longer executable and therefore satisfies the no-orphaned-work guarantee.
+        state = stat_line.rpartition(") ")[2][:1]
+        if state == "Z":
+            return
+        time.sleep(0.01)
+    pytest.fail(f"timed-out descendant {descendant_pid} is still running")
 
 
 def test_fixed_candidate_ignores_a_planted_caller_path(
@@ -137,7 +171,7 @@ def test_production_timeout_is_typed_unavailable(
     ) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(list(command), CONTROL_TIMEOUT_SECONDS)
 
-    monkeypatch.setattr(subprocess, "run", timeout_run)
+    monkeypatch.setattr(client_module, "_bounded_control_command", timeout_run)
     client = HerdrClient(herdr_bin="fixture-herdr")
     with pytest.raises(HerdrUnavailable, match="timed out"):
         client.workspace_id_for_label("workspace")
@@ -313,6 +347,78 @@ def test_process_info_refuses_a_response_for_another_pane() -> None:
     )
     with pytest.raises(HerdrUnavailable, match="expected 'wanted'"):
         client.process_info("wanted")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("shell_pid", -1),
+        ("shell_pid", 0),
+        ("shell_pid", 2_147_483_648),
+        ("foreground_process_group_id", -1),
+        ("foreground_process_group_id", 0),
+        ("foreground_process_group_id", 2_147_483_648),
+        ("foreground_pid", -1),
+        ("foreground_pid", 0),
+        ("foreground_pid", 2_147_483_648),
+    ],
+)
+def test_process_info_refuses_out_of_range_process_ids(
+    field: str, value: int
+) -> None:
+    info: dict[str, object] = {
+        "pane_id": "p",
+        "shell_pid": 7,
+        "foreground_process_group_id": 7,
+        "foreground_processes": [{"pid": 7, "name": "sh", "cmdline": "sh"}],
+    }
+    if field == "foreground_pid":
+        info["foreground_processes"] = [
+            {"pid": value, "name": "sh", "cmdline": "sh"}
+        ]
+    else:
+        info[field] = value
+    response = json.dumps({"result": {"process_info": info}})
+    client = HerdrClient(
+        herdr_bin="fixture-herdr", run=RecordingRunner(((0, response, ""),))
+    )
+    with pytest.raises(HerdrUnavailable, match="positive Linux pid_t range"):
+        client.process_info("p")
+
+
+@pytest.mark.parametrize(
+    "field", ["shell_pid", "foreground_process_group_id", "foreground_pid"]
+)
+def test_process_info_refuses_boolean_process_ids(field: str) -> None:
+    info: dict[str, object] = {
+        "pane_id": "p",
+        "shell_pid": 7,
+        "foreground_process_group_id": 7,
+        "foreground_processes": [{"pid": 7, "name": "sh", "cmdline": "sh"}],
+    }
+    if field == "foreground_pid":
+        info["foreground_processes"] = [
+            {"pid": True, "name": "sh", "cmdline": "sh"}
+        ]
+    else:
+        info[field] = True
+    response = json.dumps({"result": {"process_info": info}})
+    client = HerdrClient(
+        herdr_bin="fixture-herdr", run=RecordingRunner(((0, response, ""),))
+    )
+    with pytest.raises(HerdrUnavailable, match="not an integer"):
+        client.process_info("p")
+
+
+def test_embedded_nul_identifier_is_typed_unavailable() -> None:
+    def rejecting_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        if any("\0" in argument for argument in command):
+            raise ValueError("embedded null byte")
+        raise AssertionError(f"expected a malformed identifier: {list(command)!r}")
+
+    client = HerdrClient(herdr_bin="fixture-herdr", run=rejecting_runner)
+    with pytest.raises(HerdrUnavailable, match="cannot invoke Herdr"):
+        client.read("bad\0pane")
 
 
 def test_filtered_pane_list_refuses_another_workspace() -> None:

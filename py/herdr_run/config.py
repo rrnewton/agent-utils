@@ -5,9 +5,9 @@ its tab-name schema, and its command allowlist in one tracked file next to its s
 allowlist is reviewable in that project's history rather than baked into this shared utility.
 
 Every field has a working default, so a project with no config file at all still gets the intended
-conservative behaviour (workspace ``agent-cmds``, one tab per agent, only ``git``/``gh``, optionally
-prefixed with ``with-proxy``). The declared YAML dependency is imported lazily only when a config
-file exists, which keeps bootstrap help useful even in a damaged installation.
+conservative behaviour (workspace ``agent-cmds``, one tab per agent, and only ``git``/``gh``,
+optionally prefixed with ``with-proxy``). The declared YAML dependency is imported lazily only when
+a config file exists, which keeps bootstrap help useful even in a damaged installation.
 """
 
 from __future__ import annotations
@@ -19,10 +19,12 @@ from dataclasses import dataclass, field, replace
 
 from herdr_run.errors import ConfigError
 from herdr_run.jsonx import as_mapping, as_sequence
+from herdr_run.retention import MAX_RETENTION_DAYS
 from herdr_run.yamlcore import core_load
 
 __all__ = [
     "CONFIG_FILENAMES",
+    "MAX_RETENTION_DAYS",
     "MAX_TIMEOUT_SECONDS",
     "Config",
     "find_config_file",
@@ -37,18 +39,20 @@ CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
 #: overflow into an accidental infinite wait in either implementation.
 MAX_TIMEOUT_SECONDS = 31_536_000.0
 
-#: Programs allowed by default. Deliberately tiny: this is a sandbox door, not a shell.
-#: ``cargo`` is admitted ONLY for the network-only subcommands in
-#: :data:`_DEFAULT_ALLOW_SUBCOMMAND`; that restriction is load-bearing, not cosmetic.
-_DEFAULT_ALLOW: tuple[str, ...] = ("git", "gh", "cargo")
+#: Programs allowed by default. Deliberately tiny: this is a sandbox door, not a shell. Cargo is
+#: NOT a default: even dependency-oriented subcommands can execute configured rustc wrappers,
+#: credential providers, or fetch helpers. Projects may explicitly opt it in, accepting that trust
+#: widening; :data:`_DEFAULT_ALLOW_SUBCOMMAND` still fails closed against compiling subcommands.
+_DEFAULT_ALLOW: tuple[str, ...] = ("git", "gh")
 
 #: Wrapper programs that may precede an allowlisted program. A wrapper takes a command and execs it,
 #: so allowing it as a PREFIX (never as a program in its own right) keeps wrapped commands
 #: expressible without widening the allowlist to "anything this wrapper can exec".
 _DEFAULT_PREFIXES: tuple[str, ...] = ("with-proxy",)
 
-#: Options that make an otherwise-allowlisted program run arbitrary code, matched among the GLOBAL
-#: options that precede the subcommand. ``git -c core.pager=...`` / ``git -c alias.x='!sh'`` /
+#: Options that make an otherwise-allowlisted program run arbitrary code. Git's are matched among
+#: GLOBAL options preceding its subcommand; Cargo accepts its global options on either side, so its
+#: entries are matched everywhere. ``git -c core.pager=...`` / ``git -c alias.x='!sh'`` /
 #: ``git --exec-path=/tmp/evil`` all turn "run git" into "run anything".
 #:
 #: Defense in depth for cooperative callers, not a same-user security boundary. A determined caller
@@ -56,21 +60,26 @@ _DEFAULT_PREFIXES: tuple[str, ...] = ("with-proxy",)
 _DEFAULT_DENY_GLOBAL: dict[str, tuple[str, ...]] = {
     "git": ("-c", "--config-env", "--exec-path", "--namespace"),
     "gh": (),
-    # `cargo --config` can inject source replacement and a build wrapper; `-Z` unlocks unstable
-    # behaviour. Neither is needed to download dependencies.
+    # These are Cargo's CLI configuration-mutation surfaces: `--config` can inject source
+    # replacement, compilers, wrappers, and credential providers; `-Z` unlocks unstable behavior.
+    # They are unnecessary for the dependency-oriented commands admitted after explicit opt-in.
+    # Ordinary selection/output flags (`--manifest-path`, `--target`, `--registry`, feature and
+    # lock flags) do not themselves name a process or mutate Cargo configuration. Ambient Cargo
+    # configuration can still execute helpers, which is why Cargo is not in `_DEFAULT_ALLOW`.
     "cargo": ("--config", "-Z"),
 }
 
 #: Per-program subcommand ALLOWLIST. When a program appears here its subcommand MUST be in the
-#: list; anything else -- including no subcommand at all -- is refused. Fail-closed, and the only
-#: safe way to admit ``cargo``.
+#: list; anything else -- including no subcommand at all -- is refused. This limits an explicit
+#: ``cargo`` opt-in, but does not make Cargo a no-code-execution boundary: Cargo may invoke ambient
+#: rustc wrappers, credential providers, or fetch helpers even during dependency resolution.
 #:
 #: WHY: the pane runs OUTSIDE the sandbox, and `cargo build`/`test`/`run` execute build scripts and
 #: proc macros from freshly downloaded third-party crates. Allowing those would run untrusted code
 #: outside the very confinement this tool exists to cross in a controlled way. The subcommands below
-#: resolve and DOWNLOAD only; they never compile. The intended pattern is to fetch through the door
-#: and then build in-jail with `--offline` against the warm cache, so the network step crosses the
-#: boundary and the compute step stays boxed.
+#: are dependency-resolution-oriented and do not request compilation. A project that deliberately
+#: accepts Cargo's ambient helper execution can fetch through the door and then build in-jail with
+#: `--offline` against the warm cache.
 #:
 #: A deny-list is the wrong shape here: `build`, `test`, `run`, `bench`, `install`, `rustc`,
 #: `clippy`, `doc`, `miri` and every third-party `cargo-*` subcommand execute code, and a new one
@@ -122,7 +131,8 @@ class Config:
     tab_name: str = "{agent}"
 
     #: Working directory for commands, relative to the project root when not absolute.
-    #: ``None`` means "the project root itself".
+    #: ``None`` leaves command execution at the caller's current directory; session bootstrap uses
+    #: the project root when it needs a concrete initial directory.
     cwd: str | None = None
 
     allow: tuple[str, ...] = _DEFAULT_ALLOW
@@ -234,6 +244,16 @@ def _number(raw: object, what: str) -> float:
     if value > MAX_TIMEOUT_SECONDS:
         raise ConfigError(f"{what}: must not exceed {MAX_TIMEOUT_SECONDS:g} seconds")
     return value
+
+
+def _nonnegative_integer(raw: object, what: str) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ConfigError(
+            f"{what}: must be a non-negative integer, got {type(raw).__name__}"
+        )
+    if raw > MAX_RETENTION_DAYS:
+        raise ConfigError(f"{what}: must not exceed {MAX_RETENTION_DAYS} days")
+    return raw
 
 
 def _text(raw: object, what: str) -> str:
@@ -393,8 +413,8 @@ def _parse_config(
     if "retention_days" in mapping:
         config = replace(
             config,
-            retention_days=int(
-                _number(mapping["retention_days"], f"{what}.retention_days")
+            retention_days=_nonnegative_integer(
+                mapping["retention_days"], f"{what}.retention_days"
             ),
         )
     if "ready_timeout_seconds" in mapping:
@@ -436,6 +456,10 @@ def _parse_config(
     if not config.allow:
         raise ConfigError(
             f"{what}.allow: refusing an EMPTY allowlist — no command could ever run"
+        )
+    if "cargo" in config.allow and "cargo" not in config.allow_subcommand:
+        raise ConfigError(
+            f"{what}.allow_subcommand: cargo is allowed but has no positive subcommand list"
         )
     for index, name in enumerate(config.allow):
         _policy_name(name, f"{what}.allow[{index}]")

@@ -36,6 +36,10 @@ const SERVER_ATTEMPTS: usize = 30;
 const SERVER_DELAY: Duration = Duration::from_millis(200);
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
 
+// Linux `pid_t` is signed.  Parsing into i64 first lets us issue one clear protocol error for
+// zero, negative, and otherwise representable values beyond the shared process-ID range.
+const MAX_PROCESS_ID: i64 = i32::MAX as i64;
+
 pub(crate) struct BoundedOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
@@ -519,7 +523,7 @@ impl HerdrClient {
             .iter()
             .map(|process| {
                 Ok((
-                    required_integer(process, "pid", "foreground process")?,
+                    required_process_id(process, "pid", "foreground process")?,
                     optional_string(process, "name", "foreground process")?.unwrap_or_default(),
                     optional_string(process, "cmdline", "foreground process")?.unwrap_or_default(),
                 ))
@@ -527,8 +531,8 @@ impl HerdrClient {
             .collect::<Result<Vec<_>>>()?;
         let parsed = ProcessInfo {
             pane_id: required_string(info, "pane_id", "pane process-info")?,
-            shell_pid: required_integer(info, "shell_pid", "pane process-info")?,
-            foreground_pgid: required_integer(
+            shell_pid: required_process_id(info, "shell_pid", "pane process-info")?,
+            foreground_pgid: required_process_id(
                 info,
                 "foreground_process_group_id",
                 "pane process-info",
@@ -928,6 +932,16 @@ fn required_integer(object: &Map<String, Value>, key: &str, what: &str) -> Resul
         .ok_or_else(|| HerdrRunError::unavailable(format!("{what}: {key:?} is not an integer")))
 }
 
+fn required_process_id(object: &Map<String, Value>, key: &str, what: &str) -> Result<i64> {
+    let value = required_integer(object, key, what)?;
+    if !(1..=MAX_PROCESS_ID).contains(&value) {
+        return Err(HerdrRunError::unavailable(format!(
+            "{what}: {key:?} is outside the positive Linux pid_t range"
+        )));
+    }
+    Ok(value)
+}
+
 fn unique_label_id(
     entries: &[Map<String, Value>],
     id_key: &str,
@@ -1160,6 +1174,78 @@ mod tests {
         )]);
         let error = client("direct", runner).process_info("wanted").unwrap_err();
         assert!(error.to_string().contains("expected \"wanted\""));
+    }
+
+    #[test]
+    fn process_info_refuses_out_of_range_process_ids() {
+        for field in ["shell_pid", "foreground_process_group_id", "foreground_pid"] {
+            for value in [-1_i64, 0, MAX_PROCESS_ID + 1] {
+                let mut info = serde_json::json!({
+                    "pane_id": "p",
+                    "shell_pid": 7,
+                    "foreground_process_group_id": 7,
+                    "foreground_processes": [{"pid": 7, "name": "sh", "cmdline": "sh"}],
+                });
+                if field == "foreground_pid" {
+                    info["foreground_processes"][0]["pid"] = Value::from(value);
+                } else {
+                    info[field] = Value::from(value);
+                }
+                let response = serde_json::json!({"result": {"process_info": info}}).to_string();
+                let runner = FakeRunner::with_outputs(vec![output(0, &response, "")]);
+                let error = client("direct", runner).process_info("p").unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("outside the positive Linux pid_t range"),
+                    "field={field} value={value}: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn process_info_refuses_boolean_process_ids() {
+        for field in ["shell_pid", "foreground_process_group_id", "foreground_pid"] {
+            let mut info = serde_json::json!({
+                "pane_id": "p",
+                "shell_pid": 7,
+                "foreground_process_group_id": 7,
+                "foreground_processes": [{"pid": 7, "name": "sh", "cmdline": "sh"}],
+            });
+            if field == "foreground_pid" {
+                info["foreground_processes"][0]["pid"] = Value::Bool(true);
+            } else {
+                info[field] = Value::Bool(true);
+            }
+            let response = serde_json::json!({"result": {"process_info": info}}).to_string();
+            let runner = FakeRunner::with_outputs(vec![output(0, &response, "")]);
+            let error = client("direct", runner).process_info("p").unwrap_err();
+            assert!(
+                error.to_string().contains("not an integer"),
+                "field={field}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedded_nul_identifier_is_typed_unavailable() {
+        struct NulRejectingRunner;
+
+        impl CommandRunner for NulRejectingRunner {
+            fn run(&self, argv: &[String]) -> io::Result<CommandOutput> {
+                assert!(argv.iter().any(|argument| argument.contains('\0')));
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "nul byte found in provided data",
+                ))
+            }
+        }
+
+        let error = client("direct", Arc::new(NulRejectingRunner))
+            .read("bad\0pane", "recent-unwrapped", None)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot invoke Herdr"));
     }
 
     #[test]

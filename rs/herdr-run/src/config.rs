@@ -26,24 +26,28 @@ pub struct Config {
     pub workspace: String,
     /// Tab-label format supporting `{agent}` and `{project}`.
     pub tab_name: String,
-    /// Optional command working directory, relative to `project_root` when needed.
+    /// Optional command working directory; `None` leaves execution at the caller's directory.
     pub cwd: Option<String>,
     /// Bare program names admitted by policy.
     pub allow: Vec<String>,
     /// Wrapper programs that may precede an allowlisted program.
     pub prefixes: Vec<String>,
-    /// Program-specific options denied before the subcommand.
+    /// Program-specific global options; Cargo entries are denied in every argument position.
     pub deny_global: BTreeMap<String, Vec<String>>,
     /// Program-specific subcommands denied by policy.
     pub deny_subcommand: BTreeMap<String, Vec<String>>,
     /// Options denied wherever they occur after the program.
     pub deny_anywhere: Vec<String>,
+    /// Programs whose subcommand must appear in the corresponding positive list.
+    pub allow_subcommand: BTreeMap<String, Vec<String>>,
     /// Global options whose value occupies the following token.
     pub value_options: BTreeMap<String, Vec<String>>,
     /// Directory holding run spools, audit log, and session cache.
     pub spool_dir: String,
     /// Maximum seconds to wait for a launched command to complete.
     pub timeout_seconds: f64,
+    /// Days of per-run spool output to retain, pruned when a new run is written.
+    pub retention_days: u64,
     /// Maximum seconds to wait for a pane to become ready.
     pub ready_timeout_seconds: f64,
     /// Readiness policy: `both` or `process`.
@@ -68,17 +72,33 @@ impl Default for Config {
             workspace: "agent-cmds".to_owned(),
             tab_name: "{agent}".to_owned(),
             cwd: None,
+            // Cargo is deliberately not a default: even dependency-oriented subcommands can
+            // execute configured rustc wrappers, credential providers, or fetch helpers. The
+            // cargo-specific policy below limits projects that explicitly accept that widening.
             allow: strings(&["git", "gh"]),
             prefixes: strings(&["with-proxy"]),
             deny_global: string_map(&[
                 ("git", &["-c", "--config-env", "--exec-path", "--namespace"]),
                 ("gh", &[]),
+                ("cargo", &["--config", "-Z"]),
             ]),
             deny_subcommand: string_map(&[
                 ("git", &["filter-branch", "daemon", "instaweb"]),
                 ("gh", &["alias", "extension", "ext", "codespace", "cs"]),
             ]),
             deny_anywhere: strings(&["--upload-pack", "--receive-pack"]),
+            allow_subcommand: string_map(&[(
+                "cargo",
+                &[
+                    "fetch",
+                    "update",
+                    "generate-lockfile",
+                    "vendor",
+                    "metadata",
+                    "tree",
+                    "search",
+                ],
+            )]),
             value_options: string_map(&[
                 (
                     "git",
@@ -93,9 +113,21 @@ impl Default for Config {
                     ],
                 ),
                 ("gh", &["-R", "--repo"]),
+                (
+                    "cargo",
+                    &[
+                        "--manifest-path",
+                        "--config",
+                        "-Z",
+                        "-p",
+                        "--package",
+                        "--target-dir",
+                    ],
+                ),
             ]),
             spool_dir: ".herdr-run".to_owned(),
             timeout_seconds: 900.0,
+            retention_days: crate::retention::RETENTION_DAYS,
             ready_timeout_seconds: 0.0,
             readiness: "both".to_owned(),
             prompt_tail: None,
@@ -381,6 +413,9 @@ pub fn parse_config(
     if let Some(value) = mapping.get("deny_anywhere") {
         config.deny_anywhere = require_policy_list(value, &format!("{what}.deny_anywhere"))?;
     }
+    if let Some(value) = mapping.get("allow_subcommand") {
+        config.allow_subcommand = require_string_map(value, &format!("{what}.allow_subcommand"))?;
+    }
     if let Some(value) = mapping.get("value_options") {
         config.value_options = require_string_map(value, &format!("{what}.value_options"))?;
     }
@@ -389,6 +424,10 @@ pub fn parse_config(
     }
     if let Some(value) = mapping.get("timeout_seconds") {
         config.timeout_seconds = require_number(value, &format!("{what}.timeout_seconds"))?;
+    }
+    if let Some(value) = mapping.get("retention_days") {
+        config.retention_days =
+            require_nonnegative_integer(value, &format!("{what}.retention_days"))?;
     }
     if let Some(value) = mapping.get("ready_timeout_seconds") {
         config.ready_timeout_seconds =
@@ -416,11 +455,18 @@ pub fn parse_config(
             "{what}.allow: refusing an EMPTY allowlist — no command could ever run"
         )));
     }
+    if config.allow.iter().any(|program| program == "cargo")
+        && !config.allow_subcommand.contains_key("cargo")
+    {
+        return Err(HerdrRunError::config(format!(
+            "{what}.allow_subcommand: cargo is allowed but has no positive subcommand list"
+        )));
+    }
     Ok(config)
 }
 
 fn reject_unknown_keys(mapping: &Map<String, Value>, what: &str) -> Result<()> {
-    const KNOWN: [&str; 17] = [
+    const KNOWN: [&str; 19] = [
         "workspace",
         "tab_name",
         "cwd",
@@ -429,9 +475,11 @@ fn reject_unknown_keys(mapping: &Map<String, Value>, what: &str) -> Result<()> {
         "deny_global",
         "deny_subcommand",
         "deny_anywhere",
+        "allow_subcommand",
         "value_options",
         "spool_dir",
         "timeout_seconds",
+        "retention_days",
         "ready_timeout_seconds",
         "readiness",
         "prompt_tail",
@@ -579,6 +627,22 @@ fn require_number(value: &Value, what: &str) -> Result<f64> {
     Ok(number)
 }
 
+fn require_nonnegative_integer(value: &Value, what: &str) -> Result<u64> {
+    let number = value.as_u64().ok_or_else(|| {
+        HerdrRunError::config(format!(
+            "{what}: must be a non-negative integer, got {}",
+            value_type(value)
+        ))
+    })?;
+    if number > crate::retention::MAX_RETENTION_DAYS {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must not exceed {} days",
+            crate::retention::MAX_RETENTION_DAYS
+        )));
+    }
+    Ok(number)
+}
+
 fn require_nonempty(value: &str, what: &str) -> Result<()> {
     if value.is_empty() {
         Err(HerdrRunError::config(format!(
@@ -685,8 +749,21 @@ mod tests {
         assert_eq!(config.workspace, "agent-cmds");
         assert_eq!(config.tab_name, "{agent}");
         assert_eq!(config.allow, strings(&["git", "gh"]));
+        assert_eq!(
+            config.allow_subcommand.get("cargo").unwrap(),
+            &strings(&[
+                "fetch",
+                "update",
+                "generate-lockfile",
+                "vendor",
+                "metadata",
+                "tree",
+                "search",
+            ])
+        );
         assert_eq!(config.prefixes, strings(&["with-proxy"]));
         assert_eq!(config.timeout_seconds, 900.0);
+        assert_eq!(config.retention_days, 4);
         assert_eq!(config.readiness, "both");
         assert_eq!(config.broker, "direct");
     }
@@ -697,8 +774,10 @@ mod tests {
             "workspace": "cmds", "tab_name": "{project}-{agent}", "cwd": "sub",
             "allow": ["cargo"], "prefixes": [], "deny_global": {"cargo": ["-Z"]},
             "deny_subcommand": {"cargo": ["install"]}, "deny_anywhere": ["--evil"],
+            "allow_subcommand": {"cargo": ["fetch", "build"]},
             "value_options": {"cargo": ["--manifest-path"]}, "spool_dir": "out",
-            "timeout_seconds": 30, "ready_timeout_seconds": 5, "readiness": "process",
+            "timeout_seconds": 30, "retention_days": 7,
+            "ready_timeout_seconds": 5, "readiness": "process",
             "prompt_tail": "% ", "shells": ["zsh"], "broker": "systemd-run",
             "probe_remote": "https://example.test/repo"
         });
@@ -706,7 +785,12 @@ mod tests {
         assert_eq!(config.allow, strings(&["cargo"]));
         assert_eq!(config.deny_global.len(), 1);
         assert!(!config.deny_global.contains_key("git"));
+        assert_eq!(
+            config.allow_subcommand["cargo"],
+            strings(&["fetch", "build"])
+        );
         assert_eq!(config.timeout_seconds, 30.0);
+        assert_eq!(config.retention_days, 7);
         assert_eq!(config.prompt_tail.as_deref(), Some("% "));
     }
 
@@ -719,6 +803,10 @@ mod tests {
             serde_json::json!({"timeout_seconds": true}),
             serde_json::json!({"timeout_seconds": -1}),
             serde_json::json!({"timeout_seconds": MAX_TIMEOUT_SECONDS + 1.0}),
+            serde_json::json!({"retention_days": -1}),
+            serde_json::json!({"retention_days": 1.5}),
+            serde_json::json!({"retention_days": "4"}),
+            serde_json::json!({"retention_days": crate::retention::MAX_RETENTION_DAYS + 1}),
             serde_json::json!({"readiness": "maybe"}),
             serde_json::json!({"deny_global": ["git"]}),
             serde_json::json!({"allow": []}),
@@ -729,6 +817,18 @@ mod tests {
                 .expect_err("malformed config must fail");
             assert_eq!(error.exit_code(), crate::error::EXIT_CONFIG);
         }
+    }
+
+    #[test]
+    fn cargo_allow_requires_its_positive_subcommand_map() {
+        let document = serde_json::json!({
+            "allow": ["git", "cargo"],
+            "allow_subcommand": {"custom-tool": ["inspect"]}
+        });
+        let error = parse_config(&document, Some("x.yaml".into()), "/tmp".into()).unwrap_err();
+        assert!(error
+            .message()
+            .contains("cargo is allowed but has no positive"));
     }
 
     #[test]

@@ -43,6 +43,7 @@ class Render:
     document: str
     language: str
     destination: str
+    exemptions: tuple[str, ...] = ()
 
     @property
     def template(self) -> str:
@@ -54,6 +55,10 @@ class Render:
 
 
 def _renders() -> tuple[Render, ...]:
+    # herdr-run's Python distribution intentionally documents `cargo fetch` as an allowlisted
+    # TARGET command. That is user-visible subject matter, not a reference to its Rust sibling.
+    # Keep the Cargo-only exemption scoped to those two documents; rustc/rustup/crates.io remain
+    # forbidden so the exception cannot hide an accidental sibling-implementation reference.
     rendered: list[Render] = []
     for tool, py_package, rust_crate in TOOLS:
         rendered.extend(
@@ -63,12 +68,14 @@ def _renders() -> tuple[Render, ...]:
                     "README",
                     "python",
                     f"common/docs/{tool}/rendered/python/README.md",
+                    ("target Cargo command",) if tool == "herdr-run" else (),
                 ),
                 Render(
                     tool,
                     "USER_GUIDE",
                     "python",
                     f"common/docs/{tool}/rendered/python/USER_GUIDE.md",
+                    ("target Cargo command",) if tool == "herdr-run" else (),
                 ),
                 Render(
                     tool,
@@ -119,9 +126,10 @@ COMMON_FORBIDDEN: tuple[tuple[str, re.Pattern[str]], ...] = (
 LANGUAGE_FORBIDDEN: dict[str, tuple[tuple[str, re.Pattern[str]], ...]] = {
     "python": (
         ("other implementation language", re.compile(r"\bRust\b", re.IGNORECASE)),
+        ("target Cargo command", re.compile(r"\bCargo\b", re.IGNORECASE)),
         (
             "other toolchain",
-            re.compile(r"\b(?:Cargo|rustc|rustup)\b|crates\.io", re.IGNORECASE),
+            re.compile(r"\b(?:rustc|rustup)\b|crates\.io", re.IGNORECASE),
         ),
         ("other source-tree path", re.compile(r"(?:^|[ (`])rs/", re.MULTILINE)),
     ),

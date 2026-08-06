@@ -19,6 +19,12 @@ def config() -> Config:
     return Config()
 
 
+@pytest.fixture()
+def cargo_config() -> Config:
+    """A project has explicitly accepted Cargo's ambient helper-execution trust widening."""
+    return Config(allow=("git", "gh", "cargo"))
+
+
 # --- positive bracket: the intended commands really are admitted -------------------------------
 
 
@@ -255,7 +261,20 @@ def test_only_a_leading_tilde_is_touched(token: str, expanded: bool) -> None:
     assert (result != token) == expanded
 
 
-# --- cargo: admitted ONLY for network-only subcommands -------------------------------------------
+# --- cargo: disabled by default; explicit opt-in remains fail-closed by subcommand --------------
+
+
+def test_cargo_is_not_allowed_by_default(config: Config) -> None:
+    with pytest.raises(Refused, match="not allowlisted"):
+        admit("cargo fetch", config)
+
+
+def test_cargo_opt_in_cannot_drop_its_positive_subcommand_policy() -> None:
+    config = Config(
+        allow=("git", "cargo"), allow_subcommand={"custom-tool": ("inspect",)}
+    )
+    with pytest.raises(Refused, match="requires an explicit allow_subcommand"):
+        admit("cargo build", config)
 
 
 @pytest.mark.parametrize(
@@ -269,8 +288,10 @@ def test_only_a_leading_tilde_is_touched(token: str, expanded: bool) -> None:
         ("cargo metadata", "metadata"),
     ],
 )
-def test_admits_network_only_cargo_subcommands(config: Config, command: str, subcommand: str) -> None:
-    admission = admit(command, config)
+def test_explicit_opt_in_admits_dependency_oriented_cargo_subcommands(
+    cargo_config: Config, command: str, subcommand: str
+) -> None:
+    admission = admit(command, cargo_config)
     assert admission.program == "cargo"
     assert admission.subcommand == subcommand
 
@@ -291,28 +312,55 @@ def test_admits_network_only_cargo_subcommands(config: Config, command: str, sub
         "with-proxy cargo build",
     ],
 )
-def test_refuses_cargo_subcommands_that_execute_code(config: Config, command: str) -> None:
+def test_refuses_cargo_subcommands_that_execute_code(cargo_config: Config, command: str) -> None:
     """The pane is OUTSIDE the sandbox: compiling there runs third-party build scripts unconfined."""
     with pytest.raises(Refused, match="not allowlisted"):
-        admit(command, config)
+        admit(command, cargo_config)
 
 
-def test_refuses_bare_cargo(config: Config) -> None:
+def test_refuses_bare_cargo(cargo_config: Config) -> None:
     """Fail-closed: a program with a subcommand allowlist must name one of them."""
     with pytest.raises(Refused, match="requires a subcommand"):
-        admit("cargo", config)
+        admit("cargo", cargo_config)
 
 
-def test_refuses_unknown_cargo_subcommand(config: Config) -> None:
+def test_refuses_unknown_cargo_subcommand(cargo_config: Config) -> None:
     """A third-party `cargo-<x>` subcommand is arbitrary code and is not enumerable in a deny-list."""
     with pytest.raises(Refused, match="not allowlisted"):
-        admit("cargo something-new", config)
+        admit("cargo something-new", cargo_config)
 
 
-@pytest.mark.parametrize("command", ["cargo --config build.rustc-wrapper='/tmp/evil' fetch", "cargo -Z unstable-options fetch"])
-def test_refuses_cargo_global_code_injection_options(config: Config, command: str) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cargo --config build.rustc-wrapper='/tmp/evil' fetch",
+        "cargo --config=build.rustc-wrapper='/tmp/evil' fetch",
+        "cargo fetch --config build.rustc-wrapper='/tmp/evil'",
+        "cargo fetch --config=build.rustc-wrapper='/tmp/evil'",
+        "cargo -Z unstable-options fetch",
+        "cargo -Zunstable-options fetch",
+        "cargo fetch -Z unstable-options",
+        "cargo fetch -Zunstable-options",
+        "cargo fetch -Z=unstable-options",
+        "cargo fetch -qZunstable-options",
+    ],
+)
+def test_refuses_cargo_code_injection_options_in_every_position_and_form(
+    cargo_config: Config, command: str
+) -> None:
     with pytest.raises(Refused, match="denied"):
-        admit(command, config)
+        admit(command, cargo_config)
+
+
+def test_cargo_minimum_injection_denies_cannot_be_removed() -> None:
+    config = Config(
+        allow=("cargo",),
+        allow_subcommand={"cargo": ("fetch",)},
+        deny_global={},
+    )
+    for command in ("cargo fetch --config=x", "cargo fetch -Zunstable-options"):
+        with pytest.raises(Refused, match="denied"):
+            admit(command, config)
 
 
 def test_subcommand_allowlist_does_not_constrain_programs_without_one(config: Config) -> None:
@@ -323,5 +371,7 @@ def test_subcommand_allowlist_does_not_constrain_programs_without_one(config: Co
 
 def test_project_can_grant_cargo_build_explicitly() -> None:
     """The restriction is policy, not a hard-coded ban: a project that accepts the risk can opt in."""
-    config = Config(allow_subcommand={"cargo": ("fetch", "build")})
+    config = Config(
+        allow=("git", "gh", "cargo"), allow_subcommand={"cargo": ("fetch", "build")}
+    )
     assert admit("cargo build", config).subcommand == "build"

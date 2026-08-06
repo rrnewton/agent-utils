@@ -313,7 +313,7 @@ def _bootstrap(harness: Harness, report: Report) -> None:
 
     python, rust = harness.invoke(
         case,
-        ("--dry-run", "--agent", "fixture-agent", "--", "git", "--help"),
+        ("--dry-run", "--agent", "fixture-agent", "--", "git --help"),
     )
     report.exact("bootstrap/double-dash-command-help", python, rust, expected_rc=0)
     report.require(
@@ -388,6 +388,11 @@ def _policy(harness: Harness, report: Report) -> None:
         ("control-escape", "git status\x1b[2J"),
         ("control-del", "git status\x7f"),
         ("control-c1", "git status\x85"),
+        ("cargo-bare", "cargo"),
+        ("cargo-fetch-default", "cargo fetch"),
+        ("cargo-build", "cargo build --release"),
+        ("cargo-unknown", "cargo something-new"),
+        ("cargo-config", "cargo --config build.rustc-wrapper=/tmp/evil fetch"),
     )
     for label, command in refused:
         case = harness.case(f"policy-refuse-{label}")
@@ -397,9 +402,41 @@ def _policy(harness: Harness, report: Report) -> None:
     widened = {
         ".herdr-run.yaml": "allow: [git, cargo]\nprefixes: []\n",
     }
-    case = harness.case("policy-custom-widened", widened)
-    python, rust = harness.invoke(case, ("check", "cargo fetch"))
-    report.exact("policy/custom-widened", python, rust, expected_rc=0)
+    for label, command in (
+        ("fetch", "cargo fetch"),
+        ("update", "cargo update -p serde"),
+    ):
+        case = harness.case(f"policy-custom-widened-{label}", widened)
+        python, rust = harness.invoke(case, ("check", command))
+        report.exact(f"policy/custom-widened/{label}", python, rust, expected_rc=0)
+
+    for label, command in (
+        ("config-before", "cargo --config build.rustc-wrapper=/tmp/evil fetch"),
+        ("config-after", "cargo fetch --config build.rustc-wrapper=/tmp/evil"),
+        ("config-attached-after", "cargo fetch --config=build.rustc-wrapper=/tmp/evil"),
+        ("z-before-attached", "cargo -Zunstable-options fetch"),
+        ("z-after", "cargo fetch -Z unstable-options"),
+        ("z-after-attached", "cargo fetch -Zunstable-options"),
+        ("z-after-clustered", "cargo fetch -qZunstable-options"),
+    ):
+        case = harness.case(f"policy-custom-widened-refuse-{label}", widened)
+        python, rust = harness.invoke(case, ("check", command))
+        report.exact(f"policy/custom-widened/refused/{label}", python, rust, expected_rc=77)
+
+    minimum_cargo_guards = {
+        ".herdr-run.yaml": (
+            "allow: [cargo]\n"
+            "deny_global: {}\n"
+            "allow_subcommand:\n  cargo: [fetch]\n"
+        ),
+    }
+    for label, command in (
+        ("config-attached", "cargo fetch --config=x"),
+        ("unstable-attached", "cargo fetch -Zunstable-options"),
+    ):
+        case = harness.case(f"policy-cargo-minimum-guard-{label}", minimum_cargo_guards)
+        python, rust = harness.invoke(case, ("check", command))
+        report.exact(f"policy/cargo-minimum-guard/{label}", python, rust, expected_rc=77)
 
     narrowed = {
         ".herdr-run.yaml": "allow: [git]\nprefixes: []\n",
@@ -453,12 +490,15 @@ deny_subcommand:
   gh: [alias]
   cargo: [install]
 deny_anywhere: [--upload-pack]
+allow_subcommand:
+  cargo: [fetch, update]
 value_options:
   git: [-C]
   gh: [-R]
   cargo: [--manifest-path]
 spool_dir: .state/herdr
 timeout_seconds: 12.5
+retention_days: 7
 ready_timeout_seconds: 3
 readiness: process
 prompt_tail: "$ "
@@ -546,8 +586,14 @@ def _config_malformed(harness: Harness, report: Report) -> None:
         ("allow-scalar", "allow: git\n"),
         ("allow-non-string", "allow: [git, true]\n"),
         ("empty-allow", "allow: []\n"),
+        (
+            "cargo-positive-list-omitted",
+            "allow: [git, cargo]\nallow_subcommand:\n  custom-tool: [inspect]\n",
+        ),
         ("negative-timeout", "timeout_seconds: -1\n"),
         ("excessive-timeout", "timeout_seconds: 1e300\n"),
+        ("negative-retention", "retention_days: -1\n"),
+        ("fractional-retention", "retention_days: 1.5\n"),
         ("malformed-tab-template", 'tab_name: "{agent"\n'),
         ("attribute-tab-template", 'tab_name: "{agent.__class__}"\n'),
         ("format-tab-template", 'tab_name: "{agent:>10}"\n'),

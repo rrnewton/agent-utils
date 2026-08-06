@@ -11,13 +11,24 @@ import json
 import os
 import sys
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from herdr_run.audit import audit_path, record
 import herdr_run.cli as cli_module
 from herdr_run.cli import _default_agent, build_parser, main
-from herdr_run.errors import EXIT_REFUSED
+from herdr_run.config import Config
+from herdr_run.errors import (
+    EXIT_CONFIG,
+    EXIT_REFUSED,
+    ConfigError,
+    HerdrRunError,
+    HerdrUnavailable,
+    PaneBusy,
+    Refused,
+    RunTimeout,
+)
 
 
 # --- argument shapes -------------------------------------------------------------------------------
@@ -117,7 +128,7 @@ def test_config_subcommand_reports_the_effective_policy(
     document = json.loads(capsys.readouterr().out)
     assert document["workspace"] == "agent-cmds"
     assert document["tab_label"] == "hermit-lander"
-    assert document["allow"] == ["git", "gh", "cargo"]
+    assert document["allow"] == ["git", "gh"]
 
 
 class _CapturedText(io.StringIO):
@@ -144,6 +155,50 @@ def test_raw_result_streams_are_emitted_byte_exactly_once(
 
     assert stdout.raw.getvalue() == b"A\x00\xff"
     assert stderr.raw.getvalue() == b"B\r\n"
+
+
+@pytest.mark.parametrize("stream_name", ["stdout", "stderr"])
+def test_raw_output_write_failure_is_a_typed_wrapper_error(
+    stream_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _BrokenBuffer:
+        def write(self, data: bytes) -> int:
+            del data
+            raise OSError("output pipe closed")
+
+    stream = _CapturedText()
+    stream.raw = cast(io.BytesIO, _BrokenBuffer())
+    monkeypatch.setattr(sys, stream_name, stream)
+
+    with pytest.raises(HerdrRunError, match=f"cannot write {stream_name}"):
+        cli_module._emit_raw_output(b"output", b"error")
+
+
+def test_timeout_partial_output_write_failure_has_no_traceback(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = str(tmp_path)
+    monkeypatch.chdir(root)
+    target = SimpleNamespace(pane_id="p1", tab_label="agent")
+    timed_out = RunTimeout("still running")
+    timed_out.partial_stdout = "partial\n"
+    timed_out.partial_stderr = ""
+    monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
+    monkeypatch.setattr(cli_module, "resolve_target", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(cli_module, "execute", lambda *_args, **_kwargs: _raise(timed_out))
+    monkeypatch.setattr(
+        cli_module,
+        "_emit_raw_output",
+        lambda *_args: _raise(HerdrRunError("cannot write stdout: closed")),
+    )
+
+    assert main(["agent", "git status"]) == 1
+    captured = capsys.readouterr()
+    assert "cannot write stdout" in captured.err
+    assert "Traceback" not in captured.err
 
 
 def test_metadata_failure_does_not_mask_completed_command(
@@ -190,6 +245,128 @@ def test_metadata_failure_does_not_mask_completed_command(
     assert "meta_error" in entries[-1]
 
 
+def _raise(error: Exception) -> object:
+    raise error
+
+
+@pytest.mark.parametrize(
+    ("failure_site", "error", "verdict"),
+    [
+        ("client", HerdrUnavailable("client unavailable"), "HERDRUNAVAILABLE"),
+        ("target", HerdrUnavailable("target unavailable"), "HERDRUNAVAILABLE"),
+        ("cwd", ConfigError("caller cwd vanished"), "CONFIGERROR"),
+        ("execute", PaneBusy("pane stayed busy"), "PANEBUSY"),
+    ],
+)
+def test_doctor_pane_failures_keep_doctor_output_exit_and_audit_shape(
+    failure_site: str,
+    error: Exception,
+    verdict: str,
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every failure in the pane half is a failed diagnosis, not a typed early exit."""
+    root = str(tmp_path)
+    monkeypatch.chdir(root)
+
+    def inside_probe(
+        command: object, *, timeout: float
+    ) -> SimpleNamespace:
+        assert command == [
+            "/bin/bash",
+            "-lc",
+            "with-proxy git ls-remote https://github.com/git/git HEAD",
+        ]
+        assert timeout == 120
+        return SimpleNamespace(returncode=1, stdout="", stderr="blocked in jail\n")
+
+    monkeypatch.setattr(
+        cli_module,
+        "_bounded_control_command",
+        inside_probe,
+    )
+    target = SimpleNamespace(pane_id="p1", tab_label="agent")
+    monkeypatch.setattr(
+        cli_module,
+        "_client",
+        lambda *_args: _raise(error) if failure_site == "client" else object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "resolve_target",
+        lambda *_args, **_kwargs: (
+            _raise(error) if failure_site == "target" else target
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_resolved_cwd",
+        lambda *_args: _raise(error) if failure_site == "cwd" else root,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "execute",
+        lambda *_args, **_kwargs: _raise(error),
+    )
+
+    assert main(["doctor"]) == 1
+    captured = capsys.readouterr()
+    assert f"[via pane] FAILED: {error}" in captured.out
+    assert "VERDICT: the pane path is NOT working." in captured.out
+    assert "Traceback" not in captured.err
+
+    with open(audit_path(root, ".herdr-run"), encoding="utf-8") as handle:
+        entries = [json.loads(line) for line in handle]
+    assert [entry["verdict"] for entry in entries] == ["ADMITTED", verdict]
+    assert entries[-1]["doctor"] is True
+    assert entries[-1]["inside_exit_code"] == 1
+
+
+def test_doctor_pre_admission_refusal_is_marked_as_doctor(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = str(tmp_path)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(
+        cli_module, "admit", lambda *_args: _raise(Refused("probe refused"))
+    )
+
+    assert main(["doctor"]) == EXIT_REFUSED
+    assert "herdr-run: probe refused" in capsys.readouterr().err
+    with open(audit_path(root, ".herdr-run"), encoding="utf-8") as handle:
+        entry = json.loads(handle.read())
+    assert entry["verdict"] == "REFUSED"
+    assert entry["doctor"] is True
+
+
+def test_vanished_caller_cwd_is_typed_and_audited_after_admission(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Model getcwd(3)'s ENOENT after another process removes the caller's directory."""
+    root = str(tmp_path)
+    config = Config(project_root=root)
+    monkeypatch.setattr(cli_module, "_load", lambda *_args: config)
+    monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
+    monkeypatch.setattr(
+        os,
+        "getcwd",
+        lambda: _raise(FileNotFoundError("caller directory was removed")),
+    )
+
+    assert main(["agent", "git status"]) == EXIT_CONFIG
+    captured = capsys.readouterr()
+    assert "cannot determine current directory" in captured.err
+    assert "Traceback" not in captured.err
+    with open(audit_path(root, ".herdr-run"), encoding="utf-8") as handle:
+        entries = [json.loads(line) for line in handle]
+    assert [entry["verdict"] for entry in entries] == ["ADMITTED", "CONFIGERROR"]
+
+
 # --- audit trail ---------------------------------------------------------------------------------------
 
 
@@ -212,13 +389,14 @@ def test_refusals_are_audited(
 
 def test_audit_appends_rather_than_truncating(tmp_path: object) -> None:
     path = os.path.join(str(tmp_path), "audit.jsonl")
+    os.chmod(str(tmp_path), 0o755)
     assert record(path, agent="a", command="git status", verdict="RAN", detail="exit 0")
     assert record(path, agent="b", command="curl x", verdict="REFUSED", detail="nope")
     with open(path, encoding="utf-8") as handle:
         entries = [json.loads(line) for line in handle if line.strip()]
     assert [entry["verdict"] for entry in entries] == ["RAN", "REFUSED"]
     assert os.stat(path).st_mode & 0o777 == 0o600
-    assert os.stat(str(tmp_path)).st_mode & 0o777 == 0o700
+    assert os.stat(str(tmp_path)).st_mode & 0o777 == 0o755
 
 
 def test_unwritable_audit_log_does_not_raise() -> None:
@@ -233,6 +411,28 @@ def test_unwritable_audit_log_does_not_raise() -> None:
 
 
 # --- spool hygiene: command output must not land where `git add` can pick it up ---------------------
+
+
+def test_spool_ignore_probe_uses_bounded_group_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import herdr_run.audit as audit_module
+
+    def bounded(command: list[str], *, timeout: float) -> SimpleNamespace:
+        assert command == [
+            "git",
+            "-C",
+            "/repo",
+            "check-ignore",
+            "-q",
+            "--",
+            "/repo/.herdr-run/probe",
+        ]
+        assert timeout == 10
+        return SimpleNamespace(returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(audit_module, "_bounded_control_command", bounded)
+    assert audit_module.spool_is_ignored("/repo", ".herdr-run") is False
 
 
 def test_warns_when_the_spool_dir_is_not_gitignored(
@@ -405,3 +605,15 @@ def test_explicit_cwd_still_wins(tmp_path: object) -> None:
 
     target = str(tmp_path)
     assert _resolved_cwd(Config(project_root="/elsewhere"), argparse.Namespace(cwd=target)) == target
+
+
+def test_explicit_empty_cwd_means_the_project_root() -> None:
+    """An explicitly supplied empty value is not the same as omitting --cwd."""
+    import argparse
+
+    from herdr_run.cli import _resolved_cwd
+    from herdr_run.config import Config
+
+    assert _resolved_cwd(
+        Config(project_root="/project", cwd="configured"), argparse.Namespace(cwd="")
+    ) == "/project"
