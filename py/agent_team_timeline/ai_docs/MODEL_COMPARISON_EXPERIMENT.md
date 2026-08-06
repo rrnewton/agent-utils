@@ -1,6 +1,8 @@
-# Summary backend comparison experiment (2026-08-05)
+# Summary backend comparison experiments
 
-## Bottom line
+## 2026-08-05 controlled experiment
+
+### Bottom line
 
 This was **not a completed three-LLM comparison**. It was one controlled
 comparison between the deterministic heuristic and Sol, plus an attempted Luna
@@ -22,7 +24,7 @@ The exact controlled inputs and results are retained under `~/temp/` for
 inspection. The archive format and normal workflow are described in the
 [project README](../README.md).
 
-## Controlled workload
+### Controlled workload
 
 The immutable source archive was
 `~/temp/codex-hermit-timeline-benchmark-source`. Its digest was:
@@ -65,7 +67,7 @@ the Git SHA, so the latter is operator provenance rather than a property that
 can be re-derived from the archive. Future experiments should persist the tool
 SHA.
 
-## Results
+### Results
 
 `total` is `input + output`. Cached input is already included in input, and
 reasoning output is already included in output; neither should be added to the
@@ -89,7 +91,7 @@ a backend exit before a usable response; the deployment diagnosis during the
 experiment was HTTP 404/unavailable. There is neither a summary artifact nor a
 metered token record to compare with Sol.
 
-### Sol token detail
+#### Sol token detail
 
 | Sol receipt set | Input | Cached input (subset) | Output | Reasoning output (subset) | Total |
 |---|---:|---:|---:|---:|---:|
@@ -108,7 +110,7 @@ the experiment. The difference is real retry overhead, not cache replay.
 The immediate replay was idempotent: 228 cache hits, zero misses, zero backend
 batches, zero newly spent tokens, and a subsequent build changed zero files.
 
-## Plain-language feature extension
+### Plain-language feature extension
 
 `~/temp/05_codex-hermit-sol-feature-complete` was copied from the controlled
 Sol output and then updated by a later pipeline revision. It uses the same
@@ -129,7 +131,7 @@ Its replay had 233 cache hits, zero misses, zero backend batches, zero newly
 spent tokens, and a zero-change build. Those numbers demonstrate idempotence;
 they do not turn the feature migration into an apples-to-apples model test.
 
-## Qualitative observations
+### Qualitative observations
 
 The heuristic and Sol artifacts can be compared on identical transcript data,
 but this inspection was not blinded or scored. One daily-summary comparison
@@ -150,7 +152,7 @@ rollup, but it still contains project terms such as `AGENTS.md`, registry, and
 skill adapter. That is a prompt/product observation, not evidence of model
 superiority, because no other model produced the same plain-language jobs.
 
-## Why the Orc number is separate
+### Why the Orc number is separate
 
 The Orc artifact is `~/temp/06_orc-hermit-day1-sol`. It summarizes a
 different provider snapshot and date window with different transcript density,
@@ -171,7 +173,7 @@ is its all-in cost. Neither number says whether Sol is cheaper or more expensive
 than another model: there is no second model on the same Orc input, and this is
 not the controlled Codex-Hermit workload.
 
-## Evidence and audit method
+### Evidence and audit method
 
 The figures above were recomputed from JSON rather than copied from console
 output:
@@ -189,7 +191,7 @@ output_tokens`. Cache-write input was zero in every receipt discussed here.
 No dollar estimate is given because the artifacts do not carry a dated,
 model-specific price schedule.
 
-## Requirements for a valid three-model comparison
+### Requirements for a valid three-model comparison
 
 1. Pin and record one Git revision, prompt versions, source digest, timezone,
    date bounds, phase/context/transcript limits, batch sizes, worker count, and
@@ -214,3 +216,122 @@ model-specific price schedule.
 Until those steps produce three completed LLM arms, describe this evidence as a
 heuristic-versus-Sol control with a failed Luna availability attempt—not a
 three-model benchmark.
+
+## 2026-08-06 live-session experiment
+
+This follow-up froze a much larger, newer snapshot of the same Codex coordinator
+lineage and attempted independent Sol, Terra, Luna, and candidate lightweight-
+model arms. It did **not** produce a valid four-model quality comparison: Sol
+completed, while every other attempted deployment failed before producing a
+summary.
+
+### Frozen workload and output directories
+
+Every arm copied and ingested the same source snapshot:
+
+| Measure | Value |
+|---|---:|
+| Source digest | `934bda3c981c1af0151673bac7327ca0a7b4a3e4b42224089db9ff1bfc85a3dd` |
+| Source transcript files / agents | 142 |
+| Source bytes | 653,329,377 |
+| Source lines | 389,732 |
+| Events | 8,040 |
+| Outer tool calls | 25,787 |
+| Imported interaction edges | 2,316 |
+| Extracted artifacts | 1,313 |
+| Repositories | 8 |
+| Logical summarization jobs | 577 |
+
+The root session was `019fcfe7-0f68-7301-8aab-c2f90a7026c7`. The display
+timezone was `America/New_York`; the declared primary project and host were
+`dev-hermit` and `devbig014`.
+
+| Attempt | Artifact directory |
+|---|---|
+| `gpt-5.6-sol` | `~/temp/codex-coord-latest-sol` |
+| `gpt-5.6-terra` | `~/temp/codex-coord-latest-terra` |
+| `gpt-5.6-luna` | `~/temp/codex-coord-latest-luna` |
+| `gpt-5.4-mini` availability probe | `~/temp/codex-coord-latest-5.4-mini` |
+
+### Results and deployment availability
+
+| Arm | Completed receipts | Failed receipts | Result | Actual experiment spend |
+|---|---:|---:|---|---:|
+| Sol | 96 | 3 | Complete website | 5,423,037 known tokens |
+| Terra | 0 | 12 | No summaries; HTTP 404 deployment missing | unknown |
+| Luna | 0 | 28 | No summaries; HTTP 404 deployment missing | unknown |
+| GPT-5.4-mini | 0 | 8 | No summaries; HTTP 421, retired/unroutable | unknown |
+
+Terra and Luna were visible and marked API-supported in the model catalog, but
+their live Azure transport traces returned HTTP 404 `DeploymentNotFound`.
+Terra's archive retains that full text. Luna's archive retains only the
+truncated endpoint/error tail; its full status was observed in the temporary
+transport trace during the run and is not independently recoverable from the
+archive alone. Luna's error included Azure's generic suggestion to wait five
+minutes; the observed HTTP status and error code distinguish this from a
+rolling token quota. GPT-5.4-mini returned “no upstream configured for this
+host,” and its catalog entry is hidden/retired with an upgrade recommendation
+to Luna.
+
+Every failed-arm receipt has `usage: null`. Their actual spend is therefore
+unknown, not zero. Only an all-cache-hit replay that makes no backend calls is a
+known zero-token run.
+
+There is no `spark` model identifier, including no `gpt-5.3-spark`, in the
+current nine-model catalog. “Fast” is instead a `priority` service tier offered
+for visible models including `gpt-5.5`, Sol, Terra, and Luna. A fast-tier arm
+must record that service tier in its cache identity and run metadata before its
+speed or usage can be compared rigorously; silently treating it as a model slug
+would make the experiment irreproducible.
+
+### Sol cost, completion, and idempotence
+
+The complete Aug. 6 Sol rebuild spent 5,423,037 tokens across all attempts:
+
+| Receipt set | Input | Output | Total |
+|---|---:|---:|---:|
+| 96 completed receipts | 5,007,735 | 198,405 | 5,206,140 |
+| 3 failed receipts | 210,123 | 6,774 | 216,897 |
+| All Aug. 6 attempts | 5,217,858 | 205,179 | 5,423,037 |
+
+The successful final invocation reused 511 cached jobs and generated the
+remaining 66 jobs in 21 backend batches. It took about 4m36s and newly spent
+636,615 tokens: 617,311 input tokens (including 155,904 cached-input tokens)
+and 19,304 output tokens (including 3,699 reasoning tokens).
+
+From ingestion start through the first complete website build, the experiment
+took about 24m42s. Including the all-hit replay and zero-change rebuild, it took
+about 25m12s. The resulting site contains 142 agents, 391 phases, 2,811 edges,
+33,041 rendered events, six calendar rollups, and 547 Markdown summary files.
+
+The idempotence replay recorded 577 cache hits, zero misses, zero backend
+batches, and zero newly spent tokens. The following build changed zero files.
+The successful completion record is
+`runs/20260806T122734995728Z-d8da957c.json`.
+
+Three Sol totals answer different questions and must not be added together:
+
+- **5,423,037 tokens** is the actual Aug. 6 ledger increase, including failed
+  attempts.
+- **5,293,891 tokens** is generation provenance attached to the returned
+  artifact set. It includes 87,751 tokens of reused Aug. 5 artifacts and is not
+  additional spend by the final invocation.
+- **8,315,054 tokens** is the output directory's lifetime ledger, including
+  2,892,017 tokens from the earlier experiment and feature-development history.
+
+The current-run result is independently recoverable as
+`8,315,054 lifetime - 2,892,017 inherited = 5,423,037`.
+
+### Interpretation
+
+This experiment validates source parity, durable partial caches, exact Sol
+accounting, and idempotent replay. It does not support a Sol-versus-Terra-versus-
+Luna quality or cost claim because only Sol reached inference successfully.
+Failed-arm wall times measure deployment failure detection, not summarization
+throughput. Retry configurations also differed: Luna was reduced to one worker
+and eventually one item per batch, while later Terra and GPT-5.4-mini probes
+used diagnostic wrappers. In addition, some Sol run commands and receipt paths
+retain pre-rename `~/temp/` directory names even though the current documented
+output directory exists. A real head-to-head still requires available
+deployments, identical settings and empty per-arm caches, followed by blinded
+scoring of the generated summaries.
