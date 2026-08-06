@@ -21,10 +21,40 @@ cargo install pr-landing-planner
 For workspace development:
 
 ```sh
-cargo build --release --workspace --manifest-path rs/Cargo.toml
-cargo test --workspace --manifest-path rs/Cargo.toml
-cargo clippy --workspace --all-targets --manifest-path rs/Cargo.toml -- -D warnings
+host_target="$(rustc -vV | sed -n 's/^host: //p')"
+cargo build --release --workspace --manifest-path rs/Cargo.toml --target "$host_target"
+cargo test --release --workspace --manifest-path rs/Cargo.toml --target "$host_target"
+cargo clippy --release --workspace --all-targets --manifest-path rs/Cargo.toml \
+  --target "$host_target" -- -D warnings
 ```
+
+The explicit host target shares the cache layout used by the source launchers.
+
+The tracked `rs/bin/<command>` links are source-checkout launchers, not copied
+build artifacts. They ask Cargo to validate its incremental workspace cache,
+verify and refresh binary provenance, and then replace themselves with the
+resulting host-target executable. The target and target directory are explicit,
+so ambient Cargo target selection cannot redirect a build away from the binary
+that will run. Before execution, the launcher publishes a named,
+content-addressed copy outside the deletable Cargo cache; containment code can
+therefore safely re-execute its own path while another process cleans or rebuilds.
+Direct invocations cannot silently use a binary from older checked-out source.
+
+These source-checkout launchers target Linux development hosts and require Git,
+Bash 4+, Cargo/Rust, GNU coreutils (`cp`, `readlink`, and `sha256sum`), and
+util-linux `flock`. This development path does not affect the portability or
+behavior of standalone binaries produced by `cargo install`.
+
+`make clean` removes `rs/target` while holding the launcher lock. It intentionally
+retains the content-addressed `rs/.agent-utils-snapshots` cache: an already
+running containment command may still need its stable path for re-execution.
+Those snapshots are never selected by name or age, only by a freshly verified
+binary hash. They may be removed manually when no source-checkout Rust command
+is running.
+
+On the first `./setup rs` after upgrading from the former copied-binary layout,
+setup removes only the four known legacy `rs/bin/<command>.provenance` cache
+files. Any other unexpected `rs/bin` entry is reported and refused.
 
 Run `make check-rust-packages` from the repository root to build, inspect, and
 smoke the registry archive for each crate independently.

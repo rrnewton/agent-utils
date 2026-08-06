@@ -22,7 +22,10 @@ mypy:
 
 # Lint/typecheck gates (what CI runs).
 check: check-deps mypy
-	cargo clippy --release --workspace --manifest-path rs/Cargo.toml -- -D warnings
+	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
+	test -n "$$host_target"; \
+	cargo clippy --release --workspace --manifest-path rs/Cargo.toml \
+		--target "$$host_target" -- -D warnings
 
 # Stdlib-only smoke check: every console entrypoint must start cleanly (--help / --version /
 # no-args) with ZERO optional dependencies. Catches the "optional dep imported at module scope
@@ -32,7 +35,10 @@ check-deps:
 
 test:
 	cd py && python3 -m pytest -q
-	cargo test --release --workspace --manifest-path rs/Cargo.toml
+	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
+	test -n "$$host_target"; \
+	cargo test --release --workspace --manifest-path rs/Cargo.toml \
+		--target "$$host_target"
 
 # Cross-language observable behavior for every paired command.
 cross:
@@ -51,7 +57,11 @@ fmt:
 	cargo fmt --manifest-path rs/Cargo.toml
 
 clean:
-	rm -rf rs/target rs/bin/* bin
+	mkdir -p rs/.agent-utils-locks
+	flock rs/.agent-utils-locks/cache.lock rm -rf -- rs/target
+	rm -f -- rs/bin/safe-ci-dag-runner.provenance rs/bin/cpuset-alloc.provenance \
+		rs/bin/tick-hub.provenance rs/bin/pr-landing-planner.provenance
+	rm -f -- bin
 	find . -name __pycache__  -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	find . -name .mypy_cache  -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	find . -name .pytest_cache -type d -prune -exec rm -rf {} + 2>/dev/null || true

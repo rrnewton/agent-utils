@@ -2,22 +2,23 @@
 # TRACKED, deterministic engine resolver for repository-local tool commands.
 #
 # The paired commands (`safe-ci-dag-runner`, `cpuset-alloc`, `tick-hub`, and
-# `pr-landing-planner`) have a tracked Python entrypoint under `py/bin` and may have an untracked,
-# locally built Rust binary under `rs/bin`. `agent-team-timeline` is intentionally Python-only.
+# `pr-landing-planner`) have tracked Python and Cargo-backed Rust launchers under their respective
+# `*/bin` directories. `agent-team-timeline` and the newly added `herdr-run` are currently
+# Python-only.
 # Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
 # one consistent command surface after any setup mode.
 #
 # Contract enforced here
 # ----------------------
 #   * DETERMINISTIC + TRACKED default: with no override, ALWAYS the tracked Python entrypoint.
-#   * Rust is opt-in ONLY, via SAFE_CI_DAG_RUNNER_ENGINE=rust, and is NEVER a silent fallback:
-#     if Rust is requested but not built, this errors instead of quietly running Python.
+#   * Rust is opt-in ONLY, via SAFE_CI_DAG_RUNNER_ENGINE=rust. Its tracked launcher asks Cargo to
+#     validate the workspace cache and provenance before executing; it never silently falls back.
 #   * LOGS WHICH ENGINE WON on every invocation (one stderr line), so the resolved engine and its
 #     exact path are always visible in logs.
 #
 # The resolved tool name is this script's invocation basename. The tracked links for
 # `safe-ci-dag-runner`, `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, and
-# `agent-team-timeline` all point here.
+# `agent-team-timeline`, and `herdr-run` all point here.
 set -euo pipefail
 
 # Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent
@@ -27,7 +28,7 @@ ROOT="$(cd "$(dirname "$SELF")/../.." && pwd)"
 
 TOOL="$(basename "$0")"
 if [[ "$TOOL" == "engine-resolver" ]]; then
-    echo "engine-resolver: invoke via a tool symlink (safe-ci-dag-runner|cpuset-alloc|pr-landing-planner|tick-hub|agent-team-timeline), not directly" >&2
+    echo "engine-resolver: invoke via a tracked tool symlink, not directly" >&2
     exit 2
 fi
 
@@ -45,40 +46,16 @@ case "$ENGINE" in
         exec "${CI_HUB_PYTHON:-python3}" "$TARGET" "$@"
         ;;
     rust|rs)
-        # Rust binaries are UNTRACKED build artifacts. Use ONLY when explicitly requested, present,
-        # AND content-verified against the currently-pinned source. A binary built from source older
-        # than the pinned gitlink (a warm/stale artifact) or a binary swapped in without a rebuild is
-        # REFUSED, never silently run — that is exactly how a runner missing an enforcement guard can
-        # run while we believe the tracked source is executing. Never fall back to Python silently
-        # either; that would re-hide the engine mismatch.
+        # The tracked rs/bin link invokes the shared Cargo/provenance launcher. It checks the real
+        # workspace cache on every invocation, rejects replaced artifacts, and rebuilds stale source
+        # before exec. Never fall back to Python silently; that would re-hide an engine mismatch.
         TARGET="$ROOT/rs/bin/$TOOL"
         if [[ ! -x "$TARGET" ]]; then
-            echo "[$TOOL] engine=rust requested but no built binary at rs/bin/$TOOL; run './setup rs'. Refusing to silently fall back to Python." >&2
+            echo "[$TOOL] engine=rust requested but no tracked launcher exists at rs/bin/$TOOL. Refusing to silently fall back to Python." >&2
             exit 127
         fi
-        # Content-verify against build provenance stamped by `setup rs`.
-        prov="$TARGET.provenance"
-        if [[ ! -f "$prov" ]]; then
-            echo "[$TOOL] engine=rust REFUSED: no build provenance ($TOOL.provenance). The UNTRACKED binary cannot be verified against pinned source; rebuild with './setup rs'." >&2
-            exit 3
-        fi
-        want_src="$(sed -n 's/^source_fp=//p' "$prov")"
-        want_bin="$(sed -n 's/^binary_sha256=//p' "$prov")"
-        if [[ -z "$want_src" || -z "$want_bin" ]]; then
-            echo "[$TOOL] engine=rust REFUSED: malformed provenance ($TOOL.provenance); rebuild with './setup rs'." >&2
-            exit 3
-        fi
-        have_src="$("$ROOT/common/bin/rs-source-fingerprint")"
-        have_bin="$(sha256sum -- "$TARGET" | cut -d' ' -f1)"
-        if [[ "$have_src" != "$want_src" ]]; then
-            echo "[$TOOL] engine=rust REFUSED: STALE binary — built from source ${want_src:0:12} but pinned source is now ${have_src:0:12}. Rebuild with './setup rs'." >&2
-            exit 3
-        fi
-        if [[ "$have_bin" != "$want_bin" ]]; then
-            echo "[$TOOL] engine=rust REFUSED: binary ${TARGET#"$ROOT"/} does not match its provenance (have ${have_bin:0:12}, want ${want_bin:0:12}) — modified/planted artifact. Rebuild with './setup rs'." >&2
-            exit 3
-        fi
-        echo "[$TOOL] engine=rust (source-verified ${have_src:0:12}: ${TARGET#"$ROOT"/})" >&2
+        echo "[$TOOL] engine=rust (tracked Cargo launcher: ${TARGET#"$ROOT"/})" >&2
+        unset AGENT_UTILS_RS_ENSURE_ONLY
         exec "$TARGET" "$@"
         ;;
     *)

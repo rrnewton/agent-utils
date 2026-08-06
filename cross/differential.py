@@ -3,8 +3,8 @@
 
 Prove the Python and Rust builds produce identical OBSERVABLE behavior. For a set of
 representative and randomized DAG fixtures, this runs BOTH the Python CLI
-(``python3 -m safe_ci_dag_runner``) and the Rust binary (``rs/target/release/…`` or
-``rs/bin/…``) and asserts:
+(``python3 -m safe_ci_dag_runner``) and a private copy of the executable resolved by the tracked
+``rs/bin`` Cargo launcher and asserts:
 
 * ``list``, ``ascii``, ``dot`` stdout are BYTE-IDENTICAL.
 * ``json`` stdout is BYTE-IDENTICAL (both builds emit ``ensure_ascii=False`` canonical JSON, so
@@ -54,10 +54,13 @@ Exit status is nonzero on any divergence. The module is kept mypy-strict clean.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -143,16 +146,125 @@ def py_command() -> list[str]:
     return [sys.executable, "-m", "safe_ci_dag_runner"]
 
 
-def rs_command(tool: str) -> list[str]:
-    for candidate in (
-        os.path.join(REPO_ROOT, "rs", "target", "release", tool),
-        os.path.join(REPO_ROOT, "rs", "bin", tool),
+_RUST_SNAPSHOTS: list[tempfile.TemporaryDirectory[str]] = []
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _read_provenance(path: str) -> tuple[str, str] | None:
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    source_values = [line.removeprefix("source_fp=") for line in lines if line.startswith("source_fp=")]
+    binary_values = [
+        line.removeprefix("binary_sha256=")
+        for line in lines
+        if line.startswith("binary_sha256=")
+    ]
+    if len(source_values) != 1 or len(binary_values) != 1:
+        return None
+    if not re.fullmatch(r"[0-9a-f]{64}", source_values[0]) or not re.fullmatch(
+        r"[0-9a-f]{64}", binary_values[0]
     ):
-        if os.path.exists(candidate):
-            return [candidate]
-    raise FileNotFoundError(
-        f"rust binary for {tool!r} not found; run `./setup rs` or `cargo build --release`"
-    )
+        return None
+    return source_values[0], binary_values[0]
+
+
+def rs_command(tool: str) -> list[str]:
+    launcher = os.path.join(REPO_ROOT, "rs", "bin", tool)
+    if not os.path.exists(launcher):
+        raise FileNotFoundError(f"tracked Rust launcher for {tool!r} is missing: {launcher}")
+    target_root = os.path.realpath(os.path.join(REPO_ROOT, "rs", "target"))
+    lock_root = os.path.join(REPO_ROOT, "rs", ".agent-utils-locks")
+    os.makedirs(lock_root, exist_ok=True)
+    fingerprint = os.path.join(REPO_ROOT, "common", "bin", "rs-source-fingerprint")
+    last_error = "launcher did not return an artifact"
+
+    for _attempt in range(3):
+        env = dict(os.environ)
+        env["AGENT_UTILS_RS_ENSURE_ONLY"] = "1"
+        ensured = subprocess.run(
+            [launcher],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+        if ensured.returncode != 0:
+            raise FileNotFoundError(
+                f"Rust launcher for {tool!r} could not verify/build its cache: {ensured.stderr}"
+            )
+        candidate = ensured.stdout.strip()
+        candidate_real = os.path.realpath(candidate)
+        try:
+            inside_target_root = os.path.commonpath([target_root, candidate_real]) == target_root
+        except ValueError:
+            inside_target_root = False
+        expected_suffix = os.path.join("release", tool)
+        if not inside_target_root or not candidate_real.endswith(os.sep + expected_suffix):
+            raise FileNotFoundError(
+                f"Rust launcher for {tool!r} returned an invalid executable path: {candidate!r}"
+            )
+
+        # The launcher releases its lock before returning. Reacquire the same outside-target lock,
+        # then revalidate source + provenance around a private copy. A concurrent clean or raw Cargo
+        # write either precedes this critical section or produces a hash mismatch and a retry.
+        with open(os.path.join(lock_root, "cache.lock"), "a+b") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            provenance = _read_provenance(candidate_real + ".provenance")
+            source_before = subprocess.run(
+                [fingerprint],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if provenance is None or source_before.returncode != 0:
+                last_error = "artifact or provenance disappeared before it could be copied"
+                continue
+            stamped_source, stamped_binary = provenance
+            snapshot = tempfile.TemporaryDirectory(prefix=f"agent-utils-{tool}-")
+            snapshot_path = os.path.join(snapshot.name, tool)
+            try:
+                shutil.copy2(candidate_real, snapshot_path)
+                copied_binary = _sha256_file(snapshot_path)
+            except OSError as exc:
+                snapshot.cleanup()
+                last_error = f"artifact copy failed: {exc}"
+                continue
+            source_after = subprocess.run(
+                [fingerprint],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if (
+                source_after.returncode == 0
+                and source_before.stdout.strip() == stamped_source
+                and source_after.stdout.strip() == stamped_source
+                and copied_binary == stamped_binary
+                and os.access(snapshot_path, os.X_OK)
+            ):
+                _RUST_SNAPSHOTS.append(snapshot)
+                # Hundreds of comparisons now reuse immutable private bytes, not Cargo's mutable
+                # top-level target path, without repeatedly invoking the build frontend.
+                return [snapshot_path]
+            snapshot.cleanup()
+            last_error = "source, artifact, or provenance changed while making the private copy"
+
+    raise FileNotFoundError(f"Rust artifact for {tool!r} would not stabilize: {last_error}")
 
 
 def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:

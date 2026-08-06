@@ -5,11 +5,11 @@
 #   ./setup            build BOTH python and rust (default)
 #   ./setup both       same
 #   ./setup py         python only: mypy-strict typecheck
-#   ./setup rs         rust only:   cargo build --release -> rs/bin
-#   ./setup rs --clean rust, then remove rs/target (standalone binaries remain in rs/bin)
+#   ./setup rs         rust only:   verify/build every tracked Cargo-backed launcher
+#   ./setup rs --clean remove the Rust cache first, then rebuild every launcher
 #
 # Every mode wires ./bin at the TRACKED engine resolver (common/bin). The resolver runs the tracked
-# Python entrypoint by default and the UNTRACKED Rust binary only on explicit
+# Python entrypoint by default and the tracked Cargo-backed Rust launcher only on explicit
 # SAFE_CI_DAG_RUNNER_ENGINE=rust, logging which engine won on every invocation.
 #
 # `make` just calls `./setup`.
@@ -67,50 +67,51 @@ setup_py() {
 }
 
 setup_rs() {
-  echo "==> [rs] cargo build --release --workspace"
+  local runner legacy unexpected launcher tool target
+  echo "==> [rs] verify/build tracked Cargo-backed launchers"
   command -v cargo >/dev/null || { echo "rs: cargo not found" >&2; return 1; }
-  cargo build --release --workspace --manifest-path rs/Cargo.toml
-  mkdir -p rs/bin
-  # Copy each workspace bin target into rs/bin so the binaries are standalone and
-  # rs/target can be deleted. Bin names are discovered from cargo metadata.
-  python3 - "$ROOT" <<'PY'
-import json, os, shutil, subprocess, sys
-root = sys.argv[1]
-manifest = os.path.join(root, "rs", "Cargo.toml")
-meta = json.loads(subprocess.check_output(
-    ["cargo", "metadata", "--format-version", "1", "--no-deps", "--manifest-path", manifest]))
-rel = os.path.join(root, "rs", "target", "release")
-binroot = os.path.join(root, "rs", "bin")
-os.makedirs(binroot, exist_ok=True)
-installed = []
-for pkg in meta["packages"]:
-    for tgt in pkg["targets"]:
-        if "bin" in tgt["kind"]:
-            src = os.path.join(rel, tgt["name"])
-            if os.path.exists(src):
-                dst = os.path.join(binroot, tgt["name"])
-                shutil.copy2(src, dst)
-                os.chmod(dst, 0o755)
-                installed.append(tgt["name"])
-print("rs: installed binaries:", ", ".join(sorted(installed)) or "(none)")
-PY
-  # Stamp build provenance next to each installed binary so the engine resolver can content-verify,
-  # at run time, that the UNTRACKED rs/bin artifact was built from the currently-pinned source. This
-  # closes the stale/planted-binary gap: a warm binary built from source older than the pinned gitlink
-  # (or a binary swapped in without a rebuild) is REFUSED instead of silently run. Both sides compute
-  # the source fingerprint via the SAME tracked helper (common/bin/rs-source-fingerprint), so they
-  # cannot drift. The .provenance files land in rs/bin, which is already gitignored.
-  local src_fp
-  src_fp="$("$ROOT/common/bin/rs-source-fingerprint")"
-  local bin bin_sha
-  for bin in rs/bin/*; do
-    [ -f "$bin" ] || continue
-    case "$(basename "$bin")" in .gitkeep | *.provenance) continue ;; esac
-    bin_sha="$(sha256sum -- "$bin" | cut -d' ' -f1)"
-    printf 'source_fp=%s\nbinary_sha256=%s\n' "$src_fp" "$bin_sha" >"$bin.provenance"
+  command -v flock >/dev/null || { echo "rs: flock not found" >&2; return 1; }
+  local lock_root="$ROOT/rs/.agent-utils-locks"
+  mkdir -p "$lock_root"
+  if [ "$CLEAN" = 1 ]; then
+    echo "==> [rs] --clean: removing the repository-local Cargo cache before rebuilding"
+    flock "$lock_root/cache.lock" rm -rf -- "$ROOT/rs/target"
+  fi
+
+  runner="$ROOT/rs/bin/cargo-runner"
+  if [ ! -f "$runner" ] || [ -L "$runner" ] || [ ! -x "$runner" ]; then
+    echo "rs: tracked rs/bin/cargo-runner is missing, linked, or non-executable" >&2
+    return 1
+  fi
+  # Migrate the four adjacent stamps written by setup versions that copied binaries into rs/bin.
+  # These exact files were generated cache metadata; no other unexpected entry is removed.
+  for tool in safe-ci-dag-runner cpuset-alloc tick-hub pr-landing-planner; do
+    legacy="$ROOT/rs/bin/$tool.provenance"
+    if [ -f "$legacy" ] && [ ! -L "$legacy" ]; then
+      rm -f -- "$legacy"
+      echo "rs: removed legacy cache metadata ${legacy#"$ROOT"/}"
+    elif [ -e "$legacy" ] || [ -L "$legacy" ]; then
+      echo "rs: legacy metadata path is not a regular file; refusing: ${legacy#"$ROOT"/}" >&2
+      return 1
+    fi
   done
-  echo "==> [rs] stamped build provenance (source_fp=${src_fp:0:12}...)"
-  if [ "$CLEAN" = 1 ]; then echo "==> [rs] --clean: removing rs/target"; rm -rf rs/target; fi
+  unexpected="$(find "$ROOT/rs/bin" -mindepth 1 -maxdepth 1 \
+    ! -name cargo-runner ! -name safe-ci-dag-runner ! -name cpuset-alloc \
+    ! -name tick-hub ! -name pr-landing-planner -print -quit)"
+  if [ -n "$unexpected" ]; then
+    echo "rs: unexpected rs/bin entry refused: ${unexpected#"$ROOT"/}" >&2
+    return 1
+  fi
+
+  for tool in safe-ci-dag-runner cpuset-alloc tick-hub pr-landing-planner; do
+    launcher="$ROOT/rs/bin/$tool"
+    if [ ! -L "$launcher" ] || [ "$(readlink -- "$launcher")" != cargo-runner ]; then
+      echo "rs: $tool must be the tracked symlink to cargo-runner" >&2
+      return 1
+    fi
+    target="$(AGENT_UTILS_RS_ENSURE_ONLY=1 "$launcher")"
+    echo "rs: ready $tool -> ${target#"$ROOT"/}"
+  done
   echo "==> [rs] ok"
 }
 
@@ -129,6 +130,6 @@ esac
 # stale locally-built Rust binary silently beat the tracked entrypoint.
 wire_bin "common/bin"
 if [ "$WHAT" = rs ]; then
-  echo "==> note: run Rust via SAFE_CI_DAG_RUNNER_ENGINE=rust ./bin/safe-ci-dag-runner (default is tracked Python)"
+  echo "==> note: run Rust via SAFE_CI_DAG_RUNNER_ENGINE=rust ./bin/safe-ci-dag-runner (default is tracked Python; rs/bin is Cargo-backed)"
 fi
 echo "setup: done ($WHAT)"

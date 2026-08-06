@@ -1,9 +1,9 @@
 # --- build outputs (produced by ./setup) ---
-# top-level convenience symlink -> rs/bin or py/bin
+# top-level convenience symlink -> the tracked common dispatcher
 /bin
 /rs/target/
-/rs/bin/*
-!/rs/bin/.gitkeep
+/rs/.agent-utils-locks/
+/rs/.agent-utils-snapshots/
 
 # --- python ---
 __pycache__/

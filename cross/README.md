@@ -10,6 +10,13 @@ Run the complete paired-tool contract:
 python3 cross/differential.py --tool all
 ```
 
+The harness resolves each Rust command through its tracked `rs/bin` Cargo
+launcher before starting comparisons. Cargo validates the real workspace cache
+and the launcher refreshes source/binary provenance. While holding the same
+checkout cache lock, the harness revalidates that provenance and makes a private,
+hash-checked executable copy for the tool's full subprocess corpus. Concurrent
+cleaning or rebuilding therefore cannot mix Rust versions within a differential.
+
 Run one tool, or increase the randomized corpus reproducibly:
 
 ```sh

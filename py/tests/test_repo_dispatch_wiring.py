@@ -11,14 +11,17 @@ from types import ModuleType
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-RESOLVER_TOOLS = (
+RUST_TOOLS = (
     "safe-ci-dag-runner",
     "cpuset-alloc",
     "tick-hub",
     "pr-landing-planner",
+)
+PYTHON_ONLY_TOOLS = (
     "agent-team-timeline",
     "herdr-run",
 )
+RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS
 
 
 def _load_check_deps() -> ModuleType:
@@ -63,6 +66,23 @@ def test_tracked_python_launchers_are_directly_executable() -> None:
             f"{tool}: direct launcher failed with {completed.returncode}: "
             f"{completed.stderr}"
         )
+
+
+def test_tracked_rust_launchers_share_the_cargo_runner() -> None:
+    """Every paired Rust command resolves through one tracked source-current launcher."""
+    rust_bin = REPO_ROOT / "rs" / "bin"
+    runner = rust_bin / "cargo-runner"
+    assert runner.is_file()
+    assert runner.stat().st_mode & stat.S_IXUSR
+    assert runner.read_bytes().startswith(b"#!/usr/bin/env bash\n")
+    assert {path.name for path in rust_bin.iterdir()} == {
+        "cargo-runner",
+        *RUST_TOOLS,
+    }
+    for tool in RUST_TOOLS:
+        link = rust_bin / tool
+        assert link.is_symlink(), tool
+        assert link.readlink() == Path("cargo-runner"), tool
 
 
 def test_dependency_smoke_covers_cpuset_companion() -> None:
