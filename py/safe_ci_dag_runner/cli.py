@@ -53,11 +53,15 @@ from safe_ci_dag_runner.io import (
     dag_to_yaml,
 )
 from safe_ci_dag_runner.model import (
+    CPU_TIMEOUT_MULTIPLIER_ENV,
+    CPU_TIMEOUT_PLATFORM_ENV,
+    DEFAULT_CPU_TIMEOUT_MULTIPLIER,
     DEFAULT_SMALL_CPU_COUNT,
     DEFAULT_SMALL_CPU_TIMEOUT,
     DEFAULT_SMALL_MEM_CAP_BYTES,
     DagConfig,
     Step,
+    resolve_cpu_timeout_multiplier,
     step_classification,
 )
 from safe_ci_dag_runner.profile_enrich import container_core_budget
@@ -434,6 +438,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="compatibility flag that explicitly reasserts the default SMALL forcing-function caps "
         "(1 core / 1 GiB / 10 s CPU) for steps that DECLARE NOTHING. The caps are already ON by "
         "default; an explicit per-step hint still wins.",
+    )
+    run_p.add_argument(
+        "--cpu-timeout-multiplier",
+        type=float,
+        default=None,
+        metavar="FACTOR",
+        help="scale every step's canonical cpu_timeout by FACTOR on THIS platform (default 1.0 = "
+        "no scaling). A CPU second is load-immune but not clock-immune, so identical work burns "
+        "more CPU-seconds on a slower runner; this keeps ONE canonical budget in the graph and "
+        "adapts enforcement per platform instead of maintaining a second, drifting table of "
+        f"pre-multiplied numbers. Also settable per-lane via ${CPU_TIMEOUT_MULTIPLIER_ENV} "
+        f"(and ${CPU_TIMEOUT_PLATFORM_ENV} for the label named in breach messages).",
     )
     run_p.add_argument("-v", dest="verbosity", action="count", default=1, help="-v: stream child output")
     run_p.add_argument("-q", "--quiet", action="store_true", help="quieter output")
@@ -1806,6 +1822,30 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             f"undeclared steps are boxed to "
             f"(mem {DEFAULT_SMALL_MEM_CAP_BYTES} B / {DEFAULT_SMALL_CPU_COUNT} core / "
             f"{DEFAULT_SMALL_CPU_TIMEOUT} s CPU); declared per-step hints still win",
+            file=sys.stderr,
+        )
+    # Per-platform CPU-budget scaling. Resolved AFTER apply_plan_to_config so the planner never
+    # sees (and cannot bake in) a platform-specific number: the graph and the plan stay canonical,
+    # and only enforcement is scaled.
+    try:
+        cpu_multiplier, cpu_platform = resolve_cpu_timeout_multiplier(
+            getattr(ns, "cpu_timeout_multiplier", None)
+        )
+    except ValueError as exc:
+        print(f"{PROG}: error: {exc}", file=sys.stderr)
+        return 2
+    if cpu_multiplier != DEFAULT_CPU_TIMEOUT_MULTIPLIER:
+        cfg = dataclasses.replace(
+            cfg,
+            cpu_timeout_multiplier=cpu_multiplier,
+            cpu_timeout_platform=cpu_platform,
+        )
+        # Announce it: a scaled budget silently in force is exactly the invisible-policy problem
+        # this mechanism exists to avoid.
+        label = f" ({cpu_platform})" if cpu_platform else ""
+        print(
+            f"{PROG}: per-platform CPU-budget multiplier x{cpu_multiplier:g}{label} in effect; "
+            "every step's canonical cpu_timeout is scaled by it for enforcement on this platform",
             file=sys.stderr,
         )
     if bool(ns.show_plan):

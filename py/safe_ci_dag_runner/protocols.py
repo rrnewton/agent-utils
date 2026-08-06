@@ -37,7 +37,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from safe_ci_dag_runner.model import step_failure_reason
+from safe_ci_dag_runner.model import DEFAULT_CPU_TIMEOUT_MULTIPLIER, step_failure_reason
 
 __all__ = [
     "CgroupManager",
@@ -278,6 +278,9 @@ class StepOutcome:
         detail_write_failure: Sequence[str],
         cpu_timed_out: bool = False,
         cpu_timeout: int = 0,
+        cpu_timeout_canonical: int = 0,
+        cpu_timeout_multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+        cpu_timeout_platform: str = "",
         aborted: bool = False,
     ) -> "StepOutcome":
         """Build a failed outcome, deriving :attr:`reason` from the shared precedence
@@ -293,6 +296,9 @@ class StepOutcome:
             pids_guard_reason=pids_guard_reason,
             detail_write_failure=detail_write_failure,
             cpu_timed_out=cpu_timed_out,
+            cpu_timeout_canonical=cpu_timeout_canonical,
+            cpu_timeout_multiplier=cpu_timeout_multiplier,
+            cpu_timeout_platform=cpu_timeout_platform,
             cpu_timeout=cpu_timeout,
         )
         return cls(

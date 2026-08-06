@@ -60,7 +60,8 @@ from safe_ci_dag_runner.model import (
     Step,
     command_with_inner_jobs,
     effective_cpu_count,
-    effective_cpu_timeout,
+    canonical_cpu_timeout,
+    scale_cpu_timeout,
     preferred_inner_jobs,
     step_classification,
 )
@@ -369,7 +370,10 @@ class Runner:
             default_cap_bytes=self.cfg.default_step_mem_cap_bytes,
         )
         cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
-        cpu_budget = effective_cpu_timeout(step, self.cfg.default_step_cpu_timeout)
+        cpu_canonical = canonical_cpu_timeout(step, self.cfg.default_step_cpu_timeout)
+        # The ENFORCED budget is the canonical one scaled for this platform; both are kept
+        # so a breach can name the graph's number and the policy that changed it.
+        cpu_budget = scale_cpu_timeout(cpu_canonical, self.cfg.cpu_timeout_multiplier)
         start = time.time()
         stream = self.verbosity >= 2
         timed_out = False
@@ -564,6 +568,9 @@ class Runner:
                     timeout=step.timeout,
                     cpu_timed_out=cpu_timed_out,
                     cpu_timeout=cpu_budget,
+                    cpu_timeout_canonical=cpu_canonical,
+                    cpu_timeout_multiplier=self.cfg.cpu_timeout_multiplier,
+                    cpu_timeout_platform=self.cfg.cpu_timeout_platform,
                     pids_guard_tripped=False,
                     pids_guard_reason=None,
                     detail_write_failure=(),

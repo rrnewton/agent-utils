@@ -262,9 +262,18 @@ fn wants_help(rest: &[String]) -> bool {
 
 /// Render a per-subcommand help page: a usage line, a one-line summary, then each accepted flag with
 /// a ONE-LINE description. Mirrors the Python argparse per-subcommand help.
-fn render_subcommand_help(c: &Palette, usage: &str, summary: &str, flags: &[(&str, &str)]) -> String {
+fn render_subcommand_help(
+    c: &Palette,
+    usage: &str,
+    summary: &str,
+    flags: &[(&str, &str)],
+) -> String {
     let width = flags.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
-    let mut out = format!("{} {PROG} {usage}\n\n{summary}\n\n{}\n", c.bold("usage"), c.bold("options"));
+    let mut out = format!(
+        "{} {PROG} {usage}\n\n{summary}\n\n{}\n",
+        c.bold("usage"),
+        c.bold("options")
+    );
     for (flag, desc) in flags {
         let padded = format!("{flag:<width$}");
         out.push_str(&format!("  {}  {desc}\n", c.cyan(&padded)));
@@ -295,6 +304,11 @@ fn run_help(c: &Palette) -> String {
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
             ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
+            (
+                "--cpu-timeout-multiplier FACTOR",
+                "scale every step's canonical cpu_timeout by FACTOR on THIS platform \
+                 (default 1.0 = no scaling); also $SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER",
+            ),
             ("-v", "stream child output (repeatable)"),
             ("-q, --quiet", "quieter output"),
             ("-h, --help", "show this help and exit"),
@@ -329,11 +343,20 @@ fn plan_help(c: &Palette) -> String {
         "Show learned estimates + the scheduled order. Does NOT run anything.",
         &[
             ("--dag FILE", "DAG file ('-' = stdin) [required]"),
-            ("--planner NAME", "greedy-lpt (default) | critical-path | cpa"),
-            ("--max-mem SPEC", "RAM budget (e.g. 8G) used by the cpa planner"),
+            (
+                "--planner NAME",
+                "greedy-lpt (default) | critical-path | cpa",
+            ),
+            (
+                "--max-mem SPEC",
+                "RAM budget (e.g. 8G) used by the cpa planner",
+            ),
             ("--format FORMAT", "text (default) | json"),
             ("--perf-dir DIR", "read the profile store from DIR"),
-            ("--no-profile-feedback", "do NOT read the profile store to refine estimates"),
+            (
+                "--no-profile-feedback",
+                "do NOT read the profile store to refine estimates",
+            ),
             ("-h, --help", "show this help and exit"),
         ],
     )
@@ -354,7 +377,10 @@ fn simple_help(c: &Palette, command: &str) -> String {
         &usage,
         summary,
         &[
-            ("--dag FILE", "DAG file to read ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
+            (
+                "--dag FILE",
+                "DAG file to read ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]",
+            ),
             ("-h, --help", "show this help and exit"),
         ],
     )
@@ -453,6 +479,7 @@ struct RunArgs {
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
     small_default_cap: bool,
+    cpu_timeout_multiplier: Option<f64>,
     verbosity: i64,
     quiet: bool,
 }
@@ -476,6 +503,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
         small_default_cap: false,
+        cpu_timeout_multiplier: None,
         verbosity: 1,
         quiet: false,
     };
@@ -541,6 +569,13 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
             "--small-default-cap" => a.small_default_cap = true,
+            "--cpu-timeout-multiplier" => {
+                let v = take_value(inline, &mut i)?;
+                a.cpu_timeout_multiplier = Some(
+                    v.parse::<f64>()
+                        .map_err(|_| format!("{key}: invalid float value: '{v}'"))?,
+                );
+            }
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
             other => {
@@ -1603,6 +1638,32 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             crate::model::DEFAULT_SMALL_MEM_CAP_BYTES,
             crate::model::DEFAULT_SMALL_CPU_COUNT,
             crate::model::DEFAULT_SMALL_CPU_TIMEOUT,
+        );
+    }
+    // Per-platform CPU-budget scaling. Applied AFTER apply_plan_to_config so the planner never
+    // sees (and cannot bake in) a platform-specific number: the graph and the plan stay canonical,
+    // and only enforcement is scaled. Mirrors the Python CLI.
+    let (cpu_multiplier, cpu_platform) =
+        match crate::model::resolve_cpu_timeout_multiplier(a.cpu_timeout_multiplier) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("{PROG}: error: {e}");
+                return 2;
+            }
+        };
+    if cpu_multiplier != crate::model::DEFAULT_CPU_TIMEOUT_MULTIPLIER {
+        applied.cpu_timeout_multiplier = cpu_multiplier;
+        applied.cpu_timeout_platform = cpu_platform.clone();
+        // Announce it: a scaled budget silently in force is exactly the invisible-policy problem
+        // this mechanism exists to avoid.
+        let label = if cpu_platform.is_empty() {
+            String::new()
+        } else {
+            format!(" ({cpu_platform})")
+        };
+        eprintln!(
+            "{PROG}: per-platform CPU-budget multiplier x{cpu_multiplier}{label} in effect; \
+             every step's canonical cpu_timeout is scaled by it for enforcement on this platform"
         );
     }
     let cfg: &DagConfig = &applied;
