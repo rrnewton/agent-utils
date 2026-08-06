@@ -203,6 +203,8 @@ class BatchReceipt:
     model: str
     reasoning_effort: str | None
     status: str
+    started_at: str
+    completed_at: str
     usage: Usage | None
 
     @classmethod
@@ -218,6 +220,8 @@ class BatchReceipt:
             model=_required_string(obj, "model", where),
             reasoning_effort=_optional_string(obj, "reasoning_effort", where),
             status=_required_string(obj, "status", where),
+            started_at=_required_string(obj, "started_at", where),
+            completed_at=_required_string(obj, "completed_at", where),
             usage=(
                 None
                 if raw_usage is None
@@ -227,8 +231,8 @@ class BatchReceipt:
 
 
 @dataclass(frozen=True)
-class ModelLedger:
-    """Aggregated receipt counts and usage for one backend/model/effort."""
+class ReceiptLedger:
+    """Aggregated statuses and known usage for a set of backend receipts."""
 
     attempts: int = 0
     completed: int = 0
@@ -237,10 +241,16 @@ class ModelLedger:
     unknown_usage: int = 0
     usage: Usage = Usage()
 
-    def add(self, receipt: BatchReceipt) -> ModelLedger:
+    @property
+    def known_usage_receipts(self) -> int:
+        """Return how many receipts reported a token breakdown."""
+
+        return self.attempts - self.unknown_usage
+
+    def add(self, receipt: BatchReceipt) -> ReceiptLedger:
         """Return this ledger with one backend receipt incorporated."""
 
-        return ModelLedger(
+        return ReceiptLedger(
             attempts=self.attempts + 1,
             completed=self.completed + int(receipt.status == "completed"),
             failed=self.failed + int(receipt.status == "failed"),
@@ -293,6 +303,89 @@ def _load_receipts(archive: Path) -> tuple[list[BatchReceipt], list[str]]:
     return sorted(by_id.values(), key=lambda item: item.receipt_id), warnings
 
 
+_SUMMARIZATION_ACTIONS = frozenset(
+    ("summarize", "refresh", "refresh-claude", "refresh-orc")
+)
+
+
+def _run_action(record: RunRecord) -> str:
+    return record.command[1] if len(record.command) > 1 else "command"
+
+
+def _is_summarization_run(record: RunRecord) -> bool:
+    return _run_action(record) in _SUMMARIZATION_ACTIONS
+
+
+def _timestamp(value: str) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def _receipt_ledger(receipts: Sequence[BatchReceipt]) -> ReceiptLedger:
+    ledger = ReceiptLedger()
+    for receipt in receipts:
+        ledger = ledger.add(receipt)
+    return ledger
+
+
+def _associate_receipts(
+    runs: Sequence[RunRecord], receipts: Sequence[BatchReceipt]
+) -> tuple[dict[str, tuple[BatchReceipt, ...]], tuple[BatchReceipt, ...], list[str]]:
+    """Associate receipts with non-overlapping summarize runs by interval containment."""
+
+    windows: list[tuple[RunRecord, datetime, datetime]] = []
+    warnings: list[str] = []
+    associated: dict[str, list[BatchReceipt]] = {}
+    for run in runs:
+        if not _is_summarization_run(run):
+            continue
+        associated[run.run_id] = []
+        started = _timestamp(run.started_at)
+        completed = _timestamp(run.completed_at)
+        if started is None or completed is None or completed < started:
+            warnings.append(
+                f"cannot attribute receipts to run {run.run_id}: invalid timestamp interval"
+            )
+            continue
+        windows.append((run, started, completed))
+
+    unattributed: list[BatchReceipt] = []
+    for receipt in receipts:
+        started = _timestamp(receipt.started_at)
+        completed = _timestamp(receipt.completed_at)
+        if started is None or completed is None or completed < started:
+            warnings.append(
+                f"cannot attribute receipt {receipt.receipt_id}: invalid timestamp interval"
+            )
+            unattributed.append(receipt)
+            continue
+        matches = [
+            run
+            for run, run_started, run_completed in windows
+            if run_started <= started and completed <= run_completed
+        ]
+        if len(matches) == 1:
+            associated[matches[0].run_id].append(receipt)
+            continue
+        if len(matches) > 1:
+            warnings.append(
+                f"cannot uniquely attribute receipt {receipt.receipt_id}: "
+                f"matches {len(matches)} summarize runs"
+            )
+        unattributed.append(receipt)
+
+    frozen = {
+        run_id: tuple(sorted(items, key=lambda item: item.receipt_id))
+        for run_id, items in associated.items()
+    }
+    return frozen, tuple(unattributed), warnings
+
+
 def _format_usage(usage: Usage) -> str:
     return (
         f"total={usage.total_tokens:,}; input={usage.input_tokens:,} "
@@ -301,13 +394,45 @@ def _format_usage(usage: Usage) -> str:
     )
 
 
+def _format_actual_usage(ledger: ReceiptLedger) -> str:
+    if ledger.unknown_usage == 0:
+        return _format_usage(ledger.usage)
+    receipt_word = "receipt" if ledger.unknown_usage == 1 else "receipts"
+    verb = "lacks" if ledger.unknown_usage == 1 else "lack"
+    prefix = f"UNKNOWN ({ledger.unknown_usage:,} {receipt_word} {verb} usage)"
+    if ledger.known_usage_receipts == 0:
+        return prefix + "; no known token subtotal was reported"
+    known_word = "receipt" if ledger.known_usage_receipts == 1 else "receipts"
+    return (
+        prefix
+        + f"; known subtotal from {ledger.known_usage_receipts:,} {known_word}: "
+        + _format_usage(ledger.usage)
+    )
+
+
+def _format_reported_usage(usage: Usage | None, unknown_receipts: int) -> str:
+    receipt_word = "receipt" if unknown_receipts == 1 else "receipts"
+    verb = "lacks" if unknown_receipts == 1 else "lack"
+    prefix = f"UNKNOWN ({unknown_receipts:,} {receipt_word} {verb} usage)"
+    if usage is None:
+        return (
+            prefix + "; no known token subtotal was reported"
+            if unknown_receipts
+            else "unavailable"
+        )
+    if unknown_receipts == 0:
+        return _format_usage(usage)
+    if usage == Usage():
+        return prefix + "; no known token subtotal was reported"
+    return prefix + "; known subtotal: " + _format_usage(usage)
+
+
 def _duration(started_at: str, completed_at: str) -> str:
-    try:
-        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
-        seconds = max(0, round((completed - started).total_seconds()))
-    except ValueError:
+    started = _timestamp(started_at)
+    completed = _timestamp(completed_at)
+    if started is None or completed is None:
         return "unknown"
+    seconds = max(0, round((completed - started).total_seconds()))
     hours, remainder = divmod(seconds, 3_600)
     minutes, final_seconds = divmod(remainder, 60)
     if hours:
@@ -343,14 +468,34 @@ def _summary_int(
     return default if value is None else value
 
 
-def _format_run(record: RunRecord, archive: Path, index: int) -> list[str]:
-    action = record.command[1] if len(record.command) > 1 else "command"
+def _format_run(
+    record: RunRecord,
+    archive: Path,
+    index: int,
+    attributed_receipts: Sequence[BatchReceipt] | None,
+) -> list[str]:
+    action = _run_action(record)
     lines = [
         f"[{index:03d}] {record.completed_at}  {record.status.upper()}  "
         f"{record.team_slug} / {action}",
         f"      duration: {_duration(record.started_at, record.completed_at)}",
         f"      command: {shlex.join(record.command)}",
     ]
+    if attributed_receipts is not None:
+        ledger = _receipt_ledger(attributed_receipts)
+        statuses = (
+            f"{ledger.completed:,} completed, {ledger.failed:,} failed, "
+            f"{ledger.other_status:,} other"
+        )
+        lines.extend(
+            (
+                f"      backend receipts attributed by timestamp: {ledger.attempts:,} "
+                f"({statuses}); usage known={ledger.known_usage_receipts:,}; "
+                f"usage unknown={ledger.unknown_usage:,}",
+                "      actual model-token spend for this run: "
+                + _format_actual_usage(ledger),
+            )
+        )
     if record.ingest is not None:
         lines.append(f"      ingest: {_object_counts(record.ingest)}")
     if record.summaries is not None:
@@ -388,9 +533,8 @@ def _format_run(record: RunRecord, archive: Path, index: int) -> list[str]:
             record.summaries, "newly_spent_unknown_receipts", where
         )
         lines.append(
-            "      tokens newly spent: "
-            + (_format_usage(new_usage) if new_usage is not None else "unavailable")
-            + f"; unknown receipts={new_unknown:,}"
+            "      successful summary report, tokens newly spent: "
+            + _format_reported_usage(new_usage, new_unknown)
         )
         artifact_usage = _summary_usage(
             record.summaries, "artifact_generation_usage", where
@@ -401,14 +545,26 @@ def _format_run(record: RunRecord, archive: Path, index: int) -> list[str]:
         legacy_unknown = _summary_int(
             record.summaries, "unknown_legacy_artifacts", where
         )
+        artifact_text = _format_reported_usage(artifact_usage, artifact_unknown)
+        if legacy_unknown:
+            legacy_word = "artifact" if legacy_unknown == 1 else "artifacts"
+            legacy_verb = "lacks" if legacy_unknown == 1 else "lack"
+            known_text = (
+                "no known receipt subtotal was reported"
+                if artifact_usage is None or artifact_usage == Usage()
+                else "known receipt subtotal: " + _format_usage(artifact_usage)
+            )
+            artifact_text = (
+                f"UNKNOWN ({legacy_unknown:,} legacy {legacy_word} "
+                f"{legacy_verb} provenance); {known_text}"
+                if artifact_unknown == 0
+                else artifact_text
+                + f"; {legacy_unknown:,} legacy {legacy_word} also "
+                + f"{legacy_verb} provenance"
+            )
         lines.append(
             "      returned-artifact generation cost (not new spend): "
-            + (
-                _format_usage(artifact_usage)
-                if artifact_usage is not None
-                else "unavailable"
-            )
-            + f"; unknown receipts={artifact_unknown:,}; legacy unknown={legacy_unknown:,}"
+            + artifact_text
         )
         raw_paths = record.summaries.get("usage_run_paths")
         if isinstance(raw_paths, list):
@@ -429,26 +585,25 @@ def render_run_stats(archive: Path) -> str:
         raise ValueError(f"archive directory does not exist: {root}")
     runs, run_warnings = _load_runs(root)
     receipts, receipt_warnings = _load_receipts(root)
+    receipts_by_run, unattributed_receipts, attribution_warnings = (
+        _associate_receipts(runs, receipts)
+    )
 
-    model_ledgers: dict[tuple[str, str, str], ModelLedger] = {}
-    receipt_usage = Usage()
-    receipt_unknown = 0
+    model_ledgers: dict[tuple[str, str, str], ReceiptLedger] = {}
     for receipt in receipts:
         effort = receipt.reasoning_effort or "default"
         key = (receipt.backend, receipt.model, effort)
-        model_ledgers[key] = model_ledgers.get(key, ModelLedger()).add(receipt)
-        if receipt.usage is None:
-            receipt_unknown += 1
-        else:
-            receipt_usage += receipt.usage
+        model_ledgers[key] = model_ledgers.get(key, ReceiptLedger()).add(receipt)
+    receipt_ledger = _receipt_ledger(receipts)
+    unattributed_ledger = _receipt_ledger(unattributed_receipts)
 
     logged_usage = Usage()
     logged_unknown = 0
-    summarized_runs = 0
+    successful_summary_reports = 0
     for run in runs:
-        if run.summaries is None:
+        if not _is_summarization_run(run) or run.summaries is None:
             continue
-        summarized_runs += 1
+        successful_summary_reports += 1
         where = str(run.path) + ".summaries"
         usage = _summary_usage(run.summaries, "newly_spent_usage", where)
         if usage is not None:
@@ -460,17 +615,26 @@ def render_run_stats(archive: Path) -> str:
     completed = sum(run.status == "completed" for run in runs)
     failed = sum(run.status == "failed" for run in runs)
     other = len(runs) - completed - failed
+    summarization_runs = sum(_is_summarization_run(run) for run in runs)
+    attributed_count = len(receipts) - len(unattributed_receipts)
+    attributed_receipts = tuple(
+        receipt
+        for items in receipts_by_run.values()
+        for receipt in items
+    )
+    attributed_ledger = _receipt_ledger(attributed_receipts)
     lines = [
         "Agent Team Timeline run statistics",
         f"Archive: {root}",
         f"Top-level runs: {len(runs):,} "
         f"({completed:,} completed, {failed:,} failed, {other:,} other; "
-        f"{summarized_runs:,} with summarization)",
+        f"{summarization_runs:,} summarize/refresh attempts, "
+        f"{successful_summary_reports:,} with successful summary reports)",
         "",
         "Backend receipt ledger (archive-wide actual attempts)",
-        f"  Receipts: {len(receipts):,}; usage known={len(receipts) - receipt_unknown:,}; "
-        f"usage unknown={receipt_unknown:,}",
-        f"  Known tokens spent: {_format_usage(receipt_usage)}",
+        f"  Receipts: {len(receipts):,}; usage known={receipt_ledger.known_usage_receipts:,}; "
+        f"usage unknown={receipt_ledger.unknown_usage:,}",
+        f"  Actual tokens spent: {_format_actual_usage(receipt_ledger)}",
     ]
     if model_ledgers:
         lines.append("  By backend / model / reasoning effort:")
@@ -482,8 +646,9 @@ def render_run_stats(archive: Path) -> str:
             )
             lines.append(
                 f"    {key[0]} / {key[1]} / {key[2]}: attempts={ledger.attempts:,} "
-                f"({statuses}); unknown usage={ledger.unknown_usage:,}; "
-                f"{_format_usage(ledger.usage)}"
+                f"({statuses}); usage known={ledger.known_usage_receipts:,}; "
+                f"usage unknown={ledger.unknown_usage:,}; actual tokens: "
+                f"{_format_actual_usage(ledger)}"
             )
     else:
         lines.append("  No backend receipts found.")
@@ -491,17 +656,28 @@ def render_run_stats(archive: Path) -> str:
     lines.extend(
         (
             "",
-            "Top-level run-log accounting (successful summarization reports)",
-            f"  Newly spent: {_format_usage(logged_usage)}; "
-            f"unknown receipts={logged_unknown:,}",
+            "Top-level summarize-run receipt attribution",
+            f"  Attributed receipts: {attributed_count:,} of {len(receipts):,}; "
+            f"actual tokens: {_format_actual_usage(attributed_ledger)}",
+            f"  Unattributed receipts: {len(unattributed_receipts):,}; actual tokens: "
+            f"{_format_actual_usage(unattributed_ledger)}",
+            "",
+            "Successful summary-report fields (cross-check, not archive totals)",
+            "  Reported newly spent: "
+            + (
+                _format_reported_usage(logged_usage, logged_unknown)
+                if successful_summary_reports
+                else "unavailable (no successful summary reports)"
+            ),
         )
     )
-    delta = receipt_usage.total_tokens - logged_usage.total_tokens
-    if delta != 0 or receipt_unknown != logged_unknown:
+    delta = receipt_ledger.usage.total_tokens - logged_usage.total_tokens
+    if delta != 0 or receipt_ledger.unknown_usage != logged_unknown:
         lines.append(
             f"  Ledger difference: {delta:+,} known tokens and "
-            f"{receipt_unknown - logged_unknown:+,} unknown-usage receipts. "
-            "This includes failed/unattributed backend attempts or missing top-level logs."
+            f"{receipt_ledger.unknown_usage - logged_unknown:+,} unknown-usage receipts. "
+            "This includes successful batches retained from failed top-level runs, failed "
+            "backend calls, unattributed receipts, or missing top-level logs."
         )
 
     lines.extend(("", "Runs (oldest to newest)"))
@@ -510,9 +686,10 @@ def render_run_stats(archive: Path) -> str:
     for index, run in enumerate(runs, start=1):
         if index > 1:
             lines.append("")
-        lines.extend(_format_run(run, root, index))
+        attributed = receipts_by_run.get(run.run_id)
+        lines.extend(_format_run(run, root, index, attributed))
 
-    warnings = run_warnings + receipt_warnings
+    warnings = run_warnings + receipt_warnings + attribution_warnings
     if warnings:
         lines.extend(("", f"Warnings ({len(warnings):,})"))
         lines.extend(f"  - {warning}" for warning in warnings)
@@ -520,6 +697,10 @@ def render_run_stats(archive: Path) -> str:
         (
             "",
             "Notes: cached input is a subset of input; reasoning output is a subset of output.",
+            "Backend receipts are attributed by timestamp; archive writes serialize "
+            "summarize and refresh runs.",
+            "If any receipt lacks usage, the actual total is UNKNOWN; a known subtotal is "
+            "not a complete cost.",
             "Returned-artifact generation cost is provenance, not additional spend, and is not "
             "added to totals.",
         )

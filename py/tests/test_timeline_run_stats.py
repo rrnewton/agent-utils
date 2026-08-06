@@ -28,6 +28,7 @@ def _write_json(path: Path, value: object) -> None:
 
 def _run(
     run_id: str,
+    started_at: str,
     completed_at: str,
     status: str,
     summaries: dict[str, object] | None,
@@ -36,11 +37,11 @@ def _run(
         "schema_version": 1,
         "run_id": run_id,
         "tool_version": "test",
-        "started_at": "2026-08-06T00:00:00Z",
+        "started_at": started_at,
         "completed_at": completed_at,
         "status": status,
         "team_slug": "codex-coord",
-        "command": ["agent-team-timeline", "refresh", "--team", "codex-coord"],
+        "command": ["agent-team-timeline", "summarize", "--team", "codex-coord"],
         "ingest": {
             "sources": 2,
             "source_bytes": 4096,
@@ -80,7 +81,11 @@ def _summary() -> dict[str, object]:
 
 
 def _receipt(
-    receipt_id: str, status: str, usage: dict[str, object] | None
+    receipt_id: str,
+    status: str,
+    started_at: str,
+    completed_at: str,
+    usage: dict[str, object] | None,
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -89,8 +94,8 @@ def _receipt(
         "model": "gpt-5.6-sol",
         "reasoning_effort": "xhigh",
         "status": status,
-        "started_at": "2026-08-06T00:00:01Z",
-        "completed_at": "2026-08-06T00:00:02Z",
+        "started_at": started_at,
+        "completed_at": completed_at,
         "input_hashes": ["abc"],
         "usage": usage,
         "error": None if status == "completed" else "failed",
@@ -101,16 +106,46 @@ def _archive(tmp_path: Path) -> Path:
     archive = tmp_path / "archive"
     _write_json(
         archive / "runs" / "001.json",
-        _run("001", "2026-08-06T00:01:00Z", "completed", _summary()),
+        _run(
+            "001",
+            "2026-08-06T00:00:00Z",
+            "2026-08-06T00:01:00Z",
+            "completed",
+            _summary(),
+        ),
     )
     _write_json(
         archive / "runs" / "002.json",
-        _run("002", "2026-08-06T00:02:00Z", "failed", None),
+        _run(
+            "002",
+            "2026-08-06T00:01:30Z",
+            "2026-08-06T00:02:00Z",
+            "failed",
+            None,
+        ),
     )
     receipts = (
-        ("successful", "completed", _usage(100, 10)),
-        ("failed-known", "failed", _usage(7, 3)),
-        ("failed-unknown", "failed", None),
+        (
+            "successful",
+            "completed",
+            "2026-08-06T00:00:01Z",
+            "2026-08-06T00:00:02Z",
+            _usage(100, 10),
+        ),
+        (
+            "completed-in-failed-run",
+            "completed",
+            "2026-08-06T00:01:31Z",
+            "2026-08-06T00:01:32Z",
+            _usage(7, 3),
+        ),
+        (
+            "failed-unknown",
+            "failed",
+            "2026-08-06T00:01:33Z",
+            "2026-08-06T00:01:34Z",
+            None,
+        ),
     )
     receipt_root = (
         archive
@@ -121,8 +156,11 @@ def _archive(tmp_path: Path) -> Path:
         / "_usage"
         / "receipts"
     )
-    for receipt_id, status, usage in receipts:
-        _write_json(receipt_root / f"{receipt_id}.json", _receipt(receipt_id, status, usage))
+    for receipt_id, status, started_at, completed_at, usage in receipts:
+        _write_json(
+            receipt_root / f"{receipt_id}.json",
+            _receipt(receipt_id, status, started_at, completed_at, usage),
+        )
     return archive
 
 
@@ -132,17 +170,74 @@ def test_report_separates_run_spend_from_complete_backend_ledger(
     archive = _archive(tmp_path)
     report = run_stats.render_run_stats(archive)
 
-    assert "Top-level runs: 2 (1 completed, 1 failed, 0 other; 1 with summarization)" in report
+    assert (
+        "Top-level runs: 2 (1 completed, 1 failed, 0 other; "
+        "2 summarize/refresh attempts, 1 with successful summary reports)"
+    ) in report
     assert "Receipts: 3; usage known=2; usage unknown=1" in report
-    assert "Known tokens spent: total=120; input=107" in report
-    assert "attempts=3 (1 completed, 2 failed, 0 other)" in report
-    assert "Newly spent: total=110; input=100" in report
+    assert "Actual tokens spent: UNKNOWN (1 receipt lacks usage)" in report
+    assert "known subtotal from 2 receipts: total=120; input=107" in report
+    assert "attempts=3 (2 completed, 1 failed, 0 other)" in report
+    assert "Reported newly spent: total=110; input=100" in report
     assert "Ledger difference: +10 known tokens and +1 unknown-usage receipts" in report
-    assert "tokens newly spent: total=110" in report
-    assert "returned-artifact generation cost (not new spend): total=154" in report
+    assert "backend receipts attributed by timestamp: 1 (1 completed, 0 failed" in report
+    assert "actual model-token spend for this run: total=110" in report
+    assert "backend receipts attributed by timestamp: 2 (1 completed, 1 failed" in report
+    assert "actual model-token spend for this run: UNKNOWN (1 receipt lacks usage)" in report
+    assert "known subtotal from 1 receipt: total=10; input=7" in report
+    assert "successful summary report, tokens newly spent: total=110" in report
+    assert "returned-artifact generation cost (not new spend): UNKNOWN" in report
+    assert "known subtotal: total=154" in report
+    assert "2 legacy artifacts also lack provenance" in report
     assert "[001] 2026-08-06T00:01:00Z  COMPLETED" in report
     assert "[002] 2026-08-06T00:02:00Z  FAILED" in report
     assert "run log: runs/001.json" in report
+
+
+def test_unknown_only_receipts_never_render_as_zero_actual_cost(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "unknown-only"
+    _write_json(
+        archive / "runs" / "001.json",
+        _run(
+            "001",
+            "2026-08-06T00:00:00Z",
+            "2026-08-06T00:01:00Z",
+            "failed",
+            None,
+        ),
+    )
+    receipt_path = (
+        archive
+        / "teams"
+        / "codex-coord"
+        / "summary_data"
+        / "cache"
+        / "_usage"
+        / "receipts"
+        / "unknown.json"
+    )
+    _write_json(
+        receipt_path,
+        _receipt(
+            "unknown",
+            "failed",
+            "2026-08-06T00:00:01Z",
+            "2026-08-06T00:00:02Z",
+            None,
+        ),
+    )
+
+    report = run_stats.render_run_stats(archive)
+
+    assert "Actual tokens spent: UNKNOWN (1 receipt lacks usage)" in report
+    assert "no known token subtotal was reported" in report
+    assert (
+        "Reported newly spent: unavailable (no successful summary reports)" in report
+    )
+    assert "Actual tokens spent: total=0" not in report
+    assert "known subtotal: total=0" not in report
 
 
 def test_bundled_script_defaults_to_its_own_archive_directory(
@@ -163,4 +258,4 @@ def test_bundled_script_defaults_to_its_own_archive_directory(
 
     assert completed.returncode == 0, completed.stderr
     assert f"Archive: {archive.resolve()}" in completed.stdout
-    assert "Known tokens spent: total=120" in completed.stdout
+    assert "Actual tokens spent: UNKNOWN" in completed.stdout

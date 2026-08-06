@@ -271,7 +271,11 @@ explicitly as having unknown original usage rather than being regenerated or cou
 Aggregate accounting and receipt paths are also retained in the top-level `runs/*.json` metadata.
 From the archive directory, `make run-stats` formats those top-level records as an oldest-to-newest
 run history, including cache hits/misses, generated products, build counts, newly spent tokens, and
-returned-artifact provenance costs. It separately scans the immutable backend receipt ledger and
+returned-artifact provenance costs. Backend receipts are also attributed to their serialized
+summarize/refresh invocation by timestamp, so a failed top-level run still shows its completed and
+failed batches and their known token subtotal. If even one attributed receipt lacks usage, the
+actual total is labeled `UNKNOWN` rather than presenting that subtotal as a zero or complete cost.
+The report separately scans the immutable backend receipt ledger and
 groups actual attempts by backend, model, and reasoning effort. This archive-wide ledger includes a
 failed attempt when the backend returned usage before failing; any usage-less receipt remains
 explicitly unknown. Returned-artifact generation cost is never added to new spend.
