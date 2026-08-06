@@ -43,8 +43,8 @@ use crate::attribution::{
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
-    command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout, preferred_inner_jobs,
-    step_classification, DagConfig, RunResult, Step, StepOutcome,
+    canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, preferred_inner_jobs,
+    scale_cpu_timeout, step_classification, DagConfig, RunResult, Step, StepOutcome,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -505,6 +505,8 @@ struct Runner {
     default_step_mem_cap_bytes: Option<i64>,
     default_step_cpu_count: Option<i64>,
     default_step_cpu_timeout: i64,
+    cpu_timeout_multiplier: f64,
+    cpu_timeout_platform: String,
     // CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set loop
     // never lets the summed inner-jobs width of concurrently-running steps exceed this total core
     // budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
@@ -569,6 +571,8 @@ impl Runner {
             default_step_mem_cap_bytes: cfg.default_step_mem_cap_bytes,
             default_step_cpu_count: cfg.default_step_cpu_count,
             default_step_cpu_timeout: cfg.default_step_cpu_timeout,
+            cpu_timeout_multiplier: cfg.cpu_timeout_multiplier,
+            cpu_timeout_platform: cfg.cpu_timeout_platform.clone(),
             core_budget,
             run_timeout_s,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
@@ -740,6 +744,8 @@ impl Runner {
                 let default_step_cpu_count = self.default_step_cpu_count;
                 let default_step_cpu_timeout = self.default_step_cpu_timeout;
                 let evidence = self.evidence.clone();
+                let cpu_timeout_multiplier = self.cpu_timeout_multiplier;
+                let cpu_timeout_platform = self.cpu_timeout_platform.clone();
                 handles.push(thread::spawn(move || {
                     run_step(StepCtx {
                         step,
@@ -753,6 +759,8 @@ impl Runner {
                         default_step_cpu_count,
                         default_step_cpu_timeout,
                         evidence,
+                        cpu_timeout_multiplier,
+                        cpu_timeout_platform,
                     });
                 }));
             }
@@ -1021,6 +1029,8 @@ struct StepCtx {
     default_step_cpu_timeout: i64,
     /// Run-level durable evidence sink (per-step log + test-boundary journal), if enabled.
     evidence: Option<Arc<RunEvidence>>,
+    cpu_timeout_multiplier: f64,
+    cpu_timeout_platform: String,
 }
 
 /// Tear down one step's whole process tree: SIGTERM grace, then `cgroup.kill`/SIGKILL.
@@ -1220,6 +1230,8 @@ fn run_step(ctx: StepCtx) {
         default_step_cpu_count,
         default_step_cpu_timeout,
         evidence,
+        cpu_timeout_multiplier,
+        cpu_timeout_platform,
     } = ctx;
     let tag = step.tag();
     emit(&format!("[{tag}] \u{25b6} START  {}", step.desc));
@@ -1238,7 +1250,10 @@ fn run_step(ctx: StepCtx) {
     // WITHOUT appending a bogus `-j 1` to a command that may not accept it.
     let cpu_count = effective_cpu_count(&step, default_step_cpu_count);
     // CPU-time budget: declared cpu_timeout (>0) wins, else the small 10-s default.
-    let cpu_budget = effective_cpu_timeout(&step, default_step_cpu_timeout);
+    let cpu_canonical = canonical_cpu_timeout(&step, default_step_cpu_timeout);
+    // The ENFORCED budget is the canonical one scaled for this platform; both are kept so a
+    // breach can name the graph's number and the policy that changed it.
+    let cpu_budget = scale_cpu_timeout(cpu_canonical, cpu_timeout_multiplier);
     // When boxing is enabled, prepare_command wraps the command so the bash leader self-moves into
     // the step's child cgroup BEFORE forking any grandchild (the cgroup-v2 fork-inheritance rule),
     // applying the inner memory/CPU caps. Disabled / absent -> the command is unchanged.
@@ -1309,6 +1324,9 @@ fn run_step(ctx: StepCtx) {
                 step.timeout,
                 false,
                 cpu_budget,
+                cpu_canonical,
+                cpu_timeout_multiplier,
+                &cpu_timeout_platform,
                 false,
                 None,
                 None,
@@ -1653,6 +1671,9 @@ fn run_step(ctx: StepCtx) {
                 step.timeout,
                 cpu_timed_out,
                 cpu_budget,
+                cpu_canonical,
+                cpu_timeout_multiplier,
+                &cpu_timeout_platform,
                 false,
                 test_counts.executed,
                 test_counts.filtered,

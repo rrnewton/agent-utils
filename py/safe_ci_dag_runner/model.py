@@ -6,6 +6,8 @@ hints, then pass a :class:`DagConfig` to the scheduler.
 
 from __future__ import annotations
 
+import math
+import os
 import signal
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -22,6 +24,35 @@ DEFAULT_STEP_TIMEOUT = 1800
 DEFAULT_SMALL_MEM_CAP_BYTES = 1024**3  # 1 GiB inner memory.max when no memory hint is declared
 DEFAULT_SMALL_CPU_COUNT = 1  # 1-core cpu.max when no inner-parallelism width is declared
 DEFAULT_SMALL_CPU_TIMEOUT = 10  # 10 s CPU-time budget when cpu_timeout is unset
+
+#: Per-platform CPU-budget multiplier, applied at EXECUTION time to whatever CPU budget is in
+#: effect for a step. A CPU second is load-immune (wall = cpu_busy + wait; contention inflates
+#: only wait) but it is NOT clock-immune: a slower core retires the same instruction stream over
+#: more seconds of CPU occupancy, so identical work legitimately burns more CPU-seconds on an
+#: underpowered runner. A graph therefore carries ONE canonical `cpu_timeout` per step and the
+#: platform scales it here.
+#:
+#: Applying it at execution — rather than baking a second column of pre-multiplied numbers into
+#: the graph — is the whole point: two independently-maintained timeout tables drift, and a step
+#: has only one `cpu_timeout` field, so a per-platform column would force declaration authors to
+#: pick a single number that is either too tight for the slow platform or too loose for the fast
+#: one (hiding the very hangs the budget exists to catch).
+#:
+#: 1.0 is a strict no-op: unset, every platform enforces the canonical budget exactly as before.
+#: A platform opts in explicitly (`--cpu-timeout-multiplier`, or
+#: $SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER in a lane's environment), and every breach message
+#: then states the canonical budget, the multiplier and the platform label, so a kill stays
+#: attributable to a specific policy rather than to an anonymous number.
+DEFAULT_CPU_TIMEOUT_MULTIPLIER = 1.0
+
+#: Environment override for :data:`DEFAULT_CPU_TIMEOUT_MULTIPLIER`, so a CI lane can set the
+#: policy once for its whole platform without threading a flag through every invocation.
+CPU_TIMEOUT_MULTIPLIER_ENV = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER"
+
+#: Companion label naming the platform the multiplier describes. Free-form (e.g.
+#: "github-hosted"); it appears verbatim in the breach message so the reader can find the lane
+#: that set it. Empty when the multiplier is 1.0 or the caller supplied no label.
+CPU_TIMEOUT_PLATFORM_ENV = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_PLATFORM"
 
 #: Default template for the inner-parallelism (concurrency) flag appended to a step's command
 #: when the step declares ``preferred_inner_jobs``. See :func:`render_jobs_flag`.
@@ -164,11 +195,76 @@ def preferred_inner_jobs(step: Step, experiment_override: int | None = None) -> 
     return step.hint.preferred_inner_jobs
 
 
-def effective_cpu_timeout(step: Step, default_cpu_timeout: int) -> int:
-    """CPU-time budget (seconds) in effect for a step: its declared ``cpu_timeout`` (>0) wins;
-    otherwise the DAG's SMALL default. Both 0 means the guard is disabled. This is the
-    forcing-function default for the CPU-time dimension (see DEFAULT_SMALL_CPU_TIMEOUT)."""
+def canonical_cpu_timeout(step: Step, default_cpu_timeout: int) -> int:
+    """CANONICAL CPU-time budget (seconds) for a step, before any per-platform scaling: its
+    declared ``cpu_timeout`` (>0) wins; otherwise the DAG's SMALL default. Both 0 means the guard
+    is disabled. This is the forcing-function default for the CPU-time dimension (see
+    DEFAULT_SMALL_CPU_TIMEOUT). This is the number a graph declares and a derivation pipeline
+    produces — one table, platform-independent."""
     return step.cpu_timeout if step.cpu_timeout > 0 else default_cpu_timeout
+
+
+def scale_cpu_timeout(canonical: int, multiplier: float) -> int:
+    """Apply a per-platform multiplier to a canonical CPU budget.
+
+    Rounds to whole seconds (the enforcement poll is 1 Hz, so sub-second precision is not
+    meaningful) and never rounds a live budget down to 0 — that would silently DISABLE the guard
+    on a platform whose multiplier is small, turning a scaling policy into an opt-out. A disabled
+    budget (canonical 0) stays disabled regardless of the multiplier.
+    """
+    if canonical <= 0:
+        return 0
+    if multiplier == DEFAULT_CPU_TIMEOUT_MULTIPLIER:
+        return canonical
+    # Round HALF AWAY FROM ZERO, not Python's banker's rounding. Two reasons, both
+    # load-bearing: (1) Rust's f64::round() is half-away-from-zero, and a budget that differs
+    # between the engines by a second is a real cross-language divergence (round(4.5) is 4 in
+    # Python, 5 in Rust); (2) at a tie the more generous budget is the right default for a
+    # guard whose whole purpose is to avoid false-killing a healthy-but-slow platform.
+    return max(1, math.floor(canonical * multiplier + 0.5))
+
+
+def effective_cpu_timeout(
+    step: Step,
+    default_cpu_timeout: int,
+    multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+) -> int:
+    """CPU-time budget actually ENFORCED for a step on this platform: the canonical budget
+    (:func:`canonical_cpu_timeout`) scaled by the platform multiplier
+    (:func:`scale_cpu_timeout`). With the default 1.0 multiplier this is exactly the canonical
+    budget, so an unconfigured platform behaves as it always did."""
+    return scale_cpu_timeout(canonical_cpu_timeout(step, default_cpu_timeout), multiplier)
+
+
+def resolve_cpu_timeout_multiplier(
+    explicit: float | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[float, str]:
+    """Resolve the platform CPU-budget multiplier and its platform label.
+
+    Precedence: an explicit CLI value wins over the environment, which wins over the 1.0 no-op.
+    A malformed or non-positive environment value is REFUSED rather than silently ignored — a
+    typo that quietly reverted the platform to 1.0 would loosen enforcement invisibly, which is
+    the failure mode this whole mechanism exists to prevent.
+    """
+    environ = os.environ if env is None else env
+    label = (environ.get(CPU_TIMEOUT_PLATFORM_ENV) or "").strip()
+    if explicit is not None:
+        if explicit <= 0:
+            raise ValueError(f"cpu-timeout multiplier must be > 0, got {explicit}")
+        return explicit, label
+    raw = (environ.get(CPU_TIMEOUT_MULTIPLIER_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_CPU_TIMEOUT_MULTIPLIER, label
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{CPU_TIMEOUT_MULTIPLIER_ENV}={raw!r} is not a number"
+        ) from exc
+    if value <= 0:
+        raise ValueError(f"{CPU_TIMEOUT_MULTIPLIER_ENV}={raw!r} must be > 0")
+    return value, label
 
 
 def effective_cpu_count(step: Step, default_cpu_count: int | None) -> int | None:
@@ -178,6 +274,18 @@ def effective_cpu_count(step: Step, default_cpu_count: int | None) -> int | None
     1-core box without a bogus ``-j 1`` appended to a command that may not accept it)."""
     inner = step.hint.preferred_inner_jobs
     return inner if inner is not None else default_cpu_count
+
+
+def _cpu_timeout_policy_suffix(
+    canonical: int, multiplier: float, platform: str
+) -> str:
+    """`` (canonical 3s x2 github-hosted)`` when a platform multiplier scaled the budget, else
+    empty. Silent at 1.0 so the overwhelmingly common unscaled message is unchanged."""
+    if multiplier == DEFAULT_CPU_TIMEOUT_MULTIPLIER or canonical <= 0:
+        return ""
+    rendered = f"{multiplier:g}"
+    label = f" {platform}" if platform else ""
+    return f" (canonical {canonical}s x{rendered}{label})"
 
 
 def step_failure_reason(
@@ -192,6 +300,9 @@ def step_failure_reason(
     detail_write_failure: Sequence[str],
     cpu_timed_out: bool = False,
     cpu_timeout: int = 0,
+    cpu_timeout_canonical: int = 0,
+    cpu_timeout_multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+    cpu_timeout_platform: str = "",
 ) -> str:
     """Describe a failed step without conflating an external signal with an OOM.
 
@@ -210,7 +321,13 @@ def step_failure_reason(
     if oomed:
         return f"OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))"
     if cpu_timed_out:
-        return f"CPU-TIMEOUT >{cpu_timeout}s cpu"
+        # When a platform multiplier is in effect the enforced number is NOT the number written
+        # in the graph, so the message must carry both plus the policy that connects them —
+        # otherwise the reader cannot tell a genuine overrun from a mis-set platform policy, and
+        # cannot find which knob to turn.
+        return f"CPU-TIMEOUT >{cpu_timeout}s cpu" + _cpu_timeout_policy_suffix(
+            cpu_timeout_canonical, cpu_timeout_multiplier, cpu_timeout_platform
+        )
     if timed_out:
         return f"TIMEOUT >{timeout}s"
     if pids_guard_tripped:
@@ -269,6 +386,15 @@ class DagConfig:
     # non-allowlisted failure still fails the run, and an allowlisted step that PASSES is
     # unaffected (membership is consulted only on failure). Empty by default (fail-closed).
     known_failures: frozenset[str] = frozenset()
+
+    # --- Per-platform CPU-budget scaling (see DEFAULT_CPU_TIMEOUT_MULTIPLIER) ---
+    # Execution-time multiplier over whatever canonical CPU budget is in effect, so one graph
+    # runs unchanged on a fast dev box and an underpowered hosted runner. NOT persisted with the
+    # graph: this is caller/platform policy, not a property of the pipeline, and writing it into
+    # the DAG file would recreate the per-platform table this mechanism replaces.
+    cpu_timeout_multiplier: float = DEFAULT_CPU_TIMEOUT_MULTIPLIER
+    # Free-form platform label reported alongside the multiplier in a breach message.
+    cpu_timeout_platform: str = ""
 
     def by_tag(self) -> dict[str, Step]:
         """Index configured steps by their stable tags."""

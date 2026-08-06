@@ -29,7 +29,34 @@ pub const DEFAULT_SMALL_CPU_COUNT: i64 = 1; // 1-core cpu.max
 /// Default CPU-time limit applied to a step with no declared budget, in seconds.
 pub const DEFAULT_SMALL_CPU_TIMEOUT: i64 = 10; // 10 s CPU-time budget
 
-/// How a step uses the machine for scheduling purposes.
+/// Per-platform CPU-budget multiplier, applied at EXECUTION time to whatever CPU budget is in
+/// effect for a step. A CPU second is load-immune (wall = cpu_busy + wait; contention inflates
+/// only wait) but it is NOT clock-immune: a slower core retires the same instruction stream over
+/// more seconds of CPU occupancy, so identical work legitimately burns more CPU-seconds on an
+/// underpowered runner. A graph therefore carries ONE canonical `cpu_timeout` per step and the
+/// platform scales it here.
+///
+/// Applying it at execution — rather than baking a second column of pre-multiplied numbers into
+/// the graph — is the whole point: two independently-maintained timeout tables drift, and a step
+/// has only one `cpu_timeout` field, so a per-platform column would force declaration authors to
+/// pick a single number that is either too tight for the slow platform or too loose for the fast
+/// one (hiding the very hangs the budget exists to catch).
+///
+/// 1.0 is a strict no-op. Mirrors Python's `DEFAULT_CPU_TIMEOUT_MULTIPLIER`.
+pub const DEFAULT_CPU_TIMEOUT_MULTIPLIER: f64 = 1.0;
+
+/// Environment override for [`DEFAULT_CPU_TIMEOUT_MULTIPLIER`], so a CI lane can set the policy
+/// once for its whole platform. Mirrors Python's `CPU_TIMEOUT_MULTIPLIER_ENV`.
+pub const CPU_TIMEOUT_MULTIPLIER_ENV: &str = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER";
+
+/// Companion label naming the platform the multiplier describes; appears verbatim in the breach
+/// message. Mirrors Python's `CPU_TIMEOUT_PLATFORM_ENV`.
+pub const CPU_TIMEOUT_PLATFORM_ENV: &str = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_PLATFORM";
+
+/// How a step uses the machine, used for scheduling decisions.
+///
+/// The serde/string values (`"cpu-bound"`, `"latency-bound"`, `"light"`) are load-bearing:
+/// they appear verbatim in JSON, `list`, `ascii`, and `dot` output and must match Python.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StepClass {
     /// Throughput scales primarily with CPU allocation.
@@ -217,10 +244,11 @@ pub fn preferred_inner_jobs(step: &Step, experiment_override: Option<i64>) -> Op
     experiment_override.or(step.hint.preferred_inner_jobs)
 }
 
-/// Resolve the step CPU-time budget, preferring a positive per-step declaration.
-///
-/// A zero result disables the CPU-time guard.
-pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
+/// CANONICAL CPU-time budget (seconds) for a step, before any per-platform scaling: its declared
+/// `cpu_timeout` (>0) wins; otherwise the DAG's SMALL default. Both 0 means the guard is
+/// disabled. This is the number a graph declares — one table, platform-independent. Mirrors
+/// Python's `canonical_cpu_timeout`.
+pub fn canonical_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
     if step.cpu_timeout > 0 {
         step.cpu_timeout
     } else {
@@ -228,9 +256,88 @@ pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
     }
 }
 
-/// Resolve the step's cgroup core cap from its preferred width or the DAG default.
+/// Apply a per-platform multiplier to a canonical CPU budget.
 ///
-/// This value bounds CPU allocation only; it does not independently alter the command line.
+/// Rounds to whole seconds (the enforcement poll is 1 Hz) and never rounds a live budget down to
+/// 0 — that would silently DISABLE the guard on a platform with a small multiplier, turning a
+/// scaling policy into an opt-out. A disabled budget (canonical 0) stays disabled. Mirrors
+/// Python's `scale_cpu_timeout`.
+pub fn scale_cpu_timeout(canonical: i64, multiplier: f64) -> i64 {
+    if canonical <= 0 {
+        return 0;
+    }
+    if multiplier == DEFAULT_CPU_TIMEOUT_MULTIPLIER {
+        return canonical;
+    }
+    let scaled = (canonical as f64 * multiplier).round() as i64;
+    scaled.max(1)
+}
+
+/// CPU-time budget actually ENFORCED for a step on this platform: the canonical budget scaled by
+/// the platform multiplier. With the default 1.0 multiplier this is exactly the canonical budget.
+/// Mirrors Python's `effective_cpu_timeout`.
+pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64, multiplier: f64) -> i64 {
+    scale_cpu_timeout(canonical_cpu_timeout(step, default_cpu_timeout), multiplier)
+}
+
+/// Resolve the platform CPU-budget multiplier and its label from an explicit value then the
+/// environment. A malformed or non-positive environment value is REFUSED rather than silently
+/// ignored — a typo that quietly reverted to 1.0 would loosen enforcement invisibly. Mirrors
+/// Python's `resolve_cpu_timeout_multiplier`.
+pub fn resolve_cpu_timeout_multiplier(explicit: Option<f64>) -> Result<(f64, String), String> {
+    let label = std::env::var(CPU_TIMEOUT_PLATFORM_ENV)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if let Some(value) = explicit {
+        if value <= 0.0 {
+            return Err(format!("cpu-timeout multiplier must be > 0, got {value}"));
+        }
+        return Ok((value, label));
+    }
+    let raw = std::env::var(CPU_TIMEOUT_MULTIPLIER_ENV).unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok((DEFAULT_CPU_TIMEOUT_MULTIPLIER, label));
+    }
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| format!("{CPU_TIMEOUT_MULTIPLIER_ENV}={raw:?} is not a number"))?;
+    if value <= 0.0 {
+        return Err(format!("{CPU_TIMEOUT_MULTIPLIER_ENV}={raw:?} must be > 0"));
+    }
+    Ok((value, label))
+}
+
+/// `" (canonical 3s x2 github-hosted)"` when a platform multiplier scaled the budget, else empty.
+/// Silent at 1.0 so the common unscaled message is unchanged. Mirrors Python's
+/// `_cpu_timeout_policy_suffix`.
+fn cpu_timeout_policy_suffix(canonical: i64, multiplier: f64, platform: &str) -> String {
+    if multiplier == DEFAULT_CPU_TIMEOUT_MULTIPLIER || canonical <= 0 {
+        return String::new();
+    }
+    let rendered = format_multiplier(multiplier);
+    let label = if platform.is_empty() {
+        String::new()
+    } else {
+        format!(" {platform}")
+    };
+    format!(" (canonical {canonical}s x{rendered}{label})")
+}
+
+/// Render a multiplier the way Python's `%g` does (`2.0 -> "2"`, `1.5 -> "1.5"`), so the two
+/// engines emit byte-identical breach strings.
+fn format_multiplier(value: f64) -> String {
+    let mut s = format!("{value}");
+    if let Some(stripped) = s.strip_suffix(".0") {
+        s = stripped.to_string();
+    }
+    s
+}
+
+/// Core cap (cgroup `cpu.max`) in effect for a step: its declared `preferred_inner_jobs` wins;
+/// otherwise the DAG's SMALL default. Bounds cpu.max ONLY, never the command's inner `-j` flag
+/// (which stays keyed to the declared width). Mirrors Python's `effective_cpu_count`.
 pub fn effective_cpu_count(step: &Step, default_cpu_count: Option<i64>) -> Option<i64> {
     step.hint.preferred_inner_jobs.or(default_cpu_count)
 }
@@ -292,12 +399,22 @@ pub fn step_failure_reason(
     detail_write_failure: &[String],
     cpu_timed_out: bool,
     cpu_timeout: i64,
+    cpu_timeout_canonical: i64,
+    cpu_timeout_multiplier: f64,
+    cpu_timeout_platform: &str,
 ) -> String {
     if oomed {
         return format!("OOM-KILLED (hit inner MemoryMax; {oom_kills} oom_kill event(s))");
     }
     if cpu_timed_out {
-        return format!("CPU-TIMEOUT >{cpu_timeout}s cpu");
+        // When a platform multiplier is in effect the enforced number is NOT the number written
+        // in the graph, so the message must carry both plus the policy that connects them.
+        let suffix = cpu_timeout_policy_suffix(
+            cpu_timeout_canonical,
+            cpu_timeout_multiplier,
+            cpu_timeout_platform,
+        );
+        return format!("CPU-TIMEOUT >{cpu_timeout}s cpu{suffix}");
     }
     if timed_out {
         return format!("TIMEOUT >{timeout}s");
@@ -354,6 +471,11 @@ pub struct DagConfig {
     /// Deliberately SMALL default CPU-time budget (seconds) for a step whose `cpu_timeout` is
     /// unset (see `DEFAULT_SMALL_CPU_TIMEOUT`). `0` disables it.
     pub default_step_cpu_timeout: i64,
+    /// Execution-time multiplier over the canonical CPU budget for THIS platform (see
+    /// `DEFAULT_CPU_TIMEOUT_MULTIPLIER`). Caller/platform policy, never persisted with the graph.
+    pub cpu_timeout_multiplier: f64,
+    /// Free-form platform label reported alongside the multiplier in a breach message.
+    pub cpu_timeout_platform: String,
 }
 
 impl Default for DagConfig {
@@ -374,6 +496,8 @@ impl Default for DagConfig {
             default_step_mem_cap_bytes: Some(DEFAULT_SMALL_MEM_CAP_BYTES),
             default_step_cpu_count: Some(DEFAULT_SMALL_CPU_COUNT),
             default_step_cpu_timeout: DEFAULT_SMALL_CPU_TIMEOUT,
+            cpu_timeout_multiplier: DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+            cpu_timeout_platform: String::new(),
         }
     }
 }
@@ -445,6 +569,9 @@ impl StepOutcome {
         timeout: i64,
         cpu_timed_out: bool,
         cpu_timeout: i64,
+        cpu_timeout_canonical: i64,
+        cpu_timeout_multiplier: f64,
+        cpu_timeout_platform: &str,
         aborted: bool,
         executed_tests: Option<u64>,
         filtered_tests: Option<u64>,
@@ -462,6 +589,9 @@ impl StepOutcome {
             // at parity with the Python runner; thread the real breach flag through.
             cpu_timed_out,
             cpu_timeout,
+            cpu_timeout_canonical,
+            cpu_timeout_multiplier,
+            cpu_timeout_platform,
         );
         StepOutcome {
             tag,
@@ -613,29 +743,269 @@ mod tests {
     fn failure_reason_precedence() {
         // OOM beats a signal.
         assert_eq!(
-            step_failure_reason(Some(-9), true, 2, false, 10, false, None, &[], false, 0),
+            step_failure_reason(
+                Some(-9),
+                true,
+                2,
+                false,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                0,
+                0,
+                DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+                ""
+            ),
             "OOM-KILLED (hit inner MemoryMax; 2 oom_kill event(s))"
         );
         // CPU-timeout beats a wall timeout (more specific cause).
         assert_eq!(
-            step_failure_reason(Some(-9), false, 0, true, 600, false, None, &[], true, 30),
+            step_failure_reason(
+                Some(-9),
+                false,
+                0,
+                true,
+                600,
+                false,
+                None,
+                &[],
+                true,
+                30,
+                0,
+                DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+                ""
+            ),
             "CPU-TIMEOUT >30s cpu"
         );
         // timeout beats a signal.
         assert_eq!(
-            step_failure_reason(Some(-15), false, 0, true, 30, false, None, &[], false, 0),
+            step_failure_reason(
+                Some(-15),
+                false,
+                0,
+                true,
+                30,
+                false,
+                None,
+                &[],
+                false,
+                0,
+                0,
+                DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+                ""
+            ),
             "TIMEOUT >30s"
         );
         // negative return code without oom/timeout -> signal name.
         assert_eq!(
-            step_failure_reason(Some(-9), false, 0, false, 10, false, None, &[], false, 0),
+            step_failure_reason(
+                Some(-9),
+                false,
+                0,
+                false,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                0,
+                0,
+                DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+                ""
+            ),
             "received SIGKILL with no validate timeout, pids guard, \
              or child-cgroup OOM recorded"
         );
         // plain non-zero exit.
         assert_eq!(
-            step_failure_reason(Some(1), false, 0, false, 10, false, None, &[], false, 0),
+            step_failure_reason(
+                Some(1),
+                false,
+                0,
+                false,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                0,
+                0,
+                DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+                ""
+            ),
             "exit 1"
         );
+    }
+}
+
+#[cfg(test)]
+mod cpu_timeout_multiplier_tests {
+    //! Per-platform CPU-budget multiplier — the Rust half of a cross-language contract.
+    //!
+    //! Every case here is mirrored in `py/tests/test_cpu_timeout_multiplier.py`; the two engines
+    //! must agree on the scaled number AND on the breach string, because a DAG is expected to run
+    //! identically under either. The rounding case is not incidental: Python's `round()` is
+    //! banker's rounding and Rust's `f64::round()` is half-away-from-zero, so a naive port
+    //! silently disagrees by a second at every `.5` tie.
+    use super::*;
+
+    fn step(cpu_timeout: i64) -> Step {
+        Step {
+            group: "g".into(),
+            job: "j".into(),
+            desc: "d".into(),
+            description: String::new(),
+            cmd: "true".into(),
+            deps: vec![],
+            env: std::collections::BTreeMap::new(),
+            hint: ResourceHint::default(),
+            networkonly: false,
+            engine_only: false,
+            timeout: DEFAULT_STEP_TIMEOUT,
+            cpu_timeout,
+            jobs_flag: None,
+        }
+    }
+
+    #[test]
+    fn unity_is_a_strict_no_op() {
+        assert_eq!(DEFAULT_CPU_TIMEOUT_MULTIPLIER, 1.0);
+        let cfg = DagConfig::default();
+        assert_eq!(cfg.cpu_timeout_multiplier, DEFAULT_CPU_TIMEOUT_MULTIPLIER);
+        assert_eq!(cfg.cpu_timeout_platform, "");
+        let s = step(30);
+        assert_eq!(canonical_cpu_timeout(&s, DEFAULT_SMALL_CPU_TIMEOUT), 30);
+        assert_eq!(
+            effective_cpu_timeout(
+                &s,
+                DEFAULT_SMALL_CPU_TIMEOUT,
+                DEFAULT_CPU_TIMEOUT_MULTIPLIER
+            ),
+            30
+        );
+    }
+
+    #[test]
+    fn declared_and_default_budgets_both_scale() {
+        assert_eq!(
+            effective_cpu_timeout(&step(30), DEFAULT_SMALL_CPU_TIMEOUT, 2.0),
+            60
+        );
+        assert_eq!(
+            effective_cpu_timeout(&step(30), DEFAULT_SMALL_CPU_TIMEOUT, 1.5),
+            45
+        );
+        // The forcing-function floor is a budget like any other.
+        assert_eq!(effective_cpu_timeout(&step(0), 10, 2.0), 20);
+    }
+
+    #[test]
+    fn rounding_matches_python_half_away_from_zero() {
+        // These exact pairs are asserted in the Python suite too. Banker's rounding would give
+        // 4 / 10 / 8 / 2 / 14 for the .5 ties and diverge from this engine.
+        assert_eq!(scale_cpu_timeout(3, 1.5), 5);
+        assert_eq!(scale_cpu_timeout(7, 1.5), 11);
+        assert_eq!(scale_cpu_timeout(5, 1.5), 8);
+        assert_eq!(scale_cpu_timeout(1, 1.5), 2);
+        assert_eq!(scale_cpu_timeout(9, 1.5), 14);
+        assert_eq!(scale_cpu_timeout(3, 2.0), 6);
+    }
+
+    #[test]
+    fn scaling_can_never_become_an_opt_out() {
+        // A disabled budget stays disabled; multiplying must not invent a guard.
+        assert_eq!(scale_cpu_timeout(0, 2.0), 0);
+        assert_eq!(scale_cpu_timeout(-5, 2.0), 0);
+        // A sub-unity multiplier must never round a live budget down to 0 (= guard removed).
+        assert_eq!(scale_cpu_timeout(3, 0.1), 1);
+        assert_eq!(scale_cpu_timeout(1, 0.01), 1);
+    }
+
+    #[test]
+    fn scaled_breach_names_canonical_multiplier_and_platform() {
+        let reason = step_failure_reason(
+            Some(-9),
+            false,
+            0,
+            false,
+            600,
+            false,
+            None,
+            &[],
+            true,
+            60,
+            30,
+            2.0,
+            "github-hosted",
+        );
+        assert_eq!(
+            reason,
+            "CPU-TIMEOUT >60s cpu (canonical 30s x2 github-hosted)"
+        );
+    }
+
+    #[test]
+    fn breach_is_unchanged_at_unity_and_platform_label_is_optional() {
+        let unscaled = step_failure_reason(
+            Some(-9),
+            false,
+            0,
+            false,
+            600,
+            false,
+            None,
+            &[],
+            true,
+            30,
+            30,
+            DEFAULT_CPU_TIMEOUT_MULTIPLIER,
+            "github-hosted",
+        );
+        assert_eq!(unscaled, "CPU-TIMEOUT >30s cpu");
+        let unlabelled = step_failure_reason(
+            Some(-9),
+            false,
+            0,
+            false,
+            600,
+            false,
+            None,
+            &[],
+            true,
+            45,
+            30,
+            1.5,
+            "",
+        );
+        assert_eq!(unlabelled, "CPU-TIMEOUT >45s cpu (canonical 30s x1.5)");
+    }
+
+    #[test]
+    fn oom_still_outranks_a_scaled_cpu_timeout() {
+        let reason = step_failure_reason(
+            Some(-9),
+            true,
+            2,
+            false,
+            600,
+            false,
+            None,
+            &[],
+            true,
+            60,
+            30,
+            2.0,
+            "github-hosted",
+        );
+        assert!(reason.starts_with("OOM-KILLED"), "{reason}");
+    }
+
+    #[test]
+    fn a_nonpositive_explicit_multiplier_is_refused() {
+        assert!(resolve_cpu_timeout_multiplier(Some(0.0)).is_err());
+        assert!(resolve_cpu_timeout_multiplier(Some(-1.0)).is_err());
+        assert_eq!(resolve_cpu_timeout_multiplier(Some(1.5)).unwrap().0, 1.5);
     }
 }
