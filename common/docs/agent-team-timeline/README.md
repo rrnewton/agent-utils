@@ -44,6 +44,8 @@ agent-team-timeline refresh \
 
 cd ./timelines/example-team
 make serve
+# in another shell, inspect every run and the exact model-token ledger
+make run-stats
 ```
 
 Use `refresh-claude --session-file SESSION.jsonl` for a Claude lineage or
@@ -54,8 +56,10 @@ project is primary. Codex archives infer repository labels and links from struct
 metadata when no override is needed.
 
 Every archive includes its launcher, static site, normalized message JSON, cached summary data,
-rendered Markdown, source provenance, and run metadata. Repeating `summarize` on unchanged input
-uses cached results; repeating `build` only regenerates deterministic presentation files. Use
+rendered Markdown, source provenance, and run metadata. `make run-stats` prints per-run cache,
+product, build, and exact token statistics, followed by the immutable backend receipt ledger; that
+ledger includes failed calls when a backend reported their usage. Repeating `summarize` on unchanged
+input uses cached results; repeating `build` only regenerates deterministic presentation files. Use
 `--backend heuristic --model deterministic-local` for an offline pipeline exercise.
 
 Run `agent-team-timeline quickstart` for the short tour or

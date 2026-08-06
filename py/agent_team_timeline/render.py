@@ -725,11 +725,22 @@ def render_archive(
             write_text_if_changed(archive / "vendor" / vendor_name, text)
         )
     changed += int(write_text_if_changed(archive / "serve.py", _standalone_server(), executable=True))
+    run_stats_source = (files("agent_team_timeline") / "run_stats.py").read_text(
+        encoding="utf-8"
+    )
+    changed += int(
+        write_text_if_changed(
+            archive / "run_stats.py", run_stats_source, executable=True
+        )
+    )
     changed += int(
         write_text_if_changed(
             archive / "Makefile",
-            ".PHONY: serve open\nPORT ?= 8765\n\nserve:\n\tpython3 serve.py --port $(PORT)\n\n"
-            "open:\n\tpython3 serve.py --port $(PORT) --open\n",
+            ".PHONY: serve open run-stats\n"
+            "PORT ?= 8765\n\n"
+            "serve:\n\tpython3 serve.py --port $(PORT)\n\n"
+            "open:\n\tpython3 serve.py --port $(PORT) --open\n\n"
+            "run-stats:\n\tpython3 run_stats.py\n",
         )
     )
     changed += int(
@@ -738,7 +749,8 @@ def render_archive(
             f"# {team.team_slug} agent-team timeline\n\n"
             "This directory is a self-contained, version-controllable timeline archive.\n\n"
             "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
-            "Use `make open` to ask Python to open the browser. Do not open `index.html` directly: "
+            "Use `make open` to ask Python to open the browser. Use `make run-stats` to print "
+            "every pipeline run and exact recorded model-token costs. Do not open `index.html` directly: "
             "browsers block the JSON fetch from `file://`.\n",
         )
     )

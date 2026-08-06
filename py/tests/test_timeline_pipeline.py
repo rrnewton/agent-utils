@@ -276,7 +276,11 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     index_text = (tmp_path / "index.html").read_text(encoding="utf-8")
     assert index_text.index("markdown-it-15.0.0.min.js") < index_text.index("timeline-core.js")
     assert index_text.index("timeline-core.js") < index_text.index("app.js")
-    assert (tmp_path / "Makefile").read_text(encoding="utf-8").startswith(".PHONY: serve")
+    generated_makefile = (tmp_path / "Makefile").read_text(encoding="utf-8")
+    assert generated_makefile.startswith(".PHONY: serve")
+    assert "run-stats:\n\tpython3 run_stats.py\n" in generated_makefile
+    assert (tmp_path / "run_stats.py").is_file()
+    assert (tmp_path / "run_stats.py").stat().st_mode & 0o111
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
     assert len(timeline["agents"]) == 2
     child_track = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)

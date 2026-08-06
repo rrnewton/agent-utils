@@ -164,6 +164,7 @@ Every output archive includes its own launcher:
 cd ./timelines/example-team
 make serve                 # http://127.0.0.1:8765/
 make open                  # also ask Python to open the browser
+make run-stats             # every pipeline run plus exact model-token accounting
 PORT=9000 make serve
 ```
 
@@ -268,6 +269,12 @@ original generation cost of all returned artifacts; an all-hit rerun therefore r
 tokens without losing the original cost. Older cache entries remain valid and are reported
 explicitly as having unknown original usage rather than being regenerated or counted as zero.
 Aggregate accounting and receipt paths are also retained in the top-level `runs/*.json` metadata.
+From the archive directory, `make run-stats` formats those top-level records as an oldest-to-newest
+run history, including cache hits/misses, generated products, build counts, newly spent tokens, and
+returned-artifact provenance costs. It separately scans the immutable backend receipt ledger and
+groups actual attempts by backend, model, and reasoning effort. This archive-wide ledger includes a
+failed attempt when the backend returned usage before failing; any usage-less receipt remains
+explicitly unknown. Returned-artifact generation cost is never added to new spend.
 
 For offline development or tests:
 
@@ -348,7 +355,7 @@ example-team/
 ├── .agent-team-timeline.json
 ├── index.html, timeline-core.js, app.js, style.css
 ├── vendor/markdown-it-15.0.0.min.js  # pinned offline Markdown renderer + license
-├── Makefile, serve.py, README.md
+├── Makefile, serve.py, run_stats.py, README.md
 ├── manifest.json
 ├── runs/<timestamp>-<hash>.json
 ├── data/
