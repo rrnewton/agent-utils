@@ -40,6 +40,7 @@ use crate::model::{
     command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout, preferred_inner_jobs,
     step_classification, DagConfig, RunResult, Step, StepOutcome,
 };
+use crate::proccpu::{subtree_cpu_seconds, CPU_SOURCE_CGROUP, CPU_SOURCE_PROCFS};
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
@@ -582,15 +583,21 @@ fn run_step(ctx: StepCtx) {
         readers.push(spawn_reader(err, Arc::clone(&err_buf), tag.clone(), stream));
     }
 
-    // Poll the step's cgroup once per MONITOR_INTERVAL for two purposes: (1) a per-step peak
-    // descendant-thread count (metrics only), and (2) CPU-time budget enforcement. Only when
-    // boxing is enabled (both readings are meaningless otherwise), so the un-boxed path adds no
-    // extra thread. The poll is interruptible (checks the stop flag every 50ms), so joining it at
-    // step end returns promptly.
+    // Poll once per MONITOR_INTERVAL for two purposes: (1) a per-step peak descendant-thread
+    // count (cgroup-only metrics), and (2) CPU-time budget enforcement. The poll is
+    // interruptible (checks the stop flag every 50ms), so joining it at step end returns
+    // promptly.
+    //
+    // The thread is spawned when boxing is on OR the step declares a CPU budget. It used to be
+    // `if boxed` alone, which meant an UNBOXED step's cpu_timeout was never even polled: the
+    // budget was declared and enforced nothing. That is the normal state on any
+    // --allow-cgroup-failure lane (hermit's GitHub CI sets it unconditionally), where a
+    // cpu_timeout=3 step was measured burning 60 CPU-seconds and exiting green. An unboxed step
+    // with NO budget still adds no extra thread.
     let monitor_stop = Arc::new(AtomicBool::new(false));
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
     let cpu_exceeded = Arc::new(AtomicBool::new(false));
-    let monitor: Option<thread::JoinHandle<()>> = if boxed {
+    let monitor: Option<thread::JoinHandle<()>> = if boxed || cpu_budget > 0 {
         let stop = Arc::clone(&monitor_stop);
         let peak = Arc::clone(&thread_peak);
         let cpu_flag = Arc::clone(&cpu_exceeded);
@@ -613,18 +620,45 @@ fn run_step(ctx: StepCtx) {
                         let mut p = peak.lock().unwrap();
                         *p = Some(p.map_or(n, |cur| cur.max(n)));
                     }
-                    // CPU-time budget: a load-invariant per-step ceiling on consumed user+system
-                    // CPU (cgroup cpu.stat usage_usec), mirroring the Python runner exactly. Reap
-                    // the whole tree once when over budget, then exit the monitor.
-                    if cpu_timeout > 0 && !cpu_flag.load(Ordering::Relaxed) {
-                        if let Some(cs) = c.cpu_stats(&t) {
-                            let cpu_used_s =
-                                cs.get("usage_usec").copied().unwrap_or(0) as f64 / 1_000_000.0;
-                            if cpu_used_s >= cpu_timeout as f64 {
-                                cpu_flag.store(true, Ordering::Relaxed);
-                                reap(&cg, &t, mpid);
-                                return;
+                }
+                // CPU-time budget: a load-invariant per-step ceiling on consumed user+system
+                // CPU, mirroring the Python runner exactly. Reap the whole tree once when over
+                // budget, then exit the monitor.
+                //
+                // TWO ACCOUNTING SOURCES, cgroup PREFERRED:
+                //   cgroup  cpu.stat usage_usec -- exact, kernel-accounted, sees setsid escapees.
+                //   procfs  subtree sum over the step's process group -- used ONLY when boxing is
+                //           not established, where cpu_stats() is None. Before this fallback the
+                //           check was nested inside `if let Some(c) = &cg` and simply did not run
+                //           there. See proccpu.rs for what the fallback does and does not see.
+                if cpu_timeout > 0 && !cpu_flag.load(Ordering::Relaxed) {
+                    let cgroup_reading = cg
+                        .as_ref()
+                        .and_then(|c| c.cpu_stats(&t))
+                        .map(|cs| cs.get("usage_usec").copied().unwrap_or(0) as f64 / 1_000_000.0);
+                    let (used, source) = match cgroup_reading {
+                        Some(v) => (Some(v), CPU_SOURCE_CGROUP),
+                        // mpid IS the pgid: the step was started in its own session.
+                        None => (subtree_cpu_seconds(mpid), CPU_SOURCE_PROCFS),
+                    };
+                    if let Some(cpu_used_s) = used {
+                        if cpu_used_s >= cpu_timeout as f64 {
+                            cpu_flag.store(true, Ordering::Relaxed);
+                            if source == CPU_SOURCE_PROCFS {
+                                // Name the degraded accounting on the way past. A cgroup breach is
+                                // self-evident from the boxing banner; a procfs breach is not, and
+                                // its blind spots (setsid escapees, unreaped exits) change how much
+                                // a reader should trust the number.
+                                eprintln!(
+                                    "[scheduler] ⚠ step {t:?} exceeded its CPU budget \
+                                     ({cpu_used_s:.1}s observed >= {cpu_timeout}s) measured by \
+                                     PROCFS SUBTREE accounting because cgroup boxing is not \
+                                     established; this misses setsid escapees and not-yet-reaped \
+                                     exits, so it is a floor on true CPU use."
+                                );
                             }
+                            reap(&cg, &t, mpid);
+                            return;
                         }
                     }
                 }

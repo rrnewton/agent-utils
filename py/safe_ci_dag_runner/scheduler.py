@@ -28,6 +28,11 @@ from safe_ci_dag_runner.model import (
     preferred_inner_jobs,
     step_classification,
 )
+from safe_ci_dag_runner.proccpu import (
+    CPU_SOURCE_CGROUP,
+    CPU_SOURCE_PROCFS,
+    subtree_cpu_seconds,
+)
 from safe_ci_dag_runner.profile_enrich import (
     resolve_effective_inner_jobs,
     step_enrichment_columns,
@@ -338,6 +343,10 @@ class Runner:
         stream = self.verbosity >= 2
         timed_out = False
         cpu_timed_out = False
+        # Which accounting observed the breach, and what it observed. Reported so a
+        # CPU-TIMEOUT carries the mechanism that produced it (cgroup vs procfs fallback).
+        cpu_source: str | None = None
+        cpu_observed_s: float | None = None
 
         # Append the step's inner-parallelism (concurrency) flag when it declares one, using the
         # step's jobs_flag template (or the DagConfig default, e.g. "-j"). No-op when the step
@@ -398,12 +407,22 @@ class Runner:
             # Poll the step's cgroup descendant-thread count for a per-step peak (metrics
             # only; a noop/disabled manager returns None and this stays a cheap no-op).
             # When the step declares a CPU-time budget, this same 1 Hz loop also enforces
-            # it from the cgroup's cpu.stat usage_usec (user+system). CPU time is immune to
-            # machine load, so this guard can be far tighter than the wall `timeout` without
-            # flaking; the wall timeout stays as a backstop for a step that blocks/hangs
-            # while burning no CPU. Enforcement is best-effort at the poll granularity
-            # (_MONITOR_INTERVAL_S), and inert when cgroup boxing is off (cpu_stats is None).
-            nonlocal thread_peak, cpu_timed_out
+            # it from consumed user+system CPU. CPU time is immune to machine load, so this
+            # guard can be far tighter than the wall `timeout` without flaking; the wall
+            # timeout stays as a backstop for a step that blocks/hangs while burning no CPU.
+            # Enforcement is best-effort at the poll granularity (_MONITOR_INTERVAL_S).
+            #
+            # TWO ACCOUNTING SOURCES, cgroup PREFERRED:
+            #   cgroup  cpu.stat usage_usec -- exact, kernel-accounted, catches setsid escapees.
+            #   procfs  subtree sum over the step's process group -- used ONLY when boxing is
+            #           not established, where cpu_stats() is None. Before this fallback
+            #           existed the guard was simply SKIPPED there, so every cpu_timeout was
+            #           inert on any --allow-cgroup-failure lane (hermit's GitHub CI sets that
+            #           unconditionally): measured, cpu_timeout=3 let a step burn 60 CPU-seconds
+            #           and exit green. See proccpu.py for what the fallback does and does not
+            #           see. Whichever source fires is reported, so a breach carries its own
+            #           condition instead of leaving the reader to infer the mechanism.
+            nonlocal thread_peak, cpu_timed_out, cpu_source, cpu_observed_s
             while not monitor_stop.wait(_MONITOR_INTERVAL_S):
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
@@ -412,12 +431,31 @@ class Runner:
                     cs = self.cgroups.cpu_stats(step.tag)
                     if cs is not None:
                         cpu_used_s = cs.get("usage_usec", 0) / 1_000_000
-                        if cpu_used_s >= cpu_budget:
-                            # Over CPU budget: reap the whole group now. The main thread's
-                            # proc.wait() then returns normally (no wall TimeoutExpired).
-                            cpu_timed_out = True
-                            reap(proc, self.cgroups, step.tag)
-                            return
+                        source = CPU_SOURCE_CGROUP
+                    else:
+                        # proc.pid IS the pgid: the step was started with start_new_session.
+                        cpu_used_s = subtree_cpu_seconds(proc.pid)
+                        source = CPU_SOURCE_PROCFS
+                    if cpu_used_s is not None and cpu_used_s >= cpu_budget:
+                        # Over CPU budget: reap the whole group now. The main thread's
+                        # proc.wait() then returns normally (no wall TimeoutExpired).
+                        cpu_timed_out = True
+                        cpu_source = source
+                        cpu_observed_s = cpu_used_s
+                        if source == CPU_SOURCE_PROCFS:
+                            # Name the degraded accounting on the way past. A cgroup breach is
+                            # self-evident from the boxing banner; a procfs breach is not, and
+                            # its blind spots (setsid escapees, unreaped exits) change how much
+                            # a reader should trust the number.
+                            _warn(
+                                f"step {step.tag!r} exceeded its CPU budget "
+                                f"({cpu_used_s:.1f}s observed >= {cpu_budget}s) measured by "
+                                "PROCFS SUBTREE accounting because cgroup boxing is not "
+                                "established; this misses setsid escapees and not-yet-reaped "
+                                "exits, so it is a floor on true CPU use."
+                            )
+                        reap(proc, self.cgroups, step.tag)
+                        return
 
         reader = threading.Thread(target=_pump, daemon=True)
         monitor = threading.Thread(target=_monitor, daemon=True)
