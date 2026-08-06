@@ -22,12 +22,12 @@ Two consequences follow, and they are the whole problem:
 
 ## The classification
 
-### (a) DIRECT — allowlistable, and already allowlisted
+### (a) DIRECT — eligible for a constrained positive policy
 
-| Program | Why it qualifies | Residual |
+| Program | Why it qualifies | Status and residual |
 | --- | --- | --- |
-| `gh` | Fixed subcommand surface; the code-executing subcommands are enumerable | `alias`, `extension`/`ext`, `codespace` denied |
-| `cargo` | Only the resolve/download subcommands are admitted | `build`/`test`/`run`/`install`/`clippy` and every third-party `cargo-*` refused; a deny-list would be the wrong shape here since the code-executing set is open-ended |
+| `gh` | Fixed subcommand surface; the code-executing subcommands are enumerable | Enabled by default; `alias`, `extension`/`ext`, and `codespace` are denied |
+| `cargo` | A positive list can restrict the visible subcommand surface to dependency-oriented operations | **Disabled by default.** A project may opt in to the constrained subcommands, but even `fetch` can execute helpers selected by ambient Cargo configuration. `build`/`test`/`run`/`install`/`clippy` and every third-party `cargo-*` remain refused; a deny-list would be the wrong shape because the code-executing set is open-ended |
 
 ### (a′) DIRECT IN NAME, WRAPPER IN FACT — the leak in the category we thought was safe
 
@@ -50,7 +50,8 @@ Counted in this tree, by entry-point shape rather than by file:
 | `make <target>` | 37 targets | `make check-agent-utils-pin` → `scripts/check-agent-utils-pin.rs` → `with-proxy git fetch` |
 | `#!/usr/bin/env rust-script` | 21 | `ci-hub/ci-hub`, `scripts/check-agent-utils-pin.rs`, `compat-envelope/collect-envelope.rs` |
 
-**Roughly 167 wrapped entry points against 3 direct ones** — and one of the three leaks. Any sweep
+**Roughly 167 wrapped entry points against 3 direct candidates** — one is disabled by default and
+one of the two defaults leaks through hooks. Any sweep
 that assumes "find the network call, add an allowlist entry" will resolve a small minority of what
 it finds. That ratio is the deliverable.
 
@@ -90,5 +91,5 @@ presented as a tightening. The honest framing is that we already have that expos
 and have not been counting it.
 
 **Prerequisite for either (2) or (3): close or consciously accept (a′).** Deciding the mechanism for
-167 wrapped entry points while the 3-entry direct list has an unbounded hole in it is optimising the
-wrong end.
+167 wrapped entry points while the three-name direct candidate set has an unbounded hook path is
+optimising the wrong end.
