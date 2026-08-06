@@ -18,13 +18,14 @@ the best-known self-escapes (``git -c alias.x='!sh'``) as defense in depth, not 
 
 from __future__ import annotations
 
+import os
 import shlex
 from dataclasses import dataclass
 
 from herdr_run.config import Config
 from herdr_run.errors import Refused
 
-__all__ = ["Admission", "admit", "render"]
+__all__ = ["Admission", "admit", "render", "expand_tilde"]
 
 
 @dataclass(frozen=True)
@@ -46,9 +47,26 @@ class Admission:
         return render(self.argv)
 
 
+def expand_tilde(token: str) -> str:
+    """Expand a LEADING ``~`` / ``~user`` in one token, the way a shell would.
+
+    Quoting every token is what makes injection impossible, but it also suppresses the one
+    expansion callers reasonably expect: ``git -C ~/work/repo`` arrived at git as a literal ``~``
+    and failed with ``cannot change to '~/work/repo'``. Doing the expansion HERE keeps the security
+    property intact -- Python resolves the path and the result is still quoted, so the shell never
+    gets a chance to interpret anything.
+
+    Only a leading tilde is touched. A tilde anywhere else is an ordinary character (``a~b`` stays
+    ``a~b``), and a token that ``expanduser`` cannot resolve is returned unchanged.
+    """
+    if not token.startswith("~"):
+        return token
+    return os.path.expanduser(token)
+
+
 def render(argv: tuple[str, ...]) -> str:
     """Quote every token so the resulting shell word list is exactly ``argv``."""
-    return " ".join(shlex.quote(token) for token in argv)
+    return " ".join(shlex.quote(expand_tilde(token)) for token in argv)
 
 
 def _split(command: str) -> tuple[str, ...]:

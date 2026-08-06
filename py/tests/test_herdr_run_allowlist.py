@@ -198,3 +198,41 @@ def test_project_can_drop_prefixes() -> None:
     config = Config(prefixes=())
     with pytest.raises(Refused, match="not allowlisted"):
         admit("with-proxy git status", config)
+
+
+# --- tilde expansion: the one expansion re-quoting would otherwise suppress --------------------
+
+
+def test_leading_tilde_is_expanded_so_git_c_works(config: Config) -> None:
+    """Regression: `git -C ~/work/repo` reached git as a literal '~' and failed.
+
+    Quoting every token is what blocks injection, but it also stopped the shell expanding `~`.
+    Expanding it in Python keeps the guarantee (the result is still quoted) and makes the natural
+    invocation work.
+    """
+    import os
+
+    home = os.path.expanduser("~")
+    admission = admit("with-proxy git -C ~/work/dev-hermit/hermit ls-remote origin main", config)
+    assert f"{home}/work/dev-hermit/hermit" in admission.rendered
+    assert "~" not in admission.rendered
+
+
+def test_tilde_expansion_still_quotes_the_result(config: Config) -> None:
+    """The expansion must not become a hole: the expanded token is still shell-quoted."""
+    admission = admit("git -C '~/dir; rm -rf /' status", config)
+    # The metacharacters survive as one literal argument, not as a second command.
+    assert admission.argv[2] == "~/dir; rm -rf /"
+    assert "'" in admission.rendered
+
+
+@pytest.mark.parametrize(
+    "token,expanded",
+    [("~", True), ("~/x", True), ("a~b", False), ("--opt=~/x", False), ("", False)],
+)
+def test_only_a_leading_tilde_is_touched(token: str, expanded: bool) -> None:
+    """A tilde anywhere but the start is an ordinary character."""
+    from herdr_run.allowlist import expand_tilde
+
+    result = expand_tilde(token)
+    assert (result != token) == expanded
