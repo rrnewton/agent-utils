@@ -220,10 +220,12 @@ three-model benchmark.
 ## 2026-08-06 live-session experiment
 
 This follow-up froze a much larger, newer snapshot of the same Codex coordinator
-lineage and attempted independent Sol, Terra, Luna, and candidate lightweight-
-model arms. It did **not** produce a valid four-model quality comparison: Sol
-completed, while every other attempted deployment failed before producing a
-summary.
+lineage. It produced two complete websites: `gpt-5.6-sol` and `gpt-5.5` using
+the explicit `priority` service tier. Terra and Luna remained unavailable at
+the provider, while GPT-5.4-mini was retired or unroutable. The two completed
+outputs support same-snapshot inspection, but not a controlled throughput
+claim: the legacy Sol receipts did not record their service tier, and the
+GPT-5.5 run changed phase batch size during recovery.
 
 ### Frozen workload and output directories
 
@@ -241,6 +243,7 @@ Every arm copied and ingested the same source snapshot:
 | Extracted artifacts | 1,313 |
 | Repositories | 8 |
 | Logical summarization jobs | 577 |
+| Latest imported event | `2026-08-06T12:03:07.253Z` (`2026-08-06 08:03:07.253 EDT`) |
 
 The root session was `019fcfe7-0f68-7301-8aab-c2f90a7026c7`. The display
 timezone was `America/New_York`; the declared primary project and host were
@@ -252,15 +255,17 @@ timezone was `America/New_York`; the declared primary project and host were
 | `gpt-5.6-terra` | `~/temp/codex-coord-latest-terra` |
 | `gpt-5.6-luna` | `~/temp/codex-coord-latest-luna` |
 | `gpt-5.4-mini` availability probe | `~/temp/codex-coord-latest-5.4-mini` |
+| `gpt-5.5`, `priority` tier | `~/temp/codex-coord-latest-gpt-5.5-fast` |
 
 ### Results and deployment availability
 
-| Arm | Completed receipts | Failed receipts | Result | Actual experiment spend |
-|---|---:|---:|---|---:|
-| Sol | 96 | 3 | Complete website | 5,423,037 known tokens |
-| Terra | 0 | 12 | No summaries; HTTP 404 deployment missing | unknown |
-| Luna | 0 | 28 | No summaries; HTTP 404 deployment missing | unknown |
-| GPT-5.4-mini | 0 | 8 | No summaries; HTTP 421, retired/unroutable | unknown |
+| Arm | Service tier | Completed receipts | Failed receipts | Result | Actual experiment spend |
+|---|---|---:|---:|---|---:|
+| Sol | Unrecorded legacy receipts | 96 | 3 | Complete website | 5,423,037 known tokens |
+| Terra | Unrecorded legacy; latest probe `default` | 0 | 14 | No summaries; deployment missing | unknown |
+| Luna | Unrecorded legacy; latest probe `default` | 0 | 30 | No summaries; deployment missing | unknown |
+| GPT-5.4-mini | Unrecorded legacy receipts | 0 | 8 | No summaries; HTTP 421, retired/unroutable | unknown |
+| GPT-5.5 | `priority` | 153 | 4 | Complete website | 6,142,518 known tokens |
 
 Terra and Luna were visible and marked API-supported in the model catalog, but
 their live Azure transport traces returned HTTP 404 `DeploymentNotFound`.
@@ -273,16 +278,17 @@ rolling token quota. GPT-5.4-mini returned “no upstream configured for this
 host,” and its catalog entry is hidden/retired with an upgrade recommendation
 to Luna.
 
-Every failed-arm receipt has `usage: null`. Their actual spend is therefore
-unknown, not zero. Only an all-cache-hit replay that makes no backend calls is a
-known zero-token run.
+Every Terra, Luna, and GPT-5.4-mini receipt has `usage: null`; their spend is
+unknown, not zero. Fresh explicit-default probes added two failed receipts
+apiece to Terra and Luna without creating cache artifacts. GPT-5.5's four
+validation-failed calls do contain usage and are included in its all-in total.
+Only an all-cache-hit replay that makes no backend calls is a known zero-token
+run.
 
-There is no `spark` model identifier, including no `gpt-5.3-spark`, in the
-current nine-model catalog. “Fast” is instead a `priority` service tier offered
-for visible models including `gpt-5.5`, Sol, Terra, and Luna. A fast-tier arm
-must record that service tier in its cache identity and run metadata before its
-speed or usage can be compared rigorously; silently treating it as a model slug
-would make the experiment irreproducible.
+There is no Spark model identifier, including no `gpt-5.3-spark`, in the
+current nine-model catalog. “Fast” is instead the `priority` service tier. The
+GPT-5.5 archive records that tier in every v2 receipt, run report, and cache
+identity. Sol predates this provenance, so its service tier remains unknown.
 
 ### Sol cost, completion, and idempotence
 
@@ -322,16 +328,52 @@ Three Sol totals answer different questions and must not be added together:
 The current-run result is independently recoverable as
 `8,315,054 lifetime - 2,892,017 inherited = 5,423,037`.
 
+### GPT-5.5 priority cost, recovery, and idempotence
+
+The complete GPT-5.5 priority arm spent 6,142,518 tokens across all attempts:
+
+| Receipt set | Input | Cached input (subset) | Output | Reasoning output (subset) | Total |
+|---|---:|---:|---:|---:|---:|
+| 153 completed artifact receipts | 5,587,005 | 788,480 | 323,514 | 100,145 | 5,910,519 |
+| 4 failed receipts | 217,810 | 22,528 | 14,189 | 2,800 | 231,999 |
+| All recorded calls | 5,804,815 | 811,008 | 337,703 | 102,945 | 6,142,518 |
+
+The first three top-level attempts used phase batches of six. They retained 84
+valid jobs, but four calls failed structural validation, chiefly because a work
+summary timestamp fell outside its phase. Reducing only the phase batch size to
+three completed the cache. That successful invocation generated 493 remaining
+jobs in 139 backend batches over 33m20s and newly spent 5,096,871 tokens. The
+5,910,519-token artifact provenance includes the valid batches retained from
+the earlier attempts; the 231,999-token difference to the all-in ledger is
+failed-call overhead.
+
+From the first model attempt through complete summaries took about 39m41s; the
+first website was ready after about 43m08s. Including the all-hit replay and
+zero-change rebuild took about 45m50s. The resulting site has the same 142
+agents, 391 phases, 2,811 edges, and 547 Markdown summary files as Sol.
+
+The replay restored the original batch-size-six command and recorded 577 cache
+hits, zero misses, zero backend calls, and zero newly spent tokens. Its following
+build changed zero files. The successful run, replay, and final build are:
+
+- `runs/20260806T145114506396Z-e4021a7b.json`
+- `runs/20260806T145607809173Z-33c36a9a.json`
+- `runs/20260806T145723511951Z-50415762.json`
+
 ### Interpretation
 
-This experiment validates source parity, durable partial caches, exact Sol
-accounting, and idempotent replay. It does not support a Sol-versus-Terra-versus-
-Luna quality or cost claim because only Sol reached inference successfully.
-Failed-arm wall times measure deployment failure detection, not summarization
-throughput. Retry configurations also differed: Luna was reduced to one worker
-and eventually one item per batch, while later Terra and GPT-5.4-mini probes
-used diagnostic wrappers. In addition, some Sol run commands and receipt paths
-retain pre-rename `~/temp/` directory names even though the current documented
-output directory exists. A real head-to-head still requires available
-deployments, identical settings and empty per-arm caches, followed by blinded
-scoring of the generated summaries.
+This experiment produced two complete same-snapshot LLM outputs, but it is not
+a controlled speed benchmark. GPT-5.5 explicitly used `priority`; Sol's legacy
+service tier is unrecorded. GPT-5.5 also needed three failed batch-size-six
+attempts before batch size three completed successfully. Those retries and
+smaller batches materially affect elapsed time, and the observed Fast arm did
+not finish faster than Sol.
+
+The experiment does validate frozen-source parity, service-tier provenance for
+new receipts, durable partial caches, exact all-in accounting, and idempotent
+replay. Terra and Luna still have no summaries, so there is no four-model
+quality or cost result. Some Sol run commands and receipt paths also retain
+pre-rename `~/temp/` names even though the current documented directory exists.
+A rigorous head-to-head still requires available deployments, identical
+recorded tiers and batching, empty caches, identical retry policy, and blinded
+quality scoring.
