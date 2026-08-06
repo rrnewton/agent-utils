@@ -35,6 +35,7 @@ CRATES: tuple[Crate, ...] = (
     Crate("safe-ci-dag-runner", ("safe-ci-dag-runner", "cpuset-alloc"), "safe_ci_dag_runner"),
     Crate("tick-hub", ("tick-hub",), "tick_hub"),
     Crate("pr-landing-planner", ("pr-landing-planner",), "pr_landing_planner"),
+    Crate("herdr-run", ("herdr-run",), "herdr_run"),
 )
 
 _FOREIGN_DOC_TERMS = re.compile(

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["safe-ci-dag-runner", "tick-hub", "pr-landing-planner"]
+members = ["safe-ci-dag-runner", "tick-hub", "pr-landing-planner", "herdr-run"]
 
 [workspace.package]
 edition = "2021"

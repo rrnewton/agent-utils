@@ -12,7 +12,7 @@ engine resolver verified their source and artifact provenance, but a direct
 older copied executable after source changed.
 
 Making each link execute its crate `main.rs` through `rust-script` was evaluated
-and rejected. All four entrypoints delegate into library crates, while
+and rejected. All five paired-tool entrypoints delegate into library crates, while
 `rust-script` 0.36 decides whether to reuse its executable from the entrypoint
 script and generated manifest timestamps. A library/module change with an
 unchanged `main.rs` can consequently reuse stale code. Its generated package
@@ -20,7 +20,7 @@ also does not use the workspace's lockfile and profile as the package itself.
 
 ## Resolution
 
-- All four `rs/bin/<command>` paths are tracked links to one `cargo-runner`.
+- All five `rs/bin/<command>` paths are tracked links to one `cargo-runner`.
 - Every normal invocation asks Cargo to check the real locked release workspace
   cache, then replaces the launcher process with the resulting binary.
 - One checkout-wide lock outside `rs/target` serializes verification, cleanup,
@@ -58,14 +58,16 @@ prove that:
 7. ambient environment and Cargo-config target defaults cannot redirect a build;
 8. unrelated caller-directory Cargo configuration cannot affect the build, while
    the final command still receives the caller's working directory; and
-9. a launched executable can resolve and re-execute its own stable path; and
+9. a launched executable can resolve and re-execute its own stable path;
 10. a coordinated clean waits for an in-flight build and cannot remove the Cargo
-    cache before the stable launch snapshot is published.
+    cache before the stable launch snapshot is published; and
+11. changes to nonignored, untracked Rust source invalidate the cache even when
+    modification times are preserved.
 
 The provenance files are corruption and staleness controls, not cryptographic
 authentication. A process that can rewrite both ignored artifact bytes and their
 adjacent hashes is inside the checkout owner's trust boundary. The launcher does
 not claim to defend against that actor.
 
-The repository topology test additionally requires all four Rust command links
+The repository topology test additionally requires all five Rust command links
 to resolve to the executable tracked launcher.

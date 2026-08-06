@@ -15,12 +15,17 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import fcntl
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from herdr_run.client import HerdrClient
-from herdr_run.config import Config
+from herdr_run.config import Config, render_tab_name
 from herdr_run.errors import HerdrUnavailable
 from herdr_run.jsonx import as_mapping, opt_str
+from herdr_run.state import open_lock_file, session_lock_path
 
 __all__ = ["Target", "resolve_target", "tab_label_for", "cache_path"]
 
@@ -39,15 +44,9 @@ class Target:
 
 
 def tab_label_for(config: Config, agent: str) -> str:
-    """Expand the project's tab-name schema. Unknown placeholders are a config error, not a crash."""
+    """Expand the project's restricted tab-name schema."""
     project = os.path.basename(os.path.abspath(config.project_root)) or "project"
-    try:
-        return config.tab_name.format(agent=agent, project=project)
-    except (KeyError, IndexError) as exc:
-        raise HerdrUnavailable(
-            f"tab_name schema {config.tab_name!r} uses an unknown placeholder ({exc}); "
-            "available placeholders are {agent} and {project}"
-        ) from exc
+    return render_tab_name(config.tab_name, agent=agent, project=project)
 
 
 def cache_path(config: Config) -> str:
@@ -78,29 +77,63 @@ def _load_cache(path: str, key: str) -> tuple[str, str, str] | None:
 
 
 def _store_cache(path: str, key: str, target: Target) -> None:
-    entries: dict[str, object] = {}
+    parent = os.path.dirname(path)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    os.chmod(parent, 0o700)
+    # Serialize the whole read/modify/write. Without this, two agents resolving different tabs can
+    # both read the old document and the later rename silently loses the earlier cache entry.
+    flags = (
+        os.O_CREAT
+        | os.O_RDWR
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    lock_descriptor = os.open(f"{path}.lock", flags, 0o600)
     try:
-        with open(path, encoding="utf-8") as handle:
-            existing: object = json.load(handle)
-        if isinstance(existing, dict):
-            entries = as_mapping(existing, "session cache")
-    except (OSError, json.JSONDecodeError, TypeError):
-        entries = {}
-    entries[key] = {
-        "workspace_id": target.workspace_id,
-        "tab_id": target.tab_id,
-        "pane_id": target.pane_id,
-        "workspace_label": target.workspace_label,
-        "tab_label": target.tab_label,
-    }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # Write-then-rename: a torn cache file would be discarded on read anyway, but this keeps a
-    # concurrent reader from ever seeing one.
-    temporary = f"{path}.tmp.{os.getpid()}"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(entries, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.replace(temporary, path)
+        os.fchmod(lock_descriptor, 0o600)
+    except OSError:
+        os.close(lock_descriptor)
+        raise
+    with os.fdopen(lock_descriptor, "r+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        entries: dict[str, object] = {}
+        try:
+            with open(path, encoding="utf-8") as handle:
+                existing: object = json.load(handle)
+            if isinstance(existing, dict):
+                entries = as_mapping(existing, "session cache")
+        except (OSError, json.JSONDecodeError, TypeError):
+            entries = {}
+        entries[key] = {
+            "workspace_id": target.workspace_id,
+            "tab_id": target.tab_id,
+            "pane_id": target.pane_id,
+            "workspace_label": target.workspace_label,
+            "tab_label": target.tab_label,
+        }
+        # A unique temporary plus rename keeps readers from seeing a torn file, including callers
+        # in another thread of this process (a PID-only temporary name did not).
+        temporary = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=parent,
+                prefix=".session-cache.",
+                delete=False,
+            ) as handle:
+                temporary = handle.name
+                os.fchmod(handle.fileno(), 0o600)
+                json.dump(entries, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, path)
+            os.chmod(path, 0o600)
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except FileNotFoundError:
+                    pass
 
 
 def _pane_of_tab(client: HerdrClient, workspace_id: str, tab_id: str) -> str:
@@ -118,21 +151,63 @@ def _pane_of_tab(client: HerdrClient, workspace_id: str, tab_id: str) -> str:
     return panes[0].pane_id
 
 
-def _cache_still_valid(client: HerdrClient, cached: tuple[str, str, str], tab_label: str) -> bool:
+def _cache_still_valid(
+    client: HerdrClient,
+    cached: tuple[str, str, str],
+    workspace_label: str,
+    tab_label: str,
+) -> bool:
     workspace_id, tab_id, pane_id = cached
     if not client.pane_exists(pane_id):
         return False
     try:
+        # IDs may be reused after a server restart. Validate the workspace label as well as the
+        # pane/tab relationship before trusting the cached destination.
+        if client.workspace_id_for_label(workspace_label) != workspace_id:
+            return False
         live_tab = client.tab_id_for_label(workspace_id, tab_label)
     except HerdrUnavailable:
         return False
     if live_tab != tab_id:
         return False
-    return any(pane.pane_id == pane_id and pane.tab_id == tab_id for pane in client.panes(workspace_id))
+    return any(
+        pane.pane_id == pane_id
+        and pane.tab_id == tab_id
+        and pane.workspace_id == workspace_id
+        for pane in client.panes(workspace_id)
+    )
 
 
-def resolve_target(client: HerdrClient, config: Config, agent: str, *, use_cache: bool = True) -> Target:
+@contextmanager
+def _session_resolution_lock() -> Iterator[None]:
+    """Serialize all account-global Herdr session discovery and creation."""
+    path = session_lock_path()
+    handle = open_lock_file(path)
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise HerdrUnavailable(
+                f"cannot lock Herdr session resolution at {path}: {exc}"
+            ) from exc
+        yield
+    finally:
+        # Closing releases `flock` even when the protected operation raised.
+        handle.close()
+
+
+def resolve_target(
+    client: HerdrClient, config: Config, agent: str, *, use_cache: bool = True
+) -> Target:
     """Bring up (or reuse) the workspace/tab/pane for ``agent`` and return the resolved ids."""
+    with _session_resolution_lock():
+        return _resolve_target_locked(client, config, agent, use_cache=use_cache)
+
+
+def _resolve_target_locked(
+    client: HerdrClient, config: Config, agent: str, *, use_cache: bool
+) -> Target:
+    """Resolve a target while the account-global session lock is held."""
     tab_label = tab_label_for(config, agent)
     cwd = config.cwd or config.project_root
     if not os.path.isabs(cwd):
@@ -146,7 +221,9 @@ def resolve_target(client: HerdrClient, config: Config, agent: str, *, use_cache
 
     if use_cache and not created:
         cached = _load_cache(path, key)
-        if cached is not None and _cache_still_valid(client, cached, tab_label):
+        if cached is not None and _cache_still_valid(
+            client, cached, config.workspace, tab_label
+        ):
             return Target(
                 workspace_id=cached[0],
                 tab_id=cached[1],
@@ -162,14 +239,18 @@ def resolve_target(client: HerdrClient, config: Config, agent: str, *, use_cache
     if workspace_id is None:
         # A new workspace arrives with one default tab; rename it into our schema instead of adding
         # a second one, so the common first-run case leaves exactly one tab behind.
-        workspace_id, root_tab_id, _root_pane_id = client.create_workspace(label=config.workspace, cwd=cwd)
+        workspace_id, root_tab_id, _root_pane_id = client.create_workspace(
+            label=config.workspace, cwd=cwd
+        )
         client.rename_tab(root_tab_id, tab_label)
         tab_id = root_tab_id
         created.extend(["workspace", "tab"])
     else:
         tab_id = client.tab_id_for_label(workspace_id, tab_label)
         if tab_id is None:
-            tab_id = client.create_tab(workspace_id=workspace_id, label=tab_label, cwd=cwd)
+            tab_id = client.create_tab(
+                workspace_id=workspace_id, label=tab_label, cwd=cwd
+            )
             created.append("tab")
 
     pane_id = _pane_of_tab(client, workspace_id, tab_id)

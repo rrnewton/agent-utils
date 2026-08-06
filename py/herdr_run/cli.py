@@ -13,8 +13,11 @@ no command string follows.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
+import math
 import os
+import shlex
 import sys
 from collections.abc import Sequence
 
@@ -22,15 +25,37 @@ from herdr_run import __version__
 from herdr_run.allowlist import Admission, admit
 from herdr_run.audit import audit_path, record, warn_if_spool_is_tracked
 from herdr_run.client import HerdrClient
-from herdr_run.config import Config, load_config
-from herdr_run.errors import HerdrRunError, Refused, RunTimeout
+from herdr_run.config import MAX_TIMEOUT_SECONDS, Config, load_config
+from herdr_run.errors import (
+    EXIT_BUSY,
+    HerdrRunError,
+    HerdrUnavailable,
+    Refused,
+    RunTimeout,
+)
 from herdr_run.readiness import assess, infer_prompt_tail
-from herdr_run.runner import execute, write_meta
+from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
 
 __all__ = ["main", "build_parser"]
 
 _SUBCOMMANDS = ("check", "doctor", "config", "target", "userguide")
+
+
+def _nonnegative_finite(value: str) -> float:
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    if parsed > MAX_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must not exceed {MAX_TIMEOUT_SECONDS:g} seconds"
+        )
+    return parsed
 
 
 def _default_agent(environ: dict[str, str]) -> str:
@@ -46,13 +71,16 @@ def build_parser() -> argparse.ArgumentParser:
     """Construct the argument parser."""
     parser = argparse.ArgumentParser(
         prog="herdr-run",
+        allow_abbrev=False,
         description=(
             "Run an allowlisted command in a Herdr pane OUTSIDE the agent sandbox. "
             "Intended for git/gh network operations that the in-jail proxy allowlist blocks."
         ),
         epilog="Full documentation: herdr-run userguide",
     )
-    parser.add_argument("--version", action="version", version=f"herdr-run {__version__}")
+    parser.add_argument(
+        "--version", action="version", version=f"herdr-run {__version__}"
+    )
     parser.add_argument(
         "--userguide",
         action="store_true",
@@ -62,22 +90,40 @@ def build_parser() -> argparse.ArgumentParser:
         "positional",
         nargs="*",
         metavar="ARG",
-        help="Either '<agent> <command>', '<command>', or one of: " + ", ".join(_SUBCOMMANDS),
+        help="Either '<agent> <command>', '<command>', or one of: "
+        + ", ".join(_SUBCOMMANDS),
     )
-    parser.add_argument("--config", metavar="PATH", help="Explicit config file (default: nearest .herdr-run.yaml)")
-    parser.add_argument("--agent", metavar="NAME", help="Override the invoking agent name")
-    parser.add_argument("--cwd", metavar="PATH", help="Working directory for the command")
-    parser.add_argument("--timeout", type=float, metavar="SECONDS", help="Override the command timeout")
+    parser.add_argument(
+        "--config",
+        metavar="PATH",
+        help="Explicit config file (default: nearest .herdr-run.yaml)",
+    )
+    parser.add_argument(
+        "--agent", metavar="NAME", help="Override the invoking agent name"
+    )
+    parser.add_argument(
+        "--cwd", metavar="PATH", help="Working directory for the command"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=_nonnegative_finite,
+        metavar="SECONDS",
+        help="Override the command timeout",
+    )
     parser.add_argument(
         "--wait-ready",
-        type=float,
+        type=_nonnegative_finite,
         metavar="SECONDS",
         help="Wait up to SECONDS for the pane to become idle instead of refusing immediately",
     )
     parser.add_argument(
-        "--no-cache", action="store_true", help="Ignore the session cache and re-resolve from labels"
+        "--no-cache",
+        action="store_true",
+        help="Ignore the session cache and re-resolve from labels",
     )
-    parser.add_argument("--json", action="store_true", help="Emit one JSON object instead of raw output")
+    parser.add_argument(
+        "--json", action="store_true", help="Emit one JSON object instead of raw output"
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -120,19 +166,27 @@ def _cmd_config(config: Config, agent: str) -> int:
         "workspace": config.workspace,
         "tab_name": config.tab_name,
         "tab_label": tab_label_for(config, agent),
+        "cwd": config.cwd,
         "allow": list(config.allow),
         "prefixes": list(config.prefixes),
         "deny_global": {key: list(value) for key, value in config.deny_global.items()},
-        "deny_subcommand": {key: list(value) for key, value in config.deny_subcommand.items()},
+        "deny_subcommand": {
+            key: list(value) for key, value in config.deny_subcommand.items()
+        },
         "deny_anywhere": list(config.deny_anywhere),
+        "value_options": {
+            key: list(value) for key, value in config.value_options.items()
+        },
         "spool_dir": config.spool_dir,
         "timeout_seconds": config.timeout_seconds,
         "ready_timeout_seconds": config.ready_timeout_seconds,
         "readiness": config.readiness,
         "prompt_tail": config.prompt_tail,
+        "shells": list(config.shells),
+        "probe_remote": config.probe_remote,
         "broker": config.broker,
     }
-    json.dump(document, sys.stdout, indent=2, sort_keys=True)
+    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
 
@@ -144,12 +198,16 @@ def _cmd_check(config: Config, command: str) -> int:
     except Refused as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return Refused.exit_code
-    print(f"ALLOWED: program={admission.program} subcommand={admission.subcommand or '-'}")
+    print(
+        f"ALLOWED: program={admission.program} subcommand={admission.subcommand or '-'}"
+    )
     print(f"rendered: {admission.rendered}")
     return 0
 
 
-def _cmd_target(config: Config, agent: str, environ: dict[str, str], *, use_cache: bool) -> int:
+def _cmd_target(
+    config: Config, agent: str, environ: dict[str, str], *, use_cache: bool
+) -> int:
     client = _client(config, environ)
     target = resolve_target(client, config, agent, use_cache=use_cache)
     prompt_tail = infer_prompt_tail(config)
@@ -164,9 +222,9 @@ def _cmd_target(config: Config, agent: str, environ: dict[str, str], *, use_cach
         "readiness": readiness.describe(),
         "prompt_tail": prompt_tail,
     }
-    json.dump(document, sys.stdout, indent=2, sort_keys=True)
+    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
     sys.stdout.write("\n")
-    return 0 if readiness.ready else 0
+    return 0 if readiness.ready else EXIT_BUSY
 
 
 def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
@@ -179,26 +237,61 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
     """
     import subprocess
 
-    probe = f"git ls-remote {config.probe_remote} HEAD"
-    prefixed = f"with-proxy {probe}" if "with-proxy" in config.prefixes else probe
+    probe = shlex.join(("git", "ls-remote", config.probe_remote, "HEAD"))
+    prefixed = (
+        shlex.join(("with-proxy", *shlex.split(probe)))
+        if "with-proxy" in config.prefixes
+        else probe
+    )
+    log = audit_path(config.project_root, config.spool_dir)
+    warn_if_spool_is_tracked(config.project_root, config.spool_dir)
+    try:
+        admission = admit(prefixed, config)
+    except Refused as exc:
+        _record_audit(log, agent, prefixed, "REFUSED", str(exc), {"doctor": True})
+        raise
+    _record_audit(
+        log,
+        agent,
+        prefixed,
+        "ADMITTED",
+        "doctor probe accepted; target resolution and launch have not yet completed",
+        {"doctor": True, "rendered": admission.rendered},
+    )
 
-    print(f"herdr-run doctor  (agent={agent}, config={config.source_path or 'defaults'})")
+    print(
+        f"herdr-run doctor  (agent={agent}, config={config.source_path or 'defaults'})"
+    )
     print()
 
-    inside = subprocess.run(
-        ["bash", "-lc", prefixed], text=True, capture_output=True, check=False, timeout=120
-    )
+    try:
+        inside = subprocess.run(
+            ["/bin/bash", "-lc", prefixed],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        error = HerdrUnavailable(f"cannot run the in-jail doctor probe: {exc}")
+        _record_audit(
+            log, agent, prefixed, "HERDRUNAVAILABLE", str(error), {"doctor": True}
+        )
+        raise error from exc
     inside_ok = inside.returncode == 0
     print(f"[in-jail ] {prefixed}")
     print(f"           rc={inside.returncode} {'SUCCEEDED' if inside_ok else 'failed'}")
     if not inside_ok:
-        print(f"           {(inside.stderr or '').strip().splitlines()[-1] if inside.stderr.strip() else ''}")
+        print(
+            f"           {(inside.stderr or '').strip().splitlines()[-1] if inside.stderr.strip() else ''}"
+        )
 
-    client = _client(config, environ)
-    target = resolve_target(client, config, agent)
-    admission = admit(prefixed, config)
     outside_rc = -1
     try:
+        client = _client(config, environ)
+        target = resolve_target(client, config, agent)
         result = execute(
             client,
             config,
@@ -210,15 +303,48 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
             timeout=min(config.timeout_seconds, 180.0),
         )
         outside_rc = result.exit_code
+        meta, meta_error = _write_meta_best_effort(result, admission, config, agent)
+        fields: dict[str, object] = {
+            "doctor": True,
+            "inside_exit_code": inside.returncode,
+            "exit_code": outside_rc,
+            "run_id": result.run_id,
+            "pane_id": result.target.pane_id,
+            "meta": meta,
+        }
+        if meta_error is not None:
+            fields["meta_error"] = meta_error
+        _record_audit(
+            log,
+            agent,
+            prefixed,
+            "RAN",
+            f"doctor pane probe exited {outside_rc}",
+            fields,
+        )
         head = (result.stdout.strip().splitlines() or [""])[0]
-        print(f"[via pane] {prefixed}   (pane {target.pane_id}, tab {target.tab_label})")
-        print(f"           rc={outside_rc} {'SUCCEEDED' if outside_rc == 0 else 'failed'}  {head[:80]}")
+        print(
+            f"[via pane] {prefixed}   (pane {target.pane_id}, tab {target.tab_label})"
+        )
+        print(
+            f"           rc={outside_rc} {'SUCCEEDED' if outside_rc == 0 else 'failed'}  {head[:80]}"
+        )
     except HerdrRunError as exc:
+        _record_audit(
+            log,
+            agent,
+            prefixed,
+            type(exc).__name__.upper(),
+            str(exc),
+            {"doctor": True, "inside_exit_code": inside.returncode},
+        )
         print(f"[via pane] FAILED: {exc}")
 
     print()
     if outside_rc == 0 and not inside_ok:
-        print("VERDICT: working as intended — blocked in-jail, succeeds through the pane.")
+        print(
+            "VERDICT: working as intended — blocked in-jail, succeeds through the pane."
+        )
         return 0
     if outside_rc == 0 and inside_ok:
         print(
@@ -236,7 +362,11 @@ def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
 
 
 def _run_command(
-    config: Config, agent: str, command: str, args: argparse.Namespace, environ: dict[str, str]
+    config: Config,
+    agent: str,
+    command: str,
+    args: argparse.Namespace,
+    environ: dict[str, str],
 ) -> int:
     log = audit_path(config.project_root, config.spool_dir)
     warn_if_spool_is_tracked(config.project_root, config.spool_dir)
@@ -244,27 +374,42 @@ def _run_command(
     try:
         admission: Admission = admit(command, config)
     except Refused as exc:
-        record(log, agent=agent, command=command, verdict="REFUSED", detail=str(exc))
+        _record_audit(log, agent, command, "REFUSED", str(exc))
         print(f"herdr-run: REFUSED: {exc}", file=sys.stderr)
         return Refused.exit_code
 
     if args.dry_run:
-        record(log, agent=agent, command=command, verdict="DRY-RUN", detail=admission.rendered)
+        _record_audit(log, agent, command, "DRY-RUN", admission.rendered)
         if args.json:
             json.dump(
-                {"verdict": "allowed", "program": admission.program, "rendered": admission.rendered},
+                {
+                    "verdict": "allowed",
+                    "program": admission.program,
+                    "rendered": admission.rendered,
+                },
                 sys.stdout,
                 indent=2,
                 sort_keys=True,
+                ensure_ascii=False,
             )
             sys.stdout.write("\n")
         else:
             print(admission.rendered)
         return 0
 
+    _record_audit(
+        log,
+        agent,
+        command,
+        "ADMITTED",
+        "policy accepted command; target resolution and launch have not yet completed",
+        {"rendered": admission.rendered},
+    )
     client = _client(config, environ)
     cwd = _resolved_cwd(config, args)
-    ready_timeout = args.wait_ready if args.wait_ready is not None else config.ready_timeout_seconds
+    ready_timeout = (
+        args.wait_ready if args.wait_ready is not None else config.ready_timeout_seconds
+    )
     timeout = args.timeout if args.timeout is not None else config.timeout_seconds
 
     try:
@@ -289,25 +434,29 @@ def _run_command(
         print(f"herdr-run: {exc}", file=sys.stderr)
         return exc.exit_code
     except HerdrRunError as exc:
-        record(log, agent=agent, command=command, verdict=type(exc).__name__.upper(), detail=str(exc))
+        _record_audit(log, agent, command, type(exc).__name__.upper(), str(exc))
         print(f"herdr-run: {exc}", file=sys.stderr)
         return exc.exit_code
 
-    meta = write_meta(result, admission, config, agent)
-    record(
+    meta, meta_error = _write_meta_best_effort(result, admission, config, agent)
+    stdout_bytes, stderr_bytes = read_output_bytes(result)
+    audit_fields: dict[str, object] = {
+        "run_id": result.run_id,
+        "pane_id": result.target.pane_id,
+        "tab": result.target.tab_label,
+        "exit_code": result.exit_code,
+        "rendered": admission.rendered,
+        "meta": meta,
+    }
+    if meta_error is not None:
+        audit_fields["meta_error"] = meta_error
+    _record_audit(
         log,
-        agent=agent,
-        command=command,
-        verdict="RAN",
-        detail=f"exit {result.exit_code} in {result.duration_seconds:.1f}s",
-        fields={
-            "run_id": result.run_id,
-            "pane_id": result.target.pane_id,
-            "tab": result.target.tab_label,
-            "exit_code": result.exit_code,
-            "rendered": admission.rendered,
-            "meta": meta,
-        },
+        agent,
+        command,
+        "RAN",
+        f"exit {result.exit_code} in {result.duration_seconds:.1f}s",
+        audit_fields,
     )
 
     if args.json:
@@ -316,6 +465,8 @@ def _run_command(
                 "exit_code": result.exit_code,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
+                "stdout_base64": base64.b64encode(stdout_bytes).decode("ascii"),
+                "stderr_base64": base64.b64encode(stderr_bytes).decode("ascii"),
                 "run_id": result.run_id,
                 "pane_id": result.target.pane_id,
                 "tab": result.target.tab_label,
@@ -327,12 +478,63 @@ def _run_command(
             sys.stdout,
             indent=2,
             sort_keys=True,
+            ensure_ascii=False,
         )
         sys.stdout.write("\n")
     else:
-        sys.stdout.write(result.stdout)
-        sys.stderr.write(result.stderr)
+        _emit_raw_output(stdout_bytes, stderr_bytes)
     return result.exit_code
+
+
+def _record_audit(
+    path: str,
+    agent: str,
+    command: str,
+    verdict: str,
+    detail: str,
+    fields: dict[str, object] | None = None,
+) -> None:
+    """Attempt one audit append and make degradation visible without changing the result."""
+    if not record(
+        path,
+        agent=agent,
+        command=command,
+        verdict=verdict,
+        detail=detail,
+        fields=fields,
+    ):
+        print(
+            f"herdr-run: WARNING: could not append audit record to {path}",
+            file=sys.stderr,
+        )
+
+
+def _write_meta_best_effort(
+    result: RunResult, admission: Admission, config: Config, agent: str
+) -> tuple[str | None, str | None]:
+    """Write supplemental metadata without replacing an already-completed command result."""
+    try:
+        return write_meta(result, admission, config, agent), None
+    except (OSError, UnicodeError) as exc:
+        error = f"cannot write run metadata: {exc}"
+        print(f"herdr-run: WARNING: {error}", file=sys.stderr)
+        return None, error
+
+
+def _emit_raw_output(stdout_bytes: bytes, stderr_bytes: bytes) -> None:
+    """Write each captured byte stream exactly once, without newline or text translation."""
+    stdout_buffer = getattr(sys.stdout, "buffer", None)
+    stderr_buffer = getattr(sys.stderr, "buffer", None)
+    if stdout_buffer is not None:
+        stdout_buffer.write(stdout_bytes)
+        stdout_buffer.flush()
+    else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
+        sys.stdout.write(stdout_bytes.decode("utf-8", errors="replace"))
+    if stderr_buffer is not None:
+        stderr_buffer.write(stderr_bytes)
+        stderr_buffer.flush()
+    else:  # pragma: no cover - only nonstandard embedded text streams lack .buffer
+        sys.stderr.write(stderr_bytes.decode("utf-8", errors="replace"))
 
 
 def _print_userguide() -> int:
@@ -341,19 +543,28 @@ def _print_userguide() -> int:
 
         text = (files("herdr_run") / "USER_GUIDE.md").read_text(encoding="utf-8")
     except (OSError, ModuleNotFoundError):
-        print("herdr-run: user guide resource is not available in this installation", file=sys.stderr)
+        print(
+            "herdr-run: user guide resource is not available in this installation",
+            file=sys.stderr,
+        )
         return 1
     sys.stdout.write(text)
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point. Returns the wrapped command's exit code, or a distinct herdr-run code."""
+    """Entry point. Return the wrapped status or the documented code for a wrapper failure."""
     parser = build_parser()
     # parse_intermixed_args, not parse_args: with a greedy `nargs="*"` positional, plain parse_args
     # cannot handle an option BETWEEN positionals, so `herdr-run agent --cwd DIR 'cmd'` failed with
     # "unrecognized arguments" — and that is the natural way to write the call.
-    args = parser.parse_intermixed_args(list(argv) if argv is not None else None)
+    raw_args = list(argv) if argv is not None else sys.argv[1:]
+    if any(
+        any(0xD800 <= ord(character) <= 0xDFFF for character in token)
+        for token in raw_args
+    ):
+        parser.error("arguments must be valid UTF-8")
+    args = parser.parse_intermixed_args(raw_args)
     environ = dict(os.environ)
 
     positional: list[str] = list(args.positional)

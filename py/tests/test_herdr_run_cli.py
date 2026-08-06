@@ -6,12 +6,16 @@ command failed" without parsing prose — so each distinguishable outcome is ass
 
 from __future__ import annotations
 
+import io
 import json
 import os
+import sys
+from types import SimpleNamespace
 
 import pytest
 
 from herdr_run.audit import audit_path, record
+import herdr_run.cli as cli_module
 from herdr_run.cli import _default_agent, build_parser, main
 from herdr_run.errors import EXIT_REFUSED
 
@@ -30,14 +34,19 @@ def test_agent_is_taken_from_the_orc_environment_variable() -> None:
 
 
 def test_explicit_override_beats_the_environment() -> None:
-    assert _default_agent({"HERDR_RUN_AGENT": "chosen", "DG_AGENT_NAME": "ambient"}) == "chosen"
+    assert (
+        _default_agent({"HERDR_RUN_AGENT": "chosen", "DG_AGENT_NAME": "ambient"})
+        == "chosen"
+    )
 
 
 def test_unknown_agent_when_nothing_is_set() -> None:
     assert _default_agent({}) == "unknown-agent"
 
 
-def test_bare_invocation_prints_help_and_succeeds(capsys: pytest.CaptureFixture[str]) -> None:
+def test_bare_invocation_prints_help_and_succeeds(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """The `make check-deps` contract: every entrypoint starts cleanly with no arguments."""
     assert main([]) == 0
     out = capsys.readouterr().out
@@ -45,23 +54,36 @@ def test_bare_invocation_prints_help_and_succeeds(capsys: pytest.CaptureFixture[
     assert "no command given" in out
 
 
+@pytest.mark.parametrize("value", ["nan", "inf", "-1", "1e300"])
+def test_invalid_cli_timeouts_are_rejected(value: str) -> None:
+    with pytest.raises(SystemExit) as excinfo:
+        build_parser().parse_args(["--timeout", value])
+    assert excinfo.value.code == 2
+
+
 # --- policy-only paths touch no Herdr server ---------------------------------------------------------
 
 
-def test_check_allows_an_allowlisted_command(capsys: pytest.CaptureFixture[str]) -> None:
+def test_check_allows_an_allowlisted_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     assert main(["check", "with-proxy git ls-remote origin main"]) == 0
     out = capsys.readouterr().out
     assert "ALLOWED" in out
     assert "program=git" in out
 
 
-def test_check_refuses_a_non_allowlisted_command(capsys: pytest.CaptureFixture[str]) -> None:
+def test_check_refuses_a_non_allowlisted_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     assert main(["check", "curl https://evil.example"]) == EXIT_REFUSED
     assert "REFUSED" in capsys.readouterr().err
 
 
 def test_dry_run_refusal_never_reaches_a_pane(
-    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A refused command must exit 77 without any Herdr interaction at all."""
     root = str(tmp_path)
@@ -75,7 +97,9 @@ def test_dry_run_refusal_never_reaches_a_pane(
 
 
 def test_dry_run_prints_the_rendered_command(
-    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(str(tmp_path))
     assert main(["--dry-run", "agent", "git commit -m 'two words'"]) == 0
@@ -83,7 +107,9 @@ def test_dry_run_prints_the_rendered_command(
 
 
 def test_config_subcommand_reports_the_effective_policy(
-    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     monkeypatch.chdir(str(tmp_path))
     monkeypatch.setenv("DG_AGENT_NAME", "hermit-lander")
@@ -94,10 +120,82 @@ def test_config_subcommand_reports_the_effective_policy(
     assert document["allow"] == ["git", "gh", "cargo"]
 
 
+class _CapturedText(io.StringIO):
+    """Text stream exposing the binary buffer used by a normal terminal stream."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.raw = io.BytesIO()
+
+    @property
+    def buffer(self) -> io.BytesIO:
+        return self.raw
+
+
+def test_raw_result_streams_are_emitted_byte_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = _CapturedText()
+    stderr = _CapturedText()
+    monkeypatch.setattr(sys, "stdout", stdout)
+    monkeypatch.setattr(sys, "stderr", stderr)
+
+    cli_module._emit_raw_output(b"A\x00\xff", b"B\r\n")
+
+    assert stdout.raw.getvalue() == b"A\x00\xff"
+    assert stderr.raw.getvalue() == b"B\r\n"
+
+
+def test_metadata_failure_does_not_mask_completed_command(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = str(tmp_path)
+    monkeypatch.chdir(root)
+    target = SimpleNamespace(
+        pane_id="p1", tab_label="agent", created=(), tab_id="t1", workspace_id="w1"
+    )
+    result = SimpleNamespace(
+        exit_code=23,
+        stdout="output",
+        stderr="",
+        run_id="run-1",
+        spool=SimpleNamespace(
+            directory=os.path.join(root, ".herdr-run", "runs", "run-1")
+        ),
+        target=target,
+        duration_seconds=0.25,
+    )
+    monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
+    monkeypatch.setattr(cli_module, "resolve_target", lambda *_args, **_kwargs: target)
+    monkeypatch.setattr(cli_module, "execute", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(
+        cli_module,
+        "write_meta",
+        lambda *_args: (_ for _ in ()).throw(OSError("read-only metadata")),
+    )
+    monkeypatch.setattr(
+        cli_module, "read_output_bytes", lambda _result: (b"output", b"")
+    )
+
+    assert main(["--json", "agent", "git status"]) == 23
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["meta"] is None
+    assert "WARNING: cannot write run metadata" in captured.err
+    with open(audit_path(root, ".herdr-run"), encoding="utf-8") as handle:
+        entries = [json.loads(line) for line in handle]
+    assert [entry["verdict"] for entry in entries] == ["ADMITTED", "RAN"]
+    assert entries[-1]["meta"] is None
+    assert "meta_error" in entries[-1]
+
+
 # --- audit trail ---------------------------------------------------------------------------------------
 
 
-def test_refusals_are_audited(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_refusals_are_audited(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A log that recorded only successes would make the allowlist unobservable after the fact."""
     root = str(tmp_path)
     monkeypatch.chdir(root)
@@ -114,16 +212,24 @@ def test_refusals_are_audited(tmp_path: object, monkeypatch: pytest.MonkeyPatch)
 
 def test_audit_appends_rather_than_truncating(tmp_path: object) -> None:
     path = os.path.join(str(tmp_path), "audit.jsonl")
-    record(path, agent="a", command="git status", verdict="RAN", detail="exit 0")
-    record(path, agent="b", command="curl x", verdict="REFUSED", detail="nope")
+    assert record(path, agent="a", command="git status", verdict="RAN", detail="exit 0")
+    assert record(path, agent="b", command="curl x", verdict="REFUSED", detail="nope")
     with open(path, encoding="utf-8") as handle:
         entries = [json.loads(line) for line in handle if line.strip()]
     assert [entry["verdict"] for entry in entries] == ["RAN", "REFUSED"]
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert os.stat(str(tmp_path)).st_mode & 0o777 == 0o700
 
 
 def test_unwritable_audit_log_does_not_raise() -> None:
     """The audit log must never be the reason a run fails."""
-    record("/proc/definitely/not/writable/audit.jsonl", agent="a", command="c", verdict="RAN", detail="d")
+    assert not record(
+        "/proc/definitely/not/writable/audit.jsonl",
+        agent="a",
+        command="c",
+        verdict="RAN",
+        detail="d",
+    )
 
 
 # --- spool hygiene: command output must not land where `git add` can pick it up ---------------------
@@ -182,7 +288,10 @@ def test_no_claim_outside_a_git_work_tree(tmp_path: object) -> None:
     ],
 )
 def test_options_may_appear_between_positionals(
-    argv: list[str], tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    argv: list[str],
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Regression: `herdr-run agent --cwd DIR 'cmd'` must parse.
 

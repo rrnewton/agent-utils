@@ -16,10 +16,10 @@ RUST_TOOLS = (
     "cpuset-alloc",
     "tick-hub",
     "pr-landing-planner",
+    "herdr-run",
 )
 PYTHON_ONLY_TOOLS = (
     "agent-team-timeline",
-    "herdr-run",
 )
 RESOLVER_TOOLS = RUST_TOOLS + PYTHON_ONLY_TOOLS
 

@@ -31,6 +31,7 @@ TOOLS: tuple[tuple[str, str, str], ...] = (
     ("safe-ci-dag-runner", "safe_ci_dag_runner", "safe-ci-dag-runner"),
     ("tick-hub", "tick_hub", "tick-hub"),
     ("pr-landing-planner", "pr_landing_planner", "pr-landing-planner"),
+    ("herdr-run", "herdr_run", "herdr-run"),
 )
 
 
@@ -175,22 +176,6 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         language="python",
         source="common/docs/agent-team-timeline/USER_GUIDE.md",
     ),
-    # herdr-run ALLOWLISTS `cargo` as a target program, so its docs must name it. That is subject
-    # matter, not a reference to a sibling Rust implementation -- herdr-run has no Rust port.
-    StandaloneDocument(
-        tool="herdr-run",
-        document="README",
-        language="python",
-        source="common/docs/herdr-run/README.md",
-        exemptions=("other toolchain",),
-    ),
-    StandaloneDocument(
-        tool="herdr-run",
-        document="USER_GUIDE",
-        language="python",
-        source="common/docs/herdr-run/USER_GUIDE.md",
-        exemptions=("other toolchain",),
-    ),
 )
 
 
@@ -230,9 +215,6 @@ def _package_links() -> tuple[PackageLink, ...]:
                 "common/docs/agent-team-timeline/USER_GUIDE.md",
             ),
             PackageLink("py/agent_team_timeline/LICENSE", "LICENSE"),
-            PackageLink("py/herdr_run/README.md", "common/docs/herdr-run/README.md"),
-            PackageLink("py/herdr_run/USER_GUIDE.md", "common/docs/herdr-run/USER_GUIDE.md"),
-            PackageLink("py/herdr_run/LICENSE", "LICENSE"),
         )
     )
     return tuple(links)

@@ -9,6 +9,7 @@ version, license, README, and embedded user guide.
 | `safe-ci-dag-runner` | `safe-ci-dag-runner`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
+| `herdr-run` | `herdr-run` | Run policy-admitted commands through a Herdr pane and capture audited results. |
 
 Install one published command with Cargo:
 
@@ -16,6 +17,7 @@ Install one published command with Cargo:
 cargo install safe-ci-dag-runner
 cargo install tick-hub
 cargo install pr-landing-planner
+cargo install herdr-run
 ```
 
 For workspace development:
@@ -53,7 +55,7 @@ binary hash. They may be removed manually when no source-checkout Rust command
 is running.
 
 On the first `./setup rs` after upgrading from the former copied-binary layout,
-setup removes only the four known legacy `rs/bin/<command>.provenance` cache
+setup removes only the known legacy `rs/bin/<command>.provenance` cache
 files. Any other unexpected `rs/bin` entry is reported and refused.
 
 Run `make check-rust-packages` from the repository root to build, inspect, and

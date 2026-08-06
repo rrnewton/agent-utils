@@ -10,7 +10,7 @@ workspace: agent-cmds
 # {agent} = invoking agent name, {project} = project directory basename.
 tab_name: "{agent}"
 
-# THE ALLOWLIST. Only these programs may cross the sandbox boundary.
+# Cooperative policy rail: only these programs may be submitted through herdr-run.
 allow:
   - git
   - gh
@@ -25,5 +25,5 @@ spool_dir: .herdr-run
 # Landing operations (git push, gh pr checks) can be slow on a loaded box.
 timeout_seconds: 900
 
-# Panes are shared with a human. Wait briefly rather than refusing the instant one is busy.
-ready_timeout_seconds: 30
+# Panes are shared with a human. The default refuses immediately when one is busy.
+ready_timeout_seconds: 0

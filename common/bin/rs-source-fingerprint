@@ -7,19 +7,24 @@
 # guards against, so there is deliberately only one.
 #
 # Output (stdout): a single line, "<64-hex sha256>", covering the WORKING-TREE contents of every
-# git-tracked file under rs/ EXCEPT the tracked launcher links in rs/bin and ignored rs/target
-# outputs. Any change to Cargo.toml/Cargo.lock or a source file changes the fingerprint; a rebuild
-# refreshes the stamp.
+# tracked or nonignored untracked file under rs/ EXCEPT the launcher links in rs/bin and rs/target
+# outputs. Including untracked source is essential during development: a newly created module must
+# invalidate an older binary before its first commit. Any manifest, lockfile, or source-content
+# change refreshes the stamp.
 # Exits nonzero (no output) if the rs/ source cannot be enumerated, so callers fail closed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../.." && pwd)"
 cd "$ROOT"
 
-# Deterministic order: git ls-files is sorted, but pin the locale so it is stable everywhere.
-mapfile -t files < <(git ls-files -- rs ':!rs/bin' ':!rs/target' | LC_ALL=C sort)
+# Include cached paths plus nonignored untracked paths. NUL delimiters preserve every legal Git
+# filename, and the pinned bytewise sort makes the path stream stable everywhere.
+mapfile -d '' -t files < <(
+    git ls-files -z --cached --others --exclude-standard -- rs ':!rs/bin' ':!rs/target' |
+        LC_ALL=C sort -z
+)
 if ((${#files[@]} == 0)); then
-    echo "rs-source-fingerprint: no tracked rs/ source files found under $ROOT (not a checkout?)" >&2
+    echo "rs-source-fingerprint: no rs/ source files found under $ROOT (not a checkout?)" >&2
     exit 3
 fi
 

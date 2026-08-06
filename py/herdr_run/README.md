@@ -1,1 +1,1 @@
-../../common/docs/herdr-run/README.md
+../../common/docs/herdr-run/rendered/python/README.md

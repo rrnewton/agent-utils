@@ -1,13 +1,14 @@
-"""Append-only record of every attempt to cross the sandbox boundary.
+"""Best-effort append-only records of attempts to cross the sandbox boundary.
 
 A tool whose whole purpose is to bypass a confinement boundary must leave a trail that is complete
 rather than convenient: REFUSED attempts are logged as prominently as successful ones, because a
 run of refusals is exactly the signal worth noticing, and a log that only recorded successes would
 make the allowlist's behaviour unobservable after the fact.
 
-JSONL, one object per line, appended with a single ``write`` of a line that ends in ``\\n``. Nothing
-here locks: concurrent agents append to the same file, and single-line appends under the pipe-buffer
-size are not interleaved by the kernel on Linux.
+JSONL, one object per line, appended with one ``write`` of a line that ends in ``\\n``. Nothing here
+locks. Linux ``O_APPEND`` assigns each write its end-of-file offset atomically, but this remains an
+operational aid rather than durable or tamper-proof audit storage: writes are not fsynced and a
+same-UID process can modify the file.
 """
 
 from __future__ import annotations
@@ -22,7 +23,9 @@ __all__ = ["audit_path", "record", "spool_is_ignored", "warn_if_spool_is_tracked
 
 def audit_path(project_root: str, spool_dir: str) -> str:
     """Absolute path of the append-only audit log for a project's spool directory."""
-    root = spool_dir if os.path.isabs(spool_dir) else os.path.join(project_root, spool_dir)
+    root = (
+        spool_dir if os.path.isabs(spool_dir) else os.path.join(project_root, spool_dir)
+    )
     return os.path.join(root, "audit.jsonl")
 
 
@@ -34,10 +37,20 @@ def spool_is_ignored(project_root: str, spool_dir: str) -> bool | None:
     """
     import subprocess
 
-    root = spool_dir if os.path.isabs(spool_dir) else os.path.join(project_root, spool_dir)
+    root = (
+        spool_dir if os.path.isabs(spool_dir) else os.path.join(project_root, spool_dir)
+    )
     try:
         completed = subprocess.run(
-            ["git", "-C", project_root, "check-ignore", "-q", "--", os.path.join(root, "probe")],
+            [
+                "git",
+                "-C",
+                project_root,
+                "check-ignore",
+                "-q",
+                "--",
+                os.path.join(root, "probe"),
+            ],
             capture_output=True,
             check=False,
             timeout=10,
@@ -52,7 +65,9 @@ def spool_is_ignored(project_root: str, spool_dir: str) -> bool | None:
     return None
 
 
-def warn_if_spool_is_tracked(project_root: str, spool_dir: str, *, stream: object = None) -> bool:
+def warn_if_spool_is_tracked(
+    project_root: str, spool_dir: str, *, stream: object = None
+) -> bool:
     """Warn when command output would be written into a tracked part of a source tree.
 
     The spool holds real stdout/stderr from commands that crossed the sandbox boundary. Writing that
@@ -82,8 +97,8 @@ def record(
     detail: str,
     fields: dict[str, object] | None = None,
     now: Callable[[], float] = time.time,
-) -> None:
-    """Append one audit entry. Never raises: an unwritable log must not block or mask the result."""
+) -> bool:
+    """Append one audit entry, returning success without ever masking the command result."""
     entry: dict[str, object] = {
         "time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now())),
         "agent": agent,
@@ -95,8 +110,25 @@ def record(
     if fields:
         entry.update(fields)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, sort_keys=True) + "\n")
-    except OSError:
-        pass
+        parent = os.path.dirname(path) or "."
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        os.chmod(parent, 0o700)
+        encoded = (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode(
+            "utf-8"
+        )
+        flags = (
+            os.O_APPEND
+            | os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            # One O_APPEND write gives concurrent callers a whole-line placement boundary.
+            return os.write(descriptor, encoded) == len(encoded)
+        finally:
+            os.close(descriptor)
+    except (OSError, UnicodeError, ValueError):
+        return False

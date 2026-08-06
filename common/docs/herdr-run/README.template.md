@@ -12,8 +12,11 @@ even though the agent legitimately needs them to publish its work. The Herdr ter
 outside that confinement, so a shell in one of its panes is not confined either. `herdr-run` turns
 that into one narrow, audited door instead of an ad-hoc pile of keystroke injection.
 
-> **This tool deliberately crosses a security boundary.** Keep the allowlist as small as your
-> project can tolerate, and read the threat model in the user guide before widening it.
+> **This tool deliberately uses an out-of-sandbox channel.** Its allowlist prevents accidental and
+> cooperative misuse; it is not a containment boundary against a hostile process running as the
+> same user. Read the trust model in the user guide before widening policy.
+
+{{DISTRIBUTION}}
 
 ## What it does
 
@@ -23,12 +26,16 @@ that into one narrow, audited door instead of an ad-hoc pile of keystroke inject
 - **Allowlist by construction.** The command is split into argv, the program name is checked against
   a per-project allowlist, and every token is re-quoted before it reaches a shell - so shell
   metacharacters become literal arguments instead of a second command.
-- **Real results, not screen scraping.** The pane redirects into a spool directory, so you get exact
-  bytes and a genuine exit code rather than text recovered from a hard-wrapping, finite,
-  ANSI-laden terminal that shows no exit status at all.
-- **Conservative readiness.** Two independent signals must agree before anything is typed into a
-  terminal a human may also be using, and the check fails closed.
-- **Audited.** Every attempt - including every refusal - appends one JSON line to a durable log.
+- **Real results, not screen scraping.** The pane redirects into a spool directory, preserving raw
+  bytes and a genuine exit code. Raw mode passes those bytes through; JSON mode also includes
+  base64 fields alongside readable UTF-8-with-replacement text.
+- **Conservative readiness.** The foreground process group must prove the shell is idle twice; a
+  prompt-tail check independently vetoes a half-typed human command when it has positive evidence.
+- **Serialized account-wide use.** An account-global resolution lock prevents duplicate first-run
+  workspaces/tabs, and an account-global per-pane lock spans readiness, launch, and collection, so
+  callers from different projects cannot inject into the same pane concurrently.
+- **Visible, best-effort audit.** Refusals, admissions, failures, and completions are appended to a
+  private JSONL log. Storage failures warn but never replace a completed command's exit status.
 
 ## Configuration
 
@@ -38,7 +45,7 @@ project can adopt the tool with no configuration at all:
 ```yaml
 workspace: agent-cmds     # Herdr workspace holding this project's command tabs
 tab_name: "{agent}"       # one tab per agent
-allow: [git, gh]          # THE ALLOWLIST - keep it small
+allow: [git, gh]          # cooperative policy rail - keep it small
 prefixes: [with-proxy]    # wrappers that may precede an allowlisted program
 spool_dir: .herdr-run     # git-ignored: holds command output, not source
 ```
@@ -54,7 +61,9 @@ herdr-run doctor                 verify the sandbox-crossing actually works, bot
 herdr-run userguide              the full user guide
 ```
 
-Requires the `herdr` terminal multiplexer on `PATH`. `PyYAML` is optional and needed only when a
-configuration file is present.
+Requires Linux with a working systemd user manager and a separately installed
+[`herdr`](https://github.com/herdrdev/herdr) command in a fixed location such as `/usr/local/bin`,
+`~/.local/bin`, or `~/bin`. The integration is tested with Herdr 0.8.0; compatible
+newer releases must provide its `status`, `workspace`, `tab`, and `pane` command APIs.
 
 Full documentation: `herdr-run userguide`.

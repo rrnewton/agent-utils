@@ -9,15 +9,22 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import cast
 
 import pytest
 
+import herdr_run.state as state
 from herdr_run.client import HerdrClient
 from herdr_run.config import Config
-from herdr_run.errors import HerdrUnavailable
+from herdr_run.errors import ConfigError, HerdrUnavailable
 from herdr_run.session import cache_path, resolve_target, tab_label_for
-from herdr_run.fakeherdr import FakeHerdrClient
+from tests.herdr_fake import FakeHerdrClient
+
+
+@pytest.fixture(autouse=True)
+def _isolated_account_state(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(state, "_account_home", lambda: os.path.join(str(tmp_path), "account-home"))
 
 
 def _config(tmp_path: str, **kwargs: object) -> Config:
@@ -59,6 +66,11 @@ def test_second_run_creates_nothing(tmp_path: object) -> None:
     assert second.from_cache is True
     assert [call for call in fake.calls if call.startswith("create_")] == creates_after_first
 
+    path = cache_path(config)
+    assert os.stat(os.path.dirname(path)).st_mode & 0o777 == 0o700
+    assert os.stat(path).st_mode & 0o777 == 0o600
+    assert os.stat(f"{path}.lock").st_mode & 0o777 == 0o600
+
 
 def test_second_agent_reuses_the_workspace_and_adds_only_a_tab(tmp_path: object) -> None:
     root = str(tmp_path)
@@ -90,6 +102,65 @@ def test_starts_the_server_when_absent(tmp_path: object) -> None:
     assert "server" in target.created
 
 
+def test_concurrent_first_resolution_across_projects_creates_session_once(
+    tmp_path: object,
+) -> None:
+    """The account-global resolution lock closes the lookup-then-create race."""
+
+    class BlockingFirstCreate(FakeHerdrClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self._count_lock = threading.Lock()
+            self.create_count = 0
+
+        def create_workspace(self, *, label: str, cwd: str) -> tuple[str, str, str]:
+            with self._count_lock:
+                self.create_count += 1
+                ordinal = self.create_count
+            if ordinal == 1:
+                self.entered.set()
+                if not self.release.wait(timeout=5.0):
+                    raise AssertionError("test did not release the first workspace creation")
+            return super().create_workspace(label=label, cwd=cwd)
+
+    root = str(tmp_path)
+    project_one = os.path.join(root, "project-one")
+    project_two = os.path.join(root, "project-two")
+    os.makedirs(project_one)
+    os.makedirs(project_two)
+    configs = (_config(project_one), _config(project_two))
+    fake = BlockingFirstCreate()
+    targets: list[object] = []
+    failures: list[BaseException] = []
+
+    def resolve(config: Config) -> None:
+        try:
+            targets.append(resolve_target(_client(fake), config, "agent"))
+        except BaseException as exc:
+            failures.append(exc)
+
+    first = threading.Thread(target=resolve, args=(configs[0],), daemon=True)
+    first.start()
+    assert fake.entered.wait(timeout=5.0), "first resolver never reached workspace creation"
+    second = threading.Thread(target=resolve, args=(configs[1],), daemon=True)
+    second.start()
+    try:
+        second.join(timeout=0.1)
+        assert second.is_alive(), "second resolver bypassed the account-global session lock"
+    finally:
+        fake.release.set()
+        first.join(timeout=5.0)
+        second.join(timeout=5.0)
+
+    assert failures == []
+    assert not first.is_alive() and not second.is_alive()
+    assert fake.create_count == 1
+    assert len(fake.workspaces) == 1
+    assert len(targets) == 2
+
+
 # --- the cache is an optimisation, never an authority --------------------------------------------
 
 
@@ -119,6 +190,22 @@ def test_cache_is_rejected_when_the_tab_label_moved(tmp_path: object) -> None:
     second = resolve_target(_client(fake), config, "agent")
     assert second.from_cache is False
     assert second.tab_id != first.tab_id
+
+
+def test_cache_is_rejected_when_the_workspace_label_moved(tmp_path: object) -> None:
+    """A live pane id is not authority when its workspace has become somebody else's."""
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root)
+    first = resolve_target(_client(fake), config, "agent")
+    fake.workspaces[first.workspace_id].label = "someone-elses-workspace"
+
+    second = resolve_target(_client(fake), config, "agent")
+
+    assert second.from_cache is False
+    assert second.workspace_id != first.workspace_id
+    assert fake.workspaces[second.workspace_id].label == config.workspace
+    assert fake.workspaces[first.workspace_id].label == "someone-elses-workspace"
 
 
 def test_corrupt_cache_is_ignored_rather_than_fatal(tmp_path: object) -> None:
@@ -174,5 +261,5 @@ def test_tab_label_schema_supports_project_placeholder() -> None:
 
 def test_unknown_placeholder_is_a_clear_error() -> None:
     config = Config(tab_name="{nope}")
-    with pytest.raises(HerdrUnavailable, match="unknown placeholder"):
+    with pytest.raises(ConfigError, match=r"plain \{agent\} and \{project\}"):
         tab_label_for(config, "agent")

@@ -69,6 +69,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from herdr_differential import compare_herdr_run
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 #: Passed to every `run` comparison. Cgroup boxing is ON by default in both builds; this flag
@@ -2379,6 +2381,7 @@ def py_command_for(tool: str) -> list[str]:
         "cpuset-alloc": "safe_ci_dag_runner.cpuset_allocator",
         "tick-hub": "tick_hub",
         "pr-landing-planner": "pr_landing_planner",
+        "herdr-run": "herdr_run",
     }
     module = modules.get(tool)
     if module is None:
@@ -3644,7 +3647,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--tool",
         default="safe-ci-dag-runner",
-        choices=("safe-ci-dag-runner", "cpuset-alloc", "tick-hub", "pr-landing-planner", "all"),
+        choices=(
+            "safe-ci-dag-runner",
+            "cpuset-alloc",
+            "tick-hub",
+            "pr-landing-planner",
+            "herdr-run",
+            "all",
+        ),
     )
     parser.add_argument("--random", type=int, default=24, help="number of randomized fixtures")
     parser.add_argument("--seed", type=int, default=1234, help="RNG seed for randomized fixtures")
@@ -3660,11 +3670,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return compare_tick_hub(rand_count, seed)
     if tool == "pr-landing-planner":
         return compare_pr_landing_planner(rand_count, seed)
+    if tool == "herdr-run":
+        return compare_herdr_run(py_command_for(tool), rs_command(tool))
     results = (
         compare_safe_ci_dag_runner(rand_count, seed),
         compare_cpuset_alloc(),
         compare_tick_hub(rand_count, seed),
         compare_pr_landing_planner(rand_count, seed),
+        compare_herdr_run(py_command_for("herdr-run"), rs_command("herdr-run")),
     )
     return 1 if any(results) else 0
 

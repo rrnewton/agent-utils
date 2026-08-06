@@ -1,4 +1,4 @@
-"""An in-memory stand-in for a live Herdr session.
+"""Test-only in-memory stand-in for a live Herdr session.
 
 Models the parts the tool depends on — workspaces and tabs keyed by LABEL, one pane per tab, and a
 per-pane foreground-process state — so bring-up, caching, and readiness can be tested without a

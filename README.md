@@ -17,6 +17,7 @@ schema, CLI, output, error, and state-transition drift.
 | `cpuset-alloc` | Reserve disjoint CPU sets and hard-pin benchmark process trees. | Companion command in `safe-ci-dag-runner` | Companion binary in `safe-ci-dag-runner` |
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
 | `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
+| `herdr-run` | Run policy-admitted commands through an out-of-sandbox Herdr pane with audited, byte-preserving results. | `herdr-run` | `herdr-run` |
 
 Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not

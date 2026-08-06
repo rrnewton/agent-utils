@@ -1,7 +1,7 @@
 """Decide whether a pane is safe to type a command into.
 
-This is the dangerous part of the tool, so it is built out of two INDEPENDENT signals that must
-agree, and it fails closed.
+This is the dangerous part of the tool. The foreground-process signal must prove idleness; an
+independent prompt signal vetoes only when it has positive evidence of a half-typed command.
 
 **Primary — the foreground process group (an observable, not a proxy).** ``herdr pane
 process-info`` reports the pane's ``shell_pid`` and its ``foreground_process_group_id``. When the
@@ -33,6 +33,7 @@ signal must hold for two consecutive polls.
 from __future__ import annotations
 
 import os
+import pwd
 import re
 from dataclasses import dataclass
 
@@ -138,7 +139,13 @@ def infer_prompt_tail(config: Config, *, home: str | None = None) -> str | None:
     """Resolve the prompt tail from explicit config, else by reading the user's shell rc files."""
     if config.prompt_tail is not None:
         return config.prompt_tail
-    base = home if home is not None else os.path.expanduser("~")
+    if home is not None:
+        base = home
+    else:
+        try:
+            base = pwd.getpwuid(os.getuid()).pw_dir
+        except (KeyError, OSError):
+            return None
     for name in (".bashrc", ".zshrc", ".bash_profile", ".profile"):
         path = os.path.join(base, name)
         try:
@@ -207,10 +214,13 @@ def assess_prompt(text: str, tail: str | None) -> PromptSignal:
     needle = tail.rstrip()
     if not needle:
         return PromptSignal("abstain", "prompt tail is whitespace only", tail, last)
-    if last.rstrip().endswith(needle):
+    stripped_last = last.rstrip()
+    if stripped_last.endswith(needle) and stripped_last.count(needle) == 1:
         return PromptSignal("clean", f"last line ends with prompt tail {needle!r}", tail, last)
     if needle in last:
-        return PromptSignal("dirty", f"text typed after prompt tail {needle!r}: {last.rstrip()[-80:]!r}", tail, last)
+        return PromptSignal(
+            "dirty", f"text typed after prompt tail {needle!r}: {stripped_last[-80:]!r}", tail, last
+        )
     return PromptSignal("abstain", f"prompt tail {needle!r} not found in last line", tail, last)
 
 

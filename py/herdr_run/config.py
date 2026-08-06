@@ -6,42 +6,53 @@ allowlist is reviewable in that project's history rather than baked into this sh
 
 Every field has a working default, so a project with no config file at all still gets the intended
 conservative behaviour (workspace ``agent-cmds``, one tab per agent, only ``git``/``gh``, optionally
-prefixed with ``with-proxy``). PyYAML is therefore an OPTIONAL dependency: it is imported lazily and
-only when a config file actually exists, which keeps ``--help`` working on a bare host (the
-``make check-deps`` contract).
+prefixed with ``with-proxy``). The declared YAML dependency is imported lazily only when a config
+file exists, which keeps bootstrap help useful even in a damaged installation.
 """
 
 from __future__ import annotations
 
+import math
 import os
+import string
 from dataclasses import dataclass, field, replace
 
 from herdr_run.errors import ConfigError
 from herdr_run.jsonx import as_mapping, as_sequence
+from herdr_run.yamlcore import core_load
 
-__all__ = ["Config", "load_config", "find_config_file", "CONFIG_FILENAMES"]
+__all__ = [
+    "CONFIG_FILENAMES",
+    "MAX_TIMEOUT_SECONDS",
+    "Config",
+    "find_config_file",
+    "load_config",
+]
 
 #: Accepted config basenames, in search order, looked up from the working directory upward.
 CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
+
+#: Largest command/readiness timeout accepted from either configuration or the CLI. Keeping this
+#: comfortably below platform ``Instant``/``time.monotonic`` limits means a finite value can never
+#: overflow into an accidental infinite wait in either implementation.
+MAX_TIMEOUT_SECONDS = 31_536_000.0
 
 #: Programs allowed by default. Deliberately tiny: this is a sandbox door, not a shell.
 #: ``cargo`` is admitted ONLY for the network-only subcommands in
 #: :data:`_DEFAULT_ALLOW_SUBCOMMAND`; that restriction is load-bearing, not cosmetic.
 _DEFAULT_ALLOW: tuple[str, ...] = ("git", "gh", "cargo")
 
-#: Wrapper programs that may precede an allowlisted program. ``with-proxy`` is the Meta forward-proxy
-#: wrapper; it takes a command and execs it, so allowing it as a PREFIX (never as a program in its
-#: own right) keeps ``with-proxy git push`` expressible without widening the allowlist to "anything
-#: with-proxy can exec".
+#: Wrapper programs that may precede an allowlisted program. A wrapper takes a command and execs it,
+#: so allowing it as a PREFIX (never as a program in its own right) keeps wrapped commands
+#: expressible without widening the allowlist to "anything this wrapper can exec".
 _DEFAULT_PREFIXES: tuple[str, ...] = ("with-proxy",)
 
 #: Options that make an otherwise-allowlisted program run arbitrary code, matched among the GLOBAL
 #: options that precede the subcommand. ``git -c core.pager=...`` / ``git -c alias.x='!sh'`` /
 #: ``git --exec-path=/tmp/evil`` all turn "run git" into "run anything".
 #:
-#: Defense in depth, NOT the security boundary. The boundary is: the program name is allowlisted and
-#: the argv is re-quoted so it cannot escape into the shell. A determined caller with `git` can still
-#: reach a lot; see the Threat model section of the user guide.
+#: Defense in depth for cooperative callers, not a same-user security boundary. A determined caller
+#: with `git` can still reach a lot; see the trust model in the user guide.
 _DEFAULT_DENY_GLOBAL: dict[str, tuple[str, ...]] = {
     "git": ("-c", "--config-env", "--exec-path", "--namespace"),
     "gh": (),
@@ -82,7 +93,15 @@ _DEFAULT_DENY_ANYWHERE: tuple[str, ...] = ("--upload-pack", "--receive-pack")
 #: Needed to find the subcommand correctly: in ``git -C /tmp/repo log``, ``/tmp/repo`` is a value,
 #: not the subcommand, and misreading it would point every subcommand-level rule at the wrong token.
 _DEFAULT_VALUE_OPTIONS: dict[str, tuple[str, ...]] = {
-    "git": ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"),
+    "git": (
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--config-env",
+    ),
     "gh": ("-R", "--repo"),
     "cargo": ("--manifest-path", "--config", "-Z", "-p", "--package", "--target-dir"),
 }
@@ -108,7 +127,9 @@ class Config:
 
     allow: tuple[str, ...] = _DEFAULT_ALLOW
     prefixes: tuple[str, ...] = _DEFAULT_PREFIXES
-    deny_global: dict[str, tuple[str, ...]] = field(default_factory=lambda: dict(_DEFAULT_DENY_GLOBAL))
+    deny_global: dict[str, tuple[str, ...]] = field(
+        default_factory=lambda: dict(_DEFAULT_DENY_GLOBAL)
+    )
     deny_subcommand: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(_DEFAULT_DENY_SUBCOMMAND)
     )
@@ -121,9 +142,8 @@ class Config:
     )
 
     #: Where run spools (stdout/stderr/exit-code files) and the audit log live, relative to the
-    #: project root. MUST be a git-ignored path: it holds command OUTPUT, not source. The default
-    #: matches the sibling tools' convention (``.safe-ci-dag-runner/``, ``.tick-hub/``) so one
-    #: ``.herdr-run/`` line in .gitignore covers it in any adopting project.
+    #: project root. MUST be a git-ignored path: it holds command OUTPUT, not source. Add the
+    #: default ``.herdr-run/`` directory to each adopting project's ``.gitignore``.
     spool_dir: str = ".herdr-run"
 
     #: Seconds to wait for the command's exit-code file after launching it.
@@ -150,9 +170,9 @@ class Config:
     #: the sandbox blocks and the pane does not.
     probe_remote: str = "https://github.com/git/git"
 
-    #: How herdr control calls reach the server. ``direct`` was measured to work from inside the
-    #: agent jail (the server's unix socket is reachable); ``systemd-run`` brokers each call through
-    #: a transient user unit for hosts where it is not.
+    #: How herdr control calls reach the server. ``direct`` uses the server's Unix socket;
+    #: ``systemd-run`` brokers each call through a transient user unit for hosts where that socket
+    #: is not reachable from the caller.
     broker: str = "direct"
 
     #: Absolute path of the config file this came from, or ``None`` for pure defaults.
@@ -185,29 +205,79 @@ def _str_tuple(raw: object, what: str) -> tuple[str, ...]:
     out: list[str] = []
     for item in items:
         if not isinstance(item, str):
-            raise ConfigError(f"{what}: every entry must be a string, got {type(item).__name__}")
-        out.append(item)
+            raise ConfigError(
+                f"{what}: every entry must be a string, got {type(item).__name__}"
+            )
+        out.append(_policy_name(item, f"{what}[{len(out)}]"))
     return tuple(out)
 
 
 def _str_tuple_map(raw: object, what: str) -> dict[str, tuple[str, ...]]:
     mapping = as_mapping(raw, what)
-    return {key: _str_tuple(value, f"{what}.{key}") for key, value in mapping.items()}
+    return {
+        _policy_name(key, f"{what} key"): _str_tuple(value, f"{what}.{key}")
+        for key, value in mapping.items()
+    }
 
 
 def _number(raw: object, what: str) -> float:
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         raise ConfigError(f"{what}: must be a number, got {type(raw).__name__}")
-    value = float(raw)
+    try:
+        value = float(raw)
+    except (OverflowError, ValueError) as exc:
+        raise ConfigError(f"{what}: must be a finite number") from exc
+    if not math.isfinite(value):
+        raise ConfigError(f"{what}: must be finite")
     if value < 0:
         raise ConfigError(f"{what}: must not be negative")
+    if value > MAX_TIMEOUT_SECONDS:
+        raise ConfigError(f"{what}: must not exceed {MAX_TIMEOUT_SECONDS:g} seconds")
     return value
 
 
 def _text(raw: object, what: str) -> str:
     if not isinstance(raw, str):
         raise ConfigError(f"{what}: must be a string, got {type(raw).__name__}")
+    if any(
+        ord(char) < 32 or 127 <= ord(char) <= 159 or 0xD800 <= ord(char) <= 0xDFFF
+        for char in raw
+    ):
+        raise ConfigError(
+            f"{what}: control characters and Unicode surrogates are not allowed"
+        )
     return raw
+
+
+def _policy_name(raw: object, what: str) -> str:
+    value = _text(raw, what)
+    if not value:
+        raise ConfigError(f"{what}: must not be empty")
+    return value
+
+
+def render_tab_name(schema: str, *, agent: str, project: str) -> str:
+    """Render a tab schema restricted to literal text plus ``{agent}``/``{project}``."""
+    try:
+        chunks = list(string.Formatter().parse(schema))
+    except ValueError as exc:
+        raise ConfigError(f"tab_name schema {schema!r} is malformed: {exc}") from exc
+    for _literal, field_name, format_spec, conversion in chunks:
+        if field_name is None:
+            continue
+        if (
+            field_name not in ("agent", "project")
+            or format_spec
+            or conversion is not None
+        ):
+            raise ConfigError(
+                f"tab_name schema {schema!r} may use only plain {{agent}} and {{project}} placeholders"
+            )
+    try:
+        rendered = schema.format(agent=agent, project=project)
+    except (KeyError, IndexError, AttributeError, ValueError) as exc:
+        raise ConfigError(f"tab_name schema {schema!r} is invalid: {exc}") from exc
+    return _policy_name(rendered, "rendered tab_name")
 
 
 def _choice(raw: object, what: str, allowed: tuple[str, ...]) -> str:
@@ -217,7 +287,9 @@ def _choice(raw: object, what: str, allowed: tuple[str, ...]) -> str:
     return value
 
 
-def parse_config(document: object, *, source_path: str | None, project_root: str) -> Config:
+def _parse_config(
+    document: object, *, source_path: str | None, project_root: str
+) -> Config:
     """Build a :class:`Config` from an already-decoded YAML document.
 
     Split out from :func:`load_config` so the whole validation surface is testable without touching
@@ -254,25 +326,41 @@ def parse_config(document: object, *, source_path: str | None, project_root: str
     if unknown:
         # Reject rather than ignore: a typo'd `allowlist:` key silently falling back to the default
         # allowlist is exactly the kind of quiet policy failure this tool must not have.
-        raise ConfigError(f"{what}: unknown key(s): {', '.join(unknown)}. Known keys: {', '.join(sorted(known))}")
+        raise ConfigError(
+            f"{what}: unknown key(s): {', '.join(unknown)}. Known keys: {', '.join(sorted(known))}"
+        )
 
     config = Config(source_path=source_path, project_root=project_root)
     if "workspace" in mapping:
-        config = replace(config, workspace=_text(mapping["workspace"], f"{what}.workspace"))
+        config = replace(
+            config, workspace=_policy_name(mapping["workspace"], f"{what}.workspace")
+        )
     if "tab_name" in mapping:
-        config = replace(config, tab_name=_text(mapping["tab_name"], f"{what}.tab_name"))
+        config = replace(
+            config, tab_name=_policy_name(mapping["tab_name"], f"{what}.tab_name")
+        )
     if "cwd" in mapping:
         raw_cwd = mapping["cwd"]
-        config = replace(config, cwd=None if raw_cwd is None else _text(raw_cwd, f"{what}.cwd"))
+        config = replace(
+            config, cwd=None if raw_cwd is None else _text(raw_cwd, f"{what}.cwd")
+        )
     if "allow" in mapping:
         config = replace(config, allow=_str_tuple(mapping["allow"], f"{what}.allow"))
     if "prefixes" in mapping:
-        config = replace(config, prefixes=_str_tuple(mapping["prefixes"], f"{what}.prefixes"))
+        config = replace(
+            config, prefixes=_str_tuple(mapping["prefixes"], f"{what}.prefixes")
+        )
     if "deny_global" in mapping:
-        config = replace(config, deny_global=_str_tuple_map(mapping["deny_global"], f"{what}.deny_global"))
+        config = replace(
+            config,
+            deny_global=_str_tuple_map(mapping["deny_global"], f"{what}.deny_global"),
+        )
     if "deny_subcommand" in mapping:
         config = replace(
-            config, deny_subcommand=_str_tuple_map(mapping["deny_subcommand"], f"{what}.deny_subcommand")
+            config,
+            deny_subcommand=_str_tuple_map(
+                mapping["deny_subcommand"], f"{what}.deny_subcommand"
+            ),
         )
     if "allow_subcommand" in mapping:
         config = replace(
@@ -280,35 +368,99 @@ def parse_config(document: object, *, source_path: str | None, project_root: str
             allow_subcommand=_str_tuple_map(mapping["allow_subcommand"], f"{what}.allow_subcommand"),
         )
     if "deny_anywhere" in mapping:
-        config = replace(config, deny_anywhere=_str_tuple(mapping["deny_anywhere"], f"{what}.deny_anywhere"))
+        config = replace(
+            config,
+            deny_anywhere=_str_tuple(mapping["deny_anywhere"], f"{what}.deny_anywhere"),
+        )
     if "value_options" in mapping:
-        config = replace(config, value_options=_str_tuple_map(mapping["value_options"], f"{what}.value_options"))
+        config = replace(
+            config,
+            value_options=_str_tuple_map(
+                mapping["value_options"], f"{what}.value_options"
+            ),
+        )
     if "spool_dir" in mapping:
-        config = replace(config, spool_dir=_text(mapping["spool_dir"], f"{what}.spool_dir"))
+        config = replace(
+            config, spool_dir=_text(mapping["spool_dir"], f"{what}.spool_dir")
+        )
     if "timeout_seconds" in mapping:
-        config = replace(config, timeout_seconds=_number(mapping["timeout_seconds"], f"{what}.timeout_seconds"))
+        config = replace(
+            config,
+            timeout_seconds=_number(
+                mapping["timeout_seconds"], f"{what}.timeout_seconds"
+            ),
+        )
     if "retention_days" in mapping:
-        config = replace(config, retention_days=int(_number(mapping["retention_days"], f"{what}.retention_days")))
+        config = replace(
+            config,
+            retention_days=int(
+                _number(mapping["retention_days"], f"{what}.retention_days")
+            ),
+        )
     if "ready_timeout_seconds" in mapping:
         config = replace(
             config,
-            ready_timeout_seconds=_number(mapping["ready_timeout_seconds"], f"{what}.ready_timeout_seconds"),
+            ready_timeout_seconds=_number(
+                mapping["ready_timeout_seconds"], f"{what}.ready_timeout_seconds"
+            ),
         )
     if "readiness" in mapping:
-        config = replace(config, readiness=_choice(mapping["readiness"], f"{what}.readiness", ("both", "process")))
+        config = replace(
+            config,
+            readiness=_choice(
+                mapping["readiness"], f"{what}.readiness", ("both", "process")
+            ),
+        )
     if "prompt_tail" in mapping:
         raw_tail = mapping["prompt_tail"]
-        config = replace(config, prompt_tail=None if raw_tail is None else _text(raw_tail, f"{what}.prompt_tail"))
+        config = replace(
+            config,
+            prompt_tail=(
+                None if raw_tail is None else _text(raw_tail, f"{what}.prompt_tail")
+            ),
+        )
     if "shells" in mapping:
         config = replace(config, shells=_str_tuple(mapping["shells"], f"{what}.shells"))
     if "probe_remote" in mapping:
-        config = replace(config, probe_remote=_text(mapping["probe_remote"], f"{what}.probe_remote"))
+        config = replace(
+            config, probe_remote=_text(mapping["probe_remote"], f"{what}.probe_remote")
+        )
     if "broker" in mapping:
-        config = replace(config, broker=_choice(mapping["broker"], f"{what}.broker", ("direct", "systemd-run")))
+        config = replace(
+            config,
+            broker=_choice(
+                mapping["broker"], f"{what}.broker", ("direct", "systemd-run")
+            ),
+        )
 
     if not config.allow:
-        raise ConfigError(f"{what}.allow: refusing an EMPTY allowlist — no command could ever run")
+        raise ConfigError(
+            f"{what}.allow: refusing an EMPTY allowlist — no command could ever run"
+        )
+    for index, name in enumerate(config.allow):
+        _policy_name(name, f"{what}.allow[{index}]")
+    for index, name in enumerate(config.prefixes):
+        _policy_name(name, f"{what}.prefixes[{index}]")
+    for index, name in enumerate(config.shells):
+        _policy_name(name, f"{what}.shells[{index}]")
+    render_tab_name(config.tab_name, agent="agent", project="project")
     return config
+
+
+def parse_config(
+    document: object, *, source_path: str | None, project_root: str
+) -> Config:
+    """Validate a decoded configuration document without leaking narrowing exceptions.
+
+    YAML is an untyped boundary.  Shape errors are configuration failures (exit 78), not Python
+    programming errors that should escape as a traceback.
+    """
+    try:
+        return _parse_config(
+            document, source_path=source_path, project_root=project_root
+        )
+    except TypeError as exc:
+        raise ConfigError(str(exc)) from exc
 
 
 def load_config(*, explicit_path: str | None, start_dir: str) -> Config:
@@ -328,21 +480,20 @@ def load_config(*, explicit_path: str | None, start_dir: str) -> Config:
     try:
         with open(path, encoding="utf-8") as handle:
             text = handle.read()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise ConfigError(f"cannot read config file {path}: {exc}") from exc
 
     try:
         import yaml
-    except ModuleNotFoundError as exc:  # pragma: no cover - environment-dependent
+    except ModuleNotFoundError as exc:  # pragma: no cover - damaged installation
         raise ConfigError(
-            f"{path} exists but PyYAML is not installed. Install it with "
-            "'python3 -m pip install pyyaml>=6', or delete the config file to fall back to "
-            "built-in defaults."
+            f"{path} exists but the declared PyYAML dependency is not installed. Repair this "
+            "herdr-run installation."
         ) from exc
 
     try:
-        document: object = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
+        document = core_load(text)
+    except (yaml.YAMLError, ValueError, OverflowError) as exc:
         raise ConfigError(f"{path}: invalid YAML: {exc}") from exc
 
     return parse_config(document, source_path=path, project_root=project_root)

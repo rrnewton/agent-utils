@@ -1,4 +1,4 @@
-"""Decide whether a requested command may cross the sandbox boundary, and render it safely.
+"""Apply cooperative command policy and render an admitted argument vector safely.
 
 Two separate jobs, deliberately not conflated:
 
@@ -11,9 +11,8 @@ Two separate jobs, deliberately not conflated:
    shell metacharacters is a proxy for "cannot start a second command"; re-quoting is the property
    itself.
 
-The remaining privilege is whatever the allowlisted program can do on its own. That residue is real
-and documented in the user guide's threat model; :data:`Config.deny_global` and friends shave off
-the best-known self-escapes (``git -c alias.x='!sh'``) as defense in depth, not as the boundary.
+The remaining privilege is whatever the allowlisted program can do on its own. The user guide also
+explains why same-user access to Herdr makes this a safety rail rather than a containment boundary.
 """
 
 from __future__ import annotations
@@ -25,7 +24,18 @@ from dataclasses import dataclass
 from herdr_run.config import Config
 from herdr_run.errors import Refused
 
-__all__ = ["Admission", "admit", "render", "expand_tilde"]
+__all__ = ["Admission", "admit", "render", "expand_tilde", "reject_terminal_controls"]
+
+
+def reject_terminal_controls(value: str, what: str) -> None:
+    """Refuse bytes a terminal driver can act on before shell quoting has any effect."""
+    for char in value:
+        codepoint = ord(char)
+        if codepoint < 32 or 127 <= codepoint <= 159:
+            raise Refused(
+                f"{what} contains terminal control U+{codepoint:04X}; control characters cannot "
+                "be injected into a shared pane"
+            )
 
 
 @dataclass(frozen=True)
@@ -40,11 +50,8 @@ class Admission:
     program: str
     #: The program's first non-option argument, when it has one (e.g. ``"ls-remote"``).
     subcommand: str | None
-
-    @property
-    def rendered(self) -> str:
-        """The exact shell text that will be executed, safe to embed in a larger shell command."""
-        return render(self.argv)
+    #: Validated shell text safe to embed in the POSIX result-capture wrapper.
+    rendered: str
 
 
 def expand_tilde(token: str) -> str:
@@ -66,7 +73,12 @@ def expand_tilde(token: str) -> str:
 
 def render(argv: tuple[str, ...]) -> str:
     """Quote every token so the resulting shell word list is exactly ``argv``."""
-    return " ".join(shlex.quote(expand_tilde(token)) for token in argv)
+    rendered: list[str] = []
+    for token in argv:
+        expanded = expand_tilde(token)
+        reject_terminal_controls(expanded, "command argument")
+        rendered.append(shlex.quote(expanded))
+    return " ".join(rendered)
 
 
 def _split(command: str) -> tuple[str, ...]:
@@ -87,7 +99,10 @@ def admit(command: str, config: Config) -> Admission:
 
     Raises before any pane is touched, so a refusal never leaves partial state anywhere.
     """
+    reject_terminal_controls(command, "command")
     argv = _split(command)
+    for token in argv:
+        reject_terminal_controls(token, "command argument")
 
     # Peel allowed wrapper prefixes. Each wrapper may appear at most once, so `with-proxy with-proxy
     # ... ` cannot be used to pad an argv into a shape the later checks read differently.
@@ -177,4 +192,10 @@ def admit(command: str, config: Config) -> Admission:
     if subcommand is not None and subcommand in config.deny_subcommand.get(program, ()):
         raise Refused(f"subcommand '{program} {subcommand}' is denied: it defines or runs arbitrary code")
 
-    return Admission(argv=argv, prefix=tuple(prefix), program=program, subcommand=subcommand)
+    return Admission(
+        argv=argv,
+        prefix=tuple(prefix),
+        program=program,
+        subcommand=subcommand,
+        rendered=render(argv),
+    )

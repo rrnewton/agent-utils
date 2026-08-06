@@ -1,1 +1,1 @@
-../../common/docs/herdr-run/USER_GUIDE.md
+../../common/docs/herdr-run/rendered/python/USER_GUIDE.md

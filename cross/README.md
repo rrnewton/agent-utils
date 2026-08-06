@@ -24,6 +24,7 @@ python3 cross/differential.py --tool safe-ci-dag-runner
 python3 cross/differential.py --tool tick-hub --random 100 --seed 8675309
 python3 cross/differential.py --tool pr-landing-planner --random 100 --seed 8675309
 python3 cross/differential.py --tool cpuset-alloc
+python3 cross/differential.py --tool herdr-run
 ```
 
 When `--tool` is omitted, the harness checks `safe-ci-dag-runner`.
@@ -36,6 +37,7 @@ When `--tool` is omitted, the harness checks `safe-ci-dag-runner`.
 | `cpuset-alloc` | CLI surface, version, durable-ledger status and reclaim JSON, malformed and boundary arguments, reservation behavior, mutation self-test verdicts, and hard-pin fail-closed behavior. |
 | `tick-hub` | Strict JSON/YAML config loading, canonical emission, cadence state, reminder gates, freshness output, flush transitions, CLI failures, numeric boundaries, malformed documents, and randomized tick configurations. |
 | `pr-landing-planner` | Fixture collection, graphs, clusters, status and plan output in every format, exact-head/base validation, approval and gate safety decisions, ordering/conflict groups, malformed evidence, numeric boundaries, and randomized PR graphs. |
+| `herdr-run` | CLI bootstrap, strict YAML 1.2 configuration and discovery, allow/deny policy, shell-compatible tokenization and inert rendering, terminal-control rejection, malformed inputs, successful dry runs, and byte-identical audit JSONL. Live Herdr protocol/session behavior uses dense fake-client unit suites because production deliberately ignores caller-controlled executable paths. |
 
 Machine-oriented output is compared byte for byte where it is specified as
 canonical. YAML emitters and other intentionally idiomatic text are parsed or

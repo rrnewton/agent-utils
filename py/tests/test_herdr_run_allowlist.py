@@ -103,7 +103,6 @@ def test_refuses_pathed_program(config: Config, program: str) -> None:
         ("git status | sh", ("git", "status", "|", "sh")),
         ("git log --format='%H$(id)'", ("git", "log", "--format=%H$(id)")),
         ("git status `id`", ("git", "status", "`id`")),
-        ("git status\nid", ("git", "status", "id")),
     ],
 )
 def test_metacharacters_survive_as_literal_arguments(
@@ -136,6 +135,24 @@ def test_rendered_command_cannot_escape_into_a_second_command() -> None:
 
 def test_render_quotes_every_token() -> None:
     assert render(("git", "commit", "-m", "two words")) == "git commit -m 'two words'"
+
+
+@pytest.mark.parametrize(
+    "control",
+    ["\x00", "\x07", "\t", "\n", "\r", "\x1b", "\x7f", "\x85"],
+)
+def test_refuses_terminal_control_characters_before_rendering(
+    config: Config, control: str
+) -> None:
+    """Shell quoting cannot neutralize bytes the terminal driver consumes before the shell."""
+    with pytest.raises(Refused, match="terminal control"):
+        admit(f"git status{control}payload", config)
+
+
+def test_render_also_refuses_terminal_controls_for_prebuilt_argv() -> None:
+    """Admission is not the only caller of render, so the final boundary repeats the check."""
+    with pytest.raises(Refused, match="terminal control"):
+        render(("git", "status\x1b[2J"))
 
 
 # --- defense in depth: known self-escapes of the allowlisted programs ---------------------------

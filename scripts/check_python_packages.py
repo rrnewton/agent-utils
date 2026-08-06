@@ -124,9 +124,7 @@ PROJECTS: tuple[Project, ...] = (
             "py.typed",
             "examples/project.yaml",
         ),
-        # PyYAML is imported lazily and only when a configuration file exists, so it is an EXTRA
-        # rather than a required dependency: the built-in defaults work on a bare host.
-        required_dependencies=(),
+        required_dependencies=("pyyaml",),
     ),
 )
 

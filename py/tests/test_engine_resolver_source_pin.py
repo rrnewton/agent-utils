@@ -194,6 +194,30 @@ def test_library_change_rebuilds_unchanged_entrypoint(tmp_path: Path) -> None:
     assert "cache=refreshed" in changed.stderr
 
 
+def test_nonignored_untracked_source_change_rebuilds(tmp_path: Path) -> None:
+    """A new module is live source before its first commit and must invalidate the cache."""
+    root = _build_sandbox(tmp_path)
+    library = root / "rs" / "tick-hub" / "src" / "lib.rs"
+    payload = library.with_name("payload.txt")
+    library.write_text(
+        'pub fn message() -> &\'static str { include_str!("payload.txt") }\n'
+    )
+    payload.write_text("v1")
+    _git(root, "add", "rs/tick-hub/src/lib.rs", "rs/tick-hub/src/payload.txt")
+    assert _run_launcher(root).stdout == "v1\n"
+
+    # Keep the same path/content in the working tree but make it ordinary untracked source.
+    _git(root, "rm", "--cached", "rs/tick-hub/src/payload.txt")
+    original_stat = payload.stat()
+    payload.write_text("v2")
+    os.utime(payload, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    changed = _run_launcher(root)
+    assert changed.returncode == 0, changed.stderr
+    assert changed.stdout == "v2\n"
+    assert "cache=refreshed" in changed.stderr
+
+
 def test_replaced_or_unstamped_artifact_is_rebuilt_not_executed(tmp_path: Path) -> None:
     """A planted binary and a missing stamp both fail closed into a Cargo rebuild."""
     root = _build_sandbox(tmp_path)

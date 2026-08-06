@@ -8,17 +8,34 @@ are actually executed.
 from __future__ import annotations
 
 import os
+import shlex
+import threading
 from typing import cast
 
 import pytest
 
+import herdr_run.state as state
 from herdr_run.allowlist import admit
 from herdr_run.client import HerdrClient
 from herdr_run.config import Config
-from herdr_run.errors import PaneBusy, RunTimeout
-from herdr_run.runner import build_shell_command, execute, spool_paths, wait_ready
+from herdr_run.errors import HerdrUnavailable, PaneBusy, RunTimeout
+from herdr_run.runner import (
+    RunResult,
+    build_shell_command,
+    execute,
+    make_run_id,
+    read_output_bytes,
+    spool_paths,
+    wait_ready,
+    write_meta,
+)
 from herdr_run.session import resolve_target
-from herdr_run.fakeherdr import FakeHerdrClient
+from tests.herdr_fake import FakeHerdrClient
+
+
+@pytest.fixture(autouse=True)
+def _isolated_account_state(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(state, "_account_home", lambda: os.path.join(str(tmp_path), "account-home"))
 
 
 def _config(root: str, **kwargs: object) -> Config:
@@ -154,10 +171,44 @@ def test_failed_cd_is_reported_as_a_failure(tmp_path: object) -> None:
 
 def test_spool_files_are_written(tmp_path: object) -> None:
     root = str(tmp_path)
-    result = _run(FakeHerdrClient(), _config(root), "echo spooled")
-    spool = spool_paths(_config(root), result.run_id)  # type: ignore[attr-defined]
-    for path in (spool.stdout, spool.stderr, spool.exit_code, os.path.join(spool.directory, "command")):
+    config = _config(root)
+    result = cast(RunResult, _run(FakeHerdrClient(), config, "echo spooled"))
+    spool = spool_paths(config, result.run_id)
+    meta = write_meta(result, admit("echo spooled", config), config, "agent")
+    for directory in (
+        os.path.join(root, "spool"),
+        os.path.join(root, "spool", "runs"),
+        spool.directory,
+    ):
+        assert os.stat(directory).st_mode & 0o777 == 0o700
+    for path in (
+        spool.stdout,
+        spool.stderr,
+        spool.exit_code,
+        os.path.join(spool.directory, "command"),
+        meta,
+    ):
         assert os.path.isfile(path), path
+        assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+def test_binary_spool_bytes_are_preserved_without_text_decoding(tmp_path: object) -> None:
+    root = str(tmp_path)
+    config = _config(root, allow=("python3",))
+    command = (
+        "python3 -c 'import os;"
+        "os.write(1,bytes([0,255,13,10]));"
+        "os.write(2,bytes([254,66]))'"
+    )
+    result = cast(RunResult, _run(FakeHerdrClient(), config, command))
+
+    stdout, stderr = read_output_bytes(result)
+    assert stdout == bytes([0, 255, 13, 10])
+    assert stderr == bytes([254, 66])
+    with open(result.spool.stdout, "rb") as handle:
+        assert handle.read() == stdout
+    with open(result.spool.stderr, "rb") as handle:
+        assert handle.read() == stderr
 
 
 # --- the shell wrapper ------------------------------------------------------------------------------
@@ -167,9 +218,103 @@ def test_shell_wrapper_quotes_every_interpolated_path() -> None:
     config = Config(allow=("git",))
     spool = spool_paths(Config(project_root="/tmp/root x", spool_dir="sp ool"), "run 1")
     line = build_shell_command(admit("git status", config), spool, "/tmp/work dir")
-    # Every path with a space must be quoted; an unquoted one would split into extra words.
-    assert "'/tmp/work dir'" in line
-    assert "'" + spool.stdout + "'" in line
+    # The interactive pane shell sees only a portable `command sh -c ONE_ARGUMENT` shape. The
+    # potentially POSIX-specific grouping/redirection syntax lives inside that sh argument, so a
+    # fish prompt can launch it without trying to parse `{ ...; }` itself.
+    outer = shlex.split(line)
+    assert outer[:3] == ["command", "sh", "-c"]
+    assert len(outer) == 4
+    inner = outer[3]
+    assert shlex.quote("/tmp/work dir") in inner
+    assert shlex.quote(spool.stdout) in inner
+    assert shlex.quote(spool.stderr) in inner
+    assert shlex.quote(spool.exit_code) in inner
+
+
+def test_shell_wrapper_refuses_terminal_controls_in_paths() -> None:
+    config = Config(allow=("git",))
+    spool = spool_paths(Config(project_root="/tmp", spool_dir="spool"), "run")
+    with pytest.raises(HerdrUnavailable, match="terminal control"):
+        build_shell_command(admit("git status", config), spool, "/tmp/work\x1b[2J")
+
+
+def test_same_second_runs_allocate_distinct_spools(tmp_path: object) -> None:
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient()
+    target = resolve_target(_client(fake), config, "agent")
+    fixed_now = lambda: 1_700_000_000.0
+
+    first = execute(
+        _client(fake),
+        config,
+        target,
+        admit("echo first", config),
+        agent="agent",
+        cwd=root,
+        ready_timeout=0.0,
+        timeout=30.0,
+        now=fixed_now,
+        poll_interval=0.0,
+        home="/nonexistent",
+    )
+    second = execute(
+        _client(fake),
+        config,
+        target,
+        admit("false", config),
+        agent="agent",
+        cwd=root,
+        ready_timeout=0.0,
+        timeout=30.0,
+        now=fixed_now,
+        poll_interval=0.0,
+        home="/nonexistent",
+    )
+
+    assert first.run_id != second.run_id
+    assert first.spool.directory != second.spool.directory
+    assert first.exit_code == 0
+    assert second.exit_code == 1
+    assert os.path.isdir(first.spool.directory)
+    assert os.path.isdir(second.spool.directory)
+
+
+def test_preplanted_exit_code_cannot_complete_a_new_run(tmp_path: object) -> None:
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient(execute_locally=False)
+    target = resolve_target(_client(fake), config, "agent")
+    fixed_epoch = 1_700_000_000.0
+    base_id = make_run_id("agent", now=fixed_epoch, pid=os.getpid())
+    planted = spool_paths(config, base_id)
+    os.makedirs(planted.directory)
+    with open(planted.exit_code, "w", encoding="utf-8") as handle:
+        handle.write("91\n")
+    with open(planted.stdout, "w", encoding="utf-8") as handle:
+        handle.write("stale output\n")
+
+    with pytest.raises(RunTimeout):
+        execute(
+            _client(fake),
+            config,
+            target,
+            admit("echo never-ran", config),
+            agent="agent",
+            cwd=root,
+            ready_timeout=0.0,
+            timeout=0.0,
+            now=lambda: fixed_epoch,
+            poll_interval=0.0,
+            home="/nonexistent",
+        )
+
+    fresh = spool_paths(config, f"{base_id}-1")
+    assert os.path.isdir(fresh.directory)
+    assert not os.path.exists(fresh.exit_code)
+    with open(planted.exit_code, encoding="utf-8") as handle:
+        assert handle.read() == "91\n"
+    assert len(fake.commands) == 1
 
 
 # --- readiness gating ---------------------------------------------------------------------------------
@@ -263,6 +408,85 @@ def test_waits_for_a_pane_that_becomes_free(tmp_path: object) -> None:
         _client(fake), config, target, prompt_tail=None, timeout=10.0, sleep=fake_sleep, poll_interval=0.0
     )
     assert readiness.ready is True
+
+
+def test_per_pane_lock_prevents_two_concurrent_launches(tmp_path: object) -> None:
+    """Different project spools still share the account-global lock for the same pane."""
+
+    class BlockingFirstRun(FakeHerdrClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self._count_lock = threading.Lock()
+            self._run_count = 0
+
+        def run(self, pane_id: str, command: str) -> None:
+            with self._count_lock:
+                self._run_count += 1
+                ordinal = self._run_count
+            if ordinal == 1:
+                self.entered.set()
+                if not self.release.wait(timeout=5.0):
+                    raise AssertionError("test did not release the first pane run")
+            super().run(pane_id, command)
+
+    root = str(tmp_path)
+    first_root = os.path.join(root, "project-one")
+    second_root = os.path.join(root, "project-two")
+    os.makedirs(first_root)
+    os.makedirs(second_root)
+    first_config = _config(first_root)
+    second_config = _config(second_root)
+    fake = BlockingFirstRun()
+    target = resolve_target(_client(fake), first_config, "agent")
+    first_results: list[RunResult] = []
+    first_errors: list[BaseException] = []
+
+    def launch_first() -> None:
+        try:
+            first_results.append(
+                execute(
+                    _client(fake),
+                    first_config,
+                    target,
+                    admit("echo first", first_config),
+                    agent="agent",
+                    cwd=first_root,
+                    ready_timeout=0.0,
+                    timeout=30.0,
+                    poll_interval=0.0,
+                    home="/nonexistent",
+                )
+            )
+        except BaseException as exc:  # preserve the worker failure for the main assertion
+            first_errors.append(exc)
+
+    worker = threading.Thread(target=launch_first, daemon=True)
+    worker.start()
+    assert fake.entered.wait(timeout=5.0), "first run never reached the pane launch"
+    try:
+        with pytest.raises(PaneBusy, match="already reserved"):
+            execute(
+                _client(fake),
+                second_config,
+                target,
+                admit("echo second", second_config),
+                agent="agent",
+                cwd=second_root,
+                ready_timeout=0.0,
+                timeout=30.0,
+                poll_interval=0.0,
+                home="/nonexistent",
+            )
+    finally:
+        fake.release.set()
+        worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    assert first_errors == []
+    assert [result.stdout.strip() for result in first_results] == ["first"]
+    assert len(fake.commands) == 1
 
 
 # --- timeout -------------------------------------------------------------------------------------------

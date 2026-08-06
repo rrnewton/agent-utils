@@ -51,9 +51,11 @@ def get_int(mapping: dict[str, object], key: str, what: str) -> int:
 
 
 def opt_str(mapping: dict[str, object], key: str) -> str | None:
-    """Return ``mapping[key]`` if it is a string, else ``None`` (absent or wrong type)."""
+    """Return an absent/null/string field, rejecting every other protocol shape."""
     value = mapping.get(key)
-    return value if isinstance(value, str) else None
+    if value is None or isinstance(value, str):
+        return value
+    raise TypeError(f"field {key!r} is not a string")
 
 
 def dig(value: object, path: tuple[str, ...], what: str) -> object:

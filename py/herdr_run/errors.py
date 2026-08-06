@@ -1,7 +1,7 @@
 """Typed failure modes, one per distinguishable outcome.
 
-Each maps to its own process exit code so a caller can branch on WHY it failed without parsing
-prose. In particular ``Refused`` (policy said no) must never be confused with ``PaneBusy``
+Each maps to a stable process exit code so a caller can branch on WHY the wrapper failed without
+parsing prose. In particular ``Refused`` (policy said no) must never be confused with ``PaneBusy``
 (policy said yes, the terminal was not in a state where we could safely type) or with a non-zero
 exit code from the command itself, which is not a herdr-run failure at all.
 """
@@ -22,9 +22,9 @@ __all__ = [
     "EXIT_TIMEOUT",
 ]
 
-#: Exit codes. Kept out of the 0-127 range a wrapped command commonly returns where possible; 0 and
-#: any code the wrapped command itself produced are passed through untouched by the CLI, so these
-#: are deliberately distinctive values documented in the user guide.
+#: Exit codes for wrapper failures. A wrapped command's status is passed through untouched, so a
+#: child that itself returns one of these numbers is numerically ambiguous in raw-output mode; the
+#: installed guide documents how JSON mode distinguishes that case.
 EXIT_CONFIG = 78  # EX_CONFIG: the project config is malformed or unreadable.
 EXIT_REFUSED = 77  # EX_NOPERM: the allowlist rejected the command. Nothing was executed.
 EXIT_UNAVAILABLE = 69  # EX_UNAVAILABLE: Herdr server / workspace / pane could not be brought up.
