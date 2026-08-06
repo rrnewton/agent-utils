@@ -25,7 +25,9 @@ __all__ = ["Config", "load_config", "find_config_file", "CONFIG_FILENAMES"]
 CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
 
 #: Programs allowed by default. Deliberately tiny: this is a sandbox door, not a shell.
-_DEFAULT_ALLOW: tuple[str, ...] = ("git", "gh")
+#: ``cargo`` is admitted ONLY for the network-only subcommands in
+#: :data:`_DEFAULT_ALLOW_SUBCOMMAND`; that restriction is load-bearing, not cosmetic.
+_DEFAULT_ALLOW: tuple[str, ...] = ("git", "gh", "cargo")
 
 #: Wrapper programs that may precede an allowlisted program. ``with-proxy`` is the Meta forward-proxy
 #: wrapper; it takes a command and execs it, so allowing it as a PREFIX (never as a program in its
@@ -43,6 +45,27 @@ _DEFAULT_PREFIXES: tuple[str, ...] = ("with-proxy",)
 _DEFAULT_DENY_GLOBAL: dict[str, tuple[str, ...]] = {
     "git": ("-c", "--config-env", "--exec-path", "--namespace"),
     "gh": (),
+    # `cargo --config` can inject source replacement and a build wrapper; `-Z` unlocks unstable
+    # behaviour. Neither is needed to download dependencies.
+    "cargo": ("--config", "-Z"),
+}
+
+#: Per-program subcommand ALLOWLIST. When a program appears here its subcommand MUST be in the
+#: list; anything else -- including no subcommand at all -- is refused. Fail-closed, and the only
+#: safe way to admit ``cargo``.
+#:
+#: WHY: the pane runs OUTSIDE the sandbox, and `cargo build`/`test`/`run` execute build scripts and
+#: proc macros from freshly downloaded third-party crates. Allowing those would run untrusted code
+#: outside the very confinement this tool exists to cross in a controlled way. The subcommands below
+#: resolve and DOWNLOAD only; they never compile. The intended pattern is to fetch through the door
+#: and then build in-jail with `--offline` against the warm cache, so the network step crosses the
+#: boundary and the compute step stays boxed.
+#:
+#: A deny-list is the wrong shape here: `build`, `test`, `run`, `bench`, `install`, `rustc`,
+#: `clippy`, `doc`, `miri` and every third-party `cargo-*` subcommand execute code, and a new one
+#: can appear at any time.
+_DEFAULT_ALLOW_SUBCOMMAND: dict[str, tuple[str, ...]] = {
+    "cargo": ("fetch", "update", "generate-lockfile", "vendor", "metadata", "tree", "search"),
 }
 
 #: Subcommands (the first non-option token) that define or execute arbitrary code.
@@ -61,6 +84,7 @@ _DEFAULT_DENY_ANYWHERE: tuple[str, ...] = ("--upload-pack", "--receive-pack")
 _DEFAULT_VALUE_OPTIONS: dict[str, tuple[str, ...]] = {
     "git": ("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"),
     "gh": ("-R", "--repo"),
+    "cargo": ("--manifest-path", "--config", "-Z", "-p", "--package", "--target-dir"),
 }
 
 #: Process names accepted as "this pane is sitting at a shell prompt".
@@ -89,6 +113,9 @@ class Config:
         default_factory=lambda: dict(_DEFAULT_DENY_SUBCOMMAND)
     )
     deny_anywhere: tuple[str, ...] = _DEFAULT_DENY_ANYWHERE
+    allow_subcommand: dict[str, tuple[str, ...]] = field(
+        default_factory=lambda: dict(_DEFAULT_ALLOW_SUBCOMMAND)
+    )
     value_options: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(_DEFAULT_VALUE_OPTIONS)
     )
@@ -101,6 +128,9 @@ class Config:
 
     #: Seconds to wait for the command's exit-code file after launching it.
     timeout_seconds: float = 900.0
+
+    #: Days of run spools to keep. Pruned when a new run is written; see :mod:`herdr_run.retention`.
+    retention_days: int = 4
 
     #: Seconds to wait for the pane to become idle before giving up with :class:`PaneBusy`.
     ready_timeout_seconds: float = 0.0
@@ -207,10 +237,12 @@ def parse_config(document: object, *, source_path: str | None, project_root: str
         "prefixes",
         "deny_global",
         "deny_subcommand",
+        "allow_subcommand",
         "deny_anywhere",
         "value_options",
         "spool_dir",
         "timeout_seconds",
+        "retention_days",
         "ready_timeout_seconds",
         "readiness",
         "prompt_tail",
@@ -242,6 +274,11 @@ def parse_config(document: object, *, source_path: str | None, project_root: str
         config = replace(
             config, deny_subcommand=_str_tuple_map(mapping["deny_subcommand"], f"{what}.deny_subcommand")
         )
+    if "allow_subcommand" in mapping:
+        config = replace(
+            config,
+            allow_subcommand=_str_tuple_map(mapping["allow_subcommand"], f"{what}.allow_subcommand"),
+        )
     if "deny_anywhere" in mapping:
         config = replace(config, deny_anywhere=_str_tuple(mapping["deny_anywhere"], f"{what}.deny_anywhere"))
     if "value_options" in mapping:
@@ -250,6 +287,8 @@ def parse_config(document: object, *, source_path: str | None, project_root: str
         config = replace(config, spool_dir=_text(mapping["spool_dir"], f"{what}.spool_dir"))
     if "timeout_seconds" in mapping:
         config = replace(config, timeout_seconds=_number(mapping["timeout_seconds"], f"{what}.timeout_seconds"))
+    if "retention_days" in mapping:
+        config = replace(config, retention_days=int(_number(mapping["retention_days"], f"{what}.retention_days")))
     if "ready_timeout_seconds" in mapping:
         config = replace(
             config,

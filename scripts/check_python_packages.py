@@ -46,6 +46,10 @@ class Project:
     commands: tuple[str, ...]
     resources: tuple[str, ...]
     required_dependencies: tuple[str, ...]
+    #: Doc-lint terms that do not apply to this distribution, because the term is the tool's
+    #: SUBJECT MATTER rather than an accidental reference to a sibling implementation. Named per
+    #: project so a waiver stays visible instead of becoming a hole in the rule.
+    doc_term_exemptions: tuple[str, ...] = ()
 
 
 PROJECTS: tuple[Project, ...] = (
@@ -111,6 +115,9 @@ PROJECTS: tuple[Project, ...] = (
         distribution="herdr-run",
         package="herdr_run",
         commands=("herdr-run",),
+        # herdr-run ALLOWLISTS `cargo` as a target program, so its docs must name it. herdr-run has
+        # no Rust implementation, so this is not a sibling-toolchain leak.
+        doc_term_exemptions=("cargo",),
         resources=(
             "README.md",
             "USER_GUIDE.md",
@@ -286,7 +293,7 @@ def _source_resources(project: Project, source: Path) -> tuple[tuple[str, bytes]
 def _doc_violations(project: Project, text: str) -> list[str]:
     errors: list[str] = []
     foreign = _FOREIGN_DOC_TERMS.search(text)
-    if foreign is not None:
+    if foreign is not None and foreign.group(0).lower() not in project.doc_term_exemptions:
         errors.append(f"foreign-language term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:
         match = pattern.search(text)

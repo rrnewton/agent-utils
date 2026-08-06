@@ -74,6 +74,15 @@ class RunTimeout(HerdrRunError):
     """The command was launched in the pane but produced no exit-code file in time.
 
     The command is NOT killed by default: it is running in a terminal this process does not own.
+
+    Carries whatever the command printed before the deadline. A timeout that reported only a
+    message would make a partially-successful run look like a run that produced nothing, and a
+    caller cannot tell a false empty result from a real one.
     """
 
     exit_code = EXIT_TIMEOUT
+
+    #: Output captured before the deadline. Empty string, never None, so callers need no guard.
+    partial_stdout: str = ""
+    partial_stderr: str = ""
+    spool_directory: str = ""

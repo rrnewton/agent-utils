@@ -236,3 +236,75 @@ def test_only_a_leading_tilde_is_touched(token: str, expanded: bool) -> None:
 
     result = expand_tilde(token)
     assert (result != token) == expanded
+
+
+# --- cargo: admitted ONLY for network-only subcommands -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command,subcommand",
+    [
+        ("cargo fetch", "fetch"),
+        ("with-proxy cargo fetch --manifest-path /w/Cargo.toml", "fetch"),
+        ("cargo update -p serde", "update"),
+        ("cargo generate-lockfile", "generate-lockfile"),
+        ("cargo vendor", "vendor"),
+        ("cargo metadata", "metadata"),
+    ],
+)
+def test_admits_network_only_cargo_subcommands(config: Config, command: str, subcommand: str) -> None:
+    admission = admit(command, config)
+    assert admission.program == "cargo"
+    assert admission.subcommand == subcommand
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cargo build",
+        "cargo build --release",
+        "cargo test",
+        "cargo run",
+        "cargo bench",
+        "cargo install ripgrep",
+        "cargo rustc",
+        "cargo clippy",
+        "cargo doc",
+        "cargo miri test",
+        "with-proxy cargo build",
+    ],
+)
+def test_refuses_cargo_subcommands_that_execute_code(config: Config, command: str) -> None:
+    """The pane is OUTSIDE the sandbox: compiling there runs third-party build scripts unconfined."""
+    with pytest.raises(Refused, match="not allowlisted"):
+        admit(command, config)
+
+
+def test_refuses_bare_cargo(config: Config) -> None:
+    """Fail-closed: a program with a subcommand allowlist must name one of them."""
+    with pytest.raises(Refused, match="requires a subcommand"):
+        admit("cargo", config)
+
+
+def test_refuses_unknown_cargo_subcommand(config: Config) -> None:
+    """A third-party `cargo-<x>` subcommand is arbitrary code and is not enumerable in a deny-list."""
+    with pytest.raises(Refused, match="not allowlisted"):
+        admit("cargo something-new", config)
+
+
+@pytest.mark.parametrize("command", ["cargo --config build.rustc-wrapper='/tmp/evil' fetch", "cargo -Z unstable-options fetch"])
+def test_refuses_cargo_global_code_injection_options(config: Config, command: str) -> None:
+    with pytest.raises(Refused, match="denied"):
+        admit(command, config)
+
+
+def test_subcommand_allowlist_does_not_constrain_programs_without_one(config: Config) -> None:
+    """Positive control: git/gh have no allow_subcommand entry, so they stay unrestricted."""
+    assert admit("git status", config).subcommand == "status"
+    assert admit("gh pr list", config).subcommand == "pr"
+
+
+def test_project_can_grant_cargo_build_explicitly() -> None:
+    """The restriction is policy, not a hard-coded ban: a project that accepts the risk can opt in."""
+    config = Config(allow_subcommand={"cargo": ("fetch", "build")})
+    assert admit("cargo build", config).subcommand == "build"

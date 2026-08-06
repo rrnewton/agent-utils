@@ -91,6 +91,12 @@ cwd: null
 allow:
   - git
   - gh
+  - cargo
+
+# Per-program subcommand allowlist. FAIL-CLOSED: a program listed here may ONLY run these
+# subcommands. This is what makes cargo admissible -- see Threat model.
+allow_subcommand:
+  cargo: [fetch, update, generate-lockfile, vendor, metadata, tree, search]
 
 # Wrapper programs that may PRECEDE an allowlisted program, never run on their own.
 prefixes:
@@ -108,6 +114,7 @@ deny_anywhere: ["--upload-pack", "--receive-pack"]
 spool_dir: .herdr-run
 
 timeout_seconds: 900          # wait for the command's exit code
+retention_days: 4             # run spools older than this are pruned when a new run is written
 ready_timeout_seconds: 0      # wait for the pane to go idle (0 = refuse immediately)
 
 readiness: both               # 'both' = process signal AND prompt veto; 'process' = drop the veto
@@ -192,6 +199,17 @@ value that does not parse as an integer is treated as "still being written", not
 
 Each run directory holds `command`, `stdout`, `stderr`, `exit_code`, and `meta.json`.
 
+### Retention
+
+Run spools are pruned when a **new run is written**, not by a timer: a scheduled job that silently
+stops is indistinguishable from one that runs and finds nothing to do. Directories under
+`<spool_dir>/runs/` whose mtime is older than four days are removed.
+
+Scope is enforced rather than trusted -- only entries whose real parent is exactly the resolved
+`runs/` directory are considered, symlinks are skipped rather than followed, and the root itself is
+never removed. The **audit log is never pruned**: it is the evidence trail, it is one line per
+invocation, and a record that deletes itself is worse than no policy.
+
 ### Audit log
 
 Every attempt appends one JSON line to `<spool_dir>/audit.jsonl` — including **refusals**, which is
@@ -217,6 +235,14 @@ for "cannot start a second command", whereas re-quoting is the property itself.
 
 Also enforced: the program must be a **bare name** resolved from the pane's `PATH` (so `./git` or
 `/tmp/gh` cannot masquerade), and each wrapper prefix may appear at most once.
+
+**`cargo` is a special case.** It is allowlisted only for subcommands that resolve and download;
+`build`, `test`, `run`, `install`, `clippy` and every third-party `cargo-*` subcommand are refused,
+because the pane runs OUTSIDE the sandbox and those execute build scripts and proc macros from
+freshly downloaded third-party crates. The intended pattern is to **fetch through this tool, then
+build in-jail with `--offline`** against the warm cache: the network step crosses the boundary, the
+compute step stays boxed. A deny-list would be the wrong shape -- the set of code-executing
+subcommands is open-ended.
 
 **What is NOT guaranteed:** anything an allowlisted program can do by itself. `git` writes files,
 runs hooks from the repository being operated on, and honours ambient configuration. `gh`

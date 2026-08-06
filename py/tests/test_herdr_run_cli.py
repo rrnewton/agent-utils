@@ -78,8 +78,7 @@ def test_dry_run_prints_the_rendered_command(
     tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.chdir(str(tmp_path))
-    assert main(["--dry-run", "agent", "git commit -m", "two words"]) == 0
-    # Positional tokens are re-joined, then re-split and re-quoted by the allowlist.
+    assert main(["--dry-run", "agent", "git commit -m 'two words'"]) == 0
     assert "git commit -m" in capsys.readouterr().out
 
 
@@ -92,7 +91,7 @@ def test_config_subcommand_reports_the_effective_policy(
     document = json.loads(capsys.readouterr().out)
     assert document["workspace"] == "agent-cmds"
     assert document["tab_label"] == "hermit-lander"
-    assert document["allow"] == ["git", "gh"]
+    assert document["allow"] == ["git", "gh", "cargo"]
 
 
 # --- audit trail ---------------------------------------------------------------------------------------
@@ -193,3 +192,42 @@ def test_options_may_appear_between_positionals(
     monkeypatch.chdir(str(tmp_path))
     assert main(argv) == 0
     assert "git status" in capsys.readouterr().out
+
+
+def test_loose_argv_words_are_refused_not_silently_rejoined(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Re-joining loose words would silently destroy quoting; refuse instead.
+
+    `herdr-run agent git commit -m "two words"` would otherwise arrive at git as `-m two words`,
+    and nothing in the output would reveal that the caller's quoting had been discarded.
+    """
+    monkeypatch.chdir(str(tmp_path))
+    # Flagless loose words: argparse accepts them as positionals, so OUR guard must refuse.
+    assert main(["agent", "git", "status", "--", "path with spaces"]) == 2
+    err = capsys.readouterr().err
+    assert "ONE quoted argument" in err
+    assert "silently change the quoting" in err
+
+
+def test_loose_argv_containing_an_unknown_flag_is_also_refused(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other loose shape: argparse itself rejects it, so it is refused too, just earlier.
+
+    Recorded because the two shapes fail through DIFFERENT paths and both must be non-silent:
+    `-m` is not a herdr-run flag, so argparse exits before the command is ever assembled.
+    """
+    monkeypatch.chdir(str(tmp_path))
+    with pytest.raises(SystemExit) as excinfo:
+        main(["agent", "git", "commit", "-m", "two words"])
+    assert excinfo.value.code == 2
+
+
+def test_the_documented_two_positional_form_still_works(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control: agent + one quoted command is the supported shape and must not regress."""
+    monkeypatch.chdir(str(tmp_path))
+    assert main(["--dry-run", "agent", "with-proxy git ls-remote origin main"]) == 0
+    assert "with-proxy git ls-remote origin main" in capsys.readouterr().out

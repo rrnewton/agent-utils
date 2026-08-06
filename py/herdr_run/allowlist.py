@@ -155,6 +155,25 @@ def admit(command: str, config: Config) -> Admission:
         if base in value_options and "=" not in token:
             expect_value = True
 
+    # A per-program subcommand ALLOWLIST, when present, is fail-closed: it is checked before the
+    # deny-list and refuses anything not named, including a bare program with no subcommand. This
+    # is what makes `cargo` admissible at all -- `cargo fetch` only downloads, while `cargo build`
+    # would execute build scripts from third-party crates OUTSIDE the sandbox.
+    allowed_subcommands = config.allow_subcommand.get(program)
+    if allowed_subcommands is not None:
+        if subcommand is None:
+            raise Refused(
+                f"{program} requires a subcommand, and only these are allowed: "
+                f"{', '.join(sorted(allowed_subcommands))}"
+            )
+        if subcommand not in allowed_subcommands:
+            raise Refused(
+                f"subcommand '{program} {subcommand}' is not allowlisted. Allowed: "
+                f"{', '.join(sorted(allowed_subcommands))}. "
+                f"{program} subcommands that compile or execute code are deliberately excluded: "
+                "fetch through this tool, then build in-jail with --offline against the warm cache."
+            )
+
     if subcommand is not None and subcommand in config.deny_subcommand.get(program, ()):
         raise Refused(f"subcommand '{program} {subcommand}' is denied: it defines or runs arbitrary code")
 

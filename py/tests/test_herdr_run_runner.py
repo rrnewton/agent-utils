@@ -322,3 +322,55 @@ def test_partially_written_exit_code_is_not_read_as_a_result(tmp_path: object) -
             poll_interval=0.01,
             home="/nonexistent",
         )
+
+
+# --- the timeout path must not swallow what the command already printed --------------------------
+
+
+def test_timeout_carries_the_partial_output(tmp_path: object) -> None:
+    """A timed-out run that printed something must not look like one that printed nothing."""
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient(execute_locally=False)
+    target = resolve_target(_client(fake), config, "agent")
+
+    original_run = fake.run
+
+    def run_and_emit_partial(pane_id: str, command: str) -> None:
+        original_run(pane_id, command)
+        run_id = os.listdir(os.path.join(root, "spool", "runs"))[0]
+        base = os.path.join(root, "spool", "runs", run_id)
+        with open(os.path.join(base, "stdout"), "w", encoding="utf-8") as handle:
+            handle.write("PARTIAL-STDOUT\n")
+        with open(os.path.join(base, "stderr"), "w", encoding="utf-8") as handle:
+            handle.write("PARTIAL-STDERR\n")
+
+    fake.run = run_and_emit_partial  # type: ignore[method-assign]
+
+    with pytest.raises(RunTimeout) as excinfo:
+        execute(
+            _client(fake), config, target, admit("echo x", config), agent="agent", cwd=root,
+            ready_timeout=0.0, timeout=0.05, poll_interval=0.01, home="/nonexistent",
+        )
+    assert excinfo.value.partial_stdout == "PARTIAL-STDOUT\n"
+    assert excinfo.value.partial_stderr == "PARTIAL-STDERR\n"
+
+
+def test_retention_runs_on_write(tmp_path: object) -> None:
+    """Prune-on-write: an old run directory is gone after the next run, with no timer involved."""
+    import time as _time
+
+    root = str(tmp_path)
+    config = _config(root)
+    runs = os.path.join(root, "spool", "runs")
+    os.makedirs(runs)
+    stale = os.path.join(runs, "20260101T000000-old-1")
+    os.makedirs(stale)
+    old = _time.time() - 9 * 86400
+    os.utime(stale, (old, old))
+
+    result = _run(FakeHerdrClient(), config, "echo fresh")
+
+    assert result.exit_code == 0  # type: ignore[attr-defined]
+    assert not os.path.exists(stale), "writing a new run must prune the stale one"
+    assert os.path.isdir(result.spool.directory)  # type: ignore[attr-defined]

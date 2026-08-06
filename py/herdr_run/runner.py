@@ -29,6 +29,7 @@ from herdr_run.client import HerdrClient
 from herdr_run.config import Config
 from herdr_run.errors import PaneBusy, RunTimeout
 from herdr_run.readiness import Readiness, assess, infer_prompt_tail
+from herdr_run.retention import prune_runs, runs_root
 from herdr_run.session import Target
 
 __all__ = ["RunResult", "execute", "wait_ready", "spool_paths"]
@@ -202,6 +203,9 @@ def execute(
     run_id = make_run_id(agent, now=now(), pid=os.getpid())
     spool = spool_paths(config, run_id)
     os.makedirs(spool.directory, exist_ok=True)
+    # Retention is applied HERE, as a side effect of writing a new run, so it cannot silently stop
+    # the way a cron or timer can. It never raises; see herdr_run.retention.
+    prune_runs(runs_root(config.spool_dir, config.project_root), retention_days=config.retention_days)
     # Pre-create the output files so a reader never has to distinguish "not created yet" from
     # "created and empty"; the exit-code file is deliberately NOT pre-created, since its appearance
     # is the completion signal.
@@ -232,11 +236,19 @@ def execute(
             break
         sleep(poll_interval)
 
-    raise RunTimeout(
+    # Carry the partial output OUT with the failure. Raising a bare message would leave whatever
+    # the command already printed visible only on disk, so a caller scraping stdout would read a
+    # timed-out run as having produced nothing -- a false empty result, which is exactly the class
+    # of mistake a landing decision must not be built on.
+    timed_out = RunTimeout(
         f"command did not finish within {timeout:g}s. It is STILL RUNNING in pane "
         f"{target.pane_id} ({target.tab_label}) and was not killed. Partial output is in "
         f"{spool.directory}; the exit code will appear in {spool.exit_code} when it finishes."
     )
+    timed_out.partial_stdout = _read_text(spool.stdout)
+    timed_out.partial_stderr = _read_text(spool.stderr)
+    timed_out.spool_directory = spool.directory
+    raise timed_out
 
 
 def write_meta(result: RunResult, admission: Admission, config: Config, agent: str) -> str:

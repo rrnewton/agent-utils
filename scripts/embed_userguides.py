@@ -143,6 +143,11 @@ class StandaloneDocument:
     document: str
     language: str
     source: str
+    #: Forbidden-pattern descriptions that do not apply to this document, each with a reason.
+    #: The language rules assume a tool's docs only ever mention a foreign toolchain by accident,
+    #: which is false when that toolchain is the tool's SUBJECT MATTER. Exemptions are per-document
+    #: and named, so waiving a rule stays visible instead of becoming a hole in the rule itself.
+    exemptions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -170,17 +175,21 @@ STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
         language="python",
         source="common/docs/agent-team-timeline/USER_GUIDE.md",
     ),
+    # herdr-run ALLOWLISTS `cargo` as a target program, so its docs must name it. That is subject
+    # matter, not a reference to a sibling Rust implementation -- herdr-run has no Rust port.
     StandaloneDocument(
         tool="herdr-run",
         document="README",
         language="python",
         source="common/docs/herdr-run/README.md",
+        exemptions=("other toolchain",),
     ),
     StandaloneDocument(
         tool="herdr-run",
         document="USER_GUIDE",
         language="python",
         source="common/docs/herdr-run/USER_GUIDE.md",
+        exemptions=("other toolchain",),
     ),
 )
 
@@ -258,7 +267,10 @@ def _lint(item: Render | StandaloneDocument, text: str) -> list[str]:
     if template_match is not None:
         line = text.count("\n", 0, template_match.start()) + 1
         errors.append(f"unexpanded template syntax at line {line}")
+    exemptions = getattr(item, "exemptions", ())
     for description, pattern in COMMON_FORBIDDEN + LANGUAGE_FORBIDDEN[item.language]:
+        if description in exemptions:
+            continue
         match = pattern.search(text)
         if match is not None:
             line = text.count("\n", 0, match.start()) + 1

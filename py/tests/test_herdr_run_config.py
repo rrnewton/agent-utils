@@ -21,8 +21,11 @@ def test_defaults_match_the_intended_policy() -> None:
     config = Config()
     assert config.workspace == "agent-cmds"
     assert config.tab_name == "{agent}"
-    assert config.allow == ("git", "gh")
+    assert config.allow == ("git", "gh", "cargo")
     assert config.prefixes == ("with-proxy",)
+    # cargo is admitted only for network-only subcommands; see the threat model.
+    assert "build" not in config.allow_subcommand["cargo"]
+    assert "fetch" in config.allow_subcommand["cargo"]
     assert config.readiness == "both"
 
 
@@ -30,7 +33,7 @@ def test_no_config_file_anywhere_yields_defaults(tmp_path: object) -> None:
     root = str(tmp_path)
     config = load_config(explicit_path=None, start_dir=root)
     assert config.source_path is None
-    assert config.allow == ("git", "gh")
+    assert config.allow == ("git", "gh", "cargo")
 
 
 # --- discovery -----------------------------------------------------------------------------------
@@ -105,7 +108,7 @@ def test_parses_every_supported_key() -> None:
 
 def test_empty_document_is_defaults() -> None:
     config = parse_config(None, source_path="/tmp/x.yaml", project_root="/tmp")
-    assert config.allow == ("git", "gh")
+    assert config.allow == ("git", "gh", "cargo")
 
 
 def test_unknown_key_is_rejected() -> None:

@@ -23,7 +23,7 @@ from herdr_run.allowlist import Admission, admit
 from herdr_run.audit import audit_path, record, warn_if_spool_is_tracked
 from herdr_run.client import HerdrClient
 from herdr_run.config import Config, load_config
-from herdr_run.errors import HerdrRunError, Refused
+from herdr_run.errors import HerdrRunError, Refused, RunTimeout
 from herdr_run.readiness import assess, infer_prompt_tail
 from herdr_run.runner import execute, write_meta
 from herdr_run.session import resolve_target, tab_label_for
@@ -268,6 +268,15 @@ def _run_command(
             ready_timeout=ready_timeout,
             timeout=timeout,
         )
+    except RunTimeout as exc:
+        # Emit whatever the command managed to print BEFORE reporting the timeout. Dropping it would
+        # make a partially-successful run look like one that produced nothing, and a caller cannot
+        # distinguish a false empty result from a real one.
+        record(log, agent=agent, command=command, verdict="RUNTIMEOUT", detail=str(exc))
+        sys.stdout.write(exc.partial_stdout)
+        sys.stderr.write(exc.partial_stderr)
+        print(f"herdr-run: {exc}", file=sys.stderr)
+        return exc.exit_code
     except HerdrRunError as exc:
         record(log, agent=agent, command=command, verdict=type(exc).__name__.upper(), detail=str(exc))
         print(f"herdr-run: {exc}", file=sys.stderr)
@@ -355,12 +364,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     # quoted command from being mistaken for an agent name.
     agent = args.agent or ""
     command: str | None = None
-    if len(positional) >= 2:
+    if len(positional) == 2:
         if not agent:
             agent = positional[0]
-        command = " ".join(positional[1:])
+        command = positional[1]
     elif len(positional) == 1:
         command = positional[0]
+    elif len(positional) > 2:
+        # REFUSE rather than re-join. Joining loose words and re-splitting them silently DESTROYS
+        # quoting: `herdr-run agent git commit -m "two words"` would arrive as four arguments
+        # (`-m`, `two`, `words`) instead of two, and the caller would never see that it happened.
+        # A loud refusal is the only safe reading of an ambiguous invocation.
+        joined = " ".join(positional)
+        print(
+            "herdr-run: pass the command as ONE quoted argument, not as separate words.\n"
+            f"  you wrote:  herdr-run {joined}\n"
+            f"  instead:    herdr-run --agent {agent or '<agent>'} "
+            f"'{' '.join(positional[1:] if not args.agent else positional)}'\n"
+            "Re-joining loose words would silently change the quoting of your arguments.",
+            file=sys.stderr,
+        )
+        return 2
     if not agent:
         agent = _default_agent(environ)
 
