@@ -589,6 +589,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if subcommand == "userguide" or args.userguide:
         return _print_userguide()
 
+    # A truly bare invocation is a help probe, not an attempt to run anything.  Keep it independent
+    # of ambient project policy so a malformed repository config cannot break the dependency-free
+    # startup contract before there is even a command to authorize.
+    if not raw_args:
+        parser.print_help()
+        print("\nNothing to do: no command given. See 'herdr-run userguide'.")
+        return 0
+
     try:
         config = _load(args, environ)
     except HerdrRunError as exc:

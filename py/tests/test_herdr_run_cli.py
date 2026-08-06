@@ -56,9 +56,15 @@ def test_unknown_agent_when_nothing_is_set() -> None:
 
 
 def test_bare_invocation_prints_help_and_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The `make check-deps` contract: every entrypoint starts cleanly with no arguments."""
+
+    def fail_if_config_is_loaded(*_args: object, **_kwargs: object) -> Config:
+        raise AssertionError("a bare help probe must not load ambient project policy")
+
+    monkeypatch.setattr(cli_module, "_load", fail_if_config_is_loaded)
     assert main([]) == 0
     out = capsys.readouterr().out
     assert "usage: herdr-run" in out
