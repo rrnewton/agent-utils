@@ -33,5 +33,5 @@ code should expose:
 The fixture intentionally has four agents: one coordinator, two overlapping agents,
 and a third agent whose lifetime starts exactly when the first ends. That makes the
 packed-lane assertion cover both overlap and half-open lifetime reuse. Its spawn,
-intermediate message, and final result also verify that fork/join edges remain visible
+intermediate message, and lifetime result also verify that fork/join edges remain visible
 while detailed traffic follows the toolbar toggles.

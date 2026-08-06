@@ -1339,7 +1339,21 @@
     };
   }
 
-  function edgePath(x1, y1, x2, y2) {
+  function edgePath(x1, y1, x2, y2, kind) {
+    var structuralDirection = kind === "spawn" ? -1 : kind === "result" ? 1 : 0;
+    if (structuralDirection !== 0 && Math.abs(y2 - y1) > 2) {
+      var structuralBend = 28;
+      var verticalDirection = y2 > y1 ? 1 : -1;
+      var approachY = y2 - verticalDirection * 9;
+      var outerX = structuralDirection < 0
+        ? Math.min(x1, x2) - structuralBend
+        : Math.max(x1, x2) + structuralBend;
+      return "M " + x1.toFixed(2) + " " + y1.toFixed(2) +
+        " C " + outerX.toFixed(2) + " " + y1.toFixed(2) +
+        ", " + outerX.toFixed(2) + " " + approachY.toFixed(2) +
+        ", " + x2.toFixed(2) + " " + approachY.toFixed(2) +
+        " L " + x2.toFixed(2) + " " + y2.toFixed(2);
+    }
     var direction = x2 >= x1 ? 1 : -1;
     var bend = Math.max(20, Math.abs(x2 - x1) * 0.42);
     var control1 = x1 + direction * bend;
@@ -1662,7 +1676,7 @@
     if (displayState === "hidden") {
       return;
     }
-    var pathData = edgePath(x1, y1, x2, y2);
+    var pathData = edgePath(x1, y1, x2, y2, kind);
     var group = svgElement("g", {
       class: "edge-group edge-state-" + displayState,
       tabindex: "0",

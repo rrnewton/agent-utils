@@ -320,7 +320,7 @@
   /** Return hidden/normal/dimmed/highlighted for one structural or detailed edge. */
   function edgeDisplayState(edge, selection, showGlobalDetailed, showHighlightedDetailed) {
     var kind = string(edge.kind).toLowerCase();
-    // Spawns and final results are the fork and join of one delegated turn. Keep both
+    // Spawns and lifetime results are the fork and join of one delegated agent. Keep both
     // visible as structural context; only intermediate message traffic obeys the
     // detailed-edge toggles.
     var structural = kind === "spawn" || kind === "result";

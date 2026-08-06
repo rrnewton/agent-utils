@@ -24,6 +24,7 @@ from agent_team_timeline.summarize import (
     _input_hash,
     _parse_backend_output,
     build_summary_prompt,
+    clean_summary_prose,
     knowledge_text_has_link,
     summarize_jobs,
 )
@@ -77,6 +78,55 @@ def test_fingerprint_is_canonical_and_second_run_is_a_no_churn_hit(tmp_path: Pat
     assert second_stats.backend_batches == 0
     assert cache_file.read_bytes() == original_bytes
     assert cache_file.stat().st_mtime_ns == original_mtime
+
+
+def test_summary_prose_omits_transcript_timestamps_roles_tools_and_encrypted_spawn() -> None:
+    noisy = (
+        "## [2026-08-05T04:41:50.424000Z] AGENT: [Encrypted Codex collaboration "
+        "new task from /root to /root/audit; message body unavailable offline.] "
+        "[2026-08-05T04:41:53.546000Z] ASSISTANT: Implemented the parser fix. "
+        "[2026-08-05T04:41:55Z] TOOLS: 2 bash, 1 git "
+        "[1785904916000] Parser audit: All 12 regression tests passed."
+    )
+
+    assert clean_summary_prose(noisy) == (
+        "Implemented the parser fix. All 12 regression tests passed."
+    )
+
+
+def test_tool_scaffolding_cleanup_preserves_following_substantive_prose() -> None:
+    noisy = (
+        "[2026-08-05T04:41:55Z] TOOLS: 2 bash. "
+        "Shipped the parser fix and all 12 tests passed."
+    )
+
+    assert clean_summary_prose(noisy) == (
+        "Shipped the parser fix and all 12 tests passed."
+    )
+
+
+def test_heuristic_summary_never_promotes_transcript_scaffolding(tmp_path: Path) -> None:
+    job = _job(
+        "agent-a",
+        "[2026-08-05T04:41:50.424000Z] AGENT: [Encrypted Codex collaboration new task "
+        "from /root to /root/audit; message body unavailable offline.]\n\n"
+        "[2026-08-05T04:41:53.546000Z] ASSISTANT: Implemented the parser fix.\n\n"
+        "[2026-08-05T04:41:55Z] TOOLS: 2 bash, 1 git",
+    )
+
+    results, _ = summarize_jobs(
+        [job], tmp_path / "cache", backend="heuristic", model="offline"
+    )
+    rendered = " ".join(
+        [results[job.key].phrase, results[job.key].paragraph]
+        + [item.text for item in results[job.key].work_summary]
+    )
+    assert "2026-08-05" not in rendered
+    assert "AGENT:" not in rendered
+    assert "ASSISTANT:" not in rendered
+    assert "TOOLS:" not in rendered
+    assert "Encrypted Codex" not in rendered
+    assert "Implemented the parser fix" in rendered
 
 
 def test_clean_runs_have_deterministic_fingerprints(tmp_path: Path) -> None:

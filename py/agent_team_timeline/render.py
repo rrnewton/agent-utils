@@ -26,7 +26,11 @@ from agent_team_timeline.phases import (
     TranscriptEntry,
     phase_agent_ids,
 )
-from agent_team_timeline.summarize import SummaryResult
+from agent_team_timeline.summarize import (
+    SummaryResult,
+    clean_summary_prose,
+    clean_summary_result,
+)
 from agent_team_timeline.terminology import (
     GlossaryTerm,
     glossary_catalog_markdown,
@@ -48,18 +52,19 @@ def _local_time(at_ms: int, display_timezone: str) -> str:
 
 
 def _summary_obj(result: SummaryResult) -> dict[str, object]:
+    cleaned = clean_summary_result(result)
     return {
-        "key": result.key,
-        "phrase": result.phrase,
-        "paragraph": result.paragraph,
+        "key": cleaned.key,
+        "phrase": cleaned.phrase,
+        "paragraph": cleaned.paragraph,
         "work_summary": [
             {"at_ms": bullet.at_ms, "text": bullet.text}
-            for bullet in result.work_summary
+            for bullet in cleaned.work_summary
         ],
-        "model": result.model,
-        "prompt_version": result.prompt_version,
-        "input_hash": result.input_hash,
-        "generated_at": result.generated_at,
+        "model": cleaned.model,
+        "prompt_version": cleaned.prompt_version,
+        "input_hash": cleaned.input_hash,
+        "generated_at": cleaned.generated_at,
     }
 
 
@@ -83,7 +88,7 @@ def _agent_identity_obj(agent: Agent, name: AgentNameResult) -> dict[str, object
         "official_leaf": _official_leaf(agent),
         "coordinator_nickname": agent.nickname or "",
         "naming_rationale": name.rationale,
-        "lifetime_summary": name.lifetime_summary,
+        "lifetime_summary": clean_summary_prose(name.lifetime_summary),
         "naming_model": name.model,
         "naming_input_hash": name.input_hash,
     }
@@ -203,7 +208,7 @@ def _agent_markdown(
         "",
         "## Lifetime summary",
         "",
-        name.lifetime_summary,
+        clean_summary_prose(name.lifetime_summary),
         "",
         "## Work phases",
         "",
@@ -318,6 +323,8 @@ def _result_edge_objs(
     summaries: Mapping[str, SummaryResult],
     names: Mapping[str, AgentNameResult],
 ) -> list[dict[str, object]]:
+    """Render turn responses as details and one structural join per agent lifetime."""
+
     result: list[dict[str, object]] = []
     for agent in team.agents:
         if (
@@ -334,6 +341,9 @@ def _result_edge_objs(
             and event.phase == "final_answer"
             and event.text
         ]
+        # A reused agent can complete many turns during one lifetime. Those responses are
+        # messages, not additional fork/join structure, and retain the coordinator that
+        # initiated each turn as their destination.
         for final in sorted(finals, key=lambda event: (event.timestamp_ms, event.event_id)):
             if not _in_window(team, final.timestamp_ms):
                 continue
@@ -345,18 +355,68 @@ def _result_edge_objs(
             )
             result.append(
                 {
-                    "id": f"result-{final.event_id}",
+                    "id": f"turn-result-{final.event_id}",
                     "source_id": agent.thread_id,
                     "target_id": target_id,
                     "source_ms": final.timestamp_ms,
                     "target_ms": final.timestamp_ms,
-                    "kind": "result",
-                    "phrase": f"{_agent_name(agent, names).short_name} reports results",
+                    "kind": "message",
+                    "phrase": f"{_agent_name(agent, names).short_name} reports progress",
                     "paragraph": summary.paragraph if summary else (final.text or "")[:500],
                     "full_text": final.text or "",
                     "content_status": "",
                 }
             )
+
+        # The structural return mirrors the one immutable parent->child spawn. Keep it
+        # independent from turn delivery: a completed thread can be resumed by a coordinator
+        # other than its lineage parent, while its lifetime still joins the parent that forked it.
+        if agent.ended_at_ms is None:
+            continue
+        phase_end_ms = max(
+            (
+                phase.end_ms
+                for phase in phases
+                if phase.agent_id == agent.thread_id
+            ),
+            default=agent.ended_at_ms,
+        )
+        # Provider lifecycle records can be second-granular while the final response retains
+        # milliseconds. Match the end of the rendered lifetime rather than drawing the join a
+        # few pixels inside its block.
+        return_ms = max(agent.ended_at_ms, phase_end_ms)
+        if not _in_window(team, return_ms):
+            continue
+        parent = agents[agent.parent_thread_id]
+        summary = _summary_for_agent_at(agent.thread_id, return_ms, phases, summaries)
+        child_name = _agent_name(agent, names).short_name
+        parent_name = _agent_name(parent, names).short_name
+        phrase = (
+            f"{child_name} returns to {parent_name}"
+            if agent.status == "completed"
+            else f"{child_name} lifetime ends at {parent_name} ({agent.status})"
+        )
+        result.append(
+            {
+                "id": f"result-{agent.thread_id}",
+                "source_id": agent.thread_id,
+                "target_id": agent.parent_thread_id,
+                "source_ms": return_ms,
+                "target_ms": return_ms,
+                "kind": "result",
+                "phrase": phrase,
+                "paragraph": (
+                    summary.paragraph
+                    if summary is not None
+                    else f"{child_name} ended with status {agent.status}."
+                ),
+                "full_text": "",
+                "content_status": (
+                    f"Structural lifetime join. Agent status: {agent.status}. Turn responses "
+                    "are available as detailed message edges."
+                ),
+            }
+        )
     return result
 
 
@@ -733,7 +793,7 @@ def render_archive(
                 "official_leaf": _official_leaf(agent),
                 "nickname": agent.nickname or "",
                 "naming_rationale": track_name.rationale,
-                "lifetime_summary": track_name.lifetime_summary,
+                "lifetime_summary": clean_summary_prose(track_name.lifetime_summary),
                 "depth": agent.depth,
                 "start_ms": track_start,
                 "end_ms": min(track_end, end_ms),

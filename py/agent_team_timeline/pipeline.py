@@ -87,6 +87,8 @@ from agent_team_timeline.summarize import (
     SummaryRunStats,
     TECHNICAL_ROLLUP_STYLE,
     WorkBullet,
+    clean_summary_prose,
+    clean_summary_result,
     knowledge_text_has_link,
     summarize_jobs,
 )
@@ -1221,17 +1223,18 @@ def _phase_jobs(
 
 
 def _summary_json(summary: SummaryResult) -> dict[str, JsonValue]:
+    cleaned = clean_summary_result(summary)
     return {
-        "key": summary.key,
-        "phrase": summary.phrase,
-        "paragraph": summary.paragraph,
+        "key": cleaned.key,
+        "phrase": cleaned.phrase,
+        "paragraph": cleaned.paragraph,
         "work_summary": [
-            {"at_ms": item.at_ms, "text": item.text} for item in summary.work_summary
+            {"at_ms": item.at_ms, "text": item.text} for item in cleaned.work_summary
         ],
-        "model": summary.model,
-        "prompt_version": summary.prompt_version,
-        "input_hash": summary.input_hash,
-        "generated_at": summary.generated_at,
+        "model": cleaned.model,
+        "prompt_version": cleaned.prompt_version,
+        "input_hash": cleaned.input_hash,
+        "generated_at": cleaned.generated_at,
     }
 
 
@@ -1276,19 +1279,25 @@ def _summary_from_json(value: JsonValue, where: str) -> SummaryResult:
     bullets = tuple(
         WorkBullet(
             at_ms=as_int(as_object(item, f"{where}.work_summary[]").get("at_ms"), "at_ms"),
-            text=as_string(as_object(item, f"{where}.work_summary[]").get("text"), "text"),
+            text=as_string(
+                as_object(item, f"{where}.work_summary[]").get("text"), "text"
+            ),
         )
         for item in raw_bullets
     )
-    return SummaryResult(
-        key=as_string(obj.get("key"), f"{where}.key"),
-        phrase=as_string(obj.get("phrase"), f"{where}.phrase"),
-        paragraph=as_string(obj.get("paragraph"), f"{where}.paragraph"),
-        work_summary=bullets,
-        model=as_string(obj.get("model"), f"{where}.model"),
-        prompt_version=as_string(obj.get("prompt_version"), f"{where}.prompt_version"),
-        input_hash=as_string(obj.get("input_hash"), f"{where}.input_hash"),
-        generated_at=as_string(obj.get("generated_at"), f"{where}.generated_at"),
+    return clean_summary_result(
+        SummaryResult(
+            key=as_string(obj.get("key"), f"{where}.key"),
+            phrase=as_string(obj.get("phrase"), f"{where}.phrase"),
+            paragraph=as_string(obj.get("paragraph"), f"{where}.paragraph"),
+            work_summary=bullets,
+            model=as_string(obj.get("model"), f"{where}.model"),
+            prompt_version=as_string(
+                obj.get("prompt_version"), f"{where}.prompt_version"
+            ),
+            input_hash=as_string(obj.get("input_hash"), f"{where}.input_hash"),
+            generated_at=as_string(obj.get("generated_at"), f"{where}.generated_at"),
+        )
     )
 
 
@@ -1752,7 +1761,12 @@ def _load_agent_names(
                 raw_name.get("rationale"), f"{path}.name.rationale"
             ),
             lifetime_summary=_nonempty_string(
-                raw_name.get("lifetime_summary"),
+                clean_summary_prose(
+                    _nonempty_string(
+                        raw_name.get("lifetime_summary"),
+                        f"{path}.name.lifetime_summary",
+                    )
+                ),
                 f"{path}.name.lifetime_summary",
             ),
             model=_nonempty_string(raw_name.get("model"), f"{path}.name.model"),

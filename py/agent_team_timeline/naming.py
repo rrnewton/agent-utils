@@ -27,7 +27,7 @@ from agent_team_timeline.archive import (
     read_json,
     write_json_if_changed,
 )
-from agent_team_timeline.summarize import SummaryRunStats
+from agent_team_timeline.summarize import SummaryRunStats, clean_summary_prose
 from agent_team_timeline.token_usage import (
     BatchUsageReceipt,
     TokenUsage,
@@ -319,7 +319,7 @@ def _validate_short_name(name: str, job: AgentNameJob, where: str) -> str:
 
 
 def _validate_lifetime_summary(summary: str, where: str) -> str:
-    normalized = _SPACE_RE.sub(" ", summary).strip()
+    normalized = _SPACE_RE.sub(" ", clean_summary_prose(summary)).strip()
     if not normalized:
         raise AgentNameError(f"{where}: must not be empty")
     if len(normalized) > _MAX_LIFETIME_SUMMARY_LENGTH:

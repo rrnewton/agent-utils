@@ -63,6 +63,23 @@ _KNOWLEDGE_LINK = re.compile(
     r"\b[a-z0-9.-]+\.(?:com|org|net|io|dev|ai|gov|edu)(?:/|\b))",
     re.IGNORECASE,
 )
+_TRANSCRIPT_TIMESTAMP: Final = (
+    r"(?:\d{10,16}|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))"
+)
+_TRANSCRIPT_PREFIX_RE: Final = re.compile(
+    rf"(?:^|\s)(?:#{{1,6}}\s+)?\[{_TRANSCRIPT_TIMESTAMP}\]\s+[^:\n]{{1,120}}:\s*",
+    re.IGNORECASE,
+)
+_TRANSCRIPT_TOOL_NAME: Final = r"[A-Za-z0-9_/@:+-]+(?:\.[A-Za-z0-9_/@:+-]+)*"
+_TRANSCRIPT_TOOL_ENTRY_RE: Final = re.compile(
+    rf"(?:^|\s)(?:#{{1,6}}\s+)?\[{_TRANSCRIPT_TIMESTAMP}\]\s+TOOLS?:\s*"
+    rf"\d+\s+{_TRANSCRIPT_TOOL_NAME}(?:,\s*\d+\s+{_TRANSCRIPT_TOOL_NAME})*[.;]?",
+    re.IGNORECASE,
+)
+_ENCRYPTED_COLLABORATION_RE: Final = re.compile(
+    r"\[Encrypted Codex collaboration\b(?:[^\]]*\]|[^.!?\n]{0,300}…)",
+    re.IGNORECASE,
+)
 
 
 class SummaryError(RuntimeError):
@@ -428,7 +445,9 @@ def _parse_bullets(value: JsonValue, job: SummaryJob, where: str) -> tuple[WorkB
         at_ms = _integer(bullet["at_ms"], item_where + ".at_ms")
         if at_ms < job.start_ms or at_ms > job.end_ms:
             raise SummaryError(f"{item_where}.at_ms: outside the summary interval")
-        text = _string(bullet["text"], item_where + ".text")
+        text = clean_summary_prose(_string(bullet["text"], item_where + ".text"))
+        if not text:
+            continue
         bullets.append(WorkBullet(at_ms=at_ms, text=text))
     # Structured-output models occasionally return otherwise-valid bullets out of order. Stable
     # canonicalization is lossless and avoids spending another full backend batch merely to
@@ -475,12 +494,20 @@ def _parse_backend_output(
             raise SummaryError(f"{where}.key: unexpected key {key!r}")
         if key in results:
             raise SummaryError(f"{where}.key: duplicate key {key!r}")
-        phrase = _string(summary["phrase"], where + ".phrase")
+        phrase = clean_summary_prose(_string(summary["phrase"], where + ".phrase"))
+        if not phrase:
+            raise SummaryError(f"{where}.phrase: empty after removing transcript scaffolding")
         if len(phrase) > _PHRASE_LIMIT:
             raise SummaryError(
                 f"{where}.phrase: exceeds {_PHRASE_LIMIT} characters"
             )
-        paragraph = _string(summary["paragraph"], where + ".paragraph")
+        paragraph = clean_summary_prose(
+            _string(summary["paragraph"], where + ".paragraph")
+        )
+        if not paragraph:
+            raise SummaryError(
+                f"{where}.paragraph: empty after removing transcript scaffolding"
+            )
         item = expected[key]
         bullets = _parse_bullets(summary["work_summary"], item.job, where + ".work_summary")
         if item.job.summary_style == PROJECT_OVERVIEW_STYLE:
@@ -602,10 +629,18 @@ def _load_cache(
         }
         _require_keys(raw_result, expected_keys, "summary cache.result")
         key = _string(raw_result["key"], "summary cache.result.key")
-        phrase = _string(raw_result["phrase"], "summary cache.result.phrase")
+        phrase = clean_summary_prose(
+            _string(raw_result["phrase"], "summary cache.result.phrase")
+        )
+        if not phrase:
+            return None
         if len(phrase) > _PHRASE_LIMIT:
             return None
-        paragraph = _string(raw_result["paragraph"], "summary cache.result.paragraph")
+        paragraph = clean_summary_prose(
+            _string(raw_result["paragraph"], "summary cache.result.paragraph")
+        )
+        if not paragraph:
+            return None
         cached_model = _string(raw_result["model"], "summary cache.result.model")
         prompt_version = _string(
             raw_result["prompt_version"], "summary cache.result.prompt_version"
@@ -648,6 +683,45 @@ def _utc_now() -> str:
 
 def _one_line(text: str) -> str:
     return " ".join(text.strip().split())
+
+
+def clean_summary_prose(text: str) -> str:
+    """Remove transcript-only timing and role scaffolding from summary prose."""
+
+    without_tools = text
+    while True:
+        updated = _TRANSCRIPT_TOOL_ENTRY_RE.sub(" ", without_tools)
+        if updated == without_tools:
+            break
+        without_tools = updated
+    without_encrypted_placeholders = _ENCRYPTED_COLLABORATION_RE.sub(" ", without_tools)
+    without_prefixes = without_encrypted_placeholders
+    while True:
+        updated = _TRANSCRIPT_PREFIX_RE.sub(" ", without_prefixes)
+        if updated == without_prefixes:
+            break
+        without_prefixes = updated
+    return _one_line(without_prefixes).lstrip(" .;,:—-")
+
+
+def clean_summary_result(result: SummaryResult) -> SummaryResult:
+    """Return a summary with transcript scaffolding removed from every prose field."""
+
+    bullets: list[WorkBullet] = []
+    for bullet in result.work_summary:
+        text = clean_summary_prose(bullet.text)
+        if text:
+            bullets.append(WorkBullet(at_ms=bullet.at_ms, text=text))
+    return SummaryResult(
+        key=result.key,
+        phrase=clean_summary_prose(result.phrase),
+        paragraph=clean_summary_prose(result.paragraph),
+        work_summary=tuple(bullets),
+        model=result.model,
+        prompt_version=result.prompt_version,
+        input_hash=result.input_hash,
+        generated_at=result.generated_at,
+    )
 
 
 def _shorten(text: str, limit: int) -> str:
@@ -700,7 +774,7 @@ def _heuristic_sentences(transcript: str) -> list[str]:
     candidates: list[tuple[int, int, str]] = []
     fallback: list[str] = []
     for index, part in enumerate(_SENTENCE_SPLIT_RE.split(transcript)):
-        sentence = _one_line(part)
+        sentence = clean_summary_prose(part)
         if len(sentence) < 8:
             continue
         lowered = sentence.lower().lstrip("-*#> ")

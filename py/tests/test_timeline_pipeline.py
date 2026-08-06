@@ -42,7 +42,6 @@ from agent_team_timeline.pipeline import (
     record_run,
     summarize_archive,
 )
-from agent_team_timeline.render import _result_target
 from agent_team_timeline.server import make_server
 from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
@@ -286,12 +285,34 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert child_track["official_leaf"] == "release_receipt_audit"
     assert child_track["nickname"] == "Ada"
     assert "receipt binding" in child_track["lifetime_summary"]
+    summary_prose = " ".join(
+        [child_track["lifetime_summary"]]
+        + [
+            value
+            for phase in timeline["phases"]
+            for value in (phase["phrase"], phase["paragraph"])
+        ]
+    )
+    assert "ASSISTANT:" not in summary_prose
+    assert "TOOLS:" not in summary_prose
+    assert "[2026-" not in summary_prose
     assert timeline["source_digest"] == source_digest(team)
     assert timeline["display_timezone_source"] == "legacy_team_data"
     assert timeline["teams"][0]["projects"] == []
     assert timeline["teams"][0]["hosts"] == []
     assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
-    assert any(edge["kind"] == "result" for edge in timeline["edges"])
+    result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
+    assert len(result_edges) == 1
+    assert result_edges[0]["source_id"] == CHILD
+    assert result_edges[0]["target_id"] == ROOT
+    assert result_edges[0]["source_ms"] == child_track["end_ms"]
+    assert result_edges[0]["target_ms"] == child_track["end_ms"]
+    detail = json.loads(
+        next((tmp_path / "data" / "details").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert all("at_ms" in entry and "role" in entry for entry in detail["transcript"])
     rollup = timeline["rollups"][0]
     assert (tmp_path / rollup["technical_path"]).is_file()
     assert (tmp_path / rollup["plain_language_path"]).is_file()
@@ -670,7 +691,7 @@ def test_phase_details_emit_conservative_pull_request_link_spans(tmp_path: Path)
     assert enriched_entry["pull_requests"][0]["merged_at"] == "2026-08-05T10:00:00Z"
 
 
-def test_every_completed_subagent_turn_gets_a_result_edge(tmp_path: Path) -> None:
+def test_reused_subagent_gets_one_structural_lifetime_result(tmp_path: Path) -> None:
     team = _team()
     second_final = _event(
         "child-final-again",
@@ -686,13 +707,56 @@ def test_every_completed_subagent_turn_gets_a_result_edge(tmp_path: Path) -> Non
     build_archive(tmp_path, updated.team_slug)
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
     result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
-    assert {edge["id"] for edge in result_edges} == {
-        "result-child-final",
-        "result-child-final-again",
+    assert len(result_edges) == 1
+    lifetime_result = result_edges[0]
+    assert lifetime_result["id"] == f"result-{CHILD}"
+    assert lifetime_result["source_id"] == CHILD
+    assert lifetime_result["target_id"] == ROOT
+    assert lifetime_result["source_ms"] == START + 19_000
+    assert lifetime_result["target_ms"] == START + 19_000
+    assert lifetime_result["phrase"] == "Release receipt audit returns to Coordinator"
+    assert lifetime_result["full_text"] == ""
+    assert lifetime_result["content_status"].startswith("Structural lifetime join.")
+    turn_results = {
+        edge["id"]: edge
+        for edge in timeline["edges"]
+        if edge["id"].startswith("turn-result-")
     }
+    assert set(turn_results) == {
+        "turn-result-child-final",
+        "turn-result-child-final-again",
+    }
+    assert {edge["kind"] for edge in turn_results.values()} == {"message"}
+    assert {edge["target_id"] for edge in turn_results.values()} == {ROOT}
 
 
-def test_resumed_nested_agent_reports_to_turn_initiator_not_finished_parent(
+@pytest.mark.parametrize(
+    ("status", "ended_at_ms", "expected_results"),
+    (("interrupted", START + 19_000, 1), ("running", None, 0)),
+)
+def test_only_ended_agent_lifetimes_get_a_structural_join(
+    tmp_path: Path,
+    status: str,
+    ended_at_ms: int | None,
+    expected_results: int,
+) -> None:
+    team = _team()
+    child = replace(team.agents[1], status=status, ended_at_ms=ended_at_ms)
+    updated = replace(team, agents=(team.agents[0], child))
+    _write_team(tmp_path, updated)
+    summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
+    build_archive(tmp_path, updated.team_slug)
+
+    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
+    assert len(result_edges) == expected_results
+    if expected_results:
+        assert result_edges[0]["source_id"] == CHILD
+        assert result_edges[0]["target_id"] == ROOT
+        assert result_edges[0]["phrase"].endswith(f"({status})")
+
+
+def test_resumed_nested_agent_joins_parent_while_turn_results_reach_initiators(
     tmp_path: Path,
 ) -> None:
     team = _team()
@@ -794,24 +858,24 @@ def test_resumed_nested_agent_reports_to_turn_initiator_not_finished_parent(
     build_archive(tmp_path, updated.team_slug)
 
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
-    result_targets = {
+    result_edges = {
         edge["id"]: edge["target_id"]
         for edge in timeline["edges"]
         if edge["kind"] == "result"
     }
-    assert result_targets["result-nested-initial-final"] == CHILD
-    assert result_targets["result-nested-resumed-final"] == ROOT
+    assert result_edges[f"result-{NESTED}"] == CHILD
+    turn_result_targets = {
+        edge["id"]: edge["target_id"]
+        for edge in timeline["edges"]
+        if edge["id"].startswith("turn-result-nested-")
+    }
+    assert turn_result_targets == {
+        "turn-result-nested-initial-final": CHILD,
+        "turn-result-nested-resumed-final": ROOT,
+    }
     nested_track = next(agent for agent in timeline["agents"] if agent["id"] == NESTED)
     assert nested_track["parent_id"] == CHILD
     assert nested_track["end_ms"] > team.agents[1].ended_at_ms
-
-
-def test_unmatched_result_falls_back_to_lineage_parent() -> None:
-    team = replace(_team(), edges=())
-    child = next(agent for agent in team.agents if agent.thread_id == CHILD)
-    final = next(event for event in team.events if event.event_id == "child-final")
-
-    assert _result_target(team, child, final) == ROOT
 
 
 def test_team_slug_and_archived_identity_cannot_escape_archive(tmp_path: Path) -> None:

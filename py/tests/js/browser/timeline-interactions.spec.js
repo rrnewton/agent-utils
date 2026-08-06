@@ -352,6 +352,15 @@ test("fork and join edges stay structural while intermediate messages are detail
   });
   expect(resultWidth).toBe(spawnWidth);
 
+  const structuralBends = await Promise.all([spawn, result].map(async function (edge) {
+    return edge.locator(".edge-visible").evaluate(function (element) {
+      const coordinates = (element.getAttribute("d") || "").match(/-?\d+(?:\.\d+)?/g) || [];
+      return Number(coordinates[2]) - Number(coordinates[0]);
+    });
+  }));
+  expect(structuralBends[0]).toBeLessThan(0);
+  expect(structuralBends[1]).toBeGreaterThan(0);
+
   await globalDetailed.check();
   await expect(message).toHaveCount(1);
   await expect(message).toHaveAttribute("data-edge-state", "normal");
