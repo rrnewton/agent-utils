@@ -292,6 +292,8 @@ def _write_fake_codex(path: Path) -> None:
         """#!/usr/bin/env python3
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -303,6 +305,22 @@ for required in (
 ):
     assert required in args
 assert Path.cwd().name.startswith("agent-team-timeline-summary-")
+repository_check = subprocess.run(
+    ["git", "rev-parse", "--is-inside-work-tree"],
+    text=True,
+    capture_output=True,
+    check=True,
+)
+assert repository_check.stdout.strip() == "true"
+compatibility_command = shutil.which("hg") or shutil.which("sl")
+if compatibility_command is not None:
+    compatibility_check = subprocess.run(
+        [compatibility_command, "root"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert Path(compatibility_check.stdout.strip()) == Path.cwd()
 schema_path = Path(args[args.index("--output-schema") + 1])
 schema = json.loads(schema_path.read_text(encoding="utf-8"))
 assert schema["properties"]["summaries"]["type"] == "array"
@@ -545,6 +563,30 @@ def test_backend_failure_is_concise_and_preserves_existing_cache(tmp_path: Path)
         "reasoning_output_tokens": 0,
         "total_tokens": 38,
     }
+
+
+def test_backend_failure_preserves_actionable_stderr_tail(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    diagnostic = "abort: temporary cwd is not inside a repository"
+    backend = (
+        "import sys; "
+        "sys.stderr.write('Codex CLI at Meta ' + ('banner ' * 100) + "
+        f"{diagnostic!r}); "
+        "sys.exit(7)"
+    )
+
+    with pytest.raises(SummaryError, match="not inside a repository"):
+        summarize_jobs(
+            [_job("agent-a")],
+            cache,
+            backend="codex",
+            model="gpt-test",
+            codex_command=(sys.executable, "-c", backend),
+        )
+
+    receipt_path = next((cache / "_usage" / "receipts").glob("*.json"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert diagnostic in receipt["error"]
 
 
 def test_invalid_model_output_preserves_terminal_usage_receipt(tmp_path: Path) -> None:

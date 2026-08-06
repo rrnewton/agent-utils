@@ -318,13 +318,36 @@ def test_codex_naming_records_tokens_model_and_reasoning_effort(tmp_path: Path) 
     fake.write_text(
         """#!/usr/bin/env python3
 import json
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
 args = sys.argv[1:]
 assert args[0] == "exec"
-assert "--json" in args
+for required in (
+    "--ephemeral", "--skip-git-repo-check", "--sandbox", "read-only",
+    "--model", "--json", "--output-schema", "--output-last-message", "-",
+):
+    assert required in args
 assert 'model_reasoning_effort="high"' in args
+assert Path.cwd().name.startswith("agent-team-timeline-name-")
+repository_check = subprocess.run(
+    ["git", "rev-parse", "--is-inside-work-tree"],
+    text=True,
+    capture_output=True,
+    check=True,
+)
+assert repository_check.stdout.strip() == "true"
+compatibility_command = shutil.which("hg") or shutil.which("sl")
+if compatibility_command is not None:
+    compatibility_check = subprocess.run(
+        [compatibility_command, "root"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert Path(compatibility_check.stdout.strip()) == Path.cwd()
 prompt = sys.stdin.read()
 payload = prompt.split("BEGIN_AGENT_NAME_JOBS_JSON\\n", 1)[1].split(
     "END_AGENT_NAME_JOBS_JSON", 1
@@ -390,13 +413,15 @@ print(json.dumps({
 
 def test_failed_codex_naming_preserves_terminal_usage_receipt(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
+    diagnostic = "HTTP 404 Luna deployment unavailable"
     backend = (
         "import json,sys; "
         "print(json.dumps({'type':'turn.completed','usage':{"
         "'input_tokens':41,'cached_input_tokens':13,'output_tokens':8}})); "
-        "sys.stderr.write('naming failed'); sys.exit(9)"
+        f"print(json.dumps({{'type':'error','message':{diagnostic!r}}})); "
+        "sys.stderr.write('Codex CLI at Meta ' + ('banner ' * 100)); sys.exit(9)"
     )
-    with pytest.raises(AgentNameError, match="failed usage receipt:") as caught:
+    with pytest.raises(AgentNameError, match="deployment unavailable") as caught:
         name_agents(
             [_job()],
             cache,
@@ -414,6 +439,7 @@ def test_failed_codex_naming_preserves_terminal_usage_receipt(tmp_path: Path) ->
     assert receipt["usage"]["input_tokens"] == 41
     assert receipt["usage"]["output_tokens"] == 8
     assert receipt["usage"]["total_tokens"] == 49
+    assert diagnostic in receipt["error"]
 
 
 @pytest.mark.parametrize(

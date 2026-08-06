@@ -27,6 +27,11 @@ from agent_team_timeline.archive import (
     read_json,
     write_json_if_changed,
 )
+from agent_team_timeline.codex_workspace import (
+    CodexWorkspaceError,
+    codex_failure_detail,
+    initialize_codex_workspace,
+)
 from agent_team_timeline.summarize import SummaryRunStats, clean_summary_prose
 from agent_team_timeline.token_usage import (
     BatchUsageReceipt,
@@ -610,6 +615,12 @@ def _codex_batch(
         raise AgentNameError("codex command must not be empty")
     with tempfile.TemporaryDirectory(prefix="agent-team-timeline-name-") as raw_dir:
         work_dir = Path(raw_dir)
+        try:
+            initialize_codex_workspace(work_dir)
+        except CodexWorkspaceError as error:
+            raise AgentNameError(
+                f"could not prepare codex naming workspace: {error}"
+            ) from error
         schema_path = work_dir / "output-schema.json"
         output_path = work_dir / "last-message.json"
         schema_path.write_text(canonical_json(_output_schema()), encoding="utf-8")
@@ -650,7 +661,7 @@ def _codex_batch(
                 f"codex naming batch reported invalid usage: {error}"
             ) from error
         if completed.returncode != 0:
-            detail = _shorten(_one_line(completed.stderr or completed.stdout), 240)
+            detail = codex_failure_detail(completed.stdout, completed.stderr)
             suffix = f": {detail}" if detail else ""
             raise _CodexNameBatchError(
                 f"codex naming batch failed with exit {completed.returncode}{suffix}",
