@@ -96,7 +96,18 @@ def _client(config: Config, environ: dict[str, str]) -> HerdrClient:
 
 
 def _resolved_cwd(config: Config, args: argparse.Namespace) -> str:
-    cwd = args.cwd or config.cwd or config.project_root
+    """Where the command runs: --cwd, else the project's configured cwd, else THE CALLER'S CWD.
+
+    Defaulting to ``project_root`` was a silent-mistargeting bug. Config discovery walks UP to the
+    nearest ``.herdr-run.yaml``, so a config file at the top of a multi-repo tree makes every nested
+    worktree resolve ``project_root`` to that top directory -- and the command then ran there
+    instead of in the slot the caller was standing in. It did not look like an error; it looked like
+    the wrong repository answering. "Where the policy lives" and "where the command runs" are
+    different questions, and only the first is anchored to the config file.
+    """
+    cwd = args.cwd or config.cwd
+    if cwd is None:
+        return os.getcwd()
     if not os.path.isabs(cwd):
         cwd = os.path.abspath(os.path.join(config.project_root, cwd))
     return cwd

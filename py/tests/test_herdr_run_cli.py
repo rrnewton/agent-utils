@@ -259,3 +259,40 @@ def test_explicit_agent_with_one_quoted_command_still_works(
     monkeypatch.chdir(str(tmp_path))
     assert main(["--dry-run", "--agent", "someagent", "with-proxy git ls-remote origin main"]) == 0
     assert "with-proxy git ls-remote origin main" in capsys.readouterr().out
+
+
+def test_command_runs_in_the_callers_cwd_not_the_config_directory(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: a config file ABOVE the caller must not relocate where the command runs.
+
+    Config discovery walks up to the nearest .herdr-run.yaml, so a file at the top of a multi-repo
+    tree used to make every nested worktree run its command in that top directory instead of the
+    one the caller was standing in -- silent mistargeting that reads as the wrong repo answering.
+    """
+    import argparse
+    import os
+
+    from herdr_run.cli import _resolved_cwd
+    from herdr_run.config import Config
+
+    root = str(tmp_path)
+    nested = os.path.join(root, "worktrees", "slot", "repo")
+    os.makedirs(nested)
+    config = Config(project_root=root)  # config lives at the top...
+    monkeypatch.chdir(nested)  # ...caller stands in the nested worktree
+
+    assert _resolved_cwd(config, argparse.Namespace(cwd=None)) == os.path.realpath(nested) or (
+        _resolved_cwd(config, argparse.Namespace(cwd=None)) == nested
+    )
+
+
+def test_explicit_cwd_still_wins(tmp_path: object) -> None:
+    """Positive control: --cwd is still honoured over both the config and the caller's cwd."""
+    import argparse
+
+    from herdr_run.cli import _resolved_cwd
+    from herdr_run.config import Config
+
+    target = str(tmp_path)
+    assert _resolved_cwd(Config(project_root="/elsewhere"), argparse.Namespace(cwd=target)) == target
