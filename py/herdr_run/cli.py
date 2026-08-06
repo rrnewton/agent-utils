@@ -362,15 +362,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Agent resolution: --agent wins, then a leading positional when a command follows it, then the
     # environment. Requiring TWO positionals for the '<agent> <command>' form is what keeps a single
     # quoted command from being mistaken for an agent name.
+    #
+    # When --agent is given explicitly, NO positional may be consumed as an agent name: every
+    # positional belongs to the command. Consuming positional[0] anyway used to silently DELETE a
+    # leading `with-proxy` wrapper from `herdr-run --agent X with-proxy '<cmd>'`. The command still
+    # ran -- just without its proxy -- so `gh` dialled GitHub direct and failed with "network is
+    # unreachable", which reads like an egress outage rather than a mangled argv. Anything past a
+    # single quoted command is now the loose-words shape, and is refused below like any other.
     agent = args.agent or ""
     command: str | None = None
-    if len(positional) == 2:
-        if not agent:
-            agent = positional[0]
+    if len(positional) == 2 and not args.agent:
+        agent = positional[0]
         command = positional[1]
     elif len(positional) == 1:
         command = positional[0]
-    elif len(positional) > 2:
+    elif len(positional) > 1:
         # REFUSE rather than re-join. Joining loose words and re-splitting them silently DESTROYS
         # quoting: `herdr-run agent git commit -m "two words"` would arrive as four arguments
         # (`-m`, `two`, `words`) instead of two, and the caller would never see that it happened.

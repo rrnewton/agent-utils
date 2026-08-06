@@ -231,3 +231,31 @@ def test_the_documented_two_positional_form_still_works(
     monkeypatch.chdir(str(tmp_path))
     assert main(["--dry-run", "agent", "with-proxy git ls-remote origin main"]) == 0
     assert "with-proxy git ls-remote origin main" in capsys.readouterr().out
+
+
+def test_explicit_agent_never_swallows_a_leading_wrapper(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--agent X with-proxy '<cmd>'` must NOT drop `with-proxy`.
+
+    It used to: with two positionals the leading one was discarded from the command even when
+    --agent had already supplied the name. The command still ran, minus its proxy wrapper, so `gh`
+    dialled GitHub directly and reported "network is unreachable" -- indistinguishable from a real
+    egress outage, and the reason a whole fleet concluded `gh` was unusable through the pane.
+    Refusing is the safe reading; silently running a DIFFERENT command is not.
+    """
+    monkeypatch.chdir(str(tmp_path))
+    assert main(["--dry-run", "--agent", "someagent", "with-proxy", "git ls-remote origin"]) == 2
+    err = capsys.readouterr().err
+    assert "ONE quoted argument" in err
+    # The suggestion must put the wrapper back INSIDE the quotes, not drop it again.
+    assert "'with-proxy git ls-remote origin'" in err
+
+
+def test_explicit_agent_with_one_quoted_command_still_works(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control for the guard above: the correct shape must still render in full."""
+    monkeypatch.chdir(str(tmp_path))
+    assert main(["--dry-run", "--agent", "someagent", "with-proxy git ls-remote origin main"]) == 0
+    assert "with-proxy git ls-remote origin main" in capsys.readouterr().out
