@@ -2475,10 +2475,10 @@ def compare_cpuset_alloc() -> int:
     for args, required in (
         ((), ("run", "status", "reclaim", "selftest")),
         (("--help",), ("run", "status", "reclaim", "selftest")),
-        (("run", "--help"), ("--cores", "--tag", "--sample-s")),
+        (("run", "--help"), ("--cores", "--tag", "--sample-s", "--max-irq-rate")),
         (("status", "--help"), ("--ledger",)),
         (("reclaim", "--help"), ("--ledger",)),
-        (("selftest", "--help"), ("--cores", "--sample-s")),
+        (("selftest", "--help"), ("--cores", "--sample-s", "--max-irq-rate")),
     ):
         for engine, command in (("py", py), ("rs", rs)):
             outcome = run(command, args)

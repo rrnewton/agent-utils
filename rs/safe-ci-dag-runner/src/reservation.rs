@@ -285,6 +285,7 @@ pub fn acquire(
     sample_s: f64,
     ledger: Option<&Path>,
     exclude: &HashSet<usize>,
+    max_irq_rate: Option<f64>,
 ) -> Result<Reservation, String> {
     if k < 1 {
         return Err(format!("k must be >= 1, got {k}"));
@@ -303,7 +304,7 @@ pub fn acquire(
     for record in &live {
         held.extend(record.cores.iter().copied());
     }
-    let cores = pick_least_busy_free_cores_excluding(k, sample_s, &held);
+    let cores = pick_least_busy_free_cores_excluding(k, sample_s, &held, max_irq_rate);
     if cores.len() < k as usize {
         store(&path, &live)?;
         return Err(format!(
@@ -388,7 +389,8 @@ mod tests {
     fn acquire_release_and_shared_schema() {
         let path = temp_ledger("release");
         let _ = fs::remove_file(&path);
-        let mut reservation = acquire(1, "unit", 0.001, Some(&path), &HashSet::new()).unwrap();
+        let mut reservation =
+            acquire(1, "unit", 0.001, Some(&path), &HashSet::new(), None).unwrap();
         assert_eq!(held_cores(Some(&path)).unwrap(), reservation.cores);
         let parsed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert!(parsed["reservations"][0]["starttime"].is_number());
@@ -402,7 +404,7 @@ mod tests {
     fn acquire_rejects_invalid_sample_windows() {
         let path = temp_ledger("sample-window");
         for sample_s in [-1.0, f64::NAN, f64::INFINITY] {
-            let error = acquire(1, "unit", sample_s, Some(&path), &HashSet::new())
+            let error = acquire(1, "unit", sample_s, Some(&path), &HashSet::new(), None)
                 .expect_err("invalid sample window must be rejected");
             assert!(error.contains("sample_s must be finite and >= 0"));
         }
@@ -433,8 +435,8 @@ mod tests {
         }
         let path = temp_ledger("same-tag");
         let _ = fs::remove_file(&path);
-        let mut first = acquire(1, "same", 0.001, Some(&path), &HashSet::new()).unwrap();
-        let mut second = acquire(1, "same", 0.001, Some(&path), &HashSet::new()).unwrap();
+        let mut first = acquire(1, "same", 0.001, Some(&path), &HashSet::new(), None).unwrap();
+        let mut second = acquire(1, "same", 0.001, Some(&path), &HashSet::new(), None).unwrap();
         assert_ne!(first.cores, second.cores);
         first.release().unwrap();
         assert_eq!(held_cores(Some(&path)).unwrap(), second.cores);

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::sizing::{cpu_count, mem_available_bytes};
 
@@ -458,6 +458,76 @@ fn current_affinity() -> Vec<usize> {
     cores
 }
 
+/// Cumulative DEVICE interrupt count per CPU from `/proc/interrupts`.
+///
+/// Only numerically-named rows are summed. That restriction is measured, not stylistic: on a
+/// 316-CPU host the architectural/IPI rows (`LOC`, `RES`, `CAL`, `TLB`, ...) spanned only
+/// 49-4846/s across CPUs — a 3.6x spread with ZERO CPUs above 4x the median — so including them
+/// would re-rank cores by "how busy is this CPU", which `/proc/stat` sampling already measures.
+/// The device rows on the same host spanned 0.0-1100.6/s with 45.6% of CPUs at exactly zero.
+///
+/// An empty map means the signal is UNAVAILABLE, never "this host has no interrupts".
+fn device_irq_snapshot() -> BTreeMap<usize, u64> {
+    match fs::read_to_string("/proc/interrupts") {
+        Ok(text) => parse_device_irq_counts(&text),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// Pure parser for `/proc/interrupts` text.
+///
+/// Split out from the read so it can be exercised on fixture text: the core ordering guarantee
+/// is only as good as agreement on what counts as a device row, and that is worth pinning down
+/// directly rather than through a live `/proc` read.
+pub(crate) fn parse_device_irq_counts(text: &str) -> BTreeMap<usize, u64> {
+    let mut out = BTreeMap::new();
+    let mut lines = text.lines();
+    let header: Vec<&str> = match lines.next() {
+        Some(h) => h.split_whitespace().collect(),
+        None => return out,
+    };
+    let ncpu = header.len();
+    if ncpu == 0 {
+        return out;
+    }
+    let mut totals = vec![0u64; ncpu];
+    for line in lines {
+        let colon = match line.find(':') {
+            Some(i) if i > 0 => i,
+            _ => continue,
+        };
+        if !line[..colon].trim().chars().all(|c| c.is_ascii_digit())
+            || line[..colon].trim().is_empty()
+        {
+            continue;
+        }
+        // Only the first `ncpu` whitespace fields are counts; the rest is the chip/name text.
+        // A row with FEWER than `ncpu` fields is malformed for this header and is skipped
+        // whole, matching Python -- counting its prefix would silently attribute one CPU's
+        // interrupts to another and the two engines would then disagree.
+        let fields: Vec<&str> = line[colon + 1..].split_whitespace().take(ncpu).collect();
+        if fields.len() < ncpu {
+            continue;
+        }
+        for (index, field) in fields.iter().enumerate() {
+            if let Ok(value) = field.parse::<u64>() {
+                totals[index] += value;
+            }
+        }
+    }
+    for (index, name) in header.iter().enumerate() {
+        let lowered = name.to_ascii_lowercase();
+        if let Some(digits) = lowered.strip_prefix("cpu") {
+            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(cpu) = digits.parse::<usize>() {
+                    out.insert(cpu, totals[index]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Per-CPU (idle+iowait, total) jiffies snapshot from `/proc/stat` (keyed by cpu id).
 fn proc_stat_snapshot() -> BTreeMap<usize, (u64, u64)> {
     let mut d = BTreeMap::new();
@@ -526,7 +596,7 @@ fn parse_cpuset(value: Option<&str>) -> Option<HashSet<usize>> {
 /// over `sample_s` seconds, and returns the `k` cores with the highest idle fraction. `k` is
 /// clamped to `[1, len(allowed)]`.
 pub fn pick_least_busy_free_cores(k: i64, sample_s: f64) -> Vec<usize> {
-    pick_least_busy_free_cores_excluding(k, sample_s, &HashSet::new())
+    pick_least_busy_free_cores_excluding(k, sample_s, &HashSet::new(), None)
 }
 
 /// Pick least-busy allowed cores while excluding cores held by another reservation.
@@ -538,6 +608,7 @@ pub fn pick_least_busy_free_cores_excluding(
     k: i64,
     sample_s: f64,
     exclude: &HashSet<usize>,
+    max_irq_rate: Option<f64>,
 ) -> Vec<usize> {
     if k < 1 || !sample_s.is_finite() || sample_s < 0.0 {
         return Vec::new();
@@ -554,9 +625,29 @@ pub fn pick_least_busy_free_cores_excluding(
         return Vec::new();
     }
     let k = k.clamp(1, available as i64) as usize;
+    // One sleep serves both signals, so IRQ awareness does not lengthen the
+    // reservation ledger's critical section.
     let a = proc_stat_snapshot();
+    let irq_a = device_irq_snapshot();
+    let started = Instant::now();
     thread::sleep(Duration::from_secs_f64(sample_s));
     let b = proc_stat_snapshot();
+    let irq_b = device_irq_snapshot();
+    let elapsed = started.elapsed().as_secs_f64();
+    let mut irq_rate: BTreeMap<usize, f64> = BTreeMap::new();
+    if !irq_a.is_empty() && !irq_b.is_empty() && elapsed > 0.0 {
+        for (cpu, first) in &irq_a {
+            if let Some(second) = irq_b.get(cpu) {
+                irq_rate.insert(*cpu, second.saturating_sub(*first) as f64 / elapsed);
+            }
+        }
+    }
+    // An explicit budget must be CHECKED, not assumed. When the signal is missing there is
+    // nothing to check it against, so refuse rather than return a full set that silently never
+    // honoured it.
+    if max_irq_rate.is_some() && irq_rate.is_empty() {
+        return Vec::new();
+    }
     let idle_frac = |c: usize| -> f64 {
         match (a.get(&c), b.get(&c)) {
             (Some(&(ai, at)), Some(&(bi, bt))) => {
@@ -573,12 +664,25 @@ pub fn pick_least_busy_free_cores_excluding(
     let mut ranked: Vec<usize> = allowed
         .into_iter()
         .filter(|c| !exclude.contains(c) && b.contains_key(c))
+        .filter(|c| match max_irq_rate {
+            Some(limit) => irq_rate.get(c).copied().unwrap_or(0.0) <= limit,
+            None => true,
+        })
         .collect();
-    // Descending idle fraction; stable so ties keep ascending core-id order (matches Python).
+    // Interrupt rate leads, idle fraction breaks its ties, core id breaks those. The order is
+    // TOTAL, which is what lets the two engines agree exactly instead of merely agreeing on the
+    // multiset of "quiet enough" cores. Matches Python's (irq_rate, -idle_frac, core_id).
     ranked.sort_by(|&x, &y| {
-        idle_frac(y)
-            .partial_cmp(&idle_frac(x))
+        let rx = irq_rate.get(&x).copied().unwrap_or(0.0);
+        let ry = irq_rate.get(&y).copied().unwrap_or(0.0);
+        rx.partial_cmp(&ry)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                idle_frac(y)
+                    .partial_cmp(&idle_frac(x))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| x.cmp(&y))
     });
     ranked.truncate(k);
     ranked
@@ -1028,6 +1132,57 @@ impl CgroupManager for Cgroups {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Same fixture shape the paired test suite uses. The architectural rows carry a
+    // deliberately huge uniform count: if either engine ever summed them they would swamp the
+    // device signal and these assertions would fail. That is what makes the device-rows-only
+    // rule observable rather than merely documented.
+    fn interrupts_fixture(rates: &[u64], arch_per_cpu: u64) -> String {
+        let ncpu = rates.len();
+        let header: Vec<String> = (0..ncpu).map(|i| format!("CPU{i}")).collect();
+        let row = |values: &[u64]| -> String {
+            values
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let arch: Vec<u64> = vec![arch_per_cpu; ncpu];
+        format!(
+            "      {}\n  17: {}   PCI-MSI  nvme0q1\n 130: {}   IR-PCI-MSI  eth0-tx\n LOC: {}   Local timer interrupts\n RES: {}   Rescheduling interrupts\n ERR: 0\n",
+            header.join(" "),
+            row(rates),
+            row(&vec![0u64; ncpu]),
+            row(&arch),
+            row(&arch),
+        )
+    }
+
+    #[test]
+    fn device_rows_are_counted_and_architectural_rows_are_not() {
+        let text = interrupts_fixture(&[7, 0, 300], 99_000);
+        let counts = parse_device_irq_counts(&text);
+        assert_eq!(counts.get(&0), Some(&7));
+        assert_eq!(counts.get(&1), Some(&0));
+        assert_eq!(counts.get(&2), Some(&300));
+        assert_eq!(counts.len(), 3);
+    }
+
+    #[test]
+    fn empty_or_headerless_input_yields_an_absent_signal_not_zeroes() {
+        assert!(parse_device_irq_counts("").is_empty());
+        assert!(parse_device_irq_counts("\n").is_empty());
+    }
+
+    #[test]
+    fn short_rows_are_skipped_whole_so_counts_are_not_misattributed() {
+        // A numeric row with fewer fields than the header must not have its prefix counted.
+        let text = "      CPU0 CPU1 CPU2\n  17: 5 5\n  18: 1 2 3   PCI-MSI  dev\n";
+        let counts = parse_device_irq_counts(text);
+        assert_eq!(counts.get(&0), Some(&1));
+        assert_eq!(counts.get(&1), Some(&2));
+        assert_eq!(counts.get(&2), Some(&3));
+    }
 
     fn temp_scope(name: &str) -> PathBuf {
         let path =

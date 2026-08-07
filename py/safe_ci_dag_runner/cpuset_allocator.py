@@ -174,7 +174,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     cmd = raw[1:]
     try:
         with reservation.reserve_cores(
-            args.cores, tag=args.tag, sample_s=args.sample_s
+            args.cores,
+            tag=args.tag,
+            sample_s=args.sample_s,
+            max_irq_rate=args.max_irq_rate,
         ) as cores:
             return _run_reserved_hard(cores, cmd, tag=args.tag, prog=f"{PROG}: run")
     except (ValueError, reservation.InsufficientCoresError) as exc:
@@ -395,6 +398,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--cores", type=_positive_int, required=True, metavar="K", help="how many cores to reserve (allocator picks WHICH)")
     run_p.add_argument("--tag", default="", help="label for this reservation (debugging)")
     run_p.add_argument("--sample-s", type=_nonnegative_finite_float, default=0.3, help="/proc/stat idle-sampling window (s)")
+    run_p.add_argument("--max-irq-rate", type=_nonnegative_finite_float, default=None, metavar="RATE", help="refuse cores above this measured device-IRQ rate (per second); no default")
     run_p.add_argument("argv_rest", nargs=argparse.REMAINDER, metavar="-- CMD [ARGS...]", help="the command to run pinned")
     run_p.set_defaults(func=cmd_run)
 
@@ -417,6 +421,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stf_p.add_argument("--cores", type=_positive_int, default=2, metavar="K", help="cores to reserve for the test (>=2 exercises the positive multi-core check)")
     stf_p.add_argument("--sample-s", type=_nonnegative_finite_float, default=0.3, help="/proc/stat idle-sampling window (s)")
+    stf_p.add_argument("--max-irq-rate", type=_nonnegative_finite_float, default=None, metavar="RATE", help="refuse cores above this measured device-IRQ rate (per second); no default")
     stf_p.set_defaults(func=cmd_selftest)
 
     return p

@@ -1897,7 +1897,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // process affinity is escapable and cannot enforce a collision-free reservation.
     let mut core_reservation = None;
     if let Some(k) = a.cores {
-        match crate::reservation::acquire(k, "run", 0.3, None, &HashSet::new()) {
+        match crate::reservation::acquire(k, "run", 0.3, None, &HashSet::new(), None) {
             Ok(mut reservation) => {
                 if apply_specific_cores(&reservation.cores, &format!("--cores {k}")).is_none() {
                     eprintln!(
@@ -2134,13 +2134,14 @@ fn cmd_pin_run(rest: &[String]) -> i32 {
     if tag.is_empty() {
         tag = "pin-run".to_string();
     }
-    let mut reservation = match crate::reservation::acquire(k, &tag, 0.3, None, &HashSet::new()) {
-        Ok(value) => value,
-        Err(error) => {
-            eprintln!("{PROG}: pin-run: {error}");
-            return 3;
-        }
-    };
+    let mut reservation =
+        match crate::reservation::acquire(k, &tag, 0.3, None, &HashSet::new(), None) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("{PROG}: pin-run: {error}");
+                return 3;
+            }
+        };
     let code = crate::cpuset_allocator::run_reserved_hard(
         &reservation.cores,
         &command,

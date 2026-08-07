@@ -269,6 +269,7 @@ def acquire(
     sample_s: float = 0.3,
     ledger: Path | None = None,
     exclude: Collection[int] = (),
+    max_irq_rate: float | None = None,
 ) -> Reservation:
     """Reserve K disjoint cores for this process, collision-free.
 
@@ -294,7 +295,9 @@ def acquire(
         held: set[int] = set(int(c) for c in exclude)
         for r in live:
             held.update(r.cores)
-        cores = pick_least_busy_free_cores(k, sample_s=sample_s, exclude=held)
+        cores = pick_least_busy_free_cores(
+            k, sample_s=sample_s, exclude=held, max_irq_rate=max_irq_rate
+        )
         if len(cores) < k:
             # Persist the sweep even on failure, so leaked cores are reclaimed.
             _store(path, live)
@@ -363,12 +366,14 @@ class reserve_cores:
         sample_s: float = 0.3,
         ledger: Path | None = None,
         exclude: Collection[int] = (),
+        max_irq_rate: float | None = None,
     ):
         self._k = k
         self._tag = tag
         self._sample_s = sample_s
         self._ledger = ledger
         self._exclude = exclude
+        self._max_irq_rate = max_irq_rate
         self._reservation: Reservation | None = None
 
     def __enter__(self) -> list[int]:
@@ -378,6 +383,7 @@ class reserve_cores:
             sample_s=self._sample_s,
             ledger=self._ledger,
             exclude=self._exclude,
+            max_irq_rate=self._max_irq_rate,
         )
         return self._reservation.cores
 

@@ -29,11 +29,11 @@ options:\n\
 fn command_help(command: &str) -> &'static str {
     match command {
         "run" => {
-            "usage: cpuset-alloc run --cores K [--tag STR] [--sample-s SECS] -- CMD [ARGS...]\n"
+            "usage: cpuset-alloc run --cores K [--tag STR] [--sample-s SECS] [--max-irq-rate RATE] -- CMD [ARGS...]\n"
         }
         "status" => "usage: cpuset-alloc status [--ledger FILE]\n",
         "reclaim" => "usage: cpuset-alloc reclaim [--ledger FILE]\n",
-        "selftest" => "usage: cpuset-alloc selftest [--cores K] [--sample-s SECS]\n",
+        "selftest" => "usage: cpuset-alloc selftest [--cores K] [--sample-s SECS] [--max-irq-rate RATE]\n",
         _ => usage(),
     }
 }
@@ -402,14 +402,27 @@ fn ledger_flag(args: &[String]) -> Result<Option<PathBuf>, String> {
     Ok(ledger)
 }
 
+/// Parsed `run`/`selftest` options. A named struct rather than a tuple so adding a knob does
+/// not silently renumber every call site's field access.
+struct CoreOptions {
+    cores: i64,
+    tag: String,
+    sample_s: f64,
+    max_irq_rate: Option<f64>,
+    command: Vec<String>,
+}
+
 fn parse_core_options(
     args: &[String],
     default_cores: Option<i64>,
     allow_tag: bool,
-) -> Result<(i64, String, f64, Vec<String>), String> {
+) -> Result<CoreOptions, String> {
     let mut cores = default_cores;
     let mut tag = String::new();
     let mut sample_s: f64 = 0.3;
+    // No default: a caller that knows its interrupt budget states it. Measurement showed any
+    // fixed threshold would misclassify a bursty signal, so the tool does not invent one.
+    let mut max_irq_rate: Option<f64> = None;
     let mut command = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -433,6 +446,13 @@ fn parse_core_options(
                     .parse()
                     .map_err(|_| format!("invalid --sample-s: {raw}"))?;
             }
+            "--max-irq-rate" => {
+                let raw = parse_value(args, &mut i, inline, key)?;
+                let value: f64 = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --max-irq-rate: {raw}"))?;
+                max_irq_rate = Some(value);
+            }
             other => return Err(format!("unrecognized argument: {other}")),
         }
         i += 1;
@@ -444,7 +464,18 @@ fn parse_core_options(
     if !sample_s.is_finite() || sample_s < 0.0 {
         return Err("--sample-s must be finite and >= 0".to_string());
     }
-    Ok((cores, tag, sample_s, command))
+    if let Some(value) = max_irq_rate {
+        if !value.is_finite() || value < 0.0 {
+            return Err("--max-irq-rate must be finite and >= 0".to_string());
+        }
+    }
+    Ok(CoreOptions {
+        cores,
+        tag,
+        sample_s,
+        max_irq_rate,
+        command,
+    })
 }
 
 fn wrapped_status(status: std::process::ExitStatus) -> i32 {
@@ -515,7 +546,13 @@ pub(crate) fn run_reserved_hard(
 }
 
 fn cmd_run(args: &[String]) -> i32 {
-    let (cores, tag, sample_s, command) = match parse_core_options(args, None, true) {
+    let CoreOptions {
+        cores,
+        tag,
+        sample_s,
+        max_irq_rate,
+        command,
+    } = match parse_core_options(args, None, true) {
         Ok(value) => value,
         Err(error) => return usage_error("run", &error),
     };
@@ -528,6 +565,7 @@ fn cmd_run(args: &[String]) -> i32 {
         sample_s,
         None,
         &std::collections::HashSet::new(),
+        max_irq_rate,
     ) {
         Ok(value) => value,
         Err(error) => return operational_error("run", &error),
@@ -538,7 +576,13 @@ fn cmd_run(args: &[String]) -> i32 {
 }
 
 fn cmd_selftest(args: &[String]) -> i32 {
-    let (cores, _tag, sample_s, command) = match parse_core_options(args, Some(2), false) {
+    let CoreOptions {
+        cores,
+        sample_s,
+        max_irq_rate,
+        command,
+        ..
+    } = match parse_core_options(args, Some(2), false) {
         Ok(value) => value,
         Err(error) => return usage_error("selftest", &error),
     };
@@ -558,6 +602,7 @@ fn cmd_selftest(args: &[String]) -> i32 {
         sample_s,
         None,
         &std::collections::HashSet::new(),
+        max_irq_rate,
     ) {
         Ok(value) => value,
         Err(error) => return operational_error("selftest", &error),
@@ -642,13 +687,34 @@ mod tests {
             "--cores=2".into(),
             "--tag=x".into(),
             "--sample-s=0.01".into(),
+            "--max-irq-rate=12.5".into(),
             "--".into(),
             "true".into(),
         ];
         let parsed = parse_core_options(&args, None, true).unwrap();
-        assert_eq!(parsed.0, 2);
-        assert_eq!(parsed.1, "x");
-        assert_eq!(parsed.3, vec!["true"]);
+        assert_eq!(parsed.cores, 2);
+        assert_eq!(parsed.tag, "x");
+        assert_eq!(parsed.max_irq_rate, Some(12.5));
+        assert_eq!(parsed.command, vec!["true"]);
+    }
+
+    #[test]
+    fn max_irq_rate_is_absent_by_default_and_validated_when_given() {
+        // No default: measurement showed a fixed threshold misclassifies a bursty signal.
+        let parsed = parse_core_options(&["--cores=1".into()], None, true).unwrap();
+        assert_eq!(parsed.max_irq_rate, None);
+        assert!(parse_core_options(
+            &["--cores=1".into(), "--max-irq-rate=-1".into()],
+            None,
+            true
+        )
+        .is_err());
+        assert!(parse_core_options(
+            &["--cores=1".into(), "--max-irq-rate=NaN".into()],
+            None,
+            true
+        )
+        .is_err());
     }
 
     #[test]
