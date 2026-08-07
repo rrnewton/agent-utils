@@ -1609,8 +1609,9 @@ def _frozen_project_overview_input(
     epoch = _knowledge_epoch_from_json(
         obj.get("knowledge_epoch"), f"{path}.knowledge_epoch"
     )
-    if team.window_end_ms is not None and epoch.cutoff_ms > team.window_end_ms:
-        return None
+    outside_window = (
+        team.window_end_ms is not None and epoch.cutoff_ms > team.window_end_ms
+    )
     source = as_object(obj.get("source"), f"{path}.source")
     _require_exact_keys(
         source,
@@ -1628,7 +1629,10 @@ def _frozen_project_overview_input(
     )
     if end_ms < start_ms or end_ms >= epoch.cutoff_ms:
         raise ValueError(f"{path}.source: timestamps escape the knowledge epoch")
-    current = _root_overview_input(team, epoch)
+    validation_team = (
+        load_archived_team(archive, team.team_slug) if outside_window else team
+    )
+    current = _root_overview_input(validation_team, epoch)
     if (
         current.event_ids != event_ids
         or current.start_ms != start_ms
@@ -1638,7 +1642,7 @@ def _frozen_project_overview_input(
         raise ValueError(
             f"{path}.source: frozen overview evidence was mutated or truncated"
         )
-    return current
+    return None if outside_window else current
 
 
 def _glossary_evidence_from_json(
@@ -2106,7 +2110,22 @@ def _load_agent_names(
         )
         if result.thread_id != agent.thread_id:
             raise ValueError(f"agent-name result thread mismatch at {path}")
-        results[agent.thread_id] = result
+        provenance = result.artifact_provenance
+        if provenance is not None and (
+            provenance.summarizer_id != AGENT_LIFETIME_SUMMARIZER.summarizer_id
+            or provenance.logical_key != f"agent-name:{agent.thread_id}"
+            or provenance.team_slug != team.team_slug
+            or provenance.input_hash != result.input_hash
+            or provenance.model != result.model
+            or provenance.prompt_version != result.prompt_version
+        ):
+            raise ValueError(f"{path}: agent-name provenance differs from result")
+        if team.window_end_ms is not None and (
+            provenance is None or provenance.end_ms > team.window_end_ms
+        ):
+            results[agent.thread_id] = _fallback_agent_name(agent)
+        else:
+            results[agent.thread_id] = result
     return results
 
 
@@ -2967,11 +2986,16 @@ def _validate_legacy_project_overview(
         as_string(value, f"{path}.source.event_ids[{index}]")
     as_int(source.get("start_ms"), f"{path}.source.start_ms")
     as_int(source.get("end_ms"), f"{path}.source.end_ms")
-    _nonempty_string(
+    expected_sha256 = _nonempty_string(
         source.get("context_sha256"), f"{path}.source.context_sha256"
     )
     if version == 2:
-        as_string(source.get("transcript"), f"{path}.source.transcript")
+        transcript = as_string(
+            source.get("transcript"), f"{path}.source.transcript"
+        )
+        actual_sha256 = hashlib.sha256(transcript.encode("utf-8")).hexdigest()
+        if actual_sha256 != expected_sha256:
+            raise ValueError(f"{path}.source: transcript digest mismatch")
     summary = _summary_from_json(root.get("summary"), f"{path}.summary")
     _validate_project_overview(summary, f"{path}.summary")
 
@@ -3006,6 +3030,8 @@ def _load_project_overview(
         )
     if version != _PROJECT_OVERVIEW_SCHEMA_VERSION:
         raise ValueError(f"{path}: unsupported project-overview schema; run summarize")
+    summary = _summary_from_json(root.get("summary"), f"{path}.summary")
+    _validate_project_overview(summary, f"{path}.summary")
     source = _frozen_project_overview_input(archive, team)
     if source is None:
         fallback_source = _root_overview_input(team)
@@ -3017,8 +3043,6 @@ def _load_project_overview(
             ),
             fallback_source,
         )
-    summary = _summary_from_json(root.get("summary"), f"{path}.summary")
-    _validate_project_overview(summary, f"{path}.summary")
     return summary, source
 
 
@@ -3174,6 +3198,52 @@ def _load_glossary(
     return () if suppress else tuple(result)
 
 
+def _load_rollup_projection(
+    path: Path, period: Period
+) -> tuple[SummaryResult, SummaryResult, bool]:
+    """Strictly validate one presentation projection before it can be suppressed."""
+
+    obj = as_object(read_json(path), str(path))
+    _require_exact_keys(
+        obj,
+        {
+            "schema_version",
+            "kind",
+            "key",
+            "start_ms",
+            "end_ms",
+            "partial",
+            "technical_summary",
+            "plain_language_summary",
+        },
+        str(path),
+    )
+    if as_int(obj.get("schema_version"), f"{path}.schema_version") != 2:
+        raise ValueError(
+            f"{path}: rollup lacks a plain-language summary; run summarize"
+        )
+    if (
+        as_string(obj.get("kind"), f"{path}.kind") != period.kind
+        or as_string(obj.get("key"), f"{path}.key") != period.key
+        or as_int(obj.get("start_ms"), f"{path}.start_ms") != period.start_ms
+        or as_int(obj.get("end_ms"), f"{path}.end_ms") != period.end_ms
+    ):
+        raise ValueError(f"{path}: rollup projection identity mismatch")
+    recorded_partial = obj.get("partial")
+    if not isinstance(recorded_partial, bool):
+        raise ValueError(f"{path}.partial: expected a boolean")
+    return (
+        _summary_from_json(
+            obj.get("technical_summary"), f"{path}.technical_summary"
+        ),
+        _summary_from_json(
+            obj.get("plain_language_summary"),
+            f"{path}.plain_language_summary",
+        ),
+        recorded_partial,
+    )
+
+
 def build_archive(
     archive: Path,
     team_slug: str,
@@ -3222,7 +3292,10 @@ def build_archive(
         )
         key = _period_key(period)
         rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
+        projection_missing = _summary_projection_missing(path)
         if display_window is not None and period.partial:
+            if not projection_missing:
+                _load_rollup_projection(path, period)
             rollup_results[key] = _unavailable_summary(
                 f"rollup:{period.kind}:{period.key}",
                 period.end_ms,
@@ -3234,7 +3307,7 @@ def build_archive(
                 f"partial plain-language {period.kind} rollup",
             )
             continue
-        if _summary_projection_missing(path):
+        if projection_missing:
             rollup_results[key] = _select_catalog_summary(
                 summary_root,
                 summary_catalog,
@@ -3258,17 +3331,21 @@ def build_archive(
                 ),
             )
             continue
-        obj = as_object(read_json(path), str(path))
-        if obj.get("schema_version") != 2:
-            raise ValueError(
-                f"{path}: rollup lacks a plain-language summary; run summarize"
+        projected_technical, projected_plain, recorded_partial = (
+            _load_rollup_projection(path, period)
+        )
+        if recorded_partial != period.partial:
+            rollup_results[key] = _unavailable_summary(
+                f"rollup:{period.kind}:{period.key}",
+                period.end_ms,
+                f"stale {period.kind} rollup",
             )
-        projected_technical = _summary_from_json(
-            obj.get("technical_summary"), f"{path}.technical_summary"
-        )
-        projected_plain = _summary_from_json(
-            obj.get("plain_language_summary"), f"{path}.plain_language_summary"
-        )
+            plain_rollup_results[key] = _unavailable_summary(
+                f"rollup-plain:{period.kind}:{period.key}",
+                period.end_ms,
+                f"stale plain-language {period.kind} rollup",
+            )
+            continue
         rollup_results[key] = _select_catalog_summary(
             summary_root,
             summary_catalog,

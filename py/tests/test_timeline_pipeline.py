@@ -1363,9 +1363,6 @@ def test_build_does_not_recover_future_catalog_knowledge_into_slice(
     team = _team()
     _write_team(tmp_path, team)
     summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
-    summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
-    (summary_root / "agents" / f"{CHILD}.json").unlink()
-    (summary_root / "project_overview.json").unlink()
     window = DateWindow(
         start_date=None,
         end_date=None,
@@ -1399,6 +1396,199 @@ def test_build_does_not_recover_future_catalog_knowledge_into_slice(
     )
     assert "no cached model summary" in timeline["project_overview"]["text"]
     assert timeline["glossary"] == []
+
+
+def test_build_validates_corrupt_partial_rollup_before_suppressing(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        rollup_kinds=("hourly",),
+    )
+    period = periods_for_range(
+        START,
+        START + 9_999,
+        team.display_timezone,
+        team.team_slug,
+        ("hourly",),
+    )[0]
+    rollup_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "rollups"
+        / "hourly"
+        / f"{period.key}.json"
+    )
+    write_json_if_changed(rollup_path, {"schema_version": 2})
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 10_000,
+        start_time="2026-03-31T23:33:20.000Z",
+        end_time="2026-03-31T23:33:30.000Z",
+    )
+
+    with pytest.raises(ValueError, match="schema mismatch"):
+        build_archive(
+            tmp_path,
+            team.team_slug,
+            display_window=window,
+            rollup_kinds=("hourly",),
+            output=tmp_path / "corrupt-partial-rollup-site",
+        )
+
+
+def test_build_does_not_render_stale_partial_rollup_as_complete(
+    tmp_path: Path,
+) -> None:
+    hour_ms = 60 * 60 * 1000
+    hour_start = (START // hour_ms) * hour_ms
+    hour_end = hour_start + hour_ms
+    team = replace(
+        _team(),
+        window_start_ms=hour_start,
+        window_end_ms=hour_end,
+    )
+    _write_team(tmp_path, team)
+    summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        rollup_kinds=("hourly",),
+    )
+    period = periods_for_range(
+        hour_start,
+        hour_end - 1,
+        team.display_timezone,
+        team.team_slug,
+        ("hourly",),
+    )[0]
+    assert not period.partial
+    rollup_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "rollups"
+        / "hourly"
+        / f"{period.key}.json"
+    )
+    rollup = json.loads(rollup_path.read_text(encoding="utf-8"))
+    rollup["partial"] = True
+    write_json_if_changed(rollup_path, rollup)
+
+    output = tmp_path / "stale-partial-rollup-site"
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        rollup_kinds=("hourly",),
+        output=output,
+    )
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert len(timeline["rollups"]) == 1
+    assert "Summary unavailable" in (
+        output / timeline["rollups"][0]["technical_path"]
+    ).read_text(encoding="utf-8")
+
+
+def test_build_validates_out_of_window_overview_source(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    overview_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "project_overview.json"
+    )
+    overview = json.loads(overview_path.read_text(encoding="utf-8"))
+    overview["source"]["context_sha256"] = "0" * 64
+    write_json_if_changed(overview_path, overview)
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 10_000,
+        start_time="2026-03-31T23:33:20.000Z",
+        end_time="2026-03-31T23:33:30.000Z",
+    )
+
+    with pytest.raises(ValueError, match="mutated or truncated"):
+        build_archive(
+            tmp_path,
+            team.team_slug,
+            display_window=window,
+            output=tmp_path / "corrupt-out-of-window-overview-site",
+        )
+
+
+def test_build_validates_out_of_window_overview_summary(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    overview_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "project_overview.json"
+    )
+    overview = json.loads(overview_path.read_text(encoding="utf-8"))
+    overview["summary"]["phrase"] = "corrupt evidence status"
+    write_json_if_changed(overview_path, overview)
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 10_000,
+        start_time="2026-03-31T23:33:20.000Z",
+        end_time="2026-03-31T23:33:30.000Z",
+    )
+
+    with pytest.raises(ValueError, match="invalid project-overview evidence status"):
+        build_archive(
+            tmp_path,
+            team.team_slug,
+            display_window=window,
+            output=tmp_path / "corrupt-out-of-window-summary-site",
+        )
+
+
+def test_build_validates_legacy_v2_overview_transcript_digest(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    overview_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "project_overview.json"
+    )
+    overview = json.loads(overview_path.read_text(encoding="utf-8"))
+    overview["schema_version"] = 2
+    overview["source"]["transcript"] = _root_overview_input(team).transcript
+    overview["source"]["context_sha256"] = "0" * 64
+    write_json_if_changed(overview_path, overview)
+
+    with pytest.raises(ValueError, match="transcript digest mismatch"):
+        build_archive(
+            tmp_path,
+            team.team_slug,
+            output=tmp_path / "corrupt-legacy-overview-site",
+        )
 
 
 def test_build_rejects_present_corrupt_overview_projection(tmp_path: Path) -> None:
