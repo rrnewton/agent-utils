@@ -10,6 +10,7 @@ import pytest
 
 from agent_team_timeline.codex_workspace import (
     CodexWorkspaceError,
+    codex_failure_detail,
     initialize_codex_workspace,
 )
 
@@ -113,3 +114,44 @@ def test_workspace_reports_initializer_failure(
 
     with pytest.raises(CodexWorkspaceError, match=expected):
         initialize_codex_workspace(tmp_path)
+
+
+def test_failure_detail_prefers_final_structured_provider_error() -> None:
+    provider_error = (
+        "unexpected status 404 Not Found: The API deployment for this resource "
+        "does not exist. If you created the deployment within the last 5 minutes, "
+        "please wait a moment and try again."
+    )
+    stdout = "\n".join(
+        (
+            '{"type":"thread.started","thread_id":"test"}',
+            '{"type":"error","message":"Reconnecting... 1/5 ('
+            + provider_error
+            + ')"}',
+            '{"type":"error","message":"Reconnecting... 5/5 ('
+            + provider_error
+            + ')"}',
+            '{"type":"turn.failed","error":{"message":"'
+            + provider_error
+            + '"}}',
+        )
+    )
+
+    detail = codex_failure_detail(
+        stdout,
+        "Codex CLI at Meta. Using AI Gateway. Promotional launcher banner.",
+    )
+
+    assert "404 Not Found" in detail
+    assert "does not exist" in detail
+    assert "turn.failed" in detail
+    assert "Promotional launcher banner" not in detail
+    assert len(detail) <= 320
+
+
+def test_failure_detail_retains_stderr_when_jsonl_has_no_diagnostic() -> None:
+    detail = codex_failure_detail(
+        '{"type":"thread.started","thread_id":"test"}\n',
+        "backend exited before the first response",
+    )
+    assert detail == "backend exited before the first response"

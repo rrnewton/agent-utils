@@ -47,23 +47,28 @@ def _bounded_head_tail(text: str, limit: int) -> str:
 
 
 def codex_failure_detail(stdout: str, stderr: str, *, limit: int = 320) -> str:
-    """Return bounded diagnostics without letting a launcher banner hide the tail."""
+    """Return the most actionable bounded backend diagnostic.
+
+    Codex JSONL commonly repeats reconnect errors before ending with a
+    ``turn.failed`` record, while launcher banners are written to stderr.  Keep
+    the final structured diagnostic by itself when one exists so a banner and
+    repeated retries cannot displace the HTTP status and provider message.
+    """
 
     stderr_detail = _one_line(stderr)
     stdout_lines = tuple(_one_line(line) for line in stdout.splitlines() if line.strip())
-    diagnostic_stdout = " ".join(
+    diagnostic_stdout = tuple(
         line
         for line in stdout_lines
         if any(hint in line.casefold() for hint in _DIAGNOSTIC_HINTS)
     )
-    parts: list[str] = []
-    if stderr_detail:
-        parts.append(stderr_detail)
     if diagnostic_stdout:
-        parts.append(f"stdout: {diagnostic_stdout}")
-    elif not stderr_detail and stdout_lines:
-        parts.append(" ".join(stdout_lines))
-    return _bounded_head_tail(" | ".join(parts), limit) if parts else ""
+        return _bounded_head_tail(f"stdout: {diagnostic_stdout[-1]}", limit)
+    if stderr_detail:
+        return _bounded_head_tail(stderr_detail, limit)
+    if stdout_lines:
+        return _bounded_head_tail(stdout_lines[-1], limit)
+    return ""
 
 
 def _run_initializer(command: tuple[str, ...], work_dir: Path, label: str) -> None:
