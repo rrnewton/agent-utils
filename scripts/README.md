@@ -9,6 +9,7 @@ These scripts enforce contracts that span otherwise independent packages:
 | `check_no_any.py` | Reject explicit `typing.Any` use at typed boundaries. |
 | `check_python_packages.py` | Build each wheel and sdist, rebuild from the sdist, then inspect, install, and smoke every Python distribution in isolation. |
 | `check_rust_packages.py` | Package and inspect each Rust crate in isolation. |
+| `agent-log-archive/fetch_agent_logs.sh` | Non-deleting, resumable local/SSH backup of agent-harness logs with per-run receipts. |
 
 Run the focused checks directly:
 
