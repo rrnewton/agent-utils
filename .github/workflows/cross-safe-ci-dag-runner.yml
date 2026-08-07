@@ -26,8 +26,12 @@ jobs:
     # Keep the complete repository test contract on a fresh runner. Running it after the build,
     # type, and lint contract repeatedly caused the hosted runner to disappear before it could
     # report any test result; the independent minimum-version suites remained green. This job
-    # still invokes the repository-owned target and must execute both nonzero suites.
+    # still invokes the repository-owned target and must execute both nonzero suites. Serialize
+    # Rust's release-mode test threads so process-tree and resource-cap tests cannot overlap each
+    # other's process-group teardown or deliberate memory pressure.
     runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
