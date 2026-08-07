@@ -33,12 +33,24 @@ check: check-deps mypy
 check-deps:
 	python3 scripts/check_deps.py
 
+TEST_SUITE ?= all
+ifneq ($(words $(TEST_SUITE)),1)
+$(error TEST_SUITE must be exactly one of: all, python, rust)
+endif
+ifeq ($(filter $(TEST_SUITE),all python rust),)
+$(error TEST_SUITE must be exactly one of: all, python, rust)
+endif
+
 test:
+ifneq ($(TEST_SUITE),rust)
 	cd py && python3 -m pytest -q
+endif
+ifneq ($(TEST_SUITE),python)
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	test -n "$$host_target"; \
 	cargo test --release --workspace --manifest-path rs/Cargo.toml \
 		--target "$$host_target"
+endif
 
 # Cross-language observable behavior for every paired command.
 cross:

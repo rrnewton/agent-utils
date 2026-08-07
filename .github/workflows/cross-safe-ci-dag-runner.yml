@@ -22,26 +22,32 @@ jobs:
       - name: verify registry artifacts on the declared MSRV
         run: python3 scripts/check_rust_packages.py
 
-  tests:
-    # Keep the complete repository test contract on a fresh runner. Running it after the build,
-    # type, and lint contract repeatedly caused the hosted runner to disappear before it could
-    # report any test result; the independent minimum-version suites remained green. This job
-    # still invokes the repository-owned target and must execute both nonzero suites. Serialize
-    # Rust's release-mode test threads so process-tree and resource-cap tests cannot overlap each
-    # other's process-group teardown or deliberate memory pressure.
+  tests-python:
+    # Carry the selected suite with the repository-owned test target. The union of this job and
+    # tests-rust is exactly the default `make test` contract, while each runner reports its own
+    # nonzero executed count instead of losing both results when one runner disappears.
     runs-on: ubuntu-latest
-    env:
-      RUST_TEST_THREADS: '1'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
       - name: install test dependencies
         run: python -m pip install --upgrade 'setuptools>=77' pytest pyyaml
-      - name: repository tests (nonzero Python and Rust suites)
-        run: make test
+      - name: repository tests (nonzero Python suite)
+        run: make test TEST_SUITE=python
+
+  tests-rust:
+    # Release-mode process-tree and resource-cap tests run serially so their process-group teardown
+    # and deliberate memory pressure cannot overlap. The suite condition is explicit in the log.
+    runs-on: ubuntu-latest
+    env:
+      RUST_TEST_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: repository tests (nonzero Rust suite)
+        run: make test TEST_SUITE=rust
 
   cross:
     runs-on: ubuntu-latest
