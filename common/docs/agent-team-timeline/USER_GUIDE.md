@@ -106,8 +106,8 @@ agent-team-timeline refresh \
   --project example-project=https://github.com/example/example-project \
   --source-host build-host-01 \
   --backend codex \
-  --model gpt-5.6-luna \
-  --reasoning-effort xhigh \
+  --model gpt-5.5 \
+  --reasoning-effort medium \
   --service-tier priority \
   --summary-workers 3 \
   --name-batch-size 12
@@ -223,9 +223,14 @@ counts; agent blocks and task notes provide incarnation lifetimes and timestampe
 ```bash
 agent-team-timeline summarize \
   --team example-team --output ./timelines/example-team \
-  --backend codex --model gpt-5.6-luna --reasoning-effort xhigh \
+  --backend codex --model gpt-5.5 --reasoning-effort medium \
   --service-tier priority
 ```
+
+The CLI defaults to `gpt-5.5` at `medium` reasoning effort. A provider or model failure stops the
+run and leaves its failure receipt; it never silently changes models or switches to the heuristic
+backend. Use `--model` or the
+`AGENT_TEAM_TIMELINE_MODEL` environment variable only when intentionally overriding that policy.
 
 Each stable time window gets a content-addressed cache key over:
 
@@ -302,7 +307,7 @@ agent-team-timeline summarize \
   --team example-team --output ./timelines/example-team \
   --summary-start-time 2026-08-07T02:00:00Z \
   --summary-end-time 2026-08-07T03:00:00Z \
-  --rollup-kind hourly --model gpt-5.6-luna
+  --rollup-kind hourly --model gpt-5.5 --reasoning-effort medium
 ```
 
 Repeat `--rollup-kind` to request several levels. Omitting it retains the daily, weekly, monthly,

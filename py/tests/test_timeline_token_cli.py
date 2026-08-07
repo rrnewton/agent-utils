@@ -126,3 +126,22 @@ def test_reasoning_effort_and_service_tier_reach_pipeline(
         ["summarize", "--output", str(tmp_path), "--team", "test-team"]
     )
     assert default_ns.service_tier is None
+
+
+def test_default_summary_model_is_supported_configuration(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    parser = timeline_cli._parser()
+    ns = parser.parse_args(
+        ["summarize", "--output", "unused", "--team", "test-team"]
+    )
+
+    assert ns.backend == "codex"
+    assert ns.model == "gpt-5.5"
+    assert ns.reasoning_effort == "medium"
+
+    with pytest.raises(SystemExit) as raised:
+        timeline_cli.main(["summarize", "--help"])
+    assert raised.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "instead of selecting another model or backend" in help_text

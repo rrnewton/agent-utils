@@ -37,9 +37,9 @@ from agent_team_timeline.token_usage import TokenUsage
 from agent_team_timeline.window import DateWindow, parse_date_window
 
 PROG = "agent-team-timeline"
-DEFAULT_MODEL = os.environ.get("AGENT_TEAM_TIMELINE_MODEL", "gpt-5.6-luna")
+DEFAULT_MODEL = os.environ.get("AGENT_TEAM_TIMELINE_MODEL", "gpt-5.5")
 DEFAULT_REASONING_EFFORT = os.environ.get(
-    "AGENT_TEAM_TIMELINE_REASONING_EFFORT", "xhigh"
+    "AGENT_TEAM_TIMELINE_REASONING_EFFORT", "medium"
 )
 
 
@@ -174,7 +174,8 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_REASONING_EFFORT,
         help=(
             "Codex reasoning effort, recorded in cache provenance "
-            "(default: %(default)s)"
+            "(default: %(default)s). "
+            "A model/provider failure aborts instead of selecting another model or backend"
         ),
     )
     parser.add_argument(

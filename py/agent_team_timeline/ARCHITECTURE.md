@@ -238,5 +238,5 @@ The durable archive must support independent summary selection from ingestion ra
 
 The proving target is all three teams from `2026-08-07T02:00:00Z` through
 `2026-08-07T11:00:00Z` (22:00 Aug. 6 through 07:00 Aug. 7 EDT). The first paid proving run is only
-the first hour and uses `gpt-5.6-luna`; provider failure must be reported rather than silently
-falling back to another model.
+the first hour and uses `gpt-5.5` at `medium` reasoning effort; provider failure must be reported
+rather than silently falling back to another model or backend.

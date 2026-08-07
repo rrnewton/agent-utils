@@ -66,6 +66,10 @@ corresponding actual total explicitly `UNKNOWN` instead of zero. Repeating `summ
 input uses cached results; repeating `build` only regenerates deterministic presentation files. Use
 `--backend heuristic --model deterministic-local` for an offline pipeline exercise.
 
+The default summary configuration is `gpt-5.5` with `--reasoning-effort medium`. A provider or
+model failure aborts the summary run and retains its failure receipt; the pipeline never silently
+substitutes another model or the heuristic backend.
+
 Summarization bounds are independent from ingestion. For example, backfill one exact hour without
 truncating durable normalized data:
 
@@ -73,7 +77,7 @@ truncating durable normalized data:
 agent-team-timeline summarize --output ./timelines/example-team --team example-team \
   --summary-start-time 2026-08-07T02:00:00Z \
   --summary-end-time 2026-08-07T03:00:00Z \
-  --rollup-kind hourly --model gpt-5.6-luna
+  --rollup-kind hourly --model gpt-5.5 --reasoning-effort medium
 ```
 
 After those cache entries exist, export the same zero-token website slice elsewhere with
