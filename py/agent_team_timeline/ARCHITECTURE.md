@@ -20,9 +20,13 @@ The durable archive and a website export are distinct concepts:
 - Rebuilding an export never invokes a model. Missing summaries degrade to normalized transcript
   and statistics rather than causing unrelated cached summaries to be discarded.
 
-The current implementation can store several teams in one archive, but `build` still renders one
-team at a time into the shared top-level site. Combined-team build selection and independent slice
-exports are therefore required before the Hermit archive is considered complete.
+`build` retains its single-team archive behavior. `export` accepts repeated `--team` values and
+composes those independently cached teams into one self-contained site. The compositor renders
+each team without model calls, namespaces thread, phase, edge, glossary, artifact, evidence, and
+detail identities by team, and aligns every track to one shared UTC interval. It merges team
+project/host identity, events, statistics, rollups, summaries, and artifact catalogs while keeping
+the team label on every filterable record. Repeating the same export is byte-idempotent; a managed
+file inventory removes only stale files from an earlier combined export.
 
 ## Cost boundary
 

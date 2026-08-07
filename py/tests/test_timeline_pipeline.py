@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed
+from agent_team_timeline.artifacts import extract_artifacts
+from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.github_enrich import pull_metadata_path
 from agent_team_timeline.github_metadata import (
     PullRequestKey,
@@ -28,6 +30,7 @@ from agent_team_timeline.model import (
     Turn,
     source_digest,
 )
+from agent_team_timeline.multi_team import build_combined_archive
 from agent_team_timeline.periods import Period, periods_for_range
 from agent_team_timeline.phases import PhaseStats, PhaseWindow, build_phases
 from agent_team_timeline.pipeline import (
@@ -1238,6 +1241,159 @@ def test_summary_window_can_backfill_one_hour_without_other_rollup_levels(
         START <= phase["start_ms"] < START + 20_000
         for phase in timeline["phases"]
     )
+
+
+def test_combined_export_namespaces_teams_and_is_byte_idempotent(
+    tmp_path: Path,
+) -> None:
+    first_team = _team(
+        "Reviewed https://github.com/example/project/pull/12 as part of the result."
+    )
+    second_team = replace(first_team, team_slug="claude-test", provider="claude")
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 20_000,
+        start_time="2026-04-01T00:00:00.000Z",
+        end_time="2026-04-01T00:00:20.000Z",
+    )
+    for team in (first_team, second_team):
+        _write_team(tmp_path, team)
+        write_json_if_changed(
+            tmp_path / "teams" / team.team_slug / "raw" / "artifacts.json",
+            narrow_json(extract_artifacts(team).to_json_obj()),
+        )
+        summarize_archive(
+            tmp_path,
+            team.team_slug,
+            "heuristic",
+            "offline",
+            summary_window=window,
+            rollup_kinds=("hourly",),
+        )
+    output = tmp_path / "combined"
+
+    first = build_combined_archive(
+        tmp_path,
+        ("claude-test", first_team.team_slug),
+        output=output,
+        display_timezone="America/New_York",
+        display_window=window,
+        rollup_kinds=("hourly",),
+    )
+    second = build_combined_archive(
+        tmp_path,
+        (first_team.team_slug, "claude-test"),
+        output=output,
+        display_timezone="America/New_York",
+        display_window=window,
+        rollup_kinds=("hourly",),
+    )
+
+    assert first["teams"] == 2
+    assert first["files_changed"] > 0
+    assert second["files_changed"] == 0
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert timeline["range"] == {"start_ms": START, "end_ms": START + 20_000}
+    assert [team["slug"] for team in timeline["teams"]] == [
+        "claude-test",
+        first_team.team_slug,
+    ]
+    assert {team["provider"] for team in timeline["teams"]} == {"claude", "codex"}
+    agent_ids = {agent["id"] for agent in timeline["agents"]}
+    assert len(agent_ids) == len(timeline["agents"])
+    assert all("::" in agent_id for agent_id in agent_ids)
+    assert all(phase["team"] in {"claude-test", first_team.team_slug} for phase in timeline["phases"])
+    assert all(phase["agent_id"] in agent_ids for phase in timeline["phases"])
+    assert all(edge["source_id"] in agent_ids for edge in timeline["edges"])
+    assert all(edge["target_id"] in agent_ids for edge in timeline["edges"])
+    assert {rollup["team"] for rollup in timeline["rollups"]} == {
+        "claude-test",
+        first_team.team_slug,
+    }
+    assert {rollup["kind"] for rollup in timeline["rollups"]} == {"hourly"}
+    assert {item["team"] for item in timeline["summary_files"]} == {
+        "claude-test",
+        first_team.team_slug,
+    }
+    for phase in timeline["phases"]:
+        detail_path = output / phase["detail_path"]
+        assert detail_path.is_file()
+        assert phase["detail_path"].startswith(f"data/details/{phase['team']}/")
+    assert (output / "Makefile").is_file()
+    assert (output / ".agent-team-timeline.json").is_file()
+    export_manifest = json.loads(
+        (output / "data" / "export.json").read_text(encoding="utf-8")
+    )
+    assert export_manifest["teams"] == ["claude-test", first_team.team_slug]
+    artifact_catalog = json.loads(
+        (output / "data" / "artifacts.json").read_text(encoding="utf-8")
+    )
+    artifact_ids = {
+        artifact["artifact_id"] for artifact in artifact_catalog["artifacts"]
+    }
+    assert len(artifact_ids) == 2
+    assert any(value.startswith("artifact-claude-test-") for value in artifact_ids)
+    assert any(
+        value.startswith(f"artifact-{first_team.team_slug}-")
+        for value in artifact_ids
+    )
+    assert {artifact["team"] for artifact in artifact_catalog["artifacts"]} == {
+        "claude-test",
+        first_team.team_slug,
+    }
+
+    assert timeline_main(
+        (
+            "export",
+            "--archive",
+            str(tmp_path),
+            "--output",
+            str(output),
+            "--team",
+            first_team.team_slug,
+            "--team",
+            "claude-test",
+            "--start-time",
+            "2026-03-31T23:33:20Z",
+            "--end-time",
+            "2026-03-31T23:33:40Z",
+            "--rollup-kind",
+            "hourly",
+            "--timezone",
+            "America/New_York",
+        )
+    ) == 0
+    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["teams"] == ["claude-test", first_team.team_slug]
+    run = json.loads(
+        (output / "runs" / f"{manifest['last_run_id']}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert run["team_slugs"] == ["claude-test", first_team.team_slug]
+
+
+def test_combined_export_refuses_unmarked_nonempty_output(tmp_path: Path) -> None:
+    team = _team()
+    other = replace(team, team_slug="claude-test", provider="claude")
+    for item in (team, other):
+        _write_team(tmp_path, item)
+    output = tmp_path / "not-an-archive"
+    output.mkdir()
+    (output / "valuable.txt").write_text("keep me\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="refusing non-empty non-archive"):
+        build_combined_archive(
+            tmp_path,
+            (team.team_slug, other.team_slug),
+            output=output,
+            display_timezone="UTC",
+        )
+    assert (output / "valuable.txt").read_text(encoding="utf-8") == "keep me\n"
 
 
 def test_agent_name_v1_projection_degrades_without_lifetime_summary(

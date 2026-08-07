@@ -174,6 +174,34 @@ def test_cli_accepts_exact_bounds_and_rejects_same_bound_date_mix() -> None:
     assert parsed.start_time == "2026-08-06T22:00:00-04:00"
     assert parsed.end_time == "2026-08-07T07:00:00-04:00"
 
+    exported = parser.parse_args(
+        (
+            "export",
+            "--archive",
+            "archive",
+            "--output",
+            "site",
+            "--team",
+            "codex-coord-030",
+            "--team",
+            "claude-coord-176",
+            "--team",
+            "orc-coord-014",
+            "--start-time",
+            "2026-08-06T22:00:00-04:00",
+            "--end-time",
+            "2026-08-07T07:00:00-04:00",
+            "--rollup-kind",
+            "hourly",
+        )
+    )
+    assert exported.team == [
+        "codex-coord-030",
+        "claude-coord-176",
+        "orc-coord-014",
+    ]
+    assert exported.rollup_kind == ["hourly"]
+
     with pytest.raises(SystemExit):
         parser.parse_args(
             (

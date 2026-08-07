@@ -79,7 +79,9 @@ agent-team-timeline summarize --output ./timelines/example-team --team example-t
 After those cache entries exist, export the same zero-token website slice elsewhere with
 `agent-team-timeline export --archive ./timelines/example-team --output ./hour-site --team
 example-team --start-time 2026-08-07T02:00:00Z --end-time 2026-08-07T03:00:00Z --rollup-kind
-hourly`.
+hourly`. Repeat `--team` to align several independently summarized teams on the same real-time
+axis; the generated site keeps team filters, identities, rollups, detail files, and artifact links
+collision-safe.
 
 Codex's catalog label **Fast** maps to `--service-tier priority`. Codex runs always override the
 child CLI with an effective tier: omission and explicit `default` both mean `default`, while a tier

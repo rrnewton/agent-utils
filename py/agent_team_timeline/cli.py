@@ -16,6 +16,7 @@ from agent_team_timeline.claude import ClaudeParseError
 from agent_team_timeline.codex import CodexParseError
 from agent_team_timeline.github_enrich import PullMetadataReport, enrich_pull_request_metadata
 from agent_team_timeline.identity import IdentityOverrides, parse_identity_overrides
+from agent_team_timeline.multi_team import build_combined_archive
 from agent_team_timeline.naming import AgentNameError
 from agent_team_timeline.orc import OrcParseError
 from agent_team_timeline.pipeline import (
@@ -311,7 +312,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     export.add_argument("--archive", required=True, help="durable source archive")
     export.add_argument("--output", required=True, help="website export directory")
-    export.add_argument("--team", required=True, help="team slug to export")
+    export.add_argument(
+        "--team",
+        action="append",
+        required=True,
+        help="team slug to export; repeat to align multiple teams in one site",
+    )
     export.add_argument("--phase-minutes", type=int, default=30)
     _add_export_selection(export)
     export.set_defaults(handler="export")
@@ -538,14 +544,23 @@ def _print_github_metadata(report: PullMetadataReport) -> None:
 
 
 def _export_selection(
-    ns: argparse.Namespace, archive: Path, team_slug: str
-) -> tuple[DateWindow | None, tuple[str, ...]]:
-    raw_timezone: object = ns.timezone
-    timezone_name = (
+    ns: argparse.Namespace, archive: Path, team_slugs: Sequence[str]
+) -> tuple[DateWindow | None, tuple[str, ...], str]:
+    if not team_slugs:
+        raise ValueError("at least one --team is required")
+    archived_timezones = {
         load_archived_team(archive, team_slug).display_timezone
-        if raw_timezone is None
-        else str(raw_timezone)
-    )
+        for team_slug in team_slugs
+    }
+    raw_timezone: object = ns.timezone
+    if raw_timezone is None:
+        if len(archived_timezones) != 1:
+            raise ValueError(
+                "teams use different display timezones; pass --timezone for one shared axis"
+            )
+        timezone_name = next(iter(archived_timezones))
+    else:
+        timezone_name = str(raw_timezone)
     window = parse_date_window(
         str(ns.start_date) if ns.start_date is not None else None,
         str(ns.end_date) if ns.end_date is not None else None,
@@ -563,7 +578,7 @@ def _export_selection(
         if raw_kinds
         else ("daily", "weekly", "monthly", "quarterly")
     )
-    return window, kinds
+    return window, kinds, timezone_name
 
 
 def _inspect(archive: Path) -> int:
@@ -617,20 +632,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     if handler == "export":
         source_archive = _path(str(ns.archive))
         target = _path(str(ns.output))
-        team_slug = str(ns.team)
+        raw_teams: object = ns.team
+        if not isinstance(raw_teams, list) or not all(
+            isinstance(item, str) for item in raw_teams
+        ):
+            raise ValueError("--team values must be strings")
+        team_slugs = tuple(raw_teams)
+        team_slug = team_slugs[0]
         started = utc_now()
         command = [PROG, *args]
         try:
-            window, rollup_kinds = _export_selection(
-                ns, source_archive, team_slug
+            window, rollup_kinds, display_timezone = _export_selection(
+                ns, source_archive, team_slugs
             )
-            export_report = build_archive(
-                source_archive,
-                team_slug,
-                phase_minutes=int(ns.phase_minutes),
-                display_window=window,
-                rollup_kinds=rollup_kinds,
-                output=target,
+            export_report = (
+                build_archive(
+                    source_archive,
+                    team_slug,
+                    phase_minutes=int(ns.phase_minutes),
+                    display_window=window,
+                    display_timezone=display_timezone,
+                    rollup_kinds=rollup_kinds,
+                    output=target,
+                )
+                if len(team_slugs) == 1
+                else build_combined_archive(
+                    source_archive,
+                    team_slugs,
+                    output=target,
+                    display_timezone=display_timezone,
+                    phase_minutes=int(ns.phase_minutes),
+                    display_window=window,
+                    rollup_kinds=rollup_kinds,
+                )
             )
             run_path = record_run(
                 target,
@@ -641,9 +675,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None,
                 None,
                 export_report,
+                team_slugs=team_slugs,
             )
             print(
-                f"export: {export_report['agents']} tracks, "
+                f"export: {len(team_slugs)} team(s), "
+                f"{export_report['agents']} tracks, "
                 f"{export_report['phases']} phases, "
                 f"{export_report['rollups']} rollups; "
                 f"{export_report['files_changed']} files changed"
@@ -663,6 +699,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     None,
                     None,
                     error=str(error),
+                    team_slugs=team_slugs,
                 )
                 print(f"run metadata: {run_path}", file=sys.stderr)
             except (OSError, ValueError):

@@ -210,6 +210,9 @@
   function glossaryMatches(value) {
     var candidates = [];
     app.glossaryById.forEach(function (entry, id) {
+      if (!selectedTeamAllows(entry)) {
+        return;
+      }
       var term = text(entry.term);
       if (!term) {
         return;
@@ -782,7 +785,6 @@
         return number(left.start_ms, 0) - number(right.start_ms, 0);
       });
     });
-    var glossaryTerms = new Set();
     data.glossary.forEach(function (entry) {
       if (!entry || typeof entry !== "object") {
         throw new Error("glossary entries must be objects");
@@ -792,11 +794,10 @@
       if (!id || !term || text(entry.url) !== "#glossary/" + id) {
         throw new Error("glossary entry has an invalid stable target");
       }
-      if (app.glossaryById.has(id) || glossaryTerms.has(term)) {
-        throw new Error("glossary contains a duplicate ID or exact term");
+      if (app.glossaryById.has(id)) {
+        throw new Error("glossary contains a duplicate ID");
       }
       app.glossaryById.set(id, entry);
-      glossaryTerms.add(term);
     });
     dom.glossaryOpen.hidden = !data.glossary.length && !data.glossary_path;
 
@@ -834,7 +835,9 @@
   }
 
   function populateSummaryFiles() {
-    var files = app.data.summary_files;
+    var files = app.data.summary_files.filter(function (file) {
+      return selectedTeamAllows(file);
+    });
     var children = [];
     if (!files.length) {
       children.push(htmlElement("p", "summary-files-empty", "No summary files in this dataset."));
@@ -842,7 +845,12 @@
       files.forEach(function (file) {
         var button = htmlElement("button", "summary-file-button");
         button.type = "button";
-        var kind = htmlElement("span", "summary-file-kind", text(file.kind, "summary"));
+        var team = text(file.team);
+        var kindLabel = text(file.kind, "summary");
+        if (!app.selectedTeam && team) {
+          kindLabel = team + " · " + kindLabel;
+        }
+        var kind = htmlElement("span", "summary-file-kind", kindLabel);
         var label = htmlElement(
           "span",
           "summary-file-label",
@@ -868,6 +876,18 @@
       .map(function (value) { return text(value); })
       .join(" ")
       .toLocaleLowerCase();
+  }
+
+  function selectedTeamAllows(item) {
+    if (!app.selectedTeam) {
+      return true;
+    }
+    var itemTeam = text(item && item.team);
+    if (itemTeam) {
+      return itemTeam === app.selectedTeam;
+    }
+    var teams = app.data ? array(app.data.teams) : [];
+    return teams.length === 1 && text(teams[0] && teams[0].slug) === app.selectedTeam;
   }
 
   function agentOfficialLeaf(agent) {
@@ -2179,7 +2199,10 @@
   }
 
   function renderRollups() {
-    if (!app.data.rollups.length) {
+    var visibleRollups = app.data.rollups.filter(function (rollup) {
+      return selectedTeamAllows(rollup);
+    });
+    if (!visibleRollups.length) {
       dom.rollupRow.hidden = true;
       dom.rollupTrack.replaceChildren();
       return;
@@ -2187,7 +2210,14 @@
     dom.rollupRow.hidden = false;
     var span = app.viewEnd - app.viewStart;
     var children = [];
+    var visibleTeams = Array.from(new Set(visibleRollups.map(function (rollup) {
+      return text(rollup.team);
+    }).filter(Boolean))).sort();
     app.data.rollups.forEach(function (rollup) {
+      var rollupTeam = text(rollup.team);
+      if (!selectedTeamAllows(rollup)) {
+        return;
+      }
       var start = number(rollup.start_ms, NaN);
       var end = number(rollup.end_ms, start);
       if (!Number.isFinite(start) || !Number.isFinite(end) ||
@@ -2211,12 +2241,28 @@
       button.type = "button";
       button.style.left = left.toFixed(2) + "px";
       button.style.width = width.toFixed(2) + "px";
-      button.textContent = width >= 36 ? text(rollup.label, kind) : "";
+      if (!app.selectedTeam && visibleTeams.length > 1 && rollupTeam) {
+        var teamIndex = visibleTeams.indexOf(rollupTeam);
+        var markerHeight = Math.max(4, Math.floor(18 / visibleTeams.length));
+        var baseTop = { daily: 3, weekly: 29, monthly: 55, quarterly: 81 }[kind];
+        button.style.top = (baseTop + Math.max(0, teamIndex) * markerHeight) + "px";
+        button.style.height = markerHeight + "px";
+        button.style.lineHeight = Math.max(4, markerHeight - 2) + "px";
+        button.style.padding = "0 2px";
+      }
+      var teamLabel = app.teamBySlug.has(rollupTeam)
+        ? text(app.teamBySlug.get(rollupTeam).label, rollupTeam)
+        : rollupTeam;
+      var markerLabel = text(rollup.label, kind);
+      button.textContent = width >= 36 && (!teamLabel || app.selectedTeam)
+        ? markerLabel
+        : "";
       button.setAttribute(
         "aria-label",
-        kind + " summary: " + text(rollup.label, formatRange(start, end))
+        (teamLabel ? teamLabel + " " : "") + kind + " summary: " +
+          text(rollup.label, formatRange(start, end))
       );
-      button.title = text(rollup.label, kind + " summary");
+      button.title = (teamLabel ? teamLabel + " · " : "") + markerLabel;
       button.dataset.startMs = String(start);
       button.dataset.endMs = String(end);
       button.dataset.rollupKind = kind;
@@ -3592,7 +3638,8 @@
       setGlossaryHash(id);
     }
     openModalBase(
-      "Project glossary · " + text(entry.week, "term"),
+      "Project glossary" + (text(entry.team) ? " · " + text(entry.team) : "") +
+        " · " + text(entry.week, "term"),
       text(entry.term, "Glossary entry"),
       "",
       null
@@ -3638,7 +3685,14 @@
     openModalBase("Project terminology", "Project glossary", "", null);
     var list = htmlElement("div", "glossary-list");
     app.glossaryById.forEach(function (entry) {
-      var link = htmlElement("a", "glossary-term-link", text(entry.term));
+      if (!selectedTeamAllows(entry)) {
+        return;
+      }
+      var entryLabel = text(entry.term);
+      if (!app.selectedTeam && text(entry.team)) {
+        entryLabel += " · " + text(entry.team);
+      }
+      var link = htmlElement("a", "glossary-term-link", entryLabel);
       link.href = "#glossary/" + glossaryId(entry.id);
       link.addEventListener("click", function (event) {
         event.preventDefault();
@@ -3674,7 +3728,8 @@
   function openRollupModal(rollup, kind, start, end) {
     app.detailRequest += 1;
     openModalBase(
-      kind + " rollup · " + formatRange(start, end),
+      (text(rollup.team) ? text(rollup.team) + " · " : "") +
+        kind + " rollup · " + formatRange(start, end),
       text(rollup.label, kind + " summary"),
       "",
       null
@@ -3737,6 +3792,7 @@
   dom.teamFilter.addEventListener("change", function () {
     app.selectedTeam = dom.teamFilter.value;
     dom.scroll.scrollTop = 0;
+    populateSummaryFiles();
     scheduleRender();
   });
 

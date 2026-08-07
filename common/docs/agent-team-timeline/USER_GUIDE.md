@@ -364,6 +364,24 @@ agent-team-timeline export \
 The export has its own archive marker, run receipt, Makefile, and local server launcher. It reads
 the durable archive but does not copy or truncate normalized source data and cannot invoke a model.
 
+Repeat `--team` to combine providers or machines in one aligned site. Every team receives the
+same half-open interval and rollup selection:
+
+```bash
+agent-team-timeline export \
+  --archive ~/agent_logs_archive/summary/example-project \
+  --output ./exports/example-project-overnight \
+  --team codex-project --team claude-project --team orc-project \
+  --start-time 2026-08-06T22:00:00-04:00 \
+  --end-time 2026-08-07T07:00:00-04:00 \
+  --rollup-kind hourly --timezone America/New_York
+```
+
+Combined exports namespace provider-owned identifiers and phase-detail paths by team, merge
+project and host identity, and preserve team labels for filters, rollups, summary files, events,
+and statistics. If archived teams disagree about their display timezone, pass one explicit
+`--timezone` for the shared axis.
+
 ### 4. Optional GitHub pull metadata — conditional and cached
 
 ```bash

@@ -2868,6 +2868,7 @@ def build_archive(
     *,
     phase_minutes: int = 30,
     display_window: DateWindow | None = None,
+    display_timezone: str | None = None,
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
     output: Path | None = None,
 ) -> dict[str, int]:
@@ -2876,6 +2877,14 @@ def build_archive(
     target = output or archive
     _ensure_archive(target, team_slug, create=output is not None)
     team = load_archived_team(archive, team_slug)
+    site_identity = load_site_identity(archive, team)
+    if display_timezone is not None:
+        team = replace(team, display_timezone=display_timezone)
+        site_identity = replace(
+            site_identity,
+            display_timezone=display_timezone,
+            display_timezone_source="export_override",
+        )
     if display_window is not None:
         team = apply_date_window(team, display_window)
     summary_root = _summary_root(archive, team_slug)
@@ -2946,7 +2955,6 @@ def build_archive(
         pull_metadata_path(archive, team_slug)
     )
     pull_metadata = {record.key: record for record in pull_cache.records}
-    site_identity = load_site_identity(archive, team)
     return render_archive(
         target,
         team,
@@ -2975,9 +2983,16 @@ def record_run(
     summaries: SummarizeReport | None,
     build: Mapping[str, int] | None,
     error: str | None = None,
+    *,
+    team_slugs: Sequence[str] = (),
 ) -> Path:
     """Append immutable run provenance and update the small archive manifest."""
 
+    recorded_teams = tuple(sorted(set(team_slugs or (team_slug,))))
+    if team_slug not in recorded_teams:
+        raise ValueError("primary run team must be present in team_slugs")
+    for recorded_team in recorded_teams:
+        _validate_team_slug(recorded_team)
     _ensure_archive(archive, team_slug, create=True)
     completed_at = utc_now()
     stamp = completed_at.replace("-", "").replace(":", "").replace(".", "")
@@ -2998,6 +3013,8 @@ def record_run(
         "build": {key: value for key, value in sorted((build or {}).items())},
         "error": error,
     }
+    if len(recorded_teams) > 1:
+        run_obj["team_slugs"] = list(recorded_teams)
     path = archive / "runs" / f"{run_id}.json"
     write_json_if_changed(path, run_obj)
     manifest_path = archive / "manifest.json"
@@ -3019,7 +3036,7 @@ def record_run(
         if isinstance(old_teams, list)
         else set()
     )
-    teams.add(team_slug)
+    teams.update(recorded_teams)
     team_values: list[JsonValue] = []
     for team in sorted(teams):
         team_values.append(team)
