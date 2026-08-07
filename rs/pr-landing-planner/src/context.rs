@@ -12,6 +12,8 @@ pub const AGENT_PREFIX: &str = "agent:";
 pub const POLICY_PREFIX: &str = "landing-policy:";
 /// Informational label indicating local validation without authoritative identity evidence.
 pub const LOCALLY_VALIDATED_LABEL: &str = "locally-validated";
+/// Review lanes required by the adversarial-review protocol.
+pub const REQUIRED_REVIEW_LANES: [&str; 2] = ["codex", "claude"];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Caller-owned facts for one PR, optionally guarded by fetched commit identities.
@@ -26,8 +28,17 @@ pub struct LandingContext {
     pub assigned_agent: String,
     /// Optional validation-evidence override.
     pub validation_evidence: Option<ValidationEvidence>,
+    /// Caller-verified review lane to exact reviewed-head SHA receipts.
+    pub review_pass_heads: BTreeMap<String, String>,
     /// Optional policy classification override.
     pub policy_class: Option<PolicyClass>,
+}
+
+fn is_exact_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Parse and validate a `{"prs": [...]}` landing-context document.
@@ -84,12 +95,31 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
                 "PR #{pr} clean-validate-record evidence requires exact 'head_sha' and 'base_sha'; revalidate and record both fetched identities"
             ));
         }
+        let mut review_pass_heads = BTreeMap::new();
+        if let Some(raw_heads) = item.get("review_pass_heads") {
+            let heads = raw_heads.as_object().ok_or_else(|| {
+                format!("PR #{pr} review_pass_heads must be an object mapping lane to exact SHA")
+            })?;
+            for (lane, raw_sha) in heads {
+                if !REQUIRED_REVIEW_LANES.contains(&lane.as_str()) {
+                    return Err(format!("PR #{pr} has unknown review lane {lane:?}"));
+                }
+                let sha = raw_sha.as_str().unwrap_or("");
+                if !is_exact_sha(sha) {
+                    return Err(format!(
+                        "PR #{pr} review_pass_heads[{lane:?}] must be an exact 40-character lowercase hex SHA"
+                    ));
+                }
+                review_pass_heads.insert(lane.clone(), sha.to_owned());
+            }
+        }
         contexts.push(LandingContext {
             pr,
             head_sha,
             base_sha,
             assigned_agent: string("assigned_agent"),
             validation_evidence: evidence,
+            review_pass_heads,
             policy_class: policy,
         });
     }
@@ -191,6 +221,8 @@ pub fn apply_landing_context(
             if let Some(evidence) = context.validation_evidence {
                 node.validation_evidence = evidence;
             }
+            node.review_pass_heads
+                .clone_from(&context.review_pass_heads);
             if let Some(policy) = context.policy_class {
                 node.policy_class = policy;
             }
@@ -202,7 +234,13 @@ pub fn apply_landing_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::{held_reasons, review_binding};
+    use crate::model::ReviewBinding;
     use serde_json::json;
+
+    const REVIEWED_HEAD: &str = "92e1e0d0af65e50cd2991d4deaa25f726832fbf4";
+    const REBASED_HEAD: &str = "0fc9f61edc01d6425def2efb0ed82f01410c7fcc";
+    const CHANGED_HEAD: &str = "1111111111111111111111111111111111111111";
 
     fn node(number: i64, head: &str, labels: &[&str]) -> PrNode {
         PrNode {
@@ -261,5 +299,84 @@ mod tests {
         assert!(apply_landing_context(vec![duplicate], &[])
             .unwrap_err()
             .contains("multiple agent labels"));
+    }
+
+    #[test]
+    fn review_passes_bind_exact_head_and_head_moves_fail_closed() {
+        let labels = [
+            "post-facto-human-review",
+            "passed-review-codex",
+            "passed-review-claude",
+        ];
+        let exact = parse_landing_context(&json!({"prs":[{
+            "pr":394,
+            "review_pass_heads":{
+                "codex":REBASED_HEAD,
+                "claude":REBASED_HEAD
+            }
+        }]}))
+        .unwrap();
+        let exact_node = apply_landing_context(vec![node(394, REBASED_HEAD, &labels)], &exact)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            review_binding(&exact_node),
+            (ReviewBinding::ExactHead, vec![])
+        );
+        assert!(held_reasons(&[exact_node], &[]).is_empty());
+
+        let stale = parse_landing_context(&json!({"prs":[{
+            "pr":394,
+            "review_pass_heads":{
+                "codex":REBASED_HEAD,
+                "claude":REVIEWED_HEAD
+            }
+        }]}))
+        .unwrap();
+        let stale_node = apply_landing_context(vec![node(394, REBASED_HEAD, &labels)], &stale)
+            .unwrap()
+            .remove(0);
+        let (binding, reasons) = review_binding(&stale_node);
+        assert_eq!(binding, ReviewBinding::Stale);
+        assert_eq!(
+            reasons,
+            vec![format!(
+                "review-pass-stale:claude:reviewed={REVIEWED_HEAD}:current={REBASED_HEAD}"
+            )]
+        );
+        assert_eq!(held_reasons(&[stale_node], &[])[0].reasons, reasons);
+
+        let changed_node = apply_landing_context(vec![node(394, CHANGED_HEAD, &labels)], &stale)
+            .unwrap()
+            .remove(0);
+        assert_eq!(review_binding(&changed_node).0, ReviewBinding::Stale);
+    }
+
+    #[test]
+    fn review_pass_labels_without_receipts_are_unbound_and_bad_receipts_refuse() {
+        let labels = [
+            "post-facto-human-review",
+            "passed-review-codex",
+            "passed-review-claude",
+        ];
+        let unbound = apply_landing_context(vec![node(394, REBASED_HEAD, &labels)], &[])
+            .unwrap()
+            .remove(0);
+        assert_eq!(review_binding(&unbound).0, ReviewBinding::Unbound);
+
+        let malformed = json!({"prs":[{
+            "pr":394,
+            "review_pass_heads":{"claude":"0fc9f61e"}
+        }]});
+        assert!(parse_landing_context(&malformed)
+            .unwrap_err()
+            .contains("exact 40-character lowercase hex SHA"));
+        let unknown = json!({"prs":[{
+            "pr":394,
+            "review_pass_heads":{"other":REBASED_HEAD}
+        }]});
+        assert!(parse_landing_context(&unknown)
+            .unwrap_err()
+            .contains("unknown review lane"));
     }
 }

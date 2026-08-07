@@ -1,8 +1,8 @@
 """Pure parsing and application of caller-supplied landing context.
 
-GitHub exposes checks and labels, but an external coordinator owns three facts the
-generic planner cannot infer: an exact-head/base local validation record, the assigned
-landing agent, and whether a change alters gate policy.  ``--landing-context``
+GitHub exposes checks and labels, but an external coordinator owns facts the generic
+planner cannot infer: an exact-head/base local validation record, exact-head review
+receipts, the assigned landing agent, and whether a change alters gate policy. ``--landing-context``
 supplies those facts without baking one project's ledger or task system into this
 package.
 """
@@ -22,6 +22,7 @@ from pr_landing_planner.model import (
 AGENT_PREFIX = "agent:"
 POLICY_PREFIX = "landing-policy:"
 LOCALLY_VALIDATED_LABEL = "locally-validated"
+REQUIRED_REVIEW_LANES = ("codex", "claude")
 
 
 @dataclass(frozen=True)
@@ -33,12 +34,17 @@ class LandingContext:
     base_sha: str = ""
     assigned_agent: str = ""
     validation_evidence: ValidationEvidence | None = None
+    review_pass_heads: tuple[tuple[str, str], ...] = ()
     policy_class: PolicyClass | None = None
 
 
 def _str_field(obj: Mapping[str, object], key: str) -> str:
     value = obj.get(key)
     return value if isinstance(value, str) else ""
+
+
+def _exact_sha(value: str) -> bool:
+    return len(value) == 40 and all(char in "0123456789abcdef" for char in value)
 
 
 def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
@@ -84,6 +90,23 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
                 f"PR #{pr} clean-validate-record evidence requires exact 'head_sha' "
                 "and 'base_sha'; revalidate and record both fetched identities"
             )
+        raw_review_pass_heads = obj.get("review_pass_heads", {})
+        if not isinstance(raw_review_pass_heads, dict):
+            raise ValueError(
+                f"PR #{pr} review_pass_heads must be an object mapping lane to exact SHA"
+            )
+        review_pass_heads: list[tuple[str, str]] = []
+        for raw_lane, raw_sha in raw_review_pass_heads.items():
+            lane = raw_lane if isinstance(raw_lane, str) else ""
+            if lane not in REQUIRED_REVIEW_LANES:
+                raise ValueError(f"PR #{pr} has unknown review lane {lane!r}")
+            sha = raw_sha if isinstance(raw_sha, str) else ""
+            if not _exact_sha(sha):
+                raise ValueError(
+                    f"PR #{pr} review_pass_heads[{lane!r}] must be an exact "
+                    "40-character lowercase hex SHA"
+                )
+            review_pass_heads.append((lane, sha))
         contexts.append(
             LandingContext(
                 pr=pr,
@@ -91,6 +114,7 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
                 base_sha=base_sha,
                 assigned_agent=_str_field(obj, "assigned_agent"),
                 validation_evidence=evidence,
+                review_pass_heads=tuple(sorted(review_pass_heads)),
                 policy_class=policy,
             )
         )
@@ -173,6 +197,7 @@ def apply_landing_context(
                     if context.validation_evidence is not None
                     else node.validation_evidence
                 ),
+                review_pass_heads=context.review_pass_heads,
                 policy_class=(
                     context.policy_class
                     if context.policy_class is not None

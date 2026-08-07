@@ -1,6 +1,6 @@
 //! Core vocabulary: pure data and enums, with no I/O.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Empty repository default, forcing live callers to choose one explicitly.
 pub const DEFAULT_REPO: &str = "";
@@ -142,6 +142,35 @@ impl ValidationEvidence {
             "locally-validated" => Some(Self::LocallyValidated),
             "clean-validate-record" => Some(Self::CleanValidateRecord),
             _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Binding state of required adversarial-review PASS receipts.
+pub enum ReviewBinding {
+    /// No review-protocol label or receipt is present.
+    #[default]
+    NotRequired,
+    /// One or more required review lanes have no PASS label.
+    Missing,
+    /// A PASS label exists without a receipt naming the reviewed head SHA.
+    Unbound,
+    /// A PASS receipt names a head other than the current fetched head.
+    Stale,
+    /// Every required lane has a PASS label and receipt for the current head.
+    ExactHead,
+}
+
+impl ReviewBinding {
+    /// Return the stable machine-facing value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not-required",
+            Self::Missing => "missing",
+            Self::Unbound => "unbound",
+            Self::Stale => "stale",
+            Self::ExactHead => "exact-head",
         }
     }
 }
@@ -310,6 +339,8 @@ pub struct PrNode {
     pub assigned_agent: String,
     /// Validation evidence associated with this snapshot.
     pub validation_evidence: ValidationEvidence,
+    /// Caller-verified review lane to exact reviewed-head SHA receipts.
+    pub review_pass_heads: BTreeMap<String, String>,
     /// Landing-policy classification.
     pub policy_class: PolicyClass,
 }

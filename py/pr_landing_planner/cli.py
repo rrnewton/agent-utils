@@ -217,7 +217,7 @@ def _quickstart(c: Palette) -> str:
   --batch                                         also propose one green, conflict/dependency-free batch
   --archive-dir DIR / --no-archive                archive the plan JSON to disk (on by default for
                                                   live runs; path printed as a NOTE on stderr)
-  --landing-context FILE                          exact head/base evidence / policy / assigned agent
+  --landing-context FILE                          exact validation/review evidence / policy / agent
 
 {h('Exit codes')}  0 = ok | 2 = bad usage / host or fixture error
 

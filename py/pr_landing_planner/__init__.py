@@ -45,6 +45,7 @@ from pr_landing_planner.graph import (
     build_stacks,
     held_reasons,
     partition_parallel_safe,
+    review_binding,
     transitive_reduce,
 )
 from pr_landing_planner.host import VcsHost
@@ -67,6 +68,7 @@ from pr_landing_planner.model import (
     PolicyClass,
     RawPr,
     RedClass,
+    ReviewBinding,
     ValidationEvidence,
 )
 from pr_landing_planner.plan import assemble_result, compute_plan
@@ -100,6 +102,7 @@ __all__ = [
     "PolicyClass",
     "RawPr",
     "RedClass",
+    "ReviewBinding",
     "ValidationEvidence",
     # classify
     "ClassifyConfig",
@@ -112,6 +115,7 @@ __all__ = [
     "build_stacks",
     "held_reasons",
     "partition_parallel_safe",
+    "review_binding",
     "transitive_reduce",
     # collect
     "collect_graph",

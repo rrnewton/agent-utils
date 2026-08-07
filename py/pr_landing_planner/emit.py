@@ -13,7 +13,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Callable
 
-from pr_landing_planner.graph import cluster_by_conflict, rebases_avoided
+from pr_landing_planner.graph import cluster_by_conflict, rebases_avoided, review_binding
 from pr_landing_planner.model import (
     CiState,
     Cluster,
@@ -83,6 +83,8 @@ def _node_obj(node: PrNode, held: bool) -> dict[str, object]:
         "validation_evidence": node.validation_evidence.value,
         "policy_class": node.policy_class.value,
         "review_decision": node.review_decision or None,
+        "review_binding": review_binding(node)[0].value,
+        "review_pass_heads": dict(node.review_pass_heads),
     }
 
 

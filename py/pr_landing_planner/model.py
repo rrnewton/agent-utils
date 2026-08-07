@@ -86,6 +86,16 @@ class ValidationEvidence(Enum):
     CLEAN_VALIDATE_RECORD = "clean-validate-record"
 
 
+class ReviewBinding(Enum):
+    """Whether required adversarial-review PASS receipts bind to the current head."""
+
+    NOT_REQUIRED = "not-required"
+    MISSING = "missing"
+    UNBOUND = "unbound"
+    STALE = "stale"
+    EXACT_HEAD = "exact-head"
+
+
 class PolicyClass(Enum):
     """Whether a change is routine CI hygiene or changes the gate policy itself."""
 
@@ -195,6 +205,7 @@ class PrNode:
     priority: int = 0
     assigned_agent: str = ""
     validation_evidence: ValidationEvidence = ValidationEvidence.NONE
+    review_pass_heads: tuple[tuple[str, str], ...] = ()
     policy_class: PolicyClass = PolicyClass.UNCLASSIFIED
 
     @property
