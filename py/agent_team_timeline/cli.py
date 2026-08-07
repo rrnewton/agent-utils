@@ -25,6 +25,7 @@ from agent_team_timeline.pipeline import (
     ingest_claude,
     ingest_codex,
     ingest_orc,
+    load_archived_team,
     record_run,
     summarize_archive,
     utc_now,
@@ -32,7 +33,7 @@ from agent_team_timeline.pipeline import (
 from agent_team_timeline.server import serve
 from agent_team_timeline.summarize import SummaryError
 from agent_team_timeline.token_usage import TokenUsage
-from agent_team_timeline.window import parse_date_window
+from agent_team_timeline.window import DateWindow, parse_date_window
 
 PROG = "agent-team-timeline"
 DEFAULT_MODEL = os.environ.get("AGENT_TEAM_TIMELINE_MODEL", "gpt-5.6-luna")
@@ -197,6 +198,39 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--codex-command", default="codex", help="Codex executable (primarily for testing/wrappers)"
     )
+    summary_start = parser.add_mutually_exclusive_group()
+    summary_start.add_argument(
+        "--summary-start-date",
+        help="first local date to summarize without truncating archived data",
+    )
+    summary_start.add_argument(
+        "--summary-start-time",
+        help="first RFC3339 instant to summarize, inclusive",
+    )
+    summary_end = parser.add_mutually_exclusive_group()
+    summary_end.add_argument(
+        "--summary-end-date",
+        help="local date boundary where summarization stops, exclusive",
+    )
+    summary_end.add_argument(
+        "--summary-end-time",
+        help="RFC3339 instant where summarization stops, exclusive",
+    )
+    parser.add_argument(
+        "--summary-timezone",
+        default=None,
+        help="IANA timezone for summary date bounds (defaults to the archived team timezone)",
+    )
+    parser.add_argument(
+        "--rollup-kind",
+        action="append",
+        choices=("hourly", "daily", "weekly", "monthly", "quarterly"),
+        default=[],
+        help=(
+            "calendar summary level to generate; repeat as needed "
+            "(default: daily, weekly, monthly, quarterly)"
+        ),
+    )
 
 
 def _add_github_options(parser: argparse.ArgumentParser) -> None:
@@ -210,6 +244,27 @@ def _add_github_options(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=15.0,
         help="per-request GitHub API timeout in seconds (default: %(default)s)",
+    )
+
+
+def _add_export_selection(parser: argparse.ArgumentParser) -> None:
+    start = parser.add_mutually_exclusive_group()
+    start.add_argument("--start-date", help="first local date to export")
+    start.add_argument("--start-time", help="first RFC3339 instant to export")
+    end = parser.add_mutually_exclusive_group()
+    end.add_argument("--end-date", help="exclusive local date boundary")
+    end.add_argument("--end-time", help="exclusive RFC3339 instant")
+    parser.add_argument(
+        "--timezone",
+        default=None,
+        help="IANA timezone for date bounds (defaults to the archived team timezone)",
+    )
+    parser.add_argument(
+        "--rollup-kind",
+        action="append",
+        choices=("hourly", "daily", "weekly", "monthly", "quarterly"),
+        default=[],
+        help="calendar summary level to include; repeat as needed",
     )
 
 
@@ -250,6 +305,16 @@ def _parser() -> argparse.ArgumentParser:
     _add_archive(build)
     build.add_argument("--phase-minutes", type=int, default=30)
     build.set_defaults(handler="build")
+
+    export = sub.add_parser(
+        "export", help="build a zero-token website slice in a separate directory"
+    )
+    export.add_argument("--archive", required=True, help="durable source archive")
+    export.add_argument("--output", required=True, help="website export directory")
+    export.add_argument("--team", required=True, help="team slug to export")
+    export.add_argument("--phase-minutes", type=int, default=30)
+    _add_export_selection(export)
+    export.set_defaults(handler="export")
 
     refresh = sub.add_parser("refresh", help="idempotent ingest + summarize + build")
     _add_ingest(refresh)
@@ -314,8 +379,50 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
     service_tier = (
         None if raw_service_tier is None else str(raw_service_tier)
     )
+    archive = _path(str(ns.output))
+    raw_summary_timezone: object = ns.summary_timezone
+    has_summary_date_bound = (
+        ns.summary_start_date is not None or ns.summary_end_date is not None
+    )
+    if raw_summary_timezone is None and has_summary_date_bound:
+        summary_timezone = load_archived_team(
+            archive, str(ns.team)
+        ).display_timezone
+    elif raw_summary_timezone is None:
+        summary_timezone = "UTC"
+    else:
+        summary_timezone = str(raw_summary_timezone)
+    summary_window = parse_date_window(
+        (
+            str(ns.summary_start_date)
+            if ns.summary_start_date is not None
+            else None
+        ),
+        str(ns.summary_end_date) if ns.summary_end_date is not None else None,
+        summary_timezone,
+        start_time=(
+            str(ns.summary_start_time)
+            if ns.summary_start_time is not None
+            else None
+        ),
+        end_time=(
+            str(ns.summary_end_time)
+            if ns.summary_end_time is not None
+            else None
+        ),
+    )
+    raw_rollup_kinds: object = ns.rollup_kind
+    if not isinstance(raw_rollup_kinds, list) or not all(
+        isinstance(item, str) for item in raw_rollup_kinds
+    ):
+        raise ValueError("--rollup-kind values must be strings")
+    rollup_kinds = (
+        tuple(raw_rollup_kinds)
+        if raw_rollup_kinds
+        else ("daily", "weekly", "monthly", "quarterly")
+    )
     return summarize_archive(
-        _path(str(ns.output)),
+        archive,
         str(ns.team),
         str(ns.backend),
         str(ns.model),
@@ -328,6 +435,8 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
         codex_command=(str(ns.codex_command),),
         reasoning_effort=str(ns.reasoning_effort),
         service_tier=service_tier,
+        summary_window=summary_window,
+        rollup_kinds=rollup_kinds,
     )
 
 
@@ -372,7 +481,8 @@ def _print_summaries(report: SummarizeReport) -> None:
         f"{report.rollups} calendar periods × 2 summary audiences; "
         f"cache {report.cache_hits} hit / {report.cache_misses} miss in "
         f"{report.backend_batches} backend batch(es); {report.project_overviews} project overview + "
-        f"{report.glossary_definitions} glossary definitions"
+        f"{report.glossary_definitions} glossary definitions; "
+        f"catalog {report.catalog_artifacts} immutable artifacts"
     )
     print(
         _usage_line(
@@ -427,6 +537,35 @@ def _print_github_metadata(report: PullMetadataReport) -> None:
     )
 
 
+def _export_selection(
+    ns: argparse.Namespace, archive: Path, team_slug: str
+) -> tuple[DateWindow | None, tuple[str, ...]]:
+    raw_timezone: object = ns.timezone
+    timezone_name = (
+        load_archived_team(archive, team_slug).display_timezone
+        if raw_timezone is None
+        else str(raw_timezone)
+    )
+    window = parse_date_window(
+        str(ns.start_date) if ns.start_date is not None else None,
+        str(ns.end_date) if ns.end_date is not None else None,
+        timezone_name,
+        start_time=str(ns.start_time) if ns.start_time is not None else None,
+        end_time=str(ns.end_time) if ns.end_time is not None else None,
+    )
+    raw_kinds: object = ns.rollup_kind
+    if not isinstance(raw_kinds, list) or not all(
+        isinstance(item, str) for item in raw_kinds
+    ):
+        raise ValueError("--rollup-kind values must be strings")
+    kinds = (
+        tuple(raw_kinds)
+        if raw_kinds
+        else ("daily", "weekly", "monthly", "quarterly")
+    )
+    return window, kinds
+
+
 def _inspect(archive: Path) -> int:
     timeline_path = archive / "data" / "timeline.json"
     manifest_path = archive / "manifest.json"
@@ -473,6 +612,61 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return _inspect(_path(str(ns.output)))
         except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "export":
+        source_archive = _path(str(ns.archive))
+        target = _path(str(ns.output))
+        team_slug = str(ns.team)
+        started = utc_now()
+        command = [PROG, *args]
+        try:
+            window, rollup_kinds = _export_selection(
+                ns, source_archive, team_slug
+            )
+            export_report = build_archive(
+                source_archive,
+                team_slug,
+                phase_minutes=int(ns.phase_minutes),
+                display_window=window,
+                rollup_kinds=rollup_kinds,
+                output=target,
+            )
+            run_path = record_run(
+                target,
+                command,
+                started,
+                "completed",
+                team_slug,
+                None,
+                None,
+                export_report,
+            )
+            print(
+                f"export: {export_report['agents']} tracks, "
+                f"{export_report['phases']} phases, "
+                f"{export_report['rollups']} rollups; "
+                f"{export_report['files_changed']} files changed"
+            )
+            print(f"run metadata: {run_path}")
+            print(f"open: cd {target} && make serve")
+            return 0
+        except (OSError, ValueError) as error:
+            try:
+                run_path = record_run(
+                    target,
+                    command,
+                    started,
+                    "failed",
+                    team_slug,
+                    None,
+                    None,
+                    None,
+                    error=str(error),
+                )
+                print(f"run metadata: {run_path}", file=sys.stderr)
+            except (OSError, ValueError):
+                pass
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
 

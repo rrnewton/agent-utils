@@ -321,7 +321,7 @@ TECHNICAL_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
         "aggregate activity statistics",
     ),
     output_fields=("phrase", "paragraph", "work_summary"),
-    granularities=("daily", "weekly", "monthly", "quarterly"),
+    granularities=("hourly", "daily", "weekly", "monthly", "quarterly"),
     changelog=(
         SummarizerChange(
             1,
@@ -353,7 +353,7 @@ PLAIN_LANGUAGE_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
         "aggregate activity statistics",
     ),
     output_fields=("phrase", "paragraph", "work_summary"),
-    granularities=("daily", "weekly", "monthly", "quarterly"),
+    granularities=("hourly", "daily", "weekly", "monthly", "quarterly"),
     changelog=(
         SummarizerChange(
             1,

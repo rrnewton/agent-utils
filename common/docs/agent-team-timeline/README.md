@@ -3,7 +3,7 @@
 Build a self-contained, zoomable website from Codex, Claude Code, or Orc coordinator and subagent
 transcripts. Provider importers reconstruct the fork/join tree, agent lifetimes, tool/wait/idle
 intervals, interaction edges, and full message views; cached model summaries add phrase,
-paragraph, daily, weekly, monthly, and quarterly levels of detail.
+paragraph, hourly, daily, weekly, monthly, and quarterly levels of detail.
 
 The generated archive is ordinary JSON and Markdown plus dependency-free HTML/CSS/JavaScript. It
 is designed to be committed, backed up, copied to another machine, and served with Python's built-in
@@ -17,14 +17,15 @@ web server.
 - Hindsight short names and lifetime summaries grounded in completed work while retaining official
   paths and coordinator nicknames.
 - Phrase, paragraph, cultivated work-summary, condensed-transcript, and rendered Markdown views.
-- Separate technical and newcomer-oriented plain-language summaries for every day, week, month,
-  and quarter, with an in-modal audience switch.
+- Separate technical and newcomer-oriented plain-language summaries for selected hours, days,
+  weeks, months, and quarters, with an in-modal audience switch.
 - A durable newcomer project overview and model-backed glossary definitions, each bounded by
   immutable retained source evidence, with append-stable availability and verified links from
   recognized terms.
 - A linked site title grounded in structured repository metadata, with durable multi-project and
   multi-host identity plus explicit provenance.
-- Content-addressed model caches, append-only raw-log snapshots, and immutable run receipts.
+- Versioned content-addressed model caches, a logical-key artifact catalog with context-quality
+  scores, append-only raw-log snapshots, and immutable run receipts.
 - A self-contained static website served by a built-in loopback server, with no CDN dependency.
 
 Install from the package index:
@@ -64,6 +65,21 @@ are attributed to successful and failed summarize invocations; any usage-less re
 corresponding actual total explicitly `UNKNOWN` instead of zero. Repeating `summarize` on unchanged
 input uses cached results; repeating `build` only regenerates deterministic presentation files. Use
 `--backend heuristic --model deterministic-local` for an offline pipeline exercise.
+
+Summarization bounds are independent from ingestion. For example, backfill one exact hour without
+truncating durable normalized data:
+
+```bash
+agent-team-timeline summarize --output ./timelines/example-team --team example-team \
+  --summary-start-time 2026-08-07T02:00:00Z \
+  --summary-end-time 2026-08-07T03:00:00Z \
+  --rollup-kind hourly --model gpt-5.6-luna
+```
+
+After those cache entries exist, export the same zero-token website slice elsewhere with
+`agent-team-timeline export --archive ./timelines/example-team --output ./hour-site --team
+example-team --start-time 2026-08-07T02:00:00Z --end-time 2026-08-07T03:00:00Z --rollup-kind
+hourly`.
 
 Codex's catalog label **Fast** maps to `--service-tier priority`. Codex runs always override the
 child CLI with an effective tier: omission and explicit `default` both mean `default`, while a tier

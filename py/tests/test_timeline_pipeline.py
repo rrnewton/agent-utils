@@ -35,6 +35,7 @@ from agent_team_timeline.pipeline import (
     _agent_name_jobs,
     _definition_evidence,
     _glossary_terms,
+    _load_agent_names,
     _root_overview_input,
     _rollup_jobs_for_level,
     build_archive,
@@ -45,6 +46,7 @@ from agent_team_timeline.pipeline import (
 from agent_team_timeline.server import make_server
 from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
+from agent_team_timeline.window import DateWindow
 
 
 ROOT = "00000000-0000-0000-0000-000000000001"
@@ -255,6 +257,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         + first.project_overviews
         + first.glossary_definitions
     )
+    assert first.catalog_artifacts == first.cache_misses
     assert first.backend == "heuristic"
     assert first.model == "test-model"
     assert first.reasoning_effort == "high"
@@ -356,6 +359,26 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         "project-overview-v2"
     )
     assert overview_record["summary"]["phrase"] == "Insufficient evidence"
+    assert overview_record["summary"]["artifact_provenance"]["model"] == (
+        "test-model"
+    )
+    summary_catalog = json.loads(
+        (
+            tmp_path
+            / "teams"
+            / team.team_slug
+            / "summary_data"
+            / "artifacts.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert summary_catalog["artifact_count"] == first.catalog_artifacts
+    assert summary_catalog["logical_key_count"] == first.catalog_artifacts
+    assert summary_catalog["model_counts"] == {"test-model": first.catalog_artifacts}
+    assert all(
+        (tmp_path / "teams" / team.team_slug / "summary_data" / item["cache_path"])
+        .is_file()
+        for item in summary_catalog["artifacts"]
+    )
     glossary_record = json.loads(
         (
             tmp_path
@@ -1023,6 +1046,67 @@ def test_later_daily_rollup_hash_includes_prior_daily_summary(tmp_path: Path) ->
     assert first_plain[1] != second_plain[1]
 
 
+def test_isolated_day_backfill_loads_prior_day_from_artifact_catalog(
+    tmp_path: Path,
+) -> None:
+    team = _two_day_team(
+        "Implemented exact receipt binding and verified the focused tests."
+    )
+    _write_team(tmp_path, team)
+    event_start = min(event.timestamp_ms for event in team.events)
+    event_end = max(event.timestamp_ms for event in team.events)
+    days = [
+        period
+        for period in periods_for_range(
+            event_start,
+            event_end,
+            team.display_timezone,
+            team.team_slug,
+        )
+        if period.kind == "daily"
+    ]
+    assert len(days) >= 2
+
+    for period in days[:2]:
+        summarize_archive(
+            tmp_path,
+            team.team_slug,
+            "heuristic",
+            "offline",
+            summary_window=DateWindow(
+                None,
+                None,
+                period.start_ms,
+                period.end_ms,
+            ),
+            rollup_kinds=("daily",),
+        )
+
+    second_record = json.loads(
+        (
+            tmp_path
+            / "teams"
+            / team.team_slug
+            / "summary_data"
+            / "rollups"
+            / "daily"
+            / f"{days[1].key}.json"
+        ).read_text(encoding="utf-8")
+    )
+    coverage = second_record["technical_summary"]["artifact_provenance"][
+        "context_coverage"
+    ]
+    prior = next(
+        item
+        for item in coverage["components"]
+        if item["name"] == "prior_same_level_summaries"
+    )
+    assert prior["requested"] == 1
+    assert prior["provided"] == 1
+    assert coverage["coverage_percent"] == 100
+    assert coverage["frontier_status"] == "contiguous-extension"
+
+
 def test_append_only_changed_window_and_rollups_invalidate(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)
@@ -1088,6 +1172,115 @@ def test_hindsight_name_job_combines_phase_summary_with_parent_context() -> None
     assert child.depth == 1
     assert "safe-landing protocol" in child.prior_context
     assert "exact-head release receipt binding" in child.work_summary
+
+
+def test_summary_window_can_backfill_one_hour_without_other_rollup_levels(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 20_000,
+        start_time="2026-04-01T00:00:00.000Z",
+        end_time="2026-04-01T00:00:20.000Z",
+    )
+
+    report = summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        summary_window=window,
+        rollup_kinds=("hourly",),
+    )
+
+    assert report.rollups == 1
+    rollup_root = tmp_path / "teams" / team.team_slug / "summary_data" / "rollups"
+    assert len(list((rollup_root / "hourly").glob("*.json"))) == 1
+    assert not (rollup_root / "daily").exists()
+    phase_records = list(
+        (tmp_path / "teams" / team.team_slug / "summary_data" / "phases").glob(
+            "*.json"
+        )
+    )
+    assert phase_records
+    assert all(
+        START <= json.loads(path.read_text(encoding="utf-8"))["start_ms"]
+        < START + 20_000
+        for path in phase_records
+    )
+    export = tmp_path / "hour-export"
+    first_export = build_archive(
+        tmp_path,
+        team.team_slug,
+        display_window=window,
+        rollup_kinds=("hourly",),
+        output=export,
+    )
+    second_export = build_archive(
+        tmp_path,
+        team.team_slug,
+        display_window=window,
+        rollup_kinds=("hourly",),
+        output=export,
+    )
+    assert first_export["files_changed"] > 0
+    assert second_export["files_changed"] == 0
+    assert (export / ".agent-team-timeline.json").is_file()
+    timeline = json.loads(
+        (export / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert {item["kind"] for item in timeline["rollups"]} == {"hourly"}
+    assert all(
+        START <= phase["start_ms"] < START + 20_000
+        for phase in timeline["phases"]
+    )
+
+
+def test_agent_name_v1_projection_degrades_without_lifetime_summary(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    child = next(agent for agent in team.agents if agent.thread_id == CHILD)
+    path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "agents"
+        / f"{CHILD}.json"
+    )
+    write_json_if_changed(
+        path,
+        {
+            "schema_version": 1,
+            "agent": {
+                "thread_id": CHILD,
+                "official_path": child.agent_path,
+                "coordinator_nickname": child.nickname,
+                "role": child.role,
+                "depth": child.depth,
+                "parent_official_path": "/root",
+            },
+            "name": {
+                "thread_id": CHILD,
+                "short_name": "Release receipt audit",
+                "rationale": "The work audited release receipt binding.",
+                "model": "gpt-5.6-sol",
+                "prompt_version": "agent-team-timeline-agent-name-v1",
+                "input_hash": "legacy-name-hash",
+                "generated_at": "2026-08-05T00:00:00Z",
+            },
+        },
+    )
+
+    loaded = _load_agent_names(tmp_path, team, frozenset({CHILD}))[CHILD]
+
+    assert loaded.short_name == "Release receipt audit"
+    assert loaded.lifetime_summary is None
 
 
 def test_spanning_tool_is_not_repeated_before_later_phase_boundary() -> None:

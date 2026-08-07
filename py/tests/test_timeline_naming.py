@@ -320,6 +320,7 @@ def test_heuristic_uses_only_nested_official_leaf(tmp_path: Path) -> None:
     assert result.short_name == "Budget overlap audit"
     assert "budget_overlap_audit" in result.rationale
     assert "transcript auditor" not in result.short_name.lower()
+    assert result.lifetime_summary is not None
     assert "separated Hermit CPU-second budgets" in result.lifetime_summary
 
 

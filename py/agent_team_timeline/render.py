@@ -88,7 +88,7 @@ def _agent_identity_obj(agent: Agent, name: AgentNameResult) -> dict[str, object
         "official_leaf": _official_leaf(agent),
         "coordinator_nickname": agent.nickname or "",
         "naming_rationale": name.rationale,
-        "lifetime_summary": clean_summary_prose(name.lifetime_summary),
+        "lifetime_summary": clean_summary_prose(name.lifetime_summary or ""),
         "naming_model": name.model,
         "naming_input_hash": name.input_hash,
     }
@@ -208,7 +208,8 @@ def _agent_markdown(
         "",
         "## Lifetime summary",
         "",
-        clean_summary_prose(name.lifetime_summary),
+        clean_summary_prose(name.lifetime_summary or "")
+        or "Unavailable in this summary version.",
         "",
         "## Work phases",
         "",
@@ -805,7 +806,9 @@ def render_archive(
                 "official_leaf": _official_leaf(agent),
                 "nickname": agent.nickname or "",
                 "naming_rationale": track_name.rationale,
-                "lifetime_summary": clean_summary_prose(track_name.lifetime_summary),
+                "lifetime_summary": clean_summary_prose(
+                    track_name.lifetime_summary or ""
+                ),
                 "depth": agent.depth,
                 "start_ms": track_start,
                 "end_ms": min(track_end, end_ms),
@@ -980,6 +983,7 @@ def render_archive(
         "phases": len(phases),
         "agents": len(visible_agent_ids),
         "edges": len(edge_objs),
+        "rollups": len(periods),
         "summary_files": len(summary_files),
         "artifacts": len(artifact_catalog.artifacts),
         "projects": len(artifact_catalog.projects),

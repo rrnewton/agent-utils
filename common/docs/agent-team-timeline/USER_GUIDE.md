@@ -293,6 +293,22 @@ Cache records link to that receipt. The command prints both tokens newly spent b
 deduplicated original generation cost of all returned artifacts; an all-hit rerun therefore
 reports zero new tokens without losing the original cost. Older cache entries remain valid and are
 reported explicitly as having unknown original usage rather than being regenerated or counted as zero.
+
+Summary selection is independent from ingestion. To backfill one exact hour while retaining the
+archive's complete normalized source, run:
+
+```bash
+agent-team-timeline summarize \
+  --team example-team --output ./timelines/example-team \
+  --summary-start-time 2026-08-07T02:00:00Z \
+  --summary-end-time 2026-08-07T03:00:00Z \
+  --rollup-kind hourly --model gpt-5.6-luna
+```
+
+Repeat `--rollup-kind` to request several levels. Omitting it retains the daily, weekly, monthly,
+and quarterly defaults. Each generated artifact records whether it begins the project, extends a
+contiguous same-level frontier, or is an isolated backfill, plus a component-level context score.
+`summary_data/artifacts.json` retains every indexed model/version variant by logical key.
 Aggregate accounting and receipt paths are also retained in the top-level `runs/*.json` metadata.
 From the archive directory, `make run-stats` formats those top-level records as an oldest-to-newest
 run history, including cache hits/misses, generated products, build counts, newly spent tokens, and
@@ -333,6 +349,20 @@ Markdown formatting changes. Because those presentation files live at the output
 refuses to use a non-empty directory unless it already contains its archive marker or a recognized
 existing `teams/<slug>/raw/team.json`; a mistaken `--output` cannot replace another project's
 README or Makefile.
+
+To create a separate zero-token website package for a selected interval, use `export` after the
+needed summaries are cached:
+
+```bash
+agent-team-timeline export \
+  --archive ./timelines/example-team --output ./exports/overnight-hour \
+  --team example-team \
+  --start-time 2026-08-07T02:00:00Z --end-time 2026-08-07T03:00:00Z \
+  --rollup-kind hourly
+```
+
+The export has its own archive marker, run receipt, Makefile, and local server launcher. It reads
+the durable archive but does not copy or truncate normalized source data and cannot invoke a model.
 
 ### 4. Optional GitHub pull metadata — conditional and cached
 
@@ -403,17 +433,19 @@ example-team/
     │   ├── source-snapshot.json
     │   └── messages/<thread-id>.json
     ├── summary_data/
+    │   ├── artifacts.json             # logical-key/version/model/context catalog
     │   ├── cache/<content-hash>.json
     │   ├── name_cache/<content-hash>.json
     │   ├── agents/<thread-id>.json   # hindsight name, lifetime summary + provenance
     │   ├── phases/<phase-id>.json
     │   ├── project_overview.json     # immutable evidence epoch + generated overview
-    │   ├── rollups/{daily,weekly,monthly,quarterly}/... # both structured audiences
+    │   ├── rollups/{hourly,daily,weekly,monthly,quarterly}/... # both audiences
     │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata
     │   └── glossary.json             # frozen definitions, availability + provenance
     └── summaries/
         ├── agents/<thread-id>.md
         ├── phases/<phase-id>.md
+        ├── hourly/YYYY-MM-DD/YYYY-MM-DDTHHZ-<team>-hourly.md
         ├── daily/<ISO-week>/YYYY-MM-DD-<team>-daily.md
         ├── daily/<ISO-week>/YYYY-MM-DD-<team>-daily-plain-language.md
         ├── weekly/<year>/YYYY-Www-<team>-weekly.md

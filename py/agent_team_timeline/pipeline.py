@@ -67,7 +67,12 @@ from agent_team_timeline.orc import (
     load_orc_team,
     snapshot_orc_lineage,
 )
-from agent_team_timeline.periods import Period, periods_for_range
+from agent_team_timeline.periods import (
+    DEFAULT_ROLLUP_KINDS,
+    ROLLUP_KINDS,
+    Period,
+    periods_for_range,
+)
 from agent_team_timeline.phases import (
     PhaseStats,
     PhaseWindow,
@@ -77,10 +82,8 @@ from agent_team_timeline.phases import (
 )
 from agent_team_timeline.render import render_archive
 from agent_team_timeline.summarize import (
-    GLOSSARY_DEFINITION_PROMPT_VERSION,
     GLOSSARY_DEFINITION_STYLE,
     PLAIN_LANGUAGE_ROLLUP_STYLE,
-    PROJECT_OVERVIEW_PROMPT_VERSION,
     PROJECT_OVERVIEW_STYLE,
     SummaryJob,
     SummaryResult,
@@ -93,11 +96,26 @@ from agent_team_timeline.summarize import (
     summarize_jobs,
 )
 from agent_team_timeline.summary_registry import (
+    AGENT_LIFETIME_SUMMARIZER,
     ContextComponent,
     ContextCoverage,
+    GLOSSARY_DEFINITION_SUMMARIZER,
+    PROJECT_OVERVIEW_SUMMARIZER,
     registry_json_obj,
+    summarizer_change_for_prompt,
 )
-from agent_team_timeline.summary_artifacts import SummaryArtifactProvenance
+from agent_team_timeline.summary_artifacts import (
+    ARTIFACT_ENVELOPE_FORMAT,
+    ARTIFACT_ENVELOPE_VERSION,
+    SummaryArtifactProvenance,
+)
+from agent_team_timeline.summary_catalog import (
+    SummaryArtifactCatalog,
+    SummaryArtifactReference,
+    load_summary_catalog,
+    merge_summary_catalog,
+    select_summary_artifact,
+)
 from agent_team_timeline.token_usage import TokenUsage, resolve_service_tier
 from agent_team_timeline.terminology import (
     GlossaryTerm,
@@ -241,6 +259,7 @@ class SummarizeReport:
     glossary_terms: int
     project_overviews: int
     glossary_definitions: int
+    catalog_artifacts: int
     cache_hits: int
     cache_misses: int
     backend_batches: int
@@ -268,6 +287,7 @@ class SummarizeReport:
             "glossary_terms": self.glossary_terms,
             "project_overviews": self.project_overviews,
             "glossary_definitions": self.glossary_definitions,
+            "catalog_artifacts": self.catalog_artifacts,
             "cache_hits": self.cache_hits,
             "cache_misses": self.cache_misses,
             "backend_batches": self.backend_batches,
@@ -1359,11 +1379,109 @@ def _summary_from_json(value: JsonValue, where: str) -> SummaryResult:
     )
 
 
-def _validate_project_overview(summary: SummaryResult, where: str) -> None:
-    if summary.prompt_version != PROJECT_OVERVIEW_PROMPT_VERSION:
-        raise ValueError(
-            f"{where}: project overview prompt version is stale; run summarize"
+def _summary_from_catalog_reference(
+    summary_root: Path, reference: SummaryArtifactReference
+) -> SummaryResult:
+    path = summary_root / reference.cache_path
+    root = as_object(read_json(path), str(path))
+    provenance = reference.provenance
+    if root.get("format") == ARTIFACT_ENVELOPE_FORMAT:
+        if as_int(root.get("schema_version"), f"{path}.schema_version") != (
+            ARTIFACT_ENVELOPE_VERSION
+        ):
+            raise ValueError(f"{path}: unsupported model-artifact envelope")
+        cached_provenance = SummaryArtifactProvenance.from_json_obj(
+            root.get("artifact"), f"{path}.artifact"
         )
+        if cached_provenance != provenance:
+            raise ValueError(f"{path}: cache provenance differs from artifact catalog")
+    elif not provenance.legacy_storage:
+        raise ValueError(f"{path}: cataloged artifact lacks its common envelope")
+    result = _summary_from_json(root.get("result"), f"{path}.result")
+    if (
+        result.input_hash != provenance.input_hash
+        or result.model != provenance.model
+        or result.prompt_version != provenance.prompt_version
+    ):
+        raise ValueError(f"{path}: cached result differs from artifact provenance")
+    return replace(result, artifact_provenance=provenance)
+
+
+def _select_catalog_summary(
+    summary_root: Path,
+    catalog: SummaryArtifactCatalog,
+    logical_key: str,
+    summarizer_id: str,
+    fallback: SummaryResult,
+) -> SummaryResult:
+    reference = select_summary_artifact(
+        catalog,
+        logical_key,
+        summarizer_id,
+    )
+    if reference is None:
+        return fallback
+    return _summary_from_catalog_reference(summary_root, reference)
+
+
+def _prior_catalog_rollups(
+    summary_root: Path,
+    catalog: SummaryArtifactCatalog,
+    kind: str,
+    summary_style: str,
+    before_ms: int,
+) -> list[tuple[Period, SummaryResult]]:
+    plain_language = summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE
+    summarizer_id = (
+        "plain-language-rollup" if plain_language else "technical-rollup"
+    )
+    key_prefix = "rollup-plain" if plain_language else "rollup"
+    logical_prefix = f"{key_prefix}:{kind}:"
+    logical_keys = sorted(
+        {
+            record.provenance.logical_key
+            for record in catalog.records
+            if record.provenance.summarizer_id == summarizer_id
+            and record.provenance.logical_key.startswith(logical_prefix)
+            and record.provenance.end_ms <= before_ms
+        }
+    )
+    result: list[tuple[Period, SummaryResult]] = []
+    for logical_key in logical_keys:
+        reference = select_summary_artifact(
+            catalog,
+            logical_key,
+            summarizer_id,
+        )
+        if reference is None:
+            continue
+        provenance = reference.provenance
+        key = logical_key[len(logical_prefix) :]
+        result.append(
+            (
+                Period(
+                    kind=kind,
+                    key=key,
+                    label=f"Prior {kind} · {key}",
+                    start_ms=provenance.start_ms,
+                    end_ms=provenance.end_ms,
+                    relative_path="",
+                    partial=False,
+                ),
+                _summary_from_catalog_reference(summary_root, reference),
+            )
+        )
+    result.sort(key=lambda item: (item[0].end_ms, item[0].key))
+    return result[-10:]
+
+
+def _validate_project_overview(summary: SummaryResult, where: str) -> None:
+    try:
+        summarizer_change_for_prompt(
+            PROJECT_OVERVIEW_SUMMARIZER, summary.prompt_version
+        )
+    except ValueError as error:
+        raise ValueError(f"{where}: unregistered project overview version") from error
     if summary.phrase not in {"Project overview supported", "Insufficient evidence"}:
         raise ValueError(f"{where}: invalid project-overview evidence status")
     if summary.work_summary:
@@ -1377,10 +1495,12 @@ def _validate_project_overview(summary: SummaryResult, where: str) -> None:
 
 
 def _validate_glossary_definition(summary: SummaryResult, where: str) -> None:
-    if summary.prompt_version != GLOSSARY_DEFINITION_PROMPT_VERSION:
-        raise ValueError(
-            f"{where}: glossary definition prompt version is stale; run summarize"
+    try:
+        summarizer_change_for_prompt(
+            GLOSSARY_DEFINITION_SUMMARIZER, summary.prompt_version
         )
+    except ValueError as error:
+        raise ValueError(f"{where}: unregistered glossary definition version") from error
     _definition_status(summary)
     if summary.work_summary:
         raise ValueError(f"{where}: glossary definition must not contain work bullets")
@@ -1670,6 +1790,20 @@ def _result_artifact_key(result: SummaryResult) -> str:
     return provenance.artifact_id if provenance is not None else result.input_hash
 
 
+def _summary_catalog_reference(
+    result: SummaryResult | AgentNameResult, cache_directory: str
+) -> SummaryArtifactReference:
+    provenance = result.artifact_provenance
+    if provenance is None:
+        raise ValueError(
+            f"model artifact {result.input_hash!r} lacks common provenance"
+        )
+    return SummaryArtifactReference(
+        provenance=provenance,
+        cache_path=f"{cache_directory}/{result.input_hash}.json",
+    )
+
+
 def _agent_name_jobs(
     team: TeamData,
     phases: Sequence[PhaseWindow],
@@ -1832,14 +1966,13 @@ def _load_agent_names(
         if not path.is_file():
             raise ValueError(
                 f"missing hindsight name for {agent.agent_path}; run `agent-team-timeline summarize`"
-            )
+        )
         root = as_object(read_json(path), str(path))
-        schema_version = root.get("schema_version")
-        if schema_version not in {2, 3}:
-            raise ValueError(
-                f"unsupported agent-name schema at {path}; run summarize to generate "
-                "hindsight lifetime summaries"
-            )
+        schema_version = as_int(
+            root.get("schema_version"), f"{path}.schema_version"
+        )
+        if schema_version not in {1, 2, 3}:
+            raise ValueError(f"unsupported agent-name schema at {path}")
         identity = as_object(root.get("agent"), f"{path}.agent")
         recorded_thread = _nonempty_string(
             identity.get("thread_id"), f"{path}.agent.thread_id"
@@ -1857,6 +1990,35 @@ def _load_agent_names(
                 f"stale hindsight name metadata for {agent.agent_path}; run summarize"
             )
         raw_name = as_object(root.get("name"), f"{path}.name")
+        prompt_version = _nonempty_string(
+            raw_name.get("prompt_version"), f"{path}.name.prompt_version"
+        )
+        try:
+            prompt_contract = summarizer_change_for_prompt(
+                AGENT_LIFETIME_SUMMARIZER, prompt_version
+            )
+        except ValueError as error:
+            raise ValueError(f"{path}: unregistered agent-lifetime version") from error
+        if schema_version == 1:
+            if prompt_contract.output_schema_version != 1:
+                raise ValueError(
+                    f"{path}: agent-name wrapper and prompt schemas disagree"
+                )
+            lifetime_summary: str | None = None
+        else:
+            if prompt_contract.output_schema_version < 2:
+                raise ValueError(
+                    f"{path}: agent-name wrapper and prompt schemas disagree"
+                )
+            lifetime_summary = _nonempty_string(
+                clean_summary_prose(
+                    _nonempty_string(
+                        raw_name.get("lifetime_summary"),
+                        f"{path}.name.lifetime_summary",
+                    )
+                ),
+                f"{path}.name.lifetime_summary",
+            )
         result = AgentNameResult(
             thread_id=_nonempty_string(
                 raw_name.get("thread_id"), f"{path}.name.thread_id"
@@ -1867,19 +2029,9 @@ def _load_agent_names(
             rationale=_nonempty_string(
                 raw_name.get("rationale"), f"{path}.name.rationale"
             ),
-            lifetime_summary=_nonempty_string(
-                clean_summary_prose(
-                    _nonempty_string(
-                        raw_name.get("lifetime_summary"),
-                        f"{path}.name.lifetime_summary",
-                    )
-                ),
-                f"{path}.name.lifetime_summary",
-            ),
+            lifetime_summary=lifetime_summary,
             model=_nonempty_string(raw_name.get("model"), f"{path}.name.model"),
-            prompt_version=_nonempty_string(
-                raw_name.get("prompt_version"), f"{path}.name.prompt_version"
-            ),
+            prompt_version=prompt_version,
             input_hash=_nonempty_string(
                 raw_name.get("input_hash"), f"{path}.name.input_hash"
             ),
@@ -1993,6 +2145,20 @@ def _rollup_jobs_for_level(
             frontier_status = "contiguous-extension"
         else:
             frontier_status = "isolated-backfill"
+        expected_prior_summaries = 0
+        if earliest_activity < period.start_ms:
+            expected_prior_summaries = min(
+                10,
+                len(
+                    periods_for_range(
+                        earliest_activity,
+                        period.start_ms - 1,
+                        team.display_timezone,
+                        team.team_slug,
+                        (period.kind,),
+                    )
+                ),
+            )
         jobs.append(
             SummaryJob(
                 key=f"{key_prefix}:{period.kind}:{period.key}",
@@ -2017,8 +2183,8 @@ def _rollup_jobs_for_level(
                         ),
                         ContextComponent(
                             "prior_same_level_summaries",
-                            10,
-                            len(prior),
+                            expected_prior_summaries,
+                            min(expected_prior_summaries, len(prior)),
                             "summaries",
                         ),
                     )
@@ -2093,14 +2259,22 @@ def _summarize_archive_locked(
     codex_command: Sequence[str] = ("codex",),
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
+    summary_window: DateWindow | None = None,
+    rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
 ) -> SummarizeReport:
     """Fill only missing/changed structured summaries; never format the website."""
 
     service_tier = resolve_service_tier(backend, service_tier)
     team = load_archived_team(archive, team_slug)
+    if summary_window is not None:
+        team = apply_date_window(team, summary_window)
+    summary_root = _summary_root(archive, team_slug)
+    existing_summary_catalog = load_summary_catalog(
+        summary_root / "artifacts.json", team_slug
+    )
     changed = int(
         write_json_if_changed(
-            _summary_root(archive, team_slug) / "summarizers.json",
+            summary_root / "summarizers.json",
             registry_json_obj(),
         )
     )
@@ -2111,7 +2285,7 @@ def _summarize_archive_locked(
         transcript_chars=transcript_chars,
     )
     terms = _glossary_terms(team)
-    cache = _summary_root(archive, team_slug) / "cache"
+    cache = summary_root / "cache"
     # Validate immutable knowledge provenance before any backend invocation. A historical source
     # mutation must fail closed without spending tokens on summaries that cannot be published.
     overview_source = _frozen_project_overview_input(archive, team)
@@ -2166,7 +2340,7 @@ def _summarize_archive_locked(
     name_jobs = _agent_name_jobs(team, phases, phase_results, context_chars)
     agent_names, name_stats = name_agents(
         name_jobs,
-        _summary_root(archive, team_slug) / "name_cache",
+        summary_root / "name_cache",
         backend,
         model,
         max_workers=max_workers,
@@ -2233,10 +2407,17 @@ def _summarize_archive_locked(
     )
 
     start_ms, end_ms = _period_range(team, phases)
-    periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
+    periods = periods_for_range(
+        start_ms,
+        end_ms,
+        team.display_timezone,
+        team.team_slug,
+        rollup_kinds,
+    )
+    selected_kinds = tuple(kind for kind in ROLLUP_KINDS if kind in rollup_kinds)
     by_kind = {
         kind: [period for period in periods if period.kind == kind]
-        for kind in ("daily", "weekly", "monthly", "quarterly")
+        for kind in selected_kinds
     }
     all_results: dict[str, SummaryResult] = {}
     all_plain_results: dict[str, SummaryResult] = {}
@@ -2250,10 +2431,23 @@ def _summarize_archive_locked(
     previous_periods: list[Period] = []
     previous_results: dict[str, SummaryResult] = {}
     previous_plain_results: dict[str, SummaryResult] = {}
-    for kind in ("daily", "weekly", "monthly", "quarterly"):
+    for kind in selected_kinds:
         current = by_kind[kind]
-        completed: list[tuple[Period, SummaryResult]] = []
-        completed_plain: list[tuple[Period, SummaryResult]] = []
+        first_start_ms = current[0].start_ms if current else start_ms
+        completed = _prior_catalog_rollups(
+            summary_root,
+            existing_summary_catalog,
+            kind,
+            TECHNICAL_ROLLUP_STYLE,
+            first_start_ms,
+        )
+        completed_plain = _prior_catalog_rollups(
+            summary_root,
+            existing_summary_catalog,
+            kind,
+            PLAIN_LANGUAGE_ROLLUP_STYLE,
+            first_start_ms,
+        )
         # Same-level context is an intentional chronology dependency: day N reads up to ten
         # earlier daily summaries (and likewise for weeks/months/quarters). Generate those jobs
         # one at a time so the actual prior summaries—not empty placeholders—enter the next
@@ -2384,6 +2578,31 @@ def _summarize_archive_locked(
             _summary_root(archive, team_slug) / "glossary.json", glossary_obj
         )
     )
+    summary_results = (
+        tuple(phase_results.values())
+        + (project_overview,)
+        + tuple(definition_results.values())
+        + tuple(all_results.values())
+        + tuple(all_plain_results.values())
+    )
+    catalog_additions = tuple(
+        _summary_catalog_reference(result, "cache") for result in summary_results
+    ) + tuple(
+        _summary_catalog_reference(result, "name_cache")
+        for result in agent_names.values()
+    )
+    for reference in catalog_additions:
+        cache_path = summary_root / reference.cache_path
+        if not cache_path.is_file():
+            raise ValueError(
+                f"summary artifact cache entry is missing: {cache_path}"
+            )
+    catalog, catalog_changed = merge_summary_catalog(
+        summary_root / "artifacts.json",
+        team_slug,
+        catalog_additions,
+    )
+    changed += int(catalog_changed)
     combined = _accumulate_stats(backend_stats)
     return SummarizeReport(
         backend=backend,
@@ -2396,6 +2615,7 @@ def _summarize_archive_locked(
         glossary_terms=len(terms),
         project_overviews=1,
         glossary_definitions=len(definition_jobs),
+        catalog_artifacts=len(catalog.records),
         cache_hits=combined.hits,
         cache_misses=combined.misses,
         backend_batches=combined.batches,
@@ -2430,6 +2650,8 @@ def summarize_archive(
     codex_command: Sequence[str] = ("codex",),
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
+    summary_window: DateWindow | None = None,
+    rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
 ) -> SummarizeReport:
     """Fill structured summaries/names while serializing token-spending cache misses."""
 
@@ -2448,13 +2670,19 @@ def summarize_archive(
             codex_command=codex_command,
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
+            summary_window=summary_window,
+            rollup_kinds=rollup_kinds,
         )
 
 
 def _load_phase_summaries(
-    archive: Path, team_slug: str, phases: Sequence[PhaseWindow]
+    archive: Path,
+    team_slug: str,
+    phases: Sequence[PhaseWindow],
+    catalog: SummaryArtifactCatalog,
 ) -> dict[str, SummaryResult]:
     result: dict[str, SummaryResult] = {}
+    summary_root = _summary_root(archive, team_slug)
     for phase in phases:
         path = _summary_root(archive, team_slug) / "phases" / f"{phase.phase_id}.json"
         if not path.is_file():
@@ -2462,7 +2690,14 @@ def _load_phase_summaries(
                 f"missing summary for {phase.phase_id}; run `agent-team-timeline summarize`"
             )
         obj = as_object(read_json(path), str(path))
-        result[phase.summary_key] = _summary_from_json(obj.get("summary"), str(path))
+        projected = _summary_from_json(obj.get("summary"), str(path))
+        result[phase.summary_key] = _select_catalog_summary(
+            summary_root,
+            catalog,
+            phase.summary_key,
+            "phase-work-summary",
+            projected,
+        )
     return result
 
 
@@ -2628,17 +2863,39 @@ def _load_glossary(
 
 
 def build_archive(
-    archive: Path, team_slug: str, *, phase_minutes: int = 30
+    archive: Path,
+    team_slug: str,
+    *,
+    phase_minutes: int = 30,
+    display_window: DateWindow | None = None,
+    rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
+    output: Path | None = None,
 ) -> dict[str, int]:
     """Regenerate Markdown/HTML/JSON exclusively from cached structured data."""
 
+    target = output or archive
+    _ensure_archive(target, team_slug, create=output is not None)
     team = load_archived_team(archive, team_slug)
+    if display_window is not None:
+        team = apply_date_window(team, display_window)
+    summary_root = _summary_root(archive, team_slug)
+    summary_catalog = load_summary_catalog(
+        summary_root / "artifacts.json", team_slug
+    )
     phases = build_phases(team, phase_minutes=phase_minutes)
-    phase_results = _load_phase_summaries(archive, team_slug, phases)
+    phase_results = _load_phase_summaries(
+        archive, team_slug, phases, summary_catalog
+    )
     agent_names = _load_agent_names(archive, team, phase_agent_ids(team, phases))
     project_overview, project_overview_source = _load_project_overview(archive, team)
     start_ms, end_ms = _period_range(team, phases)
-    periods = periods_for_range(start_ms, end_ms, team.display_timezone, team.team_slug)
+    periods = periods_for_range(
+        start_ms,
+        end_ms,
+        team.display_timezone,
+        team.team_slug,
+        rollup_kinds,
+    )
     rollup_results: dict[str, SummaryResult] = {}
     plain_rollup_results: dict[str, SummaryResult] = {}
     rollup_stats: dict[str, PhaseStats] = {}
@@ -2657,11 +2914,25 @@ def build_archive(
                 f"{path}: rollup lacks a plain-language summary; run summarize"
             )
         key = _period_key(period)
-        rollup_results[key] = _summary_from_json(
+        projected_technical = _summary_from_json(
             obj.get("technical_summary"), f"{path}.technical_summary"
         )
-        plain_rollup_results[key] = _summary_from_json(
+        projected_plain = _summary_from_json(
             obj.get("plain_language_summary"), f"{path}.plain_language_summary"
+        )
+        rollup_results[key] = _select_catalog_summary(
+            summary_root,
+            summary_catalog,
+            f"rollup:{period.kind}:{period.key}",
+            "technical-rollup",
+            projected_technical,
+        )
+        plain_rollup_results[key] = _select_catalog_summary(
+            summary_root,
+            summary_catalog,
+            f"rollup-plain:{period.kind}:{period.key}",
+            "plain-language-rollup",
+            projected_plain,
         )
         rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
     terms = _load_glossary(
@@ -2677,7 +2948,7 @@ def build_archive(
     pull_metadata = {record.key: record for record in pull_cache.records}
     site_identity = load_site_identity(archive, team)
     return render_archive(
-        archive,
+        target,
         team,
         phases,
         phase_results,

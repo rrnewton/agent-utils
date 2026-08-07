@@ -41,11 +41,12 @@ versions; a prompt constant must not be invented elsewhere.
 | `agent-lifetime` | 2 | one agent lifetime | `naming.py:build_agent_name_prompt` |
 | `project-overview` | 2 | one project/team knowledge epoch | `summarize.py:build_summary_prompt` (`project-overview`) |
 | `glossary-definition` | 2 | one deterministic glossary term | `summarize.py:build_summary_prompt` (`glossary-definition`) |
-| `technical-rollup` | 2 | day, week, month, or quarter | `summarize.py:build_summary_prompt` (`technical-rollup`) |
-| `plain-language-rollup` | 2 | day, week, month, or quarter | `summarize.py:build_summary_prompt` (`plain-language-rollup`) |
+| `technical-rollup` | 2 | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`technical-rollup`) |
+| `plain-language-rollup` | 2 | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`plain-language-rollup`) |
 
-Hourly rollups are a required next granularity, but are not listed as implemented until their
-period construction, selection, persistence, and tests land.
+Hourly rollups use UTC-stable keys and local-time labels, including distinct keys for a repeated
+daylight-saving hour. Summary selection can request only hourly work or combine it with higher
+calendar levels.
 
 ### Phase work summary
 
@@ -98,14 +99,15 @@ no invented links or acronym expansions. Definitions and evidence are projected 
 
 ### Technical calendar rollup
 
-Staged by `pipeline.py:_rollup_jobs_for_level` in chronological order for daily, weekly, monthly,
-and quarterly levels.
+Staged by `pipeline.py:_rollup_jobs_for_level` in chronological order for selected hourly, daily,
+weekly, monthly, and quarterly levels.
 
 Inputs are fully contained lower-level summaries, uncovered phase summaries at calendar
 boundaries, up to ten already-completed earlier summaries of the same level, the chronological
 glossary, and aggregate statistics. Thus a weekly job consumes daily summaries plus up to ten prior
 weekly summaries; it does not directly receive an arbitrary independent array of ten prior days and
-ten prior weeks. A daily job consumes phases plus up to ten prior daily summaries.
+ten prior weeks. An hourly job consumes phases. A daily job consumes hourly summaries when that
+level was requested in the same run, otherwise phases, plus up to ten prior daily summaries.
 
 Outputs use the common phrase/paragraph/work-bullet schema and are projected under
 `summary_data/rollups/<kind>/<key>.json`.
@@ -138,8 +140,10 @@ and `unknown-legacy` context coverage. They are never rewritten merely to migrat
 Pre-lifetime naming-cache v2 remains incompatible because it lacks the required lifetime summary.
 
 Projection records now carry the common provenance when it is known, while readers continue to
-accept pre-envelope projections. A logical-key artifact catalog and newest-compatible selection
-remain to be implemented before sparse mixed-version archives are fully inspectable.
+accept pre-envelope projections. `summary_data/artifacts.json` retains every observed artifact
+reference across runs and reports counts by summarizer version, output schema, model, and frontier
+status. Its selection API prefers the strongest registered compatible version and context score,
+with an optional explicit model preference.
 
 ## Standard staged-computation contract
 
@@ -161,9 +165,9 @@ Every registered summarizer will use the following common lifecycle:
 6. **Render.** Select the newest compatible artifact available for each logical key. Missing newer
    fields are absent/unknown in the UI, not fabricated and not a build failure.
 
-Steps 1 through 4 use the shared runner contract for all six summarizers. Projection provenance is
-also common. Step 5's logical-key catalog and Step 6's mixed-version selection remain the next
-refactor; no production summary tokens should be spent before they land.
+Steps 1 through 5 use the shared runner contract for all six summarizers. Projection provenance and
+the logical-key catalog are common. Readers accept registered compatible prompt versions; an
+agent-name artifact that lacks the later lifetime paragraph renders that field as unavailable.
 
 ## Context completeness and frontier metadata
 
@@ -208,13 +212,14 @@ spends tokens.
 The durable archive must support independent summary selection from ingestion range. In particular:
 
 - Generate or backfill one exact hour, day, or arbitrary half-open interval without buying every
-  later summary.
+  later summary. `--summary-start-time`, `--summary-end-time`, and repeatable `--rollup-kind`
+  control this independently from normalized ingestion.
 - Record whether each calendar result extended a contiguous frontier or was isolated.
 - Load sparse prior hour/day/week artifacts when available and record missing slots when absent.
 - Sweep left-to-right later to improve context without making that sweep a prerequisite for a
   useful partial archive.
-- Export one website slice without truncating or changing durable normalized data or cached
-  artifacts.
+- Export one website slice into a separate package without truncating or changing durable
+  normalized data or cached artifacts.
 
 The proving target is all three teams from `2026-08-07T02:00:00Z` through
 `2026-08-07T11:00:00Z` (22:00 Aug. 6 through 07:00 Aug. 7 EDT). The first paid proving run is only

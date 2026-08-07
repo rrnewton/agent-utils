@@ -23,6 +23,7 @@ def _report() -> SummarizeReport:
         glossary_terms=3,
         project_overviews=1,
         glossary_definitions=3,
+        catalog_artifacts=13,
         cache_hits=1,
         cache_misses=6,
         backend_batches=2,
@@ -84,6 +85,8 @@ def test_reasoning_effort_and_service_tier_reach_pipeline(
             model=model,
             reasoning_effort=kwargs.get("reasoning_effort"),
             service_tier=kwargs.get("service_tier"),
+            summary_window=kwargs.get("summary_window"),
+            rollup_kinds=kwargs.get("rollup_kinds"),
         )
         return _report()
 
@@ -102,12 +105,23 @@ def test_reasoning_effort_and_service_tier_reach_pipeline(
             "high",
             "--service-tier",
             "priority",
+            "--summary-start-time",
+            "2026-08-07T02:00:00Z",
+            "--summary-end-time",
+            "2026-08-07T03:00:00Z",
+            "--rollup-kind",
+            "hourly",
         ]
     )
     timeline_cli._summary_call(ns)
     assert seen["model"] == "model-under-test"
     assert seen["reasoning_effort"] == "high"
     assert seen["service_tier"] == "priority"
+    summary_window = seen["summary_window"]
+    assert summary_window is not None
+    assert getattr(summary_window, "start_ms") == 1_786_068_000_000
+    assert getattr(summary_window, "end_ms") == 1_786_071_600_000
+    assert seen["rollup_kinds"] == ("hourly",)
     default_ns = parser.parse_args(
         ["summarize", "--output", str(tmp_path), "--team", "test-team"]
     )

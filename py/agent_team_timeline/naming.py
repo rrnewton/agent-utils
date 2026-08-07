@@ -102,7 +102,7 @@ class AgentNameResult:
     thread_id: str
     short_name: str
     rationale: str
-    lifetime_summary: str
+    lifetime_summary: str | None
     model: str
     prompt_version: str
     input_hash: str
