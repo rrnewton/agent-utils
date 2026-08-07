@@ -444,7 +444,14 @@ def _trim_url(raw: str) -> str:
 
 def _normalized_http(raw: str) -> str | None:
     candidate = _trim_url(raw)
-    parts = urlsplit(candidate)
+    try:
+        parts = urlsplit(candidate)
+    except ValueError:
+        # Transcript prose is untrusted input. In particular, strings beginning with an
+        # unmatched ``[`` after the authority delimiter make urllib interpret the text as
+        # a malformed IPv6 literal. Such text is not evidence for an artifact and must not
+        # abort ingestion of the enclosing transcript.
+        return None
     if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
         return None
     if parts.username is not None or parts.password is not None:

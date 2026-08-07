@@ -285,6 +285,23 @@ def test_generic_links_are_excluded_but_successful_upload_is_retained_safely() -
     assert urls[0].evidence[0].relation is EvidenceRelation.PUBLISHED
 
 
+def test_malformed_ipv6_like_url_does_not_abort_artifact_extraction() -> None:
+    malformed = _event(
+        "malformed",
+        1_000,
+        "Offline marker https://[Encrypted Codex collaboration message unavailable.",
+    )
+    valid = _event("valid", 2_000, REPOSITORY + "/pull/61")
+
+    catalog = extract_artifacts(_team(events=(malformed, valid)))
+
+    assert any(
+        item.kind is ArtifactKind.PULL_REQUEST and item.external_id == "61"
+        for item in catalog.artifacts
+    )
+    assert "Encrypted" not in json.dumps(catalog.to_json_obj())
+
+
 def test_context_only_links_explicit_pr_and_issue_markers() -> None:
     catalog = extract_artifacts(
         _team(
