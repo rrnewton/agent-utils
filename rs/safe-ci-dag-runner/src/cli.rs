@@ -42,7 +42,9 @@ use crate::estimates::{
     plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
-use crate::model::{step_classification, DagConfig, Step, StepOutcome};
+use crate::model::{
+    step_classification, DagConfig, ResourceHint, Step, StepOutcome, DEFAULT_STEP_TIMEOUT,
+};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{run_dag_boxed, run_dag_boxed_ordered, BoxedCgroups};
@@ -126,6 +128,7 @@ fn help_text(c: &Palette) -> String {
          {usage}\n  {PROG} <command> [options]\n\n\
          {commands}\n\
          \x20 run        run a DAG (exit 0 iff every step passes)\n\
+         \x20 box        box ONE command (--mem/--timeout/--cores) as a singleton DAG, no JSON\n\
          \x20 sweep      parallel-speedup sweep of ONE step (inner -j1..-jN + timing table)\n\
          \x20 plan       show learned estimates + the scheduled order (does NOT run anything)\n\
          \x20 list       list the steps\n\
@@ -142,6 +145,7 @@ fn help_text(c: &Palette) -> String {
          \x20 {e1}\n\
          \x20 {e2}\n\
          \x20 {e3}\n\
+         \x20 {e7}\n\
          \x20 {e6}\n\
          \x20 {e4}\n\
          \x20 {e5}\n\n\
@@ -153,6 +157,9 @@ fn help_text(c: &Palette) -> String {
         e1 = ex(&format!("{PROG} quickstart")),
         e2 = ex(&format!("{PROG} run --dag dag.json --profile")),
         e3 = ex(&format!("{PROG} run --dag dag.json --only build.app")),
+        e7 = ex(&format!(
+            "{PROG} box --mem 512M --timeout 30 --cores 2 -- ./probe.sh"
+        )),
         e6 = ex(&format!("{PROG} plan --dag dag.json --planner critical-path")),
         e4 = ex(&format!("{PROG} sweep --dag dag.json --step build.app --jobs 1..8")),
         e5 = ex(&format!("{PROG} ascii --dag dag.json")),
@@ -335,6 +342,37 @@ fn run_help(c: &Palette) -> String {
             ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
             ("-v", "stream child output (repeatable)"),
             ("-q, --quiet", "quieter output"),
+            ("-h, --help", "show this help and exit"),
+        ],
+    )
+}
+
+fn box_help(c: &Palette) -> String {
+    render_subcommand_help(
+        c,
+        "box [--mem SIZE] --timeout SECS [--cores N] -- CMD [ARGS...]",
+        "Run one command in the same fail-closed cgroup-v2 box used for DAG steps.",
+        &[
+            (
+                "--mem SIZE",
+                "hard memory.max cap for the command subtree (e.g. 512M, 6G)",
+            ),
+            ("--timeout SECS", "hard wall-clock limit [required]"),
+            (
+                "--cores N",
+                "hard cpu.max cap in full CPUs; does not append a jobs flag",
+            ),
+            ("--label STR", "label printed in the final VERDICT line"),
+            (
+                "--perf-dir DIR",
+                "write per-step resource-usage CSVs into DIR",
+            ),
+            (
+                "--allow-cgroup-failure",
+                "if cgroup boxing is unavailable, run UNBOXED with a warning",
+            ),
+            ("-q, --quiet", "suppress step chatter; still print VERDICT"),
+            ("-- CMD [ARGS...]", "command to execute inside the cgroup box"),
             ("-h, --help", "show this help and exit"),
         ],
     )
@@ -2060,6 +2098,239 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     }
 }
 
+// --------------------------------------------------------------------------- box subcommand
+
+struct BoxArgs {
+    mem_bytes: Option<i64>,
+    timeout: i64,
+    cores: Option<i64>,
+    label: String,
+    perf_dir: Option<String>,
+    allow_cgroup_failure: bool,
+    quiet: bool,
+    cmd: Vec<String>,
+}
+
+/// Quote one argv element for the `bash -c` command string carried by [`Step`].
+fn shell_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return "''".to_string();
+    }
+    if arg.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'_' | b'-' | b'.' | b'/' | b'=' | b':' | b'+' | b'@' | b','
+            )
+    }) {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn parse_box_args(rest: &[String]) -> Result<BoxArgs, String> {
+    let mut args = BoxArgs {
+        mem_bytes: None,
+        timeout: DEFAULT_STEP_TIMEOUT,
+        cores: None,
+        label: "box".to_string(),
+        perf_dir: None,
+        allow_cgroup_failure: false,
+        quiet: false,
+        cmd: Vec::new(),
+    };
+    let mut index = 0usize;
+    let mut saw_timeout = false;
+    while index < rest.len() {
+        let argument = &rest[index];
+        if argument == "--" {
+            args.cmd = rest[index + 1..].to_vec();
+            break;
+        }
+        let (key, inline) = match argument.split_once('=') {
+            Some((key, value)) => (key, Some(value.to_string())),
+            None => (argument.as_str(), None),
+        };
+        let value = |name: &str, index: &mut usize| -> Result<String, String> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            *index += 1;
+            rest.get(*index)
+                .cloned()
+                .ok_or_else(|| format!("the argument {name} requires a value"))
+        };
+        match key {
+            "--mem" => {
+                let raw = value("--mem", &mut index)?;
+                let bytes = parse_size(&raw).ok_or_else(|| {
+                    format!("--mem: cannot parse size '{raw}' (e.g. 6G, 512M, 2048K)")
+                })?;
+                if bytes < 1 {
+                    return Err(format!("--mem: must be greater than zero (got {raw})"));
+                }
+                args.mem_bytes = Some(bytes);
+            }
+            "--timeout" => {
+                let raw = value("--timeout", &mut index)?;
+                let seconds = raw
+                    .parse::<i64>()
+                    .map_err(|_| format!("--timeout: invalid int value: '{raw}'"))?;
+                if seconds < 1 {
+                    return Err(format!("--timeout: must be >= 1 (got {seconds})"));
+                }
+                args.timeout = seconds;
+                saw_timeout = true;
+            }
+            "--cores" => {
+                let raw = value("--cores", &mut index)?;
+                let cores = raw
+                    .parse::<i64>()
+                    .map_err(|_| format!("--cores: invalid int value: '{raw}'"))?;
+                if cores < 1 {
+                    return Err(format!("--cores: must be >= 1 (got {cores})"));
+                }
+                args.cores = Some(cores);
+            }
+            "--label" => args.label = value("--label", &mut index)?,
+            "--perf-dir" => args.perf_dir = Some(value("--perf-dir", &mut index)?),
+            "--allow-cgroup-failure" => args.allow_cgroup_failure = true,
+            "-q" | "--quiet" => args.quiet = true,
+            other => return Err(format!("unrecognized argument: {other}")),
+        }
+        index += 1;
+    }
+    if !saw_timeout {
+        return Err("--timeout is required".to_string());
+    }
+    if args.cmd.is_empty() {
+        return Err("no command given (put it after '--')".to_string());
+    }
+    Ok(args)
+}
+
+/// Run one command through the same fail-closed cgroup implementation used for DAG steps.
+fn cmd_box(args: &BoxArgs, c: &Palette) -> i32 {
+    let command = args
+        .cmd
+        .iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let hint = ResourceHint {
+        hard_mem_max_bytes: args.mem_bytes,
+        preferred_inner_jobs: args.cores,
+        ..ResourceHint::default()
+    };
+    let step = Step {
+        group: "box".to_string(),
+        job: args.label.clone(),
+        desc: String::new(),
+        description: String::new(),
+        cmd: command,
+        deps: Vec::new(),
+        env: BTreeMap::new(),
+        hint,
+        networkonly: false,
+        engine_only: false,
+        timeout: args.timeout,
+        cpu_timeout: 0,
+        // `--cores` constrains cpu.max; it must not mutate the user's command line.
+        jobs_flag: Some(String::new()),
+    };
+    let cfg = DagConfig {
+        steps: vec![step],
+        // An omitted box limit means "no limit on that axis", not the DAG runner's small
+        // declarations-first default. Explicit --mem/--cores values above still win.
+        default_step_mem_cap_bytes: None,
+        default_step_cpu_count: None,
+        default_step_cpu_timeout: 0,
+        ..DagConfig::default()
+    };
+
+    let cgroups = match resolve_cgroups(args.allow_cgroup_failure, false) {
+        Ok(cgroups) => cgroups,
+        Err(code) => {
+            println!(
+                "VERDICT label={} class=BOX-UNAVAILABLE exit={} wall_s=0.0 \
+                 detail=cgroup-boxing-unavailable",
+                args.label, code
+            );
+            return code;
+        }
+    };
+    let verbosity = if args.quiet { 0 } else { 1 };
+    let result = run_dag_boxed(&cfg, 1, false, verbosity, cgroups);
+
+    if let Some(directory) = args.perf_dir.as_deref().filter(|value| !value.is_empty()) {
+        append_step_profiles(
+            Path::new(directory),
+            &result.step_profile_rows,
+            &git_sha(),
+            1,
+            None,
+            "unverified",
+            "local",
+        );
+        report_profile_written(directory, "box");
+    }
+
+    let outcome = result.outcomes.first();
+    let (class, detail) = match outcome {
+        Some(outcome) if outcome.ok => ("PASS", String::new()),
+        Some(outcome) => {
+            let detail = outcome.reason.clone();
+            let class = if detail.contains("OOM-KILLED") {
+                "OOM"
+            } else if detail.contains("TIMEOUT") {
+                "TIMEOUT"
+            } else {
+                "FAIL"
+            };
+            (class, detail)
+        }
+        None => ("FAIL", "no-outcome".to_string()),
+    };
+    let wall = outcome
+        .map(|outcome| outcome.duration_s)
+        .unwrap_or(result.wall_s);
+    let verdict = if class == "PASS" {
+        c.green(class)
+    } else {
+        c.red(class)
+    };
+    let exit_code = if result.ok { 0 } else { 1 };
+    eprintln!(
+        "{PROG}: box {verdict} - {} in {:.1}s{}",
+        args.label,
+        wall,
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({detail})")
+        }
+    );
+    println!(
+        "VERDICT label={} class={} exit={} wall_s={:.1} detail={}",
+        args.label,
+        class,
+        exit_code,
+        wall,
+        if detail.is_empty() { "none" } else { &detail }
+    );
+    exit_code
+}
+
 fn cmd_pin_run(rest: &[String]) -> i32 {
     let mut cores: Option<i64> = None;
     let mut tag = "pin-run".to_string();
@@ -2219,6 +2490,20 @@ pub fn run(argv: &[String]) -> i32 {
             };
             cmd_run(&cfg, &a, &c)
         }
+        "box" => {
+            if wants_help(rest) {
+                print!("{}", box_help(&c));
+                return 0;
+            }
+            let args = match parse_box_args(rest) {
+                Ok(args) => args,
+                Err(message) => {
+                    eprintln!("{PROG} box: error: {message}");
+                    return 2;
+                }
+            };
+            cmd_box(&args, &c)
+        }
         "sweep" => {
             if wants_help(rest) {
                 print!("{}", sweep_help(&c));
@@ -2301,7 +2586,7 @@ pub fn run(argv: &[String]) -> i32 {
             eprintln!(
                 "usage: {PROG} [-h] [--version] <command> ...\n\
                  {PROG}: error: argument <command>: invalid choice: '{other}' \
-                 (choose from run, sweep, plan, summary, list, ascii, dot, json, yaml, quickstart, capabilities)"
+                 (choose from run, box, sweep, plan, summary, list, ascii, dot, json, yaml, quickstart, capabilities)"
             );
             2
         }
@@ -2685,6 +2970,62 @@ mod tests {
         let help = run_help(&palette);
         for flag in ["--args", "--stress", "--cores", "--profile-sync"] {
             assert!(help.contains(flag), "missing {flag} from run help");
+        }
+    }
+
+    #[test]
+    fn box_help_exposes_enforcement_contract() {
+        let palette = Palette { enabled: false };
+        let help = box_help(&palette);
+        for token in [
+            "box [--mem SIZE] --timeout SECS",
+            "fail-closed cgroup-v2 box",
+            "hard memory.max cap",
+            "hard wall-clock limit",
+            "hard cpu.max cap",
+        ] {
+            assert!(help.contains(token), "missing {token} from box help");
+        }
+    }
+
+    #[test]
+    fn box_parser_maps_limits_and_preserves_argv() {
+        let args = parse_box_args(&[
+            "--mem=512M".to_string(),
+            "--timeout".to_string(),
+            "30".to_string(),
+            "--cores=2".to_string(),
+            "--label".to_string(),
+            "breach".to_string(),
+            "--".to_string(),
+            "printf".to_string(),
+            "%s".to_string(),
+            "hello world".to_string(),
+        ])
+        .expect("valid box arguments");
+        assert_eq!(args.mem_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(args.timeout, 30);
+        assert_eq!(args.cores, Some(2));
+        assert_eq!(args.label, "breach");
+        assert_eq!(args.cmd, ["printf", "%s", "hello world"]);
+        assert_eq!(shell_quote("hello world"), "'hello world'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn box_parser_requires_positive_timeout_and_command() {
+        let cases = [
+            vec!["--".to_string(), "true".to_string()],
+            vec![
+                "--timeout".to_string(),
+                "0".to_string(),
+                "--".to_string(),
+                "true".to_string(),
+            ],
+            vec!["--timeout".to_string(), "1".to_string()],
+        ];
+        for args in cases {
+            assert!(parse_box_args(&args).is_err(), "accepted {args:?}");
         }
     }
 
