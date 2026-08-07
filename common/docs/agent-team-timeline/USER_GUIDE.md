@@ -363,6 +363,10 @@ agent-team-timeline export \
 
 The export has its own archive marker, run receipt, Makefile, and local server launcher. It reads
 the durable archive but does not copy or truncate normalized source data and cannot invoke a model.
+If a selected phase or rollup has no cached summary, the site labels it `Summary unavailable` and
+still exposes its normalized transcript and statistics. These build-only placeholders never enter
+the model cache; rerunning `summarize` later replaces them with paid summaries without discarding
+already compatible cached work.
 
 Repeat `--team` to combine providers or machines in one aligned site. Every team receives the
 same half-open interval and rollup selection:

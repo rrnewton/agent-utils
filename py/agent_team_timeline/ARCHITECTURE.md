@@ -20,6 +20,15 @@ The durable archive and a website export are distinct concepts:
 - Rebuilding an export never invokes a model. Missing summaries degrade to normalized transcript
   and statistics rather than causing unrelated cached summaries to be discarded.
 
+That degradation is presentation-only. Missing phase, agent-lifetime, project-overview, or calendar
+summary data receives an in-memory fallback labeled `Summary unavailable`; the builder writes
+ordinary website/Markdown presentation files but never writes the fallback under `summary_data/`
+or registers it as a model artifact. Compatible phase/rollup artifacts and source-bounded lifetime
+artifacts take precedence. Project overviews require their source-bound projection, and summaries
+whose ranges extend beyond a sliced export are not reused. Thus patchy archives preserve verified
+paid work without leaking later knowledge into an earlier slice. A later `summarize` run upgrades
+missing regions normally.
+
 `build` retains its single-team archive behavior. `export` accepts repeated `--team` values and
 composes those independently cached teams into one self-contained site. The compositor renders
 each team without model calls, namespaces thread, phase, edge, glossary, artifact, evidence, and

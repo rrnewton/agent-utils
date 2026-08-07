@@ -1243,6 +1243,196 @@ def test_summary_window_can_backfill_one_hour_without_other_rollup_levels(
     )
 
 
+def test_build_without_summary_cache_uses_presentation_only_fallbacks(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 20_000,
+        start_time="2026-03-31T23:33:20.000Z",
+        end_time="2026-03-31T23:33:40.000Z",
+    )
+    output = tmp_path / "zero-summary-site"
+    source_summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+
+    first = build_archive(
+        tmp_path,
+        team.team_slug,
+        display_window=window,
+        rollup_kinds=("hourly",),
+        output=output,
+    )
+    second = build_archive(
+        tmp_path,
+        team.team_slug,
+        display_window=window,
+        rollup_kinds=("hourly",),
+        output=output,
+    )
+
+    assert first["files_changed"] > 0
+    assert second["files_changed"] == 0
+    assert not source_summary_root.exists()
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert timeline["phases"]
+    assert {phase["phrase"] for phase in timeline["phases"]} == {
+        "Summary unavailable"
+    }
+    assert all(
+        "normalized logs" in phase["paragraph"] for phase in timeline["phases"]
+    )
+    assert all(
+        "no cached hindsight name" in agent["naming_rationale"]
+        for agent in timeline["agents"]
+    )
+    assert "no cached model summary" in timeline["project_overview"]["text"]
+    assert {rollup["kind"] for rollup in timeline["rollups"]} == {"hourly"}
+    for phase in timeline["phases"]:
+        detail = json.loads(
+            (output / phase["detail_path"]).read_text(encoding="utf-8")
+        )
+        assert detail["transcript"]
+        assert detail["stats"] == phase["stats"]
+        assert detail["phrase"] == "Summary unavailable"
+    rollup = timeline["rollups"][0]
+    assert "Summary unavailable" in (output / rollup["technical_path"]).read_text(
+        encoding="utf-8"
+    )
+
+
+def test_build_preserves_available_phase_summaries_in_patchy_archive(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    phases = build_phases(team, phase_minutes=30)
+    assert len(phases) >= 2
+    missing = phases[-1]
+    summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+    (summary_root / "phases" / f"{missing.phase_id}.json").unlink()
+    (summary_root / "artifacts.json").unlink()
+
+    output = tmp_path / "patchy-site"
+    build_archive(tmp_path, team.team_slug, output=output)
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    phrases = {phase["id"]: phase["phrase"] for phase in timeline["phases"]}
+
+    assert phrases[missing.phase_id] == "Summary unavailable"
+    assert any(
+        phrase != "Summary unavailable"
+        for phase_id, phrase in phrases.items()
+        if phase_id != missing.phase_id
+    )
+
+
+def test_build_recovers_compatible_paid_name_from_catalog(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+    name_path = summary_root / "agents" / f"{CHILD}.json"
+    overview_path = summary_root / "project_overview.json"
+    expected_name = json.loads(name_path.read_text(encoding="utf-8"))["name"]
+    name_path.unlink()
+    overview_path.unlink()
+
+    output = tmp_path / "catalog-recovery-site"
+    build_archive(tmp_path, team.team_slug, output=output)
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    child = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
+    assert child["short_name"] == expected_name["short_name"]
+    assert child["lifetime_summary"] == expected_name["lifetime_summary"]
+    assert "no cached model summary" in timeline["project_overview"]["text"]
+    assert timeline["glossary"] == []
+
+
+def test_build_does_not_recover_future_catalog_knowledge_into_slice(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+    (summary_root / "agents" / f"{CHILD}.json").unlink()
+    (summary_root / "project_overview.json").unlink()
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 10_000,
+        start_time="2026-03-31T23:33:20.000Z",
+        end_time="2026-03-31T23:33:30.000Z",
+    )
+
+    output = tmp_path / "bounded-catalog-site"
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        display_window=window,
+        rollup_kinds=("hourly",),
+        output=output,
+    )
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    child = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
+    assert "no cached hindsight name" in child["naming_rationale"]
+    assert all(
+        phase["phrase"] == "Summary unavailable" for phase in timeline["phases"]
+    )
+    assert all("final" not in phase["paragraph"].lower() for phase in timeline["phases"])
+    assert all(
+        "Summary unavailable"
+        in (output / rollup["technical_path"]).read_text(encoding="utf-8")
+        for rollup in timeline["rollups"]
+    )
+    assert "no cached model summary" in timeline["project_overview"]["text"]
+    assert timeline["glossary"] == []
+
+
+def test_build_rejects_present_corrupt_overview_projection(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    overview_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "project_overview.json"
+    )
+    write_json_if_changed(overview_path, {"legacy": "corrupt-shape"})
+
+    with pytest.raises(ValueError, match="schema_version"):
+        build_archive(tmp_path, team.team_slug, output=tmp_path / "corrupt-site")
+
+
+def test_build_rejects_non_regular_summary_projection(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    overview_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "project_overview.json"
+    )
+    overview_path.mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="not a regular file"):
+        build_archive(tmp_path, team.team_slug, output=tmp_path / "directory-site")
+
+
 def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     tmp_path: Path,
 ) -> None:
@@ -1375,6 +1565,61 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         )
     )
     assert run["team_slugs"] == ["claude-test", first_team.team_slug]
+
+
+def test_combined_export_builds_two_zero_summary_teams(tmp_path: Path) -> None:
+    codex_team = _team()
+    claude_team = replace(codex_team, team_slug="claude-test", provider="claude")
+    for team in (codex_team, claude_team):
+        _write_team(tmp_path, team)
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 20_000,
+        start_time="2026-03-31T23:33:20.000Z",
+        end_time="2026-03-31T23:33:40.000Z",
+    )
+    output = tmp_path / "combined-zero-summary"
+
+    first = build_combined_archive(
+        tmp_path,
+        (codex_team.team_slug, claude_team.team_slug),
+        output=output,
+        display_timezone="America/New_York",
+        display_window=window,
+        rollup_kinds=("hourly",),
+    )
+    second = build_combined_archive(
+        tmp_path,
+        (claude_team.team_slug, codex_team.team_slug),
+        output=output,
+        display_timezone="America/New_York",
+        display_window=window,
+        rollup_kinds=("hourly",),
+    )
+
+    assert first["teams"] == 2
+    assert first["files_changed"] > 0
+    assert second["files_changed"] == 0
+    assert all(
+        not (tmp_path / "teams" / team.team_slug / "summary_data").exists()
+        for team in (codex_team, claude_team)
+    )
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert {item["slug"] for item in timeline["teams"]} == {
+        codex_team.team_slug,
+        claude_team.team_slug,
+    }
+    assert timeline["phases"]
+    assert all(phase["phrase"] == "Summary unavailable" for phase in timeline["phases"])
+    assert all("::" in phase["agent_id"] for phase in timeline["phases"])
+    assert {rollup["team"] for rollup in timeline["rollups"]} == {
+        codex_team.team_slug,
+        claude_team.team_slug,
+    }
 
 
 def test_combined_export_refuses_unmarked_nonempty_output(tmp_path: Path) -> None:

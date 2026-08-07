@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import os
 import re
+import stat
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -43,7 +44,7 @@ from agent_team_timeline.claude import (
     load_claude_team,
     snapshot_claude_lineage,
 )
-from agent_team_timeline.model import Event, TeamData, ToolCall, source_digest
+from agent_team_timeline.model import Agent, Event, TeamData, ToolCall, source_digest
 from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.naming import (
     AgentNameJob,
@@ -364,6 +365,18 @@ def _artifact_catalog_path(archive: Path, team_slug: str) -> Path:
 def _summary_root(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
     return archive / "teams" / team_slug / "summary_data"
+
+
+def _summary_projection_missing(path: Path) -> bool:
+    """Return true only for an absent optional projection, not a malformed path."""
+
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError:
+        return True
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"{path}: summary projection is not a regular file")
+    return False
 
 
 def _source_snapshot_root(archive: Path, team_slug: str) -> Path:
@@ -1424,6 +1437,26 @@ def _select_catalog_summary(
     return _summary_from_catalog_reference(summary_root, reference)
 
 
+def _select_catalog_summary_for_range(
+    summary_root: Path,
+    catalog: SummaryArtifactCatalog,
+    logical_key: str,
+    summarizer_id: str,
+    start_ms: int,
+    end_ms: int,
+    fallback: SummaryResult,
+) -> SummaryResult:
+    """Use a catalog result only when its source interval exactly matches the view."""
+
+    reference = select_summary_artifact(catalog, logical_key, summarizer_id)
+    if reference is None or (
+        reference.provenance.start_ms != start_ms
+        or reference.provenance.end_ms != end_ms
+    ):
+        return fallback
+    return _summary_from_catalog_reference(summary_root, reference)
+
+
 def _prior_catalog_rollups(
     summary_root: Path,
     catalog: SummaryArtifactCatalog,
@@ -1952,8 +1985,15 @@ def _nonempty_string(value: JsonValue, where: str) -> str:
 
 
 def _load_agent_names(
-    archive: Path, team: TeamData, selected_ids: frozenset[str]
+    archive: Path,
+    team: TeamData,
+    selected_ids: frozenset[str],
+    catalog: SummaryArtifactCatalog | None = None,
 ) -> dict[str, AgentNameResult]:
+    selected_catalog = catalog or load_summary_catalog(
+        _summary_root(archive, team.team_slug) / "artifacts.json",
+        team.team_slug,
+    )
     results: dict[str, AgentNameResult] = {}
     for agent in team.agents:
         if agent.thread_id not in selected_ids:
@@ -1963,10 +2003,27 @@ def _load_agent_names(
             / "agents"
             / f"{agent.thread_id}.json"
         )
-        if not path.is_file():
-            raise ValueError(
-                f"missing hindsight name for {agent.agent_path}; run `agent-team-timeline summarize`"
-        )
+        if _summary_projection_missing(path):
+            reference = select_summary_artifact(
+                selected_catalog,
+                f"agent-name:{agent.thread_id}",
+                AGENT_LIFETIME_SUMMARIZER.summarizer_id,
+                minimum_output_schema=2,
+            )
+            if (
+                reference is not None
+                and team.window_end_ms is not None
+                and reference.provenance.end_ms > team.window_end_ms
+            ):
+                reference = None
+            results[agent.thread_id] = (
+                _agent_name_from_catalog_reference(
+                    _summary_root(archive, team.team_slug), reference, agent
+                )
+                if reference is not None
+                else _fallback_agent_name(agent)
+            )
+            continue
         root = as_object(read_json(path), str(path))
         schema_version = as_int(
             root.get("schema_version"), f"{path}.schema_version"
@@ -2685,35 +2742,282 @@ def _load_phase_summaries(
     summary_root = _summary_root(archive, team_slug)
     for phase in phases:
         path = _summary_root(archive, team_slug) / "phases" / f"{phase.phase_id}.json"
-        if not path.is_file():
-            raise ValueError(
-                f"missing summary for {phase.phase_id}; run `agent-team-timeline summarize`"
+        if _summary_projection_missing(path):
+            result[phase.summary_key] = _select_catalog_summary_for_range(
+                summary_root,
+                catalog,
+                phase.summary_key,
+                "phase-work-summary",
+                phase.start_ms,
+                phase.end_ms,
+                _unavailable_summary(
+                    phase.summary_key,
+                    phase.end_ms,
+                    "work phase",
+                ),
             )
+            continue
         obj = as_object(read_json(path), str(path))
-        projected = _summary_from_json(obj.get("summary"), str(path))
-        result[phase.summary_key] = _select_catalog_summary(
-            summary_root,
-            catalog,
-            phase.summary_key,
-            "phase-work-summary",
-            projected,
+        _require_exact_keys(
+            obj,
+            {"phase_id", "agent_id", "start_ms", "end_ms", "summary"},
+            str(path),
         )
+        recorded_phase_id = as_string(obj.get("phase_id"), f"{path}.phase_id")
+        recorded_agent_id = as_string(obj.get("agent_id"), f"{path}.agent_id")
+        recorded_start_ms = as_int(obj.get("start_ms"), f"{path}.start_ms")
+        recorded_end_ms = as_int(obj.get("end_ms"), f"{path}.end_ms")
+        if recorded_phase_id != phase.phase_id or recorded_agent_id != phase.agent_id:
+            raise ValueError(f"{path}: phase projection identity mismatch")
+        projected = _summary_from_json(obj.get("summary"), str(path))
+        if (
+            recorded_start_ms != phase.start_ms
+            or recorded_end_ms != phase.end_ms
+        ):
+            result[phase.summary_key] = _unavailable_summary(
+                phase.summary_key, phase.end_ms, "clipped work phase"
+            )
+        else:
+            result[phase.summary_key] = _select_catalog_summary_for_range(
+                summary_root,
+                catalog,
+                phase.summary_key,
+                "phase-work-summary",
+                phase.start_ms,
+                phase.end_ms,
+                projected,
+            )
     return result
 
 
+_PRESENTATION_FALLBACK_VERSION = "agent-team-timeline-presentation-fallback-v1"
+
+
+def _fallback_generated_at(at_ms: int) -> str:
+    return datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _unavailable_summary(key: str, at_ms: int, subject: str) -> SummaryResult:
+    """Return an ephemeral build-only placeholder; never persist it as model output."""
+
+    identity = hashlib.sha256(
+        f"{_PRESENTATION_FALLBACK_VERSION}\0{key}\0{subject}".encode("utf-8")
+    ).hexdigest()
+    return SummaryResult(
+        key=key,
+        phrase="Summary unavailable",
+        paragraph=(
+            f"Summary unavailable: no cached model summary exists for this {subject}. "
+            "The transcript and statistics shown here come directly from normalized logs."
+        ),
+        work_summary=(),
+        model="none",
+        prompt_version=_PRESENTATION_FALLBACK_VERSION,
+        input_hash=identity,
+        generated_at=_fallback_generated_at(at_ms),
+    )
+
+
+def _fallback_agent_name(agent: Agent) -> AgentNameResult:
+    leaf = agent.agent_path.rstrip("/").rsplit("/", 1)[-1]
+    if agent.parent_thread_id is None:
+        short_name = "Coordinator"
+    else:
+        readable = re.sub(r"[-_]+", " ", leaf).strip()
+        short_name = (readable or "Unnamed agent")[:48].rstrip()
+    identity = hashlib.sha256(
+        (
+            f"{_PRESENTATION_FALLBACK_VERSION}\0{agent.thread_id}\0"
+            f"{agent.agent_path}"
+        ).encode("utf-8")
+    ).hexdigest()
+    return AgentNameResult(
+        thread_id=agent.thread_id,
+        short_name=short_name,
+        rationale=(
+            "Mechanical name from the official agent path; no cached hindsight name "
+            "is available."
+        ),
+        lifetime_summary=(
+            "Summary unavailable: no cached agent-lifetime summary exists. "
+            "Open a work phase to inspect normalized transcript and statistics."
+        ),
+        model="none",
+        prompt_version=_PRESENTATION_FALLBACK_VERSION,
+        input_hash=identity,
+        generated_at=_fallback_generated_at(agent.ended_at_ms or agent.started_at_ms),
+    )
+
+
+def _agent_name_from_catalog_reference(
+    summary_root: Path,
+    reference: SummaryArtifactReference,
+    agent: Agent,
+) -> AgentNameResult:
+    """Recover a compatible paid lifetime result when its projection is absent."""
+
+    path = summary_root / reference.cache_path
+    root = as_object(read_json(path), str(path))
+    provenance = reference.provenance
+    if root.get("format") == ARTIFACT_ENVELOPE_FORMAT:
+        _require_exact_keys(
+            root,
+            {"format", "schema_version", "artifact", "result"},
+            str(path),
+        )
+        if as_int(root.get("schema_version"), f"{path}.schema_version") != (
+            ARTIFACT_ENVELOPE_VERSION
+        ):
+            raise ValueError(f"{path}: unsupported model-artifact envelope")
+        cached_provenance = SummaryArtifactProvenance.from_json_obj(
+            root.get("artifact"), f"{path}.artifact"
+        )
+        if cached_provenance != provenance:
+            raise ValueError(f"{path}: cache provenance differs from artifact catalog")
+    else:
+        if not provenance.legacy_storage:
+            raise ValueError(f"{path}: cataloged artifact lacks its common envelope")
+        _require_exact_keys(
+            root,
+            {"cache_version", "backend", "usage_receipt_id", "result"},
+            str(path),
+        )
+        if as_string(root.get("backend"), f"{path}.backend") != provenance.backend:
+            raise ValueError(f"{path}: legacy cache backend differs from catalog")
+
+    where = f"{path}.result"
+    raw = as_object(root.get("result"), where)
+    _require_exact_keys(
+        raw,
+        {
+            "thread_id",
+            "short_name",
+            "rationale",
+            "lifetime_summary",
+            "model",
+            "prompt_version",
+            "input_hash",
+            "generated_at",
+        },
+        where,
+    )
+    prompt_version = _nonempty_string(
+        raw.get("prompt_version"), f"{where}.prompt_version"
+    )
+    prompt_contract = summarizer_change_for_prompt(
+        AGENT_LIFETIME_SUMMARIZER, prompt_version
+    )
+    if prompt_contract.output_schema_version < 2:
+        raise ValueError(f"{path}: agent-lifetime artifact lacks a lifetime summary")
+    result = AgentNameResult(
+        thread_id=_nonempty_string(raw.get("thread_id"), f"{where}.thread_id"),
+        short_name=_nonempty_string(raw.get("short_name"), f"{where}.short_name"),
+        rationale=_nonempty_string(raw.get("rationale"), f"{where}.rationale"),
+        lifetime_summary=_nonempty_string(
+            clean_summary_prose(
+                _nonempty_string(
+                    raw.get("lifetime_summary"), f"{where}.lifetime_summary"
+                )
+            ),
+            f"{where}.lifetime_summary",
+        ),
+        model=_nonempty_string(raw.get("model"), f"{where}.model"),
+        prompt_version=prompt_version,
+        input_hash=_nonempty_string(raw.get("input_hash"), f"{where}.input_hash"),
+        generated_at=_nonempty_string(
+            raw.get("generated_at"), f"{where}.generated_at"
+        ),
+        artifact_provenance=provenance,
+    )
+    if (
+        result.thread_id != agent.thread_id
+        or result.input_hash != provenance.input_hash
+        or result.model != provenance.model
+        or result.prompt_version != provenance.prompt_version
+    ):
+        raise ValueError(f"{path}: cached agent lifetime differs from provenance")
+    return result
+
+
+def _validate_legacy_project_overview(
+    root: Mapping[str, JsonValue], path: Path, version: int
+) -> None:
+    """Distinguish a complete old projection from a truncated/corrupt file."""
+
+    root_keys = {"schema_version", "style", "source", "summary"}
+    if version == 2:
+        root_keys.add("knowledge_epoch")
+    _require_exact_keys(root, root_keys, str(path))
+    if as_string(root.get("style"), f"{path}.style") != PROJECT_OVERVIEW_STYLE:
+        raise ValueError(f"{path}: invalid project-overview style")
+    if version == 2:
+        _knowledge_epoch_from_json(
+            root.get("knowledge_epoch"), f"{path}.knowledge_epoch"
+        )
+    source = as_object(root.get("source"), f"{path}.source")
+    source_keys = {"event_ids", "start_ms", "end_ms", "context_sha256"}
+    if version == 2:
+        source_keys.add("transcript")
+    _require_exact_keys(source, source_keys, f"{path}.source")
+    for index, value in enumerate(
+        as_array(source.get("event_ids"), f"{path}.source.event_ids")
+    ):
+        as_string(value, f"{path}.source.event_ids[{index}]")
+    as_int(source.get("start_ms"), f"{path}.source.start_ms")
+    as_int(source.get("end_ms"), f"{path}.source.end_ms")
+    _nonempty_string(
+        source.get("context_sha256"), f"{path}.source.context_sha256"
+    )
+    if version == 2:
+        as_string(source.get("transcript"), f"{path}.source.transcript")
+    summary = _summary_from_json(root.get("summary"), f"{path}.summary")
+    _validate_project_overview(summary, f"{path}.summary")
+
+
 def _load_project_overview(
-    archive: Path, team: TeamData
-) -> tuple[SummaryResult, _ProjectOverviewInput]:
+    archive: Path,
+    team: TeamData,
+) -> tuple[SummaryResult, _ProjectOverviewInput | None]:
     path = _summary_root(archive, team.team_slug) / "project_overview.json"
-    if not path.is_file():
-        raise ValueError(f"missing project overview at {path}; run summarize")
+    if _summary_projection_missing(path):
+        fallback_source = _root_overview_input(team)
+        return (
+            _unavailable_summary(
+                f"project-overview:{team.team_slug}",
+                fallback_source.end_ms,
+                "project overview",
+            ),
+            fallback_source,
+        )
+    root = as_object(read_json(path), str(path))
+    version = as_int(root.get("schema_version"), f"{path}.schema_version")
+    if version in {1, 2}:
+        _validate_legacy_project_overview(root, path, version)
+        fallback_source = _root_overview_input(team)
+        return (
+            _unavailable_summary(
+                f"project-overview:{team.team_slug}",
+                fallback_source.end_ms,
+                "project overview stored with a legacy schema",
+            ),
+            fallback_source,
+        )
+    if version != _PROJECT_OVERVIEW_SCHEMA_VERSION:
+        raise ValueError(f"{path}: unsupported project-overview schema; run summarize")
     source = _frozen_project_overview_input(archive, team)
     if source is None:
-        raise ValueError(
-            f"{path}: unsupported or out-of-window project-overview epoch; run summarize"
+        fallback_source = _root_overview_input(team)
+        return (
+            _unavailable_summary(
+                f"project-overview:{team.team_slug}",
+                fallback_source.end_ms,
+                "project overview for this time slice",
+            ),
+            fallback_source,
         )
-    obj = as_object(read_json(path), str(path))
-    summary = _summary_from_json(obj.get("summary"), f"{path}.summary")
+    summary = _summary_from_json(root.get("summary"), f"{path}.summary")
     _validate_project_overview(summary, f"{path}.summary")
     return summary, source
 
@@ -2722,11 +3026,12 @@ def _load_glossary(
     archive: Path,
     team_slug: str,
     project_overview: SummaryResult,
-    project_epoch_id: str,
+    project_epoch_id: str | None,
 ) -> tuple[GlossaryTerm, ...]:
+    suppress = project_overview.prompt_version == _PRESENTATION_FALLBACK_VERSION
     path = _summary_root(archive, team_slug) / "glossary.json"
-    if not path.is_file():
-        raise ValueError(f"missing glossary at {path}; run summarize")
+    if _summary_projection_missing(path):
+        return ()
     obj = as_object(read_json(path), str(path))
     _require_exact_keys(
         obj,
@@ -2743,16 +3048,23 @@ def _load_glossary(
         _GLOSSARY_SCHEMA_VERSION
     ):
         raise ValueError(f"{path}: unsupported glossary schema; run summarize")
-    if as_string(
+    recorded_overview_hash = as_string(
         obj.get("project_overview_input_hash"),
         f"{path}.project_overview_input_hash",
-    ) != project_overview.input_hash:
+    )
+    if not suppress and recorded_overview_hash != project_overview.input_hash:
         raise ValueError(f"{path}: glossary used a stale project overview; run summarize")
-    if as_string(
+    recorded_project_epoch_id = as_string(
         obj.get("project_overview_epoch_id"),
         f"{path}.project_overview_epoch_id",
-    ) != project_epoch_id:
+    )
+    if (
+        not suppress
+        and project_epoch_id is not None
+        and recorded_project_epoch_id != project_epoch_id
+    ):
         raise ValueError(f"{path}: glossary used a different knowledge epoch")
+    project_epoch_id = recorded_project_epoch_id
     as_int(obj.get("observed_through_ms"), f"{path}.observed_through_ms")
     result: list[GlossaryTerm] = []
     for index, raw in enumerate(as_array(obj.get("terms"), f"{path}.terms")):
@@ -2859,7 +3171,7 @@ def _load_glossary(
                 available_at_ms=available_at_ms,
             )
         )
-    return tuple(result)
+    return () if suppress else tuple(result)
 
 
 def build_archive(
@@ -2886,7 +3198,9 @@ def build_archive(
     phase_results = _load_phase_summaries(
         archive, team_slug, phases, summary_catalog
     )
-    agent_names = _load_agent_names(archive, team, phase_agent_ids(team, phases))
+    agent_names = _load_agent_names(
+        archive, team, phase_agent_ids(team, phases), summary_catalog
+    )
     project_overview, project_overview_source = _load_project_overview(archive, team)
     start_ms, end_ms = _period_range(team, phases)
     periods = periods_for_range(
@@ -2906,14 +3220,49 @@ def build_archive(
             / period.kind
             / f"{period.key}.json"
         )
-        if not path.is_file():
-            raise ValueError(f"missing {period.kind} summary {period.key}; run summarize")
+        key = _period_key(period)
+        rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
+        if display_window is not None and period.partial:
+            rollup_results[key] = _unavailable_summary(
+                f"rollup:{period.kind}:{period.key}",
+                period.end_ms,
+                f"partial {period.kind} rollup",
+            )
+            plain_rollup_results[key] = _unavailable_summary(
+                f"rollup-plain:{period.kind}:{period.key}",
+                period.end_ms,
+                f"partial plain-language {period.kind} rollup",
+            )
+            continue
+        if _summary_projection_missing(path):
+            rollup_results[key] = _select_catalog_summary(
+                summary_root,
+                summary_catalog,
+                f"rollup:{period.kind}:{period.key}",
+                "technical-rollup",
+                _unavailable_summary(
+                    f"rollup:{period.kind}:{period.key}",
+                    period.end_ms,
+                    f"{period.kind} rollup",
+                ),
+            )
+            plain_rollup_results[key] = _select_catalog_summary(
+                summary_root,
+                summary_catalog,
+                f"rollup-plain:{period.kind}:{period.key}",
+                "plain-language-rollup",
+                _unavailable_summary(
+                    f"rollup-plain:{period.kind}:{period.key}",
+                    period.end_ms,
+                    f"plain-language {period.kind} rollup",
+                ),
+            )
+            continue
         obj = as_object(read_json(path), str(path))
         if obj.get("schema_version") != 2:
             raise ValueError(
                 f"{path}: rollup lacks a plain-language summary; run summarize"
             )
-        key = _period_key(period)
         projected_technical = _summary_from_json(
             obj.get("technical_summary"), f"{path}.technical_summary"
         )
@@ -2934,12 +3283,15 @@ def build_archive(
             "plain-language-rollup",
             projected_plain,
         )
-        rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
     terms = _load_glossary(
         archive,
         team_slug,
         project_overview,
-        project_overview_source.epoch.epoch_id,
+        (
+            project_overview_source.epoch.epoch_id
+            if project_overview_source is not None
+            else None
+        ),
     )
     artifact_catalog = load_artifact_catalog(archive, team_slug, team)
     pull_cache = load_pull_request_metadata_cache(
