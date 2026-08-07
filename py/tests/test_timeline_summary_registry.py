@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from agent_team_timeline.summary_artifacts import (
+    SummaryArtifactProvenance,
+    make_summary_provenance,
+)
 from agent_team_timeline.summary_registry import (
     ContextComponent,
     ContextCoverage,
@@ -65,3 +69,50 @@ def test_context_coverage_rejects_impossible_provenance() -> None:
                 ContextComponent("prior_days", 1, 1, "summaries"),
             )
         )
+
+
+def test_context_coverage_round_trips_known_and_unknown_records() -> None:
+    known = ContextCoverage(
+        components=(ContextComponent("prior_days", 10, 7, "summaries"),),
+        frontier_status="isolated-backfill",
+        predecessor_keys=("daily:2026-08-05",),
+    )
+    unknown = ContextCoverage.unknown_legacy()
+
+    assert ContextCoverage.from_json_obj(known.to_json_obj(), "known") == known
+    assert ContextCoverage.from_json_obj(unknown.to_json_obj(), "unknown") == unknown
+    assert unknown.coverage_percent is None
+
+
+def test_summary_artifact_provenance_has_stable_validated_identity() -> None:
+    provenance = make_summary_provenance(
+        PHASE_SUMMARIZER,
+        logical_key="phase:one",
+        team_slug="codex-hermit",
+        start_ms=100,
+        end_ms=200,
+        input_hash="abc123",
+        backend="codex",
+        model="gpt-5.6-luna",
+        reasoning_effort="high",
+        service_tier="priority",
+        generated_at="2026-08-07T15:00:00Z",
+        usage_receipt_id="receipt-1",
+        context_coverage=ContextCoverage(
+            components=(ContextComponent("ancestor_transcript", 16_000, 8_000, "characters"),)
+        ),
+        dependency_keys=("summary-parent",),
+    )
+
+    restored = SummaryArtifactProvenance.from_json_obj(
+        provenance.to_json_obj(), "artifact"
+    )
+    assert restored == provenance
+    assert restored.artifact_id.startswith("summary-")
+    assert restored.summarizer_version == PHASE_SUMMARIZER.current_version
+    assert restored.model == "gpt-5.6-luna"
+
+    tampered = provenance.to_json_obj()
+    tampered["model"] = "gpt-5.6-sol"
+    with pytest.raises(ValueError, match="artifact ID"):
+        SummaryArtifactProvenance.from_json_obj(tampered, "artifact")

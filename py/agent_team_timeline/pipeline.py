@@ -92,7 +92,12 @@ from agent_team_timeline.summarize import (
     knowledge_text_has_link,
     summarize_jobs,
 )
-from agent_team_timeline.summary_registry import registry_json_obj
+from agent_team_timeline.summary_registry import (
+    ContextComponent,
+    ContextCoverage,
+    registry_json_obj,
+)
+from agent_team_timeline.summary_artifacts import SummaryArtifactProvenance
 from agent_team_timeline.token_usage import TokenUsage, resolve_service_tier
 from agent_team_timeline.terminology import (
     GlossaryTerm,
@@ -1100,6 +1105,16 @@ def _project_overview_job(
             "source_characters": len(source.transcript),
         },
         summary_style=PROJECT_OVERVIEW_STYLE,
+        context_coverage=ContextCoverage(
+            components=(
+                ContextComponent(
+                    "early_root_transcript",
+                    _OVERVIEW_CONTEXT_CHARS,
+                    min(_OVERVIEW_CONTEXT_CHARS, len(source.transcript)),
+                    "characters",
+                ),
+            )
+        ),
     )
 
 
@@ -1186,6 +1201,24 @@ def _glossary_definition_job(
         glossary=f"Exact glossary name: {term.term}",
         stats={"source_occurrences": len(evidence)},
         summary_style=GLOSSARY_DEFINITION_STYLE,
+        context_coverage=ContextCoverage(
+            components=(
+                ContextComponent(
+                    "source_occurrences",
+                    _TERM_EVIDENCE_LIMIT,
+                    min(_TERM_EVIDENCE_LIMIT, len(evidence)),
+                    "occurrences",
+                ),
+                ContextComponent("project_overview", 1, 1, "artifacts"),
+            )
+        ),
+        dependency_keys=(
+            (
+                project_overview.artifact_provenance.artifact_id
+                if project_overview.artifact_provenance is not None
+                else project_overview.input_hash
+            ),
+        ),
     )
 
 
@@ -1200,7 +1233,10 @@ def _definition_status(summary: SummaryResult) -> str:
 
 
 def _phase_jobs(
-    team: TeamData, phases: Sequence[PhaseWindow], terms: Sequence[GlossaryTerm]
+    team: TeamData,
+    phases: Sequence[PhaseWindow],
+    terms: Sequence[GlossaryTerm],
+    context_chars: int,
 ) -> tuple[SummaryJob, ...]:
     jobs: list[SummaryJob] = []
     for phase in phases:
@@ -1220,6 +1256,16 @@ def _phase_jobs(
                 transcript=phase.transcript_text,
                 glossary=glossary_prompt_text(chronological_terms),
                 stats=phase.stats.to_mapping(),
+                context_coverage=ContextCoverage(
+                    components=(
+                        ContextComponent(
+                            "ancestor_transcript",
+                            context_chars,
+                            min(context_chars, len(phase.prior_context)),
+                            "characters",
+                        ),
+                    )
+                ),
             )
         )
     return tuple(jobs)
@@ -1227,7 +1273,7 @@ def _phase_jobs(
 
 def _summary_json(summary: SummaryResult) -> dict[str, JsonValue]:
     cleaned = clean_summary_result(summary)
-    return {
+    result: dict[str, JsonValue] = {
         "key": cleaned.key,
         "phrase": cleaned.phrase,
         "paragraph": cleaned.paragraph,
@@ -1239,6 +1285,9 @@ def _summary_json(summary: SummaryResult) -> dict[str, JsonValue]:
         "input_hash": cleaned.input_hash,
         "generated_at": cleaned.generated_at,
     }
+    if cleaned.artifact_provenance is not None:
+        result["artifact_provenance"] = cleaned.artifact_provenance.to_json_obj()
+    return result
 
 
 def _require_exact_keys(
@@ -1259,20 +1308,19 @@ def _require_exact_keys(
 
 def _summary_from_json(value: JsonValue, where: str) -> SummaryResult:
     obj = as_object(value, where)
-    _require_exact_keys(
-        obj,
-        {
-            "key",
-            "phrase",
-            "paragraph",
-            "work_summary",
-            "model",
-            "prompt_version",
-            "input_hash",
-            "generated_at",
-        },
-        where,
-    )
+    base_keys = {
+        "key",
+        "phrase",
+        "paragraph",
+        "work_summary",
+        "model",
+        "prompt_version",
+        "input_hash",
+        "generated_at",
+    }
+    actual_keys = set(obj)
+    if actual_keys not in (base_keys, base_keys | {"artifact_provenance"}):
+        _require_exact_keys(obj, base_keys, where)
     raw_bullets = as_array(obj.get("work_summary"), f"{where}.work_summary")
     for index, raw_bullet in enumerate(raw_bullets):
         bullet = as_object(raw_bullet, f"{where}.work_summary[{index}]")
@@ -1300,6 +1348,13 @@ def _summary_from_json(value: JsonValue, where: str) -> SummaryResult:
             ),
             input_hash=as_string(obj.get("input_hash"), f"{where}.input_hash"),
             generated_at=as_string(obj.get("generated_at"), f"{where}.generated_at"),
+            artifact_provenance=(
+                SummaryArtifactProvenance.from_json_obj(
+                    obj.get("artifact_provenance"), f"{where}.artifact_provenance"
+                )
+                if "artifact_provenance" in obj
+                else None
+            ),
         )
     )
 
@@ -1610,10 +1665,16 @@ def _result_line(result: SummaryResult, label: str, at_ms: int) -> str:
     return f"[{at_ms}] {label}: {result.phrase}. {result.paragraph} {bullets}".strip()
 
 
+def _result_artifact_key(result: SummaryResult) -> str:
+    provenance = result.artifact_provenance
+    return provenance.artifact_id if provenance is not None else result.input_hash
+
+
 def _agent_name_jobs(
     team: TeamData,
     phases: Sequence[PhaseWindow],
     phase_results: Mapping[str, SummaryResult],
+    context_chars: int = 16_000,
 ) -> tuple[AgentNameJob, ...]:
     """Build hindsight naming inputs after all phase-level work has been summarized."""
 
@@ -1641,10 +1702,26 @@ def _agent_name_jobs(
             if agent.parent_thread_id is not None
             else None
         )
+        if own_phases:
+            job_start_ms = own_phases[0].start_ms
+            job_end_ms = own_phases[-1].end_ms
+        else:
+            job_start_ms = max(
+                agent.started_at_ms,
+                team.window_start_ms or agent.started_at_ms,
+            )
+            natural_end_ms = agent.ended_at_ms or team.window_end_ms or job_start_ms
+            job_end_ms = max(
+                job_start_ms,
+                min(natural_end_ms, team.window_end_ms or natural_end_ms),
+            )
         jobs.append(
             AgentNameJob(
                 key=f"agent-name:{agent.thread_id}",
+                team_slug=team.team_slug,
                 thread_id=agent.thread_id,
+                start_ms=job_start_ms,
+                end_ms=job_end_ms,
                 official_path=agent.agent_path,
                 coordinator_nickname=agent.nickname,
                 role=agent.role,
@@ -1654,7 +1731,30 @@ def _agent_name_jobs(
                 work_summary=(
                     "\n\n".join(work_lines)
                     if work_lines
-                    else "No substantive phase summary was available for this thread."
+                        else "No substantive phase summary was available for this thread."
+                ),
+                context_coverage=ContextCoverage(
+                    components=(
+                        ContextComponent(
+                            "ancestor_transcript",
+                            context_chars,
+                            min(
+                                context_chars,
+                                len(own_phases[0].prior_context) if own_phases else 0,
+                            ),
+                            "characters",
+                        ),
+                        ContextComponent(
+                            "phase_work_summaries",
+                            len(own_phases),
+                            len(own_phases),
+                            "summaries",
+                        ),
+                    )
+                ),
+                dependency_keys=tuple(
+                    _result_artifact_key(phase_results[phase.summary_key])
+                    for phase in own_phases
                 ),
             )
         )
@@ -1664,8 +1764,20 @@ def _agent_name_jobs(
 def _agent_name_json(
     job: AgentNameJob, result: AgentNameResult
 ) -> dict[str, JsonValue]:
+    name: dict[str, JsonValue] = {
+        "thread_id": result.thread_id,
+        "short_name": result.short_name,
+        "rationale": result.rationale,
+        "lifetime_summary": result.lifetime_summary,
+        "model": result.model,
+        "prompt_version": result.prompt_version,
+        "input_hash": result.input_hash,
+        "generated_at": result.generated_at,
+    }
+    if result.artifact_provenance is not None:
+        name["artifact_provenance"] = result.artifact_provenance.to_json_obj()
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "agent": {
             "thread_id": job.thread_id,
             "official_path": job.official_path,
@@ -1674,16 +1786,7 @@ def _agent_name_json(
             "depth": job.depth,
             "parent_official_path": job.parent_official_path,
         },
-        "name": {
-            "thread_id": result.thread_id,
-            "short_name": result.short_name,
-            "rationale": result.rationale,
-            "lifetime_summary": result.lifetime_summary,
-            "model": result.model,
-            "prompt_version": result.prompt_version,
-            "input_hash": result.input_hash,
-            "generated_at": result.generated_at,
-        },
+        "name": name,
     }
 
 
@@ -1731,7 +1834,8 @@ def _load_agent_names(
                 f"missing hindsight name for {agent.agent_path}; run `agent-team-timeline summarize`"
             )
         root = as_object(read_json(path), str(path))
-        if root.get("schema_version") != 2:
+        schema_version = root.get("schema_version")
+        if schema_version not in {2, 3}:
             raise ValueError(
                 f"unsupported agent-name schema at {path}; run summarize to generate "
                 "hindsight lifetime summaries"
@@ -1782,6 +1886,14 @@ def _load_agent_names(
             generated_at=_nonempty_string(
                 raw_name.get("generated_at"), f"{path}.name.generated_at"
             ),
+            artifact_provenance=(
+                SummaryArtifactProvenance.from_json_obj(
+                    raw_name.get("artifact_provenance"),
+                    f"{path}.name.artifact_provenance",
+                )
+                if "artifact_provenance" in raw_name
+                else None
+            ),
         )
         if result.thread_id != agent.thread_id:
             raise ValueError(f"agent-name result thread mismatch at {path}")
@@ -1799,7 +1911,7 @@ def _rollup_jobs_for_level(
     completed_same_level: Sequence[tuple[Period, SummaryResult]],
     terms: Sequence[GlossaryTerm],
     summary_style: str = TECHNICAL_ROLLUP_STYLE,
-    project_overview: str = "",
+    project_overview: SummaryResult | None = None,
 ) -> tuple[SummaryJob, ...]:
     jobs: list[SummaryJob] = []
     for period in periods:
@@ -1816,6 +1928,7 @@ def _rollup_jobs_for_level(
             )
             for item in lower
         ]
+        dependency_results = [lower_results[_period_key(item)] for item in lower]
         # Calendar levels do not nest perfectly: an ISO week can straddle a month. Summarize only
         # fully-contained lower periods and fill uncovered boundary time from phase summaries, so
         # January's monthly report never imports work from December or February.
@@ -1836,6 +1949,9 @@ def _rollup_jobs_for_level(
             )
             for phase in uncovered_phases
         )
+        dependency_results.extend(
+            phase_results[phase.summary_key] for phase in uncovered_phases
+        )
         transcript = "\n\n".join(
             line for _, line in sorted(transcript_parts, key=lambda item: item[0])
         )
@@ -1847,6 +1963,7 @@ def _rollup_jobs_for_level(
         prior_context = "\n\n".join(
             _result_line(result, item.label, item.start_ms) for item, result in prior
         )
+        dependency_results.extend(result for _, result in prior)
         stats = aggregate_stats(own_phases)
         plain_language = summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE
         key_prefix = "rollup-plain" if plain_language else "rollup"
@@ -1856,13 +1973,26 @@ def _rollup_jobs_for_level(
         )
         if plain_language:
             glossary = plain_language_context_text(
-                project_overview,
+                project_overview.paragraph if project_overview is not None else "",
                 [
                     term
                     for term in terms
                     if term.summary_available_at_ms < period.end_ms
                 ],
             )
+            if project_overview is not None:
+                dependency_results.append(project_overview)
+        earliest_activity = min(
+            (event.timestamp_ms for event in team.events),
+            default=period.start_ms,
+        )
+        previous_period = completed_same_level[-1][0] if completed_same_level else None
+        if period.start_ms <= earliest_activity < period.end_ms:
+            frontier_status = "project-start"
+        elif previous_period is not None and previous_period.end_ms == period.start_ms:
+            frontier_status = "contiguous-extension"
+        else:
+            frontier_status = "isolated-backfill"
         jobs.append(
             SummaryJob(
                 key=f"{key_prefix}:{period.kind}:{period.key}",
@@ -1877,6 +2007,32 @@ def _rollup_jobs_for_level(
                 glossary=glossary,
                 stats=stats.to_mapping(),
                 summary_style=summary_style,
+                context_coverage=ContextCoverage(
+                    components=(
+                        ContextComponent(
+                            "lower_level_summaries",
+                            len(transcript_parts),
+                            len(transcript_parts),
+                            "summaries",
+                        ),
+                        ContextComponent(
+                            "prior_same_level_summaries",
+                            10,
+                            len(prior),
+                            "summaries",
+                        ),
+                    )
+                    + (
+                        (ContextComponent("project_overview", 1, 1, "artifacts"),)
+                        if plain_language and project_overview is not None
+                        else ()
+                    ),
+                    frontier_status=frontier_status,
+                    predecessor_keys=tuple(_period_key(item) for item, _ in prior),
+                ),
+                dependency_keys=tuple(
+                    dict.fromkeys(_result_artifact_key(result) for result in dependency_results)
+                ),
             )
         )
     return tuple(jobs)
@@ -1996,7 +2152,7 @@ def _summarize_archive_locked(
         for term_id, knowledge in knowledge_by_term.items()
     }
     phase_results, phase_stats = summarize_jobs(
-        _phase_jobs(team, phases, terms),
+        _phase_jobs(team, phases, terms, context_chars),
         cache,
         backend,
         model,
@@ -2007,7 +2163,7 @@ def _summarize_archive_locked(
         service_tier=service_tier,
     )
     changed += _write_phase_data(archive, team_slug, phases, phase_results)
-    name_jobs = _agent_name_jobs(team, phases, phase_results)
+    name_jobs = _agent_name_jobs(team, phases, phase_results, context_chars)
     agent_names, name_stats = name_agents(
         name_jobs,
         _summary_root(archive, team_slug) / "name_cache",
@@ -2139,7 +2295,7 @@ def _summarize_archive_locked(
                 completed_plain,
                 enriched_terms,
                 PLAIN_LANGUAGE_ROLLUP_STYLE,
-                project_overview.paragraph,
+                project_overview,
             )
             plain_results, plain_stats = summarize_jobs(
                 plain_jobs,

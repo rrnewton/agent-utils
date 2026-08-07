@@ -118,22 +118,28 @@ supported chronological glossary definitions. It must identify the project for a
 describe content before opaque work-management identifiers. It shares each rollup projection with
 the technical result but has an independent input hash and usage receipt.
 
-## Existing cache identity and receipts
+## Common cache identity and receipts
 
-Both current runners content-address a job over the exact structured model payload plus backend,
-model, prompt version, reasoning effort, and non-default service tier. The default tier is omitted
-from the hash for compatibility with caches predating explicit tier support. Batch size and worker
-count do not affect artifact identity.
+Both runners content-address a job over the exact structured model payload plus registered
+summarizer ID/version, output schema version, backend, model, prompt version, reasoning effort, and
+non-default service tier. The default tier is omitted from the hash for compatibility with caches
+predating explicit tier support. Batch size and worker count do not affect artifact identity.
 
-Validated batches are published immediately. Every attempted backend batch has an immutable usage
-receipt under the relevant cache's `_usage/` tree; cache records link to the generating receipt.
-The cache-envelope version (`summary` cache v2 and naming cache v3 at the time of writing) describes
-storage shape and is distinct from the registered summarizer version.
+Validated batches are published immediately in the shared version-1 envelope defined by
+`summary_artifacts.py`. Every artifact records its deterministic artifact ID, logical key, team and
+time interval, complete summarizer contract, model selection, context coverage, dependency keys,
+generation time, and generating usage receipt. Every attempted backend batch has an immutable
+usage receipt under the relevant cache's `_usage/` tree. The envelope version describes storage
+shape and is distinct from the registered summarizer and output-schema versions.
 
-This already preserves older content-addressed files after a prompt bump, but the projections and
-build readers are too strict: several readers demand only the current wrapper schema or prompt
-version. They must be changed to select the newest compatible available artifact per logical key
-and gracefully expose missing fields from older versions.
+The resolvers also try the former hash scheme. Valid summary-cache v1/v2 and naming-cache v3 files
+remain hits without token spend; they receive in-memory provenance marked `legacy_storage: true`
+and `unknown-legacy` context coverage. They are never rewritten merely to migrate storage.
+Pre-lifetime naming-cache v2 remains incompatible because it lacks the required lifetime summary.
+
+Projection records now carry the common provenance when it is known, while readers continue to
+accept pre-envelope projections. A logical-key artifact catalog and newest-compatible selection
+remain to be implemented before sparse mixed-version archives are fully inspectable.
 
 ## Standard staged-computation contract
 
@@ -155,9 +161,9 @@ Every registered summarizer will use the following common lifecycle:
 6. **Render.** Select the newest compatible artifact available for each logical key. Missing newer
    fields are absent/unknown in the UI, not fabricated and not a build failure.
 
-The registry and context vocabulary are now centralized. Moving both runners onto a shared cache
-envelope/index is the next refactor; no production summary tokens should be spent between those
-steps.
+Steps 1 through 4 use the shared runner contract for all six summarizers. Projection provenance is
+also common. Step 5's logical-key catalog and Step 6's mixed-version selection remain the next
+refactor; no production summary tokens should be spent before they land.
 
 ## Context completeness and frontier metadata
 

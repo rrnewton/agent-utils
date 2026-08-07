@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
-from agent_team_timeline.archive import JsonValue
+from agent_team_timeline.archive import JsonValue, as_array, as_int, as_object, as_string
 
 
 PHASE_STYLE: Final = "phase"
@@ -27,6 +27,7 @@ class SummarizerChange:
 
     version: int
     prompt_version: str
+    output_schema_version: int
     change: str
 
     def to_json_obj(self) -> dict[str, JsonValue]:
@@ -35,13 +36,14 @@ class SummarizerChange:
         return {
             "version": self.version,
             "prompt_version": self.prompt_version,
+            "output_schema_version": self.output_schema_version,
             "change": self.change,
         }
 
 
 @dataclass(frozen=True, slots=True)
 class SummarizerSpec:
-    """The current contract and complete known version history for one model task."""
+    """The selected contract and complete known version ledger for one model task."""
 
     summarizer_id: str
     summary_style: str
@@ -70,6 +72,7 @@ class SummarizerSpec:
         if (
             current.version != self.current_version
             or current.prompt_version != self.prompt_version
+            or current.output_schema_version != self.output_schema_version
         ):
             raise ValueError(
                 f"summarizer {self.summarizer_id!r} current contract differs from its changelog"
@@ -128,6 +131,33 @@ class ContextComponent:
             "coverage_basis_points": self.coverage_basis_points,
         }
 
+    @classmethod
+    def from_json_obj(cls, value: JsonValue, where: str) -> ContextComponent:
+        """Strictly parse one persisted context channel."""
+
+        obj = as_object(value, where)
+        expected = {
+            "name",
+            "requested",
+            "provided",
+            "unit",
+            "coverage_basis_points",
+        }
+        if set(obj) != expected:
+            raise ValueError(f"{where}: invalid context component fields")
+        result = cls(
+            name=as_string(obj.get("name"), f"{where}.name"),
+            requested=as_int(obj.get("requested"), f"{where}.requested"),
+            provided=as_int(obj.get("provided"), f"{where}.provided"),
+            unit=as_string(obj.get("unit"), f"{where}.unit"),
+        )
+        recorded = as_int(
+            obj.get("coverage_basis_points"), f"{where}.coverage_basis_points"
+        )
+        if recorded != result.coverage_basis_points:
+            raise ValueError(f"{where}: context coverage does not match raw counts")
+        return result
+
 
 @dataclass(frozen=True, slots=True)
 class ContextCoverage:
@@ -136,6 +166,7 @@ class ContextCoverage:
     components: tuple[ContextComponent, ...] = ()
     frontier_status: str = "not-applicable"
     predecessor_keys: tuple[str, ...] = ()
+    known: bool = True
 
     def __post_init__(self) -> None:
         if self.frontier_status not in {
@@ -149,11 +180,15 @@ class ContextCoverage:
         names = tuple(item.name for item in self.components)
         if len(names) != len(set(names)):
             raise ValueError("context component names must be unique")
+        if not self.known and self.components:
+            raise ValueError("unknown context coverage cannot contain measured components")
 
     @property
-    def coverage_basis_points(self) -> int:
+    def coverage_basis_points(self) -> int | None:
         """Average optional-channel completeness without mixing unlike raw units."""
 
+        if not self.known:
+            return None
         if not self.components:
             return 10_000
         return sum(item.coverage_basis_points for item in self.components) // len(
@@ -161,21 +196,24 @@ class ContextCoverage:
         )
 
     @property
-    def coverage_percent(self) -> int:
+    def coverage_percent(self) -> int | None:
         """Return a simple whole-number context coverage score."""
 
-        return (self.coverage_basis_points + 50) // 100
+        basis_points = self.coverage_basis_points
+        return None if basis_points is None else (basis_points + 50) // 100
 
     @property
-    def missing_percent(self) -> int:
+    def missing_percent(self) -> int | None:
         """Return the complementary whole-number missing-context score."""
 
-        return 100 - self.coverage_percent
+        coverage = self.coverage_percent
+        return None if coverage is None else 100 - coverage
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return deterministic context and frontier metadata."""
 
         return {
+            "known": self.known,
             "coverage_basis_points": self.coverage_basis_points,
             "coverage_percent": self.coverage_percent,
             "missing_percent": self.missing_percent,
@@ -183,6 +221,65 @@ class ContextCoverage:
             "predecessor_keys": list(self.predecessor_keys),
             "components": [item.to_json_obj() for item in self.components],
         }
+
+    @classmethod
+    def unknown_legacy(cls) -> ContextCoverage:
+        """Represent an artifact whose context measurements are unavailable."""
+
+        return cls(frontier_status="unknown-legacy", known=False)
+
+    @classmethod
+    def from_json_obj(cls, value: JsonValue, where: str) -> ContextCoverage:
+        """Strictly parse persisted context and verify all derived percentages."""
+
+        obj = as_object(value, where)
+        expected = {
+            "known",
+            "coverage_basis_points",
+            "coverage_percent",
+            "missing_percent",
+            "frontier_status",
+            "predecessor_keys",
+            "components",
+        }
+        if set(obj) != expected:
+            raise ValueError(f"{where}: invalid context coverage fields")
+        known = obj.get("known")
+        if not isinstance(known, bool):
+            raise ValueError(f"{where}.known: expected a boolean")
+        components = tuple(
+            ContextComponent.from_json_obj(item, f"{where}.components[{index}]")
+            for index, item in enumerate(
+                as_array(obj.get("components"), f"{where}.components")
+            )
+        )
+        result = cls(
+            components=components,
+            frontier_status=as_string(
+                obj.get("frontier_status"), f"{where}.frontier_status"
+            ),
+            predecessor_keys=tuple(
+                as_string(item, f"{where}.predecessor_keys[{index}]")
+                for index, item in enumerate(
+                    as_array(
+                        obj.get("predecessor_keys"), f"{where}.predecessor_keys"
+                    )
+                )
+            ),
+            known=known,
+        )
+        for key, expected_value in (
+            ("coverage_basis_points", result.coverage_basis_points),
+            ("coverage_percent", result.coverage_percent),
+            ("missing_percent", result.missing_percent),
+        ):
+            raw = obj.get(key)
+            if expected_value is None:
+                if raw is not None:
+                    raise ValueError(f"{where}.{key}: expected null")
+            elif as_int(raw, f"{where}.{key}") != expected_value:
+                raise ValueError(f"{where}.{key}: derived value mismatch")
+        return result
 
 
 PHASE_SUMMARIZER: Final = SummarizerSpec(
@@ -204,6 +301,7 @@ PHASE_SUMMARIZER: Final = SummarizerSpec(
         SummarizerChange(
             1,
             "agent-team-timeline-summary-v1",
+            1,
             "Initial substantive phase summary with three display resolutions.",
         ),
     ),
@@ -228,11 +326,13 @@ TECHNICAL_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
         SummarizerChange(
             1,
             "agent-team-timeline-technical-rollup-v1",
+            1,
             "Initial calendar super-summary.",
         ),
         SummarizerChange(
             2,
             "agent-team-timeline-technical-rollup-v2",
+            1,
             "Require content before work-management identifiers and expand opaque shorthand.",
         ),
     ),
@@ -258,11 +358,13 @@ PLAIN_LANGUAGE_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
         SummarizerChange(
             1,
             "agent-team-timeline-plain-rollup-v1",
+            1,
             "Initial separate plain-language calendar summary.",
         ),
         SummarizerChange(
             2,
             "agent-team-timeline-plain-rollup-v2",
+            1,
             "Ground newcomer explanations in the project overview and verified glossary.",
         ),
     ),
@@ -282,11 +384,13 @@ PROJECT_OVERVIEW_SUMMARIZER: Final = SummarizerSpec(
         SummarizerChange(
             1,
             "agent-team-timeline-project-overview-v1",
+            1,
             "Initial project knowledge summary.",
         ),
         SummarizerChange(
             2,
             "agent-team-timeline-project-overview-v2",
+            1,
             "Freeze evidence frontiers and require explicit insufficient-evidence results.",
         ),
     ),
@@ -310,11 +414,13 @@ GLOSSARY_DEFINITION_SUMMARIZER: Final = SummarizerSpec(
         SummarizerChange(
             1,
             "agent-team-timeline-glossary-definition-v1",
+            1,
             "Initial model-backed glossary definition.",
         ),
         SummarizerChange(
             2,
             "agent-team-timeline-glossary-definition-v2",
+            1,
             "Bind definitions to frozen occurrences and reject unsupported inference.",
         ),
     ),
@@ -338,11 +444,13 @@ AGENT_LIFETIME_SUMMARIZER: Final = SummarizerSpec(
         SummarizerChange(
             1,
             "agent-team-timeline-agent-name-v1",
+            1,
             "Initial hindsight short name.",
         ),
         SummarizerChange(
             2,
             "agent-team-timeline-agent-name-v2",
+            2,
             "Add the substantive lifetime summary used by agent hover cards.",
         ),
     ),
@@ -358,6 +466,7 @@ SUMMARIZER_REGISTRY: Final = (
 )
 
 _BY_STYLE: Final = {item.summary_style: item for item in SUMMARIZER_REGISTRY}
+_BY_ID: Final = {item.summarizer_id: item for item in SUMMARIZER_REGISTRY}
 
 if len(_BY_STYLE) != len(SUMMARIZER_REGISTRY):
     raise ValueError("summarizer registry contains duplicate styles")
@@ -374,6 +483,39 @@ def summarizer_for_style(summary_style: str) -> SummarizerSpec:
         return _BY_STYLE[summary_style]
     except KeyError as error:
         raise ValueError(f"unregistered summary style {summary_style!r}") from error
+
+
+def summarizer_for_id(summarizer_id: str) -> SummarizerSpec:
+    """Return the registered contract for a durable summarizer ID."""
+
+    try:
+        return _BY_ID[summarizer_id]
+    except KeyError as error:
+        raise ValueError(f"unregistered summarizer ID {summarizer_id!r}") from error
+
+
+def summarizer_version_for_prompt(spec: SummarizerSpec, prompt_version: str) -> int:
+    """Resolve a prompt identifier to its registered numeric version."""
+
+    for change in spec.changelog:
+        if change.prompt_version == prompt_version:
+            return change.version
+    raise ValueError(
+        f"summarizer {spec.summarizer_id!r} has no prompt version {prompt_version!r}"
+    )
+
+
+def summarizer_change_for_prompt(
+    spec: SummarizerSpec, prompt_version: str
+) -> SummarizerChange:
+    """Return the complete registered contract selected by a prompt identifier."""
+
+    for change in spec.changelog:
+        if change.prompt_version == prompt_version:
+            return change
+    raise ValueError(
+        f"summarizer {spec.summarizer_id!r} has no prompt version {prompt_version!r}"
+    )
 
 
 def registry_json_obj() -> dict[str, JsonValue]:
@@ -404,5 +546,8 @@ __all__ = [
     "TECHNICAL_ROLLUP_STYLE",
     "TECHNICAL_ROLLUP_SUMMARIZER",
     "registry_json_obj",
+    "summarizer_for_id",
     "summarizer_for_style",
+    "summarizer_change_for_prompt",
+    "summarizer_version_for_prompt",
 ]

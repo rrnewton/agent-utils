@@ -22,6 +22,7 @@ from agent_team_timeline.summarize import (
     TECHNICAL_ROLLUP_STYLE,
     _PendingJob,
     _input_hash,
+    _legacy_input_hash,
     _parse_backend_output,
     build_summary_prompt,
     clean_summary_prose,
@@ -64,6 +65,10 @@ def test_fingerprint_is_canonical_and_second_run_is_a_no_churn_hit(tmp_path: Pat
     assert len(first["root"].phrase) <= 80
 
     cache_file = next(cache.glob("*.json"))
+    cache_json = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert cache_json["format"] == "agent-team-timeline-model-artifact"
+    assert cache_json["artifact"]["model"] == "offline"
+    assert cache_json["artifact"]["context_coverage"]["known"] is True
     original_bytes = cache_file.read_bytes()
     original_mtime = cache_file.stat().st_mtime_ns
 
@@ -581,14 +586,27 @@ def test_legacy_cache_is_a_hit_with_explicitly_unknown_historical_cost(
     original, _ = summarize_jobs([job], cache, backend="heuristic", model="offline")
     cache_file = next(cache.glob("*.json"))
     raw = json.loads(cache_file.read_text(encoding="utf-8"))
-    raw["cache_version"] = 1
-    del raw["usage_receipt_id"]
-    cache_file.write_text(json.dumps(raw), encoding="utf-8")
+    legacy_hash = _legacy_input_hash(job, "heuristic", "offline")
+    legacy_result = raw["result"]
+    legacy_result["input_hash"] = legacy_hash
+    cache_file.unlink()
+    legacy_file = cache / f"{legacy_hash}.json"
+    legacy_file.write_text(
+        json.dumps(
+            {"cache_version": 1, "backend": "heuristic", "result": legacy_result}
+        ),
+        encoding="utf-8",
+    )
 
     reused, stats = summarize_jobs(
         [job], cache, backend="heuristic", model="offline"
     )
-    assert reused == original
+    assert reused[job.key].phrase == original[job.key].phrase
+    provenance = reused[job.key].artifact_provenance
+    assert provenance is not None
+    assert provenance.legacy_storage is True
+    assert provenance.context_coverage.known is False
+    assert reused[job.key].input_hash == legacy_hash
     assert stats.hits == 1
     assert stats.misses == 0
     assert stats.newly_spent_usage == TokenUsage()

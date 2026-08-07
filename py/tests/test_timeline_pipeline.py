@@ -402,7 +402,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         / f"{CHILD}.json"
     )
     name_record = json.loads(name_path.read_text(encoding="utf-8"))
-    assert name_record["schema_version"] == 2
+    assert name_record["schema_version"] == 3
     assert name_record["agent"]["official_path"] == "/root/release_receipt_audit"
     assert name_record["name"]["short_name"] == "Release receipt audit"
     assert "receipt binding" in name_record["name"]["lifetime_summary"]
@@ -1212,7 +1212,10 @@ def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
         (),
         (supported, unsupported),
         PLAIN_LANGUAGE_ROLLUP_STYLE,
-        "Hermit runs guest software in a repeatable environment.",
+        _rollup_result(
+            "project-overview",
+            "Hermit runs guest software in a repeatable environment.",
+        ),
     )[0]
     without_definitions = tuple(
         replace(term, definition="", definition_status="unavailable")

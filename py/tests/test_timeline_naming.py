@@ -15,6 +15,7 @@ from agent_team_timeline.naming import (
     AgentNameJob,
     _PendingName,
     _input_hash,
+    _legacy_input_hash,
     _parse_backend_output,
     build_agent_name_prompt,
     name_agents,
@@ -44,7 +45,10 @@ def _job(
 ) -> AgentNameJob:
     return AgentNameJob(
         key=key,
+        team_slug="codex-hermit",
         thread_id=thread_id,
+        start_ms=1_800_000_000_000,
+        end_ms=1_800_000_060_000,
         official_path=official_path,
         coordinator_nickname="Beauvoir" if depth > 0 else None,
         role="reviewer" if depth > 0 else "coordinator",
@@ -254,6 +258,9 @@ def test_cache_hit_is_idempotent_without_rewriting(tmp_path: Path) -> None:
         [job], cache, backend="heuristic", model="offline"
     )
     cache_file = next(cache.glob("*.json"))
+    cache_json = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert cache_json["format"] == "agent-team-timeline-model-artifact"
+    assert cache_json["artifact"]["summarizer_id"] == "agent-lifetime"
     original_bytes = cache_file.read_bytes()
     original_mtime = cache_file.stat().st_mtime_ns
 
@@ -353,8 +360,44 @@ def test_pre_lifetime_cache_version_is_regenerated_once(tmp_path: Path) -> None:
     assert second_stats.hits == 1 and second_stats.misses == 0
     assert first[job.thread_id].lifetime_summary == second[job.thread_id].lifetime_summary
     migrated = json.loads(pending.cache_path.read_text(encoding="utf-8"))
-    assert migrated["cache_version"] == 3
+    assert migrated["format"] == "agent-team-timeline-model-artifact"
     assert migrated["result"]["lifetime_summary"]
+
+
+def test_legacy_lifetime_cache_is_reused_without_token_spend(tmp_path: Path) -> None:
+    job = _job()
+    cache = tmp_path / "cache"
+    generated, _ = name_agents(
+        [job], cache, backend="heuristic", model="offline"
+    )
+    current_file = next(cache.glob("*.json"))
+    current = json.loads(current_file.read_text(encoding="utf-8"))
+    legacy_hash = _legacy_input_hash(job, "heuristic", "offline")
+    legacy_result = current["result"]
+    legacy_result["input_hash"] = legacy_hash
+    current_file.unlink()
+    (cache / f"{legacy_hash}.json").write_text(
+        json.dumps(
+            {
+                "cache_version": 3,
+                "backend": "heuristic",
+                "usage_receipt_id": current["artifact"]["usage_receipt_id"],
+                "result": legacy_result,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    reused, stats = name_agents(
+        [job], cache, backend="heuristic", model="offline"
+    )
+
+    assert reused[job.thread_id].short_name == generated[job.thread_id].short_name
+    provenance = reused[job.thread_id].artifact_provenance
+    assert provenance is not None
+    assert provenance.legacy_storage is True
+    assert provenance.context_coverage.known is False
+    assert stats.hits == 1 and stats.misses == 0
 
 
 def test_codex_naming_records_tokens_model_and_reasoning_effort(

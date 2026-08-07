@@ -14,7 +14,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
@@ -33,7 +33,16 @@ from agent_team_timeline.codex_workspace import (
     initialize_codex_workspace,
 )
 from agent_team_timeline.summarize import SummaryRunStats, clean_summary_prose
-from agent_team_timeline.summary_registry import AGENT_LIFETIME_SUMMARIZER
+from agent_team_timeline.summary_artifacts import (
+    ARTIFACT_ENVELOPE_FORMAT,
+    ARTIFACT_ENVELOPE_VERSION,
+    SummaryArtifactProvenance,
+    make_summary_provenance,
+)
+from agent_team_timeline.summary_registry import (
+    AGENT_LIFETIME_SUMMARIZER,
+    ContextCoverage,
+)
 from agent_team_timeline.token_usage import (
     BatchUsageReceipt,
     DEFAULT_SERVICE_TIER,
@@ -47,7 +56,7 @@ from agent_team_timeline.token_usage import (
 
 
 PROMPT_VERSION: Final = AGENT_LIFETIME_SUMMARIZER.prompt_version
-_CACHE_VERSION: Final = 3
+_LEGACY_CACHE_VERSION: Final = 3
 _MAX_NAME_LENGTH: Final = 48
 _MIN_NAME_WORDS: Final = 2
 _MAX_NAME_WORDS: Final = 5
@@ -71,7 +80,10 @@ class AgentNameJob:
     """One agent's provenance, ancestor context, and hindsight work summary."""
 
     key: str
+    team_slug: str
     thread_id: str
+    start_ms: int
+    end_ms: int
     official_path: str
     coordinator_nickname: str | None
     role: str | None
@@ -79,6 +91,8 @@ class AgentNameJob:
     parent_official_path: str | None
     prior_context: str
     work_summary: str
+    context_coverage: ContextCoverage = ContextCoverage()
+    dependency_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -93,6 +107,7 @@ class AgentNameResult:
     prompt_version: str
     input_hash: str
     generated_at: str
+    artifact_provenance: SummaryArtifactProvenance | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +134,12 @@ def _validate_job(job: AgentNameJob) -> None:
         raise AgentNameError("agent name job key must not be empty")
     if not job.thread_id.strip():
         raise AgentNameError(f"agent name job {job.key!r} has an empty thread id")
+    if not job.team_slug.strip():
+        raise AgentNameError(f"agent name job {job.key!r} has an empty team slug")
+    if isinstance(job.start_ms, bool) or isinstance(job.end_ms, bool):
+        raise AgentNameError(f"agent name job {job.key!r} timestamps must be integers")
+    if job.end_ms < job.start_ms:
+        raise AgentNameError(f"agent name job {job.key!r} ends before it starts")
     if not job.official_path.strip():
         raise AgentNameError(f"agent name job {job.key!r} has an empty official path")
     if not isinstance(job.prior_context, str):
@@ -140,6 +161,10 @@ def _validate_job(job: AgentNameJob) -> None:
     ):
         if value is not None and not isinstance(value, str):
             raise AgentNameError(f"agent name job {job.key!r} {label} is not a string")
+    if any(not key.strip() for key in job.dependency_keys):
+        raise AgentNameError(f"agent name job {job.key!r} has an empty dependency key")
+    if len(job.dependency_keys) != len(set(job.dependency_keys)):
+        raise AgentNameError(f"agent name job {job.key!r} has duplicate dependency keys")
 
 
 def _job_json(job: AgentNameJob) -> dict[str, JsonValue]:
@@ -156,6 +181,26 @@ def _job_json(job: AgentNameJob) -> dict[str, JsonValue]:
     }
 
 
+def _legacy_input_hash(
+    job: AgentNameJob,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+) -> str:
+    payload: dict[str, JsonValue] = {
+        "backend": backend,
+        "model": model,
+        "prompt_version": PROMPT_VERSION,
+        "job": _job_json(job),
+    }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+    if service_tier not in (None, DEFAULT_SERVICE_TIER):
+        payload["service_tier"] = service_tier
+    return content_hash(canonical_json(payload))
+
+
 def _input_hash(
     job: AgentNameJob,
     backend: str,
@@ -164,6 +209,9 @@ def _input_hash(
     service_tier: str | None = None,
 ) -> str:
     payload: dict[str, JsonValue] = {
+        "summarizer_id": AGENT_LIFETIME_SUMMARIZER.summarizer_id,
+        "summarizer_version": AGENT_LIFETIME_SUMMARIZER.current_version,
+        "output_schema_version": AGENT_LIFETIME_SUMMARIZER.output_schema_version,
         "backend": backend,
         "model": model,
         "prompt_version": PROMPT_VERSION,
@@ -410,36 +458,64 @@ def _result_json(result: AgentNameResult) -> dict[str, JsonValue]:
     }
 
 
-def _cache_json(
-    result: AgentNameResult, backend: str, usage_receipt_id: str
-) -> dict[str, JsonValue]:
+def _cache_json(result: AgentNameResult) -> dict[str, JsonValue]:
+    provenance = result.artifact_provenance
+    if provenance is None:
+        raise AgentNameError("cannot cache an agent lifetime result without provenance")
     return {
-        "cache_version": _CACHE_VERSION,
-        "backend": backend,
-        "usage_receipt_id": usage_receipt_id,
+        "format": ARTIFACT_ENVELOPE_FORMAT,
+        "schema_version": ARTIFACT_ENVELOPE_VERSION,
+        "artifact": provenance.to_json_obj(),
         "result": _result_json(result),
     }
 
 
 def _load_cache(
-    pending: _PendingName, backend: str, model: str
+    pending: _PendingName,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
 ) -> _ResolvedName | None:
     if not pending.cache_path.is_file():
         return None
     try:
         root = _object(read_json(pending.cache_path), "agent name cache")
-        version = _integer(root.get("cache_version"), "agent name cache.cache_version")
-        if version != _CACHE_VERSION:
-            return None
-        _require_keys(
-            root,
-            {"cache_version", "backend", "usage_receipt_id", "result"},
-            "agent name cache",
-        )
-        usage_receipt_id = _string(
-            root["usage_receipt_id"], "agent name cache.usage_receipt_id"
-        )
-        if _string(root["backend"], "agent name cache.backend") != backend:
+        artifact_provenance: SummaryArtifactProvenance | None = None
+        if root.get("format") == ARTIFACT_ENVELOPE_FORMAT:
+            _require_keys(
+                root,
+                {"format", "schema_version", "artifact", "result"},
+                "agent name cache",
+            )
+            if (
+                _integer(
+                    root.get("schema_version"), "agent name cache.schema_version"
+                )
+                != ARTIFACT_ENVELOPE_VERSION
+            ):
+                return None
+            artifact_provenance = SummaryArtifactProvenance.from_json_obj(
+                root.get("artifact"), "agent name cache.artifact"
+            )
+            usage_receipt_id = artifact_provenance.usage_receipt_id
+            cached_backend = artifact_provenance.backend
+        else:
+            version = _integer(
+                root.get("cache_version"), "agent name cache.cache_version"
+            )
+            if version != _LEGACY_CACHE_VERSION:
+                return None
+            _require_keys(
+                root,
+                {"cache_version", "backend", "usage_receipt_id", "result"},
+                "agent name cache",
+            )
+            usage_receipt_id = _string(
+                root["usage_receipt_id"], "agent name cache.usage_receipt_id"
+            )
+            cached_backend = _string(root["backend"], "agent name cache.backend")
+        if cached_backend != backend:
             return None
         raw = _object(root["result"], "agent name cache.result")
         expected_keys = {
@@ -482,6 +558,40 @@ def _load_cache(
             or input_hash != pending.input_hash
         ):
             return None
+        if artifact_provenance is None:
+            artifact_provenance = make_summary_provenance(
+                AGENT_LIFETIME_SUMMARIZER,
+                logical_key=pending.job.key,
+                team_slug=pending.job.team_slug,
+                start_ms=pending.job.start_ms,
+                end_ms=pending.job.end_ms,
+                input_hash=input_hash,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
+                generated_at=generated_at,
+                usage_receipt_id=usage_receipt_id,
+                context_coverage=ContextCoverage.unknown_legacy(),
+                dependency_keys=(),
+                legacy_storage=True,
+                prompt_version=prompt_version,
+            )
+        elif (
+            artifact_provenance.summarizer_id
+            != AGENT_LIFETIME_SUMMARIZER.summarizer_id
+            or artifact_provenance.logical_key != pending.job.key
+            or artifact_provenance.team_slug != pending.job.team_slug
+            or artifact_provenance.start_ms != pending.job.start_ms
+            or artifact_provenance.end_ms != pending.job.end_ms
+            or artifact_provenance.input_hash != pending.input_hash
+            or artifact_provenance.backend != backend
+            or artifact_provenance.model != model
+            or artifact_provenance.reasoning_effort != reasoning_effort
+            or artifact_provenance.service_tier != service_tier
+            or artifact_provenance.prompt_version != prompt_version
+        ):
+            return None
         return _ResolvedName(
             result=AgentNameResult(
                 thread_id=thread_id,
@@ -492,6 +602,7 @@ def _load_cache(
                 prompt_version=prompt_version,
                 input_hash=input_hash,
                 generated_at=generated_at,
+                artifact_provenance=artifact_provenance,
             ),
             usage_receipt_id=usage_receipt_id,
         )
@@ -805,7 +916,26 @@ def name_agents(
             input_hash=input_hash,
             cache_path=cache_dir / f"{input_hash}.json",
         )
-        cached = _load_cache(item, backend, model)
+        cached = _load_cache(
+            item, backend, model, reasoning_effort, effective_service_tier
+        )
+        if cached is None:
+            legacy_hash = _legacy_input_hash(
+                job, backend, model, reasoning_effort, effective_service_tier
+            )
+            if legacy_hash != input_hash:
+                legacy_item = _PendingName(
+                    job=job,
+                    input_hash=legacy_hash,
+                    cache_path=cache_dir / f"{legacy_hash}.json",
+                )
+                cached = _load_cache(
+                    legacy_item,
+                    backend,
+                    model,
+                    reasoning_effort,
+                    effective_service_tier,
+                )
         if cached is None:
             pending.append(item)
         else:
@@ -820,17 +950,37 @@ def name_agents(
 
     def publish_batch(
         batch: Sequence[_PendingName], batch_result: _GeneratedNameBatch
-    ) -> None:
+    ) -> dict[str, AgentNameResult]:
+        published: dict[str, AgentNameResult] = {}
         for item in batch:
             result = batch_result.results.get(item.job.key)
             if result is None:
                 raise AgentNameError(f"agent naming backend omitted job {item.job.key!r}")
+            provenance = make_summary_provenance(
+                AGENT_LIFETIME_SUMMARIZER,
+                logical_key=item.job.key,
+                team_slug=item.job.team_slug,
+                start_ms=item.job.start_ms,
+                end_ms=item.job.end_ms,
+                input_hash=item.input_hash,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=effective_service_tier,
+                generated_at=result.generated_at,
+                usage_receipt_id=batch_result.receipt.receipt_id,
+                context_coverage=item.job.context_coverage,
+                dependency_keys=item.job.dependency_keys,
+            )
+            enriched = replace(result, artifact_provenance=provenance)
             write_json_if_changed(
                 item.cache_path,
-                _cache_json(result, backend, batch_result.receipt.receipt_id),
+                _cache_json(enriched),
             )
             generated_receipt_by_key[item.job.key] = batch_result.receipt.receipt_id
+            published[item.job.key] = enriched
         new_receipts.append(batch_result.receipt)
+        return published
 
     if backend == "heuristic":
         for batch in batches:
@@ -843,8 +993,7 @@ def name_agents(
                 service_tier=effective_service_tier,
                 codex_command=codex_command,
             )
-            publish_batch(batch, batch_result)
-            generated.update(batch_result.results)
+            generated.update(publish_batch(batch, batch_result))
     elif batches:
         command = tuple(codex_command)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -865,8 +1014,7 @@ def name_agents(
             for future in concurrent.futures.as_completed(futures):
                 try:
                     batch_result = future.result()
-                    publish_batch(futures[future], batch_result)
-                    generated.update(batch_result.results)
+                    generated.update(publish_batch(futures[future], batch_result))
                 except concurrent.futures.CancelledError:
                     continue
                 except AgentNameError as error:

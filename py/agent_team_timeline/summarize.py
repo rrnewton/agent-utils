@@ -13,7 +13,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final
@@ -32,6 +32,7 @@ from agent_team_timeline.codex_workspace import (
 )
 from agent_team_timeline.summary_registry import (
     AGENT_LIFETIME_STYLE,
+    ContextCoverage,
     GLOSSARY_DEFINITION_STYLE,
     GLOSSARY_DEFINITION_SUMMARIZER,
     PHASE_SUMMARIZER,
@@ -41,6 +42,12 @@ from agent_team_timeline.summary_registry import (
     SUMMARIZER_REGISTRY,
     TECHNICAL_ROLLUP_STYLE,
     summarizer_for_style,
+)
+from agent_team_timeline.summary_artifacts import (
+    ARTIFACT_ENVELOPE_FORMAT,
+    ARTIFACT_ENVELOPE_VERSION,
+    SummaryArtifactProvenance,
+    make_summary_provenance,
 )
 from agent_team_timeline.token_usage import (
     BatchUsageReceipt,
@@ -117,6 +124,8 @@ class SummaryJob:
     glossary: str
     stats: Mapping[str, int]
     summary_style: str = "phase"
+    context_coverage: ContextCoverage = ContextCoverage()
+    dependency_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +148,7 @@ class SummaryResult:
     prompt_version: str
     input_hash: str
     generated_at: str
+    artifact_provenance: SummaryArtifactProvenance | None = None
 
 
 @dataclass(frozen=True)
@@ -215,6 +225,10 @@ def _validate_job(job: SummaryJob) -> None:
             raise SummaryError(
                 f"summary job {job.key!r} stat {stat_key!r} is not an integer"
             )
+    if any(not key.strip() for key in job.dependency_keys):
+        raise SummaryError(f"summary job {job.key!r} has an empty dependency key")
+    if len(job.dependency_keys) != len(set(job.dependency_keys)):
+        raise SummaryError(f"summary job {job.key!r} has duplicate dependency keys")
 
 
 def _prompt_version(job: SummaryJob) -> str:
@@ -249,7 +263,7 @@ def _job_json(job: SummaryJob) -> dict[str, JsonValue]:
     return result
 
 
-def _input_hash(
+def _legacy_input_hash(
     job: SummaryJob,
     backend: str,
     model: str,
@@ -260,6 +274,30 @@ def _input_hash(
         "backend": backend,
         "model": model,
         "prompt_version": _prompt_version(job),
+        "job": _job_json(job),
+    }
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+    if service_tier not in (None, DEFAULT_SERVICE_TIER):
+        payload["service_tier"] = service_tier
+    return content_hash(canonical_json(payload))
+
+
+def _input_hash(
+    job: SummaryJob,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None = None,
+    service_tier: str | None = None,
+) -> str:
+    spec = summarizer_for_style(job.summary_style)
+    payload: dict[str, JsonValue] = {
+        "summarizer_id": spec.summarizer_id,
+        "summarizer_version": spec.current_version,
+        "output_schema_version": spec.output_schema_version,
+        "backend": backend,
+        "model": model,
+        "prompt_version": spec.prompt_version,
         "job": _job_json(job),
     }
     if reasoning_effort is not None:
@@ -585,40 +623,68 @@ def _result_json(result: SummaryResult) -> dict[str, JsonValue]:
     }
 
 
-def _cache_json(
-    result: SummaryResult, backend: str, usage_receipt_id: str
-) -> dict[str, JsonValue]:
+def _cache_json(result: SummaryResult) -> dict[str, JsonValue]:
+    provenance = result.artifact_provenance
+    if provenance is None:
+        raise SummaryError("cannot cache a summary without artifact provenance")
     return {
-        "cache_version": _CACHE_VERSION,
-        "backend": backend,
-        "usage_receipt_id": usage_receipt_id,
+        "format": ARTIFACT_ENVELOPE_FORMAT,
+        "schema_version": ARTIFACT_ENVELOPE_VERSION,
+        "artifact": provenance.to_json_obj(),
         "result": _result_json(result),
     }
 
 
 def _load_cache(
-    pending: _PendingJob, backend: str, model: str
+    pending: _PendingJob,
+    backend: str,
+    model: str,
+    reasoning_effort: str | None,
+    service_tier: str | None,
 ) -> _ResolvedSummary | None:
     if not pending.cache_path.is_file():
         return None
     try:
         root = _object(read_json(pending.cache_path), "summary cache")
-        version = _integer(root.get("cache_version"), "summary cache.cache_version")
-        if version == 1:
-            _require_keys(root, {"cache_version", "backend", "result"}, "summary cache")
-            usage_receipt_id: str | None = None
-        elif version == _CACHE_VERSION:
+        artifact_provenance: SummaryArtifactProvenance | None = None
+        if root.get("format") == ARTIFACT_ENVELOPE_FORMAT:
             _require_keys(
                 root,
-                {"cache_version", "backend", "usage_receipt_id", "result"},
+                {"format", "schema_version", "artifact", "result"},
                 "summary cache",
             )
-            usage_receipt_id = _string(
-                root["usage_receipt_id"], "summary cache.usage_receipt_id"
+            if (
+                _integer(root.get("schema_version"), "summary cache.schema_version")
+                != ARTIFACT_ENVELOPE_VERSION
+            ):
+                return None
+            artifact_provenance = SummaryArtifactProvenance.from_json_obj(
+                root.get("artifact"), "summary cache.artifact"
             )
+            usage_receipt_id = artifact_provenance.usage_receipt_id
+            cached_backend = artifact_provenance.backend
         else:
-            return None
-        if _string(root["backend"], "summary cache.backend") != backend:
+            version = _integer(
+                root.get("cache_version"), "summary cache.cache_version"
+            )
+            if version == 1:
+                _require_keys(
+                    root, {"cache_version", "backend", "result"}, "summary cache"
+                )
+                usage_receipt_id = None
+            elif version == _CACHE_VERSION:
+                _require_keys(
+                    root,
+                    {"cache_version", "backend", "usage_receipt_id", "result"},
+                    "summary cache",
+                )
+                usage_receipt_id = _string(
+                    root["usage_receipt_id"], "summary cache.usage_receipt_id"
+                )
+            else:
+                return None
+            cached_backend = _string(root["backend"], "summary cache.backend")
+        if cached_backend != backend:
             return None
         raw_result = _object(root["result"], "summary cache.result")
         expected_keys = {
@@ -660,6 +726,40 @@ def _load_cache(
             or input_hash != pending.input_hash
         ):
             return None
+        expected_spec = summarizer_for_style(pending.job.summary_style)
+        if artifact_provenance is None:
+            artifact_provenance = make_summary_provenance(
+                expected_spec,
+                logical_key=pending.job.key,
+                team_slug=pending.job.team_slug,
+                start_ms=pending.job.start_ms,
+                end_ms=pending.job.end_ms,
+                input_hash=input_hash,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=service_tier,
+                generated_at=generated_at,
+                usage_receipt_id=usage_receipt_id,
+                context_coverage=ContextCoverage.unknown_legacy(),
+                dependency_keys=(),
+                legacy_storage=True,
+                prompt_version=prompt_version,
+            )
+        elif (
+            artifact_provenance.summarizer_id != expected_spec.summarizer_id
+            or artifact_provenance.logical_key != pending.job.key
+            or artifact_provenance.team_slug != pending.job.team_slug
+            or artifact_provenance.start_ms != pending.job.start_ms
+            or artifact_provenance.end_ms != pending.job.end_ms
+            or artifact_provenance.input_hash != pending.input_hash
+            or artifact_provenance.backend != backend
+            or artifact_provenance.model != model
+            or artifact_provenance.reasoning_effort != reasoning_effort
+            or artifact_provenance.service_tier != service_tier
+            or artifact_provenance.prompt_version != prompt_version
+        ):
+            return None
         bullets = _parse_bullets(
             raw_result["work_summary"], pending.job, "summary cache.result.work_summary"
         )
@@ -673,6 +773,7 @@ def _load_cache(
                 prompt_version=prompt_version,
                 input_hash=input_hash,
                 generated_at=generated_at,
+                artifact_provenance=artifact_provenance,
             ),
             usage_receipt_id=usage_receipt_id,
         )
@@ -725,6 +826,7 @@ def clean_summary_result(result: SummaryResult) -> SummaryResult:
         prompt_version=result.prompt_version,
         input_hash=result.input_hash,
         generated_at=result.generated_at,
+        artifact_provenance=result.artifact_provenance,
     )
 
 
@@ -1060,7 +1162,30 @@ def summarize_jobs(
             input_hash=input_hash,
             cache_path=cache_dir / f"{input_hash}.json",
         )
-        cached = _load_cache(item, backend, model)
+        cached = _load_cache(
+            item,
+            backend,
+            model,
+            reasoning_effort,
+            effective_service_tier,
+        )
+        if cached is None:
+            legacy_hash = _legacy_input_hash(
+                job, backend, model, reasoning_effort, effective_service_tier
+            )
+            if legacy_hash != input_hash:
+                legacy_item = _PendingJob(
+                    job=job,
+                    input_hash=legacy_hash,
+                    cache_path=cache_dir / f"{legacy_hash}.json",
+                )
+                cached = _load_cache(
+                    legacy_item,
+                    backend,
+                    model,
+                    reasoning_effort,
+                    effective_service_tier,
+                )
         if cached is None:
             pending.append(item)
         else:
@@ -1075,20 +1200,40 @@ def summarize_jobs(
 
     def publish_batch(
         batch: Sequence[_PendingJob], batch_result: _GeneratedBatch
-    ) -> None:
+    ) -> dict[str, SummaryResult]:
         # Cache names are content-addressed and backend batches have already passed strict
         # shape/key/range validation. Preserve successful expensive work immediately so an
         # independent later batch failure does not spend those tokens again on the retry.
+        published: dict[str, SummaryResult] = {}
         for item in batch:
             result = batch_result.results.get(item.job.key)
             if result is None:
                 raise SummaryError(f"summary backend omitted job {item.job.key!r}")
+            provenance = make_summary_provenance(
+                summarizer_for_style(item.job.summary_style),
+                logical_key=item.job.key,
+                team_slug=item.job.team_slug,
+                start_ms=item.job.start_ms,
+                end_ms=item.job.end_ms,
+                input_hash=item.input_hash,
+                backend=backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                service_tier=effective_service_tier,
+                generated_at=result.generated_at,
+                usage_receipt_id=batch_result.receipt.receipt_id,
+                context_coverage=item.job.context_coverage,
+                dependency_keys=item.job.dependency_keys,
+            )
+            enriched = replace(result, artifact_provenance=provenance)
             write_json_if_changed(
                 item.cache_path,
-                _cache_json(result, backend, batch_result.receipt.receipt_id),
+                _cache_json(enriched),
             )
             generated_receipt_by_key[item.job.key] = batch_result.receipt.receipt_id
+            published[item.job.key] = enriched
         new_receipts.append(batch_result.receipt)
+        return published
 
     if backend == "heuristic":
         for batch in batches:
@@ -1101,8 +1246,7 @@ def summarize_jobs(
                 service_tier=effective_service_tier,
                 codex_command=codex_command,
             )
-            publish_batch(batch, batch_result)
-            generated.update(batch_result.results)
+            generated.update(publish_batch(batch, batch_result))
     elif batches:
         command = tuple(codex_command)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1123,8 +1267,7 @@ def summarize_jobs(
             for future in concurrent.futures.as_completed(futures):
                 try:
                     batch_result = future.result()
-                    publish_batch(futures[future], batch_result)
-                    generated.update(batch_result.results)
+                    generated.update(publish_batch(futures[future], batch_result))
                 except concurrent.futures.CancelledError:
                     continue
                 except SummaryError as error:
