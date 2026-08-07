@@ -280,10 +280,17 @@ to Luna.
 
 Every Terra, Luna, and GPT-5.4-mini receipt has `usage: null`; their spend is
 unknown, not zero. Fresh explicit-default probes added two failed receipts
-apiece to Terra and Luna without creating cache artifacts. GPT-5.5's four
+apiece to Terra and Luna without creating cache artifacts. The probe records
+are `runs/20260806T142003303321Z-878de678.json` for Terra and
+`runs/20260806T142045939904Z-16e122e5.json` for Luna. GPT-5.5's four
 validation-failed calls do contain usage and are included in its all-in total.
 Only an all-cache-hit replay that makes no backend calls is a known zero-token
 run.
+
+Luna is the requested default for the next comparison once its deployment is
+available. That preference does not turn these failed probes into a result:
+the prior Luna attempts produced no summaries, and their null usage means the
+tokens spent, if any, remain unknown rather than zero.
 
 There is no Spark model identifier, including no `gpt-5.3-spark`, in the
 current nine-model catalog. “Fast” is instead the `priority` service tier. The
@@ -352,6 +359,12 @@ first website was ready after about 43m08s. Including the all-hit replay and
 zero-change rebuild took about 45m50s. The resulting site has the same 142
 agents, 391 phases, 2,811 edges, and 547 Markdown summary files as Sol.
 
+The widest recorded wall-clock envelope, from ingest start through the final
+zero-change build, was about 1h26m01s. It includes an intentional 38m14s pause
+between ingest and the first model attempt plus later inter-command gaps; it is
+therefore an upper bound on pipeline time, not model latency. Summing the eight
+recorded command durations gives about 43m40s of active command time.
+
 The replay restored the original batch-size-six command and recorded 577 cache
 hits, zero misses, zero backend calls, and zero newly spent tokens. Its following
 build changed zero files. The successful run, replay, and final build are:
@@ -372,8 +385,9 @@ not finish faster than Sol.
 The experiment does validate frozen-source parity, service-tier provenance for
 new receipts, durable partial caches, exact all-in accounting, and idempotent
 replay. Terra and Luna still have no summaries, so there is no four-model
-quality or cost result. Some Sol run commands and receipt paths also retain
-pre-rename `~/temp/` names even though the current documented directory exists.
-A rigorous head-to-head still requires available deployments, identical
-recorded tiers and batching, empty caches, identical retry policy, and blinded
-quality scoring.
+quality or cost result. Luna remains the requested future default arm, but it
+must first pass an availability probe with durable usage accounting. Some Sol
+run commands and receipt paths also retain pre-rename `~/temp/` names even
+though the current documented directory exists. A rigorous head-to-head still
+requires available deployments, identical recorded tiers and batching, empty
+caches, identical retry policy, and blinded quality scoring.
