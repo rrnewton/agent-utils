@@ -33,6 +33,7 @@ from agent_team_timeline.codex_workspace import (
     initialize_codex_workspace,
 )
 from agent_team_timeline.summarize import SummaryRunStats, clean_summary_prose
+from agent_team_timeline.summary_registry import AGENT_LIFETIME_SUMMARIZER
 from agent_team_timeline.token_usage import (
     BatchUsageReceipt,
     DEFAULT_SERVICE_TIER,
@@ -45,7 +46,7 @@ from agent_team_timeline.token_usage import (
 )
 
 
-PROMPT_VERSION: Final = "agent-team-timeline-agent-name-v2"
+PROMPT_VERSION: Final = AGENT_LIFETIME_SUMMARIZER.prompt_version
 _CACHE_VERSION: Final = 3
 _MAX_NAME_LENGTH: Final = 48
 _MIN_NAME_WORDS: Final = 2

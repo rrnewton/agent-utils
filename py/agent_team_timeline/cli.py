@@ -35,7 +35,7 @@ from agent_team_timeline.token_usage import TokenUsage
 from agent_team_timeline.window import parse_date_window
 
 PROG = "agent-team-timeline"
-DEFAULT_MODEL = os.environ.get("AGENT_TEAM_TIMELINE_MODEL", "gpt-5.6-sol")
+DEFAULT_MODEL = os.environ.get("AGENT_TEAM_TIMELINE_MODEL", "gpt-5.6-luna")
 DEFAULT_REASONING_EFFORT = os.environ.get(
     "AGENT_TEAM_TIMELINE_REASONING_EFFORT", "xhigh"
 )
@@ -86,13 +86,23 @@ def _add_date_window(parser: argparse.ArgumentParser) -> None:
         default="America/New_York",
         help="IANA display/calendar timezone (UTC instants remain canonical)",
     )
-    parser.add_argument(
+    start = parser.add_mutually_exclusive_group()
+    start.add_argument(
         "--start-date",
         help="first local calendar date to include (YYYY-MM-DD, inclusive)",
     )
-    parser.add_argument(
+    start.add_argument(
+        "--start-time",
+        help="first instant to include (RFC3339 with offset or Z, inclusive)",
+    )
+    end = parser.add_mutually_exclusive_group()
+    end.add_argument(
         "--end-date",
         help="local calendar boundary to stop at (YYYY-MM-DD, exclusive)",
+    )
+    end.add_argument(
+        "--end-time",
+        help="instant to stop at (RFC3339 with offset or Z, exclusive)",
     )
 
 
@@ -488,6 +498,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 str(ns.start_date) if ns.start_date is not None else None,
                 str(ns.end_date) if ns.end_date is not None else None,
                 str(ns.timezone),
+                start_time=(
+                    str(ns.start_time) if ns.start_time is not None else None
+                ),
+                end_time=str(ns.end_time) if ns.end_time is not None else None,
             )
             if handler in ("ingest_claude", "refresh_claude"):
                 _, ingest_report = ingest_claude(

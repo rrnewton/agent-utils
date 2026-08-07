@@ -92,6 +92,7 @@ from agent_team_timeline.summarize import (
     knowledge_text_has_link,
     summarize_jobs,
 )
+from agent_team_timeline.summary_registry import registry_json_obj
 from agent_team_timeline.token_usage import TokenUsage, resolve_service_tier
 from agent_team_timeline.terminology import (
     GlossaryTerm,
@@ -1941,6 +1942,12 @@ def _summarize_archive_locked(
 
     service_tier = resolve_service_tier(backend, service_tier)
     team = load_archived_team(archive, team_slug)
+    changed = int(
+        write_json_if_changed(
+            _summary_root(archive, team_slug) / "summarizers.json",
+            registry_json_obj(),
+        )
+    )
     phases = build_phases(
         team,
         phase_minutes=phase_minutes,
@@ -1999,7 +2006,7 @@ def _summarize_archive_locked(
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
     )
-    changed = _write_phase_data(archive, team_slug, phases, phase_results)
+    changed += _write_phase_data(archive, team_slug, phases, phase_results)
     name_jobs = _agent_name_jobs(team, phases, phase_results)
     agent_names, name_stats = name_agents(
         name_jobs,

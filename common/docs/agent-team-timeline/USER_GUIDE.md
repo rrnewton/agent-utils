@@ -106,7 +106,7 @@ agent-team-timeline refresh \
   --project example-project=https://github.com/example/example-project \
   --source-host build-host-01 \
   --backend codex \
-  --model gpt-5.6-sol \
+  --model gpt-5.6-luna \
   --reasoning-effort xhigh \
   --service-tier priority \
   --summary-workers 3 \
@@ -156,6 +156,21 @@ context remains available to phase summarization, but the website, statistics, n
 rollups are bounded to the requested dates. A daylight-saving boundary may therefore span 23 or 25
 hours. Reuse the same bounds when refreshing an archive; use another output directory for different
 bounds.
+
+For a non-calendar slice, use RFC3339 instants with an explicit offset or `Z`:
+
+```bash
+agent-team-timeline ingest-orc \
+  --source-root /path/to/project --root-session SESSION_UUID \
+  --team orc-project --output ./orc-project \
+  --timezone America/New_York \
+  --start-time 2026-08-06T22:00:00-04:00 \
+  --end-time 2026-08-07T07:00:00-04:00
+```
+
+`--start-time` is inclusive and `--end-time` is exclusive. A date and exact time may be mixed at
+opposite bounds, but the date and time forms for the same bound are mutually exclusive. Instants
+are canonicalized to UTC milliseconds in archive metadata.
 
 ### Start the website
 
@@ -208,7 +223,7 @@ counts; agent blocks and task notes provide incarnation lifetimes and timestampe
 ```bash
 agent-team-timeline summarize \
   --team example-team --output ./timelines/example-team \
-  --backend codex --model gpt-5.6-sol --reasoning-effort xhigh \
+  --backend codex --model gpt-5.6-luna --reasoning-effort xhigh \
   --service-tier priority
 ```
 

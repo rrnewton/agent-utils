@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_team_timeline.archive import narrow_json, write_json_if_changed
+from agent_team_timeline.cli import _parser
 from agent_team_timeline.model import Agent, Edge, Event, SourceSnapshot, TeamData
 from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.phases import build_phases
@@ -92,6 +93,103 @@ def test_local_dates_become_half_open_utc_bounds_with_dst() -> None:
     assert fall is not None
     assert fall.end_ms is not None and fall.start_ms is not None
     assert fall.end_ms - fall.start_ms == 25 * 60 * 60 * 1000
+
+
+def test_exact_times_are_canonical_half_open_utc_bounds() -> None:
+    window = parse_date_window(
+        None,
+        None,
+        "America/New_York",
+        start_time="2026-08-06T20:35:17.752-04:00",
+        end_time="2026-08-07T14:25:28.290Z",
+    )
+
+    assert window is not None
+    assert window.start_time == "2026-08-07T00:35:17.752Z"
+    assert window.end_time == "2026-08-07T14:25:28.290Z"
+    assert window.contains(_ms("2026-08-07T00:35:17.752+00:00"))
+    assert not window.contains(_ms("2026-08-07T14:25:28.290+00:00"))
+    assert window.to_json_obj() == {
+        "start_date": None,
+        "end_date": None,
+        "start_ms": window.start_ms,
+        "end_ms": window.end_ms,
+        "start_time": "2026-08-07T00:35:17.752Z",
+        "end_time": "2026-08-07T14:25:28.290Z",
+    }
+
+
+@pytest.mark.parametrize(
+    ("start_time", "end_time", "message"),
+    [
+        ("2026-08-07T00:35:17", None, "explicit offset"),
+        ("2026-08-07 00:35:17Z", None, "RFC3339"),
+        (
+            "2026-08-07T14:25:28.290Z",
+            "2026-08-07T00:35:17.752Z",
+            "earlier",
+        ),
+    ],
+)
+def test_invalid_exact_time_windows_are_rejected(
+    start_time: str, end_time: str | None, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        parse_date_window(
+            None,
+            None,
+            "UTC",
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+
+def test_same_bound_cannot_mix_date_and_exact_time() -> None:
+    with pytest.raises(ValueError, match="either start date or start time"):
+        parse_date_window(
+            "2026-08-07",
+            None,
+            "UTC",
+            start_time="2026-08-07T00:35:17Z",
+        )
+
+
+def test_cli_accepts_exact_bounds_and_rejects_same_bound_date_mix() -> None:
+    parser = _parser()
+    parsed = parser.parse_args(
+        (
+            "ingest",
+            "--output",
+            "archive",
+            "--team",
+            "example",
+            "--root-session",
+            "root",
+            "--start-time",
+            "2026-08-06T22:00:00-04:00",
+            "--end-time",
+            "2026-08-07T07:00:00-04:00",
+        )
+    )
+    assert parsed.start_time == "2026-08-06T22:00:00-04:00"
+    assert parsed.end_time == "2026-08-07T07:00:00-04:00"
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            (
+                "ingest",
+                "--output",
+                "archive",
+                "--team",
+                "example",
+                "--root-session",
+                "root",
+                "--start-date",
+                "2026-08-06",
+                "--start-time",
+                "2026-08-06T22:00:00-04:00",
+            )
+        )
 
 
 @pytest.mark.parametrize(

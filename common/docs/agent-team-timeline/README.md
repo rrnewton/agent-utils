@@ -51,7 +51,9 @@ make run-stats
 Use `refresh-claude --session-file SESSION.jsonl` for a Claude lineage or
 `refresh-orc --source-root PROJECT --root-session SESSION_UUID` for an Orc SQLite lineage. All
 three refresh commands accept inclusive `--start-date` and exclusive `--end-date` local-calendar
-bounds. `--project LABEL=URL` and `--source-host HOSTNAME` are repeatable; the first explicit
+bounds, or inclusive `--start-time` and exclusive `--end-time` RFC3339 instants for an exact
+slice. Each bound may use either its date or time form. `--project LABEL=URL` and
+`--source-host HOSTNAME` are repeatable; the first explicit
 project is primary. Codex archives infer repository labels and links from structured session
 metadata when no override is needed.
 
@@ -71,3 +73,6 @@ retained in batch, invocation, and top-level run provenance.
 
 Run `agent-team-timeline quickstart` for the short tour or
 `agent-team-timeline --userguide` for the complete storage, privacy, and rerun contract.
+
+The complete inventory of model-backed computations, their version histories, cache identities,
+and compatibility rules is in [`ARCHITECTURE.md`](../../../py/agent_team_timeline/ARCHITECTURE.md).

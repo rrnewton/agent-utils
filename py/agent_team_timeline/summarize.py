@@ -30,6 +30,18 @@ from agent_team_timeline.codex_workspace import (
     codex_failure_detail,
     initialize_codex_workspace,
 )
+from agent_team_timeline.summary_registry import (
+    AGENT_LIFETIME_STYLE,
+    GLOSSARY_DEFINITION_STYLE,
+    GLOSSARY_DEFINITION_SUMMARIZER,
+    PHASE_SUMMARIZER,
+    PLAIN_LANGUAGE_ROLLUP_STYLE,
+    PROJECT_OVERVIEW_STYLE,
+    PROJECT_OVERVIEW_SUMMARIZER,
+    SUMMARIZER_REGISTRY,
+    TECHNICAL_ROLLUP_STYLE,
+    summarizer_for_style,
+)
 from agent_team_timeline.token_usage import (
     BatchUsageReceipt,
     DEFAULT_SERVICE_TIER,
@@ -42,25 +54,15 @@ from agent_team_timeline.token_usage import (
 )
 
 
-PROMPT_VERSION: Final = "agent-team-timeline-summary-v1"
-TECHNICAL_ROLLUP_STYLE: Final = "technical-rollup"
-PLAIN_LANGUAGE_ROLLUP_STYLE: Final = "plain-language-rollup"
-PROJECT_OVERVIEW_STYLE: Final = "project-overview"
-GLOSSARY_DEFINITION_STYLE: Final = "glossary-definition"
-_TECHNICAL_ROLLUP_PROMPT_VERSION: Final = "agent-team-timeline-technical-rollup-v2"
-_PLAIN_LANGUAGE_ROLLUP_PROMPT_VERSION: Final = "agent-team-timeline-plain-rollup-v2"
-PROJECT_OVERVIEW_PROMPT_VERSION: Final = "agent-team-timeline-project-overview-v2"
+PROMPT_VERSION: Final = PHASE_SUMMARIZER.prompt_version
+PROJECT_OVERVIEW_PROMPT_VERSION: Final = PROJECT_OVERVIEW_SUMMARIZER.prompt_version
 GLOSSARY_DEFINITION_PROMPT_VERSION: Final = (
-    "agent-team-timeline-glossary-definition-v2"
+    GLOSSARY_DEFINITION_SUMMARIZER.prompt_version
 )
 _SUMMARY_STYLES: Final = frozenset(
-    {
-        "phase",
-        TECHNICAL_ROLLUP_STYLE,
-        PLAIN_LANGUAGE_ROLLUP_STYLE,
-        PROJECT_OVERVIEW_STYLE,
-        GLOSSARY_DEFINITION_STYLE,
-    }
+    item.summary_style
+    for item in SUMMARIZER_REGISTRY
+    if item.summary_style != AGENT_LIFETIME_STYLE
 )
 _CACHE_VERSION: Final = 2
 _PHRASE_LIMIT: Final = 80
@@ -216,15 +218,7 @@ def _validate_job(job: SummaryJob) -> None:
 
 
 def _prompt_version(job: SummaryJob) -> str:
-    if job.summary_style == TECHNICAL_ROLLUP_STYLE:
-        return _TECHNICAL_ROLLUP_PROMPT_VERSION
-    if job.summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE:
-        return _PLAIN_LANGUAGE_ROLLUP_PROMPT_VERSION
-    if job.summary_style == PROJECT_OVERVIEW_STYLE:
-        return PROJECT_OVERVIEW_PROMPT_VERSION
-    if job.summary_style == GLOSSARY_DEFINITION_STYLE:
-        return GLOSSARY_DEFINITION_PROMPT_VERSION
-    return PROMPT_VERSION
+    return summarizer_for_style(job.summary_style).prompt_version
 
 
 def knowledge_text_has_link(value: str) -> bool:

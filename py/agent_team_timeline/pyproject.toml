@@ -38,6 +38,7 @@ agent_team_timeline = [
   "py.typed",
   "README.md",
   "USER_GUIDE.md",
+  "ARCHITECTURE.md",
   "static/*.html",
   "static/*.js",
   "static/*.css",
