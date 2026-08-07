@@ -35,7 +35,10 @@ check-deps:
 
 test:
 	cd py && python3 -m pytest -q
-	cargo test --release --workspace --manifest-path rs/Cargo.toml
+	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
+	test -n "$$host_target"; \
+	cargo test --release --workspace --manifest-path rs/Cargo.toml \
+		--target "$$host_target"
 
 # Cross-language observable behavior for every paired command.
 cross:

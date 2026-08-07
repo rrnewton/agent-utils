@@ -22,6 +22,23 @@ jobs:
       - name: verify registry artifacts on the declared MSRV
         run: python3 scripts/check_rust_packages.py
 
+  tests:
+    # Keep the complete repository test contract on a fresh runner. Running it after the build,
+    # type, and lint contract repeatedly caused the hosted runner to disappear before it could
+    # report any test result; the independent minimum-version suites remained green. This job
+    # still invokes the repository-owned target and must execute both nonzero suites.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install test dependencies
+        run: python -m pip install --upgrade 'setuptools>=77' pytest pyyaml
+      - name: repository tests (nonzero Python and Rust suites)
+        run: make test
+
   cross:
     runs-on: ubuntu-latest
     steps:
@@ -47,8 +64,6 @@ jobs:
         run: make mypy
       - name: repository checks
         run: make check
-      - name: repository tests
-        run: make test
       - name: mypy the differential harness
         run: python -m mypy cross/differential.py
       - name: all paired behavioral differentials
