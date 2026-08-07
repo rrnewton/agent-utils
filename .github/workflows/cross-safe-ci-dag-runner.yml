@@ -9,11 +9,18 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Keep checkout's temporary `git init` deterministic and quiet. Without this,
+# Git emits a default-branch warning before the repository config exists.
+env:
+  GIT_CONFIG_COUNT: '1'
+  GIT_CONFIG_KEY_0: init.defaultBranch
+  GIT_CONFIG_VALUE_0: main
+
 jobs:
   rust-msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85.0
       - name: check the declared Rust 1.85 MSRV
         run: cargo check --locked --workspace --all-targets --manifest-path rs/Cargo.toml
@@ -28,8 +35,8 @@ jobs:
     # nonzero executed count instead of losing both results when one runner disappears.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - name: install test dependencies
@@ -44,7 +51,7 @@ jobs:
     env:
       RUST_TEST_THREADS: '1'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: repository tests (nonzero Rust suite)
         run: make test TEST_SUITE=rust
@@ -52,8 +59,8 @@ jobs:
   cross:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
       - uses: dtolnay/rust-toolchain@stable
@@ -84,8 +91,8 @@ jobs:
   python-minimum:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.10'
       - name: install minimum-runtime test tooling

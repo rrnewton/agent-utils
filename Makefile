@@ -1,5 +1,5 @@
 # `make` just runs ./setup (both python and rust), per repo convention.
-.PHONY: all both py rs check check-deps mypy test cross check-packages \
+.PHONY: all both py rs check check-deps check-test-suite-selector mypy test cross check-packages \
 	check-python-packages check-rust-packages fmt clean
 
 all: both
@@ -21,7 +21,7 @@ mypy:
 	python3 scripts/check_no_any.py .
 
 # Lint/typecheck gates (what CI runs).
-check: check-deps mypy
+check: check-deps mypy check-test-suite-selector
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	test -n "$$host_target"; \
 	cargo clippy --release --workspace --manifest-path rs/Cargo.toml \
@@ -37,9 +37,20 @@ TEST_SUITE ?= all
 ifneq ($(words $(TEST_SUITE)),1)
 $(error TEST_SUITE must be exactly one of: all, python, rust)
 endif
-ifeq ($(filter $(TEST_SUITE),all python rust),)
+ifeq ($(filter all python rust,$(TEST_SUITE)),)
 $(error TEST_SUITE must be exactly one of: all, python, rust)
 endif
+
+check-test-suite-selector:
+	@for valid in all python rust; do \
+		$(MAKE) --no-print-directory -s -n test TEST_SUITE="$$valid" >/dev/null; \
+	done
+	@for invalid in bogus '%' 'p%' 'python rust'; do \
+		if $(MAKE) --no-print-directory -s -n test TEST_SUITE="$$invalid" >/dev/null 2>&1; then \
+			echo "test suite selector accepted invalid value: $$invalid" >&2; \
+			exit 1; \
+		fi; \
+	done
 
 test:
 ifneq ($(TEST_SUITE),rust)
