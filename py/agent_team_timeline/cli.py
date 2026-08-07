@@ -651,7 +651,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                     team_slug,
                     phase_minutes=int(ns.phase_minutes),
                     display_window=window,
-                    display_timezone=display_timezone,
                     rollup_kinds=rollup_kinds,
                     output=target,
                 )

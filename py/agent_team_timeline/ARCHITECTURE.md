@@ -26,7 +26,9 @@ each team without model calls, namespaces thread, phase, edge, glossary, artifac
 detail identities by team, and aligns every track to one shared UTC interval. It merges team
 project/host identity, events, statistics, rollups, summaries, and artifact catalogs while keeping
 the team label on every filterable record. Repeating the same export is byte-idempotent; a managed
-file inventory removes only stale files from an earlier combined export.
+file inventory removes only stale files from an earlier combined export. Calendar rollups retain
+the timezone in which each team's cached summary was generated; hourly keys are UTC-stable. The
+export timezone controls date-bound parsing and the shared display axis, not cache reinterpretation.
 
 ## Cost boundary
 

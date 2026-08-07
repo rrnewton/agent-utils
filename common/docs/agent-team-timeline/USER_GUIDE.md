@@ -380,7 +380,9 @@ agent-team-timeline export \
 Combined exports namespace provider-owned identifiers and phase-detail paths by team, merge
 project and host identity, and preserve team labels for filters, rollups, summary files, events,
 and statistics. If archived teams disagree about their display timezone, pass one explicit
-`--timezone` for the shared axis.
+`--timezone` for date-bound parsing and the shared axis. Existing daily and higher rollups retain
+each archive's calendar timezone rather than being relabeled as a different cached computation;
+hourly rollup keys are UTC-stable.
 
 ### 4. Optional GitHub pull metadata — conditional and cached
 

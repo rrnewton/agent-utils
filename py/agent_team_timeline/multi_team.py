@@ -463,7 +463,6 @@ def build_combined_archive(
                 team_slug,
                 phase_minutes=phase_minutes,
                 display_window=display_window,
-                display_timezone=display_timezone,
                 rollup_kinds=rollup_kinds,
                 output=team_root,
             )

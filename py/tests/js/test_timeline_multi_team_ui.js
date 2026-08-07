@@ -50,12 +50,14 @@ const context = {
         { slug: "claude-coord-176" },
         { slug: "codex-coord-030" }
       ]
-    }
+    },
+    glossaryById: new Map()
   }
 };
 vm.createContext(context);
 vm.runInContext(
-  ["array", "text", "selectedTeamAllows"].map(functionSource).join("\n"),
+  ["array", "text", "selectedTeamAllows", "glossaryTermIsAmbiguous"]
+    .map(functionSource).join("\n"),
   context
 );
 
@@ -66,9 +68,20 @@ assert.strictEqual(context.selectedTeamAllows({ team: "codex-coord-030" }), fals
 assert.strictEqual(context.selectedTeamAllows({}), false);
 context.app.data.teams = [{ slug: "claude-coord-176" }];
 assert.strictEqual(context.selectedTeamAllows({}), true);
+context.app.selectedTeam = "";
+context.app.glossaryById = new Map([
+  ["term-codex-parser", { term: "parser", team: "codex-coord-030" }],
+  ["term-claude-parser", { term: "parser", team: "claude-coord-176" }]
+]);
+assert.strictEqual(context.glossaryTermIsAmbiguous("parser"), true);
+assert.strictEqual(context.glossaryTermIsAmbiguous("scheduler"), false);
+context.app.selectedTeam = "codex-coord-030";
+assert.strictEqual(context.glossaryTermIsAmbiguous("parser"), false);
 
 assert.match(source, /item\["team"\]|item\.team/);
 assert.match(source, /visibleTeams\.indexOf\(rollupTeam\)/);
+assert.match(source, /\["hourly", "daily", "weekly", "monthly", "quarterly"\]/);
+assert.match(source, /hourly: "hour"/);
 assert.match(source, /populateSummaryFiles\(\);\s*scheduleRender\(\);/);
 
 console.log("multi-team UI tests passed");

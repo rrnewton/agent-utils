@@ -2868,7 +2868,6 @@ def build_archive(
     *,
     phase_minutes: int = 30,
     display_window: DateWindow | None = None,
-    display_timezone: str | None = None,
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
     output: Path | None = None,
 ) -> dict[str, int]:
@@ -2877,14 +2876,6 @@ def build_archive(
     target = output or archive
     _ensure_archive(target, team_slug, create=output is not None)
     team = load_archived_team(archive, team_slug)
-    site_identity = load_site_identity(archive, team)
-    if display_timezone is not None:
-        team = replace(team, display_timezone=display_timezone)
-        site_identity = replace(
-            site_identity,
-            display_timezone=display_timezone,
-            display_timezone_source="export_override",
-        )
     if display_window is not None:
         team = apply_date_window(team, display_window)
     summary_root = _summary_root(archive, team_slug)
@@ -2955,6 +2946,7 @@ def build_archive(
         pull_metadata_path(archive, team_slug)
     )
     pull_metadata = {record.key: record for record in pull_cache.records}
+    site_identity = load_site_identity(archive, team)
     return render_archive(
         target,
         team,

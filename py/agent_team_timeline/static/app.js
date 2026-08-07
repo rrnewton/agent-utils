@@ -214,7 +214,7 @@
         return;
       }
       var term = text(entry.term);
-      if (!term) {
+      if (!term || glossaryTermIsAmbiguous(term)) {
         return;
       }
       var from = 0;
@@ -248,6 +248,19 @@
       }
     });
     return accepted;
+  }
+
+  function glossaryTermIsAmbiguous(term) {
+    if (app.selectedTeam) {
+      return false;
+    }
+    var matches = 0;
+    app.glossaryById.forEach(function (entry) {
+      if (text(entry.term) === term) {
+        matches += 1;
+      }
+    });
+    return matches > 1;
   }
 
   function linkKnownGlossaryTerms(container) {
@@ -2229,7 +2242,7 @@
       var width = Math.max(4, right - left);
       var kind = normalizeKind(
         rollup.kind,
-        ["daily", "weekly", "monthly", "quarterly"],
+        ["hourly", "daily", "weekly", "monthly", "quarterly"],
         "daily"
       );
       var selected = app.selection && app.selection.kind === "rollup" &&
@@ -2244,7 +2257,13 @@
       if (!app.selectedTeam && visibleTeams.length > 1 && rollupTeam) {
         var teamIndex = visibleTeams.indexOf(rollupTeam);
         var markerHeight = Math.max(4, Math.floor(18 / visibleTeams.length));
-        var baseTop = { daily: 3, weekly: 29, monthly: 55, quarterly: 81 }[kind];
+        var baseTop = {
+          hourly: 3,
+          daily: 29,
+          weekly: 55,
+          monthly: 81,
+          quarterly: 107
+        }[kind];
         button.style.top = (baseTop + Math.max(0, teamIndex) * markerHeight) + "px";
         button.style.height = markerHeight + "px";
         button.style.lineHeight = Math.max(4, markerHeight - 2) + "px";
@@ -2284,6 +2303,7 @@
       });
       button.addEventListener("contextmenu", function (event) {
         var rangeName = {
+          hourly: "hour",
           daily: "day",
           weekly: "week",
           monthly: "month",
