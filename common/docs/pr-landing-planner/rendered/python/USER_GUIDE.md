@@ -127,7 +127,8 @@ a systemic outage.
 ## Exact head/base landing context
 
 Some facts belong to the caller rather than the repository host: an assigned
-agent, exact head/base local validation, and whether a PR changes gate policy.
+agent, exact head/base local validation, exact-head adversarial-review receipts,
+and whether a PR changes gate policy.
 Provide them with `--landing-context`:
 
 ```yaml
@@ -137,6 +138,9 @@ prs:
     base_sha: fedcba9876543210
     assigned_agent: release-coordinator
     validation_evidence: clean-validate-record
+    review_pass_heads:
+      codex: 0123456789abcdef0123456789abcdef01234567
+      claude: 0123456789abcdef0123456789abcdef01234567
     policy_class: ci-hygiene
 ```
 
@@ -147,6 +151,15 @@ and is rejected with a revalidation instruction. Accepted policy classes are `un
 `ci-hygiene`, and `gate-policy`; a gate-policy change is escalated rather than
 treated like routine hygiene. Unknown PRs, duplicate entries, and head drift
 are errors.
+
+`review_pass_heads` maps each required review lane (`codex` and `claude`) to the
+exact 40-character lowercase head SHA that reviewer passed. Review labels are
+cache hints: when the review protocol is active, each lane needs both its
+`passed-review-LANE` label and an exact-head receipt. A missing receipt is
+`unbound`; a different head is `stale`. Any rebase, including one with an
+identical patch-id, therefore requires a bounded delta re-check and a new
+exact-head receipt. The JSON node reports `review_binding` and
+`review_pass_heads`; stale or incomplete bindings are held.
 
 ## Freshness, holds, priority, and batching
 

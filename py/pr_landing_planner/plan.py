@@ -55,6 +55,7 @@ def _held_action(reasons: Sequence[str]) -> tuple[PrAction, str]:
     if any(
         r in ("review-required", "changes-requested")
         or r.startswith("review-decision-unknown:")
+        or r.startswith("review-pass-")
         for r in reasons
     ):
         return PrAction.WAIT, f"held: {', '.join(reasons)}"

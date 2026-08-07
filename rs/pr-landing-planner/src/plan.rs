@@ -21,6 +21,7 @@ fn held_action(reasons: &[String]) -> (PrAction, String) {
     if reasons.iter().any(|reason| {
         matches!(reason.as_str(), "review-required" | "changes-requested")
             || reason.starts_with("review-decision-unknown:")
+            || reason.starts_with("review-pass-")
     }) {
         return (PrAction::Wait, format!("held: {}", reasons.join(", ")));
     }

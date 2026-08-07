@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Map, Value};
 
-use crate::graph::{cluster_by_conflict, rebases_avoided};
+use crate::graph::{cluster_by_conflict, rebases_avoided, review_binding};
 use crate::model::{CiState, Cluster, HeldPr, PlanResult, PrAction, PrActionDecision, PrNode};
 
 /// Explanation emitted with the rebase and validation-run savings calculation.
@@ -41,6 +41,8 @@ fn node_obj(node: &PrNode, held: bool) -> Value {
         "validation_evidence": node.validation_evidence.as_str(),
         "policy_class": node.policy_class.as_str(),
         "review_decision": (!node.review_decision.is_empty()).then_some(node.review_decision.as_str()),
+        "review_binding": review_binding(node).0.as_str(),
+        "review_pass_heads": node.review_pass_heads,
     })
 }
 

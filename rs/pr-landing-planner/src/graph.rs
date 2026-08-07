@@ -3,9 +3,10 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::context::REQUIRED_REVIEW_LANES;
 use crate::mechanism::{classify, Mechanism};
 use crate::model::{
-    Cluster, ConflictEdge, HeldPr, MechanismEdge, OrderingEdge, OverlapEdge, PrNode,
+    Cluster, ConflictEdge, HeldPr, MechanismEdge, OrderingEdge, OverlapEdge, PrNode, ReviewBinding,
     UnclassifiedMechanism,
 };
 
@@ -277,6 +278,7 @@ pub fn held_reasons(nodes: &[PrNode], ordering_edges: &[OrderingEdge]) -> Vec<He
             "" | "APPROVED" => {}
             _ => why.push(format!("review-decision-unknown:{review}")),
         }
+        why.extend(review_binding(node).1);
         if !node.base_conflict_paths.is_empty() {
             why.push("local-base-conflict".to_owned());
         }
@@ -311,6 +313,58 @@ pub fn held_reasons(nodes: &[PrNode], ordering_edges: &[OrderingEdge]) -> Vec<He
         .into_iter()
         .map(|(pr, reasons)| HeldPr { pr, reasons })
         .collect()
+}
+
+/// Dereference review-protocol labels through exact-head caller receipts.
+///
+/// PASS labels are caches, never authority by themselves. A protocol-active PR is
+/// landable only when every required lane has both its label and a receipt for the
+/// current fetched head. Any head change deliberately makes the receipt stale,
+/// including a patch-identical rebase, until the reviewer re-attests the delta.
+pub fn review_binding(node: &PrNode) -> (ReviewBinding, Vec<String>) {
+    let protocol_active = !node.review_pass_heads.is_empty()
+        || node.labels.iter().any(|label| {
+            label == "post-facto-human-review"
+                || label.starts_with("passed-review-")
+                || label.starts_with("adversarial-review-")
+        });
+    if !protocol_active {
+        return (ReviewBinding::NotRequired, Vec::new());
+    }
+
+    let mut reasons = Vec::new();
+    for lane in REQUIRED_REVIEW_LANES {
+        let pass_label = format!("passed-review-{lane}");
+        if !node.labels.iter().any(|label| label == &pass_label) {
+            reasons.push(format!("review-pass-missing:{lane}"));
+            continue;
+        }
+        match node.review_pass_heads.get(lane) {
+            None => reasons.push(format!("review-pass-unbound:{lane}")),
+            Some(reviewed) if reviewed != &node.head_sha => reasons.push(format!(
+                "review-pass-stale:{lane}:reviewed={reviewed}:current={}",
+                node.head_sha
+            )),
+            Some(_) => {}
+        }
+    }
+
+    let binding = if reasons.is_empty() {
+        ReviewBinding::ExactHead
+    } else if reasons
+        .iter()
+        .any(|reason| reason.starts_with("review-pass-stale:"))
+    {
+        ReviewBinding::Stale
+    } else if reasons
+        .iter()
+        .any(|reason| reason.starts_with("review-pass-unbound:"))
+    {
+        ReviewBinding::Unbound
+    } else {
+        ReviewBinding::Missing
+    };
+    (binding, reasons)
 }
 
 fn rank(node: &PrNode) -> (i64, i64, &str, i64) {

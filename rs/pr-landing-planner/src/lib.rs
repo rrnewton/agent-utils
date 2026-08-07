@@ -21,7 +21,7 @@ pub use classify::{classify_pr, classify_state, ClassifyConfig, FlakySignature};
 pub use collect::{collect_graph, CollectOptions};
 pub use fixture::FakeHost;
 pub use host::{GitHubHost, VcsHost};
-pub use model::{CollectedGraph, PlanResult, PrAction, PrNode};
+pub use model::{CollectedGraph, PlanResult, PrAction, PrNode, ReviewBinding};
 pub use plan::{assemble_result, compute_plan};
 
 /// Package version reported by the command-line interface.

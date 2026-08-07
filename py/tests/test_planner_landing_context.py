@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -11,7 +12,7 @@ from pr_landing_planner.landing_context import (
     apply_landing_context,
     parse_landing_context,
 )
-from pr_landing_planner.graph import build_mechanism_edges
+from pr_landing_planner.graph import build_mechanism_edges, held_reasons, review_binding
 from pr_landing_planner.model import (
     CiState,
     CiVerdict,
@@ -20,6 +21,7 @@ from pr_landing_planner.model import (
     PrAction,
     PrNode,
     RedClass,
+    ReviewBinding,
     ValidationEvidence,
 )
 from pr_landing_planner.plan import assemble_result, compute_plan
@@ -185,6 +187,82 @@ def test_json_schema_exposes_context_and_mechanism_overlap() -> None:
     )
     payload = json.loads(render_json(result))
     assert payload["nodes"][0]["validation_evidence"] == "locally-validated"
+    assert payload["nodes"][0]["review_binding"] == "not-required"
+    assert payload["nodes"][0]["review_pass_heads"] == {}
     assert payload["mechanism_overlap_edges"] == [
         {"a": 1, "b": 2, "mechanisms": ["cancel-in-progress"]}
     ]
+
+
+REVIEWED_HEAD = "92e1e0d0af65e50cd2991d4deaa25f726832fbf4"
+REBASED_HEAD = "0fc9f61edc01d6425def2efb0ed82f01410c7fcc"
+CHANGED_HEAD = "1111111111111111111111111111111111111111"
+REVIEW_LABELS = (
+    "post-facto-human-review",
+    "passed-review-codex",
+    "passed-review-claude",
+)
+
+
+def test_review_passes_bind_exact_head_and_head_moves_fail_closed() -> None:
+    exact_context = parse_landing_context(
+        {
+            "prs": [
+                {
+                    "pr": 394,
+                    "review_pass_heads": {
+                        "codex": REBASED_HEAD,
+                        "claude": REBASED_HEAD,
+                    },
+                }
+            ]
+        }
+    )
+    exact = apply_landing_context(
+        [replace(_node(394, labels=REVIEW_LABELS), head_sha=REBASED_HEAD)],
+        exact_context,
+    )[0]
+    assert review_binding(exact) == (ReviewBinding.EXACT_HEAD, ())
+    assert not held_reasons((exact,), ())
+
+    stale_context = parse_landing_context(
+        {
+            "prs": [
+                {
+                    "pr": 394,
+                    "review_pass_heads": {
+                        "codex": REBASED_HEAD,
+                        "claude": REVIEWED_HEAD,
+                    },
+                }
+            ]
+        }
+    )
+    stale = apply_landing_context(
+        [replace(_node(394, labels=REVIEW_LABELS), head_sha=REBASED_HEAD)],
+        stale_context,
+    )[0]
+    reason = (
+        f"review-pass-stale:claude:reviewed={REVIEWED_HEAD}:current={REBASED_HEAD}"
+    )
+    assert review_binding(stale) == (ReviewBinding.STALE, (reason,))
+    assert held_reasons((stale,), ())[0].reasons == (reason,)
+
+    changed = replace(stale, head_sha=CHANGED_HEAD)
+    assert review_binding(changed)[0] is ReviewBinding.STALE
+
+
+def test_review_pass_labels_without_receipts_are_unbound_and_bad_receipts_refuse() -> None:
+    unbound = apply_landing_context(
+        [replace(_node(394, labels=REVIEW_LABELS), head_sha=REBASED_HEAD)], ()
+    )[0]
+    assert review_binding(unbound)[0] is ReviewBinding.UNBOUND
+
+    with pytest.raises(ValueError, match="exact 40-character lowercase hex SHA"):
+        parse_landing_context(
+            {"prs": [{"pr": 394, "review_pass_heads": {"claude": "0fc9f61e"}}]}
+        )
+    with pytest.raises(ValueError, match="unknown review lane"):
+        parse_landing_context(
+            {"prs": [{"pr": 394, "review_pass_heads": {"other": REBASED_HEAD}}]}
+        )

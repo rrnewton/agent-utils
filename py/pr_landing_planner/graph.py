@@ -26,8 +26,10 @@ from pr_landing_planner.model import (
     OrderingEdge,
     OverlapEdge,
     PrNode,
+    ReviewBinding,
     UnclassifiedMechanism,
 )
+from pr_landing_planner.landing_context import REQUIRED_REVIEW_LANES
 
 #: PRs/tasks may declare the mechanism they change with a ``mechanism:<slug>`` label (owner
 #: convention). The slug is one derive source, fed through the same classifier
@@ -246,6 +248,7 @@ def held_reasons(
             node_reasons.append("changes-requested")
         elif review and review != "APPROVED":
             node_reasons.append(f"review-decision-unknown:{review}")
+        node_reasons.extend(review_binding(node)[1])
         if node.base_conflict_paths:
             node_reasons.append("local-base-conflict")
         if node.mergeable == "CONFLICTING":
@@ -266,6 +269,46 @@ def held_reasons(
     return tuple(
         HeldPr(pr=number, reasons=tuple(reasons[number])) for number in sorted(reasons)
     )
+
+
+def review_binding(node: PrNode) -> tuple[ReviewBinding, tuple[str, ...]]:
+    """Dereference review PASS labels through exact-head caller receipts.
+
+    A head move always makes the receipt stale, even for a patch-identical rebase,
+    until the reviewer re-attests the bounded delta at the new head.
+    """
+    protocol_active = bool(node.review_pass_heads) or any(
+        label == "post-facto-human-review"
+        or label.startswith("passed-review-")
+        or label.startswith("adversarial-review-")
+        for label in node.labels
+    )
+    if not protocol_active:
+        return ReviewBinding.NOT_REQUIRED, ()
+
+    receipts = dict(node.review_pass_heads)
+    reasons: list[str] = []
+    for lane in REQUIRED_REVIEW_LANES:
+        if f"passed-review-{lane}" not in node.labels:
+            reasons.append(f"review-pass-missing:{lane}")
+            continue
+        reviewed = receipts.get(lane)
+        if reviewed is None:
+            reasons.append(f"review-pass-unbound:{lane}")
+        elif reviewed != node.head_sha:
+            reasons.append(
+                f"review-pass-stale:{lane}:reviewed={reviewed}:current={node.head_sha}"
+            )
+
+    if not reasons:
+        binding = ReviewBinding.EXACT_HEAD
+    elif any(reason.startswith("review-pass-stale:") for reason in reasons):
+        binding = ReviewBinding.STALE
+    elif any(reason.startswith("review-pass-unbound:") for reason in reasons):
+        binding = ReviewBinding.UNBOUND
+    else:
+        binding = ReviewBinding.MISSING
+    return binding, tuple(reasons)
 
 
 # --------------------------------------------------------------------------- parallel-safe partition
