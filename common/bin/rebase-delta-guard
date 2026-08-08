@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# TRACKED tool: prove a rebase moved the base and changed nothing else.
+#
+# WHY THIS EXISTS. On 2026-08-08 a conflict-free `git rebase` in the Hermit
+# checkout silently re-serialized ci/dag/portable.json end to end: the delta went
+# from 99,021 bytes to 155,143, keys reordered, hunk `@@ -1,492 +1,947 @@`, with
+# NO conflict, NO warning, and a clean `git status`. The cause was an UNTRACKED,
+# machine-local `$GIT_DIR/info/attributes` binding that file to a re-serializing
+# merge driver; the default rebase backend runs a 3-way merge per file, so the
+# driver fired even though the patch would have applied cleanly.
+#
+# It was caught only because someone happened to know the delta's byte count from
+# a measurement minutes earlier. That is not a control. This is.
+#
+# The mechanism is not specific to that repository or that driver. Any
+# re-serializing merge driver, smudge/clean filter, mis-resolved conflict, or
+# mis-picked commit produces the same signature: a successful rebase, a clean
+# tree, and a delta that is no longer the one you wrote. The binding lives in
+# untracked config, so no hosted CI job can ever observe it -- the check has to
+# run where the rebase runs.
+#
+# THE HABIT IT ENCODES, which matters more than the check: RECORD THE IDENTITY
+# BEFORE YOU START; DO NOT SEARCH FOR IT AFTERWARDS. `record` captures the base
+# and head as SHAs up front, plus the series' commit subjects, and `verify`
+# derives the new base from those rather than re-resolving a branch name. Two agents lost time on
+# 2026-08-08 recovering a pre-rebase SHA with `git log --grep | tail -1` and
+# getting a rebased commit back. It is the same principle as never reading
+# FETCH_HEAD or a symbolic ref in a shared checkout: do not re-derive an identity
+# you could have captured.
+#
+# USAGE
+#   rebase-delta-guard record [--repo DIR] [--base REV]
+#   rebase-delta-guard verify [--repo DIR] [--new-base REV] [--keep]
+#   rebase-delta-guard check  OLD_BASE OLD_HEAD NEW_BASE NEW_HEAD [--repo DIR]
+#   rebase-delta-guard status|clear [--repo DIR]
+#
+#   $ rebase-delta-guard record            # before the rebase
+#   $ git rebase --apply origin/main       # (--apply avoids the 3-way merge path)
+#   $ rebase-delta-guard verify            # after
+#
+# WHAT IS COMPARED. `git diff BASE HEAD` on both sides, ignoring exactly the two
+# things that legitimately move when the base moves:
+#   * `index <blob>..<blob>` lines  -- blob hashes follow content from the new base
+#   * `@@ -a,b +c,d @@` hunk headers -- offsets shift when lines are added above
+# Every other line must match byte for byte: the file list, the mode lines, and
+# every single +/- content line. Rename detection is disabled so the comparison
+# cannot flip on a heuristic that reads the base.
+#
+# EXIT STATUS -- 3 is not a pass; treat it as fail-closed.
+#   0  the delta is unchanged
+#   1  the delta CHANGED -- inspect before pushing
+#   2  usage or internal error
+#   3  indeterminate: no recording, or the commits below HEAD are not the
+#      recorded series, so the new base cannot be derived. Re-run with an
+#      explicit --new-base. A COUNT IS NOT AN IDENTITY -- drop a commit from the
+#      series while the base gains one and the arithmetic still balances, which
+#      is why the recorded subjects are checked too.
+
+set -uo pipefail
+
+readonly PROGRAM=${0##*/}
+
+die() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 2
+}
+
+usage() {
+    sed -n '31,44p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+repo_dir=""
+
+# Resolve the state file. Deliberately the PER-WORKTREE git dir, not the common
+# dir: linked worktrees share $GIT_COMMON_DIR, so a single state file there would
+# let two agents rebasing two worktrees of one repository overwrite each other's
+# recording. Getting that wrong would reintroduce the shared-mutable-state class
+# this tool was written in response to.
+state_path() {
+    local gd
+    gd=$(git -C "$repo_dir" rev-parse --git-dir 2>/dev/null) || return 1
+    case "$gd" in
+        /*) ;;
+        *) gd="$(git -C "$repo_dir" rev-parse --show-toplevel)/$gd" ;;
+    esac
+    printf '%s/rebase-delta-guard.state' "$gd"
+}
+
+resolve() {
+    git -C "$repo_dir" rev-parse --verify --quiet "${1}^{commit}" 2>/dev/null
+}
+
+short() {
+    git -C "$repo_dir" rev-parse --short "$1" 2>/dev/null || printf '%s' "${1:0:9}"
+}
+
+# The normalized diff. --no-renames keeps the comparison from depending on a
+# similarity heuristic that reads the base; --no-ext-diff and --no-color keep an
+# external differ or a terminal setting out of the answer.
+normalized_diff() {
+    git -C "$repo_dir" diff --no-color --no-ext-diff --no-renames "$1" "$2" |
+        grep -v -E '^index [0-9a-f]+\.\.[0-9a-f]+|^@@ '
+}
+
+raw_diff_bytes() {
+    git -C "$repo_dir" diff --no-color --no-ext-diff --no-renames "$1" "$2" | wc -c
+}
+
+changed_files() {
+    git -C "$repo_dir" diff --no-color --no-ext-diff --no-renames --name-only "$1" "$2" | wc -l
+}
+
+# ---------------------------------------------------------------- compare -----
+compare() {
+    local old_base=$1 old_head=$2 new_base=$3 new_head=$4
+    local tmp before_bytes after_bytes
+    tmp=$(mktemp -d) || die "cannot create a temporary directory"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" RETURN
+
+    normalized_diff "$old_base" "$old_head" > "$tmp/before"
+    normalized_diff "$new_base" "$new_head" > "$tmp/after"
+    before_bytes=$(raw_diff_bytes "$old_base" "$old_head")
+    after_bytes=$(raw_diff_bytes "$new_base" "$new_head")
+
+    printf 'before: %s..%s  %s bytes, %s file(s)\n' \
+        "$(short "$old_base")" "$(short "$old_head")" "$before_bytes" "$(changed_files "$old_base" "$old_head")"
+    printf 'after:  %s..%s  %s bytes, %s file(s)\n' \
+        "$(short "$new_base")" "$(short "$new_head")" "$after_bytes" "$(changed_files "$new_base" "$new_head")"
+
+    if cmp -s "$tmp/before" "$tmp/after"; then
+        printf '%s: OK — every content line matches; only blob hashes and hunk offsets moved\n' "$PROGRAM"
+        return 0
+    fi
+
+    local only_after only_before
+    only_after=$(comm -13 <(sort "$tmp/before") <(sort "$tmp/after"))
+    only_before=$(comm -23 <(sort "$tmp/before") <(sort "$tmp/after"))
+
+    printf '\n%s: FAIL — the rebase changed your delta\n\n' "$PROGRAM"
+    printf '  lines only in the new delta: %s\n' "$(printf '%s\n' "$only_after" | grep -c . || true)"
+    printf '  lines only in the old delta: %s\n' "$(printf '%s\n' "$only_before" | grep -c . || true)"
+    printf '\n'
+    printf '%s\n' "$only_after" | head -n 12 | sed 's/^/  + /'
+    printf '%s\n' "$only_before" | head -n 12 | sed 's/^/  - /'
+    cat <<'EOF'
+
+A silent whole-file re-serialization looks exactly like this: the rebase reports
+success, `git status` is clean, and the delta is many times larger. Check with
+`git check-attr merge -- <path>` whether a custom merge driver is bound, and
+replay with `git rebase --apply`, which uses `git apply` instead of a per-file
+3-way merge and therefore preserves bytes on a conflict-free rebase.
+EOF
+    return 1
+}
+
+# ----------------------------------------------------------------- record -----
+cmd_record() {
+    local base_rev="" old_base old_head series state
+    while (($#)); do
+        case $1 in
+            --base) base_rev=${2:-}; shift 2 || die "--base needs a value" ;;
+            --repo) shift 2 ;;
+            *) die "unexpected argument to record: $1" ;;
+        esac
+    done
+
+    old_head=$(resolve HEAD) || die "cannot resolve HEAD"
+
+    if [[ -n $base_rev ]]; then
+        old_base=$(resolve "$base_rev") || die "cannot resolve --base $base_rev"
+    else
+        local upstream
+        upstream=$(git -C "$repo_dir" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null) || upstream=""
+        [[ -n $upstream ]] || die "no upstream is configured for this branch; pass --base <rev> explicitly.
+   Guessing a base is the error this tool exists to prevent."
+        old_base=$(git -C "$repo_dir" merge-base "$upstream" HEAD 2>/dev/null) ||
+            die "cannot compute merge-base against $upstream; pass --base <rev>"
+    fi
+
+    [[ $old_base != "$old_head" ]] || die "base and head are the same commit; there is no delta to guard"
+
+    series=$(git -C "$repo_dir" rev-list --count "$old_base..$old_head") || die "cannot count the series"
+    ((series > 0)) || die "HEAD does not descend from the recorded base; pass --base <rev>"
+
+    state=$(state_path) || die "not inside a git work tree"
+    {
+        printf 'old_base=%s\n' "$old_base"
+        printf 'old_head=%s\n' "$old_head"
+        printf 'series=%s\n' "$series"
+    } > "$state"
+    # Commit subjects, newest first. `verify` uses them to confirm that the N
+    # commits it counted back from HEAD really are the recorded series. A count
+    # alone is not an identity: a dropped commit plus a base that gained one
+    # leaves the count intact and silently names the wrong base. Subjects
+    # survive both a rebase and a content rewrite, so this can only ever
+    # downgrade the answer to INDETERMINATE -- it can never manufacture a pass.
+    git -C "$repo_dir" log --format=%s "$old_base..$old_head" > "$state.subjects"
+
+    printf 'recorded: base %s  head %s  series %s commit(s)\n' "$old_base" "$old_head" "$series"
+    printf 'state: %s\n' "$state"
+    printf 'after the rebase, run: %s verify\n' "$PROGRAM"
+}
+
+# ----------------------------------------------------------------- verify -----
+cmd_verify() {
+    local new_base_rev="" keep=0 state new_head new_base now_series
+    while (($#)); do
+        case $1 in
+            --new-base) new_base_rev=${2:-}; shift 2 || die "--new-base needs a value" ;;
+            --keep) keep=1; shift ;;
+            --repo) shift 2 ;;
+            *) die "unexpected argument to verify: $1" ;;
+        esac
+    done
+
+    state=$(state_path) || die "not inside a git work tree"
+    if [[ ! -f $state ]]; then
+        printf '%s: INDETERMINATE — nothing was recorded for this worktree.\n' "$PROGRAM" >&2
+        printf '   Run `%s record` BEFORE the rebase. Reconstructing the\n' "$PROGRAM" >&2
+        printf '   pre-rebase head afterwards is the mistake this tool exists to remove.\n' >&2
+        return 3
+    fi
+    # shellcheck disable=SC1090
+    local old_base="" old_head="" series=""
+    source "$state"
+    [[ -n $old_base && -n $old_head && -n $series ]] || die "state file is malformed: $state"
+
+    new_head=$(resolve HEAD) || die "cannot resolve HEAD"
+
+    if [[ -n $new_base_rev ]]; then
+        new_base=$(resolve "$new_base_rev") || die "cannot resolve --new-base $new_base_rev"
+    else
+        # Derive the new base by COUNTING the recorded series -- no ref lookup, so
+        # nothing here can move under a concurrent fetch in a shared checkout.
+        new_base=$(resolve "HEAD~$series") || {
+            printf '%s: INDETERMINATE — HEAD has fewer than %s ancestors, so the new base\n' "$PROGRAM" "$series" >&2
+            printf '   cannot be derived by counting. Re-run with --new-base <rev>.\n' >&2
+            return 3
+        }
+        now_series=$(git -C "$repo_dir" rev-list --count "$new_base..$new_head")
+        if [[ $now_series != "$series" ]]; then
+            printf '%s: INDETERMINATE — the series changed length (recorded %s, now %s).\n' "$PROGRAM" "$series" "$now_series" >&2
+            printf '   A commit was dropped, squashed, or added, so counting cannot find the\n' >&2
+            printf '   new base. Re-run with --new-base <rev>. This is not a pass.\n' >&2
+            return 3
+        fi
+        # A COUNT IS NOT AN IDENTITY. Counting back N commits finds the right base
+        # only if those N commits really are the recorded series. Drop one commit
+        # from the series while the base gains one and the count still matches --
+        # `HEAD~N` then names a commit that is not the base at all, and the
+        # comparison silently reports a difference that is an artifact of the
+        # wrong base rather than a rewritten file. Recorded subjects survive both
+        # a rebase and a content rewrite, so they distinguish the two. This can
+        # only downgrade the answer to INDETERMINATE; it can never produce a pass.
+        if [[ -f $state.subjects ]]; then
+            local recorded_subjects current_subjects
+            recorded_subjects=$(cat "$state.subjects")
+            current_subjects=$(git -C "$repo_dir" log --format=%s -n "$series" "$new_head")
+            if [[ $recorded_subjects != "$current_subjects" ]]; then
+                printf '%s: INDETERMINATE — the %s commit(s) below HEAD are not the recorded series,\n' "$PROGRAM" "$series" >&2
+                printf '   so counting back named the wrong base. The count matched, which is\n' >&2
+                printf '   exactly why the count alone cannot be trusted.\n' >&2
+                printf '   recorded: %s\n' "$(printf '%s' "$recorded_subjects" | tr '\n' '|')" >&2
+                printf '   found:    %s\n' "$(printf '%s' "$current_subjects" | tr '\n' '|')" >&2
+                printf '   Re-run with --new-base <rev>. This is not a pass.\n' >&2
+                return 3
+            fi
+        fi
+    fi
+
+    local rc=0
+    compare "$old_base" "$old_head" "$new_base" "$new_head" || rc=$?
+    ((keep)) || rm -f "$state" "$state.subjects"
+    return "$rc"
+}
+
+# ------------------------------------------------------------------ other -----
+cmd_check() {
+    (($# == 4)) || die "check needs exactly four revisions: OLD_BASE OLD_HEAD NEW_BASE NEW_HEAD"
+    local r=() rev
+    for rev in "$@"; do
+        local sha
+        sha=$(resolve "$rev") || die "not a commit: $rev"
+        r+=("$sha")
+    done
+    compare "${r[0]}" "${r[1]}" "${r[2]}" "${r[3]}"
+}
+
+cmd_status() {
+    local state
+    state=$(state_path) || die "not inside a git work tree"
+    if [[ ! -f $state ]]; then
+        printf '%s: no recording for this worktree (%s)\n' "$PROGRAM" "$state"
+        return 3
+    fi
+    printf 'state: %s\n' "$state"
+    cat "$state"
+}
+
+cmd_clear() {
+    local state
+    state=$(state_path) || die "not inside a git work tree"
+    rm -f "$state" "$state.subjects"
+    printf '%s: cleared %s\n' "$PROGRAM" "$state"
+}
+
+# ------------------------------------------------------------------- main -----
+main() {
+    local args=() i
+    # --repo may appear anywhere; pull it out first so every subcommand honours it.
+    while (($#)); do
+        case $1 in
+            --repo)
+                repo_dir=${2:-}
+                [[ -n $repo_dir ]] || die "--repo needs a value"
+                shift 2
+                ;;
+            -h | --help)
+                usage
+                return 0
+                ;;
+            *)
+                args+=("$1")
+                shift
+                ;;
+        esac
+    done
+    [[ -n $repo_dir ]] || repo_dir=$PWD
+    git -C "$repo_dir" rev-parse --show-toplevel >/dev/null 2>&1 ||
+        die "$repo_dir is not inside a git work tree"
+
+    ((${#args[@]})) || { usage; return 2; }
+    local sub=${args[0]}
+    unset 'args[0]'
+    set -- ${args[@]+"${args[@]}"}
+
+    case $sub in
+        record) cmd_record "$@" ;;
+        verify) cmd_verify "$@" ;;
+        check) cmd_check "$@" ;;
+        status) cmd_status ;;
+        clear) cmd_clear ;;
+        *) die "unknown subcommand: $sub (record|verify|check|status|clear)" ;;
+    esac
+}
+
+main "$@"
