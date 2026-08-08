@@ -97,11 +97,139 @@ fn deps_known(sh: &Shared, step: &Step) -> bool {
     step.deps.iter().all(|d| sh.done.contains_key(d))
 }
 
+/// What a lookup actually found. `Absent` is a DISTINCT variant, never rendered as a value,
+/// because `unwrap_or(x)` FUSES "not specified" with "specified as x" and that fusion is the
+/// whole defect class here: an undeclared `resource_caps` entry read identically to a
+/// deliberate `0`, so a config typo and a deliberate zero-capacity bucket were indistinguishable
+/// in both behavior and diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observed {
+    Absent,
+    Present(String),
+}
+
+impl std::fmt::Display for Observed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Observed::Absent => write!(f, "<absent>"),
+            Observed::Present(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+/// One refused condition, carrying enough to be fixed WITHOUT opening the source: where it was
+/// found, what was required, what was actually observed, and the surrounding declarations that
+/// turn a refusal into a spotted typo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub site: String,
+    pub required: String,
+    pub observed: Observed,
+    pub context: Vec<String>,
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: requires {}, but got {}",
+            self.site, self.required, self.observed
+        )?;
+        if !self.context.is_empty() {
+            write!(f, " (declared: {})", self.context.join(", "))?;
+        }
+        Ok(())
+    }
+}
+
+/// The declared capacity for `r`, keeping ABSENT distinguishable from a declared `0`.
+fn res_cap(sh: &Shared, r: &str) -> Option<i64> {
+    sh.resource_avail.get(r).copied()
+}
+
 fn res_free(sh: &Shared, step: &Step) -> bool {
+    // An ABSENT cap is treated as 0, i.e. never schedulable, deliberately: silently granting
+    // unlimited capacity to an undeclared resource would turn a config typo into an unbounded
+    // fan-out. The two cases are identical HERE (both block) but must never be identical in the
+    // diagnostics -- see `ungrantable_resources`, which reports `<absent>` distinctly so the
+    // reader can tell "you forgot to declare it" from "you set it to zero on purpose".
     step.hint
         .resources
         .iter()
-        .all(|(r, n)| sh.resource_avail.get(r).copied().unwrap_or(0) >= *n)
+        .all(|(r, n)| res_cap(sh, r).unwrap_or(0) >= *n)
+}
+
+/// Every step demand that the config can NEVER satisfy, as refusals.
+///
+/// This is a PRE-DISPATCH check: a demand exceeding the declared cap is not a wait, it is
+/// capacity that was never granted, so there is no released-capacity edge to wait for. Reporting
+/// EVERY violation rather than the first is deliberate -- a first-failure abort makes the reader
+/// iterate N times for N typos, and the total count is itself evidence (it is what tied the
+/// original 14-minute hang to its 29 starved steps).
+pub fn ungrantable_resources(cfg: &DagConfig) -> Vec<Refusal> {
+    let declared: Vec<String> = cfg
+        .resource_caps
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    let mut out = Vec::new();
+    for step in &cfg.steps {
+        let tag = format!("{}.{}", step.group, step.job);
+        for (r, n) in &step.hint.resources {
+            let cap = cfg.resource_caps.get(r).copied();
+            if cap.unwrap_or(0) < *n {
+                out.push(Refusal {
+                    site: format!("step {tag:?}"),
+                    required: format!("{r}={n}"),
+                    observed: match cap {
+                        None => Observed::Absent,
+                        Some(c) => Observed::Present(format!("{r}={c}")),
+                    },
+                    context: declared.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The in-loop counterpart of [`ungrantable_resources`], reading LIVE capacity off `Shared`.
+///
+/// Safe to read as declared capacity only because the caller invokes it with `running` EMPTY:
+/// every `acquire` is matched by a `release` when its step completes, so with nothing running
+/// `resource_avail` has returned to the configured caps. Returns empty when the starve has some
+/// other cause (dangling dep, cycle, collapsed duplicate tag) -- the detector still refuses; this
+/// only supplies the named cause when the cause is capacity.
+fn ungrantable_resources_from(
+    sh: &Shared,
+    steps: &HashMap<String, Step>,
+    tags: &[String],
+) -> Vec<Refusal> {
+    let mut declared: Vec<String> = sh
+        .resource_avail
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    declared.sort();
+    let mut out = Vec::new();
+    for tag in tags {
+        let Some(step) = steps.get(tag) else { continue };
+        for (r, n) in &step.hint.resources {
+            let cap = res_cap(sh, r);
+            if cap.unwrap_or(0) < *n {
+                out.push(Refusal {
+                    site: format!("step {tag:?}"),
+                    required: format!("{r}={n}"),
+                    observed: match cap {
+                        None => Observed::Absent,
+                        Some(c) => Observed::Present(format!("{r}={c}")),
+                    },
+                    context: declared.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// The step's inner-jobs width for the core-budget gate (its `preferred_inner_jobs`, else 1).
@@ -289,6 +417,46 @@ impl Runner {
                         acquire(&mut sh, &step);
                         sh.cores_used += step_width(&step);
                         launchable.push(step);
+                    }
+                    // TERMINAL STARVE. Nothing is launchable, nothing is running, and work
+                    // remains: no future event can change that, because every state transition
+                    // in this loop is caused by a running step completing. Sleeping here is what
+                    // turned four distinct defects -- an unsatisfiable resource cap, a dangling
+                    // dep, a dependency cycle, and collapsed duplicate tags -- into one
+                    // indistinguishable symptom: a live process at 0% CPU with a frozen log.
+                    //
+                    // SOUNDNESS: the `-j` cap cannot be the cause of an empty `launchable` here.
+                    // `sh.running.len() >= self.jobs` can only break the scan while `running` is
+                    // NON-empty (`jobs` is `jobs.max(1)` in `Runner::new`, so it is >= 1). And
+                    // with `running` empty no worker thread can be mutating `sh.done`, so the
+                    // counts below are stable rather than merely sampled.
+                    let remaining = self.steps.len() - (sh.done.len() + skipped.len());
+                    if launchable.is_empty() && sh.running.is_empty() && remaining > 0 {
+                        let mut stuck: Vec<String> = self
+                            .order
+                            .iter()
+                            .filter(|t| {
+                                !sh.done.contains_key(*t) && !skipped.contains(*t)
+                            })
+                            .cloned()
+                            .collect();
+                        stuck.sort();
+                        eprintln!(
+                            "[scheduler] REFUSED: terminal starve -- {remaining} step(s) can \
+                             never be admitted; nothing is running and nothing is launchable, so \
+                             no future event can unblock them."
+                        );
+                        for r in ungrantable_resources_from(&sh, &self.steps, &stuck) {
+                            eprintln!("[scheduler]   {r}");
+                        }
+                        eprintln!(
+                            "[scheduler]   starved step(s) ({}): {}",
+                            stuck.len(),
+                            stuck.join(", ")
+                        );
+                        sh.failed = true;
+                        sh.stop = true;
+                        break;
                     }
                 }
             }
@@ -896,6 +1064,38 @@ pub fn run_dag_boxed_ordered(
             );
         }
     }
+    // REFUSE AT THE BOUNDARY, BEFORE ANY SIDE EFFECT. A demand that exceeds its declared cap can
+    // never be admitted, so running the satisfiable steps first would consume a slot, write
+    // partial state, and teach the reader to suspect whichever step happened to be last. The
+    // in-loop detector in `Runner::run` is the more general invariant and would eventually catch
+    // this too; this pre-flight exists to catch it BEFORE anything runs and to name the cause.
+    let refusals = ungrantable_resources(cfg);
+    if !refusals.is_empty() {
+        eprintln!(
+            "[scheduler] REFUSED: {} step(s) demand capacity the config never grants; nothing was \
+             run.",
+            refusals.len()
+        );
+        for r in &refusals {
+            eprintln!("[scheduler]   {r}");
+        }
+        let mut skipped: Vec<String> = cfg
+            .steps
+            .iter()
+            .map(|s| format!("{}.{}", s.group, s.job))
+            .collect();
+        skipped.sort();
+        // `RunResult` has no error variant, so `ok: false` with zero outcomes and every tag
+        // skipped is the least invasive shape that keeps the public API intact. A refusal RAN
+        // NOTHING: `outcomes` is empty on purpose, so no consumer can count this as a product red.
+        return RunResult {
+            ok: false,
+            wall_s: 0.0,
+            outcomes: vec![],
+            skipped,
+            step_profile_rows: vec![],
+        };
+    }
     let runner = Runner::new(
         cfg,
         jobs,
@@ -946,6 +1146,111 @@ mod tests {
             cpu_timeout: 0,
             jobs_flag: None,
         }
+    }
+
+    // ---------------------------------------------------------------- starve brackets
+    //
+    // Both directions with counts, because each leg alone is passed by a broken guard: a check
+    // that refuses EVERYTHING passes the negative leg, and a check wired to NOTHING passes the
+    // positive leg. Counts are asserted, not just non-emptiness, because "29 steps" is what tied
+    // the original refusal to the observed 14-minute hang.
+
+    fn caps(pairs: &[(&str, i64)]) -> BTreeMap<String, i64> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn positive_satisfiable_caps_produce_zero_refusals_and_still_run() {
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "A", "true", &[], 0.0, &[("hg", 1)]),
+                step("g", "B", "true", &[], 0.0, &[("hg", 1)]),
+            ],
+            resource_caps: caps(&[("hg", 1)]),
+            ..Default::default()
+        };
+        assert_eq!(ungrantable_resources(&cfg).len(), 0, "positive: 0 refusals");
+        let res = run_dag(&cfg, 4, false, 0);
+        assert!(res.ok, "positive: a satisfiable DAG must still run to completion");
+        assert_eq!(res.outcomes.len(), 2, "positive: 2 steps executed");
+        assert_eq!(res.skipped.len(), 0);
+    }
+
+    #[test]
+    fn negative_absent_cap_is_refused_before_anything_runs() {
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "needs_gpu", "true", &[], 0.0, &[("gpu", 1)]),
+                step("g", "plain", "true", &[], 0.0, &[]),
+            ],
+            resource_caps: caps(&[("hg", 4)]),
+            ..Default::default()
+        };
+        let refusals = ungrantable_resources(&cfg);
+        assert_eq!(refusals.len(), 1, "negative(absent): exactly 1 refusal");
+        assert_eq!(refusals[0].observed, Observed::Absent);
+        let rendered = refusals[0].to_string();
+        assert!(rendered.contains("<absent>"), "must render Absent distinctly: {rendered}");
+        assert!(rendered.contains("gpu=1"), "must name the demand: {rendered}");
+        assert!(rendered.contains("hg=4"), "must show what WAS declared: {rendered}");
+
+        let res = run_dag(&cfg, 4, false, 0);
+        assert!(!res.ok, "negative(absent): must refuse");
+        assert_eq!(res.outcomes.len(), 0, "a refusal RAN NOTHING -- no outcomes to miscount as reds");
+        assert_eq!(res.skipped.len(), 2, "both tags skipped");
+        assert_eq!(res.wall_s, 0.0);
+    }
+
+    #[test]
+    fn negative_deliberate_zero_is_refused_but_reads_differently_from_absent() {
+        // The absent-vs-zero bracket: same BEHAVIOR (both block), different DIAGNOSTIC. Before
+        // this fix `unwrap_or(0)` made these two literally indistinguishable.
+        let cfg = DagConfig {
+            steps: vec![step("g", "needs_gpu", "true", &[], 0.0, &[("gpu", 1)])],
+            resource_caps: caps(&[("gpu", 0)]),
+            ..Default::default()
+        };
+        let refusals = ungrantable_resources(&cfg);
+        assert_eq!(refusals.len(), 1, "negative(zero): exactly 1 refusal");
+        assert_eq!(refusals[0].observed, Observed::Present("gpu=0".into()));
+        let rendered = refusals[0].to_string();
+        assert!(rendered.contains("gpu=0"), "declared zero must show its value: {rendered}");
+        assert!(!rendered.contains("<absent>"), "a declared 0 must NOT read as absent: {rendered}");
+    }
+
+    #[test]
+    fn negative_in_loop_detector_catches_a_cycle_the_preflight_cannot_enumerate() {
+        // The general invariant. A dependency cycle satisfies every declared cap, so the
+        // pre-flight finds nothing -- yet before this fix the loop slept on it forever at 0% CPU,
+        // exactly as an unsatisfiable cap did. If this test HANGS, the detector has regressed.
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "A", "true", &["g.B"], 0.0, &[]),
+                step("g", "B", "true", &["g.A"], 0.0, &[]),
+                step("g", "ok", "true", &[], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            ungrantable_resources(&cfg).len(),
+            0,
+            "pre-flight cannot see a cycle -- that is the point of the in-loop detector"
+        );
+        let res = run_dag(&cfg, 4, false, 0);
+        assert!(!res.ok, "a cycle must REFUSE, not hang");
+        assert_eq!(res.outcomes.len(), 1, "the one satisfiable step still ran");
+        assert!(res.outcomes.iter().all(|o| o.ok));
+    }
+
+    #[test]
+    fn negative_in_loop_detector_catches_a_dangling_dep() {
+        let cfg = DagConfig {
+            steps: vec![step("g", "A", "true", &["g.nonexistent"], 0.0, &[])],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 4, false, 0);
+        assert!(!res.ok, "a dangling dep must REFUSE, not hang");
+        assert_eq!(res.outcomes.len(), 0);
     }
 
     #[test]
