@@ -99,11 +99,46 @@ fn deps_known(sh: &Shared, step: &Step) -> bool {
     step.deps.iter().all(|d| sh.done.contains_key(d))
 }
 
+// ABSENT vs DELIBERATELY-ZERO. `unwrap_or(0)` here is CORRECT ONLY BECAUSE the absent case can no
+// longer reach this point: `undeclared_resource_demands` refuses, before the loop starts, any step
+// demanding a resource that `cfg.resource_caps` never declares. So by the time we are here every
+// demanded resource HAS a declared cap, and a cap of 0 means what it says — deliberately blocked,
+// nothing may run — which is a real value and must still gate the step.
+//
+// Without that preflight the two collapse: "you forgot to declare cpu" and "cpu is deliberately 0"
+// both produced the identical silent 50 ms sleep forever, and their remedies are opposites. Do not
+// reintroduce a bare `unwrap_or(0)` here without keeping the preflight.
 fn res_free(sh: &Shared, step: &Step) -> bool {
     step.hint
         .resources
         .iter()
         .all(|(r, n)| sh.resource_avail.get(r).copied().unwrap_or(0) >= *n)
+}
+
+/// Steps demanding a named resource that `cfg.resource_caps` never declares.
+///
+/// This is the ABSENT case, and it is a different condition from a declared cap of 0: an undeclared
+/// resource means the DAG author forgot to grant capacity, while a declared 0 means the author
+/// deliberately blocked the step. The scheduler cannot express the difference once both are an
+/// integer, so it is caught here and named instead.
+///
+/// Returns `"<tag>: <resource>"` entries, sorted, for a caller to report.
+pub fn undeclared_resource_demands(cfg: &DagConfig) -> Vec<String> {
+    let mut out: Vec<String> = cfg
+        .steps
+        .iter()
+        .flat_map(|s| {
+            let tag = s.tag();
+            s.hint
+                .resources
+                .iter()
+                .filter(|(r, n)| **n > 0 && !cfg.resource_caps.contains_key(*r))
+                .map(move |(r, _)| format!("{tag}: {r}"))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The step's inner-jobs width for the core-budget gate (its `preferred_inner_jobs`, else 1).
@@ -600,6 +635,8 @@ fn run_step(ctx: StepCtx) {
         let mpid = pid;
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
+            // One-shot so an unmeasurable CPU budget is reported once per step, not every tick.
+            let mut cpu_unmeasurable_warned = false;
             let tick = Duration::from_millis(50);
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(tick);
@@ -618,8 +655,23 @@ fn run_step(ctx: StepCtx) {
                     // the whole tree once when over budget, then exit the monitor.
                     if cpu_timeout > 0 && !cpu_flag.load(Ordering::Relaxed) {
                         if let Some(cs) = c.cpu_stats(&t) {
-                            let cpu_used_s =
-                                cs.get("usage_usec").copied().unwrap_or(0) as f64 / 1_000_000.0;
+                            // ABSENT is not ZERO. `usage_usec` missing means we CANNOT MEASURE the
+                            // step's CPU, not that it has consumed none. Defaulting to 0 made the
+                            // comparison below unsatisfiable, so the CPU-time budget silently never
+                            // fired — an enforcement guard disabled by a missing field, with no
+                            // warning. Say so once and leave the budget unenforced explicitly.
+                            let Some(usage_usec) = cs.get("usage_usec").copied() else {
+                                if !cpu_unmeasurable_warned {
+                                    cpu_unmeasurable_warned = true;
+                                    eprintln!(
+                                        "[scheduler] WARNING: step {t}: cgroup cpu.stat has no \
+                                         `usage_usec`; the {cpu_timeout}s CPU-time budget CANNOT be \
+                                         enforced for this step (wall timeout still applies)."
+                                    );
+                                }
+                                continue;
+                            };
+                            let cpu_used_s = usage_usec as f64 / 1_000_000.0;
                             if cpu_used_s >= cpu_timeout as f64 {
                                 cpu_flag.store(true, Ordering::Relaxed);
                                 reap(&cg, &t, mpid);
@@ -898,6 +950,27 @@ pub fn run_dag_boxed_ordered(
             );
         }
     }
+    // ABSENT is not ZERO. A step demanding a resource that `resource_caps` never declares can never
+    // become schedulable, and the scheduler expresses that as an infinite 50 ms sleep at 0% CPU with
+    // no error — indistinguishable from a deliberate cap of 0. Refuse it here, by name, before the
+    // loop can hang on it. A DECLARED cap of 0 is a real value and still gates normally.
+    let undeclared = undeclared_resource_demands(cfg);
+    if !undeclared.is_empty() {
+        eprintln!(
+            "[scheduler] ERROR: {} step/resource pair(s) demand a resource with NO declared cap in \
+             `resource_caps`; these can never be scheduled. This is an UNDECLARED resource, not a \
+             cap of 0 — declare the capacity, or set it to 0 explicitly to block deliberately:\n  {}",
+            undeclared.len(),
+            undeclared.join("\n  ")
+        );
+        return RunResult {
+            ok: false,
+            wall_s: 0.0,
+            outcomes: Vec::new(),
+            skipped: cfg.steps.iter().map(|s| s.tag()).collect(),
+            step_profile_rows: Vec::new(),
+        };
+    }
     let runner = Runner::new(
         cfg,
         jobs,
@@ -916,6 +989,55 @@ mod tests {
     use super::*;
     use crate::model::ResourceHint;
     use std::collections::BTreeMap;
+
+    // ABSENT vs DELIBERATELY-ZERO, bracketed BOTH ways. Before the preflight these two produced
+    // byte-identical output (an infinite 50 ms sleep at 0% CPU, no message), and their remedies are
+    // opposites. A one-sided test would pass if the predicate simply flagged everything, so the
+    // declared-zero case is asserted just as hard as the undeclared one.
+    #[test]
+    fn undeclared_resource_is_named_and_declared_zero_is_not() {
+        let mut demand = BTreeMap::new();
+        demand.insert("cpu".to_string(), 1i64);
+        let mut st = step("g", "a", "true", &[], 0.0, &[]);
+        st.hint = ResourceHint {
+            resources: demand,
+            ..Default::default()
+        };
+
+        // NEGATIVE: no `resource_caps` entry for "cpu" -> ABSENT -> must be named.
+        let absent = DagConfig {
+            steps: vec![st.clone()],
+            ..Default::default()
+        };
+        let found = undeclared_resource_demands(&absent);
+        assert_eq!(
+            found,
+            vec!["g.a: cpu".to_string()],
+            "undeclared demand must be named"
+        );
+
+        // POSITIVE: cap DECLARED as 0 -> a real value, deliberately blocking -> must NOT be named.
+        let mut caps = BTreeMap::new();
+        caps.insert("cpu".to_string(), 0i64);
+        let zero = DagConfig {
+            steps: vec![st.clone()],
+            resource_caps: caps.clone(),
+            ..Default::default()
+        };
+        assert!(
+            undeclared_resource_demands(&zero).is_empty(),
+            "a declared cap of 0 is a real value, not an absent one"
+        );
+
+        // POSITIVE: a normal declared cap is likewise not flagged.
+        caps.insert("cpu".to_string(), 4i64);
+        let ok = DagConfig {
+            steps: vec![st],
+            resource_caps: caps,
+            ..Default::default()
+        };
+        assert!(undeclared_resource_demands(&ok).is_empty());
+    }
 
     fn step(
         group: &str,
