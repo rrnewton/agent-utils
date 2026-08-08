@@ -26,9 +26,17 @@ Use serial landing unless the repository explicitly permits a coalesced staging 
 authorized coalesced landing:
 
 1. Fetch and create staging from the current target branch.
-2. Combine only ready, conflict-free heads; return conflicts for individual resolution and review.
-3. Validate and review the exact combined staging head.
-4. Publish through the repository's normal protection and authorization path.
+2. Screen the constituent list before combining anything. Ready and conflict-free say nothing about
+   whether a change was DELIBERATELY REFUSED, and a wave's constituents are usually listed by hand,
+   so a closed-on-the-merits change folded into staging lands under the wave's single approval.
+   Refuse any constituent whose pull request was closed without naming a successor that carries the
+   work. Treat an unannotated close as REFUSED, not as permission: record why it was closed, then
+   re-screen. Closed alone is not the predicate — after a wave lands, its own constituents are
+   normally closed, so refusing every closed pull request would block the routine case and teach
+   operators to skip the check.
+3. Combine only ready, conflict-free heads; return conflicts for individual resolution and review.
+4. Validate and review the exact combined staging head.
+5. Publish through the repository's normal protection and authorization path.
 
 If the target branch moves, refresh the candidate and repeat revision-bound checks. Do not claim an
 older receipt for a new head.
