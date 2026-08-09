@@ -232,6 +232,27 @@ def test_status_and_read_cover_arbitrary_target(tmp_path: object) -> None:
     assert read(client(fake), target(), lines=17) == "agent transcript\n"
 
 
+def test_status_on_absent_queue_creates_no_files(tmp_path: Path) -> None:
+    root = tmp_path / "does-not-exist"
+    fake = FakeAgentHerdr(["idle"])
+    snapshot = status(client(fake), target(), str(root))
+    assert snapshot["pending"] == []
+    assert snapshot["inflight"] == []
+    assert snapshot["failed"] == []
+    assert not root.exists()
+
+
+def test_status_read_only_validates_existing_binding(tmp_path: Path) -> None:
+    fake = FakeAgentHerdr(["working"])
+    with pytest.raises(AgentPending):
+        send(client(fake), target(), str(tmp_path), "bound", ready_timeout=0)
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    with pytest.raises(AgentDeliveryError, match="bound to"):
+        status(client(fake), target(session_value="different"), str(tmp_path))
+    after = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+    assert after == before
+
+
 def test_read_falls_back_when_unwrapped_source_is_empty(tmp_path: object) -> None:
     fake = FakeAgentHerdr(["idle"])
     sources: list[str] = []

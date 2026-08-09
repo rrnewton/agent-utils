@@ -2,7 +2,7 @@
 
 Target identity is supplied by adapters.  This module owns every transport
 property: durable FIFO files, idle/done readiness, atomic multiline submission,
-working-state confirmation, bounded retries/quarantine, status, and reading.
+working-state confirmation, at-most-once ambiguity quarantine, status, and reading.
 """
 
 from __future__ import annotations
@@ -190,6 +190,23 @@ def _bind_queue(root: str, target: Target) -> None:
             _atomic_json(binding_path, expected)
     finally:
         os.close(descriptor)
+
+
+def _validate_existing_binding(root: str, target: Target) -> None:
+    """Read-only binding validation for observational commands such as status."""
+    binding_path = os.path.join(root, "target.json")
+    if not os.path.exists(binding_path):
+        return
+    expected = _binding(target)
+    try:
+        with open(binding_path, encoding="utf-8") as handle:
+            actual: object = json.load(handle)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise AgentDeliveryError(f"cannot read queue target binding {binding_path}: {exc}") from exc
+    if actual != expected:
+        raise AgentDeliveryError(
+            f"queue {root} is bound to {actual!r}, refusing different target {expected!r}"
+        )
 
 
 def _transition(source: str, destination: str) -> None:
@@ -394,7 +411,7 @@ def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: ob
         except AgentDeliveryError:
             pass
         raise AgentPossiblySubmitted(
-            f"message {identifier} failed after bounded retries: {detail}; "
+            f"message {identifier} has an ambiguous outcome after one injection: {detail}; "
             f"it is retained under {root}/failed",
             message_id=identifier,
             artifact=failed_path,
@@ -409,16 +426,22 @@ def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: ob
 
 
 def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
-    _bind_queue(root, target)
+    _validate_existing_binding(root, target)
     info = resolve_target(client, target)
-    inbox, inflight, _processed, failed = _prepare(root)
+    inbox, inflight, _processed, failed = _dirs(root)
+
+    def identifiers(path: str) -> list[str]:
+        if not os.path.isdir(path):
+            return []
+        return sorted(name[:-5] for name in os.listdir(path) if name.endswith(".json"))
+
     return {
         "pane_id": info.pane_id, "agent": info.agent, "agent_status": info.status,
         "session_agent": info.session_agent, "session_value": info.session_value,
         "workspace_id": info.workspace_id, "cwd": info.cwd,
-        "pending": sorted(name[:-5] for name in os.listdir(inbox) if name.endswith(".json")),
-        "inflight": sorted(name[:-5] for name in os.listdir(inflight) if name.endswith(".json")),
-        "failed": sorted(name[:-5] for name in os.listdir(failed) if name.endswith(".json")),
+        "pending": identifiers(inbox),
+        "inflight": identifiers(inflight),
+        "failed": identifiers(failed),
     }
 
 
