@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from pathlib import Path
 from typing import cast
 
 import pytest
@@ -13,7 +14,7 @@ from herdr_run.agent import Target, drain, enqueue, read, send, status
 from herdr_run.agent import QueueResult
 import herdr_run.agent_cli as agent_cli
 from herdr_run.client import AgentPaneInfo, HerdrClient, Pane
-from herdr_run.errors import AgentDeliveryError, HerdrUnavailable
+from herdr_run.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable
 
 
 class FakeAgentHerdr:
@@ -266,3 +267,118 @@ def test_drain_cli_returns_temporary_failure_when_fifo_remains_blocked(
         lambda *_args, **_kwargs: QueueResult("", (), (), ("pending",), "agent still working"),
     )
     assert agent_cli.main(["drain", "--pane", "w1:p1", "--queue", str(tmp_path)]) == 75
+
+
+@pytest.mark.parametrize("raw", [b"{not json\n", b'{"id":"bad","text":7}\n'])
+def test_invalid_fifo_head_preserves_raw_and_does_not_block_valid(
+    tmp_path: object, raw: bytes
+) -> None:
+    inbox = tmp_path / "inbox"  # type: ignore[operator]
+    inbox.mkdir()
+    bad = inbox / "000000000001.json"
+    bad.write_bytes(raw)
+    good = inbox / "000000000002.json"
+    good.write_text(json.dumps({"id": "good", "text": "deliver me"}) + "\n")
+    fake = FakeAgentHerdr(["idle"])
+    result = drain(client(fake), target(), str(tmp_path))
+    failed = tmp_path / "failed" / bad.name  # type: ignore[operator]
+    assert failed.read_bytes() == raw
+    metadata = json.loads((tmp_path / "failed" / f"{bad.name}.error").read_text())  # type: ignore[operator]
+    assert metadata["outcome"] == "invalid_message"
+    assert result.quarantined == ("000000000001",)
+    assert result.delivered == ("good",)
+    assert fake.runs == ["deliver me"]
+
+
+def test_crash_after_run_before_wait_is_never_resubmitted_on_restart(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["idle"])
+
+    def crash_after_run(_pane: str, _state: str, _timeout: int) -> None:
+        raise KeyboardInterrupt("simulated process death")
+
+    fake.wait_agent_status = crash_after_run  # type: ignore[assignment]
+    with pytest.raises(KeyboardInterrupt):
+        send(client(fake), target(), str(tmp_path), "at most once")
+    assert fake.runs == ["at most once"]
+    assert len(list((tmp_path / "inflight").glob("*.json"))) == 1  # type: ignore[operator]
+
+    restarted = FakeAgentHerdr(["idle"])
+    result = drain(client(restarted), target(), str(tmp_path))
+    assert restarted.runs == []
+    assert len(list((tmp_path / "inflight").glob("*.json"))) == 0  # type: ignore[operator]
+    assert len(list((tmp_path / "failed").glob("*.json"))) == 1  # type: ignore[operator]
+    assert result.outcome == "possibly_submitted"
+
+
+def test_send_failures_have_distinct_typed_machine_outcomes(tmp_path: Path) -> None:
+    busy = FakeAgentHerdr(["working"])
+    with pytest.raises(AgentPending) as pending:
+        send(client(busy), target(), str(tmp_path / "pending"), "safe", ready_timeout=0)
+    assert pending.value.outcome == "pending"
+    assert os.path.isfile(pending.value.artifact)
+
+    ambiguous = FakeAgentHerdr(["idle"])
+    ambiguous.wait_agent_status = lambda *_args: (_ for _ in ()).throw(HerdrUnavailable("lost"))  # type: ignore[method-assign]
+    with pytest.raises(AgentPossiblySubmitted) as submitted:
+        send(client(ambiguous), target(), str(tmp_path / "ambiguous"), "unsafe")
+    assert submitted.value.outcome == "possibly_submitted"
+    assert os.path.isfile(submitted.value.artifact)
+
+
+def test_send_cli_emits_structured_distinct_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    artifact = str(tmp_path / "inbox" / "m.json")
+    monkeypatch.setattr(
+        agent_cli,
+        "send",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AgentPending("busy", message_id="m", artifact=artifact)
+        ),
+    )
+    assert agent_cli.main(["send", "--pane", "w1:p1", "hello"]) == 75
+    assert json.loads(capsys.readouterr().out) == {
+        "artifact": artifact,
+        "error": "busy",
+        "message_id": "m",
+        "outcome": "pending",
+        "safe_to_retry": True,
+    }
+
+    failed_artifact = str(tmp_path / "failed" / "m2.json")
+    monkeypatch.setattr(
+        agent_cli,
+        "send",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AgentPossiblySubmitted("unknown", message_id="m2", artifact=failed_artifact)
+        ),
+    )
+    assert agent_cli.main(["send", "--pane", "w1:p1", "hello"]) == 76
+    assert json.loads(capsys.readouterr().out)["safe_to_retry"] is False
+
+
+def test_drain_cli_distinguishes_quarantine_from_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        agent_cli,
+        "drain",
+        lambda *_args, **_kwargs: QueueResult(
+            "", (), ("ambiguous",), (), None, "possibly_submitted"
+        ),
+    )
+    assert agent_cli.main(["drain", "--pane", "w1:p1", "--queue", str(tmp_path)]) == 76
+
+
+def test_enqueue_and_delivery_state_transitions_fsync(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(descriptor: int) -> None:
+        calls.append(descriptor)
+        real_fsync(descriptor)
+
+    monkeypatch.setattr("herdr_run.agent.os.fsync", recording_fsync)
+    fake = FakeAgentHerdr(["idle"])
+    send(client(fake), target(), str(tmp_path), "durable")
+    # Enqueue file+directory, inbox->inflight, inflight update, and
+    # inflight->processed each require syncs; keep the assertion structural.
+    assert len(calls) >= 8

@@ -16,7 +16,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from herdr_run.client import AgentPaneInfo, HerdrClient
-from herdr_run.errors import AgentDeliveryError, HerdrUnavailable
+from herdr_run.errors import (
+    AgentDeliveryError,
+    AgentPending,
+    AgentPossiblySubmitted,
+    HerdrUnavailable,
+)
 
 __all__ = ["Target", "QueueResult", "resolve_target", "enqueue", "drain", "send", "status", "read"]
 
@@ -38,6 +43,7 @@ class QueueResult:
     quarantined: tuple[str, ...]
     pending: tuple[str, ...]
     blocked: str | None = None
+    outcome: str = "delivered"
 
 
 class _PossiblySubmitted(AgentDeliveryError):
@@ -89,14 +95,24 @@ def resolve_target(client: HerdrClient, target: Target) -> AgentPaneInfo:
     return info
 
 
-def _dirs(root: str) -> tuple[str, str, str]:
-    return tuple(os.path.join(root, name) for name in ("inbox", "processed", "failed"))  # type: ignore[return-value]
+def _fsync_dir(path: str) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
-def _prepare(root: str) -> tuple[str, str, str]:
+def _dirs(root: str) -> tuple[str, str, str, str]:
+    return tuple(os.path.join(root, name) for name in ("inbox", "inflight", "processed", "failed"))  # type: ignore[return-value]
+
+
+def _prepare(root: str) -> tuple[str, str, str, str]:
+    os.makedirs(root, mode=0o700, exist_ok=True)
     paths = _dirs(root)
     for path in paths:
         os.makedirs(path, mode=0o700, exist_ok=True)
+    _fsync_dir(root)
     return paths
 
 
@@ -109,7 +125,10 @@ def _atomic_json(path: str, document: dict[str, object]) -> None:
             os.fchmod(handle.fileno(), 0o600)
             json.dump(document, handle, indent=2, sort_keys=True)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_dir(parent)
     finally:
         if temporary:
             try:
@@ -122,7 +141,7 @@ def enqueue(root: str, text: str, *, message_id: str | None = None) -> str:
     """Persist a prompt before any readiness or transport operation."""
     if not text:
         raise AgentDeliveryError("message must not be empty")
-    inbox, _processed, _failed = _prepare(root)
+    inbox, _inflight, _processed, _failed = _prepare(root)
     identifier = message_id or f"{time.time_ns():020d}-{os.getpid()}"
     path = os.path.join(inbox, f"{identifier}.json")
     if os.path.exists(path):
@@ -171,6 +190,48 @@ def _bind_queue(root: str, target: Target) -> None:
             _atomic_json(binding_path, expected)
     finally:
         os.close(descriptor)
+
+
+def _transition(source: str, destination: str) -> None:
+    """Durably rename an artifact and sync both directory entries."""
+    source_parent = os.path.dirname(source)
+    destination_parent = os.path.dirname(destination)
+    os.replace(source, destination)
+    _fsync_dir(destination_parent)
+    if source_parent != destination_parent:
+        _fsync_dir(source_parent)
+
+
+def _failed_metadata(failed_path: str, *, outcome: str, error: str) -> None:
+    _atomic_json(
+        failed_path + ".error",
+        {"artifact": os.path.basename(failed_path), "outcome": outcome, "error": error, "failed_at": time.time()},
+    )
+
+
+def _quarantine_raw(path: str, failed: str, *, outcome: str, error: str) -> str:
+    """Preserve malformed bytes exactly, add separate durable metadata, and advance FIFO."""
+    basename = os.path.basename(path)
+    destination = os.path.join(failed, basename)
+    _transition(path, destination)
+    _failed_metadata(destination, outcome=outcome, error=error)
+    return basename[:-5] if basename.endswith(".json") else basename
+
+
+def _recover_inflight(inflight: str, failed: str) -> list[str]:
+    """Never resubmit a prompt whose process died after durable injection intent."""
+    recovered: list[str] = []
+    for name in sorted(entry for entry in os.listdir(inflight) if entry.endswith(".json")):
+        source = os.path.join(inflight, name)
+        destination = os.path.join(failed, name)
+        _transition(source, destination)
+        _failed_metadata(
+            destination,
+            outcome="possibly_submitted",
+            error="recovered an inflight prompt after process restart; refusing automatic resubmission",
+        )
+        recovered.append(name[:-5])
+    return recovered
 
 
 def _load(path: str) -> dict[str, object]:
@@ -246,7 +307,7 @@ def drain(
 ) -> QueueResult:
     """Serialize and drain a FIFO; poison prompts are retained in ``failed``."""
     _bind_queue(root, target)
-    inbox, processed, failed = _prepare(root)
+    inbox, inflight, processed, failed = _prepare(root)
     lock_path = os.path.join(root, ".delivery.lock")
     delivered: list[str] = []
     quarantined: list[str] = []
@@ -254,12 +315,28 @@ def drain(
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        quarantined.extend(_recover_inflight(inflight, failed))
         for path in sorted(os.path.join(inbox, name) for name in os.listdir(inbox) if name.endswith(".json")):
-            document = _load(path)
+            try:
+                document = _load(path)
+            except AgentDeliveryError as exc:
+                quarantined.append(
+                    _quarantine_raw(path, failed, outcome="invalid_message", error=str(exc))
+                )
+                continue
             identifier = str(document.get("id", os.path.basename(path)[:-5]))
             attempts_raw = document.get("delivery_attempts", document.get("tui_delivery_attempts", 0))
             attempts = attempts_raw if isinstance(attempts_raw, int) and attempts_raw >= 0 else 0
             while attempts < max_attempts:
+                # ``inflight`` is a durable at-most-once barrier. Once this rename commits, a
+                # crash is treated as possibly submitted even if it happened immediately before
+                # pane.run; safety takes precedence over an automatic duplicate.
+                document["possibly_submitted"] = True
+                document["delivery_state"] = "inflight"
+                document["inflight_at"] = time.time()
+                _atomic_json(path, document)
+                inflight_path = os.path.join(inflight, os.path.basename(path))
+                _transition(path, inflight_path)
                 try:
                     _deliver_one(
                         client, target, str(document["text"]), ready_timeout=ready_timeout,
@@ -272,20 +349,28 @@ def drain(
                     document["delivery_error"] = str(exc)
                     document["possibly_submitted"] = True
                     document["delivery_failed_at"] = time.time()
-                    _atomic_json(path, document)
-                    os.replace(path, os.path.join(failed, os.path.basename(path)))
+                    _atomic_json(inflight_path, document)
+                    failed_path = os.path.join(failed, os.path.basename(path))
+                    _transition(inflight_path, failed_path)
+                    _failed_metadata(failed_path, outcome="possibly_submitted", error=str(exc))
                     quarantined.append(identifier)
                     break
                 except (AgentDeliveryError, HerdrUnavailable) as exc:
-                    # No pane injection happened. Keep the FIFO head pending and do not burn a
-                    # poison-attempt budget: ordinary busy->idle is a scheduling condition.
+                    # Readiness failures happen inside _deliver_one before pane.run. Move the
+                    # artifact back to inbox; no injection occurred and no retry is consumed.
+                    document.pop("possibly_submitted", None)
+                    document["delivery_state"] = "pending"
                     document["delivery_error"] = str(exc)
                     document["delivery_blocked_at"] = time.time()
-                    _atomic_json(path, document)
+                    _atomic_json(inflight_path, document)
+                    _transition(inflight_path, path)
                     blocked = str(exc)
                     break
                 else:
-                    os.replace(path, os.path.join(processed, os.path.basename(path)))
+                    document["delivery_state"] = "processed"
+                    document["confirmed_at"] = time.time()
+                    _atomic_json(inflight_path, document)
+                    _transition(inflight_path, os.path.join(processed, os.path.basename(path)))
                     delivered.append(identifier)
                     break
             if blocked is not None:
@@ -293,7 +378,8 @@ def drain(
     finally:
         os.close(descriptor)
     pending = tuple(name[:-5] for name in sorted(os.listdir(inbox)) if name.endswith(".json"))
-    return QueueResult("", tuple(delivered), tuple(quarantined), pending, blocked)
+    outcome = "pending" if blocked is not None else ("possibly_submitted" if quarantined else "delivered")
+    return QueueResult("", tuple(delivered), tuple(quarantined), pending, blocked, outcome)
 
 
 def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: object) -> QueueResult:
@@ -310,26 +396,31 @@ def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: ob
                 detail = recorded
         except AgentDeliveryError:
             pass
-        raise AgentDeliveryError(
+        raise AgentPossiblySubmitted(
             f"message {identifier} failed after bounded retries: {detail}; "
-            f"it is retained under {root}/failed"
+            f"it is retained under {root}/failed",
+            message_id=identifier,
+            artifact=failed_path,
         )
     if identifier in result.pending:
-        raise AgentDeliveryError(
-            f"message {identifier} remains pending without consuming a retry attempt: {result.blocked}"
+        raise AgentPending(
+            f"message {identifier} remains pending without consuming a retry attempt: {result.blocked}",
+            message_id=identifier,
+            artifact=os.path.join(root, "inbox", f"{identifier}.json"),
         )
-    return QueueResult(identifier, result.delivered, result.quarantined, result.pending, result.blocked)
+    return QueueResult(identifier, result.delivered, result.quarantined, result.pending, result.blocked, "delivered")
 
 
 def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
     _bind_queue(root, target)
     info = resolve_target(client, target)
-    inbox, _processed, failed = _prepare(root)
+    inbox, inflight, _processed, failed = _prepare(root)
     return {
         "pane_id": info.pane_id, "agent": info.agent, "agent_status": info.status,
         "session_agent": info.session_agent, "session_value": info.session_value,
         "workspace_id": info.workspace_id, "cwd": info.cwd,
         "pending": sorted(name[:-5] for name in os.listdir(inbox) if name.endswith(".json")),
+        "inflight": sorted(name[:-5] for name in os.listdir(inflight) if name.endswith(".json")),
         "failed": sorted(name[:-5] for name in os.listdir(failed) if name.endswith(".json")),
     }
 
