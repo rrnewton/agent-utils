@@ -26,7 +26,7 @@
 // `unsafe`/`libc`). Per-step measurement rows are collected for the perf-log sink either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::ExitStatus;
 use std::process::{Command, Stdio};
@@ -36,6 +36,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::ambient::{capture_ambient_snapshot, PsiReading};
+use crate::attribution::{
+    default_log_dir, mint_step_nonce, Culprit, RunEvidence, StepStream, STEP_NONCE_ENV,
+};
 use crate::cgroup::CgroupManager;
 use crate::model::{
     command_with_inner_jobs, effective_cpu_count, effective_cpu_timeout, preferred_inner_jobs,
@@ -95,6 +98,9 @@ struct Shared {
     cores_used: i64,
     /// Accumulated per-step measurement rows (forwarded to a metrics sink after the run).
     step_profile_rows: Vec<ProfileRow>,
+    /// Per-step ownership nonce, so the eager-cancel path can terminate another step's escapees
+    /// as thoroughly as that step's own supervisor would (see [`kill_by_nonce`]).
+    running_nonces: HashMap<String, String>,
 }
 
 /// SIGKILL a whole process group by pid (the child is its own group leader via
@@ -178,6 +184,78 @@ fn kill_descendants(root: u32) -> usize {
         for pid in proc_descendants(root) {
             if pid <= 1 || pid == own {
                 continue; // a reap must never signal the runner itself
+            }
+            if killed.insert(pid) {
+                fresh += 1;
+            }
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if fresh == 0 {
+            break;
+        }
+    }
+    killed.len()
+}
+
+/// SIGKILL every process carrying this step's ownership nonce in its environment.
+///
+/// THIS IS THE ESCAPEE CLOSER, and it is what makes termination GENERAL rather than boxed-only.
+/// The three earlier mechanisms each have a hole. `cgroup.kill` is exact but exists only when
+/// containment is available. A process-group kill misses anything that called `setsid`, because an
+/// escapee changes session and pgid. The `/proc` parentage sweep misses a DOUBLE-FORK escapee,
+/// whose intermediate parent exits so the survivor reparents away from the step entirely —
+/// measured on a planted escapee, which showed `PPid=1`. Subreaper adoption pulls such orphans
+/// back to the RUNNER, but that makes them siblings of every other step's tree, not descendants of
+/// the step that spawned them, so a parentage walk rooted at the step still cannot see them and a
+/// walk rooted at the runner would reach other steps' live work.
+///
+/// A nonce closes exactly that hole. Each step is launched with `SAFE_CI_DAG_RUNNER_STEP=<nonce>`
+/// in its environment; `fork` copies the environment and `execve` carries it, so EVERY descendant
+/// inherits it however far it runs from its origin — changing session, changing process group, and
+/// being reparented all leave it intact.
+///
+/// SAFETY, AND WHY THIS IS NOT A PATTERN KILL. The match is an exact NUL-delimited environment
+/// entry against a token this runner minted from its own pid, a per-process sequence number, and
+/// the wall clock. It is never a process name, never a command line, and never a substring of
+/// either. No process outside this step's own fork tree can carry it, so unlike a `pkill`-style
+/// match it cannot reach a sibling agent's work on a shared machine. Processes owned by other
+/// users are unreadable and are skipped rather than signalled. The runner's own pid is excluded.
+///
+/// Sweeps like [`kill_descendants`], for the same reason: the walk races a tree that may still be
+/// forking. Returns the number of distinct pids signalled.
+fn kill_by_nonce(nonce: &str) -> usize {
+    if nonce.is_empty() {
+        return 0;
+    }
+    let needle = format!("{STEP_NONCE_ENV}={nonce}");
+    let own = std::process::id();
+    let mut killed: HashSet<u32> = HashSet::new();
+    for _ in 0..DESCENDANT_KILL_SWEEPS {
+        let mut fresh = 0usize;
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            break;
+        };
+        for entry in entries.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid <= 1 || pid == own {
+                continue;
+            }
+            // Unreadable (another user, or exited mid-walk) is the common case and is benign.
+            let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+                continue;
+            };
+            let carries = environ
+                .split(|b| *b == 0)
+                .any(|entry| entry == needle.as_bytes());
+            if !carries {
+                continue;
             }
             if killed.insert(pid) {
                 fresh += 1;
@@ -351,6 +429,9 @@ struct Runner {
     // never lets the summed inner-jobs width of concurrently-running steps exceed this total core
     // budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
     core_budget: Option<i64>,
+    /// Durable, incrementally-flushed evidence for this run (per-step logs + boundary journal), or
+    /// `None` when the operator opted out or the directory could not be created.
+    evidence: Option<Arc<RunEvidence>>,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -396,6 +477,7 @@ impl Runner {
             default_step_cpu_count: cfg.default_step_cpu_count,
             default_step_cpu_timeout: cfg.default_step_cpu_timeout,
             core_budget,
+            evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
                 running: HashSet::new(),
@@ -406,6 +488,7 @@ impl Runner {
                 stop: false,
                 cores_used: 0,
                 step_profile_rows: Vec::new(),
+                running_nonces: HashMap::new(),
             })),
         }
     }
@@ -489,6 +572,7 @@ impl Runner {
                 let default_step_mem_cap_bytes = self.default_step_mem_cap_bytes;
                 let default_step_cpu_count = self.default_step_cpu_count;
                 let default_step_cpu_timeout = self.default_step_cpu_timeout;
+                let evidence = self.evidence.clone();
                 handles.push(thread::spawn(move || {
                     run_step(StepCtx {
                         step,
@@ -501,6 +585,7 @@ impl Runner {
                         default_step_mem_cap_bytes,
                         default_step_cpu_count,
                         default_step_cpu_timeout,
+                        evidence,
                     });
                 }));
             }
@@ -546,28 +631,52 @@ impl Runner {
 }
 
 // Read a child pipe to EOF into `buf`; when `stream`, also echo each line tagged.
+/// Pump one output stream: into the in-memory buffer, through to the durable per-step log, and
+/// into the test-boundary tracker.
+///
+/// CHUNKED, NOT LINE-ORIENTED, and that change is load-bearing for test attribution. The previous
+/// `read_until(b'\n')` could not observe a test that never finished: Rust's libtest prints
+/// `test some::name ... ` and only then RUNS the test, so under `--nocapture` the hung test's own
+/// announcement sits in the pipe with no trailing newline and a line reader blocks on it forever —
+/// the one test whose name matters is the one such a reader can never see. Reading chunks and
+/// letting [`StepStream`] hold the bytes since the last newline leaves that announcement available
+/// at teardown. Line-at-a-time streaming to the console is preserved by [`StepStream`]'s own
+/// splitting, so `-vv` output is unchanged.
 fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
     buf: Arc<Mutex<Vec<u8>>>,
     tag: String,
     stream: bool,
+    sink: Arc<StepStream>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut br = BufReader::new(reader);
-        let mut line: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        let mut pending: Vec<u8> = Vec::new();
         loop {
-            line.clear();
-            match br.read_until(b'\n', &mut line) {
+            match br.read(&mut chunk) {
                 Ok(0) => break,
-                Ok(_) => {
-                    buf.lock().unwrap().extend_from_slice(&line);
+                Ok(n) => {
+                    let bytes = &chunk[..n];
+                    buf.lock().unwrap().extend_from_slice(bytes);
+                    sink.ingest(bytes);
                     if stream {
-                        let text = String::from_utf8_lossy(&line);
-                        emit(&format!("[{tag}] {}", text.trim_end_matches('\n')));
+                        // Console streaming stays line-at-a-time: hold back the unterminated tail
+                        // so a partially-received line is not printed twice.
+                        pending.extend_from_slice(bytes);
+                        while let Some(idx) = pending.iter().position(|b| *b == b'\n') {
+                            let line: Vec<u8> = pending.drain(..=idx).collect();
+                            let text = String::from_utf8_lossy(&line);
+                            emit(&format!("[{tag}] {}", text.trim_end_matches('\n')));
+                        }
                     }
                 }
                 Err(_) => break,
             }
+        }
+        if stream && !pending.is_empty() {
+            let text = String::from_utf8_lossy(&pending);
+            emit(&format!("[{tag}] {}", text.trim_end_matches('\n')));
         }
     })
 }
@@ -607,6 +716,8 @@ struct StepCtx {
     default_step_mem_cap_bytes: Option<i64>,
     default_step_cpu_count: Option<i64>,
     default_step_cpu_timeout: i64,
+    /// Run-level durable evidence sink (per-step log + test-boundary journal), if enabled.
+    evidence: Option<Arc<RunEvidence>>,
 }
 
 /// Tear down one step's whole process tree: `cgroup.kill` first (setsid-proof), then killpg.
@@ -627,7 +738,7 @@ struct StepCtx {
 /// cgroup's kill failed, so the unboxed path — which has exactly the same weakness — degraded in
 /// silence. A step running without enforceable containment must say so once, or "unbounded" is
 /// invisible in the log.
-fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32) {
+fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
     let contained = match cgroups {
         Some(cg) if cg.enabled() => {
             if cg.kill(tag) {
@@ -660,6 +771,20 @@ fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32) {
             eprintln!(
                 "[scheduler] step {tag}: killed {swept} descendant(s) the process-group kill \
                  missed (setsid/double-fork escapees)."
+            );
+        }
+    }
+    // FINAL BACKSTOP, RUN ON EVERY PATH — boxed and unboxed alike. Boxed, it should find nothing
+    // and costs one `/proc` walk; that it runs anyway is the point, because "cgroup.kill returned
+    // success" is a claim about a write, not evidence that the subtree is empty. Unboxed it is the
+    // only mechanism that reaches a double-fork escapee at all.
+    if let Some(n) = nonce {
+        let swept = kill_by_nonce(n);
+        if swept > 0 {
+            eprintln!(
+                "[scheduler] step {tag}: killed {swept} process(es) by ownership nonce that \
+                 neither the process-group kill nor the parentage sweep could reach \
+                 (setsid/double-fork escapees)."
             );
         }
     }
@@ -698,6 +823,7 @@ fn run_step(ctx: StepCtx) {
         default_step_mem_cap_bytes,
         default_step_cpu_count,
         default_step_cpu_timeout,
+        evidence,
     } = ctx;
     let tag = step.tag();
     emit(&format!("[{tag}] \u{25b6} START  {}", step.desc));
@@ -742,11 +868,17 @@ fn run_step(ctx: StepCtx) {
         None
     };
 
+    // Per-step ownership nonce. Set BEFORE the step's own env so a DAG cannot overwrite it, and
+    // inherited by every descendant through fork/exec — the only handle that still reaches a
+    // double-fork escapee once it has left the step's process group AND its parentage. See
+    // [`kill_by_nonce`].
+    let nonce = mint_step_nonce(&tag);
     let mut cmd = Command::new("bash");
     cmd.arg("-c").arg(&run_cmd);
     for (k, v) in &step.env {
         cmd.env(k, v);
     }
+    cmd.env(STEP_NONCE_ENV, &nonce);
     // Own process group (pgid == child pid) so teardown can reap the whole tree with a
     // negative-pid kill without ever touching the runner's own group.
     cmd.process_group(0);
@@ -764,6 +896,7 @@ fn run_step(ctx: StepCtx) {
             let mut sh = shared.lock().unwrap();
             sh.running.remove(&tag);
             sh.running_pids.remove(&tag);
+            sh.running_nonces.remove(&tag);
             release(&mut sh, &step);
             let outcome = StepOutcome::failed(
                 tag.clone(),
@@ -793,16 +926,44 @@ fn run_step(ctx: StepCtx) {
     {
         let mut sh = shared.lock().unwrap();
         sh.running_pids.insert(tag.clone(), pid);
+        sh.running_nonces.insert(tag.clone(), nonce.clone());
+    }
+
+    // ONE stream object shared by stdout and stderr, so the tracker sees the step's output in a
+    // single order and a harness that reports progress on stderr is attributed just as well.
+    let sink = Arc::new(StepStream::new(&tag, evidence.clone()));
+    if let Some(e) = &evidence {
+        e.record(
+            "step_start",
+            &[
+                ("step", tag.clone()),
+                ("pid", pid.to_string()),
+                ("timeout_s", step.timeout.to_string()),
+                ("cmd", run_cmd.clone()),
+            ],
+        );
     }
 
     let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
-        readers.push(spawn_reader(out, Arc::clone(&out_buf), tag.clone(), stream));
+        readers.push(spawn_reader(
+            out,
+            Arc::clone(&out_buf),
+            tag.clone(),
+            stream,
+            Arc::clone(&sink),
+        ));
     }
     if let Some(err) = child.stderr.take() {
-        readers.push(spawn_reader(err, Arc::clone(&err_buf), tag.clone(), stream));
+        readers.push(spawn_reader(
+            err,
+            Arc::clone(&err_buf),
+            tag.clone(),
+            stream,
+            Arc::clone(&sink),
+        ));
     }
 
     // Poll the step's cgroup once per MONITOR_INTERVAL for two purposes: (1) a per-step peak
@@ -821,6 +982,7 @@ fn run_step(ctx: StepCtx) {
         let t = tag.clone();
         let cpu_timeout = cpu_budget;
         let mpid = pid;
+        let mnonce = nonce.clone();
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
             let tick = Duration::from_millis(50);
@@ -845,7 +1007,7 @@ fn run_step(ctx: StepCtx) {
                                 cs.get("usage_usec").copied().unwrap_or(0) as f64 / 1_000_000.0;
                             if cpu_used_s >= cpu_timeout as f64 {
                                 cpu_flag.store(true, Ordering::Relaxed);
-                                reap(&cg, &t, mpid);
+                                reap(&cg, &t, mpid, Some(&mnonce));
                                 return;
                             }
                         }
@@ -865,7 +1027,25 @@ fn run_step(ctx: StepCtx) {
             Ok(None) => {
                 if start.elapsed().as_secs() as i64 >= step.timeout {
                     timed_out = true;
-                    reap(&cgroups, &tag, pid);
+                    // Journal the teardown BEFORE attempting it. If the kill escalates to the CI
+                    // provider cancelling the whole job, this record is already on disk; a record
+                    // written after a successful kill would be missing in exactly the case that
+                    // most needs explaining.
+                    if let Some(e) = &evidence {
+                        let c = sink.culprit();
+                        e.record(
+                            "step_timeout",
+                            &[
+                                ("step", tag.clone()),
+                                ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
+                                ("timeout_s", step.timeout.to_string()),
+                                ("culprit_test", c.test.clone().unwrap_or_default()),
+                                ("culprit_basis", c.how.to_string()),
+                                ("tests_completed", c.completed.to_string()),
+                            ],
+                        );
+                    }
+                    reap(&cgroups, &tag, pid, Some(&nonce));
                     break wait_bounded(&mut child, &tag, POST_REAP_WAIT);
                 }
                 thread::sleep(POLL_INTERVAL);
@@ -880,7 +1060,7 @@ fn run_step(ctx: StepCtx) {
 
     // Reap the whole tree (cgroup.kill + killpg) so orphan grandchildren die now and the readers
     // see EOF; then stop the monitor and join the reader threads.
-    reap(&cgroups, &tag, pid);
+    reap(&cgroups, &tag, pid, Some(&nonce));
     monitor_stop.store(true, Ordering::Relaxed);
     if let Some(m) = monitor {
         join_bounded(m, &tag, "monitor", JOIN_WAIT);
@@ -896,6 +1076,17 @@ fn run_step(ctx: StepCtx) {
     for r in readers {
         join_bounded(r, &tag, "output reader", JOIN_WAIT);
     }
+
+    // TEST-LEVEL ATTRIBUTION, derived from the step's own output stream. Computed here, after the
+    // readers have finished or been abandoned, so every byte the step managed to emit has been
+    // seen. The verdict is only reported for a step that did NOT finish cleanly: naming a culprit
+    // for a passing step would be noise, and naming one for a step that simply exited non-zero
+    // would compete with the harness's own (better) failure report.
+    let culprit: Option<Culprit> = if timed_out || cpu_exceeded.load(Ordering::Relaxed) {
+        Some(sink.culprit())
+    } else {
+        None
+    };
 
     // Read the step's cgroup measurements BEFORE cleanup() removes the child cgroup.
     let (oom, peak, cpu_stats) = match &cgroups {
@@ -993,6 +1184,7 @@ fn run_step(ctx: StepCtx) {
         let mut sh = shared.lock().unwrap();
         sh.running.remove(&tag);
         sh.running_pids.remove(&tag);
+        sh.running_nonces.remove(&tag);
         release(&mut sh, &step);
         sh.cores_used -= step_width(&step);
         sh.step_profile_rows.push(row);
@@ -1025,14 +1217,14 @@ fn run_step(ctx: StepCtx) {
             sh.failed = true;
             sh.stop = true;
             if !keep_going {
-                let others: Vec<(String, u32)> = sh
+                let others: Vec<(String, u32, Option<String>)> = sh
                     .running_pids
                     .iter()
-                    .map(|(k, v)| (k.clone(), *v))
+                    .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
                     .collect();
-                for (other, other_pid) in others {
+                for (other, other_pid, other_nonce) in others {
                     sh.aborted.insert(other.clone());
-                    reap(&cgroups, &other, other_pid);
+                    reap(&cgroups, &other, other_pid, other_nonce.as_deref());
                 }
             }
         }
@@ -1056,6 +1248,18 @@ fn run_step(ctx: StepCtx) {
             step.desc
         ));
     } else {
+        if let Some(c) = &culprit {
+            // NAME THE TEST, NOT JUST THE NODE. "the strict-compat step timed out" is not
+            // actionable; "test X started and never completed, 37 tests in" is.
+            emit(&format!("[{tag}] \u{21b3} {}", c.describe()));
+            if let Some(e) = &evidence {
+                emit(&format!(
+                    "[{tag}] \u{21b3} full step output preserved at {}/{}.log",
+                    e.dir().display(),
+                    crate::attribution::sanitize(&tag)
+                ));
+            }
+        }
         emit(&format!(
             "[{tag}] \u{2717} FAIL   {} ({dur}s, {reason})",
             step.desc
@@ -1075,6 +1279,32 @@ fn run_step(ctx: StepCtx) {
             emit(&format!("[{tag}] {line}"));
         }
         emit(&format!("[{tag}] ----- end detail -----"));
+    }
+
+    // Terminal record. Written for EVERY step, pass or fail, so the journal alone answers "what
+    // was this run doing" without needing the end-of-run profile rows that a hard kill destroys.
+    if let Some(e) = &evidence {
+        let counts = sink.counts();
+        e.record(
+            "step_end",
+            &[
+                ("step", tag.clone()),
+                ("ok", ok.to_string()),
+                ("aborted", was_aborted.to_string()),
+                ("timed_out", timed_out.to_string()),
+                ("cpu_timed_out", cpu_timed_out.to_string()),
+                ("elapsed_s", format!("{elapsed:.3}")),
+                ("tests_started", counts.started.to_string()),
+                ("tests_completed", counts.completed.to_string()),
+                (
+                    "culprit_test",
+                    culprit
+                        .as_ref()
+                        .and_then(|c| c.test.clone())
+                        .unwrap_or_default(),
+                ),
+            ],
+        );
     }
 }
 
@@ -1136,6 +1366,19 @@ pub fn run_dag_boxed_ordered(
         order,
         core_budget,
     );
+    // ANNOUNCE THE EVIDENCE PATH ONCE, AT THE START. A durable log nobody can find is not
+    // evidence; and printing it only on failure is printing it only where the run still had a
+    // chance to print something. Stated up front, it is on the console even for a run that is
+    // later cancelled from outside.
+    if let Some(e) = &runner.evidence {
+        eprintln!(
+            "[scheduler] per-step logs + test-boundary journal: {} (set {} to relocate, {}=1 to \
+             disable)",
+            e.dir().display(),
+            crate::attribution::LOG_DIR_ENV,
+            crate::attribution::NO_LOGS_ENV,
+        );
+    }
     let (_ok, wall) = runner.run();
     runner.result(wall)
 }
