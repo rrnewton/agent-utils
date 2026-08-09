@@ -336,4 +336,5 @@ def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
 
 def read(client: HerdrClient, target: Target, *, lines: int = 500) -> str:
     info = resolve_target(client, target)
-    return client.read(info.pane_id, source="recent-unwrapped", lines=lines)
+    text = client.read(info.pane_id, source="recent-unwrapped", lines=lines)
+    return text if text else client.read(info.pane_id, source="recent", lines=lines)

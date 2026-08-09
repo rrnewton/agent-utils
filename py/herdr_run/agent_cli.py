@@ -100,7 +100,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             json.dump(result.__dict__, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
-            return 0 if not result.quarantined else 75
+            return 0 if not result.quarantined and result.blocked is None else 75
         if args.command == "status":
             json.dump(status(client, target, queue), sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
