@@ -310,6 +310,33 @@ def test_crash_after_run_before_wait_is_never_resubmitted_on_restart(tmp_path: o
     assert result.outcome == "possibly_submitted"
 
 
+def test_crash_during_busy_wait_stays_pending_and_delivers_after_restart(tmp_path: Path) -> None:
+    busy = FakeAgentHerdr(["working"])
+
+    def crash_while_waiting(_seconds: float) -> None:
+        raise KeyboardInterrupt("simulated process death before injection")
+
+    with pytest.raises(KeyboardInterrupt):
+        send(
+            client(busy),
+            target(),
+            str(tmp_path),
+            "still safe",
+            ready_timeout=900,
+            sleep=crash_while_waiting,
+        )
+    assert busy.runs == []
+    assert len(list((tmp_path / "inbox").glob("*.json"))) == 1
+    assert list((tmp_path / "inflight").glob("*.json")) == []
+    assert list((tmp_path / "failed").glob("*.json")) == []
+
+    restarted = FakeAgentHerdr(["idle"])
+    result = drain(client(restarted), target(), str(tmp_path))
+    assert restarted.runs == ["still safe"]
+    assert result.outcome == "delivered"
+    assert result.pending == ()
+
+
 def test_send_failures_have_distinct_typed_machine_outcomes(tmp_path: Path) -> None:
     busy = FakeAgentHerdr(["working"])
     with pytest.raises(AgentPending) as pending:
