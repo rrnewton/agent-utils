@@ -76,7 +76,7 @@ def _guide() -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
-    args = parser.parse_args(list(argv) if argv is not None else None)
+    args = parser.parse_intermixed_args(list(argv) if argv is not None else None)
     if args.command == "userguide":
         return _guide()
     if args.ready_timeout < 0 or args.working_timeout <= 0 or args.max_attempts <= 0 or args.lines <= 0:
