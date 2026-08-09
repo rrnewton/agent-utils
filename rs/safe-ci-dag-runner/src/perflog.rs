@@ -194,8 +194,7 @@ pub fn effective_cpu_quota_at(mount_root: &Path, relpath: &str) -> String {
             seen_any = true;
             let parts: Vec<&str> = raw.split_whitespace().collect();
             if parts.len() == 2 && parts[0] != "max" {
-                if let (Ok(quota), Ok(period)) =
-                    (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+                if let (Ok(quota), Ok(period)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>())
                 {
                     if period > 0 {
                         let ratio = quota as f64 / period as f64;
@@ -215,7 +214,11 @@ pub fn effective_cpu_quota_at(mount_root: &Path, relpath: &str) -> String {
             _ => break,
         }
     }
-    if seen_any { best_text } else { "unknown".to_string() }
+    if seen_any {
+        best_text
+    } else {
+        "unknown".to_string()
+    }
 }
 
 /// The CPU quota binding this process, resolved from its own cgroup hierarchy.

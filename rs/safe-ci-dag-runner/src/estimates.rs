@@ -188,7 +188,10 @@ pub fn row_is_measurement(row: &HashMap<String, String>) -> bool {
             return false;
         }
     }
-    if let Some(rc) = row.get("returncode").and_then(|v| v.trim().parse::<i64>().ok()) {
+    if let Some(rc) = row
+        .get("returncode")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
         if rc != 0 {
             return false;
         }
@@ -199,7 +202,10 @@ pub fn row_is_measurement(row: &HashMap<String, String>) -> bool {
     {
         return false;
     }
-    if let Some(oom) = row.get("oom_kills").and_then(|v| v.trim().parse::<i64>().ok()) {
+    if let Some(oom) = row
+        .get("oom_kills")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
         if oom > 0 {
             return false;
         }
@@ -573,9 +579,7 @@ const REGRESSION_MIN_SLOWDOWN: f64 = 1.05;
 /// is not distinguishable from it. A level missing either bound is skipped rather than guessed at.
 pub fn regression_inner_jobs(levels: &[SpeedupLevel]) -> Option<i64> {
     let ranked: Vec<&SpeedupLevel> = levels.iter().filter(|l| l.wall_s > 0.0).collect();
-    let best = ranked
-        .iter()
-        .min_by(|a, b| a.wall_s.total_cmp(&b.wall_s))?;
+    let best = ranked.iter().min_by(|a, b| a.wall_s.total_cmp(&b.wall_s))?;
     let (best_min, best_max) = (best.wall_min_s?, best.wall_max_s?);
     let mut candidates: Vec<&&SpeedupLevel> = ranked
         .iter()
@@ -741,14 +745,8 @@ pub fn step_speedups_from_buckets(
                 samples: wall_samples.len() as i64,
                 wall_s: robust_median(wall_samples),
                 raw_wall_s: median_of(&raws),
-                wall_min_s: wall_samples
-                    .iter()
-                    .copied()
-                    .reduce(f64::min),
-                wall_max_s: wall_samples
-                    .iter()
-                    .copied()
-                    .reduce(f64::max),
+                wall_min_s: wall_samples.iter().copied().reduce(f64::min),
+                wall_max_s: wall_samples.iter().copied().reduce(f64::max),
                 cpu_s: median_of(&cpus),
                 effective_cores: median_of(&effs),
                 throttled_s: median_of(&thrs),
