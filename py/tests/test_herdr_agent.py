@@ -112,7 +112,7 @@ def test_concurrent_senders_are_serialized_and_fifo(tmp_path: object) -> None:
     assert fake.runs == ["first", "second"]
 
 
-def test_working_confirmation_failure_retries_then_quarantines(tmp_path: object) -> None:
+def test_working_confirmation_failure_never_resubmits_and_marks_ambiguous(tmp_path: object) -> None:
     fake = FakeAgentHerdr(["idle"])
 
     def fail(*_args: object) -> None:
@@ -125,8 +125,9 @@ def test_working_confirmation_failure_retries_then_quarantines(tmp_path: object)
     assert len(failed) == 1
     document = json.loads(failed[0].read_text())
     assert document["text"] == "preserve me"
-    assert document["delivery_attempts"] == 2
-    assert len(fake.runs) == 2
+    assert document["delivery_attempts"] == 1
+    assert document["possibly_submitted"] is True
+    assert len(fake.runs) == 1
 
 
 @pytest.mark.parametrize(
@@ -145,14 +146,60 @@ def test_wrong_identity_workspace_or_cwd_refuses(
     with pytest.raises(AgentDeliveryError, match=expected):
         send(client(fake), target(**change), str(tmp_path), "never submit", max_attempts=1)
     assert fake.runs == []
-    assert len(list((tmp_path / "failed").glob("*.json"))) == 1  # type: ignore[operator]
+    assert len(list((tmp_path / "inbox").glob("*.json"))) == 1  # type: ignore[operator]
+    assert len(list((tmp_path / "failed").glob("*.json"))) == 0  # type: ignore[operator]
 
 
 def test_timeout_retains_prompt_and_loud_error(tmp_path: object) -> None:
     fake = FakeAgentHerdr(["working"])
-    with pytest.raises(AgentDeliveryError, match="retained"):
+    with pytest.raises(AgentDeliveryError, match="remains pending"):
         send(client(fake), target(), str(tmp_path), "poll artifact survives", ready_timeout=0, max_attempts=1)
-    assert "poll artifact survives" in next((tmp_path / "failed").glob("*.json")).read_text()  # type: ignore[operator]
+    pending = next((tmp_path / "inbox").glob("*.json"))  # type: ignore[operator]
+    document = json.loads(pending.read_text())
+    assert document["text"] == "poll artifact survives"
+    assert document["delivery_attempts"] == 0
+    assert list((tmp_path / "failed").glob("*.json")) == []  # type: ignore[operator]
+
+
+def test_fast_idle_working_idle_transition_is_confirmed_without_screen_matching(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["idle", "idle"])
+
+    def fast_transition(pane_id: str, state: str, timeout_ms: int) -> None:
+        assert (pane_id, state, timeout_ms) == ("w1:p1", "working", 30000)
+        # Native wait observed working even though a later point probe is already idle.
+        fake.states = ["idle"]
+
+    fake.wait_agent_status = fast_transition  # type: ignore[method-assign]
+    result = send(client(fake), target(), str(tmp_path), "fast turn")
+    assert result.delivered == (result.message_id,)
+    assert fake.runs == ["fast turn"]
+    assert status(client(fake), target(), str(tmp_path))["agent_status"] == "idle"
+
+
+def test_post_run_transport_crash_is_quarantined_once_as_possibly_submitted(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["idle"])
+
+    def crash_after_possible_accept(_pane_id: str, text: str) -> None:
+        fake.runs.append(text)
+        raise RuntimeError("connection vanished after write")
+
+    fake.run = crash_after_possible_accept  # type: ignore[assignment]
+    with pytest.raises(AgentDeliveryError, match="may have been submitted"):
+        send(client(fake), target(), str(tmp_path), "only once", max_attempts=3)
+    assert fake.runs == ["only once"]
+    document = json.loads(next((tmp_path / "failed").glob("*.json")).read_text())  # type: ignore[operator]
+    assert document["possibly_submitted"] is True
+    assert document["delivery_attempts"] == 1
+
+
+def test_queue_binding_refuses_a_different_session_without_moving_prompt(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["working"])
+    with pytest.raises(AgentDeliveryError, match="remains pending"):
+        send(client(fake), target(), str(tmp_path), "bound prompt", ready_timeout=0)
+    with pytest.raises(AgentDeliveryError, match="bound to"):
+        drain(client(fake), target(session_value="different"), str(tmp_path))
+    pending = next((tmp_path / "inbox").glob("*.json"))  # type: ignore[operator]
+    assert "bound prompt" in pending.read_text()
 
 
 def test_status_and_read_cover_arbitrary_target(tmp_path: object) -> None:
