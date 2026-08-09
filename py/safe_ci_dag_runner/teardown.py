@@ -64,12 +64,43 @@ class ProcessGroupLeader(Protocol):
 # --------------------------------------------------------------------------------------
 
 
+#: Grace between the SIGTERM that lets a step SAY what it was doing and the
+#: SIGKILL that guarantees it stops. See :func:`reap` for why this exists.
+REAP_TERM_GRACE_S = 5.0
+_REAP_POLL_S = 0.1
+
+
 def reap(
     process: ProcessGroupLeader,
     cgroups: CgroupManager | None,
     tag: str | None,
+    *,
+    term_grace_s: float = REAP_TERM_GRACE_S,
 ) -> None:
-    """Tear down one step's whole process tree: ``cgroup.kill`` first, then ``killpg``.
+    """Tear down one step's tree: SIGTERM, a grace, then ``cgroup.kill``/``killpg``.
+
+    WHY THE SIGTERM PHASE EXISTS -- it is what makes a timeout ATTRIBUTABLE.
+
+    A step that FAILS reports itself. A step KILLED by a timeout does not: the
+    process dies mid-run, so its output must ALREADY have named what was in
+    flight or that information does not exist afterwards. It cannot be recovered
+    by parsing logs later, because there is no output to parse.
+
+    Many inner runners handle SIGTERM by cancelling and naming the unit that was
+    still executing; on SIGKILL they cannot, and the log simply stops. Measured
+    both ways against one such runner, same timeout and same slow unit, with the
+    signal as the only variable: under SIGKILL the in-flight unit was named zero
+    times, and the log ended at the start-of-run banner; under SIGTERM the runner
+    printed a cancellation line naming the exact unit id. So the identity was
+    always available -- this function used to destroy it by going straight to
+    SIGKILL. The fix is not more logging; it is giving existing logging a chance
+    to run.
+
+    THE HARD PHASE IS UNCHANGED AND STILL GUARANTEED. After the grace this does
+    exactly what it always did -- ``cgroup.kill`` first, then ``killpg`` -- so a
+    genuinely wedged tree still cannot occupy a runner. The grace only bounds how
+    long we wait for a cooperative exit; a step that ignores SIGTERM is killed on
+    schedule, and one that honours it is reaped sooner than before.
 
     When per-step containment is available, writing the step's child ``cgroup.kill``
     SIGKILLs the ENTIRE subtree atomically, including ``setsid`` / double-fork escapees a
@@ -84,6 +115,25 @@ def reap(
     When enabled containment cannot perform ``cgroup.kill``, a warning makes the degraded
     teardown visible before the process-group fallback runs.
     """
+    pgid = process.pid
+    # The same guard the SIGKILL path has always used, hoisted so the SIGTERM
+    # phase is protected by it too: a reap must never signal the runner itself.
+    signalable = pgid > 1 and pgid != os.getpgrp()
+
+    if signalable and term_grace_s > 0:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass  # already gone; nothing to be graceful toward
+        else:
+            deadline = time.monotonic() + term_grace_s
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(pgid, 0)  # liveness probe, delivers no signal
+                except (ProcessLookupError, OSError):
+                    break  # exited during the grace: it got to say its piece
+                time.sleep(_REAP_POLL_S)
+
     if cgroups is not None and tag is not None and cgroups.enabled:
         if not cgroups.kill(tag):
             _warn(
@@ -91,8 +141,7 @@ def reap(
                 "kill only — setsid/double-fork escapees may survive."
             )
 
-    pgid = process.pid
-    if pgid <= 1 or pgid == os.getpgrp():
+    if not signalable:
         return
     try:
         os.killpg(pgid, signal.SIGKILL)
