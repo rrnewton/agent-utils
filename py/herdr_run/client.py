@@ -563,10 +563,24 @@ class HerdrClient:
 
     def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
         """Wait for a native Herdr agent-state transition."""
-        self._call(
-            ["wait", "agent-status", pane_id, "--status", status, "--timeout", str(timeout_ms)],
-            f"wait for pane {pane_id} status {status}",
+        purpose = f"wait for pane {pane_id} status {status}"
+        completed = self._invoke(
+            ["wait", "agent-status", pane_id, "--status", status, "--timeout", str(timeout_ms)]
         )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"
+            raise HerdrUnavailable(f"{purpose}: {detail}")
+        try:
+            envelope = as_mapping(json.loads(completed.stdout), purpose)
+            data = as_mapping(envelope.get("data"), purpose)
+            returned_pane = get_str(data, "pane_id", purpose)
+            returned_status = get_str(data, "agent_status", purpose)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise HerdrUnavailable(f"{purpose}: invalid Herdr event response: {exc}") from exc
+        if returned_pane != pane_id or returned_status != status:
+            raise HerdrUnavailable(
+                f"{purpose}: event reported pane={returned_pane!r} status={returned_status!r}"
+            )
 
     def process_info(self, pane_id: str) -> ProcessInfo:
         """The pane's live shell pid and foreground process group — the readiness signal."""
