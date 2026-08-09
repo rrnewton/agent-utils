@@ -35,6 +35,7 @@ __all__ = [
     "Runner",
     "SERVER_UNIT",
     "CONTROL_TIMEOUT_SECONDS",
+    "AgentPaneInfo",
 ]
 
 #: A ``subprocess.run``-shaped callable, injected so tests never spawn a real process.
@@ -82,6 +83,19 @@ class ProcessInfo:
     foreground_pgid: int
     #: ``(pid, name, cmdline)`` for each process in the pane's foreground process group.
     foreground: tuple[tuple[int, str, str], ...]
+
+
+@dataclass(frozen=True)
+class AgentPaneInfo:
+    """Identity and readiness fields for one interactive-agent pane."""
+
+    pane_id: str
+    workspace_id: str
+    cwd: str
+    agent: str | None
+    status: str
+    session_agent: str | None
+    session_value: str | None
 
 
 def _bounded_control_command(
@@ -508,6 +522,51 @@ class HerdrClient:
         except HerdrUnavailable:
             return False
         return True
+
+    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+        """Return validated identity/readiness data for an interactive pane."""
+        result = self._call(["pane", "get", pane_id], f"pane get {pane_id}")
+        try:
+            pane = as_mapping(result.get("pane"), "pane get")
+            returned = get_str(pane, "pane_id", "pane get")
+            if returned != pane_id:
+                raise HerdrUnavailable(
+                    f"pane get: returned pane {returned!r}, expected {pane_id!r}"
+                )
+            session_raw = pane.get("agent_session")
+            session_agent: str | None = None
+            session_value: str | None = None
+            if session_raw is not None:
+                session = as_mapping(session_raw, "pane agent_session")
+                session_agent = opt_str(session, "agent")
+                session_value = opt_str(session, "value")
+            return AgentPaneInfo(
+                pane_id=returned,
+                workspace_id=get_str(pane, "workspace_id", "pane get"),
+                cwd=get_str(pane, "cwd", "pane get"),
+                agent=opt_str(pane, "agent"),
+                status=opt_str(pane, "agent_status") or "unknown",
+                session_agent=session_agent,
+                session_value=session_value,
+            )
+        except TypeError as exc:
+            raise HerdrUnavailable(f"pane get: invalid Herdr response: {exc}") from exc
+
+    def workspace_label(self, workspace_id: str) -> str:
+        """Return the label for one exact workspace id."""
+        result = self._call(["workspace", "get", workspace_id], "workspace get")
+        try:
+            workspace = as_mapping(result.get("workspace"), "workspace get")
+            return get_str(workspace, "label", "workspace get")
+        except TypeError as exc:
+            raise HerdrUnavailable(f"workspace get: invalid Herdr response: {exc}") from exc
+
+    def wait_agent_status(self, pane_id: str, status: str, timeout_ms: int) -> None:
+        """Wait for a native Herdr agent-state transition."""
+        self._call(
+            ["wait", "agent-status", pane_id, "--status", status, "--timeout", str(timeout_ms)],
+            f"wait for pane {pane_id} status {status}",
+        )
 
     def process_info(self, pane_id: str) -> ProcessInfo:
         """The pane's live shell pid and foreground process group — the readiness signal."""
