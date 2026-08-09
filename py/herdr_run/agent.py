@@ -37,6 +37,11 @@ class QueueResult:
     delivered: tuple[str, ...]
     quarantined: tuple[str, ...]
     pending: tuple[str, ...]
+    blocked: str | None = None
+
+
+class _PossiblySubmitted(AgentDeliveryError):
+    """The atomic pane injection happened, but its working transition was not observed."""
 
 
 def _real(path: str) -> str:
@@ -126,6 +131,48 @@ def enqueue(root: str, text: str, *, message_id: str | None = None) -> str:
     return identifier
 
 
+def _binding(target: Target) -> dict[str, object]:
+    """Identity authority for a queue: stable session when present, otherwise exact pane."""
+    identity: dict[str, object]
+    if target.session_value is not None:
+        identity = {"kind": "session", "agent": target.session_agent, "value": target.session_value}
+    else:
+        identity = {"kind": "pane", "pane_id": target.pane_id}
+    identity.update(
+        {
+            "expected_agent": target.expected_agent,
+            "expected_workspace": target.expected_workspace,
+            "expected_cwd": None if target.expected_cwd is None else _real(target.expected_cwd),
+        }
+    )
+    return identity
+
+
+def _bind_queue(root: str, target: Target) -> None:
+    """Create or verify the durable queue-to-target binding under its own lock."""
+    _prepare(root)
+    lock_path = os.path.join(root, ".binding.lock")
+    binding_path = os.path.join(root, "target.json")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    expected = _binding(target)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if os.path.exists(binding_path):
+            try:
+                with open(binding_path, encoding="utf-8") as handle:
+                    actual: object = json.load(handle)
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise AgentDeliveryError(f"cannot read queue target binding {binding_path}: {exc}") from exc
+            if actual != expected:
+                raise AgentDeliveryError(
+                    f"queue {root} is bound to {actual!r}, refusing different target {expected!r}"
+                )
+        else:
+            _atomic_json(binding_path, expected)
+    finally:
+        os.close(descriptor)
+
+
 def _load(path: str) -> dict[str, object]:
     try:
         with open(path, encoding="utf-8") as handle:
@@ -170,11 +217,18 @@ def _deliver_one(
     monotonic: Callable[[], float],
 ) -> None:
     info = _wait_ready(client, target, ready_timeout, sleep=sleep, monotonic=monotonic)
-    client.run(info.pane_id, text)
+    try:
+        client.run(info.pane_id, text)
+    except Exception as exc:
+        # The terminal server may have accepted the atomic text+Enter before the client lost its
+        # response. Once pane.run is entered, failure is ambiguous and must never be retried.
+        raise _PossiblySubmitted(
+            f"pane {info.pane_id} pane-run outcome is unknown; prompt may have been submitted: {exc}"
+        ) from exc
     try:
         client.wait_agent_status(info.pane_id, "working", max(1, int(working_timeout * 1000)))
     except HerdrUnavailable as exc:
-        raise AgentDeliveryError(
+        raise _PossiblySubmitted(
             f"pane {info.pane_id} did not confirm idle/done -> working submission: {exc}"
         ) from exc
 
@@ -191,10 +245,12 @@ def drain(
     monotonic: Callable[[], float] = time.monotonic,
 ) -> QueueResult:
     """Serialize and drain a FIFO; poison prompts are retained in ``failed``."""
+    _bind_queue(root, target)
     inbox, processed, failed = _prepare(root)
     lock_path = os.path.join(root, ".delivery.lock")
     delivered: list[str] = []
     quarantined: list[str] = []
+    blocked: str | None = None
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
@@ -209,28 +265,39 @@ def drain(
                         client, target, str(document["text"]), ready_timeout=ready_timeout,
                         working_timeout=working_timeout, sleep=sleep, monotonic=monotonic,
                     )
-                except (AgentDeliveryError, HerdrUnavailable) as exc:
+                except _PossiblySubmitted as exc:
                     attempts += 1
                     document["delivery_attempts"] = attempts
                     document["tui_delivery_attempts"] = attempts
                     document["delivery_error"] = str(exc)
+                    document["possibly_submitted"] = True
                     document["delivery_failed_at"] = time.time()
                     _atomic_json(path, document)
-                    if attempts >= max_attempts:
-                        os.replace(path, os.path.join(failed, os.path.basename(path)))
-                        quarantined.append(identifier)
-                        break
+                    os.replace(path, os.path.join(failed, os.path.basename(path)))
+                    quarantined.append(identifier)
+                    break
+                except (AgentDeliveryError, HerdrUnavailable) as exc:
+                    # No pane injection happened. Keep the FIFO head pending and do not burn a
+                    # poison-attempt budget: ordinary busy->idle is a scheduling condition.
+                    document["delivery_error"] = str(exc)
+                    document["delivery_blocked_at"] = time.time()
+                    _atomic_json(path, document)
+                    blocked = str(exc)
+                    break
                 else:
                     os.replace(path, os.path.join(processed, os.path.basename(path)))
                     delivered.append(identifier)
                     break
+            if blocked is not None:
+                break
     finally:
         os.close(descriptor)
     pending = tuple(name[:-5] for name in sorted(os.listdir(inbox)) if name.endswith(".json"))
-    return QueueResult("", tuple(delivered), tuple(quarantined), pending)
+    return QueueResult("", tuple(delivered), tuple(quarantined), pending, blocked)
 
 
 def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: object) -> QueueResult:
+    _bind_queue(root, target)
     identifier = enqueue(root, text)
     result = drain(client, target, root, **kwargs)  # type: ignore[arg-type]
     if identifier in result.quarantined:
@@ -247,10 +314,15 @@ def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: ob
             f"message {identifier} failed after bounded retries: {detail}; "
             f"it is retained under {root}/failed"
         )
-    return QueueResult(identifier, result.delivered, result.quarantined, result.pending)
+    if identifier in result.pending:
+        raise AgentDeliveryError(
+            f"message {identifier} remains pending without consuming a retry attempt: {result.blocked}"
+        )
+    return QueueResult(identifier, result.delivered, result.quarantined, result.pending, result.blocked)
 
 
 def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
+    _bind_queue(root, target)
     info = resolve_target(client, target)
     inbox, _processed, failed = _prepare(root)
     return {
