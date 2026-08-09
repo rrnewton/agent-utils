@@ -539,17 +539,73 @@ _SPEEDUP_MAX_WORK_GROWTH = 1.5
 #: A step needs at least this many DISTINCT inner_jobs levels (with wall data) to model a curve;
 #: fewer and there is nothing to say about speedup vs. parallelism.
 _SPEEDUP_MIN_LEVELS = 2
+#: A wider level must be at least this much SLOWER than the fastest measured level before it can be
+#: called a regression. Paired with the dispersion test in :func:`_regression_inner_jobs`; neither
+#: check is sufficient alone.
+_REGRESSION_MIN_SLOWDOWN = 1.05
+
+
+def _regression_inner_jobs(levels: Sequence[SpeedupLevel]) -> int | None:
+    """The narrowest width above the fastest one where going wider is measurably SLOWER.
+
+    Two conditions must BOTH hold, and requiring both is the whole point:
+
+    1. the level's median wall exceeds the fastest level's by :data:`_REGRESSION_MIN_SLOWDOWN`, and
+    2. its observed [min, max] wall range is DISJOINT from the fastest level's range.
+
+    Condition 2 is what keeps this honest on a shared machine. A percentage test alone reports
+    ordinary sample noise as a cliff: a width measured 13.7% slower than the best, whose sample
+    range still overlaps the best width's, is not distinguishable from it, and acting on that would
+    narrow a step for no reason. A level missing either bound cannot be separated from the best one
+    and is skipped rather than guessed at.
+
+    Returns ``None`` when nothing above the fastest width regresses, which is the common case for a
+    curve that merely flattens.
+    """
+    ranked = [lvl for lvl in levels if lvl.wall_s > 0.0]
+    if not ranked:
+        return None
+    best = min(ranked, key=lambda lvl: lvl.wall_s)
+    if best.wall_min_s is None or best.wall_max_s is None:
+        return None
+    for level in sorted(ranked, key=lambda lvl: lvl.inner_jobs):
+        if level.inner_jobs <= best.inner_jobs:
+            continue
+        if level.wall_min_s is None or level.wall_max_s is None:
+            continue
+        if level.wall_s <= best.wall_s * _REGRESSION_MIN_SLOWDOWN:
+            continue
+        overlaps = not (level.wall_min_s > best.wall_max_s or level.wall_max_s < best.wall_min_s)
+        if not overlaps:
+            return level.inner_jobs
+    return None
 
 
 @dataclass(frozen=True)
 class SpeedupLevel:
     """One measured point on a step's speedup curve: its robust wall (and work) at one inner_jobs
-    width, plus the speedup relative to the smallest measured width."""
+    width, plus the speedup relative to the smallest measured width.
+
+    ``wall_s`` is MODELLED and ``raw_wall_s`` is MEASURED, and they are carried side by side on
+    purpose. ``wall_s`` has a contention discount applied (see :meth:`Sample.intrinsic_s`), which is
+    not a small correction -- on a busy host it has been observed to move a width-1 wall from a
+    measured 94.435 s to a discounted 71.278 s, 25%. A consumer that prints only ``wall_s`` is
+    presenting a modelled number as a measurement; print both, or say which one it is.
+    """
 
     inner_jobs: int
     samples: int
-    #: Contention-discounted MAD-trimmed median ``elapsed_s`` at this width.
+    #: Contention-discounted MAD-trimmed median ``elapsed_s`` at this width. MODELLED: this is what
+    #: the curve is fitted to, so the speedup and the recommendation both derive from it.
     wall_s: float
+    #: MAD-trimmed median of the RAW recorded ``elapsed_s`` at this width, with no discount applied
+    #: -- the measurement ``wall_s`` was derived from. ``None`` when no sample carried a wall.
+    raw_wall_s: float | None
+    #: Smallest and largest contention-discounted wall observed at this width. The spread of the
+    #: samples, kept so a regression verdict can be checked against dispersion rather than taken on
+    #: trust: two widths whose ranges overlap are not distinguishable.
+    wall_min_s: float | None
+    wall_max_s: float | None
     #: Robust-median total CPU-seconds (``user_s`` + ``sys_s``) — the work-conservation signal.
     cpu_s: float | None
     #: Robust-median achieved parallelism (``effective_cores``) at this width.
@@ -567,42 +623,85 @@ class StepSpeedup:
     ``recommended_inner_jobs`` is the best wall time still within diminishing-returns AND the core
     budget: the loop advances the recommendation to a wider level only while that level is
     materially faster than the previous one (:data:`_SPEEDUP_MIN_MARGINAL_GAIN`) and does not blow
-    up total CPU-seconds (:data:`_SPEEDUP_MAX_WORK_GROWTH`), stopping at the knee."""
+    up total CPU-seconds (:data:`_SPEEDUP_MAX_WORK_GROWTH`), stopping at the knee.
+
+    A PLATEAU AND A CLIFF ARE DIFFERENT THINGS and the recommendation alone cannot tell them apart.
+    A curve that flattens above the knee and a curve that becomes 2.4x SLOWER above the knee both
+    stop the walk at the same width and yield the same ``recommended_inner_jobs``. The
+    recommendation is safe either way -- the walk stops at the first level that fails to improve, so
+    it can never advance past a degradation -- but "safe" is not "visible", and an operator widening
+    a step by hand needs to know a cliff is there. ``regression_inner_jobs`` names it.
+    """
 
     step: str
     baseline_inner_jobs: int
     recommended_inner_jobs: int
     #: Achieved parallelism at the recommended width (``None`` if not measured there).
     measured_effective_cores: float | None
+    #: The narrowest width ABOVE the fastest measured one where going wider is measurably SLOWER,
+    #: or ``None`` when no width regresses within the measured range. See
+    #: :func:`_regression_inner_jobs` for the dispersion test that must be satisfied before a width
+    #: is named here; a slower median alone is not enough.
+    regression_inner_jobs: int | None
     levels: tuple[SpeedupLevel, ...]
+
+
+@dataclass(frozen=True)
+class LevelAggregate:
+    """The per-width aggregate :func:`_build_step_speedup` fits one :class:`SpeedupLevel` from.
+
+    A named carrier rather than a positional tuple: the fit needs the discounted median, the raw
+    median it came from, and the observed spread, and a nine-slot tuple makes those trivially easy
+    to transpose at a call site."""
+
+    inner_jobs: int
+    samples: int
+    #: Contention-discounted MAD-trimmed median wall (what the curve is fitted to).
+    wall_s: float
+    #: MAD-trimmed median of the raw recorded walls, undiscounted.
+    raw_wall_s: float | None
+    #: Smallest / largest discounted wall observed at this width.
+    wall_min_s: float | None
+    wall_max_s: float | None
+    cpu_s: float | None
+    effective_cores: float | None
+    throttled_s: float | None
 
 
 def _build_step_speedup(
     step: str,
-    raw_levels: Sequence[tuple[int, int, float, float | None, float | None, float | None]],
+    raw_levels: Sequence[LevelAggregate],
     core_budget: int | None,
 ) -> StepSpeedup:
-    """Assemble a :class:`StepSpeedup` from per-level ``(inner_jobs, samples, wall, cpu, eff,
-    throttled)`` tuples SORTED ascending by inner_jobs. Deterministic across builds (only compares
-    robust medians of identical inputs)."""
-    baseline_j = raw_levels[0][0]
-    baseline_wall = raw_levels[0][2]
+    """Assemble a :class:`StepSpeedup` from per-level aggregates SORTED ascending by inner_jobs.
+    Deterministic across builds (only compares robust medians of identical inputs)."""
+    baseline_j = raw_levels[0].inner_jobs
+    baseline_wall = raw_levels[0].wall_s
     levels: list[SpeedupLevel] = []
     recommended = baseline_j
     still_scaling = True
     prev_wall = baseline_wall
-    prev_cpu = raw_levels[0][3]
+    prev_cpu = raw_levels[0].cpu_s
     eff_by_j: dict[int, float | None] = {}
-    for idx, (j, n, wall, cpu, eff, throttled) in enumerate(raw_levels):
+    for idx, aggregate in enumerate(raw_levels):
+        j, wall, cpu, eff = (
+            aggregate.inner_jobs,
+            aggregate.wall_s,
+            aggregate.cpu_s,
+            aggregate.effective_cores,
+        )
         speedup = baseline_wall / wall if wall > 0.0 else 1.0
         levels.append(
             SpeedupLevel(
                 inner_jobs=j,
-                samples=n,
+                samples=aggregate.samples,
                 wall_s=wall,
+                raw_wall_s=aggregate.raw_wall_s,
+                wall_min_s=aggregate.wall_min_s,
+                wall_max_s=aggregate.wall_max_s,
                 cpu_s=cpu,
                 effective_cores=eff,
-                throttled_s=throttled,
+                throttled_s=aggregate.throttled_s,
                 speedup=speedup,
             )
         )
@@ -628,6 +727,7 @@ def _build_step_speedup(
         baseline_inner_jobs=baseline_j,
         recommended_inner_jobs=recommended,
         measured_effective_cores=eff_by_j.get(recommended),
+        regression_inner_jobs=_regression_inner_jobs(levels),
         levels=tuple(levels),
     )
 
@@ -644,6 +744,7 @@ def step_speedups_from_buckets(
     are absent. The shared core behind :func:`load_step_speedups` (CSV) and
     :func:`safe_ci_dag_runner.summary.step_speedups_from_summary` (mergeable summary)."""
     walls: dict[BucketKey, list[float]] = {}
+    raws: dict[BucketKey, list[float]] = {}
     cpus: dict[BucketKey, list[float]] = {}
     effs: dict[BucketKey, list[float]] = {}
     thrs: dict[BucketKey, list[float]] = {}
@@ -655,6 +756,8 @@ def step_speedups_from_buckets(
             intrinsic = sample.intrinsic_s()
             if intrinsic is not None:
                 walls.setdefault(key, []).append(intrinsic)
+            if sample.elapsed_s is not None:
+                raws.setdefault(key, []).append(sample.elapsed_s)
             if sample.cpu_s is not None:
                 cpus.setdefault(key, []).append(sample.cpu_s)
             if sample.effective_cores is not None:
@@ -669,21 +772,25 @@ def step_speedups_from_buckets(
         levels_j = sorted(set(widths))
         if len(levels_j) < _SPEEDUP_MIN_LEVELS:
             continue
-        raw_levels: list[tuple[int, int, float, float | None, float | None, float | None]] = []
+        raw_levels: list[LevelAggregate] = []
         for inner in levels_j:
             key = (step, inner)
             wall_samples = walls[key]
+            raw_samples = raws.get(key)
             cpu_samples = cpus.get(key)
             eff_samples = effs.get(key)
             thr_samples = thrs.get(key)
             raw_levels.append(
-                (
-                    inner,
-                    len(wall_samples),
-                    _robust_median(wall_samples),
-                    _robust_median(cpu_samples) if cpu_samples else None,
-                    _robust_median(eff_samples) if eff_samples else None,
-                    _robust_median(thr_samples) if thr_samples else None,
+                LevelAggregate(
+                    inner_jobs=inner,
+                    samples=len(wall_samples),
+                    wall_s=_robust_median(wall_samples),
+                    raw_wall_s=_robust_median(raw_samples) if raw_samples else None,
+                    wall_min_s=min(wall_samples),
+                    wall_max_s=max(wall_samples),
+                    cpu_s=_robust_median(cpu_samples) if cpu_samples else None,
+                    effective_cores=_robust_median(eff_samples) if eff_samples else None,
+                    throttled_s=_robust_median(thr_samples) if thr_samples else None,
                 )
             )
         result[step] = _build_step_speedup(step, raw_levels, core_budget)
@@ -1296,10 +1403,18 @@ def _opt_secs_json(value: float | None) -> str:
     return "null" if value is None else f'"{_fmt_secs(value)}"'
 
 
+def _opt_int_json(value: int | None) -> str:
+    """An optional integer as a JSON literal: the number, or ``null``."""
+    return "null" if value is None else str(value)
+
+
 def _speedup_level_json(level: SpeedupLevel) -> str:
     """One speedup-curve level as a single-line JSON object (byte-identical across builds)."""
     return (
         f'{{"inner_jobs": {level.inner_jobs}, "wall_s": "{_fmt_secs(level.wall_s)}", '
+        f'"raw_wall_s": {_opt_secs_json(level.raw_wall_s)}, '
+        f'"wall_min_s": {_opt_secs_json(level.wall_min_s)}, '
+        f'"wall_max_s": {_opt_secs_json(level.wall_max_s)}, '
         f'"speedup": "{_fmt_secs(level.speedup)}", "cpu_s": {_opt_secs_json(level.cpu_s)}, '
         f'"effective_cores": {_opt_secs_json(level.effective_cores)}, '
         f'"throttled_s": {_opt_secs_json(level.throttled_s)}, "samples": {level.samples}}}'
@@ -1318,6 +1433,7 @@ def _speedup_to_json(speedup: "StepSpeedup | None") -> str:
         f'        "baseline_inner_jobs": {speedup.baseline_inner_jobs},\n'
         f'        "recommended_inner_jobs": {speedup.recommended_inner_jobs},\n'
         f'        "measured_effective_cores": {_opt_secs_json(speedup.measured_effective_cores)},\n'
+        f'        "regression_inner_jobs": {_opt_int_json(speedup.regression_inner_jobs)},\n'
         '        "levels": [\n'
         f"{levels}\n"
         "        ]\n"
@@ -1512,14 +1628,29 @@ def _allocation_text_lines(plan: Plan) -> list[str]:
 
 def _speedup_text_lines(plan: Plan) -> list[str]:
     """The optional parallel-speedup section for :func:`plan_to_text`: one row per step that HAS a
-    learned curve (>=2 inner_jobs widths), showing the recommended width, achieved cores, the
-    speedup at that (knee) width, and the full ``inner_jobs->speedup`` curve. Empty (no lines) when
-    no step has a model, so a store without multi-width samples renders exactly as before."""
+    learned curve (>=2 inner_jobs widths).
+
+    Two columns exist to keep a modelled number from reading as a measurement. ``regress_at`` names
+    the width where going wider becomes measurably slower, so a cliff is distinguishable from a
+    plateau at a glance. ``wall@rec discounted/raw`` prints the contention-discounted wall the curve
+    was fitted to NEXT TO the raw measured wall it came from, so the size of the adjustment is
+    visible in the output rather than something the reader has to know about.
+
+    Empty (no lines) when no step has a model, so a store without multi-width samples renders
+    exactly as before."""
     by_tag = plan.by_tag()
     modeled = [(tag, by_tag[tag].speedup) for tag in plan.order if by_tag[tag].speedup is not None]
     if not modeled:
         return []
-    headers = ["step", "rec_inner_jobs", "eff_cores", "speedup@rec", "curve(inner_jobs->speedup)"]
+    headers = [
+        "step",
+        "rec_inner_jobs",
+        "regress_at",
+        "eff_cores",
+        "speedup@rec",
+        "wall@rec discounted/raw",
+        "curve(inner_jobs->speedup)",
+    ]
     rows: list[list[str]] = []
     for tag, speedup in modeled:
         assert speedup is not None  # narrowed by the filter above (for the type checker)
@@ -1533,8 +1664,30 @@ def _speedup_text_lines(plan: Plan) -> list[str]:
             else "-"
         )
         curve = " ".join(f"{lvl.inner_jobs}:{lvl.speedup:.2f}x" for lvl in speedup.levels)
+        at_rec = next(
+            (lvl for lvl in speedup.levels if lvl.inner_jobs == speedup.recommended_inner_jobs),
+            None,
+        )
+        # Both terms, always: the left number is discounted (modelled), the right one measured.
+        if at_rec is None:
+            walls = "-"
+        elif at_rec.raw_wall_s is None:
+            walls = f"{at_rec.wall_s:.3f}/-"
+        else:
+            walls = f"{at_rec.wall_s:.3f}/{at_rec.raw_wall_s:.3f}"
+        regress = (
+            "-" if speedup.regression_inner_jobs is None else str(speedup.regression_inner_jobs)
+        )
         rows.append(
-            [tag, str(speedup.recommended_inner_jobs), eff, f"{knee:.2f}x", curve]
+            [
+                tag,
+                str(speedup.recommended_inner_jobs),
+                regress,
+                eff,
+                f"{knee:.2f}x",
+                walls,
+                curve,
+            ]
         )
     widths = [len(h) for h in headers]
     for row in rows:

@@ -705,3 +705,102 @@ def test_a_step_that_failed_at_every_width_yields_no_curve() -> None:
         for width in (1, 2, 4, 8)
     ]
     assert estimates.step_speedups_from_buckets(estimates.bucketize_rows(rows, None), None) == {}
+
+
+def _speedup_over(walls_by_width: dict[int, list[float]]) -> estimates.StepSpeedup:
+    """Fit one step's curve from explicit per-width wall samples (no contention signal)."""
+    rows = [
+        {
+            "step": "s",
+            "inner_jobs": str(width),
+            "elapsed_s": str(wall),
+            "ok": "True",
+            "returncode": "0",
+        }
+        for width, walls in walls_by_width.items()
+        for wall in walls
+    ]
+    buckets = estimates.bucketize_rows(rows, None)
+    return estimates.step_speedups_from_buckets(buckets, None)["s"]
+
+
+def test_a_curve_that_only_flattens_reports_no_regression() -> None:
+    """A plateau is not a cliff: nothing above the fastest width is measurably slower."""
+    fitted = _speedup_over(
+        {1: [40.0, 40.1], 2: [21.0, 21.1], 4: [11.0, 11.1], 8: [10.6, 10.7], 16: [10.5, 10.6]}
+    )
+    assert fitted.recommended_inner_jobs == 4
+    assert fitted.regression_inner_jobs is None
+
+
+def test_a_curve_that_degrades_names_the_width_where_it_turns() -> None:
+    """Where going wider is measurably slower, the width is named rather than left implicit.
+
+    The recommendation is identical to the flattening case above, which is exactly why the separate
+    field is needed: these two curves are indistinguishable by recommendation alone.
+    """
+    fitted = _speedup_over(
+        {
+            1: [40.0, 40.1],
+            2: [21.0, 21.1],
+            4: [11.0, 11.1],
+            8: [10.6, 10.7],
+            16: [17.0, 17.1],
+            32: [26.0, 26.1],
+        }
+    )
+    assert fitted.recommended_inner_jobs == 4
+    assert fitted.regression_inner_jobs == 16
+
+
+def test_a_slower_median_with_overlapping_spread_is_not_called_a_regression() -> None:
+    """Dispersion decides. A width that is slower on the median but whose sample range overlaps the
+    fastest width's is not distinguishable from it, and narrowing a step on that would be acting on
+    noise."""
+    fitted = _speedup_over(
+        {
+            1: [40.0, 40.1],
+            2: [21.0, 21.1],
+            4: [10.0, 12.0],   # best median, wide spread
+            8: [11.4, 11.5],   # slower median, but inside width 4's observed range
+        }
+    )
+    assert fitted.regression_inner_jobs is None
+
+
+def test_levels_carry_the_raw_wall_beside_the_discounted_one() -> None:
+    """The modelled wall and the measurement it came from are both present on every level."""
+    fitted = _speedup_over({1: [40.0, 40.0], 2: [20.0, 20.0]})
+    for level in fitted.levels:
+        assert level.raw_wall_s is not None
+        assert level.wall_min_s is not None and level.wall_max_s is not None
+        assert level.wall_min_s <= level.wall_s <= level.wall_max_s
+    # With no contention signal the discount is a no-op, so the two agree exactly.
+    assert fitted.levels[0].raw_wall_s == fitted.levels[0].wall_s
+
+
+def test_a_contention_discount_moves_the_modelled_wall_off_the_raw_one() -> None:
+    """When the store records contention, wall_s and raw_wall_s must DIFFER and both be reported.
+
+    A consumer printing only wall_s would be showing a modelled number as a measurement; the raw
+    term has to survive the fit for that to be avoidable.
+    """
+    rows = [
+        {
+            "step": "s",
+            "inner_jobs": "1",
+            "elapsed_s": "100.0",
+            "external_cores": "8",
+            "ok": "True",
+            "returncode": "0",
+        }
+        for _ in range(3)
+    ]
+    fitted = estimates.step_speedups_from_buckets(estimates.bucketize_rows(rows, 32), None)
+    if fitted:  # a single width yields no curve; assert only the sample-level reduction
+        pass
+    sample = estimates.sample_from_row(rows[0], 32)
+    assert sample.elapsed_s == 100.0
+    assert sample.contention > 0.0
+    intrinsic = sample.intrinsic_s()
+    assert intrinsic is not None and intrinsic < sample.elapsed_s

@@ -493,8 +493,17 @@ pub struct SpeedupLevel {
     pub inner_jobs: i64,
     /// Number of wall-time samples contributing to this level.
     pub samples: i64,
-    /// Robust contention-adjusted wall time in seconds.
+    /// Robust contention-adjusted wall time in seconds. MODELLED: the curve is fitted to this, so
+    /// the speedup and the recommendation both derive from it. A discount of ~25% has been observed
+    /// on a busy host, so a consumer printing only this is showing a model as a measurement.
     pub wall_s: f64,
+    /// Robust median of the RAW recorded wall times at this width, undiscounted -- the measurement
+    /// `wall_s` was derived from.
+    pub raw_wall_s: Option<f64>,
+    /// Smallest observed contention-adjusted wall at this width.
+    pub wall_min_s: Option<f64>,
+    /// Largest observed contention-adjusted wall at this width.
+    pub wall_max_s: Option<f64>,
     /// Robust total CPU time in seconds, when available.
     pub cpu_s: Option<f64>,
     /// Robust observed CPU concurrency, when available.
@@ -516,30 +525,100 @@ pub struct StepSpeedup {
     pub recommended_inner_jobs: i64,
     /// Effective CPU concurrency measured at the recommended width.
     pub measured_effective_cores: Option<f64>,
+    /// Narrowest width ABOVE the fastest measured one where going wider is measurably SLOWER, or
+    /// `None` when nothing in the measured range regresses. A plateau and a cliff stop the fit at
+    /// the same width and yield the same recommendation, so this is the only field that tells them
+    /// apart. See [`regression_inner_jobs`] for the dispersion test a width must pass.
+    pub regression_inner_jobs: Option<i64>,
     /// Curve levels ordered by increasing inner-job width.
     pub levels: Vec<SpeedupLevel>,
 }
 
-/// Per-level `(inner_jobs, samples, wall, cpu, effective_cores, throttled)` tuple.
-type RawLevel = (i64, i64, f64, Option<f64>, Option<f64>, Option<f64>);
+/// The per-width aggregate one [`SpeedupLevel`] is fitted from. A named carrier rather than a
+/// positional tuple: the fit needs the discounted median, the raw median it came from, and the
+/// observed spread, and a nine-slot tuple makes those trivially easy to transpose at a call site.
+#[derive(Debug, Clone, Copy)]
+pub struct LevelAggregate {
+    /// Inner worker width these samples ran at.
+    pub inner_jobs: i64,
+    /// Number of wall-time samples at this width.
+    pub samples: i64,
+    /// Contention-adjusted robust median wall (what the curve is fitted to).
+    pub wall_s: f64,
+    /// Robust median of the raw recorded walls, undiscounted.
+    pub raw_wall_s: Option<f64>,
+    /// Smallest observed adjusted wall at this width.
+    pub wall_min_s: Option<f64>,
+    /// Largest observed adjusted wall at this width.
+    pub wall_max_s: Option<f64>,
+    /// Robust median total CPU seconds, when available.
+    pub cpu_s: Option<f64>,
+    /// Robust median observed CPU concurrency, when available.
+    pub effective_cores: Option<f64>,
+    /// Robust median throttling seconds, when available.
+    pub throttled_s: Option<f64>,
+}
+
+/// A wider level must be at least this much SLOWER than the fastest measured level before it can be
+/// called a regression. Paired with the dispersion test in [`regression_inner_jobs`]; neither check
+/// is sufficient alone.
+const REGRESSION_MIN_SLOWDOWN: f64 = 1.05;
+
+/// The narrowest width above the fastest one where going wider is measurably SLOWER.
+///
+/// Two conditions must BOTH hold: the level's median wall exceeds the fastest level's by
+/// [`REGRESSION_MIN_SLOWDOWN`], AND its observed `[min, max]` range is DISJOINT from the fastest
+/// level's. The second is what keeps this honest on a shared machine -- a percentage test alone
+/// reports ordinary sample noise as a cliff, and a width whose range still overlaps the best one's
+/// is not distinguishable from it. A level missing either bound is skipped rather than guessed at.
+pub fn regression_inner_jobs(levels: &[SpeedupLevel]) -> Option<i64> {
+    let ranked: Vec<&SpeedupLevel> = levels.iter().filter(|l| l.wall_s > 0.0).collect();
+    let best = ranked
+        .iter()
+        .min_by(|a, b| a.wall_s.total_cmp(&b.wall_s))?;
+    let (best_min, best_max) = (best.wall_min_s?, best.wall_max_s?);
+    let mut candidates: Vec<&&SpeedupLevel> = ranked
+        .iter()
+        .filter(|l| l.inner_jobs > best.inner_jobs)
+        .collect();
+    candidates.sort_by_key(|l| l.inner_jobs);
+    for level in candidates {
+        let (Some(lo), Some(hi)) = (level.wall_min_s, level.wall_max_s) else {
+            continue;
+        };
+        if level.wall_s <= best.wall_s * REGRESSION_MIN_SLOWDOWN {
+            continue;
+        }
+        if lo > best_max || hi < best_min {
+            return Some(level.inner_jobs);
+        }
+    }
+    None
+}
 
 // Assemble a [`StepSpeedup`] from per-level tuples SORTED ascending by inner_jobs. Deterministic
 // across builds (only compares robust medians of identical inputs). Mirrors Python's
 // `_build_step_speedup`.
 fn build_step_speedup(
     step: String,
-    raw_levels: &[RawLevel],
+    raw_levels: &[LevelAggregate],
     core_budget: Option<i64>,
 ) -> StepSpeedup {
-    let baseline_j = raw_levels[0].0;
-    let baseline_wall = raw_levels[0].2;
+    let baseline_j = raw_levels[0].inner_jobs;
+    let baseline_wall = raw_levels[0].wall_s;
     let mut levels: Vec<SpeedupLevel> = Vec::with_capacity(raw_levels.len());
     let mut recommended = baseline_j;
     let mut still_scaling = true;
     let mut prev_wall = baseline_wall;
-    let mut prev_cpu = raw_levels[0].3;
+    let mut prev_cpu = raw_levels[0].cpu_s;
     let mut eff_by_j: HashMap<i64, Option<f64>> = HashMap::new();
-    for (idx, &(j, n, wall, cpu, eff, throttled)) in raw_levels.iter().enumerate() {
+    for (idx, aggregate) in raw_levels.iter().enumerate() {
+        let (j, wall, cpu, eff) = (
+            aggregate.inner_jobs,
+            aggregate.wall_s,
+            aggregate.cpu_s,
+            aggregate.effective_cores,
+        );
         let speedup = if wall > 0.0 {
             baseline_wall / wall
         } else {
@@ -547,11 +626,14 @@ fn build_step_speedup(
         };
         levels.push(SpeedupLevel {
             inner_jobs: j,
-            samples: n,
+            samples: aggregate.samples,
             wall_s: wall,
+            raw_wall_s: aggregate.raw_wall_s,
+            wall_min_s: aggregate.wall_min_s,
+            wall_max_s: aggregate.wall_max_s,
             cpu_s: cpu,
             effective_cores: eff,
-            throttled_s: throttled,
+            throttled_s: aggregate.throttled_s,
             speedup,
         });
         eff_by_j.insert(j, eff);
@@ -572,11 +654,13 @@ fn build_step_speedup(
         prev_wall = wall;
         prev_cpu = cpu;
     }
+    let regression = regression_inner_jobs(&levels);
     StepSpeedup {
         step,
         baseline_inner_jobs: baseline_j,
         recommended_inner_jobs: recommended,
         measured_effective_cores: eff_by_j.get(&recommended).copied().flatten(),
+        regression_inner_jobs: regression,
         levels,
     }
 }
@@ -604,6 +688,7 @@ pub fn step_speedups_from_buckets(
     core_budget: Option<i64>,
 ) -> HashMap<String, StepSpeedup> {
     let mut walls: HashMap<BucketKey, Vec<f64>> = HashMap::new();
+    let mut raws: HashMap<BucketKey, Vec<f64>> = HashMap::new();
     let mut cpus: HashMap<BucketKey, Vec<f64>> = HashMap::new();
     let mut effs: HashMap<BucketKey, Vec<f64>> = HashMap::new();
     let mut thrs: HashMap<BucketKey, Vec<f64>> = HashMap::new();
@@ -615,6 +700,9 @@ pub fn step_speedups_from_buckets(
         for sample in samples {
             if let Some(intrinsic) = sample.intrinsic_s() {
                 walls.entry(key.clone()).or_default().push(intrinsic);
+            }
+            if let Some(raw) = sample.elapsed_s {
+                raws.entry(key.clone()).or_default().push(raw);
             }
             if let Some(c) = sample.cpu_s {
                 cpus.entry(key.clone()).or_default().push(c);
@@ -639,7 +727,7 @@ pub fn step_speedups_from_buckets(
         if levels_j.len() < SPEEDUP_MIN_LEVELS {
             continue;
         }
-        let mut raw_levels: Vec<RawLevel> = Vec::with_capacity(levels_j.len());
+        let mut raw_levels: Vec<LevelAggregate> = Vec::with_capacity(levels_j.len());
         for inner in &levels_j {
             let key = (step.clone(), *inner);
             let wall_samples = &walls[&key];
@@ -648,14 +736,23 @@ pub fn step_speedups_from_buckets(
                     .filter(|v| !v.is_empty())
                     .map(|v| robust_median(v))
             };
-            raw_levels.push((
-                *inner,
-                wall_samples.len() as i64,
-                robust_median(wall_samples),
-                median_of(&cpus),
-                median_of(&effs),
-                median_of(&thrs),
-            ));
+            raw_levels.push(LevelAggregate {
+                inner_jobs: *inner,
+                samples: wall_samples.len() as i64,
+                wall_s: robust_median(wall_samples),
+                raw_wall_s: median_of(&raws),
+                wall_min_s: wall_samples
+                    .iter()
+                    .copied()
+                    .reduce(f64::min),
+                wall_max_s: wall_samples
+                    .iter()
+                    .copied()
+                    .reduce(f64::max),
+                cpu_s: median_of(&cpus),
+                effective_cores: median_of(&effs),
+                throttled_s: median_of(&thrs),
+            });
         }
         let model = build_step_speedup(step.clone(), &raw_levels, core_budget);
         result.insert(step, model);
@@ -1393,12 +1490,23 @@ fn opt_secs_json(value: Option<f64>) -> String {
     }
 }
 
+// An optional integer as a JSON literal: the number, or `null`.
+fn opt_int_json(value: Option<i64>) -> String {
+    match value {
+        None => "null".to_string(),
+        Some(v) => v.to_string(),
+    }
+}
+
 // One speedup-curve level as a single-line JSON object (byte-identical to the Python build).
 fn speedup_level_json(level: &SpeedupLevel) -> String {
     format!(
-        "{{\"inner_jobs\": {}, \"wall_s\": \"{}\", \"speedup\": \"{}\", \"cpu_s\": {}, \"effective_cores\": {}, \"throttled_s\": {}, \"samples\": {}}}",
+        "{{\"inner_jobs\": {}, \"wall_s\": \"{}\", \"raw_wall_s\": {}, \"wall_min_s\": {}, \"wall_max_s\": {}, \"speedup\": \"{}\", \"cpu_s\": {}, \"effective_cores\": {}, \"throttled_s\": {}, \"samples\": {}}}",
         level.inner_jobs,
         fmt_secs(level.wall_s),
+        opt_secs_json(level.raw_wall_s),
+        opt_secs_json(level.wall_min_s),
+        opt_secs_json(level.wall_max_s),
         fmt_secs(level.speedup),
         opt_secs_json(level.cpu_s),
         opt_secs_json(level.effective_cores),
@@ -1421,10 +1529,11 @@ fn speedup_to_json(speedup: &Option<StepSpeedup>) -> String {
         .map(|l| format!("          {}", speedup_level_json(l)))
         .collect();
     format!(
-        "{{\n        \"baseline_inner_jobs\": {},\n        \"recommended_inner_jobs\": {},\n        \"measured_effective_cores\": {},\n        \"levels\": [\n{}\n        ]\n      }}",
+        "{{\n        \"baseline_inner_jobs\": {},\n        \"recommended_inner_jobs\": {},\n        \"measured_effective_cores\": {},\n        \"regression_inner_jobs\": {},\n        \"levels\": [\n{}\n        ]\n      }}",
         sp.baseline_inner_jobs,
         sp.recommended_inner_jobs,
         opt_secs_json(sp.measured_effective_cores),
+        opt_int_json(sp.regression_inner_jobs),
         levels.join(",\n"),
     )
 }
@@ -1665,8 +1774,10 @@ fn speedup_text_lines(plan: &Plan) -> Vec<String> {
     let headers = [
         "step",
         "rec_inner_jobs",
+        "regress_at",
         "eff_cores",
         "speedup@rec",
+        "wall@rec discounted/raw",
         "curve(inner_jobs->speedup)",
     ];
     let mut rows: Vec<Vec<String>> = Vec::with_capacity(modeled.len());
@@ -1687,11 +1798,29 @@ fn speedup_text_lines(plan: &Plan) -> Vec<String> {
             .map(|l| format!("{}:{:.2}x", l.inner_jobs, l.speedup))
             .collect::<Vec<_>>()
             .join(" ");
+        let at_rec = sp
+            .levels
+            .iter()
+            .find(|l| l.inner_jobs == sp.recommended_inner_jobs);
+        // Both terms, always: the left number is discounted (modelled), the right one measured.
+        let walls = match at_rec {
+            None => "-".to_string(),
+            Some(l) => match l.raw_wall_s {
+                None => format!("{:.3}/-", l.wall_s),
+                Some(raw) => format!("{:.3}/{:.3}", l.wall_s, raw),
+            },
+        };
+        let regress = match sp.regression_inner_jobs {
+            None => "-".to_string(),
+            Some(w) => w.to_string(),
+        };
         rows.push(vec![
             (*tag).clone(),
             sp.recommended_inner_jobs.to_string(),
+            regress,
             eff,
             format!("{knee:.2}x"),
+            walls,
             curve,
         ]);
     }
