@@ -15,6 +15,7 @@ __all__ = [
     "HerdrUnavailable",
     "PaneBusy",
     "RunTimeout",
+    "AgentDeliveryError",
     "EXIT_CONFIG",
     "EXIT_REFUSED",
     "EXIT_UNAVAILABLE",
@@ -86,3 +87,9 @@ class RunTimeout(HerdrRunError):
     partial_stdout: str = ""
     partial_stderr: str = ""
     spool_directory: str = ""
+
+
+class AgentDeliveryError(HerdrRunError):
+    """A durable interactive-agent message could not be safely delivered."""
+
+    exit_code = EXIT_BUSY

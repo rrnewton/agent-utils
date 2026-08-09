@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "herdr-run"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run allowlisted commands in a Herdr terminal pane outside an AI agent's sandbox, with real exit codes."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,6 +28,7 @@ Issues = "https://github.com/rrnewton/agent-utils/issues"
 
 [project.scripts]
 herdr-run = "herdr_run.cli:main"
+herdr-agent = "herdr_run.agent_cli:main"
 
 [tool.setuptools]
 packages = ["herdr_run"]
@@ -35,4 +36,4 @@ package-dir = { herdr_run = "." }
 include-package-data = false
 
 [tool.setuptools.package-data]
-herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "examples/*.yaml"]
+herdr_run = ["py.typed", "README.md", "USER_GUIDE.md", "AGENT_USER_GUIDE.md", "examples/*.yaml"]

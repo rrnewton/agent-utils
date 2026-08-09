@@ -1,0 +1,176 @@
+"""Focused contract tests for the shared interactive-agent queue."""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+from typing import cast
+
+import pytest
+
+from herdr_run.agent import Target, drain, enqueue, read, send, status
+from herdr_run.client import AgentPaneInfo, HerdrClient, Pane
+from herdr_run.errors import AgentDeliveryError, HerdrUnavailable
+
+
+class FakeAgentHerdr:
+    def __init__(self, states: list[str] | None = None) -> None:
+        self.states = states or ["idle"]
+        self.index = 0
+        self.runs: list[str] = []
+        self.waits: list[tuple[str, str, int]] = []
+        self.workspace = "deepscry"
+        self.cwd = "/work/mtg"
+        self.session = "session-1"
+        self.read_text = "agent transcript\n"
+        self.run_entered = threading.Event()
+        self.run_release: threading.Event | None = None
+
+    def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
+        del workspace_id
+        return (Pane("w1:p1", "w1:t1", "w1"),)
+
+    def pane_info(self, pane_id: str) -> AgentPaneInfo:
+        assert pane_id == "w1:p1"
+        state = self.states[min(self.index, len(self.states) - 1)]
+        self.index += 1
+        return AgentPaneInfo(pane_id, "w1", self.cwd, "codex", state, "codex", self.session)
+
+    def workspace_label(self, workspace_id: str) -> str:
+        assert workspace_id == "w1"
+        return self.workspace
+
+    def run(self, pane_id: str, text: str) -> None:
+        assert pane_id == "w1:p1"
+        self.run_entered.set()
+        if self.run_release is not None:
+            assert self.run_release.wait(5)
+        self.runs.append(text)
+
+    def wait_agent_status(self, pane_id: str, state: str, timeout_ms: int) -> None:
+        self.waits.append((pane_id, state, timeout_ms))
+        if state != "working":
+            raise AssertionError(state)
+
+    def read(self, pane_id: str, *, source: str, lines: int) -> str:
+        assert (pane_id, source, lines) == ("w1:p1", "recent-unwrapped", 17)
+        return self.read_text
+
+
+def client(fake: FakeAgentHerdr) -> HerdrClient:
+    return cast(HerdrClient, fake)
+
+
+def target(**changes: str) -> Target:
+    values = {
+        "pane_id": "w1:p1", "session_agent": "codex", "session_value": "session-1",
+        "expected_agent": "codex", "expected_workspace": "deepscry", "expected_cwd": "/work/mtg",
+    }
+    values.update(changes)
+    return Target(**values)
+
+
+def test_multiline_busy_then_idle_is_atomic_and_confirmed(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["working", "working", "idle"])
+    text = "first line\nsecond line\nthird line"
+    result = send(client(fake), target(), str(tmp_path), text, ready_timeout=1, sleep=lambda _s: None)
+    assert fake.runs == [text]
+    assert fake.waits == [("w1:p1", "working", 30000)]
+    assert result.message_id in result.delivered
+
+
+def test_done_is_submit_safe(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["done"])
+    send(client(fake), target(), str(tmp_path), "from done")
+    assert fake.runs == ["from done"]
+
+
+def test_concurrent_senders_are_serialized_and_fifo(tmp_path: object) -> None:
+    root = str(tmp_path)
+    fake = FakeAgentHerdr(["idle"])
+    fake.run_release = threading.Event()
+    errors: list[BaseException] = []
+
+    def invoke(text: str) -> None:
+        try:
+            send(client(fake), target(), root, text)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=invoke, args=("first",), daemon=True)
+    second = threading.Thread(target=invoke, args=("second",), daemon=True)
+    first.start()
+    assert fake.run_entered.wait(5)
+    second.start()
+    second.join(0.05)
+    assert second.is_alive()
+    fake.run_release.set()
+    first.join(5)
+    second.join(5)
+    assert errors == []
+    assert fake.runs == ["first", "second"]
+
+
+def test_working_confirmation_failure_retries_then_quarantines(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["idle"])
+
+    def fail(*_args: object) -> None:
+        raise HerdrUnavailable("no working transition")
+
+    fake.wait_agent_status = fail  # type: ignore[assignment]
+    with pytest.raises(AgentDeliveryError, match="retained"):
+        send(client(fake), target(), str(tmp_path), "preserve me", max_attempts=2)
+    failed = list((tmp_path / "failed").glob("*.json"))  # type: ignore[operator]
+    assert len(failed) == 1
+    document = json.loads(failed[0].read_text())
+    assert document["text"] == "preserve me"
+    assert document["delivery_attempts"] == 2
+    assert len(fake.runs) == 2
+
+
+@pytest.mark.parametrize(
+    "change,expected",
+    [
+        ({"session_value": "wrong"}, "found 0"),
+        ({"expected_workspace": "wrong"}, "workspace"),
+        ({"expected_cwd": "/wrong"}, "cwd"),
+        ({"expected_agent": "claude"}, "agent"),
+    ],
+)
+def test_wrong_identity_workspace_or_cwd_refuses(
+    tmp_path: object, change: dict[str, str], expected: str
+) -> None:
+    fake = FakeAgentHerdr(["idle"])
+    with pytest.raises(AgentDeliveryError, match=expected):
+        send(client(fake), target(**change), str(tmp_path), "never submit", max_attempts=1)
+    assert fake.runs == []
+    assert len(list((tmp_path / "failed").glob("*.json"))) == 1  # type: ignore[operator]
+
+
+def test_timeout_retains_prompt_and_loud_error(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["working"])
+    with pytest.raises(AgentDeliveryError, match="retained"):
+        send(client(fake), target(), str(tmp_path), "poll artifact survives", ready_timeout=0, max_attempts=1)
+    assert "poll artifact survives" in next((tmp_path / "failed").glob("*.json")).read_text()  # type: ignore[operator]
+
+
+def test_status_and_read_cover_arbitrary_target(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["idle"])
+    queued = enqueue(str(tmp_path), "queued")
+    snapshot = status(client(fake), target(), str(tmp_path))
+    assert snapshot["pending"] == [queued]
+    assert snapshot["session_value"] == "session-1"
+    assert read(client(fake), target(), lines=17) == "agent transcript\n"
+
+
+def test_drain_accepts_existing_subagent_message_shape(tmp_path: object) -> None:
+    inbox = tmp_path / "inbox"  # type: ignore[operator]
+    inbox.mkdir()
+    path = inbox / "000000000007.json"
+    path.write_text(json.dumps({"seq": 7, "text": "legacy fifo", "tui_delivery_attempts": 0}))
+    fake = FakeAgentHerdr(["idle"])
+    result = drain(client(fake), target(), str(tmp_path))
+    assert result.delivered == ("000000000007",)
+    assert fake.runs == ["legacy fifo"]
+    assert os.path.isfile(tmp_path / "processed" / path.name)  # type: ignore[operator]
