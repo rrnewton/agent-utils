@@ -58,6 +58,7 @@ import fcntl
 import hashlib
 import json
 import os
+import signal
 import random
 import re
 import shutil
@@ -882,6 +883,116 @@ def compare_only_errors(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad(label, f"expected exit 2 for an unknown --only tag; got {po.returncode}")
         else:
             rep.ok(label)
+
+
+#: How long the planted escapee lives. It MUST exceed `run`'s own expiry, or the case cannot
+#: distinguish a build that finishes from one that blocks: a self-limiting escapee releases the
+#: pipes on its own, the blocked build returns just before the harness gives up, and the two builds
+#: agree on an exit code for the wrong reason. Measured against a build with the defect still in
+#: place: at a 90s lifetime it returned at 90s and the check PASSED; the case only fails when the
+#: survivor outlives the harness. The fixture kills the pid it recorded once the run is over, so a
+#: long lifetime does not mean a long-lived leak.
+_ESCAPEE_LIFETIME_S = 300
+
+
+def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must FINISH a step whose child outlives the kill, and agree on the outcome.
+
+    THE CASE THIS COVERS, AND WHY ITS ABSENCE MATTERED. Every other `run` comparison here uses a
+    step that dies when its process group is signalled, so all of them exercise the easy teardown
+    path. A step can instead leave a `setsid` child behind: the child changes session and process
+    group, the intermediate parent exits, and the survivor keeps the step's stdout/stderr write ends
+    open. A build that waits unconditionally for those pipes to reach EOF never returns -- it does
+    not fail, it hangs, and a run that hangs writes no results at all. Two builds can therefore
+    disagree completely on this path while every other check agrees, which is exactly what happened:
+    the suite reported full agreement across every fixture while the two runners behaved differently
+    on the one behaviour that decides whether the system can report on its own failures.
+
+    WHAT IS ASSERTED. Both builds must return the SAME exit status, and neither may hit the harness
+    timeout. The second half is the load-bearing one: `run` turns its own 120s expiry into exit 124,
+    so a build that blocks forever is observable rather than fatal to the suite -- but only if the
+    check refuses 124 explicitly. Comparing exit codes alone would pass the day BOTH builds hang.
+
+    The escapee bounds itself with a short sleep and is also killed by recorded pid afterwards, so
+    the fixture cannot leak a process onto a shared machine even if a build leaves it running.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # ONE PID FILE PER BUILD. Both runs plant an escapee, so a single shared file records only
+        # the second one and the first is leaked onto the machine on every invocation. Found by
+        # counting survivors after a full suite run, not by reading the code.
+        def _case(tag: str, cmd: list[str]) -> tuple[str, Outcome]:
+            pid_file = os.path.join(tmp, f"escapee-{tag}.pid")
+            script = os.path.join(tmp, f"escapee-{tag}.sh")
+            with open(script, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "#!/usr/bin/env bash\n"
+                    # setsid leaves the step's session AND process group, so a process-group kill
+                    # cannot reach it; it inherits the pipes, so the readers never see EOF.
+                    f"setsid bash -c 'echo $$ > {pid_file}; exec sleep {_ESCAPEE_LIFETIME_S}' &\n"
+                    f"sleep {_ESCAPEE_LIFETIME_S}\n"
+                )
+            os.chmod(script, 0o755)
+            dag_path = os.path.join(tmp, f"dag-{tag}.json")
+            with open(dag_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        {
+                            "steps": [
+                                {
+                                    "group": "escapee",
+                                    "job": "setsid_child",
+                                    "cmd": f"bash {script}",
+                                    "timeout": 5,
+                                    "cpu_timeout": 600,
+                                }
+                            ]
+                        }
+                    )
+                )
+            return pid_file, run(cmd, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
+
+        pid_files: list[str] = []
+        try:
+            pf, po = _case("py", py)
+            pid_files.append(pf)
+            pf, ro = _case("rs", rs)
+            pid_files.append(pf)
+        finally:
+            for pf in pid_files:
+                _kill_recorded_pid(pf)
+
+        label = "escapee-teardown"
+        blocked = [n for n, o in (("py", po), ("rs", ro)) if o.returncode == 124]
+        if blocked:
+            rep.bad(
+                label,
+                f"{'/'.join(blocked)} never returned after a step left a setsid child behind "
+                f"(exit py={po.returncode} rs={ro.returncode}); a run that cannot finish cannot "
+                "report what went wrong",
+            )
+        elif po.returncode != ro.returncode:
+            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+        elif po.returncode == 0:
+            rep.bad(label, "a step killed at its wall budget must not report success")
+        else:
+            rep.ok(label)
+
+
+def _kill_recorded_pid(pid_file: str) -> None:
+    """SIGKILL the pid this fixture recorded, if it is still alive.
+
+    Kills one EXPLICIT pid that the fixture itself spawned -- never a name or command-line pattern,
+    which on a shared machine would reach other tenants' work.
+    """
+    try:
+        with open(pid_file, encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return  # never started, or already cleaned up
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass  # already gone, which is the expected outcome once a build reaps correctly
 
 
 def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> None:
@@ -2342,6 +2453,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_yaml_isomorphism(py, rs, rep)
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
+    compare_escapee_teardown(py, rs, rep)
     compare_profile_store(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)
