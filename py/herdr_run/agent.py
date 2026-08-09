@@ -8,8 +8,10 @@ working-state confirmation, at-most-once ambiguity quarantine, status, and readi
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 from collections.abc import Callable
@@ -171,6 +173,25 @@ def _binding(target: Target) -> dict[str, object]:
     return identity
 
 
+def _target_lock_path(target: Target) -> str:
+    """Return a host-wide lock path shared by every queue for this target."""
+    identity: dict[str, object]
+    if target.session_value is not None:
+        identity = {"kind": "session", "value": target.session_value}
+    else:
+        identity = {"kind": "pane", "pane_id": target.pane_id}
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    digest = hashlib.sha256(encoded).hexdigest()
+    lock_root = os.path.join(tempfile.gettempdir(), f"herdr-agent-target-locks-{os.getuid()}")
+    os.makedirs(lock_root, mode=0o700, exist_ok=True)
+    metadata = os.stat(lock_root, follow_symlinks=False)
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid():
+        raise AgentDeliveryError(f"unsafe host-wide target lock directory: {lock_root}")
+    if stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise AgentDeliveryError(f"host-wide target lock directory is not private: {lock_root}")
+    return os.path.join(lock_root, f"{digest}.lock")
+
+
 def _bind_queue(root: str, target: Target) -> None:
     """Create or verify the durable queue-to-target binding under its own lock."""
     _prepare(root)
@@ -330,8 +351,13 @@ def drain(
     quarantined: list[str] = []
     blocked: str | None = None
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    target_descriptor = -1
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
+        # A queue lock protects FIFO order within one root. This second lock protects the
+        # interactive target itself when independent callers use distinct queue roots.
+        target_descriptor = os.open(_target_lock_path(target), os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(target_descriptor, fcntl.LOCK_EX)
         quarantined.extend(_recover_inflight(inflight, failed))
         for path in sorted(os.path.join(inbox, name) for name in os.listdir(inbox) if name.endswith(".json")):
             try:
@@ -361,12 +387,15 @@ def drain(
                 # ``inflight`` is a durable at-most-once barrier. Once this rename commits, a
                 # crash is treated as possibly submitted. Readiness was already proven above;
                 # this transition occurs immediately before pane.run.
+                inflight_path = os.path.join(inflight, os.path.basename(path))
+                # Rename first: a crash at every later instruction leaves the artifact in the
+                # restart-quarantined directory. Updating the inbox file before this rename
+                # would leave a small but real restart-resubmission window.
+                _transition(path, inflight_path)
                 document["possibly_submitted"] = True
                 document["delivery_state"] = "inflight"
                 document["inflight_at"] = time.time()
-                _atomic_json(path, document)
-                inflight_path = os.path.join(inflight, os.path.basename(path))
-                _transition(path, inflight_path)
+                _atomic_json(inflight_path, document)
                 try:
                     _deliver_one(
                         client, info, str(document["text"]), working_timeout=working_timeout,
@@ -394,6 +423,8 @@ def drain(
             if blocked is not None:
                 break
     finally:
+        if target_descriptor >= 0:
+            os.close(target_descriptor)
         os.close(descriptor)
     pending = tuple(name[:-5] for name in sorted(os.listdir(inbox)) if name.endswith(".json"))
     outcome = "pending" if blocked is not None else ("possibly_submitted" if quarantined else "delivered")

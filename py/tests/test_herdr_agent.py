@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+import herdr_run.agent as agent_api
 from herdr_run.agent import Target, drain, enqueue, read, send, status
 from herdr_run.agent import QueueResult
 import herdr_run.agent_cli as agent_cli
@@ -131,6 +132,32 @@ def test_concurrent_senders_are_serialized_and_fifo(tmp_path: object) -> None:
     second.join(5)
     assert errors == []
     assert fake.runs == ["first", "second"]
+
+
+def test_distinct_queue_roots_serialize_one_shared_target(tmp_path: Path) -> None:
+    fake = FakeAgentHerdr(["idle"])
+    fake.run_release = threading.Event()
+    errors: list[BaseException] = []
+
+    def invoke(root: Path, text: str) -> None:
+        try:
+            send(client(fake), target(), str(root), text)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=invoke, args=(tmp_path / "queue-a", "from a"), daemon=True)
+    second = threading.Thread(target=invoke, args=(tmp_path / "queue-b", "from b"), daemon=True)
+    first.start()
+    assert fake.run_entered.wait(5)
+    second.start()
+    second.join(0.05)
+    assert second.is_alive(), "a different queue root must wait on the host-wide target lock"
+    assert fake.runs == []
+    fake.run_release.set()
+    first.join(5)
+    second.join(5)
+    assert errors == []
+    assert fake.runs == ["from a", "from b"]
 
 
 def test_working_confirmation_failure_never_resubmits_and_marks_ambiguous(tmp_path: object) -> None:
@@ -329,6 +356,32 @@ def test_crash_after_run_before_wait_is_never_resubmitted_on_restart(tmp_path: o
     assert len(list((tmp_path / "inflight").glob("*.json"))) == 0  # type: ignore[operator]
     assert len(list((tmp_path / "failed").glob("*.json"))) == 1  # type: ignore[operator]
     assert result.outcome == "possibly_submitted"
+
+
+def test_crash_after_inflight_rename_before_metadata_or_run_is_never_resubmitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeAgentHerdr(["idle"])
+    original = agent_api._atomic_json
+
+    def crash_on_inflight(path: str, document: dict[str, object]) -> None:
+        if Path(path).parent.name == "inflight":
+            raise KeyboardInterrupt("simulated death immediately after durable rename")
+        original(path, document)
+
+    monkeypatch.setattr(agent_api, "_atomic_json", crash_on_inflight)
+    with pytest.raises(KeyboardInterrupt):
+        send(client(fake), target(), str(tmp_path), "rename barrier")
+    assert fake.runs == []
+    assert list((tmp_path / "inbox").glob("*.json")) == []
+    assert len(list((tmp_path / "inflight").glob("*.json"))) == 1
+
+    monkeypatch.setattr(agent_api, "_atomic_json", original)
+    restarted = FakeAgentHerdr(["idle"])
+    result = drain(client(restarted), target(), str(tmp_path))
+    assert restarted.runs == []
+    assert result.outcome == "possibly_submitted"
+    assert len(list((tmp_path / "failed").glob("*.json"))) == 1
 
 
 def test_crash_during_busy_wait_stays_pending_and_delivers_after_restart(tmp_path: Path) -> None:
