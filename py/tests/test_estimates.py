@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from safe_ci_dag_runner import estimates
+
 from pathlib import Path
 
 from safe_ci_dag_runner import (
@@ -635,3 +637,71 @@ def test_cpa_plan_json_and_text_shape(tmp_path: Path) -> None:
     assert text.startswith("plan: cpa\n")
     assert "alloc_inner_jobs" in text
     assert "allocator (cpa):" in text
+
+
+def _measurement_row(**overrides: str) -> dict[str, str]:
+    """A row recording one successful step, before applying the caller's overrides."""
+    row = {
+        "step": "build.unit",
+        "inner_jobs": "4",
+        "elapsed_s": "1.0",
+        "ok": "True",
+        "returncode": "0",
+        "timed_out": "False",
+        "cpu_timed_out": "False",
+        "oom_kills": "0",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_row_is_measurement_accepts_a_successful_step() -> None:
+    """A completed step is a timing measurement and must reach the speedup model."""
+    assert estimates.row_is_measurement(_measurement_row())
+
+
+def test_row_is_measurement_accepts_a_row_with_no_verdict_columns() -> None:
+    """Silence is not failure: a store carrying no verdict columns must still be usable.
+
+    A gate that rejected every row lacking an explicit verdict would empty the model instead of
+    correcting it, which is a worse outcome than the defect it fixes.
+    """
+    assert estimates.row_is_measurement({"step": "build.unit", "inner_jobs": "4", "elapsed_s": "1.0"})
+
+
+def test_row_is_measurement_rejects_each_recorded_failure_signal() -> None:
+    """Every explicit failure marker must reject the row on its own."""
+    for overrides in (
+        {"ok": "False"},
+        {"returncode": "2"},
+        {"returncode": "127"},
+        {"timed_out": "True"},
+        {"cpu_timed_out": "True"},
+        {"oom_kills": "1"},
+    ):
+        assert not estimates.row_is_measurement(_measurement_row(**overrides)), overrides
+
+
+def test_bucketize_rows_drops_failures_and_keeps_the_measurements() -> None:
+    """Filtering is per-sample: a width whose run failed disappears, valid widths survive.
+
+    A step killed by the CPU-time guard at some widths still has genuine timings at the widths
+    that completed, and those must continue to fit a curve.
+    """
+    rows = [
+        _measurement_row(inner_jobs="1", elapsed_s="8.0", ok="False", cpu_timed_out="True"),
+        _measurement_row(inner_jobs="2", elapsed_s="4.0", ok="False", cpu_timed_out="True"),
+        _measurement_row(inner_jobs="4", elapsed_s="2.0"),
+        _measurement_row(inner_jobs="8", elapsed_s="1.0"),
+    ]
+    buckets = estimates.bucketize_rows(rows, None)
+    assert sorted(width for _, width in buckets) == [4, 8]
+
+
+def test_a_step_that_failed_at_every_width_yields_no_curve() -> None:
+    """Uniform failure must produce nothing rather than a plausible curve of crash times."""
+    rows = [
+        _measurement_row(inner_jobs=str(width), elapsed_s=str(1.0 / width), ok="False", returncode="127")
+        for width in (1, 2, 4, 8)
+    ]
+    assert estimates.step_speedups_from_buckets(estimates.bucketize_rows(rows, None), None) == {}

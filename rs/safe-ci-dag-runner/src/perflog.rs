@@ -156,11 +156,84 @@ fn affinity_width() -> Option<i64> {
 }
 
 /// Stable CPU-container key: affinity width plus the cgroup-v2 CPU quota (`/sys/fs/cgroup/cpu.max`).
+/// This process's cgroup-v2 path relative to the mount root, e.g. `/user.slice/foo.scope`.
+fn own_cgroup_relpath() -> Option<String> {
+    let text = fs::read_to_string("/proc/self/cgroup").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("0::") {
+            let rest = rest.trim();
+            return Some(if rest.is_empty() {
+                "/".to_string()
+            } else {
+                rest.to_string()
+            });
+        }
+    }
+    None
+}
+
+/// The CPU quota actually BINDING this process, as a normalized `<quota>_<period>` string.
+///
+/// Walks the selected cgroup and every ancestor up to the mount root and returns the most
+/// restrictive `cpu.max` (smallest quota/period ratio), because a cgroup-v2 quota is enforced by
+/// the whole ancestor chain, not just the leaf. Returns `max` when nothing in the chain constrains
+/// CPU, and `unknown` when the hierarchy cannot be read at all.
+///
+/// The mount-root `/sys/fs/cgroup/cpu.max` must NOT be used for this: on an ordinary host that file
+/// does not exist, so the quota half of [`container_class`] degenerates to the constant `unknown`
+/// and stops distinguishing anything. A slice several levels up is where a CPU bandwidth cap
+/// typically lives, so a step can run with a full-width affinity mask and still be held to a
+/// fraction of a core by an ancestor's quota.
+pub fn effective_cpu_quota_at(mount_root: &Path, relpath: &str) -> String {
+    let mut best_ratio: Option<f64> = None;
+    let mut best_text = "max".to_string();
+    let mut seen_any = false;
+    let mut node = mount_root.join(relpath.trim_start_matches('/'));
+    loop {
+        if let Ok(raw) = fs::read_to_string(node.join("cpu.max")) {
+            seen_any = true;
+            let parts: Vec<&str> = raw.split_whitespace().collect();
+            if parts.len() == 2 && parts[0] != "max" {
+                if let (Ok(quota), Ok(period)) =
+                    (parts[0].parse::<i64>(), parts[1].parse::<i64>())
+                {
+                    if period > 0 {
+                        let ratio = quota as f64 / period as f64;
+                        if best_ratio.is_none_or(|b| ratio < b) {
+                            best_ratio = Some(ratio);
+                            best_text = format!("{quota}_{period}");
+                        }
+                    }
+                }
+            }
+        }
+        if node == mount_root {
+            break;
+        }
+        match node.parent() {
+            Some(parent) if parent.starts_with(mount_root) => node = parent.to_path_buf(),
+            _ => break,
+        }
+    }
+    if seen_any { best_text } else { "unknown".to_string() }
+}
+
+/// The CPU quota binding this process, resolved from its own cgroup hierarchy.
+pub fn effective_cpu_quota() -> String {
+    match own_cgroup_relpath() {
+        Some(rel) => effective_cpu_quota_at(Path::new("/sys/fs/cgroup"), &rel),
+        None => "unknown".to_string(),
+    }
+}
+
+/// Stable CPU-container key: affinity width plus the CPU quota binding this process.
+///
+/// Both halves matter and they constrain independently: a cpuset narrows WHICH cpus (reflected in
+/// [`nproc`] via the affinity mask) while `cpu.max` caps total CPU BANDWIDTH. Samples taken under
+/// different containers must not share a key, or the speedup model fits one curve across
+/// incompatible populations.
 pub fn container_class() -> String {
-    let quota = fs::read_to_string("/sys/fs/cgroup/cpu.max")
-        .map(|s| s.trim().replace(' ', "_"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    format!("affinity{}_cpu-max-{}", nproc(), quota)
+    format!("affinity{}_cpu-max-{}", nproc(), effective_cpu_quota())
 }
 
 /// The whole-run summary CSV file name for a machine: `<machine_id>.csv`.

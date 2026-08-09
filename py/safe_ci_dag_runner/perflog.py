@@ -30,6 +30,7 @@ __all__ = [
     "append_step_profiles",
     "PerfWindow",
     "CsvMetricsSink",
+    "effective_cpu_quota",
 ]
 
 #: CSV row terminator. The stdlib csv module defaults to RFC-4180 ``\r\n`` (CRLF); we pin ``\n``
@@ -133,15 +134,78 @@ def nproc() -> int:
         return os.cpu_count() or 1
 
 
-def container_class() -> str:
-    """Stable CPU-container key: affinity width plus the cgroup-v2 CPU quota
-    (``/sys/fs/cgroup/cpu.max``). cgroup-v2 only, matching the target host."""
-    quota = "unknown"
+def _own_cgroup_relpath() -> str | None:
+    """This process's cgroup-v2 path relative to the mount root, e.g. ``/user.slice/foo.scope``."""
     try:
-        quota = Path("/sys/fs/cgroup/cpu.max").read_text().strip().replace(" ", "_")
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                # cgroup-v2 unified line: "0::/user.slice/..."
+                if line.startswith("0::"):
+                    return line.split("::", 1)[1].strip() or "/"
     except OSError:
         pass
-    return f"affinity{nproc()}_cpu-max-{quota}"
+    return None
+
+
+def effective_cpu_quota(
+    *, mount_root: str | Path = "/sys/fs/cgroup", relpath: str | None = None
+) -> str:
+    """The CPU quota actually BINDING this process, as a normalized ``<quota>_<period>`` string.
+
+    ``mount_root`` and ``relpath`` select the hierarchy to inspect; by default this process's
+    own cgroup under the standard cgroup-v2 mount.
+
+    Walks the selected cgroup and every ancestor up to the mount root and returns the most
+    restrictive `cpu.max` (smallest quota/period ratio), because a cgroup-v2 quota is enforced by
+    the whole ancestor chain, not just the leaf. Returns ``"max"`` when nothing in the chain
+    constrains CPU, and ``"unknown"`` when the hierarchy cannot be read at all.
+
+    The mount-root ``/sys/fs/cgroup/cpu.max`` must NOT be used for this: on an ordinary host that
+    file does not exist, so the quota half of :func:`container_class` degenerates to the constant
+    ``unknown`` and stops distinguishing anything. That matters because a slice several levels up
+    is where a CPU bandwidth cap typically lives -- a step can run with a full-width affinity mask
+    and still be held to a fraction of a core by an ancestor's quota. Two genuinely different
+    containers then share one key, the speedup model fits a single curve across both populations,
+    and it recommends the wide machine's width to the constrained one.
+    """
+    if relpath is None:
+        relpath = _own_cgroup_relpath()
+    if relpath is None:
+        return "unknown"
+    best_ratio: float | None = None
+    best_text = "max"
+    seen_any = False
+    root = Path(mount_root)
+    node = root / relpath.lstrip("/")
+    while True:
+        try:
+            raw = (node / "cpu.max").read_text().strip()
+            seen_any = True
+            parts = raw.split()
+            if len(parts) == 2 and parts[0] != "max":
+                quota, period = int(parts[0]), int(parts[1])
+                if period > 0:
+                    ratio = quota / period
+                    if best_ratio is None or ratio < best_ratio:
+                        best_ratio, best_text = ratio, f"{quota}_{period}"
+        except (OSError, ValueError):
+            pass
+        if node == root or root not in node.parents:
+            break
+        node = node.parent
+    if not seen_any:
+        return "unknown"
+    return best_text
+
+
+def container_class() -> str:
+    """Stable CPU-container key: affinity width plus the CPU quota binding this process.
+
+    Both halves matter and they constrain independently: a cpuset narrows WHICH cpus (reflected in
+    ``nproc()`` via the affinity mask) while ``cpu.max`` caps total CPU BANDWIDTH. Samples taken
+    under different containers must not share a key, or the speedup model fits one curve across
+    incompatible populations."""
+    return f"affinity{nproc()}_cpu-max-{effective_cpu_quota()}"
 
 
 def _whole_run_csv_name(machine_id_value: str | None = None) -> str:

@@ -8,6 +8,8 @@ not-yet-existent file for reading (a ``FileNotFoundError``).
 
 from __future__ import annotations
 
+from safe_ci_dag_runner import perflog
+
 import csv
 import tempfile
 from pathlib import Path
@@ -132,3 +134,47 @@ def test_csv_metrics_sink_appends_across_runs() -> None:
         with step_csv.open(newline="") as f:
             rows = list(csv.DictReader(f))
         assert len(rows) == 6  # 3 steps x 2 runs, single header
+
+
+def test_effective_cpu_quota_reports_max_when_no_ancestor_constrains_cpu(tmp_path: Path) -> None:
+    """An unconstrained chain reports ``max``, which is distinct from an unreadable one."""
+    root = tmp_path / "cgroup"
+    (root / "a" / "b").mkdir(parents=True)
+    for node in (root, root / "a", root / "a" / "b"):
+        (node / "cpu.max").write_text("max 100000\n")
+    assert perflog.effective_cpu_quota(mount_root=root, relpath="/a/b") == "max"
+
+
+def test_effective_cpu_quota_takes_the_binding_ancestor_limit(tmp_path: Path) -> None:
+    """A quota on a slice several levels up still binds the leaf, so the key must report it."""
+    root = tmp_path / "cgroup"
+    (root / "slice" / "scope").mkdir(parents=True)
+    (root / "cpu.max").write_text("max 100000\n")
+    (root / "slice" / "cpu.max").write_text("1440000 100000\n")   # 14.4 cores, the binding cap
+    (root / "slice" / "scope" / "cpu.max").write_text("max 100000\n")
+    assert perflog.effective_cpu_quota(mount_root=root, relpath="/slice/scope") == "1440000_100000"
+
+
+def test_effective_cpu_quota_prefers_the_most_restrictive_of_several(tmp_path: Path) -> None:
+    """With caps at more than one level the smallest cores-per-period wins."""
+    root = tmp_path / "cgroup"
+    (root / "a" / "b").mkdir(parents=True)
+    (root / "cpu.max").write_text("max 100000\n")
+    (root / "a" / "cpu.max").write_text("3200000 100000\n")       # 32 cores
+    (root / "a" / "b" / "cpu.max").write_text("400000 100000\n")  # 4 cores, binding
+    assert perflog.effective_cpu_quota(mount_root=root, relpath="/a/b") == "400000_100000"
+
+
+def test_effective_cpu_quota_is_unknown_when_the_hierarchy_is_unreadable(tmp_path: Path) -> None:
+    """No readable cpu.max anywhere is reported as unknown, never as unconstrained."""
+    root = tmp_path / "cgroup"
+    (root / "a").mkdir(parents=True)
+    assert perflog.effective_cpu_quota(mount_root=root, relpath="/a") == "unknown"
+
+
+def test_container_class_names_both_the_width_and_the_quota() -> None:
+    """The key must carry both constraints; a quota-blind key merges unlike containers."""
+    key = perflog.container_class()
+    width, _, quota = key.partition("_cpu-max-")
+    assert width.startswith("affinity") and width[len("affinity"):].isdigit()
+    assert quota

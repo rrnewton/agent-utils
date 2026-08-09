@@ -44,6 +44,7 @@ __all__ = [
     "apply_plan_to_config",
     "plan_to_json",
     "plan_to_text",
+    "row_is_measurement",
 ]
 
 #: Environment overrides for the feedback identity. Normally the reader derives the machine id
@@ -411,18 +412,65 @@ def _row_inner_jobs(row: Mapping[str, str]) -> int:
     return inner if (inner is not None and inner > 0) else 0
 
 
+#: Row cells that, when explicitly truthy, mean the step did NOT complete its work.
+_FAILURE_FLAG_COLUMNS = ("timed_out", "cpu_timed_out")
+
+
+def _is_truthy_flag(value: str | None) -> bool:
+    """True only for an explicit affirmative cell. A blank/absent cell is NOT a failure."""
+    return (value or "").strip().lower() in {"true", "1", "yes"}
+
+
+def row_is_measurement(row: Mapping[str, str]) -> bool:
+    """True when a profile row is a TIMING MEASUREMENT rather than a record of a failed step.
+
+    A timed-out run's duration is the moment the guard fired, and an OOM-killed run's duration is
+    the moment the kernel intervened; neither is how long the work takes. Admitting them fits the
+    speedup curve partly to failures, and the result is indistinguishable from ordinary data: a
+    step that dies fast at every width looks exactly like a step that is flat and very quick.
+
+    FAIL-OPEN ON SILENCE, BY DESIGN. Only an EXPLICIT failure signal rejects a row:
+
+    * ``ok`` explicitly falsy, or
+    * ``returncode`` present, parseable and non-zero, or
+    * ``timed_out`` / ``cpu_timed_out`` explicitly truthy, or
+    * ``oom_kills`` present, parseable and greater than zero.
+
+    A row whose verdict cells are absent or blank is ACCEPTED. A store may carry no verdict columns
+    at all, and a filter that rejected silence would discard every such sample and leave the model
+    with nothing -- trading a wrong answer for no answer. This gate rejects recorded failure, not
+    unfamiliarity.
+    """
+    ok_cell = (row.get("ok") or "").strip().lower()
+    if ok_cell and ok_cell not in {"true", "1", "yes"}:
+        return False
+    rc = _parse_int(row.get("returncode"))
+    if rc is not None and rc != 0:
+        return False
+    if any(_is_truthy_flag(row.get(col)) for col in _FAILURE_FLAG_COLUMNS):
+        return False
+    oom = _parse_int(row.get("oom_kills"))
+    if oom is not None and oom > 0:
+        return False
+    return True
+
+
 def bucketize_rows(
     rows: Sequence[Mapping[str, str]], affinity_width: int | None
 ) -> dict[BucketKey, list[Sample]]:
     """Group raw profile ``rows`` into per-``(step, inner_jobs)`` sample lists.
 
-    A row with no ``step`` cell is skipped (it cannot be attributed). Every other row becomes one
-    :class:`Sample`. This is the raw (UNCAPPED) bucketization shared by the CSV readers and the
-    summary builder; the summary builder additionally caps each bucket to its reservoir size."""
+    A row with no ``step`` cell is skipped (it cannot be attributed), and so is a row that records
+    a FAILED step rather than a measurement (:func:`row_is_measurement`) -- a timed-out or
+    OOM-killed duration is not a timing. Every other row becomes one :class:`Sample`. This is the
+    raw (UNCAPPED) bucketization shared by the CSV readers and the summary builder; the summary
+    builder additionally caps each bucket to its reservoir size."""
     buckets: dict[BucketKey, list[Sample]] = {}
     for row in rows:
         step = row.get("step")
         if not step:
+            continue
+        if not row_is_measurement(row):
             continue
         key: BucketKey = (step, _row_inner_jobs(row))
         buckets.setdefault(key, []).append(sample_from_row(row, affinity_width))

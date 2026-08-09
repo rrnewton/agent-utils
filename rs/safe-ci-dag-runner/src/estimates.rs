@@ -158,9 +158,60 @@ fn row_inner_jobs(row: &HashMap<String, String>) -> i64 {
     }
 }
 
+/// Cells that, when explicitly affirmative, mean the step did NOT complete its work.
+const FAILURE_FLAG_COLUMNS: [&str; 2] = ["timed_out", "cpu_timed_out"];
+
+/// True only for an explicit affirmative cell; a blank or absent cell is NOT a failure.
+fn is_truthy_flag(value: Option<&String>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("true") | Some("1") | Some("yes")
+    )
+}
+
+/// True when a profile row is a TIMING MEASUREMENT rather than a record of a failed step.
+///
+/// A timed-out run's duration is the moment the guard fired, and an OOM-killed run's duration is
+/// the moment the kernel intervened; neither is how long the work takes. Admitting them fits the
+/// speedup curve partly to failures, and a step that dies fast at every width then looks exactly
+/// like a step that is flat and very quick.
+///
+/// FAIL-OPEN ON SILENCE, BY DESIGN. Only an explicit failure signal rejects a row: `ok` explicitly
+/// falsy, a non-zero parseable `returncode`, an affirmative `timed_out` / `cpu_timed_out`, or a
+/// positive `oom_kills`. A row whose verdict cells are absent or blank is ACCEPTED, because a store
+/// may carry no verdict columns at all and a gate that rejected silence would leave the model with
+/// nothing -- trading a wrong answer for no answer.
+pub fn row_is_measurement(row: &HashMap<String, String>) -> bool {
+    if let Some(ok) = row.get("ok") {
+        let ok = ok.trim().to_ascii_lowercase();
+        if !ok.is_empty() && !matches!(ok.as_str(), "true" | "1" | "yes") {
+            return false;
+        }
+    }
+    if let Some(rc) = row.get("returncode").and_then(|v| v.trim().parse::<i64>().ok()) {
+        if rc != 0 {
+            return false;
+        }
+    }
+    if FAILURE_FLAG_COLUMNS
+        .iter()
+        .any(|col| is_truthy_flag(row.get(*col)))
+    {
+        return false;
+    }
+    if let Some(oom) = row.get("oom_kills").and_then(|v| v.trim().parse::<i64>().ok()) {
+        if oom > 0 {
+            return false;
+        }
+    }
+    true
+}
+
 /// Group raw profile rows into uncapped per-step, per-width sample lists.
 ///
-/// Rows without a non-empty `step` cell are ignored.
+/// Rows without a non-empty `step` cell are ignored, and so are rows recording a FAILED step
+/// rather than a measurement (see [`row_is_measurement`]): a timed-out or OOM-killed duration is
+/// not a timing.
 pub fn bucketize_rows(
     rows: &[HashMap<String, String>],
     affinity: Option<i64>,
@@ -171,6 +222,9 @@ pub fn bucketize_rows(
             Some(s) if !s.is_empty() => s.clone(),
             _ => continue,
         };
+        if !row_is_measurement(row) {
+            continue;
+        }
         let key: BucketKey = (step, row_inner_jobs(row));
         buckets
             .entry(key)
