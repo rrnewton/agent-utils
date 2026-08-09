@@ -10,6 +10,8 @@ from typing import cast
 import pytest
 
 from herdr_run.agent import Target, drain, enqueue, read, send, status
+from herdr_run.agent import QueueResult
+import herdr_run.agent_cli as agent_cli
 from herdr_run.client import AgentPaneInfo, HerdrClient, Pane
 from herdr_run.errors import AgentDeliveryError, HerdrUnavailable
 
@@ -253,3 +255,14 @@ def test_drain_accepts_existing_subagent_message_shape(tmp_path: object) -> None
     assert result.delivered == ("000000000007",)
     assert fake.runs == ["legacy fifo"]
     assert os.path.isfile(tmp_path / "processed" / path.name)  # type: ignore[operator]
+
+
+def test_drain_cli_returns_temporary_failure_when_fifo_remains_blocked(
+    tmp_path: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        agent_cli,
+        "drain",
+        lambda *_args, **_kwargs: QueueResult("", (), (), ("pending",), "agent still working"),
+    )
+    assert agent_cli.main(["drain", "--pane", "w1:p1", "--queue", str(tmp_path)]) == 75
