@@ -75,6 +75,8 @@ def _guide() -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the durable interactive-agent messaging command-line interface."""
+
     parser = _parser()
     args = parser.parse_intermixed_args(list(argv) if argv is not None else None)
     if args.command == "userguide":

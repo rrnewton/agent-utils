@@ -28,6 +28,8 @@ __all__ = ["Target", "QueueResult", "resolve_target", "enqueue", "drain", "send"
 
 @dataclass(frozen=True)
 class Target:
+    """Identity assertions for one already-running interactive Herdr agent."""
+
     pane_id: str | None = None
     session_agent: str | None = None
     session_value: str | None = None
@@ -38,6 +40,8 @@ class Target:
 
 @dataclass(frozen=True)
 class QueueResult:
+    """Structured outcome of one durable queue send or drain operation."""
+
     message_id: str
     delivered: tuple[str, ...]
     quarantined: tuple[str, ...]
@@ -397,6 +401,8 @@ def drain(
 
 
 def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: object) -> QueueResult:
+    """Durably enqueue one prompt, drain its bound FIFO, and return confirmed delivery."""
+
     _bind_queue(root, target)
     identifier = enqueue(root, text)
     result = drain(client, target, root, **kwargs)  # type: ignore[arg-type]
@@ -426,6 +432,8 @@ def send(client: HerdrClient, target: Target, root: str, text: str, **kwargs: ob
 
 
 def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
+    """Read validated live-agent and queue state without creating or changing queue files."""
+
     _validate_existing_binding(root, target)
     info = resolve_target(client, target)
     inbox, inflight, _processed, failed = _dirs(root)
@@ -446,6 +454,8 @@ def status(client: HerdrClient, target: Target, root: str) -> dict[str, object]:
 
 
 def read(client: HerdrClient, target: Target, *, lines: int = 500) -> str:
+    """Read recent terminal output from a validated interactive-agent target."""
+
     info = resolve_target(client, target)
     text = client.read(info.pane_id, source="recent-unwrapped", lines=lines)
     return text if text else client.read(info.pane_id, source="recent", lines=lines)
