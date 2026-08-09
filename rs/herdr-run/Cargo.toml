@@ -1,6 +1,6 @@
 [package]
 name = "herdr-run"
-version = "0.1.0"
+version = "0.2.0"
 description = "Run allowlisted commands through an out-of-sandbox Herdr pane with audited results"
 readme = "README.md"
 keywords = ["agents", "sandbox", "terminal", "allowlist"]
