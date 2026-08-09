@@ -37,3 +37,11 @@ Queue layout:
 returns recent unwrapped terminal text. `drain` retries an existing queue. A nonzero
 result is loud; inspect the JSON artifact before retrying. The API never clears a
 composer because Herdr cannot prove whether it contains a human's unsaved draft.
+
+`send` and `drain` intentionally block while the FIFO head is busy, up to
+`--ready-timeout` (900 seconds by default). They yield between state probes rather
+than spin. If that bound expires, the prompt stays pending with an unchanged retry
+count and the command exits with temporary-failure status 75; a later `drain` must
+resume it. Long-running agents should set the bound above a normal turn duration,
+or arrange a periodic/idle-triggered `drain` rather than assuming a 30-second wait
+will eventually deliver.

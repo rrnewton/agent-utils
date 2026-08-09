@@ -54,7 +54,7 @@ class FakeAgentHerdr:
             raise AssertionError(state)
 
     def read(self, pane_id: str, *, source: str, lines: int) -> str:
-        assert (pane_id, source, lines) == ("w1:p1", "recent-unwrapped", 17)
+        assert pane_id == "w1:p1" and source in ("recent-unwrapped", "recent") and lines == 17
         return self.read_text
 
 
@@ -78,6 +78,24 @@ def test_multiline_busy_then_idle_is_atomic_and_confirmed(tmp_path: object) -> N
     assert fake.runs == [text]
     assert fake.waits == [("w1:p1", "working", 30000)]
     assert result.message_id in result.delivered
+
+
+def test_busy_for_more_than_thirty_seconds_still_delivers_with_turn_sized_budget(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["working", "working", "idle"])
+    clock = {"now": 0.0}
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    def sleep(_seconds: float) -> None:
+        clock["now"] += 31.0
+
+    result = send(
+        client(fake), target(), str(tmp_path), "after a normal turn",
+        ready_timeout=900, sleep=sleep, monotonic=monotonic,
+    )
+    assert clock["now"] > 30
+    assert result.delivered == (result.message_id,)
 
 
 def test_done_is_submit_safe(tmp_path: object) -> None:
@@ -209,6 +227,20 @@ def test_status_and_read_cover_arbitrary_target(tmp_path: object) -> None:
     assert snapshot["pending"] == [queued]
     assert snapshot["session_value"] == "session-1"
     assert read(client(fake), target(), lines=17) == "agent transcript\n"
+
+
+def test_read_falls_back_when_unwrapped_source_is_empty(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["idle"])
+    sources: list[str] = []
+
+    def source_read(_pane_id: str, *, source: str, lines: int) -> str:
+        assert lines == 17
+        sources.append(source)
+        return "" if source == "recent-unwrapped" else "fallback transcript\n"
+
+    fake.read = source_read  # type: ignore[assignment]
+    assert read(client(fake), target(), lines=17) == "fallback transcript\n"
+    assert sources == ["recent-unwrapped", "recent"]
 
 
 def test_drain_accepts_existing_subagent_message_shape(tmp_path: object) -> None:
