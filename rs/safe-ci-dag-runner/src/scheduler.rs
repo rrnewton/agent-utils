@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::ExitStatus;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +56,24 @@ const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const LOOP_SLEEP: Duration = Duration::from_millis(50);
 /// Poll interval while a step's supervisor waits for the child (std has no wait-with-timeout).
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How many times [`kill_descendants`] re-walks `/proc` before giving up. The walk races a tree
+/// that may still be forking, so one pass can miss a child born mid-sweep; a small fixed bound
+/// converts a pathological forker into a reported failure instead of an unbounded loop.
+const DESCENDANT_KILL_SWEEPS: usize = 4;
+/// Latches once the unboxed-teardown warning has been emitted, so it is stated once per run
+/// instead of once per step.
+static UNBOXED_REAP_WARNED: AtomicBool = AtomicBool::new(false);
+/// How long to wait for a timed-out child to actually die after [`reap`] before giving up on it.
+///
+/// The wait after a kill USED TO BE UNBOUNDED. If the kill could not reach the process — the exact
+/// unboxed case above — the run blocked here forever: no timeout was reported, the scheduler never
+/// returned, and the end-of-run profile flush never happened, so the lane produced no evidence
+/// about its own failure. Bounding it means an unkillable child degrades to a REPORTED failure
+/// whatever the reason the kill failed, including reasons this code does not anticipate.
+const POST_REAP_WAIT: Duration = Duration::from_secs(30);
+/// How long to wait for the monitor and output-reader threads after teardown before abandoning
+/// them. See [`join_bounded`].
+const JOIN_WAIT: Duration = Duration::from_secs(15);
 
 // Mutable scheduler state, guarded by one lock (mirrors the Python `Runner`'s single lock).
 struct Shared {
@@ -87,6 +106,172 @@ fn kill_group(pid: u32) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
+}
+
+/// Every live descendant of `root`, deepest-first, from `/proc` parentage.
+///
+/// Reads `PPid:` out of `/proc/<pid>/status` rather than field 4 of `/proc/<pid>/stat`, because a
+/// process name can contain spaces and parentheses and positional parsing of `stat` mis-attributes
+/// parentage for exactly the adversarial names a test corpus is most likely to contain.
+///
+/// Deepest-first matters: killing a parent before its children can leave the children reparented
+/// to init and out of reach on the next sweep.
+fn proc_descendants(root: u32) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue; // not a pid directory
+        };
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            continue; // exited between readdir and read: benign
+        };
+        if let Some(ppid) = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+        {
+            children.entry(ppid).or_default().push(pid);
+        }
+    }
+    // Iterative DFS, then reverse, so parents are signalled after their children.
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    let mut seen: HashSet<u32> = HashSet::new();
+    while let Some(pid) = stack.pop() {
+        for &child in children.get(&pid).into_iter().flatten() {
+            if seen.insert(child) {
+                out.push(child);
+                stack.push(child);
+            }
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// SIGKILL every descendant of `root`, sweeping until no new ones appear.
+///
+/// This is the fallback for the UNBOXED path, where there is no `cgroup.kill` to clear a subtree
+/// atomically. A process-group kill alone misses `setsid`/double-fork escapees — an escapee changes
+/// session and pgid but stays a descendant — and the strict-compat lane demonstrably has them. A
+/// budget that detects without terminating is indistinguishable from no budget at all.
+///
+/// Sweeps repeatedly because the walk races a tree that may still be forking; it stops when a sweep
+/// finds nothing new or after [`DESCENDANT_KILL_SWEEPS`], so a pathological forker degrades to a
+/// bounded, reported failure rather than an unbounded loop.
+///
+/// SAFETY: the set is derived strictly by parentage from `root`, never from a name or command-line
+/// pattern, so it cannot reach a sibling process belonging to somebody else. `root` itself is left
+/// to the caller's process-group kill; this only reaches things that escaped it. Returns the number
+/// of distinct pids signalled.
+fn kill_descendants(root: u32) -> usize {
+    if root <= 1 {
+        return 0; // never walk from init, and never from a bogus pid
+    }
+    let own = std::process::id();
+    let mut killed: HashSet<u32> = HashSet::new();
+    for _ in 0..DESCENDANT_KILL_SWEEPS {
+        let mut fresh = 0usize;
+        for pid in proc_descendants(root) {
+            if pid <= 1 || pid == own {
+                continue; // a reap must never signal the runner itself
+            }
+            if killed.insert(pid) {
+                fresh += 1;
+            }
+            let _ = Command::new("kill")
+                .arg("-KILL")
+                .arg(pid.to_string())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if fresh == 0 {
+            break;
+        }
+    }
+    killed.len()
+}
+
+/// Wait for an already-reaped child to exit, giving up after `limit`.
+///
+/// Returns the real exit status when the child dies in time, and a fabricated killed status when it
+/// does not. Reporting a killed status for a process that is still alive is deliberate and is the
+/// lesser evil: the alternative is the scheduler blocking indefinitely, which reports NOTHING and
+/// loses the whole run's measurements along with it. The survivor is named so the leak is visible
+/// rather than inferred.
+fn wait_bounded(child: &mut std::process::Child, tag: &str, limit: Duration) -> ExitStatus {
+    let deadline = Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    eprintln!(
+                        "[scheduler] WARNING: step {tag} did not exit within {}s of being killed; \
+                         abandoning the wait and reporting it as killed. Its process tree may \
+                         still be running.",
+                        limit.as_secs()
+                    );
+                    return ExitStatus::from_raw(9);
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => return ExitStatus::from_raw(9),
+        }
+    }
+}
+
+/// Become the reaper for orphaned descendants, so a `setsid`/double-fork escapee stays reachable.
+///
+/// WITHOUT THIS THE DESCENDANT SWEEP HAS NOTHING TO FIND. An escapee's intermediate parent exits
+/// immediately, so the grandchild reparents to init and is no longer a descendant of anything the
+/// runner knows about — measured directly on a planted escapee, which showed `PPid=1`. That is the
+/// same reason `killpg` misses it: it has left the family, not merely changed process group. With
+/// `PR_SET_CHILD_SUBREAPER` the kernel reparents such orphans to THIS process instead of init, so
+/// they remain enumerable by parentage and [`kill_descendants`] can reach them.
+///
+/// The attribute is per-process and is not inherited by children, so setting it once on the runner
+/// is both necessary and sufficient. A failure is reported once and is not fatal: the run then
+/// degrades to exactly today's behaviour rather than refusing to start.
+fn become_subreaper() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: prctl with PR_SET_CHILD_SUBREAPER takes an integer flag and touches no memory
+        // owned by this process; the remaining arguments are ignored for this option.
+        let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+        if rc != 0 {
+            eprintln!(
+                "[scheduler] WARNING: could not become child subreaper; setsid/double-fork \
+                 escapees will reparent to init and survive step teardown."
+            );
+        }
+    });
+}
+
+/// Join a worker thread, abandoning it if it does not finish within `limit`.
+///
+/// `JoinHandle::join` cannot time out, so bounding it means polling `is_finished` and simply not
+/// joining a thread that overruns. The thread stays parked until the process exits; that is a
+/// deliberate, bounded leak chosen over losing the whole run's results to an indefinite block.
+fn join_bounded(handle: thread::JoinHandle<()>, tag: &str, what: &str, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    while !handle.is_finished() && Instant::now() < deadline {
+        thread::sleep(POLL_INTERVAL);
+    }
+    if handle.is_finished() {
+        let _ = handle.join();
+    } else {
+        eprintln!(
+            "[scheduler] WARNING: step {tag}: {what} thread still blocked {}s after teardown \
+             (a surviving process is likely holding the pipe open); abandoning it so the run can \
+             finish and report.",
+            limit.as_secs()
+        );
+    }
 }
 
 fn deps_ok(sh: &Shared, step: &Step) -> bool {
@@ -430,16 +615,54 @@ struct StepCtx {
 /// ENTIRE subtree atomically, including `setsid`/double-fork escapees a process-group kill misses.
 /// The killpg that follows is a belt-and-suspenders for the no-cgroup path. No Silent Failure: a
 /// failed cgroup.kill while containment is enabled surfaces a warning.
+/// Tear down one step's whole process tree.
+///
+/// `cgroup.kill` clears a subtree atomically, including `setsid`/double-fork escapees, because an
+/// escapee changes session and pgid but not cgroup membership. Without containment there is no such
+/// primitive, and a process-group kill alone leaves escapees running — the step never exits, the
+/// run never returns, and the end-of-run profile flush never happens, so the lane cannot even
+/// report what went wrong. `kill_descendants` is the fallback that closes that gap by parentage.
+///
+/// The degraded case is announced whenever it happens. It used to be announced ONLY when an enabled
+/// cgroup's kill failed, so the unboxed path — which has exactly the same weakness — degraded in
+/// silence. A step running without enforceable containment must say so once, or "unbounded" is
+/// invisible in the log.
 fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32) {
-    if let Some(cg) = cgroups {
-        if cg.enabled() && !cg.kill(tag) {
+    let contained = match cgroups {
+        Some(cg) if cg.enabled() => {
+            if cg.kill(tag) {
+                true
+            } else {
+                eprintln!(
+                    "[scheduler] WARNING: cgroup.kill for step {tag} failed; falling back to \
+                     process-group kill plus a /proc descendant sweep."
+                );
+                false
+            }
+        }
+        _ => {
+            // ONCE per run, not once per step: reap runs for every step (and twice for a
+            // timed-out one), so a per-step warning would bury the log it is meant to inform.
+            if !UNBOXED_REAP_WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[scheduler] WARNING: steps are UNBOXED (no cgroup containment). Teardown is \
+                     a process-group kill plus a /proc descendant sweep, not an atomic \
+                     cgroup.kill. A budget can only be enforced as far as the kill reaches."
+                );
+            }
+            false
+        }
+    };
+    kill_group(pid);
+    if !contained {
+        let swept = kill_descendants(pid);
+        if swept > 0 {
             eprintln!(
-                "[scheduler] WARNING: cgroup.kill for step {tag} failed; falling back to \
-                 process-group kill only — setsid/double-fork escapees may survive."
+                "[scheduler] step {tag}: killed {swept} descendant(s) the process-group kill \
+                 missed (setsid/double-fork escapees)."
             );
         }
     }
-    kill_group(pid);
 }
 
 /// Human-readable byte count (e.g. `3.5 GiB`); `"?"` when unknown.
@@ -643,10 +866,7 @@ fn run_step(ctx: StepCtx) {
                 if start.elapsed().as_secs() as i64 >= step.timeout {
                     timed_out = true;
                     reap(&cgroups, &tag, pid);
-                    break child.wait().unwrap_or_else(|_| {
-                        // Fabricate a killed status if wait somehow fails.
-                        std::process::ExitStatus::from_raw(9)
-                    });
+                    break wait_bounded(&mut child, &tag, POST_REAP_WAIT);
                 }
                 thread::sleep(POLL_INTERVAL);
             }
@@ -663,10 +883,18 @@ fn run_step(ctx: StepCtx) {
     reap(&cgroups, &tag, pid);
     monitor_stop.store(true, Ordering::Relaxed);
     if let Some(m) = monitor {
-        let _ = m.join();
+        join_bounded(m, &tag, "monitor", JOIN_WAIT);
     }
+    // BOUNDED, and this is the join that actually hung. A surviving escapee inherited the step's
+    // stdout/stderr pipe write ends, so those pipes never reach EOF and a plain `join()` here
+    // blocks FOREVER — measured: with the post-reap child wait already bounded to 30s, a planted
+    // escapee still forced an external kill at 300s, which locates the block here rather than at
+    // `child.wait()`. Blocking here loses the entire run: the scheduler never returns, so the
+    // end-of-run profile flush never happens and the lane cannot report on its own failure.
+    // Abandoning a reader costs one parked thread until the process exits; keeping the run's
+    // measurements is worth far more.
     for r in readers {
-        let _ = r.join();
+        join_bounded(r, &tag, "output reader", JOIN_WAIT);
     }
 
     // Read the step's cgroup measurements BEFORE cleanup() removes the child cgroup.
@@ -889,6 +1117,7 @@ pub fn run_dag_boxed_ordered(
     order: Option<Vec<String>>,
     core_budget: Option<i64>,
 ) -> RunResult {
+    become_subreaper();
     if let Some(cg) = &cgroups {
         if !cg.enabled() {
             // No Silent Failure: a present-but-disabled manager means containment is degraded.
