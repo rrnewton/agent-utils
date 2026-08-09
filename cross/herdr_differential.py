@@ -262,15 +262,25 @@ def _bootstrap(harness: Harness, report: Report) -> None:
     case = harness.case("bootstrap")
     python, rust = harness.invoke(case, ("--version",))
     report.exact("bootstrap/version", python, rust, expected_rc=0)
+    version_pattern = re.compile(
+        r"herdr-run (?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)\n"
+    )
+    python_version = version_pattern.fullmatch(python.stdout)
+    rust_version = version_pattern.fullmatch(rust.stdout)
     report.require(
         "bootstrap/version-shape",
-        re.fullmatch(
-            r"herdr-run \d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\n",
-            python.stdout,
-        )
-        is not None
+        python_version is not None
+        and rust_version is not None
         and python.stderr == "",
-        f"unexpected version output: {_describe(python)}",
+        f"unexpected version output: python={_describe(python)} rust={_describe(rust)}",
+    )
+    report.require(
+        "bootstrap/version-source-parity",
+        python_version is not None
+        and rust_version is not None
+        and python_version.group("version") == rust_version.group("version"),
+        "Python package release version and Rust Cargo package version differ: "
+        f"python={_describe(python)} rust={_describe(rust)}",
     )
 
     help_python, help_rust = harness.invoke(case, ("--help",))
