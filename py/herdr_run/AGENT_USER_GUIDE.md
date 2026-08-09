@@ -4,8 +4,8 @@
 running in a Herdr pane. It durably queues prompts, waits for native `idle` or
 `done`, submits the complete literal text and Enter in one `pane run`, and requires
 Herdr to observe the subsequent `working` state. One lock serializes overlapping
-senders. Failed prompts remain in `inbox/` for another attempt or move to `failed/`
-after the configured bounded retry count; neither outcome discards the prompt.
+senders. Safe pre-injection failures remain in `inbox/`; ambiguous post-injection
+failures move to `failed/` after one injection. Neither outcome discards the prompt.
 
 The caller is the target-resolution adapter. Give either an exact pane or a stable
 session. Assert every identity fact you know; a mismatch is a refusal:
@@ -29,8 +29,9 @@ silently retarget delivery.
 Queue layout:
 
 - `inbox/*.json`: prompts awaiting confirmed submission, including failure details;
+- `inflight/*.json`: prompts durably marked possibly submitted before `pane run`;
 - `processed/*.json`: prompts whose idle/done → working transition was confirmed;
-- `failed/*.json`: poison prompts retained after bounded retries;
+- `failed/*.json`: ambiguous or malformed prompts retained without resubmission;
 - `.delivery.lock`: serialization across cron ticks and interactive callers.
 
 `status` prints the validated live identity/state and pending/failed IDs. `read`
@@ -45,3 +46,19 @@ count and the command exits with temporary-failure status 75; a later `drain` mu
 resume it. Long-running agents should set the bound above a normal turn duration,
 or arrange a periodic/idle-triggered `drain` rather than assuming a 30-second wait
 will eventually deliver.
+
+Before injection, the FIFO head is durably moved to `inflight/` and all file and
+directory transitions are synced to disk. If the sender crashes after that point,
+the next drain moves the inflight artifact to `failed/` as possibly submitted without
+reinjection. Invalid JSON or schema is preserved byte-for-byte in `failed/` with a
+separate `.error` metadata file, and later valid FIFO entries continue.
+
+Machine outcomes are distinct: exit 75 plus JSON `outcome: pending` means nothing was
+injected and the artifact is safe to retry; exit 76 plus `outcome: possibly_submitted`
+means it must be inspected before any manual retry. Successful sends emit
+`outcome: delivered`.
+
+Production resolves Herdr from fixed install locations and refuses a group/world-
+writable binary. Install or repair a per-user copy with
+`chmod go-w "$(readlink -f ~/.local/bin/herdr)"`, then run `status` as a preflight
+before enabling cron.

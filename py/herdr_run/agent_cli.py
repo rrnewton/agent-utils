@@ -10,7 +10,7 @@ from collections.abc import Sequence
 
 from herdr_run.agent import Target, drain, read, send, status
 from herdr_run.client import HerdrClient
-from herdr_run.errors import HerdrRunError
+from herdr_run.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -100,13 +100,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             json.dump(result.__dict__, sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
-            return 0 if not result.quarantined and result.blocked is None else 75
+            if result.blocked is not None:
+                return 75
+            return 76 if result.quarantined else 0
         if args.command == "status":
             json.dump(status(client, target, queue), sys.stdout, indent=2, sort_keys=True)
             sys.stdout.write("\n")
             return 0
         sys.stdout.write(read(client, target, lines=args.lines))
         return 0
+    except (AgentPending, AgentPossiblySubmitted) as exc:
+        json.dump(
+            {
+                "outcome": exc.outcome,
+                "message_id": exc.message_id,
+                "artifact": exc.artifact,
+                "error": str(exc),
+                "safe_to_retry": isinstance(exc, AgentPending),
+            },
+            sys.stdout,
+            indent=2,
+            sort_keys=True,
+        )
+        sys.stdout.write("\n")
+        return exc.exit_code
     except (HerdrRunError, ValueError) as exc:
         print(f"herdr-agent: {exc}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, HerdrRunError) else 2

@@ -16,6 +16,8 @@ __all__ = [
     "PaneBusy",
     "RunTimeout",
     "AgentDeliveryError",
+    "AgentPending",
+    "AgentPossiblySubmitted",
     "EXIT_CONFIG",
     "EXIT_REFUSED",
     "EXIT_UNAVAILABLE",
@@ -93,3 +95,27 @@ class AgentDeliveryError(HerdrRunError):
     """A durable interactive-agent message could not be safely delivered."""
 
     exit_code = EXIT_BUSY
+
+
+class AgentPending(AgentDeliveryError):
+    """Nothing was injected; the durable prompt remains safe to retry."""
+
+    exit_code = EXIT_BUSY
+
+    def __init__(self, message: str, *, message_id: str, artifact: str) -> None:
+        super().__init__(message)
+        self.message_id = message_id
+        self.artifact = artifact
+        self.outcome = "pending"
+
+
+class AgentPossiblySubmitted(AgentDeliveryError):
+    """Injection may have succeeded; automatic retry could duplicate a turn."""
+
+    exit_code = EXIT_TIMEOUT
+
+    def __init__(self, message: str, *, message_id: str, artifact: str) -> None:
+        super().__init__(message)
+        self.message_id = message_id
+        self.artifact = artifact
+        self.outcome = "possibly_submitted"
