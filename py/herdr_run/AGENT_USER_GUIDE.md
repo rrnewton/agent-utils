@@ -47,8 +47,10 @@ resume it. Long-running agents should set the bound above a normal turn duration
 or arrange a periodic/idle-triggered `drain` rather than assuming a 30-second wait
 will eventually deliver.
 
-Before injection, the FIFO head is durably moved to `inflight/` and all file and
-directory transitions are synced to disk. If the sender crashes after that point,
+Readiness and target validation happen while the FIFO head remains in `inbox/`, so a
+crash during a normal busy wait stays safely pending. Immediately after `idle`/`done`
+is observed and before injection, the head is durably moved to `inflight/`; all file
+and directory transitions are synced to disk. If the sender crashes after that point,
 the next drain moves the inflight artifact to `failed/` as possibly submitted without
 reinjection. Invalid JSON or schema is preserved byte-for-byte in `failed/` with a
 separate `.error` metadata file, and later valid FIFO entries continue.

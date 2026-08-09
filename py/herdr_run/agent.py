@@ -269,15 +269,11 @@ def _wait_ready(
 
 def _deliver_one(
     client: HerdrClient,
-    target: Target,
+    info: AgentPaneInfo,
     text: str,
     *,
-    ready_timeout: float,
     working_timeout: float,
-    sleep: Callable[[float], None],
-    monotonic: Callable[[], float],
 ) -> None:
-    info = _wait_ready(client, target, ready_timeout, sleep=sleep, monotonic=monotonic)
     try:
         client.run(info.pane_id, text)
     except Exception as exc:
@@ -328,9 +324,22 @@ def drain(
             attempts_raw = document.get("delivery_attempts", document.get("tui_delivery_attempts", 0))
             attempts = attempts_raw if isinstance(attempts_raw, int) and attempts_raw >= 0 else 0
             while attempts < max_attempts:
+                # Readiness is entirely pre-injection. Keep the artifact in inbox while the pane
+                # is busy so a process death during an ordinary wait remains safely retryable.
+                try:
+                    info = _wait_ready(
+                        client, target, ready_timeout, sleep=sleep, monotonic=monotonic
+                    )
+                except (AgentDeliveryError, HerdrUnavailable) as exc:
+                    document["delivery_state"] = "pending"
+                    document["delivery_error"] = str(exc)
+                    document["delivery_blocked_at"] = time.time()
+                    _atomic_json(path, document)
+                    blocked = str(exc)
+                    break
                 # ``inflight`` is a durable at-most-once barrier. Once this rename commits, a
-                # crash is treated as possibly submitted even if it happened immediately before
-                # pane.run; safety takes precedence over an automatic duplicate.
+                # crash is treated as possibly submitted. Readiness was already proven above;
+                # this transition occurs immediately before pane.run.
                 document["possibly_submitted"] = True
                 document["delivery_state"] = "inflight"
                 document["inflight_at"] = time.time()
@@ -339,8 +348,7 @@ def drain(
                 _transition(path, inflight_path)
                 try:
                     _deliver_one(
-                        client, target, str(document["text"]), ready_timeout=ready_timeout,
-                        working_timeout=working_timeout, sleep=sleep, monotonic=monotonic,
+                        client, info, str(document["text"]), working_timeout=working_timeout,
                     )
                 except _PossiblySubmitted as exc:
                     attempts += 1
@@ -354,17 +362,6 @@ def drain(
                     _transition(inflight_path, failed_path)
                     _failed_metadata(failed_path, outcome="possibly_submitted", error=str(exc))
                     quarantined.append(identifier)
-                    break
-                except (AgentDeliveryError, HerdrUnavailable) as exc:
-                    # Readiness failures happen inside _deliver_one before pane.run. Move the
-                    # artifact back to inbox; no injection occurred and no retry is consumed.
-                    document.pop("possibly_submitted", None)
-                    document["delivery_state"] = "pending"
-                    document["delivery_error"] = str(exc)
-                    document["delivery_blocked_at"] = time.time()
-                    _atomic_json(inflight_path, document)
-                    _transition(inflight_path, path)
-                    blocked = str(exc)
                     break
                 else:
                     document["delivery_state"] = "processed"
