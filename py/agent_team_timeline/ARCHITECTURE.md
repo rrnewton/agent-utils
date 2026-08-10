@@ -55,6 +55,38 @@ individual archive and a combined export. List projections expose references and
 phase, calendar, and condensed-transcript text. JSON responses use query schema version 1, JSONL
 emits one record per line, and Markdown is presentation-only.
 
+## Codex snapshot and continuation contract
+
+Codex ingestion snapshots the newline-complete prefix of every selected rollout before parsing.
+The schema-1 source manifest records each copied path, byte length, line count, digest, and update
+time. Reruns accept exact reuse, a byte-for-byte prefix extension, or a newly discovered descendant;
+disappearance, truncation, prefix rewriting, source-identity changes, and unsafe/symlinked paths
+fail before an existing snapshot is replaced. Parsing is restricted to the paths in that validated
+manifest generation, so an orphan copy from an interrupted attempt is not adopted.
+
+A logical coordinator history may cross process/session restarts, but this relationship is never
+inferred from temporal proximity. The only authority is an ordered, repeatable
+`--continuation-session <root-uuid>` argument. The first configured successor links to
+`--root-session`; every later one links to the preceding configured successor. Each successor must
+be a coordinator root, and thread identities may not occur in more than one configured lineage.
+
+The first successful snapshot freezes each boundary in optional schema-1
+`continuation_sessions` records: predecessor and successor IDs, both source paths, the exact final
+predecessor source line and UTC timestamp before the successor start, the successor start, and the
+millisecond gap. Later appends never move that boundary. A manifest without the optional field is a
+fully compatible single-session archive. Once records exist, omitting continuation flags reuses
+them; supplied flags must preserve the recorded ordered prefix and may only append successors.
+Changing, removing, or reordering the chain requires another archive.
+
+Canonical-lineage IDs and cache-visible inputs remain byte-for-byte unchanged. A continuation
+lineage namespaces event, turn, tool, call, and fallback IDs with its root UUID and prefixes agent
+paths beneath `/root/continuation-<root-uuid>`, preventing common per-session IDs and `/root` paths
+from colliding. The successor coordinator keeps its own thread UUID and is parented to the preceding
+root for navigation. The provider-neutral graph contains one `continuation` edge from the frozen
+predecessor point to the successor start. It is structural in the site, but it is not a spawn and
+the renderer does not invent a child-to-parent lifetime return or progress messages for the
+successor coordinator.
+
 ## Orc snapshot transaction and compatibility contract
 
 Orc ingestion has two identities for every source. The logical identity is its original

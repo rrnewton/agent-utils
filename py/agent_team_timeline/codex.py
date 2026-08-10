@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 import re
 import secrets
 import stat
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from agent_team_timeline.model import (
@@ -105,11 +106,103 @@ class CodexSourceCopy:
 
 
 @dataclass(frozen=True)
+class CodexContinuationLink:
+    """One explicit, evidence-backed transition between coordinator sessions."""
+
+    predecessor_thread_id: str
+    thread_id: str
+    predecessor_source_path: str
+    predecessor_source_line: int
+    predecessor_at_ms: int
+    source_path: str
+    started_at_ms: int
+    gap_ms: int
+
+    def to_json_obj(self) -> dict[str, object]:
+        """Return the exact durable continuation-boundary record."""
+
+        return {
+            "predecessor_thread_id": self.predecessor_thread_id,
+            "thread_id": self.thread_id,
+            "predecessor_source_path": self.predecessor_source_path,
+            "predecessor_source_line": self.predecessor_source_line,
+            "predecessor_at_ms": self.predecessor_at_ms,
+            "source_path": self.source_path,
+            "started_at_ms": self.started_at_ms,
+            "gap_ms": self.gap_ms,
+        }
+
+    @classmethod
+    def from_json_obj(
+        cls, raw: Mapping[str, object], where: str
+    ) -> CodexContinuationLink:
+        """Parse one exact continuation record from a source manifest."""
+
+        expected = {
+            "predecessor_thread_id",
+            "thread_id",
+            "predecessor_source_path",
+            "predecessor_source_line",
+            "predecessor_at_ms",
+            "source_path",
+            "started_at_ms",
+            "gap_ms",
+        }
+        if set(raw) != expected:
+            missing = sorted(expected - set(raw))
+            unknown = sorted(set(raw) - expected)
+            raise CodexParseError(
+                f"{where}: invalid continuation fields; "
+                f"missing={missing!r}, unknown={unknown!r}"
+            )
+        predecessor_thread_id = _string(raw.get("predecessor_thread_id"))
+        thread_id = _string(raw.get("thread_id"))
+        predecessor_source_path = _string(raw.get("predecessor_source_path"))
+        predecessor_source_line = _integer(raw.get("predecessor_source_line"))
+        predecessor_at_ms = _integer(raw.get("predecessor_at_ms"))
+        source_path = _string(raw.get("source_path"))
+        started_at_ms = _integer(raw.get("started_at_ms"))
+        gap_ms = _integer(raw.get("gap_ms"))
+        if (
+            predecessor_thread_id is None
+            or not predecessor_thread_id
+            or thread_id is None
+            or not thread_id
+            or predecessor_thread_id == thread_id
+            or predecessor_source_path is None
+            or source_path is None
+            or predecessor_source_line is None
+            or predecessor_source_line < 1
+            or predecessor_at_ms is None
+            or predecessor_at_ms < 0
+            or started_at_ms is None
+            or started_at_ms < 0
+            or gap_ms is None
+            or gap_ms <= 0
+            or gap_ms != started_at_ms - predecessor_at_ms
+        ):
+            raise CodexParseError(f"{where}: malformed continuation record")
+        _safe_snapshot_relative(predecessor_source_path)
+        _safe_snapshot_relative(source_path)
+        return cls(
+            predecessor_thread_id,
+            thread_id,
+            predecessor_source_path,
+            predecessor_source_line,
+            predecessor_at_ms,
+            source_path,
+            started_at_ms,
+            gap_ms,
+        )
+
+
+@dataclass(frozen=True)
 class CodexSnapshotResult:
     """Result of copying a lineage into an archive-local source directory."""
 
     sources: tuple[CodexSourceCopy, ...]
     files_changed: int
+    continuations: tuple[CodexContinuationLink, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,6 +220,7 @@ class _Rollout:
     metadata: Mapping[str, object]
     records: tuple[_Record, ...]
     canonical_records: tuple[_Record, ...]
+    lineage_root_id: str
 
 
 @dataclass(frozen=True)
@@ -139,6 +233,8 @@ class _AgentSeed:
     depth: int
     started_at_ms: int
     source_path: str
+    lineage_root_id: str
+    raw_agent_path: str
 
 
 @dataclass
@@ -168,6 +264,7 @@ class _ToolBuilder:
     output_text: str | None
     nested_tools: tuple[tuple[str, int], ...]
     source_line: int
+    lineage_root_id: str
 
 
 @dataclass(frozen=True)
@@ -176,6 +273,7 @@ class _Activity:
     timestamp_ms: int
     payload: Mapping[str, object]
     source_line: int
+    lineage_root_id: str
 
 
 @dataclass(frozen=True)
@@ -419,10 +517,39 @@ def _first_snapshot_metadata(
     return _mapping(record.get("payload"))
 
 
+def _lineage_roots(
+    root_thread_id: str, continuation_thread_ids: Sequence[str]
+) -> tuple[str, ...]:
+    roots = (root_thread_id, *continuation_thread_ids)
+    if any(not item for item in roots):
+        raise CodexParseError("Codex root and continuation session IDs must not be empty")
+    if len(set(roots)) != len(roots):
+        raise CodexParseError("Codex root and continuation session IDs must be unique")
+    return roots
+
+
+def _metadata_lineage_root(
+    metadata: Mapping[str, object], lineage_roots: Sequence[str], where: str
+) -> str:
+    thread_id = _string(metadata.get("id"))
+    session_id = _string(metadata.get("session_id"))
+    matches = [
+        root
+        for root in lineage_roots
+        if thread_id == root or session_id == root
+    ]
+    if len(matches) != 1:
+        raise CodexParseError(
+            f"{where}: source belongs to {len(matches)} configured Codex lineages"
+        )
+    return matches[0]
+
+
 def codex_identity_metadata(
     snapshot_root: Path,
     source_paths: Sequence[str],
     root_thread_id: str,
+    continuation_thread_ids: Sequence[str] = (),
 ) -> tuple[Mapping[str, object], ...]:
     """Return structured session metadata, root first, for identity inference.
 
@@ -431,20 +558,29 @@ def codex_identity_metadata(
     is deliberately excluded from identity inference.
     """
 
-    records: list[Mapping[str, object]] = []
+    roots = _lineage_roots(root_thread_id, continuation_thread_ids)
+    root_order = {thread_id: index for index, thread_id in enumerate(roots)}
+    records: list[tuple[Mapping[str, object], str]] = []
     for source_path in source_paths:
         metadata = _first_snapshot_metadata(snapshot_root, source_path)
         if metadata is None:
             raise CodexParseError(
                 f"source snapshot lacks valid session metadata: {source_path!r}"
             )
-        records.append(metadata)
+        records.append(
+            (
+                metadata,
+                _metadata_lineage_root(metadata, roots, source_path),
+            )
+        )
     return tuple(
-        sorted(
+        item[0]
+        for item in sorted(
             records,
             key=lambda item: (
-                0 if _string(item.get("id")) == root_thread_id else 1,
-                _string(item.get("id")) or "",
+                root_order[item[1]],
+                0 if _string(item[0].get("id")) == item[1] else 1,
+                _string(item[0].get("id")) or "",
             ),
         )
     )
@@ -540,7 +676,9 @@ def _discover_codex_lineage(
     root_thread_id: str,
     *,
     exclude_root: Path | None = None,
+    continuation_thread_ids: Sequence[str] = (),
 ) -> tuple[tuple[Path, Mapping[str, object]], ...]:
+    roots = frozenset(_lineage_roots(root_thread_id, continuation_thread_ids))
     candidates: list[tuple[Path, Mapping[str, object]]] = []
     excluded = exclude_root.resolve() if exclude_root is not None else None
     try:
@@ -560,9 +698,96 @@ def _discover_codex_lineage(
             continue
         thread_id = _string(metadata.get("id"))
         session_id = _string(metadata.get("session_id"))
-        if thread_id == root_thread_id or session_id == root_thread_id:
+        if thread_id in roots or session_id in roots:
             candidates.append((path, metadata))
     return tuple(candidates)
+
+
+def _complete_records(complete: bytes, where: str) -> tuple[_Record, ...]:
+    records: list[_Record] = []
+    for line_number, raw_line in enumerate(complete.splitlines(), start=1):
+        records.append(
+            _Record(
+                line_number,
+                raw_line,
+                _parse_json_object(raw_line, f"{where}:{line_number}"),
+            )
+        )
+    return tuple(records)
+
+
+def _continuation_links(
+    roots: Sequence[str],
+    root_sources: Mapping[str, str],
+    complete_by_path: Mapping[str, bytes],
+    metadata_by_path: Mapping[str, Mapping[str, object]],
+    previous: Sequence[CodexContinuationLink],
+) -> tuple[CodexContinuationLink, ...]:
+    expected_pairs = tuple(zip(roots, roots[1:]))
+    if len(previous) > len(expected_pairs):
+        raise CodexParseError(
+            "source manifest records more continuations than were configured"
+        )
+    result: list[CodexContinuationLink] = []
+    for index, (predecessor_id, successor_id) in enumerate(expected_pairs):
+        predecessor_path = root_sources[predecessor_id]
+        successor_path = root_sources[successor_id]
+        successor_started_ms = _iso_ms(
+            metadata_by_path[successor_path].get("timestamp")
+        )
+        if successor_started_ms <= 0:
+            raise CodexParseError(
+                f"continuation root {successor_id!r} lacks a valid start timestamp"
+            )
+        predecessor_records = _complete_records(
+            complete_by_path[predecessor_path], predecessor_path
+        )
+        if index < len(previous):
+            link = previous[index]
+            if (
+                link.predecessor_thread_id != predecessor_id
+                or link.thread_id != successor_id
+                or link.predecessor_source_path != predecessor_path
+                or link.source_path != successor_path
+                or link.started_at_ms != successor_started_ms
+                or link.predecessor_source_line > len(predecessor_records)
+            ):
+                raise CodexParseError(
+                    f"recorded continuation {index} no longer matches its configured sessions"
+                )
+            recorded = predecessor_records[link.predecessor_source_line - 1]
+            if _record_timestamp_ms(recorded) != link.predecessor_at_ms:
+                raise CodexParseError(
+                    f"recorded continuation {index} boundary evidence changed"
+                )
+            result.append(link)
+            continue
+        eligible = [
+            record
+            for record in predecessor_records
+            if 0 < _record_timestamp_ms(record) < successor_started_ms
+        ]
+        if not eligible:
+            raise CodexParseError(
+                f"continuation {successor_id!r} has no predecessor record before its start"
+            )
+        boundary = max(
+            eligible, key=lambda record: (_record_timestamp_ms(record), record.line)
+        )
+        predecessor_at_ms = _record_timestamp_ms(boundary)
+        result.append(
+            CodexContinuationLink(
+                predecessor_thread_id=predecessor_id,
+                thread_id=successor_id,
+                predecessor_source_path=predecessor_path,
+                predecessor_source_line=boundary.line,
+                predecessor_at_ms=predecessor_at_ms,
+                source_path=successor_path,
+                started_at_ms=successor_started_ms,
+                gap_ms=successor_started_ms - predecessor_at_ms,
+            )
+        )
+    return tuple(result)
 
 
 def snapshot_codex_lineage(
@@ -571,6 +796,8 @@ def snapshot_codex_lineage(
     snapshot_root: Path,
     previous_sources: Sequence[CodexSourceCopy],
     updated_at: str,
+    continuation_thread_ids: Sequence[str] = (),
+    previous_continuations: Sequence[CodexContinuationLink] = (),
 ) -> CodexSnapshotResult:
     """Copy the newline-complete lineage into *snapshot_root* after monotonic checks.
 
@@ -587,10 +814,22 @@ def snapshot_codex_lineage(
             )
         previous_by_path[source.source_path] = source
 
-    candidates = _discover_codex_lineage(
-        sessions_root, root_thread_id, exclude_root=snapshot_root
+    roots = _lineage_roots(root_thread_id, continuation_thread_ids)
+    candidates = (
+        _discover_codex_lineage(
+            sessions_root,
+            root_thread_id,
+            exclude_root=snapshot_root,
+            continuation_thread_ids=continuation_thread_ids,
+        )
+        if continuation_thread_ids
+        else _discover_codex_lineage(
+            sessions_root, root_thread_id, exclude_root=snapshot_root
+        )
     )
     candidate_paths: dict[str, tuple[Path, Mapping[str, object]]] = {}
+    lineage_by_thread: dict[str, str] = {}
+    root_sources: dict[str, str] = {}
     for path, metadata in candidates:
         try:
             relative = path.relative_to(sessions_root).as_posix()
@@ -601,6 +840,29 @@ def snapshot_codex_lineage(
         _safe_snapshot_relative(relative)
         if relative in candidate_paths:
             raise CodexParseError(f"duplicate Codex source path {relative!r}")
+        lineage_root_id = _metadata_lineage_root(metadata, roots, relative)
+        thread_id = _string(metadata.get("id"))
+        if thread_id is None:
+            raise CodexParseError(f"rollout {path} metadata lacks a thread id")
+        prior_lineage = lineage_by_thread.get(thread_id)
+        if prior_lineage is not None and prior_lineage != lineage_root_id:
+            raise CodexParseError(
+                f"Codex thread {thread_id!r} occurs in multiple configured lineages"
+            )
+        lineage_by_thread[thread_id] = lineage_root_id
+        if thread_id == lineage_root_id:
+            if (
+                lineage_root_id != root_thread_id
+                and _string(metadata.get("session_id")) != lineage_root_id
+            ):
+                raise CodexParseError(
+                    f"configured continuation {lineage_root_id!r} is not a root session"
+                )
+            if lineage_root_id in root_sources:
+                raise CodexParseError(
+                    f"configured Codex root {lineage_root_id!r} has multiple rollouts"
+                )
+            root_sources[lineage_root_id] = relative
         candidate_paths[relative] = (path, metadata)
 
     missing = sorted(set(previous_by_path) - set(candidate_paths))
@@ -611,10 +873,18 @@ def snapshot_codex_lineage(
             "append-only source violation: previously observed rollout disappeared: "
             f"{rendered}{suffix}"
         )
+    missing_roots = [root for root in roots if root not in root_sources]
+    if missing_roots:
+        raise CodexParseError(
+            "Codex configured root sessions were not found: "
+            + ", ".join(repr(root) for root in missing_roots)
+        )
     if not candidate_paths:
         raise CodexParseError(f"Codex root thread {root_thread_id!r} was not found")
 
     pending: list[_PendingCopy] = []
+    complete_by_path: dict[str, bytes] = {}
+    metadata_by_path: dict[str, Mapping[str, object]] = {}
     for source_path in sorted(candidate_paths):
         path, metadata = candidate_paths[source_path]
         try:
@@ -637,6 +907,9 @@ def snapshot_codex_lineage(
         thread_id = _string(copied_metadata.get("id"))
         if thread_id is None:
             raise CodexParseError(f"rollout {path} metadata lacks a thread id")
+        _metadata_lineage_root(copied_metadata, roots, source_path)
+        complete_by_path[source_path] = complete
+        metadata_by_path[source_path] = copied_metadata
 
         target = _snapshot_target(snapshot_root, source_path)
         previous = previous_by_path.get(source_path)
@@ -693,6 +966,14 @@ def snapshot_codex_lineage(
         )
         pending.append(_PendingCopy(source, complete, existing))
 
+    continuations = _continuation_links(
+        roots,
+        root_sources,
+        complete_by_path,
+        metadata_by_path,
+        previous_continuations,
+    )
+
     changed = sum(
         int(
             _write_snapshot_file(
@@ -704,7 +985,9 @@ def snapshot_codex_lineage(
         )
         for item in pending
     )
-    return CodexSnapshotResult(tuple(item.source for item in pending), changed)
+    return CodexSnapshotResult(
+        tuple(item.source for item in pending), changed, continuations
+    )
 
 
 def _content(payload: Mapping[str, object]) -> tuple[str | None, str | None, str]:
@@ -791,7 +1074,7 @@ def _read_rollout(
     path: Path,
     sessions_root: Path,
     metadata: Mapping[str, object],
-    root_thread_id: str,
+    lineage_root_id: str,
     secure_source_path: str | None = None,
 ) -> _Rollout:
     if secure_source_path is not None:
@@ -827,7 +1110,7 @@ def _read_rollout(
         working_directory=_string(metadata.get("cwd")),
         repository_url=_string(_mapping(metadata.get("git")).get("repository_url")),
     )
-    canonical = _canonical_records(records, metadata, root_thread_id)
+    canonical = _canonical_records(records, metadata, lineage_root_id)
     return _Rollout(
         path=path,
         source_path=source_path,
@@ -835,10 +1118,11 @@ def _read_rollout(
         metadata=metadata,
         records=tuple(records),
         canonical_records=canonical,
+        lineage_root_id=lineage_root_id,
     )
 
 
-def _agent_seed(rollout: _Rollout, root_thread_id: str) -> _AgentSeed:
+def _agent_seed(rollout: _Rollout) -> _AgentSeed:
     metadata = rollout.metadata
     thread_id = _string(metadata.get("id")) or ""
     source = _mapping(metadata.get("source"))
@@ -853,10 +1137,10 @@ def _agent_seed(rollout: _Rollout, root_thread_id: str) -> _AgentSeed:
     role = _string(metadata.get("agent_role")) or _string(spawn.get("agent_role"))
     depth = _integer(spawn.get("depth"))
     if depth is None:
-        depth = 0 if thread_id == root_thread_id else 1
+        depth = 0 if thread_id == rollout.lineage_root_id else 1
     path = _string(metadata.get("agent_path")) or _string(spawn.get("agent_path"))
     if path is None:
-        path = "/root" if thread_id == root_thread_id else f"/root/{thread_id}"
+        path = "/root" if thread_id == rollout.lineage_root_id else f"/root/{thread_id}"
     return _AgentSeed(
         thread_id=thread_id,
         parent_thread_id=parent,
@@ -866,6 +1150,68 @@ def _agent_seed(rollout: _Rollout, root_thread_id: str) -> _AgentSeed:
         depth=depth,
         started_at_ms=_iso_ms(metadata.get("timestamp")),
         source_path=rollout.source_path,
+        lineage_root_id=rollout.lineage_root_id,
+        raw_agent_path=path,
+    )
+
+
+def _scoped_id(lineage_root_id: str, root_thread_id: str, raw_id: str) -> str:
+    if lineage_root_id == root_thread_id:
+        return raw_id
+    # Codex IDs are provider strings, not guaranteed UUIDs. Length-prefix both variable
+    # components so pairs such as ("a-b", "c") and ("a", "b-c") cannot collapse to the
+    # same normalized identity. The canonical lineage deliberately keeps its historical IDs.
+    return (
+        f"codex-continuation-{len(lineage_root_id)}-{lineage_root_id}-"
+        f"{len(raw_id)}-{raw_id}"
+    )
+
+
+def _continuation_path(lineage_root_id: str) -> str:
+    # Keep the provider ID in one injective path component. In particular, a root ID ``a/b``
+    # must not occupy the same path as child ``b`` beneath continuation root ``a``; quoting ``%``
+    # as well as ``/`` makes the encoding reversible and collision-free.
+    return f"/root/continuation-{quote(lineage_root_id, safe='')}"
+
+
+def _normalize_seed(
+    seed: _AgentSeed,
+    root_thread_id: str,
+    continuation_thread_ids: Sequence[str],
+) -> _AgentSeed:
+    if seed.lineage_root_id == root_thread_id:
+        return seed
+    try:
+        continuation_index = continuation_thread_ids.index(seed.lineage_root_id)
+    except ValueError as error:
+        raise CodexParseError(
+            f"agent {seed.thread_id!r} belongs to an unknown continuation"
+        ) from error
+    predecessor = (
+        root_thread_id
+        if continuation_index == 0
+        else continuation_thread_ids[continuation_index - 1]
+    )
+    prefix = _continuation_path(seed.lineage_root_id)
+    raw_path = seed.raw_agent_path.rstrip("/") or "/root"
+    if raw_path == "/root":
+        normalized_path = prefix
+    elif raw_path.startswith("/root/"):
+        normalized_path = prefix + raw_path[len("/root") :]
+    else:
+        normalized_path = prefix + "/" + raw_path.strip("/")
+    is_lineage_root = seed.thread_id == seed.lineage_root_id
+    return _AgentSeed(
+        thread_id=seed.thread_id,
+        parent_thread_id=predecessor if is_lineage_root else seed.parent_thread_id,
+        agent_path=normalized_path,
+        nickname=seed.nickname,
+        role="coordinator" if is_lineage_root else seed.role,
+        depth=(continuation_index + 1 if is_lineage_root else seed.depth + continuation_index + 1),
+        started_at_ms=seed.started_at_ms,
+        source_path=seed.source_path,
+        lineage_root_id=seed.lineage_root_id,
+        raw_agent_path=seed.raw_agent_path,
     )
 
 
@@ -949,9 +1295,15 @@ def _resolve_target(
     return matches[0] if len(matches) == 1 else None
 
 
-def _turn_id_from_payload(payload: Mapping[str, object], current: str | None) -> str | None:
+def _turn_id_from_payload(
+    payload: Mapping[str, object],
+    current: str | None,
+    lineage_root_id: str,
+    root_thread_id: str,
+) -> str | None:
     passthrough = _mapping(payload.get("internal_chat_message_metadata_passthrough"))
-    return _string(passthrough.get("turn_id")) or current
+    raw = _string(passthrough.get("turn_id"))
+    return _scoped_id(lineage_root_id, root_thread_id, raw) if raw is not None else current
 
 
 def load_codex_team(
@@ -960,6 +1312,7 @@ def load_codex_team(
     team_slug: str,
     display_timezone: str,
     source_paths: Sequence[str] | None = None,
+    continuation_links: Sequence[CodexContinuationLink] = (),
 ) -> TeamData:
     """Load one Codex root and every rollout belonging to its session lineage.
 
@@ -970,9 +1323,25 @@ def load_codex_team(
     """
 
     ZoneInfo(display_timezone)  # validate now; conversion remains a presentation concern
+    continuation_thread_ids = tuple(link.thread_id for link in continuation_links)
+    roots = _lineage_roots(root_thread_id, continuation_thread_ids)
+    for index, link in enumerate(continuation_links):
+        expected_predecessor = (
+            root_thread_id
+            if index == 0
+            else continuation_links[index - 1].thread_id
+        )
+        if link.predecessor_thread_id != expected_predecessor:
+            raise CodexParseError(
+                f"continuation {index} does not follow the configured predecessor"
+            )
     secure_paths: dict[Path, str] = {}
     if source_paths is None:
-        candidates = _discover_codex_lineage(sessions_root, root_thread_id)
+        candidates = _discover_codex_lineage(
+            sessions_root,
+            root_thread_id,
+            continuation_thread_ids=continuation_thread_ids,
+        )
     else:
         seen: set[str] = set()
         explicit: list[tuple[Path, Mapping[str, object]]] = []
@@ -986,12 +1355,7 @@ def load_codex_team(
                 raise CodexParseError(
                     f"explicit source snapshot lacks valid session metadata: {source_path!r}"
                 )
-            thread_id = _string(metadata.get("id"))
-            session_id = _string(metadata.get("session_id"))
-            if thread_id != root_thread_id and session_id != root_thread_id:
-                raise CodexParseError(
-                    f"explicit source snapshot is outside root lineage: {source_path!r}"
-                )
+            _metadata_lineage_root(metadata, roots, source_path)
             explicit.append((path, metadata))
             secure_paths[path] = source_path
         candidates = tuple(explicit)
@@ -1003,7 +1367,7 @@ def load_codex_team(
             path,
             sessions_root,
             metadata,
-            root_thread_id,
+            _metadata_lineage_root(metadata, roots, str(path)),
             secure_paths.get(path),
         )
         for path, metadata in candidates
@@ -1017,8 +1381,17 @@ def load_codex_team(
                 f"expected {sorted(expected)!r}, parsed {sorted(parsed)!r}"
             )
     seeds: dict[str, _AgentSeed] = {}
+    lineage_by_thread: dict[str, str] = {}
     for rollout in rollouts:
-        seed = _agent_seed(rollout, root_thread_id)
+        seed = _normalize_seed(
+            _agent_seed(rollout), root_thread_id, continuation_thread_ids
+        )
+        prior_lineage = lineage_by_thread.get(seed.thread_id)
+        if prior_lineage is not None and prior_lineage != seed.lineage_root_id:
+            raise CodexParseError(
+                f"Codex thread {seed.thread_id!r} occurs in multiple configured lineages"
+            )
+        lineage_by_thread[seed.thread_id] = seed.lineage_root_id
         previous = seeds.get(seed.thread_id)
         if previous is None or (seed.started_at_ms, seed.source_path) < (
             previous.started_at_ms,
@@ -1027,6 +1400,14 @@ def load_codex_team(
             seeds[seed.thread_id] = seed
     if root_thread_id not in seeds:
         raise CodexParseError(f"lineage lacks root metadata for {root_thread_id!r}")
+    missing_continuations = [
+        thread_id for thread_id in continuation_thread_ids if thread_id not in seeds
+    ]
+    if missing_continuations:
+        raise CodexParseError(
+            "lineage lacks continuation root metadata for "
+            + ", ".join(repr(item) for item in missing_continuations)
+        )
 
     turns: dict[tuple[str, str], _TurnBuilder] = {}
     tools: dict[str, _ToolBuilder] = {}
@@ -1035,6 +1416,7 @@ def load_codex_team(
 
     for rollout in sorted(rollouts, key=lambda item: item.source_path):
         thread_id = _string(rollout.metadata.get("id")) or ""
+        lineage_root_id = rollout.lineage_root_id
         prompt_pairs = _prompt_pairs(rollout.canonical_records)
         current_turn: str | None = None
         for record in rollout.canonical_records:
@@ -1044,13 +1426,19 @@ def load_codex_team(
             timestamp_ms = _record_timestamp_ms(record)
 
             if top_type == "turn_context":
-                current_turn = _string(payload.get("turn_id")) or current_turn
+                raw_turn_id = _string(payload.get("turn_id"))
+                current_turn = (
+                    _scoped_id(lineage_root_id, root_thread_id, raw_turn_id)
+                    if raw_turn_id is not None
+                    else current_turn
+                )
                 continue
 
             if top_type == "event_msg" and payload_type == "task_started":
-                turn_id = _string(payload.get("turn_id"))
-                if turn_id is None:
+                raw_turn_id = _string(payload.get("turn_id"))
+                if raw_turn_id is None:
                     continue
+                turn_id = _scoped_id(lineage_root_id, root_thread_id, raw_turn_id)
                 current_turn = turn_id
                 key = (thread_id, turn_id)
                 started_at_ms = _numeric_epoch_ms(payload.get("started_at"), timestamp_ms)
@@ -1062,9 +1450,10 @@ def load_codex_team(
                 continue
 
             if top_type == "event_msg" and payload_type in ("task_complete", "turn_aborted"):
-                turn_id = _string(payload.get("turn_id"))
-                if turn_id is None:
+                raw_turn_id = _string(payload.get("turn_id"))
+                if raw_turn_id is None:
                     continue
+                turn_id = _scoped_id(lineage_root_id, root_thread_id, raw_turn_id)
                 key = (thread_id, turn_id)
                 started_at_ms = _numeric_epoch_ms(payload.get("started_at"), timestamp_ms)
                 builder = turns.get(key)
@@ -1087,7 +1476,12 @@ def load_codex_team(
                 if text is None:
                     continue
                 item_id = _claim_prompt_id(prompt_pairs, timestamp_ms, text)
-                event_id = item_id or _fallback_id(thread_id, record, "user_prompt")
+                raw_event_id = item_id or _fallback_id(
+                    thread_id, record, "user_prompt"
+                )
+                event_id = _scoped_id(
+                    lineage_root_id, root_thread_id, raw_event_id
+                )
                 events[(thread_id, event_id)] = Event(
                     event_id=event_id,
                     thread_id=thread_id,
@@ -1106,8 +1500,11 @@ def load_codex_team(
                 continue
 
             if top_type == "event_msg" and payload_type == "sub_agent_activity":
-                event_id = _string(payload.get("event_id")) or _fallback_id(
+                raw_event_id = _string(payload.get("event_id")) or _fallback_id(
                     thread_id, record, "subagent_activity"
+                )
+                event_id = _scoped_id(
+                    lineage_root_id, root_thread_id, raw_event_id
                 )
                 kind = _string(payload.get("kind")) or "interaction"
                 occurred_ms = _integer(payload.get("occurred_at_ms")) or timestamp_ms
@@ -1126,11 +1523,23 @@ def load_codex_team(
                     recipient=None,
                     source_line=record.line,
                 )
-                activities.append(_Activity(thread_id, occurred_ms, payload, record.line))
+                activities.append(
+                    _Activity(
+                        thread_id,
+                        occurred_ms,
+                        payload,
+                        record.line,
+                        lineage_root_id,
+                    )
+                )
                 continue
 
             if top_type == "event_msg" and payload_type == "context_compacted":
-                event_id = _fallback_id(thread_id, record, "context_compacted")
+                event_id = _scoped_id(
+                    lineage_root_id,
+                    root_thread_id,
+                    _fallback_id(thread_id, record, "context_compacted"),
+                )
                 events[(thread_id, event_id)] = Event(
                     event_id,
                     thread_id,
@@ -1153,7 +1562,11 @@ def load_codex_team(
                 status = _string(goal.get("status"))
                 objective = _string(goal.get("objective"))
                 text = " | ".join(value for value in (status, objective) if value) or None
-                event_id = _fallback_id(thread_id, record, "goal_updated")
+                event_id = _scoped_id(
+                    lineage_root_id,
+                    root_thread_id,
+                    _fallback_id(thread_id, record, "goal_updated"),
+                )
                 events[(thread_id, event_id)] = Event(
                     event_id,
                     thread_id,
@@ -1176,13 +1589,18 @@ def load_codex_team(
 
             if payload_type == "message" and payload.get("role") == "assistant":
                 text, encrypted, availability = _content(payload)
-                item_id = _string(payload.get("id")) or _fallback_id(
+                raw_item_id = _string(payload.get("id")) or _fallback_id(
                     thread_id, record, "assistant_message"
+                )
+                item_id = _scoped_id(
+                    lineage_root_id, root_thread_id, raw_item_id
                 )
                 events[(thread_id, item_id)] = Event(
                     event_id=item_id,
                     thread_id=thread_id,
-                    turn_id=_turn_id_from_payload(payload, current_turn),
+                    turn_id=_turn_id_from_payload(
+                        payload, current_turn, lineage_root_id, root_thread_id
+                    ),
                     timestamp_ms=timestamp_ms,
                     kind="assistant_message",
                     role="assistant",
@@ -1198,13 +1616,18 @@ def load_codex_team(
 
             if payload_type == "agent_message":
                 text, encrypted, availability = _content(payload)
-                item_id = _string(payload.get("id")) or _fallback_id(
+                raw_item_id = _string(payload.get("id")) or _fallback_id(
                     thread_id, record, "inter_agent_message"
+                )
+                item_id = _scoped_id(
+                    lineage_root_id, root_thread_id, raw_item_id
                 )
                 events[(thread_id, item_id)] = Event(
                     event_id=item_id,
                     thread_id=thread_id,
-                    turn_id=_turn_id_from_payload(payload, current_turn),
+                    turn_id=_turn_id_from_payload(
+                        payload, current_turn, lineage_root_id, root_thread_id
+                    ),
                     timestamp_ms=timestamp_ms,
                     kind="inter_agent_message",
                     role=None,
@@ -1219,20 +1642,40 @@ def load_codex_team(
                 continue
 
             if payload_type in ("custom_tool_call", "function_call"):
-                call_id = _string(payload.get("call_id"))
+                raw_call_id = _string(payload.get("call_id"))
                 name = _string(payload.get("name"))
-                if call_id is None or name is None:
+                if raw_call_id is None or name is None:
                     continue
+                call_id = _scoped_id(
+                    lineage_root_id, root_thread_id, raw_call_id
+                )
                 input_text = _string(
                     payload.get("input")
                     if payload_type == "custom_tool_call"
                     else payload.get("arguments")
                 )
+                raw_tool_item_id = _string(payload.get("id"))
+                existing_tool = tools.get(call_id)
+                if (
+                    existing_tool is not None
+                    and existing_tool.lineage_root_id != lineage_root_id
+                ):
+                    raise CodexParseError(
+                        f"tool call {raw_call_id!r} collides across Codex lineages"
+                    )
                 tools[call_id] = _ToolBuilder(
                     call_id=call_id,
-                    item_id=_string(payload.get("id")),
+                    item_id=(
+                        _scoped_id(
+                            lineage_root_id, root_thread_id, raw_tool_item_id
+                        )
+                        if raw_tool_item_id is not None
+                        else None
+                    ),
                     thread_id=thread_id,
-                    turn_id=_turn_id_from_payload(payload, current_turn),
+                    turn_id=_turn_id_from_payload(
+                        payload, current_turn, lineage_root_id, root_thread_id
+                    ),
                     name=name,
                     namespace=_string(payload.get("namespace")),
                     started_at_ms=timestamp_ms,
@@ -1242,12 +1685,18 @@ def load_codex_team(
                     output_text=None,
                     nested_tools=_nested_tools(name, input_text),
                     source_line=record.line,
+                    lineage_root_id=lineage_root_id,
                 )
                 continue
 
             if payload_type in ("custom_tool_call_output", "function_call_output"):
-                call_id = _string(payload.get("call_id"))
-                if call_id is None or call_id not in tools:
+                raw_call_id = _string(payload.get("call_id"))
+                if raw_call_id is None:
+                    continue
+                call_id = _scoped_id(
+                    lineage_root_id, root_thread_id, raw_call_id
+                )
+                if call_id not in tools:
                     continue
                 tool_builder = tools[call_id]
                 tool_builder.ended_at_ms = timestamp_ms
@@ -1296,18 +1745,54 @@ def load_codex_team(
         )
     )
 
-    path_to_thread = {seed.agent_path: seed.thread_id for seed in seeds.values()}
-    known_threads = set(seeds)
+    path_to_thread_by_lineage: dict[str, dict[str, str]] = defaultdict(dict)
+    known_threads_by_lineage: dict[str, set[str]] = defaultdict(set)
+    for seed in seeds.values():
+        path_map = path_to_thread_by_lineage[seed.lineage_root_id]
+        previous_thread = path_map.get(seed.raw_agent_path)
+        if previous_thread is not None and previous_thread != seed.thread_id:
+            raise CodexParseError(
+                f"duplicate agent path {seed.raw_agent_path!r} in Codex lineage "
+                f"{seed.lineage_root_id!r}"
+            )
+        path_map[seed.raw_agent_path] = seed.thread_id
+        known_threads_by_lineage[seed.lineage_root_id].add(seed.thread_id)
     edges_by_id: dict[str, Edge] = {}
+    for link in continuation_links:
+        edge_id = f"codex-continuation-{link.thread_id}"
+        edges_by_id[edge_id] = Edge(
+            edge_id=edge_id,
+            call_id=edge_id,
+            from_thread_id=link.predecessor_thread_id,
+            to_thread_id=link.thread_id,
+            kind="continuation",
+            timestamp_ms=link.predecessor_at_ms,
+            message_text=(
+                "Explicit Codex session continuation. Predecessor source "
+                f"{link.predecessor_source_path} line {link.predecessor_source_line} "
+                f"was recorded at {link.predecessor_at_ms} ms UTC; successor source "
+                f"{link.source_path} started at {link.started_at_ms} ms UTC "
+                f"({link.gap_ms} ms later)."
+            ),
+            content_availability="plaintext",
+            encrypted_content=None,
+            source_line=link.predecessor_source_line,
+        )
     interrupted_at: dict[str, int] = {}
     for activity in sorted(
         activities, key=lambda item: (item.timestamp_ms, item.owner_thread_id, item.source_line)
     ):
-        call_id = _string(activity.payload.get("event_id"))
+        raw_call_id = _string(activity.payload.get("event_id"))
         activity_kind = _string(activity.payload.get("kind"))
         agent_thread_id = _string(activity.payload.get("agent_thread_id"))
-        if call_id is None or activity_kind is None:
+        if raw_call_id is None or activity_kind is None:
             continue
+        call_id = _scoped_id(
+            activity.lineage_root_id, root_thread_id, raw_call_id
+        )
+        known_threads = known_threads_by_lineage[activity.lineage_root_id]
+        if agent_thread_id not in known_threads:
+            agent_thread_id = None
         tool = tools.get(call_id)
         if tool is None:
             if activity_kind == "interrupted" and agent_thread_id is not None:
@@ -1315,7 +1800,11 @@ def load_codex_team(
             continue
         arguments = _call_arguments(tool)
         target_name = _string(arguments.get("target"))
-        target_thread = _resolve_target(target_name, path_to_thread, known_threads)
+        target_thread = _resolve_target(
+            target_name,
+            path_to_thread_by_lineage[activity.lineage_root_id],
+            known_threads,
+        )
         if activity_kind == "started":
             target_thread = agent_thread_id
         if target_thread is None and agent_thread_id != tool.thread_id:
@@ -1332,6 +1821,11 @@ def load_codex_team(
         }
         edge_kind = kind_by_call.get(tool.name, activity_kind)
         message, encrypted, availability = _message_fields(arguments)
+        existing_edge = edges_by_id.get(call_id)
+        if existing_edge is not None and existing_edge.kind == "continuation":
+            raise CodexParseError(
+                f"collaboration call {raw_call_id!r} collides with a continuation edge"
+            )
         edges_by_id[call_id] = Edge(
             edge_id=call_id,
             call_id=call_id,
@@ -1425,6 +1919,7 @@ def load_codex_team(
 
 
 __all__ = [
+    "CodexContinuationLink",
     "CodexParseError",
     "CodexSnapshotResult",
     "CodexSourceCopy",

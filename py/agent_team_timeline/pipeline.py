@@ -33,6 +33,7 @@ from agent_team_timeline.artifacts import (
     extract_artifacts,
 )
 from agent_team_timeline.codex import (
+    CodexContinuationLink,
     CodexParseError,
     CodexSourceCopy,
     codex_identity_metadata,
@@ -493,15 +494,25 @@ def _ensure_source_snapshots_ignored(archive: Path) -> bool:
     return write_text_if_changed(path, prefix + "\n".join(missing) + "\n")
 
 
+@dataclass(frozen=True)
+class _CodexManifestState:
+    sources: tuple[CodexSourceCopy, ...]
+    continuation_links: tuple[CodexContinuationLink, ...]
+    continuation_thread_ids: tuple[str, ...]
+
+
 def _load_source_manifest(
     archive: Path,
     team_slug: str,
     root_thread_id: str,
     date_window: DateWindow | None,
-) -> tuple[CodexSourceCopy, ...]:
+    requested_continuation_thread_ids: Sequence[str] = (),
+) -> _CodexManifestState:
     path = _source_manifest_path(archive, team_slug)
     if not path.is_file():
-        return ()
+        return _CodexManifestState(
+            (), (), tuple(requested_continuation_thread_ids)
+        )
     obj = as_object(read_json(path), str(path))
     if obj.get("schema_version") != 1 or obj.get("provider") != "codex":
         raise CodexParseError(f"invalid Codex source manifest at {path}")
@@ -522,7 +533,31 @@ def _load_source_manifest(
     for index, raw_source in enumerate(raw_sources):
         source = as_object(raw_source, f"{path}: sources[{index}]")
         result.append(CodexSourceCopy.from_json_obj(source, f"{path}: sources[{index}]"))
-    return tuple(result)
+    raw_continuations = obj.get("continuation_sessions")
+    links: list[CodexContinuationLink] = []
+    if raw_continuations is not None:
+        for index, raw_link in enumerate(
+            as_array(raw_continuations, f"{path}: continuation_sessions")
+        ):
+            link = as_object(
+                raw_link, f"{path}: continuation_sessions[{index}]"
+            )
+            links.append(
+                CodexContinuationLink.from_json_obj(
+                    link, f"{path}: continuation_sessions[{index}]"
+                )
+            )
+    recorded_ids = tuple(link.thread_id for link in links)
+    requested_ids = tuple(requested_continuation_thread_ids)
+    if requested_ids:
+        if recorded_ids != requested_ids[: len(recorded_ids)]:
+            raise CodexParseError(
+                "requested continuation sessions do not extend the recorded ordered prefix"
+            )
+        effective_ids = requested_ids
+    else:
+        effective_ids = recorded_ids
+    return _CodexManifestState(tuple(result), tuple(links), effective_ids)
 
 
 def _load_claude_source_manifest(
@@ -713,21 +748,38 @@ def _ingest_codex_locked(
     display_timezone: str,
     date_window: DateWindow | None,
     identity_overrides: IdentityOverrides | None,
+    continuation_thread_ids: Sequence[str],
 ) -> tuple[TeamData, IngestReport]:
     """Normalize one complete Codex lineage and write canonical raw JSON."""
 
     _ensure_archive(archive, team_slug, create=True)
     changed = int(_ensure_source_snapshots_ignored(archive))
-    previous_sources = _load_source_manifest(
-        archive, team_slug, root_thread_id, date_window
+    manifest_state = _load_source_manifest(
+        archive,
+        team_slug,
+        root_thread_id,
+        date_window,
+        continuation_thread_ids,
     )
     snapshot_root = _source_snapshot_root(archive, team_slug)
-    source_copies = snapshot_codex_lineage(
-        sessions_root,
-        root_thread_id,
-        snapshot_root,
-        previous_sources,
-        utc_now(),
+    source_copies = (
+        snapshot_codex_lineage(
+            sessions_root,
+            root_thread_id,
+            snapshot_root,
+            manifest_state.sources,
+            utc_now(),
+            manifest_state.continuation_thread_ids,
+            manifest_state.continuation_links,
+        )
+        if manifest_state.continuation_thread_ids
+        else snapshot_codex_lineage(
+            sessions_root,
+            root_thread_id,
+            snapshot_root,
+            manifest_state.sources,
+            utc_now(),
+        )
     )
     changed += source_copies.files_changed
     # Parsing deliberately starts only after the original logs have been closed. Everything from
@@ -740,6 +792,7 @@ def _ingest_codex_locked(
             team_slug,
             display_timezone,
             source_paths=allowed_sources,
+            continuation_links=source_copies.continuations,
         ),
         date_window,
     )
@@ -751,7 +804,12 @@ def _ingest_codex_locked(
         archive,
         team,
         infer_structured_identity(
-            codex_identity_metadata(snapshot_root, allowed_sources, root_thread_id)
+            codex_identity_metadata(
+                snapshot_root,
+                allowed_sources,
+                root_thread_id,
+                manifest_state.continuation_thread_ids,
+            )
         ),
         identity_overrides,
     )
@@ -764,6 +822,10 @@ def _ingest_codex_locked(
         "date_window": date_window.to_json_obj() if date_window is not None else None,
         "sources": [source.to_json_obj() for source in source_copies.sources],
     }
+    if source_copies.continuations:
+        source_manifest["continuation_sessions"] = [
+            link.to_json_obj() for link in source_copies.continuations
+        ]
     changed += int(
         _write_json_durable(
             _source_manifest_path(archive, team_slug), narrow_json(source_manifest)
@@ -780,6 +842,7 @@ def ingest_codex(
     display_timezone: str,
     date_window: DateWindow | None = None,
     identity_overrides: IdentityOverrides | None = None,
+    continuation_thread_ids: Sequence[str] = (),
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Codex lineage as one serialized raw-data transaction."""
 
@@ -792,6 +855,7 @@ def ingest_codex(
             display_timezone,
             date_window,
             identity_overrides,
+            continuation_thread_ids,
         )
 
 

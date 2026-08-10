@@ -295,6 +295,7 @@ def _edge_obj(
     readable_kind = "message" if edge.kind == "followup" else edge.kind
     action = {
         "spawn": "Spawn",
+        "continuation": "Continue as",
         "message": "Message to",
         "interrupt": "Interrupt",
     }.get(readable_kind, readable_kind.replace("_", " ").title())
@@ -318,8 +319,16 @@ def _edge_obj(
         "source_id": edge.from_thread_id,
         "target_id": edge.to_thread_id,
         "source_ms": edge.timestamp_ms,
-        "target_ms": target.started_at_ms if readable_kind == "spawn" else edge.timestamp_ms,
-        "kind": readable_kind if readable_kind in ("spawn", "message", "result") else "other",
+        "target_ms": (
+            target.started_at_ms
+            if readable_kind in ("spawn", "continuation")
+            else edge.timestamp_ms
+        ),
+        "kind": (
+            readable_kind
+            if readable_kind in ("spawn", "continuation", "message", "result")
+            else "other"
+        ),
         "phrase": phrase,
         "paragraph": paragraph,
         "full_text": full_text,
@@ -337,11 +346,15 @@ def _result_edge_objs(
     """Render turn responses as details and one structural join per agent lifetime."""
 
     result: list[dict[str, object]] = []
+    continuation_targets = {
+        edge.to_thread_id for edge in team.edges if edge.kind == "continuation"
+    }
     for agent in team.agents:
         if (
             agent.thread_id not in agents
             or agent.parent_thread_id is None
             or agent.parent_thread_id not in agents
+            or agent.thread_id in continuation_targets
         ):
             continue
         finals = [

@@ -320,10 +320,10 @@
   /** Return hidden/normal/dimmed/highlighted for one structural or detailed edge. */
   function edgeDisplayState(edge, selection, showGlobalDetailed, showHighlightedDetailed) {
     var kind = string(edge.kind).toLowerCase();
-    // Spawns and lifetime results are the fork and join of one delegated agent. Keep both
-    // visible as structural context; only intermediate message traffic obeys the
-    // detailed-edge toggles.
-    var structural = kind === "spawn" || kind === "result";
+    // Spawns, explicit session continuations, and lifetime results are structural. Keep
+    // them visible as context; only intermediate message traffic obeys the detailed-edge
+    // toggles.
+    var structural = kind === "spawn" || kind === "continuation" || kind === "result";
     var highlighted = edgeTouchesSelection(edge, selection);
     if (structural) {
       if (!selection) {

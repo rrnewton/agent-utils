@@ -331,6 +331,14 @@ const result = {
   source_ms: 20,
   target_ms: 20
 };
+const continuation = {
+  id: "continuation",
+  kind: "continuation",
+  source_id: "parent",
+  target_id: "agent-a",
+  source_ms: 9,
+  target_ms: 10
+};
 const outOfPhase = {
   id: "message-out",
   kind: "message",
@@ -347,6 +355,16 @@ const phaseSelection = {
   end_ms: 20
 };
 assert.strictEqual(core.edgeDisplayState(spawn, null, false, true), "normal");
+assert.strictEqual(
+  core.edgeDisplayState(continuation, null, false, false),
+  "normal",
+  "an explicit session continuation remains visible when detailed edges are off"
+);
+assert.strictEqual(
+  core.edgeDisplayState(continuation, phaseSelection, false, false),
+  "highlighted",
+  "an explicit session continuation highlights as structural context"
+);
 assert.strictEqual(
   core.edgeDisplayState(result, null, false, false),
   "normal",

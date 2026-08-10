@@ -135,6 +135,15 @@ def _add_ingest(parser: argparse.ArgumentParser) -> None:
         "--sessions-root", default="~/.codex/sessions", help="Codex rollout tree (default: %(default)s)"
     )
     parser.add_argument("--root-session", required=True, help="coordinator thread UUID")
+    parser.add_argument(
+        "--continuation-session",
+        action="append",
+        default=[],
+        metavar="UUID",
+        help=(
+            "explicit successor coordinator session; repeat in chronological order"
+        ),
+    )
     _add_date_window(parser)
     _add_site_identity(parser)
 
@@ -894,6 +903,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     str(ns.timezone),
                     date_window,
                     identity_overrides,
+                    tuple(str(item) for item in ns.continuation_session),
                 )
             _print_ingest(ingest_report)
         refresh_handlers = ("refresh", "refresh_claude", "refresh_orc")

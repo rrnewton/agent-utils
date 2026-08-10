@@ -805,6 +805,7 @@ h1 {
 }
 
 .edge-spawn { color: var(--cyan); stroke: var(--cyan); stroke-width: 3.25; }
+.edge-continuation { color: var(--amber); stroke: var(--amber); stroke-width: 3.25; }
 .edge-message {
   color: var(--purple);
   stroke: var(--purple);

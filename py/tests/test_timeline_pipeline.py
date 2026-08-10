@@ -58,6 +58,7 @@ from agent_team_timeline.window import DateWindow
 ROOT = "00000000-0000-0000-0000-000000000001"
 CHILD = "00000000-0000-0000-0000-000000000002"
 NESTED = "00000000-0000-0000-0000-000000000003"
+CONTINUATION = "00000000-0000-0000-0000-000000000004"
 START = 1_775_000_000_000
 
 
@@ -764,6 +765,78 @@ def test_reused_subagent_gets_one_structural_lifetime_result(tmp_path: Path) -> 
     }
     assert {edge["kind"] for edge in turn_results.values()} == {"message"}
     assert {edge["target_id"] for edge in turn_results.values()} == {ROOT}
+
+
+def test_explicit_coordinator_continuation_is_structural_without_fake_join(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    continuation_start = START + 24_000
+    continuation = Agent(
+        CONTINUATION,
+        ROOT,
+        f"/root/continuation-{CONTINUATION}",
+        None,
+        "coordinator",
+        1,
+        continuation_start,
+        START + 30_000,
+        "completed",
+        "root",
+    )
+    continuation_turn = Turn(
+        "continuation-turn",
+        CONTINUATION,
+        continuation_start,
+        START + 30_000,
+        "completed",
+        10,
+        None,
+        None,
+    )
+    continuation_final = replace(
+        _event(
+            "continuation-final",
+            CONTINUATION,
+            29_000,
+            "assistant_message",
+            "The replacement coordinator completed its continued work.",
+            phase="final_answer",
+        ),
+        turn_id="continuation-turn",
+    )
+    continuation_edge = Edge(
+        f"codex-continuation-{CONTINUATION}",
+        f"codex-continuation-{CONTINUATION}",
+        ROOT,
+        CONTINUATION,
+        "continuation",
+        START + 23_000,
+        "Explicit Codex session continuation, one second later.",
+        "plaintext",
+        None,
+        1,
+    )
+    updated = replace(
+        team,
+        agents=team.agents + (continuation,),
+        turns=team.turns + (continuation_turn,),
+        events=team.events + (continuation_final,),
+        edges=team.edges + (continuation_edge,),
+    )
+    _write_team(tmp_path, updated)
+    summarize_archive(tmp_path, updated.team_slug, "heuristic", "test-model")
+    build_archive(tmp_path, updated.team_slug)
+
+    timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
+    edges = {edge["id"]: edge for edge in timeline["edges"]}
+    rendered = edges[f"codex-continuation-{CONTINUATION}"]
+    assert rendered["kind"] == "continuation"
+    assert rendered["source_ms"] == START + 23_000
+    assert rendered["target_ms"] == continuation_start
+    assert rendered["phrase"].startswith("Continue as ")
+    assert f"result-{CONTINUATION}" not in edges
+    assert "turn-result-continuation-final" not in edges
 
 
 @pytest.mark.parametrize(

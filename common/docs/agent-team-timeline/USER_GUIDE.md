@@ -22,10 +22,11 @@ do not require site changes.
 - A whole spawned interval is an **agent lifetime**; each summarized sub-block is a **work phase**.
   Work-phase boxes carry a short phrase at useful zoom levels. Their bottom strip distinguishes active,
   tool-running, waiting, idle, and explicitly blocked time.
-- Thick curved edges are structural forks (parent-to-child spawns) and joins (terminal
-  child-to-parent results), so both remain visible. Detailed intermediate message edges are hidden
-  globally by default and appear for the selected agent or work phase; both detailed-message
-  behaviors have toolbar toggles.
+- Thick curved edges are structural forks (parent-to-child spawns), joins (terminal
+  child-to-parent results), and explicitly configured coordinator-session continuations, so all
+  remain visible. A continuation does not invent a return arrow for the successor coordinator.
+  Detailed intermediate message edges are hidden globally by default and appear for the selected
+  agent or work phase; both detailed-message behaviors have toolbar toggles.
 - Hovering a phase or edge shows its paragraph summary and statistics.
 - Single-clicking selects an agent; a later single click on the same work phase narrows selection to
   that phase. Clicking a different phase selects that phase directly; clicking the selected phase
@@ -82,6 +83,25 @@ rg -l -m1 '"cwd":"/path/to/project"' ~/.codex/sessions/2026/08/05 \
 
 Pass the coordinator `payload.id` to `--root-session`. Descendants are discovered by their stable
 lineage `session_id`; no list of child files is needed.
+
+If the same logical coordinator work restarted in a new root session, add its root UUID explicitly:
+
+```bash
+agent-team-timeline ingest \
+  --sessions-root ~/.codex/sessions \
+  --root-session ORIGINAL_ROOT_UUID \
+  --continuation-session NEXT_ROOT_UUID \
+  --continuation-session LATER_ROOT_UUID \
+  --team example-team --output ./timelines/example-team
+```
+
+The option is repeatable in chronological order. Time proximity alone never links sessions. On the
+first successful ingest, the manifest freezes the exact predecessor source line/timestamp,
+successor start, and gap for each link. Later reruns may omit all continuation options and reuse the
+recorded chain, or repeat its exact prefix and append another successor. Removing, reordering, or
+replacing a recorded successor is rejected; use another archive if the chain was specified
+incorrectly. `refresh` accepts the same option and applies it during its ingest stage before any
+summary or build work.
 
 Claude Code root sessions live under `~/.claude/projects/<encoded-project>/` as
 `<session-uuid>.jsonl`. Pass that file to `--session-file`; the importer discovers nested
@@ -208,6 +228,12 @@ their completions, and writes canonical UTC timestamps. Verbatim user/assistant 
 retained. Bulky tool stdout, command bodies, and patches stay in the authoritative Codex JSONL;
 the archive stores their name, interval, status, and nested tool counts, which is enough for the
 condensed transcript and statistics.
+
+For an explicitly continued Codex history, pass ordered `--continuation-session` values as shown
+above. Each successor must be a root session. The original session's normalized IDs and existing
+summary cache inputs stay unchanged; common per-session event, turn, and tool IDs in successor
+sessions are namespaced. The browser shows one structural continuation edge rather than pretending
+that the new coordinator was a spawned worker.
 
 Use `ingest-claude --session-file FILE` for a Claude lineage. Like Codex ingestion, it is offline and
 does not invoke a model.
@@ -514,6 +540,12 @@ existing prefix, or a newly discovered child rollout. A disappeared file, shorte
 or rewritten prefix fails the ingest before replacing any prior snapshot. An incomplete trailing
 JSONL line is left for the next run.
 
+For Codex histories with explicit successor roots, the same schema-1 manifest has an optional
+ordered `continuation_sessions` array. Each entry retains the predecessor/successor IDs and source
+paths, exact predecessor source line and UTC timestamp, successor start, and millisecond gap. Old
+manifests without this field remain valid single-session archives. Once written, the evidence is
+reused rather than recomputed as source files continue to append.
+
 The snapshot, manifest, and normalized `team.json` update run under an archive-local Linux file
 lock, so concurrent refreshes cannot publish an older validated copy over a newer one. Parsing is
 restricted to the exact paths in that refresh's validated source set; leftover files from an
@@ -589,6 +621,13 @@ propagate upward so parent lifetimes contain all recorded descendant activity; m
 Codex disk logs are append-only across context compaction: old user, assistant, and tool records are
 not deleted when the in-memory context is compacted. The importer deliberately ignores compaction
 summaries and uses the original records.
+
+Separate coordinator root sessions are separate lineages unless the operator supplies ordered
+`--continuation-session` values. This explicit-only rule avoids silently merging nearby but
+unrelated work. A configured successor receives a collision-safe path beneath
+`/root/continuation-<root-uuid>` and collision-safe normalized event/turn/tool IDs, while all IDs
+and cache inputs from the original lineage stay unchanged. Its one continuation edge is structural;
+it is neither a worker spawn nor evidence for a fabricated lifetime return.
 
 Child rollout files begin with a copied parent-history prefix whose timestamps are rewritten to the
 spawn time. The importer finds the child's first incoming task message and treats earlier records as

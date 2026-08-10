@@ -30,6 +30,7 @@
   };
   var EDGE_COLORS = {
     spawn: "#4bc6e8",
+    continuation: "#f6c453",
     message: "#a77bf3",
     result: "#3bc983",
     other: "#5d8ff4"
@@ -1358,7 +1359,7 @@
   }
 
   function edgeKind(value) {
-    return normalizeKind(value, ["spawn", "message", "result"], "other");
+    return normalizeKind(value, ["spawn", "continuation", "message", "result"], "other");
   }
 
   function stateKind(value) {
@@ -1377,7 +1378,8 @@
   }
 
   function edgePath(x1, y1, x2, y2, kind) {
-    var structuralDirection = kind === "spawn" ? -1 : kind === "result" ? 1 : 0;
+    var structuralDirection =
+      kind === "spawn" || kind === "continuation" ? -1 : kind === "result" ? 1 : 0;
     if (structuralDirection !== 0 && Math.abs(y2 - y1) > 2) {
       var structuralBend = 28;
       var verticalDirection = y2 > y1 ? 1 : -1;
