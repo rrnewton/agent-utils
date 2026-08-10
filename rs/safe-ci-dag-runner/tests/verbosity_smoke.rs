@@ -19,7 +19,7 @@ impl Fixture {
 
     fn dag(&self, fail: bool) -> PathBuf {
         let first = if fail {
-            "printf 'full-error-line\\n' >&2; exit 7"
+            "printf '##TEST-START suite::failure\\nfull-error-line\\n' >&2; exit 7"
         } else {
             "printf '##TEST-START suite::case\\n:: Run1...\\n##TEST-END suite::case PASS\\n'"
         };
@@ -29,6 +29,20 @@ impl Fixture {
                 {"group": "g", "job": "first", "desc": "first", "cmd": first},
                 {"group": "g", "job": "must_not_run", "desc": "second", "cmd": "printf 'late-step-ran\\n'", "deps": ["g.first"]}
             ]
+        });
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        path
+    }
+
+    fn split_stream_dag(&self) -> PathBuf {
+        let path = self.dir.join("split-stream.json");
+        let doc = serde_json::json!({
+            "steps": [{
+                "group": "g",
+                "job": "split",
+                "desc": "split",
+                "cmd": "printf '##TEST-START stdout::case\\n'; sleep 0.1; printf 'stderr raced after stdout marker\\n' >&2"
+            }]
         });
         std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
         path
@@ -111,5 +125,31 @@ fn levels_bound_success_but_never_hide_failure() {
     assert!(
         wall < Duration::from_secs(5),
         "fail-fast was not prompt: {wall:?}"
+    );
+
+    let (code, failed_level5, _) = run(&fail, &["-v", "-v", "-v", "-v"]);
+    assert_ne!(code, 0, "{failed_level5}");
+    let detail = failed_level5
+        .split("[g.first] ----- detail -----")
+        .nth(1)
+        .and_then(|tail| tail.split("[g.first] ----- end detail -----").next())
+        .expect("level-5 failure output omitted the complete detail block");
+    assert!(
+        detail.contains("[g.first][test=suite::failure] full-error-line"),
+        "level-5 failure replay lost test identity: {detail}"
+    );
+
+    let (code, split_stream, _) = run(
+        &fixture.split_stream_dag(),
+        &["-v", "-v", "-v", "-v"],
+    );
+    assert_eq!(code, 0, "{split_stream}");
+    assert!(
+        split_stream.contains("[g.split][test=g.split] stderr raced after stdout marker"),
+        "stderr borrowed a racy stdout identity: {split_stream}"
+    );
+    assert!(
+        !split_stream.contains("[test=stdout::case] stderr raced after stdout marker"),
+        "split streams falsely attributed stderr to the stdout test: {split_stream}"
     );
 }

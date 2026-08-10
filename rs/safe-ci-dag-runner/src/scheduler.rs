@@ -863,6 +863,25 @@ fn spawn_reader<R: Read + Send + 'static>(
     })
 }
 
+fn failure_detail_lines(tag: &str, streams: &[&[u8]], verbosity: i64) -> Vec<String> {
+    let mut rendered = Vec::new();
+    for bytes in streams {
+        // stdout and stderr are independent pipes: neither stream may borrow a
+        // test boundary observed on the other. A fresh context per stream makes
+        // cross-pipe scheduling incapable of assigning the wrong test name.
+        let mut identity = ConsoleTestIdentity::default();
+        let text = String::from_utf8_lossy(bytes);
+        for line in text.lines() {
+            if verbosity >= 5 {
+                rendered.push(identity.decorate(tag, line));
+            } else {
+                rendered.push(format!("[{tag}] {line}"));
+            }
+        }
+    }
+    rendered
+}
+
 /// Best-effort one-line summary: the last non-empty decoded line of captured output.
 fn last_line(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
@@ -1147,7 +1166,6 @@ fn run_step(ctx: StepCtx) {
 
     let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let console_identity = Arc::new(Mutex::new(ConsoleTestIdentity::default()));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
         readers.push(spawn_reader(
@@ -1156,7 +1174,7 @@ fn run_step(ctx: StepCtx) {
             tag.clone(),
             verbosity,
             Arc::clone(&sink),
-            Arc::clone(&console_identity),
+            Arc::new(Mutex::new(ConsoleTestIdentity::default())),
         ));
     }
     if let Some(err) = child.stderr.take() {
@@ -1166,7 +1184,7 @@ fn run_step(ctx: StepCtx) {
             tag.clone(),
             verbosity,
             Arc::clone(&sink),
-            Arc::clone(&console_identity),
+            Arc::new(Mutex::new(ConsoleTestIdentity::default())),
         ));
     }
 
@@ -1326,8 +1344,10 @@ fn run_step(ctx: StepCtx) {
     let ok = returncode == Some(0) && !timed_out && !cpu_timed_out;
 
     // Combined captured output (stdout then stderr) for the summary + failure detail.
-    let mut combined: Vec<u8> = out_buf.lock().unwrap().clone();
-    combined.extend_from_slice(&err_buf.lock().unwrap());
+    let stdout = out_buf.lock().unwrap().clone();
+    let stderr = err_buf.lock().unwrap().clone();
+    let mut combined: Vec<u8> = stdout.clone();
+    combined.extend_from_slice(&stderr);
     let summary = last_line(&combined);
 
     // Build the per-step profile row (perflog step-profile schema keys + dynamic cpu.* counters).
@@ -1488,9 +1508,8 @@ fn run_step(ctx: StepCtx) {
             ));
         }
         emit(&format!("[{tag}] ----- detail -----"));
-        let text = String::from_utf8_lossy(&combined);
-        for line in text.lines() {
-            emit(&format!("[{tag}] {line}"));
+        for line in failure_detail_lines(&tag, &[&stdout, &stderr], verbosity) {
+            emit(&line);
         }
         emit(&format!("[{tag}] ----- end detail -----"));
     }
@@ -1729,6 +1748,30 @@ mod tests {
             context.decorate("step.outer", "harness teardown"),
             "[step.outer][test=step.outer] harness teardown"
         );
+    }
+
+    #[test]
+    fn level_five_failure_replay_preserves_identity_without_cross_stream_borrowing() {
+        let stdout = b"##TEST-START stdout::case\nstdout body\n";
+        let stderr = b"##TEST-START stderr::failure\nfull-error-line\n";
+        let lines = failure_detail_lines("step.outer", &[stdout, stderr], 5);
+        assert_eq!(
+            lines,
+            vec![
+                "[step.outer][test=stdout::case] ##TEST-START stdout::case",
+                "[step.outer][test=stdout::case] stdout body",
+                "[step.outer][test=stderr::failure] ##TEST-START stderr::failure",
+                "[step.outer][test=stderr::failure] full-error-line",
+            ]
+        );
+
+        // A marker on stdout must never misattribute an unrelated stderr line.
+        let split = failure_detail_lines(
+            "step.outer",
+            &[b"##TEST-START stdout::case\n", b"stderr raced first\n"],
+            5,
+        );
+        assert_eq!(split[1], "[step.outer][test=step.outer] stderr raced first");
     }
     use crate::model::ResourceHint;
     use std::collections::BTreeMap;
