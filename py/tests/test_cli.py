@@ -13,9 +13,20 @@ from pathlib import Path
 import pytest
 
 from safe_ci_dag_runner import __version__
-from safe_ci_dag_runner.cli import PROG, _load_userguide, main
+from safe_ci_dag_runner.cli import (
+    CGROUP_SETUP_ENVIRONMENT_ERROR,
+    PROG,
+    _load_userguide,
+    main,
+)
 
 _DEMO = '{"steps": [{"group": "g", "job": "j", "cmd": "true", "deps": []}]}'
+
+
+def test_cgroup_setup_failure_is_environmental_and_pre_node() -> None:
+    assert CGROUP_SETUP_ENVIRONMENT_ERROR.startswith("ENVIRONMENT:")
+    assert "no DAG node started" in CGROUP_SETUP_ENVIRONMENT_ERROR
+    assert "no product build started" in CGROUP_SETUP_ENVIRONMENT_ERROR
 
 
 def _capture(args: list[str]) -> tuple[int, str, str]:

@@ -8,6 +8,7 @@ callers can detect disabled containment, and failed enforcement writes emit warn
 
 from __future__ import annotations
 
+import errno
 import math
 import os
 import shlex
@@ -37,6 +38,13 @@ DEFAULT_CPU_BUDGET_FRACTION = 0.90
 #: controls, while the outer cap is the last-resort boundary that keeps a
 #: runaway run from reaching the host-global OOM killer.
 DEFAULT_MEMORY_BUDGET_FRACTION = 0.90
+
+# systemd may populate a new delegated scope asynchronously. Confirm the root is stably empty
+# rather than trusting the first empty roster read immediately after moving its initial members.
+_SCOPE_DRAIN_ATTEMPTS = 50
+_SCOPE_DRAIN_RETRY_SECONDS = 0.01
+_SCOPE_DRAIN_EMPTY_SAMPLES = 2
+_CONTROLLER_ENABLE_ATTEMPTS = 3
 
 #: Optional caller override used by containment tests and constrained hosts.
 #: It may only TIGHTEN the derived cap, never widen it.
@@ -1622,6 +1630,79 @@ def apply_specific_cores(
 # --------------------------------------------------------------------------- #
 
 
+def _drain_scope_root_with(
+    read_pids: Callable[[], list[str]],
+    move_pid: Callable[[str], None],
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Drain a scope root and require two consecutive empty observations.
+
+    A single empty read is not a stable systemd hand-off: a late helper may enter before the
+    subsequent ``cgroup.subtree_control`` write, which then fails with ``EBUSY``. The callbacks
+    keep that timing contract testable without pretending a regular fixture file has cgroupfs's
+    process-migration semantics.
+    """
+    consecutive_empty = 0
+    for attempt in range(_SCOPE_DRAIN_ATTEMPTS):
+        pids = read_pids()
+        if not pids:
+            consecutive_empty += 1
+            if consecutive_empty >= _SCOPE_DRAIN_EMPTY_SAMPLES:
+                return
+        else:
+            consecutive_empty = 0
+            for pid in pids:
+                try:
+                    move_pid(pid)
+                except OSError:
+                    # ESRCH is expected when a helper exits between the roster read and move.
+                    # A process that really remains is caught by the next roster read.
+                    pass
+        if attempt + 1 < _SCOPE_DRAIN_ATTEMPTS:
+            sleep(_SCOPE_DRAIN_RETRY_SECONDS)
+    remaining = read_pids()
+    remaining_text = ",".join(remaining) if remaining else "<empty on one unconfirmed final sample>"
+    raise BlockingIOError(
+        errno.EBUSY,
+        "scope root did not quiesce after "
+        f"{(_SCOPE_DRAIN_ATTEMPTS - 1) * _SCOPE_DRAIN_RETRY_SECONDS:.3f}s; "
+        f"remaining pid(s): {remaining_text}",
+    )
+
+
+def _enable_controller_with(
+    read_pids: Callable[[], list[str]],
+    move_pid: Callable[[str], None],
+    write_controller: Callable[[], None],
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    for attempt in range(_CONTROLLER_ENABLE_ATTEMPTS):
+        _drain_scope_root_with(read_pids, move_pid, sleep)
+        try:
+            write_controller()
+            return
+        except OSError as exc:
+            if exc.errno != errno.EBUSY or attempt + 1 >= _CONTROLLER_ENABLE_ATTEMPTS:
+                raise
+            # A member arrived after the stable-empty observation but before the controller
+            # write. Drain the newly observed member and retry the guarded transition.
+    raise AssertionError("the final controller-enable attempt returns its error")
+
+
+def _enable_controller(scope: Path, supervisor: Path, controller: str) -> None:
+    def move(pid: str) -> None:
+        (supervisor / "cgroup.procs").write_text(pid)
+
+    def write_controller() -> None:
+        (scope / "cgroup.subtree_control").write_text(f"+{controller}")
+
+    _enable_controller_with(
+        lambda: (scope / "cgroup.procs").read_text().split(),
+        move,
+        write_controller,
+    )
+
+
 class Cgroups:
     """Per-step child cgroups under the delegated outer scope — the concrete
     :class:`safe_ci_dag_runner.protocols.CgroupManager` for a real Linux
@@ -1671,33 +1752,17 @@ class Cgroups:
             _warn(naming, f"could not create supervisor cgroup {sup} ({exc}); "
                   "per-step containment disabled — falling back to process-group kill")
             return
-        for _ in range(5):
-            try:
-                pids = (scope_cg / "cgroup.procs").read_text().split()
-            except OSError:
-                pids = []
-            if not pids:
-                break
-            for pid in pids:
-                try:
-                    (sup / "cgroup.procs").write_text(pid)
-                except OSError:
-                    pass  # pid may have exited mid-drain; racy, legitimately ignored
-        # Root should now be empty → enable controllers for children. Enable each
-        # INDEPENDENTLY so a single unavailable one doesn't block the rest (the
-        # atomic multi-controller write fails wholesale on any one error).
+        # Enable each controller independently so one unavailable controller cannot make an
+        # atomic multi-controller write fail wholesale. Every write is guarded by a fresh bounded
+        # drain and an EBUSY re-drain, closing the check/act gap around late scope members.
         for c in ("memory", "cpu", "pids"):
             if c in controllers:
                 try:
-                    (scope_cg / "cgroup.subtree_control").write_text(f"+{c}")
+                    _enable_controller(scope_cg, sup, c)
                 except OSError as exc:
-                    # Non-fatal: cgroup.kill on a child still works without this
-                    # controller. But `memory` is load-bearing for the inner
-                    # caps, so surface the degradation rather than silently
-                    # dropping per-step limits/accounting for this controller.
                     _warn(naming, f"could not delegate '{c}' controller to per-step cgroups "
-                          f"({exc}); per-step {c} limits/accounting unavailable "
-                          "(outer scope cap still applies)")
+                          f"after bounded drain/retry ({exc}); per-step containment disabled")
+                    return
         self.root = scope_cg
         self.enabled = True
 

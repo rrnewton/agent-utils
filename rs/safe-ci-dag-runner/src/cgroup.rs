@@ -53,6 +53,11 @@ const LOG_PREFIX: &str = "[safe-ci]";
 const DEFAULT_CPU_BUDGET_FRACTION: f64 = 0.90;
 /// Generous last-resort run boundary, leaving memory for neighbours and the OS.
 const DEFAULT_MEMORY_BUDGET_FRACTION: f64 = 0.90;
+/// Bounded settling window for systemd's asynchronous population of a new delegated scope.
+const SCOPE_DRAIN_ATTEMPTS: usize = 50;
+const SCOPE_DRAIN_RETRY: Duration = Duration::from_millis(10);
+const SCOPE_DRAIN_EMPTY_SAMPLES: usize = 2;
+const CONTROLLER_ENABLE_ATTEMPTS: usize = 3;
 
 /// Per-step containment operations used by the scheduler.
 ///
@@ -159,6 +164,110 @@ fn read_trim(group: &Path, name: &str) -> Option<String> {
     fs::read_to_string(group.join(name))
         .ok()
         .map(|s| s.trim().to_string())
+}
+
+/// Drain a delegated scope root and require it to remain empty across two observations.
+///
+/// `systemd-run --scope` can still be finishing its own short-lived setup while the re-exec'd
+/// runner starts. A single empty read is therefore not a stable hand-off: a late helper can enter
+/// the root after that read, making the subsequent `cgroup.subtree_control` write fail with
+/// `EBUSY`. This bounded settle loop moves every observed pid, waits, and confirms quiescence
+/// before controller enablement.
+///
+/// The closures make the temporal contract executable without pretending an ordinary fixture
+/// file has cgroupfs's process-migration semantics.
+fn drain_scope_root_with<R, M, S>(
+    mut read_pids: R,
+    mut move_pid: M,
+    mut sleep: S,
+) -> std::io::Result<()>
+where
+    R: FnMut() -> std::io::Result<Vec<String>>,
+    M: FnMut(&str) -> std::io::Result<()>,
+    S: FnMut(Duration),
+{
+    let mut consecutive_empty = 0;
+    for attempt in 0..SCOPE_DRAIN_ATTEMPTS {
+        let pids = read_pids()?;
+        if pids.is_empty() {
+            consecutive_empty += 1;
+            if consecutive_empty >= SCOPE_DRAIN_EMPTY_SAMPLES {
+                return Ok(());
+            }
+        } else {
+            consecutive_empty = 0;
+            for pid in pids {
+                // ESRCH is expected when a short-lived helper exits between the roster read and
+                // migration. A process that really remains is caught by the next roster read.
+                let _ = move_pid(&pid);
+            }
+        }
+        if attempt + 1 < SCOPE_DRAIN_ATTEMPTS {
+            sleep(SCOPE_DRAIN_RETRY);
+        }
+    }
+    let remaining = read_pids()?;
+    let remaining = if remaining.is_empty() {
+        "<empty on one unconfirmed final sample>".to_string()
+    } else {
+        remaining.join(",")
+    };
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "scope root did not quiesce after {} ms; remaining pid(s): {}",
+            (SCOPE_DRAIN_ATTEMPTS - 1) * SCOPE_DRAIN_RETRY.as_millis() as usize,
+            remaining
+        ),
+    ))
+}
+
+fn enable_controller_with<R, M, W, S>(
+    mut read_pids: R,
+    mut move_pid: M,
+    mut write_controller: W,
+    mut sleep: S,
+) -> std::io::Result<()>
+where
+    R: FnMut() -> std::io::Result<Vec<String>>,
+    M: FnMut(&str) -> std::io::Result<()>,
+    W: FnMut() -> std::io::Result<()>,
+    S: FnMut(Duration),
+{
+    for attempt in 0..CONTROLLER_ENABLE_ATTEMPTS {
+        drain_scope_root_with(&mut read_pids, &mut move_pid, &mut sleep)?;
+        match write_controller() {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if e.raw_os_error() == Some(libc::EBUSY)
+                    && attempt + 1 < CONTROLLER_ENABLE_ATTEMPTS =>
+            {
+                // A member arrived after the stable-empty observation but before the controller
+                // write. Drain the newly observed member and retry the guarded transition.
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("the final controller-enable attempt returns its error")
+}
+
+fn enable_controller(scope: &Path, supervisor: &Path, controller: &str) -> std::io::Result<()> {
+    enable_controller_with(
+        || {
+            Ok(fs::read_to_string(scope.join("cgroup.procs"))?
+                .split_whitespace()
+                .map(String::from)
+                .collect())
+        },
+        |pid| fs::write(supervisor.join("cgroup.procs"), pid),
+        || {
+            fs::write(
+                scope.join("cgroup.subtree_control"),
+                format!("+{controller}"),
+            )
+        },
+        thread::sleep,
+    )
 }
 
 // Whole granted cores from a `cpu.max` string (`"<quota> <period>"`), or `None` when
@@ -1509,24 +1618,17 @@ impl Cgroups {
             ));
             return cg;
         }
-        for _ in 0..5 {
-            let pids = read_trim(&scope, "cgroup.procs").unwrap_or_default();
-            let pids: Vec<&str> = pids.split_whitespace().collect();
-            if pids.is_empty() {
-                break;
-            }
-            for pid in pids {
-                let _ = fs::write(sup.join("cgroup.procs"), pid);
-            }
-        }
-        // Enable each controller INDEPENDENTLY (an atomic multi-controller write fails wholesale).
+        // Enable each controller independently so one unavailable controller cannot make an
+        // atomic multi-controller write fail wholesale. Every write is guarded by a fresh bounded
+        // drain and an EBUSY re-drain, closing the check/act gap around late scope members.
         for c in ["memory", "cpu", "pids"] {
             if controllers.contains(c) {
-                if let Err(e) = fs::write(scope.join("cgroup.subtree_control"), format!("+{c}")) {
+                if let Err(e) = enable_controller(&scope, &sup, c) {
                     warn(&format!(
-                        "could not delegate '{c}' controller to per-step cgroups ({e}); per-step \
-                         {c} limits/accounting unavailable (outer scope cap still applies)"
+                        "could not delegate '{c}' controller to per-step cgroups after bounded \
+                         drain/retry ({e}); per-step containment disabled"
                     ));
+                    return cg;
                 }
             }
         }
@@ -1891,6 +1993,107 @@ impl CgroupManager for Cgroups {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
+    #[test]
+    fn scope_drain_waits_past_first_empty_sample_for_late_member() {
+        // This is the production race: systemd's initial members are drained, one read reports
+        // empty, then a late helper enters before subtree_control is enabled. Requiring two
+        // empty samples makes the late pid observable and movable rather than returning early.
+        let mut observations = VecDeque::from([
+            vec!["runner".to_string()],
+            vec![],
+            vec!["late-systemd-helper".to_string()],
+            vec![],
+            vec![],
+        ]);
+        let mut moved = Vec::new();
+        let mut sleeps = 0;
+        drain_scope_root_with(
+            || Ok(observations.pop_front().unwrap_or_default()),
+            |pid| {
+                moved.push(pid.to_string());
+                Ok(())
+            },
+            |_| sleeps += 1,
+        )
+        .unwrap();
+        assert_eq!(moved, ["runner", "late-systemd-helper"]);
+        assert_eq!(sleeps, 4);
+    }
+
+    #[test]
+    fn scope_drain_refuses_a_root_that_never_quiesces() {
+        let mut moves = 0;
+        let error = drain_scope_root_with(
+            || Ok(vec!["persistent-member".to_string()]),
+            |_| {
+                moves += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted refusal",
+                ))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("persistent-member"), "{error}");
+        assert_eq!(moves, SCOPE_DRAIN_ATTEMPTS);
+    }
+
+    #[test]
+    fn scope_drain_propagates_an_unreadable_roster() {
+        let mut moved = false;
+        let error = drain_scope_root_with(
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted unreadable cgroup.procs",
+                ))
+            },
+            |_| {
+                moved = true;
+                Ok(())
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!moved, "an unreadable roster must not be treated as empty");
+    }
+
+    #[test]
+    fn controller_enable_redrains_a_member_that_arrives_in_the_check_act_gap() {
+        let mut observations = VecDeque::from([
+            vec![],
+            vec![],
+            vec!["late-between-check-and-write".to_string()],
+            vec![],
+            vec![],
+        ]);
+        let mut moved = Vec::new();
+        let mut writes = 0;
+        enable_controller_with(
+            || Ok(observations.pop_front().unwrap_or_default()),
+            |pid| {
+                moved.push(pid.to_string());
+                Ok(())
+            },
+            || {
+                writes += 1;
+                if writes == 1 {
+                    Err(std::io::Error::from_raw_os_error(libc::EBUSY))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(writes, 2);
+        assert_eq!(moved, ["late-between-check-and-write"]);
+    }
 
     /// A manager that does NOT override `containment_record`, i.e. an out-of-tree implementor.
     struct SilentManager {

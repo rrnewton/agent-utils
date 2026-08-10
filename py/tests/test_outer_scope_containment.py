@@ -1,8 +1,80 @@
+import errno
 from pathlib import Path
 
 import pytest
 
 from safe_ci_dag_runner import cgroup
+
+
+def test_scope_drain_waits_past_first_empty_sample_for_late_member() -> None:
+    observations = iter([["runner"], [], ["late-systemd-helper"], [], []])
+    moved: list[str] = []
+    sleeps: list[float] = []
+
+    cgroup._drain_scope_root_with(
+        lambda: next(observations, []),
+        moved.append,
+        sleeps.append,
+    )
+
+    assert moved == ["runner", "late-systemd-helper"]
+    assert sleeps == [cgroup._SCOPE_DRAIN_RETRY_SECONDS] * 4
+
+
+def test_scope_drain_refuses_a_root_that_never_quiesces() -> None:
+    moves = 0
+
+    def refuse_move(_pid: str) -> None:
+        nonlocal moves
+        moves += 1
+        raise PermissionError("planted refusal")
+
+    with pytest.raises(BlockingIOError, match="persistent-member"):
+        cgroup._drain_scope_root_with(
+            lambda: ["persistent-member"],
+            refuse_move,
+            lambda _seconds: None,
+        )
+
+    assert moves == cgroup._SCOPE_DRAIN_ATTEMPTS
+
+
+def test_scope_drain_propagates_an_unreadable_roster() -> None:
+    moved = False
+
+    def unreadable() -> list[str]:
+        raise PermissionError("planted unreadable cgroup.procs")
+
+    def move(_pid: str) -> None:
+        nonlocal moved
+        moved = True
+
+    with pytest.raises(PermissionError, match="planted unreadable"):
+        cgroup._drain_scope_root_with(unreadable, move, lambda _seconds: None)
+
+    assert not moved
+
+
+def test_controller_enable_redrains_a_member_in_the_check_act_gap() -> None:
+    observations = iter([[], [], ["late-between-check-and-write"], [], []])
+    moved: list[str] = []
+    writes = 0
+
+    def write_controller() -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError(errno.EBUSY, "planted late member")
+
+    cgroup._enable_controller_with(
+        lambda: next(observations, []),
+        moved.append,
+        write_controller,
+        lambda _seconds: None,
+    )
+
+    assert writes == 2
+    assert moved == ["late-between-check-and-write"]
 
 
 def test_outer_memory_cap_is_derived_and_override_only_tightens(

@@ -65,6 +65,9 @@ const PROFILE_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_PROFILE_DIR";
 /// on demand; runs and sweeps auto-append here so profiling data lands somewhere obvious.
 const DEFAULT_PROFILE_DIR: &str = ".safe-ci-dag-runner/profiles";
 
+const CGROUP_SETUP_ENVIRONMENT_ERROR: &str = "ENVIRONMENT: managed cgroup scope could not \
+quiesce and delegate per-step controllers; no DAG node started and no product build started";
+
 /// The complete user guide embedded in the executable.
 const USERGUIDE: &str = include_str!("embedded_userguide.md");
 
@@ -934,8 +937,8 @@ fn resolve_cgroups(
             return Ok(None);
         }
         eprintln!(
-            "{PROG}: ERROR: inside a managed scope but per-step cgroups could not be set up; \
-             re-run with --allow-cgroup-failure to run UNBOXED."
+            "{PROG}: ERROR: {CGROUP_SETUP_ENVIRONMENT_ERROR}; re-run with \
+             --allow-cgroup-failure to run UNBOXED."
         );
         return Err(3);
     }
@@ -2816,6 +2819,13 @@ mod tests {
             r#"{"steps":[{"group":"build","job":"app","cmd":"echo {args}"},{"group":"test","job":"unit","cmd":"true","deps":["build.app"]}]}"#,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn cgroup_setup_failure_is_attributed_to_the_environment_before_any_node() {
+        assert!(CGROUP_SETUP_ENVIRONMENT_ERROR.starts_with("ENVIRONMENT:"));
+        assert!(CGROUP_SETUP_ENVIRONMENT_ERROR.contains("no DAG node started"));
+        assert!(CGROUP_SETUP_ENVIRONMENT_ERROR.contains("no product build started"));
     }
 
     #[test]

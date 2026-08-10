@@ -68,6 +68,10 @@ from safe_ci_dag_runner.sizing import jobs_for_budget, parse_size
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
 PROG = "safe-ci-dag-runner"
+CGROUP_SETUP_ENVIRONMENT_ERROR = (
+    "ENVIRONMENT: managed cgroup scope could not quiesce and delegate per-step controllers; "
+    "no DAG node started and no product build started"
+)
 
 #: Environment variable overriding the default profile-store location (Feature D). An explicit
 #: ``--perf-dir`` still wins over this; ``--no-profile`` disables logging entirely.
@@ -1620,8 +1624,8 @@ def _resolve_cgroup_manager(
             )
             return None, 0
         print(
-            f"{PROG}: ERROR: inside a managed scope but per-step cgroups could not be set up; "
-            "re-run with --allow-cgroup-failure to run UNBOXED.",
+            f"{PROG}: ERROR: {CGROUP_SETUP_ENVIRONMENT_ERROR}; re-run with "
+            "--allow-cgroup-failure to run UNBOXED.",
             file=sys.stderr,
         )
         return None, 3
