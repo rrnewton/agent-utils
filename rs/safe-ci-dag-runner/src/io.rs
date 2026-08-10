@@ -26,7 +26,8 @@ use std::fmt;
 use serde_json::Value;
 
 use crate::model::{
-    DagConfig, ResourceHint, Step, StepClass, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    DagConfig, IntentionalSkipReason, ResourceHint, Step, StepClass, DEFAULT_JOBS_FLAG,
+    DEFAULT_STEP_TIMEOUT,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -312,7 +313,35 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
             cpu_timeout: opt_int(sm, "cpu_timeout", 0)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
+            skip_reason: match opt_str_or_none(sm, "skip_reason")? {
+                Some(text) => {
+                    Some(IntentionalSkipReason::from_value(&text).ok_or_else(|| {
+                        err(format!("{where_}.skip_reason: unknown value '{text}'"))
+                    })?)
+                }
+                None => None,
+            },
         });
+    }
+    let intentional: std::collections::BTreeSet<String> = steps
+        .iter()
+        .filter(|step| step.skip_reason.is_some())
+        .map(Step::tag)
+        .collect();
+    for step in &steps {
+        let blocked: Vec<String> = step
+            .deps
+            .iter()
+            .filter(|dep| intentional.contains(*dep))
+            .cloned()
+            .collect();
+        if !blocked.is_empty() {
+            return Err(err(format!(
+                "step {}: dependency on intentionally skipped node(s) {} is undefined",
+                step.tag(),
+                blocked.join(", ")
+            )));
+        }
     }
     Ok(DagConfig {
         steps,
@@ -638,6 +667,10 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
         "\"jobs_flag\": {},\n",
         opt_str_json(step.jobs_flag.as_deref())
     ));
+    if let Some(reason) = step.skip_reason {
+        s.push_str(&key);
+        s.push_str(&format!("\"skip_reason\": {},\n", json_str(reason.value())));
+    }
     s.push_str(&key);
     s.push_str("\"hint\": ");
     emit_hint(s, &step.hint, base + 2);
@@ -842,6 +875,28 @@ steps:
         assert_eq!(by_tag["g.a"].timeout, 42);
         assert_eq!(by_tag["g.b"].timeout, 7);
         assert_eq!(cfg.default_step_timeout, 42);
+    }
+
+    #[test]
+    fn typed_intentional_skip_roundtrips_and_rejects_dependents() {
+        let cfg = dag_from_json(
+            r#"{"steps":[{"group":"g","job":"empty","cmd":"false","skip_reason":"empty-manifest-bucket"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.steps[0].skip_reason,
+            Some(IntentionalSkipReason::EmptyManifestBucket)
+        );
+        assert!(dag_to_json(&cfg).contains("\"skip_reason\": \"empty-manifest-bucket\""));
+
+        assert!(dag_from_json(
+            r#"{"steps":[{"group":"g","job":"x","cmd":"true","skip_reason":"unknown"}]}"#
+        )
+        .is_err());
+        assert!(dag_from_json(
+            r#"{"steps":[{"group":"g","job":"empty","cmd":"false","skip_reason":"empty-manifest-bucket"},{"group":"g","job":"consumer","cmd":"true","deps":["g.empty"]}]}"#
+        )
+        .is_err());
     }
 
     #[test]

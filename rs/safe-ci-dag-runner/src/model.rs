@@ -41,6 +41,30 @@ pub enum StepClass {
     Light,
 }
 
+/// Closed vocabulary for nodes deliberately omitted before process spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentionalSkipReason {
+    /// The manifest planner selected no test cells for this static bucket.
+    EmptyManifestBucket,
+}
+
+impl IntentionalSkipReason {
+    /// Return the stable serialized reason.
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::EmptyManifestBucket => "empty-manifest-bucket",
+        }
+    }
+
+    /// Parse one stable serialized reason.
+    pub fn from_value(text: &str) -> Option<Self> {
+        match text {
+            "empty-manifest-bucket" => Some(Self::EmptyManifestBucket),
+            _ => None,
+        }
+    }
+}
+
 impl StepClass {
     /// Return the canonical serialized value.
     pub fn value(self) -> &'static str {
@@ -125,6 +149,8 @@ pub struct Step {
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
     /// disables appending (the step manages its own concurrency). See [`render_jobs_flag`].
     pub jobs_flag: Option<String>,
+    /// Typed pre-execution omission, separate from PASS and dependency skip.
+    pub skip_reason: Option<IntentionalSkipReason>,
 }
 
 impl Step {
@@ -463,6 +489,8 @@ pub struct RunResult {
     pub outcomes: Vec<StepOutcome>,
     /// Tags whose dependencies failed so they never ran (sorted).
     pub skipped: Vec<String>,
+    /// `(tag, stable reason)` for nodes deliberately omitted before process spawn.
+    pub intentional_skips: Vec<(String, IntentionalSkipReason)>,
     /// Per-step measurement rows (column -> value) to forward to a metrics sink; empty when no
     /// cgroup manager supplied per-step metrics.
     pub step_profile_rows: Vec<BTreeMap<String, String>>,
@@ -508,6 +536,7 @@ mod tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: None,
+            skip_reason: None,
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
     }
@@ -527,6 +556,7 @@ mod tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: jobs_flag.map(str::to_string),
+            skip_reason: None,
         }
     }
 

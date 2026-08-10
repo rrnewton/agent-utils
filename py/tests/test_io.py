@@ -116,6 +116,31 @@ def test_default_step_timeout_falls_back_to_module_constant() -> None:
     assert cfg.default_step_timeout == 1800
 
 
+def test_typed_intentional_skip_roundtrips_and_rejects_dependents() -> None:
+    leaf = dag_from_json(
+        '{"steps":[{"group":"g","job":"empty","cmd":"false",'
+        '"skip_reason":"empty-manifest-bucket"}]}'
+    )
+    assert leaf.steps[0].skip_reason is not None
+    assert '"skip_reason": "empty-manifest-bucket"' in dag_to_json(leaf)
+
+    bad_docs = [
+        '{"steps":[{"group":"g","job":"x","cmd":"true",'
+        '"skip_reason":"unknown"}]}',
+        '{"steps":['
+        '{"group":"g","job":"empty","cmd":"false",'
+        '"skip_reason":"empty-manifest-bucket"},'
+        '{"group":"g","job":"consumer","cmd":"true","deps":["g.empty"]}]}'
+    ]
+    for doc in bad_docs:
+        try:
+            dag_from_json(doc)
+        except DagJsonError:
+            pass
+        else:
+            raise AssertionError(f"intentional-skip misuse accepted: {doc}")
+
+
 def test_strict_parse_errors() -> None:
     bad_docs = [
         "not json at all",

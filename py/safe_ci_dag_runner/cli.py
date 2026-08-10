@@ -2014,7 +2014,8 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     verdict = c.green("PASS") if result.ok else c.red("FAIL")
     print(
         f"{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, "
-        f"{len(result.skipped)} skipped in {result.wall_s:.1f}s",
+        f"{len(result.intentional_skips)} intentionally skipped, "
+        f"{len(result.skipped)} dependency-skipped in {result.wall_s:.1f}s",
         file=sys.stderr,
     )
     if perf_dir is not None:

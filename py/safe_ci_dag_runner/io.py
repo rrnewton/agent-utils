@@ -23,6 +23,7 @@ from safe_ci_dag_runner.model import (
     DEFAULT_JOBS_FLAG,
     DEFAULT_STEP_TIMEOUT,
     DagConfig,
+    IntentionalSkipReason,
     ResourceHint,
     Step,
     StepClass,
@@ -377,6 +378,13 @@ def _dag_from_obj(raw: object) -> DagConfig:
     for i, entry in enumerate(steps_raw):
         where = f"steps[{i}]"
         sm = _as_obj(entry, where)
+        skip_text = _opt_str_or_none(sm, "skip_reason")
+        try:
+            skip_reason = IntentionalSkipReason(skip_text) if skip_text is not None else None
+        except ValueError as exc:
+            raise DagJsonError(
+                f"{where}.skip_reason: unknown value {skip_text!r}"
+            ) from exc
         steps.append(
             Step(
                 group=_req_str(sm, "group", where),
@@ -392,8 +400,17 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 timeout=_opt_int(sm, "timeout", default_step_timeout),
                 cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
+                skip_reason=skip_reason,
             )
         )
+    intentional = {step.tag for step in steps if step.skip_reason is not None}
+    for step in steps:
+        blocked = sorted(set(step.deps) & intentional)
+        if blocked:
+            raise DagJsonError(
+                f"step {step.tag}: dependency on intentionally skipped node(s) "
+                f"{', '.join(blocked)} is undefined"
+            )
     return DagConfig(
         steps=tuple(steps),
         description=_opt_str(doc, "description", ""),
@@ -436,10 +453,13 @@ def _step_to_json(step: Step) -> dict[str, object]:
         # immediately after `timeout` to match the Rust serializer's key order.
         "cpu_timeout": step.cpu_timeout,
         "jobs_flag": step.jobs_flag,
+        "skip_reason": step.skip_reason.value if step.skip_reason is not None else None,
         "hint": _hint_to_json(step.hint),
     }
     if step.cpu_timeout == 0:
         del obj["cpu_timeout"]
+    if step.skip_reason is None:
+        del obj["skip_reason"]
     return obj
 
 

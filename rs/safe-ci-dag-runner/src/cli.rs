@@ -2169,7 +2169,8 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         c.red("FAIL")
     };
     eprintln!(
-        "{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, {} skipped in {:.1}s",
+        "{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, {} intentionally skipped, {} dependency-skipped in {:.1}s",
+        result.intentional_skips.len(),
         result.skipped.len(),
         result.wall_s
     );

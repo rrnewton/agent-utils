@@ -191,6 +191,12 @@ class Runner:
         self.core_budget = core_budget
         self.cores_used = 0
         self.steps: dict[str, Step] = cfg.by_tag()
+        self.intentional_skips = tuple(
+            (step.tag, step.skip_reason)
+            for step in cfg.steps
+            if step.skip_reason is not None
+        )
+        self.intentional_skip_tags = {tag for tag, _reason in self.intentional_skips}
         # Dispatch order. When the caller supplies an explicit `order` (e.g. a critical-path
         # planner's), use it verbatim; otherwise default to LONGEST-processing-time first (LPT
         # makespan heuristic): sort by the static duration hint DESCENDING. The sort is STABLE, so
@@ -278,7 +284,12 @@ class Runner:
         while changed:
             changed = False
             for tag, step in self.steps.items():
-                if tag in sk or tag in self.done or tag in self.running:
+                if (
+                    tag in sk
+                    or tag in self.done
+                    or tag in self.running
+                    or tag in self.intentional_skip_tags
+                ):
                     continue
                 for d in step.deps:
                     if (d in self.done and not self.done[d].ok) or d in sk:
@@ -364,6 +375,12 @@ class Runner:
         """
         threads: list[threading.Thread] = []
         wall_start = time.time()
+        for tag, reason in self.intentional_skips:
+            self._emit(f"[{tag}] SKIPPED reason={reason.value}")
+            if self.evidence is not None:
+                self.evidence.record(
+                    "step_skip", [("step", tag), ("reason", reason.value)]
+                )
         if self.evidence is not None:
             print(
                 f"[scheduler] per-step logs + test-boundary journal: "
@@ -421,13 +438,20 @@ class Runner:
                     )
                 skipped = self._skipped()
                 if not self.running and (
-                    self.stop or len(self.done) + len(skipped) >= len(self.steps)
+                    self.stop
+                    or len(self.done) + len(skipped) + len(self.intentional_skips)
+                    >= len(self.steps)
                 ):
                     break
                 launchable: list[Step] = []
                 if not self.stop:
                     for tag in self.order:
-                        if tag in self.done or tag in self.running or tag in skipped:
+                        if (
+                            tag in self.done
+                            or tag in self.running
+                            or tag in skipped
+                            or tag in self.intentional_skip_tags
+                        ):
                             continue
                         step = self.steps[tag]
                         if not self._deps_known(step):
@@ -816,6 +840,7 @@ class Runner:
             wall_s=self.wall,
             outcomes=outcomes,
             skipped=skipped,
+            intentional_skips=self.intentional_skips,
             step_profile_rows=tuple(self.step_profile_rows),
             run_timed_out=self.run_timed_out,
         )

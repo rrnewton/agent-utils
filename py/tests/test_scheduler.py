@@ -11,6 +11,7 @@ from safe_ci_dag_runner.model import (
     DEFAULT_SMALL_CPU_TIMEOUT,
     DEFAULT_SMALL_MEM_CAP_BYTES,
     DagConfig,
+    IntentionalSkipReason,
     ResourceHint,
     Step,
 )
@@ -25,6 +26,7 @@ def _step(
     deps: list[str] | None = None,
     resources: dict[str, int] | None = None,
     est: float = 0.0,
+    skip_reason: IntentionalSkipReason | None = None,
 ) -> Step:
     return Step(
         group,
@@ -33,6 +35,7 @@ def _step(
         cmd,
         deps=list(deps or []),
         hint=ResourceHint(resources=dict(resources or {}), est_duration_s=est),
+        skip_reason=skip_reason,
     )
 
 
@@ -73,6 +76,32 @@ def test_dep_failure_skips_dependent() -> None:
     assert outcomes["g.A"].ok is False
     assert "g.B" in res.skipped
     assert "g.B" not in outcomes  # a skipped step never produces an outcome
+
+
+def test_intentional_skip_never_spawns_and_nonempty_peer_runs() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        forbidden = os.path.join(d, "forbidden")
+        ran = os.path.join(d, "ran")
+        cfg = DagConfig(
+            steps=(
+                _step(
+                    "g",
+                    "empty",
+                    f"touch {forbidden}",
+                    skip_reason=IntentionalSkipReason.EMPTY_MANIFEST_BUCKET,
+                ),
+                _step("g", "nonempty", f"touch {ran}"),
+            )
+        )
+        res = run_dag(cfg, jobs=2, verbosity=0)
+        assert res.ok
+        assert not os.path.exists(forbidden)
+        assert os.path.exists(ran)
+        assert res.intentional_skips == (
+            ("g.empty", IntentionalSkipReason.EMPTY_MANIFEST_BUCKET),
+        )
+        assert res.skipped == ()
+        assert [outcome.tag for outcome in res.outcomes] == ["g.nonempty"]
 
 
 def test_eager_exit_aborts_inflight_step() -> None:

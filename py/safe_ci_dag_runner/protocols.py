@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
-from safe_ci_dag_runner.model import step_failure_reason
+from safe_ci_dag_runner.model import IntentionalSkipReason, step_failure_reason
 
 __all__ = [
     "CgroupManager",
@@ -282,6 +282,7 @@ class RunResult:
     wall_s: float
     outcomes: tuple[StepOutcome, ...] = ()
     skipped: tuple[str, ...] = ()
+    intentional_skips: tuple[tuple[str, IntentionalSkipReason], ...] = ()
     step_profile_rows: tuple[Mapping[str, object], ...] = field(default_factory=tuple)
     #: The WHOLE RUN hit its outer wall budget and was cut short. Distinct from a step's own
     #: ``timed_out``: no single node necessarily misbehaved, the combination did. A consumer that

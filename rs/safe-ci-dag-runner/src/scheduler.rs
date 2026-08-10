@@ -489,6 +489,7 @@ fn emit(line: &str) {
 struct Runner {
     steps: Arc<HashMap<String, Step>>,
     order: Vec<String>,
+    intentional_skips: Vec<(String, crate::model::IntentionalSkipReason)>,
     jobs: i64,
     keep_going: bool,
     verbosity: i64,
@@ -550,9 +551,15 @@ impl Runner {
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
+        let intentional_skips = cfg
+            .steps
+            .iter()
+            .filter_map(|step| step.skip_reason.map(|reason| (step.tag(), reason)))
+            .collect();
         Runner {
             steps: Arc::new(steps),
             order,
+            intentional_skips,
             jobs: jobs.max(1),
             keep_going,
             verbosity,
@@ -589,7 +596,11 @@ impl Runner {
         while changed {
             changed = false;
             for (tag, step) in self.steps.iter() {
-                if sk.contains(tag) || sh.done.contains_key(tag) || sh.running.contains(tag) {
+                if sk.contains(tag)
+                    || sh.done.contains_key(tag)
+                    || sh.running.contains(tag)
+                    || step.skip_reason.is_some()
+                {
                     continue;
                 }
                 for d in &step.deps {
@@ -609,6 +620,18 @@ impl Runner {
     fn run(&self) -> (bool, f64) {
         let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
         let wall_start = Instant::now();
+        for (tag, reason) in &self.intentional_skips {
+            emit(&format!("[{tag}] SKIPPED reason={}", reason.value()));
+            if let Some(evidence) = &self.evidence {
+                evidence.record(
+                    "step_skip",
+                    &[
+                        ("step", tag.clone()),
+                        ("reason", reason.value().to_string()),
+                    ],
+                );
+            }
+        }
         let deadline = self
             .run_timeout_s
             .filter(|s| *s > 0)
@@ -668,19 +691,22 @@ impl Runner {
                 }
                 let skipped = self.skipped(&sh);
                 if sh.running.is_empty()
-                    && (sh.stop || sh.done.len() + skipped.len() >= self.steps.len())
+                    && (sh.stop
+                        || sh.done.len() + skipped.len() + self.intentional_skips.len()
+                            >= self.steps.len())
                 {
                     break;
                 }
                 if !sh.stop {
                     for tag in &self.order {
+                        let step = self.steps[tag].clone();
                         if sh.done.contains_key(tag)
                             || sh.running.contains(tag)
                             || skipped.contains(tag)
+                            || step.skip_reason.is_some()
                         {
                             continue;
                         }
-                        let step = self.steps[tag].clone();
                         if !deps_known(&sh, &step) {
                             continue;
                         }
@@ -766,6 +792,7 @@ impl Runner {
             wall_s: wall,
             outcomes,
             skipped,
+            intentional_skips: self.intentional_skips.clone(),
             step_profile_rows: sh.step_profile_rows.clone(),
             run_timed_out: sh.run_timed_out,
         }
@@ -1756,6 +1783,7 @@ pub fn run_dag_boxed_deadline(
                 wall_s: 0.0,
                 outcomes: Vec::new(),
                 skipped: Vec::new(),
+                intentional_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
                 run_timed_out: false,
             };
@@ -1874,7 +1902,7 @@ mod tests {
         );
         assert_eq!(split[1], "[step.outer][test=step.outer] stderr raced first");
     }
-    use crate::model::ResourceHint;
+    use crate::model::{IntentionalSkipReason, ResourceHint};
     use std::collections::BTreeMap;
 
     #[test]
@@ -1921,6 +1949,7 @@ mod tests {
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
+            skip_reason: None,
         }
     }
 
@@ -1999,6 +2028,57 @@ mod tests {
         assert!(!outcomes["g.A"].ok);
         assert!(res.skipped.contains(&"g.B".to_string()));
         assert!(!outcomes.contains_key("g.B"));
+    }
+
+    #[test]
+    fn intentional_skip_never_spawns_and_nonempty_peer_runs() {
+        let dir = std::env::temp_dir().join(format!("scdr_skip_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let forbidden = dir.join("forbidden");
+        let ran = dir.join("ran");
+        let mut empty = step(
+            "g",
+            "empty",
+            &format!("touch {}", forbidden.display()),
+            &[],
+            0.0,
+            &[],
+        );
+        empty.skip_reason = Some(IntentionalSkipReason::EmptyManifestBucket);
+        let cfg = DagConfig {
+            steps: vec![
+                empty,
+                step(
+                    "g",
+                    "nonempty",
+                    &format!("touch {}", ran.display()),
+                    &[],
+                    0.0,
+                    &[],
+                ),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 2, false, 0);
+        assert!(res.ok);
+        assert!(!forbidden.exists());
+        assert!(ran.exists());
+        assert_eq!(
+            res.intentional_skips,
+            vec![(
+                "g.empty".to_string(),
+                IntentionalSkipReason::EmptyManifestBucket,
+            )]
+        );
+        assert!(res.skipped.is_empty());
+        assert_eq!(
+            res.outcomes
+                .iter()
+                .map(|o| o.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["g.nonempty"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -36,6 +36,12 @@ class StepClass(Enum):
     LIGHT = "light"
 
 
+class IntentionalSkipReason(Enum):
+    """Closed vocabulary for nodes deliberately omitted before process spawn."""
+
+    EMPTY_MANIFEST_BUCKET = "empty-manifest-bucket"
+
+
 @dataclass(frozen=True)
 class ResourceHint:
     """Optional per-step resource demand, duration, parallelism, and memory hints.
@@ -90,6 +96,9 @@ class Step:
     # `preferred_inner_jobs`. None inherits DagConfig.default_jobs_flag; "" disables appending
     # (the step manages its own concurrency). See render_jobs_flag for the template forms.
     jobs_flag: str | None = None
+    # A typed, pre-execution omission. This is not PASS and is kept separate from
+    # dependency-skipped nodes in RunResult. Unknown strings are rejected by the loader.
+    skip_reason: IntentionalSkipReason | None = None
 
     @property
     def tag(self) -> str:
