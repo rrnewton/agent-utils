@@ -243,7 +243,32 @@ databases read-only, uses SQLite's online backup API for consistent copies, and 
 archive-local snapshots. Coordinator content blocks provide prompts, responses, and condensed tool
 counts; agent blocks and task notes provide incarnation lifetimes and timestamped work updates.
 
-### 2. Summarize — the only token-spending stage
+### 2. Extract prompts and responses — no model calls
+
+After one or more teams have been ingested into the same durable archive, materialize the global
+chronological transcript projection:
+
+```bash
+agent-team-timeline extract-transcripts --output ./timelines/example-team
+# repeat --team to select teams explicitly; omission selects every ingested team
+```
+
+This reads only normalized coordinator events. It writes
+`extracted/transcripts/occurrences.jsonl`, `prompts.jsonl`, `messages.jsonl`,
+`system-inputs.jsonl`, and a digest-bound manifest. `occurrences.jsonl` retains every physical
+provider/team occurrence, while
+`prompts.jsonl` collapses only source-identical logical fork copies and contains verbatim authored
+or externally submitted prompts;
+`messages.jsonl` adds coordinator responses associated by provider turn identity. Synthetic Claude
+notifications, scheduled inputs, and inter-agent messages are retained separately rather than
+counted as the user's prompts. Every record has a stable occurrence ID and source provenance.
+
+Reruns take a monotonic union: a provider-side rewrite or rotation cannot delete an occurrence that
+was already extracted. Prompt ordinals are a convenient current 1-based chronological projection,
+not durable identity; adding newly discovered older history can renumber later prompts. The run
+receipt records zero model calls and zero model tokens.
+
+### 3. Summarize — the only token-spending stage
 
 ```bash
 agent-team-timeline summarize \
@@ -376,7 +401,7 @@ pipeline without network or token use. It labels the overview and definitions as
 evidence and retains first-use context instead of pretending to synthesize model-quality
 explanations. Its cache keys are distinct from Codex summaries.
 
-### 3. Build — guaranteed zero model calls
+### 4. Build — guaranteed zero model calls
 
 ```bash
 agent-team-timeline build --team example-team --output ./timelines/example-team
@@ -432,7 +457,7 @@ and statistics. If archived teams disagree about their display timezone, pass on
 each archive's calendar timezone rather than being relabeled as a different cached computation;
 hourly rollup keys are UTC-stable.
 
-### 4. Optional GitHub pull metadata — conditional and cached
+### 5. Optional GitHub pull metadata — conditional and cached
 
 ```bash
 agent-team-timeline github-metadata \
@@ -486,6 +511,12 @@ example-team/
 ├── Makefile, serve.py, run_stats.py, README.md
 ├── manifest.json
 ├── runs/<timestamp>-<hash>.json
+├── extracted/transcripts/
+│   ├── manifest.json                # source generations + file digests; zero-token contract
+│   ├── occurrences.jsonl            # every physical provider/team source occurrence
+│   ├── prompts.jsonl                # global chronological authored prompt report
+│   ├── messages.jsonl               # prompts plus mechanically linked responses
+│   └── system-inputs.jsonl          # retained scheduled/synthetic coordinator inputs
 ├── data/
 │   ├── timeline.json
 │   └── details/<phase-id>.json
@@ -643,9 +674,9 @@ plaintext; encrypted instruction bodies remain unavailable to the archive.
 
 ## Inspect and troubleshoot
 
-Agents and shell scripts can navigate the same built archive without starting the website. JSON is
-the default; `--format jsonl` streams one result per line, while `--format markdown` is convenient
-for a terminal transcript.
+Agents and shell scripts can navigate the same archive without starting the website. JSON is the
+default; `--format jsonl` streams one result per line, `--format markdown` renders timeline records,
+and `--format text` prints prompts/responses compactly for terminal review.
 
 ```bash
 agent-team-timeline query --output ./timelines/example-team list teams
@@ -658,7 +689,18 @@ agent-team-timeline query --output ./timelines/example-team \
   show 'phase:example-team::phase-0123456789abcdef' --transcript
 agent-team-timeline query --output ./timelines/example-team \
   search 'reproducible build' --scope all --team example-team --limit 20
+agent-team-timeline query --output ./timelines/example-team \
+  --format text prompts --range 200-300
+agent-team-timeline query --output ./timelines/example-team \
+  --format jsonl messages --range 200-300
 ```
+
+`prompts` is ordered globally by timestamp and accepts one 1-based inclusive ordinal or `N-M` via
+`--range`; `messages` returns the same prompt selection plus responses linked to those prompts. Both
+also accept repeatable `--team` and half-open RFC3339 time bounds. They read the digest-validated
+`extracted/transcripts/` projection and therefore work even before a website has been built. A
+generated archive exposes the common prompt path as `make prompts
+PROMPT_ARGS='--range 200-300'`.
 
 `list` supports `teams`, `agents`, `phases`, and `rollups`. Its records carry canonical references
 that `show` accepts directly:
@@ -675,9 +717,10 @@ children, and work-phase references for an agent; phase transcripts remain exclu
 Search is literal and case-insensitive by default. It can scan `summaries`, `transcripts`, or `all`;
 `--agent` restricts work-phase and transcript results to one canonical agent reference. Time bounds
 are half-open RFC3339 instants and select records whose intervals overlap the requested range.
-Queries only read `data/timeline.json`, `data/details/*.json`, and referenced summary Markdown; they
-never invoke a model or alter the archive. A generated archive also exposes `make query`, with
-`QUERY_ARGS` defaulting to `list teams`.
+Timeline queries only read `data/timeline.json`, `data/details/*.json`, and referenced summary
+Markdown; prompt/message queries only read the manifest-bound extracted JSONL. Neither invokes a
+model or alters the archive. A generated archive also exposes `make query`, with `QUERY_ARGS`
+defaulting to `list teams`.
 
 ```bash
 agent-team-timeline inspect --output ./timelines/example-team

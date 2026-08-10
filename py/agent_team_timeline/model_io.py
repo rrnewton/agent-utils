@@ -143,6 +143,16 @@ def team_from_json_obj(value: object) -> TeamData:
             author=_optional_string(item.get("author"), "event.author"),
             recipient=_optional_string(item.get("recipient"), "event.recipient"),
             source_line=_integer(item.get("source_line"), "event.source_line"),
+            ingress_kind=_optional_string(
+                item.get("ingress_kind"), "event.ingress_kind"
+            ),
+            author_kind=_optional_string(item.get("author_kind"), "event.author_kind"),
+            source_native_id=_optional_string(
+                item.get("source_native_id"), "event.source_native_id"
+            ),
+            classification_version=_optional_string(
+                item.get("classification_version"), "event.classification_version"
+            ),
         )
         for item in _items(root, "events")
     )

@@ -122,6 +122,10 @@ class Event:
     author: str | None
     recipient: str | None
     source_line: int
+    ingress_kind: str | None = None
+    author_kind: str | None = None
+    source_native_id: str | None = None
+    classification_version: str | None = None
 
     def to_json_obj(self) -> JsonObject:
         """Return the event as a JSON-serializable object."""
@@ -140,6 +144,10 @@ class Event:
             "author": self.author,
             "recipient": self.recipient,
             "source_line": self.source_line,
+            "ingress_kind": self.ingress_kind,
+            "author_kind": self.author_kind,
+            "source_native_id": self.source_native_id,
+            "classification_version": self.classification_version,
         }
 
 

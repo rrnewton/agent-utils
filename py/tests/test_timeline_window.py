@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_team_timeline.archive import narrow_json, write_json_if_changed
+from agent_team_timeline.archive import as_array, as_object, narrow_json, write_json_if_changed
 from agent_team_timeline.cli import _parser
 from agent_team_timeline.model import Agent, Edge, Event, SourceSnapshot, TeamData
 from agent_team_timeline.model_io import team_from_json_obj
@@ -382,3 +382,21 @@ def test_team_json_round_trip_keeps_window_fields() -> None:
     restored = team_from_json_obj(bounded.to_json_obj())
     assert restored.window_start_ms == window.start_ms
     assert restored.window_end_ms == window.end_ms
+
+
+def test_team_json_accepts_events_before_authorship_provenance_fields() -> None:
+    raw = as_object(narrow_json(_team().to_json_obj()), "team")
+    events = as_array(raw.get("events"), "team.events")
+    for index, value in enumerate(events):
+        event = as_object(value, f"team.events[{index}]")
+        event.pop("ingress_kind")
+        event.pop("author_kind")
+        event.pop("source_native_id")
+        event.pop("classification_version")
+
+    restored = team_from_json_obj(raw)
+
+    assert all(event.ingress_kind is None for event in restored.events)
+    assert all(event.author_kind is None for event in restored.events)
+    assert all(event.source_native_id is None for event in restored.events)
+    assert all(event.classification_version is None for event in restored.events)

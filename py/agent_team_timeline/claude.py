@@ -24,6 +24,12 @@ from agent_team_timeline.model import (
 
 _AGENT_FILE = re.compile(r"agent-(?P<agent>[A-Za-z0-9_-]+)\.jsonl\Z")
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+_CLASSIFICATION_VERSION = "authorship-v1"
+_SCHEDULED_INPUT_PREFIXES = (
+    "MISSION RE-READ (",
+    "Stay in the triage/rebase/fix/land loop",
+    "DISK STOPGAP (",
+)
 
 
 class ClaudeParseError(ValueError):
@@ -391,6 +397,65 @@ def _event_id(record: _Record, suffix: str) -> str:
     return f"claude-{record.thread_id}-{record.line}-{digest}:{suffix}"
 
 
+def _source_native_id(record: _Record) -> str | None:
+    """Return Claude's stable UUID when this record has one."""
+
+    return _optional_string(record.value.get("uuid"))
+
+
+def _origin_kind(value: object) -> str | None:
+    """Read the explicit producer marker used by recent Claude transcripts."""
+
+    return _optional_string(_optional_mapping(value).get("kind"))
+
+
+def _is_slash_command(text: str) -> bool:
+    return "<command-name>" in text or "<command-message>" in text
+
+
+def _is_synthetic_user_text(record: _Record, text: str) -> bool:
+    """Recognize only source-marked or exact, durable Claude synthetic inputs."""
+
+    if (
+        record.value.get("isCompactSummary") is True
+        or record.value.get("isMeta") is True
+    ):
+        return True
+    if text.startswith(
+        (
+            "<local-command-caveat>",
+            "<local-command-stdout>",
+            "A session-scoped Stop hook is now active",
+            "Stop hook feedback:",
+            "[Request interrupted by user",
+            *_SCHEDULED_INPUT_PREFIXES,
+        )
+    ):
+        return True
+    return False
+
+
+def _claude_input_provenance(
+    record: _Record,
+    text: str,
+    *,
+    origin_kind: str | None,
+    queued: bool,
+) -> tuple[str, str, str, str]:
+    """Classify a Claude input without inferring a human from the ``user`` role."""
+
+    if origin_kind == "human":
+        ingress = "claude_queued" if queued else "claude_typed"
+        return "user_prompt", "user", "owner_human", ingress
+    if _is_slash_command(text):
+        return "user_prompt", "user", "owner_human", "claude_slash"
+    if origin_kind is not None or _is_synthetic_user_text(record, text):
+        return "system_input", "system", "system", "claude_system"
+    # Older Claude logs do not carry origin metadata. Preserve their plain
+    # user messages, but do not claim that authorship is proven.
+    return "user_prompt", "user", "unknown", "claude_legacy"
+
+
 def _record_time(record: _Record) -> int:
     if record.timestamp_ms is None:
         raise ClaudeParseError(
@@ -428,6 +493,45 @@ def _extract(
     assistant_times: list[int] = []
     for record in _deduplicate(records):
         record_type = _optional_string(record.value.get("type"))
+        if record_type == "attachment":
+            attachment = _optional_mapping(record.value.get("attachment"))
+            if _optional_string(attachment.get("type")) != "queued_command":
+                continue
+            prompt = (_optional_string(attachment.get("prompt")) or "").strip()
+            attachment_origin = _origin_kind(attachment.get("origin"))
+            # Non-human queued commands are also materialized as ``user``
+            # records when delivered. Human commands can otherwise exist only
+            # in this attachment while the agent is busy.
+            if not prompt or attachment_origin != "human":
+                continue
+            kind, author, author_kind, ingress_kind = _claude_input_provenance(
+                record,
+                prompt,
+                origin_kind=attachment_origin,
+                queued=True,
+            )
+            events.append(
+                Event(
+                    event_id=_event_id(record, "queued-user"),
+                    thread_id=record.thread_id,
+                    turn_id=None,
+                    timestamp_ms=_record_time(record),
+                    kind=kind,
+                    role="user",
+                    phase=None,
+                    text=prompt,
+                    content_availability="plain",
+                    encrypted_content=None,
+                    author=author,
+                    recipient=record.thread_id,
+                    source_line=record.line,
+                    ingress_kind=ingress_kind,
+                    author_kind=author_kind,
+                    source_native_id=_source_native_id(record),
+                    classification_version=_CLASSIFICATION_VERSION,
+                )
+            )
+            continue
         if record_type not in ("user", "assistant"):
             continue
         at_ms = _record_time(record)
@@ -436,24 +540,37 @@ def _extract(
         where = f"{record.source_path}:{record.line}.message"
         content = message.get("content")
         if record_type == "user":
+            raw_origin = _origin_kind(record.value.get("origin"))
             if isinstance(content, str):
                 text = content.strip()
                 if text:
+                    kind, author, author_kind, ingress_kind = (
+                        _claude_input_provenance(
+                            record,
+                            text,
+                            origin_kind=raw_origin,
+                            queued=False,
+                        )
+                    )
                     events.append(
                         Event(
                             event_id=_event_id(record, "user"),
                             thread_id=record.thread_id,
                             turn_id=None,
                             timestamp_ms=at_ms,
-                            kind="user_prompt",
+                            kind=kind,
                             role=role or "user",
                             phase=None,
                             text=text,
                             content_availability="plain",
                             encrypted_content=None,
-                            author="user",
+                            author=author,
                             recipient=record.thread_id,
                             source_line=record.line,
+                            ingress_kind=ingress_kind,
+                            author_kind=author_kind,
+                            source_native_id=_source_native_id(record),
+                            classification_version=_CLASSIFICATION_VERSION,
                         )
                     )
                 continue
@@ -474,21 +591,33 @@ def _extract(
                 elif block_type == "text":
                     text = (_optional_string(block.get("text")) or "").strip()
                     if text:
+                        kind, author, author_kind, ingress_kind = (
+                            _claude_input_provenance(
+                                record,
+                                text,
+                                origin_kind=raw_origin,
+                                queued=False,
+                            )
+                        )
                         events.append(
                             Event(
                                 event_id=_event_id(record, f"user-{index}"),
                                 thread_id=record.thread_id,
                                 turn_id=None,
                                 timestamp_ms=at_ms,
-                                kind="user_prompt",
+                                kind=kind,
                                 role=role or "user",
                                 phase=None,
                                 text=text,
                                 content_availability="plain",
                                 encrypted_content=None,
-                                author="user",
+                                author=author,
                                 recipient=record.thread_id,
                                 source_line=record.line,
+                                ingress_kind=ingress_kind,
+                                author_kind=author_kind,
+                                source_native_id=_source_native_id(record),
+                                classification_version=_CLASSIFICATION_VERSION,
                             )
                         )
             continue
@@ -519,6 +648,10 @@ def _extract(
                             author=record.thread_id,
                             recipient=None,
                             source_line=record.line,
+                            ingress_kind="claude",
+                            author_kind="agent",
+                            source_native_id=_source_native_id(record),
+                            classification_version=_CLASSIFICATION_VERSION,
                         )
                     )
             elif block_type == "tool_use":
@@ -548,7 +681,11 @@ def _turns_for_thread(
     assistant_times: Sequence[int],
 ) -> tuple[Turn, ...]:
     prompts = sorted(
-        (event for event in events if event.kind == "user_prompt"),
+        (
+            event
+            for event in events
+            if event.kind in ("user_prompt", "system_input")
+        ),
         key=lambda event: (event.timestamp_ms, event.event_id),
     )
     activity = [event.timestamp_ms for event in events]
@@ -797,6 +934,8 @@ def load_claude_team(
                     phase="instruction",
                     author=parent,
                     recipient=event.thread_id,
+                    ingress_kind="claude_subagent",
+                    author_kind="agent",
                 )
             )
         elif event.kind == "assistant_message" and event.phase == "final_answer":
@@ -807,6 +946,8 @@ def load_claude_team(
                     role=None,
                     author=event.thread_id,
                     recipient=parent,
+                    ingress_kind="claude_subagent",
+                    author_kind="agent",
                 )
             )
         else:
@@ -849,6 +990,10 @@ def load_claude_team(
                 author=tool.thread_id,
                 recipient=recipient,
                 source_line=tool.source_line,
+                ingress_kind="claude_send_message",
+                author_kind="agent",
+                source_native_id=tool.call_id,
+                classification_version=_CLASSIFICATION_VERSION,
             )
         )
     all_events = routed_events

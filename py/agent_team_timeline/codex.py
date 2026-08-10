@@ -29,6 +29,7 @@ from agent_team_timeline.model import (
 
 
 _NESTED_TOOL_RE = re.compile(r"\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_CLASSIFICATION_VERSION = "authorship-v1"
 
 
 class CodexParseError(ValueError):
@@ -1493,9 +1494,13 @@ def load_codex_team(
                     text=text,
                     content_availability="plaintext",
                     encrypted_content=None,
-                    author=None,
+                    author="user",
                     recipient=None,
                     source_line=record.line,
+                    ingress_kind="codex",
+                    author_kind="owner_human",
+                    source_native_id=item_id,
+                    classification_version=_CLASSIFICATION_VERSION,
                 )
                 continue
 

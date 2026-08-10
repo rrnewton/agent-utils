@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agent_team_timeline import __version__
 from agent_team_timeline.archive import (
@@ -131,6 +132,9 @@ from agent_team_timeline.terminology import (
     scan_terminology,
 )
 from agent_team_timeline.window import DateWindow, apply_date_window
+
+if TYPE_CHECKING:
+    from agent_team_timeline.transcript_export import TranscriptExportReport
 
 
 _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -1140,6 +1144,39 @@ def load_archived_team(archive: Path, team_slug: str) -> TeamData:
         ):
             _validate_normalized_generation(archive, team_slug, team)
     return team
+
+
+def extract_transcripts_archive(
+    archive: Path, team_slugs: Sequence[str] = ()
+) -> TranscriptExportReport:
+    """Mechanically export coordinator prompts/responses for selected ingested teams.
+
+    An empty selection means every team with normalized raw data in this archive. The archive
+    writer lock makes the multi-file JSONL generation serial with provider ingestion and site
+    builds; no summarizer or model adapter is reachable from this operation.
+    """
+
+    from agent_team_timeline.transcript_export import export_transcripts
+
+    with _archive_writer_lock(archive):
+        selected = tuple(team_slugs)
+        if not selected:
+            teams_root = archive / "teams"
+            selected = tuple(
+                sorted(
+                    path.name
+                    for path in teams_root.iterdir()
+                    if path.is_dir()
+                    and not path.is_symlink()
+                    and (path / "raw" / "team.json").is_file()
+                )
+            ) if teams_root.is_dir() else ()
+        if not selected:
+            raise ValueError(f"no ingested teams found in {archive}")
+        if len(set(selected)) != len(selected):
+            raise ValueError("transcript extraction team selection contains duplicates")
+        teams = tuple(load_archived_team(archive, team_slug) for team_slug in selected)
+        return export_transcripts(archive, teams)
 
 
 def load_artifact_catalog(
@@ -3504,6 +3541,7 @@ def record_run(
     error: str | None = None,
     *,
     team_slugs: Sequence[str] = (),
+    mechanical: Mapping[str, JsonValue] | None = None,
 ) -> Path:
     """Append immutable run provenance and update the small archive manifest."""
 
@@ -3532,6 +3570,10 @@ def record_run(
         "build": {key: value for key, value in sorted((build or {}).items())},
         "error": error,
     }
+    if mechanical is not None:
+        run_obj["mechanical"] = {
+            key: value for key, value in sorted(mechanical.items())
+        }
     if len(recorded_teams) > 1:
         run_obj["team_slugs"] = list(recorded_teams)
     path = archive / "runs" / f"{run_id}.json"
@@ -3579,6 +3621,7 @@ __all__ = [
     "IngestReport",
     "SummarizeReport",
     "build_archive",
+    "extract_transcripts_archive",
     "ingest_claude",
     "ingest_codex",
     "ingest_orc",

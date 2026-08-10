@@ -568,6 +568,28 @@ finally:
 '''
 
 
+def standalone_query_source() -> str:
+    """Return the dependency-free query CLI copied into every archive."""
+
+    return (files("agent_team_timeline") / "query.py").read_text(encoding="utf-8")
+
+
+def archive_makefile() -> str:
+    """Return the generated archive's local serve/stats/query Makefile."""
+
+    return (
+        ".PHONY: serve open run-stats query prompts\n"
+        "PORT ?= 8765\n"
+        "QUERY_ARGS ?= list teams\n\n"
+        "PROMPT_ARGS ?=\n\n"
+        "serve:\n\tpython3 serve.py --port $(PORT)\n\n"
+        "open:\n\tpython3 serve.py --port $(PORT) --open\n\n"
+        "run-stats:\n\tpython3 run_stats.py\n\n"
+        "query:\n\t@python3 query.py $(QUERY_ARGS)\n\n"
+        "prompts:\n\t@python3 query.py --format text prompts $(PROMPT_ARGS)\n"
+    )
+
+
 def _pull_request_references(
     text: str, metadata: Mapping[PullRequestKey, PullRequestMetadata]
 ) -> list[dict[str, object]]:
@@ -797,24 +819,15 @@ def render_archive(
             archive / "run_stats.py", run_stats_source, executable=True
         )
     )
-    query_source = (files("agent_team_timeline") / "query.py").read_text(
-        encoding="utf-8"
-    )
     changed += int(
         write_text_if_changed(
-            archive / "query.py", query_source, executable=True
+            archive / "query.py", standalone_query_source(), executable=True
         )
     )
     changed += int(
         write_text_if_changed(
             archive / "Makefile",
-            ".PHONY: serve open run-stats query\n"
-            "PORT ?= 8765\n"
-            "QUERY_ARGS ?= list teams\n\n"
-            "serve:\n\tpython3 serve.py --port $(PORT)\n\n"
-            "open:\n\tpython3 serve.py --port $(PORT) --open\n\n"
-            "run-stats:\n\tpython3 run_stats.py\n\n"
-            "query:\n\t@python3 query.py $(QUERY_ARGS)\n",
+            archive_makefile(),
         )
     )
     changed += int(
@@ -828,7 +841,7 @@ def render_archive(
             "directly: browsers block the JSON fetch from `file://`.\n\n"
             "## Read-only query quickstart\n\n"
             "`make query` defaults to `list teams` in JSON. The supported output formats are "
-            "`json`, `jsonl`, and `markdown`. Copy a stable reference returned by `list` or "
+            "`json`, `jsonl`, `markdown`, and `text`. Copy a stable reference returned by `list` or "
             "`search` into `show`; references use `team:TEAM`, `agent:TEAM::ID`, "
             "`phase:TEAM::ID`, or `rollup:TEAM::KIND::START_MS`.\n\n"
             "```bash\n"
@@ -837,7 +850,11 @@ def render_archive(
             "make query QUERY_ARGS='--format markdown show agent:TEAM::AGENT_ID'\n"
             "make query QUERY_ARGS='--format markdown show phase:TEAM::PHASE_ID --transcript'\n"
             "make query QUERY_ARGS='--format json search \"SEARCH TEXT\" --scope all --limit 20'\n"
+            "make prompts PROMPT_ARGS='--range 200-300'\n"
             "```\n\n"
+            "When this package contains the optional mechanical transcript projection, its full "
+            "prompt report is `extracted/transcripts/prompts.jsonl`; `messages.jsonl` adds "
+            "mechanically associated coordinator responses.\n\n"
             "For an exported package, the requested slice is recorded in `data/export.json` "
             "under `display_window`; `make query` reports the actual team and record intervals. "
             "Do not infer the slice from file modification times.\n",

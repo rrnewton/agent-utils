@@ -537,6 +537,183 @@ def test_snapshot_and_parse_orc_lineage_read_only_and_idempotently(
     assert tools[0].nested_tools == (("readFile", 2), ("sendAgent", 1))
 
 
+def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> None:
+    source, root_db, _ = _fixture(tmp_path)
+    inputs: list[tuple[object, ...]] = [
+        (
+            "gchat-owner",
+            "message-gchat-owner",
+            ROOT,
+            0,
+            _ms("2026-07-21T05:00:00+00:00"),
+            10,
+            "user",
+            "text",
+            "Owner message",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps(
+                {
+                    "GChat": {
+                        "message_name": "spaces/x/messages/owner",
+                        "sender_unixname": "newton",
+                        "is_owner": True,
+                    }
+                }
+            ),
+            None,
+            json.dumps({"sender_display_name": "Ryan Newton"}),
+        ),
+        (
+            "gchat-other",
+            "message-gchat-other",
+            ROOT,
+            0,
+            _ms("2026-07-21T05:01:00+00:00"),
+            11,
+            "user",
+            "text",
+            "Another person's message",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps(
+                {
+                    "GChat": {
+                        "message_name": "spaces/x/messages/other",
+                        "sender_display_name": "A Collaborator",
+                        "is_owner": False,
+                    }
+                }
+            ),
+            None,
+            None,
+        ),
+        (
+            "orc-child",
+            "message-orc-child",
+            ROOT,
+            0,
+            _ms("2026-07-21T05:02:00+00:00"),
+            12,
+            "user",
+            "text",
+            "Child Orc report",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps({"Orc": {"sender_session": "child-session"}}),
+            None,
+            None,
+        ),
+        (
+            "submitted-web",
+            "message-submitted-web",
+            ROOT,
+            0,
+            _ms("2026-07-21T05:03:00+00:00"),
+            13,
+            "user",
+            "text",
+            "Web submission",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps({"Submitted": {"source": {"Web": {"view": "Inbox"}}}}),
+            None,
+            None,
+        ),
+        (
+            "tui-unknown",
+            "message-tui-unknown",
+            ROOT,
+            0,
+            _ms("2026-07-21T05:04:00+00:00"),
+            14,
+            "user",
+            "text",
+            "Unattributed terminal input",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps({"Submitted": {"source": "Tui"}}),
+            None,
+            None,
+        ),
+        (
+            "scheduled-reminder",
+            "message-scheduled-reminder",
+            ROOT,
+            0,
+            _ms("2026-07-21T05:05:00+00:00"),
+            15,
+            "user",
+            "text",
+            "This is your periodic reminder to make sure your running state is aligned "
+            "with your overarching goals, listed below.",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps({"Submitted": {"source": "Tui"}}),
+            None,
+            None,
+        ),
+    ]
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.executemany(
+            "INSERT INTO content_blocks VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            inputs,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    snapshot = tmp_path / "snapshot"
+    captured = snapshot_orc_lineage(source, ROOT, snapshot, (), "captured")
+    team = load_orc_team(snapshot, ROOT, "orc-authorship", "UTC", captured.sources)
+    events = {event.event_id: event for event in team.events}
+
+    owner = events["orc-block-gchat-owner"]
+    assert owner.kind == "user_prompt"
+    assert owner.author == "newton"
+    assert owner.author_kind == "owner_human"
+    assert owner.ingress_kind == "gchat"
+    assert owner.source_native_id == "spaces/x/messages/owner"
+    other = events["orc-block-gchat-other"]
+    assert other.kind == "external_message"
+    assert other.author_kind == "other_human"
+    child = events["orc-block-orc-child"]
+    assert child.kind == "inter_agent_message"
+    assert child.author == "child-session"
+    assert child.recipient == ROOT
+    assert events["orc-block-submitted-web"].author_kind == "external_or_unknown"
+    assert events["orc-block-tui-unknown"].author_kind == "unknown"
+    scheduled = events["orc-block-scheduled-reminder"]
+    assert scheduled.kind == "system_input"
+    assert scheduled.ingress_kind == "scheduled"
+    assert scheduled.author_kind == "system"
+    assert all(
+        event.classification_version == "authorship-v1"
+        for event in events.values()
+        if event.event_id.startswith("orc-block-")
+    )
+
+
 def test_rewritten_auxiliary_history_accepts_stable_spawns_and_is_idempotent(
     tmp_path: Path,
 ) -> None:

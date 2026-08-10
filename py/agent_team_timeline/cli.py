@@ -23,6 +23,7 @@ from agent_team_timeline.pipeline import (
     IngestReport,
     SummarizeReport,
     build_archive,
+    extract_transcripts_archive,
     ingest_claude,
     ingest_codex,
     ingest_orc,
@@ -31,7 +32,13 @@ from agent_team_timeline.pipeline import (
     summarize_archive,
     utc_now,
 )
-from agent_team_timeline.query import QueryFilters, TimelineQuery, format_query
+from agent_team_timeline.query import (
+    QueryFilters,
+    TimelineQuery,
+    TranscriptQuery,
+    format_query,
+    parse_ordinal_range,
+)
 from agent_team_timeline.server import serve
 from agent_team_timeline.summarize import SummaryError
 from agent_team_timeline.token_usage import TokenUsage
@@ -346,6 +353,21 @@ def _parser() -> argparse.ArgumentParser:
     build.add_argument("--phase-minutes", type=int, default=30)
     build.set_defaults(handler="build")
 
+    extract_transcripts = sub.add_parser(
+        "extract-transcripts",
+        help="write append-only prompt/response JSONL from normalized logs; zero tokens",
+    )
+    extract_transcripts.add_argument(
+        "--output", required=True, help="durable archive directory"
+    )
+    extract_transcripts.add_argument(
+        "--team",
+        action="append",
+        default=[],
+        help="ingested team slug to include; repeat as needed (default: all teams)",
+    )
+    extract_transcripts.set_defaults(handler="extract_transcripts")
+
     export = sub.add_parser(
         "export", help="build a zero-token website slice in a separate directory"
     )
@@ -423,7 +445,7 @@ def _parser() -> argparse.ArgumentParser:
     query.add_argument("--output", required=True, help="built single- or multi-team archive")
     query.add_argument(
         "--format",
-        choices=("json", "jsonl", "markdown"),
+        choices=("json", "jsonl", "markdown", "text"),
         default="json",
         help="response format (default: %(default)s)",
     )
@@ -455,6 +477,22 @@ def _parser() -> argparse.ArgumentParser:
     query_search.add_argument("--limit", type=int, default=50)
     _add_query_filters(query_search)
     query_search.set_defaults(handler="query_search")
+    for action, help_text in (
+        ("prompts", "list verbatim authored prompts in global timestamp order"),
+        ("messages", "list prompts and their mechanically associated responses"),
+    ):
+        query_transcript = query_sub.add_parser(action, help=help_text)
+        query_transcript.add_argument(
+            "--range",
+            dest="ordinal_range",
+            help="one prompt ordinal or inclusive range, for example 200-300",
+        )
+        query_transcript.add_argument(
+            "--team", action="append", default=[], help="team slug; repeat as needed"
+        )
+        query_transcript.add_argument("--start-time", help="inclusive RFC3339 instant")
+        query_transcript.add_argument("--end-time", help="exclusive RFC3339 instant")
+        query_transcript.set_defaults(handler=f"query_{action}")
     return parser
 
 
@@ -682,18 +720,43 @@ def _inspect(archive: Path) -> int:
     return 0
 
 
+def _transcript_teams(archive: Path, raw: object) -> tuple[str, ...]:
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError("--team values must be strings")
+    selected = tuple(raw)
+    if selected:
+        if len(set(selected)) != len(selected):
+            raise ValueError("--team must not repeat a team slug")
+        return selected
+    teams_root = archive / "teams"
+    if not teams_root.is_dir():
+        raise ValueError(f"no ingested teams found in {archive}")
+    discovered = tuple(
+        sorted(
+            path.name
+            for path in teams_root.iterdir()
+            if path.is_dir()
+            and not path.is_symlink()
+            and (path / "raw" / "team.json").is_file()
+        )
+    )
+    if not discovered:
+        raise ValueError(f"no ingested teams found in {archive}")
+    return discovered
+
+
 def _query_filters(ns: argparse.Namespace) -> QueryFilters:
     raw_teams: object = ns.team
     if not isinstance(raw_teams, list) or not all(
         isinstance(item, str) for item in raw_teams
     ):
         raise ValueError("--team values must be strings")
-    raw_kinds: object = ns.kind
+    raw_kinds: object = getattr(ns, "kind", [])
     if not isinstance(raw_kinds, list) or not all(
         isinstance(item, str) for item in raw_kinds
     ):
         raise ValueError("--kind values must be strings")
-    raw_agent: object = ns.agent
+    raw_agent: object = getattr(ns, "agent", None)
     if raw_agent is not None and not isinstance(raw_agent, str):
         raise ValueError("--agent must be a string")
     window = parse_date_window(
@@ -714,17 +777,20 @@ def _query_filters(ns: argparse.Namespace) -> QueryFilters:
 
 
 def _run_query(ns: argparse.Namespace, handler: str) -> int:
-    query = TimelineQuery(_path(str(ns.output)))
+    output = _path(str(ns.output))
     command: str
     if handler == "query_list":
+        query = TimelineQuery(output)
         resource = str(ns.resource)
         command = f"list {resource}"
         items = query.list_records(resource, _query_filters(ns))
     elif handler == "query_show":
+        query = TimelineQuery(output)
         reference = str(ns.reference)
         command = f"show {reference}"
         items = [query.show(reference, transcript=bool(ns.transcript))]
     elif handler == "query_search":
+        query = TimelineQuery(output)
         needle = str(ns.text)
         command = f"search {needle}"
         items = query.search(
@@ -733,6 +799,18 @@ def _run_query(ns: argparse.Namespace, handler: str) -> int:
             filters=_query_filters(ns),
             case_sensitive=bool(ns.case_sensitive),
             limit=int(ns.limit),
+        )
+    elif handler in {"query_prompts", "query_messages"}:
+        transcript_query = TranscriptQuery(output)
+        raw_range: object = ns.ordinal_range
+        ordinal_range = (
+            parse_ordinal_range(raw_range) if isinstance(raw_range, str) else None
+        )
+        command = "prompts" if handler == "query_prompts" else "messages"
+        items = (
+            transcript_query.list_prompts(_query_filters(ns), ordinal_range)
+            if handler == "query_prompts"
+            else transcript_query.list_messages(_query_filters(ns), ordinal_range)
         )
     else:
         raise ValueError(f"unsupported query handler {handler!r}")
@@ -765,10 +843,65 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, ValueError) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
-    if handler in {"query_list", "query_show", "query_search"}:
+    if handler in {
+        "query_list",
+        "query_show",
+        "query_search",
+        "query_prompts",
+        "query_messages",
+    }:
         try:
             return _run_query(ns, str(handler))
         except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "extract_transcripts":
+        archive = _path(str(ns.output))
+        started = utc_now()
+        command = [PROG, *args]
+        selected: tuple[str, ...] = ()
+        try:
+            selected = _transcript_teams(archive, ns.team)
+            report = extract_transcripts_archive(archive, selected)
+            run_path = record_run(
+                archive,
+                command,
+                started,
+                "completed",
+                selected[0],
+                None,
+                None,
+                None,
+                team_slugs=selected,
+                mechanical={"transcript_extraction": report.to_json_obj()},
+            )
+            print(
+                f"transcripts: {report.prompts} prompts, {report.responses} responses, "
+                f"{report.system_inputs} system inputs across {report.teams} teams; "
+                f"{report.carried_forward} historical records retained, "
+                f"{report.files_changed} files changed"
+            )
+            print(f"JSONL: {archive / 'extracted' / 'transcripts' / 'prompts.jsonl'}")
+            print(f"run metadata: {run_path}")
+            return 0
+        except (OSError, ValueError) as error:
+            if selected:
+                try:
+                    run_path = record_run(
+                        archive,
+                        command,
+                        started,
+                        "failed",
+                        selected[0],
+                        None,
+                        None,
+                        None,
+                        error=str(error),
+                        team_slugs=selected,
+                    )
+                    print(f"run metadata: {run_path}", file=sys.stderr)
+                except (OSError, ValueError):
+                    pass
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
     if handler == "export":

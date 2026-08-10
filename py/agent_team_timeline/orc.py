@@ -656,6 +656,17 @@ class _Spawn:
     source_path: str
 
 
+_CLASSIFICATION_VERSION = "authorship-v1"
+_ORC_PERIODIC_REMINDER = (
+    "This is your periodic reminder to make sure your running state is aligned "
+    "with your overarching goals"
+)
+_ORC_TIME_ORIENTATION = re.compile(
+    r"\AWe're working in eastern time and the current date/time is "
+    r"`\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} (?:EDT|EST)`, use that to orient "
+)
+
+
 def _required_string(value: object, where: str) -> str:
     if not isinstance(value, str) or not value:
         raise OrcParseError(f"{where}: expected a non-empty string")
@@ -699,6 +710,93 @@ def _mapping(value: object, where: str) -> dict[str, object]:
     if not isinstance(value, dict):
         raise OrcParseError(f"{where}: expected an object")
     return {str(key): item for key, item in value.items()}
+
+
+def _optional_json_mapping(value: object, where: str) -> dict[str, object]:
+    """Decode one optional JSON object stored in an Orc SQLite text column."""
+
+    text = _optional_string(value, where)
+    if text is None:
+        return {}
+    try:
+        decoded: object = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise OrcParseError(f"{where}: invalid JSON ({error})") from error
+    return _mapping(decoded, where)
+
+
+def _nested_mapping(raw: Mapping[str, object], key: str) -> dict[str, object]:
+    value = raw.get(key)
+    return _mapping(value, key) if isinstance(value, dict) else {}
+
+
+def _first_string(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _is_scheduled_orc_input(text: str) -> bool:
+    """Recognize only two exact scheduled-message families seen in Orc logs."""
+
+    return text.startswith(_ORC_PERIODIC_REMINDER) or bool(
+        _ORC_TIME_ORIENTATION.match(text)
+    )
+
+
+def _orc_input_provenance(
+    user_source: Mapping[str, object],
+    extra: Mapping[str, object],
+    text: str,
+    message_id: str,
+) -> tuple[str, str | None, str, str, str]:
+    """Return event kind, author, ingress, author kind, and native identity."""
+
+    orc = _nested_mapping(user_source, "Orc")
+    if "Orc" in user_source:
+        author = _first_string(orc.get("sender_session"), extra.get("sender_session"))
+        return "inter_agent_message", author, "orc", "agent", message_id
+
+    gchat = _nested_mapping(user_source, "GChat")
+    if "GChat" in user_source:
+        explicit_owner = gchat.get("is_owner")
+        if not isinstance(explicit_owner, bool):
+            explicit_owner = extra.get("is_owner")
+        author_kind = "owner_human" if explicit_owner is True else "unknown"
+        author = _first_string(
+            gchat.get("sender_unixname"),
+            extra.get("sender_unixname"),
+            gchat.get("sender_display_name"),
+            extra.get("sender_display_name"),
+            gchat.get("sender_name"),
+            extra.get("sender_name"),
+        )
+        native_id = _first_string(
+            gchat.get("message_name"), extra.get("message_name"), message_id
+        )
+        if native_id is None:
+            raise OrcParseError("GChat input lacks a native message identity")
+        event_kind = "external_message" if explicit_owner is False else "user_prompt"
+        if explicit_owner is False:
+            author_kind = "other_human"
+        return event_kind, author, "gchat", author_kind, native_id
+
+    submitted = _nested_mapping(user_source, "Submitted")
+    submitted_source = submitted.get("source")
+    if submitted_source == "Tui":
+        if _is_scheduled_orc_input(text):
+            return "system_input", "system", "scheduled", "system", message_id
+        return "user_prompt", None, "tui", "unknown", message_id
+    if isinstance(submitted_source, dict) and "Web" in submitted_source:
+        return (
+            "user_prompt",
+            None,
+            "submitted_web",
+            "external_or_unknown",
+            message_id,
+        )
+    return "user_prompt", None, "orc_unknown", "unknown", message_id
 
 
 def _require_exact_keys(
@@ -2578,7 +2676,8 @@ def _content_records(
     try:
         rows = connection.execute(
             "SELECT rowid, id, message_id, created_at_ms, turn_index, role, block_type, "
-            "content, code_input, code_output, code_exit_code FROM content_blocks "
+            "content, code_input, code_output, code_exit_code, user_source, extra "
+            "FROM content_blocks "
             "ORDER BY created_at_ms, rowid"
         ).fetchall()
     finally:
@@ -2590,6 +2689,7 @@ def _content_records(
         row = _row(raw, str(path))
         rowid = _integer(row[0], f"{path}: rowid")
         block_id = _required_string(row[1], f"{path}: block id")
+        message_id = _required_string(row[2], f"{path}: message id")
         timestamp_ms = _integer(row[3], f"{path}: created_at_ms")
         turn_index = _integer(row[4], f"{path}: turn_index")
         role = _required_string(row[5], f"{path}: role")
@@ -2608,12 +2708,43 @@ def _content_records(
             )
         event_kind: str | None = None
         event_role: str | None = None
+        event_author: str | None = None
+        event_recipient: str | None = None
+        ingress_kind: str | None = None
+        author_kind: str | None = None
+        source_native_id: str | None = message_id
         if block_type == "text" and role == "user":
-            event_kind = "user_prompt"
-            event_role = "user"
+            user_source = _optional_json_mapping(
+                row[11], f"{path}: content block {block_id} user_source"
+            )
+            extra = _optional_json_mapping(
+                row[12], f"{path}: content block {block_id} extra"
+            )
+            (
+                event_kind,
+                event_author,
+                ingress_kind,
+                author_kind,
+                source_native_id,
+            ) = _orc_input_provenance(
+                user_source,
+                extra,
+                content or "",
+                message_id,
+            )
+            if event_kind == "inter_agent_message":
+                event_role = None
+                event_recipient = meta.session_id
+            elif event_kind == "system_input":
+                event_role = "system"
+            else:
+                event_role = "user"
         elif block_type == "text" and role in ("assistant", "notification"):
             event_kind = "assistant_message"
             event_role = "assistant"
+            event_author = meta.session_id
+            ingress_kind = "orc"
+            author_kind = "agent"
         if event_kind is not None and content:
             events.append(
                 Event(
@@ -2627,9 +2758,13 @@ def _content_records(
                     text=content,
                     content_availability="plaintext",
                     encrypted_content=None,
-                    author=None,
-                    recipient=None,
+                    author=event_author,
+                    recipient=event_recipient,
                     source_line=rowid,
+                    ingress_kind=ingress_kind,
+                    author_kind=author_kind,
+                    source_native_id=source_native_id,
+                    classification_version=_CLASSIFICATION_VERSION,
                 )
             )
         if block_type == "code_execution":

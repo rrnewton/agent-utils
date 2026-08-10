@@ -111,6 +111,95 @@ def test_loads_provider_neutral_nested_team_and_joins_tools() -> None:
     assert child_result.kind == "inter_agent_message"
     assert child_result.author == "a-child"
     assert child_result.recipient == SESSION_ID
+    root_prompt = next(event for event in team.events if event.event_id == "root-user-1:user")
+    assert root_prompt.author_kind == "unknown"
+    assert root_prompt.ingress_kind == "claude_legacy"
+    assert root_prompt.source_native_id == "root-user-1"
+
+
+def test_classifies_claude_human_and_synthetic_inputs_from_native_metadata(
+    tmp_path: Path,
+) -> None:
+    session = tmp_path / f"{SESSION_ID}.jsonl"
+    records: list[dict[str, object]] = [
+        {
+            "type": "attachment",
+            "uuid": "queued-native",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-01-01T10:00:00.000Z",
+            "attachment": {
+                "type": "queued_command",
+                "prompt": "Human input while Claude was busy.",
+                "commandMode": "prompt",
+                "origin": {"kind": "human"},
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "typed-native",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-01-01T10:01:00.000Z",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "Direct human input."},
+        },
+        {
+            "type": "user",
+            "uuid": "notification-native",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-01-01T10:02:00.000Z",
+            "origin": {"kind": "task-notification"},
+            "message": {"role": "user", "content": "Synthetic task completion."},
+        },
+        {
+            "type": "user",
+            "uuid": "slash-native",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-01-01T10:03:00.000Z",
+            "message": {
+                "role": "user",
+                "content": "<command-name>/goal</command-name><command-args>ship it</command-args>",
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "compact-native",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-01-01T10:04:00.000Z",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "Compacted conversation summary."},
+        },
+        {
+            "type": "user",
+            "uuid": "meta-native",
+            "sessionId": SESSION_ID,
+            "timestamp": "2026-01-01T10:05:00.000Z",
+            "isMeta": True,
+            "message": {"role": "user", "content": "Expanded command instructions."},
+        },
+    ]
+    session.write_text(
+        "".join(json.dumps(record, separators=(",", ":")) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+    team = load_claude_team(session, "claude-authorship", "UTC")
+    events = {event.source_native_id: event for event in team.events}
+
+    assert events["queued-native"].kind == "user_prompt"
+    assert events["queued-native"].author_kind == "owner_human"
+    assert events["queued-native"].ingress_kind == "claude_queued"
+    assert events["typed-native"].kind == "user_prompt"
+    assert events["typed-native"].author_kind == "owner_human"
+    assert events["typed-native"].ingress_kind == "claude_typed"
+    assert events["notification-native"].kind == "system_input"
+    assert events["notification-native"].author_kind == "system"
+    assert events["slash-native"].kind == "user_prompt"
+    assert events["slash-native"].ingress_kind == "claude_slash"
+    assert events["compact-native"].kind == "system_input"
+    assert events["meta-native"].kind == "system_input"
+    assert all(event.classification_version == "authorship-v1" for event in events.values())
+    assert all(event.turn_id is not None for event in events.values())
+    assert len({event.turn_id for event in events.values()}) == len(events)
 
 
 def test_half_open_window_clips_activity_and_retains_ancestors() -> None:

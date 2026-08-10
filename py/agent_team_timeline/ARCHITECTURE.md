@@ -15,6 +15,12 @@ version controlled. The intended teams for the first combined archive are `codex
 The durable archive and a website export are distinct concepts:
 
 - The archive accumulates normalized team data and every validated expensive artifact.
+- `extracted/transcripts/` is a provider-neutral, zero-model projection over every selected
+  coordinator: `occurrences.jsonl` preserves physical provider/team occurrences, `prompts.jsonl`
+  is the source-identical-deduplicated chronological prompt corpus, `messages.jsonl` adds
+  mechanically turn-linked responses, and `system-inputs.jsonl` retains synthetic/scheduled inputs
+  without mislabeling them as the owner's prompts. Its manifest binds every file digest and source
+  generation.
 - A slice export is a deterministic view over selected teams and a half-open UTC interval. It may
   contain only 2026-08-06 22:00 through 2026-08-07 07:00 EDT even though the archive retains more.
 - Rebuilding an export never invokes a model. Missing summaries degrade to normalized transcript
@@ -45,6 +51,35 @@ export timezone controls date-bound parsing and the shared display axis, not cac
 internals. Its only inputs are `data/timeline.json`, referenced `data/details/*.json`, and referenced
 rollup Markdown beneath the selected archive root. Path resolution fails closed on absolute or
 escaping references. Querying has no write path and can never invoke a model.
+
+The `prompts` and `messages` query actions are an independent read-only boundary over
+`extracted/transcripts/`; they do not require `data/timeline.json`. The loader verifies the schema
+and SHA-256 of all managed JSONL against `extracted/transcripts/manifest.json` before returning a
+record. Prompt ordinals are 1-based inclusive chronological indexes for convenient slicing. Stable
+`record_id` values are the durable identity because discovering older history can change ordinals.
+
+### Mechanical transcript extraction contract
+
+`extract-transcripts` runs beneath the same archive writer lock as ingestion. It cannot reach a
+summarizer backend and records zero model calls/tokens. Occurrence IDs bind team/fork namespace,
+provider, thread, native source identity, source location, timestamp, and content digest; logical
+IDs omit the team occurrence namespace so byte-identical declared fork history can be recognized
+without being destructively content-deduplicated. Multiple text blocks from one provider message
+are grouped only by their native record identity/source occurrence.
+
+Each rerun takes a monotonic union with the prior validated generation. Records absent from the
+new provider snapshot are carried forward, protecting the archive from upstream rotation or
+history rewriting. A repeated native ID with different content receives a distinct occurrence
+because content identity participates in the ID. Immutable occurrence fields may not change;
+classifier fields and prompt ordinals are projections and may improve. Data files are written
+first and the digest manifest last, so readers fail closed on an interrupted generation.
+
+Provider provenance is deliberately not reduced to `role=user`. Codex counts paired native
+`event_msg/user_message` occurrences, not duplicated response-item context. Claude retains typed
+and queued human-origin commands while classifying hooks, task notifications, compact summaries,
+and recurring inputs as system input. Orc retains `user_source`-derived ingress and author class:
+owner GChat is distinct from inter-Orc traffic, while Web/TUI submissions without an author ID
+remain explicitly unknown rather than being asserted to be owner-authored.
 
 Canonical references are `team:<slug>`, `agent:<team>::<source-id>`,
 `phase:<team>::<phase-id>`, and `rollup:<team>::<kind>::<start-ms>`. The query loader strips the

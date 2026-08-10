@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -14,6 +15,7 @@ from typing import Protocol
 
 QUERY_SCHEMA_VERSION = 1
 TIMELINE_SCHEMA_VERSION = 1
+TRANSCRIPT_EXPORT_SCHEMA_VERSION = 1
 _WHITESPACE = re.compile(r"\s+")
 _RFC3339_INSTANT = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
@@ -108,6 +110,146 @@ class QueryFilters:
 class _IndexEntry:
     kind: str
     record: dict[str, JsonValue]
+
+
+@dataclass(frozen=True)
+class OrdinalRange:
+    """One-based inclusive prompt ordinal bounds."""
+
+    first: int
+    last: int
+
+    def contains(self, ordinal: int) -> bool:
+        """Return whether *ordinal* lies inside this inclusive range."""
+
+        return self.first <= ordinal <= self.last
+
+
+def parse_ordinal_range(raw: str) -> OrdinalRange:
+    """Parse ``N`` or inclusive ``N-M`` prompt ordinals."""
+
+    match = re.fullmatch(r"([1-9][0-9]*)(?:-([1-9][0-9]*))?", raw)
+    if match is None:
+        raise ValueError("--range must be a positive ordinal or inclusive N-M range")
+    first = int(match.group(1))
+    last = int(match.group(2) or match.group(1))
+    if first > last:
+        raise ValueError("--range first ordinal must not exceed its last ordinal")
+    return OrdinalRange(first, last)
+
+
+def _read_jsonl(path: Path) -> tuple[dict[str, JsonValue], ...]:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"transcript export file is missing or unsafe: {path}")
+    result: list[dict[str, JsonValue]] = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line:
+            continue
+        raw: object = json.loads(line)
+        result.append(
+            as_object(_narrow_json(raw, f"{path}:{line_number}"), f"{path}:{line_number}")
+        )
+    return tuple(result)
+
+
+class TranscriptQuery:
+    """Validated read-only access to the zero-model transcript projection."""
+
+    _FILES = (
+        "occurrences.jsonl",
+        "prompts.jsonl",
+        "messages.jsonl",
+        "system-inputs.jsonl",
+    )
+
+    def __init__(self, root: Path) -> None:
+        self.root = root.resolve()
+        self.transcript_root = self.root / "extracted" / "transcripts"
+        manifest_path = self.transcript_root / "manifest.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ValueError(
+                f"no extracted transcripts at {manifest_path}; run extract-transcripts"
+            )
+        manifest = as_object(read_json(manifest_path), str(manifest_path))
+        schema = as_int(manifest.get("schema_version"), "transcript manifest schema")
+        if schema != TRANSCRIPT_EXPORT_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported transcript export schema version {schema}; "
+                f"expected {TRANSCRIPT_EXPORT_SCHEMA_VERSION}"
+            )
+        files = as_object(manifest.get("files"), "transcript manifest files")
+        for name in self._FILES:
+            entry = as_object(files.get(name), f"transcript manifest files.{name}")
+            expected = as_string(entry.get("sha256"), f"{name}.sha256")
+            path = self.transcript_root / name
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"transcript export file is missing or unsafe: {path}")
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            if actual != expected:
+                raise ValueError(f"transcript export generation is incomplete: {name}")
+        self.prompts = _read_jsonl(self.transcript_root / "prompts.jsonl")
+        self.messages = _read_jsonl(self.transcript_root / "messages.jsonl")
+        self._prompt_ordinals = {
+            as_string(record.get("record_id"), "prompt.record_id"): as_int(
+                record.get("ordinal"), "prompt.ordinal"
+            )
+            for record in self.prompts
+        }
+
+    @staticmethod
+    def _selected(record: dict[str, JsonValue], filters: QueryFilters) -> bool:
+        team = as_string(record.get("team_slug"), "transcript record.team_slug")
+        if filters.teams and team not in filters.teams:
+            return False
+        if filters.window is None:
+            return True
+        at_ms = as_int(record.get("timestamp_ms"), "transcript record.timestamp_ms")
+        return filters.window.contains(at_ms)
+
+    def list_prompts(
+        self, filters: QueryFilters, ordinal_range: OrdinalRange | None
+    ) -> list[dict[str, JsonValue]]:
+        """Return verbatim authored prompt records in global timestamp order."""
+
+        result: list[dict[str, JsonValue]] = []
+        for record in self.prompts:
+            ordinal = as_int(record.get("ordinal"), "prompt.ordinal")
+            if ordinal_range is not None and not ordinal_range.contains(ordinal):
+                continue
+            if self._selected(record, filters):
+                result.append(dict(record))
+        return result
+
+    def list_messages(
+        self, filters: QueryFilters, ordinal_range: OrdinalRange | None
+    ) -> list[dict[str, JsonValue]]:
+        """Return prompts plus mechanically associated coordinator responses."""
+
+        result: list[dict[str, JsonValue]] = []
+        for record in self.messages:
+            record_type = as_string(record.get("record_type"), "message.record_type")
+            ordinal: int | None
+            if record_type == "prompt":
+                ordinal = as_int(record.get("ordinal"), "prompt.ordinal")
+            elif record_type == "response":
+                prompt_id = record.get("in_reply_to_prompt_id")
+                ordinal = (
+                    self._prompt_ordinals.get(prompt_id)
+                    if isinstance(prompt_id, str)
+                    else None
+                )
+            else:
+                raise ValueError(f"unknown transcript message type {record_type!r}")
+            if ordinal_range is not None and (
+                ordinal is None or not ordinal_range.contains(ordinal)
+            ):
+                continue
+            if self._selected(record, filters):
+                item = dict(record)
+                if record_type == "response":
+                    item["prompt_ordinal"] = ordinal
+                result.append(item)
+        return result
 
 
 def _record_array(
@@ -931,10 +1073,37 @@ def _markdown_item(item: dict[str, JsonValue]) -> str:
     return "\n".join(lines).rstrip()
 
 
+def _text_item(item: dict[str, JsonValue]) -> str:
+    record_type = _optional_string(item, "record_type") or "record"
+    ordinal = _optional_int(item, "ordinal")
+    if ordinal is None:
+        ordinal = _optional_int(item, "prompt_ordinal")
+    timestamp = (
+        _optional_string(item, "timestamp_local")
+        or _optional_string(item, "at_time")
+        or _optional_string(item, "start_time")
+        or "unknown time"
+    )
+    team = (
+        _optional_string(item, "team_slug")
+        or _optional_string(item, "team")
+        or "unknown team"
+    )
+    number = f" #{ordinal}" if ordinal is not None else ""
+    header = f"[{record_type}{number} · {timestamp} · {team}]"
+    body = (
+        _optional_string(item, "text")
+        or _optional_string(item, "excerpt")
+        or _optional_string(item, "paragraph")
+        or canonical_json(item).rstrip()
+    )
+    return f"{header}\n{body.rstrip()}"
+
+
 def format_query(
     command: str, items: list[dict[str, JsonValue]], output_format: str
 ) -> str:
-    """Render query records as versioned JSON, streaming JSONL, or compact Markdown."""
+    """Render query records as JSON, JSONL, Markdown, or scan-friendly plain text."""
 
     if output_format == "json":
         return canonical_json(query_envelope(command, items))
@@ -947,6 +1116,9 @@ def format_query(
         body = "\n\n".join(_markdown_item(item) for item in items)
         suffix = f"\n\n_{len(items)} result(s)._\n"
         return f"# agent-team-timeline query: {command}\n\n{body}{suffix}"
+    if output_format == "text":
+        body = "\n\n".join(_text_item(item) for item in items)
+        return body + ("\n" if body else "")
     raise ValueError(f"unsupported query output format {output_format!r}")
 
 
@@ -1006,7 +1178,7 @@ def _standalone_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output", default=".")
     parser.add_argument(
-        "--format", choices=("json", "jsonl", "markdown"), default="json"
+        "--format", choices=("json", "jsonl", "markdown", "text"), default="json"
     )
     sub = parser.add_subparsers(dest="action", required=True)
     listing = sub.add_parser("list")
@@ -1023,13 +1195,19 @@ def _standalone_parser() -> argparse.ArgumentParser:
     searching.add_argument("--case-sensitive", action="store_true")
     searching.add_argument("--limit", type=int, default=50)
     _standalone_add_filters(searching)
+    for action in ("prompts", "messages"):
+        transcript = sub.add_parser(action)
+        transcript.add_argument("--range", dest="ordinal_range")
+        transcript.add_argument("--team", action="append", default=[])
+        transcript.add_argument("--start-time")
+        transcript.add_argument("--end-time")
     return parser
 
 
 def _standalone_filters(ns: argparse.Namespace) -> QueryFilters:
     raw_teams: object = ns.team
-    raw_kinds: object = ns.kind
-    raw_agent: object = ns.agent
+    raw_kinds: object = getattr(ns, "kind", [])
+    raw_agent: object = getattr(ns, "agent", None)
     if not isinstance(raw_teams, list) or not all(
         isinstance(item, str) for item in raw_teams
     ):
@@ -1064,17 +1242,20 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
     parser = _standalone_parser()
     ns = parser.parse_args(list(argv) if argv is not None else None)
     try:
-        query = TimelineQuery(Path(str(ns.output)).expanduser())
+        output = Path(str(ns.output)).expanduser()
         action = str(ns.action)
         if action == "list":
+            query = TimelineQuery(output)
             resource = str(ns.resource)
             command = f"list {resource}"
             items = query.list_records(resource, _standalone_filters(ns))
         elif action == "show":
+            query = TimelineQuery(output)
             reference = str(ns.reference)
             command = f"show {reference}"
             items = [query.show(reference, transcript=bool(ns.transcript))]
         elif action == "search":
+            query = TimelineQuery(output)
             needle = str(ns.text)
             command = f"search {needle}"
             items = query.search(
@@ -1083,6 +1264,24 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
                 filters=_standalone_filters(ns),
                 case_sensitive=bool(ns.case_sensitive),
                 limit=int(ns.limit),
+            )
+        elif action in {"prompts", "messages"}:
+            query_transcripts = TranscriptQuery(output)
+            raw_range: object = ns.ordinal_range
+            ordinal_range = (
+                parse_ordinal_range(raw_range)
+                if isinstance(raw_range, str)
+                else None
+            )
+            command = action
+            items = (
+                query_transcripts.list_prompts(
+                    _standalone_filters(ns), ordinal_range
+                )
+                if action == "prompts"
+                else query_transcripts.list_messages(
+                    _standalone_filters(ns), ordinal_range
+                )
             )
         else:
             raise ValueError(f"unsupported query action {action!r}")
@@ -1094,11 +1293,14 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "OrdinalRange",
     "QueryFilters",
     "TimelineQuery",
+    "TranscriptQuery",
     "agent_ref",
     "format_query",
     "phase_ref",
+    "parse_ordinal_range",
     "query_envelope",
     "rollup_ref",
     "team_ref",

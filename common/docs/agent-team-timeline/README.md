@@ -26,9 +26,9 @@ web server.
   multi-host identity plus explicit provenance.
 - Versioned content-addressed model caches, a logical-key artifact catalog with context-quality
   scores, append-only raw-log snapshots, and immutable run receipts.
-- A read-only query CLI with stable team, agent, work-phase, and rollup references,
-  JSON/JSONL/Markdown output, time/team filters, relationship traversal, and summary or transcript
-  search.
+- A zero-model, append-only prompt/response projection plus a read-only query CLI with chronological
+  prompt ordinals, inclusive ordinal ranges, stable timeline references, JSON/JSONL/Markdown/text
+  output, time/team filters, relationship traversal, and summary or transcript search.
 - A self-contained static website served by a built-in loopback server, with no CDN dependency.
 
 Install from the package index:
@@ -55,6 +55,7 @@ make query
 make query QUERY_ARGS='--format jsonl list agents --team example-team'
 make query QUERY_ARGS='--format markdown show phase:example-team::PHASE_ID --transcript'
 make query QUERY_ARGS='--format json search "reproducible build" --scope all --limit 10'
+make prompts PROMPT_ARGS='--range 200-300'
 ```
 
 `list` and `search` return stable `team:`, `agent:`, `phase:`, and `rollup:` references that can be
@@ -70,6 +71,18 @@ slice. Each bound may use either its date or time form. `--project LABEL=URL` an
 `--source-host HOSTNAME` are repeatable; the first explicit
 project is primary. Codex archives infer repository labels and links from structured session
 metadata when no override is needed.
+
+After ingesting one or more teams, build the combined verbatim transcript projection without any
+model call:
+
+```bash
+agent-team-timeline extract-transcripts --output ./timelines/example-team
+agent-team-timeline query --output ./timelines/example-team \
+  --format text prompts --range 200-300
+```
+
+The full chronological JSONL report is `extracted/transcripts/prompts.jsonl`;
+`messages.jsonl` adds coordinator responses linked mechanically by provider turn identity.
 
 Every archive includes its launcher, static site, normalized message JSON, cached summary data,
 rendered Markdown, source provenance, and run metadata. `make run-stats` prints per-run cache,
