@@ -823,11 +823,24 @@ def render_archive(
             f"# {team.team_slug} agent-team timeline\n\n"
             "This directory is a self-contained, version-controllable timeline archive.\n\n"
             "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
-            "Use `make open` to ask Python to open the browser. Use `make run-stats` to print "
-            "every pipeline run and exact recorded model-token costs. Use `make query` for a "
-            "machine-readable team inventory, or pass another command with "
-            "`make query QUERY_ARGS='list agents --team TEAM'`. Do not open `index.html` directly: "
-            "browsers block the JSON fetch from `file://`.\n",
+            "Use `make open` to ask Python to open the browser and `make run-stats` to print "
+            "every pipeline run and exact recorded model-token costs. Do not open `index.html` "
+            "directly: browsers block the JSON fetch from `file://`.\n\n"
+            "## Read-only query quickstart\n\n"
+            "`make query` defaults to `list teams` in JSON. The supported output formats are "
+            "`json`, `jsonl`, and `markdown`. Copy a stable reference returned by `list` or "
+            "`search` into `show`; references use `team:TEAM`, `agent:TEAM::ID`, "
+            "`phase:TEAM::ID`, or `rollup:TEAM::KIND::START_MS`.\n\n"
+            "```bash\n"
+            "make query\n"
+            "make query QUERY_ARGS='--format jsonl list agents --team TEAM'\n"
+            "make query QUERY_ARGS='--format markdown show agent:TEAM::AGENT_ID'\n"
+            "make query QUERY_ARGS='--format markdown show phase:TEAM::PHASE_ID --transcript'\n"
+            "make query QUERY_ARGS='--format json search \"SEARCH TEXT\" --scope all --limit 20'\n"
+            "```\n\n"
+            "For an exported package, the requested slice is recorded in `data/export.json` "
+            "under `display_window`; `make query` reports the actual team and record intervals. "
+            "Do not infer the slice from file modification times.\n",
         )
     )
 

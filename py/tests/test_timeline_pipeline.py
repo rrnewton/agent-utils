@@ -296,6 +296,11 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert "query:\n\t@python3 query.py $(QUERY_ARGS)\n" in generated_makefile
     assert (tmp_path / "run_stats.py").is_file()
     assert (tmp_path / "run_stats.py").stat().st_mode & 0o111
+    generated_readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "## Read-only query quickstart" in generated_readme
+    assert "--format jsonl list agents --team TEAM" in generated_readme
+    assert "--format markdown show phase:TEAM::PHASE_ID --transcript" in generated_readme
+    assert "data/export.json" in generated_readme
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
     assert len(timeline["agents"]) == 2
     child_track = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
@@ -1811,6 +1816,11 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     )
     assert make_query_result.returncode == 0, make_query_result.stderr
     assert json.loads(make_query_result.stdout)["count"] == 2
+    exported_readme = (output / "README.md").read_text(encoding="utf-8")
+    assert "## Read-only query quickstart" in exported_readme
+    assert "--format jsonl list agents --team TEAM" in exported_readme
+    assert "--format markdown show phase:TEAM::PHASE_ID --transcript" in exported_readme
+    assert "data/export.json" in exported_readme
     assert (output / ".agent-team-timeline.json").is_file()
     export_manifest = json.loads(
         (output / "data" / "export.json").read_text(encoding="utf-8")

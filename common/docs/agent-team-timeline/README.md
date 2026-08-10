@@ -26,8 +26,9 @@ web server.
   multi-host identity plus explicit provenance.
 - Versioned content-addressed model caches, a logical-key artifact catalog with context-quality
   scores, append-only raw-log snapshots, and immutable run receipts.
-- A read-only query CLI with stable team, agent, work-phase, and rollup references, JSON/JSONL
-  output, time/team filters, relationship traversal, and summary or transcript search.
+- A read-only query CLI with stable team, agent, work-phase, and rollup references,
+  JSON/JSONL/Markdown output, time/team filters, relationship traversal, and summary or transcript
+  search.
 - A self-contained static website served by a built-in loopback server, with no CDN dependency.
 
 Install from the package index:
@@ -51,8 +52,15 @@ make serve
 make run-stats
 # or navigate the same archive without a browser
 make query
-make query QUERY_ARGS='search "reproducible build" --scope all --limit 10'
+make query QUERY_ARGS='--format jsonl list agents --team example-team'
+make query QUERY_ARGS='--format markdown show phase:example-team::PHASE_ID --transcript'
+make query QUERY_ARGS='--format json search "reproducible build" --scope all --limit 10'
 ```
+
+`list` and `search` return stable `team:`, `agent:`, `phase:`, and `rollup:` references that can be
+copied into `show`. In an exported package, `data/export.json` records the requested slice under
+`display_window`; query results report the actual contained team and record intervals. Do not infer
+the slice from file modification times.
 
 Use `refresh-claude --session-file SESSION.jsonl` for a Claude lineage or
 `refresh-orc --source-root PROJECT --root-session SESSION_UUID` for an Orc SQLite lineage. All
