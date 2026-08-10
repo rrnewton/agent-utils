@@ -224,6 +224,14 @@ class DagConfig:
     default_step_timeout: int = DEFAULT_STEP_TIMEOUT
     # Default inner-parallelism flag template for steps that don't set their own `jobs_flag`.
     default_jobs_flag: str = DEFAULT_JOBS_FLAG
+    # Tags (``group.job``) whose FAILURE is a DECLARED known-failure: it is reported and named
+    # loudly but does NOT flip the run's aggregate verdict, so one persistently-flaky node (e.g.
+    # a host-dependent test) can't invalidate every other step's validate record. Derived from a
+    # declared file (see :func:`safe_ci_dag_runner.io.load_known_failures`); NEVER silent — the
+    # scheduler names each excluded failure at runtime and the loader names what it loaded. A
+    # non-allowlisted failure still fails the run, and an allowlisted step that PASSES is
+    # unaffected (membership is consulted only on failure). Empty by default (fail-closed).
+    known_failures: frozenset[str] = frozenset()
 
     def by_tag(self) -> dict[str, Step]:
         return {step.tag: step for step in self.steps}
