@@ -10,12 +10,25 @@ from typing import cast
 
 import pytest
 
+from herdr_run import __version__
 import herdr_run.agent as agent_api
 from herdr_run.agent import Target, drain, enqueue, read, send, status
 from herdr_run.agent import QueueResult
 import herdr_run.agent_cli as agent_cli
 from herdr_run.client import AgentPaneInfo, HerdrClient, Pane
 from herdr_run.errors import AgentDeliveryError, AgentPending, AgentPossiblySubmitted, HerdrUnavailable
+
+
+def test_agent_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        agent_cli.main(["--version"])
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out == f"herdr-agent {__version__}\n"
+
+
+def test_agent_cli_userguide_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(agent_cli, "_guide", lambda: 0)
+    assert agent_cli.main(["--userguide"]) == 0
 
 
 class FakeAgentHerdr:
