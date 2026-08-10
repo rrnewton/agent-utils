@@ -59,8 +59,9 @@ pub use io::{
 };
 pub use model::{
     command_with_inner_jobs, effective_jobs_flag, preferred_inner_jobs, render_jobs_flag,
-    step_classification, step_failure_reason, DagConfig, ResourceHint, RunResult, Step, StepClass,
-    StepOutcome, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    step_classification, step_failure_reason, write_domain_violations, DagConfig, ResourceHint,
+    RunResult, Step, StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy,
+    DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
 };
 pub use perflog::{append_step_profiles, PerfWindow};
 pub use profile_enrich::{
@@ -100,8 +101,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 //                 by the scope's systemd RuntimeMaxSec, set strictly later so the reporting
 //                 bound fires first
 //   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
+//   write_domains pre-execution closed-vocabulary declaration guard; omission/unknown/duplicate
+//                 domains refuse before any node starts when the DAG opts in
 // The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
 // anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
 /// Canonical JSON manifest emitted by the `capabilities` subcommand.
 pub const ENFORCEMENT_CAPABILITIES: &str =
-    "{\"cpu_affinity\":true,\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"run_timeout\":true,\"wall_timeout\":true}";
+    "{\"cpu_affinity\":true,\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"run_timeout\":true,\"wall_timeout\":true,\"write_domains\":true}";

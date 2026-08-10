@@ -20,13 +20,14 @@
 // `float_roundtrip` feature so a float literal PARSES to the same `f64` CPython's `json.loads`
 // produces, which byte-identical re-emission depends on.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use serde_json::Value;
 
 use crate::model::{
-    DagConfig, ResourceHint, Step, StepClass, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    write_domain_violations, DagConfig, ResourceHint, Step, StepClass, WriteDomainGuarantee,
+    WriteDomainPolicy, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
 };
 
 const DEFAULT_MEM_CAP_FLOOR: i64 = 8 * 1024 * 1024 * 1024;
@@ -202,6 +203,61 @@ fn opt_str_list(
     }
 }
 
+fn present_str_list(
+    m: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<Vec<String>>, DagJsonError> {
+    if !m.contains_key(key) {
+        return Ok(None);
+    }
+    match m.get(key) {
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(s) => out.push(s.clone()),
+                    _ => return Err(err(format!("field '{key}' must contain only strings"))),
+                }
+            }
+            Ok(Some(out))
+        }
+        _ => Err(err(format!("field '{key}' must be a list of strings"))),
+    }
+}
+
+fn write_domain_policy(value: Option<&Value>) -> Result<WriteDomainPolicy, DagJsonError> {
+    let Some(value) = value else {
+        return Ok(WriteDomainPolicy::default());
+    };
+    if value.is_null() {
+        return Ok(WriteDomainPolicy::default());
+    }
+    let obj = as_obj(value, "write_domain_policy")?;
+    let allowed = opt_str_list(obj, "allowed_domains")?;
+    let mut allowed_domains = BTreeSet::new();
+    let mut duplicates = BTreeSet::new();
+    for name in allowed {
+        if name.is_empty() {
+            return Err(err(
+                "write_domain_policy.allowed_domains must not contain empty names",
+            ));
+        }
+        if !allowed_domains.insert(name.clone()) {
+            duplicates.insert(name);
+        }
+    }
+    if !duplicates.is_empty() {
+        return Err(err(format!(
+            "write_domain_policy.allowed_domains contains duplicates: {}",
+            duplicates.into_iter().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    Ok(WriteDomainPolicy {
+        require_explicit: opt_bool(obj, "require_explicit", false)?,
+        allowed_domains,
+    })
+}
+
 fn opt_str_int_map(
     m: &serde_json::Map<String, Value>,
     key: &str,
@@ -290,6 +346,7 @@ pub fn dag_from_yaml(text: &str) -> Result<DagConfig, DagJsonError> {
 pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     let doc = as_obj(raw, "<root>")?;
     let default_step_timeout = opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)?;
+    let policy = write_domain_policy(doc.get("write_domain_policy"))?;
     let steps_raw = match doc.get("steps") {
         Some(Value::Array(items)) => items,
         _ => return Err(err("<root>: 'steps' must be a list")),
@@ -312,9 +369,25 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
             timeout: opt_int(sm, "timeout", default_step_timeout)?,
             cpu_timeout: opt_int(sm, "cpu_timeout", 0)?,
             jobs_flag: opt_str_or_none(sm, "jobs_flag")?,
+            write_domains: present_str_list(sm, "write_domains")?,
+            write_domain_guarantee: match sm.get("write_domain_guarantee") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) => Some(
+                    WriteDomainGuarantee::from_value(value).ok_or_else(|| {
+                        err(format!(
+                            "{where_}.write_domain_guarantee: unknown value '{value}'"
+                        ))
+                    })?,
+                ),
+                Some(_) => {
+                    return Err(err(format!(
+                        "{where_}.write_domain_guarantee: field 'write_domain_guarantee' must be a string"
+                    )))
+                }
+            },
         });
     }
-    Ok(DagConfig {
+    let cfg = DagConfig {
         steps,
         description: opt_str(doc, "description", "")?,
         resource_caps: opt_str_int_map(doc, "resource_caps", "<root>")?,
@@ -323,11 +396,20 @@ pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
         outer_mem_safety_factor: opt_float(doc, "outer_mem_safety_factor", 1.0)?,
         default_step_timeout,
         default_jobs_flag: opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG)?,
+        write_domain_policy: policy,
         // SMALL forcing-function default caps for undeclared steps: not parsed from the document
         // (mirrors the Python io parser, which relies on the DagConfig dataclass defaults), so a
         // parsed DAG gets the 1-GiB / 1-core / 10-s floor. Callers override via the DagConfig fields.
         ..DagConfig::default()
-    })
+    };
+    let violations = write_domain_violations(&cfg);
+    if !violations.is_empty() {
+        return Err(err(format!(
+            "write-domain policy refused DAG before execution: {}",
+            violations.join("; ")
+        )));
+    }
+    Ok(cfg)
 }
 
 // --------------------------------------------------------------------------- serialization
@@ -641,7 +723,28 @@ fn emit_step(s: &mut String, step: &Step, base: usize) {
     s.push_str(&key);
     s.push_str("\"hint\": ");
     emit_hint(s, &step.hint, base + 2);
-    s.push('\n');
+    if step.write_domains.is_some() || step.write_domain_guarantee.is_some() {
+        s.push_str(",\n");
+    } else {
+        s.push('\n');
+    }
+    if let Some(domains) = &step.write_domains {
+        s.push_str(&key);
+        s.push_str("\"write_domains\": ");
+        emit_str_list(s, domains, base + 2);
+        if step.write_domain_guarantee.is_some() {
+            s.push_str(",\n");
+        } else {
+            s.push('\n');
+        }
+    }
+    if let Some(guarantee) = step.write_domain_guarantee {
+        s.push_str(&key);
+        s.push_str(&format!(
+            "\"write_domain_guarantee\": {}\n",
+            json_str(guarantee.value())
+        ));
+    }
     s.push_str(&ind);
     s.push('}');
 }
@@ -679,8 +782,14 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
         "  \"default_jobs_flag\": {},\n",
         json_str(&cfg.default_jobs_flag)
     ));
+    let policy_active = cfg.write_domain_policy.require_explicit
+        || !cfg.write_domain_policy.allowed_domains.is_empty();
     if cfg.steps.is_empty() {
-        s.push_str("  \"steps\": []\n");
+        s.push_str(if policy_active {
+            "  \"steps\": [],\n"
+        } else {
+            "  \"steps\": []\n"
+        });
     } else {
         s.push_str("  \"steps\": [\n");
         let n = cfg.steps.len();
@@ -688,7 +797,23 @@ pub fn dag_to_json(cfg: &DagConfig) -> String {
             emit_step(&mut s, step, 4);
             s.push_str(if i + 1 < n { ",\n" } else { "\n" });
         }
-        s.push_str("  ]\n");
+        s.push_str(if policy_active { "  ],\n" } else { "  ]\n" });
+    }
+    if policy_active {
+        s.push_str("  \"write_domain_policy\": {\n");
+        s.push_str(&format!(
+            "    \"require_explicit\": {},\n",
+            cfg.write_domain_policy.require_explicit
+        ));
+        s.push_str("    \"allowed_domains\": ");
+        let domains: Vec<String> = cfg
+            .write_domain_policy
+            .allowed_domains
+            .iter()
+            .cloned()
+            .collect();
+        emit_str_list(&mut s, &domains, 4);
+        s.push_str("\n  }\n");
     }
     s.push('}');
     s
@@ -830,6 +955,56 @@ steps:
         assert!(cfg.resource_caps.is_empty());
         assert_eq!(cfg.mem_cap_factor, 1.25);
         assert_eq!(cfg.default_jobs_flag, "-j");
+    }
+
+    #[test]
+    fn write_domain_policy_roundtrips_and_refuses_omission() {
+        let good = r#"{"steps":[
+            {"group":"g","job":"reader","cmd":"true","write_domains":[]},
+            {"group":"g","job":"barrier","cmd":"true",
+             "write_domains":["shared-cargo-target"],
+             "write_domain_guarantee":"immutable-artifact-barrier"},
+            {"group":"g","job":"shielded","cmd":"true","deps":["g.barrier"],
+             "write_domains":["shared-cargo-target"],
+             "write_domain_guarantee":"artifact-barrier-dependent"},
+            {"group":"g","job":"writer","cmd":"true",
+             "write_domains":["isolated-target"],
+             "write_domain_guarantee":"explicitly-isolated"}],
+            "write_domain_policy":{"require_explicit":true,
+             "allowed_domains":["shared-cargo-target","isolated-target"]}}"#;
+        let cfg = dag_from_json(good).unwrap();
+        assert_eq!(cfg.steps[0].write_domains, Some(Vec::new()));
+        assert_eq!(
+            cfg.steps[3].write_domain_guarantee,
+            Some(WriteDomainGuarantee::ExplicitlyIsolated)
+        );
+        let encoded = dag_to_json(&cfg);
+        assert_eq!(dag_to_json(&dag_from_json(&encoded).unwrap()), encoded);
+
+        let bad = [
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true"}],
+                "write_domain_policy":{"require_explicit":true,"allowed_domains":[]}}"#,
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true",
+                "write_domains":["typo"],"write_domain_guarantee":"artifact-producer"}],
+                "write_domain_policy":{"require_explicit":true,
+                "allowed_domains":["shared-cargo-target"]}}"#,
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true",
+                "write_domains":["shared-cargo-target","shared-cargo-target"]}],
+                "write_domain_policy":{"require_explicit":true,
+                "allowed_domains":["shared-cargo-target"]}}"#,
+            r#"{"steps":[{"group":"g","job":"j","cmd":"true",
+                "write_domains":["shared-cargo-target"],
+                "write_domain_guarantee":"artifact-barrier-dependent"}],
+                "write_domain_policy":{"require_explicit":true,
+                "allowed_domains":["shared-cargo-target"]}}"#,
+        ];
+        for doc in bad {
+            let error = dag_from_json(doc).unwrap_err().to_string();
+            assert!(
+                error.contains("write-domain policy refused"),
+                "unexpected refusal: {error}"
+            );
+        }
     }
 
     #[test]

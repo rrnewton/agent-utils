@@ -1386,6 +1386,7 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
         outer_mem_safety_factor=cfg.outer_mem_safety_factor,
         default_step_timeout=cfg.default_step_timeout,
         default_jobs_flag=cfg.default_jobs_flag,
+        write_domain_policy=cfg.write_domain_policy,
     )
 
 

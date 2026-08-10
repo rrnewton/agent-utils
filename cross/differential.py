@@ -368,6 +368,51 @@ def representative_fixtures() -> list[Fixture]:
 
     fixtures.append(Fixture("empty", {"steps": []}))
 
+    # Presence-sensitive per-node write domains: the no-protected-write node must retain an explicit
+    # empty list, the writer must retain its structural guarantee, and both engines must execute
+    # the valid graph without turning the domain into a scheduler mutex.
+    fixtures.append(
+        Fixture(
+            "write_domains",
+            {
+                "write_domain_policy": {
+                    "require_explicit": True,
+                    "allowed_domains": ["shared-cargo-target", "isolated-target"],
+                },
+                "steps": [
+                    {
+                        "group": "g",
+                        "job": "reader",
+                        "cmd": "true",
+                        "write_domains": [],
+                    },
+                    {
+                        "group": "g",
+                        "job": "barrier",
+                        "cmd": "true",
+                        "write_domains": ["shared-cargo-target"],
+                        "write_domain_guarantee": "immutable-artifact-barrier",
+                    },
+                    {
+                        "group": "g",
+                        "job": "shielded",
+                        "cmd": "true",
+                        "deps": ["g.barrier"],
+                        "write_domains": ["shared-cargo-target"],
+                        "write_domain_guarantee": "artifact-barrier-dependent",
+                    },
+                    {
+                        "group": "g",
+                        "job": "isolated",
+                        "cmd": "true",
+                        "write_domains": ["isolated-target"],
+                        "write_domain_guarantee": "explicitly-isolated",
+                    },
+                ],
+            },
+        )
+    )
+
     # A failing step whose two dependents (transitively) must be skipped identically.
     fixtures.append(
         Fixture(
@@ -756,6 +801,32 @@ def scalar_parity_cases() -> list[tuple[str, str, str]]:
     # JSON overflow-to-infinity and out-of-i64-range integer: both reject.
     cases.append(("json_overflow_float", "json", '{"mem_cap_factor": 1e400, "steps": []}'))
     cases.append(("json_bignum", "json", '{"mem_cap_floor_bytes": 99999999999999999999999999, "steps": []}'))
+
+    # Write-domain policy must refuse identically before execution: omitted is not explicit
+    # no-protected-write declaration, and neither unknown nor duplicate domains can silently enter
+    # the vocabulary.
+    cases.append((
+        "write_domain_missing",
+        "json",
+        '{"steps":[{"group":"g","job":"j","cmd":"true"}],'
+        '"write_domain_policy":{"require_explicit":true,"allowed_domains":[]}}',
+    ))
+    cases.append((
+        "write_domain_unknown",
+        "json",
+        '{"steps":[{"group":"g","job":"j","cmd":"true",'
+        '"write_domains":["typo"],"write_domain_guarantee":"artifact-producer"}],'
+        '"write_domain_policy":{"require_explicit":true,'
+        '"allowed_domains":["shared-cargo-target"]}}',
+    ))
+    cases.append((
+        "write_domain_duplicate",
+        "json",
+        '{"steps":[{"group":"g","job":"j","cmd":"true",'
+        '"write_domains":["shared-cargo-target","shared-cargo-target"]}],'
+        '"write_domain_policy":{"require_explicit":true,'
+        '"allowed_domains":["shared-cargo-target"]}}',
+    ))
 
     # Scientific-notation float VALUES must serialize byte-identically (the json_float parity fix).
     for name, tok in (

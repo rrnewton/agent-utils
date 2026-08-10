@@ -59,12 +59,15 @@ from safe_ci_dag_runner.model import (
     ResourceHint,
     Step,
     StepClass,
+    WriteDomainGuarantee,
+    WriteDomainPolicy,
     command_with_inner_jobs,
     effective_jobs_flag,
     preferred_inner_jobs,
     render_jobs_flag,
     step_classification,
     step_failure_reason,
+    write_domain_violations,
 )
 from safe_ci_dag_runner.perflog import CsvMetricsSink, PerfWindow
 from safe_ci_dag_runner.protocols import (
@@ -108,11 +111,13 @@ __version__: str = "0.12.0"
 #:                 by the scope's systemd RuntimeMaxSec, set strictly later so the reporting
 #:                 bound fires first
 #:   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
+#:   write_domains pre-execution closed-vocabulary declaration guard; omission/unknown/duplicate
+#:                 domains refuse before any node starts when the DAG opts in
 #: The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
 #: anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
 ENFORCEMENT_CAPABILITIES: str = (
     '{"cpu_affinity":true,"cpu_timeout":true,"memory_max":true,"oom_detection":true,'
-    '"pids_guard":false,"run_timeout":true,"wall_timeout":true}'
+    '"pids_guard":false,"run_timeout":true,"wall_timeout":true,"write_domains":true}'
 )
 
 __all__ = [
@@ -123,11 +128,14 @@ __all__ = [
     "StepClass",
     "ResourceHint",
     "DagConfig",
+    "WriteDomainGuarantee",
+    "WriteDomainPolicy",
     "DEFAULT_STEP_TIMEOUT",
     "DEFAULT_JOBS_FLAG",
     "step_classification",
     "preferred_inner_jobs",
     "step_failure_reason",
+    "write_domain_violations",
     "render_jobs_flag",
     "effective_jobs_flag",
     "command_with_inner_jobs",

@@ -2,8 +2,20 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+import pytest
+
 from safe_ci_dag_runner.io import DagJsonError, dag_from_json, dag_to_json
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step, StepClass
+from safe_ci_dag_runner.model import (
+    DagConfig,
+    ResourceHint,
+    Step,
+    StepClass,
+    WriteDomainGuarantee,
+    WriteDomainPolicy,
+)
+from safe_ci_dag_runner.scheduler import run_dag
 
 
 #: Multi-line description with quotes, backslashes, a tab, and unicode — proves the JSON string
@@ -135,3 +147,69 @@ def test_strict_parse_errors() -> None:
         except DagJsonError:
             raised = True
         assert raised, f"expected DagJsonError for: {doc!r}"
+
+
+def test_write_domain_policy_roundtrip_and_fail_closed_parse() -> None:
+    good = (
+        '{"steps": ['
+        '{"group":"g","job":"reader","cmd":"true","write_domains":[]},'
+        '{"group":"g","job":"barrier","cmd":"true",'
+        '"write_domains":["shared-cargo-target"],'
+        '"write_domain_guarantee":"immutable-artifact-barrier"},'
+        '{"group":"g","job":"shielded","cmd":"true","deps":["g.barrier"],'
+        '"write_domains":["shared-cargo-target"],'
+        '"write_domain_guarantee":"artifact-barrier-dependent"},'
+        '{"group":"g","job":"writer","cmd":"true",'
+        '"write_domains":["isolated-target"],'
+        '"write_domain_guarantee":"explicitly-isolated"}],'
+        '"write_domain_policy":{"require_explicit":true,'
+        '"allowed_domains":["shared-cargo-target","isolated-target"]}}'
+    )
+    cfg = dag_from_json(good)
+    assert cfg.steps[0].write_domains == []
+    assert cfg.steps[3].write_domains == ["isolated-target"]
+    assert (
+        cfg.steps[3].write_domain_guarantee
+        is WriteDomainGuarantee.EXPLICITLY_ISOLATED
+    )
+    encoded = dag_to_json(cfg)
+    assert dag_to_json(dag_from_json(encoded)) == encoded
+
+    bad_documents = (
+        # Missing is distinct from explicitly read-only [] and must refuse.
+        '{"steps":[{"group":"g","job":"j","cmd":"true"}],'
+        '"write_domain_policy":{"require_explicit":true,"allowed_domains":[]}}',
+        # Closed vocabulary: a typo cannot silently create a new domain.
+        '{"steps":[{"group":"g","job":"j","cmd":"true",'
+        '"write_domains":["typo"],"write_domain_guarantee":"artifact-producer"}],'
+        '"write_domain_policy":{"require_explicit":true,'
+        '"allowed_domains":["shared-cargo-target"]}}',
+        # Naming barrier dependence is not enough: a transitive immutable barrier is mandatory.
+        '{"steps":[{"group":"g","job":"j","cmd":"true",'
+        '"write_domains":["shared-cargo-target"],'
+        '"write_domain_guarantee":"artifact-barrier-dependent"}],'
+        '"write_domain_policy":{"require_explicit":true,'
+        '"allowed_domains":["shared-cargo-target"]}}',
+        # Duplicate declarations and nonempty declarations without a guarantee refuse.
+        '{"steps":[{"group":"g","job":"j","cmd":"true",'
+        '"write_domains":["shared-cargo-target","shared-cargo-target"]}],'
+        '"write_domain_policy":{"require_explicit":true,'
+        '"allowed_domains":["shared-cargo-target"]}}',
+    )
+    for doc in bad_documents:
+        with pytest.raises(DagJsonError, match="write-domain policy refused"):
+            dag_from_json(doc)
+
+
+def test_scheduler_rechecks_write_domains_before_spawning(tmp_path: Path) -> None:
+    marker = tmp_path / "ran"
+    cfg = DagConfig(
+        steps=(Step("g", "j", "", f"touch {marker}"),),
+        write_domain_policy=WriteDomainPolicy(
+            require_explicit=True, allowed_domains=frozenset({"target-ci"})
+        ),
+    )
+    result = run_dag(cfg, jobs=1)
+    assert not result.ok
+    assert result.outcomes == ()
+    assert not marker.exists(), "policy refusal happened after the node wrote"

@@ -36,6 +36,34 @@ class StepClass(Enum):
     LIGHT = "light"
 
 
+class WriteDomainGuarantee(Enum):
+    """Why concurrent writes declared by a step are safe.
+
+    These are deliberately not scheduler resources.  In particular,
+    ``artifact-barrier-dependent`` writers may run in parallel after consumers
+    have been shielded behind an immutable artifact barrier, while
+    ``explicitly-isolated`` writers use package/path-disjoint output.  Collapsing
+    either case into one mutex would be correct but operationally unusable.
+    """
+
+    ARTIFACT_BARRIER_DEPENDENT = "artifact-barrier-dependent"
+    IMMUTABLE_ARTIFACT_BARRIER = "immutable-artifact-barrier"
+    EXPLICITLY_ISOLATED = "explicitly-isolated"
+    ARTIFACT_PRODUCER = "artifact-producer"
+
+
+# BARE CARGO IS SHIELDED, NOT SERIALIZED. External writers never enter this
+# scheduler, so publication barriers protect consumers without inventing a lock.
+
+
+@dataclass(frozen=True)
+class WriteDomainPolicy:
+    """Closed write-domain vocabulary and omission policy for one DAG."""
+
+    require_explicit: bool = False
+    allowed_domains: frozenset[str] = field(default_factory=frozenset)
+
+
 @dataclass(frozen=True)
 class ResourceHint:
     """Optional per-step resource demand, duration, parallelism, and memory hints.
@@ -90,6 +118,12 @@ class Step:
     # `preferred_inner_jobs`. None inherits DagConfig.default_jobs_flag; "" disables appending
     # (the step manages its own concurrency). See render_jobs_flag for the template forms.
     jobs_flag: str | None = None
+    # Presence is load-bearing: ``None`` means the field was not declared,
+    # whereas ``[]`` explicitly declares no writes to the policy's protected
+    # artifact domains.  An enabled
+    # WriteDomainPolicy refuses the former before any node starts.
+    write_domains: list[str] | None = None
+    write_domain_guarantee: WriteDomainGuarantee | None = None
 
     @property
     def tag(self) -> str:
@@ -252,7 +286,73 @@ class DagConfig:
     default_step_mem_cap_bytes: int | None = DEFAULT_SMALL_MEM_CAP_BYTES
     default_step_cpu_count: int | None = DEFAULT_SMALL_CPU_COUNT
     default_step_cpu_timeout: int = DEFAULT_SMALL_CPU_TIMEOUT
+    write_domain_policy: WriteDomainPolicy = field(default_factory=WriteDomainPolicy)
 
     def by_tag(self) -> dict[str, Step]:
         """Index configured steps by their stable tags."""
         return {step.tag: step for step in self.steps}
+
+
+def write_domain_violations(cfg: DagConfig) -> list[str]:
+    """Return fail-closed write-domain declaration errors in deterministic order.
+
+    This predicate is called both while parsing and again at the scheduler entry
+    point.  The second call covers library callers that construct ``DagConfig``
+    directly, so a malformed in-memory graph cannot bypass the file parser.
+    """
+
+    policy = cfg.write_domain_policy
+    active = policy.require_explicit or bool(policy.allowed_domains)
+    if not active:
+        return []
+
+    bad: list[str] = []
+    by_tag = cfg.by_tag()
+
+    def has_immutable_barrier(step: Step) -> bool:
+        pending = list(step.deps)
+        seen: set[str] = set()
+        while pending:
+            tag = pending.pop()
+            if tag in seen:
+                continue
+            seen.add(tag)
+            ancestor = by_tag.get(tag)
+            if ancestor is None:
+                continue
+            if (
+                ancestor.write_domain_guarantee
+                is WriteDomainGuarantee.IMMUTABLE_ARTIFACT_BARRIER
+            ):
+                return True
+            pending.extend(ancestor.deps)
+        return False
+
+    for step in cfg.steps:
+        domains = step.write_domains
+        if domains is None:
+            if policy.require_explicit:
+                bad.append(f"{step.tag}: missing write_domains (use [] for no protected domains)")
+            if step.write_domain_guarantee is not None:
+                bad.append(f"{step.tag}: write_domain_guarantee requires write_domains")
+            continue
+        duplicates = sorted({name for name in domains if domains.count(name) > 1})
+        if duplicates:
+            bad.append(f"{step.tag}: duplicate write_domains: {', '.join(duplicates)}")
+        unknown = sorted(set(domains) - policy.allowed_domains)
+        if unknown:
+            bad.append(f"{step.tag}: unknown write_domains: {', '.join(unknown)}")
+        if domains and step.write_domain_guarantee is None:
+            bad.append(f"{step.tag}: nonempty write_domains require write_domain_guarantee")
+        if not domains and step.write_domain_guarantee is not None:
+            bad.append(f"{step.tag}: write_domains=[] cannot claim a write guarantee")
+        if (
+            step.write_domain_guarantee
+            is WriteDomainGuarantee.ARTIFACT_BARRIER_DEPENDENT
+            and not has_immutable_barrier(step)
+        ):
+            bad.append(
+                f"{step.tag}: artifact-barrier-dependent but no transitive dependency "
+                "is an immutable-artifact-barrier"
+            )
+    return bad

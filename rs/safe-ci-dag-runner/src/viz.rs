@@ -281,6 +281,8 @@ mod tests {
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         };
         let mut caps = BTreeMap::new();
         caps.insert("browser".to_string(), 1);
@@ -347,6 +349,8 @@ mod tests {
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         };
         let cfg = DagConfig {
             steps: vec![
@@ -384,6 +388,8 @@ mod tests {
             timeout: 1800,
             cpu_timeout: 0,
             jobs_flag: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         };
         let cfg = DagConfig {
             steps: vec![

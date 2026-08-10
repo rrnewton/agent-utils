@@ -9,6 +9,7 @@
 // Python build so the two are cross-differential-testable.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 /// Default wall-clock timeout for one step, in seconds.
 pub const DEFAULT_STEP_TIMEOUT: i64 = 1800;
@@ -60,6 +61,54 @@ impl StepClass {
             _ => None,
         }
     }
+}
+
+/// Why concurrent writes declared by a step are safe.
+///
+/// These values are deliberately not scheduler resources: artifact-shielded and
+/// path-isolated writers retain parallelism instead of collapsing onto one global mutex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteDomainGuarantee {
+    /// Consumers are shielded behind an immutable artifact barrier before later writers run.
+    ArtifactBarrierDependent,
+    /// The node atomically publishes the immutable artifact consumed by shielded nodes.
+    ImmutableArtifactBarrier,
+    /// The writer uses package/path-disjoint output.
+    ExplicitlyIsolated,
+    /// The node creates the mutable artifact set consumed by a later barrier.
+    ArtifactProducer,
+}
+
+impl WriteDomainGuarantee {
+    /// Canonical serialized spelling.
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::ArtifactBarrierDependent => "artifact-barrier-dependent",
+            Self::ImmutableArtifactBarrier => "immutable-artifact-barrier",
+            Self::ExplicitlyIsolated => "explicitly-isolated",
+            Self::ArtifactProducer => "artifact-producer",
+        }
+    }
+
+    /// Parse a canonical spelling.
+    pub fn from_value(text: &str) -> Option<Self> {
+        match text {
+            "artifact-barrier-dependent" => Some(Self::ArtifactBarrierDependent),
+            "immutable-artifact-barrier" => Some(Self::ImmutableArtifactBarrier),
+            "explicitly-isolated" => Some(Self::ExplicitlyIsolated),
+            "artifact-producer" => Some(Self::ArtifactProducer),
+            _ => None,
+        }
+    }
+}
+
+/// Closed write-domain vocabulary and omission policy for one DAG.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WriteDomainPolicy {
+    /// Require every step to carry `write_domains`, using `[]` for no protected artifact domains.
+    pub require_explicit: bool,
+    /// Domain names accepted by this DAG.
+    pub allowed_domains: BTreeSet<String>,
 }
 
 /// Per-step scheduling knowledge: scarce-resource demand, cost estimate, memory.
@@ -125,6 +174,11 @@ pub struct Step {
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
     /// disables appending (the step manages its own concurrency). See [`render_jobs_flag`].
     pub jobs_flag: Option<String>,
+    /// Presence-sensitive declaration: `None` is omitted; `Some(vec![])` explicitly declares no
+    /// writes to the policy's protected artifact domains.
+    pub write_domains: Option<Vec<String>>,
+    /// Structural guarantee used for non-empty write-domain declarations.
+    pub write_domain_guarantee: Option<WriteDomainGuarantee>,
 }
 
 impl Step {
@@ -328,6 +382,8 @@ pub struct DagConfig {
     /// Deliberately SMALL default CPU-time budget (seconds) for a step whose `cpu_timeout` is
     /// unset (see `DEFAULT_SMALL_CPU_TIMEOUT`). `0` disables it.
     pub default_step_cpu_timeout: i64,
+    /// Fail-closed write-domain policy. Default is disabled for generic DAGs that do not opt in.
+    pub write_domain_policy: WriteDomainPolicy,
 }
 
 impl Default for DagConfig {
@@ -348,6 +404,7 @@ impl Default for DagConfig {
             default_step_mem_cap_bytes: Some(DEFAULT_SMALL_MEM_CAP_BYTES),
             default_step_cpu_count: Some(DEFAULT_SMALL_CPU_COUNT),
             default_step_cpu_timeout: DEFAULT_SMALL_CPU_TIMEOUT,
+            write_domain_policy: WriteDomainPolicy::default(),
         }
     }
 }
@@ -357,6 +414,103 @@ impl DagConfig {
     pub fn by_tag(&self) -> BTreeMap<String, &Step> {
         self.steps.iter().map(|s| (s.tag(), s)).collect()
     }
+}
+
+/// Return deterministic fail-closed write-domain declaration errors.
+///
+/// Parsers call this while loading, and scheduler entry points call it again so an
+/// in-memory `DagConfig` cannot bypass the file parser.
+pub fn write_domain_violations(cfg: &DagConfig) -> Vec<String> {
+    let policy = &cfg.write_domain_policy;
+    if !policy.require_explicit && policy.allowed_domains.is_empty() {
+        return Vec::new();
+    }
+    let mut bad = Vec::new();
+    let by_tag = cfg.by_tag();
+    for step in &cfg.steps {
+        let Some(domains) = &step.write_domains else {
+            if policy.require_explicit {
+                bad.push(format!(
+                    "{}: missing write_domains (use [] for no protected domains)",
+                    step.tag()
+                ));
+            }
+            if step.write_domain_guarantee.is_some() {
+                bad.push(format!(
+                    "{}: write_domain_guarantee requires write_domains",
+                    step.tag()
+                ));
+            }
+            continue;
+        };
+        let mut seen = BTreeSet::new();
+        let duplicates: BTreeSet<String> = domains
+            .iter()
+            .filter(|name| !seen.insert((*name).clone()))
+            .cloned()
+            .collect();
+        if !duplicates.is_empty() {
+            bad.push(format!(
+                "{}: duplicate write_domains: {}",
+                step.tag(),
+                duplicates.into_iter().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        let unknown: Vec<String> = domains
+            .iter()
+            .filter(|name| !policy.allowed_domains.contains(*name))
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if !unknown.is_empty() {
+            bad.push(format!(
+                "{}: unknown write_domains: {}",
+                step.tag(),
+                unknown.join(", ")
+            ));
+        }
+        if !domains.is_empty() && step.write_domain_guarantee.is_none() {
+            bad.push(format!(
+                "{}: nonempty write_domains require write_domain_guarantee",
+                step.tag()
+            ));
+        }
+        if domains.is_empty() && step.write_domain_guarantee.is_some() {
+            bad.push(format!(
+                "{}: write_domains=[] cannot claim a write guarantee",
+                step.tag()
+            ));
+        }
+        if step.write_domain_guarantee == Some(WriteDomainGuarantee::ArtifactBarrierDependent) {
+            let mut pending = step.deps.clone();
+            let mut seen = BTreeSet::new();
+            let mut found = false;
+            while let Some(tag) = pending.pop() {
+                if !seen.insert(tag.clone()) {
+                    continue;
+                }
+                let Some(ancestor) = by_tag.get(&tag) else {
+                    continue;
+                };
+                if ancestor.write_domain_guarantee
+                    == Some(WriteDomainGuarantee::ImmutableArtifactBarrier)
+                {
+                    found = true;
+                    break;
+                }
+                pending.extend(ancestor.deps.iter().cloned());
+            }
+            if !found {
+                bad.push(format!(
+                    "{}: artifact-barrier-dependent but no transitive dependency is an \
+                     immutable-artifact-barrier",
+                    step.tag()
+                ));
+            }
+        }
+    }
+    bad
 }
 
 /// Terminal result of one scheduled step.
@@ -508,6 +662,8 @@ mod tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         };
         assert_eq!(step_classification(&step), StepClass::LatencyBound);
     }
@@ -527,6 +683,8 @@ mod tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout: 0,
             jobs_flag: jobs_flag.map(str::to_string),
+            write_domains: None,
+            write_domain_guarantee: None,
         }
     }
 

@@ -70,6 +70,50 @@ JSON and YAML express the same strict schema. File names ending in `.yaml` or
 input. Unknown fields, invalid types, duplicate step tags, missing dependencies,
 cycles, and impossible resource demands are rejected before execution.
 
+### Fail closed on protected artifact writes
+
+An opt-in `write_domain_policy` turns per-step write declarations into a
+pre-execution requirement. `allowed_domains` is a closed vocabulary;
+`require_explicit: true` requires every step to carry `write_domains` (use `[]`
+when the step writes none of the protected domains). Unknown, duplicate, or
+missing domains stop the whole DAG before the first command starts.
+
+Every non-empty declaration also names its structural guarantee:
+
+- `artifact-producer` creates mutable inputs to a later publisher.
+- `immutable-artifact-barrier` atomically publishes the immutable artifact.
+- `artifact-barrier-dependent` must transitively depend on such a barrier; the
+  runner verifies that graph relationship before execution.
+- `explicitly-isolated` writes a package/path-disjoint output.
+
+```yaml
+write_domain_policy:
+  require_explicit: true
+  allowed_domains: [shared-target, isolated-target]
+steps:
+  - group: build
+    job: publish
+    cmd: ./publish-immutable
+    write_domains: [shared-target]
+    write_domain_guarantee: immutable-artifact-barrier
+  - group: test
+    job: unit
+    cmd: ./run-shared-target-test
+    deps: [build.publish]
+    write_domains: [shared-target]
+    write_domain_guarantee: artifact-barrier-dependent
+  - group: build
+    job: fixture
+    cmd: ./build-fixture-in-private-target
+    write_domains: [isolated-target]
+    write_domain_guarantee: explicitly-isolated
+```
+
+Write domains are not scheduler semaphores. Disjoint writers retain their
+parallelism, and a shared domain is not silently converted into one global
+mutex. External writers remain outside the scheduler; an immutable publication
+barrier shields consumers without pretending those writers were serialized.
+
 ## Inspect, convert, and visualize
 
 ```sh

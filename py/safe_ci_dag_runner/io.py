@@ -26,6 +26,9 @@ from safe_ci_dag_runner.model import (
     ResourceHint,
     Step,
     StepClass,
+    WriteDomainGuarantee,
+    WriteDomainPolicy,
+    write_domain_violations,
 )
 
 __all__ = [
@@ -161,6 +164,44 @@ def _opt_str_list(m: Mapping[str, object], key: str) -> list[str]:
             raise DagJsonError(f"field '{key}' must contain only strings")
         out.append(item)
     return out
+
+
+def _present_str_list(m: Mapping[str, object], key: str) -> list[str] | None:
+    """Parse a presence-sensitive string list.
+
+    ``None`` means the key was omitted; an explicit empty list remains ``[]``.
+    Write-domain fail-closed policy depends on that distinction.
+    """
+
+    if key not in m:
+        return None
+    val = m[key]
+    if not isinstance(val, list):
+        raise DagJsonError(f"field '{key}' must be a list of strings")
+    out: list[str] = []
+    for item in val:
+        if not isinstance(item, str):
+            raise DagJsonError(f"field '{key}' must contain only strings")
+        out.append(item)
+    return out
+
+
+def _write_domain_policy(value: object) -> WriteDomainPolicy:
+    if value is None:
+        return WriteDomainPolicy()
+    obj = _as_obj(value, "write_domain_policy")
+    allowed = _opt_str_list(obj, "allowed_domains")
+    duplicates = sorted({name for name in allowed if allowed.count(name) > 1})
+    if duplicates:
+        raise DagJsonError(
+            "write_domain_policy.allowed_domains contains duplicates: " + ", ".join(duplicates)
+        )
+    if any(not name for name in allowed):
+        raise DagJsonError("write_domain_policy.allowed_domains must not contain empty names")
+    return WriteDomainPolicy(
+        require_explicit=_opt_bool(obj, "require_explicit", False),
+        allowed_domains=frozenset(allowed),
+    )
 
 
 def _opt_str_int_map(m: Mapping[str, object], key: str, where: str) -> dict[str, int]:
@@ -373,6 +414,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
     steps_raw = doc.get("steps")
     if not isinstance(steps_raw, list):
         raise DagJsonError("<root>: 'steps' must be a list")
+    policy = _write_domain_policy(doc.get("write_domain_policy"))
     steps: list[Step] = []
     for i, entry in enumerate(steps_raw):
         where = f"steps[{i}]"
@@ -392,9 +434,15 @@ def _dag_from_obj(raw: object) -> DagConfig:
                 timeout=_opt_int(sm, "timeout", default_step_timeout),
                 cpu_timeout=_opt_int(sm, "cpu_timeout", 0),
                 jobs_flag=_opt_str_or_none(sm, "jobs_flag"),
+                write_domains=_present_str_list(sm, "write_domains"),
+                write_domain_guarantee=(
+                    None
+                    if sm.get("write_domain_guarantee") is None
+                    else _parse_write_domain_guarantee(sm, where)
+                ),
             )
         )
-    return DagConfig(
+    cfg = DagConfig(
         steps=tuple(steps),
         description=_opt_str(doc, "description", ""),
         resource_caps=_opt_str_int_map(doc, "resource_caps", "<root>"),
@@ -403,7 +451,22 @@ def _dag_from_obj(raw: object) -> DagConfig:
         outer_mem_safety_factor=_opt_float(doc, "outer_mem_safety_factor", 1.0),
         default_step_timeout=default_step_timeout,
         default_jobs_flag=_opt_str(doc, "default_jobs_flag", DEFAULT_JOBS_FLAG),
+        write_domain_policy=policy,
     )
+    violations = write_domain_violations(cfg)
+    if violations:
+        raise DagJsonError("write-domain policy refused DAG before execution: " + "; ".join(violations))
+    return cfg
+
+
+def _parse_write_domain_guarantee(
+    step: Mapping[str, object], where: str
+) -> WriteDomainGuarantee:
+    raw = _req_str(step, "write_domain_guarantee", where)
+    try:
+        return WriteDomainGuarantee(raw)
+    except ValueError as exc:
+        raise DagJsonError(f"{where}.write_domain_guarantee: unknown value {raw!r}") from exc
 
 
 def _hint_to_json(hint: ResourceHint) -> dict[str, object]:
@@ -440,6 +503,10 @@ def _step_to_json(step: Step) -> dict[str, object]:
     }
     if step.cpu_timeout == 0:
         del obj["cpu_timeout"]
+    if step.write_domains is not None:
+        obj["write_domains"] = list(step.write_domains)
+    if step.write_domain_guarantee is not None:
+        obj["write_domain_guarantee"] = step.write_domain_guarantee.value
     return obj
 
 
@@ -448,7 +515,7 @@ def _dag_to_obj(cfg: DagConfig) -> dict[str, object]:
 
     A single source of truth for the field set + key order, so the two output formats cannot drift.
     """
-    return {
+    obj: dict[str, object] = {
         "description": cfg.description,
         "resource_caps": dict(sorted(cfg.resource_caps.items())),
         "mem_cap_factor": cfg.mem_cap_factor,
@@ -458,6 +525,13 @@ def _dag_to_obj(cfg: DagConfig) -> dict[str, object]:
         "default_jobs_flag": cfg.default_jobs_flag,
         "steps": [_step_to_json(s) for s in cfg.steps],
     }
+    policy = cfg.write_domain_policy
+    if policy.require_explicit or policy.allowed_domains:
+        obj["write_domain_policy"] = {
+            "require_explicit": policy.require_explicit,
+            "allowed_domains": sorted(policy.allowed_domains),
+        }
+    return obj
 
 
 def dag_to_json(cfg: DagConfig) -> str:
