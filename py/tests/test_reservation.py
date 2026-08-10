@@ -14,6 +14,7 @@ Plus PID-reuse fingerprinting and the InsufficientCores refusal.
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
 import signal
@@ -38,6 +39,88 @@ def _n_cores() -> int:
 def test_acquire_rejects_invalid_sample_window(ledger: Path, sample_s: float) -> None:
     with pytest.raises(ValueError, match="sample_s must be finite and >= 0"):
         res.acquire(1, ledger=ledger, sample_s=sample_s)
+
+
+def test_acquire_requires_a_real_sample_for_an_irq_budget(ledger: Path) -> None:
+    with pytest.raises(ValueError, match="sample_s must be > 0"):
+        res.acquire(1, ledger=ledger, sample_s=0.0, max_irq_rate=10.0)
+
+
+def test_corrupt_ledger_fails_closed(ledger: Path) -> None:
+    ledger.write_text("{")
+    ledger.chmod(0o600)
+    with pytest.raises(res.ReservationStateError, match="corrupt"):
+        res.held_cores(ledger)
+
+
+def _invalid_records() -> list[tuple[str, dict[str, object]]]:
+    base: dict[str, object] = {
+        "pid": 1,
+        "starttime": 1,
+        "cores": [0],
+        "tag": "holder",
+        "ts": 1.0,
+    }
+
+    def changed(**fields: object) -> dict[str, object]:
+        return {**base, **fields}
+
+    def missing(field: str) -> dict[str, object]:
+        record = dict(base)
+        del record[field]
+        return record
+
+    return [
+        ("mixed-invalid-core", changed(cores=[0, "bad"])),
+        ("missing-cores", missing("cores")),
+        ("empty-cores", changed(cores=[])),
+        ("negative-core", changed(cores=[-1])),
+        ("overflow-core", changed(cores=[1 << 32])),
+        ("boolean-core", changed(cores=[True])),
+        ("fractional-core", changed(cores=[1.0])),
+        ("duplicate-core", changed(cores=[1, 1])),
+        ("zero-pid", changed(pid=0)),
+        ("overflow-pid", changed(pid=1 << 32)),
+        ("boolean-pid", changed(pid=True)),
+        ("missing-pid", missing("pid")),
+        ("missing-starttime", missing("starttime")),
+        ("zero-starttime", changed(starttime=0)),
+        ("string-starttime", changed(starttime="1")),
+        ("overflow-starttime", changed(starttime=1 << 64)),
+        ("non-string-tag", changed(tag=7)),
+        ("missing-tag", missing("tag")),
+        ("missing-ts", missing("ts")),
+        ("nonfinite-ts", changed(ts=float("inf"))),
+        ("string-ts", changed(ts="1.0")),
+        ("boolean-ts", changed(ts=True)),
+        ("negative-ts", changed(ts=-1)),
+    ]
+
+
+@pytest.mark.parametrize(("case", "record"), _invalid_records(), ids=lambda value: str(value))
+def test_invalid_record_schema_fails_without_rewrite(
+    ledger: Path, case: str, record: dict[str, object]
+) -> None:
+    original = json.dumps({"reservations": [record]})
+    ledger.write_text(original)
+    ledger.chmod(0o600)
+
+    with pytest.raises(res.ReservationStateError, match="invalid record|corrupt"):
+        res.held_cores(ledger)
+
+    assert ledger.read_text() == original, f"{case} was silently repaired"
+
+
+def test_fifo_lock_and_ledger_fail_without_blocking(ledger: Path) -> None:
+    lock = ledger.with_suffix(ledger.suffix + ".lock")
+    os.mkfifo(lock, mode=0o600)
+    with pytest.raises(res.ReservationStateError, match="lock"):
+        res.held_cores(ledger)
+    lock.unlink()
+
+    os.mkfifo(ledger, mode=0o600)
+    with pytest.raises(res.ReservationStateError, match="regular file"):
+        res.held_cores(ledger)
 
 
 # --------------------------------------------------------------------------- #

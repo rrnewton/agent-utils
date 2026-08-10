@@ -88,6 +88,8 @@ def test_run_requires_command_separator(monkeypatch: pytest.MonkeyPatch) -> None
         ["run", "--cores", "0", "--", "true"],
         ["run", "--cores", "1", "--sample-s", "-1", "--", "true"],
         ["run", "--cores", "1", "--sample-s", "nan", "--", "true"],
+        ["run", "--cores", "1", "--sample-s", "0", "--max-irq-rate", "1", "--", "true"],
+        ["selftest", "--sample-s", "0", "--max-irq-rate", "1"],
         ["selftest", "--tag", "not-supported"],
     ],
 )
@@ -138,6 +140,21 @@ def test_probe_requires_real_mutation_and_every_reserved_core() -> None:
 def test_wrapped_signal_uses_shell_status() -> None:
     assert ca._wrapped_returncode(-15) == 143
     assert ca._wrapped_returncode(42) == 42
+
+
+def test_selftest_forwards_the_stated_irq_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, object] = {}
+
+    def reserve(*args: object, **kwargs: object) -> nullcontext[list[int]]:
+        seen.update(kwargs)
+        return nullcontext([0])
+
+    monkeypatch.setattr(ca, "_systemd_run_available", lambda: True)
+    monkeypatch.setattr(reservation, "reserve_cores", reserve)
+    monkeypatch.setattr(ca, "_probe_hard_pin", lambda _cores: {"verdict": "HARD"})
+
+    assert ca.main(["selftest", "--cores", "1", "--max-irq-rate", "7.5"]) == 0
+    assert seen["max_irq_rate"] == 7.5
 
 
 def test_missing_wrapped_executable_is_clean_operational_error(

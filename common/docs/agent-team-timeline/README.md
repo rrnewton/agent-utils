@@ -100,6 +100,3 @@ retained in batch, invocation, and top-level run provenance.
 
 Run `agent-team-timeline quickstart` for the short tour or
 `agent-team-timeline --userguide` for the complete storage, privacy, and rerun contract.
-
-The complete inventory of model-backed computations, their version histories, cache identities,
-and compatibility rules is in [`ARCHITECTURE.md`](../../../py/agent_team_timeline/ARCHITECTURE.md).

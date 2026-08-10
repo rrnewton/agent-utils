@@ -124,7 +124,7 @@ def test_embed_check_rejects_regular_copy_and_wrong_link_target(
 def test_package_docs_and_licenses_are_authoritative_links() -> None:
     docs = _load_script("embed_userguides")
 
-    assert len(docs.PACKAGE_LINKS) == 27
+    assert len(docs.PACKAGE_LINKS) == 29
     for link in docs.PACKAGE_LINKS:
         destination = REPO_ROOT / link.destination
         assert destination.is_symlink(), link.destination
@@ -147,6 +147,69 @@ def test_artifact_doc_linters_reject_suite_language_sibling_and_template_leaks()
         assert any("foreign" in error for error in errors)
         assert any("sibling package" in error for error in errors)
         assert any("template" in error for error in errors)
+
+
+def test_python_doc_lint_exemption_cannot_hide_a_later_foreign_term() -> None:
+    python_check = _load_script("check_python_packages")
+    project = next(
+        project for project in python_check.PROJECTS if "cargo" in project.doc_term_exemptions
+    )
+
+    errors = python_check._doc_violations(
+        project,
+        "Cargo is supported as a target program. Install the unrelated Rust implementation.",
+    )
+
+    assert "foreign-language term 'Rust'" in errors
+    assert "foreign-language term 'Cargo'" not in errors
+
+
+def test_every_declared_markdown_resource_is_standalone() -> None:
+    python_check = _load_script("check_python_packages")
+
+    for project in python_check.PROJECTS:
+        source = python_check.PY_ROOT / project.directory
+        # Reading the declared resources is the artifact checker's common source/sdist/wheel gate.
+        python_check._source_resources(project, source)
+
+
+def test_secondary_markdown_resource_gets_the_standalone_lint(tmp_path: Path) -> None:
+    python_check = _load_script("check_python_packages")
+    project = python_check.Project(
+        directory="demo",
+        distribution="demo",
+        package="demo",
+        commands=("demo",),
+        resources=("AGENT_USER_GUIDE.md",),
+        required_dependencies=(),
+    )
+    (tmp_path / "AGENT_USER_GUIDE.md").write_text(
+        "Use the DeepScry workspace.\n", encoding="utf-8"
+    )
+
+    with pytest.raises(
+        python_check.CheckError,
+        match=r"AGENT_USER_GUIDE\.md is not standalone: unrelated project 'DeepScry'",
+    ):
+        python_check._source_resources(project, tmp_path)
+
+
+def test_unexpected_package_members_reject_undeclared_documentation() -> None:
+    python_check = _load_script("check_python_packages")
+
+    unexpected = python_check._unexpected_package_members(
+        {
+            "demo/__init__.py",
+            "demo/README.md",
+            "demo/ARCHITECTURE.md",
+            "demo/static/",
+        },
+        "demo/",
+        {"demo/__init__.py"},
+        ("README.md",),
+    )
+
+    assert unexpected == ["demo/ARCHITECTURE.md"]
 
 
 def test_wheel_rejects_present_but_corrupted_declared_resource(

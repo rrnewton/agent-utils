@@ -18,6 +18,7 @@ schema, CLI, output, error, and state-transition drift.
 | `tick-hub` | Evaluate independently cadenced reminders and freshness checks in one deterministic tick. | `tick-hub` | `tick-hub` |
 | `pr-landing-planner` | Produce advisory, conflict- and CI-aware pull-request landing plans. | `pr-landing-planner` | `pr-landing-planner` |
 | `herdr-run` | Run policy-admitted commands through an out-of-sandbox Herdr pane with audited, byte-preserving results. | `herdr-run` | `herdr-run` |
+| `herdr-agent` | Durably queue, submit, inspect, and read messages for an interactive agent in a Herdr pane. | Companion command in `herdr-run` | Companion binary in `herdr-run` |
 
 Each distribution is independently installable and documented. Its README and
 embedded user guide describe only that edition, so package-index users do not

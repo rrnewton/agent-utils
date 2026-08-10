@@ -29,13 +29,32 @@ class Crate:
     name: str
     bins: tuple[str, ...]
     library: str
+    command_userguides: tuple[tuple[str, str], ...]
 
 
 CRATES: tuple[Crate, ...] = (
-    Crate("safe-ci-dag-runner", ("safe-ci-dag-runner", "cpuset-alloc"), "safe_ci_dag_runner"),
-    Crate("tick-hub", ("tick-hub",), "tick_hub"),
-    Crate("pr-landing-planner", ("pr-landing-planner",), "pr_landing_planner"),
-    Crate("herdr-run", ("herdr-run",), "herdr_run"),
+    Crate(
+        "safe-ci-dag-runner",
+        ("safe-ci-dag-runner", "cpuset-alloc"),
+        "safe_ci_dag_runner",
+        (("safe-ci-dag-runner", "src/embedded_userguide.md"),),
+    ),
+    Crate("tick-hub", ("tick-hub",), "tick_hub", (("tick-hub", "src/embedded_userguide.md"),)),
+    Crate(
+        "pr-landing-planner",
+        ("pr-landing-planner",),
+        "pr_landing_planner",
+        (("pr-landing-planner", "src/embedded_userguide.md"),),
+    ),
+    Crate(
+        "herdr-run",
+        ("herdr-run", "herdr-agent"),
+        "herdr_run",
+        (
+            ("herdr-run", "src/embedded_userguide.md"),
+            ("herdr-agent", "src/embedded_agent_userguide.md"),
+        ),
+    ),
 )
 
 _FOREIGN_DOC_TERMS = re.compile(
@@ -169,7 +188,12 @@ def _run(
 
 def _metadata(crate: Crate) -> tuple[str, set[str], set[str]]:
     manifest = RS_ROOT / crate.name / "Cargo.toml"
-    for relative in ("README.md", "src/embedded_userguide.md", "LICENSE"):
+    linked_resources = {
+        "README.md",
+        "LICENSE",
+        *(relative for _command, relative in crate.command_userguides),
+    }
+    for relative in sorted(linked_resources):
         linked = RS_ROOT / crate.name / relative
         if not linked.is_symlink() or not linked.resolve().is_file():
             raise CheckError(
@@ -246,7 +270,7 @@ def _package(crate: Crate, version: str, target_root: Path) -> Path:
     return archive
 
 
-def _inspect(crate: Crate, version: str, archive: Path) -> str:
+def _inspect(crate: Crate, version: str, archive: Path) -> dict[str, str]:
     prefix = f"{crate.name}-{version}/"
     with tarfile.open(archive, mode="r:gz") as package:
         names = set(package.getnames())
@@ -255,7 +279,7 @@ def _inspect(crate: Crate, version: str, archive: Path) -> str:
             f"{prefix}Cargo.toml.orig",
             f"{prefix}LICENSE",
             f"{prefix}README.md",
-            f"{prefix}src/embedded_userguide.md",
+            *(f"{prefix}{relative}" for _command, relative in crate.command_userguides),
         }
         missing = sorted(required - names)
         if missing:
@@ -297,7 +321,11 @@ def _inspect(crate: Crate, version: str, archive: Path) -> str:
             )
 
         documents: dict[str, str] = {}
-        for relative in ("README.md", "src/embedded_userguide.md"):
+        document_paths = {
+            "README.md",
+            *(relative for _command, relative in crate.command_userguides),
+        }
+        for relative in sorted(document_paths):
             member = package.extractfile(f"{prefix}{relative}")
             if member is None:
                 raise CheckError(f"{crate.name}: could not read {relative} from registry archive")
@@ -318,10 +346,12 @@ def _inspect(crate: Crate, version: str, archive: Path) -> str:
             raise CheckError(f"{crate.name}: could not read LICENSE from registry archive")
         if license_member.read() != (REPO_ROOT / "LICENSE").read_bytes():
             raise CheckError(f"{crate.name}: registry LICENSE differs from the authoritative license")
-        return documents["src/embedded_userguide.md"]
+        return documents
 
 
-def _smoke(crate: Crate, version: str, userguide: str, target_root: Path) -> None:
+def _smoke(
+    crate: Crate, version: str, documents: dict[str, str], target_root: Path
+) -> None:
     bindir = target_root / "debug"
     suffix = ".exe" if os.name == "nt" else ""
     env = dict(os.environ)
@@ -333,8 +363,9 @@ def _smoke(crate: Crate, version: str, userguide: str, target_root: Path) -> Non
         executable = bindir / f"{binary}{suffix}"
         if not executable.is_file():
             raise CheckError(f"{crate.name}: verified binary is missing: {executable}")
+        command_guides = dict(crate.command_userguides)
         invocations = [("--help",), ("--version",)]
-        if binary != "cpuset-alloc":
+        if binary in command_guides:
             invocations.append(("--userguide",))
         for args in invocations:
             result = _run(
@@ -348,7 +379,9 @@ def _smoke(crate: Crate, version: str, userguide: str, target_root: Path) -> Non
                 raise CheckError(
                     f"{binary} --version did not report {version!r}: {combined!r}"
                 )
-            if args == ("--userguide",) and (result.stdout != userguide or result.stderr):
+            if args == ("--userguide",) and (
+                result.stdout != documents[command_guides[binary]] or result.stderr
+            ):
                 raise CheckError(f"{binary} --userguide differs from packaged user guide")
 
 
@@ -379,8 +412,8 @@ def main() -> int:
                     )
                 target_root = package_root / crate.name
                 archive = _package(crate, version, target_root)
-                userguide = _inspect(crate, version, archive)
-                _smoke(crate, version, userguide, target_root)
+                documents = _inspect(crate, version, archive)
+                _smoke(crate, version, documents, target_root)
                 print(
                     f"check_rust_packages: ok {crate.name} {version} "
                     f"({', '.join(crate.bins)})"

@@ -1,8 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
 """Mutation controls for repository-local Rust launchers and provenance."""
 
 from __future__ import annotations
@@ -216,6 +211,36 @@ def test_nonignored_untracked_source_change_rebuilds(tmp_path: Path) -> None:
     assert changed.returncode == 0, changed.stderr
     assert changed.stdout == "v2\n"
     assert "cache=refreshed" in changed.stderr
+
+
+def test_source_enumeration_failure_cannot_execute_a_cached_binary(tmp_path: Path) -> None:
+    """A Git failure after partial output must not bless or execute that partial snapshot."""
+    root = _build_sandbox(tmp_path)
+    assert _run_launcher(root).stdout == "v1\n"
+
+    real_git = shutil.which("git")
+    assert real_git is not None
+    wrapper_dir = tmp_path / "failing git"
+    wrapper_dir.mkdir()
+    git_wrapper = wrapper_dir / "git"
+    git_wrapper.write_text(
+        "#!/bin/sh\n"
+        '"$AGENT_UTILS_TEST_REAL_GIT" "$@"\n'
+        "exit 42\n"
+    )
+    _chmod_x(git_wrapper)
+
+    failed = _run_launcher(
+        root,
+        extra_env={
+            "PATH": str(wrapper_dir) + os.pathsep + os.environ["PATH"],
+            "AGENT_UTILS_TEST_REAL_GIT": real_git,
+        },
+    )
+
+    assert failed.returncode != 0
+    assert failed.stdout == ""
+    assert "could not enumerate rs/ source" in failed.stderr
 
 
 def test_replaced_or_unstamped_artifact_is_rebuilt_not_executed(tmp_path: Path) -> None:

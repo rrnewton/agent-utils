@@ -68,7 +68,7 @@ setup_py() {
 
 setup_rs() {
   local runner legacy unexpected launcher tool target
-  local -a rust_tools=(safe-ci-dag-runner cpuset-alloc tick-hub pr-landing-planner herdr-run)
+  local -a rust_tools=(safe-ci-dag-runner cpuset-alloc tick-hub pr-landing-planner herdr-run herdr-agent)
   echo "==> [rs] verify/build tracked Cargo-backed launchers"
   command -v cargo >/dev/null || { echo "rs: cargo not found" >&2; return 1; }
   command -v flock >/dev/null || { echo "rs: flock not found" >&2; return 1; }
@@ -98,7 +98,8 @@ setup_rs() {
   done
   unexpected="$(find "$ROOT/rs/bin" -mindepth 1 -maxdepth 1 \
     ! -name cargo-runner ! -name safe-ci-dag-runner ! -name cpuset-alloc \
-    ! -name tick-hub ! -name pr-landing-planner ! -name herdr-run -print -quit)"
+    ! -name tick-hub ! -name pr-landing-planner ! -name herdr-run \
+    ! -name herdr-agent -print -quit)"
   if [ -n "$unexpected" ]; then
     echo "rs: unexpected rs/bin entry refused: ${unexpected#"$ROOT"/}" >&2
     return 1

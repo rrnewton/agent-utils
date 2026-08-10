@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import cast
@@ -29,6 +30,59 @@ def test_agent_cli_version(capsys: pytest.CaptureFixture[str]) -> None:
 def test_agent_cli_userguide_option(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(agent_cli, "_guide", lambda: 0)
     assert agent_cli.main(["--userguide"]) == 0
+
+
+def test_agent_cli_bare_invocation_is_a_successful_orientation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert agent_cli.main([]) == 0
+    captured = capsys.readouterr()
+    assert "send" in captured.out
+    assert "--session" in captured.out
+    assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["status", "--pane", "p", "--ready-timeout", "nan"],
+        ["status", "--pane", "p", "--working-timeout", "inf"],
+        ["status", "--pane", "p", "--ready-timeout", "31536001"],
+    ],
+)
+def test_agent_cli_rejects_nonfinite_or_excessive_waits(arguments: list[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        agent_cli.main(arguments)
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["status", "--pane", "--help"],
+        ["status", "--pane", "--version"],
+        ["status", "--pane", "--queue", "state"],
+        ["status", "--lines", "1_0"],
+        ["status", "--lines", "١٢"],
+        ["status", "--lines", "1000001"],
+        ["status", "--ready-timeout", "1_0"],
+        ["status", "--ready-timeout", "١.0"],
+    ],
+)
+def test_agent_cli_rejects_stolen_options_and_non_ascii_or_unbounded_numbers(
+    arguments: list[str],
+) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        agent_cli.main(arguments)
+    assert exc_info.value.code == 2
+
+
+def test_agent_cli_accepts_documented_ascii_numeric_forms() -> None:
+    args = agent_cli._parser().parse_intermixed_args(
+        ["status", "--pane=p", "--ready-timeout=.5", "--lines=00017"]
+    )
+    assert args.ready_timeout == 0.5
+    assert args.lines == 17
 
 
 class FakeAgentHerdr:
@@ -98,7 +152,9 @@ def test_multiline_busy_then_idle_is_atomic_and_confirmed(tmp_path: object) -> N
 
 
 def test_busy_for_more_than_thirty_seconds_still_delivers_with_turn_sized_budget(tmp_path: object) -> None:
-    fake = FakeAgentHerdr(["working", "working", "idle"])
+    # Session resolution reads the matching pane once while listing and once for final
+    # validation, both before and after acquiring the canonical pane lock.
+    fake = FakeAgentHerdr(["working", "working", "working", "working", "idle", "idle"])
     clock = {"now": 0.0}
 
     def monotonic() -> float:
@@ -173,6 +229,39 @@ def test_distinct_queue_roots_serialize_one_shared_target(tmp_path: Path) -> Non
     assert fake.runs == ["from a", "from b"]
 
 
+def test_exact_pane_and_session_forms_share_one_target_lock(tmp_path: Path) -> None:
+    fake = FakeAgentHerdr(["idle"])
+    fake.run_release = threading.Event()
+    errors: list[BaseException] = []
+    pane_target = Target(pane_id="w1:p1")
+    session_target = Target(session_agent="codex", session_value="session-1")
+
+    def invoke(root: Path, selected: Target, text: str) -> None:
+        try:
+            send(client(fake), selected, str(root), text)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(
+        target=invoke, args=(tmp_path / "pane-queue", pane_target, "from pane"), daemon=True
+    )
+    second = threading.Thread(
+        target=invoke,
+        args=(tmp_path / "session-queue", session_target, "from session"),
+        daemon=True,
+    )
+    first.start()
+    assert fake.run_entered.wait(5)
+    second.start()
+    second.join(0.05)
+    assert second.is_alive(), "session targeting bypassed the resolved-pane lock"
+    fake.run_release.set()
+    first.join(5)
+    second.join(5)
+    assert errors == []
+    assert fake.runs == ["from pane", "from session"]
+
+
 def test_working_confirmation_failure_never_resubmits_and_marks_ambiguous(tmp_path: object) -> None:
     fake = FakeAgentHerdr(["idle"])
 
@@ -189,6 +278,41 @@ def test_working_confirmation_failure_never_resubmits_and_marks_ambiguous(tmp_pa
     assert document["delivery_attempts"] == 1
     assert document["possibly_submitted"] is True
     assert len(fake.runs) == 1
+
+
+def test_send_inspects_terminal_artifact_when_another_drain_consumed_its_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original_enqueue = agent_api._enqueue
+
+    def consumed_enqueue(
+        root: str,
+        text: str,
+        *,
+        message_id: str | None,
+        serialize: bool,
+    ) -> str:
+        del message_id, serialize
+        identifier = original_enqueue(
+            root, text, message_id="cross-drained", serialize=True
+        )
+        source = tmp_path / "inbox/cross-drained.json"
+        document = json.loads(source.read_text())
+        document["delivery_error"] = "other drain lost confirmation"
+        destination = tmp_path / "failed/cross-drained.json"
+        source.replace(destination)
+        destination.write_text(json.dumps(document), encoding="utf-8")
+        return identifier
+
+    monkeypatch.setattr(agent_api, "_enqueue", consumed_enqueue)
+    monkeypatch.setattr(
+        agent_api,
+        "drain",
+        lambda *_args, **_kwargs: QueueResult("", (), (), (), None, "delivered"),
+    )
+
+    with pytest.raises(AgentPossiblySubmitted, match="other drain lost confirmation"):
+        agent_api.send(client(FakeAgentHerdr()), target(), str(tmp_path), "raced")
 
 
 @pytest.mark.parametrize(
@@ -209,6 +333,117 @@ def test_wrong_identity_workspace_or_cwd_refuses(
     assert fake.runs == []
     assert len(list((tmp_path / "inbox").glob("*.json"))) == 1  # type: ignore[operator]
     assert len(list((tmp_path / "failed").glob("*.json"))) == 0  # type: ignore[operator]
+
+
+def test_session_resolution_cannot_silently_override_asserted_pane(tmp_path: object) -> None:
+    fake = FakeAgentHerdr(["idle"])
+    with pytest.raises(AgentDeliveryError, match="expected exact pane"):
+        send(client(fake), target(pane_id="w9:p9"), str(tmp_path), "never retarget")
+    assert fake.runs == []
+
+
+@pytest.mark.parametrize("identifier", ["../escape", "/absolute", ".hidden", "bad/name", ""])
+def test_enqueue_rejects_unsafe_message_ids(tmp_path: object, identifier: str) -> None:
+    with pytest.raises(AgentDeliveryError, match="message id"):
+        enqueue(str(tmp_path), "safe text", message_id=identifier)
+
+
+def test_concurrent_explicit_message_id_is_created_exactly_once(tmp_path: Path) -> None:
+    barrier = threading.Barrier(2)
+    successes: list[str] = []
+    failures: list[BaseException] = []
+
+    def create() -> None:
+        barrier.wait()
+        try:
+            successes.append(enqueue(str(tmp_path), "one durable value", message_id="same-id"))
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [threading.Thread(target=create) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert successes == ["same-id"]
+    assert len(failures) == 1
+    assert isinstance(failures[0], AgentDeliveryError)
+    assert json.loads((tmp_path / "inbox/same-id.json").read_text())["text"] == "one durable value"
+
+
+@pytest.mark.parametrize("missing", [Target(), Target(pane_id="")])
+def test_missing_target_is_rejected_before_queue_mutation(
+    tmp_path: Path, missing: Target
+) -> None:
+    root = tmp_path / "queue"
+    with pytest.raises(AgentDeliveryError, match="target needs"):
+        send(client(FakeAgentHerdr()), missing, str(root), "do not strand me")
+    assert not root.exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"id":"bad","text":NaN}\n',
+        '{"id":"bad","text":"prompt","delivery_attempts":true}\n',
+        '{"id":"bad","text":""}\n',
+    ],
+)
+def test_nonstandard_or_unsafe_queue_documents_are_quarantined(
+    tmp_path: Path, payload: str
+) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(parents=True, mode=0o700)
+    (inbox / "bad.json").write_text(payload, encoding="utf-8")
+
+    result = drain(client(FakeAgentHerdr()), target(), str(tmp_path))
+
+    assert result.quarantined == ("bad",)
+    assert list((tmp_path / "failed").glob("bad.json"))
+
+
+def test_exhausted_fifo_head_is_pending_not_success(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(parents=True, mode=0o700)
+    (inbox / "exhausted.json").write_text(
+        '{"id":"exhausted","text":"keep me","delivery_attempts":1}\n',
+        encoding="utf-8",
+    )
+
+    result = drain(
+        client(FakeAgentHerdr()), target(), str(tmp_path), max_attempts=1
+    )
+
+    assert result.outcome == "pending"
+    assert result.pending == ("exhausted",)
+    assert result.blocked is not None and "maximum delivery-attempt" in result.blocked
+
+
+def test_fifo_queue_artifact_is_quarantined_without_blocking(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(parents=True, mode=0o700)
+    os.mkfifo(inbox / "pipe.json", mode=0o600)
+
+    result = drain(client(FakeAgentHerdr()), target(), str(tmp_path))
+
+    assert result.quarantined == ("pipe",)
+    assert stat.S_ISFIFO((tmp_path / "failed/pipe.json").lstat().st_mode)
+
+
+def test_queue_directories_are_tightened_and_symlink_lock_is_refused(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir(mode=0o755)
+    enqueue(str(tmp_path), "queued")
+    assert stat.S_IMODE(inbox.stat().st_mode) == 0o700
+
+    victim = tmp_path / "victim"
+    victim.write_text("do not touch", encoding="utf-8")
+    (tmp_path / ".delivery.lock").unlink()
+    (tmp_path / ".delivery.lock").symlink_to(victim)
+    with pytest.raises(AgentDeliveryError, match="cannot open queue delivery lock"):
+        drain(client(FakeAgentHerdr(["idle"])), target(), str(tmp_path))
+    assert victim.read_text(encoding="utf-8") == "do not touch"
 
 
 def test_timeout_retains_prompt_and_loud_error(tmp_path: object) -> None:
@@ -282,6 +517,35 @@ def test_status_on_absent_queue_creates_no_files(tmp_path: Path) -> None:
     assert not root.exists()
 
 
+def test_status_refuses_symlinked_queue_or_binding_without_touching_target(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+    fake = FakeAgentHerdr(["idle"])
+    with pytest.raises(AgentDeliveryError, match="unsafe queue directory"):
+        status(client(fake), target(), str(alias))
+
+    binding = real / "target.json"
+    victim = tmp_path / "victim.json"
+    victim.write_text("{}", encoding="utf-8")
+    binding.symlink_to(victim)
+    with pytest.raises(AgentDeliveryError, match="cannot read queue target binding"):
+        status(client(fake), target(), str(real))
+    assert victim.read_text(encoding="utf-8") == "{}"
+
+
+def test_status_validates_processed_directory_too(tmp_path: Path) -> None:
+    enqueue(str(tmp_path), "queued")
+    processed = tmp_path / "processed"
+    processed.chmod(0o755)
+
+    with pytest.raises(AgentDeliveryError, match="queue state directory is not private"):
+        status(client(FakeAgentHerdr()), target(), str(tmp_path))
+
+    assert stat.S_IMODE(processed.stat().st_mode) == 0o755
+
+
 def test_status_read_only_validates_existing_binding(tmp_path: Path) -> None:
     fake = FakeAgentHerdr(["working"])
     with pytest.raises(AgentPending):
@@ -330,7 +594,10 @@ def test_drain_cli_returns_temporary_failure_when_fifo_remains_blocked(
     assert agent_cli.main(["drain", "--pane", "w1:p1", "--queue", str(tmp_path)]) == 75
 
 
-@pytest.mark.parametrize("raw", [b"{not json\n", b'{"id":"bad","text":7}\n'])
+@pytest.mark.parametrize(
+    "raw",
+    [b"{not json\n", b'{"id":"bad","text":7}\n', b'{"id":[],"text":"bad"}\n'],
+)
 def test_invalid_fifo_head_preserves_raw_and_does_not_block_valid(
     tmp_path: object, raw: bytes
 ) -> None:

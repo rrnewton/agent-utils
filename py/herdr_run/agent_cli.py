@@ -1,17 +1,50 @@
-"""Command line for durable interactive-agent messaging through Herdr."""
+#!/usr/bin/env python3
+"""Command line for durable interactive-agent messaging through Herdr.
+
+This module can also run directly from a source checkout. Insert the package parent before package
+imports so that direct execution behaves like the installed console command.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
 from collections.abc import Sequence
+
+_PKG_PARENT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PKG_PARENT not in sys.path:
+    sys.path.insert(0, _PKG_PARENT)
 
 from herdr_run import __version__
 from herdr_run.agent import Target, drain, read, send, status
 from herdr_run.client import HerdrClient
 from herdr_run.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
+
+_MAX_WAIT_SECONDS = 31_536_000.0
+_MAX_COUNT = 1_000_000
+_ASCII_FLOAT = re.compile(
+    r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?\Z"
+)
+_ASCII_UINT = re.compile(r"[0-9]+\Z")
+
+
+def _ascii_float(value: str) -> float:
+    if _ASCII_FLOAT.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("expected an ASCII decimal number")
+    return float(value)
+
+
+def _bounded_uint(value: str) -> int:
+    if _ASCII_UINT.fullmatch(value) is None:
+        raise argparse.ArgumentTypeError("expected an ASCII unsigned integer")
+    parsed = int(value, 10)
+    if parsed > _MAX_COUNT:
+        raise argparse.ArgumentTypeError(f"value must not exceed {_MAX_COUNT}")
+    return parsed
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -32,10 +65,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--workspace", dest="expected_workspace")
     parser.add_argument("--cwd", dest="expected_cwd")
     parser.add_argument("--queue", default=".herdr-agent")
-    parser.add_argument("--ready-timeout", type=float, default=900.0)
-    parser.add_argument("--working-timeout", type=float, default=30.0)
-    parser.add_argument("--max-attempts", type=int, default=3)
-    parser.add_argument("--lines", type=int, default=500)
+    parser.add_argument("--ready-timeout", type=_ascii_float, default=900.0)
+    parser.add_argument("--working-timeout", type=_ascii_float, default=30.0)
+    parser.add_argument("--max-attempts", type=_bounded_uint, default=3)
+    parser.add_argument("--lines", type=_bounded_uint, default=500)
     parser.add_argument("--herdr-bin", default="herdr")
     return parser
 
@@ -85,9 +118,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.userguide or args.command == "userguide":
         return _guide()
     if args.command is None:
-        parser.error("the following arguments are required: command")
-    if args.ready_timeout < 0 or args.working_timeout <= 0 or args.max_attempts <= 0 or args.lines <= 0:
-        parser.error("timeouts, max-attempts, and lines must be positive (ready-timeout may be zero)")
+        parser.print_help()
+        return 0
+    if (
+        not math.isfinite(args.ready_timeout)
+        or not math.isfinite(args.working_timeout)
+        or args.ready_timeout < 0
+        or args.working_timeout <= 0
+        or args.ready_timeout > _MAX_WAIT_SECONDS
+        or args.working_timeout > _MAX_WAIT_SECONDS
+        or args.max_attempts <= 0
+        or args.lines <= 0
+    ):
+        parser.error(
+            "timeouts must be finite and positive (ready-timeout may be zero and must not exceed "
+            f"{_MAX_WAIT_SECONDS:g}s); max-attempts and lines must be positive"
+        )
     client = HerdrClient(herdr_bin=str(args.herdr_bin))
     target = _target(args)
     queue = os.path.abspath(str(args.queue))

@@ -19,6 +19,15 @@ from safe_ci_dag_runner.ambient import (
     PsiReading,
     capture_ambient_snapshot,
 )
+from safe_ci_dag_runner.attribution import (
+    LOG_DIR_ENV,
+    NO_LOGS_ENV,
+    Culprit,
+    RunEvidence,
+    StepStream,
+    default_log_dir,
+    sanitize as sanitize_evidence_tag,
+)
 from safe_ci_dag_runner.model import (
     DagConfig,
     Step,
@@ -40,7 +49,12 @@ from safe_ci_dag_runner.protocols import (
     StepOutcome,
 )
 from safe_ci_dag_runner.sizing import step_mem_cap_bytes
-from safe_ci_dag_runner.teardown import reap
+from safe_ci_dag_runner.teardown import (
+    STEP_NONCE_ENV,
+    mint_step_nonce,
+    reap,
+    reap_many,
+)
 
 __all__ = ["Runner", "run_dag"]
 
@@ -196,6 +210,9 @@ class Runner:
         self.running: set[str] = set()
         # tag -> the in-flight step's Popen, so a sibling that FAILS can eager-reap it.
         self.running_procs: dict[str, subprocess.Popen[bytes]] = {}
+        # The exact inherited ownership token reaches environment-preserving setsid/double-fork
+        # escapees after process-group and parentage tracking lose their originating step.
+        self.running_nonces: dict[str, str] = {}
         self.aborted: set[str] = set()  # tags killed by eager-exit (labelled ABORTED, not FAIL)
         self.step_profile_rows: list[Mapping[str, object]] = []
         self.failed = False  # a genuine (non-aborted) step failed
@@ -206,6 +223,7 @@ class Runner:
         # can run past it.
         self.run_timeout_s = run_timeout_s if (run_timeout_s or 0) > 0 else None
         self.run_timed_out = False
+        self.evidence = RunEvidence.open(default_log_dir())
 
     # -- gating helpers (mirror validate.py Runner._deps_ok / _deps_known / _res_free) --
 
@@ -285,6 +303,17 @@ class Runner:
         """
         threads: list[threading.Thread] = []
         wall_start = time.time()
+        if self.evidence is not None:
+            print(
+                f"[scheduler] per-step logs + test-boundary journal: "
+                f"{self.evidence.directory} (set {LOG_DIR_ENV} to relocate, {NO_LOGS_ENV}=1 "
+                "to disable)",
+                file=sys.stderr,
+            )
+            self.evidence.record(
+                "containment",
+                [("state", "boxed" if self.cgroups.enabled else "unboxed")],
+            )
         deadline = (
             wall_start + self.run_timeout_s if self.run_timeout_s is not None else None
         )
@@ -310,9 +339,25 @@ class Runner:
                         + (", ".join(tag for tag, _ in cut) or "<none running>"),
                         file=sys.stderr,
                     )
-                    for other, other_proc in cut:
+                    if self.evidence is not None:
+                        self.evidence.record(
+                            "run_timeout",
+                            [
+                                ("budget_s", str(self.run_timeout_s or 0)),
+                                ("elapsed_s", f"{time.time() - wall_start:.3f}"),
+                                ("cut_steps", ",".join(tag for tag, _ in cut)),
+                                ("done", str(len(self.done))),
+                            ],
+                        )
+                    for other, _other_proc in cut:
                         self.aborted.add(other)
-                        reap(other_proc, self.cgroups, other)
+                    reap_many(
+                        tuple(
+                            (other_proc, other, self.running_nonces.get(other))
+                            for other, other_proc in cut
+                        ),
+                        self.cgroups,
+                    )
                 skipped = self._skipped()
                 if not self.running and (
                     self.stop or len(self.done) + len(skipped) >= len(self.steps)
@@ -355,6 +400,9 @@ class Runner:
         self._emit(f"[{step.tag}] ▶ START  {step.desc}")
         env = dict(os.environ)
         env.update(step.env)
+        nonce = mint_step_nonce()
+        # Runner authority wins over a DAG-supplied environment value.
+        env[STEP_NONCE_ENV] = nonce
         inner_jobs = preferred_inner_jobs(step)
         # SMALL default caps for an undeclared step (the forcing function): fall back to the
         # DAG's tight 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor when the step
@@ -403,7 +451,19 @@ class Runner:
         )
         with self.lock:
             self.running_procs[step.tag] = proc
+            self.running_nonces[step.tag] = nonce
 
+        sink = StepStream(step.tag, self.evidence)
+        if self.evidence is not None:
+            self.evidence.record(
+                "step_start",
+                [
+                    ("step", step.tag),
+                    ("pid", str(proc.pid)),
+                    ("timeout_s", str(step.timeout)),
+                    ("cmd", run_cmd),
+                ],
+            )
         captured: list[bytes] = []
 
         def _pump() -> None:
@@ -414,12 +474,28 @@ class Runner:
                 stdout = proc.stdout
                 if stdout is None:
                     return
-                for raw in stdout:
+                pending = bytearray()
+                # `BufferedReader.read(n)` may wait for all n bytes. Read the pipe descriptor
+                # directly so an unterminated libtest start marker is journaled while the test is
+                # still running, rather than only after teardown closes the pipe.
+                while raw := os.read(stdout.fileno(), 8192):
                     captured.append(raw)
+                    sink.ingest(raw)
                     if stream:
-                        self._emit(
-                            f"[{step.tag}] " + raw.decode(errors="replace").rstrip("\n")
-                        )
+                        pending.extend(raw)
+                        while b"\n" in pending:
+                            index = pending.index(b"\n")
+                            line = bytes(pending[: index + 1])
+                            del pending[: index + 1]
+                            self._emit(
+                                f"[{step.tag}] "
+                                + line.decode(errors="replace").rstrip("\n")
+                            )
+                if stream and pending:
+                    self._emit(
+                        f"[{step.tag}] "
+                        + bytes(pending).decode(errors="replace").rstrip("\n")
+                    )
             except Exception:
                 pass  # a broken/held pipe must never crash the supervisor
 
@@ -448,7 +524,19 @@ class Runner:
                             # Over CPU budget: reap the whole group now. The main thread's
                             # proc.wait() then returns normally (no wall TimeoutExpired).
                             cpu_timed_out = True
-                            reap(proc, self.cgroups, step.tag)
+                            if self.evidence is not None:
+                                culprit_now = sink.culprit()
+                                self.evidence.record(
+                                    "cpu_timeout",
+                                    [
+                                        ("step", step.tag),
+                                        ("cpu_timeout_s", str(cpu_budget)),
+                                        ("culprit_test", culprit_now.test or ""),
+                                        ("culprit_basis", culprit_now.how),
+                                        ("tests_completed", str(culprit_now.completed)),
+                                    ],
+                                )
+                            reap(proc, self.cgroups, step.tag, nonce=nonce)
                             return
 
         reader = threading.Thread(target=_pump, daemon=True)
@@ -461,7 +549,20 @@ class Runner:
             # Genuine hang: reap the step's whole process group now (safe because
             # start_new_session gave it its own group; reap guards the runner's group).
             timed_out = True
-            reap(proc, self.cgroups, step.tag)
+            if self.evidence is not None:
+                culprit_now = sink.culprit()
+                self.evidence.record(
+                    "step_timeout",
+                    [
+                        ("step", step.tag),
+                        ("elapsed_s", f"{time.time() - start:.3f}"),
+                        ("timeout_s", str(step.timeout)),
+                        ("culprit_test", culprit_now.test or ""),
+                        ("culprit_basis", culprit_now.how),
+                        ("tests_completed", str(culprit_now.completed)),
+                    ],
+                )
+            reap(proc, self.cgroups, step.tag, nonce=nonce)
             try:
                 proc.wait(timeout=_POST_TIMEOUT_WAIT_S)
             except Exception:
@@ -473,7 +574,7 @@ class Runner:
         reader.join(timeout=_THREAD_JOIN_S)
         # Reap the whole process group so any orphan grandchildren are SIGKILLed now instead
         # of leaking into later steps (and this lets the abandoned reader finally see EOF).
-        reap(proc, self.cgroups, step.tag)
+        reap(proc, self.cgroups, step.tag, nonce=nonce)
 
         # Read the step's cgroup measurements BEFORE cleanup() rmdirs the child cgroup.
         oom = self.cgroups.oom_kills(step.tag)
@@ -488,6 +589,7 @@ class Runner:
         returncode = proc.returncode
         ok = returncode == 0 and not timed_out and not cpu_timed_out
         summary = _last_line(captured)
+        culprit: Culprit | None = sink.culprit() if timed_out or cpu_timed_out else None
 
         row: dict[str, object] = {
             "step": step.tag,
@@ -526,6 +628,7 @@ class Runner:
         with self.lock:
             self.running.discard(step.tag)
             self.running_procs.pop(step.tag, None)
+            self.running_nonces.pop(step.tag, None)
             self._release(step)
             self.cores_used -= self._step_width(step)
             self.step_profile_rows.append(row)
@@ -573,9 +676,16 @@ class Runner:
                 self.failed = True
                 self.stop = True
                 if not self.keep_going:
-                    for other, other_proc in list(self.running_procs.items()):
+                    others = list(self.running_procs.items())
+                    for other, _other_proc in others:
                         self.aborted.add(other)  # its thread will label itself ABORTED
-                        reap(other_proc, self.cgroups, other)
+                    reap_many(
+                        tuple(
+                            (other_proc, other, self.running_nonces.get(other))
+                            for other, other_proc in others
+                        ),
+                        self.cgroups,
+                    )
 
         # Emit terminal status OUTSIDE the lock (_emit re-acquires it).
         if outcome.aborted and self.run_timed_out:
@@ -596,6 +706,13 @@ class Runner:
             extra = f"  [{summary}]" if (summary and self.verbosity >= 1) else ""
             self._emit(f"[{step.tag}] ✓ PASS   {step.desc} ({dur}s){extra}")
         else:
+            if culprit is not None:
+                self._emit(f"[{step.tag}] ↳ {culprit.describe()}")
+                if self.evidence is not None:
+                    self._emit(
+                        f"[{step.tag}] ↳ full step output preserved at "
+                        f"{self.evidence.directory}/{sanitize_evidence_tag(step.tag)}.log"
+                    )
             self._emit(f"[{step.tag}] ✗ FAIL   {step.desc} ({dur}s, {outcome.reason})")
             if oom > 0:
                 self._emit(
@@ -606,9 +723,26 @@ class Runner:
                 )
             # Self-contained failure: dump the captured child output, tagged.
             self._emit(f"[{step.tag}] ----- detail -----")
-            for raw in captured:
-                self._emit(f"[{step.tag}] " + raw.decode(errors="replace").rstrip("\n"))
+            for line in b"".join(captured).decode(errors="replace").splitlines():
+                self._emit(f"[{step.tag}] {line}")
             self._emit(f"[{step.tag}] ----- end detail -----")
+
+        if self.evidence is not None:
+            counts = sink.counts()
+            self.evidence.record(
+                "step_end",
+                [
+                    ("step", step.tag),
+                    ("ok", str(ok).lower()),
+                    ("aborted", str(outcome.aborted).lower()),
+                    ("timed_out", str(timed_out).lower()),
+                    ("cpu_timed_out", str(cpu_timed_out).lower()),
+                    ("elapsed_s", f"{elapsed:.3f}"),
+                    ("tests_started", str(counts.started)),
+                    ("tests_completed", str(counts.completed)),
+                    ("culprit_test", culprit.test if culprit and culprit.test else ""),
+                ],
+            )
 
     def result(self) -> RunResult:
         """Assemble the typed :class:`RunResult` after :meth:`run` has returned.

@@ -8,6 +8,7 @@ working directory. Enforcement degradation is reported visibly.
 from __future__ import annotations
 
 import os
+import itertools
 import shutil
 import signal
 import subprocess
@@ -26,6 +27,7 @@ __all__ = [
     "ProcessGroupLeader",
     "ReapSummary",
     "reap",
+    "reap_many",
     "install_scope_teardown",
     "kill_cgroup",
     "stop_systemd_scope",
@@ -34,15 +36,172 @@ __all__ = [
     "reap_external",
     "reap_processes_by_cwd",
     "stop_leftover_scopes",
+    "STEP_NONCE_ENV",
 ]
 
-#: cgroup-v2 unified hierarchy mount point. Linux-only, as DeepScry targets.
+#: cgroup-v2 unified hierarchy mount point. Linux-only.
 CGROUP_ROOT = Path("/sys/fs/cgroup")
+STEP_NONCE_ENV = "SAFE_CI_DAG_RUNNER_STEP"
+
+_DESCENDANT_KILL_SWEEPS = 4
+_nonce_sequence = itertools.count()
+_unboxed_reap_warned = False
 
 
 def _warn(message: str) -> None:
     """Emit a visible degraded-enforcement warning (No Silent Failure)."""
     print(f"[teardown] ⚠ {message}", file=sys.stderr)
+
+
+def mint_step_nonce() -> str:
+    """Mint a run-unique per-step ownership token normally inherited by descendants."""
+    return f"{os.getpid()}:{next(_nonce_sequence)}:{time.time_ns()}"
+
+
+def _proc_descendants(root: int) -> list[int]:
+    """Return live descendants of ``root`` deepest-first from `/proc/*/status`."""
+    children: dict[int, list[int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
+                parent = next(
+                    (
+                        int(line.removeprefix("PPid:").strip())
+                        for line in handle
+                        if line.startswith("PPid:")
+                    ),
+                    None,
+                )
+        except (OSError, ValueError):
+            continue
+        if parent is not None:
+            children.setdefault(parent, []).append(pid)
+    out: list[int] = []
+    stack = [root]
+    seen: set[int] = set()
+    while stack:
+        parent = stack.pop()
+        for child in children.get(parent, ()):
+            if child not in seen:
+                seen.add(child)
+                out.append(child)
+                stack.append(child)
+    out.reverse()
+    return out
+
+
+def _kill_descendants(root: int) -> int:
+    """SIGKILL descendants missed by a process-group signal, on a fixed sweep bound."""
+    if root <= 1:
+        return 0
+    killed: set[int] = set()
+    for _ in range(_DESCENDANT_KILL_SWEEPS):
+        fresh = 0
+        for pid in _proc_descendants(root):
+            if pid <= 1 or pid == os.getpid():
+                continue
+            if pid not in killed:
+                killed.add(pid)
+                fresh += 1
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if fresh == 0:
+            break
+    return len(killed)
+
+
+def _live_process_groups(pgids: set[int]) -> set[int] | None:
+    """Return requested groups containing a non-zombie process.
+
+    ``killpg(pgid, 0)`` reports success while an unreaped group leader is a zombie. A supervisor
+    cannot reap that child until teardown returns, so using the signal probe makes every cooperative
+    SIGTERM exit consume the entire grace. `/proc/<pid>/stat` exposes both state and process-group id;
+    one walk handles a whole cancellation batch and deliberately excludes zombies.
+
+    ``None`` means `/proc` could not be inspected at all. Callers then retain the conservative
+    signal-probe fallback rather than assuming every group disappeared.
+    """
+    if not pgids:
+        return set()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    live: set[int] = set()
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text(encoding="utf-8")
+        except OSError:
+            continue
+        close = stat.rfind(")")
+        if close < 0:
+            continue
+        fields = stat[close + 2 :].split()
+        # fields begin at proc field 3: state, ppid, pgrp.
+        if len(fields) < 3 or fields[0] == "Z":
+            continue
+        try:
+            pgrp = int(fields[2])
+        except ValueError:
+            continue
+        if pgrp in pgids:
+            live.add(pgrp)
+            if live == pgids:
+                break
+    return live
+
+
+def _kill_by_nonce(nonce: str) -> int:
+    """SIGKILL processes carrying one exact runner-minted environment token.
+
+    This is a best-effort closer for environment-preserving escapees, not a security boundary: a
+    hostile child can scrub its environment. Cgroup containment is the only robust whole-subtree
+    primitive used by the runner.
+    """
+    if not nonce:
+        return 0
+    needle = f"{STEP_NONCE_ENV}={nonce}".encode()
+    killed: set[int] = set()
+    for _ in range(_DESCENDANT_KILL_SWEEPS):
+        fresh = 0
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            break
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid <= 1 or pid == os.getpid():
+                continue
+            try:
+                with open(f"/proc/{pid}/environ", "rb") as handle:
+                    carries = needle in handle.read().split(b"\0")
+            except OSError:
+                continue
+            if not carries:
+                continue
+            if pid not in killed:
+                killed.add(pid)
+                fresh += 1
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        if fresh == 0:
+            break
+    return len(killed)
 
 
 @runtime_checkable
@@ -76,6 +235,7 @@ def reap(
     tag: str | None,
     *,
     term_grace_s: float = REAP_TERM_GRACE_S,
+    nonce: str | None = None,
 ) -> None:
     """Tear down one step's tree: SIGTERM, a grace, then ``cgroup.kill``/``killpg``.
 
@@ -115,38 +275,102 @@ def reap(
     When enabled containment cannot perform ``cgroup.kill``, a warning makes the degraded
     teardown visible before the process-group fallback runs.
     """
+    reap_many(((process, tag, nonce),), cgroups, term_grace_s=term_grace_s)
+
+
+def _hard_reap(
+    process: ProcessGroupLeader,
+    cgroups: CgroupManager | None,
+    tag: str | None,
+    nonce: str | None,
+) -> None:
+    """Perform the non-graceful half of one reap after any shared TERM window."""
     pgid = process.pid
-    # The same guard the SIGKILL path has always used, hoisted so the SIGTERM
-    # phase is protected by it too: a reap must never signal the runner itself.
     signalable = pgid > 1 and pgid != os.getpgrp()
-
-    if signalable and term_grace_s > 0:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass  # already gone; nothing to be graceful toward
-        else:
-            deadline = time.monotonic() + term_grace_s
-            while time.monotonic() < deadline:
-                try:
-                    os.killpg(pgid, 0)  # liveness probe, delivers no signal
-                except (ProcessLookupError, OSError):
-                    break  # exited during the grace: it got to say its piece
-                time.sleep(_REAP_POLL_S)
-
+    contained = False
     if cgroups is not None and tag is not None and cgroups.enabled:
-        if not cgroups.kill(tag):
+        contained = cgroups.kill(tag)
+        if not contained:
             _warn(
                 f"cgroup.kill for step {tag!r} failed; falling back to process-group "
-                "kill only — setsid/double-fork escapees may survive."
+                "kill plus /proc ownership sweeps."
+            )
+    else:
+        global _unboxed_reap_warned
+        if not _unboxed_reap_warned:
+            _unboxed_reap_warned = True
+            _warn(
+                "steps are unboxed; teardown uses process-group and /proc ownership sweeps "
+                "instead of atomic cgroup.kill"
             )
 
-    if not signalable:
-        return
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except (ProcessLookupError, OSError):
-        pass  # whole group already gone — an expected, benign race, not a degraded skip
+    if signalable:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass  # whole group already gone — an expected, benign race, not a degraded skip
+
+    if not contained:
+        swept = _kill_descendants(pgid)
+        if swept:
+            _warn(f"step {tag!r}: killed {swept} descendant(s) outside its process group")
+    if nonce:
+        swept = _kill_by_nonce(nonce)
+        if swept:
+            _warn(
+                f"step {tag!r}: killed {swept} process(es) by ownership nonce "
+                "(an environment-preserving setsid/double-fork escapee)"
+            )
+
+
+def reap_many(
+    processes: Sequence[tuple[ProcessGroupLeader, str | None, str | None]],
+    cgroups: CgroupManager | None,
+    *,
+    term_grace_s: float = REAP_TERM_GRACE_S,
+) -> None:
+    """Tear down several steps with ONE shared SIGTERM window, then hard-reap each.
+
+    Eager cancellation and whole-run timeout used to call :func:`reap` serially, granting every
+    resistant process group its own five-second grace. Enough in-flight steps could therefore carry
+    the internal run timeout past the outer systemd cushion and lose the evidence it was designed to
+    preserve. Signal every group first and charge the grace once for the entire cancellation batch.
+
+    The liveness walk ignores zombies. A child that honored SIGTERM cannot be ``wait()``-reaped until
+    its supervisor regains control; treating that zombie as live made even a cooperative exit consume
+    the full grace.
+    """
+    items = tuple(processes)
+    own_group = os.getpgrp()
+    active: set[int] = set()
+    if term_grace_s > 0:
+        for process, _tag, _nonce in items:
+            pgid = process.pid
+            if pgid <= 1 or pgid == own_group:
+                continue
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                continue
+            active.add(pgid)
+
+    deadline = time.monotonic() + max(0.0, term_grace_s)
+    while active and time.monotonic() < deadline:
+        observed = _live_process_groups(active)
+        if observed is None:
+            observed = set()
+            for pgid in active:
+                try:
+                    os.killpg(pgid, 0)
+                except (ProcessLookupError, OSError):
+                    continue
+                observed.add(pgid)
+        active = observed
+        if active:
+            time.sleep(min(_REAP_POLL_S, max(0.0, deadline - time.monotonic())))
+
+    for process, tag, nonce in items:
+        _hard_reap(process, cgroups, tag, nonce)
 
 
 # --------------------------------------------------------------------------------------

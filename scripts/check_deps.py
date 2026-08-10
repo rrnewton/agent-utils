@@ -26,6 +26,7 @@ ENTRYPOINT_MODULES = [
     "pr_landing_planner",
     "agent_team_timeline",
     "herdr_run",
+    "herdr_run.agent_cli",
 ]
 
 # Invocations that MUST succeed without importing third-party dependencies.

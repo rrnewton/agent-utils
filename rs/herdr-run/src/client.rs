@@ -130,6 +130,25 @@ pub struct ProcessInfo {
     pub foreground: Vec<(i64, String, String)>,
 }
 
+/// Identity and readiness fields for one interactive-agent pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentPaneInfo {
+    /// Herdr pane identifier.
+    pub pane_id: String,
+    /// Owning workspace identifier.
+    pub workspace_id: String,
+    /// Pane working directory as reported by Herdr.
+    pub cwd: String,
+    /// Interactive agent implementation, when Herdr recognizes one.
+    pub agent: Option<String>,
+    /// Native Herdr agent status, or `"unknown"` when no status was reported.
+    pub status: String,
+    /// Agent name carried by the stable session identity, when present.
+    pub session_agent: Option<String>,
+    /// Stable session value, when present.
+    pub session_value: Option<String>,
+}
+
 /// Captured result of one external command invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandOutput {
@@ -145,6 +164,13 @@ pub struct CommandOutput {
 pub trait CommandRunner: Send + Sync {
     /// Run exactly `argv`, capturing its status and both output streams.
     fn run(&self, argv: &[String]) -> io::Result<CommandOutput>;
+
+    /// Run with an explicit outer wall bound.
+    ///
+    /// Test transports may ignore the bound because they execute synchronously in-process.
+    fn run_with_timeout(&self, argv: &[String], _timeout: Duration) -> io::Result<CommandOutput> {
+        self.run(argv)
+    }
 }
 
 /// Real [`CommandRunner`] backed by [`std::process::Command`].
@@ -182,7 +208,11 @@ impl SystemCommandRunner {
 
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, argv: &[String]) -> io::Result<CommandOutput> {
-        let output = bounded_output(&mut self.command(argv)?, self.timeout)?;
+        self.run_with_timeout(argv, self.timeout)
+    }
+
+    fn run_with_timeout(&self, argv: &[String], timeout: Duration) -> io::Result<CommandOutput> {
+        let output = bounded_output(&mut self.command(argv)?, timeout)?;
         Ok(CommandOutput {
             status: output.status.code().unwrap_or(1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -283,8 +313,17 @@ impl fmt::Debug for HerdrClient {
 impl HerdrClient {
     /// Construct a production client without consulting caller-controlled `HOME` or `PATH`.
     pub fn new(broker: &str) -> Result<Self> {
+        Self::with_executable(broker, Path::new("herdr"))
+    }
+
+    /// Construct a production client with one explicitly configured Herdr executable.
+    ///
+    /// A bare filename is searched only in the fixed trusted install locations. A path is
+    /// canonicalized directly. Either form must resolve to an executable regular file that is not
+    /// group/world writable; caller-controlled `PATH` is never searched.
+    pub fn with_executable(broker: &str, configured: &Path) -> Result<Self> {
         let account_home = current_account_home()?;
-        let herdr_bin = resolve_herdr_executable(&account_home)?;
+        let herdr_bin = resolve_configured_herdr_executable(configured, &account_home)?;
         let systemd_run_bin = resolve_fixed_executable(
             "systemd-run",
             &[
@@ -511,6 +550,98 @@ impl HerdrClient {
         .is_ok()
     }
 
+    /// Return validated identity and readiness data for an interactive pane.
+    pub fn pane_info(&self, pane_id: &str) -> Result<AgentPaneInfo> {
+        let result = self.call(
+            &strings(&["pane", "get", pane_id]),
+            &format!("pane get {pane_id}"),
+        )?;
+        let pane = required_object(&result, "pane", "pane get")?;
+        let returned = required_string(pane, "pane_id", "pane get")?;
+        if returned != pane_id {
+            return Err(HerdrRunError::unavailable(format!(
+                "pane get: returned pane {returned:?}, expected {pane_id:?}"
+            )));
+        }
+        let (session_agent, session_value) = match pane.get("agent_session") {
+            None | Some(Value::Null) => (None, None),
+            Some(Value::Object(session)) => (
+                optional_string(session, "agent", "pane agent_session")?,
+                optional_string(session, "value", "pane agent_session")?,
+            ),
+            Some(_) => {
+                return Err(HerdrRunError::unavailable(
+                    "pane get: 'agent_session' is not an object",
+                ));
+            }
+        };
+        Ok(AgentPaneInfo {
+            pane_id: returned,
+            workspace_id: required_string(pane, "workspace_id", "pane get")?,
+            cwd: required_string(pane, "cwd", "pane get")?,
+            agent: optional_string(pane, "agent", "pane get")?,
+            status: optional_string(pane, "agent_status", "pane get")?
+                .unwrap_or_else(|| "unknown".to_owned()),
+            session_agent,
+            session_value,
+        })
+    }
+
+    /// Return the label for one exact workspace identifier.
+    pub fn workspace_label(&self, workspace_id: &str) -> Result<String> {
+        let result = self.call(
+            &strings(&["workspace", "get", workspace_id]),
+            &format!("workspace get {workspace_id}"),
+        )?;
+        let workspace = required_object(&result, "workspace", "workspace get")?;
+        let returned = required_string(workspace, "workspace_id", "workspace get")?;
+        if returned != workspace_id {
+            return Err(HerdrRunError::unavailable(format!(
+                "workspace get: returned workspace {returned:?}, expected {workspace_id:?}"
+            )));
+        }
+        required_string(workspace, "label", "workspace get")
+    }
+
+    /// Wait for one native Herdr interactive-agent state transition.
+    pub fn wait_agent_status(&self, pane_id: &str, status: &str, timeout_ms: u64) -> Result<()> {
+        let purpose = format!("wait for pane {pane_id} status {status}");
+        let completed = self.invoke_with_timeout(
+            &[
+                "wait".to_owned(),
+                "agent-status".to_owned(),
+                pane_id.to_owned(),
+                "--status".to_owned(),
+                status.to_owned(),
+                "--timeout".to_owned(),
+                timeout_ms.to_string(),
+            ],
+            CONTROL_TIMEOUT
+                .max(Duration::from_millis(timeout_ms).saturating_add(Duration::from_secs(5))),
+        )?;
+        if completed.status != 0 {
+            return Err(HerdrRunError::unavailable(format!(
+                "{purpose}: {}",
+                stderr_detail(&completed)
+            )));
+        }
+        let document = serde_json::from_str::<Value>(&completed.stdout).map_err(|error| {
+            HerdrRunError::unavailable(format!("{purpose}: invalid Herdr event response: {error}"))
+        })?;
+        let envelope = document.as_object().ok_or_else(|| {
+            HerdrRunError::unavailable(format!("{purpose}: event response is not an object"))
+        })?;
+        let data = required_object(envelope, "data", &purpose)?;
+        let returned_pane = required_string(data, "pane_id", &purpose)?;
+        let returned_status = required_string(data, "agent_status", &purpose)?;
+        if returned_pane != pane_id || returned_status != status {
+            return Err(HerdrRunError::unavailable(format!(
+                "{purpose}: event reported pane={returned_pane:?} status={returned_status:?}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Read foreground-process information for `pane_id`.
     pub fn process_info(&self, pane_id: &str) -> Result<ProcessInfo> {
         let result = self.call(
@@ -604,6 +735,10 @@ impl HerdrClient {
     }
 
     fn invoke(&self, args: &[String]) -> Result<CommandOutput> {
+        self.invoke_with_timeout(args, CONTROL_TIMEOUT)
+    }
+
+    fn invoke_with_timeout(&self, args: &[String], timeout: Duration) -> Result<CommandOutput> {
         let mut command = Vec::with_capacity(args.len() + 1);
         command.push(self.herdr_bin.clone());
         command.extend_from_slice(args);
@@ -622,7 +757,7 @@ impl HerdrClient {
             command = wrapped;
         }
         self.runner
-            .run(&command)
+            .run_with_timeout(&command, timeout)
             .map_err(|error| HerdrRunError::unavailable(format!("cannot invoke Herdr: {error}")))
     }
 
@@ -783,15 +918,19 @@ pub(crate) fn current_account_home() -> Result<PathBuf> {
     }
 }
 
-fn resolve_herdr_executable(home: &Path) -> Result<PathBuf> {
+fn resolve_configured_herdr_executable(configured: &Path, home: &Path) -> Result<PathBuf> {
+    if configured.components().count() > 1 || configured.is_absolute() {
+        return resolve_fixed_executable("Herdr", &[configured.to_path_buf()]);
+    }
+    let name = configured.as_os_str();
     resolve_fixed_executable(
         "Herdr",
         &[
-            PathBuf::from("/usr/local/bin/herdr"),
-            PathBuf::from("/usr/bin/herdr"),
-            home.join(".local/bin/herdr"),
-            home.join("bin/herdr"),
-            home.join(".cargo/bin/herdr"),
+            Path::new("/usr/local/bin").join(name),
+            Path::new("/usr/bin").join(name),
+            home.join(".local/bin").join(name),
+            home.join("bin").join(name),
+            home.join(".cargo/bin").join(name),
         ],
     )
 }
@@ -1074,14 +1213,14 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&candidate, permissions).unwrap();
         assert_eq!(
-            resolve_herdr_executable(&root).unwrap(),
+            resolve_configured_herdr_executable(Path::new("herdr"), &root).unwrap(),
             fs::canonicalize(&candidate).unwrap()
         );
 
         let mut permissions = fs::metadata(&candidate).unwrap().permissions();
         permissions.set_mode(0o720);
         fs::set_permissions(&candidate, permissions).unwrap();
-        let error = resolve_herdr_executable(&root).unwrap_err();
+        let error = resolve_configured_herdr_executable(Path::new("herdr"), &root).unwrap_err();
         assert!(error.to_string().contains("group/world-writable"));
 
         fs::remove_file(&candidate).unwrap();
@@ -1092,7 +1231,7 @@ mod tests {
         permissions.set_mode(0o700);
         fs::set_permissions(&cargo_candidate, permissions).unwrap();
         assert_eq!(
-            resolve_herdr_executable(&root).unwrap(),
+            resolve_configured_herdr_executable(Path::new("herdr"), &root).unwrap(),
             fs::canonicalize(&cargo_candidate).unwrap()
         );
         fs::remove_dir_all(root).unwrap();
@@ -1163,6 +1302,99 @@ mod tests {
             .workspace_id_for_label("x")
             .unwrap_err();
         assert!(error.to_string().contains("expected an array"));
+    }
+
+    #[test]
+    fn interactive_agent_identity_workspace_and_wait_event_are_narrowed() {
+        let runner = FakeRunner::with_outputs(vec![
+            output(
+                0,
+                r#"{"result":{"pane":{"pane_id":"p1","workspace_id":"w1","cwd":"/work/project","agent":"codex","agent_status":"idle","agent_session":{"agent":"codex","value":"session-1"}}}}"#,
+                "",
+            ),
+            output(
+                0,
+                r#"{"result":{"workspace":{"workspace_id":"w1","label":"project"}}}"#,
+                "",
+            ),
+            output(
+                0,
+                r#"{"data":{"pane_id":"p1","agent_status":"working"}}"#,
+                "",
+            ),
+        ]);
+        let client = client("direct", runner.clone());
+        assert_eq!(
+            client.pane_info("p1").unwrap(),
+            AgentPaneInfo {
+                pane_id: "p1".to_owned(),
+                workspace_id: "w1".to_owned(),
+                cwd: "/work/project".to_owned(),
+                agent: Some("codex".to_owned()),
+                status: "idle".to_owned(),
+                session_agent: Some("codex".to_owned()),
+                session_value: Some("session-1".to_owned()),
+            }
+        );
+        assert_eq!(client.workspace_label("w1").unwrap(), "project");
+        client.wait_agent_status("p1", "working", 30_000).unwrap();
+        let calls = runner.calls();
+        assert_eq!(
+            &calls[2][1..],
+            strings(&[
+                "wait",
+                "agent-status",
+                "p1",
+                "--status",
+                "working",
+                "--timeout",
+                "30000",
+            ])
+        );
+    }
+
+    #[test]
+    fn interactive_agent_protocol_refuses_cross_pane_and_wrong_wait_event() {
+        let wrong_pane = FakeRunner::with_outputs(vec![output(
+            0,
+            r#"{"result":{"pane":{"pane_id":"other","workspace_id":"w1","cwd":"/work","agent_status":"idle"}}}"#,
+            "",
+        )]);
+        let error = client("direct", wrong_pane)
+            .pane_info("wanted")
+            .unwrap_err();
+        assert!(error.to_string().contains("expected \"wanted\""));
+
+        let wrong_event = FakeRunner::with_outputs(vec![output(
+            0,
+            r#"{"data":{"pane_id":"other","agent_status":"done"}}"#,
+            "",
+        )]);
+        let error = client("direct", wrong_event)
+            .wait_agent_status("wanted", "working", 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("event reported"));
+        assert!(error.to_string().contains("other"));
+        assert!(error.to_string().contains("done"));
+    }
+
+    #[test]
+    fn interactive_agent_protocol_refuses_malformed_session_and_event() {
+        let malformed_session = FakeRunner::with_outputs(vec![output(
+            0,
+            r#"{"result":{"pane":{"pane_id":"p","workspace_id":"w","cwd":"/work","agent_status":"idle","agent_session":7}}}"#,
+            "",
+        )]);
+        let error = client("direct", malformed_session)
+            .pane_info("p")
+            .unwrap_err();
+        assert!(error.to_string().contains("agent_session"));
+
+        let malformed_event = FakeRunner::with_outputs(vec![output(0, "not-json", "")]);
+        let error = client("direct", malformed_event)
+            .wait_agent_status("p", "working", 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid Herdr event response"));
     }
 
     #[test]

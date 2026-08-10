@@ -265,7 +265,12 @@ class HerdrClient:
             "systemd-run was not found at /usr/bin/systemd-run or /bin/systemd-run"
         )
 
-    def _execute(self, command: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    def _execute(
+        self,
+        command: Sequence[str],
+        *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> "subprocess.CompletedProcess[str]":
         """Invoke one control command; production calls discard caller HOME/PATH."""
         try:
             if not self._production_runner:
@@ -273,10 +278,10 @@ class HerdrClient:
             environ = dict(self._environ)
             environ.pop("PATH", None)
             environ["HOME"] = self._account_home()
-            return _bounded_control_command(command, environ=environ)
+            return _bounded_control_command(command, environ=environ, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise HerdrUnavailable(
-                f"Herdr control command timed out after {CONTROL_TIMEOUT_SECONDS:g} seconds"
+                f"Herdr control command timed out after {timeout:g} seconds"
             ) from exc
         except (OSError, ValueError) as exc:
             raise HerdrUnavailable(f"cannot invoke Herdr: {exc}") from exc
@@ -300,12 +305,17 @@ class HerdrClient:
             *command,
         ]
 
-    def _invoke(self, args: Sequence[str]) -> "subprocess.CompletedProcess[str]":
+    def _invoke(
+        self,
+        args: Sequence[str],
+        *,
+        timeout: float = CONTROL_TIMEOUT_SECONDS,
+    ) -> "subprocess.CompletedProcess[str]":
         command = [self._executable(), *args]
         if self._broker == "systemd-run":
             command = self._outside_jail(command)
         try:
-            return self._execute(command)
+            return self._execute(command, timeout=timeout)
         except (
             OSError
         ) as exc:  # pragma: no cover - _execute already narrows production failures
@@ -557,6 +567,11 @@ class HerdrClient:
         result = self._call(["workspace", "get", workspace_id], "workspace get")
         try:
             workspace = as_mapping(result.get("workspace"), "workspace get")
+            returned = get_str(workspace, "workspace_id", "workspace get")
+            if returned != workspace_id:
+                raise HerdrUnavailable(
+                    f"workspace get: returned workspace {returned!r}, expected {workspace_id!r}"
+                )
             return get_str(workspace, "label", "workspace get")
         except TypeError as exc:
             raise HerdrUnavailable(f"workspace get: invalid Herdr response: {exc}") from exc
@@ -565,7 +580,8 @@ class HerdrClient:
         """Wait for a native Herdr agent-state transition."""
         purpose = f"wait for pane {pane_id} status {status}"
         completed = self._invoke(
-            ["wait", "agent-status", pane_id, "--status", status, "--timeout", str(timeout_ms)]
+            ["wait", "agent-status", pane_id, "--status", status, "--timeout", str(timeout_ms)],
+            timeout=max(CONTROL_TIMEOUT_SECONDS, timeout_ms / 1000.0 + 5.0),
         )
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "").strip() or f"exit {completed.returncode}"

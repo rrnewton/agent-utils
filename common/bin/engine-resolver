@@ -2,7 +2,7 @@
 # TRACKED, deterministic engine resolver for repository-local tool commands.
 #
 # The paired commands (`safe-ci-dag-runner`, `cpuset-alloc`, `tick-hub`,
-# `pr-landing-planner`, and `herdr-run`) have tracked Python and Cargo-backed Rust launchers under
+# `pr-landing-planner`, `herdr-run`, and `herdr-agent`) have tracked Python and Cargo-backed Rust launchers under
 # their respective `*/bin` directories. `agent-team-timeline` is intentionally Python-only.
 # Every tracked command link in this directory points here, so the top-level `./bin` symlink exposes
 # one consistent command surface after any setup mode.
@@ -17,7 +17,7 @@
 #
 # The resolved tool name is this script's invocation basename. The tracked links for
 # `safe-ci-dag-runner`, `cpuset-alloc`, `pr-landing-planner`, `tick-hub`, and
-# `agent-team-timeline`, and `herdr-run` all point here.
+# `agent-team-timeline`, `herdr-run`, and `herdr-agent` all point here.
 set -euo pipefail
 
 # Locate the agent-utils root from the resolver's REAL path (follow the symlink chain), independent

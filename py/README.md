@@ -10,7 +10,7 @@ own version and documentation, and only the console commands that belong to it.
 | `tick-hub` | `tick_hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr_landing_planner` | `pr-landing-planner` | Produce an advisory, conflict-aware pull-request landing plan. |
 | `agent-team-timeline` | `agent_team_timeline` | `agent-team-timeline` | Build a durable, zoomable local timeline from coordinator and subagent transcripts. |
-| `herdr-run` | `herdr_run` | `herdr-run` | Run policy-admitted commands through a Herdr pane and capture audited results. |
+| `herdr-run` | `herdr_run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
 
 Install a tool from its project directory during development:
 

@@ -468,6 +468,9 @@ fn parse_core_options(
         if !value.is_finite() || value < 0.0 {
             return Err("--max-irq-rate must be finite and >= 0".to_string());
         }
+        if sample_s <= 0.0 {
+            return Err("--sample-s must be > 0 when --max-irq-rate is set".to_string());
+        }
     }
     Ok(CoreOptions {
         cores,
@@ -711,6 +714,16 @@ mod tests {
         .is_err());
         assert!(parse_core_options(
             &["--cores=1".into(), "--max-irq-rate=NaN".into()],
+            None,
+            true
+        )
+        .is_err());
+        assert!(parse_core_options(
+            &[
+                "--cores=1".into(),
+                "--sample-s=0".into(),
+                "--max-irq-rate=1".into()
+            ],
             None,
             true
         )

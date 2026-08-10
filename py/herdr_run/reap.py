@@ -37,11 +37,12 @@ A tab is STALE only when all of these hold, each positive evidence rather than a
   recorded exit code is IN FLIGHT -- that is the "agent is thinking" case, and it is positively
   distinguishable from a finished one rather than being inferred from silence.
 * **R2 the pane's shell is gone.** Not the run-directory PID; the shell PID.
-* **R3 PID reuse is excluded.** ``kill(pid, 0)`` alone is not sufficient on a box running ~20
-  agents: a recycled PID makes an unrelated live process look like proof of liveness, and a
+* **R3 reboot and PID reuse are excluded.** ``kill(pid, 0)`` alone is not sufficient on a busy
+  host: a recycled PID makes an unrelated live process look like proof of liveness, and a
   same-numbered stranger look like proof of death. Identity is bound as
   ``(pid, boot_id, start_ticks)`` -- field 22 of ``/proc/<pid>/stat`` -- which is the shape
-  ``ci-hub/lib/validate_lock.rs`` already uses for lock owners.
+  needed to distinguish a process from a recycled number. The recorded boot must also match the
+  current boot before absence of the old PID can authorize anything.
 
 Anything else -- unreadable ``/proc``, missing ``meta.json``, absent ``pane_id``, a boot-id
 mismatch, a pane herdr does not know about -- is UNKNOWN, and unknown is never reaped. The cost
@@ -105,7 +106,14 @@ class ProcessIdentity:
 
     def is_bound(self) -> bool:
         """True when pid, boot_id and start_ticks are all known, so reuse can be excluded."""
-        return self.pid is not None and self.boot_id is not None and self.start_ticks is not None
+        return (
+            type(self.pid) is int
+            and 1 <= self.pid <= 2_147_483_647
+            and isinstance(self.boot_id, str)
+            and bool(self.boot_id.strip())
+            and type(self.start_ticks) is int
+            and self.start_ticks >= 0
+        )
 
     def same_process_as(self, other: "ProcessIdentity") -> bool:
         """True only if both identities are bound AND agree on pid, boot and start tick."""
@@ -123,8 +131,9 @@ class PaneEvidence:
     """Everything the policy is allowed to look at for one pane.
 
     ``recorded_shell`` is the identity captured in ``meta.json`` when the run happened.
-    ``live_shell`` is the identity of that PID *right now*, or ``None`` if the PID is gone. The two
-    are compared rather than either being trusted alone: that comparison is what excludes reuse.
+    ``live_shell`` is the identity of the pane's shell *right now*, or ``None`` if the shell is
+    gone. The two are compared rather than either being trusted alone: that comparison excludes
+    both PID reuse and a new pane incarnation that reused the old pane id.
     """
 
     pane_id: str
@@ -136,6 +145,8 @@ class PaneEvidence:
     run_exit_codes_recorded: Sequence[bool] = field(default_factory=tuple)
     recorded_shell: ProcessIdentity | None = None
     live_shell: ProcessIdentity | None = None
+    #: Current kernel boot id, gathered independently even when the recorded pid is absent.
+    current_boot_id: str | None = None
     #: False when herdr no longer lists the pane, or we could not ask.
     pane_known_to_herdr: bool = True
     #: Set when evidence could not be gathered; forces UNKNOWN with this reason.
@@ -235,6 +246,17 @@ def _decide(evidence: PaneEvidence) -> ReapDecision:
             "no identity-bound shell recorded for this pane (need pid+boot_id+start_ticks)",
         )
 
+    # A missing recorded PID is only evidence of death within the SAME boot. Across a reboot every
+    # old pid is absent by construction, which cannot authorize closing a newly-created live tab.
+    current_boot = evidence.current_boot_id
+    if not isinstance(current_boot, str) or not current_boot.strip():
+        return decision(Verdict.UNKNOWN, "current boot_id is unavailable")
+    if recorded.boot_id != current_boot:
+        return decision(
+            Verdict.UNKNOWN,
+            f"recorded shell belongs to boot {recorded.boot_id!r}, current boot is {current_boot!r}",
+        )
+
     live = evidence.live_shell
 
     # R2 -- the shell is gone. Note this is the PANE shell, not the run-directory PID, which is the
@@ -252,13 +274,14 @@ def _decide(evidence: PaneEvidence) -> ReapDecision:
     if recorded.same_process_as(live):
         return decision(Verdict.SHELL_ALIVE, f"pane shell {live.pid} is still the original process")
 
-    # Same PID number, different process: reuse. Deliberately UNKNOWN, not STALE -- the original is
-    # probably gone, but "probably" is not the standard for closing someone's tab.
+    # A different identity may be PID reuse or a new pane incarnation. Deliberately UNKNOWN, not
+    # STALE: the original is probably gone, but the currently-listed pane is not proven to be it.
     return decision(
         Verdict.UNKNOWN,
-        f"pid {recorded.pid} is now a DIFFERENT process "
+        f"recorded pane shell {recorded.pid} is now a DIFFERENT process identity "
         f"(recorded {recorded.boot_id}:{recorded.start_ticks}, "
-        f"live {live.boot_id}:{live.start_ticks}) -- PID reuse, refusing to guess",
+        f"live {live.pid}/{live.boot_id}:{live.start_ticks}) -- PID reuse or new pane incarnation, "
+        "refusing to guess",
     )
 
 
@@ -279,6 +302,7 @@ def evidence_from_runs(
     """
     recorded_flags: list[bool] = []
     identity: ProcessIdentity | None = None
+    identity_conflict = False
     for record in runs:
         if record.get("pane_id") != pane_id:
             continue
@@ -286,14 +310,18 @@ def evidence_from_runs(
             continue
         recorded_flags.append(record.get("exit_code") is not None)
         readiness = record.get("readiness")
-        if identity is None and isinstance(readiness, Mapping):
+        if isinstance(readiness, Mapping):
             shell_pid = readiness.get("shell_pid")
-            if isinstance(shell_pid, int):
+            if type(shell_pid) is int:
                 boot = readiness.get("boot_id")
                 ticks = readiness.get("shell_start_ticks")
-                identity = ProcessIdentity(
+                candidate = ProcessIdentity(
                     pid=shell_pid,
-                    boot_id=boot if isinstance(boot, str) else None,
-                    start_ticks=ticks if isinstance(ticks, int) else None,
+                    boot_id=boot if isinstance(boot, str) and boot.strip() else None,
+                    start_ticks=ticks if type(ticks) is int else None,
                 )
-    return tuple(recorded_flags), identity
+                if identity is None:
+                    identity = candidate
+                elif identity != candidate:
+                    identity_conflict = True
+    return tuple(recorded_flags), None if identity_conflict else identity

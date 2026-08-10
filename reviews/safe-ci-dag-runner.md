@@ -52,17 +52,47 @@ This review record entered the repository with implementation commit
     Both editions now enforce the same positive signed-64 ASCII cap grammar and action arity, reject
     missing or invalid values, preserve `--` and empty-assignment behavior, and describe planning
     from summary JSON plus a DAG. Adversarial differentials exercise every failure and edge case.
+12. **Teardown behavior had diverged and could be bypassed.** One implementation granted a bounded
+    SIGTERM diagnostic window while the other immediately killed; the latter also invoked an
+    unqualified `kill` from caller-controlled `PATH`. Teardown now uses direct `kill(2)`, gives the
+    same bounded grace once per cancellation batch, ignores zombie leaders when deciding whether a
+    cooperative child exited, and escalates. Cgroup boxing is the robust whole-subtree boundary;
+    unboxed process-group, parentage, and ownership-nonce sweeps additionally remove ordinary
+    environment-preserving setsid/double-fork escapees, but cannot promise containment against a
+    child that scrubs its environment. The differential proves the explicit fixture PID is gone
+    and its TERM attribution marker survives. The libraries no longer make the host process a
+    permanent child subreaper as a hidden side effect.
+13. **A child could silently miss its cgroup.** The shell migration wrote `cgroup.procs` with
+    `|| true`, so a step could run outside applied limits while cleanup of an empty cgroup appeared
+    successful. Migration now fails closed with a distinct pre-command status. Cgroup names use an
+    injective byte encoding, preventing two valid DAG tags from sharing a containment directory;
+    an encoded name beyond the filesystem component limit is rejected before the user command.
+14. **IRQ-budget placement could certify missing samples.** Counter rollback, CPU hotplug between
+    snapshots, an unreadable first snapshot, missing per-core IRQ data, and a zero sampling window
+    produced exceptions or false zero rates. Both allocators now require a positive finite window
+    when a budget is requested, use only successfully measured cores, and reject missing or rolled
+    back counters. The self-test forwards the configured IRQ budget instead of silently dropping it.
+15. **Default evidence exposed logs and grew without a paired contract.** The native-only `/tmp`
+    journal was default-on, permissively created, and unbounded. Both packages now implement the
+    same explicit opt-in journal, private per-step raw logs, conservative test-boundary parser, and
+    timeout culprit report. Directories and files must be owned private objects; no-follow,
+    nonblocking, single-link validation rejects symlinks, hard links, FIFOs, and overlong names.
+16. **Malformed reservation state could silently release or rename ownership.** Rust dropped bad
+    core entries, truncated oversized PIDs, and coerced tags/timestamps while Python applied a
+    different set of coercions and defaults. Both now require the same complete typed record:
+    positive bounded PID/starttime, a nonempty unique bounded integer core list, a string tag, and
+    a finite non-negative numeric timestamp. Invalid ledgers fail closed without being rewritten.
 
 ## Cross-implementation evidence
 
 - `python3 cross/differential.py --tool cpuset-alloc`
-  - **31/31 checks passed**.
+  - **58/58 checks passed**.
   - Includes Python-to-Rust and Rust-to-Python live ownership of one shared ledger, disjoint core
     assignments under overlap, identical shared schema, exact release to an empty ledger, mutation
     self-test verdicts, signal status, invalid inputs, wrapped help, and clean missing-executable
-    failure.
+    failure, plus 23 malformed-record variants that both refuse without rewriting shared state.
 - `python3 cross/differential.py --tool safe-ci-dag-runner`
-  - Default seed/count completed with **434 checks passed across 41 fixtures**.
+  - Default seed/count completed with **441 checks passed across 41 fixtures**.
 - `python3 -m mypy cross/differential.py`
   - No issues.
 
@@ -72,12 +102,13 @@ an observed result rather than a harness-level side effect.
 
 ## Focused test evidence
 
-- Python: reservation, allocator, CLI schema, cgroup ownership/exact-set, analysis compatibility,
-  and build job-cap tests pass within the 559-test repository suite.
-- Rust: the full safe package suite passed **88 unit tests plus 8 integration tests**, including
-  live cgroup memory, CPU-time, core-box, and default-containment tests.
-- `python3 scripts/embed_userguides.py --check`: all 12 rendered paired documents and two
-  single-language package documents are current and standalone through exact checked links.
+- Python: the focused reservation, allocator, attribution, IRQ sampling, and build job-cap suites
+  passed **83 tests**.
+- Rust: the full safe package suite passed **120 unit tests plus 24 integration tests**, including
+  termination attribution, live cgroup memory, CPU-time, core-box, run-timeout, and containment
+  tests.
+- `python3 scripts/embed_userguides.py --check`: all 16 rendered paired documents and four
+  standalone document checks are current and standalone through exact checked links.
 - Isolated wheel/crate artifact checks passed for all packages, including entry points, embedded
   resources, licenses, offline startup, and foreign-documentation checks.
 

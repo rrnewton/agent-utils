@@ -41,6 +41,7 @@ import fcntl
 import json
 import math
 import os
+import stat
 import tempfile
 import time
 from collections.abc import Collection, Iterable
@@ -51,12 +52,19 @@ from typing import IO
 
 from safe_ci_dag_runner.cgroup import pick_least_busy_free_cores
 
+_MAX_U32 = (1 << 32) - 1
+_MAX_U64 = (1 << 64) - 1
+
 
 class InsufficientCoresError(RuntimeError):
     """Raised when fewer than the requested K cores are free-and-unheld.
 
     The allocator refuses to hand out a colliding core: it is better to fail
     loudly than to return a set that overlaps a live reservation."""
+
+
+class ReservationStateError(RuntimeError):
+    """The shared ledger or lock is unsafe, unreadable, or corrupt."""
 
 
 def _default_ledger_path() -> Path:
@@ -125,15 +133,68 @@ class _Record:
 
     @classmethod
     def from_json(cls, d: dict[str, object]) -> "_Record":
-        st = d.get("starttime")
-        cores_raw = d.get("cores", [])
-        cores = [int(str(c)) for c in cores_raw] if isinstance(cores_raw, list) else []
+        """Decode one strict shared-schema record or raise ``ValueError``.
+
+        The ledger is an ownership boundary, not user-friendly input: coercing strings/bools or
+        dropping malformed cores could release a live holder's CPU. Every persisted field is
+        therefore required and domain checked before the caller considers any record.
+        """
+
+        def required_int(key: str, *, minimum: int, maximum: int) -> int:
+            if key not in d:
+                raise ValueError(f"missing {key}")
+            value = d[key]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{key} must be an integer")
+            if not minimum <= value <= maximum:
+                raise ValueError(f"{key} is outside [{minimum}, {maximum}]")
+            return value
+
+        pid = required_int("pid", minimum=1, maximum=_MAX_U32)
+
+        if "starttime" not in d:
+            raise ValueError("missing starttime")
+        raw_starttime = d["starttime"]
+        starttime = (
+            None
+            if raw_starttime is None
+            else required_int("starttime", minimum=1, maximum=_MAX_U64)
+        )
+
+        if "cores" not in d or not isinstance(d["cores"], list):
+            raise ValueError("cores must be a non-empty list")
+        cores_raw = d["cores"]
+        if not cores_raw:
+            raise ValueError("cores must be a non-empty list")
+        cores: list[int] = []
+        for index, value in enumerate(cores_raw):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"cores[{index}] must be an integer")
+            if not 0 <= value <= _MAX_U32:
+                raise ValueError(f"cores[{index}] is outside [0, {_MAX_U32}]")
+            cores.append(value)
+        if len(set(cores)) != len(cores):
+            raise ValueError("cores must not contain duplicates")
+
+        if "tag" not in d or not isinstance(d["tag"], str):
+            raise ValueError("tag must be a string")
+        tag = d["tag"]
+
+        if "ts" not in d:
+            raise ValueError("missing ts")
+        raw_ts = d["ts"]
+        if isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
+            raise ValueError("ts must be a number")
+        ts = float(raw_ts)
+        if not math.isfinite(ts) or ts < 0:
+            raise ValueError("ts must be finite and non-negative")
+
         return cls(
-            pid=int(str(d.get("pid", 0))),
-            starttime=(int(str(st)) if st is not None else None),
+            pid=pid,
+            starttime=starttime,
             cores=cores,
-            tag=str(d.get("tag", "")),
-            ts=float(str(d.get("ts", 0.0))),
+            tag=tag,
+            ts=ts,
         )
 
     def to_json(self) -> dict[str, object]:
@@ -159,7 +220,32 @@ class _LedgerLock:
         self._fh: IO[str] | None = None
 
     def __enter__(self) -> "_LedgerLock":
-        self._fh = open(self._lock_path, "w")
+        try:
+            fd = os.open(
+                self._lock_path,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+            )
+        except OSError as exc:
+            raise ReservationStateError(
+                f"could not safely open reservation lock {self._lock_path}: {exc}"
+            ) from exc
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_nlink != 1
+            ):
+                raise ReservationStateError(
+                    f"reservation lock {self._lock_path} is not an owned regular file"
+                )
+            if metadata.st_mode & 0o077:
+                os.fchmod(fd, 0o600)
+            self._fh = os.fdopen(fd, "r+")
+        except BaseException:
+            os.close(fd)
+            raise
         fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
         return self
 
@@ -178,18 +264,45 @@ class _LedgerLock:
 
 def _load(ledger: Path) -> list[_Record]:
     try:
-        raw: object = json.loads(ledger.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        fd = os.open(ledger, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
         return []
+    except OSError as exc:
+        raise ReservationStateError(f"could not safely open reservation ledger {ledger}: {exc}") from exc
+    try:
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+        ):
+            raise ReservationStateError(
+                f"reservation ledger {ledger} is not an owned regular file"
+            )
+        if metadata.st_mode & 0o077:
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, encoding="utf-8") as handle:
+            fd = -1
+            try:
+                raw: object = json.load(handle)
+            except (json.JSONDecodeError, UnicodeError) as exc:
+                raise ReservationStateError(f"reservation ledger {ledger} is corrupt: {exc}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if not isinstance(raw, dict):
-        return []
-    recs = raw.get("reservations", [])
+        raise ReservationStateError(f"reservation ledger {ledger} root must be an object")
+    recs = raw.get("reservations")
     if not isinstance(recs, list):
-        return []
+        raise ReservationStateError(f"reservation ledger {ledger} has no reservations list")
     out: list[_Record] = []
-    for r in recs:
-        if isinstance(r, dict):
+    try:
+        for r in recs:
+            if not isinstance(r, dict):
+                raise ValueError("record is not an object")
             out.append(_Record.from_json(r))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ReservationStateError(f"reservation ledger {ledger} has an invalid record: {exc}") from exc
     return out
 
 
@@ -201,6 +314,8 @@ def _store(ledger: Path, records: Iterable[_Record]) -> None:
     try:
         with os.fdopen(fd, "w") as fh:
             json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, ledger)
     except BaseException:
         try:
@@ -285,6 +400,11 @@ def acquire(
         raise ValueError(f"k must be >= 1, got {k}")
     if not math.isfinite(sample_s) or sample_s < 0:
         raise ValueError(f"sample_s must be finite and >= 0, got {sample_s}")
+    if max_irq_rate is not None:
+        if not math.isfinite(max_irq_rate) or max_irq_rate < 0:
+            raise ValueError(f"max_irq_rate must be finite and >= 0, got {max_irq_rate}")
+        if sample_s <= 0:
+            raise ValueError("sample_s must be > 0 when max_irq_rate is set")
     path = ledger or _default_ledger_path()
     pid = os.getpid()
     starttime = _proc_starttime(pid)

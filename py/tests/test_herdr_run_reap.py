@@ -36,6 +36,7 @@ def scoped(**kw: object) -> PaneEvidence:
         "run_exit_codes_recorded": (True,),
         "recorded_shell": ident(4242),
         "live_shell": None,
+        "current_boot_id": BOOT,
     }
     base.update(kw)
     return PaneEvidence(**base)  # type: ignore[arg-type]
@@ -86,6 +87,29 @@ def test_different_boot_is_unknown() -> None:
     plan = plan_reap([scoped(live_shell=ident(4242, boot="boot-bbbb"))])
     assert plan.counts()["UNKNOWN"] == 1
     assert plan.reapable == ()
+
+
+def test_rebooted_host_is_unknown_even_when_recorded_pid_is_gone() -> None:
+    """Every old pid disappears at reboot; absence cannot prove this live tab is stale."""
+    plan = plan_reap(
+        [scoped(recorded_shell=ident(4242, boot="old-boot"), current_boot_id="new-boot")]
+    )
+    assert plan.counts()["UNKNOWN"] == 1
+    assert plan.reapable == ()
+    assert "current boot" in plan.declined[0].reason
+
+
+def test_missing_current_boot_is_unknown() -> None:
+    plan = plan_reap([scoped(current_boot_id=None)])
+    assert plan.counts()["UNKNOWN"] == 1
+    assert plan.reapable == ()
+
+
+def test_new_pane_incarnation_with_different_shell_pid_is_unknown() -> None:
+    plan = plan_reap([scoped(live_shell=ident(9001, ticks=2000))])
+    assert plan.counts()["UNKNOWN"] == 1
+    assert plan.reapable == ()
+    assert "new pane incarnation" in plan.declined[0].reason
 
 
 def test_unbound_recorded_identity_is_unknown() -> None:
@@ -170,3 +194,35 @@ def test_cache_hits_do_not_manufacture_a_candidate() -> None:
     )
     assert flags == ()
     assert identity is None
+
+
+def test_run_fold_rejects_conflicting_pane_shell_incarnations() -> None:
+    flags, identity = evidence_from_runs(
+        "wE:p1",
+        [
+            {
+                "pane_id": "wE:p1",
+                "exit_code": 0,
+                "readiness": {
+                    "shell_pid": 100,
+                    "boot_id": BOOT,
+                    "shell_start_ticks": 10,
+                },
+            },
+            {
+                "pane_id": "wE:p1",
+                "exit_code": 0,
+                "readiness": {
+                    "shell_pid": 200,
+                    "boot_id": BOOT,
+                    "shell_start_ticks": 20,
+                },
+            },
+        ],
+    )
+    assert flags == (True, True)
+    assert identity is None, "a recycled pane id must not inherit the first shell's authority"
+
+
+def test_boolean_pid_is_not_a_bound_process_identity() -> None:
+    assert not ProcessIdentity(pid=True, boot_id=BOOT, start_ticks=1).is_bound()

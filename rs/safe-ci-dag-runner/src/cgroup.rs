@@ -46,6 +46,7 @@ const EXPECTED_OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_B
 const SUPERVISOR: &str = "supervisor";
 /// Per-step child cgroup directory prefix (also the normal-exit backstop scan key).
 const STEP_PREFIX: &str = "step-";
+const MAX_CGROUP_COMPONENT_BYTES: usize = 255;
 /// Prefix for every log/warning line this module prints.
 const LOG_PREFIX: &str = "[safe-ci]";
 /// Fraction of WHOLE-SYSTEM CPU the shared aggregate slice may use (leaves ~10% headroom).
@@ -103,12 +104,17 @@ pub trait CgroupManager: Send + Sync {
 /// `$$` is the leader's pid; writing it moves the leader, and every descendant then inherits this
 /// cgroup AT FORK. That inheritance is the whole point: a `setsid` child changes session and pgid
 /// but NOT cgroup membership, so it stays reachable by `cgroup.kill` even though a process-group
-/// kill can no longer see it. Best-effort in the shell so a step never fails merely because the
-/// migration did not land.
+/// kill can no longer see it. Migration is fail-closed: executing the command under an empty cap
+/// would falsely claim containment while leaving the actual process tree outside it.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn join_cgroup_command(child: &Path, cmd: &str) -> String {
+    let procs = child.join("cgroup.procs");
+    let quoted = shell_quote(&procs.to_string_lossy());
     format!(
-        "echo $$ > {} 2>/dev/null || true\n{cmd}",
-        child.join("cgroup.procs").display()
+        "if ! printf '%s\\n' \"$$\" 2>/dev/null > {quoted}; then\n  echo 'ERROR: step could not join its safe-ci cgroup; refusing uncontained run' >&2\n  exit 125\nfi\n{cmd}"
     )
 }
 
@@ -117,15 +123,20 @@ fn warn(msg: &str) {
     eprintln!("{LOG_PREFIX} WARNING: degraded enforcement: {msg}");
 }
 
-/// A cgroup directory name for a step tag (cgroup-v2 names may not contain '/').
+/// An injective cgroup filename encoding for a UTF-8 step tag.
+///
+/// Replacing unsafe characters with `_` aliases distinct tags (`a/b.j` and `a_b.j`), allowing one
+/// step's cgroup kill or cleanup to affect the other. `~HH` escapes are reversible and `~` itself
+/// is escaped, so distinct byte strings remain distinct.
 fn sanitize(tag: &str) -> String {
-    let mut s = String::with_capacity(tag.len() + STEP_PREFIX.len());
+    let mut s = String::with_capacity(tag.len() * 3 + STEP_PREFIX.len());
     s.push_str(STEP_PREFIX);
-    for c in tag.chars() {
-        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-            s.push(c);
+    for byte in tag.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-') {
+            s.push(char::from(*byte));
         } else {
-            s.push('_');
+            use std::fmt::Write as _;
+            let _ = write!(s, "~{byte:02x}");
         }
     }
     s
@@ -1062,6 +1073,24 @@ fn proc_stat_snapshot() -> BTreeMap<usize, (u64, u64)> {
     d
 }
 
+/// Compute one CPU's idle fraction only when both cumulative counters moved forward.
+///
+/// `/proc/stat` can be observed across CPU hotplug or a counter reset. Treating a rollback as a
+/// zero delta would rank that CPU as perfectly idle, so an invalid interval is excluded instead.
+fn idle_fraction_between(before: (u64, u64), after: (u64, u64)) -> Option<f64> {
+    let (idle_before, total_before) = before;
+    let (idle_after, total_after) = after;
+    if idle_after < idle_before || total_after < total_before {
+        return None;
+    }
+    let total_delta = total_after - total_before;
+    Some(if total_delta == 0 {
+        1.0
+    } else {
+        (idle_after - idle_before) as f64 / total_delta as f64
+    })
+}
+
 fn parse_cpuset(value: Option<&str>) -> Option<HashSet<usize>> {
     let value = value?.trim();
     if value.is_empty() {
@@ -1110,6 +1139,9 @@ pub fn pick_least_busy_free_cores_excluding(
     if k < 1 || !sample_s.is_finite() || sample_s < 0.0 {
         return Vec::new();
     }
+    if max_irq_rate.is_some_and(|limit| !limit.is_finite() || limit < 0.0 || sample_s <= 0.0) {
+        return Vec::new();
+    }
     let allowed = current_affinity();
     if allowed.is_empty() {
         return Vec::new();
@@ -1134,8 +1166,8 @@ pub fn pick_least_busy_free_cores_excluding(
     let mut irq_rate: BTreeMap<usize, f64> = BTreeMap::new();
     if !irq_a.is_empty() && !irq_b.is_empty() && elapsed > 0.0 {
         for (cpu, first) in &irq_a {
-            if let Some(second) = irq_b.get(cpu) {
-                irq_rate.insert(*cpu, second.saturating_sub(*first) as f64 / elapsed);
+            if let Some(second) = irq_b.get(cpu).filter(|second| *second >= first) {
+                irq_rate.insert(*cpu, (*second - *first) as f64 / elapsed);
             }
         }
     }
@@ -1145,24 +1177,12 @@ pub fn pick_least_busy_free_cores_excluding(
     if max_irq_rate.is_some() && irq_rate.is_empty() {
         return Vec::new();
     }
-    let idle_frac = |c: usize| -> f64 {
-        match (a.get(&c), b.get(&c)) {
-            (Some(&(ai, at)), Some(&(bi, bt))) => {
-                let dt = bt.saturating_sub(at);
-                if dt == 0 {
-                    1.0
-                } else {
-                    bi.saturating_sub(ai) as f64 / dt as f64
-                }
-            }
-            _ => 1.0,
-        }
-    };
+    let idle_frac = |c: usize| -> Option<f64> { idle_fraction_between(*a.get(&c)?, *b.get(&c)?) };
     let mut ranked: Vec<usize> = allowed
         .into_iter()
-        .filter(|c| !exclude.contains(c) && b.contains_key(c))
+        .filter(|c| !exclude.contains(c) && idle_frac(*c).is_some())
         .filter(|c| match max_irq_rate {
-            Some(limit) => irq_rate.get(c).copied().unwrap_or(0.0) <= limit,
+            Some(limit) => irq_rate.get(c).is_some_and(|rate| *rate <= limit),
             None => true,
         })
         .collect();
@@ -1172,11 +1192,15 @@ pub fn pick_least_busy_free_cores_excluding(
     ranked.sort_by(|&x, &y| {
         let rx = irq_rate.get(&x).copied().unwrap_or(0.0);
         let ry = irq_rate.get(&y).copied().unwrap_or(0.0);
-        rx.partial_cmp(&ry)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        irq_rate
+            .contains_key(&x)
+            .cmp(&irq_rate.contains_key(&y))
+            .reverse()
+            .then_with(|| rx.partial_cmp(&ry).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| {
                 idle_frac(y)
-                    .partial_cmp(&idle_frac(x))
+                    .unwrap_or(1.0)
+                    .partial_cmp(&idle_frac(x).unwrap_or(1.0))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| x.cmp(&y))
@@ -1638,14 +1662,22 @@ impl CgroupManager for Cgroups {
             (Some(r), true) => r,
             _ => return cmd.to_string(),
         };
-        let child = root.join(sanitize(tag));
+        let encoded_tag = sanitize(tag);
+        if encoded_tag.len() > MAX_CGROUP_COMPONENT_BYTES {
+            return "echo 'ERROR: encoded step tag exceeds the cgroup filename limit; refusing \
+                    uncontained run' >&2\nexit 125\n"
+                .to_string();
+        }
+        let child = root.join(encoded_tag);
         if let Err(e) = make_dir(&child) {
             warn(&format!(
-                "step {tag}: could not create child cgroup {} ({e}); step runs under the outer \
-                 cap only",
+                "step {tag}: could not create child cgroup {} ({e}); refusing to run without the \
+                 requested per-step cgroup",
                 child.display()
             ));
-            return cmd.to_string();
+            return "echo 'ERROR: step cgroup could not be created; refusing uncontained run' \
+                    >&2\nexit 125\n"
+                .to_string();
         }
         // KILL-ONLY: no controller is delegated on this route, so every cap write below would
         // fail — and the cpu.max branch FAILS THE STEP when it cannot apply. Applying caps is not
@@ -1717,12 +1749,9 @@ impl CgroupManager for Cgroups {
         let eff_mem = mem_max.or_else(|| memory_max_bytes(read_trim(root, "memory.max")));
         let jobs = crate::sizing::derive_build_jobs(eff_cores, eff_mem);
         // $$ is the bash leader's pid; writing it migrates the leader so every subsequently
-        // forked descendant inherits this cgroup at fork. Best-effort in the shell.
-        let procs = child.join("cgroup.procs");
-        format!(
-            "echo $$ > {} 2>/dev/null || true\nexport CARGO_BUILD_JOBS={jobs}\n{cmd}",
-            procs.display()
-        )
+        // forked descendant inherits this cgroup at fork. A cap on an empty child is not
+        // containment, so a failed migration refuses to execute the user command.
+        join_cgroup_command(&child, &format!("export CARGO_BUILD_JOBS={jobs}\n{cmd}"))
     }
 
     fn kill(&self, tag: &str) -> bool {
@@ -2178,7 +2207,61 @@ mod tests {
     #[test]
     fn sanitize_makes_safe_names() {
         assert_eq!(sanitize("build.app"), "step-build.app");
-        assert_eq!(sanitize("weird/tag name"), "step-weird_tag_name");
+        assert_eq!(sanitize("weird/tag name"), "step-weird~2ftag~20name");
+        assert_ne!(sanitize("a/b.j"), sanitize("a_b.j"));
+        assert_ne!(sanitize("a/b.j"), sanitize("a~2fb.j"));
+    }
+
+    #[test]
+    fn rolled_back_cpu_counters_are_invalid() {
+        assert_eq!(idle_fraction_between((10, 20), (15, 30)), Some(0.5));
+        assert_eq!(idle_fraction_between((10, 20), (10, 20)), Some(1.0));
+        assert_eq!(idle_fraction_between((10, 20), (9, 30)), None);
+        assert_eq!(idle_fraction_between((10, 20), (15, 19)), None);
+    }
+
+    #[test]
+    fn overlong_encoded_cgroup_name_refuses_user_command() {
+        let scope = temp_scope("overlong-name");
+        fs::write(scope.join("cpu.max"), "100000 100000").unwrap();
+        fs::write(scope.join("memory.max"), "4294967296").unwrap();
+        let cg = Cgroups {
+            enabled: true,
+            root: Some(scope.clone()),
+            containment: Containment::Full,
+        };
+        let marker = scope.join("user-command-ran");
+        let wrapped = cg.prepare_command(
+            &"/".repeat(100),
+            &format!("touch {}", marker.display()),
+            None,
+            None,
+        );
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(wrapped)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(125));
+        assert!(!marker.exists());
+        let _ = fs::remove_dir_all(scope);
+    }
+
+    #[test]
+    fn failed_cgroup_migration_refuses_user_command() {
+        let scope = temp_scope("migration-failure");
+        let child = scope.join(sanitize("g.j"));
+        fs::create_dir_all(child.join("cgroup.procs")).unwrap();
+        let marker = scope.join("user-command-ran");
+        let wrapped = join_cgroup_command(&child, &format!("touch {}", marker.display()));
+        let status = Command::new("bash")
+            .arg("-c")
+            .arg(wrapped)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(125));
+        assert!(!marker.exists());
+        let _ = fs::remove_dir_all(scope);
     }
 
     #[test]

@@ -9,7 +9,7 @@ version, license, README, and embedded user guide.
 | `safe-ci-dag-runner` | `safe-ci-dag-runner`, `cpuset-alloc` | Run and inspect resource-aware CI DAGs; reserve hard-isolated CPU sets for benchmarks. |
 | `tick-hub` | `tick-hub` | Evaluate cadenced reminders and health checks in one deterministic tick. |
 | `pr-landing-planner` | `pr-landing-planner` | Produce advisory, conflict-aware pull-request landing plans. |
-| `herdr-run` | `herdr-run` | Run policy-admitted commands through a Herdr pane and capture audited results. |
+| `herdr-run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
 
 Install one published command with Cargo:
 

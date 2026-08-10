@@ -1,10 +1,18 @@
-# herdr-run
+# herdr-run and herdr-agent
 
 Run an **allowlisted** command in a Herdr terminal pane that lives **outside** an AI agent's
 sandbox, and get its real stdout, stderr, and exit code back.
 
 ```
 herdr-run release-agent 'with-proxy git ls-remote origin main'
+```
+
+The same package also installs `herdr-agent`, a durable FIFO transport for messaging an
+already-running interactive agent without losing or accidentally duplicating a prompt:
+
+```sh
+herdr-agent send --session-agent codex --session "$CODEX_SESSION_ID" \
+  --agent codex --workspace project --cwd /work/project --file ./next-task.md
 ```
 
 A sandboxed coding agent often cannot reach the network, so `git fetch`, `git push`, and `gh` fail
@@ -22,7 +30,8 @@ that into one narrow, audited door instead of an ad-hoc pile of keystroke inject
 python3 -m pip install herdr-run
 ```
 
-The distribution supports Python 3.10 and newer and installs its YAML parser dependency.
+The distribution supports Python 3.10 and newer, installs its YAML parser dependency, and provides
+both `herdr-run` and `herdr-agent`.
 
 ## What it does
 
@@ -42,6 +51,14 @@ The distribution supports Python 3.10 and newer and installs its YAML parser dep
   callers from different projects cannot inject into the same pane concurrently.
 - **Visible, best-effort audit.** Refusals, admissions, failures, and completions are appended to a
   private JSONL log. Storage failures warn but never replace a completed command's exit status.
+
+## Interactive-agent messaging
+
+`herdr-agent` binds a private on-disk queue to one exact pane or stable agent session. It waits for
+native `idle` or `done` state, durably marks the prompt in flight, submits the full literal text in
+one operation, and requires a subsequent `working` event. A pre-submission failure stays pending
+and safe to retry; an ambiguous post-submission failure is quarantined and is never automatically
+submitted twice. `status` and `read` inspect a validated target without altering its queue.
 
 ## Configuration
 
@@ -65,6 +82,11 @@ herdr-run target                 resolve/bring up the pane; print ids and readin
 herdr-run config                 print the effective configuration
 herdr-run doctor                 verify the sandbox-crossing actually works, both directions
 herdr-run userguide              the full user guide
+herdr-agent send ...             durably submit one prompt to an interactive agent
+herdr-agent drain ...            resume a bound queue without duplicating ambiguous prompts
+herdr-agent status ...           inspect validated agent identity and queue state
+herdr-agent read ...             read recent validated agent output
+herdr-agent userguide            the complete messaging and recovery contract
 ```
 
 Requires Linux with a working systemd user manager and a separately installed
@@ -72,4 +94,4 @@ Requires Linux with a working systemd user manager and a separately installed
 `~/.local/bin`, or `~/bin`. The integration is tested with Herdr 0.8.0; compatible
 newer releases must provide its `status`, `workspace`, `tab`, and `pane` command APIs.
 
-Full documentation: `herdr-run userguide`.
+Full documentation: `herdr-run userguide` and `herdr-agent userguide`.

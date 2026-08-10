@@ -14,7 +14,8 @@
 //! * a run-level `journal.jsonl` of one-line records: step start, each recognized test boundary,
 //!   teardown, and the culprit verdict.
 //!
-//! Kill the runner with SIGKILL at any instant and the directory still describes what was running.
+//! When the operator configures an evidence directory, kill the runner with SIGKILL at any instant
+//! and that directory still describes what was running.
 //!
 //! TEST-LEVEL ATTRIBUTION. Naming the NODE that hung ("the strict-compat step") is not enough to
 //! act on; the actionable fact is WHICH TEST inside that node. [`TestTracker`] derives it from the
@@ -33,8 +34,9 @@
 //! the node is named and no test is, which is strictly better than the run reporting nothing.
 
 use std::collections::BTreeMap;
-use std::fs::{File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -46,6 +48,7 @@ pub const LOG_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_LOG_DIR";
 pub const NO_LOGS_ENV: &str = "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS";
 /// Environment variable carrying the per-step ownership nonce (see `scheduler::kill_by_nonce`).
 pub const STEP_NONCE_ENV: &str = "SAFE_CI_DAG_RUNNER_STEP";
+const MAX_COMPONENT_BYTES: usize = 255;
 
 /// Monotonic per-process counter making each step's nonce unique within this runner.
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -67,23 +70,23 @@ pub fn mint_step_nonce(tag: &str) -> String {
 
 /// Filesystem-safe rendering of a step tag (used for nonces and log file names).
 pub fn sanitize(tag: &str) -> String {
-    tag.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(tag.len() * 3);
+    for byte in tag.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-') {
+            out.push(char::from(*byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "~{byte:02x}");
+        }
+    }
+    out
 }
 
 /// Where a run's durable evidence is written, or `None` when the operator opted out.
 ///
-/// DEFAULT ON, and deliberately so. A feature that only records evidence when someone remembered
-/// to enable it records nothing on the day it is needed, because a runaway is by definition
-/// unanticipated. The default location is under the CI runner's own temp area (`RUNNER_TEMP`) or
-/// `TMPDIR`, never the working tree, so a default-on writer cannot dirty a checkout.
+/// Evidence is opt-in so the package does not create an unbounded, world-discoverable accumulation
+/// under a shared `/tmp`. An explicitly configured directory is made private and validated by
+/// [`RunEvidence::open`].
 pub fn default_log_dir() -> Option<PathBuf> {
     if std::env::var(NO_LOGS_ENV)
         .map(|v| v == "1")
@@ -91,25 +94,10 @@ pub fn default_log_dir() -> Option<PathBuf> {
     {
         return None;
     }
-    if let Ok(dir) = std::env::var(LOG_DIR_ENV) {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir));
-        }
-    }
-    let base = std::env::var("RUNNER_TEMP")
+    std::env::var(LOG_DIR_ENV)
         .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("TMPDIR").ok().filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| "/tmp".to_string());
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    Some(PathBuf::from(base).join("safe-ci-dag-runner").join(format!(
-        "run-{}-{}",
-        std::process::id(),
-        nanos
-    )))
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Seconds since the epoch, as a fixed-precision string for journal records.
@@ -151,7 +139,9 @@ impl RunEvidence {
     /// or the directory cannot be created; evidence capture must never be able to fail a run.
     pub fn open(dir: Option<PathBuf>) -> Option<Self> {
         let dir = dir?;
-        if std::fs::create_dir_all(&dir).is_err() {
+        let mut builder = DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        if builder.create(&dir).is_err() {
             eprintln!(
                 "[scheduler] WARNING: could not create evidence directory {}; per-step logs and \
                  test-level attribution are disabled for this run.",
@@ -159,14 +149,49 @@ impl RunEvidence {
             );
             return None;
         }
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!(
+                    "[scheduler] WARNING: could not inspect evidence directory {} ({error}); \
+                     per-step logs and attribution are disabled for this run.",
+                    dir.display()
+                );
+                return None;
+            }
+        };
+        // Never chmod a pre-existing caller path: refuse it if its ownership or privacy is wrong.
+        if !metadata.file_type().is_dir()
+            || metadata.uid() != effective_uid()
+            || metadata.permissions().mode() & 0o700 != 0o700
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            eprintln!(
+                "[scheduler] WARNING: evidence directory {} is not a private, owned directory; \
+                 per-step logs and attribution are disabled for this run.",
+                dir.display()
+            );
+            return None;
+        }
         let journal = OpenOptions::new()
             .create(true)
             .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(dir.join("journal.jsonl"))
-            .ok();
+            .ok()
+            .filter(private_regular_file);
+        let Some(journal) = journal else {
+            eprintln!(
+                "[scheduler] WARNING: evidence journal {} is not a private, owned regular file; \
+                 per-step logs and attribution are disabled for this run.",
+                dir.join("journal.jsonl").display()
+            );
+            return None;
+        };
         Some(RunEvidence {
             dir,
-            journal: Mutex::new(journal),
+            journal: Mutex::new(Some(journal)),
         })
     }
 
@@ -192,13 +217,39 @@ impl RunEvidence {
 
     /// Open (create/truncate) the durable log file for one step.
     pub fn open_step_log(&self, tag: &str) -> Option<File> {
-        OpenOptions::new()
+        let name = format!("{}.log", sanitize(tag));
+        if name.len() > MAX_COMPONENT_BYTES {
+            return None;
+        }
+        let file = OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(true)
-            .open(self.dir.join(format!("{}.log", sanitize(tag))))
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.dir.join(name))
             .ok()
+            .filter(private_regular_file)?;
+        // Validate before truncating: `truncate(true)` in the open itself would destroy the target
+        // of a planted hard link before `fstat` had a chance to reject it.
+        file.set_len(0).ok()?;
+        Some(file)
     }
+}
+
+fn private_regular_file(file: &File) -> bool {
+    file.metadata()
+        .map(|metadata| {
+            metadata.file_type().is_file()
+                && metadata.uid() == effective_uid()
+                && metadata.permissions().mode() & 0o077 == 0
+                && metadata.nlink() == 1
+        })
+        .unwrap_or(false)
+}
+
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments and reads process credentials only.
+    unsafe { libc::geteuid() }
 }
 
 /// A recognized test-boundary event in a step's output.
@@ -606,6 +657,23 @@ pub fn culprit_columns(c: &Culprit) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    fn temp_evidence(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "safe-ci-evidence-{name}-{}-{}",
+            std::process::id(),
+            NONCE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the CString is NUL-terminated and valid for the duration of mkfifo.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
 
     #[test]
     fn libtest_completed_line_is_an_end() {
@@ -724,6 +792,97 @@ mod tests {
         let a = mint_step_nonce("g:j");
         let b = mint_step_nonce("g:j");
         assert_ne!(a, b);
-        assert!(a.ends_with("g_j"));
+        assert!(a.ends_with("g~3aj"));
+    }
+
+    #[test]
+    fn sanitized_names_are_injective_for_former_aliases() {
+        assert_ne!(sanitize("a/b.j"), sanitize("a_b.j"));
+        assert_ne!(sanitize("a/b.j"), sanitize("a~2fb.j"));
+    }
+
+    #[test]
+    fn evidence_directory_and_files_are_private() {
+        let dir = temp_evidence("private");
+        let evidence = RunEvidence::open(Some(dir.clone())).expect("private evidence opens");
+        evidence.record("test", &[]);
+        let mut step = evidence.open_step_log("g:j").expect("step log opens");
+        step.write_all(b"secret\n").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for file in [dir.join("journal.jsonl"), dir.join("g~3aj.log")] {
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(step);
+        drop(evidence);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn evidence_refuses_public_or_symlink_directories() {
+        let public = temp_evidence("public");
+        std::fs::create_dir(&public).unwrap();
+        std::fs::set_permissions(&public, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(RunEvidence::open(Some(public.clone())).is_none());
+
+        let target = temp_evidence("target");
+        let link = temp_evidence("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+        symlink(&target, &link).unwrap();
+        assert!(RunEvidence::open(Some(link.clone())).is_none());
+
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir(target);
+        let _ = std::fs::remove_dir(public);
+    }
+
+    #[test]
+    fn step_log_refuses_a_hard_link_without_truncating_its_target() {
+        let dir = temp_evidence("hard-link");
+        let evidence = RunEvidence::open(Some(dir.clone())).expect("private evidence opens");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"keep me").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(&victim, dir.join("g~3aj.log")).unwrap();
+
+        assert!(evidence.open_step_log("g:j").is_none());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep me");
+        drop(evidence);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn evidence_refuses_fifos_without_blocking() {
+        let journal_dir = temp_evidence("journal-fifo");
+        std::fs::create_dir(&journal_dir).unwrap();
+        std::fs::set_permissions(&journal_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fifo(&journal_dir.join("journal.jsonl"));
+        assert!(RunEvidence::open(Some(journal_dir.clone())).is_none());
+
+        let step_dir = temp_evidence("step-fifo");
+        let evidence = RunEvidence::open(Some(step_dir.clone())).expect("evidence opens");
+        fifo(&step_dir.join("g~3aj.log"));
+        assert!(evidence.open_step_log("g:j").is_none());
+
+        drop(evidence);
+        let _ = std::fs::remove_dir_all(journal_dir);
+        let _ = std::fs::remove_dir_all(step_dir);
+    }
+
+    #[test]
+    fn evidence_refuses_overlong_step_log_names() {
+        let dir = temp_evidence("long-name");
+        let evidence = RunEvidence::open(Some(dir.clone())).expect("evidence opens");
+        assert!(evidence.open_step_log(&"/".repeat(100)).is_none());
+
+        drop(evidence);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

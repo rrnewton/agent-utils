@@ -8,7 +8,7 @@ invocation text:
 | `safe-ci-dag-runner` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
 | `tick-hub` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
 | `pr-landing-planner` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
-| `herdr-run` | `README.template.md`, `USER_GUIDE.template.md` | `rendered/python/`, `rendered/rust/` |
+| `herdr-run`, `herdr-agent` | `README.template.md`, `USER_GUIDE.template.md`, shared `AGENT_USER_GUIDE.md` | `rendered/python/`, `rendered/rust/` plus exact guide links |
 
 Each template contains one `{{DISTRIBUTION}}` placeholder. The corresponding
 `fragments/python/` or `fragments/rust/` document supplies package-specific text. Package trees link

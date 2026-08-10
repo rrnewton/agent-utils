@@ -12,6 +12,7 @@ assertions are about git's actual pre-push evaluation rather than a mock of it.
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -114,6 +115,11 @@ def _remote_main(origin: Path) -> str:
     return _git(origin, "rev-parse", "refs/heads/main")
 
 
+def _write_receipt(path: Path, receipt: object) -> None:
+    assert isinstance(receipt, main_write.Receipt)
+    main_write._write_private_receipt(path, receipt.to_json())
+
+
 # --------------------------------------------------------------------------- #
 # POSITIVE bracket -- the guard must not be inert in the blocking direction     #
 # --------------------------------------------------------------------------- #
@@ -190,10 +196,9 @@ def test_copied_receipt_without_a_live_holder_is_refused(
     work, origin, lock = world["work"], world["origin"], world["lock"]
     before = _remote_main(origin)
     receipt = main_write.receipt_path(lock)
-    receipt.write_text(
-        main_write.Receipt(
-            token="forged", pid=os.getpid(), expect=before, started=0.0
-        ).to_json()
+    _write_receipt(
+        receipt,
+        main_write.Receipt(token="forged", pid=os.getpid(), expect=before, started=0.0),
     )
     _commit(work, "forged.txt", "forged\n")
 
@@ -218,10 +223,9 @@ def test_stale_fetch_receipt_fails_compare_and_swap(world: dict[str, Path]) -> N
     receipt = main_write.receipt_path(lock)
     # A genuine ancestor, so the CAS check is the one under test rather than
     # the ancestry check short-circuiting ahead of it.
-    receipt.write_text(
-        main_write.Receipt(
-            token="tok", pid=os.getppid(), expect="a" * 40, started=0.0
-        ).to_json()
+    _write_receipt(
+        receipt,
+        main_write.Receipt(token="tok", pid=os.getppid(), expect="a" * 40, started=0.0),
     )
     os.environ[main_write.TOKEN_ENV] = "tok"
     os.environ[main_write.RECEIPT_ENV] = str(receipt)
@@ -242,10 +246,9 @@ def test_receipt_from_an_unrelated_process_is_refused(world: dict[str, Path]) ->
     receipt = main_write.receipt_path(lock)
     # PID 1 is live but is not an ancestor of this test in the relevant sense
     # of "this push runs inside that serialized operation".
-    receipt.write_text(
-        main_write.Receipt(
-            token="tok", pid=os.getpid(), expect="c" * 40, started=0.0
-        ).to_json()
+    _write_receipt(
+        receipt,
+        main_write.Receipt(token="tok", pid=os.getpid(), expect="c" * 40, started=0.0),
     )
     os.environ[main_write.TOKEN_ENV] = "tok"
     os.environ[main_write.RECEIPT_ENV] = str(receipt)
@@ -287,6 +290,79 @@ def test_second_concurrent_writer_is_refused_while_the_lock_is_held(
     assert "another agent-utils main writer owns" in result.stderr
 
 
+def test_default_writer_state_uses_a_private_per_uid_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(main_write.LOCK_ENV, raising=False)
+
+    path = main_write.lock_path()
+
+    assert path == Path("/tmp") / f"agent-utils-main-write-{os.getuid()}" / "writer.lock"
+
+
+@pytest.mark.parametrize("planted", ["symlink", "fifo"])
+def test_writer_lock_refuses_nonregular_objects_without_touching_their_targets(
+    tmp_path: Path, planted: str
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    lock = state / "writer.lock"
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("keep\n")
+    if planted == "symlink":
+        lock.symlink_to(sentinel)
+    else:
+        os.mkfifo(lock, 0o600)
+
+    with pytest.raises(main_write.WriteRefused, match="safely open|regular file"):
+        with main_write.WriterLock(lock):
+            pytest.fail("unsafe lock must never be acquired")
+
+    assert sentinel.read_text() == "keep\n"
+
+
+def test_writer_state_refuses_an_unowned_or_nonprivate_parent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o755)
+    lock = state / "writer.lock"
+    with pytest.raises(main_write.WriteRefused, match="mode-0700"):
+        with main_write.WriterLock(lock):
+            pytest.fail("public state directory must be refused")
+
+    state.chmod(0o700)
+    monkeypatch.setattr(main_write.os, "geteuid", lambda: os.getuid() + 1)
+    with pytest.raises(main_write.WriteRefused, match="mode-0700"):
+        with main_write.WriterLock(lock):
+            pytest.fail("foreign-owned state directory must be refused")
+
+
+def test_receipt_read_refuses_a_symlink_and_atomic_write_does_not_follow_it(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir(mode=0o700)
+    lock = state / "writer.lock"
+    receipt = main_write.receipt_path(lock)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_text("keep\n")
+    receipt.symlink_to(sentinel)
+
+    with pytest.raises(main_write.WriteRefused, match="safely open"):
+        main_write._read_private_receipt(receipt)
+
+    payload = main_write.Receipt(
+        token="new", pid=os.getpid(), expect="d" * 40, started=1.0
+    ).to_json()
+    main_write._write_private_receipt(receipt, payload)
+
+    assert sentinel.read_text() == "keep\n"
+    assert not receipt.is_symlink()
+    assert receipt.read_text() == payload
+    assert receipt.stat().st_mode & 0o777 == 0o600
+
+
 def test_main_deletion_is_refused(world: dict[str, Path]) -> None:
     work, origin = world["work"], world["origin"]
     before = _remote_main(origin)
@@ -300,6 +376,32 @@ def test_main_deletion_is_refused(world: dict[str, Path]) -> None:
     assert pushed.returncode != 0
     assert "refusing to delete main" in pushed.stderr
     assert _remote_main(origin) == before
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "not four fields\n",
+        f"refs/heads/topic not-an-oid refs/heads/topic {'a' * 40}\n",
+        f"refs/heads/topic {'a' * 40} not-a-ref {'b' * 40}\n",
+        "\n",
+    ],
+)
+def test_malformed_pre_push_records_fail_closed(
+    world: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    record: str,
+) -> None:
+    """No malformed line may be skipped, including a line aimed away from main."""
+    monkeypatch.setattr(main_write.sys, "stdin", io.StringIO(record))
+
+    result = main_write.main(
+        ["--root", str(world["work"]), "hook-pre-push", "origin", "unused-url"]
+    )
+
+    assert result == 1
+    assert "REFUSED: malformed pre-push record" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------- #
@@ -363,3 +465,39 @@ def test_pr_exceptions_flags_both_violations_and_passes_a_clean_state(
     )
     assert main_write.cmd_pr_exceptions(args) == 0
     assert '"satisfied": true' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        ("not-json", "malformed PR JSON"),
+        ('[{"number": 1}, 7]', "non-object PR payload item at index 1"),
+    ],
+)
+def test_pr_exceptions_malformed_payload_is_unverifiable_exit_two(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: str,
+    message: str,
+) -> None:
+    """Bad API output is neither a policy pass nor an ordinary violation."""
+    monkeypatch.setenv(main_write.NO_PROXY_ENV, "1")
+    monkeypatch.setattr(
+        main_write.shutil,
+        "which",
+        lambda command: "/usr/bin/gh" if command == "gh" else None,
+    )
+    monkeypatch.setattr(
+        main_write,
+        "_run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            args=["gh"], returncode=0, stdout=payload, stderr=""
+        ),
+    )
+
+    result = main_write.main(["pr-exceptions"])
+
+    assert result == 2
+    stderr = capsys.readouterr().err
+    assert "UNVERIFIABLE" in stderr
+    assert message in stderr

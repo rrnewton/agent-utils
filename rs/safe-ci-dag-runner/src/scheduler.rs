@@ -20,10 +20,11 @@
 //
 // Boxing: when a [`crate::cgroup::CgroupManager`] is supplied (the default `run` path), each
 // step is wrapped so its bash leader self-moves into a per-step child cgroup with an inner
-// `memory.max` cap, and teardown writes the step's `cgroup.kill` FIRST (a setsid-proof atomic
-// SIGKILL of the whole subtree) then killpg as a belt-and-suspenders. Without a manager the
-// step runs unboxed and teardown is a plain negative-pid `kill(1)` process-group SIGKILL (no
-// `unsafe`/`libc`). Per-step measurement rows are collected for the perf-log sink either way.
+// `memory.max` cap. Teardown gives every process group one bounded SIGTERM diagnostic window,
+// then writes the step's `cgroup.kill` (a setsid-proof atomic SIGKILL of the whole subtree) and
+// follows with killpg as a belt-and-suspenders. Without a manager the step runs unboxed and uses
+// process-group plus best-effort `/proc` ownership sweeps. Per-step measurement rows are collected
+// for the perf-log sink either way.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufReader, Read};
@@ -63,6 +64,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// that may still be forking, so one pass can miss a child born mid-sweep; a small fixed bound
 /// converts a pathological forker into a reported failure instead of an unbounded loop.
 const DESCENDANT_KILL_SWEEPS: usize = 4;
+/// Grace after SIGTERM so an inner runner can identify the test it was executing before SIGKILL.
+/// The behavioral differential pins this duration across package implementations.
+const REAP_TERM_GRACE: Duration = Duration::from_secs(5);
+const REAP_TERM_POLL: Duration = Duration::from_millis(100);
 /// Latches once the unboxed-teardown warning has been emitted, so it is stated once per run
 /// instead of once per step.
 static UNBOXED_REAP_WARNED: AtomicBool = AtomicBool::new(false);
@@ -105,19 +110,99 @@ struct Shared {
     run_timed_out: bool,
 }
 
-/// SIGKILL a whole process group by pid (the child is its own group leader via
-/// `process_group(0)`), using a negative-pid `kill(1)` so no `unsafe`/`libc` is needed.
-fn kill_group(pid: u32) {
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        // A negative pid names a process group, but without the option terminator GNU kill may
-        // parse it as another option. That silently left the group leader alive while the later
-        // descendant sweep killed only its blocking child, allowing the shell to continue.
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+/// Signal a process group without consulting `PATH`.
+///
+/// The step leader is its own group leader via `process_group(0)`, so a negative pid targets the
+/// complete group.  Calling `kill(2)` directly is load-bearing: using an unqualified external
+/// `kill` made teardown replaceable by a caller-controlled `PATH` entry.
+fn signal_group(pid: u32, signal: i32) -> bool {
+    let Ok(pgid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: `getpgrp` takes no arguments and reads process metadata only.
+    let own_group = unsafe { libc::getpgrp() };
+    if pgid == own_group {
+        return false;
+    }
+    // SAFETY: a negative pid is the documented kill(2) process-group form; no pointers are used.
+    unsafe { libc::kill(-pgid, signal) == 0 }
+}
+
+/// Signal one positive pid without consulting `PATH`.
+fn signal_pid(pid: u32, signal: i32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 1 || pid == i32::try_from(std::process::id()).unwrap_or(-1) {
+        return false;
+    }
+    // SAFETY: `pid` is a checked positive process id and kill(2) dereferences no pointers.
+    unsafe { libc::kill(pid, signal) == 0 }
+}
+
+/// Requested process groups containing at least one non-zombie process.
+///
+/// `kill(-pgid, 0)` succeeds for an unreaped zombie group leader. The supervisor cannot reap that
+/// child until teardown returns, so a signal-only probe charges the entire grace even when the
+/// child honored SIGTERM immediately. One `/proc` walk handles a whole cancellation batch.
+fn live_process_groups(groups: &HashSet<u32>) -> Option<HashSet<u32>> {
+    let entries = std::fs::read_dir("/proc").ok()?;
+    let mut live = HashSet::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        // Fields after comm begin at field 3: state, ppid, pgrp.
+        let mut fields = stat[close + 1..].split_whitespace();
+        let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if state == "Z" {
+            continue;
+        }
+        let Ok(pgrp) = pgrp.parse::<u32>() else {
+            continue;
+        };
+        if groups.contains(&pgrp) {
+            live.insert(pgrp);
+            if live.len() == groups.len() {
+                break;
+            }
+        }
+    }
+    Some(live)
+}
+
+/// Let several process groups report their in-flight work under ONE shared grace.
+fn terminate_groups(pids: &[u32]) {
+    let mut active: HashSet<u32> = pids
+        .iter()
+        .copied()
+        .filter(|pid| signal_group(*pid, libc::SIGTERM))
+        .collect();
+    let deadline = Instant::now() + REAP_TERM_GRACE;
+    while !active.is_empty() && Instant::now() < deadline {
+        active = live_process_groups(&active).unwrap_or_else(|| {
+            active
+                .iter()
+                .copied()
+                .filter(|pid| signal_group(*pid, 0))
+                .collect()
+        });
+        if !active.is_empty() {
+            thread::sleep(REAP_TERM_POLL.min(deadline.saturating_duration_since(Instant::now())));
+        }
+    }
 }
 
 /// Every live descendant of `root`, deepest-first, from `/proc` parentage.
@@ -194,12 +279,7 @@ fn kill_descendants(root: u32) -> usize {
             if killed.insert(pid) {
                 fresh += 1;
             }
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = signal_pid(pid, libc::SIGKILL);
         }
         if fresh == 0 {
             break;
@@ -208,29 +288,17 @@ fn kill_descendants(root: u32) -> usize {
     killed.len()
 }
 
-/// SIGKILL every process carrying this step's ownership nonce in its environment.
+/// SIGKILL processes carrying this step's exact ownership nonce in their environment.
 ///
-/// THIS IS THE ESCAPEE CLOSER, and it is what makes termination GENERAL rather than boxed-only.
-/// The three earlier mechanisms each have a hole. `cgroup.kill` is exact but exists only when
-/// containment is available. A process-group kill misses anything that called `setsid`, because an
-/// escapee changes session and pgid. The `/proc` parentage sweep misses a DOUBLE-FORK escapee,
-/// whose intermediate parent exits so the survivor reparents away from the step entirely —
-/// measured on a planted escapee, which showed `PPid=1`. Subreaper adoption pulls such orphans
-/// back to the RUNNER, but that makes them siblings of every other step's tree, not descendants of
-/// the step that spawned them, so a parentage walk rooted at the step still cannot see them and a
-/// walk rooted at the runner would reach other steps' live work.
+/// This is the BEST-EFFORT ESCAPEE CLOSER for an unboxed run. A process-group kill misses a child
+/// that called `setsid`, and a parentage walk misses a double-fork survivor after it reparents.
+/// Ordinary descendants inherit `SAFE_CI_DAG_RUNNER_STEP=<nonce>` through `fork`/`execve`, so the
+/// exact NUL-delimited environment entry can still associate those environment-preserving
+/// escapees with their step. It is never a process-name, command-line, or substring match.
 ///
-/// A nonce closes exactly that hole. Each step is launched with `SAFE_CI_DAG_RUNNER_STEP=<nonce>`
-/// in its environment; `fork` copies the environment and `execve` carries it, so EVERY descendant
-/// inherits it however far it runs from its origin — changing session, changing process group, and
-/// being reparented all leave it intact.
-///
-/// SAFETY, AND WHY THIS IS NOT A PATTERN KILL. The match is an exact NUL-delimited environment
-/// entry against a token this runner minted from its own pid, a per-process sequence number, and
-/// the wall clock. It is never a process name, never a command line, and never a substring of
-/// either. No process outside this step's own fork tree can carry it, so unlike a `pkill`-style
-/// match it cannot reach a sibling agent's work on a shared machine. Processes owned by other
-/// users are unreadable and are skipped rather than signalled. The runner's own pid is excluded.
+/// LIMIT: a hostile child can unset or replace its environment before escaping. The nonce is an
+/// ownership aid, not a security boundary and not a substitute for cgroup containment. Processes
+/// whose environment is unreadable are skipped, and the runner's own pid is always excluded.
 ///
 /// Sweeps like [`kill_descendants`], for the same reason: the walk races a tree that may still be
 /// forking. Returns the number of distinct pids signalled.
@@ -266,12 +334,7 @@ fn kill_by_nonce(nonce: &str) -> usize {
             if killed.insert(pid) {
                 fresh += 1;
             }
-            let _ = Command::new("kill")
-                .arg("-KILL")
-                .arg(pid.to_string())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            let _ = signal_pid(pid, libc::SIGKILL);
         }
         if fresh == 0 {
             break;
@@ -307,33 +370,6 @@ fn wait_bounded(child: &mut std::process::Child, tag: &str, limit: Duration) -> 
             Err(_) => return ExitStatus::from_raw(9),
         }
     }
-}
-
-/// Become the reaper for orphaned descendants, so a `setsid`/double-fork escapee stays reachable.
-///
-/// WITHOUT THIS THE DESCENDANT SWEEP HAS NOTHING TO FIND. An escapee's intermediate parent exits
-/// immediately, so the grandchild reparents to init and is no longer a descendant of anything the
-/// runner knows about — measured directly on a planted escapee, which showed `PPid=1`. That is the
-/// same reason `killpg` misses it: it has left the family, not merely changed process group. With
-/// `PR_SET_CHILD_SUBREAPER` the kernel reparents such orphans to THIS process instead of init, so
-/// they remain enumerable by parentage and [`kill_descendants`] can reach them.
-///
-/// The attribute is per-process and is not inherited by children, so setting it once on the runner
-/// is both necessary and sufficient. A failure is reported once and is not fatal: the run then
-/// degrades to exactly today's behaviour rather than refusing to start.
-fn become_subreaper() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        // SAFETY: prctl with PR_SET_CHILD_SUBREAPER takes an integer flag and touches no memory
-        // owned by this process; the remaining arguments are ignored for this option.
-        let rc = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-        if rc != 0 {
-            eprintln!(
-                "[scheduler] WARNING: could not become child subreaper; setsid/double-fork \
-                 escapees will reparent to init and survive step teardown."
-            );
-        }
-    });
 }
 
 /// Join a worker thread, abandoning it if it does not finish within `limit`.
@@ -587,10 +623,10 @@ impl Runner {
                                 ],
                             );
                         }
-                        for (tag, pid, nonce) in cut {
+                        for (tag, _pid, _nonce) in &cut {
                             sh.aborted.insert(tag.clone());
-                            reap(&self.cgroups, &tag, pid, nonce.as_deref());
                         }
+                        reap_many(&self.cgroups, &cut);
                     }
                 }
                 let skipped = self.skipped(&sh);
@@ -789,7 +825,7 @@ struct StepCtx {
     evidence: Option<Arc<RunEvidence>>,
 }
 
-/// Tear down one step's whole process tree: `cgroup.kill` first (setsid-proof), then killpg.
+/// Tear down one step's whole process tree: SIGTERM grace, then `cgroup.kill`/SIGKILL.
 ///
 /// When per-step containment is enabled, writing the step's child `cgroup.kill` SIGKILLs the
 /// ENTIRE subtree atomically, including `setsid`/double-fork escapees a process-group kill misses.
@@ -807,7 +843,7 @@ struct StepCtx {
 /// cgroup's kill failed, so the unboxed path — which has exactly the same weakness — degraded in
 /// silence. A step running without enforceable containment must say so once, or "unbounded" is
 /// invisible in the log.
-fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
+fn hard_reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
     let contained = match cgroups {
         Some(cg) if cg.enabled() => {
             if cg.kill(tag) {
@@ -833,7 +869,7 @@ fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
             false
         }
     };
-    kill_group(pid);
+    let _ = signal_group(pid, libc::SIGKILL);
     if !contained {
         let swept = kill_descendants(pid);
         if swept > 0 {
@@ -846,16 +882,31 @@ fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
     // FINAL BACKSTOP, RUN ON EVERY PATH — boxed and unboxed alike. Boxed, it should find nothing
     // and costs one `/proc` walk; that it runs anyway is the point, because "cgroup.kill returned
     // success" is a claim about a write, not evidence that the subtree is empty. Unboxed it is the
-    // only mechanism that reaches a double-fork escapee at all.
+    // only best-effort mechanism that reaches an environment-preserving double-fork escapee.
     if let Some(n) = nonce {
         let swept = kill_by_nonce(n);
         if swept > 0 {
             eprintln!(
                 "[scheduler] step {tag}: killed {swept} process(es) by ownership nonce that \
-                 neither the process-group kill nor the parentage sweep could reach \
-                 (setsid/double-fork escapees)."
+                     neither the process-group kill nor the parentage sweep could reach \
+                     (an environment-preserving setsid/double-fork escapee)."
             );
         }
+    }
+}
+
+fn reap(cgroups: &BoxedCgroups, tag: &str, pid: u32, nonce: Option<&str>) {
+    // Give the original group one bounded chance to identify in-flight work, then hard-stop every
+    // ownership handle. `terminate_groups` ignores zombies instead of charging them the full grace.
+    terminate_groups(&[pid]);
+    hard_reap(cgroups, tag, pid, nonce);
+}
+
+/// Cancel several in-flight steps under one shared grace instead of `N * REAP_TERM_GRACE`.
+fn reap_many(cgroups: &BoxedCgroups, steps: &[(String, u32, Option<String>)]) {
+    terminate_groups(&steps.iter().map(|(_, pid, _)| *pid).collect::<Vec<_>>());
+    for (tag, pid, nonce) in steps {
+        hard_reap(cgroups, tag, *pid, nonce.as_deref());
     }
 }
 
@@ -1295,10 +1346,10 @@ fn run_step(ctx: StepCtx) {
                     .iter()
                     .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
                     .collect();
-                for (other, other_pid, other_nonce) in others {
+                for (other, _other_pid, _other_nonce) in &others {
                     sh.aborted.insert(other.clone());
-                    reap(&cgroups, &other, other_pid, other_nonce.as_deref());
                 }
+                reap_many(&cgroups, &others);
             }
         }
         (was_aborted, cut_by_run_budget, reason)
@@ -1505,7 +1556,6 @@ pub fn run_dag_boxed_deadline(
             };
         }
     }
-    become_subreaper();
     if let Some(cg) = &cgroups {
         if !cg.enabled() {
             // No Silent Failure: a present-but-disabled manager means containment is degraded.

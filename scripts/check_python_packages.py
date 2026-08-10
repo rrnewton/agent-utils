@@ -116,8 +116,8 @@ PROJECTS: tuple[Project, ...] = (
         distribution="herdr-run",
         package="herdr_run",
         commands=("herdr-run", "herdr-agent"),
-        # herdr-run ALLOWLISTS `cargo` as a target program, so its docs must name it. herdr-run has
-        # no Rust implementation, so this is not a sibling-toolchain leak.
+        # The distribution allowlists `cargo` as a target program, so its docs must name it. This is
+        # user-visible subject matter, not a reference to the sibling implementation.
         doc_term_exemptions=("cargo",),
         resources=(
             "README.md",
@@ -287,15 +287,45 @@ def _source_resources(project: Project, source: Path) -> tuple[tuple[str, bytes]
             raise CheckError(
                 f"{project.distribution}: declared source resource is missing: {relative}"
             )
-        resources.append((relative, path.read_bytes()))
+        payload = path.read_bytes()
+        if Path(relative).suffix.lower() in {".md", ".rst"}:
+            try:
+                document = payload.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise CheckError(
+                    f"{project.distribution}: documentation resource {relative} is not UTF-8"
+                ) from exc
+            errors = _doc_violations(project, document)
+            if errors:
+                raise CheckError(
+                    f"{project.distribution}: documentation resource {relative} is not standalone: "
+                    f"{'; '.join(errors)}"
+                )
+        resources.append((relative, payload))
     return tuple(resources)
+
+
+def _unexpected_package_members(
+    names: set[str],
+    package_prefix: str,
+    source_modules: set[str],
+    resources: tuple[str, ...],
+) -> list[str]:
+    """Return shipped package members that are neither source nor declared resources."""
+
+    expected = source_modules | {f"{package_prefix}{resource}" for resource in resources}
+    return sorted(
+        name
+        for name in names
+        if name.startswith(package_prefix) and not name.endswith("/") and name not in expected
+    )
 
 
 def _doc_violations(project: Project, text: str) -> list[str]:
     errors: list[str] = []
-    foreign = _FOREIGN_DOC_TERMS.search(text)
-    if foreign is not None and foreign.group(0).lower() not in project.doc_term_exemptions:
-        errors.append(f"foreign-language term {foreign.group(0)!r}")
+    for foreign in _FOREIGN_DOC_TERMS.finditer(text):
+        if foreign.group(0).lower() not in project.doc_term_exemptions:
+            errors.append(f"foreign-language term {foreign.group(0)!r}")
     for description, pattern in _COMMON_DOC_TERMS:
         match = pattern.search(text)
         if match is not None:
@@ -456,6 +486,18 @@ def _inspect_sdist(project: Project, source: Path, archive: Path) -> None:
         missing = sorted(expected - set(by_name))
         if missing:
             raise CheckError(f"{project.distribution}: sdist is missing {missing}")
+        unexpected_documents = sorted(
+            member.name
+            for member in members
+            if member.isfile()
+            and Path(member.name).suffix.lower() in {".md", ".rst"}
+            and member.name not in expected
+        )
+        if unexpected_documents:
+            raise CheckError(
+                f"{project.distribution}: sdist contains undeclared documentation resources "
+                f"{unexpected_documents}"
+            )
         source_artifacts = (("LICENSE", (source / "LICENSE").read_bytes()), *source_resources)
         for artifact_relative, source_bytes in source_artifacts:
             name = f"{prefix}{artifact_relative}"
@@ -624,6 +666,14 @@ def _inspect_wheel(project: Project, wheel: Path) -> _WheelInspection:
             raise CheckError(
                 f"{project.distribution}: wheel modules differ from differential-tested source: "
                 f"{changed_modules}"
+            )
+        unexpected_package_members = _unexpected_package_members(
+            names, package_prefix, set(source_modules), project.resources
+        )
+        if unexpected_package_members:
+            raise CheckError(
+                f"{project.distribution}: wheel contains undeclared package resources "
+                f"{unexpected_package_members}"
             )
 
         documents: dict[str, str] = {}

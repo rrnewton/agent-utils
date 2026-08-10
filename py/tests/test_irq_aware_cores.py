@@ -65,7 +65,7 @@ def install_proc(
     monkeypatch: pytest.MonkeyPatch,
     *,
     interrupts: list[str | None],
-    stat: list[str],
+    stat: list[str | None],
 ) -> None:
     """Serve fixture text through the module's own ``/proc`` seam."""
     irq_iter = iter(interrupts)
@@ -127,7 +127,7 @@ def test_rates_are_derived_from_the_delta_not_the_absolute_count(
         stat=[],
     )
 
-    rates = cgroup.device_irq_rates(sample_s=0.0)
+    rates = cgroup.device_irq_rates(sample_s=0.001)
 
     # cpu0 has a huge cumulative count but no delta: it is quiet NOW.
     assert rates[0] == 0.0
@@ -160,7 +160,10 @@ def pick(
         interrupts=[before, after],
         stat=[stat_before, stat_after],
     )
-    return cgroup.pick_least_busy_free_cores(k, sample_s=0.0, max_irq_rate=max_irq_rate)
+    sample_s = 0.001 if max_irq_rate is not None else 0.0
+    return cgroup.pick_least_busy_free_cores(
+        k, sample_s=sample_s, max_irq_rate=max_irq_rate
+    )
 
 
 def test_interrupt_hot_cores_are_ranked_below_quiet_ones(
@@ -213,6 +216,27 @@ def test_ranking_degrades_to_idle_only_when_interrupts_are_unreadable(
     assert picked == [2, 3]
 
 
+def test_transient_first_stat_snapshot_failure_refuses_instead_of_crashing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1})
+    _before, after = stat_pair({0: 0.5, 1: 0.5}, ncpu=2)
+    install_proc(monkeypatch, interrupts=[None, None], stat=[None, after])
+
+    assert cgroup.pick_least_busy_free_cores(1, sample_s=0.0) == []
+
+
+def test_cpu_counter_rollback_excludes_that_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A hotplug/reset interval must not look like a perfectly idle CPU."""
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1})
+    before = "cpu0 10 0 0 90 0 0 0 0 0 0\ncpu1 10 0 0 90 0 0 0 0 0 0\n"
+    # CPU0's total and idle counters both moved backwards; CPU1 is a valid interval.
+    after = "cpu0 5 0 0 80 0 0 0 0 0 0\ncpu1 20 0 0 180 0 0 0 0 0 0\n"
+    install_proc(monkeypatch, interrupts=[None, None], stat=[before, after])
+
+    assert cgroup.pick_least_busy_free_cores(2, sample_s=0.0) == [1]
+
+
 # --------------------------------------------------------------------------- #
 # The opt-in budget.                                                            #
 # --------------------------------------------------------------------------- #
@@ -250,6 +274,35 @@ def test_max_irq_rate_refuses_when_the_signal_is_missing(
     )
 
     assert picked == []
+
+
+def test_max_irq_rate_refuses_zero_length_measurement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0})
+    assert cgroup.pick_least_busy_free_cores(
+        1, sample_s=0.0, max_irq_rate=10.0
+    ) == []
+
+
+def test_max_irq_rate_never_treats_an_unmeasured_core_as_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: {0, 1})
+    stat_before, stat_after = stat_pair({0: 0.5, 1: 0.9}, ncpu=2)
+    # The IRQ interface reports only CPU0. CPU1 is not certified quiet merely because its column
+    # is absent, even though its idle fraction would otherwise make it the preferred core.
+    irq_before = interrupts_text({}, ncpu=1)
+    irq_after = interrupts_text({}, ncpu=1)
+    install_proc(
+        monkeypatch,
+        interrupts=[irq_before, irq_after],
+        stat=[stat_before, stat_after],
+    )
+
+    assert cgroup.pick_least_busy_free_cores(
+        2, sample_s=0.001, max_irq_rate=10.0
+    ) == [0]
 
 
 def test_no_budget_is_the_default_so_allocation_never_fails_on_interrupts(

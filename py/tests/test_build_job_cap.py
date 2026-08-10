@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 from pathlib import Path
 
+from safe_ci_dag_runner import cgroup as cgroup_module
 from safe_ci_dag_runner.cgroup import Cgroups
 
 GIB = 1024**3
@@ -66,3 +68,33 @@ def test_cap_does_not_leak_into_runner_env(tmp_path: Path) -> None:
     cg = _boxed(tmp_path, cpu_max="28400000 100000", memory_max=str(8 * GIB))
     cg.prepare_command("s", "cargo build", cpu_count=4, mem_max=4 * GIB)
     assert "CARGO_BUILD_JOBS" not in os.environ
+
+
+def test_cgroup_tag_encoding_does_not_alias_distinct_steps() -> None:
+    assert cgroup_module._sanitize("a/b.j") != cgroup_module._sanitize("a_b.j")
+    assert cgroup_module._sanitize("a~2fb.j") != cgroup_module._sanitize("a/b.j")
+
+
+def test_failed_cgroup_migration_refuses_user_command(tmp_path: Path) -> None:
+    cg = _boxed(tmp_path, cpu_max="100000 100000", memory_max=str(4 * GIB))
+    marker = tmp_path / "user-command-ran"
+    wrapped = cg.prepare_command("g.j", f"touch {marker}")
+    # A plain temporary directory does not synthesize the kernel-owned roster file, so make the
+    # redirect fail the same way an unavailable/unwritable cgroup.procs would fail on cgroupfs.
+    (tmp_path / cgroup_module._sanitize("g.j") / "cgroup.procs").mkdir()
+
+    completed = subprocess.run(["bash", "-c", wrapped], check=False)
+
+    assert completed.returncode == 125
+    assert not marker.exists(), "the user command ran despite never joining its capped cgroup"
+
+
+def test_overlong_encoded_cgroup_name_is_rejected_before_user_command(tmp_path: Path) -> None:
+    cg = _boxed(tmp_path, cpu_max="100000 100000", memory_max=str(4 * GIB))
+    marker = tmp_path / "overlong-user-command-ran"
+    wrapped = cg.prepare_command("/" * 100, f"touch {marker}")
+
+    completed = subprocess.run(["bash", "-c", wrapped], check=False)
+
+    assert completed.returncode == 125
+    assert not marker.exists()

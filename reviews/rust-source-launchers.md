@@ -12,7 +12,7 @@ engine resolver verified their source and artifact provenance, but a direct
 older copied executable after source changed.
 
 Making each link execute its crate `main.rs` through `rust-script` was evaluated
-and rejected. All five paired-tool entrypoints delegate into library crates, while
+and rejected. All six paired-tool entrypoints delegate into library crates, while
 `rust-script` 0.36 decides whether to reuse its executable from the entrypoint
 script and generated manifest timestamps. A library/module change with an
 unchanged `main.rs` can consequently reuse stale code. Its generated package
@@ -20,7 +20,7 @@ also does not use the workspace's lockfile and profile as the package itself.
 
 ## Resolution
 
-- All five `rs/bin/<command>` paths are tracked links to one `cargo-runner`.
+- All six `rs/bin/<command>` paths are tracked links to one `cargo-runner`.
 - Every normal invocation asks Cargo to check the real locked release workspace
   cache, then replaces the launcher process with the resulting binary.
 - One checkout-wide lock outside `rs/target` serializes verification, cleanup,
@@ -39,9 +39,8 @@ also does not use the workspace's lockfile and profile as the package itself.
 - The differential harness revalidates provenance under the checkout lock, then
   uses its own immutable executable copy for the subprocess corpus.
 
-The tracked launchers are outside every crate archive. Cargo manifests and bin
-targets are unchanged, so registry packages still install ordinary standalone
-executables.
+The tracked launchers are outside every crate archive. Registry packages still
+install ordinary standalone executables declared by their Cargo manifests.
 
 ## Adversarial controls
 
@@ -62,12 +61,14 @@ prove that:
 10. a coordinated clean waits for an in-flight build and cannot remove the Cargo
     cache before the stable launch snapshot is published; and
 11. changes to nonignored, untracked Rust source invalidate the cache even when
-    modification times are preserved.
+    modification times are preserved; and
+12. a source-enumeration command that emits partial output and then fails cannot
+    bless or execute a cached binary.
 
 The provenance files are corruption and staleness controls, not cryptographic
 authentication. A process that can rewrite both ignored artifact bytes and their
 adjacent hashes is inside the checkout owner's trust boundary. The launcher does
 not claim to defend against that actor.
 
-The repository topology test additionally requires all five Rust command links
+The repository topology test additionally requires all six Rust command links
 to resolve to the executable tracked launcher.

@@ -8,8 +8,9 @@ callers can detect disabled containment, and failed enforcement writes emit warn
 
 from __future__ import annotations
 
+import math
 import os
-import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -50,6 +51,7 @@ EXPECTED_RUNTIME_MAX_ENV = "SAFE_CI_EXPECTED_RUNTIME_MAX_SEC"
 #: Per-step child cgroup directory prefix (also the scan key for the
 #: normal-exit backstop). cgroup-v2 directory names may not contain '/'.
 _STEP_PREFIX = "step-"
+_MAX_CGROUP_COMPONENT_BYTES = 255
 
 
 @dataclass(frozen=True)
@@ -160,11 +162,24 @@ def expected_outer_memory_max_bytes() -> int | None:
 
 
 def _sanitize(tag: str) -> str:
-    """A cgroup directory name for a step tag. cgroup-v2 names may not contain
-    '/'; keep it readable (``group.job`` -> ``step-group.job``) but strip
-    anything odd."""
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", tag)
-    return f"{_STEP_PREFIX}{safe}"
+    """An injective cgroup filename encoding for one UTF-8 step tag.
+
+    Replacing every unsafe character with ``_`` made distinct tags such as ``a/b.j`` and
+    ``a_b.j`` share one cgroup. A timeout or cleanup of either could therefore kill the other.
+    ``~HH`` escapes are reversible; ``~`` itself is escaped, so no two byte strings collide.
+    """
+    safe = bytearray()
+    for byte in tag.encode("utf-8"):
+        if (
+            ord("A") <= byte <= ord("Z")
+            or ord("a") <= byte <= ord("z")
+            or ord("0") <= byte <= ord("9")
+            or byte in b"._-"
+        ):
+            safe.append(byte)
+        else:
+            safe.extend(f"~{byte:02x}".encode("ascii"))
+    return f"{_STEP_PREFIX}{safe.decode('ascii')}"
 
 
 def _my_cgroup_path() -> Path | None:
@@ -1369,12 +1384,13 @@ def device_irq_rates(sample_s: float = 0.3) -> dict[int, float]:
     "no interrupts here" from "could not look". Reporting an absent signal as
     zero would let a restricted sandbox certify every core as interrupt-free.
     """
+    if not math.isfinite(sample_s) or sample_s <= 0:
+        return {}
     before = device_irq_counts()
     if not before:
         return {}
     start = time.monotonic()
-    if sample_s > 0:
-        time.sleep(sample_s)
+    time.sleep(sample_s)
     after = device_irq_counts()
     elapsed = time.monotonic() - start
     if not after or elapsed <= 0:
@@ -1384,7 +1400,8 @@ def device_irq_rates(sample_s: float = 0.3) -> dict[int, float]:
         second = after.get(cpu)
         if second is None:
             continue
-        rates[cpu] = max(0, second - first) / elapsed
+        if second >= first:
+            rates[cpu] = (second - first) / elapsed
     return rates
 
 
@@ -1429,6 +1446,11 @@ def pick_least_busy_free_cores(
     one. When set, cores above it are dropped before ranking, and fewer than
     ``k`` cores may be returned -- an observable shortfall the caller can act on
     rather than a silent downgrade."""
+    if k < 1 or not math.isfinite(sample_s) or sample_s < 0:
+        return []
+    if max_irq_rate is not None:
+        if not math.isfinite(max_irq_rate) or max_irq_rate < 0 or sample_s <= 0:
+            return []
     excluded = frozenset(int(c) for c in exclude)
     allowed = [c for c in sorted(os.sched_getaffinity(0)) if c not in excluded]
     if not allowed:
@@ -1463,8 +1485,8 @@ def pick_least_busy_free_cores(
     if irq_a and irq_b and elapsed > 0:
         for cpu, first in irq_a.items():
             second = irq_b.get(cpu)
-            if second is not None:
-                irq_rates[cpu] = max(0, second - first) / elapsed
+            if second is not None and second >= first:
+                irq_rates[cpu] = (second - first) / elapsed
 
     if max_irq_rate is not None:
         if not irq_rates:
@@ -1472,7 +1494,9 @@ def pick_least_busy_free_cores(
             # silent full-set fallback would report success for a guarantee
             # that was never checked.
             return []
-        allowed = [c for c in allowed if irq_rates.get(c, 0.0) <= max_irq_rate]
+        allowed = [
+            c for c in allowed if c in irq_rates and irq_rates[c] <= max_irq_rate
+        ]
         if not allowed:
             return []
     k = max(1, min(int(k), len(allowed)))
@@ -1482,13 +1506,16 @@ def pick_least_busy_free_cores(
         dt = b[c][1] - a[c][1]
         return di / dt if dt else 1.0
 
+    def valid_cpu_delta(c: int) -> bool:
+        return c in a and c in b and b[c][0] >= a[c][0] and b[c][1] >= a[c][1]
+
     # Interrupt rate leads; idle fraction breaks its ties; core id breaks those,
     # so the order is total and both engines agree exactly. When /proc/interrupts
     # is unreadable every rate is absent and this degrades to the historical
     # idle-fraction ranking.
     ranked = sorted(
-        (c for c in allowed if c in b),
-        key=lambda c: (irq_rates.get(c, 0.0), -idle_frac(c), c),
+        (c for c in allowed if valid_cpu_delta(c)),
+        key=lambda c: (c not in irq_rates, irq_rates.get(c, 0.0), -idle_frac(c), c),
     )
     return ranked[:k]
 
@@ -1696,14 +1723,23 @@ class Cgroups:
         invisible."""
         if not self.enabled or self.root is None:
             return cmd
-        child = self.root / _sanitize(tag)
+        encoded_tag = _sanitize(tag)
+        if len(encoded_tag.encode("ascii")) > _MAX_CGROUP_COMPONENT_BYTES:
+            return (
+                "echo 'ERROR: encoded step tag exceeds the cgroup filename limit; "
+                "refusing uncontained run' >&2\nexit 125\n"
+            )
+        child = self.root / encoded_tag
         try:
             child.mkdir(exist_ok=True)
             self._made.add(tag)
         except OSError as exc:
             _warn(self._naming, f"step {tag}: could not create child cgroup {child} "
-                  f"({exc}); step runs under the outer cap only")
-            return cmd
+                  f"({exc}); refusing to run without the requested per-step cgroup")
+            return (
+                "echo 'ERROR: step cgroup could not be created; refusing uncontained run' >&2\n"
+                "exit 125\n"
+            )
         try:
             # Every step is swapless, including uncharacterized ones without an
             # inner memory.max, so host-side swap policy never selects a step
@@ -1762,10 +1798,17 @@ class Cgroups:
         procs = child / "cgroup.procs"
         # $$ is the bash leader's own pid. Writing it migrates the leader; every
         # subsequently-forked child/grandchild inherits this cgroup at fork.
-        # The self-move is best-effort in the shell (`|| true`): if it fails the
-        # step still runs and the outer-scope reaper remains the backstop.
-        # Errors are redirected so a delegation hiccup can't corrupt stdout.
-        return f'echo $$ > {procs} 2>/dev/null || true\nexport CARGO_BUILD_JOBS={jobs}\n{cmd}'
+        # A cap on an empty child is not containment. The migration is therefore fail-closed: if
+        # the shell cannot join the exact cgroup whose limits were verified above, do not execute
+        # the user command and do not claim those limits governed it.
+        quoted_procs = shlex.quote(str(procs))
+        return (
+            f"if ! printf '%s\\n' \"$$\" 2>/dev/null > {quoted_procs}; then\n"
+            "  echo 'ERROR: step could not join its safe-ci cgroup; refusing uncontained run' >&2\n"
+            "  exit 125\n"
+            "fi\n"
+            f"export CARGO_BUILD_JOBS={jobs}\n{cmd}"
+        )
 
     def oom_kills(self, tag: str) -> int:
         """OOM-kill event count inside the step's cgroup (``memory.events``

@@ -26,10 +26,11 @@ high-priority findings below were fixed in both implementations before this repo
   cache, and lock files use `0600`. A pre-existing configured spool directory is never chmoded,
   including `spool_dir: .`, and final audit/spool symlinks are not followed. The shell wrapper also
   sets `umask 077`.
-- Every Herdr/systemd control subprocess has a 30-second bound. Both process transports launch a
-  fresh process group and kill the group on timeout; Python reaps and drains its direct child, and
-  Rust drains both pipes concurrently before reaping. Invalid subprocess bytes are decoded with
-  replacement in both ports.
+- Every Herdr/systemd control subprocess has an explicit bound. Ordinary control calls use 30
+  seconds; an interactive-agent working wait uses its requested timeout plus a small shutdown
+  margin. Both process transports launch a fresh process group and kill the group on timeout;
+  Python reaps and drains its direct child, and Rust drains both pipes concurrently before
+  reaping. Invalid subprocess bytes are decoded with replacement in both ports.
 - Command/readiness timeouts have one shared one-year maximum at configuration, CLI, and public
   library boundaries. NaN, infinity, negative, and huge finite values can no longer become an
   infinite wait or differ between ports. A timeout preserves partial output and the spool path.
@@ -65,10 +66,13 @@ high-priority findings below were fixed in both implementations before this repo
   admitted fetch may execute ambient helpers and is therefore a deliberate trust widening.
 - The fake Herdr implementation moved out of the Python distribution into tests. Python and Rust
   package artifacts contain only their own implementation and standalone language-specific docs.
+- Process-reaping evidence now requires the recorded boot to equal the live boot even when a pane
+  shell is already absent. Boolean/malformed process identities and conflicting shell incarnations
+  for one pane yield unknown rather than reusing the first convenient identity as stale evidence.
 
 ## Executable evidence
 
-The black-box differential currently exercises 105 paired cases covering startup/help/version and
+The black-box `herdr-run` differential currently exercises 106 paired cases covering startup/help/version and
 argument parsing, command tokenization/rendering and policy refusal, successful and malformed
 configuration, option placement, dry-run JSON/text output, audit JSONL, control-character classes,
 Unicode, Cargo opt-in guards, and stable exit behavior. The repository contract runs it through
@@ -78,15 +82,15 @@ Lifecycle behavior is also pinned independently in both unit suites: account-glo
 and pane-lock concurrency, cache validation, split-pane refusal, readiness, control-process timeout,
 private filesystem modes, byte capture, collision-safe spools, and metadata/audit degradation.
 Package checks build and install each wheel/sdist and crate archive in isolation before exercising
-its installed command and embedded guide. The focused completion run passed 311 Python cases, 86
-Rust tests, strict Clippy, and all 105 paired differential cases.
+its installed commands and embedded guides. The follow-up completion run passed 111 Rust crate
+tests, strict Clippy, all 106 `herdr-run` paired cases, and all 50 `herdr-agent` paired cases.
 
 ## Deliberate limitations
 
 The differential does not inject a fake executable through `PATH`: production resolution rejects
 that override by design, and a test hook in the shipped command would weaken the provenance rule it
 is meant to test. Therefore live Herdr lifecycle/protocol/concurrency parity is evidenced by
-corresponding deterministic unit scenarios, not by the 105 black-box cases. A future external test
+corresponding deterministic unit scenarios, not by the 106 black-box cases. A future external test
 environment with an isolated account and real Herdr server can add end-to-end differential coverage
 without adding a production bypass.
 

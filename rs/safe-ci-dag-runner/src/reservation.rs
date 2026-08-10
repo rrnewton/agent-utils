@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,23 +34,37 @@ struct Record {
 impl Record {
     fn from_value(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
-        let pid = value_u64(obj.get("pid")?)? as u32;
-        let starttime = match obj.get("starttime") {
-            Some(Value::Null) | None => None,
-            Some(v) => value_u64(v),
+        let raw_pid = value_u64(obj.get("pid")?)?;
+        let pid = u32::try_from(raw_pid).ok().filter(|pid| *pid > 0)?;
+        let starttime = match obj.get("starttime")? {
+            Value::Null => None,
+            value => Some(value_u64(value).filter(|starttime| *starttime > 0)?),
         };
-        let cores = obj
-            .get("cores")?
-            .as_array()?
+        let raw_cores = obj.get("cores")?.as_array()?;
+        if raw_cores.is_empty() {
+            return None;
+        }
+        let cores: Vec<usize> = raw_cores
             .iter()
-            .filter_map(|v| value_u64(v).map(|n| n as usize))
-            .collect();
-        let tag = value_text(obj.get("tag")).unwrap_or_default();
-        let ts = match obj.get("ts") {
-            Some(Value::Number(n)) => n.as_f64().unwrap_or(0.0),
-            Some(Value::String(s)) => s.parse().unwrap_or(0.0),
-            _ => 0.0,
+            .map(|value| {
+                let core = value_u64(value)?;
+                if core > u64::from(u32::MAX) {
+                    return None;
+                }
+                usize::try_from(core).ok()
+            })
+            .collect::<Option<_>>()?;
+        if cores.iter().copied().collect::<HashSet<_>>().len() != cores.len() {
+            return None;
+        }
+        let tag = obj.get("tag")?.as_str()?.to_string();
+        let ts = match obj.get("ts")? {
+            Value::Number(number) => number.as_f64()?,
+            _ => return None,
         };
+        if !ts.is_finite() || ts < 0.0 {
+            return None;
+        }
         Some(Self {
             pid,
             starttime,
@@ -84,16 +99,6 @@ impl Record {
 fn value_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse().ok(),
-        _ => None,
-    }
-}
-
-fn value_text(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Number(n)) => Some(n.to_string()),
-        Some(Value::Bool(v)) => Some(v.to_string()),
         _ => None,
     }
 }
@@ -151,8 +156,11 @@ impl LedgerLock {
             .read(true)
             .write(true)
             .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&lock_path)
             .map_err(|e| format!("open ledger lock {}: {e}", lock_path.display()))?;
+        validate_private_regular(&file, &lock_path)?;
         // SAFETY: flock operates on this live file descriptor and does not retain a pointer.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(format!(
@@ -165,6 +173,25 @@ impl LedgerLock {
     }
 }
 
+fn validate_private_regular(file: &File, path: &Path) -> Result<(), String> {
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("inspect {}: {e}", path.display()))?;
+    // SAFETY: geteuid has no preconditions and does not access memory.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_file() || metadata.uid() != uid || metadata.nlink() != 1 {
+        return Err(format!(
+            "{} is not an owned, single-link regular file",
+            path.display()
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("make {} private: {e}", path.display()))?;
+    }
+    Ok(())
+}
+
 impl Drop for LedgerLock {
     fn drop(&mut self) {
         // SAFETY: the descriptor remains valid until `file` is dropped after this method.
@@ -172,21 +199,54 @@ impl Drop for LedgerLock {
     }
 }
 
-fn load(path: &Path) -> Vec<Record> {
+fn load(path: &Path) -> Result<Vec<Record>, String> {
     let mut text = String::new();
-    if File::open(path)
-        .and_then(|mut f| f.read_to_string(&mut text))
-        .is_err()
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
     {
-        return Vec::new();
-    }
-    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "open reservation ledger {}: {error}",
+                path.display()
+            ))
+        }
     };
-    root.get("reservations")
+    validate_private_regular(&file, path)?;
+    file.read_to_string(&mut text)
+        .map_err(|e| format!("read reservation ledger {}: {e}", path.display()))?;
+    let Value::Object(root) = serde_json::from_str::<Value>(&text)
+        .map_err(|e| format!("reservation ledger {} is corrupt: {e}", path.display()))?
+    else {
+        return Err(format!(
+            "reservation ledger {} root must be an object",
+            path.display()
+        ));
+    };
+    let items = root
+        .get("reservations")
         .and_then(Value::as_array)
-        .map(|items| items.iter().filter_map(Record::from_value).collect())
-        .unwrap_or_default()
+        .ok_or_else(|| {
+            format!(
+                "reservation ledger {} has no reservations list",
+                path.display()
+            )
+        })?;
+    items
+        .iter()
+        .map(|item| {
+            Record::from_value(item).ok_or_else(|| {
+                format!(
+                    "reservation ledger {} has an invalid record",
+                    path.display()
+                )
+            })
+        })
+        .collect()
 }
 
 fn store(path: &Path, records: &[Record]) -> Result<(), String> {
@@ -204,7 +264,13 @@ fn store(path: &Path, records: &[Record]) -> Result<(), String> {
             std::process::id(),
             attempt
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&temp)
+        {
             Ok(file) => {
                 created = Some((temp, file));
                 break;
@@ -252,7 +318,7 @@ impl Reservation {
             return Ok(());
         }
         let _lock = LedgerLock::acquire(&self.ledger)?;
-        let kept: Vec<Record> = load(&self.ledger)
+        let kept: Vec<Record> = load(&self.ledger)?
             .into_iter()
             .filter(|r| {
                 !(r.pid == self.pid
@@ -293,13 +359,21 @@ pub fn acquire(
     if !sample_s.is_finite() || sample_s < 0.0 {
         return Err(format!("sample_s must be finite and >= 0, got {sample_s}"));
     }
+    if let Some(limit) = max_irq_rate {
+        if !limit.is_finite() || limit < 0.0 {
+            return Err(format!("max_irq_rate must be finite and >= 0, got {limit}"));
+        }
+        if sample_s <= 0.0 {
+            return Err("sample_s must be > 0 when max_irq_rate is set".to_string());
+        }
+    }
     let path = ledger
         .map(Path::to_path_buf)
         .unwrap_or_else(default_ledger_path);
     let pid = std::process::id();
     let starttime = proc_starttime(pid);
     let _lock = LedgerLock::acquire(&path)?;
-    let (live, _) = sweep(load(&path));
+    let (live, _) = sweep(load(&path)?);
     let mut held = exclude.clone();
     for record in &live {
         held.extend(record.cores.iter().copied());
@@ -347,7 +421,7 @@ pub fn reclaim_dead(ledger: Option<&Path>) -> Result<Vec<Value>, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(default_ledger_path);
     let _lock = LedgerLock::acquire(&path)?;
-    let (live, dead) = sweep(load(&path));
+    let (live, dead) = sweep(load(&path)?);
     if !dead.is_empty() {
         store(&path, &live)?;
     }
@@ -360,7 +434,7 @@ pub fn held_cores(ledger: Option<&Path>) -> Result<Vec<usize>, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(default_ledger_path);
     let _lock = LedgerLock::acquire(&path)?;
-    let (live, dead) = sweep(load(&path));
+    let (live, dead) = sweep(load(&path)?);
     if !dead.is_empty() {
         store(&path, &live)?;
     }
@@ -377,6 +451,14 @@ pub fn held_cores(ledger: Option<&Path>) -> Result<Vec<usize>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    fn fifo(path: &Path) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: path is a live NUL-terminated string for this call.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
 
     fn temp_ledger(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -408,6 +490,93 @@ mod tests {
                 .expect_err("invalid sample window must be rejected");
             assert!(error.contains("sample_s must be finite and >= 0"));
         }
+        let error = acquire(1, "unit", 0.0, Some(&path), &HashSet::new(), Some(10.0))
+            .expect_err("an IRQ budget needs a nonzero measurement window");
+        assert!(error.contains("sample_s must be > 0"));
+    }
+
+    #[test]
+    fn corrupt_and_special_ledgers_fail_closed() {
+        let corrupt = temp_ledger("corrupt");
+        let corrupt_lock = PathBuf::from(format!("{}.lock", corrupt.display()));
+        let _ = fs::remove_file(&corrupt);
+        let _ = fs::remove_file(&corrupt_lock);
+        fs::write(&corrupt, "{").unwrap();
+        fs::set_permissions(&corrupt, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(held_cores(Some(&corrupt))
+            .expect_err("corrupt state must fail")
+            .contains("corrupt"));
+
+        let fifo_ledger = temp_ledger("fifo-ledger");
+        let fifo_ledger_lock = PathBuf::from(format!("{}.lock", fifo_ledger.display()));
+        let _ = fs::remove_file(&fifo_ledger);
+        let _ = fs::remove_file(&fifo_ledger_lock);
+        fifo(&fifo_ledger);
+        assert!(held_cores(Some(&fifo_ledger)).is_err());
+
+        let fifo_lock_ledger = temp_ledger("fifo-lock");
+        let fifo_lock = PathBuf::from(format!("{}.lock", fifo_lock_ledger.display()));
+        let _ = fs::remove_file(&fifo_lock_ledger);
+        let _ = fs::remove_file(&fifo_lock);
+        fifo(&fifo_lock);
+        assert!(held_cores(Some(&fifo_lock_ledger)).is_err());
+
+        let _ = fs::remove_file(corrupt);
+        let _ = fs::remove_file(corrupt_lock);
+        let _ = fs::remove_file(fifo_ledger);
+        let _ = fs::remove_file(fifo_ledger_lock);
+        let _ = fs::remove_file(fifo_lock);
+    }
+
+    #[test]
+    fn invalid_record_schema_is_rejected_without_coercion() {
+        let valid = serde_json::json!({
+            "pid": 1,
+            "starttime": 1,
+            "cores": [0],
+            "tag": "holder",
+            "ts": 1.0,
+        });
+        assert!(Record::from_value(&valid).is_some());
+
+        let invalid = [
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [0, "bad"], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [-1], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [4294967296_u64], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [true], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [1.0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [1, 1], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 0, "starttime": 1, "cores": [0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 4294967296_u64, "starttime": 1, "cores": [0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": true, "starttime": 1, "cores": [0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"starttime": 1, "cores": [0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "cores": [0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 0, "cores": [0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": "1", "cores": [0], "tag": "holder", "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [0], "tag": 7, "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [0], "ts": 1.0}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [0], "tag": "holder"}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [0], "tag": "holder", "ts": "1.0"}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [0], "tag": "holder", "ts": true}),
+            serde_json::json!({"pid": 1, "starttime": 1, "cores": [0], "tag": "holder", "ts": -1}),
+        ];
+        assert!(invalid
+            .iter()
+            .all(|value| Record::from_value(value).is_none()));
+
+        let path = temp_ledger("invalid-schema-preserved");
+        let lock = PathBuf::from(format!("{}.lock", path.display()));
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&lock);
+        let original = r#"{"reservations":[{"pid":1,"starttime":1,"cores":[0,"bad"],"tag":"holder","ts":1.0}]}"#;
+        fs::write(&path, original).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(held_cores(Some(&path)).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(lock);
     }
 
     #[test]

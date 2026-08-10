@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "herdr-run"
 version = "0.2.0"
-description = "Run allowlisted commands in a Herdr terminal pane outside an AI agent's sandbox, with real exit codes."
+description = "Run allowlisted commands and durably message interactive agents through Herdr panes."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

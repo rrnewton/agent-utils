@@ -180,7 +180,11 @@ def cmd_run(args: argparse.Namespace) -> int:
             max_irq_rate=args.max_irq_rate,
         ) as cores:
             return _run_reserved_hard(cores, cmd, tag=args.tag, prog=f"{PROG}: run")
-    except (ValueError, reservation.InsufficientCoresError) as exc:
+    except (
+        ValueError,
+        reservation.InsufficientCoresError,
+        reservation.ReservationStateError,
+    ) as exc:
         print(f"{PROG}: run: {exc}", file=sys.stderr)
         return 3
 
@@ -189,7 +193,11 @@ def cmd_status(args: argparse.Namespace) -> int:
     """``status``: print the live held cores and every current reservation
     (dead holders swept first, so the answer reflects reality not leaks)."""
     ledger = Path(args.ledger) if args.ledger else None
-    held = reservation.held_cores(ledger=ledger)
+    try:
+        held = reservation.held_cores(ledger=ledger)
+    except reservation.ReservationStateError as exc:
+        print(f"{PROG}: status: {exc}", file=sys.stderr)
+        return 3
     out = {"held_cores": held, "held_count": len(held)}
     print(json.dumps(out, indent=2))
     return 0
@@ -199,7 +207,11 @@ def cmd_reclaim(args: argparse.Namespace) -> int:
     """``reclaim``: sweep the ledger and drop records whose holder crashed;
     print the reclaimed records (the leaked-reservation recovery path)."""
     ledger = Path(args.ledger) if args.ledger else None
-    dead = reservation.reclaim_dead(ledger=ledger)
+    try:
+        dead = reservation.reclaim_dead(ledger=ledger)
+    except reservation.ReservationStateError as exc:
+        print(f"{PROG}: reclaim: {exc}", file=sys.stderr)
+        return 3
     print(json.dumps({"reclaimed": dead, "reclaimed_count": len(dead)}, indent=2))
     return 0
 
@@ -367,7 +379,10 @@ def cmd_selftest(args: argparse.Namespace) -> int:
 
     try:
         with reservation.reserve_cores(
-            args.cores, tag="selftest", sample_s=args.sample_s
+            args.cores,
+            tag="selftest",
+            sample_s=args.sample_s,
+            max_irq_rate=args.max_irq_rate,
         ) as cores:
             result = _probe_hard_pin(cores)
             print(json.dumps(result, indent=2))
@@ -375,7 +390,11 @@ def cmd_selftest(args: argparse.Namespace) -> int:
             if verdict == "HARD":
                 return 0
             return 1 if verdict == "SOFT_OR_INERT" else 3
-    except (ValueError, reservation.InsufficientCoresError) as exc:
+    except (
+        ValueError,
+        reservation.InsufficientCoresError,
+        reservation.ReservationStateError,
+    ) as exc:
         print(f"{PROG}: selftest: {exc}", file=sys.stderr)
         return 3
 
@@ -438,6 +457,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not hasattr(args, "func"):
         parser.print_help()
         return 0
+    if (
+        getattr(args, "max_irq_rate", None) is not None
+        and getattr(args, "sample_s", 0.0) <= 0
+    ):
+        parser.error("--sample-s must be > 0 when --max-irq-rate is set")
     func = args.func
     result = func(args)
     return int(result)

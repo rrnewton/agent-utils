@@ -172,6 +172,20 @@ class PackageLink:
 
 
 STANDALONE_DOCUMENTS: tuple[StandaloneDocument, ...] = (
+    # This guide is shared byte-for-byte by both herdr-run packages. Linting it under both rule
+    # sets ensures it contains neither edition's package-manager or implementation language.
+    StandaloneDocument(
+        tool="herdr-run",
+        document="AGENT_USER_GUIDE",
+        language="python",
+        source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
+    ),
+    StandaloneDocument(
+        tool="herdr-run",
+        document="AGENT_USER_GUIDE",
+        language="rust",
+        source="common/docs/herdr-run/AGENT_USER_GUIDE.md",
+    ),
     StandaloneDocument(
         tool="agent-team-timeline",
         document="README",
@@ -214,6 +228,14 @@ def _package_links() -> tuple[PackageLink, ...]:
         )
     links.extend(
         (
+            PackageLink(
+                "py/herdr_run/AGENT_USER_GUIDE.md",
+                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+            ),
+            PackageLink(
+                "rs/herdr-run/src/embedded_agent_userguide.md",
+                "common/docs/herdr-run/AGENT_USER_GUIDE.md",
+            ),
             PackageLink(
                 "py/agent_team_timeline/README.md",
                 "common/docs/agent-team-timeline/README.md",

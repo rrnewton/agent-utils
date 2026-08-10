@@ -190,6 +190,16 @@ whose owning process is dead. Enforcement is fail-closed: the exact reserved set
 must become the effective cgroup cpuset. A process-affinity mask is not accepted
 because a descendant can replace it.
 
+The ledger path is `SAFE_CI_CORE_LEDGER` when that variable is set. Otherwise it
+is `$XDG_RUNTIME_DIR/safe-ci-dag-runner/core-reservations.json` when the runtime
+directory exists, or
+`<system-temporary-directory>/safe-ci-dag-runner-<uid>/core-reservations.json`.
+Serialization uses the private sibling `core-reservations.json.lock`; both
+commands use the same files. A crashed holder is identified by PID plus process
+start time and reclaimed by the next ledger operation, so the state records live
+ownership rather than a permanent allocation. Unsafe, foreign, non-regular, or
+malformed state is refused instead of ignored.
+
 `pin-run` creates a transient `AllowedCPUs` scope and mutation-checks it before
 launch. `run --cores K` changes only the runner's own verified scope, so it fails
 with a capability result when combined with `--allow-cgroup-failure` or

@@ -49,12 +49,15 @@ not block a legitimate publication.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import json
+import math
 import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -182,12 +185,173 @@ def lock_path() -> Path:
     """One lock per uid per host, so every hooked checkout contends on it."""
     override = os.environ.get(LOCK_ENV)
     if override:
-        return Path(override)
-    return Path(f"/tmp/agent-utils-main-write-{os.getuid()}.lock")
+        return Path(os.path.abspath(override))
+    return Path("/tmp") / f"agent-utils-main-write-{os.getuid()}" / "writer.lock"
 
 
 def receipt_path(lock: Path) -> Path:
     return lock.with_name(lock.name + ".receipt")
+
+
+def _private_parent_fd(path: Path, *, create: bool) -> int | None:
+    """Open the state directory without following its final component.
+
+    The default lives directly below sticky ``/tmp``.  A hostile uid may win
+    the name race, but it cannot make an object pass the owner and mode checks.
+    Overrides receive the same validation and therefore must name a file in an
+    already-private directory (or one whose immediate parent can be created).
+    """
+    parent = path.parent
+    if create:
+        try:
+            os.mkdir(parent, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise WriteRefused(
+                f"cannot create private writer-state directory {parent}: {error}"
+            ) from error
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(parent, flags)
+    except FileNotFoundError:
+        if not create:
+            return None
+        raise WriteRefused(f"writer-state directory {parent} disappeared") from None
+    except OSError as error:
+        raise WriteRefused(
+            f"cannot safely open writer-state directory {parent}: {error}"
+        ) from error
+    metadata = os.fstat(fd)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or mode != 0o700
+    ):
+        os.close(fd)
+        raise WriteRefused(
+            f"writer-state directory {parent} must be an owned mode-0700 directory"
+        )
+    return fd
+
+
+def _open_private_file_at(
+    parent_fd: int, name: str, *, create: bool, writable: bool
+) -> int | None:
+    """Open and validate one private regular state file relative to ``parent_fd``."""
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise WriteRefused(f"invalid writer-state filename {name!r}")
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | os.O_NOFOLLOW | os.O_CLOEXEC
+    flags |= os.O_NONBLOCK
+    if create:
+        flags |= os.O_CREAT
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            return None
+        raise WriteRefused(f"writer-state file {name} disappeared") from None
+    except OSError as error:
+        raise WriteRefused(f"cannot safely open writer-state file {name}: {error}") from error
+    metadata = os.fstat(fd)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or mode != 0o600
+    ):
+        os.close(fd)
+        raise WriteRefused(
+            f"writer-state file {name} must be an owned, single-link mode-0600 regular file"
+        )
+    return fd
+
+
+def _read_private_receipt(path: Path) -> str:
+    parent_fd = _private_parent_fd(path, create=False)
+    if parent_fd is None:
+        raise WriteRefused(f"writer receipt {path} is unreadable")
+    fd = -1
+    try:
+        opened = _open_private_file_at(parent_fd, path.name, create=False, writable=False)
+        if opened is None:
+            raise WriteRefused(f"writer receipt {path} is unreadable")
+        fd = opened
+        chunks: list[bytes] = []
+        remaining = 16_385
+        while remaining:
+            chunk = os.read(fd, min(remaining, 4096))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > 16_384:
+            raise WriteRefused(f"writer receipt {path} is unreasonably large")
+        try:
+            return payload.decode("utf-8")
+        except UnicodeError as error:
+            raise WriteRefused(f"writer receipt {path} is not UTF-8") from error
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
+
+
+def _write_private_receipt(path: Path, payload: str) -> None:
+    """Atomically replace a receipt without ever opening the old path."""
+    parent_fd = _private_parent_fd(path, create=True)
+    assert parent_fd is not None
+    temp_name = f".{path.name}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+    fd = -1
+    installed = False
+    try:
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+            | os.O_NONBLOCK
+        )
+        try:
+            fd = os.open(temp_name, flags, 0o600, dir_fd=parent_fd)
+        except OSError as error:
+            raise WriteRefused(f"cannot create private writer receipt: {error}") from error
+        metadata = os.fstat(fd)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise WriteRefused("new writer receipt is not a private owned regular file")
+        encoded = payload.encode("utf-8")
+        view = memoryview(encoded)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:  # pragma: no cover - os.write either progresses or raises
+                raise WriteRefused("short write while creating writer receipt")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temp_name, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        installed = True
+        os.fsync(parent_fd)
+    except OSError as error:
+        raise WriteRefused(f"cannot install private writer receipt {path}: {error}") from error
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not installed:
+            try:
+                os.unlink(temp_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
 
 
 @dataclass(frozen=True)
@@ -224,11 +388,15 @@ class Receipt:
         started = raw.get("started")
         if not isinstance(token, str) or not token:
             raise WriteRefused("writer receipt has no token")
-        if not isinstance(pid, int):
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
             raise WriteRefused("writer receipt has no holder pid")
         if not isinstance(expect, str) or not _SHA_RE.match(expect):
             raise WriteRefused("writer receipt has no fetched-origin SHA")
-        if not isinstance(started, (int, float)):
+        if (
+            isinstance(started, bool)
+            or not isinstance(started, (int, float))
+            or not math.isfinite(float(started))
+        ):
             raise WriteRefused("writer receipt has no start time")
         return Receipt(token=token, pid=pid, expect=expect, started=float(started))
 
@@ -276,21 +444,27 @@ def lock_is_held(lock: Path) -> bool:
     Probing by trying to take it is the only honest answer: a recorded pid or a
     'locked' marker file would be a proxy for a lock rather than the lock.
     """
-    if not lock.exists():
+    parent_fd = _private_parent_fd(lock, create=False)
+    if parent_fd is None:
         return False
+    fd = -1
     try:
-        handle = open(lock, "a+")
-    except OSError:
-        return False
-    try:
+        opened = _open_private_file_at(parent_fd, lock.name, create=False, writable=True)
+        if opened is None:
+            return False
+        fd = opened
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                raise WriteRefused(f"cannot probe writer lock {lock}: {error}") from error
             return True
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        fcntl.flock(fd, fcntl.LOCK_UN)
         return False
     finally:
-        handle.close()
+        if fd >= 0:
+            os.close(fd)
+        os.close(parent_fd)
 
 
 class WriterLock:
@@ -305,20 +479,36 @@ class WriterLock:
         self._path = lock
         self._handle: object = None
         self._fd = -1
+        self._parent_fd = -1
 
     def __enter__(self) -> "WriterLock":
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(self._path, "a+")
+        parent_fd = _private_parent_fd(self._path, create=True)
+        assert parent_fd is not None
+        try:
+            opened = _open_private_file_at(
+                parent_fd, self._path.name, create=True, writable=True
+            )
+            assert opened is not None
+            try:
+                handle = os.fdopen(opened, "r+")
+            except BaseException:
+                os.close(opened)
+                raise
+        except BaseException:
+            os.close(parent_fd)
+            raise
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             handle.close()
+            os.close(parent_fd)
             raise WriteRefused(
                 f"another agent-utils main writer owns {self._path}; "
                 "wait for it to finish rather than pushing around it"
             ) from error
         self._handle = handle
         self._fd = handle.fileno()
+        self._parent_fd = parent_fd
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -328,14 +518,15 @@ class WriterLock:
             except OSError:
                 pass
         handle = self._handle
-        if isinstance(handle, int):  # pragma: no cover - defensive
-            return
         if handle is not None and hasattr(handle, "close"):
             close = getattr(handle, "close")
             if callable(close):
                 close()
         self._handle = None
         self._fd = -1
+        if self._parent_fd >= 0:
+            os.close(self._parent_fd)
+        self._parent_fd = -1
 
 
 def verify_receipt(lock: Path, *, expected_remote: str, hook_pid: int) -> Receipt:
@@ -348,12 +539,10 @@ def verify_receipt(lock: Path, *, expected_remote: str, hook_pid: int) -> Receip
             f"`python3 scripts/main_write.py publish` (never --no-verify)"
         )
     path = Path(recorded)
-    if path.resolve() != receipt_path(lock).resolve():
+    expected_path = receipt_path(lock)
+    if os.path.abspath(path) != os.path.abspath(expected_path):
         raise WriteRefused(f"writer receipt {path} does not name {receipt_path(lock)}")
-    try:
-        receipt = Receipt.from_text(path.read_text())
-    except OSError as error:
-        raise WriteRefused(f"writer receipt {path} is unreadable") from error
+    receipt = Receipt.from_text(_read_private_receipt(path))
     if not secrets.compare_digest(receipt.token, token):
         raise WriteRefused("writer receipt token does not match this operation")
     if not lock_is_held(lock):
@@ -396,7 +585,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
             token=secrets.token_hex(16), pid=os.getpid(), expect=expect, started=time.time()
         )
         target = receipt_path(lock)
-        target.write_text(receipt.to_json())
+        _write_private_receipt(target, receipt.to_json())
         os.environ[TOKEN_ENV] = receipt.token
         os.environ[RECEIPT_ENV] = str(target)
         try:
@@ -423,11 +612,27 @@ def cmd_hook_pre_push(args: argparse.Namespace) -> int:
     hook_pid = os.getpid()
     checked = 0
     allowed_non_main = 0
-    for line in sys.stdin.read().splitlines():
+    for line_number, line in enumerate(sys.stdin.read().splitlines(), start=1):
         fields = line.split()
         if len(fields) != 4:
-            continue
+            raise WriteRefused(
+                f"malformed pre-push record on line {line_number}: expected 4 fields, "
+                f"found {len(fields)}"
+            )
         _local_ref, local_sha, remote_ref, remote_sha = fields
+        if not _SHA_RE.match(local_sha) or not _SHA_RE.match(remote_sha):
+            raise WriteRefused(
+                f"malformed pre-push record on line {line_number}: "
+                "object IDs must be 40 lowercase hexadecimal characters"
+            )
+        checked_ref = _run(
+            ("git", "-C", str(root), "check-ref-format", remote_ref), check=False
+        )
+        if checked_ref.returncode != 0:
+            raise WriteRefused(
+                f"malformed pre-push record on line {line_number}: "
+                f"invalid remote ref {remote_ref!r}"
+            )
         if remote_ref != MAIN_REF:
             # Feature branches and PR heads are ordinary work. Refusing them
             # would make the guard worse than the gap it closes.
@@ -471,13 +676,19 @@ def _open_pull_requests(repository: str) -> list[dict[str, object]]:
         ),
         timeout=DEFAULT_NETWORK_TIMEOUT,
     )
-    raw: object = json.loads(result.stdout or "[]")
+    try:
+        raw: object = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise WriteUnverifiable(f"gh returned malformed PR JSON: {error.msg}") from error
     if not isinstance(raw, list):
         raise WriteUnverifiable("gh returned a non-list PR payload")
     out: list[dict[str, object]] = []
-    for item in raw:
-        if isinstance(item, dict):
-            out.append(item)
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise WriteUnverifiable(
+                f"gh returned a non-object PR payload item at index {index}"
+            )
+        out.append(item)
     return out
 
 

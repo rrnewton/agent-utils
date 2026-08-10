@@ -55,7 +55,7 @@ findings are recorded in `reviews/herdr-run.md` and `reviews/rust-source-launche
    resource is now byte-compared with its authoritative source, direct and sdist-rebuilt wheels must
    agree, and a deliberately corrupted `timeline-core.js` wheel proves the check fails closed.
 9. The repository dispatcher and dependency smoke test omitted the packaged `cpuset-alloc` companion
-   command. `./bin/cpuset-alloc` now shares the tracked resolver, and all six Python entry-point
+   command. `./bin/cpuset-alloc` now shares the tracked resolver, and all seven Python entry-point
    commands receive the dependency-free startup probes.
 10. `safe_ci_dag_runner.analyze` mixed a stable public `summarize` library helper with an undeclared
     Python-only `main()`. Removing the module would break the package API, so the helper remains
@@ -64,12 +64,16 @@ findings are recorded in `reviews/herdr-run.md` and `reviews/rust-source-launche
     console entry point.
 11. `herdr-run` arrived as a standalone Python change while this audit was in flight. It now has an
     independent Rust crate and binary, a Python distribution, shared templates with standalone
-    rendered editions, isolated artifact checks, 105-case behavioral differential, and a dedicated
+    rendered editions, isolated artifact checks, 106-case behavioral differential, and a dedicated
     adversarial review.
-12. Copied binaries under `rs/bin` could remain stale after source changed. All five paths are now
+12. Copied binaries under `rs/bin` could remain stale after source changed. The initial five paths are now
     tracked links to one source-aware Cargo launcher with locked provenance validation and stable
     content-addressed execution snapshots. Published crate binaries remain ordinary `cargo install`
     targets.
+13. `herdr-agent` was package-published only from the Python distribution and bypassed the command
+    inventory, common docs, Rust launcher, dependency smoke, and differential. It is now the sixth
+    paired command, shares one installed guide across packages, and has native artifact and
+    black-box parity checks.
 
 ## Executable evidence
 
@@ -80,7 +84,7 @@ make check-rust-packages
 make cross
 ```
 
-The documentation check covers 16 rendered paired documents, two authoritative single-language
-documents, and 27 exact package links. Artifact checks cover five wheels, five sdists, five wheels
+The documentation check covers 16 rendered paired documents, four standalone document checks,
+and 29 exact package links. Artifact checks cover five wheels, five sdists, five wheels
 rebuilt from sdists, and four registry crates. The repository CI additionally runs the full test,
 strict typing, formatting, Clippy, Python 3.10, and Rust 1.85 contracts.

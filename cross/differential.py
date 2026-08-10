@@ -62,6 +62,7 @@ import signal
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -70,6 +71,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from herdr_agent_differential import compare_herdr_agent
 from herdr_differential import compare_herdr_run
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +126,7 @@ class Outcome:
     returncode: int
     stdout: str
     stderr: str
+    elapsed_s: float = 0.0
 
 
 @dataclass
@@ -275,6 +278,10 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
     env["PYTHONPATH"] = os.path.join(REPO_ROOT, "py") + os.pathsep + env.get("PYTHONPATH", "")
     # Deterministic, color-free output regardless of the runner's TTY state.
     env["NO_COLOR"] = "1"
+    # Rust and Python both support explicit evidence, but an ambient caller setting must not make
+    # unrelated differential cases write into one shared directory or gain extra banners.
+    env.pop("SAFE_CI_DAG_RUNNER_LOG_DIR", None)
+    env.pop("SAFE_CI_DAG_RUNNER_NO_STEP_LOGS", None)
     if extra:
         env.update(extra)
     return env
@@ -283,6 +290,7 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
 def run(
     cmd: Sequence[str], args: Sequence[str], extra_env: Mapping[str, str] | None = None
 ) -> Outcome:
+    started = time.monotonic()
     try:
         proc = subprocess.run(
             [*cmd, *args],
@@ -296,8 +304,8 @@ def run(
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return Outcome(124, stdout, stderr + "\nTIMEOUT after 120 seconds")
-    return Outcome(proc.returncode, proc.stdout, proc.stderr)
+        return Outcome(124, stdout, stderr + "\nTIMEOUT after 120 seconds", time.monotonic() - started)
+    return Outcome(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -994,7 +1002,7 @@ def compare_run_timeout(py: list[str], rs: list[str], rep: Report) -> None:
 
 
 def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
-    """Both builds must FINISH a step whose child outlives the kill, and agree on the outcome.
+    """Both builds must FINISH and REAP a step whose child escapes its process group.
 
     THE CASE THIS COVERS, AND WHY ITS ABSENCE MATTERED. Every other `run` comparison here uses a
     step that dies when its process group is signalled, so all of them exercise the easy teardown
@@ -1006,10 +1014,10 @@ def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
     the suite reported full agreement across every fixture while the two runners behaved differently
     on the one behaviour that decides whether the system can report on its own failures.
 
-    WHAT IS ASSERTED. Both builds must return the SAME exit status, and neither may hit the harness
-    timeout. The second half is the load-bearing one: `run` turns its own 120s expiry into exit 124,
-    so a build that blocks forever is observable rather than fatal to the suite -- but only if the
-    check refuses 124 explicitly. Comparing exit codes alone would pass the day BOTH builds hang.
+    WHAT IS ASSERTED. Both builds must return the SAME exit status, neither may hit the harness
+    timeout, AND the exact recorded escapee pid must be gone before fixture cleanup runs. The last
+    assertion is load-bearing: merely closing the runner's pipe and returning would still pass an
+    exit-code comparison while leaking work onto the host.
 
     The escapee bounds itself with a short sleep and is also killed by recorded pid afterwards, so
     the fixture cannot leak a process onto a shared machine even if a build leaves it running.
@@ -1050,11 +1058,15 @@ def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
             return pid_file, run(cmd, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
 
         pid_files: list[str] = []
+        survivors: dict[str, bool | None] = {}
         try:
             pf, po = _case("py", py)
             pid_files.append(pf)
+            survivors["py"] = _recorded_pid_alive(pf)
+            _kill_recorded_pid(pf)
             pf, ro = _case("rs", rs)
             pid_files.append(pf)
+            survivors["rs"] = _recorded_pid_alive(pf)
         finally:
             for pf in pid_files:
                 _kill_recorded_pid(pf)
@@ -1072,8 +1084,219 @@ def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
         elif po.returncode == 0:
             rep.bad(label, "a step killed at its wall budget must not report success")
+        elif any(state is None for state in survivors.values()):
+            rep.bad(label, f"fixture did not record both escapee pids: {survivors}")
+        elif any(state for state in survivors.values()):
+            leaked = "/".join(name for name, alive in survivors.items() if alive)
+            rep.bad(label, f"{leaked} returned while its recorded setsid escapee was still alive")
         else:
             rep.ok(label)
+
+
+def compare_term_attribution(py: list[str], rs: list[str], rep: Report) -> None:
+    """A timed-out step gets a bounded SIGTERM opportunity to identify its in-flight work."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "dag.json")
+        marker = "TERM_ATTRIBUTION_MARKER"
+        with open(dag_path, "w", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "steps": [
+                            {
+                                "group": "timeout",
+                                "job": "reports_term",
+                                "cmd": (
+                                    f"trap 'printf {marker}\\n >&2; exit 0' TERM; "
+                                    "while :; do sleep 1; done"
+                                ),
+                                "timeout": 2,
+                                "cpu_timeout": 600,
+                            }
+                        ]
+                    }
+                )
+            )
+        args = (
+            "run",
+            "--dag",
+            dag_path,
+            "-q",
+            "-j",
+            "1",
+            NOPROF,
+            NOFB,
+            "--unsafe-no-cgroups",
+        )
+        po, ro = run(py, args), run(rs, args)
+        combined = {"py": po.stdout + po.stderr, "rs": ro.stdout + ro.stderr}
+        label = "term-attribution"
+        blocked = [name for name, out in (("py", po), ("rs", ro)) if out.returncode == 124]
+        missing = [name for name, output in combined.items() if marker not in output]
+        if blocked:
+            rep.bad(label, f"{'/'.join(blocked)} did not return after its wall timeout")
+        elif po.returncode != ro.returncode:
+            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+        elif po.returncode == 0:
+            rep.bad(label, "a step that exceeded its wall budget reported success")
+        elif missing:
+            rep.bad(label, f"{'/'.join(missing)} suppressed the timed-out step's SIGTERM marker")
+        elif max(po.elapsed_s, ro.elapsed_s) >= 4.0:
+            rep.bad(
+                label,
+                "a cooperative SIGTERM exit consumed the full grace instead of stopping early: "
+                f"py={po.elapsed_s:.3f}s rs={ro.elapsed_s:.3f}s",
+            )
+        else:
+            rep.ok(label)
+
+
+def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report) -> None:
+    """Explicit evidence and test-level culprit attribution are paired public behavior."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "attribution.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "tests",
+                            "job": "suite",
+                            "cmd": (
+                                "printf '##TEST-START suite::alpha\\n'; "
+                                "printf '##TEST-END suite::alpha ok\\n'; "
+                                "printf '##TEST-START suite::gamma_the_hang\\n'; "
+                                "trap 'exit 0' TERM; while :; do sleep 1; done"
+                            ),
+                            "timeout": 2,
+                            "cpu_timeout": 600,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        dirs = {name: os.path.join(tmp, name) for name in ("py", "rs")}
+        args = (
+            "run",
+            "--dag",
+            dag_path,
+            "-q",
+            "-j",
+            "1",
+            NOPROF,
+            NOFB,
+            "--unsafe-no-cgroups",
+        )
+        outcomes = {
+            "py": run(py, args, {"SAFE_CI_DAG_RUNNER_LOG_DIR": dirs["py"]}),
+            "rs": run(rs, args, {"SAFE_CI_DAG_RUNNER_LOG_DIR": dirs["rs"]}),
+        }
+        phrase = "culprit test suite::gamma_the_hang"
+        if any(out.returncode == 0 or phrase not in out.stdout + out.stderr for out in outcomes.values()):
+            rep.bad("attribution:culprit", f"py={outcomes['py']}\nrs={outcomes['rs']}")
+        else:
+            rep.ok("attribution:culprit")
+
+        def normalized(directory: str) -> list[tuple[str, str, str, str, str, str]]:
+            rows = [
+                json.loads(line)
+                for line in Path(directory, "journal.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            return [
+                (
+                    str(row.get("event", "")),
+                    str(row.get("step", "")),
+                    str(row.get("test", "")),
+                    str(row.get("verdict", "")),
+                    str(row.get("tests_started", "")),
+                    str(row.get("tests_completed", "")),
+                )
+                for row in rows
+                if row.get("event") in {"test_start", "test_end", "step_end"}
+            ]
+
+        try:
+            py_rows, rs_rows = normalized(dirs["py"]), normalized(dirs["rs"])
+            logs = {
+                name: Path(directory, "tests.suite.log").read_text(encoding="utf-8")
+                for name, directory in dirs.items()
+            }
+            private = all(
+                stat.S_IMODE(Path(directory, filename).stat().st_mode) == 0o600
+                for directory in dirs.values()
+                for filename in ("journal.jsonl", "tests.suite.log")
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            rep.bad("attribution:evidence", str(exc))
+        else:
+            if py_rows != rs_rows:
+                rep.bad("attribution:evidence", f"journal py={py_rows!r} rs={rs_rows!r}")
+            elif not private or any("suite::gamma_the_hang" not in log for log in logs.values()):
+                rep.bad("attribution:evidence", f"private={private} logs={logs!r}")
+            else:
+                rep.ok("attribution:evidence")
+
+
+def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> None:
+    """Eager cancellation grants one diagnostic window, not one window per sibling."""
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "batch-grace.json")
+        steps: list[dict[str, object]] = [
+            {
+                "group": "batch",
+                "job": "fails",
+                "cmd": "sleep 0.5; false",
+                "timeout": 20,
+                "cpu_timeout": 600,
+            }
+        ]
+        steps.extend(
+            {
+                "group": "batch",
+                "job": f"resists_{index}",
+                "cmd": "trap '' TERM; sleep 30",
+                "timeout": 20,
+                "cpu_timeout": 600,
+            }
+            for index in range(4)
+        )
+        Path(dag_path).write_text(json.dumps({"steps": steps}), encoding="utf-8")
+        args = (
+            "run",
+            "--dag",
+            dag_path,
+            "-q",
+            "-j",
+            "5",
+            NOPROF,
+            NOFB,
+            "--unsafe-no-cgroups",
+        )
+        po, ro = run(py, args), run(rs, args)
+        if po.returncode == ro.returncode != 0 and max(po.elapsed_s, ro.elapsed_s) < 9.0:
+            rep.ok("teardown:shared-batch-grace")
+        else:
+            rep.bad(
+                "teardown:shared-batch-grace",
+                f"exit py={po.returncode} rs={ro.returncode}; "
+                f"elapsed py={po.elapsed_s:.3f}s rs={ro.elapsed_s:.3f}s",
+            )
+
+
+def _recorded_pid_alive(pid_file: str) -> bool | None:
+    """Whether the exact fixture pid still exists as a non-zombie; None means no pid was recorded."""
+    try:
+        with open(pid_file, encoding="utf-8") as fh:
+            pid = int(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    close = stat.rfind(")")
+    return close >= 0 and stat[close + 2 :].split()[0] != "Z"
 
 
 def _kill_recorded_pid(pid_file: str) -> None:
@@ -2553,6 +2776,9 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
     compare_escapee_teardown(py, rs, rep)
+    compare_term_attribution(py, rs, rep)
+    compare_test_attribution_evidence(py, rs, rep)
+    compare_batch_teardown_grace(py, rs, rep)
     compare_run_timeout(py, rs, rep)
     compare_profile_store(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
@@ -2594,6 +2820,7 @@ def py_command_for(tool: str) -> list[str]:
         "tick-hub": "tick_hub",
         "pr-landing-planner": "pr_landing_planner",
         "herdr-run": "herdr_run",
+        "herdr-agent": "herdr_run.agent_cli",
     }
     module = modules.get(tool)
     if module is None:
@@ -2703,6 +2930,28 @@ def compare_cpuset_alloc() -> int:
             else:
                 rep.ok(f"schema:{engine}/{' '.join(args) or 'no-args'}")
 
+    invalid_budget_cases: tuple[tuple[str, ...], ...] = (
+        (
+            "run",
+            "--cores",
+            "1",
+            "--sample-s",
+            "0",
+            "--max-irq-rate",
+            "1",
+            "--",
+            "true",
+        ),
+        ("selftest", "--sample-s", "0", "--max-irq-rate", "1"),
+    )
+    for budget_args in invalid_budget_cases:
+        po, ro = run(py, budget_args), run(rs, budget_args)
+        detail = "--sample-s must be > 0 when --max-irq-rate is set"
+        if po.returncode == ro.returncode == 2 and detail in po.stderr and detail in ro.stderr:
+            rep.ok(f"irq-budget:nonzero-sample:{budget_args[0]}")
+        else:
+            rep.bad(f"irq-budget:nonzero-sample:{budget_args[0]}", f"py={po}\nrs={ro}")
+
     selftest_args = ("selftest", "--cores", "1", "--sample-s", "0")
     py_selftest = run(py, selftest_args)
     rs_selftest = run(rs, selftest_args)
@@ -2738,6 +2987,88 @@ def compare_cpuset_alloc() -> int:
                 rep.bad(
                     f"{subcommand}:empty-ledger",
                     f"py={po.returncode}:{p_value!r}; rs={ro.returncode}:{r_value!r}",
+                )
+
+        Path(py_ledger).write_text("{", encoding="utf-8")
+        Path(rs_ledger).write_text("{", encoding="utf-8")
+        po = run(py, ("status", "--ledger", py_ledger))
+        ro = run(rs, ("status", "--ledger", rs_ledger))
+        if (
+            po.returncode == ro.returncode == 3
+            and "corrupt" in po.stderr
+            and "corrupt" in ro.stderr
+        ):
+            rep.ok("status:corrupt-ledger-fails-closed")
+        else:
+            rep.bad("status:corrupt-ledger-fails-closed", f"py={po}\nrs={ro}")
+
+        fifo_outcomes: dict[str, Outcome] = {}
+        for engine, command in (("py", py), ("rs", rs)):
+            fifo_ledger = os.path.join(tmp, f"{engine}-fifo.json")
+            os.mkfifo(fifo_ledger, mode=0o600)
+            fifo_outcomes[engine] = run(command, ("status", "--ledger", fifo_ledger))
+        if all(out.returncode == 3 and out.elapsed_s < 2.0 for out in fifo_outcomes.values()):
+            rep.ok("status:fifo-ledger-nonblocking-refusal")
+        else:
+            rep.bad("status:fifo-ledger-nonblocking-refusal", repr(fifo_outcomes))
+
+        base_record: dict[str, object] = {
+            "pid": 1,
+            "starttime": 1,
+            "cores": [0],
+            "tag": "holder",
+            "ts": 1.0,
+        }
+
+        def changed(**fields: object) -> dict[str, object]:
+            return {**base_record, **fields}
+
+        def missing_field(field: str) -> dict[str, object]:
+            record = dict(base_record)
+            del record[field]
+            return record
+
+        invalid_records = {
+            "mixed-core": changed(cores=[0, "bad"]),
+            "missing-cores": missing_field("cores"),
+            "empty-cores": changed(cores=[]),
+            "negative-core": changed(cores=[-1]),
+            "overflow-core": changed(cores=[1 << 32]),
+            "boolean-core": changed(cores=[True]),
+            "fractional-core": changed(cores=[1.0]),
+            "duplicate-core": changed(cores=[1, 1]),
+            "zero-pid": changed(pid=0),
+            "overflow-pid": changed(pid=1 << 32),
+            "boolean-pid": changed(pid=True),
+            "missing-pid": missing_field("pid"),
+            "missing-starttime": missing_field("starttime"),
+            "zero-starttime": changed(starttime=0),
+            "string-starttime": changed(starttime="1"),
+            "overflow-starttime": changed(starttime=1 << 64),
+            "non-string-tag": changed(tag=7),
+            "missing-tag": missing_field("tag"),
+            "missing-ts": missing_field("ts"),
+            "nonfinite-ts": changed(ts=float("inf")),
+            "string-ts": changed(ts="1.0"),
+            "boolean-ts": changed(ts=True),
+            "negative-ts": changed(ts=-1),
+        }
+        for case, record in invalid_records.items():
+            original = json.dumps({"reservations": [record]})
+            outcomes: dict[str, Outcome] = {}
+            preserved = True
+            for engine, command in (("py", py), ("rs", rs)):
+                path = os.path.join(tmp, f"invalid-{case}-{engine}.json")
+                Path(path).write_text(original, encoding="utf-8")
+                os.chmod(path, 0o600)
+                outcomes[engine] = run(command, ("status", "--ledger", path))
+                preserved = preserved and Path(path).read_text(encoding="utf-8") == original
+            if all(outcome.returncode == 3 for outcome in outcomes.values()) and preserved:
+                rep.ok(f"schema:{case}-fails-closed")
+            else:
+                rep.bad(
+                    f"schema:{case}-fails-closed",
+                    f"preserved={preserved}; outcomes={outcomes!r}",
                 )
 
         # A parent-owned record is live from both child processes' perspective.
@@ -3865,6 +4196,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "tick-hub",
             "pr-landing-planner",
             "herdr-run",
+            "herdr-agent",
             "all",
         ),
     )
@@ -3884,12 +4216,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         return compare_pr_landing_planner(rand_count, seed)
     if tool == "herdr-run":
         return compare_herdr_run(py_command_for(tool), rs_command(tool))
+    if tool == "herdr-agent":
+        return compare_herdr_agent(py_command_for(tool), rs_command(tool))
     results = (
         compare_safe_ci_dag_runner(rand_count, seed),
         compare_cpuset_alloc(),
         compare_tick_hub(rand_count, seed),
         compare_pr_landing_planner(rand_count, seed),
         compare_herdr_run(py_command_for("herdr-run"), rs_command("herdr-run")),
+        compare_herdr_agent(py_command_for("herdr-agent"), rs_command("herdr-agent")),
     )
     return 1 if any(results) else 0
 

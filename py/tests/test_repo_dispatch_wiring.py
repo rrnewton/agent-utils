@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import stat
 import subprocess
 import sys
@@ -17,6 +18,7 @@ RUST_TOOLS = (
     "tick-hub",
     "pr-landing-planner",
     "herdr-run",
+    "herdr-agent",
 )
 PYTHON_ONLY_TOOLS = (
     "agent-team-timeline",
@@ -42,6 +44,32 @@ def test_tracked_tool_links_share_the_engine_resolver() -> None:
         link = common_bin / tool
         assert link.is_symlink(), tool
         assert link.readlink() == Path("engine-resolver"), tool
+
+
+def test_package_manifests_and_source_dispatchers_have_the_same_command_inventory() -> None:
+    """A newly published console command cannot bypass local launch and parity topology."""
+
+    python_commands: set[str] = set()
+    for manifest in sorted((REPO_ROOT / "py").glob("*/pyproject.toml")):
+        text = manifest.read_text(encoding="utf-8")
+        scripts = re.search(
+            r"(?ms)^\[project\.scripts\]\s*$\n(?P<body>.*?)(?=^\[|\Z)", text
+        )
+        assert scripts is not None, manifest
+        python_commands.update(
+            match.group(1)
+            for match in re.finditer(r"(?m)^([A-Za-z0-9-]+)\s*=", scripts.group("body"))
+        )
+    assert python_commands == set(RESOLVER_TOOLS)
+
+    rust_commands: set[str] = set()
+    for manifest in sorted((REPO_ROOT / "rs").glob("*/Cargo.toml")):
+        text = manifest.read_text(encoding="utf-8")
+        for target in re.finditer(r"(?ms)^\[\[bin\]\]\s*$\n(?P<body>.*?)(?=^\[|\Z)", text):
+            name = re.search(r'(?m)^name\s*=\s*"([^"]+)"\s*$', target.group("body"))
+            assert name is not None, manifest
+            rust_commands.add(name.group(1))
+    assert rust_commands == set(RUST_TOOLS)
 
 
 def test_tracked_python_launchers_are_directly_executable() -> None:
