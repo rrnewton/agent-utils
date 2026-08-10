@@ -139,10 +139,7 @@ fn levels_bound_success_but_never_hide_failure() {
         "level-5 failure replay lost test identity: {detail}"
     );
 
-    let (code, split_stream, _) = run(
-        &fixture.split_stream_dag(),
-        &["-v", "-v", "-v", "-v"],
-    );
+    let (code, split_stream, _) = run(&fixture.split_stream_dag(), &["-v", "-v", "-v", "-v"]);
     assert_eq!(code, 0, "{split_stream}");
     assert!(
         split_stream.contains("[g.split][test=g.split] stderr raced after stdout marker"),
