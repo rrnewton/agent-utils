@@ -110,6 +110,10 @@ struct Shared {
 fn kill_group(pid: u32) {
     let _ = Command::new("kill")
         .arg("-KILL")
+        // A negative pid names a process group, but without the option terminator GNU kill may
+        // parse it as another option. That silently left the group leader alive while the later
+        // descendant sweep killed only its blocking child, allowing the shell to continue.
+        .arg("--")
         .arg(format!("-{pid}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
