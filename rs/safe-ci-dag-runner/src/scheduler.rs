@@ -143,6 +143,26 @@ fn signal_pid(pid: u32, signal: i32) -> bool {
     unsafe { libc::kill(pid, signal) == 0 }
 }
 
+/// A live process's group from one Linux `/proc/PID/stat` record.
+///
+/// The parenthesized command may contain spaces and parentheses, so fields are interpreted only
+/// after its final `)`. Zombies deliberately return `None`: their group leader cannot be
+/// wait-reaped until the supervisor regains control, and treating it as live would spend the whole
+/// diagnostic grace after a cooperative SIGTERM exit.
+fn live_process_group_from_stat(stat: &str) -> Option<u32> {
+    let close = stat.rfind(')')?;
+    // Fields after comm begin at field 3: state, ppid, pgrp.
+    let mut fields = stat[close + 1..].split_whitespace();
+    let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    if state == "Z" {
+        return None;
+    }
+    pgrp.parse::<u32>().ok()
+}
+
 /// Requested process groups containing at least one non-zombie process.
 ///
 /// `kill(-pgid, 0)` succeeds for an unreaped zombie group leader. The supervisor cannot reap that
@@ -158,19 +178,7 @@ fn live_process_groups(groups: &HashSet<u32>) -> Option<HashSet<u32>> {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
             continue;
         };
-        let Some(close) = stat.rfind(')') else {
-            continue;
-        };
-        // Fields after comm begin at field 3: state, ppid, pgrp.
-        let mut fields = stat[close + 1..].split_whitespace();
-        let (Some(state), Some(_ppid), Some(pgrp)) = (fields.next(), fields.next(), fields.next())
-        else {
-            continue;
-        };
-        if state == "Z" {
-            continue;
-        }
-        let Ok(pgrp) = pgrp.parse::<u32>() else {
+        let Some(pgrp) = live_process_group_from_stat(&stat) else {
             continue;
         };
         if groups.contains(&pgrp) {
@@ -1626,6 +1634,20 @@ mod tests {
     use super::*;
     use crate::model::ResourceHint;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn proc_stat_parser_excludes_zombies_from_the_term_grace() {
+        assert_eq!(
+            live_process_group_from_stat("123 (worker ) with parens) Z 1 777 0 0"),
+            None
+        );
+        assert_eq!(
+            live_process_group_from_stat("456 (worker ) with parens) S 1 888 0 0"),
+            Some(888)
+        );
+        assert_eq!(live_process_group_from_stat("malformed"), None);
+        assert_eq!(live_process_group_from_stat("1 (x) S 0 nope"), None);
+    }
 
     fn step(
         group: &str,

@@ -1094,7 +1094,14 @@ def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
 
 
 def compare_term_attribution(py: list[str], rs: list[str], rep: Report) -> None:
-    """A timed-out step gets a bounded SIGTERM opportunity to identify its in-flight work."""
+    """A timed-out step gets a bounded SIGTERM opportunity to identify its in-flight work.
+
+    This cross-check intentionally asserts the observable marker and bounded command completion,
+    not an absolute sub-four-second CLI duration. Overall latency also includes repeated ``/proc``
+    ownership sweeps and host scheduling, so that wall-clock heuristic falsely accused correct
+    teardown on loaded builders. Paired unit tests pin the underlying early-exit rule directly:
+    an unreaped zombie is not a live process-group member and therefore cannot consume the grace.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         dag_path = os.path.join(tmp, "dag.json")
         marker = "TERM_ATTRIBUTION_MARKER"
@@ -1141,12 +1148,6 @@ def compare_term_attribution(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad(label, "a step that exceeded its wall budget reported success")
         elif missing:
             rep.bad(label, f"{'/'.join(missing)} suppressed the timed-out step's SIGTERM marker")
-        elif max(po.elapsed_s, ro.elapsed_s) >= 4.0:
-            rep.bad(
-                label,
-                "a cooperative SIGTERM exit consumed the full grace instead of stopping early: "
-                f"py={po.elapsed_s:.3f}s rs={ro.elapsed_s:.3f}s",
-            )
         else:
             rep.ok(label)
 

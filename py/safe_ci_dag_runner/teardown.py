@@ -119,6 +119,27 @@ def _kill_descendants(root: int) -> int:
     return len(killed)
 
 
+def _live_process_group_from_stat(stat: str) -> int | None:
+    """Return a live process's group from one Linux ``/proc/PID/stat`` record.
+
+    The parenthesized command may itself contain spaces and parentheses, so fields must be
+    interpreted only after the final ``)``.  Zombies deliberately return ``None``: their group
+    leader cannot be wait-reaped until the supervisor regains control, and treating that leader as
+    live would spend the whole diagnostic grace after a cooperative SIGTERM exit.
+    """
+    close = stat.rfind(")")
+    if close < 0:
+        return None
+    fields = stat[close + 2 :].split()
+    # fields begin at proc field 3: state, ppid, pgrp.
+    if len(fields) < 3 or fields[0] == "Z":
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
+
+
 def _live_process_groups(pgids: set[int]) -> set[int] | None:
     """Return requested groups containing a non-zombie process.
 
@@ -144,16 +165,8 @@ def _live_process_groups(pgids: set[int]) -> set[int] | None:
             stat = Path(f"/proc/{entry}/stat").read_text(encoding="utf-8")
         except OSError:
             continue
-        close = stat.rfind(")")
-        if close < 0:
-            continue
-        fields = stat[close + 2 :].split()
-        # fields begin at proc field 3: state, ppid, pgrp.
-        if len(fields) < 3 or fields[0] == "Z":
-            continue
-        try:
-            pgrp = int(fields[2])
-        except ValueError:
+        pgrp = _live_process_group_from_stat(stat)
+        if pgrp is None:
             continue
         if pgrp in pgids:
             live.add(pgrp)
