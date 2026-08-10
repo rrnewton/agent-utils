@@ -261,6 +261,14 @@ class DagConfig:
     default_step_mem_cap_bytes: int | None = DEFAULT_SMALL_MEM_CAP_BYTES
     default_step_cpu_count: int | None = DEFAULT_SMALL_CPU_COUNT
     default_step_cpu_timeout: int = DEFAULT_SMALL_CPU_TIMEOUT
+    # Tags (``group.job``) whose FAILURE is a DECLARED known-failure: it is reported and named
+    # loudly but does NOT flip the run's aggregate verdict, so one persistently-flaky node (e.g.
+    # a host-dependent test) can't invalidate every other step's validate record. Derived from a
+    # declared file (see :func:`safe_ci_dag_runner.io.load_known_failures`); NEVER silent — the
+    # scheduler names each excluded failure at runtime and the loader names what it loaded. A
+    # non-allowlisted failure still fails the run, and an allowlisted step that PASSES is
+    # unaffected (membership is consulted only on failure). Empty by default (fail-closed).
+    known_failures: frozenset[str] = frozenset()
 
     def by_tag(self) -> dict[str, Step]:
         """Index configured steps by their stable tags."""
