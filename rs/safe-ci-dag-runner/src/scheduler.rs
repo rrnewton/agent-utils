@@ -44,7 +44,8 @@ use crate::attribution::{
 use crate::cgroup::CgroupManager;
 use crate::model::{
     canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, preferred_inner_jobs,
-    scale_cpu_timeout, step_classification, DagConfig, RunResult, Step, StepOutcome,
+    scale_cpu_timeout, step_classification, write_domain_violations, DagConfig, RunResult, Step,
+    StepOutcome,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -1878,6 +1879,23 @@ pub fn run_dag_boxed_deadline(
     core_budget: Option<i64>,
     run_timeout_s: Option<i64>,
 ) -> RunResult {
+    let domain_errors = write_domain_violations(cfg);
+    if !domain_errors.is_empty() {
+        eprintln!(
+            "[scheduler] ERROR: REFUSING to run before any node starts: write-domain policy \
+             violation(s): {}",
+            domain_errors.join("; ")
+        );
+        return RunResult {
+            ok: false,
+            wall_s: 0.0,
+            outcomes: Vec::new(),
+            skipped: Vec::new(),
+            intentional_skips: Vec::new(),
+            step_profile_rows: Vec::new(),
+            run_timed_out: false,
+        };
+    }
     if let Some(limit) = run_timeout_s.filter(|s| *s > 0) {
         let bad = steps_violating_run_timeout(cfg, limit);
         if !bad.is_empty() {
@@ -2113,6 +2131,8 @@ mod tests {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }
     }
 
@@ -2339,6 +2359,37 @@ mod tests {
         // A cap of 1 must serialize the two: their run intervals cannot overlap.
         assert!(ends["one"] <= starts["two"] || ends["two"] <= starts["one"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_domain_policy_refuses_before_spawning() {
+        let dir = std::env::temp_dir().join(format!(
+            "scdr_write_domain_preexec_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let mut cfg = DagConfig {
+            steps: vec![step(
+                "g",
+                "writer",
+                &format!("touch {}", marker.display()),
+                &[],
+                0.0,
+                &[],
+            )],
+            ..Default::default()
+        };
+        cfg.write_domain_policy.require_explicit = true;
+        cfg.write_domain_policy
+            .allowed_domains
+            .insert("target-ci".to_string());
+        let result = run_dag(&cfg, 1, false, 0);
+        assert!(!result.ok);
+        assert!(result.outcomes.is_empty());
+        assert!(!marker.exists(), "policy refusal happened after the node wrote");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

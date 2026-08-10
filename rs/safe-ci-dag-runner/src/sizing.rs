@@ -470,6 +470,8 @@ mod tests {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         }
     }
 
@@ -556,6 +558,8 @@ mod tests {
             cpu_timeout: 0,
             jobs_flag: None,
             skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
         };
         assert_eq!(step_mem_cap_bytes(&s, 1.25, None), Some(9 * GIB));
     }

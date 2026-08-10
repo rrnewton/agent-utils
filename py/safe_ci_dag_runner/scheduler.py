@@ -39,6 +39,7 @@ from safe_ci_dag_runner.model import (
     scale_cpu_timeout,
     preferred_inner_jobs,
     step_classification,
+    write_domain_violations,
 )
 from safe_ci_dag_runner.profile_enrich import (
     resolve_effective_inner_jobs,
@@ -938,6 +939,14 @@ def run_dag(
         a bound whose breach cannot be attributed to a node reads like enforcement without being
         usable as one.
     """
+    domain_errors = write_domain_violations(cfg)
+    if domain_errors:
+        print(
+            "[scheduler] ERROR: REFUSING to run before any node starts: "
+            "write-domain policy violation(s): " + "; ".join(domain_errors),
+            file=sys.stderr,
+        )
+        return RunResult(ok=False, wall_s=0.0)
     if (run_timeout_s or 0) > 0:
         assert run_timeout_s is not None
         bad = steps_violating_run_timeout(cfg, run_timeout_s)
