@@ -19,13 +19,15 @@ web server.
 - Phrase, paragraph, cultivated work-summary, condensed-transcript, and rendered Markdown views.
 - Separate technical and newcomer-oriented plain-language summaries for selected hours, days,
   weeks, months, and quarters, with an in-modal audience switch.
-- A durable newcomer project overview and model-backed glossary definitions, each bounded by
-  immutable retained source evidence, with append-stable availability and verified links from
-  recognized terms.
+- A durable newcomer project overview and fail-closed glossary boundary: retired mechanical
+  definition artifacts remain auditable, but unclassified candidate strings never become prompt
+  context or rendered links.
 - A linked site title grounded in structured repository metadata, with durable multi-project and
   multi-host identity plus explicit provenance.
 - Versioned content-addressed model caches, a logical-key artifact catalog with context-quality
   scores, append-only raw-log snapshots, and immutable run receipts.
+- A read-only query CLI with stable team, agent, work-phase, and rollup references, JSON/JSONL
+  output, time/team filters, relationship traversal, and summary or transcript search.
 - A self-contained static website served by a built-in loopback server, with no CDN dependency.
 
 Install from the package index:
@@ -47,6 +49,9 @@ cd ./timelines/example-team
 make serve
 # in another shell, inspect every run and the exact model-token ledger
 make run-stats
+# or navigate the same archive without a browser
+make query
+make query QUERY_ARGS='search "reproducible build" --scope all --limit 10'
 ```
 
 Use `refresh-claude --session-file SESSION.jsonl` for a Claude lineage or

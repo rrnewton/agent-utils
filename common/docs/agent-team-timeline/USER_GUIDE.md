@@ -44,12 +44,11 @@ do not require site changes.
 - Explicit GitHub pull-request URLs and `owner/repository#number` references become safe links in
   work summaries and transcripts. Ambiguous naked `#number` text stays plain unless importer input
   supplies repository context for that exact message.
-- **Project glossary** opens the all-time terminology catalog. Exact, known glossary names in
-  rendered summaries become links such as `#glossary/term-name-digest`. The renderer creates links
-  only from IDs present in `timeline.json` and rejects duplicate or malformed targets, so model
-  output cannot create a hallucinated glossary destination. The catalog begins with one durable
-  newcomer project overview; every term shows its model-backed definition separately from the
-  quoted first-use evidence that constrained it.
+- **Project glossary** is reserved for the all-time semantic concept catalog. The renderer accepts
+  only supported, evidence-backed semantic concepts and never accepts model-authored link targets.
+  During the semantic migration, definition-only records remain in the immutable cache for
+  provenance and cost accounting, but they are not publication authority: a zero-token build leaves
+  the catalog empty rather than link unclassified strings.
 
 The browser is self-contained SVG/HTML/CSS/JavaScript. A pinned MIT-licensed `markdown-it` browser
 bundle renders summary headings, lists, tables, blockquotes, and code with raw HTML disabled.
@@ -236,7 +235,7 @@ Each stable time window gets a content-addressed cache key over:
 
 - its transcript input;
 - the substantial ancestor/coordinator scroll-back window;
-- only glossary terms available by that point in history;
+- supported semantic concepts available by that point in history (currently empty);
 - model, reasoning effort, optional service tier, backend, prompt version, and summary schema.
 
 Codex's catalog label **Fast** maps to the canonical service-tier value `priority`. Passing
@@ -257,26 +256,18 @@ receipts and are included in the command's exact token accounting.
 Before those calendar jobs, one separately cached knowledge pass reads up to 48,000 characters of
 early root conversation and creates a durable newcomer project overview. Its first successful run
 records an immutable source cutoff plus event IDs and a context digest, without copying the raw
-48,000-character transcript into version-controlled `summary_data/`. A second batched pass sees
-that overview plus up to six retained source occurrences for each deterministic glossary term.
-Each term freezes that first evidence set and records when the term became eligible for summaries;
-a later second occurrence therefore cannot rewrite or evict terms from an already completed day.
-Both passes exclude the half-open archive end boundary. Mutation or truncation of retained evidence fails
-before any model call, while ordinary events appended beyond the recorded cutoff reuse the exact
-overview and definition cache keys.
+48,000-character transcript into version-controlled `summary_data/`. It excludes the half-open
+archive end boundary. Mutation or truncation of its retained evidence fails before any model call,
+while ordinary events appended beyond the cutoff reuse the exact overview cache key.
 
-Knowledge jobs must either write a concise evidence-supported result or explicitly return
-`Insufficient evidence`; acronym expansions and relationships cannot be guessed. URLs, Markdown
-links, images, and link targets are rejected from generated knowledge. Only supported definitions
-enter plain-language rollup prompts, and only for periods at or after their availability timestamp.
-The overview, definitions, source event IDs, evidence excerpts, immutable epoch/cutoff metadata,
-model, prompt version, input hash, and generation time are persisted under `summary_data/`; all of
-their backend receipts are included in the same exact token accounting.
+The retired glossary-definition pass is disabled because deterministic candidate strings were too
+broad to serve as a project ontology. New runs do not inject them into phase or rollup prompts,
+do not launch definition calls, and do not rewrite `summary_data/glossary.json`. Old definition
+caches, projections, and usage receipts remain on disk for audit and accounting. Builds ignore the
+retired projection and publish no glossary links until an evidence-bounded semantic discovery pass
+is implemented.
 
-Unchanged keys are never sent to the model again. Term candidates are capped by eligibility time,
-not first mention, and command lines, paths, database filenames, and unquoted uppercase prose are
-excluded before they can consume definition tokens. New later terminology does not invalidate
-older windows. A changed live window creates a new cache record while the previous valuable record
+Unchanged keys are never sent to the model again. A changed live window creates a new cache record while the previous valuable record
 remains on disk. Each batch is committed only after every response in that batch validates against
 the strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
 batches remain reusable.
@@ -355,6 +346,11 @@ refuses to use a non-empty directory unless it already contains its archive mark
 existing `teams/<slug>/raw/team.json`; a mistaken `--output` cannot replace another project's
 README or Makefile.
 
+Build fails closed on definition-only glossary projections: it ignores those retired records and
+omits them from links and rendered catalogs. This removes stale glossary links and weekly generated
+files without rewriting or deleting original definition caches, projections, artifact catalogs, or
+usage receipts.
+
 To create a separate zero-token website package for a selected interval, use `export` after the
 needed summaries are cached:
 
@@ -415,7 +411,7 @@ The pipeline performs real multilevel reduction:
 ```text
 verbatim messages + condensed tools
      -> fixed, append-stable agent phases
-     -> durable project overview + evidence-bounded glossary definitions
+     -> durable project overview
      -> daily technical + plain-language summaries
         -> weekly technical + plain-language summaries
            -> monthly technical + plain-language summaries
@@ -430,12 +426,10 @@ the browser or web-server machine's local timezone. Archives without that file r
 timezone in normalized team data; malformed or missing browser data falls back visibly to UTC,
 never silently to ambient browser time.
 
-The terminology scan runs before phase summarization. It records terms in introduction order by ISO
-week, keeps the source sentence as first-use evidence, and supplies the chronological subset to each
-phase and technical-rollup call. After phase summarization, the evidence-bounded definition pass
-adds explanations for newcomer rollups without changing those earlier cache identities. This
-discourages agents from inventing opaque “phase 2 / wave 9 / option B” labels and carries the user's
-original subsystem/workstream names across spawn boundaries.
+The retired deterministic terminology scan remains as migration/test code only. It never supplies
+new prompt context or creates model work. A future replacement must classify bounded chronological
+evidence into projects, systems, subsystems, sustained workstreams, named tasks, and milestones,
+and must establish each concept's availability before it can enter later prompts or links.
 
 ## On-disk format
 
@@ -470,7 +464,7 @@ example-team/
     │   ├── project_overview.json     # immutable evidence epoch + generated overview
     │   ├── rollups/{hourly,daily,weekly,monthly,quarterly}/... # both audiences
     │   ├── github/pulls.json         # ETag-backed bounded PR title/hover metadata
-    │   └── glossary.json             # frozen definitions, availability + provenance
+    │   └── glossary.json             # optional retired definition projection; audit-only
     └── summaries/
         ├── agents/<thread-id>.md
         ├── phases/<phase-id>.md
@@ -554,6 +548,42 @@ agent's subsequent work. Automatic final answers and each agent's own commentary
 plaintext; encrypted instruction bodies remain unavailable to the archive.
 
 ## Inspect and troubleshoot
+
+Agents and shell scripts can navigate the same built archive without starting the website. JSON is
+the default; `--format jsonl` streams one result per line, while `--format markdown` is convenient
+for a terminal transcript.
+
+```bash
+agent-team-timeline query --output ./timelines/example-team list teams
+agent-team-timeline query --output ./timelines/example-team list agents \
+  --team example-team --start-time 2026-08-07T02:00:00Z \
+  --end-time 2026-08-07T03:00:00Z
+agent-team-timeline query --output ./timelines/example-team \
+  show 'agent:example-team::SESSION_OR_AGENT_ID'
+agent-team-timeline query --output ./timelines/example-team \
+  show 'phase:example-team::phase-0123456789abcdef' --transcript
+agent-team-timeline query --output ./timelines/example-team \
+  search 'reproducible build' --scope all --team example-team --limit 20
+```
+
+`list` supports `teams`, `agents`, `phases`, and `rollups`. Its records carry canonical references
+that `show` accepts directly:
+
+- `team:TEAM`
+- `agent:TEAM::SOURCE_AGENT_ID`
+- `phase:TEAM::PHASE_ID`
+- `rollup:TEAM::KIND::START_MS`
+
+The references deliberately remove the compositor's presentation-only team prefix, so they remain
+the same when an individual team is later included in a combined export. `show` adds parent,
+children, and work-phase references for an agent; phase transcripts remain excluded unless
+`--transcript` is explicit. Showing a rollup returns both its technical and plain-language Markdown.
+Search is literal and case-insensitive by default. It can scan `summaries`, `transcripts`, or `all`;
+`--agent` restricts work-phase and transcript results to one canonical agent reference. Time bounds
+are half-open RFC3339 instants and select records whose intervals overlap the requested range.
+Queries only read `data/timeline.json`, `data/details/*.json`, and referenced summary Markdown; they
+never invoke a model or alter the archive. A generated archive also exposes `make query`, with
+`QUERY_ARGS` defaulting to `list teams`.
 
 ```bash
 agent-team-timeline inspect --output ./timelines/example-team

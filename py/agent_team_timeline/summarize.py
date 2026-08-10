@@ -31,15 +31,14 @@ from agent_team_timeline.codex_workspace import (
     initialize_codex_workspace,
 )
 from agent_team_timeline.summary_registry import (
-    AGENT_LIFETIME_STYLE,
     ContextCoverage,
     GLOSSARY_DEFINITION_STYLE,
     GLOSSARY_DEFINITION_SUMMARIZER,
+    PHASE_STYLE,
     PHASE_SUMMARIZER,
     PLAIN_LANGUAGE_ROLLUP_STYLE,
     PROJECT_OVERVIEW_STYLE,
     PROJECT_OVERVIEW_SUMMARIZER,
-    SUMMARIZER_REGISTRY,
     TECHNICAL_ROLLUP_STYLE,
     summarizer_for_style,
 )
@@ -67,9 +66,12 @@ GLOSSARY_DEFINITION_PROMPT_VERSION: Final = (
     GLOSSARY_DEFINITION_SUMMARIZER.prompt_version
 )
 _SUMMARY_STYLES: Final = frozenset(
-    item.summary_style
-    for item in SUMMARIZER_REGISTRY
-    if item.summary_style != AGENT_LIFETIME_STYLE
+    {
+        PHASE_STYLE,
+        TECHNICAL_ROLLUP_STYLE,
+        PLAIN_LANGUAGE_ROLLUP_STYLE,
+        PROJECT_OVERVIEW_STYLE,
+    }
 )
 _CACHE_VERSION: Final = 2
 _PHRASE_LIMIT: Final = 80

@@ -31,6 +31,7 @@ from agent_team_timeline.pipeline import (
     summarize_archive,
     utc_now,
 )
+from agent_team_timeline.query import QueryFilters, TimelineQuery, format_query
 from agent_team_timeline.server import serve
 from agent_team_timeline.summarize import SummaryError
 from agent_team_timeline.token_usage import TokenUsage
@@ -270,6 +271,34 @@ def _add_export_selection(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_query_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--team",
+        action="append",
+        default=[],
+        help="team slug to include; repeat to select multiple teams",
+    )
+    parser.add_argument(
+        "--start-time",
+        help="first RFC3339 instant to overlap (inclusive)",
+    )
+    parser.add_argument(
+        "--end-time",
+        help="exclusive RFC3339 overlap boundary",
+    )
+    parser.add_argument(
+        "--kind",
+        action="append",
+        choices=("hourly", "daily", "weekly", "monthly", "quarterly"),
+        default=[],
+        help="rollup kind to include; repeat as needed",
+    )
+    parser.add_argument(
+        "--agent",
+        help="canonical agent:TEAM::ID reference to select",
+    )
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=PROG,
@@ -378,6 +407,45 @@ def _parser() -> argparse.ArgumentParser:
     inspect = sub.add_parser("inspect", help="print archive/run/source counts as JSON")
     inspect.add_argument("--output", required=True)
     inspect.set_defaults(handler="inspect")
+
+    query = sub.add_parser(
+        "query", help="navigate a built timeline without starting the website"
+    )
+    query.add_argument("--output", required=True, help="built single- or multi-team archive")
+    query.add_argument(
+        "--format",
+        choices=("json", "jsonl", "markdown"),
+        default="json",
+        help="response format (default: %(default)s)",
+    )
+    query_sub = query.add_subparsers(dest="query_action", required=True)
+    query_list = query_sub.add_parser("list", help="list concise records and stable references")
+    query_list.add_argument(
+        "resource", choices=("teams", "agents", "phases", "rollups")
+    )
+    _add_query_filters(query_list)
+    query_list.set_defaults(handler="query_list")
+    query_show = query_sub.add_parser("show", help="resolve one stable reference")
+    query_show.add_argument("reference", help="team:, agent:, phase:, or rollup: reference")
+    query_show.add_argument(
+        "--transcript",
+        action="store_true",
+        help="include condensed transcript messages when showing a work phase",
+    )
+    query_show.set_defaults(handler="query_show")
+    query_search = query_sub.add_parser(
+        "search", help="search summaries and condensed transcript messages"
+    )
+    query_search.add_argument("text", help="literal text to find")
+    query_search.add_argument(
+        "--scope",
+        choices=("summaries", "transcripts", "all"),
+        default="summaries",
+    )
+    query_search.add_argument("--case-sensitive", action="store_true")
+    query_search.add_argument("--limit", type=int, default=50)
+    _add_query_filters(query_search)
+    query_search.set_defaults(handler="query_search")
     return parser
 
 
@@ -605,6 +673,64 @@ def _inspect(archive: Path) -> int:
     return 0
 
 
+def _query_filters(ns: argparse.Namespace) -> QueryFilters:
+    raw_teams: object = ns.team
+    if not isinstance(raw_teams, list) or not all(
+        isinstance(item, str) for item in raw_teams
+    ):
+        raise ValueError("--team values must be strings")
+    raw_kinds: object = ns.kind
+    if not isinstance(raw_kinds, list) or not all(
+        isinstance(item, str) for item in raw_kinds
+    ):
+        raise ValueError("--kind values must be strings")
+    raw_agent: object = ns.agent
+    if raw_agent is not None and not isinstance(raw_agent, str):
+        raise ValueError("--agent must be a string")
+    window = parse_date_window(
+        None,
+        None,
+        "UTC",
+        start_time=(
+            str(ns.start_time) if ns.start_time is not None else None
+        ),
+        end_time=str(ns.end_time) if ns.end_time is not None else None,
+    )
+    return QueryFilters(
+        teams=tuple(raw_teams),
+        window=window,
+        rollup_kinds=tuple(raw_kinds),
+        agent_ref=raw_agent,
+    )
+
+
+def _run_query(ns: argparse.Namespace, handler: str) -> int:
+    query = TimelineQuery(_path(str(ns.output)))
+    command: str
+    if handler == "query_list":
+        resource = str(ns.resource)
+        command = f"list {resource}"
+        items = query.list_records(resource, _query_filters(ns))
+    elif handler == "query_show":
+        reference = str(ns.reference)
+        command = f"show {reference}"
+        items = [query.show(reference, transcript=bool(ns.transcript))]
+    elif handler == "query_search":
+        needle = str(ns.text)
+        command = f"search {needle}"
+        items = query.search(
+            needle,
+            scope=str(ns.scope),
+            filters=_query_filters(ns),
+            case_sensitive=bool(ns.case_sensitive),
+            limit=int(ns.limit),
+        )
+    else:
+        raise ValueError(f"unsupported query handler {handler!r}")
+    print(format_query(command, items, str(ns.format)), end="")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command-line interface and return its process exit status."""
 
@@ -627,6 +753,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if handler == "inspect":
         try:
             return _inspect(_path(str(ns.output)))
+        except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler in {"query_list", "query_show", "query_search"}:
+        try:
+            return _run_query(ns, str(handler))
         except (OSError, ValueError) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2

@@ -55,6 +55,7 @@ class SummarizerSpec:
     output_fields: tuple[str, ...]
     granularities: tuple[str, ...]
     changelog: tuple[SummarizerChange, ...]
+    lifecycle: str = "active"
 
     def __post_init__(self) -> None:
         if not self.summarizer_id or not self.summary_style:
@@ -63,6 +64,10 @@ class SummarizerSpec:
             raise ValueError("summarizer versions must be positive")
         if not self.changelog:
             raise ValueError(f"summarizer {self.summarizer_id!r} has no changelog")
+        if self.lifecycle not in {"active", "historical-disabled", "planned"}:
+            raise ValueError(
+                f"summarizer {self.summarizer_id!r} has invalid lifecycle {self.lifecycle!r}"
+            )
         versions = tuple(item.version for item in self.changelog)
         if versions != tuple(sorted(set(versions))):
             raise ValueError(
@@ -92,6 +97,7 @@ class SummarizerSpec:
             "output_fields": list(self.output_fields),
             "granularities": list(self.granularities),
             "changelog": [item.to_json_obj() for item in self.changelog],
+            "lifecycle": self.lifecycle,
         }
 
 
@@ -285,8 +291,8 @@ class ContextCoverage:
 PHASE_SUMMARIZER: Final = SummarizerSpec(
     summarizer_id="phase-work-summary",
     summary_style=PHASE_STYLE,
-    current_version=1,
-    prompt_version="agent-team-timeline-summary-v1",
+    current_version=2,
+    prompt_version="agent-team-timeline-summary-v2",
     output_schema_version=1,
     description="Phrase, hover paragraph, and chronological work bullets for one agent phase.",
     input_fields=(
@@ -304,14 +310,20 @@ PHASE_SUMMARIZER: Final = SummarizerSpec(
             1,
             "Initial substantive phase summary with three display resolutions.",
         ),
+        SummarizerChange(
+            2,
+            "agent-team-timeline-summary-v2",
+            1,
+            "Use only supported semantic concepts; exclude mechanical glossary candidates.",
+        ),
     ),
 )
 
 TECHNICAL_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
     summarizer_id="technical-rollup",
     summary_style=TECHNICAL_ROLLUP_STYLE,
-    current_version=2,
-    prompt_version="agent-team-timeline-technical-rollup-v2",
+    current_version=3,
+    prompt_version="agent-team-timeline-technical-rollup-v3",
     output_schema_version=1,
     description="Content-led technical rollup over lower-level cached summaries.",
     input_fields=(
@@ -335,14 +347,20 @@ TECHNICAL_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
             1,
             "Require content before work-management identifiers and expand opaque shorthand.",
         ),
+        SummarizerChange(
+            3,
+            "agent-team-timeline-technical-rollup-v3",
+            1,
+            "Use only supported semantic concepts; exclude mechanical glossary candidates.",
+        ),
     ),
 )
 
 PLAIN_LANGUAGE_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
     summarizer_id="plain-language-rollup",
     summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE,
-    current_version=2,
-    prompt_version="agent-team-timeline-plain-rollup-v2",
+    current_version=3,
+    prompt_version="agent-team-timeline-plain-rollup-v3",
     output_schema_version=1,
     description="Newcomer-oriented rollup independent from the technical summary.",
     input_fields=(
@@ -366,6 +384,12 @@ PLAIN_LANGUAGE_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
             "agent-team-timeline-plain-rollup-v2",
             1,
             "Ground newcomer explanations in the project overview and verified glossary.",
+        ),
+        SummarizerChange(
+            3,
+            "agent-team-timeline-plain-rollup-v3",
+            1,
+            "Use only supported semantic concepts; exclude mechanical glossary candidates.",
         ),
     ),
 )
@@ -424,6 +448,7 @@ GLOSSARY_DEFINITION_SUMMARIZER: Final = SummarizerSpec(
             "Bind definitions to frozen occurrences and reject unsupported inference.",
         ),
     ),
+    lifecycle="historical-disabled",
 )
 
 AGENT_LIFETIME_SUMMARIZER: Final = SummarizerSpec(
@@ -522,7 +547,7 @@ def registry_json_obj() -> dict[str, JsonValue]:
     """Return the complete deterministic registry for docs and archive manifests."""
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "summarizers": [item.to_json_obj() for item in SUMMARIZER_REGISTRY],
     }
 

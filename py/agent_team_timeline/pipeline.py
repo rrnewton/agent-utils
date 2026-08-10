@@ -2360,49 +2360,16 @@ def _summarize_archive_locked(
         context_chars=context_chars,
         transcript_chars=transcript_chars,
     )
-    terms = _glossary_terms(team)
+    # Legacy schema-3 glossary records contain mechanically selected strings, not a supported
+    # semantic project ontology. Until the bounded semantic discovery pipeline is complete, fail
+    # closed: no candidate enters a model prompt and no glossary-specific model job can run.
+    supported_terms: tuple[GlossaryTerm, ...] = ()
     cache = summary_root / "cache"
-    # Validate immutable knowledge provenance before any backend invocation. A historical source
-    # mutation must fail closed without spending tokens on summaries that cannot be published.
     overview_source = _frozen_project_overview_input(archive, team)
     if overview_source is None:
         overview_source = _root_overview_input(team)
-    observation_epoch = _current_knowledge_epoch(team)
-    previous_observed_through, frozen_knowledge = _frozen_term_knowledge(
-        archive,
-        team,
-        overview_source.epoch.epoch_id,
-        observation_epoch.cutoff_ms,
-    )
-    knowledge_by_term: dict[str, _TermKnowledge] = {}
-    for term in terms:
-        frozen = frozen_knowledge.get(term.term_id)
-        if frozen is not None:
-            knowledge_by_term[term.term_id] = frozen
-            continue
-        evidence = _definition_evidence(
-            team, term, cutoff_ms=observation_epoch.cutoff_ms
-        )
-        available_at_ms = term.summary_available_at_ms
-        if previous_observed_through is not None:
-            available_at_ms = max(available_at_ms, previous_observed_through)
-        knowledge_by_term[term.term_id] = _TermKnowledge(
-            evidence=evidence,
-            available_at_ms=available_at_ms,
-            definition_cutoff_ms=observation_epoch.cutoff_ms,
-            definition_epoch_id=_definition_epoch_id(
-                term.term_id,
-                overview_source.epoch.epoch_id,
-                observation_epoch.cutoff_ms,
-                evidence,
-            ),
-        )
-    evidence_by_term = {
-        term_id: knowledge.evidence
-        for term_id, knowledge in knowledge_by_term.items()
-    }
     phase_results, phase_stats = summarize_jobs(
-        _phase_jobs(team, phases, terms, context_chars),
+        _phase_jobs(team, phases, supported_terms, context_chars),
         cache,
         backend,
         model,
@@ -2445,42 +2412,9 @@ def _summarize_archive_locked(
     changed += _write_project_overview_data(
         archive, team_slug, overview_source, project_overview
     )
-    definition_jobs = tuple(
-        _glossary_definition_job(
-            team, term, evidence_by_term[term.term_id], project_overview
-        )
-        for term in terms
-    )
-    if definition_jobs:
-        definition_results, definition_stats = summarize_jobs(
-            definition_jobs,
-            cache,
-            backend,
-            model,
-            max_workers=max_workers,
-            batch_size=batch_size,
-            codex_command=codex_command,
-            reasoning_effort=reasoning_effort,
-            service_tier=service_tier,
-        )
-    else:
-        definition_results = {}
-        definition_stats = SummaryRunStats(hits=0, misses=0, batches=0)
-    for key, definition in definition_results.items():
-        _validate_glossary_definition(definition, f"generated {key}")
-    enriched_terms: tuple[GlossaryTerm, ...] = tuple(
-        replace(
-            term,
-            definition=definition_results[
-                f"glossary-definition:{term.term_id}"
-            ].paragraph,
-            definition_status=_definition_status(
-                definition_results[f"glossary-definition:{term.term_id}"]
-            ),
-            available_at_ms=knowledge_by_term[term.term_id].available_at_ms,
-        )
-        for term in terms
-    )
+    definition_jobs: tuple[SummaryJob, ...] = ()
+    definition_results: dict[str, SummaryResult] = {}
+    enriched_terms = supported_terms
 
     start_ms, end_ms = _period_range(team, phases)
     periods = periods_for_range(
@@ -2502,8 +2436,6 @@ def _summarize_archive_locked(
         name_stats,
         overview_stats,
     ]
-    if definition_jobs:
-        backend_stats.append(definition_stats)
     previous_periods: list[Period] = []
     previous_results: dict[str, SummaryResult] = {}
     previous_plain_results: dict[str, SummaryResult] = {}
@@ -2537,7 +2469,7 @@ def _summarize_archive_locked(
                 previous_periods,
                 previous_results,
                 completed,
-                terms,
+                supported_terms,
                 TECHNICAL_ROLLUP_STYLE,
             )
             results, stats = summarize_jobs(
@@ -2613,47 +2545,8 @@ def _summarize_archive_locked(
                 obj,
             )
         )
-    glossary_obj: dict[str, JsonValue] = {
-        "schema_version": _GLOSSARY_SCHEMA_VERSION,
-        "project_overview_input_hash": project_overview.input_hash,
-        "project_overview_epoch_id": overview_source.epoch.epoch_id,
-        "observed_through_ms": max(
-            observation_epoch.cutoff_ms,
-            previous_observed_through or observation_epoch.cutoff_ms,
-        ),
-        "terms": [
-            {
-                "term": term.term,
-                "introduced_at_ms": term.introduced_at_ms,
-                "occurrences": term.occurrences,
-                "context": term.context,
-                "week": term.week,
-                "term_id": term.term_id,
-                "available_at_ms": term.summary_available_at_ms,
-                "definition": term.definition,
-                "definition_status": term.definition_status,
-                "definition_cutoff_ms": knowledge_by_term[
-                    term.term_id
-                ].definition_cutoff_ms,
-                "definition_epoch_id": knowledge_by_term[
-                    term.term_id
-                ].definition_epoch_id,
-                "definition_summary": _summary_json(
-                    definition_results[f"glossary-definition:{term.term_id}"]
-                ),
-                "evidence": [
-                    item.to_json_obj()
-                    for item in evidence_by_term[term.term_id]
-                ],
-            }
-            for term in enriched_terms
-        ]
-    }
-    changed += int(
-        write_json_if_changed(
-            _summary_root(archive, team_slug) / "glossary.json", glossary_obj
-        )
-    )
+    # Preserve historical schema-3 glossary bytes for provenance. The build path ignores that
+    # mechanically selected projection, and no new legacy projection is written.
     summary_results = (
         tuple(phase_results.values())
         + (project_overview,)
@@ -2688,7 +2581,7 @@ def _summarize_archive_locked(
         phases=len(phases),
         rollups=len(periods),
         agent_names=len(agent_names),
-        glossary_terms=len(terms),
+        glossary_terms=len(supported_terms),
         project_overviews=1,
         glossary_definitions=len(definition_jobs),
         catalog_artifacts=len(catalog.records),
@@ -3046,12 +2939,14 @@ def _load_project_overview(
     return summary, source
 
 
-def _load_glossary(
+def _validate_legacy_glossary(
     archive: Path,
     team_slug: str,
     project_overview: SummaryResult,
     project_epoch_id: str | None,
 ) -> tuple[GlossaryTerm, ...]:
+    """Validate the retired schema-3 projection without granting publication authority."""
+
     suppress = project_overview.prompt_version == _PRESENTATION_FALLBACK_VERSION
     path = _summary_root(archive, team_slug) / "glossary.json"
     if _summary_projection_missing(path):
@@ -3090,7 +2985,6 @@ def _load_glossary(
         raise ValueError(f"{path}: glossary used a different knowledge epoch")
     project_epoch_id = recorded_project_epoch_id
     as_int(obj.get("observed_through_ms"), f"{path}.observed_through_ms")
-    result: list[GlossaryTerm] = []
     for index, raw in enumerate(as_array(obj.get("terms"), f"{path}.terms")):
         where = f"{path}.terms[{index}]"
         item = as_object(raw, where)
@@ -3126,9 +3020,11 @@ def _load_glossary(
         )
         if definition_status not in {"supported", "insufficient-evidence"}:
             raise ValueError(f"{where}: invalid definition status")
-        available_at_ms = as_int(
-            item.get("available_at_ms"), f"{where}.available_at_ms"
-        )
+        as_int(item.get("available_at_ms"), f"{where}.available_at_ms")
+        as_int(item.get("introduced_at_ms"), f"{where}.introduced_at_ms")
+        as_int(item.get("occurrences"), f"{where}.occurrences")
+        as_string(item.get("context"), f"{where}.context")
+        as_string(item.get("week"), f"{where}.week")
         definition_cutoff_ms = as_int(
             item.get("definition_cutoff_ms"), f"{where}.definition_cutoff_ms"
         )
@@ -3178,24 +3074,28 @@ def _load_glossary(
         )
         if definition_epoch_id != expected_definition_epoch:
             raise ValueError(f"{where}: definition provenance does not match evidence")
-        result.append(
-            GlossaryTerm(
-                term=term,
-                introduced_at_ms=as_int(
-                    item.get("introduced_at_ms"), f"{where}.introduced_at_ms"
-                ),
-                occurrences=as_int(
-                    item.get("occurrences"), f"{where}.occurrences"
-                ),
-                context=as_string(item.get("context"), f"{where}.context"),
-                week=as_string(item.get("week"), f"{where}.week"),
-                term_id=term_id,
-                definition=definition,
-                definition_status=definition_status,
-                available_at_ms=available_at_ms,
-            )
-        )
-    return () if suppress else tuple(result)
+    # Schema 3 proves only that a model could define each mechanically selected string. It does
+    # not classify the string as a durable project concept, so publishing it would turn ordinary
+    # prose and workflow language into site-wide links. Keep validating the immutable projection
+    # above for provenance/integrity, but fail closed until a semantic discovery projection exists.
+    return ()
+
+
+def _load_glossary(
+    archive: Path,
+    team_slug: str,
+    project_overview: SummaryResult,
+    project_epoch_id: str | None,
+) -> tuple[GlossaryTerm, ...]:
+    """Return supported semantic concepts, never legacy mechanical candidates."""
+
+    # Keep these arguments in the stable loader boundary for the eventual semantic projection,
+    # whose provenance will be checked against the project overview and knowledge epoch.
+    _ = project_overview, project_epoch_id
+    path = _summary_root(archive, team_slug) / "semantic_glossary.json"
+    if _summary_projection_missing(path):
+        return ()
+    raise ValueError(f"{path}: semantic glossary projection is not supported by this version")
 
 
 def _load_rollup_projection(

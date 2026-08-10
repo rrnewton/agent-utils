@@ -36,6 +36,7 @@ _COMMON_FILES = (
     "style.css",
     "serve.py",
     "run_stats.py",
+    "query.py",
     "Makefile",
     "vendor/README.md",
     "vendor/markdown-it-15.0.0.min.js",

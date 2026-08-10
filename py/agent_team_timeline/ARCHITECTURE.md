@@ -39,25 +39,42 @@ file inventory removes only stale files from an earlier combined export. Calenda
 the timezone in which each team's cached summary was generated; hourly keys are UTC-stable. The
 export timezone controls date-bound parsing and the shared display axis, not cache reinterpretation.
 
+### Read-only query boundary
+
+`agent-team-timeline query` reads the deterministic presentation projection rather than model-cache
+internals. Its only inputs are `data/timeline.json`, referenced `data/details/*.json`, and referenced
+rollup Markdown beneath the selected archive root. Path resolution fails closed on absolute or
+escaping references. Querying has no write path and can never invoke a model.
+
+Canonical references are `team:<slug>`, `agent:<team>::<source-id>`,
+`phase:<team>::<phase-id>`, and `rollup:<team>::<kind>::<start-ms>`. The query loader strips the
+multi-team compositor's `<team>::` namespace from source and phase IDs before constructing those
+references. Consequently, a reference remains stable when the same team moves between an
+individual archive and a combined export. List projections expose references and concise metadata;
+`show` resolves relationships and optional phase transcripts; literal search scans lifetime,
+phase, calendar, and condensed-transcript text. JSON responses use query schema version 1, JSONL
+emits one record per line, and Markdown is presentation-only.
+
 ## Cost boundary
 
 Fetching, SQLite snapshotting, normalization, artifact extraction, terminology candidate scanning,
 phase construction, statistics, Markdown/JSON generation, and site rendering are deterministic
 compute. They may be rerun freely.
 
-Only six registered computations invoke a summary model. Their authoritative registry is
+Six model-computation contracts are registered: five active and one retained as
+`historical-disabled` so old receipts remain interpretable. Their authoritative registry is
 [`summary_registry.py`](summary_registry.py). Prompt version, output schema version, known version
 history, inputs, outputs, and supported granularities live there. Prompt builders import those
 versions; a prompt constant must not be invented elsewhere.
 
-| Registered summarizer | Current version | Unit | Prompt generator |
-|---|---:|---|---|
-| `phase-work-summary` | 1 | one agent phase | `summarize.py:build_summary_prompt` (`phase` branch) |
-| `agent-lifetime` | 2 | one agent lifetime | `naming.py:build_agent_name_prompt` |
-| `project-overview` | 2 | one project/team knowledge epoch | `summarize.py:build_summary_prompt` (`project-overview`) |
-| `glossary-definition` | 2 | one deterministic glossary term | `summarize.py:build_summary_prompt` (`glossary-definition`) |
-| `technical-rollup` | 2 | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`technical-rollup`) |
-| `plain-language-rollup` | 2 | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`plain-language-rollup`) |
+| Registered summarizer | Version | Lifecycle | Unit | Prompt generator |
+|---|---:|---|---|---|
+| `phase-work-summary` | 2 | active | one agent phase | `summarize.py:build_summary_prompt` (`phase` branch) |
+| `agent-lifetime` | 2 | active | one agent lifetime | `naming.py:build_agent_name_prompt` |
+| `project-overview` | 2 | active | one project/team knowledge epoch | `summarize.py:build_summary_prompt` (`project-overview`) |
+| `glossary-definition` | 2 | historical-disabled | one mechanical candidate | retained only to interpret old artifacts |
+| `technical-rollup` | 3 | active | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`technical-rollup`) |
+| `plain-language-rollup` | 3 | active | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`plain-language-rollup`) |
 
 Hourly rollups use UTC-stable keys and local-time labels, including distinct keys for a repeated
 daylight-saving hour. Summary selection can request only hourly work or combine it with higher
@@ -73,7 +90,8 @@ Inputs:
   capped at 30,000 characters by retaining the front and back.
 - Up to 16,000 characters immediately before the phase from that agent and every recorded
   ancestor, including the coordinator. This is a character budget, not currently a word budget.
-- Deterministically detected glossary terms available before the phase ends.
+- Supported semantic concepts available before the phase ends (empty until the bounded semantic
+  discovery pipeline is implemented).
 - User-prompt, response, inter-agent-message, and tool-call counts.
 
 Outputs are an at-most-80-character phrase, hover paragraph, and timestamped substantive work
@@ -106,11 +124,11 @@ is intentionally frozen against ordinary append-only growth.
 
 ### Glossary definition
 
-Term candidates are found deterministically from root user prompts; that scan does not spend
-tokens. One model job per term receives its exact spelling, the frozen project overview, and up to
-six bounded source occurrences. It returns an evidence support status and a short definition, with
-no invented links or acronym expansions. Definitions and evidence are projected together in
-`summary_data/glossary.json`; model results use the common summary cache.
+The definition-only contract is disabled: it established whether a mechanically selected string
+could be explained, not whether the string belonged in a durable project ontology. New summarize
+runs neither inject candidate strings into prompts nor launch definition jobs. Historical schema-3
+projections, cache artifacts, and receipts stay untouched for provenance; builds ignore them and
+publish an empty glossary until a bounded semantic discovery pipeline is implemented.
 
 ### Technical calendar rollup
 
@@ -118,8 +136,8 @@ Staged by `pipeline.py:_rollup_jobs_for_level` in chronological order for select
 weekly, monthly, and quarterly levels.
 
 Inputs are fully contained lower-level summaries, uncovered phase summaries at calendar
-boundaries, up to ten already-completed earlier summaries of the same level, the chronological
-glossary, and aggregate statistics. Thus a weekly job consumes daily summaries plus up to ten prior
+boundaries, up to ten already-completed earlier summaries of the same level, supported semantic
+concepts (currently empty), and aggregate statistics. Thus a weekly job consumes daily summaries plus up to ten prior
 weekly summaries; it does not directly receive an arbitrary independent array of ten prior days and
 ten prior weeks. An hourly job consumes phases. A daily job consumes hourly summaries when that
 level was requested in the same run, otherwise phases, plus up to ten prior daily summaries.

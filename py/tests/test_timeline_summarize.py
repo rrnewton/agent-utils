@@ -199,39 +199,32 @@ def test_rollup_prompts_have_distinct_content_led_audience_contracts() -> None:
     assert _input_hash(technical, "codex", "same-model") != _input_hash(
         plain, "codex", "same-model"
     )
-    assert "agent-team-timeline-plain-rollup-v2" in plain_prompt
+    assert "agent-team-timeline-plain-rollup-v3" in plain_prompt
 
 
-def test_knowledge_prompts_are_evidence_bounded_and_have_distinct_cache_ids() -> None:
+def test_project_overview_is_evidence_bounded_and_legacy_definitions_are_disabled() -> None:
     overview = replace(_job("overview"), summary_style=PROJECT_OVERVIEW_STYLE)
     definition = replace(
         _job("definition"), summary_style=GLOSSARY_DEFINITION_STYLE
     )
 
     overview_prompt = build_summary_prompt([overview])
-    definition_prompt = build_summary_prompt([definition])
-
     assert PROJECT_OVERVIEW_PROMPT_VERSION in overview_prompt
     assert "durable project overview" in overview_prompt
     assert "do not infer facts" in overview_prompt
-    assert GLOSSARY_DEFINITION_PROMPT_VERSION in definition_prompt
-    assert "Never guess an acronym expansion" in definition_prompt
-    assert "Insufficient evidence:" in definition_prompt
     assert "Never emit a URL, Markdown link" in overview_prompt
-    assert "Never emit a URL, Markdown link" in definition_prompt
+    assert GLOSSARY_DEFINITION_PROMPT_VERSION.endswith("glossary-definition-v2")
     assert _input_hash(overview, "codex", "same-model") != _input_hash(
         definition, "codex", "same-model"
     )
+    with pytest.raises(SummaryError, match="unsupported style 'glossary-definition'"):
+        build_summary_prompt([definition])
 
 
-@pytest.mark.parametrize(
-    "style",
-    [PROJECT_OVERVIEW_STYLE, GLOSSARY_DEFINITION_STYLE],
-)
 def test_heuristic_knowledge_results_are_honest_context_only(
-    tmp_path: Path, style: str
+    tmp_path: Path,
 ) -> None:
-    job = replace(_job("knowledge"), summary_style=style)
+    job = replace(_job("knowledge"), summary_style=PROJECT_OVERVIEW_STYLE)
 
     results, stats = summarize_jobs(
         [job], tmp_path / "cache", backend="heuristic", model="offline"
@@ -514,7 +507,7 @@ def test_codex_backend_batches_with_schema_stdin_and_temp_workdir(
     assert default_receipt["service_tier"] == "default"
 
 
-def test_codex_backend_caches_model_backed_knowledge_with_usage(
+def test_codex_backend_caches_project_overview_and_rejects_legacy_definition(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fake = tmp_path / "fake_codex.py"
@@ -534,23 +527,21 @@ def test_codex_backend_caches_model_backed_knowledge_with_usage(
         max_workers=1,
         codex_command=(sys.executable, str(fake)),
     )
-    definition_results, definition_stats = summarize_jobs(
-        [definition],
-        tmp_path / "cache",
-        backend="codex",
-        model="gpt-test",
-        max_workers=1,
-        codex_command=(sys.executable, str(fake)),
-    )
-
     assert overview_results["overview"].phrase == "Project overview supported"
-    assert definition_results["definition"].phrase == "Definition supported"
     assert overview_stats.newly_spent_usage.total_tokens == 120
-    assert definition_stats.newly_spent_usage.total_tokens == 120
-    assert log.read_text(encoding="utf-8").count("CALL\n") == 2
+    with pytest.raises(SummaryError, match="unsupported style 'glossary-definition'"):
+        summarize_jobs(
+            [definition],
+            tmp_path / "cache",
+            backend="codex",
+            model="gpt-test",
+            max_workers=1,
+            codex_command=(sys.executable, str(fake)),
+        )
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 1
 
     _, cached = summarize_jobs(
-        [definition],
+        [overview],
         tmp_path / "cache",
         backend="codex",
         model="gpt-test",

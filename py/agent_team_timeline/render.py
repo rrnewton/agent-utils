@@ -691,14 +691,48 @@ def render_archive(
         )
 
     weeks = sorted({term.week for term in glossary_terms})
+    glossary_root = archive / "teams" / team.team_slug / "summaries" / "glossary"
+    if glossary_root.is_symlink():
+        raise ValueError(f"refusing symlinked generated glossary directory: {glossary_root}")
+    expected_week_paths: set[Path] = set()
     for week in weeks:
         year = week.split("-W", 1)[0]
         path = f"teams/{team.team_slug}/summaries/glossary/{year}/{week}-{team.team_slug}-glossary.md"
+        week_path = archive / path
+        if week_path.parent.is_symlink() or week_path.is_symlink():
+            raise ValueError(f"refusing symlinked generated glossary path: {week_path}")
+        expected_week_paths.add(week_path.resolve())
         changed += int(
             write_text_if_changed(
                 archive / path, glossary_markdown(team.team_slug, week, glossary_terms)
             )
         )
+    if glossary_root.is_dir():
+        for child in sorted(glossary_root.iterdir()):
+            if child.is_symlink():
+                raise ValueError(
+                    f"refusing symlink in generated glossary directory: {child}"
+                )
+        for stale_path in sorted(glossary_root.glob("*/*.md")):
+            year = stale_path.parent.name
+            prefix = f"{year}-W"
+            suffix = f"-{team.team_slug}-glossary.md"
+            week_number = stale_path.name.removeprefix(prefix).removesuffix(suffix)
+            owned_name = (
+                len(year) == 4
+                and year.isdigit()
+                and stale_path.name.startswith(prefix)
+                and stale_path.name.endswith(suffix)
+                and len(week_number) == 2
+                and week_number.isdigit()
+            )
+            if not owned_name or stale_path.resolve() in expected_week_paths:
+                continue
+            if stale_path.parent.is_symlink() or stale_path.is_symlink():
+                raise ValueError(f"refusing symlinked generated glossary path: {stale_path}")
+            if stale_path.is_file():
+                stale_path.unlink()
+                changed += 1
     glossary_catalog_path = (
         f"teams/{team.team_slug}/summaries/glossary/{team.team_slug}-glossary.md"
     )
@@ -734,14 +768,24 @@ def render_archive(
             archive / "run_stats.py", run_stats_source, executable=True
         )
     )
+    query_source = (files("agent_team_timeline") / "query.py").read_text(
+        encoding="utf-8"
+    )
+    changed += int(
+        write_text_if_changed(
+            archive / "query.py", query_source, executable=True
+        )
+    )
     changed += int(
         write_text_if_changed(
             archive / "Makefile",
-            ".PHONY: serve open run-stats\n"
-            "PORT ?= 8765\n\n"
+            ".PHONY: serve open run-stats query\n"
+            "PORT ?= 8765\n"
+            "QUERY_ARGS ?= list teams\n\n"
             "serve:\n\tpython3 serve.py --port $(PORT)\n\n"
             "open:\n\tpython3 serve.py --port $(PORT) --open\n\n"
-            "run-stats:\n\tpython3 run_stats.py\n",
+            "run-stats:\n\tpython3 run_stats.py\n\n"
+            "query:\n\t@python3 query.py $(QUERY_ARGS)\n",
         )
     )
     changed += int(
@@ -751,7 +795,9 @@ def render_archive(
             "This directory is a self-contained, version-controllable timeline archive.\n\n"
             "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
             "Use `make open` to ask Python to open the browser. Use `make run-stats` to print "
-            "every pipeline run and exact recorded model-token costs. Do not open `index.html` directly: "
+            "every pipeline run and exact recorded model-token costs. Use `make query` for a "
+            "machine-readable team inventory, or pass another command with "
+            "`make query QUERY_ARGS='list agents --team TEAM'`. Do not open `index.html` directly: "
             "browsers block the JSON fetch from `file://`.\n",
         )
     )

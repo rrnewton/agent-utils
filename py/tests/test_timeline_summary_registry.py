@@ -11,6 +11,7 @@ from agent_team_timeline.summary_artifacts import (
 from agent_team_timeline.summary_registry import (
     ContextComponent,
     ContextCoverage,
+    GLOSSARY_DEFINITION_SUMMARIZER,
     PHASE_STYLE,
     PHASE_SUMMARIZER,
     SUMMARIZER_REGISTRY,
@@ -28,14 +29,17 @@ def test_registry_has_unique_complete_current_contracts() -> None:
         assert spec.prompt_version == spec.changelog[-1].prompt_version
         assert spec.input_fields
         assert spec.output_fields
+        assert spec.lifecycle in {"active", "historical-disabled", "planned"}
         assert summarizer_for_style(spec.summary_style) is spec
 
     manifest = registry_json_obj()
-    assert manifest["schema_version"] == 1
+    assert manifest["schema_version"] == 2
     summarizers = manifest["summarizers"]
     assert isinstance(summarizers, list)
     assert len(summarizers) == 6
     assert summarizer_for_style(PHASE_STYLE) is PHASE_SUMMARIZER
+    assert PHASE_SUMMARIZER.lifecycle == "active"
+    assert GLOSSARY_DEFINITION_SUMMARIZER.lifecycle == "historical-disabled"
 
 
 def test_unknown_summary_style_fails_closed() -> None:

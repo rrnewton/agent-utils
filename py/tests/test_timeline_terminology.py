@@ -106,7 +106,7 @@ def test_operational_backticks_do_not_leak_nested_terms() -> None:
     names = {term.term for term in scan_terminology(sources, "America/New_York")}
 
     assert names.issuperset(
-        {"safe-ci-dag-runner", "conversation_state", "Node.js", "ALL", "KVM", "PMU", "IPC", "CI"}
+        {"safe-ci-dag-runner", "conversation_state", "Node.js", "KVM", "PMU", "IPC", "CI"}
     )
     assert names.isdisjoint(
         {
@@ -116,8 +116,41 @@ def test_operational_backticks_do_not_leak_nested_terms() -> None:
             "~/.orc/sessions/<session-id>/",
             "~/temp/orc_transcripts/",
             "session-id",
+            "ALL",
         }
     )
+
+
+def test_short_inline_code_spans_do_not_turn_connectives_into_terms() -> None:
+    terms = scan_terminology(
+        (
+            TermSource(
+                1_775_000_000_000,
+                r"Escape `[` and `]`, or write `\[` or `\]`; keep `recording_metadata`.",
+            ),
+        ),
+        "America/New_York",
+    )
+
+    assert {term.term for term in terms} == {"recording_metadata"}
+
+
+def test_explicit_candidate_filter_rejects_literals_and_prose_fragments() -> None:
+    terms = scan_terminology(
+        (
+            TermSource(
+                1_775_000_000_000,
+                "Keep `safe-ci-dag-runner`, `Guest::ppid`, and `Node.js`; reject "
+                "`and`, `or`, `true`, `10m`, `4c70658e`, `.env.dbi`, "
+                "`CARGO_BUILD_JOBS=16`, `(hours),`, `check the deploy`, and "
+                "`cells, not among the 70`.",
+            ),
+        ),
+        "America/New_York",
+    )
+    names = {term.term for term in terms}
+
+    assert names == {"safe-ci-dag-runner", "Guest::ppid", "Node.js"}
 
 
 def test_term_cap_is_selected_by_eligibility_not_first_mention() -> None:
@@ -132,6 +165,19 @@ def test_term_cap_is_selected_by_eligibility_not_first_mention() -> None:
     )
 
     assert [term.term for term in terms] == ["stable-one", "stable-two"]
+
+
+def test_one_off_project_slug_is_preserved_with_first_use_chronology() -> None:
+    terms = scan_terminology(
+        (
+            TermSource(100, "in-guest is project terminology."),
+        ),
+        "America/New_York",
+    )
+
+    assert [term.term for term in terms] == ["in-guest"]
+    assert terms[0].introduced_at_ms == 100
+    assert terms[0].summary_available_at_ms == 100
 
 
 def test_unquoted_second_occurrence_sets_summary_availability() -> None:

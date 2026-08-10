@@ -44,14 +44,137 @@ class GlossaryTerm:
         )
 
 
-_BACKTICK = re.compile(r"`([^`\n]{2,80})`")
+_BACKTICK = re.compile(r"(?<!`)`([^`\n]{1,80})`(?!`)")
 _SLUG = re.compile(r"(?<![\w/])[a-z][a-z0-9]+(?:-[a-z0-9]+){1,5}(?![\w/])")
 _ACRONYM = re.compile(r"(?<!\w)[A-Z][A-Z0-9]{1,8}(?!\w)")
 _SPACE = re.compile(r"\s+")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 _ID_SEPARATOR = re.compile(r"[^a-z0-9]+")
+_DURATION_LITERAL = re.compile(r"[0-9]+(?:\.[0-9]+)?(?:ms|s|m|h|d|w)", re.IGNORECASE)
+_HEX_LITERAL = re.compile(
+    r"(?:[0-9a-f]{7,64}|[0-9a-f]{4,}(?:[-.]{1,2}[0-9a-f]{4,})+)",
+    re.IGNORECASE,
+)
 _SHELL_OPTION = re.compile(r"(?:^|\s)--?[A-Za-z0-9]")
 _SHELL_OPERATOR = re.compile(r"(?:&&|\|\||[|;$])")
+_TERM_STOPWORDS = frozenset(
+    {
+        "a",
+        "all",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "been",
+        "before",
+        "but",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "done",
+        "each",
+        "else",
+        "every",
+        "except",
+        "false",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "he",
+        "her",
+        "here",
+        "hers",
+        "him",
+        "his",
+        "how",
+        "i",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "just",
+        "like",
+        "may",
+        "maybe",
+        "me",
+        "more",
+        "most",
+        "must",
+        "my",
+        "no",
+        "none",
+        "nor",
+        "not",
+        "now",
+        "null",
+        "of",
+        "on",
+        "only",
+        "or",
+        "other",
+        "our",
+        "ours",
+        "out",
+        "over",
+        "same",
+        "she",
+        "should",
+        "so",
+        "some",
+        "than",
+        "that",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "to",
+        "too",
+        "true",
+        "up",
+        "us",
+        "use",
+        "used",
+        "using",
+        "very",
+        "want",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "why",
+        "will",
+        "with",
+        "without",
+        "would",
+        "yes",
+        "you",
+        "your",
+        "yours",
+    }
+)
+_GENERIC_PHRASE_HEADS = frozenset({"check", "run"})
 _ALWAYS_STOP = frozenset(
     {
         "EDT",
@@ -63,6 +186,7 @@ _ALWAYS_STOP = frozenset(
         "origin-main",
     }
 )
+_ALWAYS_STOP_CASEFOLD = frozenset(value.casefold() for value in _ALWAYS_STOP)
 _UPPERCASE_PROSE = frozenset(
     {
         "AGENTS",
@@ -187,6 +311,7 @@ _COMMAND_HEADS = frozenset(
         "sh",
         "sqlite3",
         "ssh",
+        "sudo",
         "tg",
         "wget",
     }
@@ -243,8 +368,40 @@ def _operational_literal(value: str) -> bool:
         or first_word in _COMMAND_HEADS
         or _SHELL_OPTION.search(clean) is not None
         or _SHELL_OPERATOR.search(clean) is not None
+        or "=" in clean
+        or " + " in clean
         or any(character in clean for character in "<>[]{}")
     )
+
+
+def _useful_candidate(value: str) -> bool:
+    """Reject mechanically recognizable literals and prose before model-backed definition work."""
+
+    clean = value.strip()
+    if not clean or clean.casefold() in _TERM_STOPWORDS:
+        return False
+    if clean.casefold() in _ALWAYS_STOP_CASEFOLD:
+        return False
+    if not any(character.isalpha() for character in clean):
+        return False
+    if not clean[0].isalnum() or not (clean[-1].isalnum() or clean.endswith(")")):
+        return False
+    if _DURATION_LITERAL.fullmatch(clean) or _HEX_LITERAL.fullmatch(clean):
+        return False
+    if len(clean) == 2 and not (clean.islower() or clean.isupper()):
+        return False
+    words = clean.split()
+    if len(words) > 5:
+        return False
+    if len(words) > 1:
+        normalized_words = {
+            word.strip(".,:;!?()\"").casefold() for word in words
+        }
+        if normalized_words & _TERM_STOPWORDS:
+            return False
+        if words[0].casefold() in _GENERIC_PHRASE_HEADS:
+            return False
+    return "," not in clean and "..." not in clean and ": " not in clean
 
 
 def _explicit_candidates(text: str) -> tuple[set[str], list[tuple[int, int]]]:
@@ -255,9 +412,9 @@ def _explicit_candidates(text: str) -> tuple[set[str], list[tuple[int, int]]]:
         term = match.group(1).strip()
         if (
             2 <= len(term) <= 80
-            and term not in _ALWAYS_STOP
             and not term.isdigit()
             and not _operational_literal(term)
+            and _useful_candidate(term)
         ):
             accepted.add(term)
     return accepted, spans
@@ -277,15 +434,19 @@ def _candidates(text: str) -> tuple[set[str], set[str]]:
     found.update(
         match.group(0)
         for match in _SLUG.finditer(prose)
-        if match.group(0) not in _ALWAYS_STOP
+        if _useful_candidate(match.group(0))
     )
     found.update(
         match.group(0)
         for match in _ACRONYM.finditer(prose)
-        if match.group(0) not in _ALWAYS_STOP
+        if _useful_candidate(match.group(0))
         and match.group(0) not in _UPPERCASE_PROSE
     )
-    return {term for term in found if 2 <= len(term) <= 80 and not term.isdigit()}, explicit
+    return {
+        term
+        for term in found
+        if 2 <= len(term) <= 80 and not term.isdigit() and _useful_candidate(term)
+    }, explicit
 
 
 def scan_terminology(
@@ -307,11 +468,7 @@ def scan_terminology(
             occurrences[term] += 1
             if term not in first:
                 first[term] = (source.at_ms, _context(source.text, term))
-            if (
-                term in explicit
-                or "-" in term
-                or occurrences[term] >= 2
-            ):
+            if term in explicit or "-" in term or occurrences[term] >= 2:
                 eligible_at.setdefault(term, source.at_ms)
 
     selected = sorted(
@@ -420,7 +577,7 @@ def glossary_catalog_markdown(
         "",
     ]
     if not terms:
-        lines.append("_No stable project terms have been detected yet._")
+        lines.append("_No supported semantic project concepts are available._")
     for term in terms:
         instant = datetime.fromtimestamp(term.introduced_at_ms / 1000, tz=timezone.utc)
         lines.extend(

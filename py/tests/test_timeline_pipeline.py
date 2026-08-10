@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 import threading
 import urllib.request
 from dataclasses import replace
@@ -219,7 +221,7 @@ def test_knowledge_evidence_keeps_prior_context_but_excludes_post_window_events(
     assert all("FUTURE_ONLY_MARKER" not in item.context for item in evidence)
 
 
-def test_unversioned_legacy_glossary_is_regenerated(tmp_path: Path) -> None:
+def test_legacy_glossary_is_preserved_without_model_work(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)
     glossary_path = (
@@ -231,11 +233,12 @@ def test_unversioned_legacy_glossary_is_regenerated(tmp_path: Path) -> None:
     )
     write_json_if_changed(glossary_path, narrow_json({"terms": []}))
 
-    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    before = glossary_path.read_bytes()
+    report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
 
-    glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
-    assert glossary["schema_version"] == 3
-    assert glossary["project_overview_epoch_id"].startswith("knowledge-")
+    assert glossary_path.read_bytes() == before
+    assert report.glossary_terms == 0
+    assert report.glossary_definitions == 0
 
 
 def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path) -> None:
@@ -252,6 +255,8 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
 
     assert first.agent_names == 2
     assert first.project_overviews == 1
+    assert first.glossary_terms == 0
+    assert first.glossary_definitions == 0
     assert first.glossary_definitions == first.glossary_terms
     assert first.cache_misses == (
         first.phases
@@ -286,6 +291,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     generated_makefile = (tmp_path / "Makefile").read_text(encoding="utf-8")
     assert generated_makefile.startswith(".PHONY: serve")
     assert "run-stats:\n\tpython3 run_stats.py\n" in generated_makefile
+    assert "query:\n\t@python3 query.py $(QUERY_ARGS)\n" in generated_makefile
     assert (tmp_path / "run_stats.py").is_file()
     assert (tmp_path / "run_stats.py").stat().st_mode & 0o111
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
@@ -339,10 +345,10 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     )
     assert rollup_record["schema_version"] == 2
     assert rollup_record["technical_summary"]["prompt_version"].endswith(
-        "technical-rollup-v2"
+        "technical-rollup-v3"
     )
     assert rollup_record["plain_language_summary"]["prompt_version"].endswith(
-        "plain-rollup-v2"
+        "plain-rollup-v3"
     )
     overview_record = json.loads(
         (
@@ -377,43 +383,43 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert summary_catalog["artifact_count"] == first.catalog_artifacts
     assert summary_catalog["logical_key_count"] == first.catalog_artifacts
     assert summary_catalog["model_counts"] == {"test-model": first.catalog_artifacts}
+    assert not any(
+        item["artifact"]["logical_key"].startswith("glossary-definition:")
+        for item in summary_catalog["artifacts"]
+    )
     assert all(
         (tmp_path / "teams" / team.team_slug / "summary_data" / item["cache_path"])
         .is_file()
         for item in summary_catalog["artifacts"]
     )
-    glossary_record = json.loads(
-        (
-            tmp_path
-            / "teams"
-            / team.team_slug
-            / "summary_data"
-            / "glossary.json"
+    assert not (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "glossary.json"
+    ).exists()
+    phase_record = json.loads(
+        next(
+            (
+                tmp_path
+                / "teams"
+                / team.team_slug
+                / "summary_data"
+                / "phases"
+            ).glob("*.json")
         ).read_text(encoding="utf-8")
     )
-    assert glossary_record["schema_version"] == 3
-    assert glossary_record["project_overview_input_hash"] == overview_record["summary"][
-        "input_hash"
-    ]
-    assert all(
-        item["definition_status"] == "insufficient-evidence"
-        and item["definition"].startswith("Insufficient evidence:")
-        and item["evidence"]
-        and item["available_at_ms"] >= item["introduced_at_ms"]
-        and item["definition_epoch_id"].startswith("definition-")
-        for item in glossary_record["terms"]
-    )
+    assert phase_record["summary"]["prompt_version"].endswith("summary-v2")
     assert timeline["glossary_path"].endswith("codex-test-glossary.md")
-    assert all(item["url"] == "#glossary/" + item["id"] for item in timeline["glossary"])
-    assert all("definition" in item for item in timeline["glossary"])
+    assert timeline["glossary"] == []
     assert timeline["project_overview"]["evidence_status"] == "insufficient-evidence"
     glossary_catalog = tmp_path / timeline["glossary_path"]
     catalog_text = glossary_catalog.read_text(encoding="utf-8")
     assert catalog_text.index("## Project overview") < catalog_text.index(
         "## Project terms"
     )
-    assert "### Definition" in catalog_text
-    assert "### First-use evidence" in catalog_text
+    assert "_No supported semantic project concepts are available._" in catalog_text
     assert timeline["events"].count(
         {"agent_id": CHILD, "at_ms": START + 10_000, "kind": "tool_call"}
     ) == 3
@@ -475,7 +481,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert run["summaries"]["usage_run_paths"] == list(second.usage_run_paths)
 
 
-def test_append_catchup_keeps_completed_historical_knowledge_jobs_stable(
+def test_append_catchup_keeps_completed_historical_overview_stable(
     tmp_path: Path,
 ) -> None:
     team = _team()
@@ -499,19 +505,7 @@ def test_append_catchup_keeps_completed_historical_knowledge_jobs_stable(
         / "summary_data"
         / "project_overview.json"
     )
-    glossary_path = (
-        tmp_path
-        / "teams"
-        / team.team_slug
-        / "summary_data"
-        / "glossary.json"
-    )
     original_overview = json.loads(overview_path.read_text(encoding="utf-8"))
-    original_glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
-    original_definitions = {
-        item["term_id"]: item["definition_summary"]["input_hash"]
-        for item in original_glossary["terms"]
-    }
 
     later_offset = 2 * 24 * 60 * 60 * 1000
     late_events = (
@@ -562,12 +556,6 @@ def test_append_catchup_keeps_completed_historical_knowledge_jobs_stable(
 
     refreshed_daily = json.loads(original_daily_path.read_text(encoding="utf-8"))
     refreshed_overview = json.loads(overview_path.read_text(encoding="utf-8"))
-    refreshed_glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
-    refreshed_definitions = {
-        item["term_id"]: item["definition_summary"]["input_hash"]
-        for item in refreshed_glossary["terms"]
-    }
-    dbi = next(item for item in refreshed_glossary["terms"] if item["term"] == "DBI")
 
     assert refreshed_daily["technical_summary"]["input_hash"] == (
         original_daily["technical_summary"]["input_hash"]
@@ -580,12 +568,13 @@ def test_append_catchup_keeps_completed_historical_knowledge_jobs_stable(
     assert refreshed_overview["summary"]["input_hash"] == (
         original_overview["summary"]["input_hash"]
     )
-    assert all(
-        refreshed_definitions[term_id] == input_hash
-        for term_id, input_hash in original_definitions.items()
-    )
-    assert dbi["available_at_ms"] == START + later_offset + 1_000
-    assert dbi["available_at_ms"] >= original_daily["end_ms"]
+    assert not (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "glossary.json"
+    ).exists()
 
 
 def test_frozen_overview_rejects_historical_source_mutation(tmp_path: Path) -> None:
@@ -604,10 +593,21 @@ def test_frozen_overview_rejects_historical_source_mutation(tmp_path: Path) -> N
         summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
 
 
-def test_frozen_definition_rejects_historical_source_mutation(tmp_path: Path) -> None:
+def test_retired_glossary_does_not_block_source_updates_or_change_bytes(
+    tmp_path: Path,
+) -> None:
     team = _team()
     _write_team(tmp_path, team)
     summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    glossary_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "glossary.json"
+    )
+    write_json_if_changed(glossary_path, narrow_json({"schema_version": 3, "terms": []}))
+    glossary_before = glossary_path.read_bytes()
     changed_events = tuple(
         replace(event, text="Rewritten child evidence no longer names the term.")
         if event.event_id == "child-update"
@@ -616,8 +616,11 @@ def test_frozen_definition_rejects_historical_source_mutation(tmp_path: Path) ->
     )
     _write_team(tmp_path, replace(team, events=changed_events))
 
-    with pytest.raises(ValueError, match="frozen source was mutated or truncated"):
-        summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    report = summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+
+    assert report.glossary_terms == 0
+    assert report.glossary_definitions == 0
+    assert glossary_path.read_bytes() == glossary_before
 
 
 def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
@@ -1704,6 +1707,32 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         assert detail_path.is_file()
         assert phase["detail_path"].startswith(f"data/details/{phase['team']}/")
     assert (output / "Makefile").is_file()
+    assert (output / "query.py").is_file()
+    query_result = subprocess.run(
+        (
+            sys.executable,
+            str(output / "query.py"),
+            "--output",
+            str(output),
+            "list",
+            "teams",
+        ),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert query_result.returncode == 0, query_result.stderr
+    assert json.loads(query_result.stdout)["count"] == 2
+    make_query_result = subprocess.run(
+        ("make", "query", "QUERY_ARGS=list teams"),
+        cwd=output,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert make_query_result.returncode == 0, make_query_result.stderr
+    assert json.loads(make_query_result.stdout)["count"] == 2
     assert (output / ".agent-team-timeline.json").is_file()
     export_manifest = json.loads(
         (output / "data" / "export.json").read_text(encoding="utf-8")
@@ -2022,7 +2051,7 @@ def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
     assert "DBI" not in plain.glossary
 
 
-def test_build_rejects_pre_definition_glossary_schema(tmp_path: Path) -> None:
+def test_build_ignores_retired_glossary_schema(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)
     summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
@@ -2033,11 +2062,86 @@ def test_build_rejects_pre_definition_glossary_schema(tmp_path: Path) -> None:
         / "summary_data"
         / "glossary.json"
     )
-    glossary = json.loads(glossary_path.read_text(encoding="utf-8"))
-    glossary["schema_version"] = 1
-    glossary_path.write_text(json.dumps(glossary), encoding="utf-8")
+    write_json_if_changed(glossary_path, narrow_json({"schema_version": 1, "terms": []}))
+    before = glossary_path.read_bytes()
 
-    with pytest.raises(ValueError, match="unsupported glossary schema; run summarize"):
+    build_archive(tmp_path, team.team_slug)
+
+    timeline = json.loads(
+        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert timeline["glossary"] == []
+    assert glossary_path.read_bytes() == before
+
+
+def test_build_excludes_legacy_glossary_without_mutating_immutable_data(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+    glossary_path = summary_root / "glossary.json"
+    write_json_if_changed(
+        glossary_path,
+        narrow_json(
+            {
+                "schema_version": 3,
+                "terms": [{"term": "and", "definition": "Retired junk."}],
+            }
+        ),
+    )
+    glossary_before = glossary_path.read_bytes()
+    legacy_glossary = json.loads(glossary_before)
+    assert legacy_glossary["schema_version"] == 3
+    assert legacy_glossary["terms"]
+    cache_before = {
+        path.relative_to(summary_root): path.read_bytes()
+        for path in sorted((summary_root / "cache").glob("*.json"))
+    }
+    assert cache_before
+    stale_week = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summaries"
+        / "glossary"
+        / "2026"
+        / f"2026-W31-{team.team_slug}-glossary.md"
+    )
+    stale_week.parent.mkdir(parents=True, exist_ok=True)
+    stale_week.write_text("# stale retired glossary\n", encoding="utf-8")
+    user_notes = stale_week.parent / f"notes-{team.team_slug}-glossary.md"
+    user_notes.write_text("# user-owned notes\n", encoding="utf-8")
+
+    build_archive(tmp_path, team.team_slug)
+
+    timeline = json.loads(
+        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert timeline["glossary"] == []
+    assert not stale_week.exists()
+    assert user_notes.read_text(encoding="utf-8") == "# user-owned notes\n"
+    assert glossary_path.read_bytes() == glossary_before
+    assert {
+        path.relative_to(summary_root): path.read_bytes()
+        for path in sorted((summary_root / "cache").glob("*.json"))
+    } == cache_before
+
+
+def test_build_refuses_symlinked_generated_glossary_directory(tmp_path: Path) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
+    glossary_root = (
+        tmp_path / "teams" / team.team_slug / "summaries" / "glossary"
+    )
+    glossary_root.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (glossary_root / "2026").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="refusing symlink in generated glossary"):
         build_archive(tmp_path, team.team_slug)
 
 
