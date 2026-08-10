@@ -94,6 +94,12 @@ A DAG node can contain a parallel test runner. On a node timeout,
 `SIGTERM` so the inner runner can flush its state, waits a bounded grace, and
 only then escalates to cgroup-wide/process-group `SIGKILL`.
 
+Use three strictly nested bounds: the test runner's per-test timeout below the
+DAG step timeout, and the step timeout below the whole-DAG timeout. The
+innermost bound produces the clearest named failure. The DAG's process snapshot
+is a backstop for a missing or mis-sized runner-native timeout, not a substitute
+for one.
+
 For a controlled harness, emit explicit boundaries as work starts and ends:
 
 ```text

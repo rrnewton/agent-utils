@@ -51,6 +51,8 @@ impl Fixture {
                 "--no-profile-feedback",
                 "--unsafe-no-cgroups",
             ])
+            .arg("--run-timeout")
+            .arg((timeout + 4).to_string())
             .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &evidence)
             .output()
             .unwrap();
@@ -144,9 +146,8 @@ bash -c 'while :; do :; done' & cpu=$!; wait"#;
         );
     }
 
-    // Nextest may not be installed in a minimal package consumer. When present, its exact child
-    // argv is a direct binding and the timed-out test must be named without parsing a guess from
-    // prose. This repository's full gate installs nextest and therefore exercises this branch.
+    // Nextest may not be installed in a minimal package consumer. This repository's full gate
+    // installs it and therefore exercises both nested timeout levels below.
     let nextest = Command::new("cargo")
         .args(["nextest", "--version"])
         .status()
@@ -156,11 +157,33 @@ bash -c 'while :; do :; done' & cpu=$!; wait"#;
         eprintln!("SKIP nextest exact-process bracket: cargo-nextest is not installed");
         return;
     }
+    // The fixture's default nextest profile has a 1s per-test bound below this 5s step and 9s
+    // whole-run bound. It must produce the clearest result at the innermost level without any DAG
+    // timeout or process-tree forensics.
     let nextest_command = format!(
         "DAG_RUNNER_PROBE_MODE=wall cargo nextest run --manifest-path '{}' --status-level all --final-status-level all",
         manifest.display()
     );
-    let (output, console, journal) = fixture.run("nextest", &nextest_command, 2);
+    let (output, console, journal) = fixture.run("nextest_inner", &nextest_command, 5);
+    assert_ne!(output.status.code(), Some(0), "{console}");
+    assert!(
+        console.contains("tests::planted_wall_hang") && console.contains("TIMEOUT"),
+        "nextest's per-test bound did not name the timed-out test:\n{console}"
+    );
+    assert!(
+        !journal.contains("\"event\":\"step_timeout\"")
+            && !journal.contains("\"event\":\"process_snapshot\""),
+        "an outer DAG bound fired before nextest's per-test bound:\n{journal}"
+    );
+
+    // A deliberately mis-sized third-party profile keeps the 60s per-test timeout outside the 2s
+    // step bound. This negative bracket exercises the outer backstop: exact child argv is a direct
+    // binding and the killed test must still be named without guessing from prose.
+    let nextest_outer_command = format!(
+        "DAG_RUNNER_PROBE_MODE=wall cargo nextest run --profile outer-backstop --manifest-path '{}' --status-level all --final-status-level all",
+        manifest.display()
+    );
+    let (output, console, journal) = fixture.run("nextest_outer", &nextest_outer_command, 2);
     assert_ne!(output.status.code(), Some(0), "{console}");
     assert!(
         console.contains("culprit test tests::planted_wall_hang")
