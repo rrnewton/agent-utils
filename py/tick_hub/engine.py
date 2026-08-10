@@ -96,7 +96,13 @@ def _eval_gate(
     """Return (fire, captured_fields, error). ``error`` non-None means the gate could not run."""
     if gate is None:
         return True, {}, None
-    result = runner.run(gate.cmd)
+    # Preserve compatibility with simple runners that implement the original
+    # one-argument protocol unless this gate explicitly opts into an override.
+    result = (
+        runner.run(gate.cmd)
+        if gate.timeout_secs is None
+        else runner.run(gate.cmd, timeout=gate.timeout_secs)
+    )
     if not result.ok:
         return False, {}, f"gate command could not run ({gate.cmd!r}): {result.error}"
     captured = parse_kv_lines(result.stdout) if gate.capture else {}

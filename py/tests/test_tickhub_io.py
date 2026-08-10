@@ -36,7 +36,12 @@ def _cfg() -> TickConfig:
                     fields={"threshold": "20"},
                 ),
                 requires_flags=("ops_in_charge",),
-                gate=Gate(cmd="echo count=3", when=GateWhen.ALWAYS, capture=True),
+                gate=Gate(
+                    cmd="echo count=3",
+                    when=GateWhen.ALWAYS,
+                    capture=True,
+                    timeout_secs=195,
+                ),
             ),
         ),
         health_checks=(
@@ -57,6 +62,7 @@ def test_roundtrip_is_stable() -> None:
     assert back.reminders[1].requires_flags == ("ops_in_charge",)
     gate = back.reminders[1].gate
     assert gate is not None and gate.when is GateWhen.ALWAYS and gate.capture is True
+    assert gate.timeout_secs == 195
     assert back.reminders[1].emit.fields == {"threshold": "20"}
     assert back.health_checks[0].glob == "/var/*.sql"
 
@@ -139,6 +145,9 @@ def test_strict_parse_errors() -> None:
         '{"reminders": [{"name": "r", "requires_flags": [1], "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "gate": {"when": "nope"}, "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "gate": {"cmd": "c", "when": "x"}, "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "r", "gate": {"cmd": "c", "timeout_secs": 0}, "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "r", "gate": {"cmd": "c", "timeout_secs": -1}, "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "r", "gate": {"cmd": "c", "timeout_secs": "195"}, "emit": {"skill": "s"}}]}',
         '{"health_checks": [{"name": "h"}]}',  # missing glob
         '{"reminders": [{"name": "r", "emit": {"skill": "s", "fields": {"k": 1}}}]}',
         '{"unknown": true}',

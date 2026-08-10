@@ -21,10 +21,10 @@ class FakeGate:
 
     def __init__(self, by_cmd: dict[str, GateResult]) -> None:
         self.by_cmd = by_cmd
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, int | None]] = []
 
-    def run(self, cmd: str) -> GateResult:
-        self.calls.append(cmd)
+    def run(self, cmd: str, *, timeout: int | None = None) -> GateResult:
+        self.calls.append((cmd, timeout))
         return self.by_cmd.get(cmd, GateResult(returncode=0, stdout="", ok=True))
 
 
@@ -102,6 +102,31 @@ def test_gate_success_fires_failure_suppresses() -> None:
         gate_runner=FakeGate({"check": GateResult(1, "", True)}), age_probe=FakeProbe({}),
     )
     assert any("ci-red" in ln for ln in red.lines)
+
+
+def test_gate_specific_timeout_is_forwarded_without_changing_default() -> None:
+    default_runner = FakeGate({})
+    override_runner = FakeGate({})
+    default = Reminder(
+        "default",
+        Emit(EmitKind.ACTION, title="default", skill="default"),
+        gate=Gate(cmd="default-check"),
+    )
+    override = Reminder(
+        "override",
+        Emit(EmitKind.ACTION, title="override", skill="override"),
+        gate=Gate(cmd="long-check", timeout_secs=195),
+    )
+    run_tick(
+        TickConfig(reminders=(default,)), OpsState.default(), now=0, fired={},
+        gate_runner=default_runner, age_probe=FakeProbe({}),
+    )
+    run_tick(
+        TickConfig(reminders=(override,)), OpsState.default(), now=0, fired={},
+        gate_runner=override_runner, age_probe=FakeProbe({}),
+    )
+    assert default_runner.calls == [("default-check", None)]
+    assert override_runner.calls == [("long-check", 195)]
 
 
 def test_gate_capture_interpolates_fields_and_title() -> None:

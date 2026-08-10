@@ -20,7 +20,8 @@ class _NoGate:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def run(self, cmd: str) -> GateResult:
+    def run(self, cmd: str, *, timeout: int | None = None) -> GateResult:
+        del timeout
         self.calls.append(cmd)
         # The example's capturing gate echoes count=42; its note gate exits 1 (stays quiet).
         if "count" in cmd:

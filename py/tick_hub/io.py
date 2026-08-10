@@ -125,6 +125,17 @@ def _opt_nonnegative_int(m: Mapping[str, object], key: str, default: int, where:
     return value
 
 
+def _opt_positive_int_or_none(
+    m: Mapping[str, object], key: str, where: str
+) -> int | None:
+    if key not in m:
+        return None
+    value = _opt_int(m, key, 0, where)
+    if value <= 0:
+        raise TickConfigError(f"{where}: field '{key}' must be positive")
+    return value
+
+
 def _opt_bool(m: Mapping[str, object], key: str, default: bool, where: str) -> bool:
     val = m.get(key, default)
     if not isinstance(val, bool):
@@ -163,7 +174,7 @@ def _gate_from(value: object, where: str) -> Gate | None:
     if value is None:
         return None
     obj = _as_obj(value, where)
-    _reject_unknown(obj, frozenset({"cmd", "when", "capture"}), where)
+    _reject_unknown(obj, frozenset({"cmd", "when", "capture", "timeout_secs"}), where)
     when_name = _opt_str(obj, "when", GateWhen.SUCCESS.value, where)
     try:
         when = GateWhen(when_name)
@@ -176,6 +187,7 @@ def _gate_from(value: object, where: str) -> Gate | None:
         cmd=_req_str(obj, "cmd", where),
         when=when,
         capture=_opt_bool(obj, "capture", False, where),
+        timeout_secs=_opt_positive_int_or_none(obj, "timeout_secs", where),
     )
 
 
@@ -316,7 +328,14 @@ def _config_from_obj(raw: object) -> TickConfig:
 def _gate_to_obj(gate: Gate | None) -> object:
     if gate is None:
         return None
-    return {"cmd": gate.cmd, "when": gate.when.value, "capture": gate.capture}
+    obj: dict[str, object] = {
+        "cmd": gate.cmd,
+        "when": gate.when.value,
+        "capture": gate.capture,
+    }
+    if gate.timeout_secs is not None:
+        obj["timeout_secs"] = gate.timeout_secs
+    return obj
 
 
 def _emit_to_obj(emit: Emit) -> dict[str, object]:

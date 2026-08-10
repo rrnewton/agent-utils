@@ -51,12 +51,15 @@ class Gate:
     stdout is parsed for ``key=value`` lines, which are merged into the emitted
     ACTION's fields and interpolated into the title/text via ``{key}``
     placeholders — so a reminder can carry live values (a count, a SHA, a URL)
-    without the engine hardcoding anything.
+    without the engine hardcoding anything. ``timeout_secs`` optionally raises
+    or lowers the subprocess boundary for this gate only; ``None`` retains the
+    runner's global default.
     """
 
     cmd: str
     when: GateWhen = GateWhen.SUCCESS
     capture: bool = False
+    timeout_secs: int | None = None
 
 
 @dataclass(frozen=True)

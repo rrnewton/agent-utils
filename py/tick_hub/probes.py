@@ -30,8 +30,9 @@ class SubprocessGateRunner:
     def __init__(self, timeout: int = DEFAULT_GATE_TIMEOUT_SECS) -> None:
         self.timeout = timeout
 
-    def run(self, cmd: str) -> GateResult:
+    def run(self, cmd: str, *, timeout: int | None = None) -> GateResult:
         """Execute ``cmd`` and return its captured completion or launch/timeout error."""
+        effective_timeout = self.timeout if timeout is None else timeout
         try:
             proc = subprocess.Popen(
                 ["bash", "-c", cmd],
@@ -45,12 +46,15 @@ class SubprocessGateRunner:
             return GateResult(returncode=-1, stdout="", ok=False, error=str(exc))
         try:
             stdout, _stderr = proc.communicate(
-                timeout=self.timeout,
+                timeout=effective_timeout,
             )
         except subprocess.TimeoutExpired:
             _terminate(proc)
             return GateResult(
-                returncode=-1, stdout="", ok=False, error=f"timed out after {self.timeout}s"
+                returncode=-1,
+                stdout="",
+                ok=False,
+                error=f"timed out after {effective_timeout}s",
             )
         except OSError as exc:
             _terminate(proc)

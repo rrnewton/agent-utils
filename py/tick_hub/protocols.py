@@ -29,8 +29,11 @@ class GateResult:
 class GateRunner(Protocol):
     """Runs a reminder's gate command and reports its exit code + stdout."""
 
-    def run(self, cmd: str) -> GateResult:
-        """Run ``cmd`` and return its captured result."""
+    def run(self, cmd: str, *, timeout: int | None = None) -> GateResult:
+        """Run ``cmd`` and return its captured result.
+
+        ``timeout`` overrides the runner's default for this invocation only.
+        """
         ...
 
 
