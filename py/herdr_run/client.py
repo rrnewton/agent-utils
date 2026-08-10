@@ -35,6 +35,7 @@ __all__ = [
     "Runner",
     "SERVER_UNIT",
     "CONTROL_TIMEOUT_SECONDS",
+    "SERVER_WORKER_THREADS",
     "AgentPaneInfo",
 ]
 
@@ -48,6 +49,14 @@ SERVER_UNIT = "herdr-run-server"
 #: Maximum/avoidance bound for one Herdr CLI or systemd control call. Command execution itself has
 #: its separate configurable timeout in the pane runner.
 CONTROL_TIMEOUT_SECONDS = 30.0
+
+#: Tokio runtime workers for the server. Herdr is a static musl binary, and musl's mallocng has one
+#: global allocator lock; tokio's default of one worker per core turns that lock into a convoy on a
+#: many-core host. Measured on devbig014 (316 cores, 260 panes) 2026-08-10: uncapped the server sat
+#: at >1000% CPU with ~98% of cycles in the kernel's futex spinlock and every control call timing
+#: out; capped at 16 the same session served ``pane list`` in 0.03s. This bounds only the runtime
+#: workers -- the per-pane blocking threads are separate and still scale with pane count.
+SERVER_WORKER_THREADS = 16
 
 # Linux exposes process IDs through the positive range of its signed ``pid_t``.  Keep this bound
 # explicit so Python's arbitrary-precision integers cannot accept protocol values that the Rust
@@ -387,6 +396,8 @@ class HerdrClient:
                     "herdr-run Herdr server (outside the agent sandbox)",
                     "--setenv",
                     f"HOME={self._account_home()}",
+                    "--setenv",
+                    f"TOKIO_WORKER_THREADS={SERVER_WORKER_THREADS}",
                     self._executable(),
                     "server",
                 ]

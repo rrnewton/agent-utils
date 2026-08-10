@@ -15,7 +15,12 @@ from collections.abc import Sequence
 import pytest
 
 import herdr_run.client as client_module
-from herdr_run.client import CONTROL_TIMEOUT_SECONDS, HerdrClient, SERVER_UNIT
+from herdr_run.client import (
+    CONTROL_TIMEOUT_SECONDS,
+    HerdrClient,
+    SERVER_UNIT,
+    SERVER_WORKER_THREADS,
+)
 from herdr_run.errors import EXIT_UNAVAILABLE, HerdrUnavailable
 
 
@@ -287,6 +292,8 @@ def test_server_start_argv_is_exact_and_never_forwards_caller_path(
         "herdr-run Herdr server (outside the agent sandbox)",
         "--setenv",
         "HOME=/account/home",
+        "--setenv",
+        f"TOKIO_WORKER_THREADS={SERVER_WORKER_THREADS}",
         "fixture-herdr",
         "server",
     )
