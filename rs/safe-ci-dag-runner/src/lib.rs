@@ -43,8 +43,9 @@ pub use attribution::{
     TestEvent, TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
 };
 pub use cgroup::{
-    expected_scope_runtime_max_s, install_scope_teardown, reexec_in_scope,
-    reexec_in_scope_with_limits, verify_scope_runtime_max, CgroupManager, Cgroups,
+    attempt_scope_reexec, expected_scope_runtime_max_s, install_scope_teardown, reexec_in_scope,
+    reexec_in_scope_with_limits, verify_scope_runtime_max, CgroupManager, Cgroups, ScopeAttempt,
+    FORCE_ATTEMPT_ENV,
 };
 pub use estimates::{
     allocate_widths, apply_plan_to_config, bucketize_rows, build_plan, feedback_identity,

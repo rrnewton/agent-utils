@@ -85,6 +85,11 @@ from safe_ci_dag_runner.sizing import (
     step_mem_cap_for_inner_jobs,
     transitive_deps,
 )
+from safe_ci_dag_runner.cgroup import (
+    ScopeAttempt,
+    ScopeAttemptKind,
+    policy_skip_reason,
+)
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
@@ -126,6 +131,10 @@ __all__ = [
     "render_jobs_flag",
     "effective_jobs_flag",
     "command_with_inner_jobs",
+    # containment outcome
+    "ScopeAttempt",
+    "ScopeAttemptKind",
+    "policy_skip_reason",
     # running
     "run_dag",
     "steps_violating_run_timeout",

@@ -33,10 +33,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cgroup::{
-    apply_specific_cores, enable_outer_oom_group, expected_outer_memory_max_bytes,
-    expected_scope_runtime_max_s, install_scope_teardown, is_in_scope, outer_memory_max_bytes,
-    reexec_in_scope_with_limits, verify_scope_limits, verify_scope_runtime_max, CgroupManager,
-    Cgroups, DIRECT_CGROUP_ENV,
+    apply_specific_cores, attempt_scope_reexec, enable_outer_oom_group,
+    expected_outer_memory_max_bytes, expected_scope_runtime_max_s, install_scope_teardown,
+    is_in_scope, outer_memory_max_bytes, verify_scope_limits, verify_scope_runtime_max,
+    CgroupManager, Cgroups, ScopeAttempt, DIRECT_CGROUP_ENV, FORCE_ATTEMPT_ENV,
 };
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
@@ -961,20 +961,28 @@ fn resolve_cgroups(
         );
         return Err(3);
     };
-    let reexeced_or_skipped = reexec_in_scope_with_limits(
+    // NAME WHAT ACTUALLY HAPPENED. This used to pick between two sentences from a bool, and on the
+    // policy-skip path it chose "boxing was skipped (e.g. CI without a systemd --user scope)" — a
+    // claim about a capability nothing had tested. Reporting the real outcome is the whole fix: the
+    // exit code is unchanged, and so is the policy.
+    let attempt = attempt_scope_reexec(
         Some(outer_memory_max),
         None,
         run_timeout_s.map(|s| s + scope_grace_s(s)),
     );
-    let detail = if reexeced_or_skipped {
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
-    } else {
-        "cgroup-v2 + a working systemd --user scope are unavailable"
-    };
-    eprintln!(
-        "{PROG}: ERROR: cgroup boxing could not be established: {detail}. Cgroup resource boxing is \
-         this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED."
-    );
+    match &attempt {
+        ScopeAttempt::SkippedByPolicy { reason } => eprintln!(
+            "{PROG}: ERROR: cgroup boxing was NOT ESTABLISHED and NOT TESTED: scope setup was \
+             skipped by policy because ${reason} is set, so this run does not know whether boxing \
+             is available here. Re-run with --allow-cgroup-failure to run UNBOXED, or with \
+             {FORCE_ATTEMPT_ENV}=1 to probe instead of skipping."
+        ),
+        other => eprintln!(
+            "{PROG}: ERROR: cgroup boxing could not be established: {}. Cgroup resource boxing is \
+             this tool's primary purpose; re-run with --allow-cgroup-failure to run UNBOXED.",
+            other.describe()
+        ),
+    }
     Err(3)
 }
 
