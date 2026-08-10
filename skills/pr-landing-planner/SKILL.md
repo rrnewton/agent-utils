@@ -22,7 +22,7 @@ pr-landing-planner plan \
 
 The context binds caller-supplied validation evidence to an exact head and base and adds policy and
 assignment facts. Review state is collected separately; verify any required approval against the
-final revision before publication. Treat labels and aggregate CI states as hints unless the
+final revision before publication. Treat labels and aggregate workflow states as hints unless the
 consuming repository's rules explicitly make them authoritative. A fixture can exercise the same
 planning path without network data:
 

@@ -1,7 +1,7 @@
 """Core vocabulary for pr-landing-planner: pure data + enums, no I/O.
 
 A landing planner answers one question over a set of open pull requests (PRs): *given the conflict
-graph and live CI health, which PRs can be landed now, which must be rebased first, which reds are
+graph and live workflow-check health, which PRs can be landed now, which must be rebased first, which reds are
 real vs. benign, and in what order should the coordinator act?*
 
 Everything here is a frozen dataclass or an :class:`enum.Enum`. The interesting work
@@ -20,12 +20,12 @@ from enum import Enum
 
 DEFAULT_REPO = ""
 DEFAULT_BASE = "main"
-#: The single required merge-gate check most callers gate on.
+#: The legacy default workflow-check name; consuming repository policy decides its role.
 DEFAULT_GATE_CHECK = "merge-gate"
 
 
 class CiState(Enum):
-    """The trinary CI verdict for a PR's whole check rollup.
+    """The trinary workflow-check verdict for a PR's whole check rollup.
 
     ``PENDING`` and ``NONE`` remain aliases for callers compiled against the
     older vocabulary. Neither is a fourth outcome: active, absent, cancelled,
