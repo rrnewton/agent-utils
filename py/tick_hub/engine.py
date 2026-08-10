@@ -16,6 +16,7 @@ deterministic given ``now`` and the injected probes.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
@@ -41,6 +42,15 @@ class TickResult:
     lines: tuple[str, ...]
     fired: Mapping[str, int]
     actions_emitted: int
+
+
+class UnresolvedPlaceholderError(ValueError):
+    """An emission still contains a template placeholder after rendering."""
+
+
+_UNRESOLVED_PLACEHOLDER = re.compile(
+    r"(?<!\{)\{[A-Za-z_][A-Za-z0-9_.-]*\}(?!\})"
+)
 
 
 def parse_kv_lines(text: str) -> dict[str, str]:
@@ -112,6 +122,14 @@ def render_emit(emit: Emit, captured: Mapping[str, str]) -> str:
         if key not in captured:
             merged[key] = _interpolate(merged[key], merged)
     title = _interpolate(emit.title, merged)
+    unresolved: set[str] = set(_UNRESOLVED_PLACEHOLDER.findall(title))
+    for value in merged.values():
+        unresolved.update(_UNRESOLVED_PLACEHOLDER.findall(value))
+    if unresolved:
+        names = ", ".join(sorted(unresolved))
+        raise UnresolvedPlaceholderError(
+            f"refusing emission with unresolved placeholder(s): {names}"
+        )
     if emit.kind is EmitKind.NOTE:
         return format_note(title)
     return format_action(emit.skill, merged, title)
@@ -158,10 +176,17 @@ def run_tick(
                 # The check did not complete: surface it and retry next tick (no fired stamp).
                 lines.append(format_error(f"reminder {rem.name}: {error}"))
                 continue
-            new_fired[rem.name] = now  # the check ran; the cadence clock resets
             if not fire:
+                new_fired[rem.name] = now  # the check ran; the cadence clock resets
                 continue
-            line = render_emit(rem.emit, captured)
+            try:
+                line = render_emit(rem.emit, captured)
+            except UnresolvedPlaceholderError as exc:
+                # A templated hole is not a domain warning. Surface the renderer
+                # failure and leave cadence unconsumed so the reminder retries.
+                lines.append(format_error(f"reminder {rem.name}: {exc}"))
+                continue
+            new_fired[rem.name] = now
             lines.append(line)
             if line.startswith("ACTION: "):
                 actions += 1
@@ -175,6 +200,7 @@ __all__ = [
     "run_tick",
     "evaluate_health",
     "render_emit",
+    "UnresolvedPlaceholderError",
     "parse_kv_lines",
     "HEALTH_STATUS_OK",
     "HEALTH_STATUS_STALE",

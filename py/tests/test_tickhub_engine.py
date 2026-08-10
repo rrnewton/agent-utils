@@ -126,6 +126,56 @@ def test_gate_capture_interpolates_fields_and_title() -> None:
     assert 'title="42 ready (>20)"' in line
 
 
+def test_captured_summary_renders_and_still_emits() -> None:
+    rem = Reminder(
+        "obligation",
+        Emit(
+            EmitKind.ACTION,
+            title="speculative land requires attention: {summary}",
+            skill="hard-warn",
+            fields={"component": "speculative-land-obligation"},
+        ),
+        gate=Gate(cmd="check", when=GateWhen.FAILURE, capture=True),
+    )
+    result = run_tick(
+        TickConfig(reminders=(rem,)), OpsState.default(), now=7, fired={},
+        gate_runner=FakeGate({"check": GateResult(1, "summary=obligation abc is red\n", True)}),
+        age_probe=FakeProbe({}),
+    )
+    assert any('title="speculative land requires attention: obligation abc is red"' in line
+               for line in result.lines)
+    assert result.fired["obligation"] == 7
+    assert result.actions_emitted == 1
+
+
+def test_unresolved_placeholder_is_refused_loudly_and_retried() -> None:
+    rem = Reminder(
+        "obligation",
+        Emit(
+            EmitKind.ACTION,
+            title="speculative land requires attention: {summary}",
+            skill="hard-warn",
+            fields={"component": "speculative-land-obligation"},
+        ),
+        gate=Gate(cmd="check", when=GateWhen.FAILURE, capture=True),
+    )
+    result = run_tick(
+        TickConfig(reminders=(rem,)), OpsState.default(), now=7, fired={},
+        gate_runner=FakeGate({"check": GateResult(1, "", True)}),
+        age_probe=FakeProbe({}),
+    )
+    assert not any(line.startswith("ACTION: hard-warn") for line in result.lines)
+    assert any(
+        line == (
+            "ERROR: reminder obligation: refusing emission with unresolved "
+            "placeholder(s): {summary}"
+        )
+        for line in result.lines
+    )
+    assert "obligation" not in result.fired
+    assert result.actions_emitted == 0
+
+
 def test_gate_run_failure_emits_error_no_fired_stamp() -> None:
     rem = Reminder("x", Emit(EmitKind.ACTION, title="x", skill="x"), gate=Gate(cmd="boom"))
     cfg = TickConfig(reminders=(rem,))
