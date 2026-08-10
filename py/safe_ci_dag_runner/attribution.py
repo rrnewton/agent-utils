@@ -13,7 +13,7 @@ import stat
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, Literal
 
@@ -220,18 +220,44 @@ class TestTracker:
     last_completed: str | None = None
     completed: int = 0
     started: int = 0
+    in_flight: dict[str, float] = field(default_factory=dict)
 
     def observe(self, event: TestEvent) -> None:
         """Apply one recognized boundary to this tracker."""
         if event.kind == "start":
             self.last_started = event.name
-            self.started += 1
+            if event.name not in self.in_flight:
+                self.started += 1
+                self.in_flight[event.name] = time.monotonic()
         else:
             if self.last_started != event.name:
                 self.last_started = event.name
                 self.started += 1
+            self.in_flight.pop(event.name, None)
             self.last_completed = event.name
             self.completed += 1
+
+    def in_flight_snapshot(self) -> tuple["InFlightTest", ...]:
+        """Return every currently declared test, longest-running first."""
+        now = time.monotonic()
+        return tuple(
+            sorted(
+                (
+                    InFlightTest(name, max(0.0, now - started), "declared test boundary")
+                    for name, started in self.in_flight.items()
+                ),
+                key=lambda test: (-test.elapsed_s, test.name),
+            )
+        )
+
+
+@dataclass(frozen=True)
+class InFlightTest:
+    """One test known to be live at the termination boundary."""
+
+    name: str
+    elapsed_s: float
+    basis: str
 
 
 @dataclass(frozen=True)
@@ -242,16 +268,167 @@ class Culprit:
     how: str
     completed: int
     last_completed: str | None
+    in_flight: tuple[InFlightTest, ...] = ()
 
     def describe(self) -> str:
         """Render a concise human-readable attribution summary."""
         last = f", last completed {self.last_completed}" if self.last_completed else ""
+        live = (
+            f"; {len(self.in_flight)} test(s) in flight ["
+            + ", ".join(
+                f"{test.name} {test.elapsed_s:.3f}s via {test.basis}"
+                for test in self.in_flight
+            )
+            + "]"
+            if self.in_flight
+            else ""
+        )
         if self.test is not None:
             return (
-                f"culprit test {self.test} ({self.how}; {self.completed} test(s) completed "
-                f"first{last})"
+                f"{'likely ' if len(self.in_flight) > 1 else ''}culprit test {self.test} "
+                f"({self.how}; {self.completed} test(s) completed first{last}{live})"
             )
-        return f"no test-level attribution ({self.how}; {self.completed} test(s) completed{last})"
+        return (
+            f"no test-level attribution ({self.how}; {self.completed} test(s) "
+            f"completed{last}{live})"
+        )
+
+
+@dataclass(frozen=True)
+class ProcessObservation:
+    """One owned process observed immediately before graceful termination."""
+
+    pid: int
+    ppid: int
+    command: str
+    wall_elapsed_s: float
+    cpu_elapsed_s: float
+    signature: str
+    test: str | None = None
+    test_basis: str | None = None
+
+
+def _exact_libtest_from_argv(argv: list[str]) -> str | None:
+    try:
+        exact = argv.index("--exact")
+    except ValueError:
+        return None
+    # libtest accepts both `--exact TEST` and `TEST --exact`; nextest currently uses the former.
+    candidates = argv[exact + 1 : exact + 2] + argv[max(1, exact - 1) : exact]
+    return next(
+        (candidate for candidate in candidates if candidate and not candidate.startswith("-")),
+        None,
+    )
+
+
+def process_snapshot(root: int, nonce: str | None) -> tuple[ProcessObservation, ...]:
+    """Snapshot root descendants plus exact-nonce escapees without guessing by process name."""
+    if root <= 1:
+        return ()
+    rows: dict[int, tuple[int, str, int, int, int, list[str], bool]] = {}
+    needle = f"SAFE_CI_DAG_RUNNER_STEP={nonce}".encode() if nonce else None
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError:
+        return ()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat_text = (entry / "stat").read_text(encoding="utf-8")
+            fields = stat_text[stat_text.rfind(")") + 1 :].split()
+            if len(fields) <= 19:
+                continue
+            state = fields[0]
+            ppid = int(fields[1])
+            utime = int(fields[11])
+            stime = int(fields[12])
+            start = int(fields[19])
+            raw_cmd = (entry / "cmdline").read_bytes()
+            argv = [part.decode(errors="replace") for part in raw_cmd.split(b"\0") if part]
+            carries = False
+            if needle:
+                try:
+                    carries = needle in (entry / "environ").read_bytes().split(b"\0")
+                except OSError:
+                    pass
+        except (OSError, ValueError):
+            continue
+        rows[pid] = (ppid, state, utime, stime, start, argv, carries)
+    owned = {root}
+    while True:
+        before = len(owned)
+        for pid, (ppid, _state, _utime, _stime, _start, _argv, carries) in rows.items():
+            if ppid in owned or carries:
+                owned.add(pid)
+        if len(owned) == before:
+            break
+    try:
+        ticks = float(os.sysconf("SC_CLK_TCK"))
+        boot_s = time.clock_gettime(time.CLOCK_MONOTONIC)
+    except (OSError, ValueError):
+        return ()
+    result: list[ProcessObservation] = []
+    for pid, (ppid, state, utime, stime, start, argv, _carries) in rows.items():
+        if pid not in owned or state == "Z":
+            continue
+        wall = max(0.0, boot_s - start / ticks)
+        cpu = (utime + stime) / ticks
+        ratio = cpu / wall if wall > 0 else 0.0
+        if cpu >= 0.25 and ratio >= 0.50:
+            signature = "cpu-burning"
+        elif wall >= 0.50 and ratio <= 0.05:
+            signature = "wall-stalled"
+        else:
+            signature = "mixed-or-too-young"
+        test = _exact_libtest_from_argv(argv)
+        command = " ".join(argv) if argv else f"[pid {pid}]"
+        if len(command) > 512:
+            command = command[:512] + "..."
+        result.append(
+            ProcessObservation(
+                pid,
+                ppid,
+                command,
+                wall,
+                cpu,
+                signature,
+                test,
+                "libtest --exact process argv" if test else None,
+            )
+        )
+    return tuple(sorted(result, key=lambda row: row.pid))
+
+
+def bind_process_tests(
+    culprit: Culprit, observations: tuple[ProcessObservation, ...]
+) -> Culprit:
+    """Use exact nextest/libtest process bindings only when output had no stronger answer."""
+    if culprit.test is not None or culprit.in_flight:
+        return culprit
+    by_name: dict[str, InFlightTest] = {}
+    for row in observations:
+        if row.test is None:
+            continue
+        current = by_name.get(row.test)
+        candidate = InFlightTest(
+            row.test, row.wall_elapsed_s, row.test_basis or "process observation"
+        )
+        if current is None or candidate.elapsed_s > current.elapsed_s:
+            by_name[row.test] = candidate
+    tests = tuple(sorted(by_name.values(), key=lambda test: (-test.elapsed_s, test.name)))
+    if not tests:
+        return culprit
+    return Culprit(
+        tests[0].name,
+        "only test-bound process live at termination"
+        if len(tests) == 1
+        else "longest-running test-bound process at termination",
+        culprit.completed,
+        culprit.last_completed,
+        tests,
+    )
 
 
 class StepStream:
@@ -295,6 +472,7 @@ class StepStream:
         if self._tail_announced == event.name:
             self._tail_announced = None
             if event.kind == "end":
+                self._tracker.in_flight.pop(event.name, None)
                 self._tracker.last_completed = event.name
                 self._tracker.completed += 1
                 if self.evidence is not None:
@@ -316,7 +494,24 @@ class StepStream:
         with self._lock:
             tail = self._partial.lstrip().rstrip("\n\r")
             event = recognize(tail) if tail.strip() else None
-            tracker = TestTracker(**vars(self._tracker))
+            tracker = TestTracker(
+                last_started=self._tracker.last_started,
+                last_completed=self._tracker.last_completed,
+                completed=self._tracker.completed,
+                started=self._tracker.started,
+                in_flight=dict(self._tracker.in_flight),
+            )
+        in_flight = tracker.in_flight_snapshot()
+        if in_flight:
+            return Culprit(
+                in_flight[0].name,
+                "declared in flight and never completed"
+                if len(in_flight) == 1
+                else "longest-running of the declared in-flight tests",
+                tracker.completed,
+                tracker.last_completed,
+                in_flight,
+            )
         if event is not None and event.kind == "start":
             return Culprit(
                 event.name,
@@ -341,4 +536,10 @@ class StepStream:
     def counts(self) -> TestTracker:
         """Return an immutable-in-practice snapshot of current tracker fields."""
         with self._lock:
-            return TestTracker(**vars(self._tracker))
+            return TestTracker(
+                last_started=self._tracker.last_started,
+                last_completed=self._tracker.last_completed,
+                completed=self._tracker.completed,
+                started=self._tracker.started,
+                in_flight=dict(self._tracker.in_flight),
+            )

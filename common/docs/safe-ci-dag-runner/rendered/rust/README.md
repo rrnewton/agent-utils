@@ -45,6 +45,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+For Rust harnesses, cargo-nextest supplies libtest's `--exact TEST` arguments,
+so the process snapshot can bind each child to its test. Ordinary `cargo test`
+runs several tests inside one shared binary; its process tree alone does not
+identify the live test and remains explicitly unattributed.
+
 ## Quick start
 
 Save this as `pipeline.yaml`:
@@ -81,6 +86,33 @@ safe-ci-dag-runner --help
 safe-ci-dag-runner --userguide
 safe-ci-dag-runner capabilities
 ```
+
+## Attributable test-runner timeouts
+
+A DAG node can contain a parallel test runner. On a node timeout,
+`safe-ci-dag-runner` first freezes durable test and process evidence, sends
+`SIGTERM` so the inner runner can flush its state, waits a bounded grace, and
+only then escalates to cgroup-wide/process-group `SIGKILL`.
+
+For a controlled harness, emit explicit boundaries as work starts and ends:
+
+```text
+##TEST-START suite::case
+##TEST-END suite::case PASS
+```
+
+Several tests may be live concurrently. The timeout report lists the complete
+live set and elapsed time for each; the longest-running is labelled only as the
+*likely* culprit when more than one remains. Set
+`SAFE_CI_DAG_RUNNER_LOG_DIR` to retain the incrementally flushed per-step log
+and `journal.jsonl` even if an outer supervisor later kills the runner.
+
+For third-party runners, the pre-signal `/proc` snapshot reports CPU-burning
+and wall-stalled processes as distinct signatures. It binds a process to a
+test only when argv supplies a direct test identifier. A one-process-per-test
+runner can therefore be bound; a shared-process runner cannot. Without a
+direct identifier or recognized output boundaries, the report says
+attribution is unavailable rather than guessing.
 
 ## CPU-set companion
 

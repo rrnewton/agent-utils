@@ -4,7 +4,14 @@ import json
 import os
 from pathlib import Path
 
-from safe_ci_dag_runner.attribution import RunEvidence, StepStream, recognize
+from safe_ci_dag_runner.attribution import (
+    Culprit,
+    ProcessObservation,
+    RunEvidence,
+    StepStream,
+    bind_process_tests,
+    recognize,
+)
 
 
 def test_recognizes_shared_harness_boundaries() -> None:
@@ -29,6 +36,37 @@ def test_unterminated_tail_names_the_culprit() -> None:
     assert culprit.test == "suite::gamma"
     assert culprit.completed == 1
     assert culprit.last_completed == "suite::alpha"
+
+
+def test_parallel_boundaries_report_all_live_tests_with_elapsed_time() -> None:
+    stream = StepStream("tests.suite", None)
+    stream.ingest(b"##TEST-START suite::older\n")
+    stream.ingest(b"##TEST-START suite::newer\n")
+    culprit = stream.culprit()
+    assert culprit.test == "suite::older"
+    assert [test.name for test in culprit.in_flight] == ["suite::older", "suite::newer"]
+    assert all(test.elapsed_s >= 0 for test in culprit.in_flight)
+    assert "likely culprit test suite::older" in culprit.describe()
+
+
+def test_process_binding_uses_exact_test_identity_and_refuses_unbound_rows() -> None:
+    unknown = Culprit(None, "no boundaries", 0, None)
+    unbound = ProcessObservation(10, 1, "shared-test-binary", 3.0, 0.0, "wall-stalled")
+    assert bind_process_tests(unknown, (unbound,)).test is None
+
+    bound = ProcessObservation(
+        11,
+        1,
+        "test-bin --exact suite::hang",
+        3.0,
+        0.0,
+        "wall-stalled",
+        "suite::hang",
+        "libtest --exact process argv",
+    )
+    culprit = bind_process_tests(unknown, (unbound, bound))
+    assert culprit.test == "suite::hang"
+    assert culprit.in_flight[0].basis == "libtest --exact process argv"
 
 
 def test_evidence_is_private_and_records_boundaries(tmp_path: Path) -> None:

@@ -39,8 +39,9 @@ pub use ambient::{
     AmbientSnapshot,
 };
 pub use attribution::{
-    culprit_columns, default_log_dir, mint_step_nonce, recognize, Culprit, RunEvidence, StepStream,
-    TestEvent, TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
+    bind_process_tests, culprit_columns, default_log_dir, mint_step_nonce, process_snapshot,
+    recognize, Culprit, InFlightTest, ProcessObservation, RunEvidence, StepStream, TestEvent,
+    TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
 };
 pub use cgroup::{
     attempt_scope_reexec, expected_scope_runtime_max_s, install_scope_teardown,

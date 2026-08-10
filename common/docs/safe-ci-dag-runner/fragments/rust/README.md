@@ -29,3 +29,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+For Rust harnesses, cargo-nextest supplies libtest's `--exact TEST` arguments,
+so the process snapshot can bind each child to its test. Ordinary `cargo test`
+runs several tests inside one shared binary; its process tree alone does not
+identify the live test and remains explicitly unattributed.

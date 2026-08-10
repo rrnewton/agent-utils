@@ -38,8 +38,8 @@ use std::time::{Duration, Instant};
 
 use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::attribution::{
-    default_log_dir, mint_step_nonce, recognize, Culprit, RunEvidence, StepStream, TestEvent,
-    STEP_NONCE_ENV,
+    bind_process_tests, default_log_dir, mint_step_nonce, process_snapshot, recognize, Culprit,
+    RunEvidence, StepStream, TestEvent, STEP_NONCE_ENV,
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
@@ -1025,6 +1025,84 @@ fn fmt_bytes(n: Option<i64>) -> String {
     format!("{} B", n.unwrap_or(0))
 }
 
+/// Freeze the evidence that must survive a timeout BEFORE sending any signal.
+///
+/// Controlled runners bind tests through explicit boundaries in `StepStream`. Third-party
+/// runners additionally get an owned `/proc` snapshot: nextest-style `--exact TEST` children can
+/// be bound directly, while cargo-test's shared test binary remains explicitly unattributed.
+struct TerminationBoundary<'a> {
+    event: &'a str,
+    limit_s: i64,
+    elapsed_s: f64,
+}
+
+fn capture_termination_evidence(
+    evidence: &Option<Arc<RunEvidence>>,
+    sink: &StepStream,
+    tag: &str,
+    pid: u32,
+    nonce: &str,
+    boundary: TerminationBoundary<'_>,
+) -> Culprit {
+    let observations = process_snapshot(pid, Some(nonce));
+    for row in &observations {
+        emit(&format!(
+            "[{tag}] ↳ process pid={} ppid={} signature={} wall={:.3}s cpu={:.3}s{} cmd={}",
+            row.pid,
+            row.ppid,
+            row.signature,
+            row.wall_elapsed_s,
+            row.cpu_elapsed_s,
+            row.test
+                .as_ref()
+                .map(|test| format!(" test={test}"))
+                .unwrap_or_default(),
+            row.command,
+        ));
+        if let Some(e) = evidence {
+            e.record(
+                "process_snapshot",
+                &[
+                    ("step", tag.to_string()),
+                    ("pid", row.pid.to_string()),
+                    ("ppid", row.ppid.to_string()),
+                    ("signature", row.signature.to_string()),
+                    ("wall_elapsed_s", format!("{:.3}", row.wall_elapsed_s)),
+                    ("cpu_elapsed_s", format!("{:.3}", row.cpu_elapsed_s)),
+                    ("test", row.test.clone().unwrap_or_default()),
+                    ("test_basis", row.test_basis.unwrap_or("").to_string()),
+                    ("command", row.command.clone()),
+                ],
+            );
+        }
+    }
+    let culprit = bind_process_tests(sink.culprit(), &observations);
+    if let Some(e) = evidence {
+        e.record(
+            boundary.event,
+            &[
+                ("step", tag.to_string()),
+                ("elapsed_s", format!("{:.3}", boundary.elapsed_s)),
+                ("limit_s", boundary.limit_s.to_string()),
+                ("culprit_test", culprit.test.clone().unwrap_or_default()),
+                ("culprit_basis", culprit.how.to_string()),
+                ("tests_completed", culprit.completed.to_string()),
+                ("in_flight_count", culprit.in_flight.len().to_string()),
+                (
+                    "in_flight_tests",
+                    culprit
+                        .in_flight
+                        .iter()
+                        .map(|test| format!("{}@{:.3}s", test.name, test.elapsed_s))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+            ],
+        );
+    }
+    culprit
+}
+
 /// Supervise ONE step: launch (cgroup-boxed when enabled), pump output, enforce the timeout,
 /// reap the whole tree, classify, and record a per-step profile row.
 fn run_step(ctx: StepCtx) {
@@ -1196,6 +1274,7 @@ fn run_step(ctx: StepCtx) {
     let monitor_stop = Arc::new(AtomicBool::new(false));
     let thread_peak = Arc::new(Mutex::new(None::<i64>));
     let cpu_exceeded = Arc::new(AtomicBool::new(false));
+    let termination_culprit = Arc::new(Mutex::new(None::<Culprit>));
     let monitor: Option<thread::JoinHandle<()>> = if boxed {
         let stop = Arc::clone(&monitor_stop);
         let peak = Arc::clone(&thread_peak);
@@ -1205,6 +1284,10 @@ fn run_step(ctx: StepCtx) {
         let cpu_timeout = cpu_budget;
         let mpid = pid;
         let mnonce = nonce.clone();
+        let mevidence = evidence.clone();
+        let msink = Arc::clone(&sink);
+        let mculprit = Arc::clone(&termination_culprit);
+        let mstart = start;
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
             let tick = Duration::from_millis(50);
@@ -1229,6 +1312,21 @@ fn run_step(ctx: StepCtx) {
                                 cs.get("usage_usec").copied().unwrap_or(0) as f64 / 1_000_000.0;
                             if cpu_used_s >= cpu_timeout as f64 {
                                 cpu_flag.store(true, Ordering::Relaxed);
+                                let culprit = capture_termination_evidence(
+                                    &mevidence,
+                                    &msink,
+                                    &t,
+                                    mpid,
+                                    &mnonce,
+                                    TerminationBoundary {
+                                        event: "cpu_timeout",
+                                        limit_s: cpu_timeout,
+                                        elapsed_s: mstart.elapsed().as_secs_f64(),
+                                    },
+                                );
+                                if let Ok(mut slot) = mculprit.lock() {
+                                    *slot = Some(culprit);
+                                }
                                 reap(&cg, &t, mpid, Some(&mnonce));
                                 return;
                             }
@@ -1249,23 +1347,22 @@ fn run_step(ctx: StepCtx) {
             Ok(None) => {
                 if start.elapsed().as_secs() as i64 >= step.timeout {
                     timed_out = true;
-                    // Journal the teardown BEFORE attempting it. If the kill escalates to the CI
-                    // provider cancelling the whole job, this record is already on disk; a record
-                    // written after a successful kill would be missing in exactly the case that
-                    // most needs explaining.
-                    if let Some(e) = &evidence {
-                        let c = sink.culprit();
-                        e.record(
-                            "step_timeout",
-                            &[
-                                ("step", tag.clone()),
-                                ("elapsed_s", format!("{:.3}", start.elapsed().as_secs_f64())),
-                                ("timeout_s", step.timeout.to_string()),
-                                ("culprit_test", c.test.clone().unwrap_or_default()),
-                                ("culprit_basis", c.how.to_string()),
-                                ("tests_completed", c.completed.to_string()),
-                            ],
-                        );
+                    // Freeze test + process evidence BEFORE SIGTERM. The subsequent reap retains
+                    // the existing gentle TERM/flush window and only then escalates to SIGKILL.
+                    let c = capture_termination_evidence(
+                        &evidence,
+                        &sink,
+                        &tag,
+                        pid,
+                        &nonce,
+                        TerminationBoundary {
+                            event: "step_timeout",
+                            limit_s: step.timeout,
+                            elapsed_s: start.elapsed().as_secs_f64(),
+                        },
+                    );
+                    if let Ok(mut slot) = termination_culprit.lock() {
+                        *slot = Some(c);
                     }
                     reap(&cgroups, &tag, pid, Some(&nonce));
                     break wait_bounded(&mut child, &tag, POST_REAP_WAIT);
@@ -1305,7 +1402,11 @@ fn run_step(ctx: StepCtx) {
     // for a passing step would be noise, and naming one for a step that simply exited non-zero
     // would compete with the harness's own (better) failure report.
     let culprit: Option<Culprit> = if timed_out || cpu_exceeded.load(Ordering::Relaxed) {
-        Some(sink.culprit())
+        termination_culprit
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .or_else(|| Some(sink.culprit()))
     } else {
         None
     };

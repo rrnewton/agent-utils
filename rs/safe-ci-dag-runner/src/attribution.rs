@@ -19,8 +19,9 @@
 //!
 //! TEST-LEVEL ATTRIBUTION. Naming the NODE that hung ("the strict-compat step") is not enough to
 //! act on; the actionable fact is WHICH TEST inside that node. [`TestTracker`] derives it from the
-//! step's own output stream as the bytes arrive, tracking the last test STARTED against the last
-//! test COMPLETED. On teardown the culprit is the test that started and never completed.
+//! step's own output stream as the bytes arrive, tracking every test STARTED against its matching
+//! completion. On teardown the complete concurrent live set and elapsed time for each survives;
+//! the longest-running one is only a likely culprit when several remain.
 //!
 //! THE UNTERMINATED TAIL IS THE STRONGEST SIGNAL, and it is why the reader here splits lines
 //! itself instead of using `read_until(b'\n')`. Rust's libtest prints `test some::name ... ` and
@@ -30,17 +31,19 @@
 //! sitting in [`StepStream::partial`] at the moment of the kill.
 //!
 //! WHAT IS RECOGNIZED. Rust libtest, pytest (`-v`), TAP, and an explicit `##TEST-START`/`##TEST-END`
-//! protocol any harness can adopt. An unrecognized harness degrades to exactly today's behaviour:
-//! the node is named and no test is, which is strictly better than the run reporting nothing.
+//! protocol any harness can adopt. A pre-signal `/proc` snapshot separately distinguishes CPU-
+//! burning from wall-stalled descendants and recognizes nextest's exact libtest argv binding. An
+//! unrecognized/shared-process harness degrades honestly: the node and processes are named but no
+//! test is, which is strictly better than a guess dressed as attribution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// Environment variable that overrides the evidence directory.
 pub const LOG_DIR_ENV: &str = "SAFE_CI_DAG_RUNNER_LOG_DIR";
@@ -359,6 +362,12 @@ pub struct TestTracker {
     pub completed: u64,
     /// How many tests began.
     pub started: u64,
+    /// Every test announced as started and awaiting its end event, with a monotonic start instant.
+    ///
+    /// A parallel harness can have several of these at once. Keeping the set is the difference
+    /// between reporting the last line we happened to read and reporting the work actually live
+    /// when teardown began.
+    in_flight: BTreeMap<String, Instant>,
 }
 
 impl TestTracker {
@@ -366,7 +375,10 @@ impl TestTracker {
         match ev {
             TestEvent::Start(name) => {
                 self.last_started = Some(name.clone());
-                self.started += 1;
+                if !self.in_flight.contains_key(name) {
+                    self.started += 1;
+                    self.in_flight.insert(name.clone(), Instant::now());
+                }
             }
             TestEvent::End(name, _) => {
                 // A captured-mode libtest line is both the start and the end of that test.
@@ -374,11 +386,43 @@ impl TestTracker {
                     self.last_started = Some(name.clone());
                     self.started += 1;
                 }
+                self.in_flight.remove(name);
                 self.last_completed = Some(name.clone());
                 self.completed += 1;
             }
         }
     }
+
+    fn in_flight_snapshot(&self) -> Vec<InFlightTest> {
+        let now = Instant::now();
+        let mut tests = self
+            .in_flight
+            .iter()
+            .map(|(name, started)| InFlightTest {
+                name: name.clone(),
+                elapsed_s: now.saturating_duration_since(*started).as_secs_f64(),
+                basis: "declared test boundary",
+            })
+            .collect::<Vec<_>>();
+        tests.sort_by(|a, b| {
+            b.elapsed_s
+                .partial_cmp(&a.elapsed_s)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        tests
+    }
+}
+
+/// One test known to be live at the termination boundary.
+#[derive(Debug, Clone)]
+pub struct InFlightTest {
+    /// Harness-level test identifier.
+    pub name: String,
+    /// Seconds elapsed from the observed start boundary to this snapshot.
+    pub elapsed_s: f64,
+    /// Observable fact binding the name to the running work.
+    pub basis: &'static str,
 }
 
 /// The runner's verdict about which test was responsible when a step had to be terminated.
@@ -392,32 +436,291 @@ pub struct Culprit {
     pub completed: u64,
     /// The last test that DID complete, which bounds the culprit even when it is unnamed.
     pub last_completed: Option<String>,
+    /// Complete current snapshot. The first entry is the longest-running and therefore the
+    /// likely culprit when several tests are live; the list prevents that heuristic from hiding
+    /// its denominator.
+    pub in_flight: Vec<InFlightTest>,
 }
 
 impl Culprit {
     /// One-line human rendering for the step's outcome line.
     pub fn describe(&self) -> String {
+        let live = if self.in_flight.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} test(s) in flight [{}]",
+                self.in_flight.len(),
+                self.in_flight
+                    .iter()
+                    .map(|t| format!("{} {:.3}s via {}", t.name, t.elapsed_s, t.basis))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         match &self.test {
             Some(name) => format!(
-                "culprit test {name} ({}; {} test(s) completed first{})",
+                "{}culprit test {name} ({}; {} test(s) completed first{}{})",
+                if self.in_flight.len() > 1 {
+                    "likely "
+                } else {
+                    ""
+                },
                 self.how,
                 self.completed,
                 match &self.last_completed {
                     Some(l) => format!(", last completed {l}"),
                     None => String::new(),
-                }
+                },
+                live,
             ),
             None => format!(
-                "no test-level attribution ({}; {} test(s) completed{})",
+                "no test-level attribution ({}; {} test(s) completed{}{})",
                 self.how,
                 self.completed,
                 match &self.last_completed {
                     Some(l) => format!(", last completed {l}"),
                     None => String::new(),
-                }
+                },
+                live,
             ),
         }
     }
+}
+
+/// One process observed in the owned step tree immediately before graceful termination.
+///
+/// This is deliberately evidence, not a test verdict. A third-party runner may not expose a
+/// process-to-test binding at all; in that case `test` stays `None` rather than guessing from a
+/// binary name. CPU-burning and wall-stalled are separate signatures because they point at
+/// different failure modes.
+#[derive(Debug, Clone)]
+pub struct ProcessObservation {
+    /// Linux process identifier observed in `/proc`.
+    pub pid: u32,
+    /// Linux parent process identifier from the same snapshot.
+    pub ppid: u32,
+    /// Bounded command-line rendering, or a PID fallback when unavailable.
+    pub command: String,
+    /// Process lifetime at the snapshot boundary.
+    pub wall_elapsed_s: f64,
+    /// User plus system CPU consumed over that lifetime.
+    pub cpu_elapsed_s: f64,
+    /// `cpu-burning`, `wall-stalled`, or `mixed-or-too-young`.
+    pub signature: &'static str,
+    /// Test identifier only when process argv carries an exact binding.
+    pub test: Option<String>,
+    /// Observable mechanism supporting `test`.
+    pub test_basis: Option<&'static str>,
+}
+
+#[derive(Debug)]
+struct ProcRow {
+    pid: u32,
+    ppid: u32,
+    state: char,
+    utime_ticks: u64,
+    stime_ticks: u64,
+    start_ticks: u64,
+    argv: Vec<String>,
+    carries_nonce: bool,
+}
+
+fn boot_elapsed_s() -> Option<f64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime writes one initialized timespec through a valid pointer.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 || ts.tv_sec < 0 {
+        return None;
+    }
+    Some(ts.tv_sec as f64 + ts.tv_nsec as f64 / 1_000_000_000.0)
+}
+
+fn proc_row(pid: u32, nonce: Option<&str>) -> Option<ProcRow> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields = stat[close + 1..].split_whitespace().collect::<Vec<_>>();
+    // fields[0] is process field 3 (state); starttime is process field 22 => index 19.
+    if fields.len() <= 19 {
+        return None;
+    }
+    let state = fields[0].chars().next()?;
+    let ppid = fields[1].parse().ok()?;
+    let utime_ticks = fields[11].parse().ok()?;
+    let stime_ticks = fields[12].parse().ok()?;
+    let start_ticks = fields[19].parse().ok()?;
+    let argv = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|raw| {
+            raw.split(|b| *b == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let carries_nonce = nonce
+        .filter(|value| !value.is_empty())
+        .and_then(|value| {
+            let needle = format!("{STEP_NONCE_ENV}={value}");
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .ok()
+                .map(|raw| raw.split(|b| *b == 0).any(|item| item == needle.as_bytes()))
+        })
+        .unwrap_or(false);
+    Some(ProcRow {
+        pid,
+        ppid,
+        state,
+        utime_ticks,
+        stime_ticks,
+        start_ticks,
+        argv,
+        carries_nonce,
+    })
+}
+
+fn exact_libtest_from_argv(argv: &[String]) -> Option<String> {
+    let exact = argv.iter().position(|arg| arg == "--exact")?;
+    // libtest accepts both `--exact TEST` and `TEST --exact`; nextest currently uses the former.
+    for candidate in [
+        argv.get(exact + 1),
+        exact.checked_sub(1).and_then(|i| argv.get(i)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !candidate.is_empty() && !candidate.starts_with('-') && candidate != &argv[0] {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+/// Snapshot every process observably owned by a step, before sending it SIGTERM.
+///
+/// Ownership is root-descendant reachability plus the runner-minted exact environment nonce. The
+/// nonce includes setsid/double-fork escapees without falling back to a process-name match. Rows
+/// are stable-sorted by PID only for reproducible evidence; no ordering is interpreted as blame.
+pub fn process_snapshot(root: u32, nonce: Option<&str>) -> Vec<ProcessObservation> {
+    if root <= 1 {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut rows = HashMap::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        if let Some(row) = proc_row(pid, nonce) {
+            rows.insert(pid, row);
+        }
+    }
+    let mut owned = HashSet::from([root]);
+    loop {
+        let before = owned.len();
+        for row in rows.values() {
+            if owned.contains(&row.ppid) || row.carries_nonce {
+                owned.insert(row.pid);
+            }
+        }
+        if owned.len() == before {
+            break;
+        }
+    }
+    let Some(boot_s) = boot_elapsed_s() else {
+        return Vec::new();
+    };
+    // SAFETY: sysconf reads one process-global constant and dereferences no pointers.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks <= 0 {
+        return Vec::new();
+    }
+    let ticks = ticks as f64;
+    let mut out = rows
+        .into_values()
+        .filter(|row| owned.contains(&row.pid) && row.state != 'Z')
+        .map(|row| {
+            let wall_elapsed_s = (boot_s - row.start_ticks as f64 / ticks).max(0.0);
+            let cpu_elapsed_s = (row.utime_ticks + row.stime_ticks) as f64 / ticks;
+            let cpu_ratio = if wall_elapsed_s > 0.0 {
+                cpu_elapsed_s / wall_elapsed_s
+            } else {
+                0.0
+            };
+            let signature = if cpu_elapsed_s >= 0.25 && cpu_ratio >= 0.50 {
+                "cpu-burning"
+            } else if wall_elapsed_s >= 0.50 && cpu_ratio <= 0.05 {
+                "wall-stalled"
+            } else {
+                "mixed-or-too-young"
+            };
+            let test = exact_libtest_from_argv(&row.argv);
+            let mut command = if row.argv.is_empty() {
+                format!("[pid {}]", row.pid)
+            } else {
+                row.argv.join(" ")
+            };
+            if command.len() > 512 {
+                command.truncate(512);
+                command.push_str("...");
+            }
+            ProcessObservation {
+                pid: row.pid,
+                ppid: row.ppid,
+                command,
+                wall_elapsed_s,
+                cpu_elapsed_s,
+                signature,
+                test_basis: test.as_ref().map(|_| "libtest --exact process argv"),
+                test,
+            }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by_key(|row| row.pid);
+    out
+}
+
+/// Use exact per-process libtest bindings only when output supplied no stronger attribution.
+///
+/// cargo-nextest launches one `--exact TEST` process per test, which makes the binding observable.
+/// ordinary `cargo test` runs several tests inside one binary and therefore produces no such row;
+/// it remains honestly unattributed unless its output carries boundaries.
+pub fn bind_process_tests(mut culprit: Culprit, observations: &[ProcessObservation]) -> Culprit {
+    if culprit.test.is_some() || !culprit.in_flight.is_empty() {
+        return culprit;
+    }
+    let mut tests = observations
+        .iter()
+        .filter_map(|row| {
+            row.test.as_ref().map(|test| InFlightTest {
+                name: test.clone(),
+                elapsed_s: row.wall_elapsed_s,
+                basis: row.test_basis.unwrap_or("process observation"),
+            })
+        })
+        .collect::<Vec<_>>();
+    tests.sort_by(|a, b| {
+        b.elapsed_s
+            .partial_cmp(&a.elapsed_s)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    tests.dedup_by(|a, b| a.name == b.name);
+    let Some(likely) = tests.first() else {
+        return culprit;
+    };
+    culprit.test = Some(likely.name.clone());
+    culprit.how = if tests.len() == 1 {
+        "only test-bound process live at termination"
+    } else {
+        "longest-running test-bound process at termination"
+    };
+    culprit.in_flight = tests;
+    culprit
 }
 
 /// One step's live output state: the durable log, the unterminated tail, and the test tracker.
@@ -525,6 +828,7 @@ impl StepStream {
                 if let TestEvent::End(n, verdict) = &ev {
                     // Already counted as started; record only the completion.
                     if let Ok(mut t) = self.tracker.lock() {
+                        t.in_flight.remove(n);
                         t.last_completed = Some(n.clone());
                         t.completed += 1;
                     }
@@ -592,6 +896,23 @@ impl StepStream {
             Ok(t) => t.clone(),
             Err(_) => TestTracker::default(),
         };
+        let in_flight = t.in_flight_snapshot();
+        // Explicit boundaries are authoritative for a controlled parallel harness. Report the
+        // whole live set with elapsed times; if several remain, the longest-running one is only a
+        // LIKELY culprit and the wording says so.
+        if let Some(likely) = in_flight.first() {
+            return Culprit {
+                test: Some(likely.name.clone()),
+                how: if in_flight.len() == 1 {
+                    "declared in flight and never completed"
+                } else {
+                    "longest-running of the declared in-flight tests"
+                },
+                completed: t.completed,
+                last_completed: t.last_completed,
+                in_flight,
+            };
+        }
         // 1) An unterminated START marker in the tail is the strongest evidence there is: the
         //    harness announced the test and never got to print its verdict.
         if let Some(TestEvent::Start(name)) = tail_event {
@@ -600,6 +921,7 @@ impl StepStream {
                 how: "announced in the unterminated output tail, never completed",
                 completed: t.completed,
                 last_completed: t.last_completed,
+                in_flight: Vec::new(),
             };
         }
         // 2) Otherwise a test that started and never ended.
@@ -610,6 +932,7 @@ impl StepStream {
                     how: "started and never completed",
                     completed: t.completed,
                     last_completed: t.last_completed,
+                    in_flight: Vec::new(),
                 };
             }
         }
@@ -625,6 +948,7 @@ impl StepStream {
             },
             completed: t.completed,
             last_completed: t.last_completed,
+            in_flight: Vec::new(),
         }
     }
 
@@ -650,6 +974,15 @@ pub fn culprit_columns(c: &Culprit) -> BTreeMap<String, String> {
     m.insert(
         "last_completed_test".into(),
         c.last_completed.clone().unwrap_or_default(),
+    );
+    m.insert("in_flight_count".into(), c.in_flight.len().to_string());
+    m.insert(
+        "in_flight_tests".into(),
+        c.in_flight
+            .iter()
+            .map(|t| format!("{}@{:.3}s", t.name, t.elapsed_s))
+            .collect::<Vec<_>>()
+            .join(","),
     );
     m
 }
@@ -758,6 +1091,50 @@ mod tests {
         let c = s.culprit();
         assert_eq!(c.test.as_deref(), Some("beta"));
         assert_eq!(c.completed, 1);
+    }
+
+    #[test]
+    fn parallel_explicit_boundaries_report_the_complete_live_set_and_elapsed_time() {
+        let s = StepStream::new("g:j", None);
+        s.ingest(b"##TEST-START suite::older\n");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        s.ingest(b"##TEST-START suite::newer\n");
+        let c = s.culprit();
+        assert_eq!(c.test.as_deref(), Some("suite::older"));
+        assert_eq!(c.in_flight.len(), 2);
+        assert_eq!(c.in_flight[0].name, "suite::older");
+        assert!(c.in_flight[0].elapsed_s > c.in_flight[1].elapsed_s);
+        assert!(c.describe().contains("likely culprit test suite::older"));
+
+        s.ingest(b"##TEST-END suite::older ok\n");
+        let c = s.culprit();
+        assert_eq!(c.test.as_deref(), Some("suite::newer"));
+        assert_eq!(c.in_flight.len(), 1);
+    }
+
+    #[test]
+    fn exact_libtest_process_binding_accepts_both_argument_orders_without_guessing() {
+        assert_eq!(
+            exact_libtest_from_argv(&[
+                "/tmp/test-bin".into(),
+                "--exact".into(),
+                "suite::case".into(),
+                "--nocapture".into(),
+            ]),
+            Some("suite::case".into())
+        );
+        assert_eq!(
+            exact_libtest_from_argv(&[
+                "/tmp/test-bin".into(),
+                "suite::case".into(),
+                "--exact".into(),
+            ]),
+            Some("suite::case".into())
+        );
+        assert_eq!(
+            exact_libtest_from_argv(&["/tmp/test-bin".into(), "--test-threads=4".into(),]),
+            None
+        );
     }
 
     #[test]

@@ -25,7 +25,9 @@ from safe_ci_dag_runner.attribution import (
     Culprit,
     RunEvidence,
     StepStream,
+    bind_process_tests,
     default_log_dir,
+    process_snapshot,
     sanitize as sanitize_evidence_tag,
 )
 from safe_ci_dag_runner.model import (
@@ -291,6 +293,65 @@ class Runner:
             sys.stdout.write(line + "\n")
             sys.stdout.flush()
 
+    def _capture_termination_evidence(
+        self,
+        *,
+        sink: StepStream,
+        step: Step,
+        proc: subprocess.Popen[bytes],
+        nonce: str,
+        event: str,
+        limit_s: int,
+        elapsed_s: float,
+    ) -> Culprit:
+        """Persist test/process state before SIGTERM starts the graceful-kill window."""
+        observations = process_snapshot(proc.pid, nonce)
+        for row in observations:
+            self._emit(
+                f"[{step.tag}] ↳ process pid={row.pid} ppid={row.ppid} "
+                f"signature={row.signature} wall={row.wall_elapsed_s:.3f}s "
+                f"cpu={row.cpu_elapsed_s:.3f}s"
+                + (f" test={row.test}" if row.test else "")
+                + f" cmd={row.command}"
+            )
+            if self.evidence is not None:
+                self.evidence.record(
+                    "process_snapshot",
+                    [
+                        ("step", step.tag),
+                        ("pid", str(row.pid)),
+                        ("ppid", str(row.ppid)),
+                        ("signature", row.signature),
+                        ("wall_elapsed_s", f"{row.wall_elapsed_s:.3f}"),
+                        ("cpu_elapsed_s", f"{row.cpu_elapsed_s:.3f}"),
+                        ("test", row.test or ""),
+                        ("test_basis", row.test_basis or ""),
+                        ("command", row.command),
+                    ],
+                )
+        culprit = bind_process_tests(sink.culprit(), observations)
+        if self.evidence is not None:
+            self.evidence.record(
+                event,
+                [
+                    ("step", step.tag),
+                    ("elapsed_s", f"{elapsed_s:.3f}"),
+                    ("limit_s", str(limit_s)),
+                    ("culprit_test", culprit.test or ""),
+                    ("culprit_basis", culprit.how),
+                    ("tests_completed", str(culprit.completed)),
+                    ("in_flight_count", str(len(culprit.in_flight))),
+                    (
+                        "in_flight_tests",
+                        ",".join(
+                            f"{test.name}@{test.elapsed_s:.3f}s"
+                            for test in culprit.in_flight
+                        ),
+                    ),
+                ],
+            )
+        return culprit
+
     def run(self) -> bool:
         """Drive the DAG to completion; returns ``True`` when no genuine failure occurred.
 
@@ -418,6 +479,7 @@ class Runner:
         stream = self.verbosity >= 2
         timed_out = False
         cpu_timed_out = False
+        termination_culprit: Culprit | None = None
 
         # Append the step's inner-parallelism (concurrency) flag when it declares one, using the
         # step's jobs_flag template (or the DagConfig default, e.g. "-j"). No-op when the step
@@ -511,7 +573,7 @@ class Runner:
             # flaking; the wall timeout stays as a backstop for a step that blocks/hangs
             # while burning no CPU. Enforcement is best-effort at the poll granularity
             # (_MONITOR_INTERVAL_S), and inert when cgroup boxing is off (cpu_stats is None).
-            nonlocal thread_peak, cpu_timed_out
+            nonlocal thread_peak, cpu_timed_out, termination_culprit
             while not monitor_stop.wait(_MONITOR_INTERVAL_S):
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
@@ -524,18 +586,15 @@ class Runner:
                             # Over CPU budget: reap the whole group now. The main thread's
                             # proc.wait() then returns normally (no wall TimeoutExpired).
                             cpu_timed_out = True
-                            if self.evidence is not None:
-                                culprit_now = sink.culprit()
-                                self.evidence.record(
-                                    "cpu_timeout",
-                                    [
-                                        ("step", step.tag),
-                                        ("cpu_timeout_s", str(cpu_budget)),
-                                        ("culprit_test", culprit_now.test or ""),
-                                        ("culprit_basis", culprit_now.how),
-                                        ("tests_completed", str(culprit_now.completed)),
-                                    ],
-                                )
+                            termination_culprit = self._capture_termination_evidence(
+                                sink=sink,
+                                step=step,
+                                proc=proc,
+                                nonce=nonce,
+                                event="cpu_timeout",
+                                limit_s=cpu_budget,
+                                elapsed_s=time.time() - start,
+                            )
                             reap(proc, self.cgroups, step.tag, nonce=nonce)
                             return
 
@@ -549,19 +608,15 @@ class Runner:
             # Genuine hang: reap the step's whole process group now (safe because
             # start_new_session gave it its own group; reap guards the runner's group).
             timed_out = True
-            if self.evidence is not None:
-                culprit_now = sink.culprit()
-                self.evidence.record(
-                    "step_timeout",
-                    [
-                        ("step", step.tag),
-                        ("elapsed_s", f"{time.time() - start:.3f}"),
-                        ("timeout_s", str(step.timeout)),
-                        ("culprit_test", culprit_now.test or ""),
-                        ("culprit_basis", culprit_now.how),
-                        ("tests_completed", str(culprit_now.completed)),
-                    ],
-                )
+            termination_culprit = self._capture_termination_evidence(
+                sink=sink,
+                step=step,
+                proc=proc,
+                nonce=nonce,
+                event="step_timeout",
+                limit_s=step.timeout,
+                elapsed_s=time.time() - start,
+            )
             reap(proc, self.cgroups, step.tag, nonce=nonce)
             try:
                 proc.wait(timeout=_POST_TIMEOUT_WAIT_S)
@@ -589,7 +644,11 @@ class Runner:
         returncode = proc.returncode
         ok = returncode == 0 and not timed_out and not cpu_timed_out
         summary = _last_line(captured)
-        culprit: Culprit | None = sink.culprit() if timed_out or cpu_timed_out else None
+        culprit: Culprit | None = (
+            termination_culprit or sink.culprit()
+            if timed_out or cpu_timed_out
+            else None
+        )
 
         row: dict[str, object] = {
             "step": step.tag,
