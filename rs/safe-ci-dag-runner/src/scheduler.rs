@@ -921,6 +921,81 @@ fn last_line(bytes: &[u8]) -> String {
     String::new()
 }
 
+/// Test counts extracted from one step's COMPLETE captured output, before
+/// verbosity decides how much of that output is presented to a human.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CapturedTestCounts {
+    executed: Option<u64>,
+    filtered: Option<u64>,
+}
+
+fn count_between(line: &str, prefix: &str, suffix: &str) -> Option<u64> {
+    let rest = line.get(line.find(prefix)? + prefix.len()..)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() || !rest.get(digits.len()..)?.starts_with(suffix) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+fn captured_test_counts(bytes: &[u8]) -> CapturedTestCounts {
+    let text = String::from_utf8_lossy(bytes);
+    let mut running_total = 0u64;
+    let mut running_seen = false;
+    let mut passed_total = 0u64;
+    let mut passed_seen = false;
+    let mut filtered_total = 0u64;
+    let mut filtered_seen = false;
+    let mut overflow = false;
+    for line in text.lines() {
+        if let Some(value) = count_between(line, "running ", " test") {
+            running_seen = true;
+            running_total = running_total.checked_add(value).unwrap_or_else(|| {
+                overflow = true;
+                0
+            });
+        }
+        if let Some(value) = count_between(line, "test result: ok. ", " passed") {
+            passed_seen = true;
+            passed_total = passed_total.checked_add(value).unwrap_or_else(|| {
+                overflow = true;
+                0
+            });
+        }
+        if let Some(marker) = line.find(" filtered out") {
+            if let Some(value) = line[..marker]
+                .split_whitespace()
+                .next_back()
+                .and_then(|v| v.parse().ok())
+            {
+                filtered_seen = true;
+                filtered_total = filtered_total.checked_add(value).unwrap_or_else(|| {
+                    overflow = true;
+                    0
+                });
+            }
+        }
+    }
+    if overflow {
+        return CapturedTestCounts {
+            executed: None,
+            filtered: None,
+        };
+    }
+    CapturedTestCounts {
+        // Match the canonical parser: `running N` is the primary executed
+        // signal; passed-count summaries are only a truncation fallback.
+        executed: if running_seen {
+            Some(running_total)
+        } else if passed_seen {
+            Some(passed_total)
+        } else {
+            None
+        },
+        filtered: filtered_seen.then_some(filtered_total),
+    }
+}
+
 /// Adapt a cgroup `cpu.pressure` `{avg10, avg60}` map to a typed [`PsiReading`] for the enrichment
 /// builder; `None` (unreadable / unboxed) passes straight through.
 fn psi_from(pressure: Option<BTreeMap<String, f64>>) -> Option<PsiReading> {
@@ -1235,6 +1310,8 @@ fn run_step(ctx: StepCtx) {
                 false,
                 cpu_budget,
                 false,
+                None,
+                None,
             );
             sh.done.insert(tag.clone(), outcome);
             sh.failed = true;
@@ -1477,6 +1554,7 @@ fn run_step(ctx: StepCtx) {
     let mut combined: Vec<u8> = stdout.clone();
     combined.extend_from_slice(&stderr);
     let summary = last_line(&combined);
+    let test_counts = captured_test_counts(&combined);
 
     // Build the per-step profile row (perflog step-profile schema keys + dynamic cpu.* counters).
     let mut row: ProfileRow = BTreeMap::new();
@@ -1546,9 +1624,23 @@ fn run_step(ctx: StepCtx) {
         // eager-exit wording sends a reader hunting for a failing peer that does not exist.
         let cut_by_run_budget = was_aborted && sh.run_timed_out;
         let outcome = if was_aborted {
-            StepOutcome::aborted_outcome(tag.clone(), elapsed, summary.clone(), returncode)
+            StepOutcome::aborted_outcome(
+                tag.clone(),
+                elapsed,
+                summary.clone(),
+                returncode,
+                test_counts.executed,
+                test_counts.filtered,
+            )
         } else if ok {
-            StepOutcome::passed(tag.clone(), elapsed, summary.clone(), returncode)
+            StepOutcome::passed(
+                tag.clone(),
+                elapsed,
+                summary.clone(),
+                returncode,
+                test_counts.executed,
+                test_counts.filtered,
+            )
         } else {
             StepOutcome::failed(
                 tag.clone(),
@@ -1562,6 +1654,8 @@ fn run_step(ctx: StepCtx) {
                 cpu_timed_out,
                 cpu_budget,
                 false,
+                test_counts.executed,
+                test_counts.filtered,
             )
         };
         let reason = outcome.reason.clone();
@@ -1859,6 +1953,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn complete_capture_counts_tests_independently_of_console_verbosity() {
+        let counts = captured_test_counts(
+            b"running 2 tests\ntest result: ok. 1 passed; 0 failed; 1 ignored; 7 filtered out\n\
+              running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 4 filtered out\n",
+        );
+        // `running` is authoritative, so ignored tests remain part of the
+        // executed denominator exactly as in the canonical Python parser.
+        assert_eq!(
+            counts,
+            CapturedTestCounts {
+                executed: Some(5),
+                filtered: Some(11)
+            }
+        );
+
+        let fallback = captured_test_counts(
+            b"test result: ok. 9 passed; 0 failed; 0 ignored; 2 filtered out\n",
+        );
+        assert_eq!(
+            fallback,
+            CapturedTestCounts {
+                executed: Some(9),
+                filtered: Some(2)
+            }
+        );
+    }
+
+    #[test]
+    fn complete_capture_keeps_zero_distinct_from_unknown() {
+        assert_eq!(
+            captured_test_counts(
+                b"running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 filtered out\n"
+            ),
+            CapturedTestCounts {
+                executed: Some(0),
+                filtered: Some(0)
+            }
+        );
+        assert_eq!(
+            captured_test_counts(b"build completed successfully\n"),
+            CapturedTestCounts {
+                executed: None,
+                filtered: None
+            }
+        );
+    }
+
+    #[test]
     fn level_five_console_lines_always_name_the_deepest_test_identity() {
         let mut context = ConsoleTestIdentity::default();
         assert_eq!(
@@ -1972,6 +2114,40 @@ mod tests {
         let seq: Vec<&str> = contents.split_whitespace().collect();
         assert_eq!(seq, vec!["A", "B"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn level_one_outcomes_retain_typed_counts_from_suppressed_output() {
+        let cfg = DagConfig {
+            steps: vec![
+                step(
+                    "g",
+                    "counted",
+                    "printf 'running 3 tests\\ntest result: ok. 3 passed; 0 failed; 5 filtered out\\n'",
+                    &[],
+                    0.0,
+                    &[],
+                ),
+                step("g", "bannerless", "printf 'build only\\n'", &[], 0.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 2, false, 1);
+        assert!(res.ok);
+        let counted = res.outcomes.iter().find(|o| o.tag == "g.counted").unwrap();
+        assert_eq!(
+            (counted.executed_tests, counted.filtered_tests),
+            (Some(3), Some(5))
+        );
+        let bannerless = res
+            .outcomes
+            .iter()
+            .find(|o| o.tag == "g.bannerless")
+            .unwrap();
+        assert_eq!(
+            (bannerless.executed_tests, bannerless.filtered_tests),
+            (None, None)
+        );
     }
 
     #[test]

@@ -396,6 +396,11 @@ pub struct StepOutcome {
     pub duration_s: f64,
     /// One-line summary extracted from the step's output (`""` when unavailable).
     pub summary: String,
+    /// Tests executed according to the step's complete captured runner output.
+    /// `None` means no recognizable test-runner banner, distinct from `Some(0)`.
+    pub executed_tests: Option<u64>,
+    /// Tests filtered according to the same complete captured output.
+    pub filtered_tests: Option<u64>,
     /// Child process exit code; negative for a Unix signal; `None` if never collected.
     pub returncode: Option<i64>,
     /// Human-readable failure reason; `""` when `ok`.
@@ -406,12 +411,21 @@ pub struct StepOutcome {
 
 impl StepOutcome {
     /// Build a passing outcome.
-    pub fn passed(tag: String, duration_s: f64, summary: String, returncode: Option<i64>) -> Self {
+    pub fn passed(
+        tag: String,
+        duration_s: f64,
+        summary: String,
+        returncode: Option<i64>,
+        executed_tests: Option<u64>,
+        filtered_tests: Option<u64>,
+    ) -> Self {
         StepOutcome {
             tag,
             ok: true,
             duration_s,
             summary,
+            executed_tests,
+            filtered_tests,
             returncode,
             reason: String::new(),
             aborted: false,
@@ -432,6 +446,8 @@ impl StepOutcome {
         cpu_timed_out: bool,
         cpu_timeout: i64,
         aborted: bool,
+        executed_tests: Option<u64>,
+        filtered_tests: Option<u64>,
     ) -> Self {
         let reason = step_failure_reason(
             returncode,
@@ -452,6 +468,8 @@ impl StepOutcome {
             ok: false,
             duration_s,
             summary,
+            executed_tests,
+            filtered_tests,
             returncode,
             reason,
             aborted,
@@ -464,12 +482,16 @@ impl StepOutcome {
         duration_s: f64,
         summary: String,
         returncode: Option<i64>,
+        executed_tests: Option<u64>,
+        filtered_tests: Option<u64>,
     ) -> Self {
         StepOutcome {
             tag,
             ok: false,
             duration_s,
             summary,
+            executed_tests,
+            filtered_tests,
             returncode,
             reason: "ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)"
                 .to_string(),
