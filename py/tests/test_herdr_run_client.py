@@ -15,7 +15,12 @@ from collections.abc import Sequence
 import pytest
 
 import herdr_run.client as client_module
-from herdr_run.client import CONTROL_TIMEOUT_SECONDS, HerdrClient, SERVER_UNIT
+from herdr_run.client import (
+    CONTROL_TIMEOUT_SECONDS,
+    HerdrClient,
+    SERVER_UNIT,
+    SERVER_WORKER_THREADS,
+)
 from herdr_run.errors import EXIT_UNAVAILABLE, HerdrUnavailable
 
 
@@ -288,7 +293,7 @@ def test_server_start_argv_is_exact_and_never_forwards_caller_path(
         "--setenv",
         "HOME=/account/home",
         "--setenv",
-        "TOKIO_WORKER_THREADS=16",
+        f"TOKIO_WORKER_THREADS={SERVER_WORKER_THREADS}",
         "fixture-herdr",
         "server",
     )
@@ -298,7 +303,6 @@ def test_server_start_argv_is_exact_and_never_forwards_caller_path(
         ("fixture-herdr", "status", "--json"),
     ]
     assert all(not argument.startswith("PATH=") for argument in expected_launch)
-    assert expected_launch.count("TOKIO_WORKER_THREADS=16") == 1
 
 
 def test_workspace_creation_is_no_focus() -> None:
