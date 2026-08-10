@@ -168,6 +168,16 @@ Outputs are an at-most-80-character phrase, hover paragraph, and timestamped sub
 bullets. Current projections are `summary_data/phases/<phase-id>.json`; immutable cache records are
 `summary_data/cache/<input-hash>.json`.
 
+Work-bullet timestamps belong to the phase's half-open `[start_ms, end_ms)` interval. There is one
+narrow response-recovery rule for this contract: after every other response field and bullet
+shape/type has validated, bullets outside that interval are dropped rather than clamped or moved.
+If any valid bullets remain, phrase and paragraph are deterministically derived only from their
+texts; if none remain, the existing transcript-only heuristic supplies all three resolutions and
+never reads `prior_context`. A genuinely empty model list is distinct and retains the model's
+phrase and paragraph. The exception does not apply to rollups or any other malformed output, which
+still fails the batch. Because this is deterministic validation of the same response contract, it
+does not change prompt version or cache identity.
+
 Important correction to earlier design recollections: phase jobs currently receive ancestor raw
 transcript context and the glossary. They do **not** receive arrays of prior daily and weekly
 summaries. Prior calendar summaries are inputs to calendar rollups only.
@@ -237,10 +247,21 @@ generation time, and generating usage receipt. Every attempted backend batch has
 usage receipt under the relevant cache's `_usage/` tree. The envelope version describes storage
 shape and is distinct from the registered summarizer and output-schema versions.
 
+When a backend's final message fails validation, or the phase timestamp rule repairs it, the exact
+raw final message is preserved at `_usage/backend_outputs/<receipt-id>.json`. That receipt-linked
+audit record includes a SHA-256 content hash, each job's half-open bounds, and the index, timestamp,
+and `dropped-out-of-range` action for every repaired bullet. It deliberately excludes the model
+prompt and captured Codex CLI stdout/stderr. For a nonzero backend exit, the durable failure
+receipt and propagated exception retain the exit code but no captured stream detail. Ordinary valid
+responses need no duplicate raw-output record.
+
 The resolvers also try the former hash scheme. Valid summary-cache v1/v2 and naming-cache v3 files
 remain hits without token spend; they receive in-memory provenance marked `legacy_storage: true`
 and `unknown-legacy` context coverage. They are never rewritten merely to migrate storage.
 Pre-lifetime naming-cache v2 remains incompatible because it lacks the required lifetime summary.
+Compatibility rule: an older paid cache whose final bullet is exactly `end_ms` remains readable as
+a cache hit and byte-for-byte unchanged. Only newly validated backend output and newly generated
+deterministic fallback use half-open bounds.
 
 Projection records now carry the common provenance when it is known, while readers continue to
 accept pre-envelope projections. `summary_data/artifacts.json` retains every observed artifact
@@ -259,7 +280,8 @@ Every registered summarizer will use the following common lifecycle:
    output schema. Derived diagnostic metadata that is not model-visible is recorded but does not
    masquerade as a prompt input.
 3. **Resolve.** Select an exact cache hit or submit a bounded batch. Validate every response against
-   that registered output schema before publication.
+   that registered output schema before publication. The phase-only timestamp recovery above is
+   the sole deterministic exception; it never broadens schema/type validation.
 4. **Publish immutable artifact.** Store the result, full version identity, dependency identities,
    context coverage, chronological frontier status, generation time, and usage-receipt ID. Never
    overwrite an artifact at a different content hash.

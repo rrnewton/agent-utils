@@ -272,6 +272,14 @@ remains on disk. Each batch is committed only after every response in that batch
 the strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
 batches remain reusable.
 
+Phase work bullets use half-open time bounds: the start timestamp is valid and the end timestamp is
+not. A model response that is otherwise completely valid may contain out-of-range phase bullets;
+the pipeline drops those bullets without shifting or inventing timestamps. It then derives the
+phrase and paragraph only from remaining valid bullet text, or uses the existing transcript-only
+fallback when every bullet was rejected. A genuinely empty model bullet list keeps the model's
+prose. This exception is phase-only: malformed fields and out-of-range calendar-rollup bullets
+still fail validation, and it does not alter the prompt version or cache key.
+
 After phase summaries exist, a separate hindsight pass names every agent and writes its lifetime
 paragraph in the same response. It sees the agent's
 official path, coordinator nickname and role, arbitrary-depth parent path, cross-spawn ancestor
@@ -289,6 +297,15 @@ Cache records link to that receipt. The command prints both tokens newly spent b
 deduplicated original generation cost of all returned artifacts; an all-hit rerun therefore
 reports zero new tokens without losing the original cost. Older cache entries remain valid and are
 reported explicitly as having unknown original usage rather than being regenerated or counted as zero.
+Failed backend final messages and timestamp-repaired phase responses are retained beside those
+receipts under `_usage/backend_outputs/<receipt-id>.json`, with a SHA-256 hash, job bounds, and each
+rejected bullet's index, timestamp, and action. These audit records store neither the prompt nor
+captured Codex CLI stdout/stderr. A nonzero-exit receipt and displayed failure retain the safe exit
+code but omit captured stream detail.
+
+For compatibility, the cache reader accepts a paid artifact whose last bullet is exactly at its end
+boundary. That artifact stays a cache hit and its bytes remain unchanged; newly generated
+responses and deterministic fallbacks remain half-open.
 
 Summary selection is independent from ingestion. To backfill one exact hour while retaining the
 archive's complete normalized source, run:
@@ -462,6 +479,7 @@ example-team/
     ├── summary_data/
     │   ├── artifacts.json             # logical-key/version/model/context catalog
     │   ├── cache/<content-hash>.json
+    │   ├── cache/_usage/backend_outputs/<receipt-id>.json # failed/repaired raw output audit
     │   ├── name_cache/<content-hash>.json
     │   ├── agents/<thread-id>.json   # hindsight name, lifetime summary + provenance
     │   ├── phases/<phase-id>.json

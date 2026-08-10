@@ -8,6 +8,7 @@ results to their formatter separately.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import re
 import subprocess
@@ -27,7 +28,6 @@ from agent_team_timeline.archive import (
 )
 from agent_team_timeline.codex_workspace import (
     CodexWorkspaceError,
-    codex_failure_detail,
     initialize_codex_workspace,
 )
 from agent_team_timeline.summary_registry import (
@@ -107,9 +107,15 @@ class SummaryError(RuntimeError):
 class _CodexBatchError(SummaryError):
     """A failed Codex invocation with any terminal usage it already reported."""
 
-    def __init__(self, message: str, usage: TokenUsage | None) -> None:
+    def __init__(
+        self,
+        message: str,
+        usage: TokenUsage | None,
+        backend_output: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.usage = usage
+        self.backend_output = backend_output
 
 
 @dataclass(frozen=True)
@@ -203,6 +209,49 @@ class _ResolvedSummary:
 class _GeneratedBatch:
     results: Mapping[str, SummaryResult]
     receipt: BatchUsageReceipt
+
+
+@dataclass(frozen=True)
+class _RejectedWorkBullet:
+    """One otherwise-valid bullet rejected solely for its timestamp."""
+
+    index: int
+    at_ms: int
+
+
+@dataclass(frozen=True)
+class _ParsedBullets:
+    """Validated in-range bullets plus recoverable timestamp rejections."""
+
+    bullets: tuple[WorkBullet, ...]
+    rejected: tuple[_RejectedWorkBullet, ...]
+
+
+@dataclass(frozen=True)
+class _SummaryRepair:
+    """Audit metadata for one phase summary repaired without another model call."""
+
+    key: str
+    start_ms: int
+    end_ms: int
+    rejected: tuple[_RejectedWorkBullet, ...]
+
+
+@dataclass(frozen=True)
+class _ParsedBackendOutput:
+    """Strictly parsed model results and any timestamp-only repairs."""
+
+    results: Mapping[str, SummaryResult]
+    repairs: tuple[_SummaryRepair, ...]
+
+
+@dataclass(frozen=True)
+class _CodexBatchOutcome:
+    """A successful Codex response with optional raw repair evidence."""
+
+    parsed: _ParsedBackendOutput
+    usage: TokenUsage | None
+    raw_output: str
 
 
 def _validate_job(job: SummaryJob) -> None:
@@ -480,23 +529,45 @@ def _require_keys(
         raise SummaryError(f"{where}: " + "; ".join(details))
 
 
-def _parse_bullets(value: JsonValue, job: SummaryJob, where: str) -> tuple[WorkBullet, ...]:
+def _parse_bullets(
+    value: JsonValue,
+    job: SummaryJob,
+    where: str,
+    *,
+    recover_out_of_range: bool = False,
+    allow_end_boundary: bool = False,
+) -> _ParsedBullets:
     bullets: list[WorkBullet] = []
+    rejected: list[_RejectedWorkBullet] = []
     for index, raw_bullet in enumerate(_array(value, where)):
         item_where = f"{where}[{index}]"
         bullet = _object(raw_bullet, item_where)
         _require_keys(bullet, {"at_ms", "text"}, item_where)
         at_ms = _integer(bullet["at_ms"], item_where + ".at_ms")
-        if at_ms < job.start_ms or at_ms > job.end_ms:
-            raise SummaryError(f"{item_where}.at_ms: outside the summary interval")
         text = clean_summary_prose(_string(bullet["text"], item_where + ".text"))
+        after_interval = (
+            at_ms > job.end_ms
+            if allow_end_boundary
+            else at_ms >= job.end_ms
+        )
+        if at_ms < job.start_ms or after_interval:
+            rejected.append(_RejectedWorkBullet(index=index, at_ms=at_ms))
+            continue
         if not text:
             continue
         bullets.append(WorkBullet(at_ms=at_ms, text=text))
+    if rejected and not recover_out_of_range:
+        first = rejected[0]
+        raise SummaryError(
+            f"{where}[{first.index}].at_ms: outside the summary interval"
+        )
     # Structured-output models occasionally return otherwise-valid bullets out of order. Stable
     # canonicalization is lossless and avoids spending another full backend batch merely to
     # repair ordering; equal timestamps retain the model's original order.
-    return tuple(sorted(bullets, key=lambda item: item.at_ms))
+    return _ParsedBullets(
+        bullets=tuple(sorted(bullets, key=lambda item: item.at_ms)),
+        rejected=tuple(rejected),
+    )
 
 
 def _decode_json(text: str, where: str) -> JsonValue:
@@ -519,16 +590,17 @@ def _decode_json(text: str, where: str) -> JsonValue:
     raise SummaryError(f"{where}: unsupported JSON value")
 
 
-def _parse_backend_output(
+def _parse_backend_output_with_repairs(
     text: str,
     pending: Sequence[_PendingJob],
     model: str,
     generated_at: str,
-) -> dict[str, SummaryResult]:
+) -> _ParsedBackendOutput:
     root = _object(_decode_json(text, "codex output"), "codex output")
     _require_keys(root, {"summaries"}, "codex output")
     expected = {item.job.key: item for item in pending}
     results: dict[str, SummaryResult] = {}
+    repairs: list[_SummaryRepair] = []
     for index, raw_summary in enumerate(_array(root["summaries"], "codex output.summaries")):
         where = f"codex output.summaries[{index}]"
         summary = _object(raw_summary, where)
@@ -553,7 +625,13 @@ def _parse_backend_output(
                 f"{where}.paragraph: empty after removing transcript scaffolding"
             )
         item = expected[key]
-        bullets = _parse_bullets(summary["work_summary"], item.job, where + ".work_summary")
+        parsed_bullets = _parse_bullets(
+            summary["work_summary"],
+            item.job,
+            where + ".work_summary",
+            recover_out_of_range=item.job.summary_style == PHASE_STYLE,
+        )
+        bullets = parsed_bullets.bullets
         if item.job.summary_style == PROJECT_OVERVIEW_STYLE:
             if phrase not in {"Project overview supported", "Insufficient evidence"}:
                 raise SummaryError(
@@ -592,6 +670,28 @@ def _parse_backend_output(
                 raise SummaryError(
                     f"{where}.paragraph: glossary definition must not contain links or URLs"
                 )
+        if parsed_bullets.rejected:
+            # Recovery is deliberately narrower than schema validation: every other field and
+            # every bullet's shape/type/text has already validated. Model prose is discarded so
+            # text attached only to a rejected timestamp cannot leak into the durable result.
+            if bullets:
+                phrase = _shorten(bullets[0].text, _PHRASE_LIMIT)
+                paragraph = _shorten(
+                    " ".join(bullet.text for bullet in bullets), 700
+                )
+            else:
+                fallback = _heuristic_result(item, model, generated_at)
+                phrase = fallback.phrase
+                paragraph = fallback.paragraph
+                bullets = fallback.work_summary
+            repairs.append(
+                _SummaryRepair(
+                    key=key,
+                    start_ms=item.job.start_ms,
+                    end_ms=item.job.end_ms,
+                    rejected=parsed_bullets.rejected,
+                )
+            )
         results[key] = SummaryResult(
             key=key,
             phrase=phrase,
@@ -605,7 +705,22 @@ def _parse_backend_output(
     missing = sorted(set(expected) - set(results))
     if missing:
         raise SummaryError("codex output: missing summaries for " + ", ".join(missing))
-    return results
+    return _ParsedBackendOutput(results=results, repairs=tuple(repairs))
+
+
+def _parse_backend_output(
+    text: str,
+    pending: Sequence[_PendingJob],
+    model: str,
+    generated_at: str,
+) -> dict[str, SummaryResult]:
+    """Return strictly validated results, applying timestamp-only phase recovery."""
+
+    return dict(
+        _parse_backend_output_with_repairs(
+            text, pending, model, generated_at
+        ).results
+    )
 
 
 def _result_json(result: SummaryResult) -> dict[str, JsonValue]:
@@ -763,8 +878,11 @@ def _load_cache(
         ):
             return None
         bullets = _parse_bullets(
-            raw_result["work_summary"], pending.job, "summary cache.result.work_summary"
-        )
+            raw_result["work_summary"],
+            pending.job,
+            "summary cache.result.work_summary",
+            allow_end_boundary=True,
+        ).bullets
         return _ResolvedSummary(
             result=SummaryResult(
                 key=key,
@@ -936,15 +1054,22 @@ def _heuristic_result(pending: _PendingJob, model: str, generated_at: str) -> Su
                 + paragraph[1:],
                 700,
             )
-        duration = max(0, pending.job.end_ms - pending.job.start_ms)
-        denominator = max(1, len(selected) - 1)
-        bullets = tuple(
-            WorkBullet(
-                at_ms=pending.job.start_ms + duration * index // denominator,
-                text=_shorten(sentence, 280),
+        # Summary intervals are half-open. Keep the deterministic transcript fallback inside
+        # [start, end), including its final bullet; a zero-width interval cannot carry a bullet.
+        if pending.job.end_ms > pending.job.start_ms:
+            duration = pending.job.end_ms - pending.job.start_ms - 1
+            denominator = max(1, len(selected) - 1)
+            bullets = tuple(
+                WorkBullet(
+                    at_ms=(
+                        pending.job.start_ms + duration * index // denominator
+                    ),
+                    text=_shorten(sentence, 280),
+                )
+                for index, sentence in enumerate(selected)
             )
-            for index, sentence in enumerate(selected)
-        )
+        else:
+            bullets = ()
     else:
         phrase = "No durable engineering outcome recorded"
         paragraph = (
@@ -980,7 +1105,7 @@ def _codex_batch(
     reasoning_effort: str | None,
     service_tier: str | None,
     codex_command: Sequence[str],
-) -> tuple[dict[str, SummaryResult], TokenUsage | None]:
+) -> _CodexBatchOutcome:
     if not codex_command:
         raise SummaryError("codex command must not be empty")
     with tempfile.TemporaryDirectory(prefix="agent-team-timeline-summary-") as raw_dir:
@@ -1027,29 +1152,38 @@ def _codex_batch(
         except OSError as error:
             raise SummaryError(f"could not start codex backend: {error}") from error
         try:
+            backend_output = output_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            backend_output = None
+        try:
             usage = parse_codex_jsonl_usage(completed.stdout)
         except ValueError as error:
-            raise SummaryError(
-                f"codex summary batch reported invalid usage: {error}"
+            raise _CodexBatchError(
+                f"codex summary batch reported invalid usage: {error}",
+                None,
+                backend_output=backend_output,
             ) from error
         if completed.returncode != 0:
-            detail = codex_failure_detail(completed.stdout, completed.stderr)
-            suffix = f": {detail}" if detail else ""
             raise _CodexBatchError(
-                f"codex summary batch failed with exit {completed.returncode}{suffix}",
+                f"codex summary batch failed with exit {completed.returncode}",
                 usage,
+                backend_output=backend_output,
             )
-        try:
-            output = output_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+        if backend_output is None:
             raise _CodexBatchError(
                 "codex summary batch produced no output message", usage
-            ) from error
+            )
         try:
-            results = _parse_backend_output(output, pending, model, _utc_now())
+            parsed = _parse_backend_output_with_repairs(
+                backend_output, pending, model, _utc_now()
+            )
         except SummaryError as error:
-            raise _CodexBatchError(str(error), usage) from error
-        return results, usage
+            raise _CodexBatchError(
+                str(error), usage, backend_output=backend_output
+            ) from error
+        return _CodexBatchOutcome(
+            parsed=parsed, usage=usage, raw_output=backend_output
+        )
 
 
 def _chunks(values: Sequence[_PendingJob], size: int) -> list[tuple[_PendingJob, ...]]:
@@ -1058,6 +1192,65 @@ def _chunks(values: Sequence[_PendingJob], size: int) -> list[tuple[_PendingJob,
 
 def _usage_root(cache_dir: Path) -> Path:
     return cache_dir / "_usage"
+
+
+def _write_backend_output_audit(
+    cache_dir: Path,
+    receipt: BatchUsageReceipt,
+    batch: Sequence[_PendingJob],
+    raw_output: str,
+    *,
+    status: str,
+    repairs: Sequence[_SummaryRepair],
+) -> Path:
+    """Preserve failed/repaired model output without prompts or CLI stdout."""
+
+    if status not in {"failed", "repaired"}:
+        raise SummaryError(f"invalid backend-output audit status {status!r}")
+    repairs_by_key = {repair.key: repair for repair in repairs}
+    jobs_json: list[JsonValue] = []
+    for item in batch:
+        repair = repairs_by_key.get(item.job.key)
+        rejected_json: list[JsonValue] = []
+        if repair is not None:
+            if (
+                repair.start_ms != item.job.start_ms
+                or repair.end_ms != item.job.end_ms
+            ):
+                raise SummaryError(
+                    f"backend-output repair bounds changed for {item.job.key!r}"
+                )
+            rejected_json = [
+                {
+                    "index": rejected.index,
+                    "at_ms": rejected.at_ms,
+                    "action": "dropped-out-of-range",
+                }
+                for rejected in repair.rejected
+            ]
+        jobs_json.append(
+            {
+                "key": item.job.key,
+                "start_ms": item.job.start_ms,
+                "end_ms": item.job.end_ms,
+                "rejected_bullets": rejected_json,
+            }
+        )
+    audit: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "receipt_id": receipt.receipt_id,
+        "status": status,
+        "raw_output_sha256": hashlib.sha256(raw_output.encode("utf-8")).hexdigest(),
+        "raw_output": raw_output,
+        "jobs": jobs_json,
+    }
+    path = (
+        _usage_root(cache_dir)
+        / "backend_outputs"
+        / f"{receipt.receipt_id}.json"
+    )
+    write_json_if_changed(path, audit)
+    return path
 
 
 def _run_backend_batch(
@@ -1074,16 +1267,30 @@ def _run_backend_batch(
 
     started_at = _utc_now()
     input_hashes = tuple(item.input_hash for item in batch)
+    results: Mapping[str, SummaryResult]
+    usage: TokenUsage | None
+    repairs: tuple[_SummaryRepair, ...]
+    raw_output: str | None
     try:
         if backend == "heuristic":
             results = _heuristic_batch(batch, model)
-            usage: TokenUsage | None = TokenUsage()
+            usage = TokenUsage()
+            repairs = ()
+            raw_output = None
         else:
-            results, usage = _codex_batch(
+            outcome = _codex_batch(
                 batch, model, reasoning_effort, service_tier, codex_command
             )
+            results = outcome.parsed.results
+            usage = outcome.usage
+            repairs = outcome.parsed.repairs
+            raw_output = outcome.raw_output
     except SummaryError as error:
         usage = error.usage if isinstance(error, _CodexBatchError) else None
+        backend_output = (
+            error.backend_output if isinstance(error, _CodexBatchError) else None
+        )
+        receipt_error = _shorten(_one_line(str(error)), 500)
         receipt = BatchUsageReceipt.create(
             backend=backend,
             model=model,
@@ -1094,9 +1301,18 @@ def _run_backend_batch(
             completed_at=_utc_now(),
             input_hashes=input_hashes,
             usage=usage,
-            error=_shorten(_one_line(str(error)), 500),
+            error=receipt_error,
         )
         receipt_path = write_batch_receipt(_usage_root(cache_dir), receipt)
+        if backend_output is not None:
+            _write_backend_output_audit(
+                cache_dir,
+                receipt,
+                batch,
+                backend_output,
+                status="failed",
+                repairs=(),
+            )
         raise SummaryError(
             f"{error} (failed usage receipt: {receipt_path})"
         ) from error
@@ -1113,6 +1329,17 @@ def _run_backend_batch(
         error=None,
     )
     write_batch_receipt(_usage_root(cache_dir), receipt)
+    if repairs:
+        if raw_output is None:
+            raise SummaryError("repaired backend output is unavailable for audit")
+        _write_backend_output_audit(
+            cache_dir,
+            receipt,
+            batch,
+            raw_output,
+            status="repaired",
+            repairs=repairs,
+        )
     return _GeneratedBatch(results=results, receipt=receipt)
 
 

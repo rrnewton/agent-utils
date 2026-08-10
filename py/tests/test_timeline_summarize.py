@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections.abc import Mapping
@@ -552,6 +553,53 @@ def test_codex_backend_caches_project_overview_and_rejects_legacy_definition(
     assert cached.newly_spent_usage == TokenUsage()
 
 
+def test_historical_end_inclusive_paid_cache_remains_a_hit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache = tmp_path / "cache"
+    fake = tmp_path / "fake_codex.py"
+    log = tmp_path / "calls.log"
+    _write_fake_codex(fake)
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    job = _job("agent-a")
+
+    generated, generated_stats = summarize_jobs(
+        [job],
+        cache,
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+    )
+    assert generated_stats.misses == 1
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 1
+
+    cache_path = cache / f"{_input_hash(job, 'codex', 'gpt-test')}.json"
+    historical = json.loads(cache_path.read_text(encoding="utf-8"))
+    assert historical["result"]["work_summary"][0]["at_ms"] == job.start_ms
+    historical["result"]["work_summary"][0]["at_ms"] = job.end_ms
+    cache_path.write_text(json.dumps(historical), encoding="utf-8")
+    historical_bytes = cache_path.read_bytes()
+
+    reused, reused_stats = summarize_jobs(
+        [job],
+        cache,
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, str(fake)),
+    )
+
+    assert reused_stats.hits == 1
+    assert reused_stats.misses == 0
+    assert reused_stats.batches == 0
+    assert reused_stats.newly_spent_usage == TokenUsage()
+    assert reused[job.key].phrase == generated[job.key].phrase
+    assert reused[job.key].work_summary[0].at_ms == job.end_ms
+    assert cache_path.read_bytes() == historical_bytes
+    assert log.read_text(encoding="utf-8").count("CALL\n") == 1
+
+
 def test_corrupt_cache_is_ignored_and_regenerated(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     job = _job("agent-a")
@@ -612,7 +660,7 @@ def test_backend_failure_is_concise_and_preserves_existing_cache(tmp_path: Path)
     original = b"corrupt but pre-existing\n"
     cache_file.write_bytes(original)
 
-    with pytest.raises(SummaryError, match="exit 7: boom") as caught:
+    with pytest.raises(SummaryError, match="exit 7") as caught:
         summarize_jobs(
             [job],
             cache,
@@ -630,6 +678,7 @@ def test_backend_failure_is_concise_and_preserves_existing_cache(tmp_path: Path)
             ),
         )
     assert len(str(caught.value)) < 300
+    assert "boom" not in str(caught.value)
     assert "failed usage receipt:" in str(caught.value)
     assert cache_file.read_bytes() == original
     receipt_paths = list((cache / "_usage" / "receipts").glob("*.json"))
@@ -647,28 +696,71 @@ def test_backend_failure_is_concise_and_preserves_existing_cache(tmp_path: Path)
     }
 
 
-def test_backend_failure_preserves_actionable_stderr_tail(tmp_path: Path) -> None:
+def test_backend_failure_does_not_persist_captured_streams(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
-    diagnostic = "abort: temporary cwd is not inside a repository"
-    backend = (
-        "import sys; "
-        "sys.stderr.write('Codex CLI at Meta ' + ('banner ' * 100) + "
-        f"{diagnostic!r}); "
-        "sys.exit(7)"
-    )
+    job = _job("agent-a")
+    stdout_sentinel = "STDOUT-FAILURE-SENTINEL"
+    stderr_sentinel = "STDERR-FAILURE-SENTINEL"
+    raw_output = '{"safe":"backend last message"}'
+    backend = f"""
+import sys
+from pathlib import Path
 
-    with pytest.raises(SummaryError, match="not inside a repository"):
+args = sys.argv[1:]
+Path(args[args.index("--output-last-message") + 1]).write_text(
+    {raw_output!r}, encoding="utf-8"
+)
+print("error: {stdout_sentinel}")
+sys.stderr.write("{stderr_sentinel}")
+raise SystemExit(7)
+"""
+
+    with pytest.raises(SummaryError, match="failed with exit 7") as caught:
         summarize_jobs(
-            [_job("agent-a")],
+            [job],
             cache,
             backend="codex",
             model="gpt-test",
             codex_command=(sys.executable, "-c", backend),
         )
+    assert stdout_sentinel not in str(caught.value)
+    assert stderr_sentinel not in str(caught.value)
 
     receipt_path = next((cache / "_usage" / "receipts").glob("*.json"))
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    assert diagnostic in receipt["error"]
+    receipt_text = receipt_path.read_text(encoding="utf-8")
+    receipt = json.loads(receipt_text)
+    assert receipt["error"] == "codex summary batch failed with exit 7"
+    assert stdout_sentinel not in receipt_text
+    assert stderr_sentinel not in receipt_text
+
+    audit_path = (
+        cache / "_usage" / "backend_outputs" / f"{receipt['receipt_id']}.json"
+    )
+    audit_text = audit_path.read_text(encoding="utf-8")
+    audit = json.loads(audit_text)
+    assert set(audit) == {
+        "schema_version",
+        "receipt_id",
+        "status",
+        "raw_output_sha256",
+        "raw_output",
+        "jobs",
+    }
+    assert audit["status"] == "failed"
+    assert audit["raw_output"] == raw_output
+    assert audit["raw_output_sha256"] == hashlib.sha256(
+        raw_output.encode("utf-8")
+    ).hexdigest()
+    assert audit["jobs"] == [
+        {
+            "key": job.key,
+            "start_ms": job.start_ms,
+            "end_ms": job.end_ms,
+            "rejected_bullets": [],
+        }
+    ]
+    assert stdout_sentinel not in audit_text
+    assert stderr_sentinel not in audit_text
 
 
 def test_invalid_model_output_preserves_terminal_usage_receipt(tmp_path: Path) -> None:
@@ -711,6 +803,160 @@ print(json.dumps({
     assert receipt["usage"]["output_tokens"] == 9
     assert receipt["usage"]["total_tokens"] == 62
 
+    audit_path = (
+        cache / "_usage" / "backend_outputs" / f"{receipt['receipt_id']}.json"
+    )
+    audit_text = audit_path.read_text(encoding="utf-8")
+    audit = json.loads(audit_text)
+    raw_output = "not valid structured JSON"
+    assert set(audit) == {
+        "schema_version",
+        "receipt_id",
+        "status",
+        "raw_output_sha256",
+        "raw_output",
+        "jobs",
+    }
+    assert audit["status"] == "failed"
+    assert audit["receipt_id"] == receipt["receipt_id"]
+    assert audit["raw_output"] == raw_output
+    assert audit["raw_output_sha256"] == hashlib.sha256(
+        raw_output.encode("utf-8")
+    ).hexdigest()
+    assert audit["jobs"] == [
+        {
+            "key": job.key,
+            "start_ms": job.start_ms,
+            "end_ms": job.end_ms,
+            "rejected_bullets": [],
+        }
+    ]
+    assert "BEGIN_JOBS_JSON" not in audit_text
+    assert "prompt" not in audit
+    assert "stdout" not in audit
+
+
+def test_repaired_backend_output_is_audited_and_cache_hit_is_stable(
+    tmp_path: Path,
+) -> None:
+    cache = tmp_path / "cache"
+    call_log = tmp_path / "calls.log"
+    job = replace(
+        _job("agent-a"),
+        prior_context="PROMPT-ONLY-SECRET must not enter the backend-output audit.",
+    )
+    backend = f"""
+import json
+import sys
+from pathlib import Path
+
+prompt = sys.stdin.read()
+payload_text = prompt.split("BEGIN_JOBS_JSON\\n", 1)[1].split("END_JOBS_JSON", 1)[0]
+job = json.loads(payload_text)[0]
+payload = {{"summaries": [{{
+    "key": job["key"],
+    "phrase": "MODEL-ONLY rejected prose",
+    "paragraph": "MODEL-ONLY rejected prose must be replaced.",
+    "work_summary": [
+        {{"at_ms": job["start_ms"], "text": "Kept in-range work."}},
+        {{"at_ms": job["end_ms"], "text": "Rejected end-boundary work."}},
+    ],
+}}]}}
+raw_output = json.dumps(payload, sort_keys=True)
+args = sys.argv[1:]
+Path(args[args.index("--output-last-message") + 1]).write_text(
+    raw_output, encoding="utf-8"
+)
+with Path({str(call_log)!r}).open("a", encoding="utf-8") as handle:
+    handle.write("CALL\\n")
+print(json.dumps({{
+    "type": "turn.completed",
+    "usage": {{
+        "input_tokens": 41,
+        "cached_input_tokens": 0,
+        "output_tokens": 13,
+    }},
+}}))
+"""
+
+    first, first_stats = summarize_jobs(
+        [job],
+        cache,
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, "-c", backend),
+    )
+
+    result = first[job.key]
+    assert result.input_hash == _input_hash(job, "codex", "gpt-test")
+    assert result.prompt_version == PROMPT_VERSION
+    assert result.phrase == "Kept in-range work."
+    assert result.paragraph == "Kept in-range work."
+    assert [(bullet.at_ms, bullet.text) for bullet in result.work_summary] == [
+        (job.start_ms, "Kept in-range work.")
+    ]
+    assert result.artifact_provenance is not None
+    receipt_id = result.artifact_provenance.usage_receipt_id
+    assert receipt_id is not None
+    audit_path = cache / "_usage" / "backend_outputs" / f"{receipt_id}.json"
+    audit_bytes = audit_path.read_bytes()
+    audit = json.loads(audit_bytes)
+    raw_output = audit["raw_output"]
+    assert isinstance(raw_output, str)
+    assert set(audit) == {
+        "schema_version",
+        "receipt_id",
+        "status",
+        "raw_output_sha256",
+        "raw_output",
+        "jobs",
+    }
+    assert audit["schema_version"] == 1
+    assert audit["receipt_id"] == receipt_id
+    assert audit["status"] == "repaired"
+    assert audit["raw_output_sha256"] == hashlib.sha256(
+        raw_output.encode("utf-8")
+    ).hexdigest()
+    assert audit["jobs"] == [
+        {
+            "key": job.key,
+            "start_ms": job.start_ms,
+            "end_ms": job.end_ms,
+            "rejected_bullets": [
+                {
+                    "index": 1,
+                    "at_ms": job.end_ms,
+                    "action": "dropped-out-of-range",
+                }
+            ],
+        }
+    ]
+    audit_text = audit_bytes.decode("utf-8")
+    assert "PROMPT-ONLY-SECRET" not in audit_text
+    assert "BEGIN_JOBS_JSON" not in audit_text
+    assert "prompt" not in audit
+    assert "stdout" not in audit
+    assert first_stats.hits == 0
+    assert first_stats.misses == 1
+    assert call_log.read_text(encoding="utf-8") == "CALL\n"
+
+    second, second_stats = summarize_jobs(
+        [job],
+        cache,
+        backend="codex",
+        model="gpt-test",
+        max_workers=1,
+        codex_command=(sys.executable, "-c", backend),
+    )
+
+    assert second == first
+    assert second_stats.hits == 1
+    assert second_stats.misses == 0
+    assert second_stats.batches == 0
+    assert call_log.read_text(encoding="utf-8") == "CALL\n"
+    assert audit_path.read_bytes() == audit_bytes
+
 
 def test_failed_invocation_keeps_independently_validated_batch(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
@@ -736,7 +982,7 @@ result = {"summaries": [{
 args = sys.argv[1:]
 Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(result))
 """
-    with pytest.raises(SummaryError, match="deliberate second-batch failure"):
+    with pytest.raises(SummaryError, match="failed with exit 7") as caught:
         summarize_jobs(
             [first, failing],
             cache,
@@ -746,6 +992,7 @@ Path(args[args.index("--output-last-message") + 1]).write_text(json.dumps(result
             batch_size=1,
             codex_command=(sys.executable, "-c", backend),
         )
+    assert "deliberate second-batch failure" not in str(caught.value)
 
     first_cache = cache / f"{_input_hash(first, 'codex', 'gpt-test')}.json"
     failing_cache = cache / f"{_input_hash(failing, 'codex', 'gpt-test')}.json"
@@ -839,16 +1086,179 @@ def test_backend_bullets_are_stably_canonicalized_by_timestamp(tmp_path: Path) -
     ]
 
 
-def test_backend_bullet_outside_interval_remains_a_hard_failure(tmp_path: Path) -> None:
+def test_backend_drops_out_of_range_bullet_and_rederives_model_prose(
+    tmp_path: Path,
+) -> None:
     job = _job("agent-a")
     payload = {
         "summaries": [
             {
                 "key": job.key,
-                "phrase": "Invalid timestamp",
-                "paragraph": "This output must not enter the archive.",
+                "phrase": "Rejected material must not survive",
+                "paragraph": "The rejected-only claim must not enter the archive.",
                 "work_summary": [
-                    {"at_ms": job.end_ms + 1, "text": "Outside the interval."},
+                    {
+                        "at_ms": job.end_ms,
+                        "text": "Rejected-only claim from outside the interval.",
+                    },
+                    {
+                        "at_ms": job.start_ms + 20_000,
+                        "text": "Implemented deterministic timestamp recovery.",
+                    },
+                    {
+                        "at_ms": job.start_ms,
+                        "text": "Added focused interval tests.",
+                    },
+                ],
+            }
+        ]
+    }
+
+    result = _parse_backend_output(
+        json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+    )[job.key]
+
+    assert result.phrase == "Added focused interval tests."
+    assert result.paragraph == (
+        "Added focused interval tests. Implemented deterministic timestamp recovery."
+    )
+    assert [(bullet.at_ms, bullet.text) for bullet in result.work_summary] == [
+        (job.start_ms, "Added focused interval tests."),
+        (
+            job.start_ms + 20_000,
+            "Implemented deterministic timestamp recovery.",
+        ),
+    ]
+    assert "Rejected" not in result.phrase + result.paragraph
+
+
+def test_backend_all_rejected_bullets_use_transcript_only_fallback(
+    tmp_path: Path,
+) -> None:
+    job = replace(
+        _job(
+            "agent-a",
+            transcript="Implemented interval recovery. All 9 focused tests passed.",
+        ),
+        prior_context="PRIOR-CONTEXT-SECRET must never become current work.",
+    )
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "REJECTED-PROSE",
+                "paragraph": "REJECTED-PROSE must not survive fallback.",
+                "work_summary": [
+                    {
+                        "at_ms": job.end_ms,
+                        "text": "REJECTED-BULLET at the exclusive boundary.",
+                    }
+                ],
+            }
+        ]
+    }
+
+    result = _parse_backend_output(
+        json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+    )[job.key]
+    rendered = " ".join(
+        [result.phrase, result.paragraph]
+        + [bullet.text for bullet in result.work_summary]
+    )
+
+    assert "Implemented interval recovery" in rendered
+    assert "9 focused tests passed" in rendered
+    assert "PRIOR-CONTEXT-SECRET" not in rendered
+    assert "REJECTED" not in rendered
+
+
+def test_backend_interval_is_inclusive_at_start_exclusive_at_end(
+    tmp_path: Path,
+) -> None:
+    job = _job("agent-a")
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "Model prose is replaced after recovery",
+                "paragraph": "Only the accepted start-boundary bullet may survive.",
+                "work_summary": [
+                    {"at_ms": job.start_ms, "text": "Accepted at interval start."},
+                    {"at_ms": job.end_ms, "text": "Rejected at interval end."},
+                ],
+            }
+        ]
+    }
+
+    result = _parse_backend_output(
+        json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+    )[job.key]
+
+    assert result.phrase == "Accepted at interval start."
+    assert result.paragraph == "Accepted at interval start."
+    assert [(bullet.at_ms, bullet.text) for bullet in result.work_summary] == [
+        (job.start_ms, "Accepted at interval start.")
+    ]
+
+
+def test_backend_legitimate_empty_work_summary_retains_model_prose(
+    tmp_path: Path,
+) -> None:
+    job = _job("agent-a")
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "No substantive phase work",
+                "paragraph": "The model found no durable work in this interval.",
+                "work_summary": [],
+            }
+        ]
+    }
+
+    result = _parse_backend_output(
+        json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+    )[job.key]
+
+    assert result.phrase == "No substantive phase work"
+    assert result.paragraph == "The model found no durable work in this interval."
+    assert result.work_summary == ()
+
+
+def test_timestamp_recovery_does_not_mask_other_schema_errors(
+    tmp_path: Path,
+) -> None:
+    job = _job("agent-a")
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "Invalid mixed output",
+                "paragraph": "A malformed bullet keeps this response invalid.",
+                "work_summary": [
+                    {"at_ms": job.end_ms, "text": "Recoverable timestamp."},
+                    {"at_ms": job.start_ms, "text": 42},
+                ],
+            }
+        ]
+    }
+
+    with pytest.raises(SummaryError, match="expected a string"):
+        _parse_backend_output(
+            json.dumps(payload), [_pending(job, tmp_path)], "gpt-test", "generated"
+        )
+
+
+def test_out_of_range_rollup_bullet_remains_a_hard_failure(tmp_path: Path) -> None:
+    job = replace(_job("daily"), summary_style=TECHNICAL_ROLLUP_STYLE)
+    payload = {
+        "summaries": [
+            {
+                "key": job.key,
+                "phrase": "Technical daily rollup",
+                "paragraph": "The rollup still obeys strict timestamp validation.",
+                "work_summary": [
+                    {"at_ms": job.end_ms, "text": "Outside the interval."},
                 ],
             }
         ]
@@ -870,7 +1280,7 @@ def test_valid_backend_output_is_narrowed_to_frozen_types(tmp_path: Path) -> Non
                 "paragraph": "Implemented and verified the timeline summary cache.",
                 "work_summary": [
                     {"at_ms": job.start_ms, "text": "Implemented the cache."},
-                    {"at_ms": job.end_ms, "text": "Verified cache hits."},
+                    {"at_ms": job.end_ms - 1, "text": "Verified cache hits."},
                 ],
             }
         ]
@@ -881,4 +1291,4 @@ def test_valid_backend_output_is_narrowed_to_frozen_types(tmp_path: Path) -> Non
     assert result.model == "gpt-test"
     assert result.prompt_version == PROMPT_VERSION
     assert isinstance(result.work_summary, tuple)
-    assert result.work_summary[-1].at_ms == job.end_ms
+    assert result.work_summary[-1].at_ms == job.end_ms - 1
