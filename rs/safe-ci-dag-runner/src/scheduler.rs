@@ -53,6 +53,34 @@ type ProfileRow = BTreeMap<String, String>;
 /// Optional per-step cgroup manager shared (behind an `Arc`) across the run's supervisor threads.
 pub type BoxedCgroups = Option<Arc<dyn CgroupManager>>;
 
+/// Monotonic start epoch of the enclosing DAG step, serialized for nested consumers.
+///
+/// A nested timeout cannot safely start a fresh clock after its own setup: doing so makes a
+/// numerically smaller timeout capable of outliving the enclosing step.  The runner owns the
+/// actual step clock, so it exports that clock's epoch before spawning the child.  Consumers add
+/// their own (smaller) allowance to this value and therefore keep one ordering across execs.
+pub const STEP_STARTED_MONOTONIC_NS_ENV: &str = "SAFE_CI_STEP_STARTED_MONOTONIC_NS";
+
+/// Read Linux's process-independent monotonic clock in nanoseconds.
+///
+/// `Instant` cannot be serialized through an exec.  `CLOCK_MONOTONIC` is the same boot-scoped
+/// clock class and remains stable across fork/exec without inheriting wall-clock adjustments.
+pub fn monotonic_now_ns() -> Option<u64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0
+        || ts.tv_sec < 0
+        || ts.tv_nsec < 0
+    {
+        return None;
+    }
+    (ts.tv_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|s| s.checked_add(ts.tv_nsec as u64))
+}
+
 /// Per-step monitor poll interval (seconds) for descendant-thread-peak sampling.
 const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -1014,6 +1042,12 @@ fn run_step(ctx: StepCtx) {
     cmd.stderr(Stdio::piped());
 
     let start = Instant::now();
+    // Set this AFTER the step's declared environment so a manifest cannot forge the epoch that
+    // downstream timeout ordering relies on.  The serialized clock is sampled beside the
+    // supervisor's `Instant`; both precede spawn, so child setup spends from the same allowance.
+    if let Some(started_ns) = monotonic_now_ns() {
+        cmd.env(STEP_STARTED_MONOTONIC_NS_ENV, started_ns.to_string());
+    }
     let stream = verbosity >= 2;
 
     let mut child = match cmd.spawn() {
@@ -1700,6 +1734,41 @@ mod tests {
         let contents = std::fs::read_to_string(&order_file).unwrap();
         let seq: Vec<&str> = contents.split_whitespace().collect();
         assert_eq!(seq, vec!["A", "B"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_exports_unforgeable_monotonic_start_epoch() {
+        let dir = std::env::temp_dir().join(format!("scdr_epoch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let observed = dir.join("started-ns");
+        let path = observed.to_string_lossy();
+        let mut s = step(
+            "g",
+            "epoch",
+            &format!("printf '%s\\n' \"${STEP_STARTED_MONOTONIC_NS_ENV}\" > {path}"),
+            &[],
+            0.0,
+            &[],
+        );
+        // A manifest-provided value must not be able to forge the load-bearing start epoch.
+        s.env
+            .insert(STEP_STARTED_MONOTONIC_NS_ENV.to_string(), "1".to_string());
+        let cfg = DagConfig {
+            steps: vec![s],
+            ..Default::default()
+        };
+        let before = monotonic_now_ns().unwrap();
+        let res = run_dag(&cfg, 1, false, 0);
+        let after = monotonic_now_ns().unwrap();
+        assert!(res.ok);
+        let exported: u64 = std::fs::read_to_string(&observed)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(exported >= before && exported <= after);
+        assert_ne!(exported, 1, "step env forged the scheduler-owned epoch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
