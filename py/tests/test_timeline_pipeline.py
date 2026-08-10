@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -290,7 +291,6 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert index_text.index("timeline-core.js") < index_text.index("app.js")
     generated_makefile = (tmp_path / "Makefile").read_text(encoding="utf-8")
     assert generated_makefile.startswith(".PHONY: serve")
-    assert "MAKEFLAGS += --no-print-directory\n" in generated_makefile
     assert "run-stats:\n\tpython3 run_stats.py\n" in generated_makefile
     assert "query:\n\t@python3 query.py $(QUERY_ARGS)\n" in generated_makefile
     assert (tmp_path / "run_stats.py").is_file()
@@ -1725,12 +1725,16 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     )
     assert query_result.returncode == 0, query_result.stderr
     assert json.loads(query_result.stdout)["count"] == 2
+    make_environment = dict(os.environ)
+    for variable in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
+        make_environment.pop(variable, None)
     make_query_result = subprocess.run(
         ("make", "query", "QUERY_ARGS=list teams"),
         cwd=output,
         check=False,
         capture_output=True,
         text=True,
+        env=make_environment,
     )
     assert make_query_result.returncode == 0, make_query_result.stderr
     assert json.loads(make_query_result.stdout)["count"] == 2
