@@ -251,6 +251,111 @@ fn ensure_aggregate_slice(fraction: f64) -> bool {
     matches!((start, set), (Ok(a), Ok(b)) if a.status.success() && b.status.success())
 }
 
+/// Why a call to [`reexec_in_scope_with_limits`] RETURNED instead of exec-ing into a scope.
+///
+/// THE BOOL THIS REPLACES RETURNED SUCCESS TO MEAN DID-NOT-ATTEMPT, and that single conflation
+/// cost a day. `true` covered both "we are already boxed, proceed" and "policy said skip, we never
+/// asked whether boxing was possible"; `false` covered both "the probe said no" and "the exec
+/// failed". The only caller then folded ALL FOUR back into one error, choosing its wording from the
+/// bool — so on the policy-skip path it printed "boxing was skipped (e.g. CI without a systemd
+/// --user scope)", asserting a cause it had never tested. Four capability probes were run against
+/// that sentence, on a branch that never executes in the environment being investigated.
+///
+/// So the outcomes are named, and a caller that wants to report or act on the difference now can.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeAttempt {
+    /// This process is ALREADY inside the managed scope (anti-recursion). Genuinely boxed.
+    AlreadyInScope,
+    /// No attempt was made, by policy — currently the `CI`/`GITHUB_ACTIONS` skip. Says nothing
+    /// about whether boxing is possible here, because nothing was asked.
+    SkippedByPolicy {
+        /// The environment variable whose presence selected the skip.
+        reason: &'static str,
+    },
+    /// An attempt WAS made and the environment cannot support it. The string is the specific
+    /// failure, not a guess.
+    Unavailable {
+        /// What was tried and what it reported.
+        detail: String,
+    },
+    /// The scope was buildable but `execve` came back, which means it failed.
+    ExecFailed {
+        /// The `execve` error.
+        detail: String,
+    },
+}
+
+impl ScopeAttempt {
+    /// Whether the caller may proceed to run (as opposed to refusing).
+    ///
+    /// EXACTLY THE BOOL THIS REPLACES, so no policy rides in the change: the two "carry on"
+    /// outcomes are the two that returned `true`. What is new is that a caller can ask WHICH,
+    /// instead of being handed one bit that answers a different question.
+    pub fn may_proceed(&self) -> bool {
+        matches!(
+            self,
+            ScopeAttempt::AlreadyInScope | ScopeAttempt::SkippedByPolicy { .. }
+        )
+    }
+
+    /// Whether containment was actually established (only true when we are inside the scope).
+    ///
+    /// This is the predicate every caller that says "boxing ACTIVE" should have been using.
+    pub fn is_contained(&self) -> bool {
+        matches!(self, ScopeAttempt::AlreadyInScope)
+    }
+
+    /// Whether the capability question was even asked. `false` for the policy skip.
+    pub fn attempted(&self) -> bool {
+        !matches!(
+            self,
+            ScopeAttempt::SkippedByPolicy { .. } | ScopeAttempt::AlreadyInScope
+        )
+    }
+
+    /// One clause naming what happened, for a caller composing a diagnostic.
+    pub fn describe(&self) -> String {
+        match self {
+            ScopeAttempt::AlreadyInScope => "already inside the managed scope".to_string(),
+            ScopeAttempt::SkippedByPolicy { reason } => format!(
+                "scope setup was SKIPPED BY POLICY because ${reason} is set; whether boxing is \
+                 possible here was NOT tested (set {FORCE_ATTEMPT_ENV}=1 to find out)"
+            ),
+            ScopeAttempt::Unavailable { detail } => {
+                format!("scope setup was attempted and failed: {detail}")
+            }
+            ScopeAttempt::ExecFailed { detail } => {
+                format!("the scope was created but exec failed: {detail}")
+            }
+        }
+    }
+}
+
+/// Set to `1` to run the capability probe even under `CI`/`GITHUB_ACTIONS`.
+///
+/// THE MEASUREMENT INSTRUMENT THE POLICY SKIP REMOVED. Ephemeral hosted runners are a population
+/// nobody has measured precisely because the skip means the probe never runs there. This makes the
+/// question answerable on any runner without editing code or changing the default, which stays
+/// exactly as it was.
+pub const FORCE_ATTEMPT_ENV: &str = "SAFE_CI_FORCE_SCOPE_ATTEMPT";
+
+/// Whether policy says to skip scope setup here, and which variable said so.
+fn policy_skip_reason() -> Option<&'static str> {
+    if std::env::var(FORCE_ATTEMPT_ENV)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    if std::env::var("GITHUB_ACTIONS").is_ok() {
+        return Some("GITHUB_ACTIONS");
+    }
+    if std::env::var("CI").is_ok() {
+        return Some("CI");
+    }
+    None
+}
+
 /// Re-execute this process inside a delegated transient user scope.
 ///
 /// A successful `exec` replaces the process and does not return. A `true` return means the process
@@ -258,6 +363,18 @@ fn ensure_aggregate_slice(fraction: f64) -> bool {
 /// caller must refuse to continue because the requested containment could not be established.
 pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool {
     reexec_in_scope_with_limits(memory_max, cpu_count, None)
+}
+
+/// [`reexec_in_scope_with_limits`], reporting WHICH outcome occurred rather than a bare bool.
+///
+/// Prefer this. The bool forms are kept so an out-of-tree caller keeps compiling, but a bool
+/// cannot express the difference that matters here — see [`ScopeAttempt`].
+pub fn attempt_scope_reexec(
+    memory_max: Option<i64>,
+    cpu_count: Option<i64>,
+    runtime_max_s: Option<i64>,
+) -> ScopeAttempt {
+    attempt_scope_reexec_inner(memory_max, cpu_count, runtime_max_s)
 }
 
 /// Env var carrying the outer scope's requested `RuntimeMaxSec` into the in-scope child.
@@ -374,11 +491,28 @@ pub fn reexec_in_scope_with_limits(
     cpu_count: Option<i64>,
     runtime_max_s: Option<i64>,
 ) -> bool {
+    attempt_scope_reexec_inner(memory_max, cpu_count, runtime_max_s).may_proceed()
+}
+
+fn attempt_scope_reexec_inner(
+    memory_max: Option<i64>,
+    cpu_count: Option<i64>,
+    runtime_max_s: Option<i64>,
+) -> ScopeAttempt {
     if in_scope() {
-        return true;
+        return ScopeAttempt::AlreadyInScope;
     }
-    if std::env::var("CI").is_ok() || std::env::var("GITHUB_ACTIONS").is_ok() {
-        return true;
+    // POLICY SKIP, UNCHANGED IN EFFECT AND NOW HONEST ABOUT ITSELF. It is stated rather than
+    // silent, it no longer borrows the capability probe's wording for a probe it did not run, and
+    // FORCE_ATTEMPT_ENV can lift it for one run. Whether the skip is CORRECT is a separate
+    // question, deliberately left open here.
+    if let Some(reason) = policy_skip_reason() {
+        eprintln!(
+            "{LOG_PREFIX} scope setup SKIPPED BY POLICY (${reason} is set). This did NOT test \
+             whether cgroup boxing is available here; set {FORCE_ATTEMPT_ENV}=1 to probe instead \
+             of skipping."
+        );
+        return ScopeAttempt::SkippedByPolicy { reason };
     }
     let memory_max = memory_max.or_else(outer_memory_max_bytes);
     if memory_max.is_none() {
@@ -386,14 +520,20 @@ pub fn reexec_in_scope_with_limits(
             "{LOG_PREFIX} ERROR: cannot derive a positive outer MemoryMax; refusing an \
              unbounded scope."
         );
-        return false;
+        return ScopeAttempt::Unavailable {
+            detail: "cannot derive a positive outer MemoryMax from MemAvailable/\
+                     $SAFE_CI_OUTER_MEMORY_MAX_BYTES"
+                .to_string(),
+        };
     }
     if !systemd_scope_available() {
         eprintln!(
             "{LOG_PREFIX} ERROR: systemd --user scope is unavailable; refusing advisory-only \
              containment."
         );
-        return false;
+        return ScopeAttempt::Unavailable {
+            detail: "`systemd-run --user --scope` probe failed".to_string(),
+        };
     }
 
     let pid = std::process::id();
@@ -457,7 +597,9 @@ pub fn reexec_in_scope_with_limits(
                 "{LOG_PREFIX} ERROR: cannot resolve own executable ({e}); refusing to run \
                        without cgroup enforcement."
             );
-            return false;
+            return ScopeAttempt::Unavailable {
+                detail: format!("cannot resolve own executable ({e})"),
+            };
         }
     }
     args.extend(std::env::args().skip(1));
@@ -472,7 +614,9 @@ pub fn reexec_in_scope_with_limits(
         "{LOG_PREFIX} ERROR: systemd-run exec failed ({err}); refusing to run without cgroup \
          enforcement."
     );
-    false
+    ScopeAttempt::ExecFailed {
+        detail: err.to_string(),
+    }
 }
 
 /// The OUTER scope's cgroup path, derived from THIS process's own cgroup (no systemctl call).
@@ -1257,6 +1401,64 @@ impl CgroupManager for Cgroups {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scope_attempt_separates_the_four_outcomes() {
+        // The bool this replaces answered "may I proceed", which is a DIFFERENT question from
+        // "was containment established" and from "did we even ask". All three now have answers.
+        let in_scope = ScopeAttempt::AlreadyInScope;
+        let skipped = ScopeAttempt::SkippedByPolicy { reason: "CI" };
+        let unavail = ScopeAttempt::Unavailable {
+            detail: "probe failed".into(),
+        };
+        let execfail = ScopeAttempt::ExecFailed {
+            detail: "ENOENT".into(),
+        };
+
+        // may_proceed reproduces the historical bool EXACTLY: no policy rides in this change.
+        assert!(in_scope.may_proceed());
+        assert!(skipped.may_proceed());
+        assert!(!unavail.may_proceed());
+        assert!(!execfail.may_proceed());
+
+        // ...but only one of the two "proceed" outcomes is actually contained.
+        assert!(in_scope.is_contained());
+        assert!(!skipped.is_contained());
+
+        // ...and the skip is the one outcome that never asked the capability question. That is
+        // the distinction whose absence sent four probes after a branch CI never executes.
+        assert!(!skipped.attempted());
+        assert!(unavail.attempted());
+        assert!(execfail.attempted());
+    }
+
+    #[test]
+    fn a_policy_skip_never_claims_the_scope_was_unavailable() {
+        // The old wording, "boxing was skipped (e.g. CI without a systemd --user scope)", asserted
+        // a cause it had not tested. A skip must describe itself as untested, and must point at
+        // the instrument that would test it.
+        let skipped = ScopeAttempt::SkippedByPolicy {
+            reason: "GITHUB_ACTIONS",
+        };
+        let text = skipped.describe();
+        assert!(text.contains("SKIPPED BY POLICY"), "{text}");
+        assert!(text.contains("GITHUB_ACTIONS"), "{text}");
+        assert!(text.contains("NOT tested"), "{text}");
+        assert!(text.contains(FORCE_ATTEMPT_ENV), "{text}");
+        assert!(
+            !text.contains("unavailable"),
+            "a skip must not claim unavailability it never measured: {text}"
+        );
+        // Whereas a real probe failure says so, and says what it tried.
+        let unavail = ScopeAttempt::Unavailable {
+            detail: "`systemd-run --user --scope` probe failed".into(),
+        };
+        assert!(
+            unavail.describe().contains("attempted and failed"),
+            "{}",
+            unavail.describe()
+        );
+    }
 
     #[test]
     fn systemd_duration_parses_both_renderings() {

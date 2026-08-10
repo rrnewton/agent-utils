@@ -127,8 +127,11 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}{stderr}");
     let code = output.status.code();
+    // Both reasons a boxed run can refuse: the probe ran and said no, or policy skipped without
+    // asking. They are now DIFFERENT sentences, and this skip guard must recognize each — folding
+    // them into one string is how the distinction was lost in the first place.
     let boxing_unavailable = combined.contains("systemd --user scope is unavailable")
-        || combined.contains("boxing was skipped (e.g. CI without a systemd --user scope)");
+        || combined.contains("SKIPPED BY POLICY");
     if code == Some(3) && boxing_unavailable {
         eprintln!(
             "SKIP boxed_oom_does_not_truncate_a_neighbour_artifact: cgroup boxing is unavailable \

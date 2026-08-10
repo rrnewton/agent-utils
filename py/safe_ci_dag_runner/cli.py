@@ -1640,10 +1640,25 @@ def _resolve_cgroup_manager(
         ),
     )
     # Only reached when NO exec happened (execvp on success never returns).
+    #
+    # NAME WHAT ACTUALLY HAPPENED. This used to pick between two sentences from a bool, and on the
+    # policy-skip path it chose "boxing was skipped (e.g. CI without a systemd --user scope)" -- a
+    # claim about a capability nothing had tested. The exit code and the policy are unchanged.
+    skip_reason = cg.policy_skip_reason()
+    if reexeced_or_skipped and skip_reason is not None:
+        print(
+            f"{PROG}: ERROR: cgroup boxing was NOT ESTABLISHED and NOT TESTED: scope setup was "
+            f"skipped by policy because ${skip_reason} is set, so this run does not know whether "
+            "boxing is available here. Re-run with --allow-cgroup-failure to run UNBOXED, or with "
+            f"{cg.FORCE_ATTEMPT_ENV}=1 to probe instead of skipping.",
+            file=sys.stderr,
+        )
+        return None, 3
     detail = (
-        "boxing was skipped (e.g. CI without a systemd --user scope)"
+        "the scope re-exec returned without entering a scope"
         if reexeced_or_skipped
-        else "cgroup-v2 + a working systemd --user scope are unavailable"
+        else "scope setup was attempted and failed (cgroup-v2 + a working systemd --user scope "
+        "are unavailable)"
     )
     print(
         f"{PROG}: ERROR: cgroup boxing could not be established: {detail}. Cgroup resource boxing "

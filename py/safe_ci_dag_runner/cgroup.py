@@ -675,6 +675,90 @@ def verify_scope_runtime_max(
     return False
 
 
+#: Set to ``1`` to run the capability probe even under ``CI``/``GITHUB_ACTIONS``.
+#:
+#: THE MEASUREMENT INSTRUMENT THE POLICY SKIP REMOVED. Ephemeral hosted runners are a population
+#: nobody has measured precisely because the skip means the probe never runs there. This makes the
+#: question answerable on any runner without editing code or changing the default.
+FORCE_ATTEMPT_ENV = "SAFE_CI_FORCE_SCOPE_ATTEMPT"
+
+
+class ScopeAttemptKind(Enum):
+    """Why :func:`attempt_scope_reexec` returned instead of exec-ing into a scope."""
+
+    #: Already inside the managed scope (anti-recursion). Genuinely boxed.
+    ALREADY_IN_SCOPE = "already-in-scope"
+    #: No attempt was made, by policy. Says NOTHING about whether boxing is possible here.
+    SKIPPED_BY_POLICY = "skipped-by-policy"
+    #: An attempt was made and the environment cannot support it.
+    UNAVAILABLE = "unavailable"
+    #: The scope was buildable but ``execvp`` came back, which means it failed.
+    EXEC_FAILED = "exec-failed"
+
+
+@dataclass(frozen=True)
+class ScopeAttempt:
+    """The outcome of a scope re-exec attempt, and why.
+
+    THE BOOL THIS REPLACES RETURNED SUCCESS TO MEAN DID-NOT-ATTEMPT. ``True`` covered both "already
+    boxed, proceed" and "policy said skip, we never asked whether boxing was possible"; ``False``
+    covered both "the probe said no" and "the exec failed". The only caller folded all four back
+    into one error and chose its wording from the bool, so the policy-skip path printed a claim
+    about a capability nothing had tested.
+    """
+
+    kind: ScopeAttemptKind
+    detail: str = ""
+
+    @property
+    def may_proceed(self) -> bool:
+        """Whether the caller may run (as opposed to refusing).
+
+        Exactly the bool this replaces, so no policy rides in the change: the two "carry on"
+        outcomes are the two that returned ``True``.
+        """
+        return self.kind in (
+            ScopeAttemptKind.ALREADY_IN_SCOPE,
+            ScopeAttemptKind.SKIPPED_BY_POLICY,
+        )
+
+    @property
+    def is_contained(self) -> bool:
+        """Whether containment was actually established."""
+        return self.kind is ScopeAttemptKind.ALREADY_IN_SCOPE
+
+    @property
+    def attempted(self) -> bool:
+        """Whether the capability question was even asked."""
+        return self.kind in (ScopeAttemptKind.UNAVAILABLE, ScopeAttemptKind.EXEC_FAILED)
+
+    def describe(self) -> str:
+        """One clause naming what happened, for a caller composing a diagnostic."""
+        if self.kind is ScopeAttemptKind.ALREADY_IN_SCOPE:
+            return "already inside the managed scope"
+        if self.kind is ScopeAttemptKind.SKIPPED_BY_POLICY:
+            return (
+                f"scope setup was SKIPPED BY POLICY because ${self.detail} is set; whether "
+                f"boxing is possible here was NOT tested (set {FORCE_ATTEMPT_ENV}=1 to find out)"
+            )
+        if self.kind is ScopeAttemptKind.UNAVAILABLE:
+            return f"scope setup was attempted and failed: {self.detail}"
+        return f"the scope was created but exec failed: {self.detail}"
+
+
+def policy_skip_reason(*, skip_in_ci: bool = True) -> str | None:
+    """The environment variable selecting a policy skip here, or ``None``."""
+    if not skip_in_ci:
+        return None
+    if os.environ.get(FORCE_ATTEMPT_ENV) == "1":
+        return None
+    if os.environ.get("GITHUB_ACTIONS"):
+        return "GITHUB_ACTIONS"
+    if os.environ.get("CI"):
+        return "CI"
+    return None
+
+
 def reexec_in_scope(
     argv: Sequence[str],
     *,
@@ -706,7 +790,16 @@ def reexec_in_scope(
     host-side swap-kill candidate."""
     if os.environ.get(naming.env_in_scope) == "1":
         return True  # already re-exec'd into the scope (anti-recursion)
-    if skip_in_ci and (os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS")):
+    # POLICY SKIP, UNCHANGED IN EFFECT AND NOW HONEST ABOUT ITSELF: stated rather than silent, no
+    # longer borrowing the capability probe's wording for a probe it did not run, and liftable for
+    # one run via FORCE_ATTEMPT_ENV. Whether the skip is CORRECT is a separate question.
+    skip_reason = policy_skip_reason(skip_in_ci=skip_in_ci)
+    if skip_reason is not None:
+        sys.stderr.write(
+            f"{naming.log_prefix} scope setup SKIPPED BY POLICY (${skip_reason} is set). This "
+            f"did NOT test whether cgroup boxing is available here; set {FORCE_ATTEMPT_ENV}=1 to "
+            "probe instead of skipping.\n"
+        )
         return True
     if memory_max is None:
         memory_max = outer_memory_max_bytes()
