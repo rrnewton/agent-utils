@@ -253,7 +253,7 @@ class TeamData:
 
 
 def source_digest(team: TeamData) -> str:
-    """Return the legacy-shaped cache digest for normalized source prefixes."""
+    """Return the compatibility-shaped cache digest for normalized source prefixes."""
 
     snapshots: list[JsonValue] = [
         {
