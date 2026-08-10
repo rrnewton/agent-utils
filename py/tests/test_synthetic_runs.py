@@ -107,11 +107,27 @@ def test_chain_is_serial() -> None:
 
 
 def test_intra_step_parallelism_runs_concurrently() -> None:
-    # one step fanning out 4 inner sleepers via env-driven INNER
-    cfg = DagConfig(steps=(sleeper("g", "fan", 0.1, inner=4),))
-    r = run_dag(cfg, jobs=1, verbosity=0)
-    assert r.ok
-    assert r.wall_s < 0.35  # 4 inner sleepers overlap (~0.1s, not 0.4s)
+    # Compare like-for-like runner and teardown overhead instead of imposing an absolute wall-time
+    # ceiling: ownership sweeps and host load are independent of the inner sleepers themselves.
+    parallel = run_dag(
+        DagConfig(steps=(sleeper("g", "fan", 0.1, inner=4),)), jobs=1, verbosity=0
+    )
+    serial = run_dag(
+        DagConfig(
+            steps=(
+                Step(
+                    "g",
+                    "serial",
+                    "g.serial",
+                    "sleep 0.1; sleep 0.1; sleep 0.1; sleep 0.1",
+                ),
+            )
+        ),
+        jobs=1,
+        verbosity=0,
+    )
+    assert parallel.ok and serial.ok
+    assert parallel.wall_s + 0.15 < serial.wall_s
 
 
 def test_dep_failure_skips_dependents() -> None:
