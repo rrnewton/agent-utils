@@ -131,6 +131,11 @@ def _phase_markdown(
             f"- User prompts: {stats.user_prompts}",
             f"- Agent responses: {stats.agent_responses}",
             f"- Inter-agent messages: {stats.inter_agent_messages}",
+            *(
+                [f"- External messages: {stats.external_messages}"]
+                if stats.external_messages
+                else []
+            ),
             f"- Tool calls: {stats.tool_calls}",
             "",
             "## Summary provenance",
@@ -174,6 +179,11 @@ def _rollup_markdown(
             f"- User prompts: {stats.user_prompts}",
             f"- Agent responses: {stats.agent_responses}",
             f"- Inter-agent messages: {stats.inter_agent_messages}",
+            *(
+                [f"- External messages: {stats.external_messages}"]
+                if stats.external_messages
+                else []
+            ),
             f"- Tool calls: {stats.tool_calls}",
             "",
             "## Summary provenance",
@@ -476,7 +486,13 @@ def _event_objs(
         if (
             event.thread_id in visible_agent_ids
             and _in_window(team, event.timestamp_ms)
-            and event.kind in ("user_prompt", "assistant_message", "inter_agent_message")
+            and event.kind
+            in (
+                "user_prompt",
+                "assistant_message",
+                "inter_agent_message",
+                "external_message",
+            )
         ):
             result.append(
                 {"at_ms": event.timestamp_ms, "agent_id": event.thread_id, "kind": event.kind}

@@ -20,16 +20,20 @@ class PhaseStats:
     agent_responses: int
     inter_agent_messages: int
     tool_calls: int
+    external_messages: int = 0
 
     def to_mapping(self) -> dict[str, int]:
         """Return the counters keyed by their stable archive field names."""
 
-        return {
+        result = {
             "user_prompts": self.user_prompts,
             "agent_responses": self.agent_responses,
             "inter_agent_messages": self.inter_agent_messages,
             "tool_calls": self.tool_calls,
         }
+        if self.external_messages:
+            result["external_messages"] = self.external_messages
+        return result
 
 
 @dataclass(frozen=True)
@@ -97,7 +101,13 @@ class PhaseWindow:
 
 
 _TEXT_KINDS = frozenset(
-    {"user_prompt", "assistant_message", "inter_agent_message", "goal_updated"}
+    {
+        "user_prompt",
+        "assistant_message",
+        "inter_agent_message",
+        "external_message",
+        "goal_updated",
+    }
 )
 _WAIT_TOOLS = frozenset({"wait", "wait_agent"})
 
@@ -281,6 +291,7 @@ def _transcript_entries(
             "user_prompt": "user",
             "assistant_message": "assistant",
             "inter_agent_message": "agent",
+            "external_message": "external",
             "goal_updated": "goal",
         }
         result.append(
@@ -455,6 +466,7 @@ def build_phases(
                 # A tool that spans a phase boundary participates in both phases' state
                 # rendering, but belongs to exactly one phase for aggregate accounting.
                 tool_calls=sum(_tool_count(tool) for tool in started_phase_tools),
+                external_messages=counts["external_message"],
             )
             stable = f"{team.team_slug}\0{agent.thread_id}\0{bucket}\0{phase_minutes}"
             suffix = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
@@ -506,4 +518,5 @@ def aggregate_stats(phases: Sequence[PhaseWindow]) -> PhaseStats:
         agent_responses=sum(phase.stats.agent_responses for phase in phases),
         inter_agent_messages=sum(phase.stats.inter_agent_messages for phase in phases),
         tool_calls=sum(phase.stats.tool_calls for phase in phases),
+        external_messages=sum(phase.stats.external_messages for phase in phases),
     )

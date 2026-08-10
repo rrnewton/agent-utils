@@ -408,12 +408,16 @@
     if (!stats || typeof stats !== "object") {
       return "";
     }
-    return [
+    var values = [
       formatCount(stats.user_prompts) + " prompts",
       formatCount(stats.agent_responses) + " responses",
       formatCount(stats.inter_agent_messages) + " inter-agent",
       formatCount(stats.tool_calls) + " tools"
-    ].join(" · ");
+    ];
+    if (Number(stats.external_messages) > 0) {
+      values.splice(3, 0, formatCount(stats.external_messages) + " external");
+    }
+    return values.join(" · ");
   }
 
   function installTimezone(value) {
@@ -2339,6 +2343,7 @@
       user_prompts: app.data.events.length ? 0 : null,
       agent_responses: app.data.events.length ? 0 : null,
       inter_agent_messages: app.data.events.length ? 0 : null,
+      external_messages: app.data.events.length ? 0 : null,
       tool_calls: app.data.events.length ? 0 : null,
       active_agents: 0,
       event_counts_available: app.data.events.length > 0
@@ -2380,6 +2385,8 @@
           kind === "agent_message"
         ) {
           result.inter_agent_messages += 1;
+        } else if (kind === "external_message" || kind === "external_messages") {
+          result.external_messages += 1;
         } else if (kind === "tool_call" || kind === "tool_calls" || kind === "tool") {
           result.tool_calls += 1;
         }
@@ -2402,13 +2409,19 @@
     dom.statsRange.textContent =
       formatRange(app.viewStart, app.viewEnd) +
       (stats.event_counts_available ? "" : " · event counts unavailable");
-    dom.statsValues.replaceChildren(
+    var nodes = [
       statNode(stats.user_prompts, "User prompts"),
       statNode(stats.agent_responses, "Agent responses"),
       statNode(stats.inter_agent_messages, "Inter-agent msgs"),
+    ];
+    if (Number(stats.external_messages) > 0) {
+      nodes.push(statNode(stats.external_messages, "External msgs"));
+    }
+    nodes.push(
       statNode(stats.tool_calls, "Tool calls"),
       statNode(stats.active_agents, "Active agents")
     );
+    dom.statsValues.replaceChildren.apply(dom.statsValues, nodes);
   }
 
   function render() {
@@ -2674,9 +2687,13 @@
       ["user_prompts", "prompts"],
       ["agent_responses", "responses"],
       ["inter_agent_messages", "inter-agent messages"],
+      ["external_messages", "external messages"],
       ["tool_calls", "tool calls"]
     ];
     values.forEach(function (entry) {
+      if (entry[0] === "external_messages" && !(Number(stats && stats[entry[0]]) > 0)) {
+        return;
+      }
       row.appendChild(
         htmlElement(
           "span",

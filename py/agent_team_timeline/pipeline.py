@@ -20,6 +20,7 @@ from agent_team_timeline.archive import (
     as_int,
     as_object,
     as_string,
+    canonical_json,
     narrow_json,
     read_json,
     write_json_if_changed,
@@ -66,6 +67,8 @@ from agent_team_timeline.orc import (
     OrcParseError,
     OrcSourceCopy,
     load_orc_team,
+    prune_orc_staging,
+    prune_orc_snapshot_objects,
     snapshot_orc_lineage,
 )
 from agent_team_timeline.periods import (
@@ -389,6 +392,26 @@ def _source_manifest_path(archive: Path, team_slug: str) -> Path:
     return archive / "teams" / team_slug / "raw" / "source-manifest.json"
 
 
+def _normalized_generation_path(archive: Path, team_slug: str) -> Path:
+    _validate_team_slug(team_slug)
+    return archive / "teams" / team_slug / "raw" / "normalized-generation.json"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                return digest.hexdigest()
+            digest.update(chunk)
+
+
+def _canonical_json_file_sha256(path: Path) -> str:
+    encoded = canonical_json(read_json(path)).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _site_identity_path(archive: Path, team_slug: str) -> Path:
     _validate_team_slug(team_slug)
     return archive / "teams" / team_slug / "raw" / "site-identity.json"
@@ -630,6 +653,58 @@ def _write_ingested_team(
     return archived, report
 
 
+def _normalized_generation_value(
+    archive: Path, team_slug: str, team: TeamData
+) -> dict[str, JsonValue]:
+    """Describe the complete normalized Orc generation committed by the marker."""
+
+    return {
+        "schema_version": 1,
+        "tool": "agent-team-timeline",
+        "normalizer_schema_version": 1,
+        "provider": "orc",
+        "source_manifest_sha256": _canonical_json_file_sha256(
+            _source_manifest_path(archive, team_slug)
+        ),
+        "team_sha256": _file_sha256(_raw_team_path(archive, team_slug)),
+        "artifact_catalog_sha256": _file_sha256(
+            _artifact_catalog_path(archive, team_slug)
+        ),
+        "source_digest": source_digest(team),
+    }
+
+
+def _validate_normalized_generation(
+    archive: Path, team_slug: str, team: TeamData
+) -> None:
+    marker_path = _normalized_generation_path(archive, team_slug)
+    if marker_path.is_symlink() or not marker_path.is_file():
+        raise ValueError(
+            f"incomplete Orc normalized generation for {team_slug!r}; rerun ingest"
+        )
+    marker = as_object(read_json(marker_path), str(marker_path))
+    expected_fields = {
+        "schema_version",
+        "tool",
+        "normalizer_schema_version",
+        "provider",
+        "source_manifest_sha256",
+        "team_sha256",
+        "artifact_catalog_sha256",
+        "source_digest",
+    }
+    if set(marker) != expected_fields:
+        raise ValueError(
+            f"invalid Orc normalized generation marker at {marker_path}"
+        )
+    expected = _normalized_generation_value(archive, team_slug, team)
+    if marker != expected:
+        raise ValueError(
+            f"stale or incomplete Orc normalized generation for {team_slug!r}; "
+            "rerun ingest"
+        )
+
+
 def _ingest_codex_locked(
     archive: Path,
     sessions_root: Path,
@@ -813,8 +888,39 @@ def _load_orc_source_manifest(
     if not path.is_file():
         return ()
     obj = as_object(read_json(path), str(path))
-    if obj.get("schema_version") != 1 or obj.get("provider") != "orc":
+    schema_version = as_int(obj.get("schema_version"), f"{path}: schema_version")
+    if schema_version not in (1, 2) or obj.get("provider") != "orc":
         raise OrcParseError(f"invalid Orc source manifest at {path}")
+    if schema_version == 2:
+        expected_fields = {
+            "schema_version",
+            "provider",
+            "root_session_id",
+            "source_root",
+            "snapshot_root",
+            "date_window",
+            "sources",
+        }
+        if set(obj) != expected_fields:
+            missing = sorted(expected_fields - set(obj))
+            unknown = sorted(set(obj) - expected_fields)
+            raise OrcParseError(
+                f"invalid Orc source manifest fields at {path}: "
+                f"missing={missing!r}, unknown={unknown!r}"
+            )
+        recorded_source_root = as_string(
+            obj.get("source_root"), f"{path}: source_root"
+        )
+        if not Path(recorded_source_root).is_absolute():
+            raise OrcParseError(f"{path}: source_root must be absolute")
+        expected_snapshot_root = f"teams/{team_slug}/source_snapshots"
+        recorded_snapshot_root = as_string(
+            obj.get("snapshot_root"), f"{path}: snapshot_root"
+        )
+        if recorded_snapshot_root != expected_snapshot_root:
+            raise OrcParseError(
+                f"{path}: snapshot_root must be {expected_snapshot_root!r}"
+            )
     recorded_root = as_string(obj.get("root_session_id"), f"{path}: root_session_id")
     if recorded_root != root_session_id:
         raise OrcParseError(
@@ -833,7 +939,11 @@ def _load_orc_source_manifest(
     ):
         source = as_object(raw_source, f"{path}: sources[{index}]")
         result.append(
-            OrcSourceCopy.from_json_obj(source, f"{path}: sources[{index}]")
+            OrcSourceCopy.from_json_obj(
+                source,
+                f"{path}: sources[{index}]",
+                schema_version,
+            )
         )
     return tuple(result)
 
@@ -855,6 +965,7 @@ def _ingest_orc_locked(
         archive, team_slug, root_session_id, date_window
     )
     snapshot_root = _source_snapshot_root(archive, team_slug)
+    changed += prune_orc_staging(snapshot_root)
     snapshot = snapshot_orc_lineage(
         source_root,
         root_session_id,
@@ -875,7 +986,7 @@ def _ingest_orc_locked(
     )
     parsed_paths = tuple(sorted(source.path for source in team.sources))
     expected_paths = tuple(
-        sorted(source.snapshot_path for source in snapshot.sources)
+        sorted(source.source_path for source in snapshot.sources)
     )
     if parsed_paths != expected_paths:
         raise OrcParseError(
@@ -885,7 +996,7 @@ def _ingest_orc_locked(
         archive, team, ((), ()), identity_overrides
     )
     source_manifest: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "provider": "orc",
         "root_session_id": root_session_id,
         "source_root": str(source_root.resolve()),
@@ -899,7 +1010,20 @@ def _ingest_orc_locked(
             narrow_json(source_manifest),
         )
     )
-    return _write_ingested_team(archive, team_slug, team, date_window, changed)
+    archived, report = _write_ingested_team(
+        archive, team_slug, team, date_window, changed
+    )
+    marker_changed = int(
+        _write_json_durable(
+            _normalized_generation_path(archive, team_slug),
+            _normalized_generation_value(archive, team_slug, archived),
+        )
+    )
+    gc_changed = prune_orc_snapshot_objects(snapshot_root, snapshot.sources)
+    return archived, replace(
+        report,
+        files_changed=report.files_changed + marker_changed + gc_changed,
+    )
 
 
 def ingest_orc(
@@ -941,6 +1065,16 @@ def load_archived_team(archive: Path, team_slug: str) -> TeamData:
     _validate_archive_id(team.root_thread_id, "root thread id")
     for agent in team.agents:
         _validate_archive_id(agent.thread_id, "thread id")
+    source_manifest_path = _source_manifest_path(archive, team_slug)
+    if source_manifest_path.is_file():
+        source_manifest = as_object(
+            read_json(source_manifest_path), str(source_manifest_path)
+        )
+        if (
+            source_manifest.get("provider") == "orc"
+            and source_manifest.get("schema_version") == 2
+        ):
+            _validate_normalized_generation(archive, team_slug, team)
     return team
 
 

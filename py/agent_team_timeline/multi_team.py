@@ -95,6 +95,7 @@ def _team_stats(
         "user_prompts": 0,
         "agent_responses": 0,
         "inter_agent_messages": 0,
+        "external_messages": 0,
         "tool_calls": 0,
     }
     for index, event in enumerate(events):
@@ -105,6 +106,8 @@ def _team_stats(
             counts["agent_responses"] += 1
         elif kind == "inter_agent_message":
             counts["inter_agent_messages"] += 1
+        elif kind == "external_message":
+            counts["external_messages"] += 1
         elif kind == "tool_call":
             counts["tool_calls"] += 1
     return {

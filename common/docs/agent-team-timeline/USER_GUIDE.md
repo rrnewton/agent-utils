@@ -447,12 +447,16 @@ example-team/
 │   ├── timeline.json
 │   └── details/<phase-id>.json
 └── teams/example-team/
-    ├── source_snapshots/             # gitignored verbatim complete-line rollout copies
-    │   └── 2026/08/04/rollout-....jsonl
+    ├── source_snapshots/             # gitignored validated source copies
+    │   ├── 2026/08/04/rollout-....jsonl       # Codex/Claude
+    │   ├── .objects/<prefix>/<sha>.db         # immutable Orc SQLite objects
+    │   ├── .projections/<prefix>/<sha>.json   # frozen Orc note provenance
+    │   └── .staging/                           # managed, retry-safe Orc candidates
     ├── raw/
     │   ├── team.json
     │   ├── site-identity.json        # projects, repositories, hosts, archive timezone
     │   ├── source-manifest.json      # versioned path/byte/hash/update provenance
+    │   ├── normalized-generation.json # Orc manifest/team/catalog commit marker
     │   ├── source-snapshot.json
     │   └── messages/<thread-id>.json
     ├── summary_data/
@@ -517,17 +521,50 @@ final response is counted as a child-to-parent message while still driving its r
 ## Orc source semantics and limitations
 
 Orc's append-only content blocks are authoritative for coordinator conversation and tool execution.
-Conversation state supplies agent spawn records. Task notes are joined to their recorded author or
-owner and mapped to the latest matching agent incarnation at that time; this is the best available
-attribution when the task database does not retain owner changes per note. Reused names
-become separate incarnation IDs while the official name remains visible. Each nonempty task note is
-shown once as a worker-to-coordinator message; notes are not labeled terminal results because they
-can represent incremental progress.
+Conversation state supplies stable agent spawn records. Local task notes are mapped to the matching
+owner incarnation available at that time. Reused names become separate incarnation IDs while the
+official name remains visible. A local note with no owner is preserved beneath an `Unattributed
+Task Work` worker. A note carrying a server author is shown as an external/server-authored message
+on the coordinator, counted separately from user prompts, and does not invent an agent or edge.
+Each nonempty note appears once; notes are not labeled terminal results because they can represent
+incremental progress.
+
+The TaskGraph database set is reference-driven. A provider-initial session uses its named database,
+or its session UUID when unnamed. Delegated sessions use their UUID even when a name was inherited;
+`associated_dbs` adds any other referenced databases. References may precede file creation, so a
+never-seen missing database is skipped. Once observed, a still-referenced disappearance fails
+closed. A deliberately detached database remains frozen in the archive, and a replacement receives
+a stable source ordinal so old event IDs and history remain intact. With an Orc session index, only
+the selected subtree is inspected; without it, only the explicit root is inspected.
+
+Orc may compact or rewrite its auxiliary conversation-state JSON even while content blocks keep
+appending. The source manifest therefore treats content blocks and task notes as strict append-only
+prefixes, but versions mutable projections separately. Task-note prefix identity excludes fields
+that Orc may fill or change later: server synchronization ID, note author, current task owner, and
+title. Their first observed per-note values are frozen in an immutable projection; later drift is
+audited as a rewrite without silently changing old timeline events or paid-summary cache keys. A
+new note captures the owner/title visible when it first appears.
+
+A conversation rewrite is accepted only when every recorded AgentBlock spawn identity and value
+remains an unchanged subset; missing or modified spawn evidence still fails before replacing any
+prior snapshot. Schema-v2 manifests record bounded message/spawn digests, cumulative rewrite
+counts, and explicit degraded flags—never the raw conversation payload. Existing schema-v1 archives
+validate their preserved byte baseline and retain their exact raw-byte summary-cache identity until
+a real semantic change moves them to deterministic schema-v2 identity.
+
+SQLite backups are staged, integrity-checked, published into an immutable content-addressed object
+store, and fsynced before the manifest is updated. `raw/normalized-generation.json` is written last
+and binds the source manifest, normalized team, artifact catalog, and semantic source digest. A
+reader rejects a stale/missing marker after an interrupted write; rerunning ingest repairs it and
+then garbage-collects unreachable managed objects. Exact schema validation and component-wise
+symlink rejection apply to both live log paths and archive paths.
 
 Some Orc installations discover nested coordinator sessions without persisting a parent identifier.
 The importer preserves nested lineage when that field exists and does not invent a parent when it is
-absent. Agent-close timestamps are also not always persisted, so a lifetime ends at its
-last attributed activity or at the next reuse of the same official name.
+absent. Agent-close timestamps are also not always persisted, so a lifetime ends at its last
+attributed event/tool/turn/spawn or at the next reuse of the same official name. Child end times
+propagate upward so parent lifetimes contain all recorded descendant activity; mutable Orc
+`updated_at` values never extend a lifetime.
 
 ## Codex source semantics and limitations
 

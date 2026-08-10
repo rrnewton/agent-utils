@@ -24,6 +24,8 @@ class SourceSnapshot:
     line_count: int
     working_directory: str | None = None
     repository_url: str | None = None
+    semantic_sha256: str | None = None
+    semantic_complete_bytes: int | None = None
 
     def to_json_obj(self) -> JsonObject:
         """Return the snapshot as a JSON-serializable object."""
@@ -38,6 +40,8 @@ class SourceSnapshot:
             "line_count": self.line_count,
             "working_directory": self.working_directory,
             "repository_url": self.repository_url,
+            "semantic_sha256": self.semantic_sha256,
+            "semantic_complete_bytes": self.semantic_complete_bytes,
         }
 
 
@@ -249,13 +253,17 @@ class TeamData:
 
 
 def source_digest(team: TeamData) -> str:
-    """Canonical digest of exactly the complete source prefixes consumed for a team."""
+    """Return the legacy-shaped cache digest for normalized source prefixes."""
 
     snapshots: list[JsonValue] = [
         {
             "thread_id": source.thread_id,
-            "complete_bytes": source.complete_bytes,
-            "sha256": source.sha256,
+            "complete_bytes": (
+                source.semantic_complete_bytes
+                if source.semantic_complete_bytes is not None
+                else source.complete_bytes
+            ),
+            "sha256": source.semantic_sha256 or source.sha256,
         }
         for source in team.sources
     ]

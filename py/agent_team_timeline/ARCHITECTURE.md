@@ -55,6 +55,76 @@ individual archive and a combined export. List projections expose references and
 phase, calendar, and condensed-transcript text. JSON responses use query schema version 1, JSONL
 emits one record per line, and Markdown is presentation-only.
 
+## Orc snapshot transaction and compatibility contract
+
+Orc ingestion has two identities for every source. The logical identity is its original
+archive-relative path, such as `.orc/sessions/<session-id>/session.db` or `.tg/<name>.db`; this is
+what discovery, ownership, and manifests use. The physical identity is an immutable,
+content-addressed copy beneath `source_snapshots/.objects/<sha-prefix>/<sha>.db`. Frozen task-note
+provenance is a separate canonical JSON object beneath
+`source_snapshots/.projections/<sha-prefix>/<sha>.json`. Temporary SQLite backups and projection
+files exist only beneath `source_snapshots/.staging/` and are never valid inputs by mere presence.
+
+The transaction is deliberately ordered:
+
+1. Discover one exact indexed session subtree. If no usable index exists, inspect only the
+   explicitly selected root session; unrelated session-directory debris is never adopted.
+2. Back up every live SQLite source into staging, run SQLite integrity/schema checks, validate all
+   append-only and mutable-projection invariants, and re-read staged TaskGraph references to catch
+   discovery/snapshot races.
+3. Hard-link validated staged files into immutable content-addressed stores and fsync the files and
+   containing directories. An orphan object from an interrupted attempt is harmless and reusable.
+4. Normalize only that validated source set, then durably write the source manifest, artifact
+   catalog, provider-neutral team data, and related raw projections.
+5. Write `raw/normalized-generation.json` last. It binds the canonical source-manifest digest,
+   byte digest of `team.json`, artifact-catalog digest, normalizer schema, and semantic source
+   digest. Readers reject a missing or stale marker, so a crash between earlier writes cannot
+   expose a mixed generation.
+6. Only after the marker is durable, garbage-collect unreferenced managed objects. A retry removes
+   stale managed staging candidates and reconstructs or reuses the generation idempotently.
+
+Schema-v2 manifests and task projections are exact schemas: unknown and missing keys, malformed
+digests, noncanonical projection JSON, duplicate note IDs, unsafe relative paths, symlinked path
+components, and content-address/path mismatches fail closed. This applies to both live `.orc`/`.tg`
+paths and archive-local object/projection paths.
+
+TaskGraph discovery follows provider semantics rather than filename scans. A provider-initial
+session (`parent_id` absent) uses its nonempty `db_name` as the primary task database, falling back
+to its session UUID. Every delegated session uses its UUID even if it inherited a `db_name`.
+`associated_dbs` contributes an additional union of references. A never-observed reference whose
+file does not yet exist is lazy and omitted. A previously snapshotted file that remains referenced
+but disappears is corruption; a source that is deliberately dereferenced is retained as an
+immutable `detached` source so old history does not vanish. A later replacement receives a stable
+per-owner source ordinal: ordinal zero preserves historical event IDs, while later sources use an
+`-sN-` namespace. Shared-source ownership is sticky after first observation; initial ranking favors
+the effective primary reference, then the provider-initial session, shallower lineage, earlier
+creation time, and stable session ID.
+
+Semantic cache identity is recomputable from the current validated generation, not a hash chain.
+For sessions it includes immutable session lineage/name semantics, authoritative content-block
+history, and stable AgentBlock spawn facts. `updated_at`, `db_name`, and associated-database
+references are discovery/provenance and do not invalidate summaries. Conversation-state rewrites
+are accepted only when every prior stable spawn fact remains an unchanged subset; other auxiliary
+message churn is recorded as degraded rewrite provenance without changing normalized semantics.
+Session names remain semantic because they are user-visible labels.
+
+For tasks, the authoritative append-only prefix is exactly `(id, task_id, content, created_at)`.
+Server synchronization IDs, note authors, current task owners, and titles may be filled or rewritten
+later, so their first observed values are frozen per note in the immutable provenance projection.
+Subsequent drift increments explicit rewrite/degradation metadata but does not silently rewrite old
+events or invalidate summary caches. A new note captures the then-current title and owner. A
+non-null server author is external/server-authored provenance: it becomes an `external_message` on
+the coordinator, is counted separately from user prompts, and creates no agent or message edge. A
+local note with no owner is retained under a synthetic `Unattributed Task Work` child rather than
+being dropped.
+
+Legacy schema-v1 sources keep their exact historical raw-byte source-digest shape and validate the
+preserved semantic-baseline object. An unchanged migration remains in `legacy-raw-v1` mode, keeping
+existing summary keys byte-for-byte stable. The first real semantic change transitions that source
+to deterministic `normalized-v2`; a mixed archive is supported. Normalized agent lifetimes never
+use mutable session `updated_at`: they end at attributed events/tools/turns/spawns, and descendant
+ends propagate recursively so every parent contains all recorded child activity.
+
 ## Cost boundary
 
 Fetching, SQLite snapshotting, normalization, artifact extraction, terminology candidate scanning,
@@ -239,6 +309,10 @@ spends tokens.
   context coverage, then degrades to the best compatible artifact or normalized source data.
 - Source mutation/truncation and a cache hash mismatch fail closed. Ordinary append-only source
   growth creates new staged inputs only for affected windows/frontiers.
+- Provider-specific mutable auxiliary indexes are isolated from authoritative transcript prefixes.
+  Orc conversation state may be rewritten only when its complete prior stable-spawn projection is
+  proven to remain an unchanged subset; the manifest records the rewrite/degradation while content
+  blocks and task notes retain strict prefix validation.
 
 ## Required time/backfill behavior
 

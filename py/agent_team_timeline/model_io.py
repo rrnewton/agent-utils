@@ -82,6 +82,13 @@ def team_from_json_obj(value: object) -> TeamData:
             repository_url=_optional_string(
                 item.get("repository_url"), "source.repository_url"
             ),
+            semantic_sha256=_optional_string(
+                item.get("semantic_sha256"), "source.semantic_sha256"
+            ),
+            semantic_complete_bytes=_optional_integer(
+                item.get("semantic_complete_bytes"),
+                "source.semantic_complete_bytes",
+            ),
         )
         for item in _items(root, "sources")
     )
