@@ -780,6 +780,7 @@ def render_archive(
         write_text_if_changed(
             archive / "Makefile",
             ".PHONY: serve open run-stats query\n"
+            "MAKEFLAGS += --no-print-directory\n"
             "PORT ?= 8765\n"
             "QUERY_ARGS ?= list teams\n\n"
             "serve:\n\tpython3 serve.py --port $(PORT)\n\n"

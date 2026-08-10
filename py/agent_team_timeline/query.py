@@ -57,30 +57,40 @@ def read_json(path: Path) -> JsonValue:
 
 
 def as_object(value: JsonValue, where: str) -> dict[str, JsonValue]:
+    """Require one JSON object and retain its recursively narrowed type."""
+
     if not isinstance(value, dict):
         raise ValueError(f"{where}: expected an object")
     return value
 
 
 def as_array(value: JsonValue, where: str) -> list[JsonValue]:
+    """Require one JSON array and retain its recursively narrowed type."""
+
     if not isinstance(value, list):
         raise ValueError(f"{where}: expected an array")
     return value
 
 
 def as_string(value: JsonValue, where: str) -> str:
+    """Require one JSON string with a location-aware validation error."""
+
     if not isinstance(value, str):
         raise ValueError(f"{where}: expected a string")
     return value
 
 
 def as_int(value: JsonValue, where: str) -> int:
+    """Require one JSON integer while rejecting booleans."""
+
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"{where}: expected an integer")
     return value
 
 
 def canonical_json(value: JsonValue) -> str:
+    """Serialize a narrowed JSON value deterministically for CLI output."""
+
     return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
