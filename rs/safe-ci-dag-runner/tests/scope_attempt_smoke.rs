@@ -12,7 +12,7 @@
 //! the instrument (`SAFE_CI_FORCE_SCOPE_ATTEMPT=1`) to answer the capability question on a runner
 //! population nobody has measured.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const DAG: &str =
@@ -324,4 +324,121 @@ fn a_forged_sentinel_with_the_opt_out_degrades_rather_than_claiming() {
         "degrading must never print a containment claim:\n{}",
         r.text
     );
+}
+
+/// Read the containment record out of a run's durable journal.
+fn journal_containment(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("journal.jsonl")).ok()?;
+    text.lines()
+        .find(|l| l.contains("\"event\":\"containment\""))
+        .map(str::to_string)
+}
+
+/// Run once with an explicit evidence directory, returning (output, journal line).
+fn run_recording(name: &str, envs: &[(&str, &str)], extra: &[&str]) -> (String, Option<String>) {
+    let bin = env!("CARGO_BIN_EXE_safe-ci-dag-runner");
+    let dir = std::env::temp_dir().join(format!("scdr_rec_{name}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dag = dir.join("one.json");
+    std::fs::write(&dag, DAG).unwrap();
+    let ev = dir.join("evidence");
+    let mut cmd = Command::new(bin);
+    cmd.args(["run", "--dag", dag.to_str().unwrap(), "--no-profile"])
+        .args(extra)
+        .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &ev);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("failed to spawn the built binary");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = journal_containment(&ev);
+    let _ = std::fs::remove_dir_all(&dir);
+    (text, line)
+}
+
+/// THE RECORD, not a warning that scrolls past.
+///
+/// A run used to say ONCE, on stderr, that it was unboxed, and then no artifact carried it — so a
+/// run reviewed later was indistinguishable from a boxed one. Establishing whether CI boxes at all
+/// then cost four probes and three confident wrong answers, because the evidence had never
+/// existed. Every state must reach the durable journal AND the banner line.
+#[test]
+fn every_containment_state_reaches_the_banner_and_the_durable_journal() {
+    // 1) UNBOXED. The state that used to vanish.
+    let (text, line) = run_recording("unboxed", &[("CI", "1")], &["--allow-cgroup-failure"]);
+    assert!(
+        text.contains("CONTAINMENT: unboxed"),
+        "the banner must name the state:\n{text}"
+    );
+    let line = line.expect("an unboxed run must still write a containment record");
+    assert!(
+        line.contains("\"state\":\"unboxed\"")
+            && line.contains("\"caps_enforced\":\"false\"")
+            && line.contains("\"subtree_killable\":\"false\""),
+        "the journal must carry the state and what it did NOT enforce:\n{line}"
+    );
+
+    // 2) STEPS-CONTAINED-ONLY must be its own state. Recording the direct route as "boxed" would
+    //    be the overclaim relocated into an artifact that outlives the run.
+    let (text, line) = run_recording(
+        "direct",
+        &[("CI", "1"), ("SAFE_CI_DAG_RUNNER_DIRECT_CGROUP", "1")],
+        &[],
+    );
+    // GATE ON WHETHER THE ROUTE WAS TAKEN, NOT ON THE ANSWER IT GAVE. Keying the skip off the
+    // state label means a build that mislabels the direct route as run-boxed simply skips this
+    // case and passes — measured: it did. The route announces itself independently of the label,
+    // so that announcement is what decides whether the assertion applies.
+    let route_taken = text.contains("teardown ACTIVE via direct cgroupfs");
+    if route_taken {
+        assert!(
+            text.contains("CONTAINMENT: steps-contained-only"),
+            "the direct cgroupfs route must record steps-contained-only, never run-boxed:\n{text}"
+        );
+        let line = line.expect("the direct route must write a containment record");
+        assert!(
+            line.contains("\"state\":\"steps-contained-only\"")
+                && line.contains("\"caps_enforced\":\"false\"")
+                && line.contains("\"subtree_killable\":\"true\""),
+            "steps-contained-only must record killable-but-uncapped, not boxed:\n{line}"
+        );
+        assert!(
+            !line.contains("\"state\":\"run-boxed\""),
+            "the direct route must never record itself as run-boxed:\n{line}"
+        );
+    } else {
+        eprintln!("skipping direct-route case: cgroupfs route unavailable here");
+    }
+
+    // 3) RUN-BOXED, where the host can box. Carries the observation so the claim is recheckable.
+    let probe = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            &format!("--unit=scdr-rec-probe-{}", std::process::id()),
+            "true",
+        ])
+        .output();
+    if probe.map(|o| o.status.success()).unwrap_or(false) {
+        let (text, line) = run_recording("boxed", &[], &[]);
+        assert!(
+            text.contains("CONTAINMENT: run-boxed"),
+            "a boxed run must say so in the banner:\n{text}"
+        );
+        let line = line.expect("a boxed run must write a containment record");
+        assert!(
+            line.contains("\"state\":\"run-boxed\"")
+                && line.contains("\"caps_enforced\":\"true\"")
+                && line.contains("observed in /sys/fs/cgroup/"),
+            "the boxed record must carry the OBSERVED cgroup, not just the word boxed:\n{line}"
+        );
+    } else {
+        eprintln!("skipping run-boxed case: no usable systemd --user scope on this host");
+    }
 }

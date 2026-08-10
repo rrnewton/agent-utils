@@ -44,8 +44,9 @@ pub use attribution::{
 };
 pub use cgroup::{
     attempt_scope_reexec, expected_scope_runtime_max_s, install_scope_teardown,
-    observe_own_containment, promised_unit, verify_scope_runtime_max, CgroupManager, Cgroups,
-    ContainmentEvidence, ContainmentProof, ScopeAttempt, FORCE_ATTEMPT_ENV,
+    observe_own_containment, promised_unit, run_containment, verify_scope_runtime_max,
+    CgroupManager, Cgroups, ContainmentEvidence, ContainmentProof, RunContainment, ScopeAttempt,
+    FORCE_ATTEMPT_ENV,
 };
 pub use estimates::{
     allocate_widths, apply_plan_to_config, bucketize_rows, build_plan, feedback_identity,

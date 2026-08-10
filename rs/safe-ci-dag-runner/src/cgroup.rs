@@ -60,6 +60,16 @@ const DEFAULT_MEMORY_BUDGET_FRACTION: f64 = 0.90;
 pub trait CgroupManager: Send + Sync {
     /// Whether per-step containment is actually usable on this host.
     fn enabled(&self) -> bool;
+    /// What this manager actually contains, for the durable record.
+    ///
+    /// DEFAULTS TO `Unknown`, DELIBERATELY. An implementation that does not answer must not have
+    /// its silence read as containment — the whole failure mode being repaired here is a missing
+    /// field reading as normal. An implementor that boxes says so explicitly.
+    fn containment_record(&self) -> RunContainment {
+        RunContainment::Unknown {
+            detail: "this CgroupManager does not report its containment".into(),
+        }
+    }
     /// Wrap a step's command so its bash leader joins the step's child cgroup before forking,
     /// applying the inner memory/CPU caps. Returns `cmd` unchanged when disabled.
     fn prepare_command(
@@ -1312,6 +1322,116 @@ const SIGINT_NUM: i32 = 2;
 const SIGTERM_NUM: i32 = 15;
 
 /// The concrete per-step cgroup manager for a real Linux cgroup-v2 host.
+/// What a run's containment ACTUALLY IS, in the form a durable record should carry it.
+///
+/// WHY THIS IS NOT A BOOL AND NOT `Option::is_some()`. From an `Arc<dyn CgroupManager>` alone a
+/// consumer can learn only "there is a manager", and a record built from that reads "boxed" for a
+/// manager that contains STEPS but not the run and applies no caps at all. That is the same overclaim this module spent the day removing, relocated into an
+/// artifact — and an artifact outlives the run, so it misleads every later reader instead of one.
+///
+/// FOUR STATES, and the fourth is the load-bearing one. `Unknown` is a first-class value, never a
+/// synonym for either of the others: a record that omits containment reads as normal, and "we
+/// could not tell" is a different fact from "there was none".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunContainment {
+    /// The RUN ITSELF is inside a delegated cgroup with controllers: per-step caps AND
+    /// `cgroup.kill`. Carries the observation, so the claim can be rechecked from the record.
+    RunBoxed {
+        /// The observed cgroup of the running process.
+        cgroup: PathBuf,
+        /// The unit the parent promised, when one was carried.
+        unit: Option<String>,
+        /// The pid whose membership was observed.
+        pid: u32,
+    },
+    /// STEPS are moved into a cgroup this process created; the RUNNER is not itself contained and
+    /// NO resource caps are enforced. Teardown works; boxing does not. Recording this as "boxed"
+    /// would blur exactly the distinction that makes the direct route honest.
+    StepsContainedOnly {
+        /// The cgroup steps are moved into.
+        cgroup: PathBuf,
+    },
+    /// No containment at all.
+    Unboxed {
+        /// Why, in the terms the run knows.
+        reason: String,
+    },
+    /// Could not be determined. NOT a default, NOT a synonym for boxed or unboxed.
+    Unknown {
+        /// What could not be established.
+        detail: String,
+    },
+}
+
+impl RunContainment {
+    /// A short, stable token for a ledger column or a grep.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RunContainment::RunBoxed { .. } => "run-boxed",
+            RunContainment::StepsContainedOnly { .. } => "steps-contained-only",
+            RunContainment::Unboxed { .. } => "unboxed",
+            RunContainment::Unknown { .. } => "unknown",
+        }
+    }
+
+    /// Whether per-step resource CAPS were enforceable. False for every state but `RunBoxed`,
+    /// including `Unknown` — an unproven cap is not a cap.
+    pub fn caps_enforced(&self) -> bool {
+        matches!(self, RunContainment::RunBoxed { .. })
+    }
+
+    /// Whether a step's whole subtree was killable via `cgroup.kill`. True for the direct route
+    /// too: that route exists precisely because killing works without controllers.
+    pub fn subtree_killable(&self) -> bool {
+        matches!(
+            self,
+            RunContainment::RunBoxed { .. } | RunContainment::StepsContainedOnly { .. }
+        )
+    }
+
+    /// One line for a durable log or banner. Always states which of the four it is.
+    pub fn describe(&self) -> String {
+        match self {
+            RunContainment::RunBoxed { cgroup, unit, pid } => format!(
+                "run-boxed: pid {pid} observed in {}{} (per-step caps enforced, subtree killable)",
+                cgroup.display(),
+                match unit {
+                    Some(u) => format!(" (promised unit {u})"),
+                    None => String::new(),
+                }
+            ),
+            RunContainment::StepsContainedOnly { cgroup } => format!(
+                "steps-contained-only: steps run in {} and the subtree is killable, but the RUNNER \
+                 is not contained and NO per-step caps are enforced",
+                cgroup.display()
+            ),
+            RunContainment::Unboxed { reason } => {
+                format!("unboxed: no containment ({reason})")
+            }
+            RunContainment::Unknown { detail } => format!(
+                "unknown: containment state could not be determined ({detail}) — this is NOT a \
+                 claim that the run was boxed"
+            ),
+        }
+    }
+}
+
+/// The containment of a run, from its manager — or its absence.
+///
+/// The `None` case is `Unboxed` rather than `Unknown` because a caller that holds no manager
+/// knows, positively, that no containment was arranged.
+pub fn run_containment(manager: Option<&dyn CgroupManager>) -> RunContainment {
+    match manager {
+        Some(m) if m.enabled() => m.containment_record(),
+        Some(_) => RunContainment::Unboxed {
+            reason: "a containment manager was supplied but reported itself disabled".into(),
+        },
+        None => RunContainment::Unboxed {
+            reason: "no containment manager was established for this run".into(),
+        },
+    }
+}
+
 /// What a live [`Cgroups`] can actually enforce. These are NOT interchangeable and the difference
 /// is deliberately visible at the type level, because "we have a cgroup" and "we can cap a step"
 /// are different capabilities, and treating them as one is what hides an unkillable step.
@@ -1475,6 +1595,36 @@ impl Default for Cgroups {
 impl CgroupManager for Cgroups {
     fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// The two routes report DIFFERENT states, which is the point: `Full` boxes the run, `KillOnly`
+    /// only moves steps into a cgroup it made. Collapsing them into "boxed" would put the overclaim
+    /// back, this time in an artifact that outlives the run.
+    fn containment_record(&self) -> RunContainment {
+        let Some(root) = self.root.clone() else {
+            return RunContainment::Unknown {
+                detail: "the manager is enabled but carries no cgroup root".into(),
+            };
+        };
+        match self.containment {
+            Containment::KillOnly => RunContainment::StepsContainedOnly { cgroup: root },
+            // Full means the RUN is in a delegated scope, so say so only if that is still
+            // OBSERVABLE right now. A scope can be stopped under a live process, and a record
+            // written from a stale assumption is worse than one that says it did not know.
+            Containment::Full => match observe_own_containment(promised_unit().as_deref()) {
+                ContainmentEvidence::Observed(p) => RunContainment::RunBoxed {
+                    cgroup: p.cgroup,
+                    unit: p.unit,
+                    pid: p.pid,
+                },
+                ContainmentEvidence::NotObserved { detail } => RunContainment::Unknown {
+                    detail: format!(
+                        "the manager reports a delegated scope but containment is not observable \
+                         now: {detail}"
+                    ),
+                },
+            },
+        }
     }
 
     fn prepare_command(
@@ -1712,6 +1862,90 @@ impl CgroupManager for Cgroups {
 
 #[cfg(test)]
 mod tests {
+
+    /// A manager that does NOT override `containment_record`, i.e. an out-of-tree implementor.
+    struct SilentManager {
+        on: bool,
+    }
+    impl CgroupManager for SilentManager {
+        fn enabled(&self) -> bool {
+            self.on
+        }
+        fn prepare_command(&self, _t: &str, c: &str, _m: Option<i64>, _p: Option<i64>) -> String {
+            c.to_string()
+        }
+        fn kill(&self, _t: &str) -> bool {
+            false
+        }
+        fn cleanup(&self, _t: &str) {}
+        fn oom_kills(&self, _t: &str) -> i64 {
+            0
+        }
+        fn peak_bytes(&self, _t: &str) -> Option<i64> {
+            None
+        }
+        fn cpu_stats(&self, _t: &str) -> Option<BTreeMap<String, i64>> {
+            None
+        }
+        fn thread_count(&self, _t: &str) -> Option<i64> {
+            None
+        }
+        fn cpu_pressure(&self, _t: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn silence_records_unknown_and_never_boxed() {
+        // THE NON-NEGOTIABLE CLAUSE. An implementor that says nothing must not have its silence
+        // read as containment; an omitted field reads as normal, which is the whole defect.
+        let silent = SilentManager { on: true };
+        let r = run_containment(Some(&silent));
+        assert_eq!(r.label(), "unknown", "{}", r.describe());
+        assert!(!r.caps_enforced(), "unknown must never imply enforced caps");
+        assert!(
+            !r.subtree_killable(),
+            "unknown must never imply a killable subtree"
+        );
+        assert!(
+            r.describe().contains("NOT a"),
+            "the record must say unknown is not a claim of boxing: {}",
+            r.describe()
+        );
+
+        // A manager that reports itself disabled, and no manager at all, are both POSITIVE
+        // knowledge that nothing was arranged -- unboxed, not unknown.
+        let off = SilentManager { on: false };
+        assert_eq!(run_containment(Some(&off)).label(), "unboxed");
+        assert_eq!(run_containment(None).label(), "unboxed");
+    }
+
+    #[test]
+    fn steps_contained_is_not_run_boxed() {
+        // "steps contained" and "run contained" are different facts, and a record that blurs them
+        // is the overclaim relocated into an artifact that outlives the run.
+        let steps = RunContainment::StepsContainedOnly {
+            cgroup: std::path::PathBuf::from("/sys/fs/cgroup/x"),
+        };
+        let boxed = RunContainment::RunBoxed {
+            cgroup: std::path::PathBuf::from("/sys/fs/cgroup/x.scope"),
+            unit: Some("x.scope".into()),
+            pid: 7,
+        };
+        assert_ne!(steps.label(), boxed.label());
+        // The direct route kills subtrees but enforces no caps; conflating the two loses exactly
+        // the capability difference that decides whether a runaway step can be capped.
+        assert!(steps.subtree_killable() && !steps.caps_enforced());
+        assert!(boxed.subtree_killable() && boxed.caps_enforced());
+        assert!(
+            steps.describe().contains("RUNNER is not contained"),
+            "{}",
+            steps.describe()
+        );
+    }
 
     #[test]
     fn only_observed_containment_can_qualify() {

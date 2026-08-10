@@ -1534,6 +1534,35 @@ pub fn run_dag_boxed_deadline(
             crate::attribution::NO_LOGS_ENV,
         );
     }
+    // CONTAINMENT GOES INTO THE RECORD, NOT ONLY INTO A WARNING THAT SCROLLS PAST.
+    //
+    // A run used to say once, on stderr, that it was unboxed, and then no artifact carried it. Any
+    // run reviewed later therefore could not be told apart from a boxed one — which is why
+    // establishing whether CI boxes at all took four probes and three confident wrong answers: the
+    // evidence had never existed. This writes the state into the durable journal and prints one
+    // machine-readable line a banner or ledger can copy verbatim rather than re-derive.
+    //
+    // ABSENT MUST NOT MEAN BOXED, so the state is written on EVERY path, `unknown` included.
+    let containment = crate::cgroup::run_containment(runner.cgroups.as_deref());
+    eprintln!(
+        "[scheduler] CONTAINMENT: {} — {}",
+        containment.label(),
+        containment.describe()
+    );
+    if let Some(e) = &runner.evidence {
+        e.record(
+            "containment",
+            &[
+                ("state", containment.label().to_string()),
+                ("caps_enforced", containment.caps_enforced().to_string()),
+                (
+                    "subtree_killable",
+                    containment.subtree_killable().to_string(),
+                ),
+                ("detail", containment.describe()),
+            ],
+        );
+    }
     let (_ok, wall) = runner.run();
     runner.result(wall)
 }
