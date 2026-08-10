@@ -16,6 +16,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FETCHER_DIR = REPO_ROOT / "scripts" / "agent-log-archive"
+KNOWN_SSH_BANNER = (
+    "Meta authorized users only. Usage is subject to monitoring and recording."
+)
 
 
 def _install_archive(
@@ -48,6 +51,53 @@ def _run(
         check=False,
         env=env,
     )
+
+
+def _fake_ssh_environment(
+    tmp_path: Path, *, manifest_stderr: str = "", manifest_exit: int = 0
+) -> dict[str, str]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        """#!/usr/bin/env python3
+import os
+import sys
+
+arguments = sys.argv[1:]
+index = 0
+while index < len(arguments):
+    if arguments[index] == "-n":
+        index += 1
+    elif arguments[index] == "-o":
+        index += 2
+    elif arguments[index] == "--":
+        index += 1
+        break
+    else:
+        break
+index += 1
+remaining = arguments[index:]
+if len(remaining) == 1:
+    remote_command = remaining[0]
+    if "find . -printf" in remote_command:
+        manifest_stderr = os.environ.get("FAKE_MANIFEST_STDERR", "")
+        if manifest_stderr:
+            print(manifest_stderr, file=sys.stderr)
+        manifest_exit = int(os.environ.get("FAKE_MANIFEST_EXIT", "0"))
+        if manifest_exit:
+            raise SystemExit(manifest_exit)
+    os.execl("/bin/sh", "sh", "-c", remote_command)
+os.execvp(remaining[0], remaining)
+""",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    environment = dict(os.environ)
+    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
+    environment["FAKE_MANIFEST_STDERR"] = manifest_stderr
+    environment["FAKE_MANIFEST_EXIT"] = str(manifest_exit)
+    return environment
 
 
 def _latest_receipt(archive: Path) -> Path:
@@ -476,7 +526,7 @@ raise SystemExit(0)
     assert history["rsync_attempted_operations"] == "1"
 
 
-def test_remote_fetch_uses_ssh_for_probe_manifest_and_rsync(
+def test_remote_fetch_ignores_known_ssh_banner_during_manifest(
     tmp_path: Path,
 ) -> None:
     home = tmp_path / "remote-home"
@@ -488,37 +538,9 @@ def test_remote_fetch_uses_ssh_for_probe_manifest_and_rsync(
         f"remote-test\tremote.invalid\t{home}\n",
         "*\tlogs\tlogs\trequired\n",
     )
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    fake_ssh = fake_bin / "ssh"
-    fake_ssh.write_text(
-        """#!/usr/bin/env python3
-import os
-import sys
-
-arguments = sys.argv[1:]
-index = 0
-while index < len(arguments):
-    if arguments[index] == "-n":
-        index += 1
-    elif arguments[index] == "-o":
-        index += 2
-    elif arguments[index] == "--":
-        index += 1
-        break
-    else:
-        break
-index += 1
-remaining = arguments[index:]
-if len(remaining) == 1:
-    os.execl("/bin/sh", "sh", "-c", remaining[0])
-os.execvp(remaining[0], remaining)
-""",
-        encoding="utf-8",
+    environment = _fake_ssh_environment(
+        tmp_path, manifest_stderr=KNOWN_SSH_BANNER
     )
-    fake_ssh.chmod(0o755)
-    environment = dict(os.environ)
-    environment["PATH"] = f"{fake_bin}{os.pathsep}{environment['PATH']}"
 
     completed = _run(archive, env=environment)
     assert completed.returncode == 0, completed.stdout + completed.stderr
@@ -528,6 +550,63 @@ os.execvp(remaining[0], remaining)
     row = _read_tsv(_latest_receipt(archive) / "results.tsv")[0]
     assert row["status"] == "fetched"
     assert int(row["manifest_entries"]) >= 2
+    assert "source_manifest_unstable" not in _warning_codes(
+        _latest_receipt(archive) / "warnings.jsonl"
+    )
+
+
+def test_remote_manifest_keeps_non_banner_stderr_actionable(tmp_path: Path) -> None:
+    home = tmp_path / "remote-home"
+    source = home / "logs"
+    source.mkdir(parents=True)
+    (source / "remote.jsonl").write_text('{"remote":true}\n', encoding="utf-8")
+    archive = _install_archive(
+        tmp_path,
+        f"remote-test\tremote.invalid\t{home}\n",
+        "*\tlogs\tlogs\trequired\n",
+    )
+    environment = _fake_ssh_environment(
+        tmp_path,
+        manifest_stderr=f"{KNOWN_SSH_BANNER}\nfind: traversal warning",
+    )
+
+    completed = _run(archive, env=environment)
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    receipt = _latest_receipt(archive)
+    row = _read_tsv(receipt / "results.tsv")[0]
+    assert row["status"] == "manifest_unstable"
+    assert _warning_codes(receipt / "warnings.jsonl") >= {
+        "source_manifest_unstable"
+    }
+    warnings = (receipt / "warnings.jsonl").read_text(encoding="utf-8")
+    assert "remote find reported: find: traversal warning" in warnings
+    assert KNOWN_SSH_BANNER not in warnings
+
+
+def test_remote_manifest_nonzero_exit_still_fails_after_banner_filtering(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "remote-home"
+    source = home / "logs"
+    source.mkdir(parents=True)
+    (source / "remote.jsonl").write_text('{"remote":true}\n', encoding="utf-8")
+    archive = _install_archive(
+        tmp_path,
+        f"remote-test\tremote.invalid\t{home}\n",
+        "*\tlogs\tlogs\trequired\n",
+    )
+    environment = _fake_ssh_environment(
+        tmp_path,
+        manifest_stderr=f"{KNOWN_SSH_BANNER}\nfind: permission denied",
+        manifest_exit=1,
+    )
+
+    completed = _run(archive, env=environment)
+    assert completed.returncode == 1, completed.stdout + completed.stderr
+    row = _read_tsv(_latest_receipt(archive) / "results.tsv")[0]
+    assert row["status"] == "manifest_failed"
+    assert "find: permission denied" in row["detail"]
+    assert KNOWN_SSH_BANNER not in row["detail"]
 
 
 def test_partial_state_survives_failure_and_is_reused_on_next_run(

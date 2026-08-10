@@ -58,6 +58,9 @@ RESERVED_MACHINE_NAMES = frozenset({"_fetch_runs", "_fetch_state"})
 SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm")
 MAX_CONFIG_BYTES = 1024 * 1024
+IGNORED_REMOTE_MANIFEST_STDERR_LINES = frozenset(
+    {"Meta authorized users only. Usage is subject to monitoring and recording."}
+)
 
 
 USAGE = """Usage: fetch_agent_logs.py [OPTIONS]
@@ -1997,6 +2000,16 @@ def _remote_manifest_command(
     )
 
 
+def _remote_manifest_stderr(stderr: bytes) -> str:
+    """Remove the exact known SSH banner line while preserving diagnostics."""
+    lines = os.fsdecode(stderr).splitlines()
+    return "\n".join(
+        line
+        for line in lines
+        if line not in IGNORED_REMOTE_MANIFEST_STDERR_LINES
+    ).strip()
+
+
 def scan_remote_tree(
     operation: Operation, resolved_source: PurePosixPath
 ) -> ManifestScan:
@@ -2010,7 +2023,7 @@ def scan_remote_tree(
         env={**os.environ, "LC_ALL": "C"},
     )
     if completed.returncode != 0:
-        stderr = os.fsdecode(completed.stderr).strip()
+        stderr = _remote_manifest_stderr(completed.stderr)
         probe_label = _probe_kind_from_remote_exit(completed.returncode).value
         detail = stderr or f"remote manifest exited {completed.returncode}"
         if completed.returncode == REMOTE_MISSING:
@@ -2056,7 +2069,7 @@ def scan_remote_tree(
             )
         )
     entries.sort(key=lambda entry: entry.path)
-    stderr_notice = os.fsdecode(completed.stderr).strip()
+    stderr_notice = _remote_manifest_stderr(completed.stderr)
     notices = (f"remote find reported: {stderr_notice}",) if stderr_notice else ()
     return ManifestScan(entries=tuple(entries), notices=notices)
 
