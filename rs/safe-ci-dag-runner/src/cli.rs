@@ -36,7 +36,7 @@ use crate::cgroup::{
     apply_specific_cores, enable_outer_oom_group, expected_outer_memory_max_bytes,
     expected_scope_runtime_max_s, install_scope_teardown, is_in_scope, outer_memory_max_bytes,
     reexec_in_scope_with_limits, verify_scope_limits, verify_scope_runtime_max, CgroupManager,
-    Cgroups,
+    Cgroups, DIRECT_CGROUP_ENV,
 };
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
@@ -904,6 +904,30 @@ fn resolve_cgroups(
              re-run with --allow-cgroup-failure to run UNBOXED."
         );
         return Err(3);
+    }
+    // No systemd scope. That is one route to a cgroup being unavailable, NOT proof that
+    // containment is impossible — the conflation that left every escapee unkillable. Where the
+    // host allows it, a cgroup we create ourselves gives `cgroup.kill`, which reaches a setsid
+    // escapee precisely because such a process changes session and pgid but not cgroup membership.
+    //
+    // OPT-IN, and deliberately so. Enabling containment where it is currently off changes every
+    // lane at once; that is an owner decision. Default behaviour below is byte-for-byte what it
+    // was. Set SAFE_CI_DAG_RUNNER_DIRECT_CGROUP=1 to use it.
+    if std::env::var(DIRECT_CGROUP_ENV).is_ok_and(|v| v == "1") {
+        let mgr = Cgroups::direct();
+        if mgr.enabled() {
+            eprintln!(
+                "{PROG}: cgroup teardown ACTIVE via direct cgroupfs (no systemd scope): steps are \
+                 KILLABLE as a subtree, including setsid/double-fork escapees. Per-step \
+                 memory/CPU caps are NOT enforced on this route — this is containment for \
+                 teardown, not resource boxing."
+            );
+            return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
+        }
+        eprintln!(
+            "{PROG}: warning: {DIRECT_CGROUP_ENV}=1 but direct cgroupfs containment could not be \
+             established; continuing with the behaviour below."
+        );
     }
     if allow_failure {
         eprintln!(

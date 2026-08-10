@@ -88,6 +88,20 @@ pub trait CgroupManager: Send + Sync {
     fn kill_all_remaining(&self) -> i64;
 }
 
+/// Shell prologue that migrates the step's bash leader into `child` before it forks anything.
+///
+/// `$$` is the leader's pid; writing it moves the leader, and every descendant then inherits this
+/// cgroup AT FORK. That inheritance is the whole point: a `setsid` child changes session and pgid
+/// but NOT cgroup membership, so it stays reachable by `cgroup.kill` even though a process-group
+/// kill can no longer see it. Best-effort in the shell so a step never fails merely because the
+/// migration did not land.
+fn join_cgroup_command(child: &Path, cmd: &str) -> String {
+    format!(
+        "echo $$ > {} 2>/dev/null || true\n{cmd}",
+        child.join("cgroup.procs").display()
+    )
+}
+
 /// Emit a visible degraded-enforcement warning (No Silent Failure).
 fn warn(msg: &str) {
     eprintln!("{LOG_PREFIX} WARNING: degraded enforcement: {msg}");
@@ -951,10 +965,25 @@ const SIGINT_NUM: i32 = 2;
 const SIGTERM_NUM: i32 = 15;
 
 /// The concrete per-step cgroup manager for a real Linux cgroup-v2 host.
+/// What a live [`Cgroups`] can actually enforce. These are NOT interchangeable and the difference
+/// is deliberately visible at the type level, because "we have a cgroup" and "we can cap a step"
+/// are different capabilities, and treating them as one is what hides an unkillable step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Containment {
+    /// A delegated systemd scope with controllers: per-step memory/CPU caps AND `cgroup.kill`.
+    Full,
+    /// A cgroup we made ourselves under our own cgroup, with NO controllers delegated. Teardown by
+    /// `cgroup.kill` works — that needs no controller — but no resource cap can be applied.
+    KillOnly,
+}
+
+/// Per-step cgroup-v2 containment for a run: an outer root plus one child cgroup per step.
 pub struct Cgroups {
     enabled: bool,
     /// The delegated outer scope cgroup root (parent of the per-step child cgroups).
     root: Option<PathBuf>,
+    /// What this manager can enforce. See [`Containment`].
+    containment: Containment,
 }
 
 impl Cgroups {
@@ -963,6 +992,7 @@ impl Cgroups {
         let mut cg = Cgroups {
             enabled: false,
             root: None,
+            containment: Containment::Full,
         };
         if !in_scope() {
             return cg;
@@ -1019,6 +1049,76 @@ impl Cgroups {
     }
 }
 
+/// Environment switch that opts a run into the kill-only direct-cgroupfs route.
+///
+/// OFF BY DEFAULT, deliberately. Turning containment on where it is currently off changes the
+/// behaviour of every lane at once, and that is an owner decision, not a library default. This
+/// makes the capability available and testable without altering a single existing run.
+pub const DIRECT_CGROUP_ENV: &str = "SAFE_CI_DAG_RUNNER_DIRECT_CGROUP";
+
+impl Cgroups {
+    /// Containment WITHOUT systemd: a cgroup we create under our own, torn down by `cgroup.kill`.
+    ///
+    /// WHY THIS EXISTS. Obtaining a systemd `--user` scope is one WAY to get a cgroup, not the
+    /// definition of having one. Where that route is unavailable the runner concluded containment
+    /// was impossible and fell back to a process-group kill — which cannot reach a `setsid` or
+    /// double-fork escapee, because such a process changes session and pgid but NOT cgroup
+    /// membership. The step then never exits, the run never returns, and no measurements are
+    /// written, so the lane cannot report on its own failure.
+    ///
+    /// Measured on the self-hosted privileged runner (a container, root, no systemd as PID 1):
+    /// creating a child cgroup and writing `cgroup.kill` terminated a `setsid` escapee that had
+    /// demonstrably left the process group. Controller delegation on that same runner returned
+    /// EIO at every level, with the cgroup holding no processes and no children — so per-step
+    /// memory/CPU caps are NOT available there and this route does not pretend otherwise. It is
+    /// [`Containment::KillOnly`]: kill correctly, do not claim to box.
+    ///
+    /// Returns a disabled manager when a usable cgroup cannot be made, so the caller degrades
+    /// exactly as it does today rather than gaining a new failure mode.
+    pub fn direct() -> Self {
+        let disabled = Cgroups {
+            enabled: false,
+            root: None,
+            containment: Containment::KillOnly,
+        };
+        let Some(own) = my_cgroup_path() else {
+            return disabled;
+        };
+        if !own.is_dir() {
+            return disabled;
+        }
+        let root = own.join(format!("{UNIT_PREFIX}-direct-{}", std::process::id()));
+        if let Err(e) = make_dir(&root) {
+            warn(&format!(
+                "direct cgroupfs containment unavailable: cannot create {} ({e})",
+                root.display()
+            ));
+            return disabled;
+        }
+        // PROVE the one capability this route claims, rather than assuming it. `cgroup.kill` is a
+        // core cgroup-v2 file and needs no controller delegated; if it is absent the route buys
+        // nothing over a process-group kill and must not advertise itself.
+        if !root.join("cgroup.kill").exists() {
+            warn(&format!(
+                "direct cgroupfs containment unavailable: {} has no cgroup.kill",
+                root.display()
+            ));
+            let _ = fs::remove_dir(&root);
+            return disabled;
+        }
+        Cgroups {
+            enabled: true,
+            root: Some(root),
+            containment: Containment::KillOnly,
+        }
+    }
+
+    /// What this manager can enforce.
+    pub fn containment(&self) -> Containment {
+        self.containment
+    }
+}
+
 impl Default for Cgroups {
     fn default() -> Self {
         Cgroups::new()
@@ -1049,6 +1149,14 @@ impl CgroupManager for Cgroups {
                 child.display()
             ));
             return cmd.to_string();
+        }
+        // KILL-ONLY: no controller is delegated on this route, so every cap write below would
+        // fail — and the cpu.max branch FAILS THE STEP when it cannot apply. Applying caps is not
+        // what this route promises; joining the cgroup so teardown can reach the whole subtree is.
+        // Returning early keeps the step running exactly as an unboxed step would, except that it
+        // is now killable.
+        if self.containment == Containment::KillOnly {
+            return join_cgroup_command(&child, cmd);
         }
         // Every step is swapless; also clear any inherited soft cap.
         if let Err(e) = fs::write(child.join("memory.swap.max"), "0") {
