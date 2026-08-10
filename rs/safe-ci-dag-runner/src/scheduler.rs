@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 
 use crate::ambient::{capture_ambient_snapshot, PsiReading};
 use crate::attribution::{
-    default_log_dir, mint_step_nonce, Culprit, RunEvidence, StepStream, STEP_NONCE_ENV,
+    default_log_dir, mint_step_nonce, recognize, Culprit, RunEvidence, StepStream, TestEvent,
+    STEP_NONCE_ENV,
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
@@ -783,12 +784,34 @@ impl Runner {
 /// letting [`StepStream`] hold the bytes since the last newline leaves that announcement available
 /// at teardown. Line-at-a-time streaming to the console is preserved by [`StepStream`]'s own
 /// splitting, so `-vv` output is unchanged.
+#[derive(Default)]
+struct ConsoleTestIdentity {
+    active: Option<String>,
+}
+
+impl ConsoleTestIdentity {
+    fn decorate(&mut self, tag: &str, line: &str) -> String {
+        let event = recognize(line);
+        let identity = match &event {
+            Some(TestEvent::Start(name)) | Some(TestEvent::End(name, _)) => name.clone(),
+            None => self.active.clone().unwrap_or_else(|| tag.to_string()),
+        };
+        match event {
+            Some(TestEvent::Start(name)) => self.active = Some(name),
+            Some(TestEvent::End(_, _)) => self.active = None,
+            None => {}
+        }
+        format!("[{tag}][test={identity}] {line}")
+    }
+}
+
 fn spawn_reader<R: Read + Send + 'static>(
     reader: R,
     buf: Arc<Mutex<Vec<u8>>>,
     tag: String,
-    stream: bool,
+    verbosity: i64,
     sink: Arc<StepStream>,
+    console_identity: Arc<Mutex<ConsoleTestIdentity>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut br = BufReader::new(reader);
@@ -801,23 +824,41 @@ fn spawn_reader<R: Read + Send + 'static>(
                     let bytes = &chunk[..n];
                     buf.lock().unwrap().extend_from_slice(bytes);
                     sink.ingest(bytes);
-                    if stream {
+                    if verbosity >= 2 {
                         // Console streaming stays line-at-a-time: hold back the unterminated tail
                         // so a partially-received line is not printed twice.
                         pending.extend_from_slice(bytes);
                         while let Some(idx) = pending.iter().position(|b| *b == b'\n') {
                             let line: Vec<u8> = pending.drain(..=idx).collect();
                             let text = String::from_utf8_lossy(&line);
-                            emit(&format!("[{tag}] {}", text.trim_end_matches('\n')));
+                            let text = text.trim_end_matches(['\n', '\r']);
+                            if verbosity >= 5 {
+                                let decorated = console_identity
+                                    .lock()
+                                    .map(|mut c| c.decorate(&tag, text))
+                                    .unwrap_or_else(|_| format!("[{tag}][test={tag}] {text}"));
+                                emit(&decorated);
+                            } else {
+                                emit(&format!("[{tag}] {text}"));
+                            }
                         }
                     }
                 }
                 Err(_) => break,
             }
         }
-        if stream && !pending.is_empty() {
+        if verbosity >= 2 && !pending.is_empty() {
             let text = String::from_utf8_lossy(&pending);
-            emit(&format!("[{tag}] {}", text.trim_end_matches('\n')));
+            let text = text.trim_end_matches(['\n', '\r']);
+            if verbosity >= 5 {
+                let decorated = console_identity
+                    .lock()
+                    .map(|mut c| c.decorate(&tag, text))
+                    .unwrap_or_else(|_| format!("[{tag}][test={tag}] {text}"));
+                emit(&decorated);
+            } else {
+                emit(&format!("[{tag}] {text}"));
+            }
         }
     })
 }
@@ -1048,8 +1089,6 @@ fn run_step(ctx: StepCtx) {
     if let Some(started_ns) = monotonic_now_ns() {
         cmd.env(STEP_STARTED_MONOTONIC_NS_ENV, started_ns.to_string());
     }
-    let stream = verbosity >= 2;
-
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -1108,14 +1147,16 @@ fn run_step(ctx: StepCtx) {
 
     let out_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let err_buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let console_identity = Arc::new(Mutex::new(ConsoleTestIdentity::default()));
     let mut readers = Vec::new();
     if let Some(out) = child.stdout.take() {
         readers.push(spawn_reader(
             out,
             Arc::clone(&out_buf),
             tag.clone(),
-            stream,
+            verbosity,
             Arc::clone(&sink),
+            Arc::clone(&console_identity),
         ));
     }
     if let Some(err) = child.stderr.take() {
@@ -1123,8 +1164,9 @@ fn run_step(ctx: StepCtx) {
             err,
             Arc::clone(&err_buf),
             tag.clone(),
-            stream,
+            verbosity,
             Arc::clone(&sink),
+            Arc::clone(&console_identity),
         ));
     }
 
@@ -1486,7 +1528,8 @@ fn run_step(ctx: StepCtx) {
 /// * `keep_going`: on a failure, let already-running steps finish instead of eager-cancelling
 ///   them; the scheduler still stops launching new steps (it does NOT run every still-runnable
 ///   step), so in-flight steps report their own pass/fail rather than ABORTED.
-/// * `verbosity`: 0 quiet (+failures), 1 default (+summaries), `>=2` stream child stdout.
+/// * `verbosity`: 0 quiet (+failures), 1 default (+summaries), 2-4 stream child stdout,
+///   and >=5 streams with the deepest recognized test identity on every line.
 pub fn run_dag(cfg: &DagConfig, jobs: i64, keep_going: bool, verbosity: i64) -> RunResult {
     run_dag_boxed(cfg, jobs, keep_going, verbosity, None)
 }
@@ -1666,6 +1709,27 @@ pub fn run_dag_boxed_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn level_five_console_lines_always_name_the_deepest_test_identity() {
+        let mut context = ConsoleTestIdentity::default();
+        assert_eq!(
+            context.decorate("step.outer", "##TEST-START suite::case"),
+            "[step.outer][test=suite::case] ##TEST-START suite::case"
+        );
+        assert_eq!(
+            context.decorate("step.outer", ":: Run1..."),
+            "[step.outer][test=suite::case] :: Run1..."
+        );
+        assert_eq!(
+            context.decorate("step.outer", "##TEST-END suite::case PASS"),
+            "[step.outer][test=suite::case] ##TEST-END suite::case PASS"
+        );
+        assert_eq!(
+            context.decorate("step.outer", "harness teardown"),
+            "[step.outer][test=step.outer] harness teardown"
+        );
+    }
     use crate::model::ResourceHint;
     use std::collections::BTreeMap;
 
