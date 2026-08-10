@@ -119,6 +119,42 @@ is to stop with a capability error. `--allow-cgroup-failure` accepts a
 best-effort unboxed fallback with a warning. `--unsafe-no-cgroups` deliberately
 skips containment even when available and should be reserved for reviewed use.
 
+### Bound the whole run, not only its steps
+
+Per-step budgets cannot bound a run: any number of individually-legal steps can
+sum past any ceiling. `--run-timeout SECONDS` adds an outer wall budget for the
+run itself.
+
+```sh
+safe-ci-dag-runner run --dag pipeline.yaml --run-timeout 900
+```
+
+On breach the scheduler stops launching, terminates every in-flight step's whole
+process tree, marks those steps aborted with that reason, and **returns** — it
+writes its profile rows and hands back a verdict rather than leaving the process
+to be killed from outside, which would discard the evidence the bound exists to
+capture. `SAFE_CI_DAG_RUNNER_RUN_TIMEOUT` sets the same budget for a wrapper that
+cannot edit the command line.
+
+The bounds are ordered, and the ordering is the point:
+
+| bound | enforced by | on breach |
+| --- | --- | --- |
+| per-step wall / CPU | the runner (CPU budget needs a cgroup) | that step dies and is named |
+| whole-run wall | the runner | in-flight steps cut, rows written, verdict returned |
+| scope `RuntimeMaxSec` | systemd, when boxed | the whole scope dies |
+
+Each level exists to stop the next one from firing. The scope budget is derived
+automatically as the run budget plus the larger of 60 s and a tenth of it, and
+the in-scope process reads the property back off the live unit rather than
+trusting the request; a mismatch is an error unless `--allow-cgroup-failure`.
+
+Because a step allowed to run as long as the whole run could only ever be
+terminated by the outer bound — attributing the overrun to the run instead of to
+the node that caused it — a run whose steps declare a wall budget at least as
+large as `--run-timeout` is **refused before anything starts**, with the
+offending steps named.
+
 Use `capabilities` for the machine-readable enforcement manifest.
 
 ## Select, parameterize, and stress a step

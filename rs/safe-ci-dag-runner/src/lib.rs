@@ -42,7 +42,10 @@ pub use attribution::{
     culprit_columns, default_log_dir, mint_step_nonce, recognize, Culprit, RunEvidence, StepStream,
     TestEvent, TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
 };
-pub use cgroup::{install_scope_teardown, reexec_in_scope, CgroupManager, Cgroups};
+pub use cgroup::{
+    expected_scope_runtime_max_s, install_scope_teardown, reexec_in_scope,
+    reexec_in_scope_with_limits, verify_scope_runtime_max, CgroupManager, Cgroups,
+};
 pub use estimates::{
     allocate_widths, apply_plan_to_config, bucketize_rows, build_plan, feedback_identity,
     load_step_samples, load_step_speedups, plan_to_json, plan_to_text, sample_from_row,
@@ -62,7 +65,10 @@ pub use profile_enrich::{
     container_core_budget, resolve_effective_inner_jobs, step_enrichment_columns,
 };
 pub use reservation::{acquire as reserve_cores, held_cores, reclaim_dead, Reservation};
-pub use scheduler::{run_dag, run_dag_boxed, run_dag_boxed_ordered};
+pub use scheduler::{
+    run_dag, run_dag_boxed, run_dag_boxed_deadline, run_dag_boxed_ordered,
+    steps_violating_run_timeout,
+};
 pub use sizing::{
     box_mem_budget_bytes, cgroup_mem_max_bytes, jobs_footprint_bytes, jobs_for_budget,
     mem_available_bytes, parse_size, schedulable_peak_mem_bytes, schedulable_peak_mem_bytes_widths,
@@ -87,9 +93,13 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 //   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
 //   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
 //   pids_guard    per-step PID/thread ceiling (plumbed in both, enforced in neither → false)
+//   run_timeout   OUTER wall budget for the WHOLE run: the scheduler cuts in-flight steps and
+//                 still reports (works boxed or unboxed); under boxing it is additionally backed
+//                 by the scope's systemd RuntimeMaxSec, set strictly later so the reporting
+//                 bound fires first
 //   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
 // The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
 // anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
 /// Canonical JSON manifest emitted by the `capabilities` subcommand.
 pub const ENFORCEMENT_CAPABILITIES: &str =
-    "{\"cpu_affinity\":true,\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"wall_timeout\":true}";
+    "{\"cpu_affinity\":true,\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"run_timeout\":true,\"wall_timeout\":true}";

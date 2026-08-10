@@ -42,6 +42,10 @@ DEFAULT_MEMORY_BUDGET_FRACTION = 0.90
 OUTER_MEMORY_MAX_ENV = "SAFE_CI_OUTER_MEMORY_MAX_BYTES"
 #: Exact cap carried across the systemd re-exec for in-scope readback.
 EXPECTED_OUTER_MEMORY_MAX_ENV = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES"
+#: Carries the outer scope's requested ``RuntimeMaxSec`` into the in-scope child, so the child can
+#: read the property back off the live unit instead of trusting the argument vector that asked
+#: for it.
+EXPECTED_RUNTIME_MAX_ENV = "SAFE_CI_EXPECTED_RUNTIME_MAX_SEC"
 
 #: Per-step child cgroup directory prefix (also the scan key for the
 #: normal-exit backstop). cgroup-v2 directory names may not contain '/'.
@@ -578,6 +582,99 @@ def enter_delegated_scope(
 # --------------------------------------------------------------------------- #
 
 
+def expected_scope_runtime_max_s() -> int | None:
+    """The ``RuntimeMaxSec`` the parent asked systemd to enforce on this run's scope, if any."""
+    raw = os.environ.get(EXPECTED_RUNTIME_MAX_ENV, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def parse_systemd_duration_secs(raw: str) -> int | None:
+    """Seconds from a systemd-rendered duration, or ``None`` for ``infinity``/unparsable.
+
+    A ``*USec`` property is NOT necessarily printed as a number. ``systemctl show --value``
+    renders it however the running systemd chooses: systemd 259 prints ``"1min 6s"`` where a
+    microsecond integer was assumed, so an integer-only parser reads a correctly-enforced bound as
+    unproven and fails the run closed. Accepts a bare microsecond integer and the human form.
+    """
+    text = raw.strip()
+    if not text or text.lower() == "infinity":
+        return None
+    if text.isdigit():
+        return int(text) // 1_000_000
+    scales = {
+        "us": 1e-6, "usec": 1e-6, "\u00b5s": 1e-6,
+        "ms": 1e-3, "msec": 1e-3,
+        "": 1.0, "s": 1.0, "sec": 1.0, "second": 1.0, "seconds": 1.0,
+        "m": 60.0, "min": 60.0, "minute": 60.0, "minutes": 60.0,
+        "h": 3600.0, "hr": 3600.0, "hour": 3600.0, "hours": 3600.0,
+        "d": 86400.0, "day": 86400.0, "days": 86400.0,
+        "w": 604800.0, "week": 604800.0, "weeks": 604800.0,
+    }
+    total = 0.0
+    for token in text.split():
+        idx = len(token)
+        for i, ch in enumerate(token):
+            if not (ch.isdigit() or ch == "."):
+                idx = i
+                break
+        number, unit = token[:idx], token[idx:]
+        try:
+            value = float(number)
+        except ValueError:
+            return None
+        if unit not in scales:
+            return None
+        total += value * scales[unit]
+    return round(total)
+
+
+def verify_scope_runtime_max(
+    expected_s: int, *, naming: ScopeNaming = DEFAULT_NAMING
+) -> bool:
+    """Confirm the OUTER scope really carries the ``RuntimeMaxSec`` that was requested.
+
+    PROXY BINDING: passing ``-p RuntimeMaxSec=N`` to ``systemd-run`` is a request, not enforcement.
+    This reads the property back off the live unit and compares, so "the run is bounded" is a
+    statement about the running unit rather than about an argument vector.
+    """
+    unit = os.environ.get(naming.env_scope_unit, "")
+    if not unit:
+        _warn(
+            naming,
+            "outer RuntimeMaxSec audit unavailable: scope unit name not carried into this child",
+        )
+        return False
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=RuntimeMaxUSec", "--value"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        _warn(naming, "outer RuntimeMaxSec audit unavailable: systemctl could not be run")
+        return False
+    raw = out.stdout.strip()
+    actual = parse_systemd_duration_secs(raw)
+    if actual == expected_s:
+        print(
+            f"{naming.log_prefix} outer scope run budget ENFORCED: {unit} "
+            f"RuntimeMaxSec={expected_s}s (read back from the live unit).",
+            file=sys.stderr,
+        )
+        return True
+    _warn(
+        naming,
+        f"outer RuntimeMaxSec readback MISMATCH on {unit}: requested {expected_s}s, unit "
+        f"reports {raw!r}; the outer scope bound is NOT proven",
+    )
+    return False
+
+
 def reexec_in_scope(
     argv: Sequence[str],
     *,
@@ -586,6 +683,7 @@ def reexec_in_scope(
     naming: ScopeNaming = DEFAULT_NAMING,
     use_aggregate_slice: bool = True,
     skip_in_ci: bool = True,
+    runtime_max_s: int | None = None,
 ) -> bool:
     """Re-exec ``argv`` inside a transient ``systemd-run --user --scope`` (a
     delegated cgroup), so EVERY descendant — including ``setsid``/double-forked
@@ -650,6 +748,19 @@ def reexec_in_scope(
         # creates spurious pressure signals). MemorySwapMax=0 already OOM-kills a
         # runaway at the cap rather than letting it swap.
         props += ["-p", f"MemoryMax={memory_max}"]
+    if runtime_max_s is not None and runtime_max_s > 0:
+        # OUTERMOST bound the machine itself enforces, and a LAST RESORT rather than the working
+        # timeout: systemd terminates the whole scope, so anything not already flushed to disk is
+        # lost. Set it strictly LARGER than the runner's own in-process run budget, so the
+        # ordering is per-step < in-process run budget < scope RuntimeMaxSec < CI job kill. Each
+        # level exists to stop the next one from being the thing that fires.
+        props += ["-p", f"RuntimeMaxSec={runtime_max_s}"]
+        props += [f"--setenv={EXPECTED_RUNTIME_MAX_ENV}={runtime_max_s}"]
+        print(
+            f"{naming.log_prefix} outer scope run budget: RuntimeMaxSec={runtime_max_s}s "
+            "(systemd terminates the whole scope; the runner's own budget must fire first).",
+            file=sys.stderr,
+        )
         print(f"{naming.log_prefix} outer scope memory cap: MemoryMax="
               f"{_fmt_bytes(memory_max)} (hard-cap-only, swap=0).")
 

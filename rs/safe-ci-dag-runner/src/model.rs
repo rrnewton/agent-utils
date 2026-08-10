@@ -466,6 +466,13 @@ pub struct RunResult {
     /// Per-step measurement rows (column -> value) to forward to a metrics sink; empty when no
     /// cgroup manager supplied per-step metrics.
     pub step_profile_rows: Vec<BTreeMap<String, String>>,
+    /// The WHOLE RUN hit its outer wall budget and was cut short.
+    ///
+    /// Distinct from a step's own `timed_out`: no single node necessarily misbehaved, the
+    /// combination did. A consumer that records results must be able to tell "this run produced a
+    /// verdict about the tree" from "this run was stopped by its own budget with work still
+    /// outstanding", and `ok == false` alone cannot.
+    pub run_timed_out: bool,
 }
 
 #[cfg(test)]

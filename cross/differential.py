@@ -895,6 +895,104 @@ def compare_only_errors(py: list[str], rs: list[str], rep: Report) -> None:
 _ESCAPEE_LIFETIME_S = 300
 
 
+def compare_run_timeout(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must bound the WHOLE run identically, and refuse a mis-ordered budget alike.
+
+    THE BOUND THAT MATTERS IS THE ONE THAT STILL REPORTS. Per-step budgets cannot bound a run:
+    any number of individually-legal steps can sum past any ceiling, and the only thing that
+    stopped such a run was an external job kill, which discards the evidence it was supposed to
+    explain. So the outer budget is checked in the scheduler's own loop, and this asserts both
+    engines do it: the run must finish EARLY (well before the DAG's natural length), must not
+    report success, and must not hit the harness timeout.
+
+    The second half is the ordering contract made executable. A step allowed to run as long as
+    the whole run can only ever be killed by the outer bound, which attributes the overrun to the
+    run instead of to the node — so both builds must REFUSE to start rather than run with a
+    budget whose breach cannot be attributed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        # Natural length ~12s (three 4s steps, -j1); budget 6s; every step's own wall budget 5s,
+        # strictly under the run budget, so the ordering is legal.
+        bounded = os.path.join(tmp, "bounded.json")
+        with open(bounded, "w", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "steps": [
+                            {
+                                "group": "a",
+                                "job": name,
+                                "cmd": "sleep 4",
+                                "timeout": 5,
+                                "cpu_timeout": 600,
+                            }
+                            for name in ("one", "two", "three")
+                        ]
+                    }
+                )
+            )
+        # Same DAG with a step allowed to outlive the run: a mis-ordered budget.
+        misordered = os.path.join(tmp, "misordered.json")
+        with open(misordered, "w", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "steps": [
+                            {
+                                "group": "a",
+                                "job": "wide",
+                                "cmd": "sleep 1",
+                                "timeout": 600,
+                                "cpu_timeout": 600,
+                            }
+                        ]
+                    }
+                )
+            )
+
+        def _run(cmd: list[str], dag: str) -> Outcome:
+            return run(
+                cmd,
+                ("run", "--dag", dag, "-q", "-j", "1", NOPROF, NOFB, ACF, "--run-timeout", "6"),
+            )
+
+        po, ro = _run(py, bounded), _run(rs, bounded)
+        label = "run-timeout"
+        blocked = [n for n, o in (("py", po), ("rs", ro)) if o.returncode == 124]
+        if blocked:
+            rep.bad(
+                label,
+                f"{'/'.join(blocked)} never returned under an outer run budget "
+                f"(exit py={po.returncode} rs={ro.returncode}); a bound that cannot report is "
+                "the external job kill it exists to replace",
+            )
+        elif po.returncode != ro.returncode:
+            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+        elif po.returncode == 0:
+            rep.bad(label, "a run cut short by its outer budget must not report success")
+        else:
+            rep.ok(label)
+
+        pm, rm = _run(py, misordered), _run(rs, misordered)
+        label = "run-timeout-misordered-refusal"
+        if pm.returncode != rm.returncode:
+            rep.bad(label, f"exit py={pm.returncode} rs={rm.returncode}")
+        elif pm.returncode == 0:
+            rep.bad(
+                label,
+                "a step allowed to run as long as the whole run must be REFUSED, not accepted: "
+                "the outer bound would fire first and the overrun could not be attributed",
+            )
+        elif not all("REFUSING" in o.stdout + o.stderr for o in (pm, rm)):
+            rep.bad(
+                label,
+                "both builds must SAY they refused and name the offending steps; "
+                f"py={pm.stderr[-200:]!r} rs={rm.stderr[-200:]!r}",
+            )
+        else:
+            rep.ok(label)
+
+
 def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
     """Both builds must FINISH a step whose child outlives the kill, and agree on the outcome.
 
@@ -2071,7 +2169,8 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
             "--dag", "--jobs", "--cores", "--cpuset", "--pin", "--max-mem", "--only",
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
             "--show-plan", "--no-profile-feedback", "--profile-sync",
-            "--profile-sync-direction", "--keep-going", "--allow-cgroup-failure",
+            "--profile-sync-direction", "--keep-going", "--run-timeout",
+            "--allow-cgroup-failure",
             "--unsafe-no-cgroups", "--small-default-cap", "--quiet",
         ),
         "sweep": (
@@ -2454,6 +2553,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
     compare_escapee_teardown(py, rs, rep)
+    compare_run_timeout(py, rs, rep)
     compare_profile_store(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)

@@ -257,6 +257,123 @@ fn ensure_aggregate_slice(fraction: f64) -> bool {
 /// was already in scope or scope setup is intentionally skipped in CI. A `false` return means the
 /// caller must refuse to continue because the requested containment could not be established.
 pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool {
+    reexec_in_scope_with_limits(memory_max, cpu_count, None)
+}
+
+/// Env var carrying the outer scope's requested `RuntimeMaxSec` into the in-scope child.
+const EXPECTED_RUNTIME_MAX_ENV: &str = "SAFE_CI_EXPECTED_RUNTIME_MAX_SEC";
+
+/// The `RuntimeMaxSec` the parent asked systemd to enforce on this run's scope, if any.
+pub fn expected_scope_runtime_max_s() -> Option<i64> {
+    std::env::var(EXPECTED_RUNTIME_MAX_ENV)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+}
+
+/// Confirm the OUTER scope really carries the `RuntimeMaxSec` that was requested.
+///
+/// PROXY BINDING: passing `-p RuntimeMaxSec=N` to `systemd-run` is a request, not enforcement.
+/// This reads the property back off the live unit (`systemctl --user show`, `RuntimeMaxUSec` in
+/// microseconds) and compares it to what was asked for, so "the run is bounded" is a statement
+/// about the running unit rather than about an argument vector. A mismatch is reported and
+/// returns false; the caller decides whether that is fatal.
+pub fn verify_scope_runtime_max(expected_s: i64) -> bool {
+    let Some(unit) = std::env::var(ENV_SCOPE_UNIT).ok().filter(|u| !u.is_empty()) else {
+        warn("outer RuntimeMaxSec audit unavailable: scope unit name not carried into this child");
+        return false;
+    };
+    let out = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &unit,
+            "--property=RuntimeMaxUSec",
+            "--value",
+        ])
+        .output();
+    let Ok(out) = out else {
+        warn("outer RuntimeMaxSec audit unavailable: systemctl could not be run");
+        return false;
+    };
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let actual_s = parse_systemd_duration_secs(&raw);
+    match actual_s {
+        Some(actual) if actual == expected_s => {
+            eprintln!(
+                "{LOG_PREFIX} outer scope run budget ENFORCED: {unit} RuntimeMaxSec={expected_s}s \
+                 (read back from the live unit)."
+            );
+            true
+        }
+        _ => {
+            warn(&format!(
+                "outer RuntimeMaxSec readback MISMATCH on {unit}: requested {expected_s}s, unit \
+                 reports {raw:?}; the outer scope bound is NOT proven"
+            ));
+            false
+        }
+    }
+}
+
+/// Seconds from a systemd-rendered duration, or `None` for `infinity`/unparsable.
+///
+/// A `*USec` property is NOT necessarily printed as a number. `systemctl show --value` renders it
+/// however the running systemd chooses: this box (systemd 259) prints `"1min 6s"` where an integer
+/// microsecond count was assumed, and an integer parser therefore read a correctly-enforced 66s
+/// bound as unproven and failed the run closed. Accepts a bare microsecond integer and the
+/// human form (`us`/`usec`, `ms`, `s`/`sec`, `min`, `h`, `d`, `w`), summing the parts.
+pub fn parse_systemd_duration_secs(raw: &str) -> Option<i64> {
+    let text = raw.trim();
+    if text.is_empty() || text.eq_ignore_ascii_case("infinity") {
+        return None;
+    }
+    if let Ok(usec) = text.parse::<u64>() {
+        return Some((usec / 1_000_000) as i64);
+    }
+    let mut total = 0f64;
+    let mut saw_one = false;
+    for token in text.split_whitespace() {
+        let split = token
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(token.len());
+        let (num, unit) = token.split_at(split);
+        let Ok(value) = num.parse::<f64>() else {
+            return None;
+        };
+        let scale = match unit.trim() {
+            "us" | "usec" | "µs" => 1e-6,
+            "ms" | "msec" => 1e-3,
+            "" | "s" | "sec" | "seconds" | "second" => 1.0,
+            "min" | "m" | "minutes" | "minute" => 60.0,
+            "h" | "hr" | "hours" | "hour" => 3600.0,
+            "d" | "days" | "day" => 86400.0,
+            "w" | "weeks" | "week" => 604800.0,
+            _ => return None,
+        };
+        total += value * scale;
+        saw_one = true;
+    }
+    if saw_one {
+        Some(total.round() as i64)
+    } else {
+        None
+    }
+}
+
+/// Re-exec into a scope, optionally asking systemd to enforce an outer wall budget on it.
+///
+/// `runtime_max_s` becomes the scope's `RuntimeMaxSec`. This is the OUTERMOST bound the machine
+/// itself will enforce, and it is a LAST RESORT rather than the working timeout: systemd kills the
+/// whole scope, so anything the runner had not already flushed to disk is lost. Set it strictly
+/// LARGER than the runner's own in-process run budget, so the ordering is
+/// per-step < in-process run budget < scope RuntimeMaxSec < whatever the CI provider does. Each
+/// level exists to stop the next one from being the thing that fires.
+pub fn reexec_in_scope_with_limits(
+    memory_max: Option<i64>,
+    cpu_count: Option<i64>,
+    runtime_max_s: Option<i64>,
+) -> bool {
     if in_scope() {
         return true;
     }
@@ -308,6 +425,15 @@ pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool 
     if let Some(m) = memory_max {
         args.push("-p".into());
         args.push(format!("MemoryMax={m}"));
+    }
+    if let Some(secs) = runtime_max_s.filter(|s| *s > 0) {
+        args.push("-p".into());
+        args.push(format!("RuntimeMaxSec={secs}"));
+        args.push(format!("--setenv={EXPECTED_RUNTIME_MAX_ENV}={secs}"));
+        eprintln!(
+            "{LOG_PREFIX} outer scope run budget: RuntimeMaxSec={secs}s (systemd terminates the \
+             whole scope; the runner's own budget must fire first)."
+        );
     }
     // Scope-wide build-job default, derived from the granted cores + memory cap, so a command
     // run directly in the scope (not via a per-step child) still can't compute NUM_JOBS=<all
@@ -1131,6 +1257,22 @@ impl CgroupManager for Cgroups {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn systemd_duration_parses_both_renderings() {
+        // The integer form is what a USec property was ASSUMED to print...
+        assert_eq!(parse_systemd_duration_secs("66000000"), Some(66));
+        // ...and this is what systemd 259 actually printed, which failed a good run closed.
+        assert_eq!(parse_systemd_duration_secs("1min 6s"), Some(66));
+        assert_eq!(parse_systemd_duration_secs("15min"), Some(900));
+        assert_eq!(parse_systemd_duration_secs("1h 5min"), Some(3900));
+        assert_eq!(parse_systemd_duration_secs("500ms"), Some(1)); // rounds
+                                                                   // No bound, and unparsable, must BOTH read as "not proven" rather than as some number.
+        assert_eq!(parse_systemd_duration_secs("infinity"), None);
+        assert_eq!(parse_systemd_duration_secs(""), None);
+        assert_eq!(parse_systemd_duration_secs("later"), None);
+        assert_eq!(parse_systemd_duration_secs("3 fortnights"), None);
+    }
     use super::*;
 
     // Same fixture shape the paired test suite uses. The architectural rows carry a

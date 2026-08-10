@@ -441,6 +441,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="on a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps)",
     )
     run_p.add_argument(
+        "--run-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="OUTER wall budget for the WHOLE run. On breach the scheduler terminates every "
+        "in-flight step's tree and still reports (rows written, verdict returned) instead of "
+        "leaving the process to be killed from outside, which would take the evidence with it. "
+        "Refuses to start if any step may run as long as the run itself.",
+    )
+    run_p.add_argument(
         "--allow-cgroup-failure",
         action="store_true",
         help="downgrade to a best-effort UNBOXED run (with a visible warning) instead of erroring "
@@ -1456,8 +1466,50 @@ def _select_jobs(cfg: DagConfig, ns: argparse.Namespace) -> int:
     return os.cpu_count() or 4
 
 
+def _effective_run_timeout(ns: argparse.Namespace) -> int | None:
+    """The outer run budget from ``--run-timeout``, else the env fallback.
+
+    The env fallback exists so a wrapper that cannot edit the command line (a CI job template, a
+    systemd unit) can still bound the run.
+    """
+    explicit = getattr(ns, "run_timeout", None)
+    if explicit:
+        return int(explicit)
+    raw = os.environ.get("SAFE_CI_DAG_RUNNER_RUN_TIMEOUT", "")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        print(
+            f"{PROG}: SAFE_CI_DAG_RUNNER_RUN_TIMEOUT={raw!r} is not a positive integer; ignoring",
+            file=sys.stderr,
+        )
+        return None
+    if value <= 0:
+        print(
+            f"{PROG}: SAFE_CI_DAG_RUNNER_RUN_TIMEOUT={raw!r} is not a positive integer; ignoring",
+            file=sys.stderr,
+        )
+        return None
+    return value
+
+
+def _scope_grace_s(run_timeout_s: int) -> int:
+    """How much longer than the runner's own budget the SCOPE is allowed to live.
+
+    The scope bound is a backstop for the runner itself wedging, so it must never be the thing
+    that fires in normal operation — the runner needs this window to terminate its steps, flush
+    profile rows, and return a verdict. Sized as the larger of 60s and a tenth of the budget,
+    because reaping a large fan-out is not a constant-time operation.
+    """
+    return max(60, run_timeout_s // 10)
+
+
 def _resolve_cgroup_manager(
-    allow_failure: bool, unsafe_no_cgroups: bool = False
+    allow_failure: bool,
+    unsafe_no_cgroups: bool = False,
+    run_timeout_s: int | None = None,
 ) -> tuple[CgroupManager | None, int]:
     """Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose.
 
@@ -1545,6 +1597,23 @@ def _resolve_cgroup_manager(
             "UNBOXED (process-group teardown only, no per-step memory/CPU caps).",
             file=sys.stderr,
         )
+        # SAY WHICH BOUNDS SURVIVE THE FALLBACK, because "unboxed" has been read as "unbounded"
+        # and that reading is how a run reached an external job kill. Per-step WALL budgets and
+        # the outer run budget are enforced by the runner itself and still apply; the per-step
+        # CPU-time budget and the scope's RuntimeMaxSec are cgroup/systemd features and do not.
+        if run_timeout_s:
+            print(
+                f"{PROG}: unboxed run is STILL wall-bounded: per-step wall timeouts apply and "
+                f"the whole run is cut at {run_timeout_s}s. Per-step CPU-time budgets and the "
+                "scope-level RuntimeMaxSec backstop are NOT enforced without cgroups.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"{PROG}: WARNING: no outer run budget is set (--run-timeout), so nothing bounds "
+                "the run as a whole; only per-step wall timeouts apply.",
+                file=sys.stderr,
+            )
         return None, 0
     # Default: boxing is required -> re-exec into a transient systemd --user scope.
     # Re-exec through __main__.py by absolute path (NOT '-m safe_ci_dag_runner'): the tool is
@@ -1563,7 +1632,13 @@ def _resolve_cgroup_manager(
             file=sys.stderr,
         )
         return None, 3
-    reexeced_or_skipped = cg.reexec_in_scope(argv, memory_max=outer_memory_max)
+    reexeced_or_skipped = cg.reexec_in_scope(
+        argv,
+        memory_max=outer_memory_max,
+        runtime_max_s=(
+            run_timeout_s + _scope_grace_s(run_timeout_s) if run_timeout_s else None
+        ),
+    )
     # Only reached when NO exec happened (execvp on success never returns).
     detail = (
         "boxing was skipped (e.g. CI without a systemd --user scope)"
@@ -1763,7 +1838,9 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         cfg = _expand_stress(cfg, stress_n)
 
     cgroups, code = _resolve_cgroup_manager(
-        bool(ns.allow_cgroup_failure), bool(getattr(ns, "unsafe_no_cgroups", False))
+        bool(ns.allow_cgroup_failure),
+        bool(getattr(ns, "unsafe_no_cgroups", False)),
+        run_timeout_s=_effective_run_timeout(ns),
     )
     if code != 0:
         return code
@@ -1876,6 +1953,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         verbosity=verbosity,
         order=list(plan.order),
         core_budget=core_budget,
+        run_timeout_s=_effective_run_timeout(ns),
     )
     passed = sum(1 for o in result.outcomes if o.ok)
     failed = sum(1 for o in result.outcomes if not o.ok and not o.aborted)

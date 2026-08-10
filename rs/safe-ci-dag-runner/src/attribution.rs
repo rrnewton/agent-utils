@@ -586,8 +586,11 @@ impl StepStream {
     }
 }
 
-/// Columns describing attribution, for callers that want them in a map (not the profile CSV, whose
-/// schema is asserted byte-identical against the Python build).
+/// Columns describing attribution, for callers that want them in a map.
+///
+/// Deliberately NOT part of the per-step profile CSV: that schema is asserted byte-identical
+/// across engines, so widening it here would break a cross-check that exists to catch exactly
+/// that kind of one-sided drift.
 pub fn culprit_columns(c: &Culprit) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     m.insert("culprit_test".into(), c.test.clone().unwrap_or_default());

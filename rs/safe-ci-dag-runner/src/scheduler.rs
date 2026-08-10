@@ -101,6 +101,8 @@ struct Shared {
     /// Per-step ownership nonce, so the eager-cancel path can terminate another step's escapees
     /// as thoroughly as that step's own supervisor would (see [`kill_by_nonce`]).
     running_nonces: HashMap<String, String>,
+    /// The WHOLE RUN exceeded its outer wall budget and cut its in-flight steps short.
+    run_timed_out: bool,
 }
 
 /// SIGKILL a whole process group by pid (the child is its own group leader via
@@ -429,6 +431,11 @@ struct Runner {
     // never lets the summed inner-jobs width of concurrently-running steps exceed this total core
     // budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
     core_budget: Option<i64>,
+    /// OUTER wall budget for the WHOLE run, in seconds; `None` leaves the run unbounded.
+    ///
+    /// Independent of every per-step budget, and that independence is the point: no combination of
+    /// individually-legal steps can run past it.
+    run_timeout_s: Option<i64>,
     /// Durable, incrementally-flushed evidence for this run (per-step logs + boundary journal), or
     /// `None` when the operator opted out or the directory could not be created.
     evidence: Option<Arc<RunEvidence>>,
@@ -436,6 +443,7 @@ struct Runner {
 }
 
 impl Runner {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         cfg: &DagConfig,
         jobs: i64,
@@ -444,6 +452,7 @@ impl Runner {
         cgroups: BoxedCgroups,
         order_override: Option<Vec<String>>,
         core_budget: Option<i64>,
+        run_timeout_s: Option<i64>,
     ) -> Self {
         let steps: HashMap<String, Step> = cfg.steps.iter().map(|s| (s.tag(), s.clone())).collect();
         // Dispatch order. When the caller supplies an explicit order (e.g. a critical-path
@@ -477,6 +486,7 @@ impl Runner {
             default_step_cpu_count: cfg.default_step_cpu_count,
             default_step_cpu_timeout: cfg.default_step_cpu_timeout,
             core_budget,
+            run_timeout_s,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
             shared: Arc::new(Mutex::new(Shared {
                 done: HashMap::new(),
@@ -489,6 +499,7 @@ impl Runner {
                 cores_used: 0,
                 step_profile_rows: Vec::new(),
                 running_nonces: HashMap::new(),
+                run_timed_out: false,
             })),
         }
     }
@@ -521,10 +532,63 @@ impl Runner {
     fn run(&self) -> (bool, f64) {
         let mut handles: Vec<thread::JoinHandle<()>> = Vec::new();
         let wall_start = Instant::now();
+        let deadline = self
+            .run_timeout_s
+            .filter(|s| *s > 0)
+            .map(|s| wall_start + Duration::from_secs(s as u64));
         loop {
             let mut launchable: Vec<Step> = Vec::new();
             {
                 let mut sh = self.shared.lock().unwrap();
+                // OUTER BUDGET, CHECKED IN OUR OWN LOOP AND NOT BY AN EXTERNAL KILLER. Stopping
+                // the run from inside is the entire reason this exists: an outside kill (a CI job
+                // cancellation, a systemd RuntimeMaxSec) also destroys the evidence, so the bound
+                // that fires FIRST must be one that can still write rows, flush the journal, and
+                // hand a verdict back to the caller.
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl && !sh.run_timed_out {
+                        sh.run_timed_out = true;
+                        sh.failed = true;
+                        sh.stop = true;
+                        let cut: Vec<(String, u32, Option<String>)> = sh
+                            .running_pids
+                            .iter()
+                            .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
+                            .collect();
+                        let names: Vec<String> = cut.iter().map(|(t, _, _)| t.clone()).collect();
+                        eprintln!(
+                            "[scheduler] RUN TIMEOUT: the whole run exceeded its outer budget of \
+                             {}s ({:.1}s elapsed). Cutting {} in-flight step(s) short so the run \
+                             can still report: {}",
+                            self.run_timeout_s.unwrap_or(0),
+                            wall_start.elapsed().as_secs_f64(),
+                            cut.len(),
+                            if names.is_empty() {
+                                "<none running>".to_string()
+                            } else {
+                                names.join(", ")
+                            }
+                        );
+                        if let Some(e) = &self.evidence {
+                            e.record(
+                                "run_timeout",
+                                &[
+                                    ("budget_s", self.run_timeout_s.unwrap_or(0).to_string()),
+                                    (
+                                        "elapsed_s",
+                                        format!("{:.3}", wall_start.elapsed().as_secs_f64()),
+                                    ),
+                                    ("cut_steps", names.join(",")),
+                                    ("done", sh.done.len().to_string()),
+                                ],
+                            );
+                        }
+                        for (tag, pid, nonce) in cut {
+                            sh.aborted.insert(tag.clone());
+                            reap(&self.cgroups, &tag, pid, nonce.as_deref());
+                        }
+                    }
+                }
                 let skipped = self.skipped(&sh);
                 if sh.running.is_empty()
                     && (sh.stop || sh.done.len() + skipped.len() >= self.steps.len())
@@ -626,6 +690,7 @@ impl Runner {
             outcomes,
             skipped,
             step_profile_rows: sh.step_profile_rows.clone(),
+            run_timed_out: sh.run_timed_out,
         }
     }
 }
@@ -1180,7 +1245,7 @@ fn run_step(ctx: StepCtx) {
         }
     }
 
-    let (was_aborted, reason) = {
+    let (was_aborted, cut_by_run_budget, reason) = {
         let mut sh = shared.lock().unwrap();
         sh.running.remove(&tag);
         sh.running_pids.remove(&tag);
@@ -1189,6 +1254,10 @@ fn run_step(ctx: StepCtx) {
         sh.cores_used -= step_width(&step);
         sh.step_profile_rows.push(row);
         let was_aborted = sh.aborted.contains(&tag);
+        // Distinguish the two ways a step gets cancelled. "Another step failed" and "the whole run
+        // ran out of budget" call for completely different follow-up, and reporting both with the
+        // eager-exit wording sends a reader hunting for a failing peer that does not exist.
+        let cut_by_run_budget = was_aborted && sh.run_timed_out;
         let outcome = if was_aborted {
             StepOutcome::aborted_outcome(tag.clone(), elapsed, summary.clone(), returncode)
         } else if ok {
@@ -1228,11 +1297,17 @@ fn run_step(ctx: StepCtx) {
                 }
             }
         }
-        (was_aborted, reason)
+        (was_aborted, cut_by_run_budget, reason)
     };
 
     // Emit the terminal status OUTSIDE the lock.
-    if was_aborted {
+    if cut_by_run_budget {
+        emit(&format!(
+            "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} cut short by the OUTER run budget, not \
+             by a failure of its own or of a peer)",
+            step.desc
+        ));
+    } else if was_aborted {
         emit(&format!(
             "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} eager-exit after another step failed; keep_going lets in-flight steps finish)",
             step.desc
@@ -1347,6 +1422,85 @@ pub fn run_dag_boxed_ordered(
     order: Option<Vec<String>>,
     core_budget: Option<i64>,
 ) -> RunResult {
+    run_dag_boxed_deadline(
+        cfg,
+        jobs,
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        core_budget,
+        None,
+    )
+}
+
+/// Steps whose own wall budget is not STRICTLY SMALLER than the run's outer budget.
+///
+/// INNER < OUTER IS THE WHOLE ORDERING, and it is checkable before anything runs. A step allowed
+/// to run as long as (or longer than) the run itself can only ever be terminated by the outer
+/// bound, which means the failure is attributed to "the run overran" instead of to the node that
+/// caused it — precisely the report that made a real regression unexplainable. Returns the
+/// offending `(tag, step_timeout_s)` pairs, empty when the ordering holds.
+pub fn steps_violating_run_timeout(cfg: &DagConfig, run_timeout_s: i64) -> Vec<(String, i64)> {
+    if run_timeout_s <= 0 {
+        return Vec::new();
+    }
+    let mut bad: Vec<(String, i64)> = cfg
+        .steps
+        .iter()
+        .filter(|s| s.timeout >= run_timeout_s)
+        .map(|s| (s.tag(), s.timeout))
+        .collect();
+    bad.sort();
+    bad
+}
+
+/// Like [`run_dag_boxed_ordered`] plus an OUTER wall budget for the whole run.
+///
+/// `run_timeout_s = None` (or a non-positive value) leaves the run unbounded. When set, the
+/// scheduler stops launching, terminates every in-flight step's whole tree, and RETURNS with
+/// [`RunResult::run_timed_out`] set — it does not abandon the process to an outside killer,
+/// because an outside kill takes the evidence with it.
+///
+/// FAIL CLOSED ON A MIS-ORDERED BUDGET. If any step is allowed to run as long as the whole run,
+/// this REFUSES to start rather than running with an ordering that cannot attribute a failure. A
+/// bound you cannot attribute is worth less than no bound, because it reads like enforcement.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dag_boxed_deadline(
+    cfg: &DagConfig,
+    jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+    core_budget: Option<i64>,
+    run_timeout_s: Option<i64>,
+) -> RunResult {
+    if let Some(limit) = run_timeout_s.filter(|s| *s > 0) {
+        let bad = steps_violating_run_timeout(cfg, limit);
+        if !bad.is_empty() {
+            let detail = bad
+                .iter()
+                .map(|(t, s)| format!("{t} ({s}s)"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "[scheduler] ERROR: REFUSING to run: the outer run budget is {limit}s but {} \
+                 step(s) declare a wall budget at least that large, so the outer bound would fire \
+                 before they do and the failure could not be attributed to a node: {detail}. \
+                 Lower those step timeouts or raise --run-timeout.",
+                bad.len()
+            );
+            return RunResult {
+                ok: false,
+                wall_s: 0.0,
+                outcomes: Vec::new(),
+                skipped: Vec::new(),
+                step_profile_rows: Vec::new(),
+                run_timed_out: false,
+            };
+        }
+    }
     become_subreaper();
     if let Some(cg) = &cgroups {
         if !cg.enabled() {
@@ -1365,6 +1519,7 @@ pub fn run_dag_boxed_ordered(
         cgroups,
         order,
         core_budget,
+        run_timeout_s,
     );
     // ANNOUNCE THE EVIDENCE PATH ONCE, AT THE START. A durable log nobody can find is not
     // evidence; and printing it only on failure is printing it only where the run still had a

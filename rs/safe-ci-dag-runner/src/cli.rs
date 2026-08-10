@@ -34,8 +34,9 @@ use std::time::Instant;
 
 use crate::cgroup::{
     apply_specific_cores, enable_outer_oom_group, expected_outer_memory_max_bytes,
-    install_scope_teardown, is_in_scope, outer_memory_max_bytes, reexec_in_scope,
-    verify_scope_limits, CgroupManager, Cgroups,
+    expected_scope_runtime_max_s, install_scope_teardown, is_in_scope, outer_memory_max_bytes,
+    reexec_in_scope_with_limits, verify_scope_limits, verify_scope_runtime_max, CgroupManager,
+    Cgroups,
 };
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
@@ -45,7 +46,7 @@ use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonE
 use crate::model::{step_classification, DagConfig, Step, StepOutcome};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
-use crate::scheduler::{run_dag_boxed, run_dag_boxed_ordered, BoxedCgroups};
+use crate::scheduler::{run_dag_boxed, run_dag_boxed_deadline, BoxedCgroups};
 use crate::sizing::{
     box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_copy_footprint_bytes,
 };
@@ -330,6 +331,7 @@ fn run_help(c: &Palette) -> String {
             ("--profile-sync BACKEND", "download+upload the shared profile summary (for ephemeral CI)"),
             ("--profile-sync-direction D", "both (default) | download | upload"),
             ("-k, --keep-going", "on failure, let running steps finish (stop launching new ones)"),
+            ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
             ("--small-default-cap", "compatibility no-op (small caps are already on by default)"),
@@ -604,6 +606,8 @@ struct RunArgs {
     profile_sync: Option<String>,
     profile_sync_direction: String,
     keep_going: bool,
+    /// OUTER wall budget for the WHOLE run, in seconds (`None` = unbounded).
+    run_timeout: Option<i64>,
     allow_cgroup_failure: bool,
     unsafe_no_cgroups: bool,
     small_default_cap: bool,
@@ -629,6 +633,7 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         profile_sync: None,
         profile_sync_direction: "both".to_string(),
         keep_going: false,
+        run_timeout: env_run_timeout(),
         allow_cgroup_failure: false,
         unsafe_no_cgroups: false,
         small_default_cap: false,
@@ -704,6 +709,18 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
                      Per-node resource limits are DAG fields (cpu_timeout, memory, pids)."
                     .to_string(),
             ),
+            "--run-timeout" => {
+                let v = take_value(inline, &mut i)?;
+                let secs = v
+                    .parse::<i64>()
+                    .map_err(|_| format!("--run-timeout: invalid int value: '{v}'"))?;
+                if secs <= 0 {
+                    return Err(format!(
+                        "--run-timeout: must be a positive number of seconds, got '{v}'"
+                    ));
+                }
+                a.run_timeout = Some(secs);
+            }
             "--allow-cgroup-failure" => a.allow_cgroup_failure = true,
             "--unsafe-no-cgroups" => a.unsafe_no_cgroups = true,
             "--small-default-cap" => a.small_default_cap = true,
@@ -790,7 +807,39 @@ fn git_sha() -> String {
 // Python `_resolve_cgroup_manager`). Returns the manager to use (`None` = intentional UNBOXED
 // run), or an `Err(exit_code)` the caller must return when boxing is required but unavailable.
 // May re-exec this process into a systemd scope (never returns on success).
-fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<BoxedCgroups, i32> {
+/// Env fallback for the outer run budget, so a wrapper that cannot edit the command line (a CI
+/// job template, a systemd unit) can still bound the run.
+fn env_run_timeout() -> Option<i64> {
+    std::env::var("SAFE_CI_DAG_RUNNER_RUN_TIMEOUT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|v| match v.parse::<i64>() {
+            Ok(n) if n > 0 => Some(n),
+            _ => {
+                eprintln!(
+                    "{PROG}: SAFE_CI_DAG_RUNNER_RUN_TIMEOUT={v:?} is not a positive integer; \
+                     ignoring"
+                );
+                None
+            }
+        })
+}
+
+/// How much longer than the runner's own budget the SCOPE is allowed to live.
+///
+/// The scope bound is a backstop for the runner itself wedging, so it must never be the thing that
+/// fires in normal operation — the runner needs this window to terminate its steps, join its
+/// readers, flush profile rows, and return a verdict. Sized as the larger of 60s and a tenth of
+/// the budget, because reaping a large fan-out is not a constant-time operation.
+fn scope_grace_s(run_timeout_s: i64) -> i64 {
+    60.max(run_timeout_s / 10)
+}
+
+fn resolve_cgroups(
+    allow_failure: bool,
+    unsafe_no_cgroups: bool,
+    run_timeout_s: Option<i64>,
+) -> Result<BoxedCgroups, i32> {
     if unsafe_no_cgroups {
         // Deliberate opt-out (--unsafe-no-cgroups): skip scope bring-up entirely and run unboxed
         // even where boxing is available. Distinct from --allow-cgroup-failure (a capability
@@ -820,6 +869,20 @@ fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<Boxed
             eprintln!("{PROG}: ERROR: {msg}.");
             return Err(3);
         }
+        // If an outer scope budget was requested, PROVE it is on the live unit. `-p
+        // RuntimeMaxSec=N` on the command line is a request; the unit's own property is the fact.
+        if let Some(expected) = expected_scope_runtime_max_s() {
+            if !verify_scope_runtime_max(expected) {
+                let msg = "outer scope RuntimeMaxSec readback failed; the run's outermost wall \
+                           bound is NOT enforced";
+                if allow_failure {
+                    eprintln!("{PROG}: warning: {msg} (--allow-cgroup-failure).");
+                } else {
+                    eprintln!("{PROG}: ERROR: {msg}.");
+                    return Err(3);
+                }
+            }
+        }
         let mgr = Cgroups::new();
         if mgr.enabled() {
             install_scope_teardown();
@@ -847,6 +910,22 @@ fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<Boxed
             "{PROG}: warning: cgroup boxing not established (--allow-cgroup-failure); running \
              UNBOXED (process-group teardown only, no per-step memory/CPU caps)."
         );
+        // SAY WHICH BOUNDS SURVIVE THE FALLBACK, because "unboxed" has been read as "unbounded"
+        // and that reading is how a run reached an external job kill. Per-step WALL budgets and
+        // the outer run budget are enforced by the runner itself and still apply; the per-step
+        // CPU-time budget and the scope's RuntimeMaxSec are cgroup/systemd features and do not.
+        match run_timeout_s {
+            Some(secs) => eprintln!(
+                "{PROG}: unboxed run is STILL wall-bounded: per-step wall timeouts apply and the \
+                 whole run is cut at {secs}s. Per-step CPU-time budgets and the scope-level \
+                 RuntimeMaxSec backstop are NOT enforced without cgroups."
+            ),
+            None => eprintln!(
+                "{PROG}: WARNING: no outer run budget is set (--run-timeout / \
+                 SAFE_CI_DAG_RUNNER_RUN_TIMEOUT), so nothing bounds the run as a whole; only \
+                 per-step wall timeouts apply."
+            ),
+        }
         return Ok(None);
     }
     // Default: boxing is required -> re-exec into a transient systemd --user scope (never returns
@@ -858,7 +937,11 @@ fn resolve_cgroups(allow_failure: bool, unsafe_no_cgroups: bool) -> Result<Boxed
         );
         return Err(3);
     };
-    let reexeced_or_skipped = reexec_in_scope(Some(outer_memory_max), None);
+    let reexeced_or_skipped = reexec_in_scope_with_limits(
+        Some(outer_memory_max),
+        None,
+        run_timeout_s.map(|s| s + scope_grace_s(s)),
+    );
     let detail = if reexeced_or_skipped {
         "boxing was skipped (e.g. CI without a systemd --user scope)"
     } else {
@@ -1699,7 +1782,7 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     let repeat = a.repeat.max(1);
 
     // Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
-    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups) {
+    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups, None) {
         Ok(cg) => cg,
         Err(code) => return code,
     };
@@ -1884,7 +1967,8 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     let cfg = &stressed;
 
     // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
-    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups) {
+    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups, a.run_timeout)
+    {
         Ok(cg) => cg,
         Err(code) => return code,
     };
@@ -1988,7 +2072,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         .as_deref()
         .map(|d| PerfWindow::start(Path::new(d), &git));
 
-    let result = run_dag_boxed_ordered(
+    let result = run_dag_boxed_deadline(
         cfg,
         jobs,
         a.keep_going || stress_active,
@@ -1996,6 +2080,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         cgroups,
         Some(plan.order.clone()),
         core_budget,
+        a.run_timeout,
     );
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
     let failed = result

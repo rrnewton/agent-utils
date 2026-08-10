@@ -160,6 +160,7 @@ class Runner:
         verbosity: int = 1,
         order: Sequence[str] | None = None,
         core_budget: int | None = None,
+        run_timeout_s: int | None = None,
     ) -> None:
         self.cfg = cfg
         self.jobs = max(1, jobs)
@@ -200,6 +201,11 @@ class Runner:
         self.failed = False  # a genuine (non-aborted) step failed
         self.stop = False  # stop scheduling new steps after a failure
         self.wall = 0.0
+        # OUTER wall budget for the WHOLE run (None = unbounded). Independent of every per-step
+        # budget, and that independence is the point: no combination of individually-legal steps
+        # can run past it.
+        self.run_timeout_s = run_timeout_s if (run_timeout_s or 0) > 0 else None
+        self.run_timed_out = False
 
     # -- gating helpers (mirror validate.py Runner._deps_ok / _deps_known / _res_free) --
 
@@ -279,8 +285,34 @@ class Runner:
         """
         threads: list[threading.Thread] = []
         wall_start = time.time()
+        deadline = (
+            wall_start + self.run_timeout_s if self.run_timeout_s is not None else None
+        )
         while True:
             with self.lock:
+                # OUTER BUDGET, CHECKED IN OUR OWN LOOP AND NOT BY AN EXTERNAL KILLER. Stopping the
+                # run from inside is the entire reason this exists: an outside kill (a CI job
+                # cancellation, a systemd RuntimeMaxSec) also destroys the evidence, so the bound
+                # that fires FIRST must be one that can still write rows and hand back a verdict.
+                if (
+                    deadline is not None
+                    and time.time() >= deadline
+                    and not self.run_timed_out
+                ):
+                    self.run_timed_out = True
+                    self.failed = True
+                    self.stop = True
+                    cut = list(self.running_procs.items())
+                    print(
+                        f"[scheduler] RUN TIMEOUT: the whole run exceeded its outer budget of "
+                        f"{self.run_timeout_s}s ({time.time() - wall_start:.1f}s elapsed). "
+                        f"Cutting {len(cut)} in-flight step(s) short so the run can still report: "
+                        + (", ".join(tag for tag, _ in cut) or "<none running>"),
+                        file=sys.stderr,
+                    )
+                    for other, other_proc in cut:
+                        self.aborted.add(other)
+                        reap(other_proc, self.cgroups, other)
                 skipped = self._skipped()
                 if not self.running and (
                     self.stop or len(self.done) + len(skipped) >= len(self.steps)
@@ -546,7 +578,16 @@ class Runner:
                         reap(other_proc, self.cgroups, other)
 
         # Emit terminal status OUTSIDE the lock (_emit re-acquires it).
-        if outcome.aborted:
+        if outcome.aborted and self.run_timed_out:
+            # Distinguish the two ways a step gets cancelled. "Another step failed" and "the whole
+            # run ran out of budget" call for different follow-up, and the eager-exit wording sends
+            # a reader hunting for a failing peer that does not exist.
+            self._emit(
+                f"[{step.tag}] ⊘ ABORT  {step.desc} "
+                f"({dur}s — cut short by the OUTER run budget, not by a failure of its own "
+                f"or of a peer)"
+            )
+        elif outcome.aborted:
             self._emit(
                 f"[{step.tag}] ⊘ ABORT  {step.desc} "
                 f"({dur}s — eager-exit after another step failed; keep_going lets in-flight steps finish)"
@@ -583,7 +624,25 @@ class Runner:
             outcomes=outcomes,
             skipped=skipped,
             step_profile_rows=tuple(self.step_profile_rows),
+            run_timed_out=self.run_timed_out,
         )
+
+
+def steps_violating_run_timeout(
+    cfg: DagConfig, run_timeout_s: int
+) -> list[tuple[str, int]]:
+    """Steps whose own wall budget is not STRICTLY SMALLER than the run's outer budget.
+
+    INNER < OUTER IS THE WHOLE ORDERING, and it is checkable before anything runs. A step allowed
+    to run as long as (or longer than) the run itself can only ever be terminated by the outer
+    bound, which attributes the failure to "the run overran" instead of to the node that caused
+    it — precisely the report that made a real regression unexplainable.
+    """
+    if run_timeout_s <= 0:
+        return []
+    return sorted(
+        (s.tag, s.timeout) for s in cfg.steps if s.timeout >= run_timeout_s
+    )
 
 
 def run_dag(
@@ -596,6 +655,7 @@ def run_dag(
     verbosity: int = 1,
     order: Sequence[str] | None = None,
     core_budget: int | None = None,
+    run_timeout_s: int | None = None,
 ) -> RunResult:
     """Run a whole DAG and return its :class:`RunResult`.
 
@@ -620,7 +680,27 @@ def run_dag(
     :param core_budget: total inner-jobs core budget ``P`` for the CPA dispatch gate; when set the
         scheduler never lets the summed width of concurrently-running steps exceed it. ``None``
         disables the gate (the non-CPA default).
+    :param run_timeout_s: OUTER wall budget for the WHOLE run. On breach the scheduler stops
+        launching, terminates every in-flight step's tree, and RETURNS with
+        ``RunResult.run_timed_out`` set — it does not abandon the process to an outside killer,
+        because an outside kill takes the evidence with it. ``None`` leaves the run unbounded.
+        FAIL CLOSED: if any step may run as long as the whole run, this refuses to start, because
+        a bound whose breach cannot be attributed to a node reads like enforcement without being
+        usable as one.
     """
+    if (run_timeout_s or 0) > 0:
+        assert run_timeout_s is not None
+        bad = steps_violating_run_timeout(cfg, run_timeout_s)
+        if bad:
+            detail = ", ".join(f"{tag} ({secs}s)" for tag, secs in bad)
+            print(
+                f"[scheduler] ERROR: REFUSING to run: the outer run budget is {run_timeout_s}s "
+                f"but {len(bad)} step(s) declare a wall budget at least that large, so the outer "
+                f"bound would fire before they do and the failure could not be attributed to a "
+                f"node: {detail}. Lower those step timeouts or raise --run-timeout.",
+                file=sys.stderr,
+            )
+            return RunResult(ok=False, wall_s=0.0)
     sink: MetricsSink = metrics if metrics is not None else _NoopMetricsSink()
     manager: CgroupManager = cgroups if cgroups is not None else _NoopCgroupManager()
     if cgroups is not None and not cgroups.enabled:
@@ -638,6 +718,7 @@ def run_dag(
         verbosity=verbosity,
         order=order,
         core_budget=core_budget,
+        run_timeout_s=run_timeout_s,
     )
     window: RunWindow = sink.start_run_window()
     ok = runner.run()

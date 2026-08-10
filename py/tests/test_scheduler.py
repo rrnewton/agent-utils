@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 
 from safe_ci_dag_runner.model import (
     DEFAULT_SMALL_CPU_COUNT,
@@ -13,7 +14,7 @@ from safe_ci_dag_runner.model import (
     ResourceHint,
     Step,
 )
-from safe_ci_dag_runner.scheduler import run_dag
+from safe_ci_dag_runner.scheduler import run_dag, steps_violating_run_timeout
 
 
 def _step(
@@ -117,3 +118,67 @@ def test_resource_cap_serializes_concurrent_steps() -> None:
                 (starts if kind == "S" else ends)[tag] = float(ts)
         # A cap of 1 must serialize the two: their run intervals cannot overlap.
         assert ends["one"] <= starts["two"] or ends["two"] <= starts["one"]
+
+
+def _timed_step(job: str, cmd: str, timeout: int) -> Step:
+    """A step with an explicit wall budget (the INNER bound of the two-level ordering)."""
+    return Step("a", job, "", cmd, deps=[], timeout=timeout, cpu_timeout=600)
+
+
+def test_outer_run_budget_cuts_a_long_run_early_and_still_reports() -> None:
+    """A run longer than its outer budget is stopped BY THE RUNNER and still returns rows.
+
+    Per-step budgets cannot bound a run: any number of individually-legal steps can sum past any
+    ceiling. Before an outer bound existed the only thing that stopped such a run was an external
+    job kill, and an external kill discards the logs that would explain why it was needed. So the
+    bound that fires first must be one the scheduler enforces on itself.
+    """
+    cfg = DagConfig(
+        steps=(
+            _timed_step("one", "sleep 4", 5),
+            _timed_step("two", "sleep 4", 5),
+            _timed_step("three", "sleep 4", 5),
+        )
+    )
+    started = time.time()
+    res = run_dag(cfg, jobs=1, verbosity=0, run_timeout_s=6)
+    elapsed = time.time() - started
+
+    assert res.ok is False
+    assert res.run_timed_out is True
+    # EARLY is the load-bearing word: ~12s would mean the budget did nothing.
+    assert elapsed < 10.0, f"expected a cut near 6s, took {elapsed:.1f}s"
+    # The evidence survives, which is the whole difference from an outside kill.
+    assert len(res.step_profile_rows) == 2
+    outcomes = {o.tag: o for o in res.outcomes}
+    assert outcomes["a.one"].ok is True
+    assert outcomes["a.two"].aborted is True
+
+
+def test_misordered_budgets_are_refused_before_anything_runs() -> None:
+    """A step allowed to outlive the run is refused: its breach could not be attributed."""
+    cfg = DagConfig(steps=(_timed_step("wide", "sleep 1", 600),))
+    started = time.time()
+    res = run_dag(cfg, jobs=1, verbosity=0, run_timeout_s=6)
+    elapsed = time.time() - started
+
+    assert res.ok is False
+    assert res.run_timed_out is False  # nothing ran, so nothing timed out
+    assert res.outcomes == ()
+    assert elapsed < 3.0, f"the refusal must precede execution, took {elapsed:.1f}s"
+    assert steps_violating_run_timeout(cfg, 6) == [("a.wide", 600)]
+
+
+def test_clean_run_inside_its_outer_budget_is_untouched() -> None:
+    """The control. A fix that only shows the positive would cut every run short."""
+    cfg = DagConfig(
+        steps=(
+            _timed_step("one", "sleep 1", 10),
+            _timed_step("two", "sleep 1", 10),
+        )
+    )
+    res = run_dag(cfg, jobs=1, verbosity=0, run_timeout_s=60)
+    assert res.ok is True
+    assert res.run_timed_out is False
+    assert all(not o.aborted for o in res.outcomes)
+    assert len(res.step_profile_rows) == 2

@@ -283,3 +283,8 @@ class RunResult:
     outcomes: tuple[StepOutcome, ...] = ()
     skipped: tuple[str, ...] = ()
     step_profile_rows: tuple[Mapping[str, object], ...] = field(default_factory=tuple)
+    #: The WHOLE RUN hit its outer wall budget and was cut short. Distinct from a step's own
+    #: ``timed_out``: no single node necessarily misbehaved, the combination did. A consumer that
+    #: records results must be able to tell "this run produced a verdict about the tree" from
+    #: "this run was stopped by its own budget with work outstanding", and ``ok`` alone cannot.
+    run_timed_out: bool = False

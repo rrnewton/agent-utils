@@ -74,7 +74,7 @@ from safe_ci_dag_runner.protocols import (
     RunWindow,
     StepOutcome,
 )
-from safe_ci_dag_runner.scheduler import Runner, run_dag
+from safe_ci_dag_runner.scheduler import Runner, run_dag, steps_violating_run_timeout
 from safe_ci_dag_runner.sizing import (
     jobs_footprint_bytes,
     jobs_for_budget,
@@ -98,12 +98,16 @@ __version__: str = "0.12.0"
 #:   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
 #:   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
 #:   pids_guard    per-step PID/thread ceiling (plumbed in both, enforced in neither -> false)
+#:   run_timeout   OUTER wall budget for the WHOLE run: the scheduler cuts in-flight steps and
+#:                 still reports (works boxed or unboxed); under boxing it is additionally backed
+#:                 by the scope's systemd RuntimeMaxSec, set strictly later so the reporting
+#:                 bound fires first
 #:   wall_timeout  per-step wall-clock ceiling (load-dependent; active with or without boxing)
 #: The cgroup-dependent guards take effect only under boxing; the boxed smoke tests in each build
 #: anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
 ENFORCEMENT_CAPABILITIES: str = (
     '{"cpu_affinity":true,"cpu_timeout":true,"memory_max":true,"oom_detection":true,'
-    '"pids_guard":false,"wall_timeout":true}'
+    '"pids_guard":false,"run_timeout":true,"wall_timeout":true}'
 )
 
 __all__ = [
@@ -124,6 +128,7 @@ __all__ = [
     "command_with_inner_jobs",
     # running
     "run_dag",
+    "steps_violating_run_timeout",
     "Runner",
     "RunResult",
     "StepOutcome",
