@@ -582,6 +582,85 @@ def enter_delegated_scope(
 # --------------------------------------------------------------------------- #
 
 
+
+@dataclass(frozen=True)
+class ContainmentProof:
+    """Evidence that THIS LIVE PROCESS is inside a specific cgroup, observed rather than declared."""
+
+    cgroup: Path
+    pid: int
+    unit: str | None = None
+
+
+@dataclass(frozen=True)
+class ContainmentEvidence:
+    """Whether the running process could be OBSERVED inside the cgroup it is claimed to be in."""
+
+    proof: ContainmentProof | None
+    detail: str = ""
+
+    def describe(self) -> str:
+        """One clause for a diagnostic."""
+        if self.proof is None:
+            return self.detail
+        unit = f" (promised unit {self.proof.unit})" if self.proof.unit else ""
+        return f"pid {self.proof.pid} observed in {self.proof.cgroup}{unit}"
+
+
+def observe_own_containment(
+    expected_unit: str | None, *, naming: ScopeNaming = DEFAULT_NAMING
+) -> ContainmentEvidence:
+    """OBSERVE the running process inside its cgroup. A declaration of containment is not containment.
+
+    The in-scope check is an ENVIRONMENT VARIABLE this process set for itself before re-exec-ing,
+    and every "cgroup boxing ACTIVE" line downstream rested on it. Anything can export it, a scope
+    can be stopped under a live process, and systemd can place a unit elsewhere than asked.
+
+    TWO DIRECTIONS, because each catches what the other cannot: ``/proc/self/cgroup`` is the
+    KERNEL's view of where this task is (and being in the ROOT is the tell a one-sided check waves
+    through, since every process is in *some* cgroup), while ``<cgroup>/cgroup.procs`` is the
+    CGROUP'S OWN ROSTER, which disagrees if the directory is gone or the task was migrated.
+    """
+    _ = naming
+    pid = os.getpid()
+    cgroup = _my_cgroup_path()
+    if cgroup is None:
+        return ContainmentEvidence(
+            None, "/proc/self/cgroup carries no cgroup-v2 (0::) entry for this process"
+        )
+    if cgroup == CGROUP_ROOT:
+        return ContainmentEvidence(
+            None, f"pid {pid} is in the cgroup ROOT ({CGROUP_ROOT}); nothing contains it"
+        )
+    if not cgroup.is_dir():
+        return ContainmentEvidence(
+            None, f"pid {pid} claims cgroup {cgroup} but that directory does not exist"
+        )
+    procs = cgroup / "cgroup.procs"
+    try:
+        roster = procs.read_text().split()
+    except OSError:
+        return ContainmentEvidence(None, f"cannot read {procs} to confirm membership")
+    if str(pid) not in roster:
+        return ContainmentEvidence(
+            None, f"pid {pid} is NOT listed in {procs}; the kernel and the cgroup disagree"
+        )
+    if expected_unit is not None:
+        names = [cgroup.name, *(p.name for p in cgroup.parents)]
+        if expected_unit not in names:
+            return ContainmentEvidence(
+                None,
+                f"pid {pid} is contained in {cgroup}, but the promised unit was "
+                f"{expected_unit}; the caps and the kill path were arranged on a different cgroup",
+            )
+    return ContainmentEvidence(ContainmentProof(cgroup, pid, expected_unit))
+
+
+def promised_unit(*, naming: ScopeNaming = DEFAULT_NAMING) -> str | None:
+    """The unit name the parent promised this child, if any."""
+    return os.environ.get(naming.env_scope_unit) or None
+
+
 def expected_scope_runtime_max_s() -> int | None:
     """The ``RuntimeMaxSec`` the parent asked systemd to enforce on this run's scope, if any."""
     raw = os.environ.get(EXPECTED_RUNTIME_MAX_ENV, "")

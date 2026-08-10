@@ -1549,6 +1549,38 @@ def _resolve_cgroup_manager(
 
     naming = cg.DEFAULT_NAMING
     if os.environ.get(naming.env_in_scope) == "1":
+        # THE SENTINEL IS A PROMISE; GO AND LOOK BEFORE CLAIMING ANYTHING. This branch reads an
+        # environment variable this process set for itself, and the "boxing ACTIVE" line below
+        # rested on it. A promised unit is REQUIRED: the re-exec sets sentinel and unit together,
+        # and without one "observed in some cgroup" is true of almost every process on a cgroup-v2
+        # host -- which would wave through exactly the forged claim this check exists to catch.
+        unit = cg.promised_unit(naming=naming)
+        evidence = (
+            cg.observe_own_containment(unit, naming=naming)
+            if unit
+            else cg.ContainmentEvidence(
+                None,
+                "the in-scope sentinel is set but no scope unit was carried with it; the re-exec "
+                "always sets both, so this claim names no cgroup to check",
+            )
+        )
+        if evidence.proof is None:
+            msg = (
+                "the in-scope sentinel is set but containment could NOT be observed: "
+                f"{evidence.describe()}"
+            )
+            if allow_failure:
+                print(
+                    f"{PROG}: warning: {msg}; running UNBOXED (--allow-cgroup-failure).",
+                    file=sys.stderr,
+                )
+                return None, 0
+            print(
+                f"{PROG}: ERROR: {msg}. Refusing to report boxing on the strength of an "
+                "environment variable.",
+                file=sys.stderr,
+            )
+            return None, 3
         expected_memory_max = cg.expected_outer_memory_max_bytes()
         controls_ok = (
             expected_memory_max is not None
@@ -1572,9 +1604,11 @@ def _resolve_cgroup_manager(
         manager = cg.Cgroups(naming)
         if manager.enabled:
             cg.install_scope_teardown(naming=naming)
+            # NAME THE OBSERVED CGROUP, not the intention, so a reader can check the claim
+            # against /sys/fs/cgroup instead of taking the word ACTIVE for it.
             print(
                 f"{PROG}: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU caps"
-                " + setsid-proof teardown).",
+                f" + setsid-proof teardown); containment OBSERVED: {evidence.describe()}.",
                 file=sys.stderr,
             )
             return manager, 0

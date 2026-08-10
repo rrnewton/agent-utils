@@ -203,3 +203,125 @@ fn forcing_the_attempt_boxes_where_boxing_is_possible() {
         r.text
     );
 }
+
+/// PROOF, NOT DECLARATION: the boxed path must SEE the live pid inside the promised cgroup.
+///
+/// Skipped where a `--user` scope is unavailable, so this says nothing false on a runner.
+#[test]
+fn the_boxed_path_observes_the_live_pid_in_the_promised_cgroup() {
+    let probe = Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            &format!("--unit=scdr-proof-probe-{}", std::process::id()),
+            "true",
+        ])
+        .output();
+    if !probe.map(|o| o.status.success()).unwrap_or(false) {
+        eprintln!("skipping: no usable systemd --user scope on this host");
+        return;
+    }
+    let fx = Fixture::new("proof");
+    let r = run(&fx, &[], &[], false);
+
+    assert_eq!(r.code, Some(0), "a boxed run should pass:\n{}", r.text);
+    assert!(
+        r.text.contains("containment OBSERVED: pid "),
+        "the run must report an OBSERVED pid, not merely that boxing is ACTIVE:\n{}",
+        r.text
+    );
+    // The observation must be bound to the cgroup that was actually arranged.
+    assert!(
+        r.text.contains("promised unit safe-ci-") && r.text.contains("/sys/fs/cgroup/"),
+        "the proof must name the promised unit and a real cgroup path:\n{}",
+        r.text
+    );
+}
+
+/// NEGATIVE: a FORGED in-scope sentinel must never be believed.
+///
+/// This is the exact lie the old code accepted — `is_in_scope()` read an environment variable, and
+/// every consumer printed "cgroup boxing ACTIVE" on the strength of it. Anything can export it.
+#[test]
+fn a_forged_in_scope_sentinel_is_refused_not_believed() {
+    let fx = Fixture::new("forged");
+    let r = run(&fx, &[("SAFE_CI_IN_SCOPE", "1")], &[], false);
+
+    assert_eq!(
+        r.code,
+        Some(3),
+        "a sentinel with no observable containment must refuse:\n{}",
+        r.text
+    );
+    assert!(
+        r.text.contains("could NOT be observed"),
+        "the refusal must say the observation failed:\n{}",
+        r.text
+    );
+    assert!(
+        !r.text.contains("boxing ACTIVE"),
+        "containment must NEVER be claimed on the strength of an environment variable:\n{}",
+        r.text
+    );
+}
+
+/// NEGATIVE: a sentinel pointing at a unit this process is not in must be refused, and the
+/// refusal must name the cgroup actually observed — a mismatch is more useful than a bare "no".
+#[test]
+fn a_sentinel_naming_the_wrong_unit_is_refused_and_names_what_it_found() {
+    let fx = Fixture::new("wrongunit");
+    let r = run(
+        &fx,
+        &[
+            ("SAFE_CI_IN_SCOPE", "1"),
+            ("SAFE_CI_SCOPE_UNIT", "totally-not-our-unit.scope"),
+        ],
+        &[],
+        false,
+    );
+
+    assert_eq!(
+        r.code,
+        Some(3),
+        "a wrong-unit claim must refuse:\n{}",
+        r.text
+    );
+    assert!(
+        r.text
+            .contains("the promised unit was totally-not-our-unit.scope"),
+        "the refusal must name the promised unit it could not confirm:\n{}",
+        r.text
+    );
+    assert!(
+        r.text.contains("/sys/fs/cgroup/"),
+        "and the cgroup it actually observed, so the mismatch is actionable:\n{}",
+        r.text
+    );
+}
+
+/// CONTROL: the forged sentinel plus the sanctioned opt-out degrades to UNBOXED and still passes.
+///
+/// Without this, the three refusals above are satisfiable by a build that refuses everything.
+#[test]
+fn a_forged_sentinel_with_the_opt_out_degrades_rather_than_claiming() {
+    let fx = Fixture::new("forged_optout");
+    let r = run(
+        &fx,
+        &[("SAFE_CI_IN_SCOPE", "1")],
+        &["--allow-cgroup-failure"],
+        false,
+    );
+
+    assert_eq!(r.code, Some(0), "the opt-out must still pass:\n{}", r.text);
+    assert!(
+        r.text.contains("UNBOXED") && r.text.contains("could NOT be observed"),
+        "it must degrade AND say why:\n{}",
+        r.text
+    );
+    assert!(
+        !r.text.contains("boxing ACTIVE"),
+        "degrading must never print a containment claim:\n{}",
+        r.text
+    );
+}

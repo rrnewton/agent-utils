@@ -265,7 +265,162 @@ fn ensure_aggregate_slice(fraction: f64) -> bool {
     matches!((start, set), (Ok(a), Ok(b)) if a.status.success() && b.status.success())
 }
 
-/// Why a call to [`reexec_in_scope_with_limits`] RETURNED instead of exec-ing into a scope.
+/// Evidence that THIS LIVE PROCESS is inside a specific cgroup, observed rather than declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainmentProof {
+    /// The cgroup the running process is in, resolved from `/proc/self/cgroup`.
+    pub cgroup: PathBuf,
+    /// The pid whose membership was observed.
+    pub pid: u32,
+    /// The unit the parent promised, when one was carried in.
+    pub unit: Option<String>,
+}
+
+/// Whether the running process could be OBSERVED inside the cgroup it is claimed to be in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainmentEvidence {
+    /// Seen, from both directions.
+    Observed(ContainmentProof),
+    /// Not seen. The string says which check failed, never a guess.
+    NotObserved {
+        /// The specific observation that failed.
+        detail: String,
+    },
+}
+
+impl ContainmentEvidence {
+    /// The proof, when there is one.
+    pub fn proof(&self) -> Option<&ContainmentProof> {
+        match self {
+            ContainmentEvidence::Observed(p) => Some(p),
+            ContainmentEvidence::NotObserved { .. } => None,
+        }
+    }
+    /// One clause for a diagnostic.
+    pub fn describe(&self) -> String {
+        match self {
+            ContainmentEvidence::Observed(p) => format!(
+                "pid {} observed in {}{}",
+                p.pid,
+                p.cgroup.display(),
+                match &p.unit {
+                    Some(u) => format!(" (promised unit {u})"),
+                    None => String::new(),
+                }
+            ),
+            ContainmentEvidence::NotObserved { detail } => detail.clone(),
+        }
+    }
+}
+
+/// OBSERVE the running process inside its cgroup. A declaration of containment is not containment.
+///
+/// WHY THIS EXISTS AT ALL. `in_scope()` answers the question by reading an ENVIRONMENT VARIABLE
+/// this process set for itself before re-exec-ing. That sentinel is a promise, and every consumer
+/// downstream printed "cgroup boxing ACTIVE" on the strength of it. Anything can export
+/// `SAFE_CI_IN_SCOPE=1`; a scope can be stopped out from under a live process; systemd can place a
+/// unit somewhere other than where it was asked to. None of those show up in an env var.
+///
+/// TWO DIRECTIONS, DELIBERATELY, because each catches what the other cannot:
+///
+/// 1. `/proc/self/cgroup` — the KERNEL'S view of where this task is. Being in the cgroup ROOT is
+///    the tell that nothing contains us, and it is the case a one-sided check waves through, since
+///    every process is in *some* cgroup.
+/// 2. `<cgroup>/cgroup.procs` — the CGROUP'S OWN ROSTER. If the directory has been removed, or the
+///    task was migrated after `/proc/self/cgroup` was read, the roster disagrees and the claim
+///    fails. This is the direction that binds the claim to a live, existing container rather than
+///    to a path string.
+///
+/// And when the parent carried a promised unit name, the observed path must actually end in it —
+/// otherwise "we are contained" is true of some cgroup, but not of the one that was arranged, and
+/// the caps and the kill path were configured on the other one.
+pub fn observe_own_containment(expected_unit: Option<&str>) -> ContainmentEvidence {
+    let pid = std::process::id();
+    let Some(cgroup) = my_cgroup_path() else {
+        return ContainmentEvidence::NotObserved {
+            detail: "/proc/self/cgroup carries no cgroup-v2 (0::) entry for this process".into(),
+        };
+    };
+    observe_containment_at(&cgroup, pid, expected_unit)
+}
+
+/// The checks of [`observe_own_containment`], against an explicit cgroup and pid.
+///
+/// Split out so the ROSTER direction can be exercised against a cgroup that genuinely exists but
+/// does not list the pid — a process's own parent cgroup is exactly that. Without a seam here the
+/// only available test re-derives the roster itself, and then deleting the product's check leaves
+/// the test green, which is the inertness this whole change exists to refuse.
+pub fn observe_containment_at(
+    cgroup: &Path,
+    pid: u32,
+    expected_unit: Option<&str>,
+) -> ContainmentEvidence {
+    let cgroup = cgroup.to_path_buf();
+    if cgroup == Path::new(CGROUP_ROOT) {
+        return ContainmentEvidence::NotObserved {
+            detail: format!("pid {pid} is in the cgroup ROOT ({CGROUP_ROOT}); nothing contains it"),
+        };
+    }
+    if !cgroup.is_dir() {
+        return ContainmentEvidence::NotObserved {
+            detail: format!(
+                "pid {pid} claims cgroup {} but that directory does not exist",
+                cgroup.display()
+            ),
+        };
+    }
+    // THE ROSTER, read from the cgroup side.
+    let procs = cgroup.join("cgroup.procs");
+    let Ok(text) = fs::read_to_string(&procs) else {
+        return ContainmentEvidence::NotObserved {
+            detail: format!("cannot read {} to confirm membership", procs.display()),
+        };
+    };
+    if !text.lines().any(|l| l.trim().parse::<u32>() == Ok(pid)) {
+        return ContainmentEvidence::NotObserved {
+            detail: format!(
+                "pid {pid} is NOT listed in {}; the kernel and the cgroup disagree",
+                procs.display()
+            ),
+        };
+    }
+    if let Some(unit) = expected_unit {
+        let observed_here = cgroup
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == unit);
+        // A step or supervisor child sits one level BELOW the scope, so an ancestor match counts.
+        let observed_above = cgroup.ancestors().any(|a| {
+            a.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == unit)
+        });
+        if !observed_here && !observed_above {
+            return ContainmentEvidence::NotObserved {
+                detail: format!(
+                    "pid {pid} is contained in {}, but the promised unit was {unit}; the caps and \
+                     the kill path were arranged on a different cgroup",
+                    cgroup.display()
+                ),
+            };
+        }
+    }
+    ContainmentEvidence::Observed(ContainmentProof {
+        cgroup,
+        pid,
+        unit: expected_unit.map(str::to_string),
+    })
+}
+
+/// The unit name the parent promised this child, if any.
+///
+/// Public so a consumer can observe against the SAME promise the re-exec made, rather than
+/// inventing its own idea of which cgroup it ought to be in.
+pub fn promised_unit() -> Option<String> {
+    std::env::var(ENV_SCOPE_UNIT).ok().filter(|u| !u.is_empty())
+}
+
+/// Why a call to [`attempt_scope_reexec`] RETURNED instead of exec-ing into a scope.
 ///
 /// THE BOOL THIS REPLACES RETURNED SUCCESS TO MEAN DID-NOT-ATTEMPT, and that single conflation
 /// cost a day. `true` covered both "we are already boxed, proceed" and "policy said skip, we never
@@ -278,8 +433,20 @@ fn ensure_aggregate_slice(fraction: f64) -> bool {
 /// So the outcomes are named, and a caller that wants to report or act on the difference now can.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScopeAttempt {
-    /// This process is ALREADY inside the managed scope (anti-recursion). Genuinely boxed.
-    AlreadyInScope,
+    /// This process is ALREADY inside the managed scope, and that was OBSERVED, not read off an
+    /// env var: the live pid was found in the cgroup, from both directions.
+    AlreadyInScope {
+        /// What was observed, so a caller can print the actual cgroup rather than a claim.
+        proof: ContainmentProof,
+    },
+    /// The in-scope SENTINEL is set but the running process could NOT be observed inside a
+    /// cgroup. The caller must proceed (re-exec-ing again would recurse forever on the same
+    /// sentinel) but MUST NOT report containment: this is the case where every consumer used to
+    /// print "boxing ACTIVE" on the strength of an environment variable.
+    SentinelWithoutContainment {
+        /// Which observation failed.
+        detail: String,
+    },
     /// No attempt was made, by policy — currently the `CI`/`GITHUB_ACTIONS` skip. Says nothing
     /// about whether boxing is possible here, because nothing was asked.
     SkippedByPolicy {
@@ -308,7 +475,9 @@ impl ScopeAttempt {
     pub fn may_proceed(&self) -> bool {
         matches!(
             self,
-            ScopeAttempt::AlreadyInScope | ScopeAttempt::SkippedByPolicy { .. }
+            ScopeAttempt::AlreadyInScope { .. }
+                | ScopeAttempt::SkippedByPolicy { .. }
+                | ScopeAttempt::SentinelWithoutContainment { .. }
         )
     }
 
@@ -316,21 +485,43 @@ impl ScopeAttempt {
     ///
     /// This is the predicate every caller that says "boxing ACTIVE" should have been using.
     pub fn is_contained(&self) -> bool {
-        matches!(self, ScopeAttempt::AlreadyInScope)
+        matches!(self, ScopeAttempt::AlreadyInScope { .. })
+    }
+
+    /// The observed containment evidence, when there is any. `None` for every other outcome —
+    /// which is the point: skipped and unavailable can never produce a proof, so they can never
+    /// qualify.
+    pub fn proof(&self) -> Option<&ContainmentProof> {
+        match self {
+            ScopeAttempt::AlreadyInScope { proof } => Some(proof),
+            _ => None,
+        }
     }
 
     /// Whether the capability question was even asked. `false` for the policy skip.
     pub fn attempted(&self) -> bool {
-        !matches!(
+        matches!(
             self,
-            ScopeAttempt::SkippedByPolicy { .. } | ScopeAttempt::AlreadyInScope
+            ScopeAttempt::Unavailable { .. } | ScopeAttempt::ExecFailed { .. }
         )
     }
 
     /// One clause naming what happened, for a caller composing a diagnostic.
     pub fn describe(&self) -> String {
         match self {
-            ScopeAttempt::AlreadyInScope => "already inside the managed scope".to_string(),
+            ScopeAttempt::AlreadyInScope { proof } => format!(
+                "pid {} observed in {}{}",
+                proof.pid,
+                proof.cgroup.display(),
+                match &proof.unit {
+                    Some(u) => format!(" (promised unit {u})"),
+                    None => String::new(),
+                }
+            ),
+            ScopeAttempt::SentinelWithoutContainment { detail } => format!(
+                "the in-scope sentinel is set but containment could NOT be observed ({detail}); \
+                 proceeding UNCONTAINED rather than claiming boxing on an environment variable"
+            ),
             ScopeAttempt::SkippedByPolicy { reason } => format!(
                 "scope setup was SKIPPED BY POLICY because ${reason} is set; whether boxing is \
                  possible here was NOT tested (set {FORCE_ATTEMPT_ENV}=1 to find out)"
@@ -375,14 +566,15 @@ fn policy_skip_reason() -> Option<&'static str> {
 /// A successful `exec` replaces the process and does not return. A `true` return means the process
 /// was already in scope or scope setup is intentionally skipped in CI. A `false` return means the
 /// caller must refuse to continue because the requested containment could not be established.
-pub fn reexec_in_scope(memory_max: Option<i64>, cpu_count: Option<i64>) -> bool {
-    reexec_in_scope_with_limits(memory_max, cpu_count, None)
-}
-
-/// [`reexec_in_scope_with_limits`], reporting WHICH outcome occurred rather than a bare bool.
+/// Re-exec into a delegated transient user scope, reporting WHICH outcome occurred.
 ///
-/// Prefer this. The bool forms are kept so an out-of-tree caller keeps compiling, but a bool
-/// cannot express the difference that matters here — see [`ScopeAttempt`].
+/// THE ONLY PUBLIC ENTRY POINT, and that is deliberate. The bool forms that used to sit beside it
+/// returned `true` for both "already contained" and "skipped, never attempted", so every consumer
+/// that read one could not tell containment from a no-op — and each of them printed "boxing
+/// ACTIVE" anyway. Keeping a convenience bool "so out-of-tree callers keep compiling" would have
+/// kept the ambiguity reachable, which is the defect, so the bools are gone rather than
+/// deprecated. See [`ScopeAttempt`], and [`ScopeAttempt::proof`] for the only outcome that can
+/// carry observed containment.
 pub fn attempt_scope_reexec(
     memory_max: Option<i64>,
     cpu_count: Option<i64>,
@@ -500,21 +692,32 @@ pub fn parse_systemd_duration_secs(raw: &str) -> Option<i64> {
 /// LARGER than the runner's own in-process run budget, so the ordering is
 /// per-step < in-process run budget < scope RuntimeMaxSec < whatever the CI provider does. Each
 /// level exists to stop the next one from being the thing that fires.
-pub fn reexec_in_scope_with_limits(
-    memory_max: Option<i64>,
-    cpu_count: Option<i64>,
-    runtime_max_s: Option<i64>,
-) -> bool {
-    attempt_scope_reexec_inner(memory_max, cpu_count, runtime_max_s).may_proceed()
-}
-
 fn attempt_scope_reexec_inner(
     memory_max: Option<i64>,
     cpu_count: Option<i64>,
     runtime_max_s: Option<i64>,
 ) -> ScopeAttempt {
     if in_scope() {
-        return ScopeAttempt::AlreadyInScope;
+        // THE SENTINEL SAYS WE ARE BOXED; GO AND LOOK. Everything downstream keyed "boxing ACTIVE"
+        // off this branch, and this branch used to be an env-var read.
+        // A PROMISED UNIT IS REQUIRED, and demanding it is what makes the observation mean
+        // something: the re-exec sets sentinel and unit TOGETHER, and without a unit "observed in
+        // some cgroup" is true of almost every process on a cgroup-v2 host — which would wave
+        // through exactly the forged claim this check exists to catch.
+        let evidence = match promised_unit() {
+            Some(unit) => observe_own_containment(Some(&unit)),
+            None => ContainmentEvidence::NotObserved {
+                detail: "the in-scope sentinel is set but no scope unit was carried with it; the \
+                         re-exec always sets both, so this claim names no cgroup to check"
+                    .to_string(),
+            },
+        };
+        return match evidence {
+            ContainmentEvidence::Observed(proof) => ScopeAttempt::AlreadyInScope { proof },
+            ContainmentEvidence::NotObserved { detail } => {
+                ScopeAttempt::SentinelWithoutContainment { detail }
+            }
+        };
     }
     // POLICY SKIP, UNCHANGED IN EFFECT AND NOW HONEST ABOUT ITSELF. It is stated rather than
     // silent, it no longer borrows the capability probe's wording for a probe it did not run, and
@@ -1511,10 +1714,104 @@ impl CgroupManager for Cgroups {
 mod tests {
 
     #[test]
+    fn only_observed_containment_can_qualify() {
+        // SKIPPED AND UNAVAILABLE CAN NEVER CARRY A PROOF. That is the whole certification
+        // condition: a typed outcome is worthless if a no-attempt can still answer "contained".
+        let skipped = ScopeAttempt::SkippedByPolicy { reason: "CI" };
+        let unavail = ScopeAttempt::Unavailable {
+            detail: "probe failed".into(),
+        };
+        let execfail = ScopeAttempt::ExecFailed {
+            detail: "ENOENT".into(),
+        };
+        let sentinel = ScopeAttempt::SentinelWithoutContainment {
+            detail: "root cgroup".into(),
+        };
+        for a in [&skipped, &unavail, &execfail, &sentinel] {
+            assert!(!a.is_contained(), "{a:?} must not qualify as contained");
+            assert!(
+                a.proof().is_none(),
+                "{a:?} must not carry a containment proof"
+            );
+        }
+        // A sentinel we could not confirm must still let the caller PROCEED -- re-exec-ing again
+        // would recurse forever on the same sentinel -- while never counting as containment.
+        assert!(sentinel.may_proceed());
+        assert!(!sentinel.is_contained());
+
+        let proof = ContainmentProof {
+            cgroup: std::path::PathBuf::from("/sys/fs/cgroup/x.scope"),
+            pid: 1234,
+            unit: Some("x.scope".into()),
+        };
+        let boxed = ScopeAttempt::AlreadyInScope {
+            proof: proof.clone(),
+        };
+        assert!(boxed.is_contained());
+        assert_eq!(boxed.proof(), Some(&proof));
+        assert!(
+            boxed.describe().contains("pid 1234"),
+            "{}",
+            boxed.describe()
+        );
+    }
+
+    #[test]
+    fn observation_of_this_live_process_is_two_directional() {
+        // Runs against the REAL /proc and /sys/fs/cgroup of the test process, so it is a
+        // statement about a live pid rather than about a fixture.
+        let seen = observe_own_containment(None);
+        match &seen {
+            ContainmentEvidence::Observed(p) => {
+                assert_eq!(p.pid, std::process::id());
+                assert!(p.cgroup.starts_with(CGROUP_ROOT), "{:?}", p.cgroup);
+                // The roster direction: our pid really is in that cgroup's own list.
+                let roster = fs::read_to_string(p.cgroup.join("cgroup.procs")).unwrap_or_default();
+                assert!(
+                    roster.lines().any(|l| l.trim() == p.pid.to_string()),
+                    "claimed {} but the roster does not list the pid",
+                    p.cgroup.display()
+                );
+            }
+            // A host without cgroup-v2 legitimately cannot observe; it must then say so rather
+            // than answer yes.
+            ContainmentEvidence::NotObserved { detail } => assert!(!detail.is_empty()),
+        }
+        // A unit this process is definitely not in must never be confirmed.
+        let wrong = observe_own_containment(Some("scdr-definitely-not-this-unit.scope"));
+        assert!(wrong.proof().is_none(), "{}", wrong.describe());
+
+        // THE ROSTER DIRECTION, bound to a cgroup that genuinely EXISTS but does not list us: our
+        // own PARENT. `/proc/self/cgroup` would happily name a path; only the roster says whether
+        // the pid is in it. Deleting the roster check makes this case pass, which is what makes
+        // this assertion worth having.
+        if let ContainmentEvidence::Observed(p) = &seen {
+            if let Some(parent) = p.cgroup.parent() {
+                if parent.is_dir() && parent != std::path::Path::new(CGROUP_ROOT) {
+                    let up = observe_containment_at(parent, p.pid, None);
+                    assert!(
+                        up.proof().is_none(),
+                        "pid {} must NOT be observable in its parent cgroup {}: {}",
+                        p.pid,
+                        parent.display(),
+                        up.describe()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn scope_attempt_separates_the_four_outcomes() {
         // The bool this replaces answered "may I proceed", which is a DIFFERENT question from
         // "was containment established" and from "did we even ask". All three now have answers.
-        let in_scope = ScopeAttempt::AlreadyInScope;
+        let in_scope = ScopeAttempt::AlreadyInScope {
+            proof: ContainmentProof {
+                cgroup: std::path::PathBuf::from("/sys/fs/cgroup/x.scope"),
+                pid: 1,
+                unit: Some("x.scope".into()),
+            },
+        };
         let skipped = ScopeAttempt::SkippedByPolicy { reason: "CI" };
         let unavail = ScopeAttempt::Unavailable {
             detail: "probe failed".into(),

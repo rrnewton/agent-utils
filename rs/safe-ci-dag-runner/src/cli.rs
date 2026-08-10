@@ -35,8 +35,9 @@ use std::time::Instant;
 use crate::cgroup::{
     apply_specific_cores, attempt_scope_reexec, enable_outer_oom_group,
     expected_outer_memory_max_bytes, expected_scope_runtime_max_s, install_scope_teardown,
-    is_in_scope, outer_memory_max_bytes, verify_scope_limits, verify_scope_runtime_max,
-    CgroupManager, Cgroups, ScopeAttempt, DIRECT_CGROUP_ENV, FORCE_ATTEMPT_ENV,
+    is_in_scope, observe_own_containment, outer_memory_max_bytes, verify_scope_limits,
+    verify_scope_runtime_max, CgroupManager, Cgroups, ScopeAttempt, DIRECT_CGROUP_ENV,
+    FORCE_ATTEMPT_ENV,
 };
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
@@ -853,6 +854,36 @@ fn resolve_cgroups(
         return Ok(None);
     }
     if is_in_scope() {
+        // THE SENTINEL IS A PROMISE; GO AND LOOK BEFORE CLAIMING ANYTHING. `is_in_scope()` reads
+        // an environment variable this process set for itself, and every "boxing ACTIVE" line
+        // downstream used to rest on it. Observing the live pid inside the cgroup, from both the
+        // kernel's view and the cgroup's own roster, is what turns the claim into a fact.
+        // A PROMISED UNIT IS REQUIRED HERE, and demanding it is what makes the observation mean
+        // something. The re-exec sets the sentinel and the unit name TOGETHER, so a sentinel with
+        // no unit has no referent — and without one, "observed in some cgroup" is true of almost
+        // every process on a cgroup-v2 host, which would wave through exactly the forged claim
+        // this check exists to catch.
+        // ONE OBSERVATION SITE, AND IT IS THE TYPED OUTCOME. Calling `observe_own_containment`
+        // here directly would leave `ScopeAttempt::AlreadyInScope` with no consumer at all — the
+        // variant would be unreachable from the binary, and mutating the enum's observation away
+        // would not fail a single test. Measured: it did not. So the in-scope branch goes through
+        // the same entry point as every other outcome.
+        let attempt = attempt_scope_reexec(None, None, None);
+        if !attempt.is_contained() {
+            let msg = format!(
+                "the in-scope sentinel is set but containment could NOT be observed: {}",
+                attempt.describe()
+            );
+            if allow_failure {
+                eprintln!("{PROG}: warning: {msg}; running UNBOXED (--allow-cgroup-failure).");
+                return Ok(None);
+            }
+            eprintln!(
+                "{PROG}: ERROR: {msg}. Refusing to report boxing on the strength of an \
+                 environment variable."
+            );
+            return Err(3);
+        }
         let expected_memory_max = expected_outer_memory_max_bytes();
         if expected_memory_max
             .is_none_or(|cap| !enable_outer_oom_group() || !verify_scope_limits(cap))
@@ -886,9 +917,12 @@ fn resolve_cgroups(
         let mgr = Cgroups::new();
         if mgr.enabled() {
             install_scope_teardown();
+            // NAME THE OBSERVED CGROUP, not the intention. A reader can now check the claim
+            // against `/sys/fs/cgroup` themselves instead of taking the word ACTIVE for it.
             eprintln!(
                 "{PROG}: cgroup boxing ACTIVE (two-level cgroup-v2 scope; per-step memory/CPU caps \
-                 + setsid-proof teardown)."
+                 + setsid-proof teardown); containment OBSERVED: {}.",
+                attempt.describe()
             );
             return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
         }
@@ -916,11 +950,16 @@ fn resolve_cgroups(
     if std::env::var(DIRECT_CGROUP_ENV).is_ok_and(|v| v == "1") {
         let mgr = Cgroups::direct();
         if mgr.enabled() {
+            // SAY WHOSE CONTAINMENT THIS IS. The runner itself is NOT moved into this cgroup —
+            // only each step is, at launch — so an observation of the RUNNER's pid would be the
+            // wrong proof and claiming it would be worse than claiming nothing. State the route,
+            // state where the runner actually sits, and leave the per-step proof to teardown.
             eprintln!(
                 "{PROG}: cgroup teardown ACTIVE via direct cgroupfs (no systemd scope): steps are \
                  KILLABLE as a subtree, including setsid/double-fork escapees. Per-step \
                  memory/CPU caps are NOT enforced on this route — this is containment for \
-                 teardown, not resource boxing."
+                 teardown, not resource boxing. The RUNNER is not itself contained here: {}.",
+                observe_own_containment(None).describe()
             );
             return Ok(Some(Arc::new(mgr) as Arc<dyn CgroupManager>));
         }
