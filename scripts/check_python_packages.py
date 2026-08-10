@@ -46,6 +46,7 @@ class Project:
     commands: tuple[str, ...]
     resources: tuple[str, ...]
     required_dependencies: tuple[str, ...]
+    command_userguides: tuple[tuple[str, str], ...] = ()
     #: Doc-lint terms that do not apply to this distribution, because the term is the tool's
     #: SUBJECT MATTER rather than an accidental reference to a sibling implementation. Named per
     #: project so a waiver stays visible instead of becoming a hole in the rule.
@@ -114,17 +115,19 @@ PROJECTS: tuple[Project, ...] = (
         directory="herdr_run",
         distribution="herdr-run",
         package="herdr_run",
-        commands=("herdr-run",),
+        commands=("herdr-run", "herdr-agent"),
         # herdr-run ALLOWLISTS `cargo` as a target program, so its docs must name it. herdr-run has
         # no Rust implementation, so this is not a sibling-toolchain leak.
         doc_term_exemptions=("cargo",),
         resources=(
             "README.md",
             "USER_GUIDE.md",
+            "AGENT_USER_GUIDE.md",
             "py.typed",
             "examples/project.yaml",
         ),
         required_dependencies=("pyyaml",),
+        command_userguides=(("herdr-agent", "AGENT_USER_GUIDE.md"),),
     ),
 )
 
@@ -709,6 +712,7 @@ def _smoke_wheel(
     wheel: Path,
     version: str,
     userguide: str,
+    resources: tuple[tuple[str, bytes], ...],
     smoke_root: Path,
 ) -> None:
     environment_root = smoke_root / project.directory
@@ -773,6 +777,8 @@ def _smoke_wheel(
                 f"python -m {project.package} --userguide differs from packaged USER_GUIDE.md"
             )
 
+    command_userguides = dict(project.command_userguides)
+    resource_text = {name: data.decode("utf-8") for name, data in resources}
     for command in project.commands:
         executable = bindir / command
         if not executable.is_file():
@@ -789,10 +795,14 @@ def _smoke_wheel(
                 raise CheckError(f"{command} {' '.join(command_args)} emitted a traceback")
             if command_args == ["--version"] and version not in combined:
                 raise CheckError(f"{command} --version did not report {version!r}: {combined!r}")
+            expected_guide_name = command_userguides.get(command, "USER_GUIDE.md")
+            expected_guide = userguide if expected_guide_name == "USER_GUIDE.md" else resource_text[expected_guide_name]
             if command_args == ["--userguide"] and (
-                result.stdout != userguide or result.stderr
+                result.stdout != expected_guide or result.stderr
             ):
-                raise CheckError(f"{command} --userguide differs from packaged USER_GUIDE.md")
+                raise CheckError(
+                    f"{command} --userguide differs from packaged {expected_guide_name}"
+                )
 
 
 def main() -> int:
@@ -838,6 +848,7 @@ def main() -> int:
                     sdist_wheel,
                     version,
                     sdist_result.userguide,
+                    sdist_result.resources,
                     smoke_root,
                 )
                 print(

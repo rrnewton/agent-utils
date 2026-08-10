@@ -8,6 +8,7 @@ import os
 import sys
 from collections.abc import Sequence
 
+from herdr_run import __version__
 from herdr_run.agent import Target, drain, read, send, status
 from herdr_run.client import HerdrClient
 from herdr_run.errors import AgentPending, AgentPossiblySubmitted, HerdrRunError
@@ -19,7 +20,9 @@ def _parser() -> argparse.ArgumentParser:
         description="Queue, submit, inspect, and read interactive agents hosted in Herdr panes.",
         allow_abbrev=False,
     )
-    parser.add_argument("command", choices=("send", "drain", "status", "read", "userguide"))
+    parser.add_argument("--version", action="version", version=f"herdr-agent {__version__}")
+    parser.add_argument("--userguide", action="store_true", help="print the installed user guide and exit")
+    parser.add_argument("command", nargs="?", choices=("send", "drain", "status", "read", "userguide"))
     parser.add_argument("text", nargs="?")
     parser.add_argument("--file", help="read a message from this artifact")
     parser.add_argument("--pane")
@@ -79,8 +82,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser = _parser()
     args = parser.parse_intermixed_args(list(argv) if argv is not None else None)
-    if args.command == "userguide":
+    if args.userguide or args.command == "userguide":
         return _guide()
+    if args.command is None:
+        parser.error("the following arguments are required: command")
     if args.ready_timeout < 0 or args.working_timeout <= 0 or args.max_attempts <= 0 or args.lines <= 0:
         parser.error("timeouts, max-attempts, and lines must be positive (ready-timeout may be zero)")
     client = HerdrClient(herdr_bin=str(args.herdr_bin))
