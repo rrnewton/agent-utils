@@ -293,13 +293,14 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     generated_makefile = (tmp_path / "Makefile").read_text(encoding="utf-8")
     assert generated_makefile.startswith(".PHONY: serve")
     assert "run-stats:\n\tpython3 run_stats.py\n" in generated_makefile
-    assert "query:\n\t@python3 query.py $(QUERY_ARGS)\n" in generated_makefile
+    assert "query:\n\t@./timeline $(QUERY_ARGS)\n" in generated_makefile
     assert (tmp_path / "run_stats.py").is_file()
     assert (tmp_path / "run_stats.py").stat().st_mode & 0o111
+    assert (tmp_path / "timeline").stat().st_mode & 0o111
     generated_readme = (tmp_path / "README.md").read_text(encoding="utf-8")
     assert "## Read-only query quickstart" in generated_readme
-    assert "--format jsonl list agents --team TEAM" in generated_readme
-    assert "--format markdown show phase:TEAM::PHASE_ID --transcript" in generated_readme
+    assert "./timeline agents --team TEAM --format jsonl" in generated_readme
+    assert "./timeline show phase:TEAM::PHASE_ID --transcript" in generated_readme
     assert "data/export.json" in generated_readme
     timeline = json.loads((tmp_path / "data" / "timeline.json").read_text(encoding="utf-8"))
     assert len(timeline["agents"]) == 2
@@ -1787,13 +1788,10 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         assert phase["detail_path"].startswith(f"data/details/{phase['team']}/")
     assert (output / "Makefile").is_file()
     assert (output / "query.py").is_file()
+    assert (output / "timeline").stat().st_mode & 0o111
     query_result = subprocess.run(
         (
-            sys.executable,
-            str(output / "query.py"),
-            "--output",
-            str(output),
-            "list",
+            str(output / "timeline"),
             "teams",
         ),
         cwd=tmp_path,
@@ -1818,8 +1816,8 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     assert json.loads(make_query_result.stdout)["count"] == 2
     exported_readme = (output / "README.md").read_text(encoding="utf-8")
     assert "## Read-only query quickstart" in exported_readme
-    assert "--format jsonl list agents --team TEAM" in exported_readme
-    assert "--format markdown show phase:TEAM::PHASE_ID --transcript" in exported_readme
+    assert "./timeline agents --team TEAM --format jsonl" in exported_readme
+    assert "./timeline show phase:TEAM::PHASE_ID --transcript" in exported_readme
     assert "data/export.json" in exported_readme
     assert (output / ".agent-team-timeline.json").is_file()
     export_manifest = json.loads(

@@ -47,10 +47,13 @@ export timezone controls date-bound parsing and the shared display axis, not cac
 
 ### Read-only query boundary
 
-`agent-team-timeline query` reads the deterministic presentation projection rather than model-cache
-internals. Its only inputs are `data/timeline.json`, referenced `data/details/*.json`, and referenced
-rollup Markdown beneath the selected archive root. Path resolution fails closed on absolute or
-escaping references. Querying has no write path and can never invoke a model.
+The installed `agent-team-timeline query` command and the archive-local `./timeline` Python
+entrypoint read the deterministic presentation projection rather than model-cache internals. The
+archive entrypoint is dependency-free, resolves its default archive from its own directory, and is
+copied byte-for-byte with the compatibility `query.py` launcher. Their only inputs are
+`data/timeline.json`, referenced `data/details/*.json`, and referenced rollup Markdown beneath the
+selected archive root. Path resolution fails closed on absolute or escaping references. Querying
+has no write path and can never invoke a model.
 
 The `prompts` and `messages` query actions are an independent read-only boundary over
 `extracted/transcripts/`; they do not require `data/timeline.json`. The loader verifies the schema

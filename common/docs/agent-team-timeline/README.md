@@ -47,19 +47,22 @@ agent-team-timeline refresh \
   --source-host build-host-01
 
 cd ./timelines/example-team
-make serve
+python3 serve.py --port 8765
 # in another shell, inspect every run and the exact model-token ledger
-make run-stats
-# or navigate the same archive without a browser
-make query
-make query QUERY_ARGS='--format jsonl list agents --team example-team'
-make query QUERY_ARGS='--format markdown show phase:example-team::PHASE_ID --transcript'
-make query QUERY_ARGS='--format json search "reproducible build" --scope all --limit 10'
-make prompts PROMPT_ARGS='--range 200-300'
+python3 run_stats.py
+# or navigate the same archive with its dependency-free Python CLI
+./timeline --help
+./timeline teams
+./timeline agents --team example-team --format jsonl
+./timeline show phase:example-team::PHASE_ID --transcript --format markdown
+./timeline search "reproducible build" --scope all --limit 10
+./timeline prompts --range 200-300
+./timeline prompts --format jsonl > prompts.jsonl
 ```
 
-`list` and `search` return stable `team:`, `agent:`, `phase:`, and `rollup:` references that can be
-copied into `show`. In an exported package, `data/export.json` records the requested slice under
+The `teams`, `agents`, `phases`, `rollups`, and `search` commands return stable `team:`, `agent:`,
+`phase:`, and `rollup:` references that can be copied into `show`. In an exported package,
+`data/export.json` records the requested slice under
 `display_window`; query results report the actual contained team and record intervals. Do not infer
 the slice from file modification times.
 
@@ -77,15 +80,15 @@ model call:
 
 ```bash
 agent-team-timeline extract-transcripts --output ./timelines/example-team
-agent-team-timeline query --output ./timelines/example-team \
-  --format text prompts --range 200-300
+cd ./timelines/example-team
+./timeline prompts --range 200-300
 ```
 
 The full chronological JSONL report is `extracted/transcripts/prompts.jsonl`;
 `messages.jsonl` adds coordinator responses linked mechanically by provider turn identity.
 
-Every archive includes its launcher, static site, normalized message JSON, cached summary data,
-rendered Markdown, source provenance, and run metadata. `make run-stats` prints per-run cache,
+Every archive includes its `./timeline` launcher, static site, normalized message JSON, cached
+summary data, rendered Markdown, source provenance, and run metadata. `python3 run_stats.py` prints per-run cache,
 product, build, and token statistics, followed by the immutable backend receipt ledger. Receipts
 are attributed to successful and failed summarize invocations; any usage-less receipt makes the
 corresponding actual total explicitly `UNKNOWN` instead of zero. Repeating `summarize` on unchanged

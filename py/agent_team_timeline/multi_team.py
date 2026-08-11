@@ -37,6 +37,7 @@ _COMMON_FILES = (
     "serve.py",
     "run_stats.py",
     "query.py",
+    "timeline",
     "Makefile",
     "vendor/README.md",
     "vendor/markdown-it-15.0.0.min.js",
@@ -433,7 +434,11 @@ def _remove_stale_files(output: Path, previous: set[str], current: set[str]) -> 
 def _copy_text_file(source: Path, target: Path) -> bool:
     if not source.is_file():
         raise ValueError(f"rendered team output is missing {source}")
-    return write_text_if_changed(target, source.read_text(encoding="utf-8"))
+    return write_text_if_changed(
+        target,
+        source.read_text(encoding="utf-8"),
+        executable=bool(source.stat().st_mode & 0o111),
+    )
 
 
 def build_combined_archive(
@@ -638,23 +643,25 @@ def build_combined_archive(
             "recorded pipeline runs. Do not open `index.html` directly: browsers block the JSON "
             "fetch from `file://`.\n\n"
             "## Read-only query quickstart\n\n"
-            "`make query` defaults to `list teams` in JSON. The supported output formats are "
-            "`json`, `jsonl`, `markdown`, and `text`. Copy a stable reference returned by `list` or "
+            "Run `./timeline --help` for the archive-local, dependency-free Python CLI. Prompt "
+            "output defaults to readable text; the supported formats are `json`, `jsonl`, "
+            "`markdown`, and `text`. Copy a stable reference returned by a list command or "
             "`search` into `show`; references use `team:TEAM`, `agent:TEAM::ID`, "
             "`phase:TEAM::ID`, or `rollup:TEAM::KIND::START_MS`.\n\n"
             "```bash\n"
-            "make query\n"
-            "make query QUERY_ARGS='--format jsonl list agents --team TEAM'\n"
-            "make query QUERY_ARGS='--format markdown show agent:TEAM::AGENT_ID'\n"
-            "make query QUERY_ARGS='--format markdown show phase:TEAM::PHASE_ID --transcript'\n"
-            "make query QUERY_ARGS='--format json search \"SEARCH TEXT\" --scope all --limit 20'\n"
-            "make prompts PROMPT_ARGS='--range 200-300'\n"
+            "./timeline teams\n"
+            "./timeline agents --team TEAM --format jsonl\n"
+            "./timeline show agent:TEAM::AGENT_ID --format markdown\n"
+            "./timeline show phase:TEAM::PHASE_ID --transcript --format markdown\n"
+            "./timeline search \"SEARCH TEXT\" --scope all --limit 20\n"
+            "./timeline prompts --range 200-300\n"
+            "./timeline prompts --format jsonl > prompts.jsonl\n"
             "```\n\n"
             "When this package contains the optional mechanical transcript projection, its full "
             "prompt report is `extracted/transcripts/prompts.jsonl`; `messages.jsonl` adds "
             "mechanically associated coordinator responses.\n\n"
             "The requested export slice is recorded in `data/export.json` under "
-            "`display_window`; `make query` reports the actual team and record intervals. Do not "
+            "`display_window`; `./timeline` reports the actual team and record intervals. Do not "
             "infer the slice from file modification times.\n"
         )
         changed += int(

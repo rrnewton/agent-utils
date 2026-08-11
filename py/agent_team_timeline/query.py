@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Read-only, machine-friendly navigation over a built timeline archive."""
 
 from __future__ import annotations
@@ -1159,49 +1160,233 @@ def _parse_instant(raw: str, label: str) -> int:
 
 
 def _standalone_add_filters(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--team", action="append", default=[])
-    parser.add_argument("--start-time")
-    parser.add_argument("--end-time")
+    parser.add_argument(
+        "--team",
+        action="append",
+        default=[],
+        metavar="SLUG",
+        help="include one team slug; repeat to include multiple teams",
+    )
+    parser.add_argument(
+        "--start-time",
+        metavar="RFC3339",
+        help="include records at or after this timestamp",
+    )
+    parser.add_argument(
+        "--end-time",
+        metavar="RFC3339",
+        help="exclude records at or after this timestamp",
+    )
     parser.add_argument(
         "--kind",
         action="append",
         choices=("hourly", "daily", "weekly", "monthly", "quarterly"),
         default=[],
+        help="include one rollup kind; repeat to include several",
     )
-    parser.add_argument("--agent")
+    parser.add_argument(
+        "--agent",
+        metavar="REF",
+        help="restrict results to one canonical agent:TEAM::ID reference",
+    )
+
+
+def _standalone_add_transcript_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--team",
+        action="append",
+        default=[],
+        metavar="SLUG",
+        help="include one team slug; repeat to include multiple teams",
+    )
+    parser.add_argument(
+        "--start-time",
+        metavar="RFC3339",
+        help="include records at or after this timestamp",
+    )
+    parser.add_argument(
+        "--end-time",
+        metavar="RFC3339",
+        help="exclude records at or after this timestamp",
+    )
+
+
+def _standalone_add_common_options(
+    parser: argparse.ArgumentParser, default_format: str
+) -> None:
+    parser.add_argument(
+        "--archive",
+        "--output",
+        dest="command_archive",
+        default=None,
+        metavar="PATH",
+        help="read a different archive instead of the one containing this executable",
+    )
+    parser.add_argument(
+        "--format",
+        dest="command_format",
+        choices=("json", "jsonl", "markdown", "text"),
+        default=None,
+        help=f"output format (default: {default_format})",
+    )
+    parser.set_defaults(default_format=default_format)
 
 
 def _standalone_parser() -> argparse.ArgumentParser:
+    program = Path(sys.argv[0]).name
     parser = argparse.ArgumentParser(
-        prog="query.py",
-        description="Read-only navigation over this built agent-team timeline.",
+        prog=program,
+        description=(
+            "Read prompts, responses, agents, and summaries from this "
+            "agent-team timeline archive."
+        ),
+        epilog=(
+            "examples:\n"
+            "  ./timeline prompts\n"
+            "  ./timeline prompts --range 200-300\n"
+            "  ./timeline prompts --format jsonl > prompts.jsonl\n"
+            "  ./timeline messages --range 200-300\n"
+            "  ./timeline agents --team codex-coord-030\n"
+            "  ./timeline search 'reproducible build' --scope all\n\n"
+            "Prompt ranges are 1-based and inclusive. The default archive is the "
+            "directory containing this executable."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--output", default=".")
     parser.add_argument(
-        "--format", choices=("json", "jsonl", "markdown", "text"), default="json"
+        "--archive",
+        "--output",
+        dest="global_archive",
+        default=str(Path(__file__).resolve().parent),
+        metavar="PATH",
+        help="archive directory (default: directory containing this executable)",
     )
-    sub = parser.add_subparsers(dest="action", required=True)
-    listing = sub.add_parser("list")
-    listing.add_argument("resource", choices=("teams", "agents", "phases", "rollups"))
+    parser.add_argument(
+        "--format",
+        dest="global_format",
+        choices=("json", "jsonl", "markdown", "text"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s archive-query schema {QUERY_SCHEMA_VERSION}",
+    )
+    sub = parser.add_subparsers(dest="action", required=True, metavar="COMMAND")
+
+    for resource, help_text in (
+        ("teams", "list teams represented in the archive"),
+        ("agents", "list coordinator and subagent lifetimes"),
+        ("phases", "list summarized agent work phases"),
+        ("rollups", "list hourly, daily, weekly, and longer summaries"),
+    ):
+        resource_parser = sub.add_parser(resource, help=help_text, description=help_text)
+        _standalone_add_filters(resource_parser)
+        _standalone_add_common_options(resource_parser, "json")
+
+    prompts = sub.add_parser(
+        "prompts",
+        help="print chronological verbatim prompts",
+        description="Print chronological verbatim prompts across the selected teams.",
+        epilog=(
+            "examples:\n"
+            "  ./timeline prompts\n"
+            "  ./timeline prompts --range 200-300\n"
+            "  ./timeline prompts --team orc-coord-014 --format jsonl"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    prompts.add_argument(
+        "--range",
+        dest="ordinal_range",
+        metavar="N[-M]",
+        help="one prompt ordinal or an inclusive range, for example 200-300",
+    )
+    _standalone_add_transcript_filters(prompts)
+    _standalone_add_common_options(prompts, "text")
+
+    messages = sub.add_parser(
+        "messages",
+        help="print prompts and their mechanically linked responses",
+        description=(
+            "Print chronological prompts plus coordinator responses mechanically "
+            "associated with the selected prompts."
+        ),
+    )
+    messages.add_argument(
+        "--range",
+        dest="ordinal_range",
+        metavar="N[-M]",
+        help="one prompt ordinal or an inclusive range, for example 200-300",
+    )
+    _standalone_add_transcript_filters(messages)
+    _standalone_add_common_options(messages, "text")
+
+    listing = sub.add_parser(
+        "list",
+        help="compatibility form of teams/agents/phases/rollups",
+        description="List one class of timeline record.",
+    )
+    listing.add_argument(
+        "resource",
+        choices=("teams", "agents", "phases", "rollups"),
+        help="record class to list",
+    )
     _standalone_add_filters(listing)
-    showing = sub.add_parser("show")
-    showing.add_argument("reference")
-    showing.add_argument("--transcript", action="store_true")
-    searching = sub.add_parser("search")
-    searching.add_argument("text")
-    searching.add_argument(
-        "--scope", choices=("summaries", "transcripts", "all"), default="summaries"
+    _standalone_add_common_options(listing, "json")
+
+    showing = sub.add_parser(
+        "show",
+        help="resolve one stable team, agent, phase, or rollup reference",
+        description="Show one record selected by a stable reference from a list or search.",
     )
-    searching.add_argument("--case-sensitive", action="store_true")
-    searching.add_argument("--limit", type=int, default=50)
+    showing.add_argument(
+        "reference", help="team:, agent:, phase:, or rollup: reference"
+    )
+    showing.add_argument(
+        "--transcript",
+        action="store_true",
+        help="include condensed transcript messages for a work phase",
+    )
+    _standalone_add_common_options(showing, "json")
+
+    searching = sub.add_parser(
+        "search",
+        help="search summaries and condensed transcript messages",
+        description="Search summary text, condensed transcripts, or both.",
+    )
+    searching.add_argument("text", help="literal text to find")
+    searching.add_argument(
+        "--scope",
+        choices=("summaries", "transcripts", "all"),
+        default="summaries",
+        help="content to search (default: %(default)s)",
+    )
+    searching.add_argument(
+        "--case-sensitive", action="store_true", help="preserve letter case"
+    )
+    searching.add_argument(
+        "--limit", type=int, default=50, help="maximum matches (default: %(default)s)"
+    )
     _standalone_add_filters(searching)
-    for action in ("prompts", "messages"):
-        transcript = sub.add_parser(action)
-        transcript.add_argument("--range", dest="ordinal_range")
-        transcript.add_argument("--team", action="append", default=[])
-        transcript.add_argument("--start-time")
-        transcript.add_argument("--end-time")
+    _standalone_add_common_options(searching, "json")
     return parser
+
+
+def _standalone_output_format(ns: argparse.Namespace) -> str:
+    command_format: object = getattr(ns, "command_format", None)
+    global_format: object = getattr(ns, "global_format", None)
+    default_format: object = getattr(ns, "default_format", "json")
+    selected = command_format or global_format or default_format
+    if not isinstance(selected, str) or selected not in {
+        "json",
+        "jsonl",
+        "markdown",
+        "text",
+    }:
+        raise ValueError("output format must be json, jsonl, markdown, or text")
+    return selected
 
 
 def _standalone_filters(ns: argparse.Namespace) -> QueryFilters:
@@ -1242,9 +1427,19 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
     parser = _standalone_parser()
     ns = parser.parse_args(list(argv) if argv is not None else None)
     try:
-        output = Path(str(ns.output)).expanduser()
+        command_archive: object = getattr(ns, "command_archive", None)
+        global_archive: object = getattr(ns, "global_archive", None)
+        if command_archive is not None and not isinstance(command_archive, str):
+            raise ValueError("--archive must be a path")
+        if not isinstance(global_archive, str):
+            raise ValueError("--archive must be a path")
+        output = Path(command_archive or global_archive).expanduser()
         action = str(ns.action)
-        if action == "list":
+        if action in {"teams", "agents", "phases", "rollups"}:
+            query = TimelineQuery(output)
+            command = f"list {action}"
+            items = query.list_records(action, _standalone_filters(ns))
+        elif action == "list":
             query = TimelineQuery(output)
             resource = str(ns.resource)
             command = f"list {resource}"
@@ -1285,10 +1480,10 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
             )
         else:
             raise ValueError(f"unsupported query action {action!r}")
-        print(format_query(command, items, str(ns.format)), end="")
+        print(format_query(command, items, _standalone_output_format(ns)), end="")
         return 0
     except (OSError, ValueError) as error:
-        print(f"query.py: {error}", file=sys.stderr)
+        print(f"{Path(sys.argv[0]).name}: {error}", file=sys.stderr)
         return 2
 
 

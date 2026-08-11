@@ -521,6 +521,11 @@ def export_transcripts(
             archive / "query.py", standalone_query_source(), executable=True
         )
     )
+    changed += int(
+        write_text_if_changed(
+            archive / "timeline", standalone_query_source(), executable=True
+        )
+    )
     changed += int(write_text_if_changed(archive / "Makefile", archive_makefile()))
     return TranscriptExportReport(
         teams=len(ordered_teams),

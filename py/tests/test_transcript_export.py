@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import stat
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
@@ -97,7 +99,7 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     assert report.prompts == 2
     assert report.responses == 1
     assert report.system_inputs == 1
-    assert report.files_changed == 7
+    assert report.files_changed == 8
     assert export_transcripts(tmp_path, (first,)).files_changed == 0
 
     # Simulate a provider rewrite that drops an old prompt/response while exposing
@@ -176,6 +178,86 @@ def test_prompt_query_range_works_without_a_built_timeline(
     lines = capsys.readouterr().out.splitlines()
     assert len(lines) == 1
     record = as_object(narrow_json(json.loads(lines[0])), "query record")
+    assert record["ordinal"] == 3
+    assert record["text"] == "Third"
+
+
+def test_archive_timeline_cli_is_discoverable_and_cwd_independent(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive with spaces"
+    archive.mkdir()
+    team = _team(
+        tuple(
+            _event(f"prompt-{index}", f"turn-{index}", index * 100, "user_prompt", text, index)
+            for index, text in enumerate(("First", "Second", "Third", "Fourth"), 1)
+        )
+    )
+    export_transcripts(archive, (team,))
+    launcher = archive / "timeline"
+    assert launcher.is_file()
+    assert launcher.stat().st_mode & stat.S_IXUSR
+
+    unrelated = tmp_path / "unrelated working directory"
+    unrelated.mkdir()
+    top_help = subprocess.run(
+        (str(launcher), "--help"),
+        cwd=unrelated,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert top_help.returncode == 0, top_help.stderr
+    assert "./timeline prompts --range 200-300" in top_help.stdout
+    assert "directory containing this executable" in top_help.stdout
+    for action in (
+        "prompts",
+        "messages",
+        "teams",
+        "agents",
+        "phases",
+        "rollups",
+        "show",
+        "search",
+        "list",
+    ):
+        action_help = subprocess.run(
+            (str(launcher), action, "--help"),
+            cwd=unrelated,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert action_help.returncode == 0, action_help.stderr
+        assert "options:" in action_help.stdout
+
+    readable = subprocess.run(
+        (str(launcher), "prompts", "--range", "2-3"),
+        cwd=unrelated,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert readable.returncode == 0, readable.stderr
+    assert readable.stderr == ""
+    assert "prompt #2" in readable.stdout
+    assert "Second" in readable.stdout
+    assert "Third" in readable.stdout
+    assert "First" not in readable.stdout
+    assert "Fourth" not in readable.stdout
+
+    machine = subprocess.run(
+        (str(launcher), "prompts", "--range", "3", "--format", "jsonl"),
+        cwd=unrelated,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert machine.returncode == 0, machine.stderr
+    assert machine.stderr == ""
+    lines = machine.stdout.splitlines()
+    assert len(lines) == 1
+    record = as_object(narrow_json(json.loads(lines[0])), "timeline JSONL record")
     assert record["ordinal"] == 3
     assert record["text"] == "Third"
 

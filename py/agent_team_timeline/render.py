@@ -575,18 +575,18 @@ def standalone_query_source() -> str:
 
 
 def archive_makefile() -> str:
-    """Return the generated archive's local serve/stats/query Makefile."""
+    """Return optional compatibility wrappers for common archive commands."""
 
     return (
         ".PHONY: serve open run-stats query prompts\n"
         "PORT ?= 8765\n"
-        "QUERY_ARGS ?= list teams\n\n"
+        "QUERY_ARGS ?= teams\n\n"
         "PROMPT_ARGS ?=\n\n"
         "serve:\n\tpython3 serve.py --port $(PORT)\n\n"
         "open:\n\tpython3 serve.py --port $(PORT) --open\n\n"
         "run-stats:\n\tpython3 run_stats.py\n\n"
-        "query:\n\t@python3 query.py $(QUERY_ARGS)\n\n"
-        "prompts:\n\t@python3 query.py --format text prompts $(PROMPT_ARGS)\n"
+        "query:\n\t@./timeline $(QUERY_ARGS)\n\n"
+        "prompts:\n\t@./timeline prompts $(PROMPT_ARGS)\n"
     )
 
 
@@ -826,6 +826,11 @@ def render_archive(
     )
     changed += int(
         write_text_if_changed(
+            archive / "timeline", standalone_query_source(), executable=True
+        )
+    )
+    changed += int(
+        write_text_if_changed(
             archive / "Makefile",
             archive_makefile(),
         )
@@ -840,23 +845,25 @@ def render_archive(
             "every pipeline run and exact recorded model-token costs. Do not open `index.html` "
             "directly: browsers block the JSON fetch from `file://`.\n\n"
             "## Read-only query quickstart\n\n"
-            "`make query` defaults to `list teams` in JSON. The supported output formats are "
-            "`json`, `jsonl`, `markdown`, and `text`. Copy a stable reference returned by `list` or "
+            "Run `./timeline --help` for the archive-local, dependency-free Python CLI. Prompt "
+            "output defaults to readable text; the supported formats are `json`, `jsonl`, "
+            "`markdown`, and `text`. Copy a stable reference returned by a list command or "
             "`search` into `show`; references use `team:TEAM`, `agent:TEAM::ID`, "
             "`phase:TEAM::ID`, or `rollup:TEAM::KIND::START_MS`.\n\n"
             "```bash\n"
-            "make query\n"
-            "make query QUERY_ARGS='--format jsonl list agents --team TEAM'\n"
-            "make query QUERY_ARGS='--format markdown show agent:TEAM::AGENT_ID'\n"
-            "make query QUERY_ARGS='--format markdown show phase:TEAM::PHASE_ID --transcript'\n"
-            "make query QUERY_ARGS='--format json search \"SEARCH TEXT\" --scope all --limit 20'\n"
-            "make prompts PROMPT_ARGS='--range 200-300'\n"
+            "./timeline teams\n"
+            "./timeline agents --team TEAM --format jsonl\n"
+            "./timeline show agent:TEAM::AGENT_ID --format markdown\n"
+            "./timeline show phase:TEAM::PHASE_ID --transcript --format markdown\n"
+            "./timeline search \"SEARCH TEXT\" --scope all --limit 20\n"
+            "./timeline prompts --range 200-300\n"
+            "./timeline prompts --format jsonl > prompts.jsonl\n"
             "```\n\n"
             "When this package contains the optional mechanical transcript projection, its full "
             "prompt report is `extracted/transcripts/prompts.jsonl`; `messages.jsonl` adds "
             "mechanically associated coordinator responses.\n\n"
             "For an exported package, the requested slice is recorded in `data/export.json` "
-            "under `display_window`; `make query` reports the actual team and record intervals. "
+            "under `display_window`; `./timeline` reports the actual team and record intervals. "
             "Do not infer the slice from file modification times.\n",
         )
     )

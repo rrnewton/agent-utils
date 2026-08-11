@@ -430,7 +430,7 @@ agent-team-timeline export \
   --rollup-kind hourly
 ```
 
-The export has its own archive marker, run receipt, Makefile, and local server launcher. It reads
+The export has its own archive marker, run receipt, `./timeline` query CLI, and local server launcher. It reads
 the durable archive but does not copy or truncate normalized source data and cannot invoke a model.
 If a selected phase or rollup has no cached summary, the site labels it `Summary unavailable` and
 still exposes its normalized transcript and statistics. These build-only placeholders never enter
@@ -508,7 +508,7 @@ example-team/
 ├── .agent-team-timeline.json
 ├── index.html, timeline-core.js, app.js, style.css
 ├── vendor/markdown-it-15.0.0.min.js  # pinned offline Markdown renderer + license
-├── Makefile, serve.py, run_stats.py, README.md
+├── timeline, query.py, Makefile, serve.py, run_stats.py, README.md
 ├── manifest.json
 ├── runs/<timestamp>-<hash>.json
 ├── extracted/transcripts/
@@ -674,36 +674,34 @@ plaintext; encrypted instruction bodies remain unavailable to the archive.
 
 ## Inspect and troubleshoot
 
-Agents and shell scripts can navigate the same archive without starting the website. JSON is the
-default; `--format jsonl` streams one result per line, `--format markdown` renders timeline records,
-and `--format text` prints prompts/responses compactly for terminal review.
+Agents and shell scripts can navigate the same archive without starting the website. Every archive
+ships a dependency-free executable named `timeline`; it locates the archive from its own path, so it
+also works when called from another directory. Prompt and message output defaults to readable text.
+`--format jsonl` streams one result per line, while `--format json` and `--format markdown` serve
+structured and rendered consumers.
 
 ```bash
-agent-team-timeline query --output ./timelines/example-team list teams
-agent-team-timeline query --output ./timelines/example-team list agents \
-  --team example-team --start-time 2026-08-07T02:00:00Z \
-  --end-time 2026-08-07T03:00:00Z
-agent-team-timeline query --output ./timelines/example-team \
-  show 'agent:example-team::SESSION_OR_AGENT_ID'
-agent-team-timeline query --output ./timelines/example-team \
-  show 'phase:example-team::phase-0123456789abcdef' --transcript
-agent-team-timeline query --output ./timelines/example-team \
-  search 'reproducible build' --scope all --team example-team --limit 20
-agent-team-timeline query --output ./timelines/example-team \
-  --format text prompts --range 200-300
-agent-team-timeline query --output ./timelines/example-team \
-  --format jsonl messages --range 200-300
+cd ./timelines/example-team
+./timeline --help
+./timeline teams
+./timeline agents --team example-team \
+  --start-time 2026-08-07T02:00:00Z --end-time 2026-08-07T03:00:00Z
+./timeline show 'agent:example-team::SESSION_OR_AGENT_ID'
+./timeline show 'phase:example-team::phase-0123456789abcdef' --transcript
+./timeline search 'reproducible build' --scope all --team example-team --limit 20
+./timeline prompts --range 200-300
+./timeline prompts --format jsonl > prompts.jsonl
+./timeline messages --range 200-300 --format jsonl
 ```
 
 `prompts` is ordered globally by timestamp and accepts one 1-based inclusive ordinal or `N-M` via
 `--range`; `messages` returns the same prompt selection plus responses linked to those prompts. Both
 also accept repeatable `--team` and half-open RFC3339 time bounds. They read the digest-validated
-`extracted/transcripts/` projection and therefore work even before a website has been built. A
-generated archive exposes the common prompt path as `make prompts
-PROMPT_ARGS='--range 200-300'`.
+`extracted/transcripts/` projection and therefore work even before a website has been built.
+`./timeline prompts --help` documents the range, team, time, and output controls.
 
-`list` supports `teams`, `agents`, `phases`, and `rollups`. Its records carry canonical references
-that `show` accepts directly:
+The `teams`, `agents`, `phases`, and `rollups` commands return records carrying canonical
+references that `show` accepts directly:
 
 - `team:TEAM`
 - `agent:TEAM::SOURCE_AGENT_ID`
@@ -719,8 +717,8 @@ Search is literal and case-insensitive by default. It can scan `summaries`, `tra
 are half-open RFC3339 instants and select records whose intervals overlap the requested range.
 Timeline queries only read `data/timeline.json`, `data/details/*.json`, and referenced summary
 Markdown; prompt/message queries only read the manifest-bound extracted JSONL. Neither invokes a
-model or alters the archive. A generated archive also exposes `make query`, with `QUERY_ARGS`
-defaulting to `list teams`.
+model or alters the archive. The older `query.py` and Make targets remain compatibility wrappers;
+new automation should call `./timeline` directly.
 
 ```bash
 agent-team-timeline inspect --output ./timelines/example-team
