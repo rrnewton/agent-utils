@@ -42,21 +42,21 @@ pub const DEFAULT_SMALL_CPU_TIMEOUT: i64 = 10; // 10 s CPU-time budget
 /// pick a single number that is either too tight for the slow platform or too loose for the fast
 /// one (hiding the very hangs the budget exists to catch).
 ///
-/// 1.0 is a strict no-op. Mirrors Python's `DEFAULT_CPU_TIMEOUT_MULTIPLIER`.
+/// 1.0 is a strict no-op and the default for every execution platform.
 pub const DEFAULT_CPU_TIMEOUT_MULTIPLIER: f64 = 1.0;
 
 /// Environment override for [`DEFAULT_CPU_TIMEOUT_MULTIPLIER`], so a CI lane can set the policy
-/// once for its whole platform. Mirrors Python's `CPU_TIMEOUT_MULTIPLIER_ENV`.
+/// once for its whole platform.
 pub const CPU_TIMEOUT_MULTIPLIER_ENV: &str = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_MULTIPLIER";
 
 /// Companion label naming the platform the multiplier describes; appears verbatim in the breach
-/// message. Mirrors Python's `CPU_TIMEOUT_PLATFORM_ENV`.
+/// message.
 pub const CPU_TIMEOUT_PLATFORM_ENV: &str = "SAFE_CI_DAG_RUNNER_CPU_TIMEOUT_PLATFORM";
 
 /// How a step uses the machine, used for scheduling decisions.
 ///
 /// The serde/string values (`"cpu-bound"`, `"latency-bound"`, `"light"`) are load-bearing:
-/// they appear verbatim in JSON, `list`, `ascii`, and `dot` output and must match Python.
+/// they appear verbatim in JSON, `list`, `ascii`, and `dot` output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StepClass {
     /// Throughput scales primarily with CPU allocation.
@@ -246,8 +246,7 @@ pub fn preferred_inner_jobs(step: &Step, experiment_override: Option<i64>) -> Op
 
 /// CANONICAL CPU-time budget (seconds) for a step, before any per-platform scaling: its declared
 /// `cpu_timeout` (>0) wins; otherwise the DAG's SMALL default. Both 0 means the guard is
-/// disabled. This is the number a graph declares — one table, platform-independent. Mirrors
-/// Python's `canonical_cpu_timeout`.
+/// disabled. This is the number a graph declares — one table, platform-independent.
 pub fn canonical_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
     if step.cpu_timeout > 0 {
         step.cpu_timeout
@@ -260,8 +259,7 @@ pub fn canonical_cpu_timeout(step: &Step, default_cpu_timeout: i64) -> i64 {
 ///
 /// Rounds to whole seconds (the enforcement poll is 1 Hz) and never rounds a live budget down to
 /// 0 — that would silently DISABLE the guard on a platform with a small multiplier, turning a
-/// scaling policy into an opt-out. A disabled budget (canonical 0) stays disabled. Mirrors
-/// Python's `scale_cpu_timeout`.
+/// scaling policy into an opt-out. A disabled budget (canonical 0) stays disabled.
 pub fn scale_cpu_timeout(canonical: i64, multiplier: f64) -> i64 {
     if canonical <= 0 {
         return 0;
@@ -275,15 +273,13 @@ pub fn scale_cpu_timeout(canonical: i64, multiplier: f64) -> i64 {
 
 /// CPU-time budget actually ENFORCED for a step on this platform: the canonical budget scaled by
 /// the platform multiplier. With the default 1.0 multiplier this is exactly the canonical budget.
-/// Mirrors Python's `effective_cpu_timeout`.
 pub fn effective_cpu_timeout(step: &Step, default_cpu_timeout: i64, multiplier: f64) -> i64 {
     scale_cpu_timeout(canonical_cpu_timeout(step, default_cpu_timeout), multiplier)
 }
 
 /// Resolve the platform CPU-budget multiplier and its label from an explicit value then the
 /// environment. A malformed or non-positive environment value is REFUSED rather than silently
-/// ignored — a typo that quietly reverted to 1.0 would loosen enforcement invisibly. Mirrors
-/// Python's `resolve_cpu_timeout_multiplier`.
+/// ignored — a typo that quietly reverted to 1.0 would loosen enforcement invisibly.
 pub fn resolve_cpu_timeout_multiplier(explicit: Option<f64>) -> Result<(f64, String), String> {
     let label = std::env::var(CPU_TIMEOUT_PLATFORM_ENV)
         .unwrap_or_default()
@@ -310,8 +306,7 @@ pub fn resolve_cpu_timeout_multiplier(explicit: Option<f64>) -> Result<(f64, Str
 }
 
 /// `" (canonical 3s x2 github-hosted)"` when a platform multiplier scaled the budget, else empty.
-/// Silent at 1.0 so the common unscaled message is unchanged. Mirrors Python's
-/// `_cpu_timeout_policy_suffix`.
+/// Silent at 1.0 so the common unscaled message is unchanged.
 fn cpu_timeout_policy_suffix(canonical: i64, multiplier: f64, platform: &str) -> String {
     if multiplier == DEFAULT_CPU_TIMEOUT_MULTIPLIER || canonical <= 0 {
         return String::new();
@@ -325,8 +320,7 @@ fn cpu_timeout_policy_suffix(canonical: i64, multiplier: f64, platform: &str) ->
     format!(" (canonical {canonical}s x{rendered}{label})")
 }
 
-/// Render a multiplier the way Python's `%g` does (`2.0 -> "2"`, `1.5 -> "1.5"`), so the two
-/// engines emit byte-identical breach strings.
+/// Render a multiplier compactly (`2.0 -> "2"`, `1.5 -> "1.5"`) for stable breach strings.
 fn format_multiplier(value: f64) -> String {
     let mut s = format!("{value}");
     if let Some(stripped) = s.strip_suffix(".0") {
@@ -337,7 +331,7 @@ fn format_multiplier(value: f64) -> String {
 
 /// Core cap (cgroup `cpu.max`) in effect for a step: its declared `preferred_inner_jobs` wins;
 /// otherwise the DAG's SMALL default. Bounds cpu.max ONLY, never the command's inner `-j` flag
-/// (which stays keyed to the declared width). Mirrors Python's `effective_cpu_count`.
+/// (which stays keyed to the declared width).
 pub fn effective_cpu_count(step: &Step, default_cpu_count: Option<i64>) -> Option<i64> {
     step.hint.preferred_inner_jobs.or(default_cpu_count)
 }
@@ -842,13 +836,10 @@ mod tests {
 
 #[cfg(test)]
 mod cpu_timeout_multiplier_tests {
-    //! Per-platform CPU-budget multiplier — the Rust half of a cross-language contract.
+    //! Per-platform CPU-budget multiplier contract.
     //!
-    //! Every case here is mirrored in `py/tests/test_cpu_timeout_multiplier.py`; the two engines
-    //! must agree on the scaled number AND on the breach string, because a DAG is expected to run
-    //! identically under either. The rounding case is not incidental: Python's `round()` is
-    //! banker's rounding and Rust's `f64::round()` is half-away-from-zero, so a naive port
-    //! silently disagrees by a second at every `.5` tie.
+    //! The scaled number and breach string must remain stable across implementations. The
+    //! rounding case is not incidental: half-away-from-zero is required at every `.5` tie.
     use super::*;
 
     fn step(cpu_timeout: i64) -> Step {
