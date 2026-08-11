@@ -88,12 +88,8 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
         let base_sha = string("base_sha");
         if matches!(
             evidence,
-            Some(
-                ValidationEvidence::LocallyValidated
-                    | ValidationEvidence::CleanValidateRecord
-            )
-        )
-            && (head_sha.is_empty() || base_sha.is_empty())
+            Some(ValidationEvidence::LocallyValidated | ValidationEvidence::CleanValidateRecord)
+        ) && (head_sha.is_empty() || base_sha.is_empty())
         {
             return Err(format!(
                 "PR #{pr} {} evidence requires exact 'head_sha' and 'base_sha'; revalidate and record both fetched identities",
@@ -311,8 +307,7 @@ mod tests {
             ValidationEvidence::LocallyValidated
         );
 
-        let missing_identity =
-            json!({"prs":[{"pr":1,"validation_evidence":"locally-validated"}]});
+        let missing_identity = json!({"prs":[{"pr":1,"validation_evidence":"locally-validated"}]});
         assert!(parse_landing_context(&missing_identity)
             .unwrap_err()
             .contains("locally-validated evidence requires"));
