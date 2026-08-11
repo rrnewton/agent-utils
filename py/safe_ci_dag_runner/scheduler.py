@@ -738,7 +738,7 @@ class Runner:
                     duration_s=elapsed,
                     summary=summary,
                     returncode=returncode,
-                    reason="ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)",
+                    reason="ABORTED (eager-exit after another step failed; --keep-going instead lets in-flight steps finish AND keeps launching the rest)",
                     aborted=True,
                     pids_events=pids_events,
                 )
@@ -779,13 +779,33 @@ class Runner:
                 )
             self.done[step.tag] = outcome
             if not was_aborted and not ok:
-                # A REAL failure. Mark failed + stop launching NEW steps. EAGER-EXIT (default):
-                # reap every step still running in parallel NOW so a fast failure doesn't wait for
-                # a slow in-flight build. keep_going instead lets those in-flight steps finish (so
-                # they report their own pass/fail); it does NOT launch any further steps.
+                # A REAL failure. The run is failed either way; what differs is COVERAGE.
+                #
+                # EAGER-EXIT (default): stop launching NEW steps AND eager-reap every step still
+                # running in parallel, so a fast failure doesn't wait on a slow in-flight build.
+                # Optimised for fast feedback, at the cost of leaving the rest of the DAG
+                # unmeasured.
+                #
+                # keep_going: do NEITHER. Every remaining runnable step still launches, and
+                # in-flight steps are left alone to report their own pass/fail, so ONE run
+                # collects EVERY independent failure. Steps whose deps actually failed are still
+                # excluded -- `_skipped()` closes over failed deps transitively -- so this widens
+                # coverage without ever running a step whose prerequisites are broken.
+                #
+                # Termination still works because `self.stop` stays False here: the loop's exit
+                # condition then rests on the other clause, `done + skipped >= len(steps)`, which
+                # every step now reaches (each either completes or is dep-skipped). The `stop`
+                # clause exists precisely for the eager-exit case, where deps-succeeded steps are
+                # neither launched nor skipped and the loop would otherwise spin forever.
+                #
+                # NOTE: the RUN-TIMEOUT path above also sets `self.stop`, and that one is
+                # deliberately unconditional -- a run that blows its outer wall-clock budget must
+                # stop scheduling whatever the caller asked for, so it can still write evidence
+                # and hand back a verdict. Do NOT "complete" this change by making that site
+                # respect keep_going.
                 self.failed = True
-                self.stop = True
                 if not self.keep_going:
+                    self.stop = True
                     others = list(self.running_procs.items())
                     for other, _other_proc in others:
                         self.aborted.add(other)  # its thread will label itself ABORTED
@@ -810,7 +830,7 @@ class Runner:
         elif outcome.aborted:
             self._emit(
                 f"[{step.tag}] ⊘ ABORT  {step.desc} "
-                f"({dur}s — eager-exit after another step failed; keep_going lets in-flight steps finish)"
+                f"({dur}s — eager-exit after another step failed; --keep-going instead lets in-flight steps finish AND keeps launching the rest)"
             )
         elif outcome.ok:
             extra = f"  [{summary}]" if (summary and self.verbosity >= 1) else ""
@@ -922,9 +942,11 @@ def run_dag(
         kill). The function does not establish an outer cgroup scope itself. A
         present-but-disabled manager triggers a visible degraded-enforcement warning.
     :param metrics: durable measurement sink, or ``None`` for no recording.
-    :param keep_going: on a failure, let already-running steps finish instead of eager-cancelling
-        them; the scheduler still stops launching new steps (it does NOT run every still-runnable
-        step), so in-flight steps report their own pass/fail rather than ABORTED.
+    :param keep_going: on a failure, do NOT eager-cancel in-flight steps AND do NOT stop
+        launching: every still-runnable step is executed, so one run collects every independent
+        failure and in-flight steps report their own pass/fail rather than ABORTED. Steps whose
+        deps actually failed are still skipped. (The separate RUN-TIMEOUT bound still stops
+        scheduling unconditionally, so a run that blows its wall-clock budget can still report.)
     :param verbosity: 0 quiet (+failures), 1 default (+summaries), >=2 stream child stdout.
     :param order: explicit dispatch order (e.g. a critical-path planner's); ``None`` uses the
         built-in longest-processing-time default.
