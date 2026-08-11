@@ -5,6 +5,9 @@ description: Produce an advisory PR landing plan from merge conflicts, exact-rev
 
 # PR landing planner
 
+**Follow skill `hermit-validation-authority` in the consuming dev-hermit workspace for
+validation authority and evidence semantics.**
+
 Use the planner to produce a shared, machine-readable landing plan. It detects real merge conflicts,
 classifies supplied validation evidence, surfaces mechanism overlaps, and forms conflict-safe groups.
 Its output is advisory and does not authorize or perform repository mutations.
@@ -20,11 +23,11 @@ pr-landing-planner plan \
   --format json
 ```
 
-The context binds caller-supplied validation evidence to an exact head and base and adds policy and
-assignment facts. Review state is collected separately; verify any required approval against the
-final revision before publication. Treat labels and aggregate workflow states as hints unless the
-consuming repository's rules explicitly make them authoritative. A fixture can exercise the same
-planning path without network data:
+The context carries caller-supplied validation references plus policy and
+assignment facts; the planner does not redefine their qualification. Review
+state is collected separately; verify any required approval against the final
+revision before publication. A fixture can exercise the same planning path
+without network data:
 
 ```sh
 pr-landing-planner plan --fixture /path/to/fixture.yaml --landing-context context.json
