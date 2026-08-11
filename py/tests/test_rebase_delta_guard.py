@@ -170,6 +170,128 @@ def rebase(repo: Path, onto: str, *flags: str) -> subprocess.CompletedProcess[st
     )
 
 
+def init_repo(repo: Path) -> None:
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "config", "user.email", "guard@test")
+    git(repo, "config", "user.name", "guard test")
+
+
+def set_gitlink(repo: Path, path: str, commit: str) -> None:
+    git(repo, "update-index", "--add", "--cacheinfo", f"160000,{commit},{path}")
+
+
+def stopped_rebase_with_file_conflict(tmp_path: Path) -> Path:
+    repo = tmp_path / "ordinary-conflict"
+    init_repo(repo)
+    target = repo / "shared.txt"
+    target.write_text("base\n")
+    git(repo, "add", "shared.txt")
+    git(repo, "commit", "-q", "-m", "base")
+
+    git(repo, "checkout", "-q", "-b", "feature")
+    target.write_text("feature\n")
+    git(repo, "commit", "-q", "-am", "feature")
+    git(repo, "checkout", "-q", "main")
+    target.write_text("main\n")
+    git(repo, "commit", "-q", "-am", "main")
+    git(repo, "checkout", "-q", "feature")
+    assert rebase(repo, "main").returncode != 0
+    return repo
+
+
+def stopped_rebase_with_file_and_gitlink_conflicts(tmp_path: Path) -> Path:
+    child = tmp_path / "gitlink-source"
+    init_repo(child)
+    payload = child / "payload"
+    payload.write_text("base\n")
+    git(child, "add", "payload")
+    git(child, "commit", "-q", "-m", "child base")
+    child_base = git(child, "rev-parse", "HEAD")
+    git(child, "checkout", "-q", "-b", "child-feature")
+    payload.write_text("feature\n")
+    git(child, "commit", "-q", "-am", "child feature")
+    child_feature = git(child, "rev-parse", "HEAD")
+    git(child, "checkout", "-q", "main")
+    payload.write_text("main\n")
+    git(child, "commit", "-q", "-am", "child main")
+    child_main = git(child, "rev-parse", "HEAD")
+
+    repo = tmp_path / "mixed-conflict"
+    init_repo(repo)
+    target = repo / "shared.txt"
+    target.write_text("base\n")
+    git(repo, "add", "shared.txt")
+    set_gitlink(repo, "agent-utils", child_base)
+    git(repo, "commit", "-q", "-m", "base")
+
+    git(repo, "checkout", "-q", "-b", "feature")
+    target.write_text("feature\n")
+    git(repo, "add", "shared.txt")
+    set_gitlink(repo, "agent-utils", child_feature)
+    git(repo, "commit", "-q", "-m", "feature")
+    git(repo, "checkout", "-q", "main")
+    target.write_text("main\n")
+    git(repo, "add", "shared.txt")
+    set_gitlink(repo, "agent-utils", child_main)
+    git(repo, "commit", "-q", "-m", "main")
+
+    git(repo, "checkout", "-q", "feature")
+    assert rebase(repo, "main").returncode != 0
+    # Reproduce the dangerous shape: a gitlink is a directory on disk, so a
+    # file-oriented tool handed this path may recurse into unrelated contents.
+    (repo / "agent-utils").mkdir(exist_ok=True)
+    (repo / "agent-utils" / "nested.txt").write_text("must not be inspected\n")
+    return repo
+
+
+def test_conflict_files_emits_an_ordinary_conflict(tmp_path: Path) -> None:
+    repo = stopped_rebase_with_file_conflict(tmp_path)
+
+    result = guard(repo, "conflict-files")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "shared.txt\n"
+    assert result.stderr == ""
+
+
+def test_help_surfaces_safe_conflict_iteration(tmp_path: Path) -> None:
+    repo = stopped_rebase_with_file_conflict(tmp_path)
+
+    result = guard(repo, "--help")
+
+    assert result.returncode == 0, result.stderr
+    assert "rebase-delta-guard conflict-files [-z|--null]" in result.stdout
+    assert "unsafe input to grep, sed" in result.stdout
+
+
+def test_conflict_files_skips_gitlink_without_mutating_stopped_rebase(
+    tmp_path: Path,
+) -> None:
+    repo = stopped_rebase_with_file_and_gitlink_conflicts(tmp_path)
+    assert set(git(repo, "diff", "--name-only", "--diff-filter=U").splitlines()) == {
+        "agent-utils",
+        "shared.txt",
+    }
+    assert (repo / "agent-utils").is_dir()
+    before_status = git(repo, "status", "--porcelain=v2")
+    before_head = git(repo, "rev-parse", "HEAD")
+
+    result = guard(repo, "conflict-files")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "shared.txt\n"
+    assert "skipped conflicted gitlink agent-utils" in result.stderr
+    assert "mode 160000" in result.stderr
+    assert all(not (repo / path).is_dir() for path in result.stdout.splitlines())
+    assert git(repo, "status", "--porcelain=v2") == before_status
+    assert git(repo, "rev-parse", "HEAD") == before_head
+
+    nul = guard(repo, "conflict-files", "--null")
+    assert nul.returncode == 0, nul.stderr
+    assert nul.stdout == "shared.txt\0"
+
+
 def test_positive_clean_rebase_passes(fixture_repo: Fixture, tmp_path: Path) -> None:
     """The guard must PASS an honest rebase. A guard that never passes is worthless."""
     repo = fixture_repo.repo

@@ -32,12 +32,19 @@
 #   rebase-delta-guard record [--repo DIR] [--base REV] [--onto REV]
 #   rebase-delta-guard verify [--repo DIR] [--new-base REV] [--keep]
 #   rebase-delta-guard check  OLD_BASE OLD_HEAD NEW_BASE NEW_HEAD [--repo DIR]
+#   rebase-delta-guard conflict-files [-z|--null] [--repo DIR]
 #   rebase-delta-guard status|clear [--repo DIR]
 #
 #   $ onto=$(git rev-parse origin/main)
 #   $ rebase-delta-guard record --onto "$onto"  # before the rebase
 #   $ git rebase --apply "$onto"                 # use the same immutable SHA
 #   $ rebase-delta-guard verify                   # after
+#
+# SAFE CONFLICT ITERATION. A conflicted gitlink is a directory on disk, so raw
+# `git diff --name-only --diff-filter=U` output is unsafe input to grep, sed, or
+# any other file-oriented loop. `conflict-files` reads the unmerged index modes,
+# emits ordinary conflicted files only, and reports every mode-160000 gitlink it
+# skips. Use `--null` with a NUL-aware reader for arbitrary path names.
 #
 # WHAT IS COMPARED. `git diff BASE HEAD` on both sides, ignoring exactly the two
 # things that legitimately move when the base moves:
@@ -545,6 +552,62 @@ cmd_verify() {
 }
 
 # ------------------------------------------------------------------ other -----
+cmd_conflict_files() (
+    local null_output=0 tmp record metadata path mode object stage extra
+    local kind quoted
+    local -a order=()
+    local -A seen=() kinds=()
+    while (($#)); do
+        case $1 in
+            -z | --null) null_output=1; shift ;;
+            --repo) shift 2 ;;
+            *) die "unexpected argument to conflict-files: $1" ;;
+        esac
+    done
+
+    tmp=$(mktemp) || die "cannot create a temporary unmerged-index file"
+    trap 'rm -f -- "$tmp"' EXIT
+    if ! GIT_NO_REPLACE_OBJECTS=1 git -C "$repo_dir" ls-files \
+        --unmerged -z -- > "$tmp"; then
+        die "cannot enumerate the unmerged index"
+    fi
+
+    while IFS= read -r -d '' record; do
+        [[ $record == *$'\t'* ]] || die "git returned a malformed unmerged-index record"
+        metadata=${record%%$'\t'*}
+        path=${record#*$'\t'}
+        read -r mode object stage extra <<< "$metadata"
+        [[ $mode =~ ^[0-7]{6}$ && $object =~ ^[0-9a-f]+$ && $stage =~ ^[123]$ && -z ${extra:-} ]] ||
+            die "git returned malformed unmerged-index metadata"
+        if [[ -z ${seen["$path"]+present} ]]; then
+            seen["$path"]=1
+            order+=("$path")
+            kinds["$path"]=file
+        fi
+        # A file/submodule type conflict is a gitlink risk too: one 160000 stage
+        # is enough to keep the on-disk directory away from file-oriented tools.
+        if [[ $mode == 160000 ]]; then
+            kinds["$path"]=gitlink
+        fi
+    done < "$tmp"
+
+    for path in "${order[@]}"; do
+        kind=${kinds["$path"]}
+        if [[ $kind == gitlink ]]; then
+            printf -v quoted '%q' "$path"
+            printf '%s: skipped conflicted gitlink %s (index mode 160000); handle it as a submodule, never as a file\n' \
+                "$PROGRAM" "$quoted" >&2
+            continue
+        fi
+        if ((null_output)); then
+            printf '%s\0' "$path"
+        else
+            [[ $path != *$'\n'* ]] || die "a conflicted file path contains a newline; rerun conflict-files --null"
+            printf '%s\n' "$path"
+        fi
+    done
+)
+
 cmd_check() {
     (($# == 4)) || die "check needs exactly four revisions: OLD_BASE OLD_HEAD NEW_BASE NEW_HEAD"
     local r=() rev
@@ -610,9 +673,10 @@ main() {
         record) cmd_record "$@" ;;
         verify) cmd_verify "$@" ;;
         check) cmd_check "$@" ;;
+        conflict-files) cmd_conflict_files "$@" ;;
         status) cmd_status ;;
         clear) cmd_clear ;;
-        *) die "unknown subcommand: $sub (record|verify|check|status|clear)" ;;
+        *) die "unknown subcommand: $sub (record|verify|check|conflict-files|status|clear)" ;;
     esac
 }
 
