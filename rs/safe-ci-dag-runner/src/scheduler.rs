@@ -2388,7 +2388,10 @@ mod tests {
         let result = run_dag(&cfg, 1, false, 0);
         assert!(!result.ok);
         assert!(result.outcomes.is_empty());
-        assert!(!marker.exists(), "policy refusal happened after the node wrote");
+        assert!(
+            !marker.exists(),
+            "policy refusal happened after the node wrote"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
