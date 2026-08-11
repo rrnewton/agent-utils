@@ -10,8 +10,6 @@ use crate::model::{CiState, PolicyClass, PrNode, ValidationEvidence};
 pub const AGENT_PREFIX: &str = "agent:";
 /// Label prefix carrying a [`PolicyClass`].
 pub const POLICY_PREFIX: &str = "landing-policy:";
-/// Informational label indicating local validation without authoritative identity evidence.
-pub const LOCALLY_VALIDATED_LABEL: &str = "locally-validated";
 /// Review lanes required by the adversarial-review protocol.
 pub const REQUIRED_REVIEW_LANES: [&str; 2] = ["codex", "claude"];
 
@@ -88,11 +86,18 @@ pub fn parse_landing_context(raw: &Value) -> Result<Vec<LandingContext>, String>
         };
         let head_sha = string("head_sha");
         let base_sha = string("base_sha");
-        if evidence == Some(ValidationEvidence::CleanValidateRecord)
+        if matches!(
+            evidence,
+            Some(
+                ValidationEvidence::LocallyValidated
+                    | ValidationEvidence::CleanValidateRecord
+            )
+        )
             && (head_sha.is_empty() || base_sha.is_empty())
         {
             return Err(format!(
-                "PR #{pr} clean-validate-record evidence requires exact 'head_sha' and 'base_sha'; revalidate and record both fetched identities"
+                "PR #{pr} {} evidence requires exact 'head_sha' and 'base_sha'; revalidate and record both fetched identities",
+                evidence.expect("matched local evidence").as_str()
             ));
         }
         let mut review_pass_heads = BTreeMap::new();
@@ -162,13 +167,10 @@ fn apply_labels(mut node: PrNode) -> Result<PrNode, String> {
     };
     node.validation_evidence = if node.ci.raw_state == CiState::Passed && node.ci.gate_ok {
         ValidationEvidence::AuthoritativeCi
-    } else if node
-        .labels
-        .iter()
-        .any(|label| label == LOCALLY_VALIDATED_LABEL)
-    {
-        ValidationEvidence::LocallyValidated
     } else {
+        // A locally-validated label is only a cache hint. It deliberately maps to
+        // None; only caller context bound to the fetched head and base may produce
+        // LocallyValidated.
         ValidationEvidence::None
     };
     Ok(node)
@@ -277,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_and_context_enrich_without_authorizing_local_hint() {
+    fn bare_label_is_cache_only_but_dereferenced_context_is_evidence() {
         let raw = node(
             1,
             "head",
@@ -290,10 +292,30 @@ mod tests {
         let enriched = apply_landing_context(vec![raw], &[]).unwrap().remove(0);
         assert_eq!(enriched.assigned_agent, "one");
         assert_eq!(enriched.policy_class, PolicyClass::CiHygiene);
+        // Negative bracket: one bare cache label produces zero validation evidence.
+        assert_eq!(enriched.validation_evidence, ValidationEvidence::None);
+
+        let context = parse_landing_context(&json!({"prs":[{
+            "pr":1,
+            "head_sha":"head",
+            "base_sha":"base",
+            "validation_evidence":"locally-validated"
+        }]}))
+        .unwrap();
+        let dereferenced = apply_landing_context(vec![node(1, "head", &[])], &context)
+            .unwrap()
+            .remove(0);
+        // Positive bracket: one caller-dereferenced exact-identity record is accepted.
         assert_eq!(
-            enriched.validation_evidence,
+            dereferenced.validation_evidence,
             ValidationEvidence::LocallyValidated
         );
+
+        let missing_identity =
+            json!({"prs":[{"pr":1,"validation_evidence":"locally-validated"}]});
+        assert!(parse_landing_context(&missing_identity)
+            .unwrap_err()
+            .contains("locally-validated evidence requires"));
 
         let duplicate = node(2, "head", &["agent:one", "agent:two"]);
         assert!(apply_landing_context(vec![duplicate], &[])

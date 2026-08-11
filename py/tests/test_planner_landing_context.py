@@ -51,7 +51,7 @@ def _node(
     )
 
 
-def test_raw_local_label_is_observed_but_does_not_authorize_landing() -> None:
+def test_raw_local_label_is_cache_only_but_dereferenced_record_is_evidence() -> None:
     nodes = apply_landing_context(
         [
             _node(
@@ -67,7 +67,8 @@ def test_raw_local_label_is_observed_but_does_not_authorize_landing() -> None:
         ],
         [],
     )
-    assert nodes[0].validation_evidence is ValidationEvidence.LOCALLY_VALIDATED
+    # Negative bracket: one bare cache label produces zero validation evidence.
+    assert nodes[0].validation_evidence is ValidationEvidence.NONE
     assert nodes[0].assigned_agent == "hermit-a"
     assert nodes[0].policy_class is PolicyClass.CI_HYGIENE
     assert build_mechanism_edges(nodes)[0].mechanisms == ("cancel-in-progress",)
@@ -75,6 +76,27 @@ def test_raw_local_label_is_observed_but_does_not_authorize_landing() -> None:
     actions = {decision.pr: decision.action for decision in plan.per_pr_actions}
     assert actions[1] is PrAction.REFIRE_CI
     assert 1 not in plan.land_now
+
+    context = parse_landing_context(
+        {
+            "prs": [
+                {
+                    "pr": 1,
+                    "head_sha": "sha-1",
+                    "base_sha": "base",
+                    "validation_evidence": "locally-validated",
+                }
+            ]
+        }
+    )
+    # Positive bracket: one caller-dereferenced exact-identity record is accepted.
+    dereferenced = apply_landing_context([_node(1)], context)[0]
+    assert dereferenced.validation_evidence is ValidationEvidence.LOCALLY_VALIDATED
+
+    with pytest.raises(ValueError, match="locally-validated evidence requires"):
+        parse_landing_context(
+            {"prs": [{"pr": 1, "validation_evidence": "locally-validated"}]}
+        )
 
 
 def test_clean_record_requires_and_checks_exact_head_and_base() -> None:
@@ -186,7 +208,7 @@ def test_json_schema_exposes_context_and_mechanism_overlap() -> None:
         )
     )
     payload = json.loads(render_json(result))
-    assert payload["nodes"][0]["validation_evidence"] == "locally-validated"
+    assert payload["nodes"][0]["validation_evidence"] == "none"
     assert payload["nodes"][0]["review_binding"] == "not-required"
     assert payload["nodes"][0]["review_pass_heads"] == {}
     assert payload["mechanism_overlap_edges"] == [

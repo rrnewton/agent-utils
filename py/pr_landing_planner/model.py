@@ -82,6 +82,8 @@ class ValidationEvidence(Enum):
 
     NONE = "none"
     AUTHORITATIVE_CI = "authoritative-ci"
+    # Caller-supplied dereferenced record bound to the fetched head and base.
+    # A bare label never produces this variant.
     LOCALLY_VALIDATED = "locally-validated"
     CLEAN_VALIDATE_RECORD = "clean-validate-record"
 

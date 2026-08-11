@@ -21,7 +21,6 @@ from pr_landing_planner.model import (
 
 AGENT_PREFIX = "agent:"
 POLICY_PREFIX = "landing-policy:"
-LOCALLY_VALIDATED_LABEL = "locally-validated"
 REQUIRED_REVIEW_LANES = ("codex", "claude")
 
 
@@ -83,11 +82,12 @@ def parse_landing_context(raw: object) -> tuple[LandingContext, ...]:
 
         head_sha = _str_field(obj, "head_sha")
         base_sha = _str_field(obj, "base_sha")
-        if evidence is ValidationEvidence.CLEAN_VALIDATE_RECORD and (
-            not head_sha or not base_sha
-        ):
+        if evidence in (
+            ValidationEvidence.LOCALLY_VALIDATED,
+            ValidationEvidence.CLEAN_VALIDATE_RECORD,
+        ) and (not head_sha or not base_sha):
             raise ValueError(
-                f"PR #{pr} clean-validate-record evidence requires exact 'head_sha' "
+                f"PR #{pr} {evidence.value} evidence requires exact 'head_sha' "
                 "and 'base_sha'; revalidate and record both fetched identities"
             )
         raw_review_pass_heads = obj.get("review_pass_heads", {})
@@ -146,11 +146,10 @@ def _label_context(node: PrNode) -> PrNode:
 
     if node.ci.raw_state is CiState.GREEN and node.ci.gate_ok:
         evidence = ValidationEvidence.AUTHORITATIVE_CI
-    elif LOCALLY_VALIDATED_LABEL in node.labels:
-        # The label is an observable cache hint, not evidence.  Only caller-supplied
-        # exact-identity records and authoritative CI can authorize a landing.
-        evidence = ValidationEvidence.LOCALLY_VALIDATED
     else:
+        # A locally-validated label is only a cache hint. It deliberately maps to
+        # NONE; only caller-supplied evidence bound to the fetched head and base may
+        # produce LOCALLY_VALIDATED.
         evidence = ValidationEvidence.NONE
     return replace(
         node,

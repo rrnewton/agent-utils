@@ -145,9 +145,11 @@ prs:
 ```
 
 Accepted validation evidence is `none`, `authoritative-ci`,
-`locally-validated`, or `clean-validate-record`. A clean validation record must
-name both the exact fetched head and base SHAs. A head-only record is incomplete
-and is rejected with a revalidation instruction. Accepted policy classes are `unclassified`,
+`locally-validated`, or `clean-validate-record`. Both local evidence values must
+come from caller-supplied dereferenced records naming the exact fetched head and
+base SHAs. A bare `locally-validated` label is only a cache hint and maps to
+`none`; a head-only record is incomplete and is rejected with a revalidation
+instruction. Accepted policy classes are `unclassified`,
 `ci-hygiene`, and `gate-policy`; a gate-policy change is escalated rather than
 treated like routine hygiene. Unknown PRs, duplicate entries, and head drift
 are errors.

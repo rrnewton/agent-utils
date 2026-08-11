@@ -117,7 +117,8 @@ pub enum ValidationEvidence {
     None,
     /// Required repository-host CI passed.
     AuthoritativeCi,
-    /// Informational local-validation label without authoritative identities.
+    /// Caller-supplied dereferenced local record bound to fetched head and base identities.
+    /// A bare label never produces this variant.
     LocallyValidated,
     /// Caller record bound to the exact fetched head and base SHAs.
     CleanValidateRecord,
