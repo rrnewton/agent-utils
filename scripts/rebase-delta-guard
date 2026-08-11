@@ -377,10 +377,15 @@ compare() (
     esac
 
     local only_after only_before
+    # LC_ALL=C ON THE `comm` CALLS TOO, NOT JUST THE SORTS. `comm` re-validates its input
+    # ordering in the AMBIENT locale, so C-collated files read as unsorted under any UTF-8
+    # locale; it warns, the chain below fires, and this degrades to INDETERMINATE on a rewrite
+    # it had already detected correctly. The two must agree on collation or the pairing is a
+    # coin flip decided by the caller's environment.
     if ! LC_ALL=C sort "$tmp/before" > "$tmp/before.sorted" ||
        ! LC_ALL=C sort "$tmp/after" > "$tmp/after.sorted" ||
-       ! comm -13 "$tmp/before.sorted" "$tmp/after.sorted" > "$tmp/only-after" ||
-       ! comm -23 "$tmp/before.sorted" "$tmp/after.sorted" > "$tmp/only-before"; then
+       ! LC_ALL=C comm -13 "$tmp/before.sorted" "$tmp/after.sorted" > "$tmp/only-after" ||
+       ! LC_ALL=C comm -23 "$tmp/before.sorted" "$tmp/after.sorted" > "$tmp/only-before"; then
         indeterminate "the deltas differ, but diagnostic generation failed"
         return 3
     fi
