@@ -293,6 +293,29 @@ def _requirement_name(requirement: str) -> str:
     return _normalized_distribution(match.group(1)) if match is not None else ""
 
 
+def _unexpected_sibling_requirements(
+    project: Project, requirement_names: set[str]
+) -> list[str]:
+    """Return undeclared coupling to another distribution in this repository.
+
+    Most projects are alternative, independently installed tools and must not
+    acquire an accidental sibling dependency.  A project that deliberately
+    composes with a sibling names it in ``sibling_package_exemptions``; the
+    exemption is therefore explicit and local to that one package.
+    """
+
+    exemptions = {
+        _normalized_distribution(name) for name in project.sibling_package_exemptions
+    }
+    return sorted(
+        sibling.distribution
+        for sibling in PROJECTS
+        if sibling != project
+        and _normalized_distribution(sibling.distribution) in requirement_names
+        and _normalized_distribution(sibling.distribution) not in exemptions
+    )
+
+
 def _source_resources(project: Project, source: Path) -> tuple[tuple[str, bytes], ...]:
     """Read declared resources, following authoritative repository symlinks."""
 
@@ -614,12 +637,7 @@ def _inspect_wheel(project: Project, wheel: Path) -> _WheelInspection:
                 f"{sorted(runtime_requirement_names)}, "
                 f"expected {sorted(project.required_dependencies)}"
             )
-        sibling_requirements = sorted(
-            sibling.distribution
-            for sibling in PROJECTS
-            if sibling != project
-            and _normalized_distribution(sibling.distribution) in requirement_names
-        )
+        sibling_requirements = _unexpected_sibling_requirements(project, requirement_names)
         if sibling_requirements:
             raise CheckError(
                 f"{project.distribution}: metadata depends on sibling package(s) "

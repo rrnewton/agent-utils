@@ -164,6 +164,23 @@ def test_python_doc_lint_exemption_cannot_hide_a_later_foreign_term() -> None:
     assert "foreign-language term 'Cargo'" not in errors
 
 
+def test_python_sibling_dependency_requires_a_project_local_exemption() -> None:
+    python_check = _load_script("check_python_packages")
+    parallel = next(
+        project
+        for project in python_check.PROJECTS
+        if project.distribution == "parallel-experiment-runner"
+    )
+    safe_ci_requirement = {"safe-ci-dag-runner"}
+
+    assert not python_check._unexpected_sibling_requirements(
+        parallel, safe_ci_requirement
+    )
+    assert python_check._unexpected_sibling_requirements(
+        python_check.PROJECTS[0], {"tick-hub"}
+    ) == ["tick-hub"]
+
+
 def test_every_declared_markdown_resource_is_standalone() -> None:
     python_check = _load_script("check_python_packages")
 
