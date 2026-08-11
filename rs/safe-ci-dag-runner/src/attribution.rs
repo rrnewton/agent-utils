@@ -723,6 +723,27 @@ pub fn bind_process_tests(mut culprit: Culprit, observations: &[ProcessObservati
     culprit
 }
 
+/// How far a step has got, sampled while it is still running.
+#[derive(Debug, Clone, Default)]
+pub struct StepProgress {
+    /// How many tests have begun.
+    pub started: u64,
+    /// How many tests have finished -- the numerator a reader uses to judge progress.
+    pub completed: u64,
+    /// The most recent test seen to begin.
+    pub last_started: Option<String>,
+    /// Tests begun and still running; a parallel harness can have several at once.
+    pub in_flight: Vec<String>,
+}
+
+impl StepProgress {
+    /// True when the step has produced no test events at all, so a caller can fall back to
+    /// elapsed-versus-expected rather than printing a row of zeroes that looks like a stall.
+    pub fn is_silent(&self) -> bool {
+        self.started == 0 && self.completed == 0
+    }
+}
+
 /// One step's live output state: the durable log, the unterminated tail, and the test tracker.
 ///
 /// stdout and stderr share ONE of these so the tracker sees a single ordered view of the step and
@@ -749,6 +770,28 @@ impl StepStream {
             tracker: Mutex::new(TestTracker::default()),
             tail_announced: Mutex::new(None),
             evidence,
+        }
+    }
+
+    /// A live snapshot of how far this step has got, for periodic progress output.
+    ///
+    /// WHY THIS EXISTS. At the default verbosity the runner emits one START line per step and
+    /// then nothing until the step ends, so a phase that legitimately takes minutes is
+    /// indistinguishable from a hang -- read as hung, someone kills a healthy run; read as
+    /// healthy, a real hang burns to its deadline. Measured on one real graph: 26 of 56 nodes
+    /// exceeded 30s and 89% of all node time was spent inside them, so most of the run was
+    /// unobservable and its latency could not be decomposed.
+    ///
+    /// This reports COUNTS, not liveness. "41 done, 3 in flight" tells a reader whether the
+    /// step is progressing and roughly how much remains; a bare "still working" tick only
+    /// distinguishes alive from dead, which was never the question.
+    pub fn progress(&self) -> StepProgress {
+        let tracker = self.tracker.lock().unwrap();
+        StepProgress {
+            started: tracker.started,
+            completed: tracker.completed,
+            last_started: tracker.last_started.clone(),
+            in_flight: tracker.in_flight.keys().cloned().collect(),
         }
     }
 

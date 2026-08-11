@@ -85,6 +85,13 @@ pub fn monotonic_now_ns() -> Option<u64> {
 
 /// Per-step monitor poll interval (seconds) for descendant-thread-peak sampling.
 const MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a still-running step reports how far it has got.
+///
+/// 30s is chosen against the measured shape of a real run rather than by taste: on one real
+/// graph 26 of 56 nodes exceed 30s and the longest is 182s, so every silent phase reports at
+/// least once and the worst reports five times. Shorter would add lines to the 30 nodes that
+/// finish quickly without telling anyone anything new.
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
 
 // Scheduler idle interval between ready-set sweeps (matches Python's `time.sleep(0.05)`).
 const LOOP_SLEEP: Duration = Duration::from_millis(50);
@@ -1389,6 +1396,60 @@ fn run_step(ctx: StepCtx) {
         ));
     }
 
+    // PERIODIC PROGRESS, always on -- not gated on boxing like the monitor below, because a
+    // silent phase is just as unreadable un-boxed. This reports COUNTS from the attribution
+    // tracker the readers already feed, so it adds no parsing and cannot disagree with the
+    // step's own output. A step with no test events (a build, a manifest gate) falls back to
+    // elapsed time, which still separates "moving" from "stationary" for a reader watching.
+    let progress_stop = Arc::new(AtomicBool::new(false));
+    let progress_thread = {
+        let stop = Arc::clone(&progress_stop);
+        let psink = Arc::clone(&sink);
+        let ptag = tag.clone();
+        let pstart = start;
+        thread::spawn(move || {
+            let tick = Duration::from_millis(200);
+            let mut since = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(tick);
+                since += tick;
+                if since < PROGRESS_INTERVAL {
+                    continue;
+                }
+                since = Duration::ZERO;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let p = psink.progress();
+                let secs = pstart.elapsed().as_secs();
+                if p.is_silent() {
+                    emit(&format!(
+                        "[{ptag}] \u{2026} {secs}s elapsed, no test events yet"
+                    ));
+                } else {
+                    let live = if p.in_flight.is_empty() {
+                        String::new()
+                    } else {
+                        let mut names: Vec<&str> =
+                            p.in_flight.iter().map(String::as_str).collect();
+                        names.sort_unstable();
+                        let shown = names.len().min(2);
+                        let more = names.len() - shown;
+                        let mut t = format!(", running {}", names[..shown].join(", "));
+                        if more > 0 {
+                            t.push_str(&format!(" (+{more} more)"));
+                        }
+                        t
+                    };
+                    emit(&format!(
+                        "[{ptag}] \u{2026} {} test(s) done, {} started{live} — {secs}s elapsed",
+                        p.completed, p.started
+                    ));
+                }
+            }
+        })
+    };
+
     // Poll the step's cgroup once per MONITOR_INTERVAL for two purposes: (1) a per-step peak
     // descendant-thread count (metrics only), and (2) CPU-time budget enforcement. Only when
     // boxing is enabled (both readings are meaningless otherwise), so the un-boxed path adds no
@@ -1507,6 +1568,8 @@ fn run_step(ctx: StepCtx) {
     if let Some(m) = monitor {
         join_bounded(m, &tag, "monitor", JOIN_WAIT);
     }
+    progress_stop.store(true, Ordering::Relaxed);
+    join_bounded(progress_thread, &tag, "progress", JOIN_WAIT);
     // BOUNDED, and this is the join that actually hung. A surviving escapee inherited the step's
     // stdout/stderr pipe write ends, so those pipes never reach EOF and a plain `join()` here
     // blocks FOREVER — measured: with the post-reap child wait already bounded to 30s, a planted
