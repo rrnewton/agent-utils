@@ -189,7 +189,13 @@ def test_unresolved_placeholder_is_refused_loudly_and_retried() -> None:
         gate_runner=FakeGate({"check": GateResult(1, "", True)}),
         age_probe=FakeProbe({}),
     )
-    assert not any(line.startswith("ACTION: hard-warn") for line in result.lines)
+    actions = [line for line in result.lines if line.startswith("ACTION: ")]
+    assert len(actions) == 1
+    assert "outcome=NO-SIGNAL" in actions[0]
+    assert "gate=obligation" in actions[0]
+    assert "reason=unresolved-placeholder" in actions[0]
+    assert "missing_placeholders=summary" in actions[0]
+    assert "obligation abc is red" not in actions[0]
     assert any(
         line == (
             "ERROR: reminder obligation: refusing emission with unresolved "
@@ -198,10 +204,10 @@ def test_unresolved_placeholder_is_refused_loudly_and_retried() -> None:
         for line in result.lines
     )
     assert "obligation" not in result.fired
-    assert result.actions_emitted == 0
+    assert result.actions_emitted == 1
 
 
-def test_gate_run_failure_emits_error_no_fired_stamp() -> None:
+def test_gate_run_failure_emits_no_signal_and_no_fired_stamp() -> None:
     rem = Reminder("x", Emit(EmitKind.ACTION, title="x", skill="x"), gate=Gate(cmd="boom"))
     cfg = TickConfig(reminders=(rem,))
     result = run_tick(
@@ -210,7 +216,13 @@ def test_gate_run_failure_emits_error_no_fired_stamp() -> None:
         age_probe=FakeProbe({}),
     )
     assert any(ln.startswith("ERROR: reminder x") for ln in result.lines)
+    actions = [line for line in result.lines if line.startswith("ACTION: ")]
+    assert len(actions) == 1
+    assert "outcome=NO-SIGNAL" in actions[0]
+    assert "gate=x" in actions[0]
+    assert "reason=gate-execution-error" in actions[0]
     assert "x" not in result.fired  # not marked -> retried next tick
+    assert result.actions_emitted == 1
 
 
 def test_requires_flags_gating() -> None:

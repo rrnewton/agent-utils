@@ -47,6 +47,14 @@ class TickResult:
 class UnresolvedPlaceholderError(ValueError):
     """An emission still contains a template placeholder after rendering."""
 
+    def __init__(
+        self, message: str, *, placeholders: Sequence[str] = ()
+    ) -> None:
+        # Keep the historical ValueError(message) construction valid for callers
+        # while giving the engine structured names for its NO-SIGNAL record.
+        self.placeholders = tuple(sorted(set(placeholders)))
+        super().__init__(message)
+
 
 _UNRESOLVED_PLACEHOLDER = re.compile(
     r"(?<!\{)\{[A-Za-z_][A-Za-z0-9_.-]*\}(?!\})"
@@ -134,11 +142,49 @@ def render_emit(emit: Emit, captured: Mapping[str, str]) -> str:
     if unresolved:
         names = ", ".join(sorted(unresolved))
         raise UnresolvedPlaceholderError(
-            f"refusing emission with unresolved placeholder(s): {names}"
+            f"refusing emission with unresolved placeholder(s): {names}",
+            placeholders=tuple(unresolved),
         )
     if emit.kind is EmitKind.NOTE:
         return format_note(title)
     return format_action(emit.skill, merged, title)
+
+
+def _no_signal_action(
+    reminder: Reminder,
+    reason: str,
+    *,
+    detail: str = "",
+    missing_placeholders: Sequence[str] = (),
+) -> str:
+    """Make a reporting failure visible to ACTION-only tick consumers.
+
+    The original domain action was not emitted, so this record never borrows its
+    fields or claims its verdict. It says only that the named gate produced no
+    usable signal and why. Reusing the configured skill preserves the caller's
+    routing; notes without a skill use a generic reporting handler name.
+    """
+    fields = {
+        "component": "tick-hub-reporting",
+        "outcome": "NO-SIGNAL",
+        "gate": reminder.name,
+        "reason": reason,
+    }
+    title = f"NO-SIGNAL gate={reminder.name}: {reason}"
+    if missing_placeholders:
+        missing = ",".join(
+            placeholder.removeprefix("{").removesuffix("}")
+            for placeholder in missing_placeholders
+        )
+        fields["missing_placeholders"] = missing
+        title += f"; missing placeholder(s)={missing}"
+    if detail:
+        fields["detail"] = " ".join(detail.split())[:240]
+    return format_action(
+        reminder.emit.skill or "tick-hub-no-signal",
+        fields,
+        title,
+    )
 
 
 def _flags_satisfied(required: Sequence[str], flags: Mapping[str, object]) -> bool:
@@ -179,8 +225,15 @@ def run_tick(
                 continue
             fire, captured, error = _eval_gate(rem.gate, gate_runner)
             if error is not None:
-                # The check did not complete: surface it and retry next tick (no fired stamp).
+                # The check did not complete. Keep the ERROR for full diagnostic
+                # readers and emit a counted NO-SIGNAL action because production
+                # consumers may intentionally forward ACTION lines only. Retry
+                # next tick by leaving the cadence unconsumed.
                 lines.append(format_error(f"reminder {rem.name}: {error}"))
+                lines.append(
+                    _no_signal_action(rem, "gate-execution-error", detail=error)
+                )
+                actions += 1
                 continue
             if not fire:
                 new_fired[rem.name] = now  # the check ran; the cadence clock resets
@@ -188,9 +241,18 @@ def run_tick(
             try:
                 line = render_emit(rem.emit, captured)
             except UnresolvedPlaceholderError as exc:
-                # A templated hole is not a domain warning. Surface the renderer
-                # failure and leave cadence unconsumed so the reminder retries.
+                # A templated hole is not the domain warning, so never emit the
+                # malformed action. Surface a separate, counted NO-SIGNAL action
+                # and leave cadence unconsumed so the reminder retries.
                 lines.append(format_error(f"reminder {rem.name}: {exc}"))
+                lines.append(
+                    _no_signal_action(
+                        rem,
+                        "unresolved-placeholder",
+                        missing_placeholders=exc.placeholders,
+                    )
+                )
+                actions += 1
                 continue
             new_fired[rem.name] = now
             lines.append(line)
