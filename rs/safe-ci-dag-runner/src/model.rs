@@ -857,6 +857,7 @@ mod cpu_timeout_multiplier_tests {
             timeout: DEFAULT_STEP_TIMEOUT,
             cpu_timeout,
             jobs_flag: None,
+            skip_reason: None,
         }
     }
 
