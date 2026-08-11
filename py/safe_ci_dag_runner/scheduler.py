@@ -29,11 +29,13 @@ these — see the accompanying report):
   ``start_new_session=True`` (its own process group/session for whole-tree reaping) plus a
   daemon stdout-reader thread so an orphan holding the stdout pipe can never wedge the run;
   the supervisor blocks only on ``proc.wait(timeout=step.timeout)``.
-* **Fail-fast (eager-exit) with ``--keep-going`` override.** The first genuine failure stops
-  the scheduler launching any NEW step. By default it also eager-reaps every in-flight step,
-  labelling those ABORTED (a cancellation) rather than FAILED; ``keep_going`` only suppresses
-  that eager-cancel so already-running steps finish — it does NOT keep launching still-runnable
-  steps.
+* **Fail-fast (eager-exit) with ``--keep-going`` override.** By DEFAULT the first genuine
+  failure stops the scheduler launching any NEW step and eager-reaps every in-flight step,
+  labelling those ABORTED (a cancellation) rather than FAILED — fast feedback, at the cost of
+  leaving the rest of the DAG unmeasured. Under ``keep_going`` neither happens: still-runnable
+  steps keep launching and in-flight steps are left to report their own result, so ONE run
+  collects EVERY independent failure. Steps whose deps actually failed are still excluded via
+  :meth:`_skipped`, so wider coverage never means running a step on broken prerequisites.
 * **Failure classification** via :func:`safe_ci_dag_runner.model.step_failure_reason`
   (OOM > timeout > pids-guard > detail-capture > signal > exit precedence).
 
@@ -512,7 +514,7 @@ class Runner:
                     duration_s=elapsed,
                     summary=summary,
                     returncode=returncode,
-                    reason="ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)",
+                    reason="ABORTED (eager-exit after another step failed; --keep-going instead lets in-flight steps finish AND keeps launching the rest)",
                     aborted=True,
                 )
             elif ok:
@@ -539,13 +541,27 @@ class Runner:
                 )
             self.done[step.tag] = outcome
             if not was_aborted and not ok:
-                # A REAL failure. Mark failed + stop launching NEW steps. EAGER-EXIT (default):
-                # reap every step still running in parallel NOW so a fast failure doesn't wait for
-                # a slow in-flight build. keep_going instead lets those in-flight steps finish (so
-                # they report their own pass/fail); it does NOT launch any further steps.
+                # A REAL failure. The run is failed either way; what differs is COVERAGE.
+                #
+                # EAGER-EXIT (default): stop launching NEW steps AND eager-reap every step still
+                # running in parallel, so a fast failure doesn't wait on a slow in-flight build.
+                # Optimised for fast feedback, at the cost of leaving the rest of the DAG
+                # unmeasured.
+                #
+                # keep_going: do NEITHER. Every remaining runnable step still launches, and
+                # in-flight steps are left alone to report their own pass/fail, so ONE run
+                # collects EVERY independent failure. Steps whose deps actually failed are still
+                # excluded -- `_skipped()` closes over failed deps transitively -- so this widens
+                # coverage without ever running a step whose prerequisites are broken.
+                #
+                # Termination still works because `self.stop` stays False here: the loop's exit
+                # condition then rests on the other clause, `done + skipped >= len(steps)`, which
+                # every step now reaches (each either completes or is dep-skipped). The `stop`
+                # clause exists precisely for the eager-exit case, where deps-succeeded steps are
+                # neither launched nor skipped and the loop would otherwise spin forever.
                 self.failed = True
-                self.stop = True
                 if not self.keep_going:
+                    self.stop = True
                     for other, other_proc in list(self.running_procs.items()):
                         self.aborted.add(other)  # its thread will label itself ABORTED
                         reap(other_proc, self.cgroups, other)
@@ -554,7 +570,7 @@ class Runner:
         if outcome.aborted:
             self._emit(
                 f"[{step.tag}] ⊘ ABORT  {step.desc} "
-                f"({dur}s — eager-exit after another step failed; keep_going lets in-flight steps finish)"
+                f"({dur}s — eager-exit after another step failed; --keep-going instead lets in-flight steps finish AND keeps launching the rest)"
             )
         elif outcome.ok:
             extra = f"  [{summary}]" if (summary and self.verbosity >= 1) else ""
