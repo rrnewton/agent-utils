@@ -93,7 +93,9 @@ def test_control_timeout_terminates_descendants(
         try:
             with open(f"/proc/{descendant_pid}/stat", encoding="ascii") as handle:
                 stat_line = handle.read()
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
+            # procfs can report ESRCH from read() after open() succeeds when the process exits
+            # between those operations. That disappearance is the success condition under test.
             return
         # A killed grandchild can briefly remain as a zombie until its subreaper collects it. It
         # is no longer executable and therefore satisfies the no-orphaned-work guarantee.
