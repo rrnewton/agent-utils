@@ -13,8 +13,8 @@ per-step control the executor already enforces —
 
 The fourth containment axis, ``worker_limits.pids_max`` (inner ``pids.max``, the fork-bomb
 guard), is NOT a per-step serialized field: it is applied uniformly to every child cgroup by the
-cgroup manager at runtime (``manager.set_worker_pids_max(...)`` in execute.py), which keeps it out
-of the DAG JSON and off the Python/Rust differential-parity surface.
+cgroup manager at runtime (``manager.set_worker_pids_max(...)``), which keeps it out of the
+serialized DAG and profile schema.
 
 ``jobs_flag=""`` is set on every step so the executor never appends its own ``-j N`` to the
 workload command — a seed sweep's command is a complete argv, not a build tool that takes a

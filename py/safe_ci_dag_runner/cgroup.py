@@ -2063,9 +2063,11 @@ class NoopCgroups:
         return None
 
     def set_worker_pids_max(self, limit: int | None) -> None:
+        """Ignore the requested PID cap because containment is disabled."""
         return None
 
     def pids_events(self, tag: str) -> int:
+        """Return zero because no cgroup PID counter is available."""
         return 0
 
     def oom_kills(self, tag: str) -> int:

@@ -320,7 +320,7 @@ def test_run_only_runs_exactly_selected_step() -> None:
         path.write_text(dag, encoding="utf-8")
         rc, _, err = _capture(["run", "--dag", str(path), "--only", "test.unit", "-q", _ACF])
         assert rc == 0
-        assert "1 passed, 0 failed, 0 aborted, 0 skipped" in err
+        assert "1 passed, 0 failed, 0 aborted, 0 intentionally skipped, 0 dependency-skipped" in err
 
 
 def test_run_only_multiple_steps() -> None:
@@ -337,7 +337,7 @@ def test_run_only_multiple_steps() -> None:
         path.write_text(dag, encoding="utf-8")
         rc, _, err = _capture(["run", "--dag", str(path), "--only", "a.x,c.z", "-q", _ACF])
         assert rc == 0
-        assert "2 passed, 0 failed, 0 aborted, 0 skipped" in err
+        assert "2 passed, 0 failed, 0 aborted, 0 intentionally skipped, 0 dependency-skipped" in err
 
 
 def test_run_only_unknown_tag_exits_2() -> None:

@@ -51,6 +51,8 @@ class Project:
     #: SUBJECT MATTER rather than an accidental reference to a sibling implementation. Named per
     #: project so a waiver stays visible instead of becoming a hole in the rule.
     doc_term_exemptions: tuple[str, ...] = ()
+    #: Sibling distributions this package deliberately composes with and therefore must name.
+    sibling_package_exemptions: tuple[str, ...] = ()
 
 
 PROJECTS: tuple[Project, ...] = (
@@ -110,6 +112,20 @@ PROJECTS: tuple[Project, ...] = (
             "static/vendor/markdown-it-LICENSE.txt",
         ),
         required_dependencies=(),
+    ),
+    Project(
+        directory="parallel_experiment_runner",
+        distribution="parallel-experiment-runner",
+        package="parallel_experiment_runner",
+        commands=("parallel-experiment-runner",),
+        resources=(
+            "README.md",
+            "USER_GUIDE.md",
+            "py.typed",
+            "examples/chaos-sweep.json",
+        ),
+        required_dependencies=("safe-ci-dag-runner",),
+        sibling_package_exemptions=("safe-ci-dag-runner", "safe_ci_dag_runner"),
     ),
     Project(
         directory="herdr_run",
@@ -334,6 +350,8 @@ def _doc_violations(project: Project, text: str) -> list[str]:
         if sibling == project:
             continue
         for name in (sibling.distribution, sibling.package):
+            if name.lower() in project.sibling_package_exemptions:
+                continue
             match = re.search(re.escape(name), text, re.IGNORECASE)
             if match is not None:
                 errors.append(f"sibling package {match.group(0)!r}")

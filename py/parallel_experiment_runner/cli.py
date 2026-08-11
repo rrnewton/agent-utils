@@ -230,6 +230,7 @@ def _cmd_run(ns: argparse.Namespace) -> int:
     slice_ = _default_slice(work_dir, ns)
 
     def emit(line: str) -> None:
+        """Print one prefixed progress line immediately."""
         print(f"[{PROG}] {line}", flush=True)
 
     from typing import cast
@@ -367,6 +368,7 @@ def _cmd_plan_round(ns: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the complete command-line parser."""
     parser = argparse.ArgumentParser(
         prog=PROG,
         description=(
@@ -502,6 +504,7 @@ Notes:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line interface and return its process exit code."""
     parser = build_parser()
     ns = parser.parse_args(list(argv) if argv is not None else None)
 

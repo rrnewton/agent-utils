@@ -4,10 +4,10 @@
 Runnable three ways, all equivalent:
   * `python -m parallel_experiment_runner`
   * the installed console script `parallel-experiment-runner`
-  * directly via the `py/bin/parallel-experiment-runner` symlink (no install needed)
+  * directly via the repository's `parallel-experiment-runner` launcher
 
-The last case is why we fix up sys.path here: when this file is executed directly, the package's
-parent dir (py/) may not be importable yet.
+The last case is why we fix up ``sys.path`` here: when this file is executed directly, the
+package's parent directory may not be importable yet.
 """
 
 from __future__ import annotations

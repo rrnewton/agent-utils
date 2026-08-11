@@ -237,10 +237,12 @@ class CostEstimate:
 
     @classmethod
     def unset(cls, source: str = "UNSET") -> "CostEstimate":
+        """Return an estimate that truthfully carries no measured samples."""
         return cls(wall_s=None, cpu_s=None, peak_mem_bytes=None, samples=0, source=source)
 
     @property
     def is_set(self) -> bool:
+        """Whether at least one comparable sample supports this estimate."""
         return self.samples > 0
 
 
@@ -264,10 +266,12 @@ class SeedOutcome:
 
     @property
     def is_hit(self) -> bool:
+        """Whether this worker produced the experiment's target signal."""
         return self.status == STATUS_HIT
 
     @property
     def is_breach(self) -> bool:
+        """Whether a declared resource-containment limit was breached."""
         return self.status in BREACH_STATUSES
 
 
@@ -286,14 +290,17 @@ class RoundResult:
 
     @property
     def hits(self) -> tuple[int, ...]:
+        """Seeds that produced the experiment's target signal."""
         return tuple(o.seed for o in self.outcomes if o.is_hit)
 
     @property
     def breaches(self) -> tuple[SeedOutcome, ...]:
+        """Worker outcomes that breached a declared resource limit."""
         return tuple(o for o in self.outcomes if o.is_breach)
 
     @property
     def throughput_seeds_per_s(self) -> float:
+        """Measured completed-worker throughput for this round."""
         return len(self.outcomes) / self.wall_s if self.wall_s > 0 else 0.0
 
 

@@ -32,7 +32,7 @@ The hard requirements, each realized by a specific piece:
 5. KILL RECLAIMS THE NAMESPACE, not just the process. The real-world pile-up that motivated this
    tool was NOT a leaked ``tracing-appender`` thread on teardown (reproduction refuted that: five
    abandonment scenarios stranded zero workers, and the ``appender-holds-namespace`` link was a
-   15-char ``comm`` truncation artifact). It was a LIVE, HUNG ``hermit run --strict --verify`` —
+   15-char ``comm`` truncation artifact). It was a LIVE, HUNG ``target-runner --strict --verify`` —
    its main parked in tokio ``epoll_wait`` while the guest made no progress — holding a PID
    namespace open so its zombies (which cost zero CPU and zero memory, invisible to a
    cpu-and-memory-only box) were never reaped. A hang is exactly what the per-worker cpu-time /

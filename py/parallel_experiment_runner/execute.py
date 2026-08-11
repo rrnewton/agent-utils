@@ -344,14 +344,17 @@ class SweepResult:
 
     @property
     def hits(self) -> tuple[int, ...]:
+        """Seeds that produced the experiment's target signal."""
         return tuple(o.seed for o in self.outcomes if o.is_hit)
 
     @property
     def breaches(self) -> tuple[SeedOutcome, ...]:
+        """Worker outcomes that breached a declared resource limit."""
         return tuple(o for o in self.outcomes if o.is_breach)
 
     @property
     def throughput_seeds_per_s(self) -> float:
+        """Measured completed-worker throughput for the whole sweep."""
         return len(self.outcomes) / self.total_wall_s if self.total_wall_s > 0 else 0.0
 
 
