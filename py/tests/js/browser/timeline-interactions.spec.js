@@ -43,6 +43,12 @@ async function waitForViewChange(timeline, previousStart, previousEnd) {
   return readView(timeline);
 }
 
+function statValue(page, label) {
+  return page.locator("#stats-values .stat")
+    .filter({ hasText: label })
+    .locator(".stat-value");
+}
+
 async function zoomOutToLod(page, timeline, target) {
   const axis = page.locator("#time-axis");
   const box = await axis.boundingBox();
@@ -65,7 +71,7 @@ test.beforeEach(async function ({ page }) {
   await page.goto("/");
   await expect(page.locator("#dataset-meta")).not.toContainText("Loading timeline");
   await expect(page.locator("#load-error")).toBeHidden();
-  await expect(page.locator(phaseSelector)).toBeVisible();
+  await expect(page.locator(".phase-group" + phaseSelector)).toBeVisible();
 });
 
 test("schema 2 loads visible detail shards once and expands search on demand", async function ({ page }) {
@@ -93,6 +99,14 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   ].forEach(function (field) { delete globalData[field]; });
   globalData.schema_version = 2;
   globalData.kind = "timeline-global";
+  globalData.stats = {
+    user_prompts: 41,
+    agent_responses: 42,
+    inter_agent_messages: 43,
+    external_messages: 44,
+    tool_calls: 45,
+    active_agents: 4
+  };
   globalData.edges = TIMELINE.edges.filter(function (edge) {
     return edge.kind === "spawn" || edge.kind === "continuation" || edge.kind === "result";
   });
@@ -190,6 +204,14 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   await expect(card).toHaveAttribute("data-timeline-schema-mode", "schema2");
   await expect(timeline).toHaveAttribute("data-render-lod", "aggregate");
   await expect(card).toHaveAttribute("data-loaded-shard-count", "0");
+  await expect(page.locator("#stats-range-label")).not.toContainText(
+    "event counts unavailable"
+  );
+  await expect(statValue(page, "User prompts")).toHaveText("41");
+  await expect(statValue(page, "Agent responses")).toHaveText("42");
+  await expect(statValue(page, "Inter-agent msgs")).toHaveText("43");
+  await expect(statValue(page, "External msgs")).toHaveText("44");
+  await expect(statValue(page, "Tool calls")).toHaveText("45");
   expect(requests.get("bootstrap")).toBe(1);
   expect(requests.get("global")).toBe(1);
   expect(requests.get("first") || 0).toBe(0);
@@ -204,8 +226,43 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   await expect(card).toHaveAttribute("data-loaded-shard-count", "0");
   await expect(page.locator('.edge-group[data-edge-id="spawn-a"]')).toHaveCount(1);
   await expect(page.locator('.edge-group[data-edge-id="result-a"]')).toHaveCount(1);
+
+  await timeline.press("ArrowLeft");
+  await expect(timeline).toHaveAttribute("data-render-lod", "lifetime");
+  const agentLifetime = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(page.getByTestId("modal")).toBeVisible();
+  await expect(page.getByRole("tab", { name: "Work Phases" })).toHaveAttribute(
+    "aria-selected",
+    "true"
+  );
+  await expect(
+    page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-1"]')
+  ).toBeVisible();
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
+  expect(requests.get("first")).toBe(1);
+  expect(requests.get("remote") || 0).toBe(0);
+  await page.locator("#modal-close").click();
+
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(
+    page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-2"]')
+  ).toBeVisible();
+  expect(requests.get("first")).toBe(1);
+  await page.locator("#modal-close").click();
+
   await page.getByTestId("fit").click();
   await expect(timeline).toHaveAttribute("data-render-lod", "aggregate");
+  await expect(page.locator("#stats-range-label")).not.toContainText(
+    "event counts unavailable"
+  );
+  await expect(statValue(page, "User prompts")).toHaveText("41");
+  await expect(statValue(page, "Agent responses")).toHaveText("42");
+  await expect(statValue(page, "Inter-agent msgs")).toHaveText("43");
+  await expect(statValue(page, "External msgs")).toHaveText("44");
+  await expect(statValue(page, "Tool calls")).toHaveText("45");
+  expect(requests.get("first")).toBe(1);
+  expect(requests.get("remote") || 0).toBe(0);
 
   const firstRollup = ROLLUP_RANGES[0];
   const marker = page.locator(
@@ -219,7 +276,7 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   await page.getByTestId("timeline-context-menu")
     .getByRole("menuitem", { name: "Zoom to day", exact: true }).click();
   await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
-  await expect(page.locator(phaseSelector)).toBeVisible();
+  await expect(page.locator(".phase-group" + phaseSelector)).toBeVisible();
   expect(requests.get("first")).toBe(1);
   expect(requests.get("remote") || 0).toBe(0);
 
