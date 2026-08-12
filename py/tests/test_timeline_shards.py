@@ -5,6 +5,8 @@ import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from agent_team_timeline.archive import JsonValue, as_array, as_object, read_json
 from agent_team_timeline.timeline_shards import (
     SCHEMA_2_BOOTSTRAP_PATH,
@@ -190,3 +192,35 @@ def test_schema_2_projection_can_skip_sidecars_for_temporary_builds(
 
     assert all(not path.endswith(".gz") for path in report.generated_files)
     assert report.object_gzip_bytes == report.object_bytes
+
+
+def test_schema_2_projection_rejects_symlinked_object_parent(tmp_path: Path) -> None:
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "timeline-v2").symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="parent symlink"):
+        write_timeline_shards(tmp_path, _timeline())
+
+    assert list(victim.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ("data/timeline-v2.json", "data/timeline-v2.json.gz"),
+)
+def test_schema_2_projection_rejects_symlinked_bootstrap_files(
+    tmp_path: Path, relative: str
+) -> None:
+    victim = tmp_path / "victim"
+    victim.write_text("preserve me\n", encoding="utf-8")
+    candidate = tmp_path / relative
+    candidate.parent.mkdir(parents=True)
+    candidate.symlink_to(victim)
+
+    with pytest.raises(ValueError, match="output symlink"):
+        write_timeline_shards(tmp_path, _timeline())
+
+    assert victim.read_text(encoding="utf-8") == "preserve me\n"

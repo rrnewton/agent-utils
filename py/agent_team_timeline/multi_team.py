@@ -23,7 +23,11 @@ from agent_team_timeline.archive import (
 )
 from agent_team_timeline.pipeline import _ensure_archive, build_archive, load_archived_team
 from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
-from agent_team_timeline.static_assets import gzip_sidecar_path, sync_gzip_sidecar
+from agent_team_timeline.static_assets import (
+    gzip_sidecar_path,
+    sync_gzip_sidecar,
+    write_text_with_gzip_invalidation,
+)
 from agent_team_timeline.timeline_shards import write_timeline_shards
 from agent_team_timeline.window import DateWindow
 
@@ -455,6 +459,11 @@ def _remove_stale_files(output: Path, previous: set[str], current: set[str]) -> 
     changed = 0
     for raw in sorted(previous - current):
         relative = _safe_generated_path(raw)
+        if relative.parts[:3] == ("data", "timeline-v2", "objects"):
+            # A browser may still hold the preceding bootstrap and request one of its immutable
+            # day objects after this rebuild publishes a new bootstrap. Keep addressed objects
+            # monotonically so that an in-flight tab never turns a valid URL into a 404.
+            continue
         path = _output_path(output, relative.as_posix())
         if path.is_file() or path.is_symlink():
             path.unlink()
@@ -462,13 +471,19 @@ def _remove_stale_files(output: Path, previous: set[str], current: set[str]) -> 
     return changed
 
 
-def _copy_text_file(source: Path, target: Path) -> bool:
+def _copy_text_file(source: Path, target: Path) -> int:
     if not source.is_file():
         raise ValueError(f"rendered team output is missing {source}")
-    return write_text_if_changed(
+    return write_text_with_gzip_invalidation(
         target,
         source.read_text(encoding="utf-8"),
         executable=bool(source.stat().st_mode & 0o111),
+    )
+
+
+def _write_compressible_json(path: Path, value: JsonValue) -> int:
+    return write_text_with_gzip_invalidation(
+        path, canonical_json(value)
     )
 
 
@@ -601,11 +616,9 @@ def build_combined_archive(
                 _safe_generated_path(target_relative)
                 generated_files.add(target_relative)
                 compressible_files.add(target_relative)
-                changed += int(
-                    write_json_if_changed(
-                        _output_path(output, target_relative),
-                        _transform_detail(rendered.slug, detail, str(source_path)),
-                    )
+                changed += _write_compressible_json(
+                    _output_path(output, target_relative),
+                    _transform_detail(rendered.slug, detail, str(source_path)),
                 )
 
         ranges = [
@@ -668,21 +681,12 @@ def build_combined_archive(
             ),
             "combined artifact catalog",
         )
-        changed += int(
-            write_json_if_changed(
-                _output_path(output, "data/timeline.json"), timeline
-            )
+        changed += _write_compressible_json(
+            _output_path(output, "data/timeline.json"), timeline
         )
         compressible_files.add("data/timeline.json")
-        shard_report = write_timeline_shards(output, timeline)
-        changed += shard_report.files_changed
-        for relative in shard_report.generated_files:
-            _safe_generated_path(relative)
-            generated_files.add(relative)
-        changed += int(
-            write_json_if_changed(
-                _output_path(output, "data/artifacts.json"), artifact_catalog
-            )
+        changed += _write_compressible_json(
+            _output_path(output, "data/artifacts.json"), artifact_catalog
         )
         compressible_files.add("data/artifacts.json")
         readme = (
@@ -728,6 +732,12 @@ def build_combined_archive(
                 sidecar_relative = relative + ".gz"
                 _safe_generated_path(sidecar_relative)
                 generated_files.add(sidecar_relative)
+
+        shard_report = write_timeline_shards(output, timeline)
+        changed += shard_report.files_changed
+        for relative in shard_report.generated_files:
+            _safe_generated_path(relative)
+            generated_files.add(relative)
 
         export_manifest = as_object(
             narrow_json(

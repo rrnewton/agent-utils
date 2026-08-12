@@ -563,7 +563,8 @@
       summary_files: array(raw.summary_files),
       glossary: array(raw.glossary),
       glossary_path: text(raw.glossary_path),
-      artifact_catalog_path: text(raw.artifact_catalog_path)
+      artifact_catalog_path: text(raw.artifact_catalog_path),
+      stats: raw.stats && typeof raw.stats === "object" ? raw.stats : null
     };
 
     var inferredStart = Infinity;
@@ -1020,10 +1021,17 @@
   function loadDetailShard(catalogEntry) {
     var url = immutableTimelineObjectUrl(catalogEntry, "detail shard");
     if (!app.detailPromises.has(url)) {
-      app.detailPromises.set(url, fetchJsonCached(url).then(function (raw) {
+      var request = fetchJsonCached(url).then(function (raw) {
         mergeDetailShard(raw, url);
         return raw;
-      }));
+      });
+      var cached = request.catch(function (error) {
+        if (app.detailPromises.get(url) === cached) {
+          app.detailPromises.delete(url);
+        }
+        throw error;
+      });
+      app.detailPromises.set(url, cached);
     }
     return app.detailPromises.get(url);
   }
@@ -1048,7 +1056,11 @@
       }
       return loadDetailShard(shard);
     });
-    return { started: started, promise: Promise.all(promises) };
+    var promise = Promise.all(promises);
+    if (started) {
+      promise.then(scheduleRender, function () { return undefined; });
+    }
+    return { started: started, promise: promise };
   }
 
   function showDetailLoadError(error) {
@@ -1066,9 +1078,7 @@
     var request = requestDetailShards(
       detailShardsForRange(app.viewStart, app.viewEnd, 0.08)
     );
-    if (request.started) {
-      request.promise.then(scheduleRender).catch(showDetailLoadError);
-    }
+    request.promise.catch(showDetailLoadError);
   }
 
   function requestSearchCorpus() {
@@ -2900,18 +2910,67 @@
     return visibleIds.has(agentId);
   }
 
+  function detailCoverageComplete(start, end) {
+    if (app.schemaMode !== "schema2") {
+      return true;
+    }
+    return app.shardCatalog.every(function (shard) {
+      var overlaps = number(shard.start_ms, Infinity) < end &&
+        number(shard.end_ms, -Infinity) > start;
+      return !overlaps || app.loadedShardUrls.has(
+        immutableTimelineObjectUrl(shard, "detail shard")
+      );
+    });
+  }
+
+  function fullRangeAggregateStats() {
+    function usableEventStats(value) {
+      if (!value || typeof value !== "object") {
+        return null;
+      }
+      var fields = [
+        "user_prompts",
+        "agent_responses",
+        "inter_agent_messages",
+        "external_messages",
+        "tool_calls"
+      ];
+      return fields.every(function (field) {
+        return Object.prototype.hasOwnProperty.call(value, field) &&
+          Number.isFinite(Number(value[field]));
+      }) ? value : null;
+    }
+    if (app.query || app.viewStart > app.data.range.start_ms ||
+        app.viewEnd < app.data.range.end_ms) {
+      return null;
+    }
+    if (!app.selectedTeam) {
+      return usableEventStats(app.data.stats);
+    }
+    var team = app.teamBySlug.get(app.selectedTeam);
+    return usableEventStats(team && team.stats);
+  }
+
   function countVisibleStats() {
     var visibleIds = new Set(app.rows.map(function (row) {
       return text(row.agent.id);
     }));
+    var eventCountsAvailable = detailCoverageComplete(app.viewStart, app.viewEnd);
+    var aggregateStats = eventCountsAvailable ? null : fullRangeAggregateStats();
+    var hasAggregateStats = aggregateStats !== null;
     var result = {
-      user_prompts: app.data.events.length ? 0 : null,
-      agent_responses: app.data.events.length ? 0 : null,
-      inter_agent_messages: app.data.events.length ? 0 : null,
-      external_messages: app.data.events.length ? 0 : null,
-      tool_calls: app.data.events.length ? 0 : null,
+      user_prompts: eventCountsAvailable ? 0 :
+        (hasAggregateStats ? number(aggregateStats.user_prompts, 0) : null),
+      agent_responses: eventCountsAvailable ? 0 :
+        (hasAggregateStats ? number(aggregateStats.agent_responses, 0) : null),
+      inter_agent_messages: eventCountsAvailable ? 0 :
+        (hasAggregateStats ? number(aggregateStats.inter_agent_messages, 0) : null),
+      external_messages: eventCountsAvailable ? 0 :
+        (hasAggregateStats ? number(aggregateStats.external_messages, 0) : null),
+      tool_calls: eventCountsAvailable ? 0 :
+        (hasAggregateStats ? number(aggregateStats.tool_calls, 0) : null),
       active_agents: 0,
-      event_counts_available: app.data.events.length > 0
+      event_counts_available: eventCountsAvailable || hasAggregateStats
     };
     app.rows.forEach(function (row) {
       var agent = row.agent;
@@ -2929,10 +2988,10 @@
       var at = number(event.at_ms, NaN);
       return Number.isFinite(at) &&
         at >= app.viewStart &&
-        at <= app.viewEnd &&
+        at < app.viewEnd &&
         eventBelongsToVisibleAgent(event, visibleIds);
     });
-    if (app.data.events.length) {
+    if (eventCountsAvailable) {
       eventsInRange.forEach(function (event) {
         var kind = text(event.kind).toLowerCase().replace(/[- ]/g, "_");
         if (kind === "user_prompt" || kind === "user_prompts" || kind === "prompt") {
@@ -4067,7 +4126,7 @@
       container.appendChild(htmlElement(
         "div",
         "empty-message",
-        "No summarized work phases were retained for this agent."
+        "No work phases were recorded for this agent."
       ));
       return;
     }
@@ -4097,8 +4156,35 @@
     container.appendChild(list);
   }
 
+  async function renderAgentLifetimePhases(container, agent, request) {
+    if (app.schemaMode === "schema2") {
+      var start = number(agent.start_ms, app.data.range.start_ms);
+      var end = number(agent.end_ms, app.data.range.end_ms);
+      var shards = app.shardCatalog.filter(function (shard) {
+        return number(shard.start_ms, Infinity) < end &&
+          number(shard.end_ms, -Infinity) > start;
+      });
+      var needsLoading = shards.some(function (shard) {
+        return !app.loadedShardUrls.has(
+          immutableTimelineObjectUrl(shard, "detail shard")
+        );
+      });
+      var detailRequest = requestDetailShards(shards);
+      if (needsLoading) {
+        showLoading(container, "Loading agent work phases…");
+      }
+      await detailRequest.promise;
+      if (request !== app.detailRequest || dom.modalBackdrop.hidden ||
+          !container.isConnected) {
+        return;
+      }
+      container.replaceChildren();
+    }
+    renderAgentLifetimeOverview(container, agent);
+  }
+
   function openAgentLifetimeModal(agent) {
-    app.detailRequest += 1;
+    var request = ++app.detailRequest;
     var start = number(agent.start_ms, app.data.range.start_ms);
     var end = number(agent.end_ms, app.data.range.end_ms);
     openModalBase(
@@ -4113,7 +4199,7 @@
       {
         label: "Work Phases",
         render: function (container) {
-          renderAgentLifetimeOverview(container, agent);
+          return renderAgentLifetimePhases(container, agent, request);
         }
       }
     ];
@@ -4452,7 +4538,7 @@
 
   function fetchJsonCached(url) {
     if (!app.resourcePromises.has(url)) {
-      app.resourcePromises.set(url, (async function () {
+      var request = (async function () {
         var response = await fetch(url, { credentials: "same-origin" });
         if (!response.ok) {
           var error = new Error("HTTP " + response.status + " " + response.statusText);
@@ -4460,7 +4546,14 @@
           throw error;
         }
         return response.json();
-      }()));
+      }());
+      var cached = request.catch(function (error) {
+        if (app.resourcePromises.get(url) === cached) {
+          app.resourcePromises.delete(url);
+        }
+        throw error;
+      });
+      app.resourcePromises.set(url, cached);
     }
     return app.resourcePromises.get(url);
   }

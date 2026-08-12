@@ -34,7 +34,10 @@ from agent_team_timeline.model import (
     Turn,
     source_digest,
 )
-from agent_team_timeline.multi_team import build_combined_archive
+from agent_team_timeline.multi_team import (
+    _remove_stale_files,
+    build_combined_archive,
+)
 from agent_team_timeline.periods import Period, periods_for_range
 from agent_team_timeline.phases import PhaseStats, PhaseWindow, build_phases
 from agent_team_timeline.pipeline import (
@@ -350,6 +353,14 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert timeline["display_timezone_source"] == "legacy_team_data"
     assert timeline["teams"][0]["projects"] == []
     assert timeline["teams"][0]["hosts"] == []
+    assert timeline["teams"][0]["stats"] == timeline["stats"]
+    assert timeline["stats"]["events"] == len(timeline["events"])
+    assert timeline["stats"]["active_agents"] == len(timeline["agents"])
+    assert timeline["stats"]["external_messages"] == 0
+    schema_2_global = json.loads(
+        (tmp_path / schema_2_bootstrap["global"]["url"]).read_text(encoding="utf-8")
+    )
+    assert schema_2_global["stats"] == timeline["stats"]
     assert any(edge["kind"] == "spawn" for edge in timeline["edges"])
     result_edges = [edge for edge in timeline["edges"] if edge["kind"] == "result"]
     assert len(result_edges) == 1
@@ -804,6 +815,7 @@ def test_build_embeds_standalone_site_identity(tmp_path: Path) -> None:
             "label": team.team_slug,
             "projects": [identity.projects[0].to_json_obj()],
             "hosts": [identity.hosts[0].to_json_obj()],
+            "stats": timeline["stats"],
         }
     ]
 
@@ -2265,6 +2277,29 @@ def test_combined_export_builds_two_zero_summary_teams(tmp_path: Path) -> None:
     assert query_item["summary_available"] is False
     assert "technical_markdown" not in query_item
     assert "plain_language_markdown" not in query_item
+
+
+def test_combined_export_retains_prior_content_addressed_timeline_objects(
+    tmp_path: Path,
+) -> None:
+    digest = "a" * 64
+    object_relative = f"data/timeline-v2/objects/{digest}.json"
+    sidecar_relative = object_relative + ".gz"
+    for relative in (object_relative, sidecar_relative, "README.md"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("old generation\n", encoding="utf-8")
+
+    changed = _remove_stale_files(
+        tmp_path,
+        {object_relative, sidecar_relative, "README.md"},
+        set(),
+    )
+
+    assert changed == 1
+    assert (tmp_path / object_relative).is_file()
+    assert (tmp_path / sidecar_relative).is_file()
+    assert not (tmp_path / "README.md").exists()
 
 
 def test_combined_export_refuses_unmarked_nonempty_output(tmp_path: Path) -> None:

@@ -9,6 +9,8 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from agent_team_timeline.archive import write_text_if_changed
+
 GZIP_COMPRESSION_LEVEL = 6
 GZIP_MINIMUM_BYTES = 1024
 
@@ -32,6 +34,35 @@ def deterministic_gzip(data: bytes) -> bytes:
     ) as compressed:
         compressed.write(data)
     return output.getvalue()
+
+
+def write_text_with_gzip_invalidation(
+    path: Path, text: str, *, executable: bool = False
+) -> int:
+    """Write text without ever pairing new identity bytes with an old gzip sidecar.
+
+    The sidecar is removed before a content-changing identity write. Callers may regenerate it
+    after all mutually referenced resources are ready, then publish their manifest/bootstrap.
+    """
+
+    if path.is_symlink():
+        raise ValueError(f"refusing to replace symlinked static asset: {path}")
+    sidecar = gzip_sidecar_path(path)
+    if sidecar.is_symlink() or (sidecar.exists() and not sidecar.is_file()):
+        raise ValueError(f"refusing unsafe gzip sidecar: {sidecar}")
+    content_changed = (
+        not path.is_file() or path.read_text(encoding="utf-8") != text
+    )
+    if not content_changed:
+        if executable:
+            path.chmod(path.stat().st_mode | 0o111)
+        return 0
+    changed = 0
+    if sidecar.is_file():
+        sidecar.unlink()
+        changed += 1
+    changed += int(write_text_if_changed(path, text, executable=executable))
+    return changed
 
 
 def _files_equal(left: Path, right: Path) -> bool:
@@ -104,4 +135,5 @@ __all__ = [
     "deterministic_gzip",
     "gzip_sidecar_path",
     "sync_gzip_sidecar",
+    "write_text_with_gzip_invalidation",
 ]

@@ -9,7 +9,12 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from agent_team_timeline.activity_bins import build_activity_bins
-from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
+from agent_team_timeline.archive import (
+    JsonValue,
+    canonical_json,
+    narrow_json,
+    write_text_if_changed,
+)
 from agent_team_timeline.artifacts import (
     ArtifactCatalog,
     ArtifactRangeIndex,
@@ -31,7 +36,11 @@ from agent_team_timeline.summarize import (
     clean_summary_prose,
     clean_summary_result,
 )
-from agent_team_timeline.static_assets import gzip_sidecar_path, sync_gzip_sidecar
+from agent_team_timeline.static_assets import (
+    gzip_sidecar_path,
+    sync_gzip_sidecar,
+    write_text_with_gzip_invalidation,
+)
 from agent_team_timeline.timeline_shards import write_timeline_shards
 from agent_team_timeline.terminology import (
     GlossaryTerm,
@@ -557,12 +566,42 @@ def _event_objs(
     return result
 
 
+def _event_stats(
+    events: Sequence[Mapping[str, object]], agent_count: int
+) -> dict[str, int]:
+    counts = {
+        "user_prompts": 0,
+        "agent_responses": 0,
+        "inter_agent_messages": 0,
+        "external_messages": 0,
+        "tool_calls": 0,
+    }
+    labels = {
+        "user_prompt": "user_prompts",
+        "assistant_message": "agent_responses",
+        "inter_agent_message": "inter_agent_messages",
+        "external_message": "external_messages",
+        "tool_call": "tool_calls",
+    }
+    for event in events:
+        label = labels.get(_object_string(event.get("kind")))
+        if label is not None:
+            counts[label] += 1
+    return {**counts, "active_agents": agent_count, "events": len(events)}
+
+
 def _object_int(value: object) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
 def _object_string(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def _write_compressible_json(path: Path, value: JsonValue) -> int:
+    return write_text_with_gzip_invalidation(
+        path, canonical_json(value)
+    )
 
 
 def _standalone_server() -> str:
@@ -720,11 +759,9 @@ def render_archive(
         phase_artifact_ids[phase.phase_id] = artifact_ids
         phase_output_artifact_ids[phase.phase_id] = output_artifact_ids
         if summary.summary_available:
-            changed += int(
-                write_text_if_changed(
-                    archive / raw_path,
-                    _phase_markdown(team, agent, phase_agent_name, phase, summary),
-                )
+            changed += write_text_with_gzip_invalidation(
+                archive / raw_path,
+                _phase_markdown(team, agent, phase_agent_name, phase, summary),
             )
             published_summary_paths.add(raw_path)
         else:
@@ -753,7 +790,9 @@ def render_archive(
             "artifact_ids": list(artifact_ids),
             "output_artifact_ids": list(output_artifact_ids),
         }
-        changed += int(write_json_if_changed(archive / detail_path, narrow_json(detail)))
+        changed += _write_compressible_json(
+            archive / detail_path, narrow_json(detail, detail_path)
+        )
 
     for agent in team.agents:
         own = sorted(phases_by_agent.get(agent.thread_id, []), key=lambda phase: phase.start_ms)
@@ -764,17 +803,15 @@ def render_archive(
             continue
         name = _agent_name(agent, agent_names)
         if _agent_summary_available(name):
-            changed += int(
-                write_text_if_changed(
-                    archive / agent_path,
-                    _agent_markdown(
-                        team,
-                        agent,
-                        name,
-                        own,
-                        phase_summaries,
-                    ),
-                )
+            changed += write_text_with_gzip_invalidation(
+                archive / agent_path,
+                _agent_markdown(
+                    team,
+                    agent,
+                    name,
+                    own,
+                    phase_summaries,
+                ),
             )
             published_summary_paths.add(agent_path)
         else:
@@ -792,11 +829,9 @@ def render_archive(
         )
         rollup_paths[period_key] = (technical_path, plain_path)
         if technical_path:
-            changed += int(
-                write_text_if_changed(
-                    archive / technical_path,
-                    _rollup_markdown(team, period, summary, stats, "technical"),
-                )
+            changed += write_text_with_gzip_invalidation(
+                archive / technical_path,
+                _rollup_markdown(team, period, summary, stats, "technical"),
             )
             published_summary_paths.add(technical_path)
         else:
@@ -804,13 +839,11 @@ def render_archive(
         expected_plain_path = _plain_language_path(period)
         compressible_paths.update((period.relative_path, expected_plain_path))
         if plain_path:
-            changed += int(
-                write_text_if_changed(
-                    archive / plain_path,
-                    _rollup_markdown(
-                        team, period, plain_summary, stats, "plain-language"
-                    ),
-                )
+            changed += write_text_with_gzip_invalidation(
+                archive / plain_path,
+                _rollup_markdown(
+                    team, period, plain_summary, stats, "plain-language"
+                ),
             )
             published_summary_paths.add(plain_path)
         else:
@@ -829,10 +862,8 @@ def render_archive(
         if week_path.parent.is_symlink() or week_path.is_symlink():
             raise ValueError(f"refusing symlinked generated glossary path: {week_path}")
         expected_week_paths.add(week_path.resolve())
-        changed += int(
-            write_text_if_changed(
-                archive / path, glossary_markdown(team.team_slug, week, glossary_terms)
-            )
+        changed += write_text_with_gzip_invalidation(
+            archive / path, glossary_markdown(team.team_slug, week, glossary_terms)
         )
         published_summary_paths.add(path)
     if glossary_root.is_dir():
@@ -874,13 +905,11 @@ def render_archive(
     glossary_catalog_path = ""
     if glossary_terms or project_overview.summary_available:
         glossary_catalog_path = expected_glossary_catalog_path
-        changed += int(
-            write_text_if_changed(
-                archive / glossary_catalog_path,
-                glossary_catalog_markdown(
-                    team.team_slug, glossary_terms, project_overview.paragraph
-                ),
-            )
+        changed += write_text_with_gzip_invalidation(
+            archive / glossary_catalog_path,
+            glossary_catalog_markdown(
+                team.team_slug, glossary_terms, project_overview.paragraph
+            ),
         )
         published_summary_paths.add(glossary_catalog_path)
     else:
@@ -891,7 +920,7 @@ def render_archive(
     static_root = files("agent_team_timeline") / "static"
     for asset_name in ("index.html", "timeline-core.js", "app.js", "style.css"):
         text = (static_root / asset_name).read_text(encoding="utf-8")
-        changed += int(write_text_if_changed(archive / asset_name, text))
+        changed += write_text_with_gzip_invalidation(archive / asset_name, text)
         compressible_paths.add(asset_name)
     vendor_root = static_root / "vendor"
     for vendor_name in (
@@ -900,11 +929,15 @@ def render_archive(
         "markdown-it-LICENSE.txt",
     ):
         text = (vendor_root / vendor_name).read_text(encoding="utf-8")
-        changed += int(
-            write_text_if_changed(archive / "vendor" / vendor_name, text)
-        )
         if vendor_name.endswith(".js"):
+            changed += write_text_with_gzip_invalidation(
+                archive / "vendor" / vendor_name, text
+            )
             compressible_paths.add(f"vendor/{vendor_name}")
+        else:
+            changed += int(
+                write_text_if_changed(archive / "vendor" / vendor_name, text)
+            )
     changed += int(write_text_if_changed(archive / "serve.py", _standalone_server(), executable=True))
     run_stats_source = (files("agent_team_timeline") / "run_stats.py").read_text(
         encoding="utf-8"
@@ -1155,6 +1188,8 @@ def render_archive(
         observed_start_ms=start_ms,
         observed_end_ms=end_ms,
     )
+    event_objs = _event_objs(team, visible_agent_ids)
+    timeline_stats = _event_stats(event_objs, len(visible_agent_ids))
     timeline: dict[str, object] = {
         "schema_version": 1,
         "generated_at": _iso(latest_ms),
@@ -1168,13 +1203,14 @@ def render_archive(
                 "label": team.team_slug,
                 "projects": [item.to_json_obj() for item in site_identity.projects],
                 "hosts": [item.to_json_obj() for item in site_identity.hosts],
+                "stats": timeline_stats,
             }
         ],
         "agents": agent_objs,
         "phases": phase_objs,
         "activity_bins": [item.to_json_obj() for item in activity_bins],
         "edges": edge_objs,
-        "events": _event_objs(team, visible_agent_ids),
+        "events": event_objs,
         "rollups": rollup_objs,
         "glossary": glossary_objs,
         "glossary_path": glossary_catalog_path,
@@ -1193,28 +1229,27 @@ def render_archive(
         "summary_files": summary_files,
         "artifact_catalog_path": "data/artifacts.json",
         "projects": [project.to_json_obj() for project in artifact_catalog.projects],
+        "stats": timeline_stats,
     }
-    changed += int(
-        write_json_if_changed(
-            archive / "data" / "artifacts.json",
-            narrow_json(artifact_catalog.to_json_obj()),
-        )
+    changed += _write_compressible_json(
+        archive / "data" / "artifacts.json",
+        narrow_json(artifact_catalog.to_json_obj(), "artifact catalog"),
     )
     compressible_paths.add("data/artifacts.json")
     timeline_json = narrow_json(timeline)
     if not isinstance(timeline_json, dict):
         raise AssertionError("timeline projection must be an object")
-    changed += int(
-        write_json_if_changed(archive / "data" / "timeline.json", timeline_json)
+    changed += _write_compressible_json(
+        archive / "data" / "timeline.json", timeline_json
     )
     compressible_paths.add("data/timeline.json")
+    if _precompress:
+        for relative in sorted(compressible_paths):
+            changed += int(sync_gzip_sidecar(archive / relative))
     shard_report = write_timeline_shards(
         archive, timeline_json, precompress=_precompress
     )
     changed += shard_report.files_changed
-    if _precompress:
-        for relative in sorted(compressible_paths):
-            changed += int(sync_gzip_sidecar(archive / relative))
     return {
         "files_changed": changed,
         "phases": len(phases),

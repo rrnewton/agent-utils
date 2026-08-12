@@ -70,8 +70,13 @@ thresholds and suppressions are part of the performance contract and are covered
 Website builds keep timeline schema 1 and every uncompressed identity file intact. They also create
 byte-idempotent gzip-6 sidecars for browser-facing JSON, JavaScript, CSS, HTML, and rendered
 Markdown files of at least 1 KiB. The gzip header has no source filename and a zero timestamp, so a
-content-identical rebuild does not change the sidecar or its mtime. Combined exports inventory and
-remove their managed sidecars just like the corresponding identity files.
+content-identical rebuild does not change the sidecar or its mtime. Combined exports inventory
+their managed sidecars; ordinary obsolete sidecars are removed with the corresponding identity
+files, while content-addressed timeline objects follow the retention rule below.
+When a compressible identity changes, its old sidecar is removed before the identity is replaced,
+so the server can fall back to the new uncompressed bytes rather than pair them with old compressed
+bytes. All artifact catalogs, phase details, summaries, and their refreshed sidecars are complete
+before a schema-2 bootstrap publishes objects that refer to them.
 
 Builds additionally project schema 1 into the backwards-compatible schema-2 browser layout.
 `data/timeline-v2.json` is the stable bootstrap: it carries site/team identity, the complete time
@@ -80,10 +85,20 @@ catalog. The immutable global object carries agent lifetimes, structural spawn/c
 edges, rollups, glossary and summary-file metadata. Each non-empty UTC-day object carries
 intersecting phases (including their states), events, and detailed message edges. A phase or
 detailed edge crossing midnight appears in both day objects; the browser deduplicates it by stable
-ID. Object basenames are their complete SHA-256 digest, and their gzip
 ID. Object basenames are their complete SHA-256 digest, and their gzip sidecars are generated
-before the bootstrap atomically publishes those URLs. Schema 1 remains the
-archive-local CLI projection and the browser fallback for older exports.
+before the bootstrap atomically publishes those URLs. Schema 1 remains the archive-local CLI
+projection and the browser fallback for older exports.
+Published content-addressed objects accumulate monotonically: a rebuild may stop listing an old
+object in its new bootstrap, but it does not immediately delete that object while an already-open
+browser tab may still hold the preceding bootstrap.
+
+The browser does not infer complete statistics from a partially loaded set of days. It uses the
+global aggregate only for an unfiltered full-range view, computes narrower totals only when every
+overlapping day is resident, and otherwise marks event counts unavailable. Opening an agent
+lifetime explicitly loads the days intersecting that lifetime before listing its work phases;
+subsequent timeline views and modal opens reuse those same in-memory promises and objects.
+Successful object requests remain cached for the page lifetime, while a rejected request is
+evicted so a later user action can retry a transient server or network failure.
 
 Both the installed `serve` command and generated `serve.py` use the same dependency-free handler.
 It selects a `.gz` companion only when `Accept-Encoding` permits gzip, retains the original MIME

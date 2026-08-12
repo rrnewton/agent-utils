@@ -8,8 +8,6 @@ Every referenced object is written before the bootstrap that publishes its URL.
 from __future__ import annotations
 
 import hashlib
-import os
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,10 +22,9 @@ from agent_team_timeline.archive import (
     write_text_if_changed,
 )
 from agent_team_timeline.static_assets import (
-    GZIP_MINIMUM_BYTES,
-    deterministic_gzip,
     gzip_sidecar_path,
     sync_gzip_sidecar,
+    write_text_with_gzip_invalidation,
 )
 
 
@@ -84,41 +81,27 @@ def _object_path(digest: str) -> str:
     return f"{_OBJECT_ROOT}/{digest}.json"
 
 
-def _write_bytes_if_changed(path: Path, content: bytes) -> bool:
-    if path.is_symlink():
-        raise ValueError(f"refusing unsafe gzip sidecar: {path}")
-    if path.is_file() and path.read_bytes() == content:
-        return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, raw_temporary = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=path.parent
-    )
-    temporary = Path(raw_temporary)
+def _safe_output_path(output: Path, relative: str) -> Path:
+    path = Path(relative)
+    if path.is_absolute() or not path.parts or any(
+        part in ("", ".", "..") for part in path.parts
+    ):
+        raise ValueError(f"unsafe timeline shard output path: {relative!r}")
+    cursor = output
+    for part in path.parts[:-1]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"refusing timeline shard parent symlink: {cursor}")
+    candidate = output.joinpath(*path.parts)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
-    return True
-
-
-def _prepare_bootstrap_sidecar(
-    path: Path, content: bytes, *, precompress: bool
-) -> tuple[int, int | None]:
-    sidecar = gzip_sidecar_path(path)
-    if sidecar.is_symlink():
-        raise ValueError(f"refusing unsafe gzip sidecar: {sidecar}")
-    if not precompress or len(content) < GZIP_MINIMUM_BYTES:
-        if sidecar.is_file():
-            sidecar.unlink()
-            return 1, None
-        return 0, None
-    compressed = deterministic_gzip(content)
-    return int(_write_bytes_if_changed(sidecar, compressed)), len(compressed)
+        candidate.parent.resolve().relative_to(output.resolve())
+    except ValueError as error:
+        raise ValueError(
+            f"timeline shard output path escapes through a symlink: {relative!r}"
+        ) from error
+    if candidate.is_symlink():
+        raise ValueError(f"refusing timeline shard output symlink: {candidate}")
+    return candidate
 
 
 def _store_object(
@@ -128,7 +111,8 @@ def _store_object(
     encoded = content.encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     relative = _object_path(digest)
-    path = output / relative
+    path = _safe_output_path(output, relative)
+    _safe_output_path(output, relative + ".gz")
     changed = int(write_text_if_changed(path, content))
     if precompress:
         changed += int(sync_gzip_sidecar(path))
@@ -256,6 +240,9 @@ def write_timeline_shards(
 
     if as_int(raw_timeline.get("schema_version"), "timeline.schema_version") != 1:
         raise ValueError("schema-2 sharding requires a schema-1 source timeline")
+    bootstrap_path = _safe_output_path(output, SCHEMA_2_BOOTSTRAP_PATH)
+    _safe_output_path(output, SCHEMA_2_BOOTSTRAP_PATH + ".gz")
+    _safe_output_path(output, f"{_OBJECT_ROOT}/object.json")
     timeline = as_object(narrow_json(raw_timeline), "timeline")
     days = _detail_days(timeline)
     generated_files: set[str] = {SCHEMA_2_BOOTSTRAP_PATH}
@@ -324,18 +311,20 @@ def write_timeline_shards(
     }
     # Publication point: every immutable URL above exists (with its gzip representation, when
     # useful) before the stable manifest begins referring to it.
-    bootstrap_path = output / SCHEMA_2_BOOTSTRAP_PATH
-    bootstrap_content = canonical_json(bootstrap).encode("utf-8")
-    sidecar_changed, bootstrap_gzip_bytes = _prepare_bootstrap_sidecar(
-        bootstrap_path, bootstrap_content, precompress=precompress
+    bootstrap_text = canonical_json(bootstrap)
+    changed += write_text_with_gzip_invalidation(bootstrap_path, bootstrap_text)
+    bootstrap_sidecar = gzip_sidecar_path(bootstrap_path)
+    if precompress:
+        changed += int(sync_gzip_sidecar(bootstrap_path))
+    elif bootstrap_sidecar.is_file():
+        bootstrap_sidecar.unlink()
+        changed += 1
+    bootstrap_gzip_bytes = (
+        bootstrap_sidecar.stat().st_size if bootstrap_sidecar.is_file() else None
     )
-    changed += sidecar_changed
     if bootstrap_gzip_bytes is not None:
         generated_files.add(SCHEMA_2_BOOTSTRAP_PATH + ".gz")
-    changed += int(
-        write_text_if_changed(bootstrap_path, bootstrap_content.decode("utf-8"))
-    )
-    bootstrap_bytes = len(bootstrap_content)
+    bootstrap_bytes = len(bootstrap_text.encode("utf-8"))
     return TimelineShardReport(
         files_changed=changed,
         generated_files=tuple(sorted(generated_files)),

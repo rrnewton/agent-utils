@@ -11,6 +11,7 @@ from agent_team_timeline.static_assets import (
     deterministic_gzip,
     gzip_sidecar_path,
     sync_gzip_sidecar,
+    write_text_with_gzip_invalidation,
 )
 
 
@@ -42,6 +43,31 @@ def test_gzip_sidecar_sync_is_idempotent_and_removes_tiny_stale_file(
     source.write_bytes(b"{}\n")
     assert sync_gzip_sidecar(source) is True
     assert not sidecar.exists()
+
+
+def test_content_change_invalidates_sidecar_before_identity_replacement(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "timeline.json"
+    source.write_text("old generation\n" * 1_000, encoding="utf-8")
+    assert sync_gzip_sidecar(source) is True
+    sidecar = gzip_sidecar_path(source)
+    assert sidecar.is_file()
+
+    changed = write_text_with_gzip_invalidation(
+        source, "new generation\n" * 1_000
+    )
+
+    assert changed == 2
+    assert not sidecar.exists()
+    assert source.read_text(encoding="utf-8").startswith("new generation")
+    assert sync_gzip_sidecar(source) is True
+    refreshed = sidecar.read_bytes()
+    assert gzip.decompress(refreshed) == source.read_bytes()
+    assert write_text_with_gzip_invalidation(
+        source, "new generation\n" * 1_000
+    ) == 0
+    assert sidecar.read_bytes() == refreshed
 
 
 def test_accept_encoding_respects_explicit_gzip_exclusion() -> None:
