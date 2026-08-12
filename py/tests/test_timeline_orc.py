@@ -559,7 +559,7 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
                 {
                     "GChat": {
                         "message_name": "spaces/x/messages/legacy-owner",
-                        "sender_name": "newton",
+                        "sender_name": "users/owner-id",
                     }
                 }
             ),
@@ -586,6 +586,7 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
                     "GChat": {
                         "message_name": "spaces/x/messages/owner",
                         "sender_unixname": "newton",
+                        "sender_name": "users/owner-id",
                         "is_owner": True,
                     }
                 }

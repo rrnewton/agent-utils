@@ -2710,7 +2710,7 @@ def _content_records(
             explicit_owner = extra.get("is_owner")
         if explicit_owner is not True:
             continue
-        sender = _first_string(
+        sender_aliases = (
             gchat.get("sender_unixname"),
             extra.get("sender_unixname"),
             gchat.get("sender_display_name"),
@@ -2718,8 +2718,9 @@ def _content_records(
             gchat.get("sender_name"),
             extra.get("sender_name"),
         )
-        if sender is not None:
-            owner_gchat_senders.add(sender)
+        owner_gchat_senders.update(
+            value for value in sender_aliases if isinstance(value, str) and value
+        )
     events: list[Event] = []
     tools: list[ToolCall] = []
     turn_bounds: dict[int, tuple[int, int, str | None]] = {}
