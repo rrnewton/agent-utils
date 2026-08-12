@@ -315,7 +315,11 @@ agent-team-timeline serve --output ./timelines/example-team --port 8765 --open
 ```
 
 Do not open `index.html` directly with `file://`; browsers block its JSON fetch. The launcher uses
-Python's built-in loopback HTTP server and exposes nothing on the network.
+Python's built-in loopback HTTP server and exposes nothing on the network. Builds retain each
+ordinary identity file and add deterministic gzip-6 companions for browser-facing files of at
+least 1 KiB. The bundled server negotiates those companions, emits representation-specific strong
+ETags, and lets the browser revalidate mutable files. Copying the archive to a generic static
+server remains compatible; it can ignore the `.gz` companions and serve the identity files.
 
 ## Separate stages
 
@@ -643,8 +647,8 @@ example-team/
 │   ├── messages.jsonl               # prompts plus mechanically linked responses
 │   └── system-inputs.jsonl          # retained scheduled/synthetic coordinator inputs
 ├── data/
-│   ├── timeline.json
-│   └── details/<phase-id>.json
+│   ├── timeline.json[.gz]           # identity file plus optional deterministic sidecar
+│   └── details/<phase-id>.json[.gz]
 └── teams/example-team/
     ├── source_snapshots/             # gitignored validated source copies
     │   ├── 2026/08/04/rollout-....jsonl       # Codex/Claude

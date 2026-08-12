@@ -23,6 +23,7 @@ from agent_team_timeline.archive import (
 )
 from agent_team_timeline.pipeline import _ensure_archive, build_archive, load_archived_team
 from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
+from agent_team_timeline.static_assets import gzip_sidecar_path, sync_gzip_sidecar
 from agent_team_timeline.window import DateWindow
 
 
@@ -394,6 +395,11 @@ def _safe_generated_path(raw: str) -> PurePosixPath:
         or any(part in ("", ".", "..") for part in path.parts)
     ):
         raise ValueError(f"unsafe generated path in export manifest: {raw!r}")
+    if raw.endswith(".gz"):
+        if raw.removesuffix(".gz").endswith(".gz"):
+            raise ValueError(f"nested gzip sidecar in export manifest: {raw!r}")
+        _safe_generated_path(raw.removesuffix(".gz"))
+        return path
     if raw in _COMMON_FILES or raw in {"README.md", _EXPORT_MANIFEST}:
         return path
     if len(path.parts) >= 2 and path.parts[0] == "teams":
@@ -488,6 +494,7 @@ def build_combined_archive(
                 display_window=display_window,
                 rollup_kinds=rollup_kinds,
                 output=team_root,
+                _precompress=False,
             )
             timeline_path = team_root / "data" / "timeline.json"
             artifacts_path = team_root / "data" / "artifacts.json"
@@ -527,6 +534,11 @@ def build_combined_archive(
                 "data/artifacts.json",
             }
         )
+        compressible_files = {
+            relative
+            for relative in _COMMON_FILES
+            if PurePosixPath(relative).suffix in {".css", ".html", ".js"}
+        }
         changed = 0
 
         first_root = rendered_teams[0].root
@@ -551,8 +563,12 @@ def build_combined_archive(
                 if not source.is_file():
                     continue
                 relative = source.relative_to(rendered.root).as_posix()
+                if relative.endswith(".gz"):
+                    continue
                 _safe_generated_path(relative)
                 generated_files.add(relative)
+                if PurePosixPath(relative).suffix == ".md":
+                    compressible_files.add(relative)
                 changed += int(
                     _copy_text_file(source, _output_path(output, relative))
                 )
@@ -573,6 +589,7 @@ def build_combined_archive(
                 )
                 _safe_generated_path(target_relative)
                 generated_files.add(target_relative)
+                compressible_files.add(target_relative)
                 changed += int(
                     write_json_if_changed(
                         _output_path(output, target_relative),
@@ -645,11 +662,13 @@ def build_combined_archive(
                 _output_path(output, "data/timeline.json"), timeline
             )
         )
+        compressible_files.add("data/timeline.json")
         changed += int(
             write_json_if_changed(
                 _output_path(output, "data/artifacts.json"), artifact_catalog
             )
         )
+        compressible_files.add("data/artifacts.json")
         readme = (
             "# Combined agent-team timeline\n\n"
             "Teams: " + ", ".join(f"`{slug}`" for slug in ordered_slugs) + "\n\n"
@@ -657,7 +676,8 @@ def build_combined_archive(
             "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
             "Use `make open` to ask Python to open the browser and `make run-stats` to inspect "
             "recorded pipeline runs. Do not open `index.html` directly: browsers block the JSON "
-            "fetch from `file://`.\n\n"
+            "fetch from `file://`. The bundled server negotiates deterministic gzip sidecars and "
+            "revalidates cached files.\n\n"
             "## Read-only query quickstart\n\n"
             "Run `./timeline --help` for the archive-local, dependency-free Python CLI. Prompt "
             "output defaults to readable text; the supported formats are `json`, `jsonl`, "
@@ -683,6 +703,15 @@ def build_combined_archive(
         changed += int(
             write_text_if_changed(_output_path(output, "README.md"), readme)
         )
+
+        for relative in sorted(compressible_files):
+            source_path = _output_path(output, relative)
+            changed += int(sync_gzip_sidecar(source_path))
+            sidecar = gzip_sidecar_path(source_path)
+            if sidecar.is_file():
+                sidecar_relative = relative + ".gz"
+                _safe_generated_path(sidecar_relative)
+                generated_files.add(sidecar_relative)
 
         export_manifest = as_object(
             narrow_json(

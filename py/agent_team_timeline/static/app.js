@@ -3289,8 +3289,7 @@
     for (var index = 0; index < candidates.length; index += 1) {
       try {
         var response = await fetch(candidates[index].href, {
-          credentials: "same-origin",
-          cache: "no-store"
+          credentials: "same-origin"
         });
         if (!response.ok) {
           throw new Error("HTTP " + response.status + " for " + candidates[index].pathname);
@@ -4250,8 +4249,7 @@
   async function loadTimeline() {
     try {
       var response = await fetch(DATA_URL, {
-        credentials: "same-origin",
-        cache: "no-store"
+        credentials: "same-origin"
       });
       if (!response.ok) {
         throw new Error("HTTP " + response.status + " " + response.statusText);

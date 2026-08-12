@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
@@ -297,6 +298,17 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert (tmp_path / "run_stats.py").is_file()
     assert (tmp_path / "run_stats.py").stat().st_mode & 0o111
     assert (tmp_path / "timeline").stat().st_mode & 0o111
+    timeline_gzip = tmp_path / "data" / "timeline.json.gz"
+    assert gzip.decompress(timeline_gzip.read_bytes()) == (
+        tmp_path / "data" / "timeline.json"
+    ).read_bytes()
+    assert gzip.decompress((tmp_path / "app.js.gz").read_bytes()) == (
+        tmp_path / "app.js"
+    ).read_bytes()
+    assert 'cache: "no-store"' not in (tmp_path / "app.js").read_text(
+        encoding="utf-8"
+    )
+    assert "Content-Encoding" in (tmp_path / "serve.py").read_text(encoding="utf-8")
     generated_readme = (tmp_path / "README.md").read_text(encoding="utf-8")
     assert "## Read-only query quickstart" in generated_readme
     assert "./timeline agents --team TEAM --format jsonl" in generated_readme
@@ -2109,6 +2121,11 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         (output / "data" / "export.json").read_text(encoding="utf-8")
     )
     assert export_manifest["teams"] == ["claude-test", first_team.team_slug]
+    assert "data/timeline.json.gz" in export_manifest["generated_files"]
+    assert "app.js.gz" in export_manifest["generated_files"]
+    assert gzip.decompress((output / "data" / "timeline.json.gz").read_bytes()) == (
+        output / "data" / "timeline.json"
+    ).read_bytes()
     artifact_catalog = json.loads(
         (output / "data" / "artifacts.json").read_text(encoding="utf-8")
     )

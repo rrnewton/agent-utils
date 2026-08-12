@@ -65,6 +65,30 @@ least two pixels wide. The coordinator has its own strip; worker-block height en
 concurrency, opacity encodes active coverage, and omitted zero-activity bins preserve gaps. These
 thresholds and suppressions are part of the performance contract and are covered by browser tests.
 
+### Static delivery and schema compatibility
+
+Website builds keep timeline schema 1 and every uncompressed identity file intact. They also create
+byte-idempotent gzip-6 sidecars for browser-facing JSON, JavaScript, CSS, HTML, and rendered
+Markdown files of at least 1 KiB. The gzip header has no source filename and a zero timestamp, so a
+content-identical rebuild does not change the sidecar or its mtime. Combined exports inventory and
+remove their managed sidecars just like the corresponding identity files.
+
+Both the installed `serve` command and generated `serve.py` use the same dependency-free handler.
+It selects a `.gz` companion only when `Accept-Encoding` permits gzip, retains the original MIME
+type, and emits `Vary: Accept-Encoding`, the selected representation's exact `Content-Length`, and
+a strong SHA-256 ETag. Mutable generated names—including `manifest.json`, `index.html`, and the
+schema-1 `data/timeline.json` monolith—use `public, no-cache`: browsers may store them but must
+revalidate before reuse. Only a filename containing a complete 64-hex content digest receives a
+one-year immutable policy; phase IDs are stable identities rather than content hashes and therefore
+remain revalidated. The browser uses normal fetch caching, allowing a matching ETag to produce a
+304 response.
+
+This delivery layer is an additive optimization, not a new archive schema. Opening the archive
+through another static server still serves the identity files correctly, while older generated
+sites without sidecars remain valid. Compression reduces transfer bytes but does not reduce the
+schema-1 monolith's JSON parsing or in-memory cost; the staged sharding design is recorded in
+`ai_docs/PAYLOAD_SCALING.md`.
+
 ### Read-only query boundary
 
 The installed `agent-team-timeline query` command and the archive-local `./timeline` Python

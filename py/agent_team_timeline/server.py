@@ -2,29 +2,15 @@
 
 from __future__ import annotations
 
-import functools
 import http.server
 import threading
 import webbrowser
 from pathlib import Path
 
+from agent_team_timeline.standalone_server import TimelineRequestHandler, make_static_server
 
-class QuietHandler(http.server.SimpleHTTPRequestHandler):
-    """A static handler that adds safe defaults and keeps routine requests quiet."""
 
-    def end_headers(self) -> None:
-        """Add browser-safety and no-cache headers to the response."""
-
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Cache-Control", "no-cache")
-        super().end_headers()
-
-    def log_message(self, format: str, *args: object) -> None:
-        """Suppress routine index requests while retaining other request logs."""
-
-        if self.command != "GET" or self.path not in ("/", "/index.html"):
-            super().log_message(format, *args)
+QuietHandler = TimelineRequestHandler
 
 
 def make_server(
@@ -37,8 +23,7 @@ def make_server(
         raise ValueError(f"archive directory does not exist: {archive}")
     if not (root / "index.html").is_file():
         raise ValueError(f"archive has no index.html; run `agent-team-timeline build`: {root}")
-    handler = functools.partial(QuietHandler, directory=str(root))
-    return http.server.ThreadingHTTPServer((host, port), handler)
+    return make_static_server(root, host, port)
 
 
 def serve(archive: Path, host: str, port: int, open_browser: bool) -> None:

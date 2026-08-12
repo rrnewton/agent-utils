@@ -29,7 +29,8 @@ web server.
 - A zero-model, append-only prompt/response projection plus a read-only query CLI with chronological
   prompt ordinals, inclusive ordinal ranges, stable timeline references, JSON/JSONL/Markdown/text
   output, time/team filters, relationship traversal, and summary or transcript search.
-- A self-contained static website served by a built-in loopback server, with no CDN dependency.
+- A self-contained static website served by a built-in loopback server, with deterministic gzip
+  sidecars, strong validators, browser revalidation, and no CDN dependency.
 
 Install from the package index:
 
@@ -61,6 +62,10 @@ python3 run_stats.py
 ./timeline prompts --format jsonl > prompts.jsonl
 ./timeline stats
 ```
+
+The generated identity files remain ordinary static-site files. The bundled server transparently
+selects deterministic gzip-6 companions for large browser assets and uses ETags so reloads can
+reuse validated responses; another basic static server can still serve the identity files.
 
 The `teams`, `agents`, `phases`, `rollups`, and `search` commands return stable `team:`, `agent:`,
 `phase:`, and `rollup:` references that can be copied into `show`. In an exported package,

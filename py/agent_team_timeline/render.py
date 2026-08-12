@@ -31,6 +31,7 @@ from agent_team_timeline.summarize import (
     clean_summary_prose,
     clean_summary_result,
 )
+from agent_team_timeline.static_assets import gzip_sidecar_path, sync_gzip_sidecar
 from agent_team_timeline.terminology import (
     GlossaryTerm,
     glossary_catalog_markdown,
@@ -564,37 +565,9 @@ def _object_string(value: object) -> str:
 
 
 def _standalone_server() -> str:
-    return '''#!/usr/bin/env python3
-"""Serve this self-contained timeline on loopback and optionally open a browser."""
-import argparse
-import functools
-import http.server
-import pathlib
-import threading
-import webbrowser
-
-parser = argparse.ArgumentParser(
-    description="Serve this timeline on loopback and optionally open it in a browser."
-)
-parser.add_argument(
-    "--port", type=int, default=8765, help="loopback port (default: %(default)s)"
-)
-parser.add_argument("--open", action="store_true", help="open the timeline in a browser")
-args = parser.parse_args()
-root = pathlib.Path(__file__).resolve().parent
-handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))
-server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), handler)
-url = f"http://127.0.0.1:{server.server_address[1]}/"
-print(f"Serving {root} at {url}")
-if args.open:
-    threading.Timer(0.2, lambda: webbrowser.open(url)).start()
-try:
-    server.serve_forever()
-except KeyboardInterrupt:
-    pass
-finally:
-    server.server_close()
-'''
+    return (files("agent_team_timeline") / "standalone_server.py").read_text(
+        encoding="utf-8"
+    )
 
 
 def standalone_query_source() -> str:
@@ -681,6 +654,9 @@ def _remove_generated_file(archive: Path, relative_path: str) -> bool:
         ) from error
     if path.is_symlink():
         raise ValueError(f"refusing generated presentation symlink: {path}")
+    sidecar = gzip_sidecar_path(path)
+    if sidecar.is_symlink():
+        raise ValueError(f"refusing symlinked gzip sidecar: {sidecar}")
     if not path.exists():
         return False
     if not path.is_file():
@@ -704,10 +680,13 @@ def render_archive(
     pull_request_metadata: Mapping[PullRequestKey, PullRequestMetadata],
     artifact_catalog: ArtifactCatalog,
     site_identity: SiteIdentity,
+    *,
+    _precompress: bool = True,
 ) -> dict[str, int]:
     """Regenerate all presentation files without invoking a summary backend."""
 
     changed = 0
+    compressible_paths: set[str] = set()
     published_summary_paths: set[str] = set()
     phase_paths: dict[str, str] = {}
     agents_by_id = {agent.thread_id: agent for agent in team.agents}
@@ -726,6 +705,7 @@ def render_archive(
         phase_agent_name = _agent_name(agent, agent_names)
         raw_path = f"teams/{team.team_slug}/summaries/phases/{phase.phase_id}.md"
         detail_path = f"data/details/{phase.phase_id}.json"
+        compressible_paths.update((raw_path, detail_path))
         phase_paths[phase.phase_id] = detail_path
         artifact_ids = artifact_index.ids_for_range(
             phase.start_ms, phase.end_ms, phase.agent_id
@@ -777,6 +757,7 @@ def render_archive(
     for agent in team.agents:
         own = sorted(phases_by_agent.get(agent.thread_id, []), key=lambda phase: phase.start_ms)
         agent_path = f"teams/{team.team_slug}/summaries/agents/{agent.thread_id}.md"
+        compressible_paths.add(agent_path)
         if not own:
             changed += int(_remove_generated_file(archive, agent_path))
             continue
@@ -820,6 +801,7 @@ def render_archive(
         else:
             changed += int(_remove_generated_file(archive, period.relative_path))
         expected_plain_path = _plain_language_path(period)
+        compressible_paths.update((period.relative_path, expected_plain_path))
         if plain_path:
             changed += int(
                 write_text_if_changed(
@@ -842,6 +824,7 @@ def render_archive(
         year = week.split("-W", 1)[0]
         path = f"teams/{team.team_slug}/summaries/glossary/{year}/{week}-{team.team_slug}-glossary.md"
         week_path = archive / path
+        compressible_paths.add(path)
         if week_path.parent.is_symlink() or week_path.is_symlink():
             raise ValueError(f"refusing symlinked generated glossary path: {week_path}")
         expected_week_paths.add(week_path.resolve())
@@ -875,11 +858,18 @@ def render_archive(
             if stale_path.parent.is_symlink() or stale_path.is_symlink():
                 raise ValueError(f"refusing symlinked generated glossary path: {stale_path}")
             if stale_path.is_file():
+                stale_sidecar = gzip_sidecar_path(stale_path)
+                if stale_sidecar.is_symlink():
+                    raise ValueError(f"refusing symlinked gzip sidecar: {stale_sidecar}")
                 stale_path.unlink()
                 changed += 1
+                if stale_sidecar.is_file():
+                    stale_sidecar.unlink()
+                    changed += 1
     expected_glossary_catalog_path = (
         f"teams/{team.team_slug}/summaries/glossary/{team.team_slug}-glossary.md"
     )
+    compressible_paths.add(expected_glossary_catalog_path)
     glossary_catalog_path = ""
     if glossary_terms or project_overview.summary_available:
         glossary_catalog_path = expected_glossary_catalog_path
@@ -901,6 +891,7 @@ def render_archive(
     for asset_name in ("index.html", "timeline-core.js", "app.js", "style.css"):
         text = (static_root / asset_name).read_text(encoding="utf-8")
         changed += int(write_text_if_changed(archive / asset_name, text))
+        compressible_paths.add(asset_name)
     vendor_root = static_root / "vendor"
     for vendor_name in (
         "README.md",
@@ -911,6 +902,8 @@ def render_archive(
         changed += int(
             write_text_if_changed(archive / "vendor" / vendor_name, text)
         )
+        if vendor_name.endswith(".js"):
+            compressible_paths.add(f"vendor/{vendor_name}")
     changed += int(write_text_if_changed(archive / "serve.py", _standalone_server(), executable=True))
     run_stats_source = (files("agent_team_timeline") / "run_stats.py").read_text(
         encoding="utf-8"
@@ -944,7 +937,8 @@ def render_archive(
             "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
             "Use `make open` to ask Python to open the browser and `make run-stats` to print "
             "every pipeline run and exact recorded model-token costs. Do not open `index.html` "
-            "directly: browsers block the JSON fetch from `file://`.\n\n"
+            "directly: browsers block the JSON fetch from `file://`. The bundled server "
+            "negotiates deterministic gzip sidecars and revalidates cached files.\n\n"
             "## Read-only query quickstart\n\n"
             "Run `./timeline --help` for the archive-local, dependency-free Python CLI. Prompt "
             "output defaults to readable text; the supported formats are `json`, `jsonl`, "
@@ -1205,9 +1199,14 @@ def render_archive(
             narrow_json(artifact_catalog.to_json_obj()),
         )
     )
+    compressible_paths.add("data/artifacts.json")
     changed += int(
         write_json_if_changed(archive / "data" / "timeline.json", narrow_json(timeline))
     )
+    compressible_paths.add("data/timeline.json")
+    if _precompress:
+        for relative in sorted(compressible_paths):
+            changed += int(sync_gzip_sidecar(archive / relative))
     return {
         "files_changed": changed,
         "phases": len(phases),

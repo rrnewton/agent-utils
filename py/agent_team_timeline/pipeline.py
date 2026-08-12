@@ -3762,6 +3762,7 @@ def build_archive(
     display_window: DateWindow | None = None,
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
     output: Path | None = None,
+    _precompress: bool = True,
 ) -> dict[str, int]:
     """Regenerate Markdown/HTML/JSON exclusively from cached structured data."""
 
@@ -3923,6 +3924,7 @@ def build_archive(
         pull_metadata,
         artifact_catalog,
         site_identity,
+        _precompress=_precompress,
     )
 
 
