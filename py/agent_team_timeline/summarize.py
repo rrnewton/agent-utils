@@ -11,7 +11,6 @@ import concurrent.futures
 import hashlib
 import json
 import re
-import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -25,6 +24,10 @@ from agent_team_timeline.archive import (
     content_hash,
     read_json,
     write_json_if_changed,
+)
+from agent_team_timeline.backend_process import (
+    BackendProcesses,
+    defer_sigint_during_cleanup,
 )
 from agent_team_timeline.codex_workspace import (
     CodexWorkspaceError,
@@ -1157,6 +1160,7 @@ def _codex_batch(
     reasoning_effort: str | None,
     service_tier: str | None,
     codex_command: Sequence[str],
+    processes: BackendProcesses,
 ) -> _CodexBatchOutcome:
     if not codex_command:
         raise SummaryError("codex command must not be empty")
@@ -1195,13 +1199,10 @@ def _codex_batch(
             ]
         )
         try:
-            completed = subprocess.run(
+            completed = processes.run(
                 command,
-                input=build_summary_prompt([item.job for item in pending]),
-                text=True,
-                capture_output=True,
+                input_text=build_summary_prompt([item.job for item in pending]),
                 cwd=work_dir,
-                check=False,
             )
         except OSError as error:
             raise SummaryError(f"could not start codex backend: {error}") from error
@@ -1245,6 +1246,7 @@ def _claude_batch(
     model: str,
     reasoning_effort: str | None,
     claude_command: Sequence[str],
+    processes: BackendProcesses,
 ) -> _CodexBatchOutcome:
     with tempfile.TemporaryDirectory(
         prefix="agent-team-timeline-summary-", ignore_cleanup_errors=True
@@ -1257,6 +1259,7 @@ def _claude_batch(
                 model=model,
                 reasoning_effort=reasoning_effort,
                 cwd=Path(raw_dir),
+                processes=processes,
             )
         except ClaudeBackendError as error:
             # The Claude result envelope is CLI transport, not a validated final
@@ -1355,6 +1358,7 @@ def _run_backend_batch(
     service_tier: str | None,
     codex_command: Sequence[str],
     claude_command: Sequence[str],
+    processes: BackendProcesses,
 ) -> _GeneratedBatch:
     """Run one batch and persist a receipt even when the backend call fails."""
 
@@ -1372,7 +1376,12 @@ def _run_backend_batch(
             raw_output = None
         elif backend == "codex":
             outcome = _codex_batch(
-                batch, model, reasoning_effort, service_tier, codex_command
+                batch,
+                model,
+                reasoning_effort,
+                service_tier,
+                codex_command,
+                processes,
             )
             results = outcome.parsed.results
             usage = outcome.usage
@@ -1380,7 +1389,7 @@ def _run_backend_batch(
             raw_output = outcome.raw_output
         else:
             outcome = _claude_batch(
-                batch, model, reasoning_effort, claude_command
+                batch, model, reasoning_effort, claude_command, processes
             )
             results = outcome.parsed.results
             usage = outcome.usage
@@ -1533,6 +1542,7 @@ def summarize_jobs(
     generated: dict[str, SummaryResult] = {}
     generated_receipt_by_key: dict[str, str] = {}
     new_receipts: list[BatchUsageReceipt] = []
+    processes = BackendProcesses()
 
     def publish_batch(
         batch: Sequence[_PendingJob], batch_result: _GeneratedBatch
@@ -1582,14 +1592,19 @@ def summarize_jobs(
                 service_tier=effective_service_tier,
                 codex_command=codex_command,
                 claude_command=claude_command,
+                processes=processes,
             )
             generated.update(publish_batch(batch, batch_result))
     elif batches:
         codex = tuple(codex_command)
         claude = tuple(claude_command)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        futures: dict[
+            concurrent.futures.Future[_GeneratedBatch], tuple[_PendingJob, ...]
+        ] = {}
+        try:
+            for batch in batches:
+                future = executor.submit(
                     _run_backend_batch,
                     batch,
                     cache_dir=cache_dir,
@@ -1599,9 +1614,9 @@ def summarize_jobs(
                     service_tier=effective_service_tier,
                     codex_command=codex,
                     claude_command=claude,
-                ): batch
-                for batch in batches
-            }
+                    processes=processes,
+                )
+                futures[future] = batch
             first_error: SummaryError | None = None
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -1623,6 +1638,15 @@ def summarize_jobs(
                                 other.cancel()
             if first_error is not None:
                 raise first_error
+            with defer_sigint_during_cleanup():
+                executor.shutdown(wait=True)
+        except BaseException:
+            processes.terminate_all()
+            for future in futures:
+                future.cancel()
+            with defer_sigint_during_cleanup():
+                executor.shutdown(wait=True, cancel_futures=True)
+            raise
 
     for item in pending:
         result = generated.get(item.job.key)

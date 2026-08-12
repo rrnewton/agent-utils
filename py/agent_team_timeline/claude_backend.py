@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +13,7 @@ from agent_team_timeline.archive import (
     canonical_json,
     narrow_json,
 )
+from agent_team_timeline.backend_process import BackendProcesses
 from agent_team_timeline.token_usage import TokenUsage, parse_claude_json_usage
 
 
@@ -70,6 +70,7 @@ def run_claude_json(
     model: str,
     reasoning_effort: str | None,
     cwd: Path,
+    processes: BackendProcesses | None = None,
 ) -> ClaudeBackendResult:
     """Run Claude once with tools/configuration disabled and require schema output.
 
@@ -103,15 +104,9 @@ def run_claude_json(
     ]
     if reasoning_effort is not None:
         args.extend(["--effort", reasoning_effort])
+    owned_processes = processes or BackendProcesses()
     try:
-        completed = subprocess.run(
-            args,
-            input=prompt,
-            text=True,
-            capture_output=True,
-            cwd=cwd,
-            check=False,
-        )
+        completed = owned_processes.run(args, input_text=prompt, cwd=cwd)
     except OSError as error:
         raise ClaudeBackendError(
             f"could not start claude backend: {error}"

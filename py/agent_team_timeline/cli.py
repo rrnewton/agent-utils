@@ -1271,6 +1271,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         if build_report is not None:
             print(f"open: cd {archive} && make serve")
         return 0
+    except KeyboardInterrupt:
+        interruption = "interrupted by user"
+        try:
+            run_path = record_run(
+                archive,
+                command,
+                started,
+                "interrupted",
+                team_slug,
+                ingest_report,
+                summary_report,
+                build_report,
+                error=interruption,
+            )
+            print(f"run metadata: {run_path}", file=sys.stderr)
+        except (OSError, ValueError):
+            pass
+        print(f"{PROG}: {interruption}", file=sys.stderr)
+        return 130
     except (
         AgentNameError,
         ClaudeParseError,

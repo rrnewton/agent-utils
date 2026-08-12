@@ -11,7 +11,6 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import re
-import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -26,6 +25,10 @@ from agent_team_timeline.archive import (
     narrow_json,
     read_json,
     write_json_if_changed,
+)
+from agent_team_timeline.backend_process import (
+    BackendProcesses,
+    defer_sigint_during_cleanup,
 )
 from agent_team_timeline.codex_workspace import (
     CodexWorkspaceError,
@@ -772,6 +775,7 @@ def _codex_batch(
     reasoning_effort: str | None,
     service_tier: str | None,
     codex_command: Sequence[str],
+    processes: BackendProcesses,
 ) -> tuple[dict[str, AgentNameResult], TokenUsage | None]:
     if not codex_command:
         raise AgentNameError("codex command must not be empty")
@@ -810,13 +814,10 @@ def _codex_batch(
             ]
         )
         try:
-            completed = subprocess.run(
+            completed = processes.run(
                 command,
-                input=build_agent_name_prompt([item.job for item in pending]),
-                text=True,
-                capture_output=True,
+                input_text=build_agent_name_prompt([item.job for item in pending]),
                 cwd=work_dir,
-                check=False,
             )
         except OSError as error:
             raise AgentNameError(f"could not start codex naming backend: {error}") from error
@@ -851,6 +852,7 @@ def _claude_batch(
     model: str,
     reasoning_effort: str | None,
     claude_command: Sequence[str],
+    processes: BackendProcesses,
 ) -> tuple[dict[str, AgentNameResult], TokenUsage]:
     with tempfile.TemporaryDirectory(
         prefix="agent-team-timeline-name-", ignore_cleanup_errors=True
@@ -863,6 +865,7 @@ def _claude_batch(
                 model=model,
                 reasoning_effort=reasoning_effort,
                 cwd=Path(raw_dir),
+                processes=processes,
             )
         except ClaudeBackendError as error:
             raise _ClaudeNameBatchError(str(error), error.usage) from error
@@ -895,6 +898,7 @@ def _run_backend_batch(
     service_tier: str | None,
     codex_command: Sequence[str],
     claude_command: Sequence[str],
+    processes: BackendProcesses,
 ) -> _GeneratedNameBatch:
     started_at = _utc_now()
     input_hashes = tuple(item.input_hash for item in batch)
@@ -904,11 +908,16 @@ def _run_backend_batch(
             usage: TokenUsage | None = TokenUsage()
         elif backend == "codex":
             results, usage = _codex_batch(
-                batch, model, reasoning_effort, service_tier, codex_command
+                batch,
+                model,
+                reasoning_effort,
+                service_tier,
+                codex_command,
+                processes,
             )
         else:
             results, usage = _claude_batch(
-                batch, model, reasoning_effort, claude_command
+                batch, model, reasoning_effort, claude_command, processes
             )
     except AgentNameError as error:
         backend_error = (
@@ -1033,6 +1042,7 @@ def name_agents(
     generated: dict[str, AgentNameResult] = {}
     generated_receipt_by_key: dict[str, str] = {}
     new_receipts: list[BatchUsageReceipt] = []
+    processes = BackendProcesses()
 
     def publish_batch(
         batch: Sequence[_PendingName], batch_result: _GeneratedNameBatch
@@ -1079,14 +1089,19 @@ def name_agents(
                 service_tier=effective_service_tier,
                 codex_command=codex_command,
                 claude_command=claude_command,
+                processes=processes,
             )
             generated.update(publish_batch(batch, batch_result))
     elif batches:
         codex = tuple(codex_command)
         claude = tuple(claude_command)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        futures: dict[
+            concurrent.futures.Future[_GeneratedNameBatch], tuple[_PendingName, ...]
+        ] = {}
+        try:
+            for batch in batches:
+                future = executor.submit(
                     _run_backend_batch,
                     batch,
                     cache_dir=cache_dir,
@@ -1096,9 +1111,9 @@ def name_agents(
                     service_tier=effective_service_tier,
                     codex_command=codex,
                     claude_command=claude,
-                ): batch
-                for batch in batches
-            }
+                    processes=processes,
+                )
+                futures[future] = batch
             first_error: AgentNameError | None = None
             for future in concurrent.futures.as_completed(futures):
                 try:
@@ -1122,6 +1137,15 @@ def name_agents(
                                 other.cancel()
             if first_error is not None:
                 raise first_error
+            with defer_sigint_during_cleanup():
+                executor.shutdown(wait=True)
+        except BaseException:
+            processes.terminate_all()
+            for future in futures:
+                future.cancel()
+            with defer_sigint_during_cleanup():
+                executor.shutdown(wait=True, cancel_futures=True)
+            raise
 
     for item in pending:
         result = generated.get(item.job.key)
