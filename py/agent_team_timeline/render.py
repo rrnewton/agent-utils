@@ -548,9 +548,13 @@ import pathlib
 import threading
 import webbrowser
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--port", type=int, default=8765)
-parser.add_argument("--open", action="store_true")
+parser = argparse.ArgumentParser(
+    description="Serve this timeline on loopback and optionally open it in a browser."
+)
+parser.add_argument(
+    "--port", type=int, default=8765, help="loopback port (default: %(default)s)"
+)
+parser.add_argument("--open", action="store_true", help="open the timeline in a browser")
 args = parser.parse_args()
 root = pathlib.Path(__file__).resolve().parent
 handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(root))

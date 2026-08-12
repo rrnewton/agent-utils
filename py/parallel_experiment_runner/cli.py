@@ -388,7 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("run", "run a seed sweep under cgroup resource containment"),
         ("plan-round", "resolve + print one round's width and DAG (dry, no containment)"),
     ):
-        sp = sub.add_parser(name, help=help_text)
+        sp = sub.add_parser(name, help=help_text, description=help_text)
         sp.add_argument("--name", default="sweep", help="experiment name (default: sweep)")
         sp.add_argument("--spec", default=None, help="JSON/YAML spec file (overrides inline flags)")
         sp.add_argument("--seeds", default="0-9", help="seed spec, e.g. '0-99,200,300-305'")
@@ -462,7 +462,7 @@ def build_parser() -> argparse.ArgumentParser:
             help="the workload argv after `--`, using {seed} where the seed goes",
         )
 
-    sub.add_parser("quickstart", help="print a self-contained getting-started guide")
+    sub.add_parser("quickstart", help="print a self-contained getting-started guide", description="print a self-contained getting-started guide")
     return parser
 
 

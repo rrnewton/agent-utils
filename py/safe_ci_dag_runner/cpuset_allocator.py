@@ -413,6 +413,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "run",
         allow_abbrev=False,
         help="reserve K cores and run CMD's whole tree pinned to them",
+        description="reserve K cores and run CMD's whole tree pinned to them",
     )
     run_p.add_argument("--cores", type=_positive_int, required=True, metavar="K", help="how many cores to reserve (allocator picks WHICH)")
     run_p.add_argument("--tag", default="", help="label for this reservation (debugging)")
@@ -422,13 +423,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.set_defaults(func=cmd_run)
 
     st_p = sub.add_parser(
-        "status", allow_abbrev=False, help="print live held cores + reservations"
+        "status", allow_abbrev=False, help="print live held cores + reservations",
+        description="print live held cores + reservations",
     )
     st_p.add_argument("--ledger", default="", help="override ledger path (default: $XDG_RUNTIME_DIR)")
     st_p.set_defaults(func=cmd_status)
 
     rc_p = sub.add_parser(
-        "reclaim", allow_abbrev=False, help="sweep dead holders; print reclaimed records"
+        "reclaim", allow_abbrev=False, help="sweep dead holders; print reclaimed records",
+        description="sweep dead holders; print reclaimed records",
     )
     rc_p.add_argument("--ledger", default="", help="override ledger path")
     rc_p.set_defaults(func=cmd_reclaim)
@@ -437,6 +440,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "selftest",
         allow_abbrev=False,
         help="mutation self-test: is the pin HARD (inescapable)?",
+        description="mutation self-test: is the pin HARD (inescapable)?",
     )
     stf_p.add_argument("--cores", type=_positive_int, default=2, metavar="K", help="cores to reserve for the test (>=2 exercises the positive multi-core check)")
     stf_p.add_argument("--sample-s", type=_nonnegative_finite_float, default=0.3, help="/proc/stat idle-sampling window (s)")

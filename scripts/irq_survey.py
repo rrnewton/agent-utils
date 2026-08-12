@@ -220,17 +220,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog=PROG, description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    dist = sub.add_parser("distribution", help="is there an interrupt signal on this host?")
+    dist = sub.add_parser("distribution", help="is there an interrupt signal on this host?", description="is there an interrupt signal on this host?")
     dist.add_argument("--window", type=float, default=5.0)
     dist.set_defaults(handler=cmd_distribution)
 
-    place = sub.add_parser("placement", help="does IRQ awareness change the selection?")
+    place = sub.add_parser("placement", help="does IRQ awareness change the selection?", description="does IRQ awareness change the selection?")
     place.add_argument("--trials", type=int, default=10)
     place.add_argument("--window", type=float, default=0.3)
     place.add_argument("--hot", type=float, default=10.0)
     place.set_defaults(handler=cmd_placement)
 
-    drift = sub.add_parser("drift", help="how much does an independent window disagree?")
+    drift = sub.add_parser("drift", help="how much does an independent window disagree?", description="how much does an independent window disagree?")
     drift.add_argument("--trials", type=int, default=10)
     drift.add_argument("--window", type=float, default=0.3)
     drift.add_argument("--hot", type=float, default=10.0)

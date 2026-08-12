@@ -322,7 +322,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     run_p = sub.add_parser(
-        "run", allow_abbrev=False, help="run a DAG (exit 0 iff every step passes)"
+        "run", allow_abbrev=False, help="run a DAG (exit 0 iff every step passes)",
+        description="run a DAG (exit 0 iff every step passes)",
     )
     run_p.add_argument(
         "--dag",
@@ -499,6 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
         "sweep",
         allow_abbrev=False,
         help="parallel-speedup sweep: run ONE step at inner -j1..-jN and print a timing table",
+        description="parallel-speedup sweep: run ONE step at inner -j1..-jN and print a timing table",
     )
     sweep_p.add_argument(
         "--dag",
@@ -556,6 +558,8 @@ def build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
         help="show the plan: per-step est_duration (+ source), rss_estimate, bottom-level, the "
         "critical path, and the scheduled order (does NOT run anything)",
+        description="show the plan: per-step est_duration (+ source), rss_estimate, bottom-level, the "
+        "critical path, and the scheduled order (does NOT run anything)",
     )
     plan_p.add_argument(
         "--dag",
@@ -605,7 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("json", "re-emit the DAG as canonical JSON"),
         ("yaml", "re-emit the DAG as YAML"),
     ):
-        sp = sub.add_parser(cmd, allow_abbrev=False, help=helptext)
+        sp = sub.add_parser(cmd, allow_abbrev=False, help=helptext, description=helptext)
         sp.add_argument(
             "--dag",
             required=True,
@@ -618,6 +622,8 @@ def build_parser() -> argparse.ArgumentParser:
         allow_abbrev=False,
         help="inspect / build / merge / plan-from the constant-sized mergeable profile SUMMARY "
         "(the artifact --profile-sync uploads+downloads to close the ephemeral-CI feedback loop)",
+        description="inspect / build / merge / plan-from the constant-sized mergeable profile SUMMARY "
+        "(the artifact --profile-sync uploads+downloads to close the ephemeral-CI feedback loop)",
     )
     summary_sub = summary_p.add_subparsers(dest="summary_command", metavar="<action>")
 
@@ -625,6 +631,7 @@ def build_parser() -> argparse.ArgumentParser:
         "build",
         allow_abbrev=False,
         help="build a summary JSON from a profile store (CSV) for the current identity",
+        description="build a summary JSON from a profile store (CSV) for the current identity",
     )
     sb_build.add_argument(
         "--perf-dir",
@@ -646,6 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
         "merge",
         allow_abbrev=False,
         help="merge one or more summary JSON files into one (order-independent) on stdout",
+        description="merge one or more summary JSON files into one (order-independent) on stdout",
     )
     sb_merge.add_argument("files", nargs="+", metavar="FILE", help="summary JSON files to merge")
     sb_merge.add_argument("--out", metavar="FILE", default=None, help="write JSON here (else stdout)")
@@ -658,6 +666,7 @@ def build_parser() -> argparse.ArgumentParser:
         "plan",
         allow_abbrev=False,
         help="build a plan from a summary JSON and DAG",
+        description="build a plan from a summary JSON and DAG",
     )
     sb_plan.add_argument("--summary", required=True, metavar="FILE", help="summary JSON file")
     sb_plan.add_argument(
@@ -677,6 +686,7 @@ def build_parser() -> argparse.ArgumentParser:
         "stats",
         allow_abbrev=False,
         help="print bucket_count / total_samples / max_bucket_samples (the bounded-size witness)",
+        description="print bucket_count / total_samples / max_bucket_samples (the bounded-size witness)",
     )
     sb_stats.add_argument("file", metavar="FILE", help="summary JSON file")
 
@@ -684,6 +694,7 @@ def build_parser() -> argparse.ArgumentParser:
         "pin-run",
         allow_abbrev=False,
         help="reserve K collision-free cores, box a command onto them, run it, release on exit",
+        description="reserve K collision-free cores, box a command onto them, run it, release on exit",
     )
     pin_p.add_argument(
         "--cores",
@@ -709,12 +720,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser(
-        "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide"
+        "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide",
+        description="print a self-contained getting-started guide",
     )
     sub.add_parser(
         "capabilities",
         allow_abbrev=False,
         help="print the machine-readable enforcement-capability manifest (cross-checked vs Rust)",
+        description="print the machine-readable enforcement-capability manifest (cross-checked vs Rust)",
     )
     return parser
 
