@@ -324,7 +324,7 @@ versions; a prompt constant must not be invented elsewhere.
 | `project-overview` | 2 | active | one project/team knowledge epoch | `summarize.py:build_summary_prompt` (`project-overview`) |
 | `glossary-definition` | 2 | historical-disabled | one mechanical candidate | retained only to interpret old artifacts |
 | `technical-rollup` | 3 | active | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`technical-rollup`) |
-| `plain-language-rollup` | 3 | active | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`plain-language-rollup`) |
+| `plain-language-rollup` | 4 | active | hour, day, week, month, or quarter | `summarize.py:build_summary_prompt` (`plain-language-rollup`) |
 
 Hourly rollups use UTC-stable keys and local-time labels, including distinct keys for a repeated
 daylight-saving hour. Summary selection can request only hourly work or combine it with higher
@@ -422,11 +422,15 @@ Outputs use the common phrase/paragraph/work-bullet schema and are projected und
 
 ### Plain-language calendar rollup
 
-This is a separate paid job, not formatting applied to the technical result. It receives analogous
-lower-level and up-to-ten prior same-level plain-language results, plus the project overview and
-supported chronological glossary definitions. It must identify the project for a newcomer and
-describe content before opaque work-management identifiers. It shares each rollup projection with
-the technical result but has an independent input hash and usage receipt.
+This is a separate paid rewrite, not deterministic formatting. It receives the same-period
+technical result as its authoritative factual account, plus analogous lower-level and up-to-ten
+prior same-level plain-language results, the project overview, and supported chronological glossary
+definitions. The plain result must preserve the technical result's completion state, outcomes,
+counts, and time scope: for example, it cannot turn validated or approved work into landed work or
+attribute an earlier backlog reduction to the current period. It identifies the project for a
+newcomer and describes content before opaque work-management identifiers. It shares each rollup
+projection with the technical result but has an independent input hash and usage receipt, with the
+technical artifact recorded as a provenance dependency.
 
 ## Common cache identity and receipts
 

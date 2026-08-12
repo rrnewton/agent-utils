@@ -187,7 +187,14 @@ def test_prompt_contains_full_context_glossary_and_terminology_rules() -> None:
 
 def test_rollup_prompts_have_distinct_content_led_audience_contracts() -> None:
     technical = replace(_job("technical"), summary_style=TECHNICAL_ROLLUP_STYLE)
-    plain = replace(_job("plain"), summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE)
+    plain = replace(
+        _job("plain"),
+        summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE,
+        factual_context=(
+            "Authoritative technical daily summary: the fix was validated but still "
+            "awaited review; it did not land."
+        ),
+    )
 
     technical_prompt = build_summary_prompt([technical])
     plain_prompt = build_summary_prompt([plain])
@@ -196,11 +203,13 @@ def test_rollup_prompts_have_distinct_content_led_audience_contracts() -> None:
     assert "opaque referent" in technical_prompt
     assert "interested newcomer" in plain_prompt
     assert "what the project or product is" in plain_prompt
+    assert plain.factual_context in plain_prompt
+    assert "Never upgrade pending, approved, validated" in plain_prompt
     assert "do not invent Markdown links or glossary entries" in plain_prompt
     assert _input_hash(technical, "codex", "same-model") != _input_hash(
         plain, "codex", "same-model"
     )
-    assert "agent-team-timeline-plain-rollup-v3" in plain_prompt
+    assert "agent-team-timeline-plain-rollup-v4" in plain_prompt
 
 
 def test_project_overview_is_evidence_bounded_and_legacy_definitions_are_disabled() -> None:
@@ -280,10 +289,21 @@ def test_backend_cannot_persist_linked_generated_knowledge(tmp_path: Path) -> No
 
 def test_one_backend_batch_cannot_mix_summary_audiences() -> None:
     technical = replace(_job("technical"), summary_style=TECHNICAL_ROLLUP_STYLE)
-    plain = replace(_job("plain"), summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE)
+    plain = replace(
+        _job("plain"),
+        summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE,
+        factual_context="Authoritative same-period technical facts.",
+    )
 
     with pytest.raises(SummaryError, match="cannot mix summary styles"):
         build_summary_prompt([technical, plain])
+
+
+def test_plain_rollup_requires_same_period_technical_facts() -> None:
+    plain = replace(_job("plain"), summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE)
+
+    with pytest.raises(SummaryError, match="lacks same-period technical facts"):
+        build_summary_prompt([plain])
 
 
 def test_service_tier_is_cache_identity_provenance() -> None:

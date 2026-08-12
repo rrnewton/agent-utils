@@ -359,11 +359,12 @@ TECHNICAL_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
 PLAIN_LANGUAGE_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
     summarizer_id="plain-language-rollup",
     summary_style=PLAIN_LANGUAGE_ROLLUP_STYLE,
-    current_version=3,
-    prompt_version="agent-team-timeline-plain-rollup-v3",
+    current_version=4,
+    prompt_version="agent-team-timeline-plain-rollup-v4",
     output_schema_version=1,
-    description="Newcomer-oriented rollup independent from the technical summary.",
+    description="Newcomer-oriented rewrite grounded in the same-period technical summary.",
     input_fields=(
+        "same-period technical summary as the factual source of truth",
         "lower-level plain-language summaries or uncovered phase summaries",
         "up to ten prior same-level plain-language summaries",
         "project overview",
@@ -390,6 +391,12 @@ PLAIN_LANGUAGE_ROLLUP_SUMMARIZER: Final = SummarizerSpec(
             "agent-team-timeline-plain-rollup-v3",
             1,
             "Use only supported semantic concepts; exclude mechanical glossary candidates.",
+        ),
+        SummarizerChange(
+            4,
+            "agent-team-timeline-plain-rollup-v4",
+            1,
+            "Ground status, outcomes, counts, and scope in the same-period technical summary.",
         ),
     ),
 )

@@ -153,6 +153,7 @@ class SummaryJob:
     glossary: str
     stats: Mapping[str, int]
     summary_style: str = "phase"
+    factual_context: str = ""
     context_coverage: ContextCoverage = ContextCoverage()
     dependency_keys: tuple[str, ...] = ()
 
@@ -291,6 +292,13 @@ def _validate_job(job: SummaryJob) -> None:
         raise SummaryError(
             f"summary job {job.key!r} has unsupported style {job.summary_style!r}"
         )
+    if (
+        job.summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE
+        and not job.factual_context.strip()
+    ):
+        raise SummaryError(
+            f"plain-language summary job {job.key!r} lacks same-period technical facts"
+        )
     for stat_key, value in job.stats.items():
         if not isinstance(stat_key, str) or not stat_key:
             raise SummaryError(f"summary job {job.key!r} has an invalid stats key")
@@ -333,6 +341,8 @@ def _job_json(job: SummaryJob) -> dict[str, JsonValue]:
     # their audience explicitly in both the backend payload and content hash.
     if job.summary_style != "phase":
         result["summary_style"] = job.summary_style
+    if job.factual_context:
+        result["factual_context"] = job.factual_context
     return result
 
 
@@ -452,6 +462,12 @@ def build_summary_prompt(jobs: Sequence[SummaryJob]) -> str:
     if style == PLAIN_LANGUAGE_ROLLUP_STYLE:
         audience = (
             "Audience contract: write for an interested newcomer who does not know this project. "
+            "The factual_context field is the authoritative technical account of this exact time "
+            "interval. Preserve its completion states, outcomes, counts, and scope exactly while "
+            "rewriting them in plain language. Never upgrade pending, approved, validated, or "
+            "awaiting-review work to landed, shipped, or complete. Never import an earlier period's "
+            "metric as a change achieved in this period. Lower-level and prior summaries may explain "
+            "terms and continuity, but they must not contradict or broaden factual_context. "
             "Briefly identify what the project or product is, using only supplied evidence, before "
             "describing the period's work. Explain specialized terms on first use and prefer plain, "
             "concrete descriptions of what changed and why it matters. A pull request, task, diff, "

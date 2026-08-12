@@ -372,7 +372,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         "technical-rollup-v3"
     )
     assert rollup_record["plain_language_summary"]["prompt_version"].endswith(
-        "plain-rollup-v3"
+        "plain-rollup-v4"
     )
     overview_record = json.loads(
         (
@@ -2450,6 +2450,10 @@ def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
         (),
         (supported, unsupported),
     )[0]
+    same_period_technical = _rollup_result(
+        "rollup:daily:day",
+        "The exact-head work was validated but still awaited review; it did not land.",
+    )
     plain = _rollup_jobs_for_level(
         team,
         (period,),
@@ -2464,6 +2468,7 @@ def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
             "project-overview",
             "Hermit runs guest software in a repeatable environment.",
         ),
+        {"day:daily": same_period_technical},
     )[0]
     without_definitions = tuple(
         replace(term, definition="", definition_status="unavailable")
@@ -2484,6 +2489,14 @@ def test_plain_rollup_gets_overview_and_supported_definitions_only() -> None:
     assert "Hermit runs guest software" in plain.glossary
     assert "A release check that requires one exact revision" in plain.glossary
     assert "DBI" not in plain.glossary
+    assert "did not land" in plain.factual_context
+    assert same_period_technical.input_hash in plain.dependency_keys
+    assert any(
+        component.name == "technical_summary"
+        and component.requested == 1
+        and component.provided == 1
+        for component in plain.context_coverage.components
+    )
 
 
 def test_build_ignores_retired_glossary_schema(tmp_path: Path) -> None:

@@ -2583,6 +2583,7 @@ def _rollup_jobs_for_level(
     terms: Sequence[GlossaryTerm],
     summary_style: str = TECHNICAL_ROLLUP_STYLE,
     project_overview: SummaryResult | None = None,
+    same_period_technical: Mapping[str, SummaryResult] | None = None,
 ) -> tuple[SummaryJob, ...]:
     jobs: list[SummaryJob] = []
     for period in periods:
@@ -2639,6 +2640,16 @@ def _rollup_jobs_for_level(
         plain_language = summary_style == PLAIN_LANGUAGE_ROLLUP_STYLE
         key_prefix = "rollup-plain" if plain_language else "rollup"
         audience = "Plain-language" if plain_language else "Technical"
+        technical_result = (
+            same_period_technical.get(_period_key(period))
+            if plain_language and same_period_technical is not None
+            else None
+        )
+        if plain_language and technical_result is None:
+            raise ValueError(
+                f"plain-language {period.kind} rollup {period.key!r} lacks "
+                "its same-period technical summary"
+            )
         glossary = glossary_prompt_text(
             [term for term in terms if term.summary_available_at_ms < period.end_ms]
         )
@@ -2653,6 +2664,8 @@ def _rollup_jobs_for_level(
             )
             if project_overview is not None:
                 dependency_results.append(project_overview)
+            if technical_result is not None:
+                dependency_results.append(technical_result)
         earliest_activity = min(
             (event.timestamp_ms for event in team.events),
             default=period.start_ms,
@@ -2692,6 +2705,15 @@ def _rollup_jobs_for_level(
                 glossary=glossary,
                 stats=stats.to_mapping(),
                 summary_style=summary_style,
+                factual_context=(
+                    _result_line(
+                        technical_result,
+                        f"Authoritative technical {period.kind} summary",
+                        period.start_ms,
+                    )
+                    if technical_result is not None
+                    else ""
+                ),
                 context_coverage=ContextCoverage(
                     components=(
                         ContextComponent(
@@ -2710,6 +2732,11 @@ def _rollup_jobs_for_level(
                     + (
                         (ContextComponent("project_overview", 1, 1, "artifacts"),)
                         if plain_language and project_overview is not None
+                        else ()
+                    )
+                    + (
+                        (ContextComponent("technical_summary", 1, 1, "summaries"),)
+                        if technical_result is not None
                         else ()
                     ),
                     frontier_status=frontier_status,
@@ -2951,6 +2978,7 @@ def _summarize_archive_locked(
                 enriched_terms,
                 PLAIN_LANGUAGE_ROLLUP_STYLE,
                 project_overview,
+                {_period_key(period): result},
             )
             plain_results, plain_stats = summarize_jobs(
                 plain_jobs,
@@ -3722,6 +3750,7 @@ def _validate_rollup_inputs(
                 terms,
                 PLAIN_LANGUAGE_ROLLUP_STYLE,
                 project_overview,
+                {key: technical},
             )[0]
             plain = plain_candidates[key]
             if not _summary_matches_job(plain, plain_job):
