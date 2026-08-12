@@ -7,6 +7,7 @@ const {
   AGENT_A_ACTIVITY_END_MS,
   AGENT_A_ACTIVITY_START_MS,
   AGENT_COUNT,
+  BASE_MS,
   DATA_END_MS,
   DATA_START_MS,
   PHASE_A_START_MS,
@@ -49,6 +50,91 @@ function statValue(page, label) {
     .locator(".stat-value");
 }
 
+function singleDaySchema2Fixture(globalDigest, detailDigest) {
+  const dayStart = Date.UTC(2026, 2, 9);
+  const globalUrl = "data/timeline-v2/objects/" + globalDigest + ".json";
+  const detailUrl = "data/timeline-v2/objects/" + detailDigest + ".json";
+  const globalData = JSON.parse(JSON.stringify(TIMELINE));
+  [
+    "generated_at",
+    "source_digest",
+    "display_timezone",
+    "display_timezone_source",
+    "range",
+    "teams",
+    "activity_bins",
+    "phases",
+    "edges",
+    "events"
+  ].forEach(function (field) { delete globalData[field]; });
+  globalData.schema_version = 2;
+  globalData.kind = "timeline-global";
+  globalData.edges = TIMELINE.edges.filter(function (edge) {
+    return edge.kind === "spawn" || edge.kind === "continuation" || edge.kind === "result";
+  });
+  return {
+    globalDigest: globalDigest,
+    detailDigest: detailDigest,
+    bootstrap: {
+      schema_version: 2,
+      kind: "timeline-bootstrap",
+      generated_at: TIMELINE.generated_at,
+      source_digest: TIMELINE.source_digest,
+      display_timezone: TIMELINE.display_timezone,
+      display_timezone_source: TIMELINE.display_timezone_source,
+      range: {
+        start_ms: BASE_MS - 36 * 60 * 60 * 1000,
+        end_ms: BASE_MS + 36 * 60 * 60 * 1000
+      },
+      teams: TIMELINE.teams,
+      activity_bins: TIMELINE.activity_bins,
+      global: { url: globalUrl, sha256: globalDigest },
+      detail_shards: [{
+        kind: "utc-day",
+        day: "2026-03-09",
+        start_ms: dayStart,
+        end_ms: dayStart + 24 * 60 * 60 * 1000,
+        url: detailUrl,
+        sha256: detailDigest
+      }]
+    },
+    globalData: globalData,
+    detail: {
+      schema_version: 2,
+      kind: "timeline-detail-day",
+      range: {
+        start_ms: dayStart,
+        end_ms: dayStart + 24 * 60 * 60 * 1000
+      },
+      phases: TIMELINE.phases,
+      edges: TIMELINE.edges.filter(function (edge) { return edge.kind === "message"; }),
+      events: TIMELINE.events
+    }
+  };
+}
+
+async function routeSingleDaySchema2Fixture(page, fixture, detailHandler) {
+  await page.route("**/data/timeline-v2.json", function (route) {
+    return route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.bootstrap)
+    });
+  });
+  await page.route("**/" + fixture.globalDigest + ".json", function (route) {
+    return route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.globalData)
+    });
+  });
+  await page.route("**/" + fixture.detailDigest + ".json", detailHandler);
+  await page.route("**/data/timeline.json", function (route) {
+    return route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(TIMELINE)
+    });
+  });
+}
+
 async function zoomOutToLod(page, timeline, target) {
   const axis = page.locator("#time-axis");
   const box = await axis.boundingBox();
@@ -78,11 +164,14 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   const globalDigest = "a".repeat(64);
   const firstDigest = "b".repeat(64);
   const remoteDigest = "c".repeat(64);
+  const finalDigest = "2".repeat(64);
   const globalUrl = "data/timeline-v2/objects/" + globalDigest + ".json";
   const firstUrl = "data/timeline-v2/objects/" + firstDigest + ".json";
   const remoteUrl = "data/timeline-v2/objects/" + remoteDigest + ".json";
+  const finalUrl = "data/timeline-v2/objects/" + finalDigest + ".json";
   const firstDayStart = Date.UTC(2026, 2, 9);
   const remoteDayStart = Date.UTC(2026, 2, 19);
+  const finalDayStart = Date.UTC(2026, 2, 29);
   const expandedEnd = Date.UTC(2026, 2, 30);
   const globalData = JSON.parse(JSON.stringify(TIMELINE));
   [
@@ -148,6 +237,14 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
         end_ms: remoteDayStart + 24 * 60 * 60 * 1000,
         url: remoteUrl,
         sha256: remoteDigest
+      },
+      {
+        kind: "utc-day",
+        day: "2026-03-29",
+        start_ms: finalDayStart,
+        end_ms: expandedEnd,
+        url: finalUrl,
+        sha256: finalDigest
       }
     ]
   };
@@ -173,6 +270,21 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
     edges: [],
     events: []
   };
+  const finalDetail = {
+    schema_version: 2,
+    kind: "timeline-detail-day",
+    range: {
+      start_ms: finalDayStart,
+      end_ms: expandedEnd
+    },
+    phases: [],
+    edges: [],
+    events: [{
+      agent_id: "agent-a",
+      at_ms: expandedEnd,
+      kind: "user_prompt"
+    }]
+  };
   const requests = new Map();
   async function fulfillJson(route, name, value) {
     requests.set(name, (requests.get(name) || 0) + 1);
@@ -192,6 +304,9 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   });
   await page.route("**/" + remoteDigest + ".json", function (route) {
     return fulfillJson(route, "remote", remoteDetail);
+  });
+  await page.route("**/" + finalDigest + ".json", function (route) {
+    return fulfillJson(route, "final", finalDetail);
   });
   await page.route("**/data/timeline.json", function (route) {
     return fulfillJson(route, "schema1", TIMELINE);
@@ -216,6 +331,7 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   expect(requests.get("global")).toBe(1);
   expect(requests.get("first") || 0).toBe(0);
   expect(requests.get("remote") || 0).toBe(0);
+  expect(requests.get("final") || 0).toBe(0);
   expect(requests.get("schema1") || 0).toBe(0);
 
   const axisBox = await page.locator("#time-axis").boundingBox();
@@ -242,6 +358,7 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
   expect(requests.get("first")).toBe(1);
   expect(requests.get("remote") || 0).toBe(0);
+  expect(requests.get("final") || 0).toBe(0);
   await page.locator("#modal-close").click();
 
   await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
@@ -263,6 +380,7 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   await expect(statValue(page, "Tool calls")).toHaveText("45");
   expect(requests.get("first")).toBe(1);
   expect(requests.get("remote") || 0).toBe(0);
+  expect(requests.get("final") || 0).toBe(0);
 
   const firstRollup = ROLLUP_RANGES[0];
   const marker = page.locator(
@@ -294,14 +412,119 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   await page.getByTestId("fit").click();
   await page.getByTestId("search").fill("remote search needle");
   await expect(card).toHaveAttribute("data-search-shard-state", "ready");
-  await expect(card).toHaveAttribute("data-loaded-shard-count", "2");
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "3");
   expect(requests.get("first")).toBe(1);
   expect(requests.get("remote")).toBe(1);
+  expect(requests.get("final")).toBe(1);
   await page.getByTestId("search").fill("");
+  await page.getByTestId("fit").click();
+  await expect(statValue(page, "User prompts")).toHaveText("1");
   await page.getByTestId("search").fill("remote search needle");
   await expect(card).toHaveAttribute("data-search-shard-state", "ready");
   expect(requests.get("remote")).toBe(1);
+  expect(requests.get("final")).toBe(1);
   expect(requests.get("schema1") || 0).toBe(0);
+});
+
+test("schema 2 retries a transiently failed detail shard", async function ({ page }) {
+  const fixture = singleDaySchema2Fixture("d".repeat(64), "e".repeat(64));
+  let detailRequests = 0;
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    detailRequests += 1;
+    if (detailRequests === 1) {
+      await route.fulfill({
+        status: 503,
+        contentType: "application/json; charset=utf-8",
+        body: JSON.stringify({ error: "transient fixture failure" })
+      });
+      return;
+    }
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+
+  await page.reload();
+  const card = page.locator(".timeline-card");
+  const timeline = page.getByTestId("timeline");
+  const agentLifetime = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+  await expect(card).toHaveAttribute("data-timeline-schema-mode", "schema2");
+  await expect(timeline).toHaveAttribute("data-render-lod", "lifetime");
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "0");
+
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(page.getByTestId("modal").locator(".error-message")).toContainText(
+    "HTTP 503"
+  );
+  expect(detailRequests).toBe(1);
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "0");
+  await page.locator("#modal-close").click();
+
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(
+    page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-1"]')
+  ).toBeVisible();
+  expect(detailRequests).toBe(2);
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
+  await page.locator("#modal-close").click();
+
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(
+    page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-2"]')
+  ).toBeVisible();
+  expect(detailRequests).toBe(2);
+});
+
+test("a delayed lifetime shard refreshes a detail view after the modal closes", async function ({
+  page
+}) {
+  const fixture = singleDaySchema2Fixture("f".repeat(64), "1".repeat(64));
+  let detailRequests = 0;
+  let releaseDetail = function () {};
+  const detailGate = new Promise(function (resolve) {
+    releaseDetail = resolve;
+  });
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    detailRequests += 1;
+    await detailGate;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+
+  await page.reload();
+  const card = page.locator(".timeline-card");
+  const timeline = page.getByTestId("timeline");
+  const agentLifetime = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+  await expect(card).toHaveAttribute("data-timeline-schema-mode", "schema2");
+  await expect(timeline).toHaveAttribute("data-render-lod", "lifetime");
+
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(page.getByTestId("modal").locator(".loading-message")).toHaveText(
+    "Loading agent work phases…"
+  );
+  await expect.poll(function () { return detailRequests; }).toBe(1);
+  await page.locator("#modal-close").click();
+  await expect(page.getByTestId("modal")).toBeHidden();
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const revision = Number(await timeline.getAttribute("data-render-revision"));
+    await timeline.press("=");
+    await expect.poll(async function () {
+      return Number(await timeline.getAttribute("data-render-revision"));
+    }).toBeGreaterThan(revision);
+  }
+  await expect(timeline).toHaveAttribute("data-render-lod", "detail");
+  expect(detailRequests).toBe(1);
+  await expect(page.locator(".phase-group" + phaseSelector)).toHaveCount(0);
+
+  releaseDetail();
+  await expect(page.locator(".phase-group" + phaseSelector)).toBeVisible();
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
+  expect(detailRequests).toBe(1);
+  await expect(page.getByTestId("modal")).toBeHidden();
 });
 
 test("the header identifies the project, execution host, and archive timezone", async function ({ page }) {
