@@ -15,6 +15,10 @@ from agent_team_timeline.archive import as_array, as_object, read_json
 from agent_team_timeline.claude import ClaudeParseError
 from agent_team_timeline.codex import CodexParseError
 from agent_team_timeline.github_enrich import PullMetadataReport, enrich_pull_request_metadata
+from agent_team_timeline.glossary_audit import (
+    audit_legacy_glossaries,
+    format_glossary_audit,
+)
 from agent_team_timeline.identity import IdentityOverrides, parse_identity_overrides
 from agent_team_timeline.multi_team import build_combined_archive
 from agent_team_timeline.naming import AgentNameError
@@ -487,6 +491,37 @@ def _parser() -> argparse.ArgumentParser:
     inspect.add_argument("--output", required=True)
     inspect.set_defaults(handler="inspect")
 
+    audit_glossary = sub.add_parser(
+        "audit-glossary",
+        help="audit retired glossary candidates without publishing links",
+        description=(
+            "read retired schema-3 glossary caches without a lock or model call; "
+            "classify definite mechanical noise and candidates requiring a future "
+            "semantic pass; no retired entry receives publication authority"
+        ),
+    )
+    audit_glossary.add_argument(
+        "--output", required=True, help="durable archive directory"
+    )
+    audit_glossary.add_argument(
+        "--team",
+        action="append",
+        default=[],
+        help="team slug to inspect; repeat as needed (default: every archive team)",
+    )
+    audit_glossary.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="report format (default: %(default)s)",
+    )
+    audit_glossary.add_argument(
+        "--details",
+        action="store_true",
+        help="include every term and its disposition",
+    )
+    audit_glossary.set_defaults(handler="audit_glossary")
+
     query = sub.add_parser(
         "query", help="navigate a built timeline without starting the website",
         description="navigate a built timeline without starting the website",
@@ -939,6 +974,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     if handler == "inspect":
         try:
             return _inspect(_path(str(ns.output)))
+        except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "audit_glossary":
+        try:
+            glossary_team_values: object = ns.team
+            if not isinstance(glossary_team_values, list) or not all(
+                isinstance(item, str) for item in glossary_team_values
+            ):
+                raise ValueError("--team values must be strings")
+            glossary_report = audit_legacy_glossaries(
+                _path(str(ns.output)), tuple(glossary_team_values)
+            )
+            output_format = str(ns.format)
+            if output_format not in {"text", "json"}:
+                raise ValueError(f"unsupported glossary audit format {output_format!r}")
+            print(
+                format_glossary_audit(
+                    glossary_report,
+                    "json" if output_format == "json" else "text",
+                    include_terms=bool(ns.details),
+                ),
+                end="",
+            )
+            return 0
         except (OSError, ValueError) as error:
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2

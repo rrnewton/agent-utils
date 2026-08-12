@@ -61,6 +61,8 @@ python3 run_stats.py
 ./timeline prompts --which all --format jsonl > all-prompts.jsonl
 ./timeline prompts --format jsonl > prompts.jsonl
 ./timeline stats
+# inspect retired glossary cache quality without writing or calling a model
+agent-team-timeline audit-glossary --output . --details
 ```
 
 The generated identity files remain ordinary static-site files. The bundled server transparently

@@ -443,6 +443,24 @@ caches, projections, and usage receipts remain on disk for audit and accounting.
 retired projection and publish no glossary links until an evidence-bounded semantic discovery pass
 is implemented.
 
+Audit those immutable records without taking the archive writer lock, changing a byte, or calling a
+model:
+
+```bash
+agent-team-timeline audit-glossary --output ./timelines/example-team
+agent-team-timeline audit-glossary --output ./timelines/example-team \
+  --team example-team --format json --details
+```
+
+The audit deterministically rejects known transcript-markup fields, durations and command examples,
+opaque record identifiers, code/configuration literals, ordinary language, and transient process
+actions. Plausible projects, systems, workstreams/tasks, and milestones are reported as
+`semantic-review-required`, never promoted. This distinction is deliberate: a cached definition can
+show that a string is explainable, but schema 3 did not ask what semantic kind it has. A future
+versioned discovery contract must classify and evidence those concepts before they can enter summary
+prompts or become site-wide links. If an older generated site still shows retired glossary links,
+run the zero-token `build` or `export` again; `summary_data/glossary.json` itself remains unchanged.
+
 Unchanged keys are never sent to the model again. A changed live window creates a new cache record while the previous valuable record
 remains on disk. Each batch is committed only after every response in that batch validates against
 the strict JSON schema; a failed batch cannot corrupt existing cache data, while other validated
@@ -545,7 +563,8 @@ cannot replace another project's README or Makefile.
 Build fails closed on definition-only glossary projections: it ignores those retired records and
 omits them from links and rendered catalogs. This removes stale glossary links and weekly generated
 files without rewriting or deleting original definition caches, projections, artifact catalogs, or
-usage receipts.
+usage receipts. `audit-glossary` is the read-only diagnostic for those retained records; it is not a
+migration command and its semantic-review list is not linkable data.
 
 To create a separate zero-token website package for a selected interval, use `export` after the
 needed summaries are cached:
