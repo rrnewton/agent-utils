@@ -1061,6 +1061,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"transcripts: {report.prompts} prompts, {report.responses} responses, "
                 f"{report.system_inputs} system inputs across {report.teams} teams; "
                 f"{report.carried_forward} historical records retained, "
+                f"{report.reclassified} source records reclassified, "
                 f"{report.files_changed} files changed"
             )
             print(f"JSONL: {archive / 'extracted' / 'transcripts' / 'prompts.jsonl'}")

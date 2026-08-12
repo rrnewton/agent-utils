@@ -117,6 +117,11 @@ history rewriting. A repeated native ID with different content receives a distin
 because content identity participates in the ID. Immutable occurrence fields may not change;
 classifier fields and prompt ordinals are projections and may improve. Data files are written
 first and the digest manifest last, so readers fail closed on an interrupted generation.
+If the current provider snapshot refines the same byte-identical source occurrence from prompt to
+system input (or another message class), that current classification supersedes the stale class
+instead of retaining both projections. The exporter matches the full provider/source/content/event
+identity without message class, verifies every other immutable field, and records the number of
+such refinements. A record absent from the current snapshot is still carried forward unchanged.
 
 Provider provenance is deliberately not reduced to `role=user`. Codex counts paired native
 `event_msg/user_message` occurrences, not duplicated response-item context. Claude retains typed

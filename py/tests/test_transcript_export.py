@@ -129,6 +129,54 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     assert response["in_reply_to_prompt_id"] == prompt_one["record_id"]
 
 
+def test_current_message_class_supersedes_stale_occurrence_projection(
+    tmp_path: Path,
+) -> None:
+    legacy_prompt = _event(
+        "scheduled", "turn-system", 300, "user_prompt", "Tick", 3
+    )
+    first = export_transcripts(tmp_path, (_team((legacy_prompt,)),))
+    assert first.prompts == 1
+    assert first.system_inputs == 0
+    assert first.reclassified == 0
+
+    corrected_system = replace(
+        legacy_prompt,
+        kind="system_input",
+        role="system",
+        author="system",
+        ingress_kind="scheduled",
+        author_kind="system",
+        classification_version="authorship-v2",
+    )
+    corrected = export_transcripts(tmp_path, (_team((corrected_system,)),))
+    assert corrected.prompts == 0
+    assert corrected.system_inputs == 1
+    assert corrected.carried_forward == 0
+    assert corrected.reclassified == 1
+
+    root = tmp_path / "extracted" / "transcripts"
+    occurrences = _jsonl(root / "occurrences.jsonl")
+    assert len(occurrences) == 1
+    assert occurrences[0]["record_type"] == "system_input"
+    assert _jsonl(root / "prompts.jsonl") == []
+    assert len(_jsonl(root / "system-inputs.jsonl")) == 1
+
+
+def test_missing_source_occurrence_still_retains_its_last_message_class(
+    tmp_path: Path,
+) -> None:
+    legacy_prompt = _event(
+        "scheduled", "turn-system", 300, "user_prompt", "Tick", 3
+    )
+    export_transcripts(tmp_path, (_team((legacy_prompt,)),))
+    retained = export_transcripts(tmp_path, (_team(()),))
+    assert retained.prompts == 1
+    assert retained.system_inputs == 0
+    assert retained.carried_forward == 1
+    assert retained.reclassified == 0
+
+
 def test_authorship_rules_are_auditable_persisted_and_reclassifiable(
     tmp_path: Path,
 ) -> None:

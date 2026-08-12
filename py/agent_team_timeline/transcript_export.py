@@ -126,6 +126,7 @@ class TranscriptExportReport:
     system_inputs: int
     carried_forward: int
     files_changed: int
+    reclassified: int = 0
 
     def to_json_obj(self) -> dict[str, JsonValue]:
         """Return a run-receipt-compatible JSON object."""
@@ -136,6 +137,7 @@ class TranscriptExportReport:
             "responses": self.responses,
             "system_inputs": self.system_inputs,
             "carried_forward": self.carried_forward,
+            "reclassified": self.reclassified,
             "files_changed": self.files_changed,
             "model_calls": 0,
             "model_tokens": 0,
@@ -546,21 +548,81 @@ def _immutable_projection(record: dict[str, JsonValue]) -> dict[str, JsonValue]:
     return {key: value for key, value in record.items() if key not in mutable}
 
 
+def _source_occurrence_id(record: dict[str, JsonValue]) -> str:
+    """Return the provider occurrence identity without its projected message class."""
+
+    source_event_ids = tuple(
+        as_string(value, "record.source_event_ids[]")
+        for value in as_array(record.get("source_event_ids"), "record.source_event_ids")
+    )
+    native_id = record.get("source_native_id")
+    return _stable_id(
+        "source-occurrence",
+        (
+            as_string(record.get("team_slug"), "record.team_slug"),
+            as_string(record.get("provider"), "record.provider"),
+            as_string(record.get("thread_id"), "record.thread_id"),
+            as_string(record.get("source_path"), "record.source_path"),
+            native_id if isinstance(native_id, str) else "",
+            str(as_int(record.get("source_line"), "record.source_line")),
+            str(as_int(record.get("timestamp_ms"), "record.timestamp_ms")),
+            as_string(record.get("content_sha256"), "record.content_sha256"),
+            *source_event_ids,
+        ),
+    )
+
+
+def _reclassification_projection(
+    record: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Return fields that must survive a prompt/system/response refinement."""
+
+    projected = _immutable_projection(record)
+    for key in ("record_type", "record_id", "logical_record_id"):
+        projected.pop(key, None)
+    return projected
+
+
 def _monotonic_union(
     old: list[dict[str, JsonValue]], new: list[dict[str, JsonValue]]
-) -> tuple[list[dict[str, JsonValue]], int]:
+) -> tuple[list[dict[str, JsonValue]], int, int]:
     merged: dict[str, dict[str, JsonValue]] = {}
+    old_by_source: dict[str, list[dict[str, JsonValue]]] = {}
     for record in old:
         record_id = as_string(record.get("record_id"), "old record.record_id")
         if record_id in merged:
             raise ValueError(f"duplicate existing transcript record {record_id!r}")
         merged[record_id] = record
+        old_by_source.setdefault(_source_occurrence_id(record), []).append(record)
     new_ids: set[str] = set()
+    new_source_ids: set[str] = set()
+    reclassified = 0
     for record in new:
         record_id = as_string(record.get("record_id"), "new record.record_id")
         if record_id in new_ids:
             raise ValueError(f"duplicate new transcript record {record_id!r}")
         new_ids.add(record_id)
+        source_id = _source_occurrence_id(record)
+        if source_id in new_source_ids:
+            raise ValueError(
+                f"duplicate new transcript source occurrence {source_id!r}"
+            )
+        new_source_ids.add(source_id)
+        for previous_class in old_by_source.get(source_id, ()):
+            previous_id = as_string(
+                previous_class.get("record_id"), "old record.record_id"
+            )
+            if previous_id == record_id:
+                continue
+            if _reclassification_projection(
+                previous_class
+            ) != _reclassification_projection(record):
+                raise ValueError(
+                    "immutable transcript occurrence changed while its message class "
+                    f"was refined for {source_id!r}"
+                )
+            del merged[previous_id]
+            reclassified += 1
         previous = merged.get(record_id)
         if previous is not None and _immutable_projection(previous) != _immutable_projection(
             record
@@ -570,7 +632,7 @@ def _monotonic_union(
             )
         merged[record_id] = record
     carried = len(set(merged) - new_ids)
-    return sorted(merged.values(), key=_record_sort_key), carried
+    return sorted(merged.values(), key=_record_sort_key), carried, reclassified
 
 
 def _logical_records(
@@ -720,7 +782,7 @@ def export_transcripts(
     ]
 
     current_occurrences = [*current_prompts, *current_responses, *current_system]
-    occurrences, carried = _monotonic_union(
+    occurrences, carried, reclassified = _monotonic_union(
         _load_jsonl(root / "occurrences.jsonl"), current_occurrences
     )
     rule_counts = _apply_authorship_rules(occurrences, rules)
@@ -808,6 +870,7 @@ def export_transcripts(
             "system_inputs": len(system_inputs),
             "occurrences": len(occurrences),
             "carried_forward": carried,
+            "reclassified": reclassified,
             "prompt_authorship_rules": len(rules),
         },
         "prompt_authorship": {
@@ -843,6 +906,7 @@ def export_transcripts(
         system_inputs=len(system_inputs),
         carried_forward=carried,
         files_changed=changed,
+        reclassified=reclassified,
     )
 
 
