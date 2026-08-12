@@ -591,6 +591,52 @@ def test_append_catchup_keeps_completed_historical_overview_stable(
     ).exists()
 
 
+def test_backfill_renews_overview_epoch_and_preserves_immutable_cache(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+    overview_path = summary_root / "project_overview.json"
+    original = json.loads(overview_path.read_text(encoding="utf-8"))
+    original_hash = original["summary"]["input_hash"]
+    original_cache_path = summary_root / "cache" / f"{original_hash}.json"
+    original_cache_bytes = original_cache_path.read_bytes()
+
+    backfill = _event(
+        "backfilled-root-intent",
+        ROOT,
+        500,
+        "user_prompt",
+        "Define safe landing as exact-head validation before any release receipt.",
+    )
+    _write_team(tmp_path, replace(team, events=team.events + (backfill,)))
+
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    renewed = json.loads(overview_path.read_text(encoding="utf-8"))
+    renewed_hash = renewed["summary"]["input_hash"]
+
+    assert renewed["knowledge_epoch"]["epoch_id"] != (
+        original["knowledge_epoch"]["epoch_id"]
+    )
+    assert renewed["knowledge_epoch"]["cutoff_ms"] == (
+        original["knowledge_epoch"]["cutoff_ms"]
+    )
+    assert renewed["source"]["event_ids"][0] == "backfilled-root-intent"
+    assert renewed_hash != original_hash
+    assert original_cache_path.read_bytes() == original_cache_bytes
+    assert (summary_root / "cache" / f"{renewed_hash}.json").is_file()
+    catalog = json.loads((summary_root / "artifacts.json").read_text(encoding="utf-8"))
+    overview_hashes = {
+        item["artifact"]["input_hash"]
+        for item in catalog["artifacts"]
+        if item["artifact"]["logical_key"]
+        == f"project-overview:{team.team_slug}"
+    }
+    assert {original_hash, renewed_hash}.issubset(overview_hashes)
+
+
 def test_frozen_overview_rejects_historical_source_mutation(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)
@@ -600,6 +646,68 @@ def test_frozen_overview_rejects_historical_source_mutation(tmp_path: Path) -> N
         if event.event_id == "root-response"
         else event
         for event in team.events
+    )
+    _write_team(tmp_path, replace(team, events=changed_events))
+
+    with pytest.raises(ValueError, match="overview evidence was mutated or truncated"):
+        summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+
+
+def test_corrected_system_input_classification_can_renew_overview_epoch(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    overview_path = (
+        tmp_path
+        / "teams"
+        / team.team_slug
+        / "summary_data"
+        / "project_overview.json"
+    )
+    original = json.loads(overview_path.read_text(encoding="utf-8"))
+    reclassified = tuple(
+        replace(
+            event,
+            kind="system_input",
+            ingress_kind="claude_system",
+            author_kind="system",
+        )
+        if event.event_id == "prompt-1"
+        else event
+        for event in team.events
+    )
+    _write_team(tmp_path, replace(team, events=reclassified))
+
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    renewed = json.loads(overview_path.read_text(encoding="utf-8"))
+
+    assert renewed["knowledge_epoch"]["epoch_id"] != (
+        original["knowledge_epoch"]["epoch_id"]
+    )
+    assert "prompt-1" not in renewed["source"]["event_ids"]
+
+
+def test_frozen_overview_rejects_mutation_even_when_source_set_grows(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(tmp_path, team.team_slug, "heuristic", "test-model")
+    changed_events = tuple(
+        replace(event, text="Historically rewritten coordinator response.")
+        if event.event_id == "root-response"
+        else event
+        for event in team.events
+    ) + (
+        _event(
+            "backfilled-root-intent",
+            ROOT,
+            500,
+            "user_prompt",
+            "Newly recovered owner intent from the same historical interval.",
+        ),
     )
     _write_team(tmp_path, replace(team, events=changed_events))
 
@@ -1747,7 +1855,7 @@ def test_build_does_not_render_stale_partial_rollup_as_complete(
     assert timeline["rollups"][0]["plain_language_path"] == ""
 
 
-def test_build_validates_out_of_window_overview_source(tmp_path: Path) -> None:
+def test_build_suppresses_stale_out_of_window_overview_source(tmp_path: Path) -> None:
     team = _team()
     _write_team(tmp_path, team)
     summarize_archive(tmp_path, team.team_slug, "heuristic", "offline")
@@ -1770,13 +1878,18 @@ def test_build_validates_out_of_window_overview_source(tmp_path: Path) -> None:
         end_time="2026-03-31T23:33:30.000Z",
     )
 
-    with pytest.raises(ValueError, match="mutated or truncated"):
-        build_archive(
-            tmp_path,
-            team.team_slug,
-            display_window=window,
-            output=tmp_path / "corrupt-out-of-window-overview-site",
-        )
+    output = tmp_path / "corrupt-out-of-window-overview-site"
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        display_window=window,
+        output=output,
+    )
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert timeline["project_overview"]["summary_available"] is False
+    assert "Summary unavailable" in timeline["project_overview"]["text"]
 
 
 def test_build_validates_out_of_window_overview_summary(tmp_path: Path) -> None:

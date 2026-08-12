@@ -12,6 +12,8 @@ import hashlib
 import json
 import re
 import shlex
+from bisect import bisect_left
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
@@ -55,6 +57,15 @@ class EvidenceConfidence(str, Enum):
 
     HIGH = "high"
     MEDIUM = "medium"
+
+
+_OUTPUT_RELATIONS = frozenset(
+    {
+        EvidenceRelation.PRODUCED,
+        EvidenceRelation.PUBLISHED,
+        EvidenceRelation.UPDATED,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,6 +182,89 @@ class ArtifactCatalog:
             "artifacts": [item.to_json_obj() for item in self.artifacts],
             "projects": [item.to_json_obj() for item in self.projects],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactRangeEntry:
+    timestamp_ms: int
+    artifact_id: str
+    output: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ArtifactRangeSeries:
+    timestamps: tuple[int, ...]
+    entries: tuple[_ArtifactRangeEntry, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRangeIndex:
+    """One-pass evidence index for repeated render-time interval queries."""
+
+    all_evidence: _ArtifactRangeSeries
+    evidence_by_thread: Mapping[str, _ArtifactRangeSeries]
+
+    @classmethod
+    def from_catalog(cls, catalog: ArtifactCatalog) -> ArtifactRangeIndex:
+        """Build a timestamp-sorted query index from one immutable catalog."""
+
+        all_entries: list[_ArtifactRangeEntry] = []
+        entries_by_thread: dict[str, list[_ArtifactRangeEntry]] = {}
+        for artifact in catalog.artifacts:
+            for evidence in artifact.evidence:
+                entry = _ArtifactRangeEntry(
+                    timestamp_ms=evidence.timestamp_ms,
+                    artifact_id=artifact.artifact_id,
+                    output=evidence.relation in _OUTPUT_RELATIONS,
+                )
+                all_entries.append(entry)
+                entries_by_thread.setdefault(evidence.thread_id, []).append(entry)
+
+        def series(entries: list[_ArtifactRangeEntry]) -> _ArtifactRangeSeries:
+            ordered = tuple(
+                sorted(entries, key=lambda item: (item.timestamp_ms, item.artifact_id))
+            )
+            return _ArtifactRangeSeries(
+                timestamps=tuple(item.timestamp_ms for item in ordered),
+                entries=ordered,
+            )
+
+        return cls(
+            all_evidence=series(all_entries),
+            evidence_by_thread={
+                thread_id: series(entries)
+                for thread_id, entries in entries_by_thread.items()
+            },
+        )
+
+    def ids_for_range(
+        self,
+        start_ms: int,
+        end_ms: int,
+        thread_id: str | None = None,
+        *,
+        outputs_only: bool = False,
+    ) -> tuple[str, ...]:
+        """Return deduplicated IDs from a half-open indexed interval."""
+
+        series = (
+            self.all_evidence
+            if thread_id is None
+            else self.evidence_by_thread.get(thread_id)
+        )
+        if series is None or end_ms <= start_ms:
+            return ()
+        left = bisect_left(series.timestamps, start_ms)
+        right = bisect_left(series.timestamps, end_ms, lo=left)
+        return tuple(
+            sorted(
+                {
+                    entry.artifact_id
+                    for entry in series.entries[left:right]
+                    if not outputs_only or entry.output
+                }
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1361,16 +1455,11 @@ def output_artifact_ids_for_range(
 ) -> tuple[str, ...]:
     """Return only artifacts with output-changing evidence in a half-open range."""
 
-    output_relations = {
-        EvidenceRelation.PRODUCED,
-        EvidenceRelation.PUBLISHED,
-        EvidenceRelation.UPDATED,
-    }
     result = {
         artifact.artifact_id
         for artifact in catalog.artifacts
         if any(
-            evidence.relation in output_relations
+            evidence.relation in _OUTPUT_RELATIONS
             and start_ms <= evidence.timestamp_ms < end_ms
             and (thread_id is None or evidence.thread_id == thread_id)
             for evidence in artifact.evidence
@@ -1383,6 +1472,7 @@ __all__ = [
     "ArtifactCatalog",
     "ArtifactEvidence",
     "ArtifactKind",
+    "ArtifactRangeIndex",
     "EvidenceConfidence",
     "EvidenceRelation",
     "ProjectIdentity",

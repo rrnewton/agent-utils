@@ -1246,6 +1246,16 @@ class _ProjectOverviewInput:
     context_sha256: str
 
 
+class _ProjectOverviewSourceSetChanged(ValueError):
+    """Signal a verified append/backfill that needs a fresh knowledge epoch."""
+
+    def __init__(self, path: Path, previous_epoch: _KnowledgeEpoch) -> None:
+        super().__init__(
+            f"{path}.source: frozen overview source set changed with prior evidence intact"
+        )
+        self.previous_epoch = previous_epoch
+
+
 @dataclass(frozen=True)
 class _GlossaryEvidence:
     """One bounded source occurrence supplied to a glossary-definition job."""
@@ -1311,6 +1321,16 @@ def _root_overview_input(
         ),
         key=lambda event: (event.timestamp_ms, event.event_id),
     )
+    return _overview_input_from_events(team, selected_epoch, events)
+
+
+def _overview_input_from_events(
+    team: TeamData,
+    epoch: _KnowledgeEpoch,
+    events: Sequence[Event],
+) -> _ProjectOverviewInput:
+    """Build overview evidence from an already ordered root-event sequence."""
+
     parts: list[str] = []
     event_ids: list[str] = []
     used = 0
@@ -1335,27 +1355,90 @@ def _root_overview_input(
         end_ms = retained[-1].timestamp_ms
     else:
         fallback = team.window_start_ms
-        if fallback is None or fallback >= selected_epoch.cutoff_ms:
+        if fallback is None or fallback >= epoch.cutoff_ms:
             fallback = min(
                 (
                     event.timestamp_ms
                     for event in team.events
-                    if event.timestamp_ms < selected_epoch.cutoff_ms
+                    if event.timestamp_ms < epoch.cutoff_ms
                 ),
-                default=max(0, selected_epoch.cutoff_ms - 1),
+                default=max(0, epoch.cutoff_ms - 1),
             )
         start_ms = fallback
         end_ms = fallback
         parts.append("No root user or assistant transcript text was retained.")
     transcript = "\n\n".join(parts)
     return _ProjectOverviewInput(
-        epoch=selected_epoch,
+        epoch=epoch,
         start_ms=start_ms,
         end_ms=end_ms,
         transcript=transcript,
         event_ids=tuple(event_ids),
         context_sha256=hashlib.sha256(transcript.encode("utf-8")).hexdigest(),
     )
+
+
+def _recorded_overview_input(
+    team: TeamData,
+    epoch: _KnowledgeEpoch,
+    event_ids: tuple[str, ...],
+) -> _ProjectOverviewInput | None:
+    """Reconstruct prior evidence by ID so new early events do not hide mutation."""
+
+    if len(event_ids) != len(set(event_ids)):
+        return None
+    by_id = {event.event_id: event for event in team.events}
+    events: list[Event] = []
+    for event_id in event_ids:
+        event = by_id.get(event_id)
+        if (
+            event is None
+            or event.thread_id != team.root_thread_id
+            or not event.text
+            or event.timestamp_ms >= epoch.cutoff_ms
+        ):
+            return None
+        if event.kind not in {"user_prompt", "assistant_message"}:
+            # Claude ingestion formerly treated provider-authored user-role envelopes as owner
+            # prompts. Reconstruct that prior prefix to prove their text/timestamp stayed intact
+            # while allowing the corrected classification to start a new source-set epoch.
+            if (
+                event.kind != "system_input"
+                or event.role != "user"
+                or event.ingress_kind != "claude_system"
+                or event.author_kind != "system"
+            ):
+                return None
+            event = replace(event, kind="user_prompt")
+        events.append(event)
+    result = _overview_input_from_events(team, epoch, events)
+    return result if result.event_ids == event_ids else None
+
+
+def _renewed_project_overview_input(
+    team: TeamData, previous_epoch: _KnowledgeEpoch
+) -> _ProjectOverviewInput:
+    """Create a deterministic new epoch for verified append/backfill evidence."""
+
+    current = _root_overview_input(team)
+    digest = hashlib.sha256(
+        canonical_json(
+            {
+                "team_slug": team.team_slug,
+                "previous_epoch_id": previous_epoch.epoch_id,
+                "cutoff_ms": current.epoch.cutoff_ms,
+                "cutoff_reason": current.epoch.cutoff_reason,
+                "event_ids": list(current.event_ids),
+                "context_sha256": current.context_sha256,
+            }
+        ).encode("utf-8")
+    ).hexdigest()[:20]
+    epoch = _KnowledgeEpoch(
+        epoch_id=f"knowledge-{digest}",
+        cutoff_ms=current.epoch.cutoff_ms,
+        cutoff_reason=current.epoch.cutoff_reason,
+    )
+    return replace(current, epoch=epoch)
 
 
 def _project_overview_job(
@@ -1851,7 +1934,7 @@ def _knowledge_epoch_from_json(value: JsonValue, where: str) -> _KnowledgeEpoch:
 def _frozen_project_overview_input(
     archive: Path, team: TeamData
 ) -> _ProjectOverviewInput | None:
-    """Load the first immutable project evidence epoch, if one has been recorded."""
+    """Load and validate the projected immutable project evidence epoch."""
 
     path = _summary_root(archive, team.team_slug) / "project_overview.json"
     if not path.is_file():
@@ -1874,9 +1957,6 @@ def _frozen_project_overview_input(
     epoch = _knowledge_epoch_from_json(
         obj.get("knowledge_epoch"), f"{path}.knowledge_epoch"
     )
-    outside_window = (
-        team.window_end_ms is not None and epoch.cutoff_ms > team.window_end_ms
-    )
     source = as_object(obj.get("source"), f"{path}.source")
     _require_exact_keys(
         source,
@@ -1894,16 +1974,30 @@ def _frozen_project_overview_input(
     )
     if end_ms < start_ms or end_ms >= epoch.cutoff_ms:
         raise ValueError(f"{path}.source: timestamps escape the knowledge epoch")
+    outside_window = (
+        team.window_end_ms is not None and epoch.cutoff_ms > team.window_end_ms
+    )
     validation_team = (
         load_archived_team(archive, team.team_slug) if outside_window else team
     )
     current = _root_overview_input(validation_team, epoch)
-    if (
-        current.event_ids != event_ids
-        or current.start_ms != start_ms
-        or current.end_ms != end_ms
-        or current.context_sha256 != expected_sha256
-    ):
+    exact_match = (
+        current.event_ids == event_ids
+        and current.start_ms == start_ms
+        and current.end_ms == end_ms
+        and current.context_sha256 == expected_sha256
+    )
+    if not exact_match:
+        reconstructed = _recorded_overview_input(
+            validation_team, epoch, event_ids
+        )
+        recorded_evidence_unchanged = reconstructed is not None and (
+            reconstructed.start_ms == start_ms
+            and reconstructed.end_ms == end_ms
+            and reconstructed.context_sha256 == expected_sha256
+        )
+        if recorded_evidence_unchanged and current.event_ids != event_ids:
+            raise _ProjectOverviewSourceSetChanged(path, epoch)
         raise ValueError(
             f"{path}.source: frozen overview evidence was mutated or truncated"
         )
@@ -2710,7 +2804,12 @@ def _summarize_archive_locked(
     # closed: no candidate enters a model prompt and no glossary-specific model job can run.
     supported_terms: tuple[GlossaryTerm, ...] = ()
     cache = summary_root / "cache"
-    overview_source = _frozen_project_overview_input(archive, team)
+    try:
+        overview_source = _frozen_project_overview_input(archive, team)
+    except _ProjectOverviewSourceSetChanged as change:
+        overview_source = _renewed_project_overview_input(
+            team, change.previous_epoch
+        )
     if overview_source is None:
         overview_source = _root_overview_input(team)
     phase_results, phase_stats = summarize_jobs(
@@ -3287,7 +3386,30 @@ def _load_project_overview(
         raise ValueError(f"{path}: unsupported project-overview schema; run summarize")
     summary = _summary_from_json(root.get("summary"), f"{path}.summary")
     _validate_project_overview(summary, f"{path}.summary")
-    source = _frozen_project_overview_input(archive, team)
+    try:
+        source = _frozen_project_overview_input(archive, team)
+    except _ProjectOverviewSourceSetChanged:
+        fallback_source = _root_overview_input(team)
+        return (
+            _unavailable_summary(
+                f"project-overview:{team.team_slug}",
+                fallback_source.end_ms,
+                "stale project overview",
+            ),
+            fallback_source,
+        )
+    except ValueError as error:
+        if "frozen overview evidence was mutated or truncated" not in str(error):
+            raise
+        fallback_source = _root_overview_input(team)
+        return (
+            _unavailable_summary(
+                f"project-overview:{team.team_slug}",
+                fallback_source.end_ms,
+                "stale project overview",
+            ),
+            fallback_source,
+        )
     if source is None:
         fallback_source = _root_overview_input(team)
         return (

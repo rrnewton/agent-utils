@@ -9,8 +9,9 @@ selection rule changes.
 The durable Hermit archive is `~/agent_logs_archive/summary/hermit`. One archive may contain
 multiple teams under `teams/<team-slug>/`; source snapshots remain ignored, while normalized data,
 expensive summary artifacts, model-usage receipts, and deterministic presentation files can be
-version controlled. The intended teams for the first combined archive are `codex-coord-030`,
-`claude-coord-176`, and `orc-coord-014`.
+version controlled. The current Hermit archive combines the registered Codex, Claude, and Orc
+coordinator sessions from all source hosts; team registration lives outside the package in the
+archive project's `projects/hermit.json` configuration rather than in application code.
 
 The durable archive and a website export are distinct concepts:
 
@@ -323,8 +324,13 @@ Staged by `pipeline.py:_project_overview_job`.
 The input is at most 48,000 characters from early root user/assistant conversation before a frozen
 knowledge cutoff. Source event IDs, bounds, and a context digest are retained. The output is either
 an evidence-supported newcomer overview or an explicit `Insufficient evidence` result. It may not
-emit links. The projection is `summary_data/project_overview.json`; its first valid evidence epoch
-is intentionally frozen against ordinary append-only growth.
+emit links. The projection is `summary_data/project_overview.json`. Ordinary later append-only
+growth reuses the frozen evidence epoch. If a later importer discovers additional early events or
+corrects a provider-system envelope that was formerly classified as an owner prompt, the pipeline
+first reconstructs every recorded event by ID and proves its text, timestamp, and aggregate digest
+are unchanged. Only then does it create a deterministic replacement knowledge epoch; both the old
+and new content-addressed artifacts remain in the catalog. Removal, truncation, or mutation of any
+recorded event still fails closed.
 
 ### Glossary definition
 

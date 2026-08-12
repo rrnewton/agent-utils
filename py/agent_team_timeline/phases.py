@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from bisect import bisect_left
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -162,22 +163,23 @@ def _tool_names(tool: ToolCall) -> tuple[TranscriptTool, ...]:
     return (TranscriptTool(tool.name, 1),)
 
 
-def _thread_end(team: TeamData, agent: Agent) -> int:
+def _thread_end(
+    agent: Agent,
+    events: Sequence[Event],
+    tools: Sequence[ToolCall],
+    turns: Sequence[Turn],
+) -> int:
     candidates = [agent.started_at_ms + 1000]
     if agent.ended_at_ms is not None:
         candidates.append(agent.ended_at_ms)
-    candidates.extend(
-        event.timestamp_ms for event in team.events if event.thread_id == agent.thread_id
-    )
+    candidates.extend(event.timestamp_ms for event in events)
     candidates.extend(
         (tool.ended_at_ms or tool.started_at_ms)
-        for tool in team.tool_calls
-        if tool.thread_id == agent.thread_id
+        for tool in tools
     )
     candidates.extend(
         (turn.ended_at_ms or turn.started_at_ms)
-        for turn in team.turns
-        if turn.thread_id == agent.thread_id
+        for turn in turns
     )
     return max(candidates)
 
@@ -317,32 +319,49 @@ def _summary_text(entries: Sequence[TranscriptEntry], max_chars: int) -> str:
     return text[:front] + "\n\n[...middle omitted for summary input...]\n\n" + text[-back:]
 
 
-def _ancestor_ids(team: TeamData, agent: Agent) -> set[str]:
-    by_id = {item.thread_id: item for item in team.agents}
+def _ancestor_ids(
+    root_thread_id: str, by_id: Mapping[str, Agent], agent: Agent
+) -> set[str]:
     ids = {agent.thread_id}
     parent = agent.parent_thread_id
     while parent is not None and parent in by_id:
         ids.add(parent)
         parent = by_id[parent].parent_thread_id
-    ids.add(team.root_thread_id)
+    ids.add(root_thread_id)
     return ids
 
 
-def _prior_context(team: TeamData, agent: Agent, start_ms: int, max_chars: int) -> str:
-    ancestor_ids = _ancestor_ids(team, agent)
-    relevant = [
-        event
-        for event in team.events
-        if event.thread_id in ancestor_ids
-        and event.timestamp_ms < start_ms
-        and event.kind in _TEXT_KINDS
-        and _text(event)
-    ]
-    lines = [
-        f"[{_iso(event.timestamp_ms)}] {event.kind}: {_text(event)}"
-        for event in sorted(relevant, key=lambda item: (item.timestamp_ms, item.event_id))
-    ]
-    text = "\n\n".join(lines)
+def _prior_context(
+    ancestor_ids: set[str],
+    context_by_thread: Mapping[str, Sequence[tuple[int, str, str]]],
+    start_ms: int,
+    max_chars: int,
+) -> str:
+    candidates: list[tuple[Sequence[tuple[int, str, str]], int]] = []
+    for thread_id in ancestor_ids:
+        entries = context_by_thread.get(thread_id, ())
+        cutoff = bisect_left(entries, (start_ms, "", ""))
+        if cutoff:
+            candidates.append((entries, cutoff - 1))
+
+    reverse_lines: list[str] = []
+    retained_chars = 0
+    while candidates and retained_chars < max_chars:
+        selected_index = max(
+            range(len(candidates)),
+            key=lambda index: candidates[index][0][candidates[index][1]][:2],
+        )
+        entries, entry_index = candidates[selected_index]
+        reverse_lines.append(entries[entry_index][2])
+        retained_chars += len(reverse_lines[-1])
+        if len(reverse_lines) > 1:
+            retained_chars += 2
+        if entry_index == 0:
+            candidates.pop(selected_index)
+        else:
+            candidates[selected_index] = (entries, entry_index - 1)
+
+    text = "\n\n".join(reversed(reverse_lines))
     return text[-max_chars:]
 
 
@@ -395,6 +414,10 @@ def build_phases(
 
     if phase_minutes <= 0:
         raise ValueError("phase_minutes must be positive")
+    if context_chars <= 0:
+        raise ValueError("context_chars must be positive")
+    if transcript_chars <= 0:
+        raise ValueError("transcript_chars must be positive")
     window_ms = phase_minutes * 60 * 1000
     events_by_thread: dict[str, list[Event]] = defaultdict(list)
     tools_by_thread: dict[str, list[ToolCall]] = defaultdict(list)
@@ -405,14 +428,38 @@ def build_phases(
         tools_by_thread[tool.thread_id].append(tool)
     for turn in team.turns:
         turns_by_thread[turn.thread_id].append(turn)
+    for own_events in events_by_thread.values():
+        own_events.sort(key=lambda event: (event.timestamp_ms, event.event_id))
+    for own_tools in tools_by_thread.values():
+        own_tools.sort(key=lambda tool: (tool.started_at_ms, tool.call_id))
+    for own_turns in turns_by_thread.values():
+        own_turns.sort(key=lambda turn: (turn.started_at_ms, turn.turn_id))
+
+    context_by_thread: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    for event in team.events:
+        rendered = _text(event)
+        if event.kind not in _TEXT_KINDS or not rendered:
+            continue
+        context_by_thread[event.thread_id].append(
+            (
+                event.timestamp_ms,
+                event.event_id,
+                f"[{_iso(event.timestamp_ms)}] {event.kind}: {rendered}",
+            )
+        )
+    for context_entries in context_by_thread.values():
+        context_entries.sort(key=lambda item: (item[0], item[1]))
+    agents_by_id = {agent.thread_id: agent for agent in team.agents}
 
     result: list[PhaseWindow] = []
     for agent in team.agents:
-        end_ms = _thread_end(team, agent)
-        if team.window_end_ms is not None:
-            end_ms = min(end_ms, team.window_end_ms)
         own_events = events_by_thread.get(agent.thread_id, [])
         own_tools = tools_by_thread.get(agent.thread_id, [])
+        own_turns = turns_by_thread.get(agent.thread_id, [])
+        end_ms = _thread_end(agent, own_events, own_tools, own_turns)
+        if team.window_end_ms is not None:
+            end_ms = min(end_ms, team.window_end_ms)
+        ancestor_ids = _ancestor_ids(team.root_thread_id, agents_by_id, agent)
         activity_times = [
             event.timestamp_ms
             for event in own_events
@@ -447,7 +494,7 @@ def build_phases(
             ]
             phase_turns = [
                 turn
-                for turn in turns_by_thread.get(agent.thread_id, [])
+                for turn in own_turns
                 if turn.started_at_ms < phase_end
                 and (turn.ended_at_ms or phase_end) > start_ms
             ]
@@ -482,7 +529,12 @@ def build_phases(
                     stats=stats,
                     states=_states(start_ms, phase_end, phase_turns, phase_tools, blocked),
                     transcript_text=_summary_text(entries, transcript_chars),
-                    prior_context=_prior_context(team, agent, start_ms, context_chars),
+                    prior_context=_prior_context(
+                        ancestor_ids,
+                        context_by_thread,
+                        start_ms,
+                        context_chars,
+                    ),
                     transcript=entries,
                 )
             )

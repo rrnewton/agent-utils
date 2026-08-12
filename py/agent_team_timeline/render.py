@@ -12,8 +12,7 @@ from agent_team_timeline.activity_bins import build_activity_bins
 from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
 from agent_team_timeline.artifacts import (
     ArtifactCatalog,
-    artifact_ids_for_range,
-    output_artifact_ids_for_range,
+    ArtifactRangeIndex,
 )
 from agent_team_timeline.github_refs import find_pull_request_references
 from agent_team_timeline.identity import SiteIdentity
@@ -276,10 +275,10 @@ def _in_window(team: TeamData, timestamp_ms: int) -> bool:
 def _summary_for_agent_at(
     agent_id: str,
     at_ms: int,
-    phases: Sequence[PhaseWindow],
+    phases_by_agent: Mapping[str, Sequence[PhaseWindow]],
     summaries: Mapping[str, SummaryResult],
 ) -> SummaryResult | None:
-    own = [phase for phase in phases if phase.agent_id == agent_id]
+    own = phases_by_agent.get(agent_id, ())
     if not own:
         return None
     containing = [phase for phase in own if phase.start_ms <= at_ms <= phase.end_ms]
@@ -293,14 +292,16 @@ def _summary_for_agent_at(
 def _edge_obj(
     edge: Edge,
     agents: Mapping[str, Agent],
-    phases: Sequence[PhaseWindow],
+    phases_by_agent: Mapping[str, Sequence[PhaseWindow]],
     summaries: Mapping[str, SummaryResult],
     names: Mapping[str, AgentNameResult],
 ) -> dict[str, object] | None:
     target = agents.get(edge.to_thread_id)
     if target is None or edge.from_thread_id not in agents:
         return None
-    summary = _summary_for_agent_at(edge.to_thread_id, edge.timestamp_ms, phases, summaries)
+    summary = _summary_for_agent_at(
+        edge.to_thread_id, edge.timestamp_ms, phases_by_agent, summaries
+    )
     readable_kind = "message" if edge.kind == "followup" else edge.kind
     action = {
         "spawn": "Spawn",
@@ -352,7 +353,7 @@ def _edge_obj(
 def _result_edge_objs(
     team: TeamData,
     agents: Mapping[str, Agent],
-    phases: Sequence[PhaseWindow],
+    phases_by_agent: Mapping[str, Sequence[PhaseWindow]],
     summaries: Mapping[str, SummaryResult],
     names: Mapping[str, AgentNameResult],
 ) -> list[dict[str, object]]:
@@ -362,6 +363,23 @@ def _result_edge_objs(
     continuation_targets = {
         edge.to_thread_id for edge in team.edges if edge.kind == "continuation"
     }
+    finals_by_agent: dict[str, list[Event]] = {}
+    for event in team.events:
+        if (
+            event.kind in ("assistant_message", "inter_agent_message")
+            and event.phase == "final_answer"
+            and event.text
+        ):
+            finals_by_agent.setdefault(event.thread_id, []).append(event)
+    turns_by_key: dict[tuple[str, str], Turn] = {}
+    for turn in team.turns:
+        # Preserve the legacy linear lookup's first-match behavior for malformed or
+        # pre-validation archives that repeat a provider turn identity.
+        turns_by_key.setdefault((turn.thread_id, turn.turn_id), turn)
+    triggers_by_target: dict[str, list[Edge]] = {}
+    for edge in team.edges:
+        if edge.kind in ("spawn", "followup"):
+            triggers_by_target.setdefault(edge.to_thread_id, []).append(edge)
     for agent in team.agents:
         if (
             agent.thread_id not in agents
@@ -370,25 +388,23 @@ def _result_edge_objs(
             or agent.thread_id in continuation_targets
         ):
             continue
-        finals = [
-            event
-            for event in team.events
-            if event.thread_id == agent.thread_id
-            and event.kind in ("assistant_message", "inter_agent_message")
-            and event.phase == "final_answer"
-            and event.text
-        ]
+        finals = finals_by_agent.get(agent.thread_id, ())
         # A reused agent can complete many turns during one lifetime. Those responses are
         # messages, not additional fork/join structure, and retain the coordinator that
         # initiated each turn as their destination.
         for final in sorted(finals, key=lambda event: (event.timestamp_ms, event.event_id)):
             if not _in_window(team, final.timestamp_ms):
                 continue
-            target_id = _result_target(team, agent, final)
+            target_id = _result_target(
+                agent,
+                final,
+                turns_by_key,
+                triggers_by_target,
+            )
             if target_id is None or target_id not in agents:
                 continue
             summary = _summary_for_agent_at(
-                agent.thread_id, final.timestamp_ms, phases, summaries
+                agent.thread_id, final.timestamp_ms, phases_by_agent, summaries
             )
             result.append(
                 {
@@ -416,9 +432,7 @@ def _result_edge_objs(
             continue
         phase_end_ms = max(
             (
-                phase.end_ms
-                for phase in phases
-                if phase.agent_id == agent.thread_id
+                phase.end_ms for phase in phases_by_agent.get(agent.thread_id, ())
             ),
             default=agent.ended_at_ms,
         )
@@ -429,7 +443,9 @@ def _result_edge_objs(
         if not _in_window(team, return_ms):
             continue
         parent = agents[agent.parent_thread_id]
-        summary = _summary_for_agent_at(agent.thread_id, return_ms, phases, summaries)
+        summary = _summary_for_agent_at(
+            agent.thread_id, return_ms, phases_by_agent, summaries
+        )
         child_name = _agent_name(agent, names).short_name
         parent_name = _agent_name(parent, names).short_name
         phrase = (
@@ -461,7 +477,12 @@ def _result_edge_objs(
     return result
 
 
-def _result_target(team: TeamData, agent: Agent, final: Event) -> str | None:
+def _result_target(
+    agent: Agent,
+    final: Event,
+    turns_by_key: Mapping[tuple[str, str], Turn],
+    triggers_by_target: Mapping[str, Sequence[Edge]],
+) -> str | None:
     """Resolve the coordinator that initiated the turn producing ``final``.
 
     ``parent_thread_id`` records immutable spawn lineage, not necessarily the coordinator that
@@ -471,16 +492,18 @@ def _result_target(team: TeamData, agent: Agent, final: Event) -> str | None:
     fallback used by older archives.
     """
 
-    turn = _event_turn(team.turns, final)
+    turn = (
+        turns_by_key.get((final.thread_id, final.turn_id))
+        if final.turn_id is not None
+        else None
+    )
     if turn is None:
         return agent.parent_thread_id
     trigger_slop_ms = 2_000
     triggers = [
         edge
-        for edge in team.edges
-        if edge.to_thread_id == agent.thread_id
-        and edge.kind in ("spawn", "followup")
-        and abs(edge.timestamp_ms - turn.started_at_ms) <= trigger_slop_ms
+        for edge in triggers_by_target.get(agent.thread_id, ())
+        if abs(edge.timestamp_ms - turn.started_at_ms) <= trigger_slop_ms
     ]
     if not triggers:
         return agent.parent_thread_id
@@ -493,21 +516,6 @@ def _result_target(team: TeamData, agent: Agent, final: Event) -> str | None:
         ),
     )
     return trigger.from_thread_id
-
-
-def _event_turn(turns: Sequence[Turn], event: Event) -> Turn | None:
-    if event.turn_id is None:
-        return None
-    return next(
-        (
-            turn
-            for turn in turns
-            if turn.thread_id == event.thread_id and turn.turn_id == event.turn_id
-        ),
-        None,
-    )
-
-
 def _event_objs(
     team: TeamData, visible_agent_ids: frozenset[str]
 ) -> list[dict[str, object]]:
@@ -704,6 +712,14 @@ def render_archive(
     phase_paths: dict[str, str] = {}
     agents_by_id = {agent.thread_id: agent for agent in team.agents}
     visible_agent_ids = phase_agent_ids(team, phases)
+    phases_by_agent: dict[str, list[PhaseWindow]] = {}
+    for phase in phases:
+        phases_by_agent.setdefault(phase.agent_id, []).append(phase)
+    for own_phases in phases_by_agent.values():
+        own_phases.sort(key=lambda phase: (phase.start_ms, phase.phase_id))
+    artifact_index = ArtifactRangeIndex.from_catalog(artifact_catalog)
+    phase_artifact_ids: dict[str, tuple[str, ...]] = {}
+    phase_output_artifact_ids: dict[str, tuple[str, ...]] = {}
     for phase in phases:
         summary = phase_summaries[phase.summary_key]
         agent = agents_by_id[phase.agent_id]
@@ -711,12 +727,17 @@ def render_archive(
         raw_path = f"teams/{team.team_slug}/summaries/phases/{phase.phase_id}.md"
         detail_path = f"data/details/{phase.phase_id}.json"
         phase_paths[phase.phase_id] = detail_path
-        artifact_ids = artifact_ids_for_range(
-            artifact_catalog, phase.start_ms, phase.end_ms, phase.agent_id
+        artifact_ids = artifact_index.ids_for_range(
+            phase.start_ms, phase.end_ms, phase.agent_id
         )
-        output_artifact_ids = output_artifact_ids_for_range(
-            artifact_catalog, phase.start_ms, phase.end_ms, phase.agent_id
+        output_artifact_ids = artifact_index.ids_for_range(
+            phase.start_ms,
+            phase.end_ms,
+            phase.agent_id,
+            outputs_only=True,
         )
+        phase_artifact_ids[phase.phase_id] = artifact_ids
+        phase_output_artifact_ids[phase.phase_id] = output_artifact_ids
         if summary.summary_available:
             changed += int(
                 write_text_if_changed(
@@ -753,9 +774,6 @@ def render_archive(
         }
         changed += int(write_json_if_changed(archive / detail_path, narrow_json(detail)))
 
-    phases_by_agent: dict[str, list[PhaseWindow]] = {}
-    for phase in phases:
-        phases_by_agent.setdefault(phase.agent_id, []).append(phase)
     for agent in team.agents:
         own = sorted(phases_by_agent.get(agent.thread_id, []), key=lambda phase: phase.start_ms)
         agent_path = f"teams/{team.team_slug}/summaries/agents/{agent.thread_id}.md"
@@ -1012,13 +1030,16 @@ def render_archive(
                 "end_ms": min(track_end, end_ms),
                 "status": agent.status,
                 "artifact_ids": list(
-                    artifact_ids_for_range(
-                        artifact_catalog, track_start, track_end, agent.thread_id
+                    artifact_index.ids_for_range(
+                        track_start, track_end, agent.thread_id
                     )
                 ),
                 "output_artifact_ids": list(
-                    output_artifact_ids_for_range(
-                        artifact_catalog, track_start, track_end, agent.thread_id
+                    artifact_index.ids_for_range(
+                        track_start,
+                        track_end,
+                        agent.thread_id,
+                        outputs_only=True,
                     )
                 ),
             }
@@ -1037,25 +1058,18 @@ def render_archive(
             "detail_path": phase_paths[phase.phase_id],
             "stats": phase.stats.to_mapping(),
             "states": [state.to_json_obj() for state in phase.states],
-            "artifact_ids": list(
-                artifact_ids_for_range(
-                    artifact_catalog,
-                    phase.start_ms,
-                    phase.end_ms,
-                    phase.agent_id,
-                )
-            ),
+            "artifact_ids": list(phase_artifact_ids[phase.phase_id]),
             "output_artifact_ids": list(
-                output_artifact_ids_for_range(
-                    artifact_catalog,
-                    phase.start_ms,
-                    phase.end_ms,
-                    phase.agent_id,
-                )
+                phase_output_artifact_ids[phase.phase_id]
             ),
         }
         for phase in phases
     ]
+    visible_agents = {
+        agent_id: agent
+        for agent_id, agent in agents_by_id.items()
+        if agent_id in visible_agent_ids
+    }
     edge_objs = [
         value
         for edge in team.edges
@@ -1065,12 +1079,8 @@ def render_archive(
         for value in [
             _edge_obj(
                 edge,
-                {
-                    agent_id: agent
-                    for agent_id, agent in agents_by_id.items()
-                    if agent_id in visible_agent_ids
-                },
-                phases,
+                visible_agents,
+                phases_by_agent,
                 phase_summaries,
                 agent_names,
             )
@@ -1080,12 +1090,8 @@ def render_archive(
     edge_objs.extend(
         _result_edge_objs(
             team,
-            {
-                agent_id: agent
-                for agent_id, agent in agents_by_id.items()
-                if agent_id in visible_agent_ids
-            },
-            phases,
+            visible_agents,
+            phases_by_agent,
             phase_summaries,
             agent_names,
         )
@@ -1118,13 +1124,15 @@ def render_archive(
                 "summary_available": technical_available or plain_available,
                 "stats": rollup_stats[period_key].to_mapping(),
                 "artifact_ids": list(
-                    artifact_ids_for_range(
-                        artifact_catalog, period.start_ms, period.end_ms
+                    artifact_index.ids_for_range(
+                        period.start_ms, period.end_ms
                     )
                 ),
                 "output_artifact_ids": list(
-                    output_artifact_ids_for_range(
-                        artifact_catalog, period.start_ms, period.end_ms
+                    artifact_index.ids_for_range(
+                        period.start_ms,
+                        period.end_ms,
+                        outputs_only=True,
                     )
                 ),
             }

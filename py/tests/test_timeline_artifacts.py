@@ -11,6 +11,7 @@ import pytest
 from agent_team_timeline.archive import narrow_json, read_json
 from agent_team_timeline.artifacts import (
     ArtifactKind,
+    ArtifactRangeIndex,
     EvidenceRelation,
     artifact_catalog_from_json,
     artifact_ids_for_range,
@@ -180,9 +181,64 @@ def test_extracts_confirmed_commit_push_and_pull_request_without_duplicates() ->
         commit_artifact.artifact_id,
         pulls[0].artifact_id,
     }
+    index = ArtifactRangeIndex.from_catalog(catalog)
+    assert index.ids_for_range(START, START + 10_000) == artifact_ids_for_range(
+        catalog, START, START + 10_000
+    )
+    assert index.ids_for_range(
+        START, START + 10_000, ROOT, outputs_only=True
+    ) == output_artifact_ids_for_range(catalog, START, START + 10_000, ROOT)
+    assert index.ids_for_range(START + 10_000, START + 20_000) == ()
     assert catalog.to_json_obj() == extract_artifacts(
         _team(events=(mention,), tools=(commit, push, pull))
     ).to_json_obj()
+
+
+def test_artifact_range_index_preserves_half_open_output_and_dedupe_semantics() -> None:
+    commit = _tool(
+        "commit",
+        1_000,
+        'git commit -m "Add deterministic receipts"',
+        "[topic abc1234] Add deterministic receipts",
+    )
+    push = _tool(
+        "push",
+        2_000,
+        "git push origin HEAD:refs/heads/topic",
+        "To https://github.com/rrnewton/example.git\n"
+        "   1111111..abc1234  HEAD -> topic",
+    )
+    reference = _event(
+        "reference",
+        3_000,
+        "Review https://github.com/rrnewton/example/commit/abc1234.",
+    )
+    catalog = extract_artifacts(_team(events=(reference,), tools=(commit, push)))
+    artifact = next(item for item in catalog.artifacts if item.kind is ArtifactKind.COMMIT)
+    assert [evidence.relation for evidence in artifact.evidence] == [
+        EvidenceRelation.PRODUCED,
+        EvidenceRelation.PUBLISHED,
+        EvidenceRelation.REFERENCED,
+    ]
+    index = ArtifactRangeIndex.from_catalog(catalog)
+    produced_at, published_at, referenced_at = (
+        evidence.timestamp_ms for evidence in artifact.evidence
+    )
+
+    all_ids = index.ids_for_range(produced_at, referenced_at + 1)
+    assert all_ids.count(artifact.artifact_id) == 1
+    assert index.ids_for_range(
+        produced_at, published_at + 1, outputs_only=True
+    ) == (artifact.artifact_id,)
+    assert index.ids_for_range(
+        referenced_at, referenced_at + 1, outputs_only=True
+    ) == ()
+    assert index.ids_for_range(produced_at + 1, published_at) == ()
+    assert index.ids_for_range(produced_at, produced_at) == ()
+    assert index.ids_for_range(published_at, produced_at) == ()
+    assert index.ids_for_range(
+        START, START + 10_000, "unknown-thread"
+    ) == ()
 
 
 def test_policy_search_and_failed_commands_never_claim_outputs() -> None:
