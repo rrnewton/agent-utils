@@ -402,6 +402,12 @@ async function benchmarkSite(options) {
     }
 
     const initial = await timelineSnapshot(page);
+    const initialWebPerformance = await browserPerformance(page);
+    const initialNetwork = Object.assign(
+      summarizeNetwork(new Map(networkRecords)),
+      initialWebPerformance.resource_entries
+    );
+    const initialHeap = await cdpHeapUsage(session);
     const samples = [];
     for (let index = 0; index < WHEEL_SEQUENCE.length; index += 1) {
       samples.push(await wheelSample(
@@ -430,11 +436,14 @@ async function benchmarkSite(options) {
       },
       payload_resources: Object.assign(
         summarizeNetwork(networkRecords),
-        webPerformance.resource_entries
+        webPerformance.resource_entries,
+        { initial: initialNetwork }
       ),
       js_heap: {
         cdp: heap,
-        performance_memory: webPerformance.performance_memory
+        performance_memory: webPerformance.performance_memory,
+        initial_cdp: initialHeap,
+        initial_performance_memory: initialWebPerformance.performance_memory
       },
       interaction: {
         sequence: "four zoom-in, two pan-right, two pan-left, four zoom-out wheel events",

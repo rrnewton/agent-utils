@@ -32,6 +32,7 @@ from agent_team_timeline.summarize import (
     clean_summary_result,
 )
 from agent_team_timeline.static_assets import gzip_sidecar_path, sync_gzip_sidecar
+from agent_team_timeline.timeline_shards import write_timeline_shards
 from agent_team_timeline.terminology import (
     GlossaryTerm,
     glossary_catalog_markdown,
@@ -1200,10 +1201,17 @@ def render_archive(
         )
     )
     compressible_paths.add("data/artifacts.json")
+    timeline_json = narrow_json(timeline)
+    if not isinstance(timeline_json, dict):
+        raise AssertionError("timeline projection must be an object")
     changed += int(
-        write_json_if_changed(archive / "data" / "timeline.json", narrow_json(timeline))
+        write_json_if_changed(archive / "data" / "timeline.json", timeline_json)
     )
     compressible_paths.add("data/timeline.json")
+    shard_report = write_timeline_shards(
+        archive, timeline_json, precompress=_precompress
+    )
+    changed += shard_report.files_changed
     if _precompress:
         for relative in sorted(compressible_paths):
             changed += int(sync_gzip_sidecar(archive / relative))
@@ -1217,6 +1225,13 @@ def render_archive(
         "summary_files": len(summary_files),
         "artifacts": len(artifact_catalog.artifacts),
         "projects": len(artifact_catalog.projects),
+        "detail_shards": shard_report.detail_shards,
+        "bootstrap_bytes": shard_report.bootstrap_bytes,
+        "bootstrap_transfer_bytes": (
+            shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes
+        ),
+        "shard_object_bytes": shard_report.object_bytes,
+        "shard_transfer_bytes": shard_report.object_gzip_bytes,
     }
 
 

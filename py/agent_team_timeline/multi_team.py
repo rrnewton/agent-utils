@@ -24,6 +24,7 @@ from agent_team_timeline.archive import (
 from agent_team_timeline.pipeline import _ensure_archive, build_archive, load_archived_team
 from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
 from agent_team_timeline.static_assets import gzip_sidecar_path, sync_gzip_sidecar
+from agent_team_timeline.timeline_shards import write_timeline_shards
 from agent_team_timeline.window import DateWindow
 
 
@@ -406,7 +407,17 @@ def _safe_generated_path(raw: str) -> PurePosixPath:
         return path
     if len(path.parts) >= 3 and path.parts[:2] == ("data", "details"):
         return path
-    if raw in {"data/timeline.json", "data/artifacts.json"}:
+    if raw in {
+        "data/timeline.json",
+        "data/timeline-v2.json",
+        "data/artifacts.json",
+    }:
+        return path
+    if (
+        len(path.parts) == 4
+        and path.parts[:3] == ("data", "timeline-v2", "objects")
+        and re.fullmatch(r"[0-9a-f]{64}\.json", path.name) is not None
+    ):
         return path
     raise ValueError(f"unrecognized generated path in export manifest: {raw!r}")
 
@@ -663,6 +674,11 @@ def build_combined_archive(
             )
         )
         compressible_files.add("data/timeline.json")
+        shard_report = write_timeline_shards(output, timeline)
+        changed += shard_report.files_changed
+        for relative in shard_report.generated_files:
+            _safe_generated_path(relative)
+            generated_files.add(relative)
         changed += int(
             write_json_if_changed(
                 _output_path(output, "data/artifacts.json"), artifact_catalog
@@ -751,6 +767,13 @@ def build_combined_archive(
         "summary_files": len(merged["summary_files"]),
         "artifacts": len(merged["artifacts"]),
         "projects": len(merged["projects"]),
+        "detail_shards": shard_report.detail_shards,
+        "bootstrap_bytes": shard_report.bootstrap_bytes,
+        "bootstrap_transfer_bytes": (
+            shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes
+        ),
+        "shard_object_bytes": shard_report.object_bytes,
+        "shard_transfer_bytes": shard_report.object_gzip_bytes,
     }
 
 

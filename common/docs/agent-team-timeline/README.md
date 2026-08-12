@@ -29,8 +29,9 @@ web server.
 - A zero-model, append-only prompt/response projection plus a read-only query CLI with chronological
   prompt ordinals, inclusive ordinal ranges, stable timeline references, JSON/JSONL/Markdown/text
   output, time/team filters, relationship traversal, and summary or transcript search.
-- A self-contained static website served by a built-in loopback server, with deterministic gzip
-  sidecars, strong validators, browser revalidation, and no CDN dependency.
+- A self-contained static website served by a built-in loopback server, with backwards-compatible
+  range-sharded timeline loading, deterministic gzip sidecars, immutable digest URLs, strong
+  validators, browser revalidation, and no CDN dependency.
 
 Install from the package index:
 
@@ -68,6 +69,10 @@ agent-team-timeline audit-glossary --output . --details
 The generated identity files remain ordinary static-site files. The bundled server transparently
 selects deterministic gzip-6 companions for large browser assets and uses ETags so reloads can
 reuse validated responses; another basic static server can still serve the identity files.
+Modern generated sites start from `data/timeline-v2.json` and fetch immutable UTC-day detail
+objects only as their time ranges become visible. `data/timeline.json` remains present for older
+browsers and the archive-local CLI. The first text-search query loads all remaining detail days so
+search results stay complete rather than being limited to the current viewport.
 
 The `teams`, `agents`, `phases`, `rollups`, and `search` commands return stable `team:`, `agent:`,
 `phase:`, and `rollup:` references that can be copied into `show`. In an exported package,

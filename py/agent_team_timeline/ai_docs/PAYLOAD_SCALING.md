@@ -25,18 +25,40 @@ Implement the transition in stages:
 
 1. Keep schema 1 and identity files, add deterministic gzip sidecars, HTTP content negotiation,
    strong validators, and browser revalidation. This is the implemented compatibility step.
-2. Add a schema-2 bootstrap containing identity, overall range, team/agent indexes, aggregate
-   activity bins, calendar-rollup availability, and a shard catalog with byte sizes and content
-   digests. Continue emitting schema 1 during migration.
-3. Put detailed phases, states, events, and structural/detailed edge records into daily UTC or
-   display-calendar shards. Fetch the visible days plus a small adjacent prefetch window, retain
-   resolved shards in an in-memory cache, and rely on immutable digest URLs or ETag revalidation
-   across reloads. Panning must never refetch an unchanged cached shard.
+2. **Implemented:** add a schema-2 bootstrap containing identity, overall range, aggregate activity
+   bins, global lifetime-data reference, and a UTC-day shard catalog with byte sizes and complete
+   content digests. Schema 1 continues to be emitted for the CLI and old browsers.
+3. **Implemented:** keep structural fork/join edges with global lifetimes, and put detailed
+   phases/states, events, and intermediate message edges into daily UTC shards. Fetch the visible
+   days plus a small time buffer only at detail zoom, retain resolved shards in a
+   `Map<URL, Promise>`, and use immutable digest URLs across reloads. Panning never refetches an
+   unchanged shard. A first text query loads all detail shards, preserving global-search semantics
+   explicitly instead of searching only already-visible days.
 4. Keep full transcript/detail documents separately addressable. Remove duplicated edge
    `full_text` from the schema-2 bootstrap and shards once stable references can resolve the same
    content on demand.
 
-The loader should select schema 2 when its bootstrap is present and fall back to the existing
+The loader now selects schema 2 when its bootstrap is present and falls back to the existing
 schema-1 monolith otherwise. This preserves exported archives and basic static-server deployment
-while allowing a multi-week view to start with hundreds of kilobytes rather than tens or hundreds
-of megabytes.
+while allowing a multi-week view to start from identity, lifetime, and aggregate data rather than
+tens or hundreds of megabytes of transcript detail. Real-corpus measurements for the implemented
+projection should be refreshed whenever the Hermit corpus or schema changes; do not substitute the
+earlier prototype decomposition for current generated-file measurements.
+
+## Implemented Hermit measurement (2026-08-12)
+
+The zero-provider projection of the 196,704,084-byte Hermit schema-1 corpus produced a 31,763-byte
+gzip bootstrap, a 941,723-byte gzip global lifetime/structural-edge object, and 24 UTC detail-day
+objects totaling 25,896,120 bytes gzip. Day objects ranged from 46,402 bytes to 4,185,274 bytes
+gzip, with a 766,772-byte median. Generation took 10.47 seconds and peaked at 1,217,636 KiB RSS;
+generator memory is a remaining optimization because the compatibility monolith is parsed before
+projection.
+
+With the built-in gzip-negotiating server, a same-host headless-Chromium run measured 1,181,666
+encoded bytes, 393.496 ms to a usable aggregate view, and 13,530,928 bytes of used JavaScript heap.
+The same corpus through schema 1 measured 196,912,397 encoded bytes without its sidecar, or
+27,123,168 bytes with it; both schema-1 cases retained about 214 MB of initial JavaScript heap.
+Thus schema 2 reduced initial transfer by 99.4% versus identity and 95.6% versus gzip, and initial
+heap by 93.7%. These are single-run engineering measurements rather than performance budgets. The
+full reports and a separately serveable package are under
+`~/temp/agent-timeline-schema2-measurement/`; no live archive files were changed.

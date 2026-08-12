@@ -73,6 +73,18 @@ Markdown files of at least 1 KiB. The gzip header has no source filename and a z
 content-identical rebuild does not change the sidecar or its mtime. Combined exports inventory and
 remove their managed sidecars just like the corresponding identity files.
 
+Builds additionally project schema 1 into the backwards-compatible schema-2 browser layout.
+`data/timeline-v2.json` is the stable bootstrap: it carries site/team identity, the complete time
+range, aggregate activity bins, a content-addressed global-object reference, and a UTC-day detail
+catalog. The immutable global object carries agent lifetimes, structural spawn/continuation/result
+edges, rollups, glossary and summary-file metadata. Each non-empty UTC-day object carries
+intersecting phases (including their states), events, and detailed message edges. A phase or
+detailed edge crossing midnight appears in both day objects; the browser deduplicates it by stable
+ID. Object basenames are their complete SHA-256 digest, and their gzip
+ID. Object basenames are their complete SHA-256 digest, and their gzip sidecars are generated
+before the bootstrap atomically publishes those URLs. Schema 1 remains the
+archive-local CLI projection and the browser fallback for older exports.
+
 Both the installed `serve` command and generated `serve.py` use the same dependency-free handler.
 It selects a `.gz` companion only when `Accept-Encoding` permits gzip, retains the original MIME
 type, and emits `Vary: Accept-Encoding`, the selected representation's exact `Content-Length`, and
@@ -83,11 +95,21 @@ one-year immutable policy; phase IDs are stable identities rather than content h
 remain revalidated. The browser uses normal fetch caching, allowing a matching ETag to produce a
 304 response.
 
-This delivery layer is an additive optimization, not a new archive schema. Opening the archive
-through another static server still serves the identity files correctly, while older generated
-sites without sidecars remain valid. Compression reduces transfer bytes but does not reduce the
-schema-1 monolith's JSON parsing or in-memory cost; the staged sharding design is recorded in
-`ai_docs/PAYLOAD_SCALING.md`.
+The browser first probes schema 2, then falls back to schema 1 when the bootstrap is absent (or when
+an incomplete schema-2 publication cannot be read). At aggregate zoom it uses bootstrap activity
+bins without loading a detail day. Detail zoom loads only UTC-day objects intersecting the visible
+range plus a one-hour-or-eight-percent buffer. Lifetime zoom uses the global lifetimes and
+structural edges without loading detail days. A `Map<URL, Promise>` retains each object request,
+and a second range visit never refetches or reapplies it. Global text search remains
+complete: the first non-empty query deliberately loads every remaining detail shard before
+declaring the search corpus ready. This can be more expensive than ordinary navigation, but it is
+explicit, one-time, and does not silently omit off-screen phase or edge text.
+
+This delivery layer is additive. Opening the archive through another static server still serves
+the identity files correctly, while older generated sites without sidecars or schema 2 remain
+valid. The schema-1 monolith remains available for compatibility, but schema-2 startup avoids its
+whole-file transfer, parsing, and object-graph cost. Measurements and remaining work are recorded
+in `ai_docs/PAYLOAD_SCALING.md`.
 
 ### Read-only query boundary
 

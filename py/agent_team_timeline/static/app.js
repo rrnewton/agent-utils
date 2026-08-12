@@ -2,6 +2,7 @@
   "use strict";
 
   var DATA_URL = "data/timeline.json";
+  var SCHEMA_2_URL = "data/timeline-v2.json";
   var SVG_NS = "http://www.w3.org/2000/svg";
   var ROW_HEIGHT = 54;
   var PHASE_TOP = 7;
@@ -127,7 +128,15 @@
     modalRestoreFocus: null,
     laneMenuAnchor: null,
     timezone: "UTC",
-    timezoneStatus: "archive fallback"
+    timezoneStatus: "archive fallback",
+    schemaMode: "schema1",
+    shardCatalog: [],
+    resourcePromises: new Map(),
+    detailPromises: new Map(),
+    loadedShardUrls: new Set(),
+    phaseIds: new Set(),
+    edgeIds: new Set(),
+    searchShardState: "legacy"
   };
 
   var timelineCore = window.AgentTimelineCore;
@@ -829,6 +838,33 @@
     dom.identityDetails.hidden = detailChildren.length === 0;
   }
 
+  function indexPhase(phase) {
+    if (!phase || typeof phase !== "object") {
+      return;
+    }
+    var id = text(phase.agent_id);
+    if (!app.phasesByAgent.has(id)) {
+      app.phasesByAgent.set(id, []);
+    }
+    app.phasesByAgent.get(id).push(phase);
+  }
+
+  function sortPhaseIndexes() {
+    app.phasesByAgent.forEach(function (phases) {
+      phases.sort(function (left, right) {
+        return number(left.start_ms, 0) - number(right.start_ms, 0) ||
+          text(left.id).localeCompare(text(right.id));
+      });
+    });
+  }
+
+  function updateShardDiagnostics() {
+    dom.card.dataset.timelineSchemaMode = app.schemaMode;
+    dom.card.dataset.detailShardCount = String(app.shardCatalog.length);
+    dom.card.dataset.loadedShardCount = String(app.loadedShardUrls.size);
+    dom.card.dataset.searchShardState = app.searchShardState;
+  }
+
   function initializeData(raw) {
     var data = normalizeData(raw);
     app.data = data;
@@ -843,6 +879,8 @@
     app.teamBySlug.clear();
     app.phasesByAgent.clear();
     app.glossaryById.clear();
+    app.phaseIds.clear();
+    app.edgeIds.clear();
 
     data.teams.forEach(function (team) {
       if (team && typeof team === "object") {
@@ -862,16 +900,18 @@
       if (!phase || typeof phase !== "object") {
         return;
       }
-      var id = text(phase.agent_id);
-      if (!app.phasesByAgent.has(id)) {
-        app.phasesByAgent.set(id, []);
+      var phaseId = text(phase.id);
+      if (phaseId) {
+        app.phaseIds.add(phaseId);
       }
-      app.phasesByAgent.get(id).push(phase);
+      indexPhase(phase);
     });
-    app.phasesByAgent.forEach(function (phases) {
-      phases.sort(function (left, right) {
-        return number(left.start_ms, 0) - number(right.start_ms, 0);
-      });
+    sortPhaseIndexes();
+    data.edges.forEach(function (edge) {
+      var edgeId = text(edge && edge.id);
+      if (edgeId) {
+        app.edgeIds.add(edgeId);
+      }
     });
     data.glossary.forEach(function (entry) {
       if (!entry || typeof entry !== "object") {
@@ -899,8 +939,154 @@
       dataVersionLabel(data.schema_version) + " · " + generated + " · display " + timezone +
       (timezoneSource ? " (" + timezoneSource + ")" : "") +
       (app.timezoneStatus === "archive" ? "" : " · " + app.timezoneStatus);
+    updateShardDiagnostics();
     scheduleRender();
     openGlossaryFromHash();
+  }
+
+  function immutableTimelineObjectUrl(reference, where) {
+    if (!reference || typeof reference !== "object") {
+      throw new Error(where + " must be an object reference.");
+    }
+    var url = text(reference.url);
+    var digest = text(reference.sha256);
+    var match = /^data\/timeline-v2\/objects\/([0-9a-f]{64})\.json$/.exec(url);
+    if (!match || match[1] !== digest) {
+      throw new Error(where + " must use its complete SHA-256 object URL.");
+    }
+    return url;
+  }
+
+  function mergeDetailShard(raw, url) {
+    if (!raw || typeof raw !== "object" || number(raw.schema_version, NaN) !== 2 ||
+        text(raw.kind) !== "timeline-detail-day") {
+      throw new Error("Unsupported timeline detail shard: " + url);
+    }
+    if (app.loadedShardUrls.has(url)) {
+      return;
+    }
+    array(raw.phases).forEach(function (phase) {
+      if (!phase || typeof phase !== "object") {
+        throw new Error("Timeline detail phases must be objects.");
+      }
+      var id = text(phase.id);
+      if (!id) {
+        throw new Error("Timeline detail phase is missing its stable ID.");
+      }
+      if (!app.phaseIds.has(id)) {
+        app.phaseIds.add(id);
+        app.data.phases.push(phase);
+        indexPhase(phase);
+      }
+    });
+    array(raw.edges).forEach(function (edge) {
+      if (!edge || typeof edge !== "object") {
+        throw new Error("Timeline detail edges must be objects.");
+      }
+      var id = text(edge.id);
+      if (!id) {
+        throw new Error("Timeline detail edge is missing its stable ID.");
+      }
+      if (!app.edgeIds.has(id)) {
+        app.edgeIds.add(id);
+        app.data.edges.push(edge);
+      }
+    });
+    // Events belong to exactly one UTC-day object, so URL-level application is sufficient to
+    // retain legitimate duplicate events while rejecting repeat fetch/application.
+    array(raw.events).forEach(function (event) {
+      if (!event || typeof event !== "object") {
+        throw new Error("Timeline detail events must be objects.");
+      }
+      app.data.events.push(event);
+    });
+    sortPhaseIndexes();
+    app.data.phases.sort(function (left, right) {
+      return number(left.start_ms, 0) - number(right.start_ms, 0) ||
+        text(left.id).localeCompare(text(right.id));
+    });
+    app.data.edges.sort(function (left, right) {
+      return number(left.source_ms, 0) - number(right.source_ms, 0) ||
+        text(left.id).localeCompare(text(right.id));
+    });
+    app.data.events.sort(function (left, right) {
+      return number(left.at_ms, 0) - number(right.at_ms, 0) ||
+        text(left.agent_id).localeCompare(text(right.agent_id));
+    });
+    app.loadedShardUrls.add(url);
+    updateShardDiagnostics();
+  }
+
+  function loadDetailShard(catalogEntry) {
+    var url = immutableTimelineObjectUrl(catalogEntry, "detail shard");
+    if (!app.detailPromises.has(url)) {
+      app.detailPromises.set(url, fetchJsonCached(url).then(function (raw) {
+        mergeDetailShard(raw, url);
+        return raw;
+      }));
+    }
+    return app.detailPromises.get(url);
+  }
+
+  function detailShardsForRange(start, end, bufferFraction) {
+    var span = Math.max(1, end - start);
+    var buffer = Math.max(60 * 60 * 1000, span * bufferFraction);
+    var bufferedStart = start - buffer;
+    var bufferedEnd = end + buffer;
+    return app.shardCatalog.filter(function (shard) {
+      return number(shard.start_ms, Infinity) < bufferedEnd &&
+        number(shard.end_ms, -Infinity) > bufferedStart;
+    });
+  }
+
+  function requestDetailShards(shards) {
+    var started = false;
+    var promises = shards.map(function (shard) {
+      var url = immutableTimelineObjectUrl(shard, "detail shard");
+      if (!app.detailPromises.has(url)) {
+        started = true;
+      }
+      return loadDetailShard(shard);
+    });
+    return { started: started, promise: Promise.all(promises) };
+  }
+
+  function showDetailLoadError(error) {
+    var message = error instanceof Error ? error.message : String(error);
+    dom.loadError.textContent =
+      "Could not load timeline detail: " + message +
+      ". The aggregate timeline remains available.";
+    dom.loadError.hidden = false;
+  }
+
+  function requestVisibleDetails() {
+    if (app.schemaMode !== "schema2" || app.renderLod !== "detail") {
+      return;
+    }
+    var request = requestDetailShards(
+      detailShardsForRange(app.viewStart, app.viewEnd, 0.08)
+    );
+    if (request.started) {
+      request.promise.then(scheduleRender).catch(showDetailLoadError);
+    }
+  }
+
+  function requestSearchCorpus() {
+    if (app.schemaMode !== "schema2") {
+      return;
+    }
+    app.searchShardState = "loading";
+    updateShardDiagnostics();
+    var request = requestDetailShards(app.shardCatalog);
+    request.promise.then(function () {
+      app.searchShardState = "ready";
+      updateShardDiagnostics();
+      scheduleRender();
+    }).catch(function (error) {
+      app.searchShardState = "error";
+      updateShardDiagnostics();
+      showDetailLoadError(error);
+    });
   }
 
   function populateTeamFilter() {
@@ -1729,16 +1915,33 @@
   }
 
   function zoomToActivityRange(bounds, scope) {
-    var activityRange = timelineCore.activityRangeWithin(
-      bounds,
-      app.data,
-      MIN_VIEW_MS,
-      scope
+    function finishZoom() {
+      var activityRange = timelineCore.activityRangeWithin(
+        bounds,
+        app.data,
+        MIN_VIEW_MS,
+        scope
+      );
+      zoomToRange(
+        activityRange ? activityRange.start_ms : bounds.start_ms,
+        activityRange ? activityRange.end_ms : bounds.end_ms
+      );
+    }
+    if (app.schemaMode !== "schema2") {
+      finishZoom();
+      return;
+    }
+    var request = requestDetailShards(
+      detailShardsForRange(
+        number(bounds.start_ms, app.viewStart),
+        number(bounds.end_ms, app.viewEnd),
+        0
+      )
     );
-    zoomToRange(
-      activityRange ? activityRange.start_ms : bounds.start_ms,
-      activityRange ? activityRange.end_ms : bounds.end_ms
-    );
+    request.promise.then(finishZoom).catch(function (error) {
+      showDetailLoadError(error);
+      finishZoom();
+    });
   }
 
   function phaseContextMenu(event, phase, agent) {
@@ -2806,6 +3009,7 @@
         ? timelineCore.semanticZoomLevel(app.viewStart, app.viewEnd, app.chartWidth)
         : "aggregate";
     }
+    requestVisibleDetails();
     dom.card.classList.toggle("aggregate-mode", app.renderLod === "aggregate");
     buildRows();
     dom.card.dataset.viewStartMs = String(app.viewStart);
@@ -2816,7 +3020,7 @@
     if (app.selection) {
       dom.card.dataset.selectionScope = text(app.selection.kind);
     } else {
-      dom.card.removeAttribute("data-selection-scope");
+      dom.card.dataset.selectionScope = "none";
     }
     if (app.selection && (app.selection.kind === "agent" || app.selection.kind === "phase")) {
       dom.card.dataset.selectedAgentId = text(app.selection.agent_id);
@@ -4246,17 +4450,106 @@
     dom.loadError.hidden = false;
   }
 
+  function fetchJsonCached(url) {
+    if (!app.resourcePromises.has(url)) {
+      app.resourcePromises.set(url, (async function () {
+        var response = await fetch(url, { credentials: "same-origin" });
+        if (!response.ok) {
+          var error = new Error("HTTP " + response.status + " " + response.statusText);
+          error.httpStatus = response.status;
+          throw error;
+        }
+        return response.json();
+      }()));
+    }
+    return app.resourcePromises.get(url);
+  }
+
+  async function loadSchema2() {
+    var bootstrap;
+    try {
+      bootstrap = await fetchJsonCached(SCHEMA_2_URL);
+    } catch (error) {
+      if (error && error.httpStatus === 404) {
+        return false;
+      }
+      throw error;
+    }
+    if (!bootstrap || typeof bootstrap !== "object" ||
+        number(bootstrap.schema_version, NaN) !== 2 ||
+        text(bootstrap.kind) !== "timeline-bootstrap") {
+      throw new Error("Unsupported schema-2 timeline bootstrap.");
+    }
+    var globalUrl = immutableTimelineObjectUrl(bootstrap.global, "timeline global");
+    var globalData = await fetchJsonCached(globalUrl);
+    if (!globalData || typeof globalData !== "object" ||
+        number(globalData.schema_version, NaN) !== 2 ||
+        text(globalData.kind) !== "timeline-global") {
+      throw new Error("Unsupported schema-2 timeline global object.");
+    }
+    var catalog = array(bootstrap.detail_shards).slice();
+    var seenUrls = new Set();
+    catalog.forEach(function (shard) {
+      var url = immutableTimelineObjectUrl(shard, "detail shard");
+      var start = number(shard.start_ms, NaN);
+      var end = number(shard.end_ms, NaN);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start ||
+          seenUrls.has(url)) {
+        throw new Error("Invalid or duplicate schema-2 detail shard catalog entry.");
+      }
+      seenUrls.add(url);
+    });
+    catalog.sort(function (left, right) {
+      return number(left.start_ms, 0) - number(right.start_ms, 0);
+    });
+    app.schemaMode = "schema2";
+    app.shardCatalog = catalog;
+    app.detailPromises.clear();
+    app.loadedShardUrls.clear();
+    app.searchShardState = catalog.length ? "unloaded" : "ready";
+    var merged = Object.assign({}, globalData, {
+      schema_version: 2,
+      generated_at: bootstrap.generated_at,
+      source_digest: bootstrap.source_digest,
+      display_timezone: bootstrap.display_timezone,
+      display_timezone_source: bootstrap.display_timezone_source,
+      range: bootstrap.range,
+      teams: bootstrap.teams,
+      activity_bins: bootstrap.activity_bins,
+      phases: [],
+      events: []
+    });
+    initializeData(merged);
+    return true;
+  }
+
+  async function loadSchema1() {
+    app.schemaMode = "schema1";
+    app.shardCatalog = [];
+    app.detailPromises.clear();
+    app.loadedShardUrls.clear();
+    app.searchShardState = "legacy";
+    initializeData(await fetchJsonCached(DATA_URL));
+  }
+
   async function loadTimeline() {
     try {
-      var response = await fetch(DATA_URL, {
-        credentials: "same-origin"
-      });
-      if (!response.ok) {
-        throw new Error("HTTP " + response.status + " " + response.statusText);
+      var schema2Error = null;
+      try {
+        if (await loadSchema2()) {
+          return;
+        }
+      } catch (error) {
+        schema2Error = error;
       }
-      var raw = await response.json();
-      var data = normalizeData(raw);
-      initializeData(data);
+      await loadSchema1();
+      if (schema2Error) {
+        var message = schema2Error instanceof Error
+          ? schema2Error.message
+          : String(schema2Error);
+        dom.meta.textContent += " · schema 2 fallback (" + message + ")";
+        dom.card.dataset.timelineSchemaMode = "schema1-fallback";
+      }
     } catch (error) {
       showLoadError(error);
     }
@@ -4272,6 +4565,10 @@
   dom.search.addEventListener("input", function () {
     app.query = dom.search.value.trim();
     dom.scroll.scrollTop = 0;
+    if (app.query && app.schemaMode === "schema2" &&
+        app.searchShardState !== "ready" && app.searchShardState !== "loading") {
+      requestSearchCorpus();
+    }
     scheduleRender();
   });
 

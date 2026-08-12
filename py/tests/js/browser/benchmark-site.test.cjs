@@ -114,12 +114,15 @@ test("fixture smoke records load, resource, structure, heap, and wheel metrics",
   assert.ok(stdoutReport.timings.usable_ms >= 0);
   assert.ok(stdoutReport.payload_resources.resource_count > 0);
   assert.ok(stdoutReport.payload_resources.encoded_bytes > 0);
+  assert.ok(stdoutReport.payload_resources.initial.resource_count > 0);
+  assert.ok(stdoutReport.payload_resources.initial.encoded_bytes > 0);
   assert.ok(stdoutReport.timeline.initial.counts.dom_nodes > 0);
   assert.ok(stdoutReport.timeline.initial.counts.svg_nodes > 0);
   assert.ok(Object.hasOwn(stdoutReport.timeline.initial.counts, "state_strips"));
   assert.ok(Object.hasOwn(stdoutReport.timeline.initial.counts, "edges"));
   assert.ok(Object.hasOwn(stdoutReport.timeline.initial.counts, "aggregate_bins"));
   assert.ok(stdoutReport.js_heap.cdp.used_js_heap_bytes > 0);
+  assert.ok(stdoutReport.js_heap.initial_cdp.used_js_heap_bytes > 0);
   assert.equal(stdoutReport.interaction.sample_count, 12);
   assert.equal(stdoutReport.interaction.input_to_raf_ms.count, 12);
   assert.ok(stdoutReport.interaction.input_to_raf_ms.p50 >= 0);

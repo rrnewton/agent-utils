@@ -68,6 +68,185 @@ test.beforeEach(async function ({ page }) {
   await expect(page.locator(phaseSelector)).toBeVisible();
 });
 
+test("schema 2 loads visible detail shards once and expands search on demand", async function ({ page }) {
+  const globalDigest = "a".repeat(64);
+  const firstDigest = "b".repeat(64);
+  const remoteDigest = "c".repeat(64);
+  const globalUrl = "data/timeline-v2/objects/" + globalDigest + ".json";
+  const firstUrl = "data/timeline-v2/objects/" + firstDigest + ".json";
+  const remoteUrl = "data/timeline-v2/objects/" + remoteDigest + ".json";
+  const firstDayStart = Date.UTC(2026, 2, 9);
+  const remoteDayStart = Date.UTC(2026, 2, 19);
+  const expandedEnd = Date.UTC(2026, 2, 30);
+  const globalData = JSON.parse(JSON.stringify(TIMELINE));
+  [
+    "generated_at",
+    "source_digest",
+    "display_timezone",
+    "display_timezone_source",
+    "range",
+    "teams",
+    "activity_bins",
+    "phases",
+    "edges",
+    "events"
+  ].forEach(function (field) { delete globalData[field]; });
+  globalData.schema_version = 2;
+  globalData.kind = "timeline-global";
+  globalData.edges = TIMELINE.edges.filter(function (edge) {
+    return edge.kind === "spawn" || edge.kind === "continuation" || edge.kind === "result";
+  });
+  const remotePhase = {
+    id: "phase-remote-search",
+    agent_id: "agent-a",
+    start_ms: remoteDayStart + 60 * 60 * 1000,
+    end_ms: remoteDayStart + 2 * 60 * 60 * 1000,
+    phrase: "Remote search needle",
+    paragraph: "This phase exists only in the shard outside the visible range.",
+    detail_path: "details/phase-a-1.json",
+    stats: {},
+    states: []
+  };
+  const bootstrap = {
+    schema_version: 2,
+    kind: "timeline-bootstrap",
+    generated_at: TIMELINE.generated_at,
+    source_digest: TIMELINE.source_digest,
+    display_timezone: TIMELINE.display_timezone,
+    display_timezone_source: TIMELINE.display_timezone_source,
+    range: { start_ms: DATA_START_MS, end_ms: expandedEnd },
+    teams: TIMELINE.teams,
+    activity_bins: TIMELINE.activity_bins,
+    global: { url: globalUrl, sha256: globalDigest },
+    detail_shards: [
+      {
+        kind: "utc-day",
+        day: "2026-03-09",
+        start_ms: firstDayStart,
+        end_ms: firstDayStart + 24 * 60 * 60 * 1000,
+        url: firstUrl,
+        sha256: firstDigest
+      },
+      {
+        kind: "utc-day",
+        day: "2026-03-19",
+        start_ms: remoteDayStart,
+        end_ms: remoteDayStart + 24 * 60 * 60 * 1000,
+        url: remoteUrl,
+        sha256: remoteDigest
+      }
+    ]
+  };
+  const detail = {
+    schema_version: 2,
+    kind: "timeline-detail-day",
+    range: {
+      start_ms: firstDayStart,
+      end_ms: firstDayStart + 24 * 60 * 60 * 1000
+    },
+    phases: TIMELINE.phases,
+    edges: TIMELINE.edges.filter(function (edge) { return edge.kind === "message"; }),
+    events: TIMELINE.events
+  };
+  const remoteDetail = {
+    schema_version: 2,
+    kind: "timeline-detail-day",
+    range: {
+      start_ms: remoteDayStart,
+      end_ms: remoteDayStart + 24 * 60 * 60 * 1000
+    },
+    phases: [remotePhase],
+    edges: [],
+    events: []
+  };
+  const requests = new Map();
+  async function fulfillJson(route, name, value) {
+    requests.set(name, (requests.get(name) || 0) + 1);
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(value)
+    });
+  }
+  await page.route("**/data/timeline-v2.json", function (route) {
+    return fulfillJson(route, "bootstrap", bootstrap);
+  });
+  await page.route("**/" + globalDigest + ".json", function (route) {
+    return fulfillJson(route, "global", globalData);
+  });
+  await page.route("**/" + firstDigest + ".json", function (route) {
+    return fulfillJson(route, "first", detail);
+  });
+  await page.route("**/" + remoteDigest + ".json", function (route) {
+    return fulfillJson(route, "remote", remoteDetail);
+  });
+  await page.route("**/data/timeline.json", function (route) {
+    return fulfillJson(route, "schema1", TIMELINE);
+  });
+
+  await page.reload();
+  const card = page.locator(".timeline-card");
+  const timeline = page.getByTestId("timeline");
+  await expect(page.locator("#dataset-meta")).toContainText("schema 2");
+  await expect(card).toHaveAttribute("data-timeline-schema-mode", "schema2");
+  await expect(timeline).toHaveAttribute("data-render-lod", "aggregate");
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "0");
+  expect(requests.get("bootstrap")).toBe(1);
+  expect(requests.get("global")).toBe(1);
+  expect(requests.get("first") || 0).toBe(0);
+  expect(requests.get("remote") || 0).toBe(0);
+  expect(requests.get("schema1") || 0).toBe(0);
+
+  const axisBox = await page.locator("#time-axis").boundingBox();
+  expect(axisBox).not.toBeNull();
+  await page.mouse.move(axisBox.x + 150, axisBox.y + axisBox.height / 2);
+  await page.mouse.wheel(0, -360);
+  await expect(timeline).toHaveAttribute("data-render-lod", "lifetime");
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "0");
+  await expect(page.locator('.edge-group[data-edge-id="spawn-a"]')).toHaveCount(1);
+  await expect(page.locator('.edge-group[data-edge-id="result-a"]')).toHaveCount(1);
+  await page.getByTestId("fit").click();
+  await expect(timeline).toHaveAttribute("data-render-lod", "aggregate");
+
+  const firstRollup = ROLLUP_RANGES[0];
+  const marker = page.locator(
+    '.rollup-marker.rollup-daily[data-start-ms="' + firstRollup.start_ms + '"]'
+  );
+  await marker.dispatchEvent("contextmenu", {
+    button: 2,
+    clientX: 240,
+    clientY: 140
+  });
+  await page.getByTestId("timeline-context-menu")
+    .getByRole("menuitem", { name: "Zoom to day", exact: true }).click();
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
+  await expect(page.locator(phaseSelector)).toBeVisible();
+  expect(requests.get("first")).toBe(1);
+  expect(requests.get("remote") || 0).toBe(0);
+
+  await page.getByTestId("fit").click();
+  await marker.dispatchEvent("contextmenu", {
+    button: 2,
+    clientX: 240,
+    clientY: 140
+  });
+  await page.getByTestId("timeline-context-menu")
+    .getByRole("menuitem", { name: "Zoom to day", exact: true }).click();
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
+  expect(requests.get("first")).toBe(1);
+
+  await page.getByTestId("fit").click();
+  await page.getByTestId("search").fill("remote search needle");
+  await expect(card).toHaveAttribute("data-search-shard-state", "ready");
+  await expect(card).toHaveAttribute("data-loaded-shard-count", "2");
+  expect(requests.get("first")).toBe(1);
+  expect(requests.get("remote")).toBe(1);
+  await page.getByTestId("search").fill("");
+  await page.getByTestId("search").fill("remote search needle");
+  await expect(card).toHaveAttribute("data-search-shard-state", "ready");
+  expect(requests.get("remote")).toBe(1);
+  expect(requests.get("schema1") || 0).toBe(0);
+});
+
 test("the header identifies the project, execution host, and archive timezone", async function ({ page }) {
   const heading = page.locator("#site-title");
   await expect(heading).toHaveText("Agent Timeline: dev-hermit, devbig014");
@@ -249,7 +428,7 @@ test("packed lane labels list their agents and empty background clears selection
   const box = await svg.boundingBox();
   expect(box).not.toBeNull();
   await page.mouse.click(box.x + box.width - 12, box.y + 54 + 27);
-  await expect(timeline).not.toHaveAttribute("data-selection-scope");
+  await expect(timeline).toHaveAttribute("data-selection-scope", "none");
 
   await lane.click();
   await expect(menu).toBeVisible();
@@ -375,7 +554,7 @@ test("rollup context menus trim empty calendar time without crossing the selecte
     await marker.click({ button: "right" });
     await expect(menu).toBeVisible();
     await expect(page.locator("#context-menu-title")).toHaveText(rollup.label);
-    await expect(timeline).not.toHaveAttribute("data-selection-scope");
+    await expect(timeline).toHaveAttribute("data-selection-scope", "none");
     await menu.getByRole("menuitem", { name: actionNames[rollup.kind], exact: true }).click();
 
     await expect.poll(async function () {

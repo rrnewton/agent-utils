@@ -302,6 +302,18 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert gzip.decompress(timeline_gzip.read_bytes()) == (
         tmp_path / "data" / "timeline.json"
     ).read_bytes()
+    schema_2_bootstrap = json.loads(
+        (tmp_path / "data" / "timeline-v2.json").read_text(encoding="utf-8")
+    )
+    assert schema_2_bootstrap["schema_version"] == 2
+    assert schema_2_bootstrap["kind"] == "timeline-bootstrap"
+    assert schema_2_bootstrap["detail_shards"]
+    schema_2_objects = [schema_2_bootstrap["global"], *schema_2_bootstrap["detail_shards"]]
+    assert all(
+        (tmp_path / value["url"]).name == value["sha256"] + ".json"
+        for value in schema_2_objects
+    )
+    assert all((tmp_path / value["url"]).is_file() for value in schema_2_objects)
     assert gzip.decompress((tmp_path / "app.js.gz").read_bytes()) == (
         tmp_path / "app.js"
     ).read_bytes()
@@ -2122,6 +2134,11 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     )
     assert export_manifest["teams"] == ["claude-test", first_team.team_slug]
     assert "data/timeline.json.gz" in export_manifest["generated_files"]
+    assert "data/timeline-v2.json" in export_manifest["generated_files"]
+    assert any(
+        value.startswith("data/timeline-v2/objects/") and value.endswith(".json")
+        for value in export_manifest["generated_files"]
+    )
     assert "app.js.gz" in export_manifest["generated_files"]
     assert gzip.decompress((output / "data" / "timeline.json.gz").read_bytes()) == (
         output / "data" / "timeline.json"
