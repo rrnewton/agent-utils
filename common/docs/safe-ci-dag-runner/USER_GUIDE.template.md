@@ -196,9 +196,21 @@ safe-ci-dag-runner run --dag pipeline.yaml --only test.unit --args='-k retry'
 ```
 
 Passing `--args` is rejected unless a selected command declares the token.
-Without `--args`, the token is removed. `--stress N` creates `N` parallel
-copies, implies keep-going, and reports the exact pass ratio. A stress request
-whose modeled memory footprint does not fit the box is rejected before launch.
+Without `--args`, the token is removed. `--stress N` duplicates the selected
+graph at generation into `N` disconnected components with no edges between
+copies. Each copy retains the original graph's internal dependency edges.
+Named-resource scheduling is removed from the generated copies, so `-j`
+controls how many copied steps run at once and may be set high for deliberate
+core over-subscription. The report includes the exact pass ratio and the largest
+number of step child processes measured alive at once. The modeled memory
+footprint must still fit the box.
+
+A singleton DAG can be generated on the fly; no `N`-node file is required:
+
+```sh
+printf '%s\n' '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 2"}]}' |
+  safe-ci-dag-runner run --dag - --stress 100 --jobs 100 --no-profile
+```
 
 ## Profiles, sweeps, and portable summaries
 

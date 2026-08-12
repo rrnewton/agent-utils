@@ -145,6 +145,9 @@ struct Shared {
     running_nonces: HashMap<String, String>,
     /// The WHOLE RUN exceeded its outer wall budget and cut its in-flight steps short.
     run_timed_out: bool,
+    /// Child processes currently alive, and the largest count observed during this run.
+    active_processes: usize,
+    max_concurrent_steps: usize,
 }
 
 /// Signal a process group without consulting `PATH`.
@@ -596,6 +599,8 @@ impl Runner {
                 step_profile_rows: Vec::new(),
                 running_nonces: HashMap::new(),
                 run_timed_out: false,
+                active_processes: 0,
+                max_concurrent_steps: 0,
             })),
         }
     }
@@ -811,6 +816,7 @@ impl Runner {
             intentional_skips: self.intentional_skips.clone(),
             step_profile_rows: sh.step_profile_rows.clone(),
             run_timed_out: sh.run_timed_out,
+            max_concurrent_steps: sh.max_concurrent_steps,
         }
     }
 }
@@ -1355,6 +1361,8 @@ fn run_step(ctx: StepCtx) {
         let mut sh = shared.lock().unwrap();
         sh.running_pids.insert(tag.clone(), pid);
         sh.running_nonces.insert(tag.clone(), nonce.clone());
+        sh.active_processes += 1;
+        sh.max_concurrent_steps = sh.max_concurrent_steps.max(sh.active_processes);
     }
 
     // ONE stream object shared by stdout and stderr, so the tracker sees the step's output in a
@@ -1430,8 +1438,7 @@ fn run_step(ctx: StepCtx) {
                     let live = if p.in_flight.is_empty() {
                         String::new()
                     } else {
-                        let mut names: Vec<&str> =
-                            p.in_flight.iter().map(String::as_str).collect();
+                        let mut names: Vec<&str> = p.in_flight.iter().map(String::as_str).collect();
                         names.sort_unstable();
                         let shown = names.len().min(2);
                         let more = names.len() - shown;
@@ -1560,6 +1567,13 @@ fn run_step(ctx: StepCtx) {
             }
         }
     };
+
+    // The child has exited. Stop counting it before teardown and reader joins, which can outlive
+    // the child when a grandchild keeps an output pipe open.
+    {
+        let mut sh = shared.lock().unwrap();
+        sh.active_processes = sh.active_processes.saturating_sub(1);
+    }
 
     // Reap the whole tree (cgroup.kill + killpg) so orphan grandchildren die now and the readers
     // see EOF; then stop the monitor and join the reader threads.
@@ -1957,6 +1971,7 @@ pub fn run_dag_boxed_deadline(
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
+            max_concurrent_steps: 0,
         };
     }
     if let Some(limit) = run_timeout_s.filter(|s| *s > 0) {
@@ -1982,6 +1997,7 @@ pub fn run_dag_boxed_deadline(
                 intentional_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
                 run_timed_out: false,
+                max_concurrent_steps: 0,
             };
         }
     }

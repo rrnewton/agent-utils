@@ -651,6 +651,48 @@ def test_cores_flag_refuses_unboxed_soft_affinity() -> None:
         assert "hard cgroup cpuset unavailable; refusing to run" in err
 
 
+def test_boxed_stdin_dag_survives_scope_reexec() -> None:
+    import os
+
+    symlink = Path(__file__).resolve().parent.parent / "bin" / "safe-ci-dag-runner"
+    dag = (
+        '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 1",'
+        '"hint":{"hard_mem_max_bytes":67108864}}]}'
+    )
+    env = {k: v for k, v in os.environ.items() if k not in ("CI", "GITHUB_ACTIONS")}
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(symlink),
+            "run",
+            "--dag",
+            "-",
+            "--stress",
+            "3",
+            "--jobs",
+            "3",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ],
+        input=dag,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    combined = proc.stdout + proc.stderr
+    if proc.returncode == 3:
+        pytest.skip(
+            "cgroup boxing unavailable here; boxed stdin ordering cannot run on this host.\n"
+            + combined
+        )
+    assert proc.returncode == 0, combined
+    assert "containment OBSERVED" in combined
+    assert "invalid JSON" not in combined
+    assert "stress.singleton: 3/3 passed" in proc.stdout
+    assert "maximum concurrent steps: 3 (--jobs 3)" in proc.stdout
+
+
 # --------------------------------------------------------------------------- --stress
 def _one_step_dag(tmp: str, cmd: str = "true") -> str:
     path = Path(tmp) / "dag.json"
@@ -664,11 +706,12 @@ def test_stress_reports_ratio_all_pass() -> None:
     # --stress N duplicates the step N times, runs the copies in parallel, and prints the
     # per-copy PASS/FAIL ratio (the finding). A passing step gives N/N.
     with tempfile.TemporaryDirectory() as tmp:
-        dag = _one_step_dag(tmp, "true")
+        dag = _one_step_dag(tmp, "sleep 0.3")
         rc, out, err = _capture(["run", "--dag", dag, "--stress", "3", "-q", _ACF])
         assert rc == 0
-        assert "stress results (3 parallel copies per step):" in out
+        assert "stress results (3 generated graph copies):" in out
         assert "g.j: 3/3 passed" in out
+        assert "maximum concurrent steps: 3 (--jobs" in out
         # All 3 copies actually ran (the run summary counts every copy).
         assert "3 passed, 0 failed" in err
         # The memory-safe OK line names the derivation.
@@ -680,7 +723,7 @@ def test_stress_single_node_via_only() -> None:
     dag = (
         '{"steps": ['
         '{"group": "build", "job": "app", "cmd": "true"},'
-        '{"group": "test", "job": "unit", "cmd": "true", "deps": ["build.app"]}'
+        '{"group": "test", "job": "unit", "cmd": "sleep 0.3", "deps": ["build.app"]}'
         "]}"
     )
     with tempfile.TemporaryDirectory() as tmp:
@@ -725,6 +768,49 @@ def test_stress_refuses_when_exceeds_box_memory() -> None:
         assert "max safe --stress" in err
 
 
+def test_stress_generation_removes_named_resource_serialization() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = Path(tmp) / "dag.json"
+        dag.write_text(
+            '{"resource_caps":{"exclusive":1},"steps":['
+            '{"group":"g","job":"j","cmd":"sleep 0.3",'
+            '"hint":{"resources":{"exclusive":1}}}]}',
+            encoding="utf-8",
+        )
+        rc, out, err = _capture(
+            ["run", "--dag", str(dag), "--stress", "4", "-q", _ACF]
+        )
+        assert rc == 0, err
+        assert "g.j: 4/4 passed" in out
+        assert "maximum concurrent steps: 4 (--jobs" in out
+
+
+def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:
+    from safe_ci_dag_runner.cli import _expand_stress
+    from safe_ci_dag_runner.io import dag_from_json
+    from safe_ci_dag_runner.scheduler import run_dag
+
+    cfg = dag_from_json(
+        '{"resource_caps":{"exclusive":1},"steps":['
+        '{"group":"g","job":"j","cmd":"sleep 0.15",'
+        '"hint":{"resources":{"exclusive":1}}}]}'
+    )
+    result = run_dag(_expand_stress(cfg, 4), jobs=4, keep_going=True, verbosity=0)
+    assert len(result.outcomes) == 4
+    assert result.max_concurrent_steps == 4
+
+
+def test_stress_reports_concurrency_governed_by_jobs() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        dag = _one_step_dag(tmp, "sleep 1")
+        rc, out, err = _capture(
+            ["run", "--dag", dag, "--stress", "4", "--jobs", "3", "-q", _ACF]
+        )
+        assert rc == 0, err
+        assert "g.j: 4/4 passed" in out
+        assert "maximum concurrent steps: 3 (--jobs 3)" in out
+
+
 def test_stress_n_must_be_positive() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _one_step_dag(tmp, "true")
@@ -753,6 +839,8 @@ def test_expand_stress_replicates_steps_and_rewires_deps() -> None:
     by_tag = expanded.by_tag()
     # Each shard's test depends on the SAME shard's build, not a cross-shard build.
     assert by_tag["test.unit#2"].deps == ["build.app#2"]
+    assert expanded.resource_caps == {}
+    assert all(not step.hint.resources for step in expanded.steps)
     # n <= 1 is a no-op.
     assert _expand_stress(cfg, 1).steps == cfg.steps
 
@@ -809,7 +897,7 @@ def test_args_composes_with_only_and_stress() -> None:
             '{"steps": ['
             '{"group": "build", "job": "app", "cmd": "true"},'
             '{"group": "dbi", "job": "file_metadata",'
-            ' "cmd": "test \\"{args}\\" = \\"--case xyz\\"", "deps": ["build.app"]}'
+            ' "cmd": "sleep 0.3; test \\"{args}\\" = \\"--case xyz\\"", "deps": ["build.app"]}'
             "]}",
             encoding="utf-8",
         )

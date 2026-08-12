@@ -147,7 +147,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} run --dag dag.json')}               {c.dim('# run it; exit 0 iff all steps pass')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --profile')}     {c.dim('# ...and print a per-step profile table')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --only build.app')} {c.dim('# run EXACTLY one step (not its deps)')}\n"
-        f"  {ex(f'{PROG} run --dag dag.json --only test.unit --stress 10')} {c.dim('# 10 parallel copies; prints the pass/fail RATIO')}\n"
+        f"  {ex(f'{PROG} run --dag dag.json --only test.unit --stress 10 -j 100')} {c.dim('# 10 disconnected graph copies; -j controls concurrency')}\n"
         f"  {ex(f'{PROG} plan --dag dag.json --planner critical-path')} {c.dim('# show learned estimates + the plan')}\n"
         f"  {ex(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')} {c.dim('# parallel-speedup study')}\n"
         f"  {ex(f'{PROG} ascii --dag dag.json')}             {c.dim('# quick ASCII view of the graph')}\n"
@@ -377,13 +377,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="STRESS mode: duplicate every selected step N times and run the copies IN PARALLEL "
-        "(combine with --only to stress a single suspect node, e.g. --only test.unit). "
-        "Reports the per-copy PASS/FAIL RATIO (e.g. '7/10 passed') and which copies failed - the "
-        "ratio is the finding, so this implies --keep-going (every copy runs to a verdict). Cores "
-        "are plentiful, memory is the binding constraint: N is capped by the box memory budget "
-        "(N x per-copy footprint must fit) and an over-large N is REFUSED LOUDLY rather than "
-        "silently OOMing sibling work.",
+        help="duplicate the selected graph at generation into N disconnected components with no "
+        "edges between copies. Named-resource scheduling is removed from the generated copies; "
+        "-j controls how many copied steps run at once and may be set high for deliberate core "
+        "over-subscription. Reports the largest measured number of overlapping child processes, "
+        "the per-copy PASS/FAIL RATIO (e.g. '7/10 passed'), and which copies failed. Combine with "
+        "--only to copy one suspect node (e.g. --only test.unit). The ratio is the finding, so "
+        "this implies --keep-going. N is still capped by the box memory budget (N x per-copy "
+        "footprint must fit).",
     )
     run_p.add_argument(
         "--perf-dir",
@@ -1057,10 +1058,10 @@ def _stress_suffix(index: int, count: int) -> str:
 def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
     """Return a DAG with every step of ``cfg`` DUPLICATED into ``n`` independent copies (shards).
 
-    Each shard is a full clone of the selected graph with a distinct ``#NN`` copy suffix appended
-    to every job (so tags stay unique and parseable) and its intra-shard dependency edges rewired
-    to the same shard's copies. Shards share no edges, so the scheduler runs all copies
-    concurrently (subject to ``-j`` and the shared ``resource_caps``). ``n <= 1`` is a no-op."""
+    Each copy has a distinct ``#NN`` suffix and its internal dependency edges point only to steps
+    in that same copy. There are no edges between copies. Named-resource scheduling is removed
+    from the generated graph so ``-j`` governs how many copied steps the scheduler starts at once;
+    stress runs deliberately permit over-subscription. ``n <= 1`` is a no-op."""
     if n <= 1:
         return cfg
     new_steps: list[Step] = []
@@ -1072,9 +1073,10 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
                     step,
                     job=f"{step.job}{suffix}",
                     deps=[f"{dep}{suffix}" for dep in step.deps],
+                    hint=dataclasses.replace(step.hint, resources={}),
                 )
             )
-    return dataclasses.replace(cfg, steps=tuple(new_steps))
+    return dataclasses.replace(cfg, steps=tuple(new_steps), resource_caps={})
 
 
 def _stress_guard(cfg: DagConfig, n: int) -> int:
@@ -1117,13 +1119,16 @@ def _stress_guard(cfg: DagConfig, n: int) -> int:
     print(
         f"{PROG}: --stress {n}: OK — {n} x {_human_bytes(footprint)}/copy = "
         f"{_human_bytes(n * footprint)} fits the box memory budget {_human_bytes(budget)} "
-        f"(max safe {max_safe}); running copies in PARALLEL.",
+        f"(max safe {max_safe}); actual concurrency will be measured from child-process "
+        "lifetimes.",
         file=sys.stderr,
     )
     return 0
 
 
-def _print_stress_report(rows: Sequence[StepOutcome], n: int, c: Palette) -> None:
+def _print_stress_report(
+    rows: Sequence[StepOutcome], n: int, max_concurrent_steps: int, jobs: int, c: Palette
+) -> None:
     """Print the per-copy PASS/FAIL RATIO for a ``--stress`` run — the ratio IS the finding.
 
     Copies are grouped back to their original (base) step tag by stripping the ``#NN`` suffix;
@@ -1136,7 +1141,7 @@ def _print_stress_report(rows: Sequence[StepOutcome], n: int, c: Palette) -> Non
             base, idx = outcome.tag, ""
         groups.setdefault(base, []).append((idx, outcome))
 
-    print(c.bold(f"stress results ({n} parallel copies per step):"))
+    print(c.bold(f"stress results ({n} generated graph copies):"))
     for base in sorted(groups):
         items = groups[base]
         items.sort(key=lambda pair: pair[0])
@@ -1156,6 +1161,7 @@ def _print_stress_report(rows: Sequence[StepOutcome], n: int, c: Palette) -> Non
                 f"{len(aborted)} aborted: " + ", ".join(f"#{i}" for i in aborted)
             )
         print(f"  {base}: {line}{detail}")
+    print(f"  maximum concurrent steps: {max_concurrent_steps} (--jobs {jobs})")
 
 
 # --------------------------------------------------------------------------- table rendering
@@ -2064,7 +2070,9 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         _sync_upload(backend, result.step_profile_rows)
     # --stress: print the per-copy PASS/FAIL ratio (the finding) to stdout.
     if stress_active:
-        _print_stress_report(result.outcomes, stress_n, c)
+        _print_stress_report(
+            result.outcomes, stress_n, result.max_concurrent_steps, jobs, c
+        )
     # Feature C: --profile prints a per-step profile table to stdout.
     if bool(ns.profile):
         _print_profile_table(result.step_profile_rows, c)
@@ -2120,6 +2128,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if dag_arg is None:
         print(f"{PROG}: {command}: --dag FILE is required", file=sys.stderr)
         return 2
+    # A boxed run re-execs itself inside systemd. When the DAG comes from stdin, that re-exec must
+    # happen BEFORE this process consumes the pipe; otherwise the child sees EOF and reports
+    # invalid JSON. The in-scope child skips this block, reads stdin once, and _run performs the
+    # normal observed-containment check. Explicit unboxed modes never re-exec and need no change.
+    if (
+        command == "run"
+        and dag_arg == "-"
+        and not bool(ns.allow_cgroup_failure)
+        and not bool(getattr(ns, "unsafe_no_cgroups", False))
+        and os.environ.get("SAFE_CI_IN_SCOPE") != "1"
+    ):
+        _manager, code = _resolve_cgroup_manager(
+            False,
+            False,
+            run_timeout_s=_effective_run_timeout(ns),
+        )
+        if code != 0:
+            return code
     try:
         cfg = _load(dag_arg)
     except (OSError, DagJsonError) as exc:
