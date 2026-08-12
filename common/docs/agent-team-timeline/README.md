@@ -57,7 +57,9 @@ python3 run_stats.py
 ./timeline show phase:example-team::PHASE_ID --transcript --format markdown
 ./timeline search "reproducible build" --scope all --limit 10
 ./timeline prompts --range 200-300
+./timeline prompts --which all --format jsonl > all-prompts.jsonl
 ./timeline prompts --format jsonl > prompts.jsonl
+./timeline stats
 ```
 
 The `teams`, `agents`, `phases`, `rollups`, and `search` commands return stable `team:`, `agent:`,
@@ -86,6 +88,17 @@ cd ./timelines/example-team
 
 The full chronological JSONL report is `extracted/transcripts/prompts.jsonl`;
 `messages.jsonl` adds coordinator responses linked mechanically by provider turn identity.
+`timeline prompts` defaults to `--which human`, where durable `owner_human` and `other_human`
+labels count as human. `--which bot` selects `agent` and `system`; `--which all` also includes
+unknown or externally unattributed records. Selection never guesses authorship from message prose.
+`./timeline stats` is the zero-model accounting view: it reports record, whitespace-delimited word,
+and UTF-8 text-byte totals separately for mechanically identified human, bot/agent, and unattributed
+prompts, mechanically linked and total responses, and generated summaries. It also
+shows available versus unavailable project-overview, agent-lifetime, work-phase, and
+technical/plain-language rollup summary slots. Repeat `--team` or
+provide half-open RFC3339 `--start-time`/`--end-time` bounds to inspect a slice; use `--format json`
+for automation. Project overviews are omitted from time-sliced totals because they have no honest
+time interval.
 
 For a durable multi-provider registry, put the relative archive output, shared identity, and each
 Codex/Claude/Orc source in a strict schema-v1 JSON manifest, then run:
@@ -98,6 +111,11 @@ agent-team-timeline ingest-project --config ./projects/example.json --team codex
 The optional team filter limits provider ingestion; the command still refreshes the monotonic
 transcript projection over every normalized archive team. It records zero model calls and does not
 build the website. See the user guide for the complete manifest schema.
+
+For transports that omitted sender identity, the registered team can carry audited,
+versioned `prompt_authorship_rules`. They match ingress plus optional exact time/message bounds,
+never prose, and preserve the original unresolved label alongside the applied rule ID. The default
+`timeline prompts` view remains human-only; `--which all` exposes unresolved records too.
 
 Every archive includes its `./timeline` launcher, static site, normalized message JSON, cached
 summary data, rendered Markdown, source provenance, and run metadata. `python3 run_stats.py` prints per-run cache,

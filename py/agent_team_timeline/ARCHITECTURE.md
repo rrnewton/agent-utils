@@ -87,6 +87,20 @@ The `prompts` and `messages` query actions are an independent read-only boundary
 and SHA-256 of all managed JSONL against `extracted/transcripts/manifest.json` before returning a
 record. Prompt ordinals are 1-based inclusive chronological indexes for convenient slicing. Stable
 `record_id` values are the durable identity because discovering older history can change ordinals.
+Prompt queries default to `human`, defined only by `author_kind` values `owner_human` and
+`other_human`; `bot` is `agent` or `system`, while `all` retains unresolved classifications. No
+message-text heuristic participates in this boundary. Message queries apply the same prompt
+selection before following `in_reply_to_prompt_id` links to responses.
+
+The archive-local `stats` action joins that digest-verified transcript projection with the
+presentation timeline through the same fail-closed readers. It has no cache, write, or model path.
+It counts logical prompts by their durable human, bot/agent, or unattributed authorship label,
+linked and unlinked response records, and only genuinely available summary text; sparse fallback
+prose contributes availability slots but no summary words or bytes. It never guesses authorship
+from message prose. Summary text is the lifetime paragraph, phase phrase plus paragraph, project
+overview, or referenced rollup Markdown. Team and half-open time filtering use the normal query
+rules. Whole-project overviews are excluded whenever a time bound is active because they have no
+interval to overlap.
 
 ### Mechanical transcript extraction contract
 
@@ -109,7 +123,18 @@ Provider provenance is deliberately not reduced to `role=user`. Codex counts pai
 and queued human-origin commands while classifying hooks, task notifications, compact summaries,
 and recurring inputs as system input. Orc retains `user_source`-derived ingress and author class:
 owner GChat is distinct from inter-Orc traffic, while Web/TUI submissions without an author ID
-remain explicitly unknown rather than being asserted to be owner-authored.
+remain explicitly unknown rather than being asserted to be owner-authored. Orc also propagates a
+later explicit `is_owner=true` observation backward to older GChat records carrying the same sender
+identity; this is an identity join, not a prose heuristic.
+
+Some legacy transports did not persist a sender at all. A registered team may therefore declare
+strict `prompt_authorship_rules` matching its slug, ingress kind, optional half-open RFC3339
+interval, and optional exact native message IDs. Rules can only refine `unknown` or
+`external_or_unknown` source labels; they cannot overwrite intrinsic provider attribution.
+Overlapping rules and unknown teams fail the extraction. The exporter preserves the source label,
+rule ID, and human-written audit reason on each corrected record and persists the normalized rule
+set as `extracted/transcripts/authorship-rules.json`. A direct later `extract-transcripts` reuses
+that set; a subsequent registered-project ingest replaces it with the config's complete rule set.
 
 ### Registered project ingestion contract
 
@@ -125,7 +150,8 @@ The Codex source variant contains a sessions root, coordinator root UUID, and op
 ordered continuation UUIDs. The Claude variant contains its canonical coordinator JSONL. The Orc
 variant contains its archived state root and coordinator session UUID. Team slugs are unique and
 provider-neutral; identity values pass through the same URL, hostname, and IANA-timezone validators
-as individual ingest commands.
+as individual ingest commands. Optional per-team prompt-authorship rules are part of the exact
+versioned config and its receipt digest; they never inspect message text.
 
 Configured teams run in file order through the existing provider snapshot transactions. Successful
 earlier teams and their provider source manifests remain durable if a later provider fails; the

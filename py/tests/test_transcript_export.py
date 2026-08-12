@@ -13,7 +13,10 @@ import pytest
 from agent_team_timeline.archive import JsonValue, as_object, narrow_json
 from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.model import Agent, Event, TeamData
-from agent_team_timeline.transcript_export import export_transcripts
+from agent_team_timeline.transcript_export import (
+    PromptAuthorshipRule,
+    export_transcripts,
+)
 
 
 def _event(
@@ -99,7 +102,7 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     assert report.prompts == 2
     assert report.responses == 1
     assert report.system_inputs == 1
-    assert report.files_changed == 8
+    assert report.files_changed == 9
     assert export_transcripts(tmp_path, (first,)).files_changed == 0
 
     # Simulate a provider rewrite that drops an old prompt/response while exposing
@@ -124,6 +127,81 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     response = next(record for record in messages if record["record_type"] == "response")
     prompt_one = next(record for record in prompts if record["text"] == "One")
     assert response["in_reply_to_prompt_id"] == prompt_one["record_id"]
+
+
+def test_authorship_rules_are_auditable_persisted_and_reclassifiable(
+    tmp_path: Path,
+) -> None:
+    unknown = replace(
+        _event("legacy-web", "turn-web", 200, "user_prompt", "Relay", 1),
+        ingress_kind="submitted_web",
+        author_kind="external_or_unknown",
+    )
+    team = _team((unknown,))
+    bot_rule = PromptAuthorshipRule(
+        "legacy-web-bot",
+        "alpha",
+        "submitted_web",
+        "agent",
+        "This legacy Web endpoint was reserved for agent relays in this interval.",
+        100,
+        300,
+    )
+
+    export_transcripts(tmp_path, (team,), (bot_rule,))
+    root = tmp_path / "extracted" / "transcripts"
+    prompt = _jsonl(root / "prompts.jsonl")[0]
+    assert prompt["source_author_kind"] == "external_or_unknown"
+    assert prompt["author_kind"] == "agent"
+    assert prompt["authorship_rule_id"] == "legacy-web-bot"
+    assert prompt["authorship_rule_reason"] == bot_rule.reason
+    assert prompt["classification_version"] == (
+        "authorship-v1+rule:legacy-web-bot"
+    )
+    persisted_rules = (root / "authorship-rules.json").read_text(encoding="utf-8")
+    assert export_transcripts(tmp_path, (team,)).files_changed == 0
+    assert (root / "authorship-rules.json").read_text(encoding="utf-8") == persisted_rules
+
+    owner_rule = replace(
+        bot_rule,
+        rule_id="legacy-web-owner",
+        author_kind="owner_human",
+        reason="The audited endpoint interval was owner-only.",
+    )
+    export_transcripts(tmp_path, (team,), (owner_rule,))
+    reclassified = _jsonl(root / "prompts.jsonl")[0]
+    assert reclassified["source_author_kind"] == "external_or_unknown"
+    assert reclassified["author_kind"] == "owner_human"
+    assert reclassified["authorship_rule_id"] == "legacy-web-owner"
+
+
+def test_authorship_rules_reject_overlap_even_before_a_record_matches(
+    tmp_path: Path,
+) -> None:
+    team = _team(
+        (
+            replace(
+                _event("legacy-web", "turn-web", 200, "user_prompt", "Relay", 1),
+                ingress_kind="submitted_web",
+                author_kind="external_or_unknown",
+            ),
+        )
+    )
+    first = PromptAuthorshipRule(
+        "first", "alpha", "submitted_web", "agent", "First audited interval.", 100, 300
+    )
+    second = PromptAuthorshipRule(
+        "second",
+        "alpha",
+        "submitted_web",
+        "owner_human",
+        "Conflicting audited interval.",
+        200,
+        400,
+    )
+
+    with pytest.raises(ValueError, match="overlapping prompt authorship rules"):
+        export_transcripts(tmp_path, (team,), (first, second))
 
 
 def test_prompt_query_range_works_without_a_built_timeline(
@@ -213,6 +291,7 @@ def test_archive_timeline_cli_is_discoverable_and_cwd_independent(
     for action in (
         "prompts",
         "messages",
+        "stats",
         "teams",
         "agents",
         "phases",
@@ -298,3 +377,70 @@ def test_prompt_query_fails_closed_on_digest_mismatch(
         == 2
     )
     assert "generation is incomplete" in capsys.readouterr().err
+
+
+def test_prompt_query_selects_durable_authorship_without_prose_guessing(
+    tmp_path: Path,
+) -> None:
+    authored = (
+        ("Owner", "owner_human"),
+        ("Other human", "other_human"),
+        ("Agent generated", "agent"),
+        ("System generated", "system"),
+        ("Ambiguous [impl agent] prose is not authority", "unknown"),
+    )
+    events = tuple(
+        replace(
+            _event(
+                f"prompt-{index}",
+                f"turn-{index}",
+                index * 100,
+                "user_prompt",
+                text,
+                index,
+            ),
+            author_kind=author_kind,
+        )
+        for index, (text, author_kind) in enumerate(authored, 1)
+    ) + (
+        _event(
+            "bot-response",
+            "turn-3",
+            350,
+            "assistant_message",
+            "Response linked to the agent prompt",
+            10,
+        ),
+    )
+    export_transcripts(tmp_path, (_team(events),))
+    launcher = tmp_path / "timeline"
+
+    def selected(*arguments: str) -> list[dict[str, JsonValue]]:
+        completed = subprocess.run(
+            (str(launcher), *arguments, "--format", "jsonl"),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return [
+            as_object(narrow_json(json.loads(line)), "query record")
+            for line in completed.stdout.splitlines()
+        ]
+
+    assert [record["text"] for record in selected("prompts")] == [
+        "Owner",
+        "Other human",
+    ]
+    assert [record["text"] for record in selected("prompts", "--which", "bot")] == [
+        "Agent generated",
+        "System generated",
+    ]
+    assert len(selected("prompts", "--which", "all")) == 5
+
+    bot_messages = selected("messages", "--which", "bot")
+    assert [record["record_type"] for record in bot_messages] == [
+        "prompt",
+        "response",
+        "prompt",
+    ]
+    assert bot_messages[1]["text"] == "Response linked to the agent prompt"

@@ -541,6 +541,32 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
     source, root_db, _ = _fixture(tmp_path)
     inputs: list[tuple[object, ...]] = [
         (
+            "gchat-legacy-owner",
+            "message-gchat-legacy-owner",
+            ROOT,
+            0,
+            _ms("2026-07-21T04:59:00+00:00"),
+            9,
+            "user",
+            "text",
+            "Legacy owner message",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps(
+                {
+                    "GChat": {
+                        "message_name": "spaces/x/messages/legacy-owner",
+                        "sender_name": "newton",
+                    }
+                }
+            ),
+            None,
+            None,
+        ),
+        (
             "gchat-owner",
             "message-gchat-owner",
             ROOT,
@@ -671,6 +697,26 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
             None,
             None,
         ),
+        (
+            "scheduled-web-reminder",
+            "message-scheduled-web-reminder",
+            ROOT,
+            0,
+            _ms("2026-07-21T05:06:00+00:00"),
+            16,
+            "user",
+            "text",
+            "This is your periodic reminder to make sure your running state is aligned "
+            "with your overarching goals, listed below.",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps({"Submitted": {"source": {"Web": {"view": "Inbox"}}}}),
+            None,
+            None,
+        ),
     ]
     connection = sqlite3.connect(root_db)
     try:
@@ -694,6 +740,7 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
     assert owner.author_kind == "owner_human"
     assert owner.ingress_kind == "gchat"
     assert owner.source_native_id == "spaces/x/messages/owner"
+    assert events["orc-block-gchat-legacy-owner"].author_kind == "owner_human"
     other = events["orc-block-gchat-other"]
     assert other.kind == "external_message"
     assert other.author_kind == "other_human"
@@ -707,8 +754,9 @@ def test_classifies_orc_inputs_from_user_source_and_extra(tmp_path: Path) -> Non
     assert scheduled.kind == "system_input"
     assert scheduled.ingress_kind == "scheduled"
     assert scheduled.author_kind == "system"
+    assert events["orc-block-scheduled-web-reminder"].kind == "system_input"
     assert all(
-        event.classification_version == "authorship-v1"
+        event.classification_version == "authorship-v2"
         for event in events.values()
         if event.event_id.startswith("orc-block-")
     )

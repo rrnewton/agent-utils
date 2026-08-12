@@ -656,7 +656,7 @@ class _Spawn:
     source_path: str
 
 
-_CLASSIFICATION_VERSION = "authorship-v1"
+_CLASSIFICATION_VERSION = "authorship-v2"
 _ORC_PERIODIC_REMINDER = (
     "This is your periodic reminder to make sure your running state is aligned "
     "with your overarching goals"
@@ -750,6 +750,7 @@ def _orc_input_provenance(
     extra: Mapping[str, object],
     text: str,
     message_id: str,
+    owner_gchat_senders: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None, str, str, str]:
     """Return event kind, author, ingress, author kind, and native identity."""
 
@@ -763,7 +764,6 @@ def _orc_input_provenance(
         explicit_owner = gchat.get("is_owner")
         if not isinstance(explicit_owner, bool):
             explicit_owner = extra.get("is_owner")
-        author_kind = "owner_human" if explicit_owner is True else "unknown"
         author = _first_string(
             gchat.get("sender_unixname"),
             extra.get("sender_unixname"),
@@ -772,6 +772,12 @@ def _orc_input_provenance(
             gchat.get("sender_name"),
             extra.get("sender_name"),
         )
+        if not isinstance(explicit_owner, bool) and author is not None:
+            if author in owner_gchat_senders:
+                explicit_owner = True
+            elif owner_gchat_senders:
+                explicit_owner = False
+        author_kind = "owner_human" if explicit_owner is True else "unknown"
         native_id = _first_string(
             gchat.get("message_name"), extra.get("message_name"), message_id
         )
@@ -784,11 +790,13 @@ def _orc_input_provenance(
 
     submitted = _nested_mapping(user_source, "Submitted")
     submitted_source = submitted.get("source")
-    if submitted_source == "Tui":
-        if _is_scheduled_orc_input(text):
-            return "system_input", "system", "scheduled", "system", message_id
+    is_tui = submitted_source == "Tui"
+    is_web = isinstance(submitted_source, dict) and "Web" in submitted_source
+    if (is_tui or is_web) and _is_scheduled_orc_input(text):
+        return "system_input", "system", "scheduled", "system", message_id
+    if is_tui:
         return "user_prompt", None, "tui", "unknown", message_id
-    if isinstance(submitted_source, dict) and "Web" in submitted_source:
+    if is_web:
         return (
             "user_prompt",
             None,
@@ -2682,6 +2690,36 @@ def _content_records(
         ).fetchall()
     finally:
         connection.close()
+    owner_gchat_senders: set[str] = set()
+    for raw in rows:
+        row = _row(raw, str(path))
+        role = _required_string(row[5], f"{path}: role")
+        if role != "user":
+            continue
+        user_source = _optional_json_mapping(
+            row[11], f"{path}: content block user_source"
+        )
+        gchat = _nested_mapping(user_source, "GChat")
+        if "GChat" not in user_source:
+            continue
+        extra = _optional_json_mapping(
+            row[12], f"{path}: content block extra"
+        )
+        explicit_owner = gchat.get("is_owner")
+        if not isinstance(explicit_owner, bool):
+            explicit_owner = extra.get("is_owner")
+        if explicit_owner is not True:
+            continue
+        sender = _first_string(
+            gchat.get("sender_unixname"),
+            extra.get("sender_unixname"),
+            gchat.get("sender_display_name"),
+            extra.get("sender_display_name"),
+            gchat.get("sender_name"),
+            extra.get("sender_name"),
+        )
+        if sender is not None:
+            owner_gchat_senders.add(sender)
     events: list[Event] = []
     tools: list[ToolCall] = []
     turn_bounds: dict[int, tuple[int, int, str | None]] = {}
@@ -2731,6 +2769,7 @@ def _content_records(
                 extra,
                 content or "",
                 message_id,
+                frozenset(owner_gchat_senders),
             )
             if event_kind == "inter_agent_message":
                 event_role = None

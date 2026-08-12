@@ -26,7 +26,10 @@ from agent_team_timeline.pipeline import (
     ingest_codex,
     ingest_orc,
 )
-from agent_team_timeline.transcript_export import TranscriptExportReport
+from agent_team_timeline.transcript_export import (
+    PromptAuthorshipRule,
+    TranscriptExportReport,
+)
 from agent_team_timeline.window import DateWindow, parse_date_window
 
 
@@ -72,6 +75,7 @@ class ProjectTeamConfig:
     timezone: str
     date_window: DateWindow | None
     identity_overrides: IdentityOverrides
+    prompt_authorship_rules: tuple[PromptAuthorshipRule, ...]
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,16 @@ class ProjectIngestConfig:
     config_sha256: str
     output: Path
     teams: tuple[ProjectTeamConfig, ...]
+
+    @property
+    def prompt_authorship_rules(self) -> tuple[PromptAuthorshipRule, ...]:
+        """Return every team-scoped rule in deterministic manifest order."""
+
+        return tuple(
+            rule
+            for team in self.teams
+            for rule in team.prompt_authorship_rules
+        )
 
     def select_teams(self, requested: Sequence[str] = ()) -> tuple[ProjectTeamConfig, ...]:
         """Return configured teams in manifest order, validating an optional filter."""
@@ -249,6 +263,54 @@ def _window_spec(value: JsonValue, where: str) -> _WindowSpec:
     return _WindowSpec(start_date, start_time, end_date, end_time)
 
 
+def _prompt_authorship_rules(
+    value: JsonValue, where: str, team_slug: str
+) -> tuple[PromptAuthorshipRule, ...]:
+    result: list[PromptAuthorshipRule] = []
+    for index, raw in enumerate(as_array(value, where)):
+        item_where = f"{where}[{index}]"
+        item = as_object(raw, item_where)
+        _check_fields(
+            item,
+            item_where,
+            frozenset(
+                {"id", "ingress_kind", "author_kind", "reason"}
+            ),
+            frozenset({"start_time", "end_time", "source_native_ids"}),
+        )
+        window = parse_date_window(
+            None,
+            None,
+            "UTC",
+            start_time=_optional_string(item, "start_time", item_where),
+            end_time=_optional_string(item, "end_time", item_where),
+        )
+        source_native_ids = (
+            _string_array(
+                item["source_native_ids"], item_where + ".source_native_ids"
+            )
+            if "source_native_ids" in item
+            else ()
+        )
+        result.append(
+            PromptAuthorshipRule(
+                _required_string(item.get("id"), item_where + ".id"),
+                team_slug,
+                _required_string(
+                    item.get("ingress_kind"), item_where + ".ingress_kind"
+                ),
+                _required_string(
+                    item.get("author_kind"), item_where + ".author_kind"
+                ),
+                _required_string(item.get("reason"), item_where + ".reason"),
+                window.start_ms if window is not None else None,
+                window.end_ms if window is not None else None,
+                source_native_ids,
+            )
+        )
+    return tuple(result)
+
+
 def _codex_source(
     value: dict[str, JsonValue], where: str, config_path: Path
 ) -> CodexProjectSource:
@@ -317,7 +379,15 @@ def _team_config(
         obj,
         where,
         frozenset({"slug", "provider", "source"}),
-        frozenset({"timezone", "projects", "source_hosts", "window"}),
+        frozenset(
+            {
+                "timezone",
+                "projects",
+                "source_hosts",
+                "window",
+                "prompt_authorship_rules",
+            }
+        ),
     )
     slug = _required_string(obj.get("slug"), where + ".slug")
     if len(slug) > 64 or _TEAM_SLUG.fullmatch(slug) is None:
@@ -357,6 +427,15 @@ def _team_config(
         if "window" in obj
         else default_window
     )
+    authorship_rules = (
+        _prompt_authorship_rules(
+            obj["prompt_authorship_rules"],
+            where + ".prompt_authorship_rules",
+            slug,
+        )
+        if "prompt_authorship_rules" in obj
+        else ()
+    )
     return ProjectTeamConfig(
         slug,
         provider,
@@ -364,6 +443,7 @@ def _team_config(
         timezone,
         window_spec.resolve(timezone),
         IdentityOverrides(projects, hosts, "config"),
+        authorship_rules,
     )
 
 
@@ -428,6 +508,15 @@ def load_project_ingest_config(path: Path) -> ProjectIngestConfig:
     slugs = tuple(team.slug for team in teams)
     if len(set(slugs)) != len(slugs):
         raise ValueError(f"{config_path}.teams: duplicate team slugs are not allowed")
+    rule_ids = [
+        rule.rule_id
+        for team in teams
+        for rule in team.prompt_authorship_rules
+    ]
+    if len(set(rule_ids)) != len(rule_ids):
+        raise ValueError(
+            f"{config_path}.teams: duplicate prompt authorship rule ids are not allowed"
+        )
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
     return ProjectIngestConfig(config_path, config_sha256, output, teams)
 
@@ -479,7 +568,9 @@ def ingest_project(
     # Always project every normalized team already in the durable archive. The projection is a
     # monotonic global database and therefore cannot safely omit teams merely because this run's
     # ingest filter selected a subset.
-    transcripts = extract_transcripts_archive(config.output)
+    transcripts = extract_transcripts_archive(
+        config.output, authorship_rules=config.prompt_authorship_rules
+    )
     return ProjectIngestReport(config.config_sha256, tuple(results), transcripts)
 
 

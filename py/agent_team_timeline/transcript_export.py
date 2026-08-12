@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_team_timeline.archive import (
@@ -32,6 +32,88 @@ _MANAGED_FILES = (
     "messages.jsonl",
     "system-inputs.jsonl",
 )
+_AUTHORSHIP_RULES_FILE = "authorship-rules.json"
+_UNCLASSIFIED_AUTHOR_KINDS = frozenset({"external_or_unknown", "unknown"})
+_RULE_AUTHOR_KINDS = frozenset(
+    {"owner_human", "other_human", "agent", "system"}
+)
+
+
+@dataclass(frozen=True)
+class PromptAuthorshipRule:
+    """Auditable correction for an ingress interval without sender identity."""
+
+    rule_id: str
+    team_slug: str
+    ingress_kind: str
+    author_kind: str
+    reason: str
+    start_ms: int | None = None
+    end_ms: int | None = None
+    source_native_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("rule_id", self.rule_id),
+            ("team_slug", self.team_slug),
+            ("ingress_kind", self.ingress_kind),
+            ("reason", self.reason),
+        ):
+            if not value.strip() or "\0" in value:
+                raise ValueError(f"prompt authorship {label} must be non-empty")
+        if self.author_kind not in _RULE_AUTHOR_KINDS:
+            raise ValueError(
+                "prompt authorship author_kind must be owner_human, other_human, "
+                "agent, or system"
+            )
+        if self.start_ms is not None and self.start_ms < 0:
+            raise ValueError("prompt authorship start_ms must be non-negative")
+        if self.end_ms is not None and self.end_ms < 0:
+            raise ValueError("prompt authorship end_ms must be non-negative")
+        if (
+            self.start_ms is not None
+            and self.end_ms is not None
+            and self.start_ms >= self.end_ms
+        ):
+            raise ValueError("prompt authorship interval must be non-empty")
+        if len(set(self.source_native_ids)) != len(self.source_native_ids):
+            raise ValueError("prompt authorship source_native_ids contain duplicates")
+        if any(not value or "\0" in value for value in self.source_native_ids):
+            raise ValueError(
+                "prompt authorship source_native_ids must contain non-empty strings"
+            )
+
+    def to_json_obj(self) -> dict[str, JsonValue]:
+        """Return the complete, deterministic rule representation."""
+
+        native_ids: list[JsonValue] = list(self.source_native_ids)
+        return {
+            "rule_id": self.rule_id,
+            "team_slug": self.team_slug,
+            "ingress_kind": self.ingress_kind,
+            "author_kind": self.author_kind,
+            "reason": self.reason,
+            "start_ms": self.start_ms,
+            "end_ms": self.end_ms,
+            "source_native_ids": native_ids,
+        }
+
+    def matches(self, record: dict[str, JsonValue]) -> bool:
+        """Return whether this rule selects one prompt occurrence."""
+
+        if record.get("team_slug") != self.team_slug:
+            return False
+        if record.get("ingress_kind") != self.ingress_kind:
+            return False
+        timestamp_ms = as_int(record.get("timestamp_ms"), "prompt.timestamp_ms")
+        if self.start_ms is not None and timestamp_ms < self.start_ms:
+            return False
+        if self.end_ms is not None and timestamp_ms >= self.end_ms:
+            return False
+        if not self.source_native_ids:
+            return True
+        native_id = record.get("source_native_id")
+        return isinstance(native_id, str) and native_id in self.source_native_ids
 
 
 @dataclass(frozen=True)
@@ -293,12 +375,172 @@ def _load_jsonl(path: Path) -> list[dict[str, JsonValue]]:
     return result
 
 
+def _prompt_authorship_rule_from_json(
+    value: JsonValue, where: str
+) -> PromptAuthorshipRule:
+    obj = as_object(value, where)
+    expected = {
+        "rule_id",
+        "team_slug",
+        "ingress_kind",
+        "author_kind",
+        "reason",
+        "start_ms",
+        "end_ms",
+        "source_native_ids",
+    }
+    if set(obj) != expected:
+        raise ValueError(
+            f"{where}: invalid fields; missing={sorted(expected - set(obj))!r}, "
+            f"unknown={sorted(set(obj) - expected)!r}"
+        )
+    start_value = obj.get("start_ms")
+    end_value = obj.get("end_ms")
+    start_ms = None if start_value is None else as_int(start_value, where + ".start_ms")
+    end_ms = None if end_value is None else as_int(end_value, where + ".end_ms")
+    native_ids = tuple(
+        as_string(item, f"{where}.source_native_ids[{index}]")
+        for index, item in enumerate(
+            as_array(obj.get("source_native_ids"), where + ".source_native_ids")
+        )
+    )
+    return PromptAuthorshipRule(
+        as_string(obj.get("rule_id"), where + ".rule_id"),
+        as_string(obj.get("team_slug"), where + ".team_slug"),
+        as_string(obj.get("ingress_kind"), where + ".ingress_kind"),
+        as_string(obj.get("author_kind"), where + ".author_kind"),
+        as_string(obj.get("reason"), where + ".reason"),
+        start_ms,
+        end_ms,
+        native_ids,
+    )
+
+
+def _rules_overlap(left: PromptAuthorshipRule, right: PromptAuthorshipRule) -> bool:
+    if left.team_slug != right.team_slug or left.ingress_kind != right.ingress_kind:
+        return False
+    if (
+        left.end_ms is not None
+        and right.start_ms is not None
+        and left.end_ms <= right.start_ms
+    ):
+        return False
+    if (
+        right.end_ms is not None
+        and left.start_ms is not None
+        and right.end_ms <= left.start_ms
+    ):
+        return False
+    if not left.source_native_ids or not right.source_native_ids:
+        return True
+    return bool(set(left.source_native_ids) & set(right.source_native_ids))
+
+
+def _validate_rules(
+    rules: Sequence[PromptAuthorshipRule], team_slugs: set[str]
+) -> tuple[PromptAuthorshipRule, ...]:
+    ordered = tuple(
+        sorted(
+            rules,
+            key=lambda rule: (
+                rule.team_slug,
+                rule.ingress_kind,
+                rule.start_ms if rule.start_ms is not None else -1,
+                rule.end_ms if rule.end_ms is not None else 2**63,
+                rule.rule_id,
+            ),
+        )
+    )
+    ids: set[str] = set()
+    for rule in ordered:
+        if rule.rule_id in ids:
+            raise ValueError(f"duplicate prompt authorship rule {rule.rule_id!r}")
+        ids.add(rule.rule_id)
+        if rule.team_slug not in team_slugs:
+            raise ValueError(
+                f"prompt authorship rule {rule.rule_id!r} selects unknown team "
+                f"{rule.team_slug!r}"
+            )
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1 :]:
+            if _rules_overlap(left, right):
+                raise ValueError(
+                    "overlapping prompt authorship rules "
+                    f"{left.rule_id!r} and {right.rule_id!r}"
+                )
+    return ordered
+
+
+def _rules_text(rules: Sequence[PromptAuthorshipRule]) -> str:
+    values: list[JsonValue] = [rule.to_json_obj() for rule in rules]
+    return canonical_json({"schema_version": 1, "rules": values})
+
+
+def _load_rules(path: Path) -> tuple[PromptAuthorshipRule, ...]:
+    if not path.exists():
+        return ()
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"prompt authorship rules are not a regular file: {path}")
+    root = as_object(read_json(path), str(path))
+    if set(root) != {"schema_version", "rules"}:
+        raise ValueError(f"invalid prompt authorship rules document at {path}")
+    if as_int(root.get("schema_version"), f"{path}.schema_version") != 1:
+        raise ValueError(f"unsupported prompt authorship rules schema at {path}")
+    return tuple(
+        _prompt_authorship_rule_from_json(value, f"{path}.rules[{index}]")
+        for index, value in enumerate(as_array(root.get("rules"), f"{path}.rules"))
+    )
+
+
+def _apply_authorship_rules(
+    records: Sequence[dict[str, JsonValue]],
+    rules: Sequence[PromptAuthorshipRule],
+) -> dict[str, int]:
+    applied = {rule.rule_id: 0 for rule in rules}
+    for record in records:
+        if record.get("record_type") != "prompt":
+            continue
+        current_kind = record.get("source_author_kind", record.get("author_kind"))
+        source_kind = current_kind if isinstance(current_kind, str) else None
+        source_version = record.get(
+            "source_classification_version", record.get("classification_version")
+        )
+        record["source_author_kind"] = source_kind
+        record["source_classification_version"] = source_version
+        record["author_kind"] = source_kind
+        record["classification_version"] = source_version
+        record.pop("authorship_rule_id", None)
+        record.pop("authorship_rule_reason", None)
+        if source_kind not in _UNCLASSIFIED_AUTHOR_KINDS:
+            continue
+        matches = [rule for rule in rules if rule.matches(record)]
+        if len(matches) > 1:
+            raise ValueError(
+                "multiple prompt authorship rules matched record "
+                f"{record.get('record_id')!r}"
+            )
+        if not matches:
+            continue
+        rule = matches[0]
+        record["author_kind"] = rule.author_kind
+        base_version = source_version if isinstance(source_version, str) else "unknown"
+        record["classification_version"] = f"{base_version}+rule:{rule.rule_id}"
+        record["authorship_rule_id"] = rule.rule_id
+        record["authorship_rule_reason"] = rule.reason
+        applied[rule.rule_id] += 1
+    return applied
+
+
 def _immutable_projection(record: dict[str, JsonValue]) -> dict[str, JsonValue]:
     mutable = {
         "ordinal",
         "ingress_kind",
         "author_kind",
         "classification_version",
+        "source_author_kind",
+        "source_classification_version",
+        "authorship_rule_id",
+        "authorship_rule_reason",
         "in_reply_to_prompt_id",
     }
     return {key: value for key, value in record.items() if key not in mutable}
@@ -345,7 +587,22 @@ def _logical_records(
     result: list[dict[str, JsonValue]] = []
     for logical_id, group in grouped.items():
         ordered = sorted(group, key=_record_sort_key)
-        record = dict(ordered[0])
+        attributed = [
+            item
+            for item in ordered
+            if isinstance(item.get("author_kind"), str)
+            and item.get("author_kind") not in _UNCLASSIFIED_AUTHOR_KINDS
+        ]
+        attributed_kinds = {
+            item.get("author_kind") for item in attributed
+        }
+        if len(attributed_kinds) > 1:
+            raise ValueError(
+                f"conflicting authorship classifications for {logical_id!r}: "
+                f"{sorted(str(value) for value in attributed_kinds)!r}"
+            )
+        representative = attributed[0] if attributed else ordered[0]
+        record = dict(representative)
         record["record_id"] = logical_id
         occurrence_ids: list[JsonValue] = []
         for occurrence_id in sorted(
@@ -387,11 +644,33 @@ def _validate_previous_manifest(root: Path) -> dict[str, JsonValue] | None:
             raise ValueError(
                 f"transcript export generation is incomplete: {managed} digest mismatch"
             )
+    rules_entry = files.get(_AUTHORSHIP_RULES_FILE)
+    if rules_entry is not None:
+        entry = as_object(
+            rules_entry, f"{path}.files.{_AUTHORSHIP_RULES_FILE}"
+        )
+        expected = as_string(
+            entry.get("sha256"),
+            f"{path}.files.{_AUTHORSHIP_RULES_FILE}.sha256",
+        )
+        rules_path = root / _AUTHORSHIP_RULES_FILE
+        if not rules_path.is_file() or rules_path.is_symlink():
+            raise ValueError(
+                f"transcript export file is missing or unsafe: {rules_path}"
+            )
+        actual = hashlib.sha256(rules_path.read_bytes()).hexdigest()
+        if actual != expected:
+            raise ValueError(
+                "transcript export generation is incomplete: "
+                f"{rules_path} digest mismatch"
+            )
     return manifest
 
 
 def export_transcripts(
-    archive: Path, teams: Iterable[TeamData]
+    archive: Path,
+    teams: Iterable[TeamData],
+    prompt_authorship_rules: Sequence[PromptAuthorshipRule] | None = None,
 ) -> TranscriptExportReport:
     """Update the archive's append-only coordinator transcript projection.
 
@@ -419,6 +698,14 @@ def export_transcripts(
                 "monotonic transcript export cannot omit previously extracted teams: "
                 + ", ".join(omitted)
             )
+    configured_rules = (
+        tuple(prompt_authorship_rules)
+        if prompt_authorship_rules is not None
+        else _load_rules(root / _AUTHORSHIP_RULES_FILE)
+    )
+    rules = _validate_rules(
+        configured_rules, {team.team_slug for team in ordered_teams}
+    )
 
     current_prompts = [
         _base_record(group, "prompt")
@@ -436,6 +723,7 @@ def export_transcripts(
     occurrences, carried = _monotonic_union(
         _load_jsonl(root / "occurrences.jsonl"), current_occurrences
     )
+    rule_counts = _apply_authorship_rules(occurrences, rules)
     prompts = _logical_records(occurrences, "prompt")
     for index, prompt in enumerate(prompts, 1):
         prompt["ordinal"] = index
@@ -465,9 +753,13 @@ def export_transcripts(
         "messages.jsonl": _jsonl(messages),
         "system-inputs.jsonl": _jsonl(system_inputs),
     }
+    rules_text = _rules_text(rules)
     changed = 0
     for name in _MANAGED_FILES:
         changed += int(write_text_if_changed(root / name, texts[name]))
+    changed += int(
+        write_text_if_changed(root / _AUTHORSHIP_RULES_FILE, rules_text)
+    )
 
     file_manifest: dict[str, JsonValue] = {}
     for name in _MANAGED_FILES:
@@ -485,6 +777,11 @@ def export_transcripts(
                 else system_inputs
             ),
         }
+    file_manifest[_AUTHORSHIP_RULES_FILE] = {
+        "sha256": _sha256_text(rules_text),
+        "bytes": len(rules_text.encode("utf-8")),
+        "records": len(rules),
+    }
     source_generations: list[JsonValue] = [
         {
             "team_slug": team.team_slug,
@@ -495,6 +792,9 @@ def export_transcripts(
         }
         for team in ordered_teams
     ]
+    rule_count_values: dict[str, JsonValue] = {
+        rule_id: count for rule_id, count in rule_counts.items()
+    }
     manifest: dict[str, JsonValue] = {
         "schema_version": TRANSCRIPT_EXPORT_SCHEMA_VERSION,
         "kind": "mechanical-coordinator-transcript-export",
@@ -508,6 +808,15 @@ def export_transcripts(
             "system_inputs": len(system_inputs),
             "occurrences": len(occurrences),
             "carried_forward": carried,
+            "prompt_authorship_rules": len(rules),
+        },
+        "prompt_authorship": {
+            "rule_application_counts": rule_count_values,
+            "unclassified_prompts": sum(
+                1
+                for prompt in prompts
+                if prompt.get("author_kind") in _UNCLASSIFIED_AUTHOR_KINDS
+            ),
         },
         "ordinal_contract": (
             "Prompt ordinals are 1-based chronological projection indexes; stable record_id "
@@ -538,6 +847,7 @@ def export_transcripts(
 
 
 __all__ = [
+    "PromptAuthorshipRule",
     "TRANSCRIPT_EXPORT_SCHEMA_VERSION",
     "TranscriptExportReport",
     "export_transcripts",

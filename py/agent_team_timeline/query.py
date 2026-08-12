@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -22,6 +22,9 @@ _RFC3339_INSTANT = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
+PROMPT_SELECTIONS = ("human", "bot", "all")
+_HUMAN_AUTHOR_KINDS = frozenset(("owner_human", "other_human"))
+_BOT_AUTHOR_KINDS = frozenset(("agent", "system"))
 
 JsonScalar = str | int | float | bool | None
 JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -126,6 +129,63 @@ class OrdinalRange:
         return self.first <= ordinal <= self.last
 
 
+@dataclass(frozen=True)
+class TextTotals:
+    """Additive counts over record text, excluding serialization framing."""
+
+    records: int = 0
+    words: int = 0
+    utf8_bytes: int = 0
+
+    @classmethod
+    def from_texts(cls, texts: Iterable[str]) -> TextTotals:
+        """Count records, whitespace-delimited words, and UTF-8 text bytes."""
+
+        records = 0
+        words = 0
+        utf8_bytes = 0
+        for text in texts:
+            records += 1
+            words += len(text.split())
+            utf8_bytes += len(text.encode("utf-8"))
+        return cls(records, words, utf8_bytes)
+
+    def __add__(self, other: TextTotals) -> TextTotals:
+        return TextTotals(
+            self.records + other.records,
+            self.words + other.words,
+            self.utf8_bytes + other.utf8_bytes,
+        )
+
+    def to_mapping(self) -> dict[str, JsonValue]:
+        """Return these totals as a JSON-compatible object."""
+
+        return {
+            "records": self.records,
+            "words": self.words,
+            "utf8_bytes": self.utf8_bytes,
+        }
+
+
+@dataclass(frozen=True)
+class SummaryKindStats:
+    """Availability and generated-text totals for one summary surface."""
+
+    available: int
+    unavailable: int
+    content: TextTotals
+
+    def to_mapping(self) -> dict[str, JsonValue]:
+        """Return coverage and content totals as a JSON-compatible object."""
+
+        return {
+            "available": self.available,
+            "unavailable": self.unavailable,
+            "total": self.available + self.unavailable,
+            "content": self.content.to_mapping(),
+        }
+
+
 def parse_ordinal_range(raw: str) -> OrdinalRange:
     """Parse ``N`` or inclusive ``N-M`` prompt ordinals."""
 
@@ -207,8 +267,28 @@ class TranscriptQuery:
         at_ms = as_int(record.get("timestamp_ms"), "transcript record.timestamp_ms")
         return filters.window.contains(at_ms)
 
+    @staticmethod
+    def _prompt_class(record: dict[str, JsonValue]) -> str:
+        author_kind = as_string(record.get("author_kind"), "prompt.author_kind")
+        if author_kind in _HUMAN_AUTHOR_KINDS:
+            return "human"
+        if author_kind in _BOT_AUTHOR_KINDS:
+            return "bot"
+        return "unclassified"
+
+    @classmethod
+    def _selected_prompt_authorship(
+        cls, record: dict[str, JsonValue], which: str
+    ) -> bool:
+        if which not in PROMPT_SELECTIONS:
+            raise ValueError("prompt selection must be human, bot, or all")
+        return which == "all" or cls._prompt_class(record) == which
+
     def list_prompts(
-        self, filters: QueryFilters, ordinal_range: OrdinalRange | None
+        self,
+        filters: QueryFilters,
+        ordinal_range: OrdinalRange | None,
+        which: str = "human",
     ) -> list[dict[str, JsonValue]]:
         """Return verbatim authored prompt records in global timestamp order."""
 
@@ -217,40 +297,85 @@ class TranscriptQuery:
             ordinal = as_int(record.get("ordinal"), "prompt.ordinal")
             if ordinal_range is not None and not ordinal_range.contains(ordinal):
                 continue
+            if not self._selected_prompt_authorship(record, which):
+                continue
             if self._selected(record, filters):
                 result.append(dict(record))
         return result
 
     def list_messages(
-        self, filters: QueryFilters, ordinal_range: OrdinalRange | None
+        self,
+        filters: QueryFilters,
+        ordinal_range: OrdinalRange | None,
+        which: str = "human",
     ) -> list[dict[str, JsonValue]]:
         """Return prompts plus mechanically associated coordinator responses."""
 
+        selected_prompts = self.list_prompts(filters, ordinal_range, which)
+        selected_prompt_ids = {
+            as_string(record.get("record_id"), "prompt.record_id")
+            for record in selected_prompts
+        }
         result: list[dict[str, JsonValue]] = []
         for record in self.messages:
             record_type = as_string(record.get("record_type"), "message.record_type")
-            ordinal: int | None
             if record_type == "prompt":
-                ordinal = as_int(record.get("ordinal"), "prompt.ordinal")
+                record_id = as_string(record.get("record_id"), "prompt.record_id")
+                if record_id not in selected_prompt_ids:
+                    continue
+                ordinal: int | None = as_int(record.get("ordinal"), "prompt.ordinal")
             elif record_type == "response":
                 prompt_id = record.get("in_reply_to_prompt_id")
-                ordinal = (
-                    self._prompt_ordinals.get(prompt_id)
-                    if isinstance(prompt_id, str)
-                    else None
-                )
+                if not isinstance(prompt_id, str) or prompt_id not in selected_prompt_ids:
+                    continue
+                ordinal = self._prompt_ordinals.get(prompt_id)
             else:
                 raise ValueError(f"unknown transcript message type {record_type!r}")
-            if ordinal_range is not None and (
-                ordinal is None or not ordinal_range.contains(ordinal)
-            ):
-                continue
             if self._selected(record, filters):
                 item = dict(record)
                 if record_type == "response":
                     item["prompt_ordinal"] = ordinal
                 result.append(item)
         return result
+
+    def content_stats(
+        self, filters: QueryFilters
+    ) -> tuple[TextTotals, TextTotals, TextTotals, TextTotals, TextTotals]:
+        """Count mechanically attributed prompt classes and responses in *filters*."""
+
+        human_prompt_texts: list[str] = []
+        bot_prompt_texts: list[str] = []
+        unattributed_prompt_texts: list[str] = []
+        for record in self.prompts:
+            if not self._selected(record, filters):
+                continue
+            text = as_string(record.get("text"), "prompt.text")
+            prompt_class = self._prompt_class(record)
+            if prompt_class == "human":
+                human_prompt_texts.append(text)
+            elif prompt_class == "bot":
+                bot_prompt_texts.append(text)
+            else:
+                unattributed_prompt_texts.append(text)
+        linked_response_texts: list[str] = []
+        unlinked_response_texts: list[str] = []
+        for record in self.messages:
+            if as_string(record.get("record_type"), "message.record_type") != "response":
+                continue
+            if not self._selected(record, filters):
+                continue
+            text = as_string(record.get("text"), "response.text")
+            if isinstance(record.get("in_reply_to_prompt_id"), str):
+                linked_response_texts.append(text)
+            else:
+                unlinked_response_texts.append(text)
+        return (
+            TextTotals.from_texts(human_prompt_texts),
+            TextTotals.from_texts(bot_prompt_texts),
+            TextTotals.from_texts(unattributed_prompt_texts),
+            TextTotals.from_texts(linked_response_texts),
+            TextTotals.from_texts(unlinked_response_texts),
+        )
 
 
 def _record_array(
@@ -380,6 +505,135 @@ class TimelineQuery:
         self.phases = _record_array(self.timeline, "phases")
         self.rollups = _record_array(self.timeline, "rollups")
         self._entries = self._build_index()
+
+    def _project_overviews(self) -> tuple[dict[str, JsonValue], ...]:
+        plural = self.timeline.get("project_overviews")
+        if plural is not None:
+            return tuple(
+                as_object(value, f"timeline.project_overviews[{index}]")
+                for index, value in enumerate(
+                    as_array(plural, "timeline.project_overviews")
+                )
+            )
+        singular = self.timeline.get("project_overview")
+        if singular is None:
+            return ()
+        if len(self.teams) != 1:
+            raise ValueError(
+                "timeline.project_overview requires exactly one timeline team"
+            )
+        result = dict(as_object(singular, "timeline.project_overview"))
+        result["team"] = as_string(self.teams[0].get("slug"), "timeline.teams[0].slug")
+        return (result,)
+
+    @staticmethod
+    def _summary_kind_stats(texts: list[str], unavailable: int) -> SummaryKindStats:
+        return SummaryKindStats(
+            available=len(texts),
+            unavailable=unavailable,
+            content=TextTotals.from_texts(texts),
+        )
+
+    def summary_stats(
+        self, filters: QueryFilters
+    ) -> dict[str, SummaryKindStats]:
+        """Count available and unavailable summaries in the presentation projection."""
+
+        project_texts: list[str] = []
+        project_unavailable = 0
+        # Project overviews describe a whole team and have no honest time interval. Exclude
+        # them from time-sliced statistics instead of pretending they belong to every window.
+        if filters.window is None:
+            for record in self._project_overviews():
+                team = _team(record, "project_overview")
+                if not self._selected_team(team, filters):
+                    continue
+                if _summary_available(record, "summary_available"):
+                    project_texts.append(
+                        as_string(record.get("text"), "project_overview.text")
+                    )
+                else:
+                    project_unavailable += 1
+
+        agent_texts: list[str] = []
+        agent_unavailable = 0
+        for record in self.agents:
+            team = _team(record, "agent")
+            if not self._selected_team(team, filters):
+                continue
+            if not _overlaps(record, agent_ref(record), filters.window):
+                continue
+            if _summary_available(record, "summary_available"):
+                agent_texts.append(
+                    as_string(record.get("lifetime_summary"), "agent.lifetime_summary")
+                )
+            else:
+                agent_unavailable += 1
+
+        phase_texts: list[str] = []
+        phase_unavailable = 0
+        for record in self.phases:
+            team = _team(record, "phase")
+            if not self._selected_team(team, filters):
+                continue
+            if not _overlaps(record, phase_ref(record), filters.window):
+                continue
+            if _summary_available(record, "summary_available"):
+                phrase = as_string(record.get("phrase"), "phase.phrase")
+                paragraph = as_string(record.get("paragraph"), "phase.paragraph")
+                phase_texts.append(f"{phrase}\n{paragraph}")
+            else:
+                phase_unavailable += 1
+
+        technical_texts: list[str] = []
+        technical_unavailable = 0
+        plain_texts: list[str] = []
+        plain_unavailable = 0
+        for record in self.rollups:
+            team = _team(record, "rollup")
+            kind = as_string(record.get("kind"), "rollup.kind")
+            reference = rollup_ref(record)
+            if not self._selected_team(team, filters):
+                continue
+            if filters.rollup_kinds and kind not in filters.rollup_kinds:
+                continue
+            if not _overlaps(record, reference, filters.window):
+                continue
+            if _summary_available(record, "technical_summary_available"):
+                relative = as_string(
+                    record.get("technical_path"), "rollup.technical_path"
+                )
+                technical_texts.append(
+                    self._rollup_file(relative, team).read_text(encoding="utf-8")
+                )
+            else:
+                technical_unavailable += 1
+            if _summary_available(record, "plain_language_summary_available"):
+                relative = as_string(
+                    record.get("plain_language_path"),
+                    "rollup.plain_language_path",
+                )
+                plain_texts.append(
+                    self._rollup_file(relative, team).read_text(encoding="utf-8")
+                )
+            else:
+                plain_unavailable += 1
+
+        return {
+            "project_overviews": self._summary_kind_stats(
+                project_texts, project_unavailable
+            ),
+            "agent_lifetimes": self._summary_kind_stats(
+                agent_texts, agent_unavailable
+            ),
+            "work_phases": self._summary_kind_stats(phase_texts, phase_unavailable),
+            "rollup_technical": self._summary_kind_stats(
+                technical_texts, technical_unavailable
+            ),
+            "rollup_plain_language": self._summary_kind_stats(
+                plain_texts, plain_unavailable
+            ),
+        }
 
     def _build_index(self) -> dict[str, _IndexEntry]:
         entries: dict[str, _IndexEntry] = {}
@@ -1036,6 +1290,130 @@ class TimelineQuery:
         return results
 
 
+@dataclass(frozen=True)
+class ArchiveStats:
+    """Content and summary-coverage totals for one filtered archive view."""
+
+    human_prompts: TextTotals
+    bot_prompts: TextTotals
+    unattributed_prompts: TextTotals
+    linked_responses: TextTotals
+    unlinked_responses: TextTotals
+    summary_kinds: dict[str, SummaryKindStats]
+    teams: tuple[str, ...]
+    time_filtered: bool
+    rollup_kinds: tuple[str, ...]
+
+    @property
+    def total_responses(self) -> TextTotals:
+        """Return linked and unlinked response totals."""
+
+        return self.linked_responses + self.unlinked_responses
+
+    @property
+    def all_prompts(self) -> TextTotals:
+        """Return human, bot, and unattributed prompt totals."""
+
+        return self.human_prompts + self.bot_prompts + self.unattributed_prompts
+
+    @property
+    def generated_summaries(self) -> TextTotals:
+        """Return content totals across every summary surface."""
+
+        total = TextTotals()
+        for item in self.summary_kinds.values():
+            total += item.content
+        return total
+
+    @property
+    def prompts_and_responses(self) -> TextTotals:
+        """Return all prompt and response content totals."""
+
+        return self.all_prompts + self.total_responses
+
+    @property
+    def all_counted_content(self) -> TextTotals:
+        """Return prompts, responses, and generated summaries together."""
+
+        return self.prompts_and_responses + self.generated_summaries
+
+    def to_mapping(self) -> dict[str, JsonValue]:
+        """Return the full accounting report as a JSON-compatible object."""
+
+        content: dict[str, JsonValue] = {
+            "human_prompts": self.human_prompts.to_mapping(),
+            "bot_prompts": self.bot_prompts.to_mapping(),
+            "unattributed_prompts": self.unattributed_prompts.to_mapping(),
+            "all_prompts": self.all_prompts.to_mapping(),
+            "mechanically_linked_responses": self.linked_responses.to_mapping(),
+            "unlinked_responses": self.unlinked_responses.to_mapping(),
+            "total_responses": self.total_responses.to_mapping(),
+            "generated_summaries": self.generated_summaries.to_mapping(),
+            "prompts_and_responses": self.prompts_and_responses.to_mapping(),
+            "all_counted_content": self.all_counted_content.to_mapping(),
+        }
+        by_kind: dict[str, JsonValue] = {
+            key: value.to_mapping() for key, value in self.summary_kinds.items()
+        }
+        available = sum(item.available for item in self.summary_kinds.values())
+        unavailable = sum(item.unavailable for item in self.summary_kinds.values())
+        scope: dict[str, JsonValue] = {
+            "teams": list(self.teams),
+            "all_teams": not self.teams,
+            "time_filtered": self.time_filtered,
+            "rollup_kinds": list(self.rollup_kinds),
+        }
+        return {
+            "schema_version": QUERY_SCHEMA_VERSION,
+            "command": "stats",
+            "scope": scope,
+            "content": content,
+            "summary_availability": {
+                "available": available,
+                "unavailable": unavailable,
+                "total": available + unavailable,
+                "by_kind": by_kind,
+            },
+            "counting_contract": {
+                "words": "Unicode text split on whitespace",
+                "utf8_bytes": "UTF-8 encoded text only; serialization framing excluded",
+                "rollup_text": "referenced generated Markdown counted verbatim",
+                "phase_summary_text": "phrase plus newline plus paragraph",
+                "time_unbounded_project_overviews": (
+                    "included only when no time filter is active"
+                ),
+                "human_prompts": "records labeled owner_human or other_human",
+                "bot_prompts": "records labeled agent or system",
+                "unattributed_prompts": "all remaining prompt authorship labels",
+            },
+        }
+
+
+def archive_stats(root: Path, filters: QueryFilters) -> ArchiveStats:
+    """Read verified projections and compute zero-model archive content totals."""
+
+    transcripts = TranscriptQuery(root)
+    (
+        human_prompts,
+        bot_prompts,
+        unattributed_prompts,
+        linked_responses,
+        unlinked_responses,
+    ) = transcripts.content_stats(filters)
+    summaries = TimelineQuery(root).summary_stats(filters)
+    return ArchiveStats(
+        human_prompts=human_prompts,
+        bot_prompts=bot_prompts,
+        unattributed_prompts=unattributed_prompts,
+        linked_responses=linked_responses,
+        unlinked_responses=unlinked_responses,
+        summary_kinds=summaries,
+        teams=filters.teams,
+        time_filtered=filters.window is not None,
+        rollup_kinds=filters.rollup_kinds,
+    )
+
+
 def query_envelope(command: str, items: list[dict[str, JsonValue]]) -> dict[str, JsonValue]:
     """Wrap records in a small versioned response for default JSON output."""
 
@@ -1151,6 +1529,136 @@ def format_query(
     if output_format == "text":
         body = "\n\n".join(_text_item(item) for item in items)
         return body + ("\n" if body else "")
+    raise ValueError(f"unsupported query output format {output_format!r}")
+
+
+def _stats_content_rows(stats: ArchiveStats) -> tuple[tuple[str, TextTotals], ...]:
+    return (
+        ("Identified human prompts", stats.human_prompts),
+        ("Identified bot/agent prompts", stats.bot_prompts),
+        ("Unattributed prompt records", stats.unattributed_prompts),
+        ("All prompt records", stats.all_prompts),
+        ("Mechanically linked responses", stats.linked_responses),
+        ("Unlinked responses", stats.unlinked_responses),
+        ("Total responses", stats.total_responses),
+        ("Generated summaries", stats.generated_summaries),
+        ("Prompts + responses", stats.prompts_and_responses),
+        ("All counted content", stats.all_counted_content),
+    )
+
+
+def _stats_scope(stats: ArchiveStats) -> str:
+    teams = ", ".join(stats.teams) if stats.teams else "all teams"
+    time_scope = "filtered time window" if stats.time_filtered else "all time"
+    rollups = (
+        ", ".join(stats.rollup_kinds)
+        if stats.rollup_kinds
+        else "all rollup kinds"
+    )
+    return f"{teams}; {time_scope}; {rollups}"
+
+
+def _format_stats_text(stats: ArchiveStats) -> str:
+    lines = [
+        "Archive content statistics",
+        f"Scope: {_stats_scope(stats)}",
+        "",
+        f"{'Content':<34} {'Records':>12} {'Words':>14} {'UTF-8 bytes':>16}",
+        f"{'-' * 34} {'-' * 12} {'-' * 14} {'-' * 16}",
+    ]
+    for label, totals in _stats_content_rows(stats):
+        lines.append(
+            f"{label:<34} {totals.records:>12,} {totals.words:>14,} "
+            f"{totals.utf8_bytes:>16,}"
+        )
+    lines.extend(
+        (
+            "",
+            "Summary availability",
+            f"{'Kind':<34} {'Available':>12} {'Unavailable':>14} {'Total':>16}",
+            f"{'-' * 34} {'-' * 12} {'-' * 14} {'-' * 16}",
+        )
+    )
+    for key, item in stats.summary_kinds.items():
+        label = key.replace("_", " ").title()
+        lines.append(
+            f"{label:<34} {item.available:>12,} {item.unavailable:>14,} "
+            f"{item.available + item.unavailable:>16,}"
+        )
+    available = sum(item.available for item in stats.summary_kinds.values())
+    unavailable = sum(item.unavailable for item in stats.summary_kinds.values())
+    lines.append(
+        f"{'All summary slots':<34} {available:>12,} {unavailable:>14,} "
+        f"{available + unavailable:>16,}"
+    )
+    lines.extend(
+        (
+            "",
+            "Words are whitespace-delimited Unicode text. Byte totals are UTF-8 text "
+            "bytes and exclude CLI/JSON serialization framing; generated rollup Markdown "
+            "is counted verbatim.",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
+def _format_stats_markdown(stats: ArchiveStats) -> str:
+    lines = [
+        "# Archive content statistics",
+        "",
+        f"Scope: {_stats_scope(stats)}.",
+        "",
+        "| Content | Records | Words | UTF-8 bytes |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for label, totals in _stats_content_rows(stats):
+        lines.append(
+            f"| {label} | {totals.records:,} | {totals.words:,} | "
+            f"{totals.utf8_bytes:,} |"
+        )
+    lines.extend(
+        (
+            "",
+            "## Summary availability",
+            "",
+            "| Kind | Available | Unavailable | Total |",
+            "| --- | ---: | ---: | ---: |",
+        )
+    )
+    for key, item in stats.summary_kinds.items():
+        label = key.replace("_", " ").title()
+        lines.append(
+            f"| {label} | {item.available:,} | {item.unavailable:,} | "
+            f"{item.available + item.unavailable:,} |"
+        )
+    available = sum(item.available for item in stats.summary_kinds.values())
+    unavailable = sum(item.unavailable for item in stats.summary_kinds.values())
+    lines.extend(
+        (
+            f"| **All summary slots** | **{available:,}** | **{unavailable:,}** | "
+            f"**{available + unavailable:,}** |",
+            "",
+            "Words are whitespace-delimited Unicode text. Byte totals are UTF-8 text "
+            "bytes and exclude CLI/JSON serialization framing; generated rollup Markdown "
+            "is counted verbatim.",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
+def format_stats(stats: ArchiveStats, output_format: str) -> str:
+    """Render content statistics without entering the generic record-list envelope."""
+
+    if output_format == "json":
+        return canonical_json(stats.to_mapping())
+    if output_format == "jsonl":
+        return json.dumps(
+            stats.to_mapping(), ensure_ascii=False, sort_keys=True
+        ) + "\n"
+    if output_format == "markdown":
+        return _format_stats_markdown(stats)
+    if output_format == "text":
+        return _format_stats_text(stats)
     raise ValueError(f"unsupported query output format {output_format!r}")
 
 
@@ -1275,8 +1783,10 @@ def _standalone_parser() -> argparse.ArgumentParser:
             "examples:\n"
             "  ./timeline prompts\n"
             "  ./timeline prompts --range 200-300\n"
+            "  ./timeline prompts --which all --format jsonl > all-prompts.jsonl\n"
             "  ./timeline prompts --format jsonl > prompts.jsonl\n"
             "  ./timeline messages --range 200-300\n"
+            "  ./timeline stats\n"
             "  ./timeline agents --team codex-coord-030\n"
             "  ./timeline search 'reproducible build' --scope all\n\n"
             "Prompt ranges are 1-based and inclusive. The default archive is the "
@@ -1319,11 +1829,15 @@ def _standalone_parser() -> argparse.ArgumentParser:
     prompts = sub.add_parser(
         "prompts",
         help="print chronological verbatim prompts",
-        description="Print chronological verbatim prompts across the selected teams.",
+        description=(
+            "Print chronological verbatim prompts across the selected teams. "
+            "Human-authored prompts are the default."
+        ),
         epilog=(
             "examples:\n"
             "  ./timeline prompts\n"
             "  ./timeline prompts --range 200-300\n"
+            "  ./timeline prompts --which all --format jsonl\n"
             "  ./timeline prompts --team orc-coord-014 --format jsonl"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1334,6 +1848,12 @@ def _standalone_parser() -> argparse.ArgumentParser:
         metavar="N[-M]",
         help="one prompt ordinal or an inclusive range, for example 200-300",
     )
+    prompts.add_argument(
+        "--which",
+        choices=PROMPT_SELECTIONS,
+        default="human",
+        help="select human, bot, or all prompt authorship (default: %(default)s)",
+    )
     _standalone_add_transcript_filters(prompts)
     _standalone_add_common_options(prompts, "text")
 
@@ -1342,7 +1862,7 @@ def _standalone_parser() -> argparse.ArgumentParser:
         help="print prompts and their mechanically linked responses",
         description=(
             "Print chronological prompts plus coordinator responses mechanically "
-            "associated with the selected prompts."
+            "associated with the selected prompts. Human-authored prompts are the default."
         ),
     )
     messages.add_argument(
@@ -1351,8 +1871,42 @@ def _standalone_parser() -> argparse.ArgumentParser:
         metavar="N[-M]",
         help="one prompt ordinal or an inclusive range, for example 200-300",
     )
+    messages.add_argument(
+        "--which",
+        choices=PROMPT_SELECTIONS,
+        default="human",
+        help="select human, bot, or all prompt authorship (default: %(default)s)",
+    )
     _standalone_add_transcript_filters(messages)
     _standalone_add_common_options(messages, "text")
+
+    stats = sub.add_parser(
+        "stats",
+        help="count prompt, response, and generated-summary text",
+        description=(
+            "Count records, whitespace-delimited words, and UTF-8 text bytes for "
+            "owner prompts, responses, and generated summaries. This is a read-only, "
+            "zero-model operation."
+        ),
+        epilog=(
+            "examples:\n"
+            "  ./timeline stats\n"
+            "  ./timeline stats --team codex-coord-030\n"
+            "  ./timeline stats --start-time 2026-08-11T00:00:00-04:00 "
+            "--end-time 2026-08-12T00:00:00-04:00\n"
+            "  ./timeline stats --format json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    _standalone_add_transcript_filters(stats)
+    stats.add_argument(
+        "--kind",
+        action="append",
+        choices=("hourly", "daily", "weekly", "monthly", "quarterly"),
+        default=[],
+        help="count one rollup kind; repeat to include several",
+    )
+    _standalone_add_common_options(stats, "text")
 
     listing = sub.add_parser(
         "list",
@@ -1502,13 +2056,20 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
             command = action
             items = (
                 query_transcripts.list_prompts(
-                    _standalone_filters(ns), ordinal_range
+                    _standalone_filters(ns), ordinal_range, str(ns.which)
                 )
                 if action == "prompts"
                 else query_transcripts.list_messages(
-                    _standalone_filters(ns), ordinal_range
+                    _standalone_filters(ns), ordinal_range, str(ns.which)
                 )
             )
+        elif action == "stats":
+            stats_result = archive_stats(output, _standalone_filters(ns))
+            print(
+                format_stats(stats_result, _standalone_output_format(ns)),
+                end="",
+            )
+            return 0
         else:
             raise ValueError(f"unsupported query action {action!r}")
         print(format_query(command, items, _standalone_output_format(ns)), end="")
@@ -1519,12 +2080,15 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
 
 
 __all__ = [
+    "ArchiveStats",
     "OrdinalRange",
     "QueryFilters",
     "TimelineQuery",
     "TranscriptQuery",
+    "archive_stats",
     "agent_ref",
     "format_query",
+    "format_stats",
     "phase_ref",
     "parse_ordinal_range",
     "query_envelope",

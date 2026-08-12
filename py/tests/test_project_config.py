@@ -25,6 +25,7 @@ from agent_team_timeline.project_config import (
     load_project_ingest_config,
 )
 from agent_team_timeline.transcript_export import TranscriptExportReport
+from agent_team_timeline.transcript_export import PromptAuthorshipRule
 from agent_team_timeline.window import DateWindow
 
 
@@ -65,6 +66,15 @@ def _manifest(output: str = "../summary/hermit") -> dict[str, object]:
                 "provider": "orc",
                 "projects": [],
                 "window": {},
+                "prompt_authorship_rules": [
+                    {
+                        "id": "legacy-owner-web",
+                        "ingress_kind": "submitted_web",
+                        "author_kind": "owner_human",
+                        "reason": "This audited legacy interval was owner-only.",
+                        "end_time": "2026-08-10T00:00:00Z",
+                    }
+                ],
                 "source": {
                     "source_root": "../raw/devbig014",
                     "root_session": "orc-root",
@@ -131,6 +141,8 @@ def test_load_project_config_resolves_paths_and_provider_schema(tmp_path: Path) 
     assert isinstance(orc.source, OrcProjectSource)
     assert orc.date_window is None
     assert orc.identity_overrides.projects == ()
+    assert orc.prompt_authorship_rules[0].rule_id == "legacy-owner-web"
+    assert orc.prompt_authorship_rules[0].end_ms == 1786320000000
 
 
 @pytest.mark.parametrize(
@@ -224,9 +236,18 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
         return cast(TeamData, object()), _report(team_slug)
 
     def fake_extract(
-        archive: Path, team_slugs: Sequence[str] = ()
+        archive: Path,
+        team_slugs: Sequence[str] = (),
+        authorship_rules: Sequence[PromptAuthorshipRule] | None = None,
     ) -> TranscriptExportReport:
-        calls.append(("extract", str(archive), *team_slugs))
+        calls.append(
+            (
+                "extract",
+                str(archive),
+                *(rule.rule_id for rule in authorship_rules or ()),
+                *team_slugs,
+            )
+        )
         return TranscriptExportReport(3, 20, 30, 4, 0, 2)
 
     monkeypatch.setattr(project_config_module, "ingest_codex", fake_codex)
@@ -242,7 +263,7 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
         "orc-team",
     )
     assert [call[0] for call in calls] == ["codex", "claude", "orc", "extract"]
-    assert calls[-1] == ("extract", str(config.output))
+    assert calls[-1] == ("extract", str(config.output), "legacy-owner-web")
     assert result.to_json_obj()["model_calls"] == 0
     assert result.to_json_obj()["website_build_performed"] is False
 

@@ -161,6 +161,15 @@ continuations, timezone, and site identity:
       "slug": "orc-example-014",
       "provider": "orc",
       "source_hosts": ["build014.example.com"],
+      "prompt_authorship_rules": [
+        {
+          "id": "owner-web-bootstrap",
+          "ingress_kind": "submitted_web",
+          "author_kind": "owner_human",
+          "reason": "The audited Web channel was owner-only before relay automation.",
+          "end_time": "2026-08-10T02:57:56.854Z"
+        }
+      ],
       "source": {
         "source_root": "../devbig014",
         "root_session": "ORC_SESSION_UUID"
@@ -191,6 +200,16 @@ continuations, absolute output paths, invalid identity, and invalid time bounds.
 objects are exact: Codex accepts `sessions_root`, `root_session`, and optional ordered
 `continuation_sessions`; Claude accepts only `session_file`; Orc accepts `source_root` and
 `root_session`.
+
+Some Web or terminal transports store no sender identity. A team may add
+`prompt_authorship_rules` to refine only those unresolved records. Each rule requires a unique
+`id`, exact `ingress_kind`, target `author_kind` (`owner_human`, `other_human`, `agent`, or
+`system`), and an audit `reason`; optional `start_time`/`end_time` bounds are half-open RFC3339
+instants, and optional `source_native_ids` restrict the rule to exact messages. Rules never inspect
+message prose, cannot override provider-attributed records, and may not overlap. Extraction writes
+the normalized active set to `extracted/transcripts/authorship-rules.json` and records the rule ID
+and original source classification on every corrected prompt. A config-driven ingest replaces the
+complete active rule set; a later direct `extract-transcripts` reuses it.
 
 This command is entirely mechanical. It snapshots and normalizes the selected registered teams,
 then refreshes `extracted/transcripts/` over **every** normalized team already in the archive so the
@@ -796,15 +815,31 @@ cd ./timelines/example-team
 ./timeline show 'phase:example-team::phase-0123456789abcdef' --transcript
 ./timeline search 'reproducible build' --scope all --team example-team --limit 20
 ./timeline prompts --range 200-300
+./timeline prompts --which all --format jsonl > all-prompts.jsonl
 ./timeline prompts --format jsonl > prompts.jsonl
 ./timeline messages --range 200-300 --format jsonl
+./timeline stats
+./timeline stats --team example-team --format json
 ```
 
 `prompts` is ordered globally by timestamp and accepts one 1-based inclusive ordinal or `N-M` via
-`--range`; `messages` returns the same prompt selection plus responses linked to those prompts. Both
-also accept repeatable `--team` and half-open RFC3339 time bounds. They read the digest-validated
+`--range`. It defaults to `--which human`: durable `owner_human` and `other_human` labels are human,
+while `--which bot` selects `agent` and `system`, and `--which all` also includes unknown or
+externally unattributed records. The query never infers authorship from prose. `messages` returns the
+same selected prompts plus responses mechanically linked to them. Both also accept repeatable
+`--team` and half-open RFC3339 time bounds. They read the digest-validated
 `extracted/transcripts/` projection and therefore work even before a website has been built.
 `./timeline prompts --help` documents the range, team, time, and output controls.
+
+`stats` performs no write and no model call. It reports record, whitespace-delimited word, and
+UTF-8 text-byte totals for mechanically identified human, bot/agent, and unattributed
+prompts, mechanically linked and total responses, and generated summaries, followed by
+available/unavailable summary coverage for each summary surface. Authorship counts use only the
+durable `author_kind` label; ambiguous provider inputs are reported as unattributed rather than
+guessed from prose. It accepts the same repeatable team and half-open RFC3339 time filters; `--kind`
+can restrict rollup accounting. Time-sliced statistics omit project overviews because an overview
+describes the whole project and has no honest time interval. Summary bytes count the user-visible
+projection text (including referenced rollup Markdown verbatim), not CLI or JSON serialization.
 
 The `teams`, `agents`, `phases`, and `rollups` commands return records carrying canonical
 references that `show` accepts directly:

@@ -136,7 +136,10 @@ from agent_team_timeline.terminology import (
 from agent_team_timeline.window import DateWindow, apply_date_window
 
 if TYPE_CHECKING:
-    from agent_team_timeline.transcript_export import TranscriptExportReport
+    from agent_team_timeline.transcript_export import (
+        PromptAuthorshipRule,
+        TranscriptExportReport,
+    )
 
 
 _TEAM_SLUG = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
@@ -1149,7 +1152,9 @@ def load_archived_team(archive: Path, team_slug: str) -> TeamData:
 
 
 def extract_transcripts_archive(
-    archive: Path, team_slugs: Sequence[str] = ()
+    archive: Path,
+    team_slugs: Sequence[str] = (),
+    authorship_rules: Sequence[PromptAuthorshipRule] | None = None,
 ) -> TranscriptExportReport:
     """Mechanically export coordinator prompts/responses for selected ingested teams.
 
@@ -1178,7 +1183,7 @@ def extract_transcripts_archive(
         if len(set(selected)) != len(selected):
             raise ValueError("transcript extraction team selection contains duplicates")
         teams = tuple(load_archived_team(archive, team_slug) for team_slug in selected)
-        return export_transcripts(archive, teams)
+        return export_transcripts(archive, teams, authorship_rules)
 
 
 def load_artifact_catalog(

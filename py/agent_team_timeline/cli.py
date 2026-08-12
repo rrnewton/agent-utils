@@ -41,7 +41,9 @@ from agent_team_timeline.query import (
     QueryFilters,
     TimelineQuery,
     TranscriptQuery,
+    archive_stats,
     format_query,
+    format_stats,
     parse_ordinal_range,
 )
 from agent_team_timeline.server import serve
@@ -526,7 +528,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_query_filters(query_search)
     query_search.set_defaults(handler="query_search")
     for action, help_text in (
-        ("prompts", "list verbatim authored prompts in global timestamp order"),
+        ("prompts", "list verbatim human-authored prompts in global timestamp order"),
         ("messages", "list prompts and their mechanically associated responses"),
     ):
         query_transcript = query_sub.add_parser(action, help=help_text, description=help_text)
@@ -536,11 +538,39 @@ def _parser() -> argparse.ArgumentParser:
             help="one prompt ordinal or inclusive range, for example 200-300",
         )
         query_transcript.add_argument(
+            "--which",
+            choices=("human", "bot", "all"),
+            default="human",
+            help="select human, bot, or all prompt authorship (default: %(default)s)",
+        )
+        query_transcript.add_argument(
             "--team", action="append", default=[], help="team slug; repeat as needed"
         )
         query_transcript.add_argument("--start-time", help="inclusive RFC3339 instant")
         query_transcript.add_argument("--end-time", help="exclusive RFC3339 instant")
         query_transcript.set_defaults(handler=f"query_{action}")
+    query_stats = query_sub.add_parser(
+        "stats",
+        help="count prompt, response, and generated-summary text",
+        description=(
+            "count records, whitespace-delimited words, and UTF-8 text bytes for "
+            "attributed and unattributed prompts, responses, and generated summaries; "
+            "read-only and zero-model"
+        ),
+    )
+    query_stats.add_argument(
+        "--team", action="append", default=[], help="team slug; repeat as needed"
+    )
+    query_stats.add_argument("--start-time", help="inclusive RFC3339 instant")
+    query_stats.add_argument("--end-time", help="exclusive RFC3339 instant")
+    query_stats.add_argument(
+        "--kind",
+        action="append",
+        choices=("hourly", "daily", "weekly", "monthly", "quarterly"),
+        default=[],
+        help="rollup kind to count; repeat as needed",
+    )
+    query_stats.set_defaults(handler="query_stats")
     return parser
 
 
@@ -867,10 +897,20 @@ def _run_query(ns: argparse.Namespace, handler: str) -> int:
         )
         command = "prompts" if handler == "query_prompts" else "messages"
         items = (
-            transcript_query.list_prompts(_query_filters(ns), ordinal_range)
+            transcript_query.list_prompts(
+                _query_filters(ns), ordinal_range, str(ns.which)
+            )
             if handler == "query_prompts"
-            else transcript_query.list_messages(_query_filters(ns), ordinal_range)
+            else transcript_query.list_messages(
+                _query_filters(ns), ordinal_range, str(ns.which)
+            )
         )
+    elif handler == "query_stats":
+        print(
+            format_stats(archive_stats(output, _query_filters(ns)), str(ns.format)),
+            end="",
+        )
+        return 0
     else:
         raise ValueError(f"unsupported query handler {handler!r}")
     print(format_query(command, items, str(ns.format)), end="")
@@ -990,6 +1030,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "query_search",
         "query_prompts",
         "query_messages",
+        "query_stats",
     }:
         try:
             return _run_query(ns, str(handler))
