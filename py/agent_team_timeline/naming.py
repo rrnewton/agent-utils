@@ -32,6 +32,10 @@ from agent_team_timeline.codex_workspace import (
     codex_failure_detail,
     initialize_codex_workspace,
 )
+from agent_team_timeline.claude_backend import (
+    ClaudeBackendError,
+    run_claude_json,
+)
 from agent_team_timeline.summarize import SummaryRunStats, clean_summary_prose
 from agent_team_timeline.summary_artifacts import (
     ARTIFACT_ENVELOPE_FORMAT,
@@ -75,6 +79,14 @@ class _CodexNameBatchError(AgentNameError):
         self.usage = usage
 
 
+class _ClaudeNameBatchError(AgentNameError):
+    """A failed Claude naming invocation with any exact usage retained."""
+
+    def __init__(self, message: str, usage: TokenUsage | None) -> None:
+        super().__init__(message)
+        self.usage = usage
+
+
 @dataclass(frozen=True)
 class AgentNameJob:
     """One agent's provenance, ancestor context, and hindsight work summary."""
@@ -108,6 +120,7 @@ class AgentNameResult:
     input_hash: str
     generated_at: str
     artifact_provenance: SummaryArtifactProvenance | None = None
+    summary_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -221,6 +234,37 @@ def _input_hash(
         payload["reasoning_effort"] = reasoning_effort
     if service_tier not in (None, DEFAULT_SERVICE_TIER):
         payload["service_tier"] = service_tier
+    return content_hash(canonical_json(payload))
+
+
+def input_hash_for_provenance(
+    job: AgentNameJob, provenance: SummaryArtifactProvenance
+) -> str:
+    """Recompute *job*'s cache identity under an existing artifact contract."""
+
+    if provenance.summarizer_id != AGENT_LIFETIME_SUMMARIZER.summarizer_id:
+        raise ValueError(
+            f"agent-name job {job.key!r} does not use summarizer "
+            f"{provenance.summarizer_id!r}"
+        )
+    payload: dict[str, JsonValue] = {
+        "backend": provenance.backend,
+        "model": provenance.model,
+        "prompt_version": provenance.prompt_version,
+        "job": _job_json(job),
+    }
+    if not provenance.legacy_storage:
+        payload.update(
+            {
+                "summarizer_id": provenance.summarizer_id,
+                "summarizer_version": provenance.summarizer_version,
+                "output_schema_version": provenance.output_schema_version,
+            }
+        )
+    if provenance.reasoning_effort is not None:
+        payload["reasoning_effort"] = provenance.reasoning_effort
+    if provenance.service_tier not in (None, DEFAULT_SERVICE_TIER):
+        payload["service_tier"] = provenance.service_tier
     return content_hash(canonical_json(payload))
 
 
@@ -731,7 +775,9 @@ def _codex_batch(
 ) -> tuple[dict[str, AgentNameResult], TokenUsage | None]:
     if not codex_command:
         raise AgentNameError("codex command must not be empty")
-    with tempfile.TemporaryDirectory(prefix="agent-team-timeline-name-") as raw_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="agent-team-timeline-name-", ignore_cleanup_errors=True
+    ) as raw_dir:
         work_dir = Path(raw_dir)
         try:
             initialize_codex_workspace(work_dir)
@@ -800,6 +846,35 @@ def _codex_batch(
         return results, usage
 
 
+def _claude_batch(
+    pending: Sequence[_PendingName],
+    model: str,
+    reasoning_effort: str | None,
+    claude_command: Sequence[str],
+) -> tuple[dict[str, AgentNameResult], TokenUsage]:
+    with tempfile.TemporaryDirectory(
+        prefix="agent-team-timeline-name-", ignore_cleanup_errors=True
+    ) as raw_dir:
+        try:
+            result = run_claude_json(
+                claude_command,
+                prompt=build_agent_name_prompt([item.job for item in pending]),
+                schema=_output_schema(),
+                model=model,
+                reasoning_effort=reasoning_effort,
+                cwd=Path(raw_dir),
+            )
+        except ClaudeBackendError as error:
+            raise _ClaudeNameBatchError(str(error), error.usage) from error
+        try:
+            results = _parse_backend_output(
+                result.output, pending, model, _utc_now()
+            )
+        except AgentNameError as error:
+            raise _ClaudeNameBatchError(str(error), result.usage) from error
+        return results, result.usage
+
+
 def _chunks(
     values: Sequence[_PendingName], size: int
 ) -> list[tuple[_PendingName, ...]]:
@@ -819,6 +894,7 @@ def _run_backend_batch(
     reasoning_effort: str | None,
     service_tier: str | None,
     codex_command: Sequence[str],
+    claude_command: Sequence[str],
 ) -> _GeneratedNameBatch:
     started_at = _utc_now()
     input_hashes = tuple(item.input_hash for item in batch)
@@ -826,12 +902,21 @@ def _run_backend_batch(
         if backend == "heuristic":
             results = _heuristic_batch(batch, model)
             usage: TokenUsage | None = TokenUsage()
-        else:
+        elif backend == "codex":
             results, usage = _codex_batch(
                 batch, model, reasoning_effort, service_tier, codex_command
             )
+        else:
+            results, usage = _claude_batch(
+                batch, model, reasoning_effort, claude_command
+            )
     except AgentNameError as error:
-        usage = error.usage if isinstance(error, _CodexNameBatchError) else None
+        backend_error = (
+            error
+            if isinstance(error, (_CodexNameBatchError, _ClaudeNameBatchError))
+            else None
+        )
+        usage = backend_error.usage if backend_error is not None else None
         receipt = BatchUsageReceipt.create(
             backend=backend,
             model=model,
@@ -874,12 +959,13 @@ def name_agents(
     codex_command: Sequence[str] = ("codex",),
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
+    claude_command: Sequence[str] = ("claude",),
 ) -> tuple[dict[str, AgentNameResult], SummaryRunStats]:
     """Name agents after their summary pass, reusing immutable validated cache entries."""
 
     run_started_at = _utc_now()
 
-    if backend not in {"codex", "heuristic"}:
+    if backend not in {"claude", "codex", "heuristic"}:
         raise AgentNameError(f"unsupported agent naming backend {backend!r}")
     if not model.strip():
         raise AgentNameError("agent naming model must not be empty")
@@ -992,10 +1078,12 @@ def name_agents(
                 reasoning_effort=reasoning_effort,
                 service_tier=effective_service_tier,
                 codex_command=codex_command,
+                claude_command=claude_command,
             )
             generated.update(publish_batch(batch, batch_result))
     elif batches:
-        command = tuple(codex_command)
+        codex = tuple(codex_command)
+        claude = tuple(claude_command)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -1006,7 +1094,8 @@ def name_agents(
                     model=model,
                     reasoning_effort=reasoning_effort,
                     service_tier=effective_service_tier,
-                    codex_command=command,
+                    codex_command=codex,
+                    claude_command=claude,
                 ): batch
                 for batch in batches
             }

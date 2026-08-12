@@ -9,6 +9,10 @@
   var COMPACT_PHASE_TOP = 16;
   var COMPACT_PHASE_HEIGHT = 31;
   var COMPACT_LABEL_WIDTH = 72;
+  var AGGREGATE_LABEL_WIDTH = 128;
+  var AGGREGATE_TEAM_HEIGHT = 78;
+  var AGGREGATE_WORKER_SCALE = 15;
+  var AGGREGATE_WORKER_MAX_HEIGHT = 48;
   var STATE_HEIGHT = 6;
   var MIN_VIEW_MS = 1000;
   var PHASE_COLORS = [
@@ -106,6 +110,7 @@
     artifactsById: new Map(),
     artifactCatalogState: "legacy",
     artifactCatalogError: "",
+    artifactCatalogPromise: null,
     axisTicks: [],
     selectedTeam: "",
     query: "",
@@ -116,6 +121,8 @@
     drag: null,
     suppressClickUntil: 0,
     renderQueued: false,
+    renderLod: "detail",
+    renderRevision: 0,
     detailRequest: 0,
     modalRestoreFocus: null,
     laneMenuAnchor: null,
@@ -152,6 +159,46 @@
 
   function text(value, fallback) {
     return typeof value === "string" ? value : (fallback || "");
+  }
+
+  function hasField(record, field) {
+    return Boolean(record) && typeof record === "object" &&
+      Object.prototype.hasOwnProperty.call(record, field);
+  }
+
+  function summaryFlagAvailable(record, field) {
+    return !hasField(record, field) || record[field] !== false;
+  }
+
+  function agentSummaryAvailable(agent) {
+    return summaryFlagAvailable(agent, "summary_available");
+  }
+
+  function phaseSummaryAvailable(phase) {
+    return summaryFlagAvailable(phase, "summary_available");
+  }
+
+  function phaseDetailSummaryAvailable(detail, phase) {
+    if (hasField(detail, "summary_available")) {
+      return detail.summary_available !== false;
+    }
+    return phaseSummaryAvailable(phase);
+  }
+
+  function rollupSummaryAvailable(rollup) {
+    if (hasField(rollup, "summary_available")) {
+      return rollup.summary_available !== false;
+    }
+    if (hasField(rollup, "technical_summary_available") ||
+        hasField(rollup, "plain_language_summary_available")) {
+      return rollup.technical_summary_available !== false ||
+        rollup.plain_language_summary_available !== false;
+    }
+    return true;
+  }
+
+  function rollupAudienceAvailable(rollup, field) {
+    return rollupSummaryAvailable(rollup) && summaryFlagAvailable(rollup, field);
   }
 
   function htmlElement(tag, className, content) {
@@ -500,6 +547,7 @@
       teams: array(raw.teams),
       agents: array(raw.agents),
       phases: array(raw.phases),
+      activity_bins: array(raw.activity_bins),
       edges: array(raw.edges),
       events: array(raw.events),
       rollups: array(raw.rollups),
@@ -542,39 +590,60 @@
     return normalized;
   }
 
-  async function loadArtifactCatalog(data) {
+  function prepareArtifactCatalog(data) {
     app.artifactsById.clear();
     app.artifactCatalogError = "";
+    app.artifactCatalogPromise = null;
+    var path = text(data && data.artifact_catalog_path);
+    if (!path) {
+      app.artifactCatalogState = "legacy";
+    } else {
+      app.artifactCatalogState = "unloaded";
+    }
+  }
+
+  async function ensureArtifactCatalog(data) {
+    if (app.artifactCatalogState === "legacy" ||
+        app.artifactCatalogState === "ready" ||
+        app.artifactCatalogState === "error") {
+      return;
+    }
+    if (app.artifactCatalogPromise) {
+      return app.artifactCatalogPromise;
+    }
     var path = text(data && data.artifact_catalog_path);
     if (!path) {
       app.artifactCatalogState = "legacy";
       return;
     }
     app.artifactCatalogState = "loading";
-    try {
-      var loaded = await fetchPath(path, "json");
-      var catalog = loaded.content;
-      if (!catalog || typeof catalog !== "object" ||
-          number(catalog.schema_version, NaN) !== 1 ||
-          !Array.isArray(catalog.artifacts)) {
-        throw new Error("Artifact catalog is not a supported schema-1 catalog.");
+    app.artifactCatalogPromise = (async function () {
+      try {
+        var loaded = await fetchPath(path, "json");
+        var catalog = loaded.content;
+        if (!catalog || typeof catalog !== "object" ||
+            number(catalog.schema_version, NaN) !== 1 ||
+            !Array.isArray(catalog.artifacts)) {
+          throw new Error("Artifact catalog is not a supported schema-1 catalog.");
+        }
+        catalog.artifacts.forEach(function (artifact) {
+          if (!artifact || typeof artifact !== "object") {
+            throw new Error("Artifact catalog entries must be objects.");
+          }
+          var id = text(artifact.artifact_id);
+          if (!/^artifact-[a-z0-9-]+$/.test(id) || app.artifactsById.has(id)) {
+            throw new Error("Artifact catalog contains an invalid or duplicate ID.");
+          }
+          app.artifactsById.set(id, artifact);
+        });
+        app.artifactCatalogState = "ready";
+      } catch (error) {
+        app.artifactsById.clear();
+        app.artifactCatalogState = "error";
+        app.artifactCatalogError = error instanceof Error ? error.message : String(error);
       }
-      catalog.artifacts.forEach(function (artifact) {
-        if (!artifact || typeof artifact !== "object") {
-          throw new Error("Artifact catalog entries must be objects.");
-        }
-        var id = text(artifact.artifact_id);
-        if (!/^artifact-[a-z0-9-]+$/.test(id) || app.artifactsById.has(id)) {
-          throw new Error("Artifact catalog contains an invalid or duplicate ID.");
-        }
-        app.artifactsById.set(id, artifact);
-      });
-      app.artifactCatalogState = "ready";
-    } catch (error) {
-      app.artifactsById.clear();
-      app.artifactCatalogState = "error";
-      app.artifactCatalogError = error instanceof Error ? error.message : String(error);
-    }
+    }());
+    return app.artifactCatalogPromise;
   }
 
   function dataVersionLabel(value) {
@@ -763,6 +832,7 @@
   function initializeData(raw) {
     var data = normalizeData(raw);
     app.data = data;
+    prepareArtifactCatalog(data);
     installTimezone(data.display_timezone);
     app.navigationRange = timelineCore
       ? timelineCore.navigableRange(data.range, data.rollups)
@@ -892,6 +962,7 @@
   function lowerSearchText(values) {
     return values
       .map(function (value) { return text(value); })
+      .filter(function (value) { return value.length > 0; })
       .join(" ")
       .toLocaleLowerCase();
   }
@@ -964,13 +1035,18 @@
     if (nickname) {
       parts.push("Coordinator nickname: " + nickname);
     }
-    if (text(agent.lifetime_summary)) {
+    if (!agentSummaryAvailable(agent)) {
+      parts.push("Lifetime summary: Summary not generated");
+    } else if (text(agent.lifetime_summary)) {
       parts.push("Lifetime summary: " + text(agent.lifetime_summary));
     }
     return parts.join(". ");
   }
 
   function agentLifetimeSummary(agent) {
+    if (!agentSummaryAvailable(agent)) {
+      return "Summary not generated for this agent lifetime.";
+    }
     return text(
       agent.lifetime_summary,
       "No lifetime summary is available; regenerate this archive's summaries."
@@ -1040,13 +1116,29 @@
       agent.official_leaf,
       agent.label,
       agent.nickname,
-      agent.lifetime_summary,
+      agentSummaryAvailable(agent) ? agent.lifetime_summary : "",
       agent.status
     ]);
   }
 
   function phaseSearchText(phase) {
-    return lowerSearchText([phase.id, phase.phrase, phase.paragraph]);
+    return lowerSearchText([
+      phase.id,
+      phaseSummaryAvailable(phase) ? phase.phrase : "",
+      phaseSummaryAvailable(phase) ? phase.paragraph : ""
+    ]);
+  }
+
+  function phaseDisplayPhrase(phase) {
+    return phaseSummaryAvailable(phase)
+      ? text(phase.phrase, "Agent phase")
+      : "Activity window";
+  }
+
+  function phaseDisplayParagraph(phase) {
+    return phaseSummaryAvailable(phase)
+      ? text(phase.paragraph, "No paragraph summary available.")
+      : "Summary not generated for this activity window. Raw transcript and statistics remain available where recorded.";
   }
 
   function edgeSearchText(edge) {
@@ -1283,7 +1375,9 @@
     }));
     children.push(svgElement("text", {
       x: 14, y: 21, class: "axis-title"
-    }, app.perAgentTracks ? "AGENT TRACKS" : "PACKED LANES"));
+    }, app.renderLod === "aggregate"
+      ? "TEAM ACTIVITY"
+      : (app.perAgentTracks ? "AGENT TRACKS" : "PACKED LANES")));
     var span = app.viewEnd - app.viewStart;
     app.axisTicks.forEach(function (tick) {
       var x = timeToX(tick);
@@ -1678,6 +1772,12 @@
   }
 
   function renderEdge(edge, layer, bounds, bufferStart, bufferEnd) {
+    var kind = edgeKind(edge.kind);
+    if (app.renderLod === "aggregate" ||
+        (app.renderLod === "lifetime" && kind !== "spawn" &&
+         kind !== "continuation" && kind !== "result")) {
+      return;
+    }
     var sourceRow = app.rowByAgent.get(text(edge.source_id));
     var targetRow = app.rowByAgent.get(text(edge.target_id));
     if (!sourceRow || !targetRow) {
@@ -1703,7 +1803,6 @@
     }
     var x1 = timeToX(sourceTime);
     var x2 = timeToX(targetTime);
-    var kind = edgeKind(edge.kind);
     var displayState = timelineCore
       ? timelineCore.edgeDisplayState(
           edge,
@@ -1814,8 +1913,11 @@
     var y = row.index * ROW_HEIGHT + phaseTop();
     var agentId = text(phase.agent_id);
     var agent = row.agent;
+    var summaryAvailable = phaseSummaryAvailable(phase);
+    var displayPhrase = phaseDisplayPhrase(phase);
     var group = svgElement("g", {
-      class: "phase-group" + selectionClass(agentId, phase),
+      class: "phase-group" + (summaryAvailable ? "" : " summary-not-generated") +
+        selectionClass(agentId, phase),
       tabindex: "0",
       role: "button",
       "data-phase-id": text(phase.id),
@@ -1824,7 +1926,9 @@
       "data-end-ms": String(end),
       "aria-pressed": app.selection && app.selection.kind === "phase" &&
         text(app.selection.phase_id) === text(phase.id) ? "true" : "false",
-      "aria-label": text(phase.phrase, "Agent phase") + ". " + agentAccessibleName(agent)
+      "aria-label": displayPhrase +
+        (summaryAvailable ? "" : ". Summary not generated") +
+        ". " + agentAccessibleName(agent)
     });
     group.appendChild(svgElement("rect", {
       x: x,
@@ -1857,7 +1961,7 @@
       }));
     });
 
-    var phrase = truncatePhrase(text(phase.phrase, "Unlabelled phase"), width);
+    var phrase = truncatePhrase(displayPhrase, width);
     if (phrase) {
       group.appendChild(svgElement("text", {
         x: x + 7,
@@ -1868,8 +1972,8 @@
     group.addEventListener("pointerenter", function (event) {
       showTooltip(
         event,
-        text(phase.phrase, "Agent phase") + " · " + agentShortName(agent),
-        text(phase.paragraph, "No paragraph summary available.") +
+        displayPhrase + " · " + agentShortName(agent),
+        phaseDisplayParagraph(phase) +
           "\n\n" + agentTooltipIdentity(agent, false),
         formatStatsInline(phase.stats)
       );
@@ -1915,7 +2019,9 @@
     var textWidth = Math.max(0, app.labelWidth - textX - 8);
     var secondaryName = fitAgentSecondaryName(agent, textWidth);
     var labelGroup = svgElement("g", {
-      class: "agent-label-group" + selectionClass(text(agent.id), null),
+      class: "agent-label-group" +
+        (agentSummaryAvailable(agent) ? "" : " summary-not-generated") +
+        selectionClass(text(agent.id), null),
       role: "button",
       tabindex: "0",
       "data-agent-id": text(agent.id),
@@ -2058,14 +2164,18 @@
     var x = timeToX(clippedStart);
     var width = Math.max(2, timeToX(clippedEnd) - x);
     var y = row.index * ROW_HEIGHT;
+    var summaryAvailable = agentSummaryAvailable(agent);
     var group = svgElement("g", {
-      class: "agent-lifetime-group" + selectionClass(text(agent.id), null),
+      class: "agent-lifetime-group" +
+        (summaryAvailable ? "" : " summary-not-generated") +
+        selectionClass(text(agent.id), null),
       role: "button",
       tabindex: "0",
       "data-agent-id": text(agent.id),
       "data-start-ms": String(start),
       "data-end-ms": String(end),
-      "aria-label": "Agent lifetime: " + agentAccessibleName(agent)
+      "aria-label": "Agent lifetime: " + agentAccessibleName(agent) +
+        (summaryAvailable ? "" : ". Summary not generated")
     });
     group.appendChild(svgElement("rect", {
       x: x,
@@ -2127,12 +2237,253 @@
     layer.appendChild(group);
   }
 
+  function aggregateTeams() {
+    var matchedTeamIds = new Set(app.rows.map(function (row) {
+      return text(row.agent.team);
+    }));
+    var teams = app.data.teams.filter(function (team) {
+      var slug = text(team.slug);
+      return (!app.selectedTeam || slug === app.selectedTeam) &&
+        (!app.query || matchedTeamIds.has(slug));
+    });
+    if (teams.length) {
+      return teams;
+    }
+    if (app.query) {
+      return [];
+    }
+    var seen = new Set();
+    return app.data.activity_bins.reduce(function (result, bin) {
+      var slug = text(bin.team);
+      if (slug && !seen.has(slug) && (!app.selectedTeam || slug === app.selectedTeam)) {
+        seen.add(slug);
+        result.push({ slug: slug, label: slug });
+      }
+      return result;
+    }, []);
+  }
+
+  function aggregateSelectionKey(bin) {
+    return [
+      "activity",
+      text(bin.team),
+      text(bin.role),
+      text(bin.resolution),
+      String(number(bin.start_ms, 0))
+    ].join(":");
+  }
+
+  function renderActivityBin(bin, team, rowIndex, layer) {
+    var start = number(bin.start_ms, NaN);
+    var end = number(bin.end_ms, NaN);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= app.viewStart ||
+        start >= app.viewEnd || end <= start) {
+      return;
+    }
+    var clippedStart = Math.max(start, app.viewStart);
+    var clippedEnd = Math.min(end, app.viewEnd);
+    var x = timeToX(clippedStart);
+    var width = Math.max(1, timeToX(clippedEnd) - x);
+    var role = text(bin.role) === "coordinator" ? "coordinator" : "workers";
+    var coverage = clamp(number(bin.activity_coverage_fraction, 0), 0, 1);
+    var average = Math.max(0, number(bin.avg_active_concurrency, 0));
+    var rowTop = rowIndex * AGGREGATE_TEAM_HEIGHT;
+    var height = role === "coordinator"
+      ? 10
+      : clamp(
+          average * AGGREGATE_WORKER_SCALE,
+          2,
+          AGGREGATE_WORKER_MAX_HEIGHT
+        );
+    var y = role === "coordinator"
+      ? rowTop + 8
+      : rowTop + AGGREGATE_TEAM_HEIGHT - 8 - height;
+    var key = aggregateSelectionKey(bin);
+    var selected = app.selection && app.selection.kind === "rollup" &&
+      text(app.selection.path) === key;
+    var group = svgElement("g", {
+      class: "activity-bin-group" + (selected ? " is-selected" : ""),
+      role: "button",
+      tabindex: "0",
+      "data-team": text(bin.team),
+      "data-activity-role": role,
+      "data-activity-resolution": text(bin.resolution),
+      "data-start-ms": String(start),
+      "data-end-ms": String(end),
+      "aria-pressed": selected ? "true" : "false",
+      "aria-label": text(team.label, text(team.slug)) + " " + role +
+        " activity. " + formatRange(start, end)
+    });
+    group.appendChild(svgElement("rect", {
+      x: x,
+      y: y,
+      width: width,
+      height: height,
+      rx: role === "coordinator" ? 2 : 3,
+      class: "activity-bin-block activity-bin-" + role,
+      "fill-opacity": (0.16 + coverage * 0.84).toFixed(3)
+    }));
+    group.addEventListener("pointerenter", function (event) {
+      showTooltip(
+        event,
+        text(team.label, text(team.slug)) + " · " +
+          (role === "coordinator" ? "Coordinator" : "Workers"),
+        formatRange(start, end) +
+          "\nAverage active concurrency: " + average.toFixed(2) +
+          "\nPeak concurrency: " + formatCount(bin.peak_concurrency) +
+          "\nActivity coverage: " + Math.round(coverage * 100) + "%" +
+          "\nDistinct active agents: " + formatCount(bin.distinct_active_agents),
+        text(bin.resolution, "aggregate") + " mechanical activity bin"
+      );
+    });
+    group.addEventListener("pointermove", positionTooltip);
+    group.addEventListener("pointerleave", hideTooltip);
+    group.addEventListener("click", function (event) {
+      if (event.detail !== 1 || Date.now() < app.suppressClickUntil) {
+        return;
+      }
+      event.stopPropagation();
+      setSelection({
+        kind: "rollup",
+        path: key,
+        start_ms: start,
+        end_ms: end
+      });
+    });
+    group.addEventListener("dblclick", function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      zoomToRange(start, end);
+    });
+    group.addEventListener("contextmenu", function (event) {
+      showContextMenu(event, "Mechanical activity bin", [{
+        label: "Zoom to activity bin",
+        run: function () { zoomToRange(start, end); }
+      }]);
+    });
+    group.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        zoomToRange(start, end);
+      } else if (event.key === " ") {
+        event.preventDefault();
+        setSelection({
+          kind: "rollup",
+          path: key,
+          start_ms: start,
+          end_ms: end
+        });
+      }
+    });
+    layer.appendChild(group);
+  }
+
+  function renderAggregateTracks() {
+    var teams = aggregateTeams();
+    var totalHeight = Math.max(
+      dom.scroll.clientHeight,
+      teams.length * AGGREGATE_TEAM_HEIGHT,
+      1
+    );
+    var resolution = timelineCore && typeof timelineCore.aggregateResolution === "function"
+      ? timelineCore.aggregateResolution(app.viewStart, app.viewEnd, app.chartWidth)
+      : "daily";
+    dom.svg.setAttribute("viewBox", "0 0 " + app.width + " " + totalHeight);
+    dom.svg.setAttribute("width", String(app.width));
+    dom.svg.setAttribute("height", String(totalHeight));
+    dom.svg.setAttribute("data-lane-count", String(teams.length));
+    dom.svg.setAttribute("data-track-mode", "aggregate");
+    dom.svg.setAttribute("data-render-lod", "aggregate");
+    dom.svg.setAttribute("data-aggregate-resolution", resolution);
+    dom.svg.setAttribute("data-activity-bin-count", "0");
+    dom.svg.replaceChildren();
+    dom.empty.hidden = teams.length > 0;
+    if (!teams.length) {
+      return;
+    }
+
+    var backgroundLayer = svgElement("g");
+    var gridLayer = svgElement("g");
+    var contentLayer = svgElement("g");
+    var labelLayer = svgElement("g");
+    teams.forEach(function (team, index) {
+      var y = index * AGGREGATE_TEAM_HEIGHT;
+      backgroundLayer.appendChild(svgElement("rect", {
+        x: 0,
+        y: y,
+        width: app.width,
+        height: AGGREGATE_TEAM_HEIGHT,
+        class: "aggregate-team-row " +
+          (index % 2 ? "track-row-odd" : "track-row-even")
+      }));
+      backgroundLayer.appendChild(svgElement("line", {
+        x1: 0,
+        y1: y + AGGREGATE_TEAM_HEIGHT,
+        x2: app.width,
+        y2: y + AGGREGATE_TEAM_HEIGHT,
+        class: "track-divider"
+      }));
+      labelLayer.appendChild(svgElement("text", {
+        x: 12,
+        y: y + 29,
+        class: "aggregate-team-label"
+      }, truncateLabel(text(team.label, text(team.slug, "Team")), app.labelWidth - 20, false)));
+      labelLayer.appendChild(svgElement("text", {
+        x: 12,
+        y: y + 45,
+        class: "aggregate-team-resolution"
+      }, resolution + " activity"));
+    });
+    app.axisTicks.forEach(function (tick) {
+      var x = timeToX(tick);
+      gridLayer.appendChild(svgElement("line", {
+        x1: x,
+        y1: 0,
+        x2: x,
+        y2: totalHeight,
+        class: "grid-line"
+      }));
+    });
+    var teamIndex = new Map();
+    teams.forEach(function (team, index) {
+      teamIndex.set(text(team.slug), index);
+    });
+    var renderedBins = 0;
+    app.data.activity_bins.forEach(function (bin) {
+      var index = teamIndex.get(text(bin.team));
+      if (index === undefined || text(bin.resolution) !== resolution) {
+        return;
+      }
+      var before = contentLayer.childElementCount;
+      renderActivityBin(bin, teams[index], index, contentLayer);
+      if (contentLayer.childElementCount > before) {
+        renderedBins += 1;
+      }
+    });
+    dom.svg.setAttribute("data-activity-bin-count", String(renderedBins));
+    labelLayer.appendChild(svgElement("rect", {
+      x: app.labelWidth - 1,
+      y: 0,
+      width: 1,
+      height: totalHeight,
+      fill: "#344057"
+    }));
+    dom.svg.append(backgroundLayer, gridLayer, contentLayer, labelLayer);
+  }
+
   function renderTracks() {
+    if (app.renderLod === "aggregate") {
+      renderAggregateTracks();
+      return;
+    }
+    dom.svg.removeAttribute("data-aggregate-resolution");
+    dom.svg.removeAttribute("data-activity-bin-count");
     var totalHeight = Math.max(dom.scroll.clientHeight, app.laneCount * ROW_HEIGHT, 1);
     dom.svg.setAttribute("viewBox", "0 0 " + app.width + " " + totalHeight);
     dom.svg.setAttribute("width", String(app.width));
     dom.svg.setAttribute("height", String(totalHeight));
     dom.svg.setAttribute("data-lane-count", String(app.laneCount));
+    dom.svg.setAttribute("data-render-lod", app.renderLod);
     dom.svg.replaceChildren();
     addDefs(dom.svg);
     dom.empty.hidden = app.rows.length > 0;
@@ -2182,12 +2533,14 @@
     var span = app.viewEnd - app.viewStart;
     var bufferStart = app.viewStart - span * 0.08;
     var bufferEnd = app.viewEnd + span * 0.08;
-    app.data.edges.forEach(function (edge) {
-      if (!app.query || edgeSearchText(edge).indexOf(app.query.toLocaleLowerCase()) >= 0 ||
-          app.rowByAgent.has(text(edge.source_id)) || app.rowByAgent.has(text(edge.target_id))) {
-        renderEdge(edge, edgeLayer, bounds, bufferStart, bufferEnd);
-      }
-    });
+    if (app.renderLod !== "aggregate") {
+      app.data.edges.forEach(function (edge) {
+        if (!app.query || edgeSearchText(edge).indexOf(app.query.toLocaleLowerCase()) >= 0 ||
+            app.rowByAgent.has(text(edge.source_id)) || app.rowByAgent.has(text(edge.target_id))) {
+          renderEdge(edge, edgeLayer, bounds, bufferStart, bufferEnd);
+        }
+      });
+    }
 
     var visibleRows = app.rows.filter(function (row) {
       return row.index >= bounds.first && row.index <= bounds.last;
@@ -2195,9 +2548,11 @@
     visibleRows.forEach(function (row) {
       var agent = row.agent;
       renderAgentLifetime(row, lifetimeLayer);
-      (app.phasesByAgent.get(text(agent.id)) || []).forEach(function (phase) {
-        renderPhase(phase, row, phaseLayer, bufferStart, bufferEnd);
-      });
+      if (app.renderLod === "detail") {
+        (app.phasesByAgent.get(text(agent.id)) || []).forEach(function (phase) {
+          renderPhase(phase, row, phaseLayer, bufferStart, bufferEnd);
+        });
+      }
       if (app.perAgentTracks) {
         renderTrackLabel(row, labelLayer);
       }
@@ -2253,9 +2608,12 @@
       );
       var selected = app.selection && app.selection.kind === "rollup" &&
         text(app.selection.path) === text(rollup.path);
+      var summaryAvailable = rollupSummaryAvailable(rollup);
       var button = htmlElement(
         "button",
-        "rollup-marker rollup-" + kind + (selected ? " is-selected" : "")
+        "rollup-marker rollup-" + kind +
+          (summaryAvailable ? "" : " summary-not-generated") +
+          (selected ? " is-selected" : "")
       );
       button.type = "button";
       button.style.left = left.toFixed(2) + "px";
@@ -2285,9 +2643,11 @@
       button.setAttribute(
         "aria-label",
         (teamLabel ? teamLabel + " " : "") + kind + " summary: " +
-          text(rollup.label, formatRange(start, end))
+          text(rollup.label, formatRange(start, end)) +
+          (summaryAvailable ? "" : ". Summary not generated")
       );
-      button.title = (teamLabel ? teamLabel + " · " : "") + markerLabel;
+      button.title = (teamLabel ? teamLabel + " · " : "") + markerLabel +
+        (summaryAvailable ? "" : " · Summary not generated");
       button.dataset.startMs = String(start);
       button.dataset.endMs = String(end);
       button.dataset.rollupKind = kind;
@@ -2431,12 +2791,28 @@
     if (!app.data) {
       return;
     }
+    var renderStarted = window.performance && typeof window.performance.now === "function"
+      ? window.performance.now()
+      : Date.now();
     configureTrackMode();
     measure();
+    app.renderLod = timelineCore && typeof timelineCore.semanticZoomLevel === "function"
+      ? timelineCore.semanticZoomLevel(app.viewStart, app.viewEnd, app.chartWidth)
+      : "detail";
+    if (app.renderLod === "aggregate") {
+      dom.card.style.setProperty("--label-width", AGGREGATE_LABEL_WIDTH + "px");
+      measure();
+      app.renderLod = timelineCore && typeof timelineCore.semanticZoomLevel === "function"
+        ? timelineCore.semanticZoomLevel(app.viewStart, app.viewEnd, app.chartWidth)
+        : "aggregate";
+    }
+    dom.card.classList.toggle("aggregate-mode", app.renderLod === "aggregate");
     buildRows();
     dom.card.dataset.viewStartMs = String(app.viewStart);
     dom.card.dataset.viewEndMs = String(app.viewEnd);
-    dom.card.dataset.trackMode = app.perAgentTracks ? "per-agent" : "packed";
+    dom.card.dataset.trackMode = app.renderLod === "aggregate"
+      ? "aggregate"
+      : (app.perAgentTracks ? "per-agent" : "packed");
     if (app.selection) {
       dom.card.dataset.selectionScope = text(app.selection.kind);
     } else {
@@ -2456,6 +2832,13 @@
     renderRollups();
     renderTracks();
     renderStats();
+    var renderFinished = window.performance && typeof window.performance.now === "function"
+      ? window.performance.now()
+      : Date.now();
+    app.renderRevision += 1;
+    dom.card.dataset.renderLod = app.renderLod;
+    dom.card.dataset.renderRevision = String(app.renderRevision);
+    dom.card.dataset.renderDurationMs = Math.max(0, renderFinished - renderStarted).toFixed(2);
   }
 
   function scheduleRender() {
@@ -3214,9 +3597,19 @@
     return section;
   }
 
-  function renderArtifacts(container, owner, fallback, context) {
+  async function renderArtifacts(container, owner, fallback, context) {
     var association = artifactAssociation(owner, fallback);
     container.dataset.artifactCount = String(association.all.length);
+    if (association.all.length &&
+        (app.artifactCatalogState === "unloaded" ||
+         app.artifactCatalogState === "loading")) {
+      showLoading(container, "Loading artifact links…");
+      await ensureArtifactCatalog(app.data);
+      if (!container.isConnected) {
+        return;
+      }
+      container.replaceChildren();
+    }
     if (app.artifactCatalogState === "error") {
       container.appendChild(htmlElement(
         "div",
@@ -3263,7 +3656,7 @@
     return {
       label: "Artifacts (" + formatCount(count) + ")",
       render: function (container) {
-        renderArtifacts(container, owner, fallback, context);
+        return renderArtifacts(container, owner, fallback, context);
       }
     };
   }
@@ -3440,14 +3833,24 @@
     );
   }
 
+  function renderSummaryNotGenerated(container, scope) {
+    var suffix = scope ? " for this " + scope : "";
+    container.appendChild(htmlElement(
+      "div",
+      "summary-not-generated-notice",
+      "Summary not generated" + suffix + ". Raw transcript, statistics, and artifacts remain available where recorded."
+    ));
+  }
+
   function phaseFallbackDetail(phase) {
     return {
-      phrase: text(phase.phrase, "Agent phase"),
-      paragraph: text(phase.paragraph),
+      phrase: phaseDisplayPhrase(phase),
+      paragraph: phaseSummaryAvailable(phase) ? text(phase.paragraph) : "",
       stats: phase.stats || {},
       work_summary: [],
       transcript: [],
-      raw_summary_path: ""
+      raw_summary_path: "",
+      summary_available: phaseSummaryAvailable(phase)
     };
   }
 
@@ -3467,7 +3870,11 @@
     }
     var list = htmlElement("div", "agent-lifetime-phase-list");
     phases.forEach(function (phase) {
-      var button = htmlElement("button", "agent-lifetime-phase");
+      var summaryAvailable = phaseSummaryAvailable(phase);
+      var button = htmlElement(
+        "button",
+        "agent-lifetime-phase" + (summaryAvailable ? "" : " summary-not-generated")
+      );
       button.type = "button";
       button.dataset.phaseId = text(phase.id);
       button.append(
@@ -3476,8 +3883,8 @@
           "agent-lifetime-phase-time",
           formatRange(number(phase.start_ms, 0), number(phase.end_ms, 0))
         ),
-        htmlElement("strong", "agent-lifetime-phase-title", text(phase.phrase, "Work phase")),
-        htmlElement("span", "agent-lifetime-phase-summary", text(phase.paragraph))
+        htmlElement("strong", "agent-lifetime-phase-title", phaseDisplayPhrase(phase)),
+        htmlElement("span", "agent-lifetime-phase-summary", phaseDisplayParagraph(phase))
       );
       button.addEventListener("click", function () {
         openPhaseModal(phase, agent);
@@ -3519,8 +3926,13 @@
   }
 
   function showPhaseDetail(detail, phase, agent, detailUrl) {
-    var phrase = text(detail.phrase, text(phase.phrase, "Agent phase"));
-    var paragraph = text(detail.paragraph, text(phase.paragraph));
+    var summaryAvailable = phaseDetailSummaryAvailable(detail, phase);
+    var phrase = summaryAvailable
+      ? text(detail.phrase, text(phase.phrase, "Agent phase"))
+      : "Activity window";
+    var paragraph = summaryAvailable
+      ? text(detail.paragraph, text(phase.paragraph))
+      : "Summary not generated for this activity window.";
     var stats = detail.stats && typeof detail.stats === "object"
       ? detail.stats
       : (phase.stats || {});
@@ -3534,20 +3946,26 @@
     var transcriptRoles = new Set(array(detail.transcript).map(function (entry) {
       return transcriptRole(entry.role);
     }));
-    var tabs = [
-      {
+    var tabs = [];
+    if (summaryAvailable) {
+      tabs.push({
         label: "Agent Work Summary",
         render: function (container) {
           renderWorkSummary(container, detail.work_summary);
         }
-      },
-      {
-        label: "Full Transcript",
-        render: function (container) {
-          renderTranscript(container, detail.transcript, transcriptRoles);
+      });
+    }
+    tabs.push({
+      label: "Full Transcript",
+      render: function (container) {
+        if (!summaryAvailable) {
+          renderSummaryNotGenerated(container, "activity window");
         }
-      },
-      {
+        renderTranscript(container, detail.transcript, transcriptRoles);
+      }
+    });
+    if (summaryAvailable) {
+      tabs.push({
         label: "Markdown Summary",
         render: function (container) {
           var path = text(detail.raw_summary_path);
@@ -3559,15 +3977,15 @@
           }
           return renderRawSummary(container, path, detailUrl);
         }
-      }
-    ];
+      });
+    }
     var artifacts = artifactTab(detail, phase, {
       start_ms: phase.start_ms,
       end_ms: phase.end_ms,
       agent_id: phase.agent_id
     });
     if (artifacts) {
-      tabs.splice(tabs.length - 1, 0, artifacts);
+      tabs.splice(summaryAvailable ? tabs.length - 1 : tabs.length, 0, artifacts);
     }
     activateTabs(tabs, 0);
   }
@@ -3576,13 +3994,13 @@
     var request = ++app.detailRequest;
     openModalBase(
       agentShortName(agent) + " · phase",
-      text(phase.phrase, "Agent phase"),
-      text(phase.paragraph),
+      phaseDisplayPhrase(phase),
+      phaseDisplayParagraph(phase),
       phase.stats || {}
     );
     dom.modalEyebrow.title = agentAccessibleName(agent);
     showModalAgentIdentity(agent);
-    showLoading(dom.modalContent, "Loading phase transcript and summaries…");
+    showLoading(dom.modalContent, "Loading phase details…");
     var path = text(phase.detail_path);
     if (!path) {
       showPhaseDetail(phaseFallbackDetail(phase), phase, agent);
@@ -3770,24 +4188,43 @@
       (text(rollup.team) ? text(rollup.team) + " · " : "") +
         kind + " rollup · " + formatRange(start, end),
       text(rollup.label, kind + " summary"),
-      "",
-      null
+      rollupSummaryAvailable(rollup) ? "" : "Summary not generated for this time range.",
+      rollup.stats || {}
     );
-    var technicalPath = text(rollup.technical_path, text(rollup.path));
-    var plainPath = text(rollup.plain_language_path);
-    var tabs = [
-      {
+    var technicalAvailable = rollupAudienceAvailable(
+      rollup,
+      "technical_summary_available"
+    );
+    var plainAvailable = rollupAudienceAvailable(
+      rollup,
+      "plain_language_summary_available"
+    );
+    var technicalPath = technicalAvailable
+      ? text(rollup.technical_path, text(rollup.path))
+      : "";
+    var plainPath = plainAvailable ? text(rollup.plain_language_path) : "";
+    var tabs = [];
+    if (technicalPath) {
+      tabs.push({
         label: "Technical",
         render: function (container) {
           return renderRawSummary(container, technicalPath, "");
         }
-      }
-    ];
+      });
+    }
     if (plainPath) {
       tabs.push({
         label: "Plain Language",
         render: function (container) {
           return renderRawSummary(container, plainPath, "");
+        }
+      });
+    }
+    if (!tabs.length) {
+      tabs.push({
+        label: "Summary",
+        render: function (container) {
+          renderSummaryNotGenerated(container, kind + " time range");
         }
       });
     }
@@ -3821,7 +4258,6 @@
       }
       var raw = await response.json();
       var data = normalizeData(raw);
-      await loadArtifactCatalog(data);
       initializeData(data);
     } catch (error) {
       showLoadError(error);

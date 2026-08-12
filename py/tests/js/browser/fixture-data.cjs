@@ -221,6 +221,59 @@ const phases = [
   }
 ];
 
+const AGGREGATE_HOUR_START_MS = Date.UTC(2026, 2, 9, 3);
+const AGGREGATE_GAP_START_MS = AGGREGATE_HOUR_START_MS + 2 * 60 * minute;
+const AGGREGATE_LATER_START_MS = AGGREGATE_HOUR_START_MS + 3 * 60 * minute;
+
+function activityBin(role, resolution, startMs, endMs, average, peak, coverage, agents) {
+  return {
+    team: "codex-hermit",
+    role: role,
+    resolution: resolution,
+    start_ms: startMs,
+    end_ms: endMs,
+    avg_active_concurrency: average,
+    peak_concurrency: peak,
+    activity_coverage_fraction: coverage,
+    distinct_active_agents: agents
+  };
+}
+
+const activityBins = [
+  activityBin(
+    "coordinator", "hourly", AGGREGATE_HOUR_START_MS,
+    AGGREGATE_HOUR_START_MS + 60 * minute, 0.75, 1, 0.75, 1
+  ),
+  activityBin(
+    "workers", "hourly", AGGREGATE_HOUR_START_MS,
+    AGGREGATE_HOUR_START_MS + 60 * minute, 1.4, 3, 0.9, 3
+  ),
+  activityBin(
+    "workers", "hourly", AGGREGATE_HOUR_START_MS + 60 * minute,
+    AGGREGATE_GAP_START_MS, 0.5, 1, 0.5, 1
+  ),
+  activityBin(
+    "workers", "hourly", AGGREGATE_LATER_START_MS,
+    AGGREGATE_LATER_START_MS + 60 * minute, 0.25, 1, 0.25, 1
+  ),
+  activityBin(
+    "coordinator", "daily", Date.UTC(2026, 2, 9), Date.UTC(2026, 2, 10),
+    0.2, 1, 0.2, 1
+  ),
+  activityBin(
+    "workers", "daily", Date.UTC(2026, 2, 9), Date.UTC(2026, 2, 10),
+    0.6, 3, 0.35, 3
+  ),
+  activityBin(
+    "coordinator", "weekly", Date.UTC(2026, 2, 9), Date.UTC(2026, 2, 16),
+    0.03, 1, 0.03, 1
+  ),
+  activityBin(
+    "workers", "weekly", Date.UTC(2026, 2, 9), Date.UTC(2026, 2, 16),
+    0.09, 3, 0.05, 3
+  )
+];
+
 const timeline = {
   schema_version: 1,
   generated_at: "2026-03-09T17:40:00Z",
@@ -258,6 +311,7 @@ const timeline = {
   }],
   agents: agents,
   phases: phases,
+  activity_bins: activityBins,
   edges: [
     {
       id: "spawn-a",
@@ -581,6 +635,8 @@ module.exports = {
   DATA_END_MS: DATA_END_MS,
   AGENT_A_ACTIVITY_START_MS: AGENT_A_ACTIVITY_START_MS,
   AGENT_A_ACTIVITY_END_MS: AGENT_A_ACTIVITY_END_MS,
+  AGGREGATE_GAP_START_MS: AGGREGATE_GAP_START_MS,
+  AGGREGATE_LATER_START_MS: AGGREGATE_LATER_START_MS,
   FIRST_DAY_ACTIVITY_START_MS: FIRST_DAY_ACTIVITY_START_MS,
   PHASE_A_START_MS: BASE_MS + 10 * minute,
   PHASE_A_END_MS: BASE_MS + 25 * minute,

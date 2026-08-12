@@ -52,6 +52,7 @@ from agent_team_timeline.model_io import team_from_json_obj
 from agent_team_timeline.naming import (
     AgentNameJob,
     AgentNameResult,
+    input_hash_for_provenance as agent_name_input_hash_for_provenance,
     name_agents,
 )
 from agent_team_timeline.github_metadata import load_pull_request_metadata_cache
@@ -98,6 +99,7 @@ from agent_team_timeline.summarize import (
     WorkBullet,
     clean_summary_prose,
     clean_summary_result,
+    input_hash_for_provenance as summary_input_hash_for_provenance,
     knowledge_text_has_link,
     summarize_jobs,
 )
@@ -1692,6 +1694,34 @@ def _select_catalog_summary_for_range(
     return _summary_from_catalog_reference(summary_root, reference)
 
 
+def _select_catalog_summary_for_job(
+    summary_root: Path,
+    catalog: SummaryArtifactCatalog,
+    job: SummaryJob,
+    summarizer_id: str,
+    fallback: SummaryResult,
+) -> SummaryResult:
+    """Select the strongest catalog artifact whose full source identity is current."""
+
+    compatible = SummaryArtifactCatalog(
+        team_slug=catalog.team_slug,
+        records=tuple(
+            reference
+            for reference in catalog.records
+            if reference.provenance.summarizer_id == summarizer_id
+            and _summary_provenance_matches_job(reference.provenance, job)
+        ),
+    )
+    reference = select_summary_artifact(
+        compatible,
+        job.key,
+        summarizer_id,
+    )
+    if reference is None:
+        return fallback
+    return _summary_from_catalog_reference(summary_root, reference)
+
+
 def _prior_catalog_rollups(
     summary_root: Path,
     catalog: SummaryArtifactCatalog,
@@ -2062,6 +2092,58 @@ def _result_artifact_key(result: SummaryResult) -> str:
     return provenance.artifact_id if provenance is not None else result.input_hash
 
 
+def _summary_provenance_matches_job(
+    provenance: SummaryArtifactProvenance, job: SummaryJob
+) -> bool:
+    if (
+        provenance.logical_key != job.key
+        or provenance.team_slug != job.team_slug
+        or provenance.start_ms != job.start_ms
+        or provenance.end_ms != job.end_ms
+        or provenance.dependency_keys != job.dependency_keys
+        or provenance.context_coverage != job.context_coverage
+    ):
+        return False
+    return summary_input_hash_for_provenance(job, provenance) == provenance.input_hash
+
+
+def _summary_matches_job(result: SummaryResult, job: SummaryJob) -> bool:
+    """Return whether a cached result was derived from the current mechanical input."""
+
+    provenance = result.artifact_provenance
+    return (
+        provenance is not None
+        and provenance.input_hash == result.input_hash
+        and _summary_provenance_matches_job(provenance, job)
+    )
+
+
+def _agent_name_provenance_matches_job(
+    provenance: SummaryArtifactProvenance, job: AgentNameJob
+) -> bool:
+    if (
+        provenance.logical_key != job.key
+        or provenance.team_slug != job.team_slug
+        or provenance.start_ms != job.start_ms
+        or provenance.end_ms != job.end_ms
+        or provenance.dependency_keys != job.dependency_keys
+        or provenance.context_coverage != job.context_coverage
+    ):
+        return False
+    return agent_name_input_hash_for_provenance(job, provenance) == provenance.input_hash
+
+
+def _agent_name_matches_job(result: AgentNameResult, job: AgentNameJob) -> bool:
+    """Return whether a cached lifetime summary covers the current agent input."""
+
+    provenance = result.artifact_provenance
+    return (
+        provenance is not None
+        and provenance.input_hash == result.input_hash
+        and _agent_name_provenance_matches_job(provenance, job)
+    )
+
+
 def _summary_catalog_reference(
     result: SummaryResult | AgentNameResult, cache_directory: str
 ) -> SummaryArtifactReference:
@@ -2223,45 +2305,67 @@ def _nonempty_string(value: JsonValue, where: str) -> str:
     return result
 
 
+def _select_catalog_agent_name_for_job(
+    summary_root: Path,
+    catalog: SummaryArtifactCatalog,
+    agent: Agent,
+    job: AgentNameJob,
+) -> AgentNameResult:
+    compatible = SummaryArtifactCatalog(
+        team_slug=catalog.team_slug,
+        records=tuple(
+            reference
+            for reference in catalog.records
+            if reference.provenance.summarizer_id
+            == AGENT_LIFETIME_SUMMARIZER.summarizer_id
+            and _agent_name_provenance_matches_job(reference.provenance, job)
+        ),
+    )
+    reference = select_summary_artifact(
+        compatible,
+        job.key,
+        AGENT_LIFETIME_SUMMARIZER.summarizer_id,
+        minimum_output_schema=2,
+    )
+    if reference is None:
+        return _fallback_agent_name(agent)
+    return _agent_name_from_catalog_reference(summary_root, reference, agent)
+
+
 def _load_agent_names(
     archive: Path,
     team: TeamData,
     selected_ids: frozenset[str],
+    jobs: Sequence[AgentNameJob],
     catalog: SummaryArtifactCatalog | None = None,
 ) -> dict[str, AgentNameResult]:
     selected_catalog = catalog or load_summary_catalog(
         _summary_root(archive, team.team_slug) / "artifacts.json",
         team.team_slug,
     )
+    jobs_by_thread = {job.thread_id: job for job in jobs}
+    if len(jobs_by_thread) != len(jobs):
+        raise ValueError("duplicate agent-name job thread")
     results: dict[str, AgentNameResult] = {}
     for agent in team.agents:
         if agent.thread_id not in selected_ids:
             continue
+        job = jobs_by_thread.get(agent.thread_id)
+        if job is None:
+            raise ValueError(f"missing agent-name job for {agent.thread_id!r}")
         path = (
             _summary_root(archive, team.team_slug)
             / "agents"
             / f"{agent.thread_id}.json"
         )
         if _summary_projection_missing(path):
-            reference = select_summary_artifact(
+            candidate = _select_catalog_agent_name_for_job(
+                _summary_root(archive, team.team_slug),
                 selected_catalog,
-                f"agent-name:{agent.thread_id}",
-                AGENT_LIFETIME_SUMMARIZER.summarizer_id,
-                minimum_output_schema=2,
+                agent,
+                job,
             )
-            if (
-                reference is not None
-                and team.window_end_ms is not None
-                and reference.provenance.end_ms > team.window_end_ms
-            ):
-                reference = None
-            results[agent.thread_id] = (
-                _agent_name_from_catalog_reference(
-                    _summary_root(archive, team.team_slug), reference, agent
-                )
-                if reference is not None
-                else _fallback_agent_name(agent)
-            )
+            results[agent.thread_id] = candidate
             continue
         root = as_object(read_json(path), str(path))
         schema_version = as_int(
@@ -2355,10 +2459,15 @@ def _load_agent_names(
             or provenance.prompt_version != result.prompt_version
         ):
             raise ValueError(f"{path}: agent-name provenance differs from result")
-        if team.window_end_ms is not None and (
-            provenance is None or provenance.end_ms > team.window_end_ms
-        ):
-            results[agent.thread_id] = _fallback_agent_name(agent)
+        if result.lifetime_summary is None:
+            results[agent.thread_id] = result
+        elif not _agent_name_matches_job(result, job):
+            results[agent.thread_id] = _select_catalog_agent_name_for_job(
+                _summary_root(archive, team.team_slug),
+                selected_catalog,
+                agent,
+                job,
+            )
         else:
             results[agent.thread_id] = result
     return results
@@ -2568,6 +2677,7 @@ def _summarize_archive_locked(
     context_chars: int = 16_000,
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
+    claude_command: Sequence[str] = ("claude",),
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
     summary_window: DateWindow | None = None,
@@ -2611,6 +2721,7 @@ def _summarize_archive_locked(
         max_workers=max_workers,
         batch_size=batch_size,
         codex_command=codex_command,
+        claude_command=claude_command,
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
     )
@@ -2624,6 +2735,7 @@ def _summarize_archive_locked(
         max_workers=max_workers,
         batch_size=name_batch_size,
         codex_command=codex_command,
+        claude_command=claude_command,
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
     )
@@ -2639,6 +2751,7 @@ def _summarize_archive_locked(
         max_workers=max_workers,
         batch_size=batch_size,
         codex_command=codex_command,
+        claude_command=claude_command,
         reasoning_effort=reasoning_effort,
         service_tier=service_tier,
     )
@@ -2715,6 +2828,7 @@ def _summarize_archive_locked(
                 max_workers=max_workers,
                 batch_size=batch_size,
                 codex_command=codex_command,
+                claude_command=claude_command,
                 reasoning_effort=reasoning_effort,
                 service_tier=service_tier,
             )
@@ -2742,6 +2856,7 @@ def _summarize_archive_locked(
                 max_workers=max_workers,
                 batch_size=batch_size,
                 codex_command=codex_command,
+                claude_command=claude_command,
                 reasoning_effort=reasoning_effort,
                 service_tier=service_tier,
             )
@@ -2852,6 +2967,7 @@ def summarize_archive(
     context_chars: int = 16_000,
     transcript_chars: int = 30_000,
     codex_command: Sequence[str] = ("codex",),
+    claude_command: Sequence[str] = ("claude",),
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
     summary_window: DateWindow | None = None,
@@ -2872,6 +2988,7 @@ def summarize_archive(
             context_chars=context_chars,
             transcript_chars=transcript_chars,
             codex_command=codex_command,
+            claude_command=claude_command,
             reasoning_effort=reasoning_effort,
             service_tier=service_tier,
             summary_window=summary_window,
@@ -2883,57 +3000,65 @@ def _load_phase_summaries(
     archive: Path,
     team_slug: str,
     phases: Sequence[PhaseWindow],
+    jobs: Sequence[SummaryJob],
     catalog: SummaryArtifactCatalog,
 ) -> dict[str, SummaryResult]:
     result: dict[str, SummaryResult] = {}
     summary_root = _summary_root(archive, team_slug)
+    jobs_by_key = {job.key: job for job in jobs}
+    if len(jobs_by_key) != len(jobs):
+        raise ValueError("duplicate phase summary job key")
     for phase in phases:
         path = _summary_root(archive, team_slug) / "phases" / f"{phase.phase_id}.json"
+        job = jobs_by_key.get(phase.summary_key)
+        if job is None:
+            raise ValueError(f"missing phase summary job {phase.summary_key!r}")
+        fallback = _unavailable_summary(
+            phase.summary_key,
+            phase.end_ms,
+            "work phase",
+        )
         if _summary_projection_missing(path):
-            result[phase.summary_key] = _select_catalog_summary_for_range(
+            candidate = _select_catalog_summary_for_job(
                 summary_root,
                 catalog,
-                phase.summary_key,
+                job,
                 "phase-work-summary",
-                phase.start_ms,
-                phase.end_ms,
-                _unavailable_summary(
-                    phase.summary_key,
-                    phase.end_ms,
-                    "work phase",
-                ),
-            )
-            continue
-        obj = as_object(read_json(path), str(path))
-        _require_exact_keys(
-            obj,
-            {"phase_id", "agent_id", "start_ms", "end_ms", "summary"},
-            str(path),
-        )
-        recorded_phase_id = as_string(obj.get("phase_id"), f"{path}.phase_id")
-        recorded_agent_id = as_string(obj.get("agent_id"), f"{path}.agent_id")
-        recorded_start_ms = as_int(obj.get("start_ms"), f"{path}.start_ms")
-        recorded_end_ms = as_int(obj.get("end_ms"), f"{path}.end_ms")
-        if recorded_phase_id != phase.phase_id or recorded_agent_id != phase.agent_id:
-            raise ValueError(f"{path}: phase projection identity mismatch")
-        projected = _summary_from_json(obj.get("summary"), str(path))
-        if (
-            recorded_start_ms != phase.start_ms
-            or recorded_end_ms != phase.end_ms
-        ):
-            result[phase.summary_key] = _unavailable_summary(
-                phase.summary_key, phase.end_ms, "clipped work phase"
+                fallback,
             )
         else:
-            result[phase.summary_key] = _select_catalog_summary_for_range(
+            obj = as_object(read_json(path), str(path))
+            _require_exact_keys(
+                obj,
+                {"phase_id", "agent_id", "start_ms", "end_ms", "summary"},
+                str(path),
+            )
+            recorded_phase_id = as_string(obj.get("phase_id"), f"{path}.phase_id")
+            recorded_agent_id = as_string(obj.get("agent_id"), f"{path}.agent_id")
+            recorded_start_ms = as_int(obj.get("start_ms"), f"{path}.start_ms")
+            recorded_end_ms = as_int(obj.get("end_ms"), f"{path}.end_ms")
+            if (
+                recorded_phase_id != phase.phase_id
+                or recorded_agent_id != phase.agent_id
+            ):
+                raise ValueError(f"{path}: phase projection identity mismatch")
+            projected = _summary_from_json(obj.get("summary"), str(path))
+            if (
+                recorded_start_ms != phase.start_ms
+                or recorded_end_ms != phase.end_ms
+            ):
+                candidate = fallback
+            else:
+                candidate = projected
+        if not _summary_matches_job(candidate, job):
+            candidate = _select_catalog_summary_for_job(
                 summary_root,
                 catalog,
-                phase.summary_key,
+                job,
                 "phase-work-summary",
-                phase.start_ms,
-                phase.end_ms,
-                projected,
+                fallback,
             )
+        result[phase.summary_key] = candidate
     return result
 
 
@@ -2964,6 +3089,7 @@ def _unavailable_summary(key: str, at_ms: int, subject: str) -> SummaryResult:
         prompt_version=_PRESENTATION_FALLBACK_VERSION,
         input_hash=identity,
         generated_at=_fallback_generated_at(at_ms),
+        summary_available=False,
     )
 
 
@@ -2995,6 +3121,7 @@ def _fallback_agent_name(agent: Agent) -> AgentNameResult:
         prompt_version=_PRESENTATION_FALLBACK_VERSION,
         input_hash=identity,
         generated_at=_fallback_generated_at(agent.ended_at_ms or agent.started_at_ms),
+        summary_available=False,
     )
 
 
@@ -3379,6 +3506,127 @@ def _load_rollup_projection(
     )
 
 
+def _validate_rollup_inputs(
+    team: TeamData,
+    periods: Sequence[Period],
+    phases: Sequence[PhaseWindow],
+    phase_results: Mapping[str, SummaryResult],
+    project_overview: SummaryResult,
+    terms: Sequence[GlossaryTerm],
+    technical_candidates: Mapping[str, SummaryResult],
+    plain_candidates: Mapping[str, SummaryResult],
+    suppressed_keys: frozenset[str],
+    summary_root: Path,
+    catalog: SummaryArtifactCatalog,
+) -> tuple[dict[str, SummaryResult], dict[str, SummaryResult]]:
+    """Fail closed when current rollup inputs differ from cached model inputs."""
+
+    selected_kinds = tuple(
+        kind for kind in ROLLUP_KINDS if any(period.kind == kind for period in periods)
+    )
+    by_kind = {
+        kind: [period for period in periods if period.kind == kind]
+        for kind in selected_kinds
+    }
+    validated: dict[str, SummaryResult] = {}
+    validated_plain: dict[str, SummaryResult] = {}
+    previous_periods: list[Period] = []
+    previous_results: dict[str, SummaryResult] = {}
+    previous_plain_results: dict[str, SummaryResult] = {}
+    for kind in selected_kinds:
+        current = by_kind[kind]
+        first_start_ms = current[0].start_ms
+        completed = _prior_catalog_rollups(
+            summary_root,
+            catalog,
+            kind,
+            TECHNICAL_ROLLUP_STYLE,
+            first_start_ms,
+        )
+        completed_plain = _prior_catalog_rollups(
+            summary_root,
+            catalog,
+            kind,
+            PLAIN_LANGUAGE_ROLLUP_STYLE,
+            first_start_ms,
+        )
+        for period in current:
+            key = _period_key(period)
+            technical_job = _rollup_jobs_for_level(
+                team,
+                (period,),
+                phases,
+                phase_results,
+                previous_periods,
+                previous_results,
+                completed,
+                terms,
+                TECHNICAL_ROLLUP_STYLE,
+            )[0]
+            technical = technical_candidates[key]
+            if not _summary_matches_job(technical, technical_job):
+                technical_fallback = _unavailable_summary(
+                    technical_job.key,
+                    period.end_ms,
+                    f"stale {period.kind} rollup",
+                )
+                technical = (
+                    technical_fallback
+                    if key in suppressed_keys
+                    else _select_catalog_summary_for_job(
+                        summary_root,
+                        catalog,
+                        technical_job,
+                        "technical-rollup",
+                        technical_fallback,
+                    )
+                )
+            validated[key] = technical
+            completed.append((period, technical))
+
+            plain_job = _rollup_jobs_for_level(
+                team,
+                (period,),
+                phases,
+                phase_results,
+                previous_periods,
+                previous_plain_results,
+                completed_plain,
+                terms,
+                PLAIN_LANGUAGE_ROLLUP_STYLE,
+                project_overview,
+            )[0]
+            plain = plain_candidates[key]
+            if not _summary_matches_job(plain, plain_job):
+                plain_fallback = _unavailable_summary(
+                    plain_job.key,
+                    period.end_ms,
+                    f"stale plain-language {period.kind} rollup",
+                )
+                plain = (
+                    plain_fallback
+                    if key in suppressed_keys
+                    else _select_catalog_summary_for_job(
+                        summary_root,
+                        catalog,
+                        plain_job,
+                        "plain-language-rollup",
+                        plain_fallback,
+                    )
+                )
+            validated_plain[key] = plain
+            completed_plain.append((period, plain))
+        previous_periods = current
+        previous_results = {
+            _period_key(period): validated[_period_key(period)] for period in current
+        }
+        previous_plain_results = {
+            _period_key(period): validated_plain[_period_key(period)]
+            for period in current
+        }
+    return validated, validated_plain
+
+
 def build_archive(
     archive: Path,
     team_slug: str,
@@ -3400,11 +3648,17 @@ def build_archive(
         summary_root / "artifacts.json", team_slug
     )
     phases = build_phases(team, phase_minutes=phase_minutes)
+    phase_jobs = _phase_jobs(team, phases, (), 16_000)
     phase_results = _load_phase_summaries(
-        archive, team_slug, phases, summary_catalog
+        archive, team_slug, phases, phase_jobs, summary_catalog
     )
+    agent_name_jobs = _agent_name_jobs(team, phases, phase_results)
     agent_names = _load_agent_names(
-        archive, team, phase_agent_ids(team, phases), summary_catalog
+        archive,
+        team,
+        phase_agent_ids(team, phases),
+        agent_name_jobs,
+        summary_catalog,
     )
     project_overview, project_overview_source = _load_project_overview(archive, team)
     start_ms, end_ms = _period_range(team, phases)
@@ -3418,6 +3672,7 @@ def build_archive(
     rollup_results: dict[str, SummaryResult] = {}
     plain_rollup_results: dict[str, SummaryResult] = {}
     rollup_stats: dict[str, PhaseStats] = {}
+    suppressed_rollup_keys: set[str] = set()
     for period in periods:
         path = (
             _summary_root(archive, team_slug)
@@ -3429,6 +3684,7 @@ def build_archive(
         rollup_stats[key] = aggregate_stats(_phases_in(period, phases))
         projection_missing = _summary_projection_missing(path)
         if display_window is not None and period.partial:
+            suppressed_rollup_keys.add(key)
             if not projection_missing:
                 _load_rollup_projection(path, period)
             rollup_results[key] = _unavailable_summary(
@@ -3470,6 +3726,7 @@ def build_archive(
             _load_rollup_projection(path, period)
         )
         if recorded_partial != period.partial:
+            suppressed_rollup_keys.add(key)
             rollup_results[key] = _unavailable_summary(
                 f"rollup:{period.kind}:{period.key}",
                 period.end_ms,
@@ -3504,6 +3761,19 @@ def build_archive(
             if project_overview_source is not None
             else None
         ),
+    )
+    rollup_results, plain_rollup_results = _validate_rollup_inputs(
+        team,
+        periods,
+        phases,
+        phase_results,
+        project_overview,
+        terms,
+        rollup_results,
+        plain_rollup_results,
+        frozenset(suppressed_rollup_keys),
+        summary_root,
+        summary_catalog,
     )
     artifact_catalog = load_artifact_catalog(archive, team_slug, team)
     pull_cache = load_pull_request_metadata_cache(

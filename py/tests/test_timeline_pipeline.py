@@ -310,6 +310,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert child_track["official_leaf"] == "release_receipt_audit"
     assert child_track["nickname"] == "Ada"
     assert "receipt binding" in child_track["lifetime_summary"]
+    assert child_track["summary_available"] is True
     summary_prose = " ".join(
         [child_track["lifetime_summary"]]
         + [
@@ -339,6 +340,9 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     )
     assert all("at_ms" in entry and "role" in entry for entry in detail["transcript"])
     rollup = timeline["rollups"][0]
+    assert rollup["summary_available"] is True
+    assert rollup["technical_summary_available"] is True
+    assert rollup["plain_language_summary_available"] is True
     assert (tmp_path / rollup["technical_path"]).is_file()
     assert (tmp_path / rollup["plain_language_path"]).is_file()
     assert "plain-language summary" in (tmp_path / rollup["plain_language_path"]).read_text(
@@ -419,6 +423,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
         ).read_text(encoding="utf-8")
     )
     assert phase_record["summary"]["prompt_version"].endswith("summary-v2")
+    assert "summary_available" not in phase_record["summary"]
     assert timeline["glossary_path"].endswith("codex-test-glossary.md")
     assert timeline["glossary"] == []
     assert timeline["project_overview"]["evidence_status"] == "insufficient-evidence"
@@ -446,6 +451,7 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert name_record["agent"]["official_path"] == "/root/release_receipt_audit"
     assert name_record["name"]["short_name"] == "Release receipt audit"
     assert "receipt binding" in name_record["name"]["lifetime_summary"]
+    assert "summary_available" not in name_record["name"]
     agent_markdown = (
         tmp_path
         / "teams"
@@ -1370,11 +1376,20 @@ def test_build_without_summary_cache_uses_presentation_only_fallbacks(
     assert all(
         "normalized logs" in phase["paragraph"] for phase in timeline["phases"]
     )
+    assert all(phase["summary_available"] is False for phase in timeline["phases"])
     assert all(
         "no cached hindsight name" in agent["naming_rationale"]
         for agent in timeline["agents"]
     )
+    assert all(agent["summary_available"] is False for agent in timeline["agents"])
+    assert timeline["activity_bins"]
+    assert {item["team"] for item in timeline["activity_bins"]} == {
+        team.team_slug
+    }
     assert "no cached model summary" in timeline["project_overview"]["text"]
+    assert timeline["project_overview"]["summary_available"] is False
+    assert timeline["summary_files"] == []
+    assert timeline["glossary_path"] == ""
     assert {rollup["kind"] for rollup in timeline["rollups"]} == {"hourly"}
     for phase in timeline["phases"]:
         detail = json.loads(
@@ -1383,10 +1398,25 @@ def test_build_without_summary_cache_uses_presentation_only_fallbacks(
         assert detail["transcript"]
         assert detail["stats"] == phase["stats"]
         assert detail["phrase"] == "Summary unavailable"
+        assert detail["summary_available"] is False
+        assert detail["raw_summary_path"] == ""
+        raw_path = (
+            output
+            / "teams"
+            / team.team_slug
+            / "summaries"
+            / "phases"
+            / f"{phase['id']}.md"
+        )
+        assert not raw_path.exists()
     rollup = timeline["rollups"][0]
-    assert "Summary unavailable" in (output / rollup["technical_path"]).read_text(
-        encoding="utf-8"
-    )
+    assert rollup["summary_available"] is False
+    assert rollup["technical_summary_available"] is False
+    assert rollup["plain_language_summary_available"] is False
+    assert rollup["technical_path"] == ""
+    assert rollup["plain_language_path"] == ""
+    assert rollup["stats"]
+    assert not list((output / "teams" / team.team_slug / "summaries").rglob("*.md"))
 
 
 def test_build_preserves_available_phase_summaries_in_patchy_archive(
@@ -1399,22 +1429,156 @@ def test_build_preserves_available_phase_summaries_in_patchy_archive(
     assert len(phases) >= 2
     missing = phases[-1]
     summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+    output = tmp_path / "patchy-site"
+    build_archive(tmp_path, team.team_slug, output=output)
+    stale_markdown = (
+        output
+        / "teams"
+        / team.team_slug
+        / "summaries"
+        / "phases"
+        / f"{missing.phase_id}.md"
+    )
+    assert stale_markdown.is_file()
     (summary_root / "phases" / f"{missing.phase_id}.json").unlink()
     (summary_root / "artifacts.json").unlink()
 
-    output = tmp_path / "patchy-site"
     build_archive(tmp_path, team.team_slug, output=output)
     timeline = json.loads(
         (output / "data" / "timeline.json").read_text(encoding="utf-8")
     )
     phrases = {phase["id"]: phase["phrase"] for phase in timeline["phases"]}
+    availability = {
+        phase["id"]: phase["summary_available"] for phase in timeline["phases"]
+    }
 
     assert phrases[missing.phase_id] == "Summary unavailable"
+    assert availability[missing.phase_id] is False
     assert any(
         phrase != "Summary unavailable"
         for phase_id, phrase in phrases.items()
         if phase_id != missing.phase_id
     )
+    assert all(
+        available is True
+        for phase_id, available in availability.items()
+        if phase_id != missing.phase_id
+    )
+    missing_record = next(
+        phase for phase in timeline["phases"] if phase["id"] == missing.phase_id
+    )
+    missing_detail = json.loads(
+        (output / missing_record["detail_path"]).read_text(encoding="utf-8")
+    )
+    assert missing_detail["summary_available"] is False
+    assert missing_detail["raw_summary_path"] == ""
+    assert not stale_markdown.exists()
+
+
+def test_build_invalidates_backfilled_phase_and_dependent_summaries(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        rollup_kinds=("daily",),
+    )
+    output = tmp_path / "freshness-site"
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        rollup_kinds=("daily",),
+        output=output,
+    )
+
+    backfilled = replace(
+        team,
+        events=team.events
+        + (
+            _event(
+                "late-recovered-child-evidence",
+                CHILD,
+                15_000,
+                "assistant_message",
+                "Recovered evidence changes the receipt-binding conclusion.",
+            ),
+        ),
+    )
+    _write_team(tmp_path, backfilled)
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        rollup_kinds=("daily",),
+        output=output,
+    )
+    timeline = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    child_phase = next(
+        phase for phase in timeline["phases"] if phase["agent_id"] == CHILD
+    )
+    child_agent = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
+    assert child_phase["summary_available"] is False
+    assert child_agent["summary_available"] is False
+    assert timeline["rollups"][0]["summary_available"] is False
+    detail = json.loads(
+        (output / child_phase["detail_path"]).read_text(encoding="utf-8")
+    )
+    assert "Recovered evidence changes" in json.dumps(detail["transcript"])
+
+    summary_root = tmp_path / "teams" / team.team_slug / "summary_data"
+    (summary_root / "phases" / f"{child_phase['id']}.json").unlink()
+    (summary_root / "agents" / f"{CHILD}.json").unlink()
+    daily_projections = list((summary_root / "rollups" / "daily").glob("*.json"))
+    assert len(daily_projections) == 1
+    daily_projections[0].unlink()
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        rollup_kinds=("daily",),
+        output=output,
+    )
+    catalog_only = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert next(
+        phase
+        for phase in catalog_only["phases"]
+        if phase["agent_id"] == CHILD
+    )["summary_available"] is False
+    assert next(
+        agent for agent in catalog_only["agents"] if agent["id"] == CHILD
+    )["summary_available"] is False
+    assert catalog_only["rollups"][0]["summary_available"] is False
+
+    rerun = summarize_archive(
+        tmp_path,
+        team.team_slug,
+        "heuristic",
+        "offline",
+        rollup_kinds=("daily",),
+    )
+    assert rerun.cache_misses > 0
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        rollup_kinds=("daily",),
+        output=output,
+    )
+    refreshed = json.loads(
+        (output / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    assert next(
+        phase for phase in refreshed["phases"] if phase["agent_id"] == CHILD
+    )["summary_available"] is True
+    assert next(
+        agent for agent in refreshed["agents"] if agent["id"] == CHILD
+    )["summary_available"] is True
+    assert refreshed["rollups"][0]["summary_available"] is True
 
 
 def test_build_recovers_compatible_paid_name_from_catalog(tmp_path: Path) -> None:
@@ -1472,11 +1636,9 @@ def test_build_does_not_recover_future_catalog_knowledge_into_slice(
         phase["phrase"] == "Summary unavailable" for phase in timeline["phases"]
     )
     assert all("final" not in phase["paragraph"].lower() for phase in timeline["phases"])
-    assert all(
-        "Summary unavailable"
-        in (output / rollup["technical_path"]).read_text(encoding="utf-8")
-        for rollup in timeline["rollups"]
-    )
+    assert all(rollup["summary_available"] is False for rollup in timeline["rollups"])
+    assert all(rollup["technical_path"] == "" for rollup in timeline["rollups"])
+    assert all(rollup["plain_language_path"] == "" for rollup in timeline["rollups"])
     assert "no cached model summary" in timeline["project_overview"]["text"]
     assert timeline["glossary"] == []
 
@@ -1580,9 +1742,9 @@ def test_build_does_not_render_stale_partial_rollup_as_complete(
         (output / "data" / "timeline.json").read_text(encoding="utf-8")
     )
     assert len(timeline["rollups"]) == 1
-    assert "Summary unavailable" in (
-        output / timeline["rollups"][0]["technical_path"]
-    ).read_text(encoding="utf-8")
+    assert timeline["rollups"][0]["summary_available"] is False
+    assert timeline["rollups"][0]["technical_path"] == ""
+    assert timeline["rollups"][0]["plain_language_path"] == ""
 
 
 def test_build_validates_out_of_window_overview_source(tmp_path: Path) -> None:
@@ -1771,6 +1933,16 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     assert all("::" in agent_id for agent_id in agent_ids)
     assert all(phase["team"] in {"claude-test", first_team.team_slug} for phase in timeline["phases"])
     assert all(phase["agent_id"] in agent_ids for phase in timeline["phases"])
+    assert timeline["activity_bins"]
+    assert {item["team"] for item in timeline["activity_bins"]} == {
+        "claude-test",
+        first_team.team_slug,
+    }
+    assert {item["resolution"] for item in timeline["activity_bins"]} == {
+        "hourly",
+        "daily",
+        "weekly",
+    }
     assert all(edge["source_id"] in agent_ids for edge in timeline["edges"])
     assert all(edge["target_id"] in agent_ids for edge in timeline["edges"])
     assert {rollup["team"] for rollup in timeline["rollups"]} == {
@@ -1920,11 +2092,32 @@ def test_combined_export_builds_two_zero_summary_teams(tmp_path: Path) -> None:
     }
     assert timeline["phases"]
     assert all(phase["phrase"] == "Summary unavailable" for phase in timeline["phases"])
+    assert all(phase["summary_available"] is False for phase in timeline["phases"])
     assert all("::" in phase["agent_id"] for phase in timeline["phases"])
+    assert all(agent["summary_available"] is False for agent in timeline["agents"])
     assert {rollup["team"] for rollup in timeline["rollups"]} == {
         codex_team.team_slug,
         claude_team.team_slug,
     }
+    assert all(rollup["summary_available"] is False for rollup in timeline["rollups"])
+    assert timeline["summary_files"] == []
+    sparse_rollup = timeline["rollups"][0]
+    reference = (
+        f"rollup:{sparse_rollup['team']}::{sparse_rollup['kind']}::"
+        f"{sparse_rollup['start_ms']}"
+    )
+    query_result = subprocess.run(
+        (str(output / "timeline"), "show", reference),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert query_result.returncode == 0, query_result.stderr
+    query_item = json.loads(query_result.stdout)["items"][0]
+    assert query_item["summary_available"] is False
+    assert "technical_markdown" not in query_item
+    assert "plain_language_markdown" not in query_item
 
 
 def test_combined_export_refuses_unmarked_nonempty_output(tmp_path: Path) -> None:
@@ -1950,6 +2143,7 @@ def test_agent_name_v1_projection_degrades_without_lifetime_summary(
     tmp_path: Path,
 ) -> None:
     team = _team()
+    _write_team(tmp_path, team)
     child = next(agent for agent in team.agents if agent.thread_id == CHILD)
     path = (
         tmp_path
@@ -1983,10 +2177,35 @@ def test_agent_name_v1_projection_degrades_without_lifetime_summary(
         },
     )
 
-    loaded = _load_agent_names(tmp_path, team, frozenset({CHILD}))[CHILD]
+    phases = build_phases(team)
+    phase_results = {
+        phase.summary_key: SummaryResult(
+            key=phase.summary_key,
+            phrase="Cached phase",
+            paragraph="Cached phase detail.",
+            work_summary=(),
+            model="test-model",
+            prompt_version="test-prompt",
+            input_hash=phase.summary_key,
+            generated_at="2026-08-05T00:00:00Z",
+        )
+        for phase in phases
+    }
+    jobs = _agent_name_jobs(team, phases, phase_results)
+    loaded = _load_agent_names(
+        tmp_path, team, frozenset({CHILD}), jobs
+    )[CHILD]
 
     assert loaded.short_name == "Release receipt audit"
     assert loaded.lifetime_summary is None
+
+    build_archive(tmp_path, team.team_slug)
+    timeline = json.loads(
+        (tmp_path / "data" / "timeline.json").read_text(encoding="utf-8")
+    )
+    child_track = next(agent for agent in timeline["agents"] if agent["id"] == CHILD)
+    assert child_track["short_name"] == "Release receipt audit"
+    assert child_track["summary_available"] is False
 
 
 def test_spanning_tool_is_not_repeated_before_later_phase_boundary() -> None:

@@ -27,13 +27,14 @@ The durable archive and a website export are distinct concepts:
   and statistics rather than causing unrelated cached summaries to be discarded.
 
 That degradation is presentation-only. Missing phase, agent-lifetime, project-overview, or calendar
-summary data receives an in-memory fallback labeled `Summary unavailable`; the builder writes
-ordinary website/Markdown presentation files but never writes the fallback under `summary_data/`
-or registers it as a model artifact. Compatible phase/rollup artifacts and source-bounded lifetime
-artifacts take precedence. Project overviews require their source-bound projection, and summaries
-whose ranges extend beyond a sliced export are not reused. Thus patchy archives preserve verified
-paid work without leaking later knowledge into an earlier slice. A later `summarize` run upgrades
-missing regions normally.
+summary data receives an in-memory fallback labeled `Summary unavailable`, with an explicit false
+availability flag in the website projection. Phase detail JSON still contains normalized transcript
+and statistics, but the builder neither creates nor links summary Markdown for an unavailable
+slot. It never writes a fallback under `summary_data/` or registers one as a model artifact.
+Compatible phase/rollup artifacts and source-bounded lifetime artifacts take precedence. Project
+overviews require their source-bound projection, and summaries whose ranges extend beyond a sliced
+export are not reused. Thus patchy archives preserve verified paid work without leaking later
+knowledge into an earlier slice. A later `summarize` run upgrades missing regions normally.
 
 `build` retains its single-team archive behavior. `export` accepts repeated `--team` values and
 composes those independently cached teams into one self-contained site. The compositor renders
@@ -45,6 +46,24 @@ file inventory removes only stale files from an earlier combined export. Calenda
 the timezone in which each team's cached summary was generated; hourly keys are UTC-stable. The
 export timezone controls date-bound parsing and the shared display axis, not cache reinterpretation.
 
+The zero-token semantic-zoom projection separately derives activity bins from normalized active
+and tool-running state. Hourly bins retain UTC-stable boundaries, while daily bins use local
+midnight and weekly bins use local Monday midnight in the team's display timezone. Local calendar
+boundaries therefore carry their real 23-, 24-, or 25-hour duration across daylight-saving
+changes. The first and last bins are clipped to the observed archive range, and concurrency and
+coverage use that clipped duration; time before capture began or after the latest captured record
+is never presented as inactivity. Empty bins remain absent so true inactive gaps stay visible.
+
+The browser chooses detail by time density, not by record count. At at most one minute per pixel,
+the detail level renders phases, state strips, and applicable message edges. Above that and through
+fifteen minutes per pixel, the lifetime level suppresses phases/states and retains one block per
+agent plus structural fork/join edges. Beyond fifteen minutes per pixel, the aggregate level
+suppresses agents, phases, states, and edges entirely and renders one compact row per team from the
+precomputed bins. It chooses the narrowest hourly/daily/weekly resolution whose nominal bin is at
+least two pixels wide. The coordinator has its own strip; worker-block height encodes average
+concurrency, opacity encodes active coverage, and omitted zero-activity bins preserve gaps. These
+thresholds and suppressions are part of the performance contract and are covered by browser tests.
+
 ### Read-only query boundary
 
 The installed `agent-team-timeline query` command and the archive-local `./timeline` Python
@@ -54,6 +73,13 @@ copied byte-for-byte with the compatibility `query.py` launcher. Their only inpu
 `data/timeline.json`, referenced `data/details/*.json`, and referenced rollup Markdown beneath the
 selected archive root. Path resolution fails closed on absolute or escaping references. Querying
 has no write path and can never invoke a model.
+
+Availability fields are additive to timeline schema 1. Older projections without them are treated
+as available; new projections mark sparse agent/phase records with `summary_available` and each
+calendar audience with `technical_summary_available` or
+`plain_language_summary_available`. `show` and summary search never open a Markdown path whose
+audience is explicitly unavailable, while phase transcript queries remain independent of summary
+availability.
 
 The `prompts` and `messages` query actions are an independent read-only boundary over
 `extracted/transcripts/`; they do not require `data/timeline.json`. The loader verifies the schema
@@ -83,6 +109,34 @@ and queued human-origin commands while classifying hooks, task notifications, co
 and recurring inputs as system input. Orc retains `user_source`-derived ingress and author class:
 owner GChat is distinct from inter-Orc traffic, while Web/TUI submissions without an author ID
 remain explicitly unknown rather than being asserted to be owner-authored.
+
+### Registered project ingestion contract
+
+`ingest-project --config FILE` is the durable orchestration boundary above the three provider
+importers. Its JSON schema version is independent of provider source-manifest versions. Schema 1
+requires a relative output path and an ordered, nonempty team registry. Top-level timezone,
+project identity, execution hosts, and optional date/time window are inherited by each team unless
+that team supplies an explicit replacement. Relative output and provider source paths resolve from
+the config file's directory, making the command independent of the caller's working directory.
+
+Every object is an exact schema: unknown and missing fields fail before provider ingestion begins.
+The Codex source variant contains a sessions root, coordinator root UUID, and optional explicitly
+ordered continuation UUIDs. The Claude variant contains its canonical coordinator JSONL. The Orc
+variant contains its archived state root and coordinator session UUID. Team slugs are unique and
+provider-neutral; identity values pass through the same URL, hostname, and IANA-timezone validators
+as individual ingest commands.
+
+Configured teams run in file order through the existing provider snapshot transactions. Successful
+earlier teams and their provider source manifests remain durable if a later provider fails; the
+top-level receipt marks the configured run failed, and a rerun resumes idempotently. Only after all
+selected ingests succeed does the command invoke global transcript extraction. Extraction always
+selects every normalized archive team, even when `--team` limited this run's provider refresh,
+because the monotonic prompt projection cannot omit previously exported teams.
+
+The command has no path to summary backends and records `model_calls: 0`, `model_tokens: 0`, and
+`website_build_performed: false` in its mechanical receipt, together with the exact config-file
+SHA-256. It does not call `build`; presentation regeneration remains an explicit, separately
+auditable zero-token operation.
 
 Canonical references are `team:<slug>`, `agent:<team>::<source-id>`,
 `phase:<team>::<phase-id>`, and `rollup:<team>::<kind>::<start-ms>`. The query loader strips the
@@ -316,6 +370,14 @@ time interval, complete summarizer contract, model selection, context coverage, 
 generation time, and generating usage receipt. Every attempted backend batch has an immutable
 usage receipt under the relevant cache's `_usage/` tree. The envelope version describes storage
 shape and is distinct from the registered summarizer and output-schema versions.
+
+The Codex runner uses an ephemeral read-only workspace. The Claude runner uses `claude --print`
+with safe mode, no session persistence, no tools, `dontAsk` permissions, and an inline JSON schema.
+It accepts only the CLI's `structured_output` object and requires the native usage object on every
+successful call; there is no plain-result, model, or backend fallback. Claude's normalized input
+counter is direct input plus cache-creation input plus cache-read input, with both cache categories
+also retained separately. Both runners feed the same strict summary/naming parsers and immutable
+receipt/cache lifecycle.
 
 When a backend's final message fails validation, or the phase timestamp rule repairs it, the exact
 raw final message is preserved at `_usage/backend_outputs/<receipt-id>.json`. That receipt-linked

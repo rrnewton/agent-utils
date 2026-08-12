@@ -1,9 +1,9 @@
 """Durable, strictly typed token-usage records for model-backed work.
 
-Codex's JSON event stream reports token counts on the final ``turn.completed``
-event.  This module keeps parsing and persistence independent from summary
-content so cache hits can report the original generation cost without
-pretending those tokens were spent again.
+Codex and Claude expose different native token fields.  This module normalizes
+them into one durable record while keeping parsing and persistence independent
+from summary content, so cache hits can report the original generation cost
+without pretending those tokens were spent again.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def resolve_service_tier(backend: str, service_tier: str | None) -> str | None:
 
 @dataclass(frozen=True)
 class TokenUsage:
-    """The stable token breakdown exposed by one Codex invocation."""
+    """The stable token breakdown exposed by one model invocation."""
 
     input_tokens: int = 0
     cached_input_tokens: int = 0
@@ -70,7 +70,7 @@ class TokenUsage:
 
     @property
     def total_tokens(self) -> int:
-        """Return Codex's total convention: all input plus all output."""
+        """Return the archive convention: all input plus all output."""
 
         return self.input_tokens + self.output_tokens
 
@@ -374,6 +374,43 @@ def parse_codex_jsonl_usage(text: str) -> TokenUsage | None:
     return found
 
 
+def parse_claude_json_usage(text: str) -> TokenUsage:
+    """Parse one Claude ``--output-format json`` result's exact token usage.
+
+    Claude reports cache reads and cache writes as separate native input-token
+    counters.  ``TokenUsage.input_tokens`` is the full billable/logical input
+    total, so it includes all three native input categories; the two cache
+    counters remain available separately as well.
+    """
+
+    try:
+        raw: object = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"claude JSON result is invalid: {error}") from error
+    root = as_object(narrow_json(raw, "claude JSON result"), "claude JSON result")
+    usage = as_object(root.get("usage"), "claude JSON result.usage")
+    direct_input = as_int(
+        usage.get("input_tokens"), "claude JSON result.usage.input_tokens"
+    )
+    cache_write = as_int(
+        usage.get("cache_creation_input_tokens"),
+        "claude JSON result.usage.cache_creation_input_tokens",
+    )
+    cache_read = as_int(
+        usage.get("cache_read_input_tokens"),
+        "claude JSON result.usage.cache_read_input_tokens",
+    )
+    output = as_int(
+        usage.get("output_tokens"), "claude JSON result.usage.output_tokens"
+    )
+    return TokenUsage(
+        input_tokens=direct_input + cache_write + cache_read,
+        cached_input_tokens=cache_read,
+        cache_write_input_tokens=cache_write,
+        output_tokens=output,
+    )
+
+
 def write_batch_receipt(root: Path, receipt: BatchUsageReceipt) -> Path:
     """Persist one batch receipt and return its path."""
 
@@ -488,6 +525,7 @@ __all__ = [
     "TokenUsage",
     "UsageRunAccounting",
     "load_batch_receipt",
+    "parse_claude_json_usage",
     "parse_codex_jsonl_usage",
     "resolve_service_tier",
     "write_batch_receipt",

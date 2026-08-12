@@ -8,6 +8,7 @@ from importlib.resources import files
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from agent_team_timeline.activity_bins import build_activity_bins
 from agent_team_timeline.archive import narrow_json, write_json_if_changed, write_text_if_changed
 from agent_team_timeline.artifacts import (
     ArtifactCatalog,
@@ -65,6 +66,7 @@ def _summary_obj(result: SummaryResult) -> dict[str, object]:
         "prompt_version": cleaned.prompt_version,
         "input_hash": cleaned.input_hash,
         "generated_at": cleaned.generated_at,
+        "summary_available": cleaned.summary_available,
     }
 
 
@@ -81,6 +83,12 @@ def _official_leaf(agent: Agent) -> str:
     return agent.agent_path.rstrip("/").rsplit("/", 1)[-1] or "root"
 
 
+def _agent_summary_available(name: AgentNameResult) -> bool:
+    return name.summary_available and bool(
+        clean_summary_prose(name.lifetime_summary or "")
+    )
+
+
 def _agent_identity_obj(agent: Agent, name: AgentNameResult) -> dict[str, object]:
     return {
         "short_name": name.short_name,
@@ -91,6 +99,7 @@ def _agent_identity_obj(agent: Agent, name: AgentNameResult) -> dict[str, object
         "lifetime_summary": clean_summary_prose(name.lifetime_summary or ""),
         "naming_model": name.model,
         "naming_input_hash": name.input_hash,
+        "summary_available": _agent_summary_available(name),
     }
 
 
@@ -300,7 +309,11 @@ def _edge_obj(
         "interrupt": "Interrupt",
     }.get(readable_kind, readable_kind.replace("_", " ").title())
     phrase = f"{action} {_agent_name(target, names).short_name}"
-    paragraph = summary.paragraph if summary is not None else phrase
+    paragraph = (
+        summary.paragraph
+        if summary is not None and summary.summary_available
+        else phrase
+    )
     full_text = edge.message_text or ""
     status = ""
     if edge.content_availability == "encrypted":
@@ -386,7 +399,11 @@ def _result_edge_objs(
                     "target_ms": final.timestamp_ms,
                     "kind": "message",
                     "phrase": f"{_agent_name(agent, names).short_name} reports progress",
-                    "paragraph": summary.paragraph if summary else (final.text or "")[:500],
+                    "paragraph": (
+                        summary.paragraph
+                        if summary is not None and summary.summary_available
+                        else (final.text or "")[:500]
+                    ),
                     "full_text": final.text or "",
                     "content_status": "",
                 }
@@ -431,7 +448,7 @@ def _result_edge_objs(
                 "phrase": phrase,
                 "paragraph": (
                     summary.paragraph
-                    if summary is not None
+                    if summary is not None and summary.summary_available
                     else f"{child_name} ended with status {agent.status}."
                 ),
                 "full_text": "",
@@ -638,6 +655,32 @@ def _transcript_entry_obj(
     return result
 
 
+def _remove_generated_file(archive: Path, relative_path: str) -> bool:
+    """Remove one known presentation file without following a path outside *archive*."""
+
+    root = archive.resolve()
+    path = archive / relative_path
+    cursor = archive
+    for part in Path(relative_path).parts[:-1]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"refusing generated presentation parent symlink: {cursor}")
+    try:
+        path.parent.resolve().relative_to(root)
+    except ValueError as error:
+        raise ValueError(
+            f"generated presentation path escapes archive: {relative_path}"
+        ) from error
+    if path.is_symlink():
+        raise ValueError(f"refusing generated presentation symlink: {path}")
+    if not path.exists():
+        return False
+    if not path.is_file():
+        raise ValueError(f"generated presentation path is not a file: {path}")
+    path.unlink()
+    return True
+
+
 def render_archive(
     archive: Path,
     team: TeamData,
@@ -657,6 +700,7 @@ def render_archive(
     """Regenerate all presentation files without invoking a summary backend."""
 
     changed = 0
+    published_summary_paths: set[str] = set()
     phase_paths: dict[str, str] = {}
     agents_by_id = {agent.thread_id: agent for agent in team.agents}
     visible_agent_ids = phase_agent_ids(team, phases)
@@ -673,15 +717,20 @@ def render_archive(
         output_artifact_ids = output_artifact_ids_for_range(
             artifact_catalog, phase.start_ms, phase.end_ms, phase.agent_id
         )
-        changed += int(
-            write_text_if_changed(
-                archive / raw_path,
-                _phase_markdown(team, agent, phase_agent_name, phase, summary),
+        if summary.summary_available:
+            changed += int(
+                write_text_if_changed(
+                    archive / raw_path,
+                    _phase_markdown(team, agent, phase_agent_name, phase, summary),
+                )
             )
-        )
+            published_summary_paths.add(raw_path)
+        else:
+            changed += int(_remove_generated_file(archive, raw_path))
         detail: dict[str, object] = {
             "phrase": summary.phrase,
             "paragraph": summary.paragraph,
+            "summary_available": summary.summary_available,
             "stats": phase.stats.to_mapping(),
             "work_summary": [
                 {
@@ -697,7 +746,7 @@ def render_archive(
                 _transcript_entry_obj(entry, pull_request_metadata)
                 for entry in phase.transcript
             ],
-            "raw_summary_path": raw_path,
+            "raw_summary_path": raw_path if summary.summary_available else "",
             "agent": _agent_identity_obj(agent, phase_agent_name),
             "artifact_ids": list(artifact_ids),
             "output_artifact_ids": list(output_artifact_ids),
@@ -709,41 +758,62 @@ def render_archive(
         phases_by_agent.setdefault(phase.agent_id, []).append(phase)
     for agent in team.agents:
         own = sorted(phases_by_agent.get(agent.thread_id, []), key=lambda phase: phase.start_ms)
-        if not own:
-            continue
         agent_path = f"teams/{team.team_slug}/summaries/agents/{agent.thread_id}.md"
-        changed += int(
-            write_text_if_changed(
-                archive / agent_path,
-                _agent_markdown(
-                    team,
-                    agent,
-                    _agent_name(agent, agent_names),
-                    own,
-                    phase_summaries,
-                ),
+        if not own:
+            changed += int(_remove_generated_file(archive, agent_path))
+            continue
+        name = _agent_name(agent, agent_names)
+        if _agent_summary_available(name):
+            changed += int(
+                write_text_if_changed(
+                    archive / agent_path,
+                    _agent_markdown(
+                        team,
+                        agent,
+                        name,
+                        own,
+                        phase_summaries,
+                    ),
+                )
             )
-        )
+            published_summary_paths.add(agent_path)
+        else:
+            changed += int(_remove_generated_file(archive, agent_path))
 
+    rollup_paths: dict[str, tuple[str, str]] = {}
     for period in periods:
         period_key = period.key + ":" + period.kind
         summary = rollup_summaries[period_key]
         plain_summary = plain_rollup_summaries[period_key]
         stats = rollup_stats[period_key]
-        changed += int(
-            write_text_if_changed(
-                archive / period.relative_path,
-                _rollup_markdown(team, period, summary, stats, "technical"),
-            )
+        technical_path = period.relative_path if summary.summary_available else ""
+        plain_path = (
+            _plain_language_path(period) if plain_summary.summary_available else ""
         )
-        changed += int(
-            write_text_if_changed(
-                archive / _plain_language_path(period),
-                _rollup_markdown(
-                    team, period, plain_summary, stats, "plain-language"
-                ),
+        rollup_paths[period_key] = (technical_path, plain_path)
+        if technical_path:
+            changed += int(
+                write_text_if_changed(
+                    archive / technical_path,
+                    _rollup_markdown(team, period, summary, stats, "technical"),
+                )
             )
-        )
+            published_summary_paths.add(technical_path)
+        else:
+            changed += int(_remove_generated_file(archive, period.relative_path))
+        expected_plain_path = _plain_language_path(period)
+        if plain_path:
+            changed += int(
+                write_text_if_changed(
+                    archive / plain_path,
+                    _rollup_markdown(
+                        team, period, plain_summary, stats, "plain-language"
+                    ),
+                )
+            )
+            published_summary_paths.add(plain_path)
+        else:
+            changed += int(_remove_generated_file(archive, expected_plain_path))
 
     weeks = sorted({term.week for term in glossary_terms})
     glossary_root = archive / "teams" / team.team_slug / "summaries" / "glossary"
@@ -762,6 +832,7 @@ def render_archive(
                 archive / path, glossary_markdown(team.team_slug, week, glossary_terms)
             )
         )
+        published_summary_paths.add(path)
     if glossary_root.is_dir():
         for child in sorted(glossary_root.iterdir()):
             if child.is_symlink():
@@ -788,17 +859,25 @@ def render_archive(
             if stale_path.is_file():
                 stale_path.unlink()
                 changed += 1
-    glossary_catalog_path = (
+    expected_glossary_catalog_path = (
         f"teams/{team.team_slug}/summaries/glossary/{team.team_slug}-glossary.md"
     )
-    changed += int(
-        write_text_if_changed(
-            archive / glossary_catalog_path,
-            glossary_catalog_markdown(
-                team.team_slug, glossary_terms, project_overview.paragraph
-            ),
+    glossary_catalog_path = ""
+    if glossary_terms or project_overview.summary_available:
+        glossary_catalog_path = expected_glossary_catalog_path
+        changed += int(
+            write_text_if_changed(
+                archive / glossary_catalog_path,
+                glossary_catalog_markdown(
+                    team.team_slug, glossary_terms, project_overview.paragraph
+                ),
+            )
         )
-    )
+        published_summary_paths.add(glossary_catalog_path)
+    else:
+        changed += int(
+            _remove_generated_file(archive, expected_glossary_catalog_path)
+        )
 
     static_root = files("agent_team_timeline") / "static"
     for asset_name in ("index.html", "timeline-core.js", "app.js", "style.css"):
@@ -873,10 +952,12 @@ def render_archive(
     )
 
     summary_files: list[dict[str, object]] = []
-    for summary_path_file in sorted(
-        (archive / "teams" / team.team_slug / "summaries").rglob("*.md")
-    ):
-        relative = summary_path_file.relative_to(archive).as_posix()
+    for relative in sorted(published_summary_paths):
+        summary_path_file = archive / relative
+        if not summary_path_file.is_file() or summary_path_file.is_symlink():
+            raise ValueError(
+                f"published summary path is missing or unsafe: {summary_path_file}"
+            )
         parts = summary_path_file.relative_to(
             archive / "teams" / team.team_slug / "summaries"
         ).parts
@@ -925,6 +1006,7 @@ def render_archive(
                 "lifetime_summary": clean_summary_prose(
                     track_name.lifetime_summary or ""
                 ),
+                "summary_available": _agent_summary_available(track_name),
                 "depth": agent.depth,
                 "start_ms": track_start,
                 "end_ms": min(track_end, end_ms),
@@ -949,6 +1031,9 @@ def render_archive(
             "end_ms": phase.end_ms,
             "phrase": phase_summaries[phase.summary_key].phrase,
             "paragraph": phase_summaries[phase.summary_key].paragraph,
+            "summary_available": phase_summaries[
+                phase.summary_key
+            ].summary_available,
             "detail_path": phase_paths[phase.phase_id],
             "stats": phase.stats.to_mapping(),
             "states": [state.to_json_obj() for state in phase.states],
@@ -1011,28 +1096,39 @@ def render_archive(
             _object_string(item.get("id")),
         )
     )
-    rollup_objs = [
-        {
-            "kind": period.kind,
-            "label": period.label + (" · partial" if period.partial else ""),
-            "start_ms": period.start_ms,
-            "end_ms": period.end_ms,
-            "path": period.relative_path,
-            "technical_path": period.relative_path,
-            "plain_language_path": _plain_language_path(period),
-            "artifact_ids": list(
-                artifact_ids_for_range(
-                    artifact_catalog, period.start_ms, period.end_ms
-                )
-            ),
-            "output_artifact_ids": list(
-                output_artifact_ids_for_range(
-                    artifact_catalog, period.start_ms, period.end_ms
-                )
-            ),
-        }
-        for period in periods
-    ]
+    rollup_objs: list[dict[str, object]] = []
+    for period in periods:
+        period_key = period.key + ":" + period.kind
+        technical_path, plain_path = rollup_paths[period_key]
+        technical_available = rollup_summaries[period_key].summary_available
+        plain_available = plain_rollup_summaries[period_key].summary_available
+        rollup_objs.append(
+            {
+                "kind": period.kind,
+                "label": period.label + (" · partial" if period.partial else ""),
+                "start_ms": period.start_ms,
+                "end_ms": period.end_ms,
+                # ``path`` remains the legacy stable selection identity. New readers use the
+                # audience-specific paths only when their availability flags are true.
+                "path": period.relative_path,
+                "technical_path": technical_path,
+                "plain_language_path": plain_path,
+                "technical_summary_available": technical_available,
+                "plain_language_summary_available": plain_available,
+                "summary_available": technical_available or plain_available,
+                "stats": rollup_stats[period_key].to_mapping(),
+                "artifact_ids": list(
+                    artifact_ids_for_range(
+                        artifact_catalog, period.start_ms, period.end_ms
+                    )
+                ),
+                "output_artifact_ids": list(
+                    output_artifact_ids_for_range(
+                        artifact_catalog, period.start_ms, period.end_ms
+                    )
+                ),
+            }
+        )
     glossary_objs = [
         {
             "id": term.term_id,
@@ -1048,6 +1144,14 @@ def render_archive(
         }
         for term in glossary_terms
     ]
+    activity_bins = build_activity_bins(
+        team.team_slug,
+        team.root_thread_id,
+        phases,
+        display_timezone=team.display_timezone,
+        observed_start_ms=start_ms,
+        observed_end_ms=end_ms,
+    )
     timeline: dict[str, object] = {
         "schema_version": 1,
         "generated_at": _iso(latest_ms),
@@ -1065,6 +1169,7 @@ def render_archive(
         ],
         "agents": agent_objs,
         "phases": phase_objs,
+        "activity_bins": [item.to_json_obj() for item in activity_bins],
         "edges": edge_objs,
         "events": _event_objs(team, visible_agent_ids),
         "rollups": rollup_objs,
@@ -1072,6 +1177,7 @@ def render_archive(
         "glossary_path": glossary_catalog_path,
         "project_overview": {
             "text": project_overview.paragraph,
+            "summary_available": project_overview.summary_available,
             "evidence_status": (
                 "supported"
                 if project_overview.phrase == "Project overview supported"
@@ -1097,6 +1203,7 @@ def render_archive(
     return {
         "files_changed": changed,
         "phases": len(phases),
+        "activity_bins": len(activity_bins),
         "agents": len(visible_agent_ids),
         "edges": len(edge_objs),
         "rollups": len(periods),

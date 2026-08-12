@@ -30,6 +30,10 @@ from agent_team_timeline.codex_workspace import (
     CodexWorkspaceError,
     initialize_codex_workspace,
 )
+from agent_team_timeline.claude_backend import (
+    ClaudeBackendError,
+    run_claude_json,
+)
 from agent_team_timeline.summary_registry import (
     ContextCoverage,
     GLOSSARY_DEFINITION_STYLE,
@@ -118,6 +122,20 @@ class _CodexBatchError(SummaryError):
         self.backend_output = backend_output
 
 
+class _ClaudeBatchError(SummaryError):
+    """A failed Claude invocation with any usage and structured output retained."""
+
+    def __init__(
+        self,
+        message: str,
+        usage: TokenUsage | None,
+        backend_output: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.usage = usage
+        self.backend_output = backend_output
+
+
 @dataclass(frozen=True)
 class SummaryJob:
     """One transcript interval plus the terminology and history needed to summarize it."""
@@ -157,6 +175,7 @@ class SummaryResult:
     input_hash: str
     generated_at: str
     artifact_provenance: SummaryArtifactProvenance | None = None
+    summary_available: bool = True
 
 
 @dataclass(frozen=True)
@@ -355,6 +374,38 @@ def _input_hash(
         payload["reasoning_effort"] = reasoning_effort
     if service_tier not in (None, DEFAULT_SERVICE_TIER):
         payload["service_tier"] = service_tier
+    return content_hash(canonical_json(payload))
+
+
+def input_hash_for_provenance(
+    job: SummaryJob, provenance: SummaryArtifactProvenance
+) -> str:
+    """Recompute *job*'s cache identity under an existing artifact contract."""
+
+    spec = summarizer_for_style(job.summary_style)
+    if provenance.summarizer_id != spec.summarizer_id:
+        raise ValueError(
+            f"summary job {job.key!r} does not use summarizer "
+            f"{provenance.summarizer_id!r}"
+        )
+    payload: dict[str, JsonValue] = {
+        "backend": provenance.backend,
+        "model": provenance.model,
+        "prompt_version": provenance.prompt_version,
+        "job": _job_json(job),
+    }
+    if not provenance.legacy_storage:
+        payload.update(
+            {
+                "summarizer_id": provenance.summarizer_id,
+                "summarizer_version": provenance.summarizer_version,
+                "output_schema_version": provenance.output_schema_version,
+            }
+        )
+    if provenance.reasoning_effort is not None:
+        payload["reasoning_effort"] = provenance.reasoning_effort
+    if provenance.service_tier not in (None, DEFAULT_SERVICE_TIER):
+        payload["service_tier"] = provenance.service_tier
     return content_hash(canonical_json(payload))
 
 
@@ -947,6 +998,7 @@ def clean_summary_result(result: SummaryResult) -> SummaryResult:
         input_hash=result.input_hash,
         generated_at=result.generated_at,
         artifact_provenance=result.artifact_provenance,
+        summary_available=result.summary_available,
     )
 
 
@@ -1108,7 +1160,9 @@ def _codex_batch(
 ) -> _CodexBatchOutcome:
     if not codex_command:
         raise SummaryError("codex command must not be empty")
-    with tempfile.TemporaryDirectory(prefix="agent-team-timeline-summary-") as raw_dir:
+    with tempfile.TemporaryDirectory(
+        prefix="agent-team-timeline-summary-", ignore_cleanup_errors=True
+    ) as raw_dir:
         work_dir = Path(raw_dir)
         try:
             initialize_codex_workspace(work_dir)
@@ -1183,6 +1237,44 @@ def _codex_batch(
             ) from error
         return _CodexBatchOutcome(
             parsed=parsed, usage=usage, raw_output=backend_output
+        )
+
+
+def _claude_batch(
+    pending: Sequence[_PendingJob],
+    model: str,
+    reasoning_effort: str | None,
+    claude_command: Sequence[str],
+) -> _CodexBatchOutcome:
+    with tempfile.TemporaryDirectory(
+        prefix="agent-team-timeline-summary-", ignore_cleanup_errors=True
+    ) as raw_dir:
+        try:
+            result = run_claude_json(
+                claude_command,
+                prompt=build_summary_prompt([item.job for item in pending]),
+                schema=_output_schema(),
+                model=model,
+                reasoning_effort=reasoning_effort,
+                cwd=Path(raw_dir),
+            )
+        except ClaudeBackendError as error:
+            # The Claude result envelope is CLI transport, not a validated final
+            # message. Keep its concise error and usage in the receipt without
+            # persisting captured stdout as a backend-output audit artifact.
+            raise _ClaudeBatchError(str(error), error.usage) from error
+        try:
+            parsed = _parse_backend_output_with_repairs(
+                result.output, pending, model, _utc_now()
+            )
+        except SummaryError as error:
+            raise _ClaudeBatchError(
+                str(error), result.usage, backend_output=result.output
+            ) from error
+        return _CodexBatchOutcome(
+            parsed=parsed,
+            usage=result.usage,
+            raw_output=result.output,
         )
 
 
@@ -1262,6 +1354,7 @@ def _run_backend_batch(
     reasoning_effort: str | None,
     service_tier: str | None,
     codex_command: Sequence[str],
+    claude_command: Sequence[str],
 ) -> _GeneratedBatch:
     """Run one batch and persist a receipt even when the backend call fails."""
 
@@ -1277,7 +1370,7 @@ def _run_backend_batch(
             usage = TokenUsage()
             repairs = ()
             raw_output = None
-        else:
+        elif backend == "codex":
             outcome = _codex_batch(
                 batch, model, reasoning_effort, service_tier, codex_command
             )
@@ -1285,10 +1378,23 @@ def _run_backend_batch(
             usage = outcome.usage
             repairs = outcome.parsed.repairs
             raw_output = outcome.raw_output
+        else:
+            outcome = _claude_batch(
+                batch, model, reasoning_effort, claude_command
+            )
+            results = outcome.parsed.results
+            usage = outcome.usage
+            repairs = outcome.parsed.repairs
+            raw_output = outcome.raw_output
     except SummaryError as error:
-        usage = error.usage if isinstance(error, _CodexBatchError) else None
+        backend_error = (
+            error
+            if isinstance(error, (_CodexBatchError, _ClaudeBatchError))
+            else None
+        )
+        usage = backend_error.usage if backend_error is not None else None
         backend_output = (
-            error.backend_output if isinstance(error, _CodexBatchError) else None
+            backend_error.backend_output if backend_error is not None else None
         )
         receipt_error = _shorten(_one_line(str(error)), 500)
         receipt = BatchUsageReceipt.create(
@@ -1353,12 +1459,13 @@ def summarize_jobs(
     codex_command: Sequence[str] = ("codex",),
     reasoning_effort: str | None = None,
     service_tier: str | None = None,
+    claude_command: Sequence[str] = ("claude",),
 ) -> tuple[dict[str, SummaryResult], SummaryRunStats]:
     """Return summaries, consulting immutable content-addressed cache entries first."""
 
     run_started_at = _utc_now()
 
-    if backend not in {"codex", "heuristic"}:
+    if backend not in {"claude", "codex", "heuristic"}:
         raise SummaryError(f"unsupported summary backend {backend!r}")
     if not model.strip():
         raise SummaryError("summary model must not be empty")
@@ -1474,10 +1581,12 @@ def summarize_jobs(
                 reasoning_effort=reasoning_effort,
                 service_tier=effective_service_tier,
                 codex_command=codex_command,
+                claude_command=claude_command,
             )
             generated.update(publish_batch(batch, batch_result))
     elif batches:
-        command = tuple(codex_command)
+        codex = tuple(codex_command)
+        claude = tuple(claude_command)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
@@ -1488,7 +1597,8 @@ def summarize_jobs(
                     model=model,
                     reasoning_effort=reasoning_effort,
                     service_tier=effective_service_tier,
-                    codex_command=command,
+                    codex_command=codex,
+                    claude_command=claude,
                 ): batch
                 for batch in batches
             }

@@ -87,6 +87,18 @@ cd ./timelines/example-team
 The full chronological JSONL report is `extracted/transcripts/prompts.jsonl`;
 `messages.jsonl` adds coordinator responses linked mechanically by provider turn identity.
 
+For a durable multi-provider registry, put the relative archive output, shared identity, and each
+Codex/Claude/Orc source in a strict schema-v1 JSON manifest, then run:
+
+```bash
+agent-team-timeline ingest-project --config ./projects/example.json
+agent-team-timeline ingest-project --config ./projects/example.json --team codex-example
+```
+
+The optional team filter limits provider ingestion; the command still refreshes the monotonic
+transcript projection over every normalized archive team. It records zero model calls and does not
+build the website. See the user guide for the complete manifest schema.
+
 Every archive includes its `./timeline` launcher, static site, normalized message JSON, cached
 summary data, rendered Markdown, source provenance, and run metadata. `python3 run_stats.py` prints per-run cache,
 product, build, and token statistics, followed by the immutable backend receipt ledger. Receipts
@@ -95,9 +107,25 @@ corresponding actual total explicitly `UNKNOWN` instead of zero. Repeating `summ
 input uses cached results; repeating `build` only regenerates deterministic presentation files. Use
 `--backend heuristic --model deterministic-local` for an offline pipeline exercise.
 
+The site can be built before any summaries exist. Agent activity, graph edges, condensed
+transcripts, and statistics remain available; sparse phase, lifetime, and calendar records are
+explicitly marked unavailable, and only genuine cached summaries receive Markdown files and links.
+
 The default summary configuration is `gpt-5.5` with `--reasoning-effort medium`. A provider or
 model failure aborts the summary run and retains its failure receipt; the pipeline never silently
 substitutes another model or the heuristic backend.
+
+To use the installed Claude Code CLI as the summary backend, select it explicitly, including the
+intended Claude model:
+
+```bash
+agent-team-timeline summarize --output ./timelines/example-team --team example-team \
+  --backend claude --model sonnet --reasoning-effort medium
+```
+
+Claude runs are non-interactive, schema-constrained, and launched in safe mode with tools disabled
+and session persistence off. Missing structured output or exact usage is a hard failure; the
+pipeline does not reinterpret Claude's plain `result` string or fall back to another backend.
 
 Summarization bounds are independent from ingestion. For example, backfill one exact hour without
 truncating durable normalized data:
@@ -118,7 +146,7 @@ collision-safe.
 
 Codex's catalog label **Fast** maps to `--service-tier priority`. Codex runs always override the
 child CLI with an effective tier: omission and explicit `default` both mean `default`, while a tier
-is rejected for the offline heuristic backend. The default tier keeps existing summary and
+is rejected for Claude and the offline heuristic backend. The default tier keeps existing summary and
 hindsight-name cache identities; priority receives distinct identities. Effective tiers are
 retained in batch, invocation, and top-level run provenance.
 

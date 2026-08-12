@@ -18,6 +18,40 @@
   }
 
   /**
+   * Select the amount of timeline detail that can remain legible at the current
+   * time density. Keeping this calculation pure makes browser behavior and
+   * performance budgets deterministic across viewport sizes.
+   */
+  function semanticZoomLevel(startMs, endMs, chartWidth) {
+    var start = finite(startMs, 0);
+    var end = finite(endMs, start + 1);
+    var width = Math.max(1, finite(chartWidth, 1));
+    var millisecondsPerPixel = Math.max(1, end - start) / width;
+    if (millisecondsPerPixel <= 60 * 1000) {
+      return "detail";
+    }
+    if (millisecondsPerPixel <= 15 * 60 * 1000) {
+      return "lifetime";
+    }
+    return "aggregate";
+  }
+
+  /** Pick the narrowest precomputed bin that stays at least two pixels wide. */
+  function aggregateResolution(startMs, endMs, chartWidth) {
+    var start = finite(startMs, 0);
+    var end = finite(endMs, start + 1);
+    var width = Math.max(1, finite(chartWidth, 1));
+    var millisecondsPerPixel = Math.max(1, end - start) / width;
+    if ((60 * 60 * 1000) / millisecondsPerPixel >= 2) {
+      return "hourly";
+    }
+    if ((24 * 60 * 60 * 1000) / millisecondsPerPixel >= 2) {
+      return "daily";
+    }
+    return "weekly";
+  }
+
+  /**
    * Calendar rollups can extend beyond the first/last recorded event. Include those
    * valid calendar bounds in the domain users may navigate without changing the
    * initially fitted event-data range.
@@ -341,12 +375,14 @@
   }
 
   return {
+    aggregateResolution: aggregateResolution,
     activityRangeWithin: activityRangeWithin,
     boundedViewRange: boundedViewRange,
     edgeDisplayState: edgeDisplayState,
     edgeTouchesSelection: edgeTouchesSelection,
     navigableRange: navigableRange,
     nextPhaseSelection: nextPhaseSelection,
-    packLifetimes: packLifetimes
+    packLifetimes: packLifetimes,
+    semanticZoomLevel: semanticZoomLevel
   };
 });

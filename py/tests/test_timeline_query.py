@@ -16,6 +16,7 @@ from agent_team_timeline.archive import (
     as_object,
     as_string,
     narrow_json,
+    read_json,
 )
 from agent_team_timeline.cli import main as timeline_main
 
@@ -260,6 +261,80 @@ def test_show_expands_relationships_rollups_and_optional_transcript(
     rollup = _items(_response(capsys))[0]
     assert "Reproducible GHC" in str(rollup["technical_markdown"])
     assert "same files" in str(rollup["plain_language_markdown"])
+
+
+def test_sparse_summaries_remain_queryable_without_markdown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    timeline_path = root / "data" / "timeline.json"
+    timeline = as_object(read_json(timeline_path), "timeline")
+    agents = [
+        as_object(value, f"timeline.agents[{index}]")
+        for index, value in enumerate(as_array(timeline["agents"], "timeline.agents"))
+    ]
+    child = next(record for record in agents if record["id"] == "alpha::child")
+    child["summary_available"] = False
+    phase = as_object(as_array(timeline["phases"], "timeline.phases")[0], "phase")
+    phase["summary_available"] = False
+    rollup = as_object(as_array(timeline["rollups"], "timeline.rollups")[0], "rollup")
+    technical_path = as_string(rollup["technical_path"], "rollup.technical_path")
+    plain_path = as_string(rollup["plain_language_path"], "rollup.plain_language_path")
+    rollup["summary_available"] = False
+    rollup["technical_summary_available"] = False
+    rollup["plain_language_summary_available"] = False
+    rollup["technical_path"] = ""
+    rollup["plain_language_path"] = ""
+    _write_json(timeline_path, timeline)
+    (root / technical_path).unlink()
+    (root / plain_path).unlink()
+
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 0
+    listed_phase = _items(_response(capsys))[0]
+    assert listed_phase["summary_available"] is False
+
+    rollup_ref = f"rollup:alpha::hourly::{START}"
+    assert timeline_main(("query", "--output", str(root), "show", rollup_ref)) == 0
+    shown_rollup = _items(_response(capsys))[0]
+    assert shown_rollup["summary_available"] is False
+    assert "technical_markdown" not in shown_rollup
+    assert "plain_language_markdown" not in shown_rollup
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "GHC",
+                "--scope",
+                "summaries",
+                "--agent",
+                "agent:alpha::child",
+            )
+        )
+        == 0
+    )
+    assert _items(_response(capsys)) == []
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "GHC",
+                "--scope",
+                "transcripts",
+                "--agent",
+                "agent:alpha::child",
+            )
+        )
+        == 0
+    )
+    assert len(_items(_response(capsys))) == 2
 
 
 def test_search_supports_summary_transcript_agent_and_jsonl_output(

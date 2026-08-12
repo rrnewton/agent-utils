@@ -58,6 +58,42 @@ calendarRollups.slice(0, 5).forEach(function (rollup) {
   );
 });
 
+assert.strictEqual(
+  core.semanticZoomLevel(0, 60 * 1000 * 1000, 1000),
+  "detail",
+  "one minute per pixel retains work phases and state strips"
+);
+assert.strictEqual(
+  core.semanticZoomLevel(0, 60 * 1000 * 1000 + 1, 1000),
+  "lifetime",
+  "medium density collapses phases into one lifetime block per agent"
+);
+assert.strictEqual(
+  core.semanticZoomLevel(0, 15 * 60 * 1000 * 1000, 1000),
+  "lifetime",
+  "fifteen minutes per pixel remains in lifetime mode"
+);
+assert.strictEqual(
+  core.semanticZoomLevel(0, 15 * 60 * 1000 * 1000 + 1, 1000),
+  "aggregate",
+  "outer views suppress individual interaction detail"
+);
+assert.strictEqual(
+  core.aggregateResolution(0, 30 * 60 * 1000 * 1000, 1000),
+  "hourly",
+  "hour bins are retained while each remains at least two pixels wide"
+);
+assert.strictEqual(
+  core.aggregateResolution(0, 31 * 60 * 1000 * 1000, 1000),
+  "daily",
+  "daily bins replace sub-two-pixel hour bins"
+);
+assert.strictEqual(
+  core.aggregateResolution(0, 13 * 60 * 60 * 1000 * 1000, 1000),
+  "weekly",
+  "weekly bins replace sub-two-pixel day bins"
+);
+
 const springForwardDay = {
   kind: "daily",
   start_ms: Date.UTC(2026, 2, 8, 5),

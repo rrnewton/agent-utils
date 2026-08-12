@@ -128,6 +128,7 @@ def _transform_team(
         for key in (
             "agents",
             "phases",
+            "activity_bins",
             "edges",
             "events",
             "rollups",
@@ -200,6 +201,19 @@ def _transform_team(
             lambda value: _artifact_id(team_slug, value),
         )
         values["phases"].append(item)
+
+    for index, raw in enumerate(
+        as_array(
+            timeline.get("activity_bins", []),
+            f"{team_slug}.timeline.activity_bins",
+        )
+    ):
+        where = f"{team_slug}.timeline.activity_bins[{index}]"
+        item = dict(as_object(raw, where))
+        if as_string(item.get("team"), where + ".team") != team_slug:
+            raise ValueError(f"{where}.team does not match its rendered team")
+        item["team"] = team_slug
+        values["activity_bins"].append(item)
 
     for index, raw in enumerate(
         as_array(timeline.get("edges"), f"{team_slug}.timeline.edges")
@@ -493,6 +507,7 @@ def build_combined_archive(
                 "teams",
                 "agents",
                 "phases",
+                "activity_bins",
                 "edges",
                 "events",
                 "rollups",
@@ -597,6 +612,7 @@ def build_combined_archive(
                     "teams": merged["teams"],
                     "agents": merged["agents"],
                     "phases": merged["phases"],
+                    "activity_bins": merged["activity_bins"],
                     "edges": merged["edges"],
                     "events": merged["events"],
                     "rollups": merged["rollups"],
@@ -698,6 +714,7 @@ def build_combined_archive(
         "files_changed": changed,
         "teams": len(ordered_slugs),
         "phases": len(merged["phases"]),
+        "activity_bins": len(merged["activity_bins"]),
         "agents": len(merged["agents"]),
         "edges": len(merged["edges"]),
         "events": len(merged["events"]),

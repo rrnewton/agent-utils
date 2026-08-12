@@ -48,6 +48,13 @@ function functionSource(name) {
 const names = [
   "text",
   "number",
+  "hasField",
+  "summaryFlagAvailable",
+  "agentSummaryAvailable",
+  "phaseSummaryAvailable",
+  "phaseDetailSummaryAvailable",
+  "rollupSummaryAvailable",
+  "rollupAudienceAvailable",
   "lowerSearchText",
   "agentOfficialLeaf",
   "agentShortName",
@@ -60,7 +67,8 @@ const names = [
   "truncateLabel",
   "fitAgentSecondaryName",
   "agentTooltipIdentity",
-  "agentSearchText"
+  "agentSearchText",
+  "phaseSearchText"
 ];
 const context = {};
 vm.createContext(context);
@@ -99,6 +107,22 @@ assert.ok(searchText.includes("plugin_layout_audit"), "full official path must b
 assert.ok(searchText.includes("overlap-checker"), "coordinator nickname must be searchable");
 assert.ok(searchText.includes("wall-clock budgets"), "lifetime summary must be searchable");
 
+const unavailableSearchText = context.agentSearchText({
+  ...agent,
+  summary_available: false,
+  lifetime_summary: "Summary unavailable normalized logs"
+});
+assert.ok(!unavailableSearchText.includes("normalized logs"));
+assert.strictEqual(
+  context.phaseSearchText({
+    id: "phase-raw",
+    phrase: "Summary unavailable",
+    paragraph: "Inspect normalized logs",
+    summary_available: false
+  }),
+  "phase-raw"
+);
+
 assert.strictEqual(
   context.truncateLabel(agent.official_name, 1000, true),
   agent.official_name,
@@ -127,6 +151,58 @@ const legacyAgent = {
 };
 assert.strictEqual(context.agentShortName(legacyAgent), "legacy-nick");
 assert.strictEqual(context.agentOfficialName(legacyAgent), legacyAgent.path);
+assert.strictEqual(
+  context.agentSummaryAvailable(legacyAgent),
+  true,
+  "archives written before availability flags remain summary-compatible"
+);
+
+const sparseAgent = Object.assign({}, agent, {
+  summary_available: false,
+  lifetime_summary: "This stale placeholder must not be presented as a summary."
+});
+assert.strictEqual(context.agentSummaryAvailable(sparseAgent), false);
+assert.strictEqual(
+  context.agentLifetimeSummary(sparseAgent),
+  "Summary not generated for this agent lifetime."
+);
+assert.match(context.agentAccessibleName(sparseAgent), /Summary not generated/);
+assert.doesNotMatch(context.agentAccessibleName(sparseAgent), /stale placeholder/);
+
+assert.strictEqual(context.phaseSummaryAvailable({}), true);
+assert.strictEqual(context.phaseSummaryAvailable({ summary_available: false }), false);
+assert.strictEqual(
+  context.phaseDetailSummaryAvailable({}, { summary_available: false }),
+  false,
+  "phase detail inherits the timeline record's availability"
+);
+assert.strictEqual(
+  context.phaseDetailSummaryAvailable(
+    { summary_available: false },
+    { summary_available: true }
+  ),
+  false,
+  "an explicit detail flag takes precedence"
+);
+assert.strictEqual(context.rollupSummaryAvailable({ path: "legacy.md" }), true);
+assert.strictEqual(
+  context.rollupSummaryAvailable({
+    technical_summary_available: false,
+    plain_language_summary_available: false
+  }),
+  false
+);
+assert.strictEqual(
+  context.rollupAudienceAvailable(
+    {
+      summary_available: false,
+      path: "legacy-path-must-not-be-used.md"
+    },
+    "technical_summary_available"
+  ),
+  false,
+  "explicit unavailability overrides a legacy path"
+);
 
 assert.match(
   source,

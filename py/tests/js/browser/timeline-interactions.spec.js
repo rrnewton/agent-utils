@@ -2,6 +2,8 @@
 
 const { test, expect } = require("@playwright/test");
 const {
+  AGGREGATE_GAP_START_MS,
+  AGGREGATE_LATER_START_MS,
   AGENT_A_ACTIVITY_END_MS,
   AGENT_A_ACTIVITY_START_MS,
   AGENT_COUNT,
@@ -39,6 +41,24 @@ async function waitForViewChange(timeline, previousStart, previousEnd) {
     return current.start !== previousStart || current.end !== previousEnd;
   }).toBeTruthy();
   return readView(timeline);
+}
+
+async function zoomOutToLod(page, timeline, target) {
+  const axis = page.locator("#time-axis");
+  const box = await axis.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    if (await timeline.getAttribute("data-render-lod") === target) {
+      return;
+    }
+    const revision = Number(await timeline.getAttribute("data-render-revision"));
+    await page.mouse.wheel(0, 500);
+    await expect.poll(async function () {
+      return Number(await timeline.getAttribute("data-render-revision"));
+    }).toBeGreaterThan(revision);
+  }
+  expect(await timeline.getAttribute("data-render-lod")).toBe(target);
 }
 
 test.beforeEach(async function ({ page }) {
@@ -104,6 +124,65 @@ test("a horizontal trackpad gesture pans the zoomed timeline", async function ({
   await page.mouse.wheel(260, 0);
   const panned = await waitForViewChange(timeline, zoomed.start, zoomed.end);
   expect(Math.abs(panned.span - zoomed.span)).toBeLessThan(zoomed.span * 0.02);
+});
+
+test("semantic zoom drops subpixel detail within a deterministic DOM budget", async function ({ page }) {
+  const timeline = page.getByTestId("timeline");
+  const svg = page.locator("#timeline-svg");
+  const globalDetailed = page.locator("#show-global-messages");
+
+  await expect(timeline).toHaveAttribute("data-render-lod", "detail");
+  await expect(timeline).toHaveAttribute("data-render-revision", /\d+/);
+  await expect(timeline).toHaveAttribute("data-render-duration-ms", /\d+(?:\.\d+)?/);
+  expect(await svg.locator(".state-strip").count()).toBeGreaterThan(0);
+  await globalDetailed.check();
+  await expect(svg.locator('[data-edge-id="message-a"]')).toHaveCount(1);
+
+  await page.locator(phaseSelector).click();
+  await expect(timeline).toHaveAttribute("data-selected-agent-id", "agent-a");
+  await zoomOutToLod(page, timeline, "lifetime");
+  await expect(svg).toHaveAttribute("data-render-lod", "lifetime");
+  await expect(svg.locator(".state-strip")).toHaveCount(0);
+  await expect(svg.locator(".phase-group")).toHaveCount(0);
+  await expect(svg.locator('[data-edge-id="message-a"]')).toHaveCount(0);
+  await expect(svg.locator('[data-edge-id="spawn-a"]')).toHaveCount(1);
+  await expect(svg.locator('[data-edge-id="result-a"]')).toHaveCount(1);
+  await expect(svg.locator(".agent-lifetime-group")).toHaveCount(AGENT_COUNT);
+  await expect(timeline).toHaveAttribute("data-selected-agent-id", "agent-a");
+
+  await zoomOutToLod(page, timeline, "aggregate");
+  await expect(svg).toHaveAttribute("data-render-lod", "aggregate");
+  await expect(svg.locator(".state-strip")).toHaveCount(0);
+  await expect(svg.locator(".phase-group")).toHaveCount(0);
+  await expect(svg.locator(".edge-group")).toHaveCount(0);
+  await expect(svg.locator(".agent-lifetime-group")).toHaveCount(0);
+  await expect(svg).toHaveAttribute("data-track-mode", "aggregate");
+  await expect(svg).toHaveAttribute("data-aggregate-resolution", "hourly");
+  await expect(svg).toHaveAttribute("data-lane-count", "1");
+  await expect(svg.locator(".activity-bin-group")).toHaveCount(4);
+  await expect(svg.locator(
+    '.activity-bin-group[data-start-ms="' + AGGREGATE_GAP_START_MS + '"]'
+  )).toHaveCount(0);
+  await expect(svg.locator(
+    '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"]'
+  )).toHaveCount(1);
+  const busyHeight = Number(await svg.locator(
+    '.activity-bin-group[data-activity-role="workers"]'
+  ).first().locator("rect").getAttribute("height"));
+  const quieterHeight = Number(await svg.locator(
+    '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"] rect'
+  ).getAttribute("height"));
+  expect(busyHeight).toBeGreaterThan(quieterHeight);
+  const busyOpacity = Number(await svg.locator(
+    '.activity-bin-group[data-activity-role="workers"]'
+  ).first().locator("rect").getAttribute("fill-opacity"));
+  const quieterOpacity = Number(await svg.locator(
+    '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"] rect'
+  ).getAttribute("fill-opacity"));
+  expect(busyOpacity).toBeGreaterThan(quieterOpacity);
+  const svgNodeCount = await svg.locator("*").count();
+  expect(svgNodeCount).toBeLessThanOrEqual(160);
+  expect(Number(await timeline.getAttribute("data-render-duration-ms"))).toBeLessThan(100);
 });
 
 test("single clicks select and a double click opens phase detail", async function ({ page }) {
@@ -442,6 +521,131 @@ test("rollups switch audiences and verified glossary terms open stable entries",
   await expect(page.locator("#modal-content")).toContainText("Data that does not satisfy");
   await expect(page.locator("#modal-content a[href^='https://attacker.invalid']")).toHaveCount(0);
   expect(attackerRequests).toEqual([]);
+});
+
+test("sparse archives expose raw detail without inventing or fetching summaries", async function ({ page }) {
+  const sparse = JSON.parse(JSON.stringify(TIMELINE));
+  const agent = sparse.agents.find(function (item) { return item.id === "agent-a"; });
+  const phase = sparse.phases.find(function (item) { return item.id === "phase-a-1"; });
+  const rollup = sparse.rollups[0];
+  agent.summary_available = false;
+  agent.lifetime_summary = "A stale lifetime placeholder that must stay hidden.";
+  phase.summary_available = false;
+  phase.phrase = "A stale phase phrase that must stay hidden";
+  phase.paragraph = "A stale phase paragraph that must stay hidden.";
+  rollup.summary_available = false;
+  rollup.technical_summary_available = false;
+  rollup.plain_language_summary_available = false;
+  rollup.technical_path = "";
+  rollup.plain_language_path = "";
+  rollup.stats = {
+    user_prompts: 7,
+    agent_responses: 11,
+    inter_agent_messages: 3,
+    tool_calls: 19
+  };
+  sparse.glossary = [];
+  sparse.glossary_path = "";
+  sparse.summary_files = [];
+
+  await page.route("**/data/timeline.json", function (route) {
+    return route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(sparse)
+    });
+  });
+  await page.route("**/details/phase-a-1.json", function (route) {
+    return route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        summary_available: false,
+        phrase: "A stale detail phrase that must stay hidden",
+        paragraph: "A stale detail paragraph that must stay hidden.",
+        stats: phase.stats,
+        work_summary: [{ at_ms: phase.start_ms, text: "Synthetic summary text" }],
+        transcript: [{
+          role: "user",
+          at_ms: phase.start_ms,
+          text: "Preserve this raw owner-intent prompt."
+        }],
+        raw_summary_path: "summaries/phases/must-not-be-fetched.md"
+      })
+    });
+  });
+  const markdownRequests = [];
+  page.on("request", function (request) {
+    if (new URL(request.url()).pathname.endsWith(".md")) {
+      markdownRequests.push(request.url());
+    }
+  });
+
+  await page.reload();
+  await expect(page.locator("#dataset-meta")).not.toContainText("Loading timeline");
+  await expect(page.locator("#load-error")).toBeHidden();
+  await expect(page.getByTestId("glossary-open")).toBeHidden();
+
+  const sparsePhase = page.locator(phaseSelector);
+  const sparseAgent = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+  const sparseRollup = page.locator(
+    '.rollup-marker[data-start-ms="' + rollup.start_ms + '"]'
+  );
+  await expect(sparsePhase).toHaveClass(/summary-not-generated/);
+  await expect(sparseAgent).toHaveClass(/summary-not-generated/);
+  await expect(sparseRollup).toHaveClass(/summary-not-generated/);
+  await expect(sparsePhase).toHaveAttribute("aria-label", /Summary not generated/);
+
+  await sparsePhase.dblclick();
+  await expect(page.getByTestId("modal")).toBeVisible();
+  await expect(page.locator("#modal-title")).toHaveText("Activity window");
+  await expect(page.locator("#modal-summary")).toContainText("Summary not generated");
+  await expect(page.getByRole("tab", { name: "Full Transcript" })).toHaveAttribute(
+    "aria-selected",
+    "true"
+  );
+  await expect(page.getByRole("tab", { name: "Agent Work Summary" })).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "Markdown Summary" })).toHaveCount(0);
+  await expect(page.locator("#modal-content")).toContainText(
+    "Preserve this raw owner-intent prompt."
+  );
+  await expect(page.locator("#modal-content")).not.toContainText("Synthetic summary text");
+  await page.locator("#modal-close").click();
+
+  await sparseAgent.dispatchEvent("dblclick", { detail: 2 });
+  await expect(page.locator("#modal-summary")).toContainText(
+    "Summary not generated for this agent lifetime."
+  );
+  await expect(page.locator("#modal-summary")).not.toContainText("stale lifetime placeholder");
+  await page.locator("#modal-close").click();
+
+  await sparseRollup.dblclick();
+  await expect(page.getByRole("tab", { name: "Summary" })).toHaveAttribute(
+    "aria-selected",
+    "true"
+  );
+  await expect(page.locator("#modal-summary")).toContainText("Summary not generated");
+  await expect(page.locator("#modal-summary")).toContainText("7 prompts");
+  await expect(page.getByRole("tab", { name: "Technical" })).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "Plain Language" })).toHaveCount(0);
+  await expect(page.locator("#modal-content")).toContainText("Summary not generated");
+  expect(markdownRequests).toEqual([]);
+});
+
+test("the artifact catalog stays lazy until an artifact tab is opened", async function ({ page }) {
+  let artifactRequests = 0;
+  page.on("request", function (request) {
+    if (new URL(request.url()).pathname === "/data/artifacts.json") {
+      artifactRequests += 1;
+    }
+  });
+  await page.reload();
+  await expect(page.locator("#dataset-meta")).not.toContainText("Loading timeline");
+  await expect(page.locator(phaseSelector)).toBeVisible();
+  expect(artifactRequests).toBe(0);
+
+  await page.locator(phaseSelector).dblclick();
+  await page.getByRole("tab", { name: "Artifacts (3)" }).click();
+  await expect.poll(function () { return artifactRequests; }).toBe(1);
+  await expect(page.locator('[data-artifact-section="outputs"] .artifact-card')).toHaveCount(1);
 });
 
 test("artifact outputs and references stay distinct across phase, rollup, and agent views", async function ({ page }) {

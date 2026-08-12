@@ -343,6 +343,15 @@ def _optional_int(record: dict[str, JsonValue], key: str) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _summary_available(record: dict[str, JsonValue], key: str) -> bool:
+    if key not in record:
+        return True
+    value = record[key]
+    if not isinstance(value, bool):
+        raise ValueError(f"{key}: expected a boolean")
+    return value
+
+
 def _copy_fields(
     record: dict[str, JsonValue], keys: tuple[str, ...]
 ) -> dict[str, JsonValue]:
@@ -511,6 +520,7 @@ class TimelineQuery:
                     "official_name",
                     "nickname",
                     "lifetime_summary",
+                    "summary_available",
                     "depth",
                     "status",
                     "start_ms",
@@ -552,6 +562,7 @@ class TimelineQuery:
                     "team",
                     "phrase",
                     "paragraph",
+                    "summary_available",
                     "stats",
                     "start_ms",
                     "end_ms",
@@ -585,6 +596,10 @@ class TimelineQuery:
                     "end_ms",
                     "technical_path",
                     "plain_language_path",
+                    "technical_summary_available",
+                    "plain_language_summary_available",
+                    "summary_available",
+                    "stats",
                 ),
             )
             result["ref"] = rollup_ref(record, where)
@@ -732,19 +747,21 @@ class TimelineQuery:
     def _expand_rollup(
         self, result: dict[str, JsonValue], record: dict[str, JsonValue]
     ) -> None:
-        technical_path = as_string(
-            record.get("technical_path"), "rollup.technical_path"
-        )
-        plain_path = as_string(
-            record.get("plain_language_path"), "rollup.plain_language_path"
-        )
         team = _team(record, "rollup")
-        result["technical_markdown"] = self._rollup_file(technical_path, team).read_text(
-            encoding="utf-8"
-        )
-        result["plain_language_markdown"] = self._rollup_file(plain_path, team).read_text(
-            encoding="utf-8"
-        )
+        if _summary_available(record, "technical_summary_available"):
+            technical_path = as_string(
+                record.get("technical_path"), "rollup.technical_path"
+            )
+            result["technical_markdown"] = self._rollup_file(
+                technical_path, team
+            ).read_text(encoding="utf-8")
+        if _summary_available(record, "plain_language_summary_available"):
+            plain_path = as_string(
+                record.get("plain_language_path"), "rollup.plain_language_path"
+            )
+            result["plain_language_markdown"] = self._rollup_file(
+                plain_path, team
+            ).read_text(encoding="utf-8")
         _with_times(result, record, "rollup")
 
     def search(
@@ -858,13 +875,14 @@ class TimelineQuery:
             if not _overlaps(record, reference, filters.window):
                 continue
             start_ms, _end_ms = _interval(record, reference)
-            for field in (
+            fields = [
                 "short_name",
                 "official_name",
                 "nickname",
-                "lifetime_summary",
-                "naming_rationale",
-            ):
+            ]
+            if _summary_available(record, "summary_available"):
+                fields.extend(("lifetime_summary", "naming_rationale"))
+            for field in fields:
                 text = _optional_string(record, field)
                 if text:
                     self._match(
@@ -889,6 +907,8 @@ class TimelineQuery:
                 continue
             reference = phase_ref(record)
             if not _overlaps(record, reference, filters.window):
+                continue
+            if not _summary_available(record, "summary_available"):
                 continue
             start_ms, _end_ms = _interval(record, reference)
             for field in ("phrase", "paragraph"):
@@ -926,19 +946,27 @@ class TimelineQuery:
             if not _overlaps(record, reference, filters.window):
                 continue
             start_ms, _end_ms = _interval(record, reference)
-            fields = (
-                (
-                    "technical_markdown",
-                    as_string(record.get("technical_path"), "rollup.technical_path"),
-                ),
-                (
-                    "plain_language_markdown",
-                    as_string(
-                        record.get("plain_language_path"),
-                        "rollup.plain_language_path",
-                    ),
-                ),
-            )
+            fields: list[tuple[str, str]] = []
+            if _summary_available(record, "technical_summary_available"):
+                fields.append(
+                    (
+                        "technical_markdown",
+                        as_string(
+                            record.get("technical_path"),
+                            "rollup.technical_path",
+                        ),
+                    )
+                )
+            if _summary_available(record, "plain_language_summary_available"):
+                fields.append(
+                    (
+                        "plain_language_markdown",
+                        as_string(
+                            record.get("plain_language_path"),
+                            "rollup.plain_language_path",
+                        ),
+                    )
+                )
             for field, relative in fields:
                 text = self._rollup_file(relative, team).read_text(encoding="utf-8")
                 self._match(
@@ -1042,6 +1070,9 @@ def _markdown_item(item: dict[str, JsonValue]) -> str:
         "end_time",
         "at_time",
         "field",
+        "summary_available",
+        "technical_summary_available",
+        "plain_language_summary_available",
     ):
         value = item.get(key)
         if isinstance(value, (str, int, float, bool)):

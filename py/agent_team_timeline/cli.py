@@ -32,6 +32,11 @@ from agent_team_timeline.pipeline import (
     summarize_archive,
     utc_now,
 )
+from agent_team_timeline.project_config import (
+    ProjectIngestConfig,
+    ingest_project,
+    load_project_ingest_config,
+)
 from agent_team_timeline.query import (
     QueryFilters,
     TimelineQuery,
@@ -181,16 +186,23 @@ def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
 def _add_summary(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--backend",
-        choices=("codex", "heuristic"),
+        choices=("codex", "claude", "heuristic"),
         default="codex",
         help="summary backend (heuristic is deterministic/offline)",
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Codex model name")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "backend model name; required for Claude, otherwise defaults to "
+            f"{DEFAULT_MODEL!r} (or AGENT_TEAM_TIMELINE_MODEL)"
+        ),
+    )
     parser.add_argument(
         "--reasoning-effort",
         default=DEFAULT_REASONING_EFFORT,
         help=(
-            "Codex reasoning effort, recorded in cache provenance "
+            "backend reasoning effort, recorded in cache provenance "
             "(default: %(default)s). "
             "A model/provider failure aborts instead of selecting another model or backend"
         ),
@@ -216,6 +228,11 @@ def _add_summary(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--transcript-chars", type=int, default=30000)
     parser.add_argument(
         "--codex-command", default="codex", help="Codex executable (primarily for testing/wrappers)"
+    )
+    parser.add_argument(
+        "--claude-command",
+        default="claude",
+        help="Claude executable (primarily for testing/wrappers)",
     )
     summary_start = parser.add_mutually_exclusive_group()
     summary_start.add_argument(
@@ -326,6 +343,28 @@ def _parser() -> argparse.ArgumentParser:
 
     quick = sub.add_parser("quickstart", help="print a short end-to-end example", description="print a short end-to-end example")
     quick.set_defaults(handler="quickstart")
+
+    ingest_project_parser = sub.add_parser(
+        "ingest-project",
+        help="ingest registered project teams and extract transcripts; zero tokens",
+        description=(
+            "ingest teams from a strict JSON manifest, then refresh the global transcript "
+            "JSONL; does not call a model or build the website"
+        ),
+    )
+    ingest_project_parser.add_argument(
+        "--config", required=True, help="schema-v1 project ingest JSON file"
+    )
+    ingest_project_parser.add_argument(
+        "--team",
+        action="append",
+        default=[],
+        help=(
+            "registered team slug to ingest; repeat as needed (default: every team); "
+            "transcript extraction still covers every normalized archive team"
+        ),
+    )
+    ingest_project_parser.set_defaults(handler="ingest_project")
 
     ingest = sub.add_parser("ingest", help="normalize Codex logs; do not call a model", description="normalize Codex logs; do not call a model")
     _add_ingest(ingest)
@@ -506,6 +545,16 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
+    backend = str(ns.backend)
+    raw_model: object = ns.model
+    if raw_model is None:
+        if backend == "claude":
+            raise ValueError("--model is required when --backend=claude")
+        model = DEFAULT_MODEL
+    else:
+        model = str(raw_model).strip()
+        if not model:
+            raise ValueError("--model must not be empty")
     raw_service_tier: object = ns.service_tier
     service_tier = (
         None if raw_service_tier is None else str(raw_service_tier)
@@ -555,8 +604,8 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
     return summarize_archive(
         archive,
         str(ns.team),
-        str(ns.backend),
-        str(ns.model),
+        backend,
+        model,
         max_workers=int(ns.summary_workers),
         batch_size=int(ns.summary_batch_size),
         name_batch_size=int(ns.name_batch_size),
@@ -564,6 +613,7 @@ def _summary_call(ns: argparse.Namespace) -> SummarizeReport:
         context_chars=int(ns.context_chars),
         transcript_chars=int(ns.transcript_chars),
         codex_command=(str(ns.codex_command),),
+        claude_command=(str(ns.claude_command),),
         reasoning_effort=str(ns.reasoning_effort),
         service_tier=service_tier,
         summary_window=summary_window,
@@ -850,6 +900,88 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             return _inspect(_path(str(ns.output)))
         except (OSError, ValueError) as error:
+            print(f"{PROG}: {error}", file=sys.stderr)
+            return 2
+    if handler == "ingest_project":
+        project_started = utc_now()
+        project_command = [PROG, *args]
+        config: ProjectIngestConfig | None = None
+        selected_slugs: tuple[str, ...] = ()
+        try:
+            config = load_project_ingest_config(_path(str(ns.config)))
+            project_team_values: object = ns.team
+            if not isinstance(project_team_values, list) or not all(
+                isinstance(item, str) for item in project_team_values
+            ):
+                raise ValueError("--team values must be strings")
+            selected_slugs = tuple(
+                team.slug
+                for team in config.select_teams(tuple(project_team_values))
+            )
+            project_report = ingest_project(config, selected_slugs)
+            project_run_path = record_run(
+                config.output,
+                project_command,
+                project_started,
+                "completed",
+                selected_slugs[0],
+                None,
+                None,
+                None,
+                team_slugs=selected_slugs,
+                mechanical={"project_ingest": project_report.to_json_obj()},
+            )
+            for team in project_report.teams:
+                print(f"{team.team_slug} ({team.provider}):", end=" ")
+                _print_ingest(team.ingest)
+            project_transcripts = project_report.transcripts
+            print(
+                f"transcripts: {project_transcripts.prompts} prompts, "
+                f"{project_transcripts.responses} responses, "
+                f"{project_transcripts.system_inputs} system inputs across "
+                f"{project_transcripts.teams} normalized archive teams; "
+                f"{project_transcripts.files_changed} files changed"
+            )
+            print(
+                "JSONL: "
+                f"{config.output / 'extracted' / 'transcripts' / 'prompts.jsonl'}"
+            )
+            print("website: not built (run `agent-team-timeline build` separately)")
+            print(f"run metadata: {project_run_path}")
+            return 0
+        except (
+            ClaudeParseError,
+            CodexParseError,
+            OrcParseError,
+            OSError,
+            ValueError,
+        ) as error:
+            if config is not None and selected_slugs:
+                try:
+                    project_run_path = record_run(
+                        config.output,
+                        project_command,
+                        project_started,
+                        "failed",
+                        selected_slugs[0],
+                        None,
+                        None,
+                        None,
+                        error=str(error),
+                        team_slugs=selected_slugs,
+                        mechanical={
+                            "project_ingest": {
+                                "schema_version": 1,
+                                "config_sha256": config.config_sha256,
+                                "model_calls": 0,
+                                "model_tokens": 0,
+                                "website_build_performed": False,
+                            }
+                        },
+                    )
+                    print(f"run metadata: {project_run_path}", file=sys.stderr)
+                except (OSError, ValueError):
+                    pass
             print(f"{PROG}: {error}", file=sys.stderr)
             return 2
     if handler in {

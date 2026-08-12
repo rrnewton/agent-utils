@@ -22,6 +22,14 @@ do not require site changes.
 - A whole spawned interval is an **agent lifetime**; each summarized sub-block is a **work phase**.
   Work-phase boxes carry a short phrase at useful zoom levels. Their bottom strip distinguishes active,
   tool-running, waiting, idle, and explicitly blocked time.
+- Semantic zoom keeps long histories responsive. At one minute per pixel or closer, the site shows
+  phases, state strips, and applicable message edges. From one to fifteen minutes per pixel it shows
+  one lifetime block per agent plus structural fork/join edges. Farther out, each team becomes a
+  compact activity heat strip with no tiny agents or edges: height represents average worker
+  concurrency and saturation represents observed active coverage. The strip selects hourly, local
+  daily, or local Monday-to-Sunday weekly bins, leaves truly inactive intervals blank, and does not
+  count time before the first or after the last captured record as inactivity. Local day/week bins
+  follow daylight-saving boundaries.
 - Thick curved edges are structural forks (parent-to-child spawns), joins (terminal
   child-to-parent results), and explicitly configured coordinator-session continuations, so all
   remain visible. A continuation does not invent a return arrow for the successor coordinator.
@@ -112,6 +120,84 @@ private thinking blocks.
 For Orc, pass the project directory containing `.orc/` and `.tg/` as `--source-root`. The root
 coordinator UUID names a directory under `.orc/sessions/`; child sessions with an explicit parent
 identifier are followed as nested coordinators.
+
+## Register a multi-team project
+
+Use `ingest-project` when a durable project archive draws from several machines or providers. The
+schema-v1 JSON manifest is the source of truth for team slugs, coordinator roots, source paths,
+continuations, timezone, and site identity:
+
+```json
+{
+  "schema_version": 1,
+  "output": "../summary/example-project",
+  "timezone": "America/New_York",
+  "projects": [
+    {
+      "label": "example-project",
+      "repository_url": "https://github.com/example/example-project"
+    }
+  ],
+  "teams": [
+    {
+      "slug": "codex-example-014",
+      "provider": "codex",
+      "source_hosts": ["build014.example.com"],
+      "source": {
+        "sessions_root": "../devbig014/.codex/sessions",
+        "root_session": "ROOT_UUID",
+        "continuation_sessions": ["NEXT_ROOT_UUID"]
+      }
+    },
+    {
+      "slug": "claude-example-176",
+      "provider": "claude",
+      "source_hosts": ["build176.example.com"],
+      "source": {
+        "session_file": "../devbig176/.claude/projects/PROJECT/SESSION.jsonl"
+      }
+    },
+    {
+      "slug": "orc-example-014",
+      "provider": "orc",
+      "source_hosts": ["build014.example.com"],
+      "source": {
+        "source_root": "../devbig014",
+        "root_session": "ORC_SESSION_UUID"
+      }
+    }
+  ]
+}
+```
+
+Run it from any directory; relative paths are anchored to the manifest, not the shell's working
+directory:
+
+```bash
+agent-team-timeline ingest-project --config ~/agent_logs_archive/projects/example.json
+# Refresh only one registered provider lineage while testing:
+agent-team-timeline ingest-project --config ~/agent_logs_archive/projects/example.json \
+  --team codex-example-014
+```
+
+`output` must be relative to the config file. Provider source paths may be relative to that file or
+absolute. Top-level `timezone`, `projects`, `source_hosts`, and `window` values are defaults; a team
+may replace any of them. `projects` contains exact `label` and `repository_url` objects, while
+`source_hosts` is an array of validated hostnames. A `window` may contain `start_date` or
+`start_time`, plus `end_date` or `end_time`, using the same inclusive/exclusive rules as the CLI.
+
+The parser rejects missing and unknown keys, unknown providers, duplicate team slugs, duplicate
+continuations, absolute output paths, invalid identity, and invalid time bounds. Provider `source`
+objects are exact: Codex accepts `sessions_root`, `root_session`, and optional ordered
+`continuation_sessions`; Claude accepts only `session_file`; Orc accepts `source_root` and
+`root_session`.
+
+This command is entirely mechanical. It snapshots and normalizes the selected registered teams,
+then refreshes `extracted/transcripts/` over **every** normalized team already in the archive so the
+global prompt database remains monotonic. A `--team` filter limits ingestion, not that final global
+projection. Its run receipt binds the exact config-file SHA-256, records zero model calls/tokens,
+and confirms that no website build ran; use `build` or `export` explicitly when presentation files
+should change.
 
 ## End-to-end refresh
 
@@ -282,6 +368,21 @@ run and leaves its failure receipt; it never silently changes models or switches
 backend. Use `--model` or the
 `AGENT_TEAM_TIMELINE_MODEL` environment variable only when intentionally overriding that policy.
 
+The summary provider is independent of the transcript source provider. To summarize any normalized
+team through the installed Claude Code CLI, run:
+
+```bash
+agent-team-timeline summarize \
+  --team example-team --output ./timelines/example-team \
+  --backend claude --model sonnet --reasoning-effort medium
+```
+
+The Claude child runs in print-only safe mode with all tools disabled, no session persistence, and
+the same strict JSON schema used by the Codex backend. Only `structured_output` is accepted; a
+plain `result` string is never treated as a schema response. Any process, provider, schema, or
+usage-accounting failure aborts without selecting a different model or backend. `--claude-command`
+can select a wrapper or alternate executable; it does not change the cache identity.
+
 Each stable time window gets a content-addressed cache key over:
 
 - its transcript input;
@@ -296,6 +397,7 @@ choice: every Codex child receives `-c service_tier="default"`, while its cache 
 compatible with summaries generated before tier support. Priority has a distinct summary and
 hindsight-name cache identity. The effective value appears in immutable batch, invocation, and
 top-level run receipts. A service tier is rejected with the deterministic heuristic backend.
+Claude does not expose this Codex scheduling option, so it also rejects `--service-tier`.
 
 Every calendar period has two distinct jobs and cache identities. The technical summary remains
 content-led and must explain what a pull request, task, or phase changed instead of using its number
@@ -344,6 +446,9 @@ simultaneous refreshes from buying the same cache miss.
 
 Every backend batch writes an immutable usage receipt with its model, reasoning effort, service
 tier, input, cached-input, cache-write-input, output, reasoning-output, and total token counts.
+For Claude, normalized input is the sum of its direct input, cache-creation input, and cache-read
+input counters; cache creation and reads are also retained in their dedicated fields. Claude does
+not expose a separate reasoning-token count, so that field is zero rather than guessed.
 Cache records link to that receipt. The command prints both tokens newly spent by this run and the
 deduplicated original generation cost of all returned artifacts; an all-hit rerun therefore
 reports zero new tokens without losing the original cost. Older cache entries remain valid and are
@@ -399,7 +504,7 @@ agent-team-timeline summarize \
 The heuristic backend is intentionally less capable, but exercises the complete cache and rendering
 pipeline without network or token use. It labels the overview and definitions as insufficient
 evidence and retains first-use context instead of pretending to synthesize model-quality
-explanations. Its cache keys are distinct from Codex summaries.
+explanations. Its cache keys are distinct from Codex and Claude summaries.
 
 ### 4. Build — guaranteed zero model calls
 
@@ -407,12 +512,12 @@ explanations. Its cache keys are distinct from Codex summaries.
 agent-team-timeline build --team example-team --output ./timelines/example-team
 ```
 
-`build` reads normalized JSON and structured summary data, then regenerates every Markdown, detail
-JSON, and website file. Identical bytes are not rewritten. Use it freely after CSS, layout, or
-Markdown formatting changes. Because those presentation files live at the output root, the tool
-refuses to use a non-empty directory unless it already contains its archive marker or a recognized
-existing `teams/<slug>/raw/team.json`; a mistaken `--output` cannot replace another project's
-README or Makefile.
+`build` reads normalized JSON and any structured summary data, then regenerates the detail JSON and
+website plus Markdown only for summaries that actually exist. Identical bytes are not rewritten.
+Use it freely after CSS, layout, or Markdown formatting changes. Because those presentation files
+live at the output root, the tool refuses to use a non-empty directory unless it already contains
+its archive marker or a recognized existing `teams/<slug>/raw/team.json`; a mistaken `--output`
+cannot replace another project's README or Makefile.
 
 Build fails closed on definition-only glossary projections: it ignores those retired records and
 omits them from links and rendered catalogs. This removes stale glossary links and weekly generated
@@ -432,8 +537,9 @@ agent-team-timeline export \
 
 The export has its own archive marker, run receipt, `./timeline` query CLI, and local server launcher. It reads
 the durable archive but does not copy or truncate normalized source data and cannot invoke a model.
-If a selected phase or rollup has no cached summary, the site labels it `Summary unavailable` and
-still exposes its normalized transcript and statistics. These build-only placeholders never enter
+If a selected phase or rollup has no cached summary, its projection carries an explicit false
+availability flag and still exposes normalized transcript and statistics. It does not masquerade as
+a Markdown summary or appear in the summary-file menu. These build-only placeholders never enter
 the model cache; rerunning `summarize` later replaces them with paid summaries without discarding
 already compatible cached work.
 
@@ -711,8 +817,9 @@ references that `show` accepts directly:
 The references deliberately remove the compositor's presentation-only team prefix, so they remain
 the same when an individual team is later included in a combined export. `show` adds parent,
 children, and work-phase references for an agent; phase transcripts remain excluded unless
-`--transcript` is explicit. Showing a rollup returns both its technical and plain-language Markdown.
-Search is literal and case-insensitive by default. It can scan `summaries`, `transcripts`, or `all`;
+`--transcript` is explicit. Showing a rollup returns each available technical or plain-language
+Markdown audience and reports false availability without trying to open a missing file. Search is
+literal and case-insensitive by default. It can scan `summaries`, `transcripts`, or `all`;
 `--agent` restricts work-phase and transcript results to one canonical agent reference. Time bounds
 are half-open RFC3339 instants and select records whose intervals overlap the requested range.
 Timeline queries only read `data/timeline.json`, `data/details/*.json`, and referenced summary

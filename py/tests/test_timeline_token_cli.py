@@ -137,7 +137,9 @@ def test_default_summary_model_is_supported_configuration(
     )
 
     assert ns.backend == "codex"
-    assert ns.model == "gpt-5.5"
+    # The parser keeps omission visible so Claude can require an explicit model;
+    # `_summary_call` resolves the Codex omission to DEFAULT_MODEL.
+    assert ns.model is None
     assert ns.reasoning_effort == "medium"
 
     with pytest.raises(SystemExit) as raised:
