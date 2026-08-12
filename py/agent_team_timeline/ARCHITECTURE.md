@@ -343,6 +343,16 @@ Outputs are a hindsight short name, naming rationale, and one-to-three-sentence 
 The independent cache is `summary_data/name_cache/<input-hash>.json`; projections are
 `summary_data/agents/<thread-id>.json`.
 
+The structured-output schema asks providers for `Coordinator` or a two-to-five-word display name
+with no slash or underscore. The job-aware validator remains authoritative. If a provider still
+returns a path or underscore slug, one narrow presentation-only recovery takes its final semantic
+component, replaces underscore separators with spaces, and revalidates the normal word-count,
+length, `/root`, and path/slug rules. It does not invent or truncate words; a leaf that cannot pass
+the original display-name contract still fails closed. A repaired batch retains every validated
+name, rationale, and lifetime summary and records the exact raw response and replacement in the
+receipt-linked backend-output audit. This deterministic enforcement of the existing output
+contract does not invalidate older valid name caches.
+
 ### Project overview
 
 Staged by `pipeline.py:_project_overview_job`.
@@ -411,13 +421,14 @@ counter is direct input plus cache-creation input plus cache-read input, with bo
 also retained separately. Both runners feed the same strict summary/naming parsers and immutable
 receipt/cache lifecycle.
 
-When a backend's final message fails validation, or the phase timestamp rule repairs it, the exact
-raw final message is preserved at `_usage/backend_outputs/<receipt-id>.json`. That receipt-linked
-audit record includes a SHA-256 content hash, each job's half-open bounds, and the index, timestamp,
-and `dropped-out-of-range` action for every repaired bullet. It deliberately excludes the model
-prompt and captured Codex CLI stdout/stderr. For a nonzero backend exit, the durable failure
-receipt and propagated exception retain the exit code but no captured stream detail. Ordinary valid
-responses need no duplicate raw-output record.
+When a backend's final message fails validation, or a bounded phase/name rule repairs it, the exact
+raw final message is preserved at `_usage/backend_outputs/<receipt-id>.json`. Every audit record
+includes a SHA-256 content hash. A phase audit also records each job's half-open bounds plus the
+index, timestamp, and `dropped-out-of-range` action for repaired bullets; a naming audit records the
+job key, response index, rejected path/slug, and validated display-name replacement. Audit records
+deliberately exclude the model prompt and captured Codex CLI stdout/stderr. For a nonzero backend
+exit, the durable failure receipt and propagated exception retain the exit code but no captured
+stream detail. Ordinary valid responses need no duplicate raw-output record.
 
 The resolvers also try the former hash scheme. Valid summary-cache v1/v2 and naming-cache v3 files
 remain hits without token spend; they receive in-memory provenance marked `legacy_storage: true`

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 
@@ -105,7 +106,9 @@ result = {
     },
 }
 mode = os.environ.get("FAKE_CLAUDE_MODE", "success")
-if mode == "success":
+if mode == "path-name":
+    structured["names"][-1]["short_name"] = jobs[-1]["official_path"]
+if mode in {"success", "path-name"}:
     result["structured_output"] = structured
 elif mode == "failure":
     result["subtype"] = "error"
@@ -269,6 +272,83 @@ def test_claude_provider_failure_and_naming_are_accounted(
     assert named["thread-one"].short_name == "Transcript index audit"
     assert named["thread-one"].lifetime_summary is not None
     assert stats.newly_spent_usage.total_tokens == 36
+
+
+def test_claude_path_name_repair_keeps_the_whole_batch_and_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = tmp_path / "fake-claude"
+    log = tmp_path / "claude-calls.jsonl"
+    _write_fake_claude(fake)
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "path-name")
+    cache = tmp_path / "name-cache"
+    first = _name_job()
+    second = replace(
+        first,
+        key="name-two",
+        thread_id="thread-two",
+        official_path="/root/release_receipt_audit",
+        coordinator_nickname="Curie",
+    )
+
+    named, stats = name_agents(
+        [first, second],
+        cache,
+        backend="claude",
+        model="claude-test",
+        reasoning_effort="medium",
+        max_workers=1,
+        batch_size=12,
+        claude_command=(str(fake),),
+    )
+
+    assert named[first.thread_id].short_name == "Transcript index audit"
+    assert named[second.thread_id].short_name == "Release receipt audit"
+    assert stats.misses == 2 and stats.batches == 1
+    assert stats.newly_spent_usage.total_tokens == 36
+    assert len(list(cache.glob("*.json"))) == 2
+    receipt = json.loads(
+        next((cache / "_usage" / "receipts").glob("*.json")).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["status"] == "completed"
+    audit = json.loads(
+        (
+            cache
+            / "_usage"
+            / "backend_outputs"
+            / f"{receipt['receipt_id']}.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert audit["status"] == "repaired"
+    assert audit["repairs"] == [
+        {
+            "key": second.key,
+            "index": 1,
+            "field": "short_name",
+            "action": "normalized-path-or-slug",
+            "rejected": second.official_path,
+            "replacement": "Release receipt audit",
+        }
+    ]
+    assert "BEGIN_AGENT_NAME_JOBS_JSON" not in audit["raw_output"]
+
+    reused, cached = name_agents(
+        [first, second],
+        cache,
+        backend="claude",
+        model="claude-test",
+        reasoning_effort="medium",
+        max_workers=1,
+        batch_size=12,
+        claude_command=(str(fake),),
+    )
+    assert reused == named
+    assert cached.hits == 2 and cached.misses == 0 and cached.batches == 0
+    assert cached.newly_spent_usage == TokenUsage()
+    assert len(log.read_text(encoding="utf-8").splitlines()) == 1
 
 
 def test_claude_rejects_codex_only_service_tier(tmp_path: Path) -> None:

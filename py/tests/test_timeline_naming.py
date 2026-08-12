@@ -239,7 +239,6 @@ def test_model_lifetime_summary_whitespace_is_canonicalized_without_retry() -> N
     "short_name, message",
     [
         ("Audit", "2 to 5 words"),
-        ("budget_overlap_audit", "not a path or slug"),
         ("Budget  overlap audit", "single spaces"),
         ("Budget overlap audit review findings now", "2 to 5 words"),
         ("A" * 24 + " " + "B" * 24, "exceeds 48 characters"),
@@ -249,6 +248,26 @@ def test_model_short_name_validation(short_name: str, message: str) -> None:
     job = _job()
     with pytest.raises(AgentNameError, match=message):
         _parse([job], [_entry(job, short_name)])
+
+
+@pytest.mark.parametrize(
+    "short_name, expected",
+    [
+        ("budget_overlap_audit", "Budget overlap audit"),
+        ("/root/audits/budget_overlap_audit", "Budget overlap audit"),
+    ],
+)
+def test_path_or_slug_short_name_is_boundedly_repaired(
+    short_name: str, expected: str
+) -> None:
+    job = _job()
+    assert _parse([job], [_entry(job, short_name)])[job.key] == expected
+
+
+def test_path_repair_does_not_relax_other_name_invariants() -> None:
+    job = _job()
+    with pytest.raises(AgentNameError, match="path or slug"):
+        _parse([job], [_entry(job, "/root/audit")])
 
 
 def test_cache_hit_is_idempotent_without_rewriting(tmp_path: Path) -> None:

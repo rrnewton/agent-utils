@@ -9,6 +9,7 @@ with ancestor context available to preserve the user's terminology.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import re
 import tempfile
@@ -77,17 +78,29 @@ class AgentNameError(RuntimeError):
 class _CodexNameBatchError(AgentNameError):
     """A failed Codex invocation with any terminal usage it already reported."""
 
-    def __init__(self, message: str, usage: TokenUsage | None) -> None:
+    def __init__(
+        self,
+        message: str,
+        usage: TokenUsage | None,
+        backend_output: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.usage = usage
+        self.backend_output = backend_output
 
 
 class _ClaudeNameBatchError(AgentNameError):
     """A failed Claude naming invocation with any exact usage retained."""
 
-    def __init__(self, message: str, usage: TokenUsage | None) -> None:
+    def __init__(
+        self,
+        message: str,
+        usage: TokenUsage | None,
+        backend_output: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.usage = usage
+        self.backend_output = backend_output
 
 
 @dataclass(frozen=True)
@@ -143,6 +156,29 @@ class _ResolvedName:
 class _GeneratedNameBatch:
     results: Mapping[str, AgentNameResult]
     receipt: BatchUsageReceipt
+
+
+@dataclass(frozen=True)
+class _NameRepair:
+    """One bounded path/slug-to-display-name normalization."""
+
+    key: str
+    index: int
+    rejected_short_name: str
+    repaired_short_name: str
+
+
+@dataclass(frozen=True)
+class _ParsedNameOutput:
+    results: Mapping[str, AgentNameResult]
+    repairs: tuple[_NameRepair, ...]
+
+
+@dataclass(frozen=True)
+class _NameBatchOutcome:
+    parsed: _ParsedNameOutput
+    usage: TokenUsage | None
+    raw_output: str
 
 
 def _validate_job(job: AgentNameJob) -> None:
@@ -330,6 +366,10 @@ def _output_schema() -> dict[str, JsonValue]:
                 "type": "string",
                 "minLength": 1,
                 "maxLength": _MAX_NAME_LENGTH,
+                # Structured-output providers should prevent the common failure before
+                # post-validation. The Coordinator alternative is the one-word /root
+                # exception; the strict job-aware validator remains authoritative.
+                "pattern": r"^(?:Coordinator|[^\s/_]+(?: [^\s/_]+){1,4})$",
             },
             "rationale": {"type": "string", "minLength": 1},
             "lifetime_summary": {
@@ -403,6 +443,7 @@ def _decode_json(text: str, where: str) -> JsonValue:
 
 
 _SPACE_RE: Final = re.compile(r"\s+")
+_PATH_NAME_SEPARATOR_RE: Final = re.compile(r"[_\s]+")
 
 
 def _validate_short_name(name: str, job: AgentNameJob, where: str) -> str:
@@ -435,19 +476,39 @@ def _validate_lifetime_summary(summary: str, where: str) -> str:
     return normalized
 
 
-def _parse_backend_output(
+def _repair_path_short_name(name: str, job: AgentNameJob, where: str) -> str:
+    """Recover only a semantic leaf expressed as a path/underscore slug.
+
+    The model has already supplied hindsight context, rationale, and a lifetime
+    summary.  Converting ``/root/foo/bar_baz`` to ``Bar baz`` is a lossless
+    presentation repair; inventing words, truncating semantic components, or
+    relaxing any other display-name invariant is intentionally out of scope.
+    """
+
+    if "/" not in name and "_" not in name:
+        raise AgentNameError(f"{where}: is not a repairable path or slug")
+    leaf = name.rstrip("/").rsplit("/", 1)[-1]
+    words = [word for word in _PATH_NAME_SEPARATOR_RE.split(leaf) if word]
+    candidate = " ".join(
+        _display_word(word, first=index == 0) for index, word in enumerate(words)
+    )
+    return _validate_short_name(candidate, job, where)
+
+
+def _parse_backend_output_with_repairs(
     text: str,
     pending: Sequence[_PendingName],
     model: str,
     generated_at: str,
-) -> dict[str, AgentNameResult]:
-    root = _object(_decode_json(text, "codex output"), "codex output")
-    _require_keys(root, {"names"}, "codex output")
+) -> _ParsedNameOutput:
+    root = _object(_decode_json(text, "backend output"), "backend output")
+    _require_keys(root, {"names"}, "backend output")
     expected = {item.job.key: item for item in pending}
     results: dict[str, AgentNameResult] = {}
+    repairs: list[_NameRepair] = []
     seen_threads: set[str] = set()
-    for index, raw_name in enumerate(_array(root["names"], "codex output.names")):
-        where = f"codex output.names[{index}]"
+    for index, raw_name in enumerate(_array(root["names"], "backend output.names")):
+        where = f"backend output.names[{index}]"
         item = _object(raw_name, where)
         _require_keys(
             item,
@@ -466,11 +527,30 @@ def _parse_backend_output(
         if thread_id in seen_threads:
             raise AgentNameError(f"{where}.thread_id: duplicate thread {thread_id!r}")
         seen_threads.add(thread_id)
-        short_name = _validate_short_name(
-            _string(item["short_name"], where + ".short_name"),
-            pending_item.job,
-            where + ".short_name",
-        )
+        raw_short_name = _string(item["short_name"], where + ".short_name")
+        try:
+            short_name = _validate_short_name(
+                raw_short_name,
+                pending_item.job,
+                where + ".short_name",
+            )
+        except AgentNameError as validation_error:
+            try:
+                short_name = _repair_path_short_name(
+                    raw_short_name,
+                    pending_item.job,
+                    where + ".short_name",
+                )
+            except AgentNameError:
+                raise validation_error
+            repairs.append(
+                _NameRepair(
+                    key=key,
+                    index=index,
+                    rejected_short_name=raw_short_name,
+                    repaired_short_name=short_name,
+                )
+            )
         rationale = _string(item["rationale"], where + ".rationale")
         lifetime_summary = _validate_lifetime_summary(
             _string(item["lifetime_summary"], where + ".lifetime_summary"),
@@ -488,8 +568,23 @@ def _parse_backend_output(
         )
     missing = sorted(set(expected) - set(results))
     if missing:
-        raise AgentNameError("codex output: missing names for " + ", ".join(missing))
-    return results
+        raise AgentNameError("backend output: missing names for " + ", ".join(missing))
+    return _ParsedNameOutput(results=results, repairs=tuple(repairs))
+
+
+def _parse_backend_output(
+    text: str,
+    pending: Sequence[_PendingName],
+    model: str,
+    generated_at: str,
+) -> dict[str, AgentNameResult]:
+    """Return validated names, including bounded presentation-only repairs."""
+
+    return dict(
+        _parse_backend_output_with_repairs(
+            text, pending, model, generated_at
+        ).results
+    )
 
 
 def _result_json(result: AgentNameResult) -> dict[str, JsonValue]:
@@ -776,7 +871,7 @@ def _codex_batch(
     service_tier: str | None,
     codex_command: Sequence[str],
     processes: BackendProcesses,
-) -> tuple[dict[str, AgentNameResult], TokenUsage | None]:
+) -> _NameBatchOutcome:
     if not codex_command:
         raise AgentNameError("codex command must not be empty")
     with tempfile.TemporaryDirectory(
@@ -841,10 +936,14 @@ def _codex_batch(
                 "codex naming batch produced no output message", usage
             ) from error
         try:
-            results = _parse_backend_output(output, pending, model, _utc_now())
+            parsed = _parse_backend_output_with_repairs(
+                output, pending, model, _utc_now()
+            )
         except AgentNameError as error:
-            raise _CodexNameBatchError(str(error), usage) from error
-        return results, usage
+            raise _CodexNameBatchError(
+                str(error), usage, backend_output=output
+            ) from error
+        return _NameBatchOutcome(parsed=parsed, usage=usage, raw_output=output)
 
 
 def _claude_batch(
@@ -853,7 +952,7 @@ def _claude_batch(
     reasoning_effort: str | None,
     claude_command: Sequence[str],
     processes: BackendProcesses,
-) -> tuple[dict[str, AgentNameResult], TokenUsage]:
+) -> _NameBatchOutcome:
     with tempfile.TemporaryDirectory(
         prefix="agent-team-timeline-name-", ignore_cleanup_errors=True
     ) as raw_dir:
@@ -870,12 +969,18 @@ def _claude_batch(
         except ClaudeBackendError as error:
             raise _ClaudeNameBatchError(str(error), error.usage) from error
         try:
-            results = _parse_backend_output(
+            parsed = _parse_backend_output_with_repairs(
                 result.output, pending, model, _utc_now()
             )
         except AgentNameError as error:
-            raise _ClaudeNameBatchError(str(error), result.usage) from error
-        return results, result.usage
+            raise _ClaudeNameBatchError(
+                str(error), result.usage, backend_output=result.output
+            ) from error
+        return _NameBatchOutcome(
+            parsed=parsed,
+            usage=result.usage,
+            raw_output=result.output,
+        )
 
 
 def _chunks(
@@ -886,6 +991,46 @@ def _chunks(
 
 def _usage_root(cache_dir: Path) -> Path:
     return cache_dir / "_usage"
+
+
+def _write_backend_output_audit(
+    cache_dir: Path,
+    receipt: BatchUsageReceipt,
+    raw_output: str,
+    *,
+    status: str,
+    repairs: Sequence[_NameRepair],
+) -> Path:
+    """Preserve a failed/repaired final message without prompts or CLI streams."""
+
+    if status not in {"failed", "repaired"}:
+        raise AgentNameError(f"invalid backend-output audit status {status!r}")
+    repair_json: list[JsonValue] = [
+        {
+            "key": repair.key,
+            "index": repair.index,
+            "field": "short_name",
+            "action": "normalized-path-or-slug",
+            "rejected": repair.rejected_short_name,
+            "replacement": repair.repaired_short_name,
+        }
+        for repair in repairs
+    ]
+    audit: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "receipt_id": receipt.receipt_id,
+        "status": status,
+        "raw_output_sha256": hashlib.sha256(raw_output.encode("utf-8")).hexdigest(),
+        "raw_output": raw_output,
+        "repairs": repair_json,
+    }
+    path = (
+        _usage_root(cache_dir)
+        / "backend_outputs"
+        / f"{receipt.receipt_id}.json"
+    )
+    write_json_if_changed(path, audit)
+    return path
 
 
 def _run_backend_batch(
@@ -902,12 +1047,18 @@ def _run_backend_batch(
 ) -> _GeneratedNameBatch:
     started_at = _utc_now()
     input_hashes = tuple(item.input_hash for item in batch)
+    results: Mapping[str, AgentNameResult]
+    usage: TokenUsage | None
+    repairs: tuple[_NameRepair, ...]
+    raw_output: str | None
     try:
         if backend == "heuristic":
             results = _heuristic_batch(batch, model)
-            usage: TokenUsage | None = TokenUsage()
+            usage = TokenUsage()
+            repairs = ()
+            raw_output = None
         elif backend == "codex":
-            results, usage = _codex_batch(
+            outcome = _codex_batch(
                 batch,
                 model,
                 reasoning_effort,
@@ -915,10 +1066,18 @@ def _run_backend_batch(
                 codex_command,
                 processes,
             )
+            results = outcome.parsed.results
+            repairs = outcome.parsed.repairs
+            usage = outcome.usage
+            raw_output = outcome.raw_output
         else:
-            results, usage = _claude_batch(
+            outcome = _claude_batch(
                 batch, model, reasoning_effort, claude_command, processes
             )
+            results = outcome.parsed.results
+            repairs = outcome.parsed.repairs
+            usage = outcome.usage
+            raw_output = outcome.raw_output
     except AgentNameError as error:
         backend_error = (
             error
@@ -926,6 +1085,9 @@ def _run_backend_batch(
             else None
         )
         usage = backend_error.usage if backend_error is not None else None
+        backend_output = (
+            backend_error.backend_output if backend_error is not None else None
+        )
         receipt = BatchUsageReceipt.create(
             backend=backend,
             model=model,
@@ -939,6 +1101,14 @@ def _run_backend_batch(
             error=_shorten(_one_line(str(error)), 500),
         )
         receipt_path = write_batch_receipt(_usage_root(cache_dir), receipt)
+        if backend_output is not None:
+            _write_backend_output_audit(
+                cache_dir,
+                receipt,
+                backend_output,
+                status="failed",
+                repairs=(),
+            )
         raise AgentNameError(
             f"{error} (failed usage receipt: {receipt_path})"
         ) from error
@@ -955,6 +1125,16 @@ def _run_backend_batch(
         error=None,
     )
     write_batch_receipt(_usage_root(cache_dir), receipt)
+    if repairs:
+        if raw_output is None:
+            raise AgentNameError("repaired backend output is unavailable for audit")
+        _write_backend_output_audit(
+            cache_dir,
+            receipt,
+            raw_output,
+            status="repaired",
+            repairs=repairs,
+        )
     return _GeneratedNameBatch(results=results, receipt=receipt)
 
 
