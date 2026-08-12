@@ -464,6 +464,7 @@ def build_parser() -> argparse.ArgumentParser:
         "plan",
         allow_abbrev=False,
         help="build the graph + CI/freshness fusion and print the PLAN",
+        description="build the graph + CI/freshness fusion and print the PLAN",
     )
     _add_collect_flags(plan_p)
     plan_p.add_argument(
@@ -514,7 +515,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     graph_p = sub.add_parser(
-        "graph", allow_abbrev=False, help="just the conflict/ordering graph view"
+        "graph", allow_abbrev=False, help="just the conflict/ordering graph view",
+        description="just the conflict/ordering graph view",
     )
     _add_collect_flags(graph_p)
     graph_p.add_argument("--format", choices=["human", "json"], default="human", help="output format")
@@ -523,6 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
         "clusters",
         allow_abbrev=False,
         help="cluster PRs by shared conflict set into stack-land lanes (rebases-avoided)",
+        description="cluster PRs by shared conflict set into stack-land lanes (rebases-avoided)",
     )
     _add_collect_flags(clusters_p)
     clusters_p.add_argument(
@@ -530,7 +533,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     status_p = sub.add_parser(
-        "status", allow_abbrev=False, help="just per-PR CI/label health"
+        "status", allow_abbrev=False, help="just per-PR CI/label health",
+        description="just per-PR CI/label health",
     )
     _add_collect_flags(status_p)
     status_p.add_argument("--format", choices=["human", "json"], default="human", help="output format")
@@ -542,7 +546,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     qs = sub.add_parser(
-        "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide"
+        "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide",
+        description="print a self-contained getting-started guide",
     )
     qs.add_argument(
         "--emit-demo",

@@ -801,6 +801,9 @@ pub struct RunResult {
     /// verdict about the tree" from "this run was stopped by its own budget with work still
     /// outstanding", and `ok == false` alone cannot.
     pub run_timed_out: bool,
+    /// Largest number of step child processes observed alive at the same time. Measured from
+    /// successful spawn until wait observes exit, not inferred from jobs or scheduler admission.
+    pub max_concurrent_steps: usize,
 }
 
 #[cfg(test)]

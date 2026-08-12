@@ -810,25 +810,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--root", default=None, help="repository to operate on")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    publish = sub.add_parser("publish", help="serialized fast-forward publish to main")
+    publish = sub.add_parser("publish", help="serialized fast-forward publish to main", description="serialized fast-forward publish to main")
     publish.add_argument("rev", nargs="?", default="HEAD")
     publish.set_defaults(handler=cmd_publish)
 
-    hook = sub.add_parser("hook-pre-push", help="pre-push hook entry point")
+    hook = sub.add_parser("hook-pre-push", help="pre-push hook entry point", description="pre-push hook entry point")
     hook.add_argument("hook_args", nargs="*")
     hook.set_defaults(handler=cmd_hook_pre_push)
 
-    status = sub.add_parser("status", help="report the serialize-queue predicate")
+    status = sub.add_parser("status", help="report the serialize-queue predicate", description="report the serialize-queue predicate")
     status.add_argument("--json", action="store_true")
     status.add_argument("--no-fetch", action="store_true")
     status.set_defaults(handler=cmd_status)
 
-    exceptions = sub.add_parser("pr-exceptions", help="check the PR-exception invariant")
+    exceptions = sub.add_parser("pr-exceptions", help="check the PR-exception invariant", description="check the PR-exception invariant")
     exceptions.add_argument("--repository", default=REPOSITORY)
     exceptions.add_argument("--json", action="store_true")
     exceptions.set_defaults(handler=cmd_pr_exceptions)
 
-    install = sub.add_parser("install-hooks", help="install the pre-push guard")
+    install = sub.add_parser("install-hooks", help="install the pre-push guard", description="install the pre-push guard")
     install.set_defaults(handler=cmd_install_hooks)
     return parser
 

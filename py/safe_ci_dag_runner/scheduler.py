@@ -229,6 +229,11 @@ class Runner:
         # The exact inherited ownership token reaches environment-preserving setsid/double-fork
         # escapees after process-group and parentage tracking lose their originating step.
         self.running_nonces: dict[str, str] = {}
+        # Measured child-process concurrency. Scheduler admission is not enough: a short command
+        # can exit before a later admitted thread creates its child, and named resources can keep
+        # all but one child from starting. Count only successful Popen -> observed-exit lifetimes.
+        self.active_processes = 0
+        self.max_concurrent_steps = 0
         self.aborted: set[str] = set()  # tags killed by eager-exit (labelled ABORTED, not FAIL)
         self.step_profile_rows: list[Mapping[str, object]] = []
         self.failed = False  # a genuine (non-aborted) step failed
@@ -549,6 +554,10 @@ class Runner:
         with self.lock:
             self.running_procs[step.tag] = proc
             self.running_nonces[step.tag] = nonce
+            self.active_processes += 1
+            self.max_concurrent_steps = max(
+                self.max_concurrent_steps, self.active_processes
+            )
 
         sink = StepStream(step.tag, self.evidence)
         if self.evidence is not None:
@@ -657,6 +666,11 @@ class Runner:
                 proc.wait(timeout=_POST_TIMEOUT_WAIT_S)
             except Exception:
                 pass
+        # proc.wait() has now observed the child exit (normally or after timeout teardown).
+        # Stop counting it before monitor/reader joins, which can outlive the child when a
+        # grandchild holds an output pipe open.
+        with self.lock:
+            self.active_processes -= 1
         monitor_stop.set()
         monitor.join(timeout=_THREAD_JOIN_S)
         # The daemon reader may still be blocked on an orphan-held pipe; because it is a
@@ -896,6 +910,7 @@ class Runner:
             intentional_skips=self.intentional_skips,
             step_profile_rows=tuple(self.step_profile_rows),
             run_timed_out=self.run_timed_out,
+            max_concurrent_steps=self.max_concurrent_steps,
         )
 
 

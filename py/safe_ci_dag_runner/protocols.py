@@ -331,3 +331,7 @@ class RunResult:
     #: records results must be able to tell "this run produced a verdict about the tree" from
     #: "this run was stopped by its own budget with work outstanding", and ``ok`` alone cannot.
     run_timed_out: bool = False
+    #: Largest number of step child processes observed alive at the same time. This is measured
+    #: from successful process creation until wait() observes exit; it is not inferred from the
+    #: requested job count or scheduler admission.
+    max_concurrent_steps: int = 0

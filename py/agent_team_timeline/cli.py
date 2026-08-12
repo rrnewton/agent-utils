@@ -324,31 +324,33 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--userguide", action="store_true", help="print the complete embedded guide")
     sub = parser.add_subparsers(dest="command")
 
-    quick = sub.add_parser("quickstart", help="print a short end-to-end example")
+    quick = sub.add_parser("quickstart", help="print a short end-to-end example", description="print a short end-to-end example")
     quick.set_defaults(handler="quickstart")
 
-    ingest = sub.add_parser("ingest", help="normalize Codex logs; do not call a model")
+    ingest = sub.add_parser("ingest", help="normalize Codex logs; do not call a model", description="normalize Codex logs; do not call a model")
     _add_ingest(ingest)
     ingest.set_defaults(handler="ingest")
 
     ingest_claude_parser = sub.add_parser(
-        "ingest-claude", help="normalize Claude logs; do not call a model"
+        "ingest-claude", help="normalize Claude logs; do not call a model",
+        description="normalize Claude logs; do not call a model",
     )
     _add_claude_ingest(ingest_claude_parser)
     ingest_claude_parser.set_defaults(handler="ingest_claude")
 
     ingest_orc_parser = sub.add_parser(
-        "ingest-orc", help="snapshot and normalize Orc SQLite logs; do not call a model"
+        "ingest-orc", help="snapshot and normalize Orc SQLite logs; do not call a model",
+        description="snapshot and normalize Orc SQLite logs; do not call a model",
     )
     _add_orc_ingest(ingest_orc_parser)
     ingest_orc_parser.set_defaults(handler="ingest_orc")
 
-    summarize = sub.add_parser("summarize", help="fill structured summary cache misses")
+    summarize = sub.add_parser("summarize", help="fill structured summary cache misses", description="fill structured summary cache misses")
     _add_archive(summarize)
     _add_summary(summarize)
     summarize.set_defaults(handler="summarize")
 
-    build = sub.add_parser("build", help="regenerate Markdown/site from cached data; zero tokens")
+    build = sub.add_parser("build", help="regenerate Markdown/site from cached data; zero tokens", description="regenerate Markdown/site from cached data; zero tokens")
     _add_archive(build)
     build.add_argument("--phase-minutes", type=int, default=30)
     build.set_defaults(handler="build")
@@ -356,6 +358,7 @@ def _parser() -> argparse.ArgumentParser:
     extract_transcripts = sub.add_parser(
         "extract-transcripts",
         help="write append-only prompt/response JSONL from normalized logs; zero tokens",
+        description="write append-only prompt/response JSONL from normalized logs; zero tokens",
     )
     extract_transcripts.add_argument(
         "--output", required=True, help="durable archive directory"
@@ -369,7 +372,8 @@ def _parser() -> argparse.ArgumentParser:
     extract_transcripts.set_defaults(handler="extract_transcripts")
 
     export = sub.add_parser(
-        "export", help="build a zero-token website slice in a separate directory"
+        "export", help="build a zero-token website slice in a separate directory",
+        description="build a zero-token website slice in a separate directory",
     )
     export.add_argument("--archive", required=True, help="durable source archive")
     export.add_argument("--output", required=True, help="website export directory")
@@ -383,7 +387,7 @@ def _parser() -> argparse.ArgumentParser:
     _add_export_selection(export)
     export.set_defaults(handler="export")
 
-    refresh = sub.add_parser("refresh", help="idempotent ingest + summarize + build")
+    refresh = sub.add_parser("refresh", help="idempotent ingest + summarize + build", description="idempotent ingest + summarize + build")
     _add_ingest(refresh)
     _add_summary(refresh)
     refresh.add_argument(
@@ -397,6 +401,7 @@ def _parser() -> argparse.ArgumentParser:
     github = sub.add_parser(
         "github-metadata",
         help="conditionally cache GitHub pull titles, then rebuild the site",
+        description="conditionally cache GitHub pull titles, then rebuild the site",
     )
     _add_archive(github)
     github.add_argument("--phase-minutes", type=int, default=30)
@@ -404,7 +409,8 @@ def _parser() -> argparse.ArgumentParser:
     github.set_defaults(handler="github-metadata")
 
     refresh_claude = sub.add_parser(
-        "refresh-claude", help="idempotent Claude ingest + summarize + build"
+        "refresh-claude", help="idempotent Claude ingest + summarize + build",
+        description="idempotent Claude ingest + summarize + build",
     )
     _add_claude_ingest(refresh_claude)
     _add_summary(refresh_claude)
@@ -417,7 +423,8 @@ def _parser() -> argparse.ArgumentParser:
     refresh_claude.set_defaults(handler="refresh_claude")
 
     refresh_orc = sub.add_parser(
-        "refresh-orc", help="idempotent Orc ingest + summarize + build"
+        "refresh-orc", help="idempotent Orc ingest + summarize + build",
+        description="idempotent Orc ingest + summarize + build",
     )
     _add_orc_ingest(refresh_orc)
     _add_summary(refresh_orc)
@@ -429,18 +436,19 @@ def _parser() -> argparse.ArgumentParser:
     _add_github_options(refresh_orc)
     refresh_orc.set_defaults(handler="refresh_orc")
 
-    serve_parser = sub.add_parser("serve", help="serve a built archive on localhost")
+    serve_parser = sub.add_parser("serve", help="serve a built archive on localhost", description="serve a built archive on localhost")
     serve_parser.add_argument("--output", required=True, help="built archive directory")
     serve_parser.add_argument("--port", type=int, default=8765, help="0 chooses an available port")
     serve_parser.add_argument("--open", action="store_true", dest="open_browser")
     serve_parser.set_defaults(handler="serve")
 
-    inspect = sub.add_parser("inspect", help="print archive/run/source counts as JSON")
+    inspect = sub.add_parser("inspect", help="print archive/run/source counts as JSON", description="print archive/run/source counts as JSON")
     inspect.add_argument("--output", required=True)
     inspect.set_defaults(handler="inspect")
 
     query = sub.add_parser(
-        "query", help="navigate a built timeline without starting the website"
+        "query", help="navigate a built timeline without starting the website",
+        description="navigate a built timeline without starting the website",
     )
     query.add_argument("--output", required=True, help="built single- or multi-team archive")
     query.add_argument(
@@ -450,13 +458,13 @@ def _parser() -> argparse.ArgumentParser:
         help="response format (default: %(default)s)",
     )
     query_sub = query.add_subparsers(dest="query_action", required=True)
-    query_list = query_sub.add_parser("list", help="list concise records and stable references")
+    query_list = query_sub.add_parser("list", help="list concise records and stable references", description="list concise records and stable references")
     query_list.add_argument(
         "resource", choices=("teams", "agents", "phases", "rollups")
     )
     _add_query_filters(query_list)
     query_list.set_defaults(handler="query_list")
-    query_show = query_sub.add_parser("show", help="resolve one stable reference")
+    query_show = query_sub.add_parser("show", help="resolve one stable reference", description="resolve one stable reference")
     query_show.add_argument("reference", help="team:, agent:, phase:, or rollup: reference")
     query_show.add_argument(
         "--transcript",
@@ -465,7 +473,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     query_show.set_defaults(handler="query_show")
     query_search = query_sub.add_parser(
-        "search", help="search summaries and condensed transcript messages"
+        "search", help="search summaries and condensed transcript messages",
+        description="search summaries and condensed transcript messages",
     )
     query_search.add_argument("text", help="literal text to find")
     query_search.add_argument(
@@ -481,7 +490,7 @@ def _parser() -> argparse.ArgumentParser:
         ("prompts", "list verbatim authored prompts in global timestamp order"),
         ("messages", "list prompts and their mechanically associated responses"),
     ):
-        query_transcript = query_sub.add_parser(action, help=help_text)
+        query_transcript = query_sub.add_parser(action, help=help_text, description=help_text)
         query_transcript.add_argument(
             "--range",
             dest="ordinal_range",

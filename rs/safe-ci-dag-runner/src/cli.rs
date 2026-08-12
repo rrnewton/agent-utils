@@ -325,7 +325,7 @@ fn run_help(c: &Palette) -> String {
             ("--max-mem SPEC", "RAM budget (e.g. 8G): pick the largest -j whose modeled footprint fits (ignored with --jobs)"),
             ("--only TAG[,TAG...]", "run EXACTLY the named step(s); dependency edges outside the selection are dropped"),
             ("--args STRING", "replace the opt-in {args} token in selected step commands"),
-            ("--stress N", "run N parallel copies of every selected step and report pass ratios"),
+            ("--stress N", "duplicate the graph into N disconnected components with no edges between copies; -j controls concurrency"),
             ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
             ("--no-profile", "disable the default auto-logging profile store for this run"),
             ("--profile", "after the run, print a per-step profile (timing/memory) table"),
@@ -1383,7 +1383,7 @@ fn stress_suffix(index: i64, count: i64) -> String {
     format!("#{index:0width$}")
 }
 
-/// Duplicate a selected graph into independent, dependency-preserving stress shards.
+/// Duplicate a selected graph into disconnected copies with no edges between copies.
 fn expand_stress(cfg: &DagConfig, n: i64) -> DagConfig {
     if n <= 1 {
         return cfg.clone();
@@ -1400,9 +1400,11 @@ fn expand_stress(cfg: &DagConfig, n: i64) -> DagConfig {
                 .iter()
                 .map(|dependency| format!("{dependency}{suffix}"))
                 .collect();
+            step.hint.resources.clear();
             out.steps.push(step);
         }
     }
+    out.resource_caps.clear();
     out
 }
 
@@ -1438,7 +1440,8 @@ fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
     }
     eprintln!(
         "{PROG}: --stress {n}: OK — {n} x {}/copy = {} fits the box memory budget {} \
-         (max safe {max_safe}); running copies in PARALLEL.",
+         (max safe {max_safe}); actual concurrency will be measured from child-process \
+         lifetimes.",
         human_bytes(Some(footprint)),
         human_bytes(Some(n.saturating_mul(footprint))),
         human_bytes(Some(budget)),
@@ -1446,7 +1449,13 @@ fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
     0
 }
 
-fn print_stress_report(rows: &[StepOutcome], n: i64, c: &Palette) {
+fn print_stress_report(
+    rows: &[StepOutcome],
+    n: i64,
+    max_concurrent_steps: usize,
+    jobs: i64,
+    c: &Palette,
+) {
     let mut groups: BTreeMap<String, Vec<(String, &StepOutcome)>> = BTreeMap::new();
     for outcome in rows {
         let (base, index) = match outcome.tag.rsplit_once('#') {
@@ -1457,7 +1466,7 @@ fn print_stress_report(rows: &[StepOutcome], n: i64, c: &Palette) {
     }
     println!(
         "{}",
-        c.bold(&format!("stress results ({n} parallel copies per step):"))
+        c.bold(&format!("stress results ({n} generated graph copies):"))
     );
     for (base, mut items) in groups {
         items.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1506,6 +1515,7 @@ fn print_stress_report(rows: &[StepOutcome], n: i64, c: &Palette) {
         }
         println!("  {base}: {styled}{detail}");
     }
+    println!("  maximum concurrent steps: {max_concurrent_steps} (--jobs {jobs})");
 }
 
 // --------------------------------------------------------------------------- table rendering
@@ -2242,7 +2252,13 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     }
 
     if stress_active {
-        print_stress_report(&result.outcomes, a.stress, c);
+        print_stress_report(
+            &result.outcomes,
+            a.stress,
+            result.max_concurrent_steps,
+            jobs,
+            c,
+        );
     }
 
     // Feature C: --profile prints a per-step profile table to stdout.
@@ -2411,6 +2427,19 @@ pub fn run(argv: &[String]) -> i32 {
                     return 2;
                 }
             };
+            // A boxed run re-execs inside systemd. Do that before consuming a stdin DAG so the
+            // in-scope child receives the untouched pipe. Explicit unboxed and direct-cgroup
+            // modes do not re-exec, so they continue to load stdin directly.
+            if dag_arg == "-"
+                && !a.allow_cgroup_failure
+                && !a.unsafe_no_cgroups
+                && !is_in_scope()
+                && std::env::var(DIRECT_CGROUP_ENV).as_deref() != Ok("1")
+            {
+                if let Err(code) = resolve_cgroups(false, false, a.run_timeout) {
+                    return code;
+                }
+            }
             let cfg = match load(&dag_arg) {
                 Ok(cfg) => cfg,
                 Err(e) => {
@@ -2885,6 +2914,23 @@ mod tests {
         assert_eq!(expanded.steps[0].tag(), "build.app#1");
         assert_eq!(expanded.steps[1].deps, vec!["build.app#1"]);
         assert_eq!(expanded.steps[5].deps, vec!["build.app#3"]);
+    }
+
+    #[test]
+    fn stress_generation_removes_named_resource_serialization() {
+        let cfg = dag_from_json(
+            r#"{"resource_caps":{"exclusive":1},"steps":[{"group":"g","job":"j","cmd":"sleep 1","hint":{"resources":{"exclusive":1}}}]}"#,
+        )
+        .unwrap();
+        let expanded = expand_stress(&cfg, 4);
+        assert!(expanded.resource_caps.is_empty());
+        assert!(expanded
+            .steps
+            .iter()
+            .all(|step| step.hint.resources.is_empty()));
+        let result = crate::scheduler::run_dag(&expanded, 4, true, 0);
+        assert_eq!(result.outcomes.len(), 4);
+        assert_eq!(result.max_concurrent_steps, 4);
     }
 
     #[test]

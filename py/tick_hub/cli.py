@@ -290,7 +290,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     tick_p = sub.add_parser(
-        "tick", allow_abbrev=False, help="run one tick (emit HEALTH/ACTION/NOTE/ERROR lines)"
+        "tick", allow_abbrev=False, help="run one tick (emit HEALTH/ACTION/NOTE/ERROR lines)",
+        description="run one tick (emit HEALTH/ACTION/NOTE/ERROR lines)",
     )
     tick_p.add_argument(
         "--config",
@@ -338,7 +339,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     state_p = sub.add_parser(
-        "state", allow_abbrev=False, help="validate + show the ops-state's own lines"
+        "state", allow_abbrev=False, help="validate + show the ops-state's own lines",
+        description="validate + show the ops-state's own lines",
     )
     state_p.add_argument("--state", required=True, metavar="FILE", help="ops-state YAML file")
     state_p.add_argument(
@@ -354,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("json", "re-emit the config as canonical JSON"),
         ("yaml", "re-emit the config as YAML"),
     ):
-        sp = sub.add_parser(cmd, allow_abbrev=False, help=helptext)
+        sp = sub.add_parser(cmd, allow_abbrev=False, help=helptext, description=helptext)
         sp.add_argument(
             "--config",
             required=True,
@@ -363,7 +365,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     sub.add_parser(
-        "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide"
+        "quickstart", allow_abbrev=False, help="print a self-contained getting-started guide",
+        description="print a self-contained getting-started guide",
     )
     return parser
 
