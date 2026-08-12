@@ -56,6 +56,7 @@ args = sys.argv[1:]
 assert args[0] == "--print"
 assert args[args.index("--output-format") + 1] == "json"
 schema = json.loads(args[args.index("--json-schema") + 1])
+assert "$schema" not in schema
 assert args[args.index("--model") + 1] == "claude-test"
 assert args[args.index("--effort") + 1] == "medium"
 assert "--safe-mode" in args
@@ -177,6 +178,13 @@ def test_claude_summary_uses_safe_structured_mode_and_exact_receipts(
     assert run["newly_spent_usage"]["total_tokens"] == 36
     call = json.loads(log.read_text(encoding="utf-8"))
     assert Path(call["cwd"]).name.startswith("agent-team-timeline-summary-")
+    args = call["args"]
+    assert args[:3] == ["--print", "--output-format", "json"]
+    serialized_schema = json.loads(args[args.index("--json-schema") + 1])
+    assert "$schema" not in serialized_schema
+    assert serialized_schema["properties"]["summaries"]["type"] == "array"
+    assert args[args.index("--model") + 1] == "claude-test"
+    assert args[args.index("--effort") + 1] == "medium"
 
     _, cached = summarize_jobs(
         [_summary_job()],

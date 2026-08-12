@@ -80,13 +80,18 @@ def run_claude_json(
 
     if not command:
         raise ClaudeBackendError("claude command must not be empty")
+    # Claude's ``--json-schema`` parser accepts the schema vocabulary we use,
+    # but currently rejects the Draft 2020-12 dialect declaration itself.
+    # Keep the complete schema in the summarization layer for validation and
+    # remove only this transport-incompatible metadata from the CLI argument.
+    cli_schema = {key: value for key, value in schema.items() if key != "$schema"}
     args = [
         *command,
         "--print",
         "--output-format",
         "json",
         "--json-schema",
-        canonical_json(schema).strip(),
+        canonical_json(cli_schema).strip(),
         "--model",
         model,
         "--safe-mode",
