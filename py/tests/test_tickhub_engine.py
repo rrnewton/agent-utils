@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tick_hub.engine import parse_kv_lines, render_emit, run_tick
+from tick_hub.engine import NO_RESULT_EXIT, parse_kv_lines, render_emit, run_tick
 from tick_hub.model import (
     Emit,
     EmitKind,
@@ -302,3 +302,86 @@ def test_static_fields_interpolate_static_and_captured_values() -> None:
     assert render_emit(emit, {"count": "3"}) == (
         'ACTION: triage base=7 copy=7 live=3 count=3 title="7/3"'
     )
+
+
+# --- COULD-NOT-DETERMINE, BOTH DIRECTIONS ------------------------------------
+#
+# The negative half is the point: a gate that cannot determine its condition
+# must be visibly distinct from one that checked and found nothing. The
+# positive halves prove the change is not inert -- a gate that CAN determine
+# still reports exactly what it reported before.
+
+
+def _probe(when: GateWhen = GateWhen.FAILURE) -> TickConfig:
+    return TickConfig(
+        reminders=(
+            Reminder(
+                "probe",
+                Emit(EmitKind.ACTION, title="probe says {summary}", skill="warn"),
+                gate=Gate(cmd="check", when=when, capture=True),
+            ),
+        )
+    )
+
+
+def _tick(cfg: TickConfig, code: int, stdout: str = ""):
+    return run_tick(
+        cfg, OpsState.default(), now=5, fired={},
+        gate_runner=FakeGate({"check": GateResult(code, stdout, True)}),
+        age_probe=FakeProbe({}),
+    )
+
+
+def test_could_not_determine_renders_no_result_not_a_pass() -> None:
+    res = _tick(_probe(), NO_RESULT_EXIT, "summary=backend unreachable\n")
+    no_result = [ln for ln in res.lines if ln.startswith("NO_RESULT: ")]
+    assert len(no_result) == 1, res.lines
+    assert "probe" in no_result[0]
+    assert "this is not a pass" in no_result[0]
+    assert "backend unreachable" in no_result[0]
+    # the domain verdict must NOT also be emitted
+    assert not any("probe says" in ln for ln in res.lines)
+
+
+def test_no_result_reaches_action_only_consumers() -> None:
+    # A consumer that forwards ACTION lines only must still see it, or the
+    # whole point is lost for exactly the readers that matter.
+    res = _tick(_probe(), NO_RESULT_EXIT, "summary=x\n")
+    actions = [ln for ln in res.lines if ln.startswith("ACTION: ")]
+    assert any("could-not-determine" in ln for ln in actions), res.lines
+    assert res.actions_emitted >= 1
+
+
+def test_no_result_is_emittable_when_the_gate_printed_nothing() -> None:
+    # THE CORRELATED-FAILURE CASE. A gate that cannot determine its condition is
+    # the one least likely to produce a usable summary=, so the line must not
+    # depend on captured fields or go through render_emit's placeholder check.
+    res = _tick(_probe(), NO_RESULT_EXIT, "")
+    no_result = [ln for ln in res.lines if ln.startswith("NO_RESULT: ")]
+    assert len(no_result) == 1, res.lines
+    assert "{" not in no_result[0]
+    assert not any("unresolved-placeholder" in ln for ln in res.lines), res.lines
+
+
+def test_no_result_does_not_consume_cadence() -> None:
+    res = _tick(_probe(), NO_RESULT_EXIT, "")
+    assert "probe" not in res.fired, "must re-announce next tick"
+
+
+def test_no_result_is_not_reinterpreted_by_when_success() -> None:
+    # Under when=success a nonzero code means "quiet". Without the pre-check, 75
+    # would read as a CLEAN PASS -- the exact collapse this removes.
+    res = _tick(_probe(GateWhen.SUCCESS), NO_RESULT_EXIT, "")
+    assert any(ln.startswith("NO_RESULT: ") for ln in res.lines), res.lines
+
+
+def test_positive_control_a_determinable_gate_is_unchanged() -> None:
+    fired = _tick(_probe(), 1, "summary=real problem\n")
+    assert any("probe says real problem" in ln for ln in fired.lines), fired.lines
+    assert not any(ln.startswith("NO_RESULT: ") for ln in fired.lines)
+    assert fired.fired["probe"] == 5, "a real verdict still consumes cadence"
+
+    quiet = _tick(_probe(), 0, "")
+    assert not any(ln.startswith("NO_RESULT: ") for ln in quiet.lines)
+    assert not any("probe says" in ln for ln in quiet.lines)
+    assert quiet.fired["probe"] == 5

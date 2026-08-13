@@ -19,9 +19,11 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 
 from tick_hub.cadence import is_due
 from tick_hub.emit import (
+    format_no_result,
     HEALTH_STATUS_MISSING,
     HEALTH_STATUS_OK,
     HEALTH_STATUS_STALE,
@@ -88,6 +90,26 @@ def evaluate_health(hc: HealthCheck, probe: FileAgeProbe, now: int) -> str:
     return format_health(hc.name, status, age, hc.threshold_secs, hc.detail)
 
 
+#: Exit code reserved for "I ran, and I could not determine my condition".
+#:
+#: 75 is EX_TEMPFAIL ("temporary failure, user is invited to retry"), chosen on
+#: collision evidence rather than taste: across the scripts behind the live gate
+#: set the codes already in use are 0, 1, 2, 3, 124 and 127. Code 2 is the
+#: tempting pick because one gate already prints NO_RESULT while exiting 2 --
+#: and it is WRONG, because argparse exits 2 on a usage error, so reserving it
+#: would render a CRASHED gate as a non-answer. Softening a real failure into
+#: NO_RESULT is the opposite of the point.
+NO_RESULT_EXIT = 75
+
+
+class GateOutcome(Enum):
+    """What one gate execution concluded."""
+
+    QUIET = "quiet"
+    FIRE = "fire"
+    NO_RESULT = "no-result"
+
+
 def _gate_fires(when: GateWhen, returncode: int, stdout: str) -> bool:
     if when is GateWhen.SUCCESS:
         return returncode == 0
@@ -100,10 +122,10 @@ def _gate_fires(when: GateWhen, returncode: int, stdout: str) -> bool:
 
 def _eval_gate(
     gate: Gate | None, runner: GateRunner
-) -> tuple[bool, dict[str, str], str | None]:
-    """Return (fire, captured_fields, error). ``error`` non-None means the gate could not run."""
+) -> tuple[GateOutcome, dict[str, str], str | None]:
+    """Return (outcome, captured_fields, error). ``error`` non-None means the gate could not run."""
     if gate is None:
-        return True, {}, None
+        return GateOutcome.FIRE, {}, None
     # Preserve compatibility with simple runners that implement the original
     # one-argument protocol unless this gate explicitly opts into an override.
     result = (
@@ -112,9 +134,17 @@ def _eval_gate(
         else runner.run(gate.cmd, timeout=gate.timeout_secs)
     )
     if not result.ok:
-        return False, {}, f"gate command could not run ({gate.cmd!r}): {result.error}"
+        return GateOutcome.QUIET, {}, f"gate command could not run ({gate.cmd!r}): {result.error}"
     captured = parse_kv_lines(result.stdout) if gate.capture else {}
-    return _gate_fires(gate.when, result.returncode, result.stdout), captured, None
+    # Checked BEFORE ``when``, so a gate that cannot determine its condition is
+    # never reinterpreted through a fire/quiet rule. Under ``when: failure`` a 75
+    # would otherwise read as an ordinary failure verdict; under ``when: success``
+    # it would read as a CLEAN PASS, which is the silence-means-healthy collapse
+    # this exists to remove.
+    if result.returncode == NO_RESULT_EXIT:
+        return GateOutcome.NO_RESULT, captured, None
+    fires = _gate_fires(gate.when, result.returncode, result.stdout)
+    return (GateOutcome.FIRE if fires else GateOutcome.QUIET), captured, None
 
 
 def _interpolate(text: str, captured: Mapping[str, str]) -> str:
@@ -223,7 +253,7 @@ def run_tick(
             if not _flags_satisfied(rem.requires_flags, state.flags):
                 # Flag-suppressed: do NOT consume the cadence, so it fires promptly once enabled.
                 continue
-            fire, captured, error = _eval_gate(rem.gate, gate_runner)
+            outcome, captured, error = _eval_gate(rem.gate, gate_runner)
             if error is not None:
                 # The check did not complete. Keep the ERROR for full diagnostic
                 # readers and emit a counted NO-SIGNAL action because production
@@ -235,7 +265,22 @@ def run_tick(
                 )
                 actions += 1
                 continue
-            if not fire:
+            if outcome is GateOutcome.NO_RESULT:
+                # A legitimate verdict, not a reporting fault: the gate ran and
+                # said it could not tell. Emitted as BOTH the explicit
+                # NO_RESULT diagnostic and a counted ACTION, because
+                # ACTION-only consumers would otherwise see nothing -- and
+                # "consumer sees nothing" is precisely the failure this code
+                # exists to remove. Cadence is left unconsumed so it
+                # re-announces every tick until it can determine something.
+                detail = captured.get("summary", "")
+                lines.append(format_no_result(rem.name, detail))
+                lines.append(
+                    _no_signal_action(rem, "could-not-determine", detail=detail)
+                )
+                actions += 1
+                continue
+            if outcome is GateOutcome.QUIET:
                 new_fired[rem.name] = now  # the check ran; the cadence clock resets
                 continue
             try:
