@@ -51,6 +51,21 @@ def format_note(text: str) -> str:
     return f"NOTE: {text}"
 
 
+def format_no_result(name: str, detail: str = "") -> str:
+    """Format a gate that ran but could not determine its condition.
+
+    Built from the gate NAME alone and never through :func:`render_emit`. A gate
+    that cannot determine its condition is exactly the gate least likely to have
+    produced a usable ``summary=``, so rendering this through the normal
+    interpolation path would raise ``UnresolvedPlaceholderError`` and report a
+    templating fault instead of the real one. This line must be emittable when
+    the gate printed nothing at all.
+    """
+    detail = detail.strip()
+    tail = f" ({detail})" if detail else ""
+    return f"NO_RESULT: {name} could not determine its condition; this is not a pass{tail}"
+
+
 def format_error(text: str) -> str:
     """Format an operational ``ERROR`` record."""
     return f"ERROR: {text}"
