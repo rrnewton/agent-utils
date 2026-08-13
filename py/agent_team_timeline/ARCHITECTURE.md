@@ -49,23 +49,36 @@ could disclose work outside the requested range. Calendar rollups retain
 the timezone in which each team's cached summary was generated; hourly keys are UTC-stable. The
 export timezone controls date-bound parsing and the shared display axis, not cache reinterpretation.
 
-The zero-token semantic-zoom projection separately derives activity bins from normalized active
-and tool-running state. Hourly bins retain UTC-stable boundaries, while daily bins use local
-midnight and weekly bins use local Monday midnight in the team's display timezone. Local calendar
-boundaries therefore carry their real 23-, 24-, or 25-hour duration across daylight-saving
-changes. The first and last bins are clipped to the observed archive range, and concurrency and
-coverage use that clipped duration; time before capture began or after the latest captured record
-is never presented as inactivity. Empty bins remain absent so true inactive gaps stay visible.
+The zero-token semantic-zoom projection derives hourly, daily, and weekly activity bins. Hourly
+bins retain UTC-stable boundaries, while daily bins use local midnight and weekly bins use local
+Monday midnight in the team's display timezone. Local calendar boundaries therefore carry their
+real 23-, 24-, or 25-hour duration across daylight-saving changes. The first and last bins are
+clipped to the observed archive range; time before capture began or after the latest captured
+record is never presented as inactivity. Empty bins remain absent so true inactive gaps stay
+visible.
+
+Normalized providers do not expose equally precise timing. Codex and Claude commonly retain turn
+and tool spans, while an Orc task note is only point evidence and its one-second normalized turn is
+not a measured duration. Bins therefore retain the exact active/tool metrics for compatibility,
+but the outer visualization uses separate, explicitly inferred fields. Each transcript entry
+contributes the same centered five-minute evidence interval; their union determines activity
+evidence opacity, and per-agent unions determine estimated average and peak worker presence. This
+keeps the overview comparable across harnesses without presenting point surrogates as exact
+wall-clock duty cycle. Tooltips label the values as estimates and expose the underlying evidence
+count.
 
 The browser chooses detail by time density, not by record count. At at most one minute per pixel,
 the detail level renders phases, state strips, and applicable message edges. Above that and through
-fifteen minutes per pixel, the lifetime level suppresses phases/states and retains one block per
-agent plus structural fork/join edges. Beyond fifteen minutes per pixel, the aggregate level
+five minutes per pixel, the lifetime level suppresses phases/states and retains one block per
+agent. Structural fork/join edges are shown there only for the selected agent family. Beyond five
+minutes per pixel, the aggregate level
 suppresses agents, phases, states, and edges entirely and renders one compact row per team from the
 precomputed bins. It chooses the narrowest hourly/daily/weekly resolution whose nominal bin is at
-least two pixels wide. The coordinator has its own strip; worker-block height encodes average
-concurrency, opacity encodes active coverage, and omitted zero-activity bins preserve gaps. These
-thresholds and suppressions are part of the performance contract and are covered by browser tests.
+least eight pixels wide. Coordinator and worker evidence is one downward-extending block:
+log-scaled height encodes estimated average worker presence, opacity encodes activity-evidence
+coverage, and a distinct hue marks ranges with cached summaries. Teams sort by descending recorded
+event volume. Omitted zero-activity bins preserve gaps. These thresholds and suppressions are part
+of the performance contract and are covered by browser tests.
 
 ### Static delivery and schema compatibility
 
