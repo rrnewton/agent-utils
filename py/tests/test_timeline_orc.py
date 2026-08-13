@@ -2588,3 +2588,47 @@ def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> Non
     assert manifest["provider"] == "orc"
     assert manifest["schema_version"] == 2
     assert manifest["date_window"]["end_date"] == "2026-07-22"
+
+
+def test_orc_pipeline_allows_narrowing_but_rejects_widening_ingest_window(
+    tmp_path: Path,
+) -> None:
+    source, _, _ = _fixture(tmp_path)
+    archive = tmp_path / "archive"
+    ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
+    window = parse_date_window(
+        "2026-07-21", "2026-07-22", "America/New_York"
+    )
+    assert window is not None
+
+    narrowed, _ = ingest_orc(
+        archive,
+        source,
+        ROOT,
+        "orc-test",
+        "America/New_York",
+        window,
+    )
+
+    assert narrowed.window_start_ms == window.start_ms
+    assert narrowed.window_end_ms == window.end_ms
+    manifest = json.loads(
+        (
+            archive
+            / "teams"
+            / "orc-test"
+            / "raw"
+            / "source-manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert manifest["date_window"]["start_ms"] == window.start_ms
+    assert manifest["date_window"]["end_ms"] == window.end_ms
+
+    with pytest.raises(OrcParseError, match="only stay unchanged or become narrower"):
+        ingest_orc(
+            archive,
+            source,
+            ROOT,
+            "orc-test",
+            "America/New_York",
+        )

@@ -517,6 +517,78 @@ def _ensure_source_snapshots_ignored(archive: Path) -> bool:
     return write_text_if_changed(path, prefix + "\n".join(missing) + "\n")
 
 
+def _manifest_window_value(date_window: DateWindow | None) -> JsonValue:
+    if date_window is None:
+        return None
+    return narrow_json(date_window.to_json_obj())
+
+
+def _manifest_window_bounds(
+    value: JsonValue, where: str
+) -> tuple[int | None, int | None]:
+    if value is None:
+        return None, None
+    obj = as_object(value, where)
+    start_value = obj.get("start_ms")
+    end_value = obj.get("end_ms")
+    start_ms = (
+        None
+        if start_value is None
+        else as_int(start_value, f"{where}.start_ms")
+    )
+    end_ms = (
+        None if end_value is None else as_int(end_value, f"{where}.end_ms")
+    )
+    return start_ms, end_ms
+
+
+def _window_is_same_or_narrower(
+    recorded: JsonValue,
+    requested: JsonValue,
+    where: str,
+) -> bool:
+    """Return whether a new half-open ingest window is a subset of the old one."""
+
+    recorded_start, recorded_end = _manifest_window_bounds(
+        recorded, where + ".recorded"
+    )
+    requested_start, requested_end = _manifest_window_bounds(
+        requested, where + ".requested"
+    )
+    start_is_narrower = (
+        recorded_start is None
+        or (
+            requested_start is not None
+            and requested_start >= recorded_start
+        )
+    )
+    end_is_narrower = (
+        recorded_end is None
+        or (
+            requested_end is not None
+            and requested_end <= recorded_end
+        )
+    )
+    return start_is_narrower and end_is_narrower
+
+
+def _validate_manifest_window(
+    recorded: JsonValue,
+    date_window: DateWindow | None,
+    where: str,
+    error_type: type[ValueError],
+) -> None:
+    requested = _manifest_window_value(date_window)
+    if recorded == requested:
+        return
+    if _window_is_same_or_narrower(recorded, requested, where):
+        return
+    raise error_type(
+        "archive date window may only stay unchanged or become narrower; "
+        "choose a new output directory to widen it"
+    )
+
+
 @dataclass(frozen=True)
 class _CodexManifestState:
     sources: tuple[CodexSourceCopy, ...]
@@ -544,13 +616,9 @@ def _load_source_manifest(
         raise CodexParseError(
             f"source manifest belongs to root {recorded_root!r}, not {root_thread_id!r}"
         )
-    expected_window: object = (
-        date_window.to_json_obj() if date_window is not None else None
+    _validate_manifest_window(
+        obj.get("date_window"), date_window, str(path), CodexParseError
     )
-    if obj.get("date_window") != expected_window:
-        raise CodexParseError(
-            "archive date window differs from this ingest; choose a new output directory"
-        )
     raw_sources = as_array(obj.get("sources"), f"{path}: sources")
     result: list[CodexSourceCopy] = []
     for index, raw_source in enumerate(raw_sources):
@@ -600,13 +668,9 @@ def _load_claude_source_manifest(
         raise ClaudeParseError(
             f"source manifest belongs to root {recorded_root!r}, not {root_thread_id!r}"
         )
-    expected_window: object = (
-        date_window.to_json_obj() if date_window is not None else None
+    _validate_manifest_window(
+        obj.get("date_window"), date_window, str(path), ClaudeParseError
     )
-    if obj.get("date_window") != expected_window:
-        raise ClaudeParseError(
-            "archive date window differs from this ingest; choose a new output directory"
-        )
     raw_sources = as_array(obj.get("sources"), f"{path}: sources")
     result: list[ClaudeSourceCopy] = []
     for index, raw_source in enumerate(raw_sources):
@@ -1013,13 +1077,9 @@ def _load_orc_source_manifest(
         raise OrcParseError(
             f"source manifest belongs to root {recorded_root!r}, not {root_session_id!r}"
         )
-    expected_window: object = (
-        date_window.to_json_obj() if date_window is not None else None
+    _validate_manifest_window(
+        obj.get("date_window"), date_window, str(path), OrcParseError
     )
-    if obj.get("date_window") != expected_window:
-        raise OrcParseError(
-            "archive date window differs from this ingest; choose a new output directory"
-        )
     result: list[OrcSourceCopy] = []
     for index, raw_source in enumerate(
         as_array(obj.get("sources"), f"{path}: sources")
