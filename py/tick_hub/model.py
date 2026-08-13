@@ -86,8 +86,11 @@ class Reminder:
     the check runs when at least that many seconds have elapsed since it last
     ran. ``requires_flags`` names caller-state flags that must all be truthy for
     the reminder to run at all (the generic analog of gating on a runtime toggle
-    like "am I the ops driver?" or "is benchmarking enabled?"). ``gate`` is an
-    optional shell check; ``emit`` is what to produce when it fires.
+    like "am I the ops driver?" or "is benchmarking enabled?"). ``depends_on``
+    names other reminders whose explicit ``NO_RESULT`` makes this reminder's
+    otherwise-quiet outcome unevaluable. Dependencies never suppress a real
+    emission and never prevent this reminder's gate from running. ``gate`` is
+    an optional shell check; ``emit`` is what to produce when it fires.
     """
 
     name: str
@@ -95,6 +98,7 @@ class Reminder:
     cadence_secs: int = EVERY_TICK
     requires_flags: Sequence[str] = field(default_factory=tuple)
     gate: Gate | None = None
+    depends_on: Sequence[str] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

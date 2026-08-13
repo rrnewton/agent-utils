@@ -3529,6 +3529,71 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                 f"py={po.returncode}:{po.stdout!r}\nrs={ro.returncode}:{ro.stdout!r}",
             )
 
+        dependency_config = {
+            "reminders": [
+                {
+                    "name": "foundation",
+                    "gate": {
+                        "cmd": "printf 'summary=foundation unavailable\\n'; exit 75",
+                        "when": "failure",
+                        "capture": True,
+                    },
+                    "emit": {"skill": "warn", "title": "foundation problem"},
+                },
+                {
+                    "name": "dependent",
+                    "depends_on": ["foundation"],
+                    "gate": {"cmd": "exit 0", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "dependent problem"},
+                },
+                {
+                    "name": "independent",
+                    "gate": {"cmd": "exit 0", "when": "failure"},
+                    "emit": {"skill": "warn", "title": "independent problem"},
+                },
+            ]
+        }
+        dependency_path = os.path.join(tmp, "dependencies.json")
+        with open(dependency_path, "w", encoding="utf-8") as handle:
+            json.dump(dependency_config, handle)
+        py_dependency_fired = os.path.join(tmp, "py-dependency-fired")
+        rs_dependency_fired = os.path.join(tmp, "rs-dependency-fired")
+        dependency_args = (
+            "tick",
+            "--config",
+            dependency_path,
+            "--state",
+            state_path,
+            "--now",
+            "1000",
+            "--no-header",
+        )
+        po = run(py, (*dependency_args, "--fired-state", py_dependency_fired, "--flush"))
+        ro = run(rs, (*dependency_args, "--fired-state", rs_dependency_fired, "--flush"))
+        with open(py_dependency_fired, encoding="utf-8") as handle:
+            py_dependency_state = handle.read()
+        with open(rs_dependency_fired, encoding="utf-8") as handle:
+            rs_dependency_state = handle.read()
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and py_dependency_state == rs_dependency_state
+            and "NO_RESULT: dependent is unevaluable" in po.stdout
+            and not any(
+                line.startswith("dependent=") for line in py_dependency_state.splitlines()
+            )
+            and any(
+                line == "independent=1000" for line in py_dependency_state.splitlines()
+            )
+        ):
+            rep.ok("dependency-no-result:quiet-dependent-unevaluable")
+        else:
+            rep.bad(
+                "dependency-no-result:quiet-dependent-unevaluable",
+                f"py={po.returncode}:{po.stdout!r}:{py_dependency_state!r}\n"
+                f"rs={ro.returncode}:{ro.stdout!r}:{rs_dependency_state!r}",
+            )
+
         po = run(py, (*common_tick, "--fired-state", py_fired, "--flush"))
         ro = run(rs, (*common_tick, "--fired-state", rs_fired, "--flush"))
         with open(py_fired, encoding="utf-8") as handle:
@@ -3593,6 +3658,15 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
             (
                 "overflow.json",
                 '{"reminders":[{"name":"r","cadence_secs":9223372036854775808,"emit":{"skill":"s"}}]}',
+            ),
+            (
+                "unknown-dependency.json",
+                '{"reminders":[{"name":"r","depends_on":["missing"],"emit":{"skill":"s"}}]}',
+            ),
+            (
+                "dependency-cycle.json",
+                '{"reminders":[{"name":"a","depends_on":["b"],"emit":{"skill":"s"}},'
+                '{"name":"b","depends_on":["a"],"emit":{"skill":"s"}}]}',
             ),
             ("duplicate.yaml", "reminders: []\nreminders: []\n"),
             ("non-string.yaml", "1: value\nreminders: []\n"),

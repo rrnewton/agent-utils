@@ -15,7 +15,7 @@ quoted. This mirrors the well-worn contract that this tool generalizes.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 HEALTH_STATUS_OK = "ok"
 HEALTH_STATUS_STALE = "stale"
@@ -54,16 +54,23 @@ def format_note(text: str) -> str:
 def format_no_result(name: str, detail: str = "") -> str:
     """Format a gate that ran but could not determine its condition.
 
-    Built from the gate NAME alone and never through :func:`render_emit`. A gate
-    that cannot determine its condition is exactly the gate least likely to have
-    produced a usable ``summary=``, so rendering this through the normal
-    interpolation path would raise ``UnresolvedPlaceholderError`` and report a
-    templating fault instead of the real one. This line must be emittable when
-    the gate printed nothing at all.
+    Built without the configured emit template and never through
+    :func:`render_emit`. A captured summary may be appended as optional detail,
+    but the name alone is sufficient, so a gate that printed nothing can still
+    report its real state instead of an unresolved-placeholder fault.
     """
     detail = detail.strip()
     tail = f" ({detail})" if detail else ""
     return f"NO_RESULT: {name} could not determine its condition; this is not a pass{tail}"
+
+
+def format_unevaluable(name: str, dependencies: Sequence[str]) -> str:
+    """Format a quiet reminder whose declared dependency has no result."""
+    joined = ",".join(dependencies)
+    return (
+        f"NO_RESULT: {name} is unevaluable because dependency "
+        f"{joined} could not determine its condition; this is not a pass"
+    )
 
 
 def format_error(text: str) -> str:

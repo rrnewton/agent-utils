@@ -1,6 +1,6 @@
 //! Strict JSON/YAML loading and canonical serialization for [`TickConfig`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -354,7 +354,14 @@ fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigErro
     let object = as_obj(value, where_)?;
     reject_unknown(
         object,
-        &["name", "emit", "cadence_secs", "requires_flags", "gate"],
+        &[
+            "name",
+            "emit",
+            "cadence_secs",
+            "requires_flags",
+            "depends_on",
+            "gate",
+        ],
         where_,
     )?;
     let emit = object
@@ -378,7 +385,87 @@ fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigErro
         cadence_secs: opt_nonnegative_int(object, "cadence_secs", 0, where_)?,
         requires_flags: opt_str_list(object, "requires_flags", where_)?,
         gate: gate_from(object.get("gate"), &format!("{where_}.gate"))?,
+        depends_on: opt_str_list(object, "depends_on", where_)?,
     })
+}
+
+fn validate_dependencies(reminders: &[Reminder]) -> Result<(), TickConfigError> {
+    let by_name: BTreeMap<&str, &Reminder> = reminders
+        .iter()
+        .map(|reminder| (reminder.name.as_str(), reminder))
+        .collect();
+    for reminder in reminders {
+        let mut unique = BTreeSet::new();
+        for dependency in &reminder.depends_on {
+            if trim(dependency).is_empty()
+                || dependency.contains('=')
+                || dependency.chars().any(is_whitespace)
+            {
+                return Err(TickConfigError(format!(
+                    "<root>: reminder {:?} has invalid depends_on name {:?}",
+                    reminder.name, dependency
+                )));
+            }
+            if !unique.insert(dependency.as_str()) {
+                return Err(TickConfigError(format!(
+                    "<root>: reminder {:?} has duplicate depends_on entries",
+                    reminder.name
+                )));
+            }
+            if dependency == &reminder.name {
+                return Err(TickConfigError(format!(
+                    "<root>: reminder {:?} cannot depend on itself",
+                    reminder.name
+                )));
+            }
+            if !by_name.contains_key(dependency.as_str()) {
+                return Err(TickConfigError(format!(
+                    "<root>: reminder {:?} depends on unknown reminder {:?}",
+                    reminder.name, dependency
+                )));
+            }
+        }
+    }
+
+    fn visit<'a>(
+        name: &'a str,
+        by_name: &BTreeMap<&'a str, &'a Reminder>,
+        visiting: &mut BTreeSet<&'a str>,
+        visited: &mut BTreeSet<&'a str>,
+        path: &mut Vec<&'a str>,
+    ) -> Result<(), TickConfigError> {
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if !visiting.insert(name) {
+            path.push(name);
+            return Err(TickConfigError(format!(
+                "<root>: reminder dependency cycle: {}",
+                path.join(" -> ")
+            )));
+        }
+        path.push(name);
+        for dependency in &by_name[name].depends_on {
+            visit(dependency, by_name, visiting, visited, path)?;
+        }
+        path.pop();
+        visiting.remove(name);
+        visited.insert(name);
+        Ok(())
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for reminder in reminders {
+        visit(
+            &reminder.name,
+            &by_name,
+            &mut visiting,
+            &mut visited,
+            &mut Vec::new(),
+        )?;
+    }
+    Ok(())
 }
 
 fn health_from(value: &Value, where_: &str) -> Result<HealthCheck, TickConfigError> {
@@ -436,6 +523,7 @@ fn config_from_value(raw: &Value) -> Result<TickConfig, TickConfigError> {
             ));
         }
     }
+    validate_dependencies(&reminders)?;
     let health_checks = match object.get("health_checks") {
         None => Vec::new(),
         Some(Value::Array(items)) => items
@@ -555,6 +643,19 @@ fn config_to_value(config: &TickConfig) -> Value {
                         .collect(),
                 ),
             );
+            if !reminder.depends_on.is_empty() {
+                object.insert(
+                    "depends_on".into(),
+                    Value::Array(
+                        reminder
+                            .depends_on
+                            .iter()
+                            .cloned()
+                            .map(Value::String)
+                            .collect(),
+                    ),
+                );
+            }
             object.insert("gate".into(), gate_to_value(reminder.gate.as_ref()));
             object.insert("emit".into(), emit_to_value(&reminder.emit));
             Value::Object(object)
@@ -597,6 +698,7 @@ fn validate_serializable(config: &TickConfig) -> Result<(), TickConfigError> {
             ));
         }
     }
+    validate_dependencies(&config.reminders)?;
     let mut health_names = BTreeSet::new();
     for check in &config.health_checks {
         if trim(&check.name).is_empty() {
@@ -677,6 +779,31 @@ mod tests {
         assert_eq!(reminder.emit.kind, EmitKind::Note);
         assert_eq!(reminder.cadence_secs, 0);
         assert!(reminder.gate.is_none());
+    }
+
+    #[test]
+    fn dependency_edges_round_trip_and_reject_invalid_graphs() {
+        let text = r#"{
+          "reminders": [
+            {"name":"foundation","gate":{"cmd":"f"},"emit":{"skill":"s"}},
+            {"name":"dependent","depends_on":["foundation"],"gate":{"cmd":"d"},"emit":{"skill":"s"}}
+          ]
+        }"#;
+        let config = config_from_json(text).unwrap();
+        assert_eq!(config.reminders[1].depends_on, vec!["foundation"]);
+        assert_eq!(
+            config_from_json(&config_to_json(&config).unwrap()).unwrap(),
+            config
+        );
+
+        for invalid in [
+            r#"{"reminders":[{"name":"a","depends_on":["missing"],"emit":{"skill":"s"}}]}"#,
+            r#"{"reminders":[{"name":"a","depends_on":["a"],"emit":{"skill":"s"}}]}"#,
+            r#"{"reminders":[{"name":"a","depends_on":["a","a"],"emit":{"skill":"s"}}]}"#,
+            r#"{"reminders":[{"name":"a","depends_on":["b"],"emit":{"skill":"s"}},{"name":"b","depends_on":["a"],"emit":{"skill":"s"}}]}"#,
+        ] {
+            assert!(config_from_json(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

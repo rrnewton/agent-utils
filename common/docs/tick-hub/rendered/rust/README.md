@@ -77,6 +77,8 @@ tick-hub --userguide
 - `ACTION:` identifies one handler plus fields and a title.
 - `NOTE:` carries informational state.
 - `ERROR:` reports a gate or operational failure.
+- `NO_RESULT:` reports that a gate could not determine its condition or that a
+  declared dependent is unevaluable. It is neither a pass nor a failure.
 
 The prefix is the record type. Consumers should parse that prefix and treat the
 remaining fields as line-oriented data.

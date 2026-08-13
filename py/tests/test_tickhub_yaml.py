@@ -133,3 +133,27 @@ def test_yaml_rejects_nonfinite_numbers_even_in_nullable_fields() -> None:
         config_from_yaml,
         "reminders:\n  - {name: r, cadence_secs: .inf, emit: {skill: s}}\n",
     )
+
+
+def test_dependency_edges_round_trip_and_reject_invalid_graphs() -> None:
+    text = (
+        "reminders:\n"
+        "  - {name: foundation, gate: {cmd: f}, emit: {skill: s}}\n"
+        "  - {name: dependent, depends_on: [foundation], gate: {cmd: d}, emit: {skill: s}}\n"
+    )
+    config = config_from_yaml(text)
+    assert config.reminders[1].depends_on == ("foundation",)
+    assert config_from_yaml(config_to_yaml(config)) == config
+
+    invalid = (
+        "reminders:\n"
+        "  - {name: a, depends_on: [%s], gate: {cmd: a}, emit: {skill: s}}\n"
+        "  - {name: b, depends_on: [%s], gate: {cmd: b}, emit: {skill: s}}\n"
+    )
+    _expect_error(config_from_yaml, invalid % ("missing", ""))
+    _expect_error(config_from_yaml, invalid % ("a", ""))
+    _expect_error(config_from_yaml, invalid % ("b", "a"))
+    _expect_error(
+        config_from_yaml,
+        "reminders:\n  - {name: a, depends_on: [a, a], gate: {cmd: a}, emit: {skill: s}}\n",
+    )

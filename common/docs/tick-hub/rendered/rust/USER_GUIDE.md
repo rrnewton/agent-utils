@@ -71,6 +71,15 @@ names are fired-state keys and therefore cannot contain whitespace or `=`.
 Unknown fields, wrong types, negative cadences or thresholds, reserved `<<`
 mapping keys, and duplicate mapping keys are errors.
 
+`depends_on` names other reminders in the same configuration. Unknown,
+duplicate, self-referential, or cyclic dependency edges are errors. Every due
+gate still runs. If a dependency exits 75 (`NO_RESULT`) and the dependent gate
+is otherwise quiet, the dependent emits its own `NO_RESULT` as unevaluable and
+does not consume cadence. A dependent that finds a real problem still emits it
+verbatim; dependency metadata never suppresses a finding. Empty output or an
+intentional zero selection does not imply `NO_RESULT`: only exit 75 carries
+that meaning.
+
 An action emit requires a non-empty `skill`; its `fields` values are strings.
 A note emit uses `title` as its text.
 
@@ -111,6 +120,9 @@ NOTE: emitted 1 instruction(s) this tick
   fields plus a quoted title.
 - `NOTE:` is informational and requires no dispatch.
 - `ERROR:` means a gate could not complete; that reminder is retried later.
+- `NO_RESULT:` means a gate could not determine its condition, or a quiet
+  dependent is unevaluable because such a gate is its declared dependency. It
+  is neither a pass nor a failure and does not consume cadence.
 
 Consumers should dispatch only the record types they understand and retain
 unknown fields for forward compatibility.

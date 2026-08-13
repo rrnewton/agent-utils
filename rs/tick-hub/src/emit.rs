@@ -69,12 +69,9 @@ pub fn format_health(
 
 /// Format a gate that could not determine its condition.
 ///
-/// Deliberately built from the gate NAME alone and never from `emit.title` or
-/// any captured field. A gate that cannot determine its condition is exactly
-/// the gate least likely to have produced a usable `summary=`, so rendering
-/// this line through the normal interpolation path would reproduce the failure
-/// it exists to report. The line must be emittable when the gate printed
-/// nothing at all.
+/// Deliberately built without `emit.title` or normal interpolation. A captured
+/// summary may be appended as optional detail, but the gate name alone is
+/// sufficient, so the line remains emittable when the gate printed nothing.
 pub fn format_no_result(name: &str, detail: &str) -> String {
     let detail = detail.trim();
     if detail.is_empty() {
@@ -84,6 +81,14 @@ pub fn format_no_result(name: &str, detail: &str) -> String {
             "NO_RESULT: {name} could not determine its condition; this is not a pass ({detail})"
         )
     }
+}
+
+/// Format a quiet reminder whose declared dependency has no result.
+pub fn format_unevaluable(name: &str, dependencies: &[String]) -> String {
+    format!(
+        "NO_RESULT: {name} is unevaluable because dependency {} could not determine its condition; this is not a pass",
+        dependencies.join(",")
+    )
 }
 
 #[cfg(test)]

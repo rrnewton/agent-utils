@@ -31,6 +31,7 @@ from tick_hub.emit import (
     format_error,
     format_health,
     format_note,
+    format_unevaluable,
 )
 from tick_hub.model import Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig
 from tick_hub.protocols import FileAgeProbe, GateRunner
@@ -108,6 +109,14 @@ class GateOutcome(Enum):
     QUIET = "quiet"
     FIRE = "fire"
     NO_RESULT = "no-result"
+
+
+@dataclass(frozen=True)
+class _ReminderEvaluation:
+    reminder: Reminder
+    outcome: GateOutcome
+    captured: dict[str, str]
+    error: str | None
 
 
 def _gate_fires(when: GateWhen, returncode: int, stdout: str) -> bool:
@@ -247,6 +256,7 @@ def run_tick(
 
     new_fired = dict(fired)
     if state.enabled:
+        evaluations: list[_ReminderEvaluation] = []
         for rem in config.reminders:
             if not is_due(rem.name, rem.cadence_secs, now, fired):
                 continue
@@ -254,6 +264,37 @@ def run_tick(
                 # Flag-suppressed: do NOT consume the cadence, so it fires promptly once enabled.
                 continue
             outcome, captured, error = _eval_gate(rem.gate, gate_runner)
+            evaluations.append(_ReminderEvaluation(rem, outcome, captured, error))
+
+        # Evaluate every due gate before interpreting dependency edges. A
+        # dependency never decides whether another gate runs, and config order
+        # therefore cannot turn a forward reference into a false clean.
+        unavailable = {
+            evaluation.reminder.name
+            for evaluation in evaluations
+            if evaluation.error is None
+            and evaluation.outcome is GateOutcome.NO_RESULT
+        }
+        changed = True
+        while changed:
+            changed = False
+            for evaluation in evaluations:
+                if evaluation.error is not None or evaluation.outcome is not GateOutcome.QUIET:
+                    continue
+                if evaluation.reminder.name in unavailable:
+                    continue
+                if any(
+                    dependency in unavailable
+                    for dependency in evaluation.reminder.depends_on
+                ):
+                    unavailable.add(evaluation.reminder.name)
+                    changed = True
+
+        for evaluation in evaluations:
+            rem = evaluation.reminder
+            outcome = evaluation.outcome
+            captured = evaluation.captured
+            error = evaluation.error
             if error is not None:
                 # The check did not complete. Keep the ERROR for full diagnostic
                 # readers and emit a counted NO-SIGNAL action because production
@@ -281,6 +322,22 @@ def run_tick(
                 actions += 1
                 continue
             if outcome is GateOutcome.QUIET:
+                unavailable_dependencies = tuple(
+                    dependency
+                    for dependency in rem.depends_on
+                    if dependency in unavailable
+                )
+                if unavailable_dependencies:
+                    lines.append(format_unevaluable(rem.name, unavailable_dependencies))
+                    lines.append(
+                        _no_signal_action(
+                            rem,
+                            "dependency-could-not-determine",
+                            detail=",".join(unavailable_dependencies),
+                        )
+                    )
+                    actions += 1
+                    continue
                 new_fired[rem.name] = now  # the check ran; the cadence clock resets
                 continue
             try:

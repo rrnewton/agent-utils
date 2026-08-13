@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from tick_hub.engine import NO_RESULT_EXIT, parse_kv_lines, render_emit, run_tick
+from tick_hub.engine import NO_RESULT_EXIT, TickResult, parse_kv_lines, render_emit, run_tick
 from tick_hub.model import (
     Emit,
     EmitKind,
@@ -324,7 +324,7 @@ def _probe(when: GateWhen = GateWhen.FAILURE) -> TickConfig:
     )
 
 
-def _tick(cfg: TickConfig, code: int, stdout: str = ""):
+def _tick(cfg: TickConfig, code: int, stdout: str = "") -> TickResult:
     return run_tick(
         cfg, OpsState.default(), now=5, fired={},
         gate_runner=FakeGate({"check": GateResult(code, stdout, True)}),
@@ -385,3 +385,127 @@ def test_positive_control_a_determinable_gate_is_unchanged() -> None:
     assert not any(ln.startswith("NO_RESULT: ") for ln in quiet.lines)
     assert not any("probe says" in ln for ln in quiet.lines)
     assert quiet.fired["probe"] == 5
+
+
+def _dependency_probe(name: str, *depends_on: str) -> Reminder:
+    return Reminder(
+        name,
+        Emit(EmitKind.ACTION, title=f"{name} found a problem", skill="warn"),
+        gate=Gate(cmd=name, when=GateWhen.FAILURE),
+        depends_on=depends_on,
+    )
+
+
+def test_foundation_no_result_marks_quiet_dependents_unevaluable() -> None:
+    # Put the dependency last to prove config order does not control whether
+    # the relationship is observed. Every gate must still run.
+    cfg = TickConfig(
+        reminders=(
+            _dependency_probe("dependent", "foundation"),
+            _dependency_probe("independent"),
+            _dependency_probe("foundation"),
+        )
+    )
+    runner = FakeGate(
+        {
+            "foundation": GateResult(NO_RESULT_EXIT, "", True),
+            "dependent": GateResult(0, "", True),
+            "independent": GateResult(0, "", True),
+        }
+    )
+    result = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=runner,
+        age_probe=FakeProbe({}),
+    )
+    assert [cmd for cmd, _ in runner.calls] == [
+        "dependent",
+        "independent",
+        "foundation",
+    ]
+    assert any(
+        line.startswith("NO_RESULT: dependent is unevaluable because dependency foundation")
+        for line in result.lines
+    ), result.lines
+    assert any("reason=dependency-could-not-determine" in line for line in result.lines)
+    assert "dependent" not in result.fired, "unevaluable silence must retry"
+    assert "foundation" not in result.fired, "direct NO_RESULT must retry"
+    assert result.fired["independent"] == 5, "independent silence stays determinable"
+
+
+def test_dependency_never_suppresses_a_real_finding() -> None:
+    cfg = TickConfig(
+        reminders=(
+            _dependency_probe("foundation"),
+            _dependency_probe("dependent", "foundation"),
+        )
+    )
+    result = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=FakeGate(
+            {
+                "foundation": GateResult(NO_RESULT_EXIT, "", True),
+                "dependent": GateResult(1, "", True),
+            }
+        ),
+        age_probe=FakeProbe({}),
+    )
+    assert any("dependent found a problem" in line for line in result.lines), result.lines
+    assert not any("dependent is unevaluable" in line for line in result.lines)
+    assert result.fired["dependent"] == 5
+
+
+def test_dependency_propagates_through_quiet_chain_only() -> None:
+    cfg = TickConfig(
+        reminders=(
+            _dependency_probe("foundation"),
+            _dependency_probe("middle", "foundation"),
+            _dependency_probe("leaf", "middle"),
+        )
+    )
+    result = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=FakeGate(
+            {
+                "foundation": GateResult(NO_RESULT_EXIT, "", True),
+                "middle": GateResult(0, "", True),
+                "leaf": GateResult(0, "", True),
+            }
+        ),
+        age_probe=FakeProbe({}),
+    )
+    assert any("middle is unevaluable" in line for line in result.lines), result.lines
+    assert any("leaf is unevaluable" in line for line in result.lines), result.lines
+
+
+def test_empty_success_is_not_inferred_to_be_no_result() -> None:
+    cfg = TickConfig(
+        reminders=(
+            _dependency_probe("foundation"),
+            _dependency_probe("dependent", "foundation"),
+        )
+    )
+    result = run_tick(
+        cfg,
+        OpsState.default(),
+        now=5,
+        fired={},
+        gate_runner=FakeGate(
+            {
+                "foundation": GateResult(0, "", True),
+                "dependent": GateResult(0, "", True),
+            }
+        ),
+        age_probe=FakeProbe({}),
+    )
+    assert not any(line.startswith("NO_RESULT: ") for line in result.lines), result.lines
+    assert result.fired == {"foundation": 5, "dependent": 5}

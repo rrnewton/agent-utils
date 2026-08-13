@@ -139,6 +139,9 @@ pub struct Reminder {
     pub requires_flags: Vec<String>,
     /// Optional shell gate.
     pub gate: Option<Gate>,
+    /// Reminders whose explicit no-result makes this reminder's silence unevaluable.
+    /// Dependencies never prevent this reminder's gate from running or suppress a real emission.
+    pub depends_on: Vec<String>,
 }
 
 impl Reminder {
@@ -150,6 +153,7 @@ impl Reminder {
             cadence_secs: EVERY_TICK,
             requires_flags: Vec::new(),
             gate: None,
+            depends_on: Vec::new(),
         }
     }
 }

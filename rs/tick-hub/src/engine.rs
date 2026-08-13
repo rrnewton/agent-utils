@@ -1,12 +1,12 @@
 //! Deterministic tick evaluation over injected gate and file-age boundaries.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use indexmap::IndexMap;
 
 use crate::cadence::is_due;
 use crate::emit::{
-    format_action, format_error, format_health, format_no_result, format_note,
+    format_action, format_error, format_health, format_no_result, format_note, format_unevaluable,
     HEALTH_STATUS_MISSING, HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
 };
 use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, TickConfig};
@@ -76,6 +76,13 @@ pub enum GateOutcome {
     NoResult,
 }
 
+struct ReminderEvaluation<'a> {
+    reminder: &'a crate::model::Reminder,
+    outcome: GateOutcome,
+    captured: IndexMap<String, String>,
+    error: Option<String>,
+}
+
 fn gate_fires(when: GateWhen, returncode: i32, stdout: &str) -> bool {
     match when {
         GateWhen::Success => returncode == 0,
@@ -119,6 +126,34 @@ fn eval_gate(
         GateOutcome::Quiet
     };
     Ok((outcome, captured))
+}
+
+fn no_signal_action(reminder: &crate::model::Reminder, reason: &str, detail: &str) -> String {
+    let mut fields = IndexMap::from([
+        ("component".into(), "tick-hub-reporting".into()),
+        ("outcome".into(), "NO-SIGNAL".into()),
+        ("gate".into(), reminder.name.clone()),
+        ("reason".into(), reason.into()),
+    ]);
+    let detail: String = detail
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect();
+    if !detail.is_empty() {
+        fields.insert("detail".into(), detail);
+    }
+    format_action(
+        if reminder.emit.skill.is_empty() {
+            "tick-hub-no-signal"
+        } else {
+            &reminder.emit.skill
+        },
+        &fields,
+        &format!("NO-SIGNAL gate={}: {reason}", reminder.name),
+    )
 }
 
 fn interpolate(mut text: String, values: &IndexMap<String, String>) -> String {
@@ -171,6 +206,7 @@ pub fn run_tick(
     }
     let mut new_fired = fired.clone();
     if state.enabled {
+        let mut evaluations = Vec::new();
         for reminder in &config.reminders {
             if !is_due(&reminder.name, reminder.cadence_secs, now, fired) {
                 continue;
@@ -182,31 +218,98 @@ pub fn run_tick(
             {
                 continue;
             }
-            let (outcome, captured) = match eval_gate(reminder.gate.as_ref(), gate_runner) {
-                Ok(result) => result,
-                Err(error) => {
-                    lines.push(format_error(&format!(
-                        "reminder {}: {error}",
-                        reminder.name
-                    )));
+            let (outcome, captured, error) = match eval_gate(reminder.gate.as_ref(), gate_runner) {
+                Ok((outcome, captured)) => (outcome, captured, None),
+                Err(error) => (GateOutcome::Quiet, IndexMap::new(), Some(error)),
+            };
+            evaluations.push(ReminderEvaluation {
+                reminder,
+                outcome,
+                captured,
+                error,
+            });
+        }
+
+        // Run every due gate before interpreting dependency edges. Dependencies
+        // never decide whether another gate runs, and config order therefore
+        // cannot turn a forward reference into a false clean.
+        let mut unavailable: BTreeSet<String> = evaluations
+            .iter()
+            .filter(|evaluation| {
+                evaluation.error.is_none() && evaluation.outcome == GateOutcome::NoResult
+            })
+            .map(|evaluation| evaluation.reminder.name.clone())
+            .collect();
+        loop {
+            let mut changed = false;
+            for evaluation in &evaluations {
+                if evaluation.error.is_some()
+                    || evaluation.outcome != GateOutcome::Quiet
+                    || unavailable.contains(&evaluation.reminder.name)
+                {
                     continue;
                 }
-            };
+                if evaluation
+                    .reminder
+                    .depends_on
+                    .iter()
+                    .any(|dependency| unavailable.contains(dependency))
+                {
+                    unavailable.insert(evaluation.reminder.name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for evaluation in evaluations {
+            let reminder = evaluation.reminder;
+            let outcome = evaluation.outcome;
+            let captured = evaluation.captured;
+            if let Some(error) = evaluation.error {
+                lines.push(format_error(&format!(
+                    "reminder {}: {error}",
+                    reminder.name
+                )));
+                continue;
+            }
             // A NO_RESULT does NOT consume cadence, matching the existing
             // cannot-run path above: the gate keeps announcing every tick until
             // it can determine something. Deliberately noisy -- silence is the
             // hazard here, so repetition is the correct trade.
             if outcome == GateOutcome::NoResult {
-                lines.push(format_no_result(
-                    &reminder.name,
-                    captured.get("summary").map(String::as_str).unwrap_or(""),
-                ));
+                let detail = captured.get("summary").map(String::as_str).unwrap_or("");
+                lines.push(format_no_result(&reminder.name, detail));
+                lines.push(no_signal_action(reminder, "could-not-determine", detail));
+                actions += 1;
+                continue;
+            }
+            if outcome == GateOutcome::Quiet {
+                let unavailable_dependencies: Vec<String> = reminder
+                    .depends_on
+                    .iter()
+                    .filter(|dependency| unavailable.contains(*dependency))
+                    .cloned()
+                    .collect();
+                if !unavailable_dependencies.is_empty() {
+                    lines.push(format_unevaluable(
+                        &reminder.name,
+                        &unavailable_dependencies,
+                    ));
+                    lines.push(no_signal_action(
+                        reminder,
+                        "dependency-could-not-determine",
+                        &unavailable_dependencies.join(","),
+                    ));
+                    actions += 1;
+                    continue;
+                }
+                new_fired.insert(reminder.name.clone(), now);
                 continue;
             }
             new_fired.insert(reminder.name.clone(), now);
-            if outcome == GateOutcome::Quiet {
-                continue;
-            }
             let line = render_emit(&reminder.emit, &captured);
             if line.starts_with("ACTION: ") {
                 actions += 1;
@@ -478,10 +581,11 @@ mod tests {
             line.contains("backend unreachable"),
             "carries detail when present: {line}"
         );
-        assert!(
-            !result.lines.iter().any(|l| l.starts_with("ACTION: ")),
-            "must not also fire a verdict"
-        );
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("reason=could-not-determine")));
+        assert!(!result.lines.iter().any(|line| line.contains("{summary}")));
     }
 
     #[test]
@@ -590,5 +694,175 @@ mod tests {
             .iter()
             .any(|l| l.starts_with("ACTION: ") || l.starts_with("NO_RESULT: ")));
         assert!(quiet.fired.contains_key("q"));
+    }
+
+    fn dependency_probe(name: &str, dependencies: &[&str]) -> Reminder {
+        let mut reminder = Reminder::new(
+            name,
+            Emit::action("warn", format!("{name} found a problem")),
+        );
+        let mut gate = Gate::new(name);
+        gate.when = GateWhen::Failure;
+        reminder.gate = Some(gate);
+        reminder.depends_on = dependencies
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        reminder
+    }
+
+    #[test]
+    fn foundation_no_result_marks_quiet_dependents_unevaluable() {
+        let config = TickConfig {
+            reminders: vec![
+                dependency_probe("dependent", &["foundation"]),
+                dependency_probe("independent", &[]),
+                dependency_probe("foundation", &[]),
+            ],
+            ..TickConfig::default()
+        };
+        let gate = FakeGate {
+            outcomes: BTreeMap::from([
+                (
+                    "foundation".into(),
+                    GateResult::completed(NO_RESULT_EXIT, ""),
+                ),
+                ("dependent".into(), GateResult::completed(0, "")),
+                ("independent".into(), GateResult::completed(0, "")),
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert_eq!(
+            *gate.calls.borrow(),
+            vec!["dependent", "independent", "foundation"]
+        );
+        assert!(result.lines.iter().any(|line| line
+            .starts_with("NO_RESULT: dependent is unevaluable because dependency foundation")));
+        assert!(!result.fired.contains_key("dependent"));
+        assert!(!result.fired.contains_key("foundation"));
+        assert_eq!(result.fired.get("independent"), Some(&5));
+    }
+
+    #[test]
+    fn dependency_never_suppresses_a_real_finding() {
+        let config = TickConfig {
+            reminders: vec![
+                dependency_probe("foundation", &[]),
+                dependency_probe("dependent", &["foundation"]),
+            ],
+            ..TickConfig::default()
+        };
+        let gate = FakeGate {
+            outcomes: BTreeMap::from([
+                (
+                    "foundation".into(),
+                    GateResult::completed(NO_RESULT_EXIT, ""),
+                ),
+                ("dependent".into(), GateResult::completed(1, "")),
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("dependent found a problem")));
+        assert!(!result
+            .lines
+            .iter()
+            .any(|line| line.contains("dependent is unevaluable")));
+        assert_eq!(result.fired.get("dependent"), Some(&5));
+    }
+
+    #[test]
+    fn dependency_propagates_through_quiet_chain_only() {
+        let config = TickConfig {
+            reminders: vec![
+                dependency_probe("foundation", &[]),
+                dependency_probe("middle", &["foundation"]),
+                dependency_probe("leaf", &["middle"]),
+            ],
+            ..TickConfig::default()
+        };
+        let gate = FakeGate {
+            outcomes: BTreeMap::from([
+                (
+                    "foundation".into(),
+                    GateResult::completed(NO_RESULT_EXIT, ""),
+                ),
+                ("middle".into(), GateResult::completed(0, "")),
+                ("leaf".into(), GateResult::completed(0, "")),
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("middle is unevaluable")));
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("leaf is unevaluable")));
+    }
+
+    #[test]
+    fn empty_success_is_not_inferred_to_be_no_result() {
+        let config = TickConfig {
+            reminders: vec![
+                dependency_probe("foundation", &[]),
+                dependency_probe("dependent", &["foundation"]),
+            ],
+            ..TickConfig::default()
+        };
+        let gate = FakeGate {
+            outcomes: BTreeMap::from([
+                ("foundation".into(), GateResult::completed(0, "")),
+                ("dependent".into(), GateResult::completed(0, "")),
+            ]),
+            calls: RefCell::new(Vec::new()),
+        };
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            5,
+            &BTreeMap::new(),
+            &gate,
+            &FakeProbe(BTreeMap::new()),
+            None,
+        );
+        assert!(!result
+            .lines
+            .iter()
+            .any(|line| line.starts_with("NO_RESULT: ")));
+        assert_eq!(
+            result.fired,
+            BTreeMap::from([("foundation".into(), 5), ("dependent".into(), 5)])
+        );
     }
 }

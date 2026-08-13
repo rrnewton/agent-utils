@@ -17,7 +17,7 @@ and every field's type is re-validated here, so no ``Any`` leaks into the model.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
@@ -217,19 +217,62 @@ def _reminder_from(value: object, where: str) -> Reminder:
     obj = _as_obj(value, where)
     _reject_unknown(
         obj,
-        frozenset({"name", "emit", "cadence_secs", "requires_flags", "gate"}),
+        frozenset(
+            {"name", "emit", "cadence_secs", "requires_flags", "depends_on", "gate"}
+        ),
         where,
     )
     emit_raw = obj.get("emit")
     if emit_raw is None:
         raise TickConfigError(f"{where}: field 'emit' is required")
+    depends_on = _opt_str_list(obj, "depends_on", where)
+    for index, dependency in enumerate(depends_on):
+        _require_reminder_name(dependency, f"{where}.depends_on[{index}]")
     return Reminder(
         name=_require_reminder_name(_req_str(obj, "name", where), where),
         emit=_emit_from(emit_raw, f"{where}.emit"),
         cadence_secs=_opt_nonnegative_int(obj, "cadence_secs", 0, where),
         requires_flags=_opt_str_list(obj, "requires_flags", where),
+        depends_on=depends_on,
         gate=_gate_from(obj.get("gate"), f"{where}.gate"),
     )
+
+
+def _validate_dependencies(reminders: Sequence[Reminder]) -> None:
+    by_name = {reminder.name: reminder for reminder in reminders}
+    for reminder in reminders:
+        if len(set(reminder.depends_on)) != len(reminder.depends_on):
+            raise TickConfigError(
+                f"<root>: reminder {reminder.name!r} has duplicate depends_on entries"
+            )
+        for dependency in reminder.depends_on:
+            if dependency == reminder.name:
+                raise TickConfigError(
+                    f"<root>: reminder {reminder.name!r} cannot depend on itself"
+                )
+            if dependency not in by_name:
+                raise TickConfigError(
+                    f"<root>: reminder {reminder.name!r} depends on unknown reminder "
+                    f"{dependency!r}"
+                )
+
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str, path: tuple[str, ...]) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            cycle = " -> ".join((*path, name))
+            raise TickConfigError(f"<root>: reminder dependency cycle: {cycle}")
+        visiting.add(name)
+        for dependency in by_name[name].depends_on:
+            visit(dependency, (*path, name))
+        visiting.remove(name)
+        visited.add(name)
+
+    for reminder in reminders:
+        visit(reminder.name, ())
 
 
 def _health_from(value: object, where: str) -> HealthCheck:
@@ -305,6 +348,7 @@ def _config_from_obj(raw: object) -> TickConfig:
     reminder_names = [reminder.name for reminder in reminders]
     if len(set(reminder_names)) != len(reminder_names):
         raise TickConfigError("<root>: reminder names must be unique")
+    _validate_dependencies(reminders)
     health: list[HealthCheck] = []
     if "health_checks" in doc:
         health_raw = doc["health_checks"]
@@ -350,13 +394,16 @@ def _emit_to_obj(emit: Emit) -> dict[str, object]:
 
 
 def _reminder_to_obj(rem: Reminder) -> dict[str, object]:
-    return {
+    obj: dict[str, object] = {
         "name": rem.name,
         "cadence_secs": rem.cadence_secs,
         "requires_flags": list(rem.requires_flags),
         "gate": _gate_to_obj(rem.gate),
         "emit": _emit_to_obj(rem.emit),
     }
+    if rem.depends_on:
+        obj["depends_on"] = list(rem.depends_on)
+    return obj
 
 
 def _health_to_obj(hc: HealthCheck) -> dict[str, object]:
