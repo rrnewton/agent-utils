@@ -469,6 +469,7 @@ h1 {
 .state-waiting { background: var(--blue); }
 .state-idle { background: #68758b; }
 .state-blocked { background: var(--red); }
+.summary-available-dot { background: var(--purple); }
 
 .interaction-hint {
   justify-self: end;
@@ -738,12 +739,12 @@ h1 {
   transition: filter 90ms ease, stroke 90ms ease;
 }
 
-.activity-bin-coordinator {
-  fill: #58c8e4;
+.activity-bin-combined {
+  fill: #557389;
 }
 
-.activity-bin-workers {
-  fill: #3bc983;
+.activity-bin-group.summary-available .activity-bin-combined {
+  fill: #a77bf3;
 }
 
 .activity-bin-group:hover .activity-bin-block,

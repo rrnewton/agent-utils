@@ -69,29 +69,29 @@ assert.strictEqual(
   "medium density collapses phases into one lifetime block per agent"
 );
 assert.strictEqual(
-  core.semanticZoomLevel(0, 15 * 60 * 1000 * 1000, 1000),
+  core.semanticZoomLevel(0, 5 * 60 * 1000 * 1000, 1000),
   "lifetime",
-  "fifteen minutes per pixel remains in lifetime mode"
+  "five minutes per pixel remains in lifetime mode"
 );
 assert.strictEqual(
-  core.semanticZoomLevel(0, 15 * 60 * 1000 * 1000 + 1, 1000),
+  core.semanticZoomLevel(0, 5 * 60 * 1000 * 1000 + 1, 1000),
   "aggregate",
   "outer views suppress individual interaction detail"
 );
 assert.strictEqual(
-  core.aggregateResolution(0, 30 * 60 * 1000 * 1000, 1000),
+  core.aggregateResolution(0, 125 * 60 * 60 * 1000, 1000),
   "hourly",
-  "hour bins are retained while each remains at least two pixels wide"
+  "hour bins are retained while each remains at least eight pixels wide"
 );
 assert.strictEqual(
-  core.aggregateResolution(0, 31 * 60 * 1000 * 1000, 1000),
+  core.aggregateResolution(0, 126 * 60 * 60 * 1000, 1000),
   "daily",
-  "daily bins replace sub-two-pixel hour bins"
+  "daily bins replace narrow hour bins"
 );
 assert.strictEqual(
-  core.aggregateResolution(0, 13 * 60 * 60 * 1000 * 1000, 1000),
+  core.aggregateResolution(0, 126 * 24 * 60 * 60 * 1000, 1000),
   "weekly",
-  "weekly bins replace sub-two-pixel day bins"
+  "weekly bins replace narrow day bins"
 );
 
 const springForwardDay = {
@@ -311,6 +311,27 @@ assert.strictEqual(packed.lane_by_id.root, 0);
 assert.strictEqual(packed.lane_by_id.a, 1);
 assert.strictEqual(packed.lane_by_id.b, 2);
 assert.strictEqual(packed.lane_by_id.c, 1, "half-open adjacent lifetimes reuse a lane");
+
+const visibleLifetimes = core.lifetimesWithin([
+  { id: "old-root", start_ms: 0, end_ms: 100, dedicated: true },
+  { id: "active-root", start_ms: 100, end_ms: 300, dedicated: true },
+  { id: "active-child", start_ms: 120, end_ms: 240, dedicated: false },
+  { id: "future-child", start_ms: 260, end_ms: 290, dedicated: false }
+], 150, 250);
+assert.deepStrictEqual(
+  visibleLifetimes.map(function (item) {
+    return [item.id, item.start_ms, item.end_ms];
+  }),
+  [
+    ["active-root", 150, 250],
+    ["active-child", 150, 240]
+  ],
+  "visible packing drops inactive roots and clips conflicts to the current range"
+);
+const visiblePacked = core.packLifetimes(visibleLifetimes);
+assert.strictEqual(visiblePacked.lane_count, 2);
+assert.strictEqual(visiblePacked.lane_by_id["active-root"], 0);
+assert.strictEqual(visiblePacked.lane_by_id["active-child"], 1);
 
 let selection = core.nextPhaseSelection(null, "agent-a", "phase-1", 10, 20);
 assert.deepStrictEqual(selection, { kind: "agent", agent_id: "agent-a" });

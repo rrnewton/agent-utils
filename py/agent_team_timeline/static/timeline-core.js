@@ -30,22 +30,22 @@
     if (millisecondsPerPixel <= 60 * 1000) {
       return "detail";
     }
-    if (millisecondsPerPixel <= 15 * 60 * 1000) {
+    if (millisecondsPerPixel <= 5 * 60 * 1000) {
       return "lifetime";
     }
     return "aggregate";
   }
 
-  /** Pick the narrowest precomputed bin that stays at least two pixels wide. */
+  /** Pick the narrowest precomputed bin that stays at least eight pixels wide. */
   function aggregateResolution(startMs, endMs, chartWidth) {
     var start = finite(startMs, 0);
     var end = finite(endMs, start + 1);
     var width = Math.max(1, finite(chartWidth, 1));
     var millisecondsPerPixel = Math.max(1, end - start) / width;
-    if ((60 * 60 * 1000) / millisecondsPerPixel >= 2) {
+    if ((60 * 60 * 1000) / millisecondsPerPixel >= 8) {
       return "hourly";
     }
-    if ((24 * 60 * 60 * 1000) / millisecondsPerPixel >= 2) {
+    if ((24 * 60 * 60 * 1000) / millisecondsPerPixel >= 8) {
       return "daily";
     }
     return "weekly";
@@ -290,6 +290,27 @@
     };
   }
 
+  /** Clip lifetimes to the visible half-open range and discard off-screen agents. */
+  function lifetimesWithin(rawItems, startMs, endMs) {
+    var viewStart = finite(startMs, 0);
+    var viewEnd = finite(endMs, viewStart + 1);
+    if (viewEnd <= viewStart) {
+      return [];
+    }
+    return (Array.isArray(rawItems) ? rawItems : []).reduce(function (result, item) {
+      var start = finite(item && item.start_ms, viewStart);
+      var end = Math.max(start, finite(item && item.end_ms, start));
+      if (end <= viewStart || start >= viewEnd) {
+        return result;
+      }
+      result.push(Object.assign({}, item, {
+        start_ms: Math.max(start, viewStart),
+        end_ms: Math.min(end, viewEnd)
+      }));
+      return result;
+    }, []);
+  }
+
   /** First click selects an agent; repeated phase clicks toggle only that same phase. */
   function nextPhaseSelection(current, agentId, phaseId, startMs, endMs) {
     var agent = string(agentId);
@@ -380,6 +401,7 @@
     boundedViewRange: boundedViewRange,
     edgeDisplayState: edgeDisplayState,
     edgeTouchesSelection: edgeTouchesSelection,
+    lifetimesWithin: lifetimesWithin,
     navigableRange: navigableRange,
     nextPhaseSelection: nextPhaseSelection,
     packLifetimes: packLifetimes,

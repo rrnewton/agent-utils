@@ -140,7 +140,7 @@ async function zoomOutToLod(page, timeline, target) {
   const box = await axis.boundingBox();
   expect(box).not.toBeNull();
   await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-  for (let attempt = 0; attempt < 8; attempt += 1) {
+  for (let attempt = 0; attempt < 24; attempt += 1) {
     if (await timeline.getAttribute("data-render-lod") === target) {
       return;
     }
@@ -709,13 +709,14 @@ test("semantic zoom drops subpixel detail within a deterministic DOM budget", as
   await globalDetailed.check();
   await expect(svg.locator('[data-edge-id="message-a"]')).toHaveCount(1);
 
-  await page.locator(phaseSelector).click();
-  await expect(timeline).toHaveAttribute("data-selected-agent-id", "agent-a");
   await zoomOutToLod(page, timeline, "lifetime");
   await expect(svg).toHaveAttribute("data-render-lod", "lifetime");
   await expect(svg.locator(".state-strip")).toHaveCount(0);
   await expect(svg.locator(".phase-group")).toHaveCount(0);
   await expect(svg.locator('[data-edge-id="message-a"]')).toHaveCount(0);
+  await expect(svg.locator(".edge-group")).toHaveCount(0);
+  await svg.locator('.agent-lifetime-group[data-agent-id="agent-a"]').click();
+  await expect(timeline).toHaveAttribute("data-selected-agent-id", "agent-a");
   await expect(svg.locator('[data-edge-id="spawn-a"]')).toHaveCount(1);
   await expect(svg.locator('[data-edge-id="result-a"]')).toHaveCount(1);
   await expect(svg.locator(".agent-lifetime-group")).toHaveCount(AGENT_COUNT);
@@ -730,7 +731,10 @@ test("semantic zoom drops subpixel detail within a deterministic DOM budget", as
   await expect(svg).toHaveAttribute("data-track-mode", "aggregate");
   await expect(svg).toHaveAttribute("data-aggregate-resolution", "hourly");
   await expect(svg).toHaveAttribute("data-lane-count", "1");
-  await expect(svg.locator(".activity-bin-group")).toHaveCount(4);
+  await expect(svg.locator(".activity-bin-group")).toHaveCount(3);
+  await expect(svg.locator('.activity-bin-group[data-activity-role="combined"]')).toHaveCount(3);
+  await expect(svg.locator('.activity-bin-group[data-summary-available="true"]')).toHaveCount(2);
+  await expect(svg.locator('.activity-bin-group[data-summary-available="false"]')).toHaveCount(1);
   await expect(svg.locator(
     '.activity-bin-group[data-start-ms="' + AGGREGATE_GAP_START_MS + '"]'
   )).toHaveCount(0);
@@ -738,14 +742,14 @@ test("semantic zoom drops subpixel detail within a deterministic DOM budget", as
     '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"]'
   )).toHaveCount(1);
   const busyHeight = Number(await svg.locator(
-    '.activity-bin-group[data-activity-role="workers"]'
+    '.activity-bin-group[data-activity-role="combined"]'
   ).first().locator("rect").getAttribute("height"));
   const quieterHeight = Number(await svg.locator(
     '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"] rect'
   ).getAttribute("height"));
   expect(busyHeight).toBeGreaterThan(quieterHeight);
   const busyOpacity = Number(await svg.locator(
-    '.activity-bin-group[data-activity-role="workers"]'
+    '.activity-bin-group[data-activity-role="combined"]'
   ).first().locator("rect").getAttribute("fill-opacity"));
   const quieterOpacity = Number(await svg.locator(
     '.activity-bin-group[data-start-ms="' + AGGREGATE_LATER_START_MS + '"] rect'

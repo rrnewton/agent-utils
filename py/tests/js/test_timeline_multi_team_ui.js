@@ -47,21 +47,42 @@ const context = {
     selectedTeam: "",
     data: {
       teams: [
-        { slug: "claude-coord-176" },
-        { slug: "codex-coord-030" }
+        { slug: "claude-coord-176", stats: { events: 17_008 } },
+        { slug: "codex-coord-030", stats: { events: 63_141 } },
+        { slug: "orc-coord-014", stats: { events: 141_438 } }
       ]
     },
+    teamBySlug: new Map(),
+    teamActivityScores: new Map(),
     glossaryById: new Map()
   }
 };
+context.app.data.teams.forEach(function (team) {
+  context.app.teamBySlug.set(team.slug, team);
+});
 vm.createContext(context);
 vm.runInContext(
-  ["array", "text", "selectedTeamAllows", "glossaryTermIsAmbiguous"]
+  [
+    "array",
+    "number",
+    "text",
+    "teamActivitySortScore",
+    "compareTeamsByActivity",
+    "selectedTeamAllows",
+    "glossaryTermIsAmbiguous"
+  ]
     .map(functionSource).join("\n"),
   context
 );
 
 assert.strictEqual(context.selectedTeamAllows({ team: "codex-coord-030" }), true);
+assert.deepStrictEqual(
+  context.app.data.teams.slice().sort(context.compareTeamsByActivity).map(function (team) {
+    return team.slug;
+  }),
+  ["orc-coord-014", "codex-coord-030", "claude-coord-176"],
+  "teams sort by descending mechanically recorded activity"
+);
 context.app.selectedTeam = "claude-coord-176";
 assert.strictEqual(context.selectedTeamAllows({ team: "claude-coord-176" }), true);
 assert.strictEqual(context.selectedTeamAllows({ team: "codex-coord-030" }), false);

@@ -109,6 +109,8 @@
     phasesByAgent: new Map(),
     agentsById: new Map(),
     teamBySlug: new Map(),
+    teamActivityScores: new Map(),
+    summaryRangesByTeam: new Map(),
     glossaryById: new Map(),
     artifactsById: new Map(),
     artifactCatalogState: "legacy",
@@ -215,6 +217,141 @@
 
   function rollupAudienceAvailable(rollup, field) {
     return rollupSummaryAvailable(rollup) && summaryFlagAvailable(rollup, field);
+  }
+
+  function recordedAgentSummaryAvailable(agent) {
+    if (hasField(agent, "summary_available")) {
+      return agent.summary_available !== false;
+    }
+    return Boolean(text(agent.lifetime_summary));
+  }
+
+  function recordedPhaseSummaryAvailable(phase) {
+    if (hasField(phase, "summary_available")) {
+      return phase.summary_available !== false;
+    }
+    return Boolean(text(phase.raw_summary_path) || text(phase.summary_path));
+  }
+
+  function recordedRollupSummaryAvailable(rollup) {
+    if (hasField(rollup, "summary_available") ||
+        hasField(rollup, "technical_summary_available") ||
+        hasField(rollup, "plain_language_summary_available")) {
+      return rollupSummaryAvailable(rollup);
+    }
+    return Boolean(
+      text(rollup.path) ||
+      text(rollup.technical_path) ||
+      text(rollup.plain_language_path)
+    );
+  }
+
+  function rebuildSummaryRanges() {
+    var byTeam = new Map();
+    function add(team, startValue, endValue) {
+      var start = number(startValue, NaN);
+      var end = number(endValue, NaN);
+      if (!team || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        return;
+      }
+      if (!byTeam.has(team)) {
+        byTeam.set(team, []);
+      }
+      byTeam.get(team).push({ start_ms: start, end_ms: end });
+    }
+    app.data.rollups.forEach(function (rollup) {
+      if (recordedRollupSummaryAvailable(rollup)) {
+        add(text(rollup.team), rollup.start_ms, rollup.end_ms);
+      }
+    });
+    app.data.agents.forEach(function (agent) {
+      // A coordinator lifetime can span the entire archive and would falsely imply
+      // fine-grained coverage everywhere. Subagent lifetime summaries remain useful.
+      if (text(agent.parent_id) && recordedAgentSummaryAvailable(agent)) {
+        add(text(agent.team), agent.start_ms, agent.end_ms);
+      }
+    });
+    app.data.phases.forEach(function (phase) {
+      if (!recordedPhaseSummaryAvailable(phase)) {
+        return;
+      }
+      var agent = app.agentsById.get(text(phase.agent_id));
+      add(text(agent && agent.team), phase.start_ms, phase.end_ms);
+    });
+    byTeam.forEach(function (ranges) {
+      ranges.sort(function (left, right) {
+        return left.start_ms - right.start_ms || left.end_ms - right.end_ms;
+      });
+    });
+    app.summaryRangesByTeam = byTeam;
+  }
+
+  function summaryAvailableInRange(team, start, end) {
+    var ranges = app.summaryRangesByTeam.get(team) || [];
+    for (var index = 0; index < ranges.length; index += 1) {
+      var range = ranges[index];
+      if (range.start_ms >= end) {
+        return false;
+      }
+      if (range.end_ms > start) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function rebuildTeamActivityScores() {
+    var scoresByResolution = new Map();
+    app.data.activity_bins.forEach(function (bin) {
+      var team = text(bin.team);
+      var resolution = text(bin.resolution);
+      var start = number(bin.start_ms, NaN);
+      var end = number(bin.end_ms, NaN);
+      if (!team || !resolution || !Number.isFinite(start) ||
+          !Number.isFinite(end) || end <= start) {
+        return;
+      }
+      if (!scoresByResolution.has(team)) {
+        scoresByResolution.set(team, new Map());
+      }
+      var scores = scoresByResolution.get(team);
+      var concurrency = Math.max(0, number(
+        bin.avg_active_concurrency,
+        number(bin.activity_coverage_fraction, 0)
+      ));
+      scores.set(
+        resolution,
+        number(scores.get(resolution), 0) + concurrency * (end - start)
+      );
+    });
+    var totals = new Map();
+    scoresByResolution.forEach(function (scores, team) {
+      var resolution = scores.has("daily")
+        ? "daily"
+        : (scores.has("hourly") ? "hourly" : "weekly");
+      totals.set(team, number(scores.get(resolution), 0));
+    });
+    app.teamActivityScores = totals;
+  }
+
+  function compareTeamsByActivity(left, right) {
+    var leftSlug = text(left && left.slug);
+    var rightSlug = text(right && right.slug);
+    return teamActivitySortScore(rightSlug) - teamActivitySortScore(leftSlug) ||
+      text(left && left.label, leftSlug).localeCompare(
+        text(right && right.label, rightSlug),
+        undefined,
+        { numeric: true }
+      );
+  }
+
+  function teamActivitySortScore(slug) {
+    var team = app.teamBySlug.get(slug);
+    var eventCount = number(team && team.stats && team.stats.events, NaN);
+    if (Number.isFinite(eventCount)) {
+      return eventCount;
+    }
+    return number(app.teamActivityScores.get(slug), 0);
   }
 
   function htmlElement(tag, className, content) {
@@ -938,6 +1075,8 @@
       }
       app.glossaryById.set(id, entry);
     });
+    rebuildTeamActivityScores();
+    rebuildSummaryRanges();
     dom.glossaryOpen.hidden = !data.glossary.length && !data.glossary_path;
 
     renderSiteIdentity(data);
@@ -1042,6 +1181,7 @@
       return number(left.at_ms, 0) - number(right.at_ms, 0) ||
         text(left.agent_id).localeCompare(text(right.agent_id));
     });
+    rebuildSummaryRanges();
     app.loadedShardUrls.add(url);
     if (app.detailErrorActive) {
       app.detailErrorActive = false;
@@ -1190,7 +1330,7 @@
     var all = htmlElement("option", "", "All teams");
     all.value = "";
     var options = [all];
-    app.data.teams.forEach(function (team) {
+    app.data.teams.slice().sort(compareTeamsByActivity).forEach(function (team) {
       var slug = text(team.slug);
       if (!slug) {
         return;
@@ -1438,6 +1578,15 @@
   }
 
   function compareAgents(left, right) {
+    var leftTeam = text(left.team);
+    var rightTeam = text(right.team);
+    if (leftTeam !== rightTeam) {
+      var activityDifference = teamActivitySortScore(rightTeam) -
+        teamActivitySortScore(leftTeam);
+      if (activityDifference) {
+        return activityDifference;
+      }
+    }
     var leftPath = agentOfficialName(left);
     var rightPath = agentOfficialName(right);
     if (leftPath && rightPath && leftPath !== rightPath) {
@@ -1556,11 +1705,10 @@
         visit(agent, Math.max(0, number(agent.depth, 0)));
       });
 
-    app.rows = rows;
     app.rowByAgent.clear();
     var packed = null;
     if (!app.perAgentTracks && timelineCore) {
-      packed = timelineCore.packLifetimes(rows.map(function (row, inputIndex) {
+      var lifetimeItems = rows.map(function (row, inputIndex) {
         var agent = row.agent;
         return {
           id: text(agent.id),
@@ -1570,8 +1718,23 @@
           input_index: inputIndex,
           dedicated: !text(agent.parent_id)
         };
-      }));
+      });
+      if (app.renderLod !== "aggregate") {
+        lifetimeItems = timelineCore.lifetimesWithin(
+          lifetimeItems,
+          app.viewStart,
+          app.viewEnd
+        );
+        var visibleIds = new Set(lifetimeItems.map(function (item) {
+          return text(item.id);
+        }));
+        rows = rows.filter(function (row) {
+          return visibleIds.has(text(row.agent.id));
+        });
+      }
+      packed = timelineCore.packLifetimes(lifetimeItems);
     }
+    app.rows = rows;
     rows.forEach(function (row, index) {
       var agentId = text(row.agent.id);
       row.index = packed ? number(packed.lane_by_id[agentId], index) : index;
@@ -2121,6 +2284,11 @@
     if (displayState === "hidden") {
       return;
     }
+    // At lifetime density even one fork and join per agent becomes a thicket. Preserve
+    // structural context for the highlighted family, but leave the unselected overview clean.
+    if (app.renderLod === "lifetime" && displayState !== "highlighted") {
+      return;
+    }
     var pathData = edgePath(x1, y1, x2, y2, kind);
     var group = svgElement("g", {
       class: "edge-group edge-state-" + displayState,
@@ -2554,7 +2722,7 @@
         (!app.query || matchedTeamIds.has(slug));
     });
     if (teams.length) {
-      return teams;
+      return teams.sort(compareTeamsByActivity);
     }
     if (app.query) {
       return [];
@@ -2567,14 +2735,47 @@
         result.push({ slug: slug, label: slug });
       }
       return result;
-    }, []);
+    }, []).sort(compareTeamsByActivity);
+  }
+
+  function combinedActivityBins(resolution, teamIndex) {
+    var grouped = new Map();
+    app.data.activity_bins.forEach(function (bin) {
+      var team = text(bin.team);
+      var start = number(bin.start_ms, NaN);
+      var end = number(bin.end_ms, NaN);
+      if (!teamIndex.has(team) || text(bin.resolution) !== resolution ||
+          !Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+        return;
+      }
+      var key = [team, String(start), String(end)].join(":");
+      if (!grouped.has(key)) {
+        grouped.set(key, {
+          team: team,
+          resolution: resolution,
+          start_ms: start,
+          end_ms: end,
+          coordinator: null,
+          workers: null
+        });
+      }
+      var combined = grouped.get(key);
+      if (text(bin.role) === "coordinator") {
+        combined.coordinator = bin;
+      } else if (text(bin.role) === "workers") {
+        combined.workers = bin;
+      }
+    });
+    return Array.from(grouped.values()).sort(function (left, right) {
+      return teamIndex.get(left.team) - teamIndex.get(right.team) ||
+        left.start_ms - right.start_ms || left.end_ms - right.end_ms;
+    });
   }
 
   function aggregateSelectionKey(bin) {
     return [
       "activity",
       text(bin.team),
-      text(bin.role),
       text(bin.resolution),
       String(number(bin.start_ms, 0))
     ].join(":");
@@ -2591,56 +2792,65 @@
     var clippedEnd = Math.min(end, app.viewEnd);
     var x = timeToX(clippedStart);
     var width = Math.max(1, timeToX(clippedEnd) - x);
-    var role = text(bin.role) === "coordinator" ? "coordinator" : "workers";
-    var coverage = clamp(number(bin.activity_coverage_fraction, 0), 0, 1);
-    var average = Math.max(0, number(bin.avg_active_concurrency, 0));
+    var coordinator = bin.coordinator || {};
+    var workers = bin.workers || {};
+    var coordinatorCoverage = clamp(
+      number(coordinator.activity_coverage_fraction, 0),
+      0,
+      1
+    );
+    var workerCoverage = clamp(number(workers.activity_coverage_fraction, 0), 0, 1);
+    var coverage = Math.max(coordinatorCoverage, workerCoverage);
+    var average = Math.max(0, number(workers.avg_active_concurrency, 0));
     var rowTop = rowIndex * AGGREGATE_TEAM_HEIGHT;
-    var height = role === "coordinator"
-      ? 10
-      : clamp(
-          average * AGGREGATE_WORKER_SCALE,
-          2,
-          AGGREGATE_WORKER_MAX_HEIGHT
-        );
-    var y = role === "coordinator"
-      ? rowTop + 8
-      : rowTop + AGGREGATE_TEAM_HEIGHT - 8 - height;
+    var height = clamp(
+      (coordinatorCoverage > 0 ? 10 : 4) + average * AGGREGATE_WORKER_SCALE,
+      4,
+      AGGREGATE_WORKER_MAX_HEIGHT + 10
+    );
+    var y = rowTop + 8;
     var key = aggregateSelectionKey(bin);
+    var hasSummary = summaryAvailableInRange(text(bin.team), start, end);
     var selected = app.selection && app.selection.kind === "rollup" &&
       text(app.selection.path) === key;
     var group = svgElement("g", {
-      class: "activity-bin-group" + (selected ? " is-selected" : ""),
+      class: "activity-bin-group " +
+        (hasSummary ? "summary-available" : "summary-unavailable") +
+        (selected ? " is-selected" : ""),
       role: "button",
       tabindex: "0",
       "data-team": text(bin.team),
-      "data-activity-role": role,
+      "data-activity-role": "combined",
       "data-activity-resolution": text(bin.resolution),
+      "data-summary-available": hasSummary ? "true" : "false",
       "data-start-ms": String(start),
       "data-end-ms": String(end),
       "aria-pressed": selected ? "true" : "false",
-      "aria-label": text(team.label, text(team.slug)) + " " + role +
-        " activity. " + formatRange(start, end)
+      "aria-label": text(team.label, text(team.slug)) +
+        " combined activity. " + formatRange(start, end) +
+        (hasSummary ? ". Summary available" : ". No summary generated")
     });
     group.appendChild(svgElement("rect", {
       x: x,
       y: y,
       width: width,
       height: height,
-      rx: role === "coordinator" ? 2 : 3,
-      class: "activity-bin-block activity-bin-" + role,
+      rx: 2,
+      class: "activity-bin-block activity-bin-combined",
       "fill-opacity": (0.16 + coverage * 0.84).toFixed(3)
     }));
     group.addEventListener("pointerenter", function (event) {
       showTooltip(
         event,
-        text(team.label, text(team.slug)) + " · " +
-          (role === "coordinator" ? "Coordinator" : "Workers"),
+        text(team.label, text(team.slug)) + " · Team activity",
         formatRange(start, end) +
-          "\nAverage active concurrency: " + average.toFixed(2) +
-          "\nPeak concurrency: " + formatCount(bin.peak_concurrency) +
-          "\nActivity coverage: " + Math.round(coverage * 100) + "%" +
-          "\nDistinct active agents: " + formatCount(bin.distinct_active_agents),
-        text(bin.resolution, "aggregate") + " mechanical activity bin"
+          "\nCoordinator coverage: " + Math.round(coordinatorCoverage * 100) + "%" +
+          "\nAverage active workers: " + average.toFixed(2) +
+          "\nPeak active workers: " + formatCount(workers.peak_concurrency) +
+          "\nAny-activity coverage: " + Math.round(coverage * 100) + "%" +
+          "\nDistinct active workers: " + formatCount(workers.distinct_active_agents) +
+          "\nSummary: " + (hasSummary ? "available" : "not generated"),
+        text(bin.resolution, "aggregate") + " combined mechanical activity bin"
       );
     });
     group.addEventListener("pointermove", positionTooltip);
@@ -2703,6 +2913,7 @@
     dom.svg.setAttribute("data-render-lod", "aggregate");
     dom.svg.setAttribute("data-aggregate-resolution", resolution);
     dom.svg.setAttribute("data-activity-bin-count", "0");
+    dom.svg.setAttribute("data-summary-bin-count", "0");
     dom.svg.replaceChildren();
     dom.empty.hidden = teams.length > 0;
     if (!teams.length) {
@@ -2757,18 +2968,23 @@
       teamIndex.set(text(team.slug), index);
     });
     var renderedBins = 0;
-    app.data.activity_bins.forEach(function (bin) {
+    var summaryBins = 0;
+    combinedActivityBins(resolution, teamIndex).forEach(function (bin) {
       var index = teamIndex.get(text(bin.team));
-      if (index === undefined || text(bin.resolution) !== resolution) {
+      if (index === undefined) {
         return;
       }
       var before = contentLayer.childElementCount;
       renderActivityBin(bin, teams[index], index, contentLayer);
       if (contentLayer.childElementCount > before) {
         renderedBins += 1;
+        if (summaryAvailableInRange(text(bin.team), bin.start_ms, bin.end_ms)) {
+          summaryBins += 1;
+        }
       }
     });
     dom.svg.setAttribute("data-activity-bin-count", String(renderedBins));
+    dom.svg.setAttribute("data-summary-bin-count", String(summaryBins));
     labelLayer.appendChild(svgElement("rect", {
       x: app.labelWidth - 1,
       y: 0,
@@ -2834,6 +3050,7 @@
     }
     dom.svg.removeAttribute("data-aggregate-resolution");
     dom.svg.removeAttribute("data-activity-bin-count");
+    dom.svg.removeAttribute("data-summary-bin-count");
     var totalHeight = Math.max(dom.scroll.clientHeight, app.laneCount * ROW_HEIGHT, 1);
     dom.svg.setAttribute("viewBox", "0 0 " + app.width + " " + totalHeight);
     dom.svg.setAttribute("width", String(app.width));
