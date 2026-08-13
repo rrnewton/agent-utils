@@ -1168,6 +1168,31 @@ def test_build_refuses_to_clobber_non_archive_directory(tmp_path: Path) -> None:
     assert makefile.read_text(encoding="utf-8") == "all:\n\t@true\n"
 
 
+def test_build_refuses_symlinked_generated_parent_before_touching_victim(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    team = _team()
+    _write_team(source, team)
+    output = tmp_path / "output"
+    output.mkdir()
+    write_json_if_changed(
+        output / ".agent-team-timeline.json",
+        {"schema_version": 1, "tool": "agent-team-timeline"},
+    )
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    sentinel = victim / "sentinel.txt"
+    sentinel.write_text("preserve me\n", encoding="utf-8")
+    (output / "data").symlink_to(victim, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="parent symlink"):
+        build_archive(source, team.team_slug, output=output)
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve me\n"
+    assert sorted(path.name for path in victim.iterdir()) == ["sentinel.txt"]
+
+
 def test_build_only_run_preserves_source_digest_and_team_history(tmp_path: Path) -> None:
     ingest = IngestReport(
         team_slug="codex-test",
@@ -1204,6 +1229,42 @@ def test_build_only_run_preserves_source_digest_and_team_history(tmp_path: Path)
     assert manifest["latest_source_digest"] == "a" * 64
     assert manifest["teams"] == ["codex-test", "other-team"]
     assert manifest["run_count"] == 2
+
+
+def test_concurrent_run_records_are_serialized_without_lost_updates(
+    tmp_path: Path,
+) -> None:
+    count = 8
+    barrier = threading.Barrier(count)
+    failures: list[BaseException] = []
+
+    def record(index: int) -> None:
+        try:
+            barrier.wait()
+            record_run(
+                tmp_path,
+                ("agent-team-timeline", "build", str(index)),
+                "2026-08-05T01:00:00Z",
+                "completed",
+                "codex-test",
+                None,
+                None,
+                {"files_changed": index},
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [threading.Thread(target=record, args=(index,)) for index in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert failures == []
+    assert all(not thread.is_alive() for thread in threads)
+    manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["run_count"] == count
+    assert len(list((tmp_path / "runs").glob("*.json"))) == count
 
 
 def _two_day_team(child_result: str) -> TeamData:
@@ -1474,6 +1535,54 @@ def test_summary_window_can_backfill_one_hour_without_other_rollup_levels(
         START <= phase["start_ms"] < START + 20_000
         for phase in timeline["phases"]
     )
+
+
+def test_single_team_export_wide_to_narrow_removes_stale_slice_data(
+    tmp_path: Path,
+) -> None:
+    team = _two_day_team("first-day child result")
+    _write_team(tmp_path, team)
+    output = tmp_path / "slice-export"
+    build_archive(tmp_path, team.team_slug, output=output)
+    wide_details = set((output / "data" / "details").glob("*.json"))
+    assert len(wide_details) > 1
+    assert any(
+        b"Verify the archived report" in path.read_bytes()
+        for path in wide_details
+    )
+
+    window = DateWindow(
+        start_date=None,
+        end_date=None,
+        start_ms=START,
+        end_ms=START + 20_000,
+        start_time="2026-03-31T23:33:20.000Z",
+        end_time="2026-03-31T23:33:40.000Z",
+    )
+    build_archive(
+        tmp_path,
+        team.team_slug,
+        display_window=window,
+        output=output,
+    )
+    narrow_details = set((output / "data" / "details").glob("*.json"))
+    stale_details = wide_details - narrow_details
+    assert stale_details
+    assert all(not path.exists() for path in stale_details)
+    assert all(not path.with_name(path.name + ".gz").exists() for path in stale_details)
+    for path in output.rglob("*"):
+        if not path.is_file():
+            continue
+        payload = path.read_bytes()
+        if path.suffix == ".gz":
+            payload = gzip.decompress(payload)
+        assert b"Verify the archived report" not in payload
+    manifest = json.loads(
+        (output / "data" / "export.json").read_text(encoding="utf-8")
+    )
+    assert manifest["kind"] == "single-team-export"
+    assert manifest["display_window"]["start_ms"] == START
+    assert manifest["display_window"]["end_ms"] == START + 20_000
 
 
 def test_build_without_summary_cache_uses_presentation_only_fallbacks(
@@ -2279,27 +2388,38 @@ def test_combined_export_builds_two_zero_summary_teams(tmp_path: Path) -> None:
     assert "plain_language_markdown" not in query_item
 
 
-def test_combined_export_retains_prior_content_addressed_timeline_objects(
+def test_combined_export_stale_cleanup_cannot_delete_raw_team_data(
     tmp_path: Path,
 ) -> None:
-    digest = "a" * 64
-    object_relative = f"data/timeline-v2/objects/{digest}.json"
-    sidecar_relative = object_relative + ".gz"
-    for relative in (object_relative, sidecar_relative, "README.md"):
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("old generation\n", encoding="utf-8")
+    raw_relative = "teams/victim/raw/team.json"
+    raw_path = tmp_path / raw_relative
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_text("valuable raw transcript\n", encoding="utf-8")
 
-    changed = _remove_stale_files(
-        tmp_path,
-        {object_relative, sidecar_relative, "README.md"},
-        set(),
-    )
+    with pytest.raises(ValueError, match="unrecognized generated path"):
+        _remove_stale_files(tmp_path, {raw_relative}, set())
 
-    assert changed == 1
-    assert (tmp_path / object_relative).is_file()
-    assert (tmp_path / sidecar_relative).is_file()
-    assert not (tmp_path / "README.md").exists()
+    assert raw_path.read_text(encoding="utf-8") == "valuable raw transcript\n"
+
+
+def test_combined_export_stale_cleanup_rejects_symlinked_summary_parent(
+    tmp_path: Path,
+) -> None:
+    raw_root = tmp_path / "teams" / "victim" / "raw"
+    raw_root.mkdir(parents=True)
+    raw_path = raw_root / "valuable.md"
+    raw_path.write_text("valuable raw data\n", encoding="utf-8")
+    summary_root = tmp_path / "teams" / "victim" / "summaries"
+    summary_root.symlink_to(raw_root, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="crosses a symlink"):
+        _remove_stale_files(
+            tmp_path,
+            {"teams/victim/summaries/valuable.md"},
+            set(),
+        )
+
+    assert raw_path.read_text(encoding="utf-8") == "valuable raw data\n"
 
 
 def test_combined_export_refuses_unmarked_nonempty_output(tmp_path: Path) -> None:

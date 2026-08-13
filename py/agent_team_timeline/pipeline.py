@@ -8,7 +8,7 @@ import os
 import re
 import stat
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -188,6 +188,20 @@ def _archive_writer_lock(archive: Path) -> Iterator[None]:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
+
+@contextmanager
+def _archive_writer_locks(*archives: Path) -> Iterator[None]:
+    """Acquire several archive locks in canonical order without alias deadlocks."""
+
+    ordered = {
+        str(archive.resolve()): archive.resolve()
+        for archive in archives
+    }
+    with ExitStack() as stack:
+        for key in sorted(ordered):
+            stack.enter_context(_archive_writer_lock(ordered[key]))
+        yield
 
 
 def _ensure_archive(archive: Path, team_slug: str, *, create: bool) -> None:
@@ -3783,7 +3797,7 @@ def _validate_rollup_inputs(
     return validated, validated_plain
 
 
-def build_archive(
+def _build_archive_locked(
     archive: Path,
     team_slug: str,
     *,
@@ -3792,6 +3806,7 @@ def build_archive(
     rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
     output: Path | None = None,
     _precompress: bool = True,
+    _write_shards: bool = True,
 ) -> dict[str, int]:
     """Regenerate Markdown/HTML/JSON exclusively from cached structured data."""
 
@@ -3954,10 +3969,39 @@ def build_archive(
         artifact_catalog,
         site_identity,
         _precompress=_precompress,
+        _write_shards=_write_shards,
+        _export_window=display_window,
     )
 
 
-def record_run(
+def build_archive(
+    archive: Path,
+    team_slug: str,
+    *,
+    phase_minutes: int = 30,
+    display_window: DateWindow | None = None,
+    rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
+    output: Path | None = None,
+    _precompress: bool = True,
+    _write_shards: bool = True,
+) -> dict[str, int]:
+    """Regenerate one site while serializing its source snapshot and output files."""
+
+    target = output or archive
+    with _archive_writer_locks(archive, target):
+        return _build_archive_locked(
+            archive,
+            team_slug,
+            phase_minutes=phase_minutes,
+            display_window=display_window,
+            rollup_kinds=rollup_kinds,
+            output=output,
+            _precompress=_precompress,
+            _write_shards=_write_shards,
+        )
+
+
+def _record_run_locked(
     archive: Path,
     command: Sequence[str],
     started_at: str,
@@ -4043,6 +4087,38 @@ def record_run(
         manifest["latest_source_digest"] = ingest.source_digest
     write_json_if_changed(manifest_path, manifest)
     return path
+
+
+def record_run(
+    archive: Path,
+    command: Sequence[str],
+    started_at: str,
+    status: str,
+    team_slug: str,
+    ingest: IngestReport | None,
+    summaries: SummarizeReport | None,
+    build: Mapping[str, int] | None,
+    error: str | None = None,
+    *,
+    team_slugs: Sequence[str] = (),
+    mechanical: Mapping[str, JsonValue] | None = None,
+) -> Path:
+    """Append run provenance as one serialized manifest transaction."""
+
+    with _archive_writer_locks(archive):
+        return _record_run_locked(
+            archive,
+            command,
+            started_at,
+            status,
+            team_slug,
+            ingest,
+            summaries,
+            build,
+            error,
+            team_slugs=team_slugs,
+            mechanical=mechanical,
+        )
 
 
 __all__ = [

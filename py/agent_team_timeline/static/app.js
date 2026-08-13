@@ -136,7 +136,11 @@
     loadedShardUrls: new Set(),
     phaseIds: new Set(),
     edgeIds: new Set(),
-    searchShardState: "legacy"
+    searchShardState: "legacy",
+    phaseIndexReference: null,
+    phaseIndexPromise: null,
+    phaseIndexByAgent: new Map(),
+    detailErrorActive: false
   };
 
   var timelineCore = window.AgentTimelineCore;
@@ -864,6 +868,9 @@
     dom.card.dataset.detailShardCount = String(app.shardCatalog.length);
     dom.card.dataset.loadedShardCount = String(app.loadedShardUrls.size);
     dom.card.dataset.searchShardState = app.searchShardState;
+    dom.card.dataset.phaseIndexState = app.phaseIndexReference
+      ? (app.phaseIndexPromise ? "requested" : "unloaded")
+      : "legacy";
   }
 
   function initializeData(raw) {
@@ -966,28 +973,49 @@
     if (app.loadedShardUrls.has(url)) {
       return;
     }
-    array(raw.phases).forEach(function (phase) {
+    var phases = array(raw.phases);
+    var edges = array(raw.edges);
+    var events = array(raw.events);
+    var shardPhaseIds = new Set();
+    var shardEdgeIds = new Set();
+    phases.forEach(function (phase) {
       if (!phase || typeof phase !== "object") {
         throw new Error("Timeline detail phases must be objects.");
       }
       var id = text(phase.id);
-      if (!id) {
-        throw new Error("Timeline detail phase is missing its stable ID.");
+      if (!id || shardPhaseIds.has(id)) {
+        throw new Error("Timeline detail phase has a missing or duplicate stable ID.");
       }
+      shardPhaseIds.add(id);
+    });
+    edges.forEach(function (edge) {
+      if (!edge || typeof edge !== "object") {
+        throw new Error("Timeline detail edges must be objects.");
+      }
+      var id = text(edge.id);
+      if (!id || shardEdgeIds.has(id)) {
+        throw new Error("Timeline detail edge has a missing or duplicate stable ID.");
+      }
+      shardEdgeIds.add(id);
+    });
+    events.forEach(function (event) {
+      if (!event || typeof event !== "object") {
+        throw new Error("Timeline detail events must be objects.");
+      }
+    });
+
+    // Validation above is deliberately atomic: a failed response must not leave partial phases,
+    // edges, or id-less events that a later retry would duplicate.
+    phases.forEach(function (phase) {
+      var id = text(phase.id);
       if (!app.phaseIds.has(id)) {
         app.phaseIds.add(id);
         app.data.phases.push(phase);
         indexPhase(phase);
       }
     });
-    array(raw.edges).forEach(function (edge) {
-      if (!edge || typeof edge !== "object") {
-        throw new Error("Timeline detail edges must be objects.");
-      }
+    edges.forEach(function (edge) {
       var id = text(edge.id);
-      if (!id) {
-        throw new Error("Timeline detail edge is missing its stable ID.");
-      }
       if (!app.edgeIds.has(id)) {
         app.edgeIds.add(id);
         app.data.edges.push(edge);
@@ -995,10 +1023,7 @@
     });
     // Events belong to exactly one UTC-day object, so URL-level application is sufficient to
     // retain legitimate duplicate events while rejecting repeat fetch/application.
-    array(raw.events).forEach(function (event) {
-      if (!event || typeof event !== "object") {
-        throw new Error("Timeline detail events must be objects.");
-      }
+    events.forEach(function (event) {
       app.data.events.push(event);
     });
     sortPhaseIndexes();
@@ -1015,7 +1040,13 @@
         text(left.agent_id).localeCompare(text(right.agent_id));
     });
     app.loadedShardUrls.add(url);
+    if (app.detailErrorActive) {
+      app.detailErrorActive = false;
+      dom.loadError.hidden = true;
+      dom.loadError.textContent = "";
+    }
     updateShardDiagnostics();
+    scheduleRender();
   }
 
   function loadDetailShard(catalogEntry) {
@@ -1069,6 +1100,7 @@
       "Could not load timeline detail: " + message +
       ". The aggregate timeline remains available.";
     dom.loadError.hidden = false;
+    app.detailErrorActive = true;
   }
 
   function requestVisibleDetails() {
@@ -1097,6 +1129,57 @@
       updateShardDiagnostics();
       showDetailLoadError(error);
     });
+  }
+
+  function loadPhaseIndex() {
+    if (!app.phaseIndexReference) {
+      return Promise.resolve(null);
+    }
+    if (!app.phaseIndexPromise) {
+      var url = immutableTimelineObjectUrl(
+        app.phaseIndexReference,
+        "timeline phase index"
+      );
+      var request = fetchJsonCached(url).then(function (raw) {
+        if (!raw || typeof raw !== "object" || number(raw.schema_version, NaN) !== 2 ||
+            text(raw.kind) !== "timeline-phase-index") {
+          throw new Error("Unsupported timeline phase index: " + url);
+        }
+        var byAgent = new Map();
+        var ids = new Set();
+        array(raw.phases).forEach(function (phase) {
+          if (!phase || typeof phase !== "object") {
+            throw new Error("Timeline phase-index entries must be objects.");
+          }
+          var id = text(phase.id);
+          var agentId = text(phase.agent_id);
+          if (!id || !agentId || ids.has(id) || Array.isArray(phase.states)) {
+            throw new Error("Timeline phase index has an invalid or duplicate entry.");
+          }
+          ids.add(id);
+          if (!byAgent.has(agentId)) {
+            byAgent.set(agentId, []);
+          }
+          byAgent.get(agentId).push(phase);
+        });
+        byAgent.forEach(function (phases) {
+          phases.sort(function (left, right) {
+            return number(left.start_ms, 0) - number(right.start_ms, 0) ||
+              text(left.id).localeCompare(text(right.id));
+          });
+        });
+        app.phaseIndexByAgent = byAgent;
+        return byAgent;
+      });
+      var cached = request.catch(function (error) {
+        if (app.phaseIndexPromise === cached) {
+          app.phaseIndexPromise = null;
+        }
+        throw error;
+      });
+      app.phaseIndexPromise = cached;
+    }
+    return app.phaseIndexPromise;
   }
 
   function populateTeamFilter() {
@@ -1936,6 +2019,13 @@
         activityRange ? activityRange.start_ms : bounds.start_ms,
         activityRange ? activityRange.end_ms : bounds.end_ms
       );
+    }
+    var recordedStart = number(bounds && bounds.activity_start_ms, NaN);
+    var recordedEnd = number(bounds && bounds.activity_end_ms, NaN);
+    if (app.schemaMode === "schema2" && Number.isFinite(recordedStart) &&
+        Number.isFinite(recordedEnd) && recordedEnd > recordedStart) {
+      zoomToRange(recordedStart, recordedEnd);
+      return;
     }
     if (app.schemaMode !== "schema2") {
       finishZoom();
@@ -4116,8 +4206,8 @@
     };
   }
 
-  function renderAgentLifetimeOverview(container, agent) {
-    var phases = app.phasesByAgent.get(text(agent.id)) || [];
+  function renderAgentLifetimeOverview(container, agent, indexedPhases) {
+    var phases = indexedPhases || app.phasesByAgent.get(text(agent.id)) || [];
     container.appendChild(
       htmlElement("h3", "agent-lifetime-section-title", "Work phases (" +
         formatCount(phases.length) + ")")
@@ -4158,22 +4248,31 @@
 
   async function renderAgentLifetimePhases(container, agent, request) {
     if (app.schemaMode === "schema2") {
+      if (app.phaseIndexReference) {
+        if (!app.phaseIndexPromise) {
+          showLoading(container, "Loading agent work phases…");
+        }
+        var index = await loadPhaseIndex();
+        if (request !== app.detailRequest || dom.modalBackdrop.hidden ||
+            !container.isConnected) {
+          return;
+        }
+        container.replaceChildren();
+        renderAgentLifetimeOverview(
+          container,
+          agent,
+          (index && index.get(text(agent.id))) || []
+        );
+        return;
+      }
       var start = number(agent.start_ms, app.data.range.start_ms);
       var end = number(agent.end_ms, app.data.range.end_ms);
       var shards = app.shardCatalog.filter(function (shard) {
         return number(shard.start_ms, Infinity) < end &&
           number(shard.end_ms, -Infinity) > start;
       });
-      var needsLoading = shards.some(function (shard) {
-        return !app.loadedShardUrls.has(
-          immutableTimelineObjectUrl(shard, "detail shard")
-        );
-      });
-      var detailRequest = requestDetailShards(shards);
-      if (needsLoading) {
-        showLoading(container, "Loading agent work phases…");
-      }
-      await detailRequest.promise;
+      showLoading(container, "Loading agent work phases…");
+      await requestDetailShards(shards).promise;
       if (request !== app.detailRequest || dom.modalBackdrop.hidden ||
           !container.isConnected) {
         return;
@@ -4574,6 +4673,9 @@
       throw new Error("Unsupported schema-2 timeline bootstrap.");
     }
     var globalUrl = immutableTimelineObjectUrl(bootstrap.global, "timeline global");
+    if (bootstrap.phase_index) {
+      immutableTimelineObjectUrl(bootstrap.phase_index, "timeline phase index");
+    }
     var globalData = await fetchJsonCached(globalUrl);
     if (!globalData || typeof globalData !== "object" ||
         number(globalData.schema_version, NaN) !== 2 ||
@@ -4600,6 +4702,9 @@
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
     app.searchShardState = catalog.length ? "unloaded" : "ready";
+    app.phaseIndexReference = bootstrap.phase_index || null;
+    app.phaseIndexPromise = null;
+    app.phaseIndexByAgent.clear();
     var merged = Object.assign({}, globalData, {
       schema_version: 2,
       generated_at: bootstrap.generated_at,
@@ -4622,6 +4727,9 @@
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
     app.searchShardState = "legacy";
+    app.phaseIndexReference = null;
+    app.phaseIndexPromise = null;
+    app.phaseIndexByAgent.clear();
     initializeData(await fetchJsonCached(DATA_URL));
   }
 

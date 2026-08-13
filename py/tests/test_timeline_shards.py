@@ -142,6 +142,31 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
         "fields": ["agent", "phase", "edge"],
         "strategy": "load-all-detail-shards-on-first-query",
     }
+    phase_index_reference = as_object(bootstrap["phase_index"], "phase index reference")
+    phase_index = _object(tmp_path, phase_index_reference)
+    assert phase_index["kind"] == "timeline-phase-index"
+    indexed_phases = [
+        as_object(value, "indexed phase")
+        for value in as_array(phase_index["phases"], "indexed phases")
+    ]
+    assert [phase["id"] for phase in indexed_phases] == [
+        "phase-spanning-midnight",
+        "phase-ending-at-midnight",
+    ]
+    assert all("states" not in phase for phase in indexed_phases)
+    assert all("activity_start_ms" in phase for phase in indexed_phases)
+    assert all(
+        set(phase)
+        == {
+            "id",
+            "agent_id",
+            "start_ms",
+            "end_ms",
+            "activity_start_ms",
+            "activity_end_ms",
+        }
+        for phase in indexed_phases
+    )
 
     global_reference = as_object(bootstrap["global"], "global reference")
     global_object = _object(tmp_path, global_reference)
@@ -183,6 +208,73 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
     second = write_timeline_shards(tmp_path, _timeline())
     assert second.files_changed == 0
     assert second.generated_files == first.generated_files
+
+
+def _shard_manifest(root: Path) -> dict[str, JsonValue]:
+    path = root / "data" / "timeline-v2" / "manifest.json"
+    return as_object(read_json(path), str(path))
+
+
+def _object_file_set(manifest: dict[str, JsonValue], field: str) -> set[str]:
+    return {
+        value
+        for value in as_array(manifest[field], field)
+        if isinstance(value, str)
+    }
+
+
+def test_schema_2_retains_one_distinct_generation_and_idempotent_reruns(
+    tmp_path: Path,
+) -> None:
+    first_timeline = _timeline()
+    first_timeline["project_overview"] = {"text": "generation one"}
+    write_timeline_shards(tmp_path, first_timeline)
+    first_current = _object_file_set(_shard_manifest(tmp_path), "current_objects")
+
+    second_timeline = _timeline()
+    second_timeline["project_overview"] = {"text": "generation two"}
+    write_timeline_shards(tmp_path, second_timeline)
+    second_manifest = _shard_manifest(tmp_path)
+    second_current = _object_file_set(second_manifest, "current_objects")
+    second_retained = _object_file_set(second_manifest, "retained_objects")
+    assert second_retained == first_current - second_current
+    assert second_retained
+    assert all((tmp_path / relative).is_file() for relative in second_retained)
+
+    unchanged = write_timeline_shards(tmp_path, second_timeline)
+    assert unchanged.files_changed == 0
+    assert _object_file_set(
+        _shard_manifest(tmp_path), "retained_objects"
+    ) == second_retained
+
+    third_timeline = _timeline()
+    third_timeline["project_overview"] = {"text": "generation three"}
+    write_timeline_shards(tmp_path, third_timeline)
+    third_manifest = _shard_manifest(tmp_path)
+    assert _object_file_set(third_manifest, "retained_objects") == (
+        second_current - _object_file_set(third_manifest, "current_objects")
+    )
+    assert all(not (tmp_path / relative).exists() for relative in second_retained)
+
+
+def test_schema_2_narrower_scope_drops_prior_generation_immediately(
+    tmp_path: Path,
+) -> None:
+    wide = _timeline()
+    wide["project_overview"] = {"text": "wide secret"}
+    write_timeline_shards(tmp_path, wide)
+    wide_objects = _object_file_set(_shard_manifest(tmp_path), "current_objects")
+
+    narrow = _timeline()
+    time_range = as_object(narrow["range"], "range")
+    time_range["start_ms"] = _ms("2026-08-12T00:00:00+00:00")
+    narrow["project_overview"] = {"text": "narrow public"}
+    write_timeline_shards(tmp_path, narrow)
+    manifest = _shard_manifest(tmp_path)
+    current = _object_file_set(manifest, "current_objects")
+
+    assert _object_file_set(manifest, "retained_objects") == set()
+    assert all(not (tmp_path / relative).exists() for relative in wide_objects - current)
 
 
 def test_schema_2_projection_can_skip_sidecars_for_temporary_builds(

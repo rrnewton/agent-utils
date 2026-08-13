@@ -21,7 +21,12 @@ from agent_team_timeline.archive import (
     write_json_if_changed,
     write_text_if_changed,
 )
-from agent_team_timeline.pipeline import _ensure_archive, build_archive, load_archived_team
+from agent_team_timeline.pipeline import (
+    _archive_writer_locks,
+    _build_archive_locked,
+    _ensure_archive,
+    load_archived_team,
+)
 from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
@@ -407,13 +412,23 @@ def _safe_generated_path(raw: str) -> PurePosixPath:
         return path
     if raw in _COMMON_FILES or raw in {"README.md", _EXPORT_MANIFEST}:
         return path
-    if len(path.parts) >= 2 and path.parts[0] == "teams":
+    if (
+        len(path.parts) >= 4
+        and path.parts[0] == "teams"
+        and path.parts[2] == "summaries"
+        and path.suffix == ".md"
+    ):
         return path
-    if len(path.parts) >= 3 and path.parts[:2] == ("data", "details"):
+    if (
+        len(path.parts) == 4
+        and path.parts[:2] == ("data", "details")
+        and path.suffix == ".json"
+    ):
         return path
     if raw in {
         "data/timeline.json",
         "data/timeline-v2.json",
+        "data/timeline-v2/manifest.json",
         "data/artifacts.json",
     }:
         return path
@@ -429,6 +444,11 @@ def _safe_generated_path(raw: str) -> PurePosixPath:
 def _output_path(output: Path, raw: str) -> Path:
     relative = _safe_generated_path(raw)
     root = output.resolve()
+    cursor = output
+    for part in relative.parts[:-1]:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"generated output path crosses a symlink: {raw!r}")
     candidate = output.joinpath(*relative.parts)
     try:
         candidate.parent.resolve().relative_to(root)
@@ -459,11 +479,6 @@ def _remove_stale_files(output: Path, previous: set[str], current: set[str]) -> 
     changed = 0
     for raw in sorted(previous - current):
         relative = _safe_generated_path(raw)
-        if relative.parts[:3] == ("data", "timeline-v2", "objects"):
-            # A browser may still hold the preceding bootstrap and request one of its immutable
-            # day objects after this rebuild publishes a new bootstrap. Keep addressed objects
-            # monotonically so that an in-flight tab never turns a valid URL into a 404.
-            continue
         path = _output_path(output, relative.as_posix())
         if path.is_file() or path.is_symlink():
             path.unlink()
@@ -487,7 +502,7 @@ def _write_compressible_json(path: Path, value: JsonValue) -> int:
     )
 
 
-def build_combined_archive(
+def _build_combined_archive_locked(
     archive: Path,
     team_slugs: Sequence[str],
     *,
@@ -513,7 +528,7 @@ def build_combined_archive(
         for team_slug in ordered_slugs:
             team = load_archived_team(archive, team_slug)
             team_root = temporary_root / team_slug
-            build_archive(
+            _build_archive_locked(
                 archive,
                 team_slug,
                 phase_minutes=phase_minutes,
@@ -521,6 +536,7 @@ def build_combined_archive(
                 rollup_kinds=rollup_kinds,
                 output=team_root,
                 _precompress=False,
+                _write_shards=False,
             )
             timeline_path = team_root / "data" / "timeline.json"
             artifacts_path = team_root / "data" / "artifacts.json"
@@ -738,7 +754,6 @@ def build_combined_archive(
         for relative in shard_report.generated_files:
             _safe_generated_path(relative)
             generated_files.add(relative)
-
         export_manifest = as_object(
             narrow_json(
                 {
@@ -785,6 +800,30 @@ def build_combined_archive(
         "shard_object_bytes": shard_report.object_bytes,
         "shard_transfer_bytes": shard_report.object_gzip_bytes,
     }
+
+
+def build_combined_archive(
+    archive: Path,
+    team_slugs: Sequence[str],
+    *,
+    output: Path,
+    display_timezone: str,
+    phase_minutes: int = 30,
+    display_window: DateWindow | None = None,
+    rollup_kinds: tuple[str, ...] = DEFAULT_ROLLUP_KINDS,
+) -> dict[str, int]:
+    """Build a combined site while serializing its source snapshot and target."""
+
+    with _archive_writer_locks(archive, output):
+        return _build_combined_archive_locked(
+            archive,
+            team_slugs,
+            output=output,
+            display_timezone=display_timezone,
+            phase_minutes=phase_minutes,
+            display_window=display_window,
+            rollup_kinds=rollup_kinds,
+        )
 
 
 __all__ = ["build_combined_archive"]

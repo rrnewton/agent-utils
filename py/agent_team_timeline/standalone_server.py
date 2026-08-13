@@ -7,6 +7,7 @@ import argparse
 import functools
 import hashlib
 import http.server
+import io
 import os
 import re
 import threading
@@ -74,6 +75,13 @@ class TimelineRequestHandler(http.server.SimpleHTTPRequestHandler):
     """Serve identity files or deterministic ``.gz`` companions with validators."""
 
     _cache_control_sent = False
+
+    def list_directory(self, path: str | os.PathLike[str]) -> io.BytesIO | None:
+        """Never expose generated-object or transcript filenames by directory listing."""
+
+        del path
+        self.send_error(404, "File not found")
+        return None
 
     def end_headers(self) -> None:
         """Add browser-safety headers and a fallback revalidation policy."""

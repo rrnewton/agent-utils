@@ -34,7 +34,9 @@ Implement the transition in stages:
    `Map<URL, Promise>`, and use immutable digest URLs across reloads. Panning never refetches an
    unchanged shard. A first text query loads all detail shards, preserving global-search semantics
    explicitly instead of searching only already-visible days.
-4. Keep full transcript/detail documents separately addressable. Remove duplicated edge
+4. **Implemented:** publish a lightweight phase-card index and exact precomputed activity bounds.
+   Agent-lifetime drill-down and zoom no longer load every UTC day spanned by a long-lived agent.
+5. Keep full transcript/detail documents separately addressable. Remove duplicated edge
    `full_text` from the schema-2 bootstrap and shards once stable references can resolve the same
    content on demand.
 

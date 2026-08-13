@@ -166,6 +166,10 @@ def test_server_negotiates_sidecar_and_revalidates_with_strong_etag(
         assert immutable_headers["cache-control"] == (
             "public, max-age=31536000, immutable"
         )
+
+        status, _, listing_body = _request(port, "GET", "/data/")
+        assert status == 404
+        assert b"timeline.json" not in listing_body
     finally:
         server.shutdown()
         server.server_close()

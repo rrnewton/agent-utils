@@ -11,8 +11,12 @@ from zoneinfo import ZoneInfo
 from agent_team_timeline.activity_bins import build_activity_bins
 from agent_team_timeline.archive import (
     JsonValue,
+    as_array,
+    as_object,
+    as_string,
     canonical_json,
     narrow_json,
+    read_json,
     write_text_if_changed,
 )
 from agent_team_timeline.artifacts import (
@@ -42,6 +46,7 @@ from agent_team_timeline.static_assets import (
     write_text_with_gzip_invalidation,
 )
 from agent_team_timeline.timeline_shards import write_timeline_shards
+from agent_team_timeline.window import DateWindow
 from agent_team_timeline.terminology import (
     GlossaryTerm,
     glossary_catalog_markdown,
@@ -265,13 +270,26 @@ def _time_range(team: TeamData, phases: Sequence[PhaseWindow]) -> tuple[int, int
     values: list[int] = []
     values.extend(phase.start_ms for phase in phases)
     values.extend(phase.end_ms for phase in phases)
+    for agent in team.agents:
+        values.append(agent.started_at_ms)
+        if agent.ended_at_ms is not None:
+            values.append(agent.ended_at_ms)
+    for turn in team.turns:
+        values.append(turn.started_at_ms)
+        if turn.ended_at_ms is not None:
+            values.append(turn.ended_at_ms)
+    values.extend(event.timestamp_ms for event in team.events)
+    for tool in team.tool_calls:
+        values.append(tool.started_at_ms)
+        if tool.ended_at_ms is not None:
+            values.append(tool.ended_at_ms)
+    values.extend(edge.timestamp_ms for edge in team.edges)
     if team.window_start_ms is not None:
         values.append(team.window_start_ms)
     if team.window_end_ms is not None:
         values.append(team.window_end_ms)
     if not values:
-        now = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-        return now - 1000, now
+        return 0, 1000
     start = team.window_start_ms if team.window_start_ms is not None else min(values)
     end = team.window_end_ms if team.window_end_ms is not None else max(values)
     return start, max(start + 1000, end)
@@ -676,16 +694,21 @@ def _transcript_entry_obj(
     return result
 
 
-def _remove_generated_file(archive: Path, relative_path: str) -> bool:
-    """Remove one known presentation file without following a path outside *archive*."""
+def _generated_path(archive: Path, relative_path: str) -> Path:
+    """Resolve one presentation path without crossing a symlink or archive boundary."""
 
+    relative = Path(relative_path)
+    if relative.is_absolute() or not relative.parts or any(
+        part in ("", ".", "..") for part in relative.parts
+    ):
+        raise ValueError(f"unsafe generated presentation path: {relative_path!r}")
     root = archive.resolve()
-    path = archive / relative_path
     cursor = archive
-    for part in Path(relative_path).parts[:-1]:
+    for part in relative.parts[:-1]:
         cursor /= part
         if cursor.is_symlink():
             raise ValueError(f"refusing generated presentation parent symlink: {cursor}")
+    path = archive.joinpath(*relative.parts)
     try:
         path.parent.resolve().relative_to(root)
     except ValueError as error:
@@ -694,15 +717,124 @@ def _remove_generated_file(archive: Path, relative_path: str) -> bool:
         ) from error
     if path.is_symlink():
         raise ValueError(f"refusing generated presentation symlink: {path}")
+    return path
+
+
+def _remove_generated_file(archive: Path, relative_path: str) -> int:
+    """Remove one known presentation file without following a path outside *archive*."""
+
+    path = _generated_path(archive, relative_path)
     sidecar = gzip_sidecar_path(path)
     if sidecar.is_symlink():
         raise ValueError(f"refusing symlinked gzip sidecar: {sidecar}")
+    changed = 0
     if not path.exists():
-        return False
+        if sidecar.is_file():
+            sidecar.unlink()
+            return 1
+        return 0
     if not path.is_file():
         raise ValueError(f"generated presentation path is not a file: {path}")
     path.unlink()
-    return True
+    changed += 1
+    if sidecar.is_file():
+        sidecar.unlink()
+        changed += 1
+    return changed
+
+
+_PRESENTATION_MANIFEST = "data/export.json"
+_PRESENTATION_COMMON = frozenset(
+    {
+        "index.html",
+        "timeline-core.js",
+        "app.js",
+        "style.css",
+        "serve.py",
+        "run_stats.py",
+        "query.py",
+        "timeline",
+        "Makefile",
+        "README.md",
+        "vendor/README.md",
+        "vendor/markdown-it-15.0.0.min.js",
+        "vendor/markdown-it-LICENSE.txt",
+    }
+)
+
+
+def _safe_presentation_file(relative: str) -> str:
+    base = relative.removesuffix(".gz")
+    if relative.endswith(".gz") and base.endswith(".gz"):
+        raise ValueError(f"nested presentation gzip sidecar: {relative!r}")
+    path = Path(base)
+    if path.is_absolute() or not path.parts or any(
+        part in ("", ".", "..") for part in path.parts
+    ):
+        raise ValueError(f"unsafe presentation manifest path: {relative!r}")
+    if base in _PRESENTATION_COMMON or base in {
+        _PRESENTATION_MANIFEST,
+        "data/timeline.json",
+        "data/timeline-v2.json",
+        "data/timeline-v2/manifest.json",
+        "data/artifacts.json",
+    }:
+        return relative
+    if (
+        len(path.parts) in (3, 4)
+        and tuple(path.parts[:2]) == ("data", "details")
+        and path.suffix == ".json"
+    ):
+        return relative
+    if (
+        len(path.parts) == 4
+        and tuple(path.parts[:3]) == ("data", "timeline-v2", "objects")
+        and path.suffix == ".json"
+        and len(path.stem) == 64
+        and all(character in "0123456789abcdef" for character in path.stem)
+    ):
+        return relative
+    if (
+        len(path.parts) >= 4
+        and path.parts[0] == "teams"
+        and path.parts[2] == "summaries"
+        and path.suffix == ".md"
+    ):
+        return relative
+    raise ValueError(f"unrecognized presentation manifest path: {relative!r}")
+
+
+def _previous_presentation_files(archive: Path) -> set[str]:
+    path = _generated_path(archive, _PRESENTATION_MANIFEST)
+    if not path.is_file():
+        return set()
+    root = as_object(read_json(path), str(path))
+    if root.get("schema_version") != 1 or root.get("kind") not in {
+        "single-team-export",
+        "multi-team-export",
+    }:
+        raise ValueError(f"unsupported presentation manifest at {path}")
+    result: set[str] = set()
+    for index, raw in enumerate(
+        as_array(root.get("generated_files"), str(path) + ".generated_files")
+    ):
+        relative = as_string(raw, f"{path}.generated_files[{index}]")
+        _safe_presentation_file(relative)
+        result.add(relative)
+    return result
+
+
+def _remove_stale_presentation_files(
+    archive: Path, previous: set[str], current: set[str]
+) -> int:
+    changed = 0
+    for relative in sorted(previous - current):
+        _safe_presentation_file(relative)
+        path = _generated_path(archive, relative)
+        if path.is_file():
+            path.unlink()
+            changed += 1
+    return changed
 
 
 def render_archive(
@@ -722,9 +854,12 @@ def render_archive(
     site_identity: SiteIdentity,
     *,
     _precompress: bool = True,
+    _write_shards: bool = True,
+    _export_window: DateWindow | None = None,
 ) -> dict[str, int]:
     """Regenerate all presentation files without invoking a summary backend."""
 
+    previous_presentation_files = _previous_presentation_files(archive)
     changed = 0
     compressible_paths: set[str] = set()
     published_summary_paths: set[str] = set()
@@ -760,12 +895,12 @@ def render_archive(
         phase_output_artifact_ids[phase.phase_id] = output_artifact_ids
         if summary.summary_available:
             changed += write_text_with_gzip_invalidation(
-                archive / raw_path,
+                _generated_path(archive, raw_path),
                 _phase_markdown(team, agent, phase_agent_name, phase, summary),
             )
             published_summary_paths.add(raw_path)
         else:
-            changed += int(_remove_generated_file(archive, raw_path))
+            changed += _remove_generated_file(archive, raw_path)
         detail: dict[str, object] = {
             "phrase": summary.phrase,
             "paragraph": summary.paragraph,
@@ -791,7 +926,7 @@ def render_archive(
             "output_artifact_ids": list(output_artifact_ids),
         }
         changed += _write_compressible_json(
-            archive / detail_path, narrow_json(detail, detail_path)
+            _generated_path(archive, detail_path), narrow_json(detail, detail_path)
         )
 
     for agent in team.agents:
@@ -799,12 +934,12 @@ def render_archive(
         agent_path = f"teams/{team.team_slug}/summaries/agents/{agent.thread_id}.md"
         compressible_paths.add(agent_path)
         if not own:
-            changed += int(_remove_generated_file(archive, agent_path))
+            changed += _remove_generated_file(archive, agent_path)
             continue
         name = _agent_name(agent, agent_names)
         if _agent_summary_available(name):
             changed += write_text_with_gzip_invalidation(
-                archive / agent_path,
+                _generated_path(archive, agent_path),
                 _agent_markdown(
                     team,
                     agent,
@@ -815,7 +950,7 @@ def render_archive(
             )
             published_summary_paths.add(agent_path)
         else:
-            changed += int(_remove_generated_file(archive, agent_path))
+            changed += _remove_generated_file(archive, agent_path)
 
     rollup_paths: dict[str, tuple[str, str]] = {}
     for period in periods:
@@ -830,40 +965,43 @@ def render_archive(
         rollup_paths[period_key] = (technical_path, plain_path)
         if technical_path:
             changed += write_text_with_gzip_invalidation(
-                archive / technical_path,
+                _generated_path(archive, technical_path),
                 _rollup_markdown(team, period, summary, stats, "technical"),
             )
             published_summary_paths.add(technical_path)
         else:
-            changed += int(_remove_generated_file(archive, period.relative_path))
+            changed += _remove_generated_file(archive, period.relative_path)
         expected_plain_path = _plain_language_path(period)
         compressible_paths.update((period.relative_path, expected_plain_path))
         if plain_path:
             changed += write_text_with_gzip_invalidation(
-                archive / plain_path,
+                _generated_path(archive, plain_path),
                 _rollup_markdown(
                     team, period, plain_summary, stats, "plain-language"
                 ),
             )
             published_summary_paths.add(plain_path)
         else:
-            changed += int(_remove_generated_file(archive, expected_plain_path))
+            changed += _remove_generated_file(archive, expected_plain_path)
 
     weeks = sorted({term.week for term in glossary_terms})
-    glossary_root = archive / "teams" / team.team_slug / "summaries" / "glossary"
+    glossary_root = _generated_path(
+        archive, f"teams/{team.team_slug}/summaries/glossary"
+    )
     if glossary_root.is_symlink():
         raise ValueError(f"refusing symlinked generated glossary directory: {glossary_root}")
     expected_week_paths: set[Path] = set()
     for week in weeks:
         year = week.split("-W", 1)[0]
         path = f"teams/{team.team_slug}/summaries/glossary/{year}/{week}-{team.team_slug}-glossary.md"
-        week_path = archive / path
+        week_path = _generated_path(archive, path)
         compressible_paths.add(path)
         if week_path.parent.is_symlink() or week_path.is_symlink():
             raise ValueError(f"refusing symlinked generated glossary path: {week_path}")
         expected_week_paths.add(week_path.resolve())
         changed += write_text_with_gzip_invalidation(
-            archive / path, glossary_markdown(team.team_slug, week, glossary_terms)
+            _generated_path(archive, path),
+            glossary_markdown(team.team_slug, week, glossary_terms),
         )
         published_summary_paths.add(path)
     if glossary_root.is_dir():
@@ -906,21 +1044,21 @@ def render_archive(
     if glossary_terms or project_overview.summary_available:
         glossary_catalog_path = expected_glossary_catalog_path
         changed += write_text_with_gzip_invalidation(
-            archive / glossary_catalog_path,
+            _generated_path(archive, glossary_catalog_path),
             glossary_catalog_markdown(
                 team.team_slug, glossary_terms, project_overview.paragraph
             ),
         )
         published_summary_paths.add(glossary_catalog_path)
     else:
-        changed += int(
-            _remove_generated_file(archive, expected_glossary_catalog_path)
-        )
+        changed += _remove_generated_file(archive, expected_glossary_catalog_path)
 
     static_root = files("agent_team_timeline") / "static"
     for asset_name in ("index.html", "timeline-core.js", "app.js", "style.css"):
         text = (static_root / asset_name).read_text(encoding="utf-8")
-        changed += write_text_with_gzip_invalidation(archive / asset_name, text)
+        changed += write_text_with_gzip_invalidation(
+            _generated_path(archive, asset_name), text
+        )
         compressible_paths.add(asset_name)
     vendor_root = static_root / "vendor"
     for vendor_name in (
@@ -931,41 +1069,55 @@ def render_archive(
         text = (vendor_root / vendor_name).read_text(encoding="utf-8")
         if vendor_name.endswith(".js"):
             changed += write_text_with_gzip_invalidation(
-                archive / "vendor" / vendor_name, text
+                _generated_path(archive, f"vendor/{vendor_name}"), text
             )
             compressible_paths.add(f"vendor/{vendor_name}")
         else:
             changed += int(
-                write_text_if_changed(archive / "vendor" / vendor_name, text)
+                write_text_if_changed(
+                    _generated_path(archive, f"vendor/{vendor_name}"), text
+                )
             )
-    changed += int(write_text_if_changed(archive / "serve.py", _standalone_server(), executable=True))
+    changed += int(
+        write_text_if_changed(
+            _generated_path(archive, "serve.py"),
+            _standalone_server(),
+            executable=True,
+        )
+    )
     run_stats_source = (files("agent_team_timeline") / "run_stats.py").read_text(
         encoding="utf-8"
     )
     changed += int(
         write_text_if_changed(
-            archive / "run_stats.py", run_stats_source, executable=True
+            _generated_path(archive, "run_stats.py"),
+            run_stats_source,
+            executable=True,
         )
     )
     changed += int(
         write_text_if_changed(
-            archive / "query.py", standalone_query_source(), executable=True
+            _generated_path(archive, "query.py"),
+            standalone_query_source(),
+            executable=True,
         )
     )
     changed += int(
         write_text_if_changed(
-            archive / "timeline", standalone_query_source(), executable=True
+            _generated_path(archive, "timeline"),
+            standalone_query_source(),
+            executable=True,
         )
     )
     changed += int(
         write_text_if_changed(
-            archive / "Makefile",
+            _generated_path(archive, "Makefile"),
             archive_makefile(),
         )
     )
     changed += int(
         write_text_if_changed(
-            archive / "README.md",
+            _generated_path(archive, "README.md"),
             f"# {team.team_slug} agent-team timeline\n\n"
             "This directory is a self-contained, version-controllable timeline archive.\n\n"
             "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
@@ -999,13 +1151,13 @@ def render_archive(
 
     summary_files: list[dict[str, object]] = []
     for relative in sorted(published_summary_paths):
-        summary_path_file = archive / relative
+        summary_path_file = _generated_path(archive, relative)
         if not summary_path_file.is_file() or summary_path_file.is_symlink():
             raise ValueError(
                 f"published summary path is missing or unsafe: {summary_path_file}"
             )
         parts = summary_path_file.relative_to(
-            archive / "teams" / team.team_slug / "summaries"
+            _generated_path(archive, f"teams/{team.team_slug}/summaries")
         ).parts
         kind = parts[0] if parts else "summary"
         summary_files.append(
@@ -1232,7 +1384,7 @@ def render_archive(
         "stats": timeline_stats,
     }
     changed += _write_compressible_json(
-        archive / "data" / "artifacts.json",
+        _generated_path(archive, "data/artifacts.json"),
         narrow_json(artifact_catalog.to_json_obj(), "artifact catalog"),
     )
     compressible_paths.add("data/artifacts.json")
@@ -1240,16 +1392,61 @@ def render_archive(
     if not isinstance(timeline_json, dict):
         raise AssertionError("timeline projection must be an object")
     changed += _write_compressible_json(
-        archive / "data" / "timeline.json", timeline_json
+        _generated_path(archive, "data/timeline.json"), timeline_json
     )
     compressible_paths.add("data/timeline.json")
     if _precompress:
         for relative in sorted(compressible_paths):
-            changed += int(sync_gzip_sidecar(archive / relative))
-    shard_report = write_timeline_shards(
-        archive, timeline_json, precompress=_precompress
+            changed += int(sync_gzip_sidecar(_generated_path(archive, relative)))
+    shard_report = (
+        write_timeline_shards(archive, timeline_json, precompress=_precompress)
+        if _write_shards
+        else None
     )
-    changed += shard_report.files_changed
+    if shard_report is not None:
+        changed += shard_report.files_changed
+    generated_files = set(_PRESENTATION_COMMON)
+    generated_files.update(published_summary_paths)
+    generated_files.update(phase_paths.values())
+    generated_files.update(
+        {
+            _PRESENTATION_MANIFEST,
+            "data/timeline.json",
+            "data/artifacts.json",
+        }
+    )
+    if shard_report is not None:
+        generated_files.update(shard_report.generated_files)
+    for relative in sorted(compressible_paths):
+        if gzip_sidecar_path(_generated_path(archive, relative)).is_file():
+            generated_files.add(relative + ".gz")
+    for relative in generated_files:
+        _safe_presentation_file(relative)
+    changed += _remove_stale_presentation_files(
+        archive, previous_presentation_files, generated_files
+    )
+    generated_values: list[JsonValue] = []
+    for relative in sorted(generated_files):
+        generated_values.append(relative)
+    export_manifest: dict[str, JsonValue] = {
+        "schema_version": 1,
+        "kind": "single-team-export",
+        "teams": [team.team_slug],
+        "display_timezone": team.display_timezone,
+        "display_window": (
+            narrow_json(_export_window.to_json_obj())
+            if _export_window is not None
+            else None
+        ),
+        "source_digest": timeline_json["source_digest"],
+        "generated_files": generated_values,
+    }
+    changed += int(
+        write_text_if_changed(
+            _generated_path(archive, _PRESENTATION_MANIFEST),
+            canonical_json(export_manifest),
+        )
+    )
     return {
         "files_changed": changed,
         "phases": len(phases),
@@ -1260,13 +1457,17 @@ def render_archive(
         "summary_files": len(summary_files),
         "artifacts": len(artifact_catalog.artifacts),
         "projects": len(artifact_catalog.projects),
-        "detail_shards": shard_report.detail_shards,
-        "bootstrap_bytes": shard_report.bootstrap_bytes,
+        "detail_shards": shard_report.detail_shards if shard_report is not None else 0,
+        "bootstrap_bytes": shard_report.bootstrap_bytes if shard_report is not None else 0,
         "bootstrap_transfer_bytes": (
-            shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes
+            (shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes)
+            if shard_report is not None
+            else 0
         ),
-        "shard_object_bytes": shard_report.object_bytes,
-        "shard_transfer_bytes": shard_report.object_gzip_bytes,
+        "shard_object_bytes": shard_report.object_bytes if shard_report is not None else 0,
+        "shard_transfer_bytes": (
+            shard_report.object_gzip_bytes if shard_report is not None else 0
+        ),
     }
 
 

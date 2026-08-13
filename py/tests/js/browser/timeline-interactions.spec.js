@@ -467,6 +467,7 @@ test("schema 2 retries a transiently failed detail shard", async function ({ pag
   ).toBeVisible();
   expect(detailRequests).toBe(2);
   await expect(card).toHaveAttribute("data-loaded-shard-count", "1");
+  await expect(page.locator("#load-error")).toBeHidden();
   await page.locator("#modal-close").click();
 
   await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
@@ -474,6 +475,64 @@ test("schema 2 retries a transiently failed detail shard", async function ({ pag
     page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-2"]')
   ).toBeVisible();
   expect(detailRequests).toBe(2);
+});
+
+test("schema 2 lifetime modal uses the phase index instead of every day shard", async function ({
+  page
+}) {
+  const fixture = singleDaySchema2Fixture("4".repeat(64), "5".repeat(64));
+  const phaseIndexDigest = "6".repeat(64);
+  fixture.bootstrap.phase_index = {
+    url: "data/timeline-v2/objects/" + phaseIndexDigest + ".json",
+    sha256: phaseIndexDigest
+  };
+  const indexedPhases = TIMELINE.phases.map(function (phase) {
+    const projected = Object.assign({}, phase);
+    delete projected.states;
+    projected.activity_start_ms = phase.start_ms;
+    projected.activity_end_ms = phase.end_ms;
+    return projected;
+  });
+  let phaseIndexRequests = 0;
+  let detailShardRequests = 0;
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    detailShardRequests += 1;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await page.route("**/" + phaseIndexDigest + ".json", async function (route) {
+    phaseIndexRequests += 1;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        schema_version: 2,
+        kind: "timeline-phase-index",
+        phases: indexedPhases
+      })
+    });
+  });
+
+  await page.reload();
+  const agentLifetime = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(
+    page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-1"]')
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-2"]')
+  ).toBeVisible();
+  expect(phaseIndexRequests).toBe(1);
+  expect(detailShardRequests).toBe(0);
+
+  await page.locator("#modal-close").click();
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(
+    page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-2"]')
+  ).toBeVisible();
+  expect(phaseIndexRequests).toBe(1);
+  expect(detailShardRequests).toBe(0);
 });
 
 test("a delayed lifetime shard refreshes a detail view after the modal closes", async function ({
