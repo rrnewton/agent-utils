@@ -529,6 +529,10 @@ def _manifest_window_bounds(
     if value is None:
         return None, None
     obj = as_object(value, where)
+    base_fields = {"start_date", "end_date", "start_ms", "end_ms"}
+    exact_fields = base_fields | {"start_time", "end_time"}
+    if set(obj) not in (base_fields, exact_fields):
+        raise ValueError(f"{where}: invalid date-window fields")
     start_value = obj.get("start_ms")
     end_value = obj.get("end_ms")
     start_ms = (
@@ -581,8 +585,11 @@ def _validate_manifest_window(
     requested = _manifest_window_value(date_window)
     if recorded == requested:
         return
-    if _window_is_same_or_narrower(recorded, requested, where):
-        return
+    try:
+        if _window_is_same_or_narrower(recorded, requested, where):
+            return
+    except ValueError as error:
+        raise error_type(f"invalid archived date window: {error}") from error
     raise error_type(
         "archive date window may only stay unchanged or become narrower; "
         "choose a new output directory to widen it"
