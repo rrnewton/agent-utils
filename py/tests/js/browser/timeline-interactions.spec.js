@@ -644,6 +644,59 @@ test("a horizontal trackpad gesture pans the zoomed timeline", async function ({
   expect(Math.abs(panned.span - zoomed.span)).toBeLessThan(zoomed.span * 0.02);
 });
 
+test("coarse wheel events and explicit buttons zoom in bounded continuous steps", async function ({ page }) {
+  const timeline = page.getByTestId("timeline");
+  const axis = page.locator("#time-axis");
+  const box = await axis.boundingBox();
+  expect(box).not.toBeNull();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+
+  const full = await readView(timeline);
+  await page.mouse.wheel(0, -500);
+  const wheelZoomed = await waitForViewChange(timeline, full.start, full.end);
+  expect(wheelZoomed.span).toBeLessThan(full.span);
+  expect(wheelZoomed.span).toBeGreaterThan(full.span * 0.84);
+
+  await page.getByTestId("zoom-in").click();
+  const buttonZoomed = await waitForViewChange(
+    timeline,
+    wheelZoomed.start,
+    wheelZoomed.end
+  );
+  expect(buttonZoomed.span).toBeLessThan(wheelZoomed.span * 0.74);
+  expect(buttonZoomed.span).toBeGreaterThan(wheelZoomed.span * 0.70);
+
+  await page.getByTestId("zoom-out").click();
+  const buttonExpanded = await waitForViewChange(
+    timeline,
+    buttonZoomed.start,
+    buttonZoomed.end
+  );
+  expect(buttonExpanded.span).toBeGreaterThan(buttonZoomed.span);
+});
+
+test("two background clicks select and zoom a visible interval", async function ({ page }) {
+  const timeline = page.getByTestId("timeline");
+  const svg = page.locator("#timeline-svg");
+  const box = await svg.boundingBox();
+  expect(box).not.toBeNull();
+  const full = await readView(timeline);
+  const y = box.y + Math.min(27, box.height / 2);
+  const startX = box.x + box.width * 0.42;
+  const endX = box.x + box.width * 0.68;
+
+  await page.mouse.click(startX, y);
+  await expect(svg).toHaveAttribute("data-range-selection-state", "active");
+  await page.mouse.move(endX, y);
+  await expect(svg.locator(".range-selection-window")).toHaveCount(1);
+  await page.mouse.click(endX, y);
+
+  await expect(svg).not.toHaveAttribute("data-range-selection-state");
+  const selected = await waitForViewChange(timeline, full.start, full.end);
+  expect(selected.span).toBeLessThan(full.span * 0.35);
+  expect(selected.span).toBeGreaterThan(full.span * 0.15);
+});
+
 test("semantic zoom drops subpixel detail within a deterministic DOM budget", async function ({ page }) {
   const timeline = page.getByTestId("timeline");
   const svg = page.locator("#timeline-svg");
@@ -768,6 +821,9 @@ test("packed lane labels list their agents and empty background clears selection
   expect(box).not.toBeNull();
   await page.mouse.click(box.x + box.width - 12, box.y + 54 + 27);
   await expect(timeline).toHaveAttribute("data-selection-scope", "none");
+  await expect(svg).toHaveAttribute("data-range-selection-state", "active");
+  await page.keyboard.press("Escape");
+  await expect(svg).not.toHaveAttribute("data-range-selection-state");
 
   await lane.click();
   await expect(menu).toBeVisible();

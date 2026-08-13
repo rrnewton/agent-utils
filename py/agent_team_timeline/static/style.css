@@ -403,6 +403,46 @@ h1 {
   white-space: nowrap;
 }
 
+.range-controls {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.range-controls .view-range {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.zoom-buttons {
+  flex: 0 0 auto;
+  display: inline-flex;
+  overflow: hidden;
+  border: 1px solid #344159;
+  border-radius: 4px;
+}
+
+.zoom-button {
+  width: 27px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-right: 1px solid #344159;
+  background: #1a2331;
+  color: #c9d8ea;
+  font: 600 16px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.zoom-button:last-child {
+  border-right: 0;
+}
+
+.zoom-button:hover {
+  background: #253246;
+  color: #fff;
+}
+
 .legend {
   display: flex;
   align-items: center;
@@ -575,6 +615,27 @@ h1 {
 
 .timeline-svg.is-panning {
   cursor: grabbing;
+}
+
+.timeline-svg.is-range-selecting {
+  cursor: crosshair;
+}
+
+.range-selection-window {
+  fill: rgb(246 196 83 / 19%);
+  stroke: none;
+  pointer-events: none;
+}
+
+.range-selection-line {
+  stroke: #f6c453;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.range-selection-cursor {
+  stroke-dasharray: 4 3;
 }
 
 .empty-state {

@@ -64,6 +64,8 @@
     perAgentTracks: byId("per-agent-tracks"),
     showGlobalMessages: byId("show-global-messages"),
     showHighlightedMessages: byId("show-highlighted-messages"),
+    zoomOut: byId("zoom-out"),
+    zoomIn: byId("zoom-in"),
     viewRange: byId("view-range"),
     rollupRow: byId("rollup-row"),
     rollupTrack: byId("rollup-track"),
@@ -119,6 +121,7 @@
     showGlobalMessages: false,
     showHighlightedMessages: true,
     selection: null,
+    rangeSelection: null,
     drag: null,
     suppressClickUntil: 0,
     renderQueued: false,
@@ -1874,6 +1877,7 @@
   }
 
   function setSelection(selection) {
+    clearRangeSelectionState();
     app.selection = selection;
     hideContextMenu();
     hideLaneAgentMenu(false);
@@ -2709,6 +2713,7 @@
     var gridLayer = svgElement("g");
     var contentLayer = svgElement("g");
     var labelLayer = svgElement("g");
+    var rangeLayer = svgElement("g", { "aria-hidden": "true" });
     teams.forEach(function (team, index) {
       var y = index * AGGREGATE_TEAM_HEIGHT;
       backgroundLayer.appendChild(svgElement("rect", {
@@ -2771,7 +2776,55 @@
       height: totalHeight,
       fill: "#344057"
     }));
-    dom.svg.append(backgroundLayer, gridLayer, contentLayer, labelLayer);
+    renderRangeSelection(rangeLayer, totalHeight);
+    dom.svg.append(backgroundLayer, gridLayer, contentLayer, rangeLayer, labelLayer);
+  }
+
+  function renderRangeSelection(layer, height) {
+    if (!app.rangeSelection) {
+      dom.svg.classList.remove("is-range-selecting");
+      dom.svg.removeAttribute("data-range-selection-state");
+      return;
+    }
+    dom.svg.classList.add("is-range-selecting");
+    dom.svg.setAttribute("data-range-selection-state", "active");
+    var anchor = clamp(
+      number(app.rangeSelection.anchor_ms, app.viewStart),
+      app.viewStart,
+      app.viewEnd
+    );
+    var cursor = clamp(
+      number(app.rangeSelection.cursor_ms, anchor),
+      app.viewStart,
+      app.viewEnd
+    );
+    var anchorX = timeToX(anchor);
+    var cursorX = timeToX(cursor);
+    var left = Math.min(anchorX, cursorX);
+    var width = Math.abs(cursorX - anchorX);
+    if (width > 0.5) {
+      layer.appendChild(svgElement("rect", {
+        x: left,
+        y: 0,
+        width: width,
+        height: Math.max(1, height),
+        class: "range-selection-window"
+      }));
+    }
+    layer.appendChild(svgElement("line", {
+      x1: anchorX,
+      y1: 0,
+      x2: anchorX,
+      y2: Math.max(1, height),
+      class: "range-selection-line range-selection-anchor"
+    }));
+    layer.appendChild(svgElement("line", {
+      x1: cursorX,
+      y1: 0,
+      x2: cursorX,
+      y2: Math.max(1, height),
+      class: "range-selection-line range-selection-cursor"
+    }));
   }
 
   function renderTracks() {
@@ -2803,6 +2856,10 @@
     var lifetimeLayer = svgElement("g");
     var phaseLayer = svgElement("g");
     var labelLayer = svgElement("g");
+    var rangeLayer = svgElement("g", {
+      "clip-path": "url(#chart-clip)",
+      "aria-hidden": "true"
+    });
     contentLayer.append(edgeLayer, lifetimeLayer, phaseLayer);
 
     for (var index = bounds.first; index <= bounds.last; index += 1) {
@@ -2872,7 +2929,8 @@
       height: Math.max(1, bounds.bottom - bounds.top),
       fill: "#344057"
     }));
-    dom.svg.append(backgroundLayer, gridLayer, contentLayer, labelLayer);
+    renderRangeSelection(rangeLayer, totalHeight);
+    dom.svg.append(backgroundLayer, gridLayer, contentLayer, rangeLayer, labelLayer);
   }
 
   function renderRollups() {
@@ -3212,6 +3270,7 @@
       app.navigationRange,
       MIN_VIEW_MS
     );
+    clearRangeSelectionState();
     app.viewStart = next.start_ms;
     app.viewEnd = next.end_ms;
     scheduleRender();
@@ -3228,6 +3287,30 @@
     var span = app.viewEnd - app.viewStart;
     var shift = (pixels / Math.max(1, app.chartWidth)) * span;
     setView(app.viewStart + shift, app.viewEnd + shift);
+  }
+
+  function zoomAround(ratio, scale) {
+    var oldSpan = app.viewEnd - app.viewStart;
+    var fullSpan = app.navigationRange.end_ms - app.navigationRange.start_ms;
+    var newSpan = clamp(
+      oldSpan * scale,
+      Math.min(MIN_VIEW_MS, fullSpan),
+      fullSpan
+    );
+    var anchorRatio = clamp(number(ratio, 0.5), 0, 1);
+    var anchor = app.viewStart + anchorRatio * oldSpan;
+    var start = anchor - anchorRatio * newSpan;
+    setView(start, start + newSpan);
+  }
+
+  function wheelDeltaPixels(event) {
+    if (event.deltaMode === WheelEvent.DOM_DELTA_LINE) {
+      return event.deltaY * 16;
+    }
+    if (event.deltaMode === WheelEvent.DOM_DELTA_PAGE) {
+      return event.deltaY * Math.max(120, dom.scroll.clientHeight);
+    }
+    return event.deltaY;
   }
 
   function wheelZoom(event) {
@@ -3265,17 +3348,91 @@
       var x = clamp(event.clientX - rect.left, app.labelWidth, app.width);
       ratio = clamp((x - app.labelWidth) / Math.max(1, app.chartWidth), 0, 1);
     }
-    var oldSpan = app.viewEnd - app.viewStart;
-    var scale = Math.exp(clamp(event.deltaY, -500, 500) * 0.0016);
-    var fullSpan = app.navigationRange.end_ms - app.navigationRange.start_ms;
-    var newSpan = clamp(oldSpan * scale, Math.min(MIN_VIEW_MS, fullSpan), fullSpan);
-    var anchor = app.viewStart + ratio * oldSpan;
-    var start = anchor - ratio * newSpan;
-    setView(start, start + newSpan);
+    // Wheel hardware reports pixels, lines, or whole pages. Normalize first and cap one
+    // browser event to a modest step so a single coarse notch cannot jump several zoom levels.
+    var delta = clamp(wheelDeltaPixels(event), -80, 80);
+    zoomAround(ratio, Math.exp(delta * 0.0015));
+  }
+
+  function eventTimeOnChart(event) {
+    var rect = dom.svg.getBoundingClientRect();
+    var x = clamp(event.clientX - rect.left, app.labelWidth, app.width);
+    var ratio = clamp((x - app.labelWidth) / Math.max(1, app.chartWidth), 0, 1);
+    return app.viewStart + ratio * (app.viewEnd - app.viewStart);
+  }
+
+  function clearRangeSelectionState() {
+    app.rangeSelection = null;
+    dom.svg.classList.remove("is-range-selecting");
+    dom.svg.removeAttribute("data-range-selection-state");
+  }
+
+  function cancelRangeSelection() {
+    if (!app.rangeSelection) {
+      return;
+    }
+    clearRangeSelectionState();
+    scheduleRender();
+  }
+
+  function updateRangeSelection(event) {
+    if (!app.rangeSelection) {
+      return;
+    }
+    app.rangeSelection.cursor_ms = eventTimeOnChart(event);
+    scheduleRender();
+  }
+
+  function handleEmptyTrackClick(event) {
+    if (Date.now() < app.suppressClickUntil) {
+      return;
+    }
+    var target = event.target;
+    if (!(target instanceof Element) ||
+        (!target.classList.contains("track-row") &&
+         !target.classList.contains("aggregate-team-row"))) {
+      return;
+    }
+    if (event.clientX < dom.svg.getBoundingClientRect().left + app.labelWidth) {
+      return;
+    }
+    if (app.rangeSelection) {
+      var start = Math.min(
+        number(app.rangeSelection.anchor_ms, app.viewStart),
+        eventTimeOnChart(event)
+      );
+      var end = Math.max(
+        number(app.rangeSelection.anchor_ms, app.viewStart),
+        eventTimeOnChart(event)
+      );
+      clearRangeSelectionState();
+      zoomToRange(start, Math.max(start + MIN_VIEW_MS, end));
+      return;
+    }
+    if (event.detail !== 1) {
+      return;
+    }
+    if (app.selection) {
+      setSelection(null);
+    }
+    var at = eventTimeOnChart(event);
+    app.rangeSelection = { anchor_ms: at, cursor_ms: at };
+    dom.svg.classList.add("is-range-selecting");
+    dom.svg.setAttribute("data-range-selection-state", "active");
+    scheduleRender();
+  }
+
+  function cancelRangeSelectionOnContextMenu(event) {
+    if (!app.rangeSelection) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    cancelRangeSelection();
   }
 
   function beginPan(event) {
-    if (!app.data || event.button !== 0) {
+    if (!app.data || event.button !== 0 || app.rangeSelection) {
       return;
     }
     app.drag = {
@@ -3324,16 +3481,6 @@
     }
     app.drag = null;
     dom.svg.classList.remove("is-panning");
-  }
-
-  function clearSelectionFromEmptyTrack(event) {
-    if (!app.selection || event.detail !== 1 || Date.now() < app.suppressClickUntil) {
-      return;
-    }
-    var target = event.target;
-    if (target instanceof Element && target.classList.contains("track-row")) {
-      setSelection(null);
-    }
   }
 
   function keyboardNavigate(event) {
@@ -4774,6 +4921,14 @@
   });
 
   dom.fit.addEventListener("click", fitTimeline);
+  dom.zoomOut.addEventListener("click", function () {
+    cancelRangeSelection();
+    zoomAround(0.5, 1 / 0.72);
+  });
+  dom.zoomIn.addEventListener("click", function () {
+    cancelRangeSelection();
+    zoomAround(0.5, 0.72);
+  });
   dom.glossaryOpen.addEventListener("click", function () {
     openGlossaryCatalog(true);
   });
@@ -4795,10 +4950,14 @@
   dom.axis.addEventListener("wheel", wheelZoom, { passive: false });
   dom.rollupTrack.addEventListener("wheel", wheelZoom, { passive: false });
   dom.svg.addEventListener("pointerdown", beginPan);
-  dom.svg.addEventListener("pointermove", continuePan);
+  dom.svg.addEventListener("pointermove", function (event) {
+    updateRangeSelection(event);
+    continuePan(event);
+  });
   dom.svg.addEventListener("pointerup", endPan);
   dom.svg.addEventListener("pointercancel", endPan);
-  dom.svg.addEventListener("click", clearSelectionFromEmptyTrack);
+  dom.svg.addEventListener("click", handleEmptyTrackClick);
+  dom.svg.addEventListener("contextmenu", cancelRangeSelectionOnContextMenu);
   dom.scroll.addEventListener("scroll", scheduleRender, { passive: true });
   dom.scroll.addEventListener("keydown", keyboardScrollTracks);
   window.addEventListener("hashchange", openGlossaryFromHash);
@@ -4811,7 +4970,9 @@
   });
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
-      if (!dom.laneMenu.hidden) {
+      if (app.rangeSelection) {
+        cancelRangeSelection();
+      } else if (!dom.laneMenu.hidden) {
         hideLaneAgentMenu(true);
       } else if (!dom.contextMenu.hidden) {
         hideContextMenu();

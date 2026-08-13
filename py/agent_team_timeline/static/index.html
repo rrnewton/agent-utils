@@ -67,7 +67,27 @@
         aria-keyshortcuts="+ - ArrowLeft ArrowRight Home"
       >
         <div class="timeline-toolbar">
-          <div id="view-range" class="view-range">—</div>
+          <div class="range-controls">
+            <div id="view-range" class="view-range">—</div>
+            <div class="zoom-buttons" role="group" aria-label="Timeline zoom">
+              <button
+                id="zoom-out"
+                data-testid="zoom-out"
+                class="zoom-button"
+                type="button"
+                title="Zoom out"
+                aria-label="Zoom out"
+              >−</button>
+              <button
+                id="zoom-in"
+                data-testid="zoom-in"
+                class="zoom-button"
+                type="button"
+                title="Zoom in"
+                aria-label="Zoom in"
+              >+</button>
+            </div>
+          </div>
           <div class="legend" aria-label="Agent state legend">
             <span><i class="legend-dot state-active"></i>Active</span>
             <span><i class="legend-dot state-tool"></i>Tool</span>
