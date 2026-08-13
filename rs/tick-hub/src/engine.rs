@@ -6,8 +6,8 @@ use indexmap::IndexMap;
 
 use crate::cadence::is_due;
 use crate::emit::{
-    format_action, format_error, format_health, format_note, HEALTH_STATUS_MISSING,
-    HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
+    format_action, format_error, format_health, format_no_result, format_note,
+    HEALTH_STATUS_MISSING, HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
 };
 use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, TickConfig};
 use crate::protocols::{FileAgeProbe, GateRunner};
@@ -54,6 +54,28 @@ pub fn evaluate_health(hc: &HealthCheck, probe: &dyn FileAgeProbe, now: i64) -> 
     format_health(&hc.name, status, age, hc.threshold_secs, &hc.detail)
 }
 
+/// Exit code reserved for "I could not determine my condition".
+///
+/// 75 is EX_TEMPFAIL ("temporary failure, user is invited to retry"), chosen on
+/// collision evidence rather than taste: across the scripts behind the live
+/// gate set the codes already in use are 0, 1, 2, 3, 124 and 127. 2 is the
+/// tempting choice because one gate already prints NO_RESULT while exiting 2 --
+/// and it is WRONG, because argparse exits 2 on a usage error, so reserving it
+/// would render a crashed gate as a non-answer. Softening a real failure into
+/// NO_RESULT is the opposite of the point.
+pub const NO_RESULT_EXIT: i32 = 75;
+
+/// What one gate execution concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    /// The gate determined its condition and it does not warrant emission.
+    Quiet,
+    /// The gate determined its condition and it warrants emission.
+    Fire,
+    /// The gate ran but could not determine its condition.
+    NoResult,
+}
+
 fn gate_fires(when: GateWhen, returncode: i32, stdout: &str) -> bool {
     match when {
         GateWhen::Success => returncode == 0,
@@ -66,9 +88,9 @@ fn gate_fires(when: GateWhen, returncode: i32, stdout: &str) -> bool {
 fn eval_gate(
     gate: Option<&Gate>,
     runner: &dyn GateRunner,
-) -> Result<(bool, IndexMap<String, String>), String> {
+) -> Result<(GateOutcome, IndexMap<String, String>), String> {
     let Some(gate) = gate else {
-        return Ok((true, IndexMap::new()));
+        return Ok((GateOutcome::Fire, IndexMap::new()));
     };
     let result = runner.run(&gate.cmd);
     if !result.ok {
@@ -83,10 +105,20 @@ fn eval_gate(
     } else {
         IndexMap::new()
     };
-    Ok((
-        gate_fires(gate.when, result.returncode, &result.stdout),
-        captured,
-    ))
+    // Checked BEFORE `when`, so a gate that cannot determine its condition is
+    // never reinterpreted through a fire/quiet rule. Under `when: failure` a
+    // 75 would otherwise read as an ordinary failure verdict; under
+    // `when: success` it would read as a clean pass, which is the exact
+    // silence-means-healthy collapse this exists to remove.
+    if result.returncode == NO_RESULT_EXIT {
+        return Ok((GateOutcome::NoResult, captured));
+    }
+    let outcome = if gate_fires(gate.when, result.returncode, &result.stdout) {
+        GateOutcome::Fire
+    } else {
+        GateOutcome::Quiet
+    };
+    Ok((outcome, captured))
 }
 
 fn interpolate(mut text: String, values: &IndexMap<String, String>) -> String {
@@ -150,7 +182,7 @@ pub fn run_tick(
             {
                 continue;
             }
-            let (fire, captured) = match eval_gate(reminder.gate.as_ref(), gate_runner) {
+            let (outcome, captured) = match eval_gate(reminder.gate.as_ref(), gate_runner) {
                 Ok(result) => result,
                 Err(error) => {
                     lines.push(format_error(&format!(
@@ -160,8 +192,19 @@ pub fn run_tick(
                     continue;
                 }
             };
+            // A NO_RESULT does NOT consume cadence, matching the existing
+            // cannot-run path above: the gate keeps announcing every tick until
+            // it can determine something. Deliberately noisy -- silence is the
+            // hazard here, so repetition is the correct trade.
+            if outcome == GateOutcome::NoResult {
+                lines.push(format_no_result(
+                    &reminder.name,
+                    captured.get("summary").map(String::as_str).unwrap_or(""),
+                ));
+                continue;
+            }
             new_fired.insert(reminder.name.clone(), now);
-            if !fire {
+            if outcome == GateOutcome::Quiet {
                 continue;
             }
             let line = render_emit(&reminder.emit, &captured);
@@ -371,5 +414,181 @@ mod tests {
             line == "ERROR: reminder x: gate command could not run ('boom'): not found"
         }));
         assert!(!result.fired.contains_key("x"));
+    }
+
+    // --- COULD-NOT-DETERMINE, BOTH DIRECTIONS ---------------------------------
+    //
+    // The negative half is the point: a gate that cannot determine its
+    // condition must be visibly distinct from one that checked and found
+    // nothing. The positive halves prove the change is not inert -- a gate that
+    // CAN determine still reports exactly what it reported before.
+
+    fn gated(
+        name: &str,
+        cmd: &str,
+        when: GateWhen,
+        code: i32,
+        stdout: &str,
+    ) -> (TickConfig, FakeGate, FakeProbe) {
+        let mut reminder = Reminder::new(name, Emit::action("warn", "{summary}"));
+        let mut gate = Gate::new(cmd);
+        gate.when = when;
+        gate.capture = true;
+        reminder.gate = Some(gate);
+        let config = TickConfig {
+            reminders: vec![reminder],
+            ..TickConfig::default()
+        };
+        let runner = FakeGate {
+            outcomes: BTreeMap::from([(cmd.into(), GateResult::completed(code, stdout))]),
+            calls: RefCell::new(Vec::new()),
+        };
+        (config, runner, FakeProbe(BTreeMap::new()))
+    }
+
+    #[test]
+    fn could_not_determine_renders_no_result_not_a_pass() {
+        let (config, gate, probe) = gated(
+            "watcher",
+            "probe",
+            GateWhen::Failure,
+            NO_RESULT_EXIT,
+            "summary=backend unreachable\n",
+        );
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+        );
+        let line = result
+            .lines
+            .iter()
+            .find(|l| l.starts_with("NO_RESULT: "))
+            .expect("a NO_RESULT line");
+        assert!(line.contains("watcher"), "names the gate: {line}");
+        assert!(
+            line.contains("this is not a pass"),
+            "distinct from a pass: {line}"
+        );
+        assert!(
+            line.contains("backend unreachable"),
+            "carries detail when present: {line}"
+        );
+        assert!(
+            !result.lines.iter().any(|l| l.starts_with("ACTION: ")),
+            "must not also fire a verdict"
+        );
+    }
+
+    #[test]
+    fn no_result_is_emittable_when_the_gate_printed_nothing() {
+        // THE CORRELATED-FAILURE CASE. A gate that cannot determine its
+        // condition is the one least likely to produce a usable summary=, so
+        // the line must not depend on captured fields or on emit.title.
+        let (config, gate, probe) = gated("mute", "probe", GateWhen::Failure, NO_RESULT_EXIT, "");
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+        );
+        let line = result
+            .lines
+            .iter()
+            .find(|l| l.starts_with("NO_RESULT: "))
+            .expect("a NO_RESULT line");
+        assert!(line.contains("mute"));
+        assert!(
+            !line.contains('{'),
+            "must not leak an unresolved placeholder: {line}"
+        );
+    }
+
+    #[test]
+    fn no_result_does_not_consume_cadence() {
+        let (config, gate, probe) = gated("retry", "probe", GateWhen::Failure, NO_RESULT_EXIT, "");
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+        );
+        assert!(
+            !result.fired.contains_key("retry"),
+            "must re-announce next tick"
+        );
+    }
+
+    #[test]
+    fn no_result_is_not_reinterpreted_by_when_success() {
+        // Under `when: success` a nonzero code means "quiet". Without the
+        // pre-check, 75 would silently read as a clean pass -- the exact
+        // collapse this change removes.
+        let (config, gate, probe) = gated("s", "probe", GateWhen::Success, NO_RESULT_EXIT, "");
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+        );
+        assert!(
+            result.lines.iter().any(|l| l.starts_with("NO_RESULT: ")),
+            "{:?}",
+            result.lines
+        );
+    }
+
+    #[test]
+    fn positive_control_a_determinable_gate_is_unchanged() {
+        // fires on real failure ...
+        let (config, gate, probe) =
+            gated("f", "probe", GateWhen::Failure, 1, "summary=real problem\n");
+        let fired = run_tick(
+            &config,
+            &OpsState::default(),
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+        );
+        assert!(fired
+            .lines
+            .iter()
+            .any(|l| l.starts_with("ACTION: ") && l.contains("real problem")));
+        assert!(!fired.lines.iter().any(|l| l.starts_with("NO_RESULT: ")));
+        assert!(
+            fired.fired.contains_key("f"),
+            "a real verdict still consumes cadence"
+        );
+        // ... and stays quiet on a clean check.
+        let (config, gate, probe) = gated("q", "probe", GateWhen::Failure, 0, "");
+        let quiet = run_tick(
+            &config,
+            &OpsState::default(),
+            10,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+        );
+        assert!(!quiet
+            .lines
+            .iter()
+            .any(|l| l.starts_with("ACTION: ") || l.starts_with("NO_RESULT: ")));
+        assert!(quiet.fired.contains_key("q"));
     }
 }

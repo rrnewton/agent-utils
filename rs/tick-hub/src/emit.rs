@@ -67,6 +67,25 @@ pub fn format_health(
     )
 }
 
+/// Format a gate that could not determine its condition.
+///
+/// Deliberately built from the gate NAME alone and never from `emit.title` or
+/// any captured field. A gate that cannot determine its condition is exactly
+/// the gate least likely to have produced a usable `summary=`, so rendering
+/// this line through the normal interpolation path would reproduce the failure
+/// it exists to report. The line must be emittable when the gate printed
+/// nothing at all.
+pub fn format_no_result(name: &str, detail: &str) -> String {
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("NO_RESULT: {name} could not determine its condition; this is not a pass")
+    } else {
+        format!(
+            "NO_RESULT: {name} could not determine its condition; this is not a pass ({detail})"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
