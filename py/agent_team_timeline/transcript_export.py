@@ -208,6 +208,14 @@ def _group_events(team: TeamData, kinds: set[str]) -> tuple[_GroupedEvent, ...]:
         if (
             event.thread_id not in coordinator_threads
             or event.kind not in kinds
+            or (
+                team.window_start_ms is not None
+                and event.timestamp_ms < team.window_start_ms
+            )
+            or (
+                team.window_end_ms is not None
+                and event.timestamp_ms >= team.window_end_ms
+            )
             or event.text is None
             or not event.text.strip()
         ):

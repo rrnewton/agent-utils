@@ -12,7 +12,7 @@
   var COMPACT_LABEL_WIDTH = 72;
   var AGGREGATE_LABEL_WIDTH = 128;
   var AGGREGATE_TEAM_HEIGHT = 78;
-  var AGGREGATE_WORKER_SCALE = 15;
+  var AGGREGATE_WORKER_SCALE = 10;
   var AGGREGATE_WORKER_MAX_HEIGHT = 48;
   var STATE_HEIGHT = 6;
   var MIN_VIEW_MS = 1000;
@@ -316,8 +316,12 @@
       }
       var scores = scoresByResolution.get(team);
       var concurrency = Math.max(0, number(
-        bin.avg_active_concurrency,
-        number(bin.activity_coverage_fraction, 0)
+        bin.avg_present_concurrency,
+        number(
+          bin.avg_active_concurrency,
+          number(bin.activity_evidence_fraction,
+            number(bin.activity_coverage_fraction, 0))
+        )
       ));
       scores.set(
         resolution,
@@ -2266,13 +2270,6 @@
     )) {
       return;
     }
-    var y1 = sourceRow.index * ROW_HEIGHT + ROW_HEIGHT / 2;
-    var y2 = targetRow.index * ROW_HEIGHT + ROW_HEIGHT / 2;
-    if (Math.max(y1, y2) < bounds.top || Math.min(y1, y2) > bounds.bottom) {
-      return;
-    }
-    var x1 = timeToX(sourceTime);
-    var x2 = timeToX(targetTime);
     var displayState = timelineCore
       ? timelineCore.edgeDisplayState(
           edge,
@@ -2284,6 +2281,22 @@
     if (displayState === "hidden") {
       return;
     }
+    var rowBuffer = 2;
+    var bothEndpointsVisible =
+      sourceRow.index >= bounds.first - rowBuffer &&
+      sourceRow.index <= bounds.last + rowBuffer &&
+      targetRow.index >= bounds.first - rowBuffer &&
+      targetRow.index <= bounds.last + rowBuffer;
+    if (displayState !== "highlighted" && !bothEndpointsVisible) {
+      return;
+    }
+    var y1 = sourceRow.index * ROW_HEIGHT + ROW_HEIGHT / 2;
+    var y2 = targetRow.index * ROW_HEIGHT + ROW_HEIGHT / 2;
+    if (Math.max(y1, y2) < bounds.top || Math.min(y1, y2) > bounds.bottom) {
+      return;
+    }
+    var x1 = timeToX(sourceTime);
+    var x2 = timeToX(targetTime);
     // At lifetime density even one fork and join per agent becomes a thicket. Preserve
     // structural context for the highlighted family, but leave the unselected overview clean.
     if (app.renderLod === "lifetime" && displayState !== "highlighted") {
@@ -2795,16 +2808,34 @@
     var coordinator = bin.coordinator || {};
     var workers = bin.workers || {};
     var coordinatorCoverage = clamp(
-      number(coordinator.activity_coverage_fraction, 0),
+      number(
+        coordinator.activity_evidence_fraction,
+        number(coordinator.activity_coverage_fraction, 0)
+      ),
       0,
       1
     );
-    var workerCoverage = clamp(number(workers.activity_coverage_fraction, 0), 0, 1);
+    var workerCoverage = clamp(
+      number(
+        workers.activity_evidence_fraction,
+        number(workers.activity_coverage_fraction, 0)
+      ),
+      0,
+      1
+    );
     var coverage = Math.max(coordinatorCoverage, workerCoverage);
-    var average = Math.max(0, number(workers.avg_active_concurrency, 0));
+    var average = Math.max(0, number(
+      workers.avg_present_concurrency,
+      number(workers.avg_active_concurrency, 0)
+    ));
+    var peak = Math.max(0, number(
+      workers.peak_present_concurrency,
+      number(workers.peak_concurrency, 0)
+    ));
     var rowTop = rowIndex * AGGREGATE_TEAM_HEIGHT;
     var height = clamp(
-      (coordinatorCoverage > 0 ? 10 : 4) + average * AGGREGATE_WORKER_SCALE,
+      (coordinatorCoverage > 0 ? 10 : 4) +
+        Math.log2(1 + average) * AGGREGATE_WORKER_SCALE,
       4,
       AGGREGATE_WORKER_MAX_HEIGHT + 10
     );
@@ -2844,13 +2875,17 @@
         event,
         text(team.label, text(team.slug)) + " · Team activity",
         formatRange(start, end) +
-          "\nCoordinator coverage: " + Math.round(coordinatorCoverage * 100) + "%" +
-          "\nAverage active workers: " + average.toFixed(2) +
-          "\nPeak active workers: " + formatCount(workers.peak_concurrency) +
-          "\nAny-activity coverage: " + Math.round(coverage * 100) + "%" +
+          "\nCoordinator activity evidence: " +
+            Math.round(coordinatorCoverage * 100) + "%" +
+          "\nEstimated average present workers: " + average.toFixed(2) +
+          "\nEstimated peak present workers: " + formatCount(peak) +
+          "\nAny activity evidence: " + Math.round(coverage * 100) + "%" +
+          "\nWorker evidence events: " +
+            formatCount(workers.activity_evidence_events) +
           "\nDistinct active workers: " + formatCount(workers.distinct_active_agents) +
           "\nSummary: " + (hasSummary ? "available" : "not generated"),
-        text(bin.resolution, "aggregate") + " combined mechanical activity bin"
+        text(bin.resolution, "aggregate") +
+          " combined mechanical activity bin · inferred timing"
       );
     });
     group.addEventListener("pointermove", positionTooltip);

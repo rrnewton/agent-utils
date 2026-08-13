@@ -8,7 +8,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from agent_team_timeline.activity_bins import ActivityBin, build_activity_bins
-from agent_team_timeline.phases import PhaseStats, PhaseWindow, StateSegment
+from agent_team_timeline.phases import (
+    PhaseStats,
+    PhaseWindow,
+    StateSegment,
+    TranscriptEntry,
+)
 
 
 MINUTE_MS = 60 * 1000
@@ -19,6 +24,7 @@ def _phase(
     phase_id: str,
     agent_id: str,
     states: tuple[StateSegment, ...],
+    transcript: tuple[TranscriptEntry, ...] = (),
 ) -> PhaseWindow:
     return PhaseWindow(
         phase_id=phase_id,
@@ -31,7 +37,7 @@ def _phase(
         states=states,
         transcript_text="",
         prior_context="",
-        transcript=(),
+        transcript=transcript,
     )
 
 
@@ -150,6 +156,40 @@ def test_activity_bins_preserve_gaps_and_measure_concurrency() -> None:
     assert week.start_ms == MONDAY_MS
     assert week.end_ms == MONDAY_MS + 7 * 24 * 60 * MINUTE_MS
     assert week.avg_active_concurrency > 0
+
+
+def test_point_activity_uses_inferred_presence_and_evidence_separately() -> None:
+    point_ms = MONDAY_MS + 10 * MINUTE_MS
+    phase = _phase(
+        "worker-point",
+        "worker",
+        (
+            _absolute_state("active", point_ms, point_ms + 1000),
+            _absolute_state(
+                "idle",
+                point_ms + 1000,
+                MONDAY_MS + 30 * MINUTE_MS,
+            ),
+        ),
+        (TranscriptEntry(point_ms, "agent", "finished work", ()),),
+    )
+
+    bins = build_activity_bins(
+        "test-team",
+        "root",
+        (phase,),
+        display_timezone="UTC",
+        observed_start_ms=MONDAY_MS,
+        observed_end_ms=MONDAY_MS + 60 * MINUTE_MS,
+    )
+
+    hour = _find(bins, "hourly", "workers", MONDAY_MS)
+    assert hour.avg_active_concurrency == pytest.approx(1 / 3600, abs=1e-6)
+    assert hour.avg_present_concurrency == pytest.approx(5 / 60, abs=1e-6)
+    assert hour.peak_present_concurrency == 1
+    assert hour.activity_evidence_fraction == pytest.approx(5 / 60, abs=1e-6)
+    assert hour.activity_evidence_events == 1
+    assert hour.timing_quality == "inferred"
 
 
 def test_daily_and_weekly_bins_follow_local_calendar_boundaries() -> None:
@@ -325,6 +365,10 @@ def test_activity_bin_json_is_additive_and_self_describing() -> None:
         peak_concurrency=3,
         activity_coverage_fraction=0.75,
         distinct_active_agents=4,
+        avg_present_concurrency=2.25,
+        peak_present_concurrency=5,
+        activity_evidence_fraction=0.5,
+        activity_evidence_events=12,
     )
     assert item.to_json_obj() == {
         "team": "team-a",
@@ -336,4 +380,9 @@ def test_activity_bin_json_is_additive_and_self_describing() -> None:
         "peak_concurrency": 3,
         "activity_coverage_fraction": 0.75,
         "distinct_active_agents": 4,
+        "avg_present_concurrency": 2.25,
+        "peak_present_concurrency": 5,
+        "activity_evidence_fraction": 0.5,
+        "activity_evidence_events": 12,
+        "timing_quality": "inferred",
     }

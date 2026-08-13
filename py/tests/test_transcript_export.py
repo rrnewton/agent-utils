@@ -129,6 +129,58 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     assert response["in_reply_to_prompt_id"] == prompt_one["record_id"]
 
 
+def test_current_snapshot_excludes_events_outside_team_window(
+    tmp_path: Path,
+) -> None:
+    events = (
+        _event("prompt-before", "turn-before", 199, "user_prompt", "Before", 1),
+        _event("prompt-start", "turn-start", 200, "user_prompt", "Start", 2),
+        _event(
+            "response-inside",
+            "turn-start",
+            250,
+            "assistant_message",
+            "Inside response",
+            3,
+        ),
+        _event(
+            "system-inside",
+            "turn-system",
+            300,
+            "system_input",
+            "Inside system input",
+            4,
+        ),
+        _event(
+            "response-end",
+            "turn-end",
+            500,
+            "assistant_message",
+            "At end",
+            5,
+        ),
+        _event("system-after", "turn-after", 501, "system_input", "After", 6),
+    )
+    team = replace(_team(events), window_start_ms=200, window_end_ms=500)
+
+    report = export_transcripts(tmp_path, (team,))
+
+    assert report.prompts == 1
+    assert report.responses == 1
+    assert report.system_inputs == 1
+    root = tmp_path / "extracted" / "transcripts"
+    assert [record["text"] for record in _jsonl(root / "prompts.jsonl")] == [
+        "Start"
+    ]
+    assert [record["text"] for record in _jsonl(root / "messages.jsonl")] == [
+        "Start",
+        "Inside response",
+    ]
+    assert [
+        record["text"] for record in _jsonl(root / "system-inputs.jsonl")
+    ] == ["Inside system input"]
+
+
 def test_current_message_class_supersedes_stale_occurrence_projection(
     tmp_path: Path,
 ) -> None:
