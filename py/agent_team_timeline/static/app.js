@@ -1710,6 +1710,14 @@
       });
 
     app.rowByAgent.clear();
+    if (app.renderLod === "aggregate") {
+      // Aggregate rendering needs the filtered agents only for team matching and
+      // statistics. Packing thousands of invisible lifetimes dominated every
+      // outer-zoom frame without affecting a single rendered object.
+      app.rows = rows;
+      app.laneCount = 0;
+      return;
+    }
     var packed = null;
     if (!app.perAgentTracks && timelineCore) {
       var lifetimeItems = rows.map(function (row, inputIndex) {
@@ -1723,19 +1731,17 @@
           dedicated: !text(agent.parent_id)
         };
       });
-      if (app.renderLod !== "aggregate") {
-        lifetimeItems = timelineCore.lifetimesWithin(
-          lifetimeItems,
-          app.viewStart,
-          app.viewEnd
-        );
-        var visibleIds = new Set(lifetimeItems.map(function (item) {
-          return text(item.id);
-        }));
-        rows = rows.filter(function (row) {
-          return visibleIds.has(text(row.agent.id));
-        });
-      }
+      lifetimeItems = timelineCore.lifetimesWithin(
+        lifetimeItems,
+        app.viewStart,
+        app.viewEnd
+      );
+      var visibleIds = new Set(lifetimeItems.map(function (item) {
+        return text(item.id);
+      }));
+      rows = rows.filter(function (row) {
+        return visibleIds.has(text(row.agent.id));
+      });
       packed = timelineCore.packLifetimes(lifetimeItems);
     }
     app.rows = rows;
