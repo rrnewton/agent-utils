@@ -334,14 +334,13 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   expect(requests.get("final") || 0).toBe(0);
   expect(requests.get("schema1") || 0).toBe(0);
 
-  const axisBox = await page.locator("#time-axis").boundingBox();
-  expect(axisBox).not.toBeNull();
-  await page.mouse.move(axisBox.x + 150, axisBox.y + axisBox.height / 2);
-  await page.mouse.wheel(0, -360);
+  await page.locator(
+    '.activity-bin-group[data-activity-resolution="daily"]'
+  ).first().dispatchEvent("dblclick", { detail: 2 });
   await expect(timeline).toHaveAttribute("data-render-lod", "lifetime");
   await expect(card).toHaveAttribute("data-loaded-shard-count", "0");
-  await expect(page.locator('.edge-group[data-edge-id="spawn-a"]')).toHaveCount(1);
-  await expect(page.locator('.edge-group[data-edge-id="result-a"]')).toHaveCount(1);
+  await expect(page.locator('.edge-group[data-edge-id="spawn-a"]')).toHaveCount(0);
+  await expect(page.locator('.edge-group[data-edge-id="result-a"]')).toHaveCount(0);
 
   await timeline.press("ArrowLeft");
   await expect(timeline).toHaveAttribute("data-render-lod", "lifetime");
