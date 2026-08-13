@@ -64,3 +64,19 @@ Thus schema 2 reduced initial transfer by 99.4% versus identity and 95.6% versus
 heap by 93.7%. These are single-run engineering measurements rather than performance budgets. The
 full reports and a separately serveable package are under
 `~/temp/agent-timeline-schema2-measurement/`; no live archive files were changed.
+
+## Outer-zoom interaction measurement (2026-08-12)
+
+The 23-day, seven-team Hermit archive was measured again after combining coordinator and worker
+activity, selecting bins by an eight-pixel minimum, retaining aggregate mode through five minutes
+per pixel, and skipping invisible lifetime packing. At the fitted 1440×900 view, resolution changed
+from hourly to daily, rendered activity blocks fell from 1,509 to 49, and SVG nodes fell from 3,054
+to 135. Usable load time fell from 1,638.485 ms to 301.469 ms. Initial render time fell from 250.1
+ms to 53.3 ms; across the deterministic zoom/pan sequence, render p50 fell from 89.4 ms to 47.8 ms
+and p95 from 279.6 ms to 57.3 ms. Input-to-animation-frame p95 was 31.566 ms.
+
+The end-to-end initial transfer changed from 197,021,654 bytes to 1,140,452 bytes and initial CDP
+heap from 216,223,692 bytes to 12,233,132 bytes. Those two gains include the schema-2 lazy-delivery
+work above and must not be attributed solely to the outer-zoom rendering changes. The exact before
+and after reports are `qa/full-site-before-summary.json` and
+`qa/full-site-after-ui-fixes.json` in the durable Hermit export.
