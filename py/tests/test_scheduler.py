@@ -15,7 +15,11 @@ from safe_ci_dag_runner.model import (
     ResourceHint,
     Step,
 )
-from safe_ci_dag_runner.scheduler import run_dag, steps_violating_run_timeout
+from safe_ci_dag_runner.scheduler import (
+    _cpu_journal_fields,
+    run_dag,
+    steps_violating_run_timeout,
+)
 
 
 def _step(
@@ -44,6 +48,22 @@ def test_default_config_enables_small_forcing_caps() -> None:
     assert cfg.default_step_mem_cap_bytes == DEFAULT_SMALL_MEM_CAP_BYTES
     assert cfg.default_step_cpu_count == DEFAULT_SMALL_CPU_COUNT
     assert cfg.default_step_cpu_timeout == DEFAULT_SMALL_CPU_TIMEOUT
+
+
+def test_cpu_journal_fields_name_units_and_never_invent_zeroes() -> None:
+    assert _cpu_journal_fields(
+        {
+            "usage_usec": 259_926_893,
+            "nr_throttled": 994,
+            "throttled_usec": 431_942_000,
+        }
+    ) == [
+        ("cpu_usage_usec", "259926893"),
+        ("cpu_nr_throttled", "994"),
+        ("cpu_throttled_usec", "431942000"),
+    ]
+    assert _cpu_journal_fields(None) == []
+    assert _cpu_journal_fields({"usage_usec": 7}) == [("cpu_usage_usec", "7")]
 
 
 def test_simple_dag_all_pass_respects_deps() -> None:

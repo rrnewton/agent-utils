@@ -52,6 +52,28 @@ use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_column
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
 type ProfileRow = BTreeMap<String, String>;
 
+/// Final cgroup CPU counters for the durable step journal, with units named in the keys.
+///
+/// The counters were already captured before cgroup cleanup. Missing input or a missing kernel
+/// counter stays absent; it must not become a measured zero.
+fn cpu_journal_fields(cpu_stats: Option<&BTreeMap<String, i64>>) -> Vec<(&'static str, String)> {
+    let Some(cpu_stats) = cpu_stats else {
+        return Vec::new();
+    };
+    [
+        ("usage_usec", "cpu_usage_usec"),
+        ("nr_throttled", "cpu_nr_throttled"),
+        ("throttled_usec", "cpu_throttled_usec"),
+    ]
+    .into_iter()
+    .filter_map(|(source, journal_key)| {
+        cpu_stats
+            .get(source)
+            .map(|value| (journal_key, value.to_string()))
+    })
+    .collect()
+}
+
 /// Optional per-step cgroup manager shared (behind an `Arc`) across the run's supervisor threads.
 pub type BoxedCgroups = Option<Arc<dyn CgroupManager>>;
 
@@ -1839,26 +1861,32 @@ fn run_step(ctx: StepCtx) {
     // was this run doing" without needing the end-of-run profile rows that a hard kill destroys.
     if let Some(e) = &evidence {
         let counts = sink.counts();
-        e.record(
-            "step_end",
-            &[
-                ("step", tag.clone()),
-                ("ok", ok.to_string()),
-                ("aborted", was_aborted.to_string()),
-                ("timed_out", timed_out.to_string()),
-                ("cpu_timed_out", cpu_timed_out.to_string()),
-                ("elapsed_s", format!("{elapsed:.3}")),
-                ("tests_started", counts.started.to_string()),
-                ("tests_completed", counts.completed.to_string()),
-                (
-                    "culprit_test",
-                    culprit
-                        .as_ref()
-                        .and_then(|c| c.test.clone())
-                        .unwrap_or_default(),
-                ),
-            ],
-        );
+        let mut journal_fields = vec![
+            ("step", tag.clone()),
+            ("ok", ok.to_string()),
+            ("aborted", was_aborted.to_string()),
+            ("timed_out", timed_out.to_string()),
+            ("cpu_timed_out", cpu_timed_out.to_string()),
+            ("elapsed_s", format!("{elapsed:.3}")),
+            ("wall_elapsed_s", format!("{elapsed:.3}")),
+            ("tests_started", counts.started.to_string()),
+            ("tests_completed", counts.completed.to_string()),
+            (
+                "culprit_test",
+                culprit
+                    .as_ref()
+                    .and_then(|c| c.test.clone())
+                    .unwrap_or_default(),
+            ),
+        ];
+        if cpu_budget > 0 {
+            journal_fields.push(("cpu_limit_s", cpu_budget.to_string()));
+        }
+        if step.timeout > 0 {
+            journal_fields.push(("wall_limit_s", step.timeout.to_string()));
+        }
+        journal_fields.extend(cpu_journal_fields(cpu_stats.as_ref()));
+        e.record("step_end", &journal_fields);
     }
 }
 
@@ -2069,6 +2097,30 @@ pub fn run_dag_boxed_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_journal_fields_name_units_and_never_invent_zeroes() {
+        let stats = BTreeMap::from([
+            ("usage_usec".to_string(), 259_926_893),
+            ("nr_throttled".to_string(), 994),
+            ("throttled_usec".to_string(), 431_942_000),
+        ]);
+        assert_eq!(
+            cpu_journal_fields(Some(&stats)),
+            vec![
+                ("cpu_usage_usec", "259926893".to_string()),
+                ("cpu_nr_throttled", "994".to_string()),
+                ("cpu_throttled_usec", "431942000".to_string()),
+            ]
+        );
+        assert!(cpu_journal_fields(None).is_empty());
+
+        let incomplete = BTreeMap::from([("usage_usec".to_string(), 7)]);
+        assert_eq!(
+            cpu_journal_fields(Some(&incomplete)),
+            vec![("cpu_usage_usec", "7".to_string())]
+        );
+    }
 
     #[test]
     fn complete_capture_counts_tests_independently_of_console_verbosity() {

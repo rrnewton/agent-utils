@@ -90,6 +90,28 @@ def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
     return PsiReading(avg10=pressure["avg10"], avg60=pressure["avg60"])
 
 
+def _cpu_journal_fields(
+    cpu_stats: Mapping[str, int] | None,
+) -> list[tuple[str, str]]:
+    """Return final cgroup CPU counters with their units named in the keys.
+
+    The counters were already captured before cgroup cleanup. Missing input or
+    a missing kernel counter stays absent; it must not become a measured zero.
+    """
+    if cpu_stats is None:
+        return []
+    fields: list[tuple[str, str]] = []
+    for source, journal_key in (
+        ("usage_usec", "cpu_usage_usec"),
+        ("nr_throttled", "cpu_nr_throttled"),
+        ("throttled_usec", "cpu_throttled_usec"),
+    ):
+        value = cpu_stats.get(source)
+        if value is not None:
+            fields.append((journal_key, str(value)))
+    return fields
+
+
 class _NoopRunWindow:
     """A no-op :class:`RunWindow`: records nothing, returns ``None`` from ``finish``."""
 
@@ -859,19 +881,26 @@ class Runner:
 
         if self.evidence is not None:
             counts = sink.counts()
+            journal_fields = [
+                ("step", step.tag),
+                ("ok", str(ok).lower()),
+                ("aborted", str(outcome.aborted).lower()),
+                ("timed_out", str(timed_out).lower()),
+                ("cpu_timed_out", str(cpu_timed_out).lower()),
+                ("elapsed_s", f"{elapsed:.3f}"),
+                ("wall_elapsed_s", f"{elapsed:.3f}"),
+                ("tests_started", str(counts.started)),
+                ("tests_completed", str(counts.completed)),
+                ("culprit_test", culprit.test if culprit and culprit.test else ""),
+            ]
+            if cpu_budget > 0:
+                journal_fields.append(("cpu_limit_s", str(cpu_budget)))
+            if step.timeout > 0:
+                journal_fields.append(("wall_limit_s", str(step.timeout)))
+            journal_fields.extend(_cpu_journal_fields(cpu_stats))
             self.evidence.record(
                 "step_end",
-                [
-                    ("step", step.tag),
-                    ("ok", str(ok).lower()),
-                    ("aborted", str(outcome.aborted).lower()),
-                    ("timed_out", str(timed_out).lower()),
-                    ("cpu_timed_out", str(cpu_timed_out).lower()),
-                    ("elapsed_s", f"{elapsed:.3f}"),
-                    ("tests_started", str(counts.started)),
-                    ("tests_completed", str(counts.completed)),
-                    ("culprit_test", culprit.test if culprit and culprit.test else ""),
-                ],
+                journal_fields,
             )
 
     def result(self) -> RunResult:
