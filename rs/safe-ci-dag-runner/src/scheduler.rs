@@ -1160,6 +1160,7 @@ struct TerminationBoundary<'a> {
     event: &'a str,
     limit_s: i64,
     elapsed_s: f64,
+    cpu_stats: Option<BTreeMap<String, i64>>,
 }
 
 fn capture_termination_evidence(
@@ -1170,6 +1171,27 @@ fn capture_termination_evidence(
     nonce: &str,
     boundary: TerminationBoundary<'_>,
 ) -> Culprit {
+    let mut cpu_fields = Vec::new();
+    if let Some(stats) = &boundary.cpu_stats {
+        let usage_usec = stats.get("usage_usec").copied().unwrap_or(0);
+        let user_usec = stats.get("user_usec").copied().unwrap_or(0);
+        let system_usec = stats.get("system_usec").copied().unwrap_or(0);
+        cpu_fields.extend([
+            (
+                "cpu_used_s",
+                format!("{:.6}", usage_usec as f64 / 1_000_000.0),
+            ),
+            ("cpu_usage_usec", usage_usec.to_string()),
+            ("cpu_user_usec", user_usec.to_string()),
+            ("cpu_system_usec", system_usec.to_string()),
+        ]);
+        emit(&format!(
+            "[{tag}] ↳ step cgroup CPU at termination: usage={:.6}s user={:.6}s system={:.6}s",
+            usage_usec as f64 / 1_000_000.0,
+            user_usec as f64 / 1_000_000.0,
+            system_usec as f64 / 1_000_000.0,
+        ));
+    }
     let observations = process_snapshot(pid, Some(nonce));
     for row in &observations {
         emit(&format!(
@@ -1204,27 +1226,26 @@ fn capture_termination_evidence(
     }
     let culprit = bind_process_tests(sink.culprit(), &observations);
     if let Some(e) = evidence {
-        e.record(
-            boundary.event,
-            &[
-                ("step", tag.to_string()),
-                ("elapsed_s", format!("{:.3}", boundary.elapsed_s)),
-                ("limit_s", boundary.limit_s.to_string()),
-                ("culprit_test", culprit.test.clone().unwrap_or_default()),
-                ("culprit_basis", culprit.how.to_string()),
-                ("tests_completed", culprit.completed.to_string()),
-                ("in_flight_count", culprit.in_flight.len().to_string()),
-                (
-                    "in_flight_tests",
-                    culprit
-                        .in_flight
-                        .iter()
-                        .map(|test| format!("{}@{:.3}s", test.name, test.elapsed_s))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-            ],
-        );
+        let mut fields = vec![
+            ("step", tag.to_string()),
+            ("elapsed_s", format!("{:.3}", boundary.elapsed_s)),
+            ("limit_s", boundary.limit_s.to_string()),
+            ("culprit_test", culprit.test.clone().unwrap_or_default()),
+            ("culprit_basis", culprit.how.to_string()),
+            ("tests_completed", culprit.completed.to_string()),
+            ("in_flight_count", culprit.in_flight.len().to_string()),
+            (
+                "in_flight_tests",
+                culprit
+                    .in_flight
+                    .iter()
+                    .map(|test| format!("{}@{:.3}s", test.name, test.elapsed_s))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+        fields.extend(cpu_fields);
+        e.record(boundary.event, &fields);
     }
     culprit
 }
@@ -1513,6 +1534,7 @@ fn run_step(ctx: StepCtx) {
                                         event: "cpu_timeout",
                                         limit_s: cpu_timeout,
                                         elapsed_s: mstart.elapsed().as_secs_f64(),
+                                        cpu_stats: Some(cs),
                                     },
                                 );
                                 if let Ok(mut slot) = mculprit.lock() {
@@ -1550,6 +1572,7 @@ fn run_step(ctx: StepCtx) {
                             event: "step_timeout",
                             limit_s: step.timeout,
                             elapsed_s: start.elapsed().as_secs_f64(),
+                            cpu_stats: cgroups.as_ref().and_then(|c| c.cpu_stats(&tag)),
                         },
                     );
                     if let Ok(mut slot) = termination_culprit.lock() {
