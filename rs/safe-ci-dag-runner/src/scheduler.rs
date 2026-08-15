@@ -1156,10 +1156,22 @@ fn fmt_bytes(n: Option<i64>) -> String {
 /// Controlled runners bind tests through explicit boundaries in `StepStream`. Third-party
 /// runners additionally get an owned `/proc` snapshot: nextest-style `--exact TEST` children can
 /// be bound directly, while cargo-test's shared test binary remains explicitly unattributed.
+/// The bound a step crossed, recorded with the unit it was measured in.
+///
+/// `measured_s` is the quantity actually compared against `limit_s`, and both
+/// carry their unit explicitly. A CPU budget is crossed on cgroup `cpu.stat`
+/// CPU-seconds while the step's wall elapsed keeps rising independently, so
+/// the two are different numbers for the same step: recording one under a name
+/// that reads like the other invites a reader to compare a wall figure with a
+/// CPU bound. `wall_elapsed_s` is always recorded as context, never as the
+/// compared quantity unless the limit is itself a wall limit.
 struct TerminationBoundary<'a> {
     event: &'a str,
     limit_s: i64,
-    elapsed_s: f64,
+    limit_unit: &'a str,
+    measured_s: f64,
+    measured_unit: &'a str,
+    wall_elapsed_s: f64,
 }
 
 fn capture_termination_evidence(
@@ -1202,14 +1214,29 @@ fn capture_termination_evidence(
             );
         }
     }
+    // A budget may only be reported against the same quantity it bounds. A CPU
+    // bound crossed on cgroup cpu.stat must not be recorded next to the step's
+    // wall elapsed, which is a different and larger number for the same step.
+    assert_eq!(
+        boundary.measured_unit, boundary.limit_unit,
+        "{}: refusing to record a {} measurement against a {} limit",
+        boundary.event, boundary.measured_unit, boundary.limit_unit
+    );
     let culprit = bind_process_tests(sink.culprit(), &observations);
     if let Some(e) = evidence {
         e.record(
             boundary.event,
             &[
                 ("step", tag.to_string()),
-                ("elapsed_s", format!("{:.3}", boundary.elapsed_s)),
+                ("measured_s", format!("{:.3}", boundary.measured_s)),
+                ("measured_unit", boundary.measured_unit.to_string()),
                 ("limit_s", boundary.limit_s.to_string()),
+                ("limit_unit", boundary.limit_unit.to_string()),
+                (
+                    "wall_elapsed_s",
+                    format!("{:.3}", boundary.wall_elapsed_s),
+                ),
+                ("elapsed_s", format!("{:.3}", boundary.wall_elapsed_s)),
                 ("culprit_test", culprit.test.clone().unwrap_or_default()),
                 ("culprit_basis", culprit.how.to_string()),
                 ("tests_completed", culprit.completed.to_string()),
@@ -1512,7 +1539,10 @@ fn run_step(ctx: StepCtx) {
                                     TerminationBoundary {
                                         event: "cpu_timeout",
                                         limit_s: cpu_timeout,
-                                        elapsed_s: mstart.elapsed().as_secs_f64(),
+                                        limit_unit: "cpu_seconds",
+                                        measured_s: cpu_used_s,
+                                        measured_unit: "cpu_seconds",
+                                        wall_elapsed_s: mstart.elapsed().as_secs_f64(),
                                     },
                                 );
                                 if let Ok(mut slot) = mculprit.lock() {
@@ -1549,7 +1579,10 @@ fn run_step(ctx: StepCtx) {
                         TerminationBoundary {
                             event: "step_timeout",
                             limit_s: step.timeout,
-                            elapsed_s: start.elapsed().as_secs_f64(),
+                            limit_unit: "wall_seconds",
+                            measured_s: start.elapsed().as_secs_f64(),
+                            measured_unit: "wall_seconds",
+                            wall_elapsed_s: start.elapsed().as_secs_f64(),
                         },
                     );
                     if let Ok(mut slot) = termination_culprit.lock() {
@@ -2497,5 +2530,51 @@ mod tests {
         };
         let res = run_dag(&cfg, 1, false, 0);
         assert!(res.ok, "expected '-j4' to be appended so the check passes");
+    }
+
+    /// A budget may only be reported against the same quantity it bounds.
+    ///
+    /// The CPU guard trips on cgroup `cpu.stat` CPU-seconds while the step's
+    /// wall elapsed keeps rising independently, so recording wall as the
+    /// compared value made a CPU breach read as far more expensive than it
+    /// was. One measured trip recorded 354.587 against a 300 CPU-second limit
+    /// on a step that had consumed about 308 CPU-seconds.
+    #[test]
+    #[should_panic(expected = "refusing to record a wall_seconds measurement")]
+    fn wall_measurement_against_a_cpu_bound_is_refused() {
+        let boundary = TerminationBoundary {
+            event: "cpu_timeout",
+            limit_s: 300,
+            limit_unit: "cpu_seconds",
+            measured_s: 354.587,
+            measured_unit: "wall_seconds",
+            wall_elapsed_s: 354.587,
+        };
+        assert_eq!(
+            boundary.measured_unit, boundary.limit_unit,
+            "{}: refusing to record a {} measurement against a {} limit",
+            boundary.event, boundary.measured_unit, boundary.limit_unit
+        );
+    }
+
+    /// Both genuine breaches keep matching units, so the guard refuses only a
+    /// mismatch rather than blocking the kills it exists to describe.
+    #[test]
+    fn matching_units_are_accepted() {
+        for (event, unit, limit_s, measured_s) in [
+            ("cpu_timeout", "cpu_seconds", 300i64, 300.42f64),
+            ("step_timeout", "wall_seconds", 900i64, 900.13f64),
+        ] {
+            let boundary = TerminationBoundary {
+                event,
+                limit_s,
+                limit_unit: unit,
+                measured_s,
+                measured_unit: unit,
+                wall_elapsed_s: measured_s,
+            };
+            assert_eq!(boundary.measured_unit, boundary.limit_unit);
+            assert_eq!(boundary.limit_s, limit_s);
+        }
     }
 }

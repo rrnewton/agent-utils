@@ -326,9 +326,28 @@ class Runner:
         nonce: str,
         event: str,
         limit_s: int,
-        elapsed_s: float,
+        limit_unit: str,
+        measured_s: float,
+        measured_unit: str,
+        wall_elapsed_s: float,
     ) -> Culprit:
-        """Persist test/process state before SIGTERM starts the graceful-kill window."""
+        """Persist test/process state before SIGTERM starts the graceful-kill window.
+
+        ``measured_s`` is the quantity that was actually compared against
+        ``limit_s``, and both carry their unit explicitly. A CPU budget is
+        crossed on cgroup ``cpu.stat`` CPU-seconds while the step's wall
+        elapsed keeps rising independently, so the two are different numbers
+        for the same step: recording one under a name that reads like the
+        other invites a reader to compare a wall figure with a CPU bound.
+        ``wall_elapsed_s`` is always recorded alongside as context, never as
+        the compared quantity unless the limit is itself a wall limit.
+        """
+        if measured_unit != limit_unit:
+            raise ValueError(
+                f"{event}: refusing to record a {measured_unit} measurement against a "
+                f"{limit_unit} limit; a budget may only be reported against the same "
+                "quantity it bounds"
+            )
         observations = process_snapshot(proc.pid, nonce)
         for row in observations:
             self._emit(
@@ -359,8 +378,12 @@ class Runner:
                 event,
                 [
                     ("step", step.tag),
-                    ("elapsed_s", f"{elapsed_s:.3f}"),
+                    ("measured_s", f"{measured_s:.3f}"),
+                    ("measured_unit", measured_unit),
                     ("limit_s", str(limit_s)),
+                    ("limit_unit", limit_unit),
+                    ("wall_elapsed_s", f"{wall_elapsed_s:.3f}"),
+                    ("elapsed_s", f"{wall_elapsed_s:.3f}"),
                     ("culprit_test", culprit.test or ""),
                     ("culprit_basis", culprit.how),
                     ("tests_completed", str(culprit.completed)),
@@ -637,7 +660,10 @@ class Runner:
                                 nonce=nonce,
                                 event="cpu_timeout",
                                 limit_s=cpu_budget,
-                                elapsed_s=time.time() - start,
+                                limit_unit="cpu_seconds",
+                                measured_s=cpu_used_s,
+                                measured_unit="cpu_seconds",
+                                wall_elapsed_s=time.time() - start,
                             )
                             reap(proc, self.cgroups, step.tag, nonce=nonce)
                             return
@@ -659,7 +685,10 @@ class Runner:
                 nonce=nonce,
                 event="step_timeout",
                 limit_s=step.timeout,
-                elapsed_s=time.time() - start,
+                limit_unit="wall_seconds",
+                measured_s=time.time() - start,
+                measured_unit="wall_seconds",
+                wall_elapsed_s=time.time() - start,
             )
             reap(proc, self.cgroups, step.tag, nonce=nonce)
             try:
