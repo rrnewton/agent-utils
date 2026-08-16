@@ -7,7 +7,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from agent_team_timeline.archive import (
@@ -101,6 +101,16 @@ class PromptAuthorshipRule:
     def matches(self, record: dict[str, JsonValue]) -> bool:
         """Return whether this rule selects one prompt occurrence."""
 
+        if not self.matches_scope(record):
+            return False
+        if not self.source_native_ids:
+            return True
+        native_id = record.get("source_native_id")
+        return isinstance(native_id, str) and native_id in self.source_native_ids
+
+    def matches_scope(self, record: dict[str, JsonValue]) -> bool:
+        """Return whether every selector except source-native provenance matches."""
+
         if record.get("team_slug") != self.team_slug:
             return False
         if record.get("ingress_kind") != self.ingress_kind:
@@ -110,10 +120,7 @@ class PromptAuthorshipRule:
             return False
         if self.end_ms is not None and timestamp_ms >= self.end_ms:
             return False
-        if not self.source_native_ids:
-            return True
-        native_id = record.get("source_native_id")
-        return isinstance(native_id, str) and native_id in self.source_native_ids
+        return True
 
 
 @dataclass(frozen=True)
@@ -153,6 +160,14 @@ class _GroupedEvent:
     @property
     def first(self) -> Event:
         return self.events[0]
+
+
+@dataclass(frozen=True)
+class _AuthorshipMigration:
+    """Prior explicit rule evidence retained across a provenance-only migration."""
+
+    rule_id: str
+    source_native_ids: tuple[str, ...]
 
 
 def _sha256_text(text: str) -> str:
@@ -505,11 +520,16 @@ def _load_rules(path: Path) -> tuple[PromptAuthorshipRule, ...]:
 def _apply_authorship_rules(
     records: Sequence[dict[str, JsonValue]],
     rules: Sequence[PromptAuthorshipRule],
+    migrated_authorship: Mapping[str, _AuthorshipMigration] | None = None,
 ) -> dict[str, int]:
     applied = {rule.rule_id: 0 for rule in rules}
+    rules_by_id = {rule.rule_id: rule for rule in rules}
+    migrations = migrated_authorship or {}
     for record in records:
         if record.get("record_type") != "prompt":
             continue
+        record_id = as_string(record.get("record_id"), "prompt.record_id")
+        migrated = migrations.get(record_id)
         current_kind = record.get("source_author_kind", record.get("author_kind"))
         source_kind = current_kind if isinstance(current_kind, str) else None
         source_version = record.get(
@@ -524,6 +544,15 @@ def _apply_authorship_rules(
         if source_kind not in _UNCLASSIFIED_AUTHOR_KINDS:
             continue
         matches = [rule for rule in rules if rule.matches(record)]
+        if not matches and migrated is not None:
+            prior_rule = rules_by_id.get(migrated.rule_id)
+            if prior_rule is not None:
+                for prior_native_id in migrated.source_native_ids:
+                    prior_record = dict(record)
+                    prior_record["source_native_id"] = prior_native_id
+                    if prior_rule.matches(prior_record):
+                        matches = [prior_rule]
+                        break
         if len(matches) > 1:
             raise ValueError(
                 "multiple prompt authorship rules matched record "
@@ -580,6 +609,27 @@ def _source_occurrence_id(record: dict[str, JsonValue]) -> str:
     )
 
 
+def _provenance_migration_id(record: dict[str, JsonValue]) -> str:
+    """Return the identity that is stable across a provider provenance overlay."""
+
+    source_event_ids = tuple(
+        as_string(value, "record.source_event_ids[]")
+        for value in as_array(record.get("source_event_ids"), "record.source_event_ids")
+    )
+    return _stable_id(
+        "provenance-migration",
+        (
+            as_string(record.get("team_slug"), "record.team_slug"),
+            as_string(record.get("provider"), "record.provider"),
+            as_string(record.get("thread_id"), "record.thread_id"),
+            as_string(record.get("source_path"), "record.source_path"),
+            str(as_int(record.get("timestamp_ms"), "record.timestamp_ms")),
+            as_string(record.get("content_sha256"), "record.content_sha256"),
+            *source_event_ids,
+        ),
+    )
+
+
 def _reclassification_projection(
     record: dict[str, JsonValue],
 ) -> dict[str, JsonValue]:
@@ -591,37 +641,172 @@ def _reclassification_projection(
     return projected
 
 
+def _source_native_id_history(
+    record: dict[str, JsonValue],
+) -> tuple[str, ...]:
+    """Return validated prior native IDs retained by a provenance migration."""
+
+    raw = record.get("source_native_id_history")
+    if raw is None:
+        return ()
+    values = tuple(
+        as_string(value, "record.source_native_id_history[]")
+        for value in as_array(raw, "record.source_native_id_history")
+    )
+    if len(set(values)) != len(values):
+        raise ValueError("record.source_native_id_history contains duplicates")
+    return values
+
+
+def _provenance_migration_projection(
+    record: dict[str, JsonValue],
+) -> dict[str, JsonValue]:
+    """Return fields that cannot change when only source provenance improves."""
+
+    projected = _immutable_projection(record)
+    for key in (
+        "record_id",
+        "logical_record_id",
+        "source_native_id",
+        "source_native_id_history",
+        "source_line",
+    ):
+        projected.pop(key, None)
+    return projected
+
+
+def _preserve_occurrence_identity(
+    record: dict[str, JsonValue], candidate: dict[str, JsonValue]
+) -> tuple[str, str, _AuthorshipMigration | None]:
+    """Retain durable occurrence/logical IDs while adopting current source fields."""
+
+    incoming_id = as_string(record.get("record_id"), "new record.record_id")
+    previous_id = as_string(candidate.get("record_id"), "old record.record_id")
+    record["record_id"] = previous_id
+    record["logical_record_id"] = as_string(
+        candidate.get("logical_record_id"), "old record.logical_record_id"
+    )
+    prior_native_ids = set(_source_native_id_history(candidate))
+    prior_native_id = candidate.get("source_native_id")
+    current_native_id = record.get("source_native_id")
+    if (
+        isinstance(prior_native_id, str)
+        and prior_native_id != current_native_id
+    ):
+        prior_native_ids.add(prior_native_id)
+    if isinstance(current_native_id, str):
+        prior_native_ids.discard(current_native_id)
+    if prior_native_ids:
+        record["source_native_id_history"] = list(sorted(prior_native_ids))
+    else:
+        record.pop("source_native_id_history", None)
+    prior_rule_id = candidate.get("authorship_rule_id")
+    migration: _AuthorshipMigration | None = None
+    if isinstance(prior_rule_id, str):
+        migration = _AuthorshipMigration(
+            prior_rule_id,
+            tuple(sorted(prior_native_ids)),
+        )
+    return incoming_id, previous_id, migration
+
+
 def _monotonic_union(
     old: list[dict[str, JsonValue]], new: list[dict[str, JsonValue]]
-) -> tuple[list[dict[str, JsonValue]], int, int]:
+) -> tuple[
+    list[dict[str, JsonValue]],
+    int,
+    int,
+    dict[str, _AuthorshipMigration],
+]:
     merged: dict[str, dict[str, JsonValue]] = {}
     old_by_source: dict[str, list[dict[str, JsonValue]]] = {}
+    old_by_migration: dict[str, list[dict[str, JsonValue]]] = {}
     for record in old:
         record_id = as_string(record.get("record_id"), "old record.record_id")
         if record_id in merged:
             raise ValueError(f"duplicate existing transcript record {record_id!r}")
         merged[record_id] = record
         old_by_source.setdefault(_source_occurrence_id(record), []).append(record)
-    new_ids: set[str] = set()
+        old_by_migration.setdefault(_provenance_migration_id(record), []).append(
+            record
+        )
+    incoming_ids: set[str] = set()
+    effective_new_ids: set[str] = set()
     new_source_ids: set[str] = set()
+    new_migration_ids: set[str] = set()
+    record_id_rewrites: dict[str, str] = {}
+    migrated_authorship: dict[str, _AuthorshipMigration] = {}
     reclassified = 0
-    for record in new:
+    for incoming in new:
+        record = dict(incoming)
+        linked_prompt = record.get("in_reply_to_prompt_id")
+        if isinstance(linked_prompt, str):
+            record["in_reply_to_prompt_id"] = record_id_rewrites.get(
+                linked_prompt, linked_prompt
+            )
         record_id = as_string(record.get("record_id"), "new record.record_id")
-        if record_id in new_ids:
+        if record_id in incoming_ids:
             raise ValueError(f"duplicate new transcript record {record_id!r}")
-        new_ids.add(record_id)
+        incoming_ids.add(record_id)
         source_id = _source_occurrence_id(record)
         if source_id in new_source_ids:
             raise ValueError(
                 f"duplicate new transcript source occurrence {source_id!r}"
             )
         new_source_ids.add(source_id)
-        for previous_class in old_by_source.get(source_id, ()):
+        migration_id = _provenance_migration_id(record)
+        if migration_id in new_migration_ids:
+            raise ValueError(
+                f"duplicate new transcript migration occurrence {migration_id!r}"
+            )
+        new_migration_ids.add(migration_id)
+        previous = merged.get(record_id)
+        if previous is not None:
+            if _immutable_projection(previous) != _immutable_projection(record):
+                raise ValueError(
+                    f"immutable transcript occurrence changed for {record_id!r}"
+                )
+            merged[record_id] = record
+            effective_new_ids.add(record_id)
+            continue
+
+        active_source_classes = [
+            candidate
+            for candidate in old_by_source.get(source_id, ())
+            if as_string(candidate.get("record_id"), "old record.record_id") in merged
+        ]
+        same_class = [
+            candidate
+            for candidate in active_source_classes
+            if candidate.get("record_type") == record.get("record_type")
+        ]
+        if len(same_class) > 1 or (same_class and len(active_source_classes) > 1):
+            raise ValueError(
+                f"ambiguous stable transcript identity for {source_id!r}"
+            )
+        if same_class:
+            candidate = same_class[0]
+            if _provenance_migration_projection(
+                candidate
+            ) != _provenance_migration_projection(record):
+                raise ValueError(
+                    "immutable transcript occurrence changed while retaining its "
+                    f"stable identity for {source_id!r}"
+                )
+            incoming_id, previous_id, authorship = _preserve_occurrence_identity(
+                record, candidate
+            )
+            if authorship is not None:
+                migrated_authorship[previous_id] = authorship
+            merged[previous_id] = record
+            effective_new_ids.add(previous_id)
+            record_id_rewrites[incoming_id] = previous_id
+            continue
+
+        for previous_class in active_source_classes:
             previous_id = as_string(
                 previous_class.get("record_id"), "old record.record_id"
             )
-            if previous_id == record_id:
-                continue
             if _reclassification_projection(
                 previous_class
             ) != _reclassification_projection(record):
@@ -631,16 +816,49 @@ def _monotonic_union(
                 )
             del merged[previous_id]
             reclassified += 1
-        previous = merged.get(record_id)
-        if previous is not None and _immutable_projection(previous) != _immutable_projection(
-            record
-        ):
+        if active_source_classes:
+            merged[record_id] = record
+            effective_new_ids.add(record_id)
+            continue
+
+        migration_candidates = [
+            candidate
+            for candidate in old_by_migration.get(migration_id, ())
+            if as_string(candidate.get("record_id"), "old record.record_id") in merged
+        ]
+        if len(migration_candidates) > 1:
             raise ValueError(
-                f"immutable transcript occurrence changed for {record_id!r}"
+                "ambiguous transcript provenance migration for "
+                f"{migration_id!r}"
             )
+        if migration_candidates:
+            candidate = migration_candidates[0]
+            if _provenance_migration_projection(
+                candidate
+            ) != _provenance_migration_projection(record):
+                raise ValueError(
+                    "immutable transcript occurrence changed during provenance "
+                    f"migration for {migration_id!r}"
+                )
+            incoming_id, previous_id, authorship = _preserve_occurrence_identity(
+                record, candidate
+            )
+            if authorship is not None:
+                migrated_authorship[previous_id] = authorship
+            merged[previous_id] = record
+            effective_new_ids.add(previous_id)
+            record_id_rewrites[incoming_id] = previous_id
+            continue
+
         merged[record_id] = record
-    carried = len(set(merged) - new_ids)
-    return sorted(merged.values(), key=_record_sort_key), carried, reclassified
+        effective_new_ids.add(record_id)
+    carried = len(set(merged) - effective_new_ids)
+    return (
+        sorted(merged.values(), key=_record_sort_key),
+        carried,
+        reclassified,
+        migrated_authorship,
+    )
 
 
 def _logical_records(
@@ -790,10 +1008,12 @@ def export_transcripts(
     ]
 
     current_occurrences = [*current_prompts, *current_responses, *current_system]
-    occurrences, carried, reclassified = _monotonic_union(
+    occurrences, carried, reclassified, migrated_authorship = _monotonic_union(
         _load_jsonl(root / "occurrences.jsonl"), current_occurrences
     )
-    rule_counts = _apply_authorship_rules(occurrences, rules)
+    rule_counts = _apply_authorship_rules(
+        occurrences, rules, migrated_authorship
+    )
     prompts = _logical_records(occurrences, "prompt")
     for index, prompt in enumerate(prompts, 1):
         prompt["ordinal"] = index

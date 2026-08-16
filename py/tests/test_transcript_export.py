@@ -229,6 +229,194 @@ def test_missing_source_occurrence_still_retains_its_last_message_class(
     assert retained.reclassified == 0
 
 
+def test_provenance_overlay_migrates_occurrence_without_duplicates_or_id_churn(
+    tmp_path: Path,
+) -> None:
+    legacy_prompt = replace(
+        _event("stable-prompt", "turn", 200, "user_prompt", "Resume Hermit", 10),
+        source_native_id="legacy-message",
+        ingress_kind="submitted_web",
+        author_kind="external_or_unknown",
+    )
+    legacy_response = replace(
+        _event("stable-response", "turn", 250, "assistant_message", "Resumed", 11),
+        source_native_id="legacy-response",
+    )
+    legacy_team = replace(
+        _team((legacy_prompt, legacy_response)), provider="orc"
+    )
+    rule = PromptAuthorshipRule(
+        "legacy-owner",
+        "alpha",
+        "submitted_web",
+        "owner_human",
+        "The audited legacy message was submitted by the owner.",
+        source_native_ids=("legacy-message",),
+    )
+
+    export_transcripts(tmp_path, (legacy_team,), (rule,))
+    root = tmp_path / "extracted" / "transcripts"
+    before_occurrences = _jsonl(root / "occurrences.jsonl")
+    before_by_type = {
+        str(record["record_type"]): record for record in before_occurrences
+    }
+    before_prompt = _jsonl(root / "prompts.jsonl")[0]
+
+    modern_prompt = replace(
+        legacy_prompt,
+        source_native_id="4b37d53f-modern-prompt",
+        source_line=101,
+    )
+    modern_response = replace(
+        legacy_response,
+        source_native_id="3cbe2d0f-modern-response",
+        source_line=102,
+    )
+    modern_team = replace(
+        legacy_team, events=(modern_prompt, modern_response)
+    )
+    migrated = export_transcripts(tmp_path, (modern_team,))
+
+    assert migrated.prompts == 1
+    assert migrated.responses == 1
+    assert migrated.carried_forward == 0
+    assert migrated.reclassified == 0
+    occurrences = _jsonl(root / "occurrences.jsonl")
+    assert len(occurrences) == 2
+    by_type = {str(record["record_type"]): record for record in occurrences}
+    assert by_type["prompt"]["record_id"] == before_by_type["prompt"]["record_id"]
+    assert by_type["prompt"]["logical_record_id"] == before_by_type["prompt"][
+        "logical_record_id"
+    ]
+    assert by_type["response"]["record_id"] == before_by_type["response"][
+        "record_id"
+    ]
+    assert by_type["prompt"]["source_native_id"] == "4b37d53f-modern-prompt"
+    assert by_type["prompt"]["source_line"] == 101
+    assert by_type["response"]["source_native_id"] == (
+        "3cbe2d0f-modern-response"
+    )
+    assert by_type["response"]["source_line"] == 102
+    assert by_type["response"]["in_reply_to_prompt_id"] == by_type["prompt"][
+        "record_id"
+    ]
+    prompt = _jsonl(root / "prompts.jsonl")[0]
+    assert prompt["record_id"] == before_prompt["record_id"]
+    assert prompt["authorship_rule_id"] == "legacy-owner"
+    assert prompt["author_kind"] == "owner_human"
+    assert prompt["source_native_id_history"] == ["legacy-message"]
+    response = next(
+        record
+        for record in _jsonl(root / "messages.jsonl")
+        if record["record_type"] == "response"
+    )
+    assert response["in_reply_to_prompt_id"] == prompt["record_id"]
+    assert export_transcripts(tmp_path, (modern_team,)).files_changed == 0
+
+
+def test_provenance_overlay_rejects_other_immutable_changes(
+    tmp_path: Path,
+) -> None:
+    legacy = replace(
+        _event("stable-prompt", "turn-old", 200, "user_prompt", "Resume", 10),
+        source_native_id="legacy-message",
+    )
+    team = replace(_team((legacy,)), provider="orc")
+    export_transcripts(tmp_path, (team,))
+    occurrences = (
+        tmp_path / "extracted" / "transcripts" / "occurrences.jsonl"
+    )
+    before = occurrences.read_bytes()
+
+    adversarial = replace(
+        legacy,
+        turn_id="turn-changed",
+        source_native_id="modern-message",
+        source_line=101,
+    )
+    with pytest.raises(
+        ValueError, match="immutable transcript occurrence changed during provenance"
+    ):
+        export_transcripts(
+            tmp_path, (replace(team, events=(adversarial,)),)
+        )
+    assert occurrences.read_bytes() == before
+
+
+def test_provenance_overlay_stops_rule_when_native_selector_changes(
+    tmp_path: Path,
+) -> None:
+    legacy = replace(
+        _event("stable-prompt", "turn", 200, "user_prompt", "Resume", 10),
+        source_native_id="legacy-message",
+        ingress_kind="submitted_web",
+        author_kind="external_or_unknown",
+    )
+    modern = replace(
+        legacy, source_native_id="modern-message", source_line=101
+    )
+    team = replace(_team((legacy,)), provider="orc")
+    rule = PromptAuthorshipRule(
+        "legacy-owner",
+        "alpha",
+        "submitted_web",
+        "owner_human",
+        "The audited legacy message was submitted by the owner.",
+        source_native_ids=("legacy-message",),
+    )
+    export_transcripts(tmp_path, (team,), (rule,))
+    export_transcripts(
+        tmp_path, (replace(team, events=(modern,)),), (rule,)
+    )
+
+    changed_rule = replace(rule, source_native_ids=("different-message",))
+    export_transcripts(
+        tmp_path, (replace(team, events=(modern,)),), (changed_rule,)
+    )
+
+    prompt = _jsonl(
+        tmp_path / "extracted" / "transcripts" / "prompts.jsonl"
+    )[0]
+    assert prompt["source_native_id"] == "modern-message"
+    assert prompt["source_native_id_history"] == ["legacy-message"]
+    assert prompt["author_kind"] == "external_or_unknown"
+    assert "authorship_rule_id" not in prompt
+
+
+def test_provenance_overlay_stops_rule_when_rule_is_removed(
+    tmp_path: Path,
+) -> None:
+    legacy = replace(
+        _event("stable-prompt", "turn", 200, "user_prompt", "Resume", 10),
+        source_native_id="legacy-message",
+        ingress_kind="submitted_web",
+        author_kind="external_or_unknown",
+    )
+    modern = replace(
+        legacy, source_native_id="modern-message", source_line=101
+    )
+    team = replace(_team((legacy,)), provider="orc")
+    rule = PromptAuthorshipRule(
+        "legacy-owner",
+        "alpha",
+        "submitted_web",
+        "owner_human",
+        "The audited legacy message was submitted by the owner.",
+        source_native_ids=("legacy-message",),
+    )
+    export_transcripts(tmp_path, (team,), (rule,))
+    modern_team = replace(team, events=(modern,))
+    export_transcripts(tmp_path, (modern_team,), (rule,))
+
+    export_transcripts(tmp_path, (modern_team,), ())
+
+    prompt = _jsonl(
+        tmp_path / "extracted" / "transcripts" / "prompts.jsonl"
+    )[0]
+    assert prompt["author_kind"] == "external_or_unknown"
+    assert "authorship_rule_id" not in prompt
+
+
 def test_authorship_rules_are_auditable_persisted_and_reclassifiable(
     tmp_path: Path,
 ) -> None:
