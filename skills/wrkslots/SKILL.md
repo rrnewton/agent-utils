@@ -48,10 +48,20 @@ liveness rc 0, a dead owner process generation, and independent absence checks f
 file descriptors, memory maps, mount references, and the recorded cgroup. rc 1, rc 2, a live or
 indeterminate owner, or any unreadable proof preserves every row and path.
 
+Before physical deletion, removal atomically moves the canonical slot path to the exact fenced path
+recorded in the recovery journal. It then repairs the Git worktree registrations and repeats the
+complete process-use proof against the moved path. A process that entered before the move follows
+the moved directory and causes refusal; a later canonical-path entry cannot open the absent path.
+When that post-move proof refuses before any checkout was removed, wrkslots restores the canonical
+path and Git registrations.
+
 Use `adopt` only to bind an unbound live owner from that owner's real process ancestry. It never
 replaces a bound historical owner. If a legacy owner never bound and is independently verified
 absent, the recorded coordinator uses `recover-unbound-owner`; this preserves `owner: null`, records
 the recovery note and validation evidence, and prepares the same post-exit removal path.
 
-Use `recover --coordinator-pid PID` whenever a create or removal journal exists. Preserve every path
-after a refusal and report the exact message. Run `worktrees/wrkslots --help` for the complete CLI.
+Use `recover --coordinator-pid PID` whenever a create or removal journal exists. Recovery accepts the
+exact active-plus-archived overlap produced when a crash lands the archive before deleting the active
+row, verifies that both rows exactly match the journal after JSON normalization, and completes
+the active-row deletion. Any unrelated or mismatched overlap still refuses. Preserve every path after
+a refusal and report the exact message. Run `worktrees/wrkslots --help` for the complete CLI.
