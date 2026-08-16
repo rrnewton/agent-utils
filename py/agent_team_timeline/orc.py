@@ -673,6 +673,8 @@ class OrcContinuationSpec:
     start_message_id: str | None = None
 
     def to_json_obj(self) -> dict[str, object]:
+        """Return the strict project-config representation of this continuation."""
+
         return {
             "session_id": self.session_id,
             "start_message_id": self.start_message_id,
@@ -682,6 +684,8 @@ class OrcContinuationSpec:
     def from_json_obj(
         cls, raw: Mapping[str, object], where: str
     ) -> OrcContinuationSpec:
+        """Decode one strict bounded-continuation configuration object."""
+
         _require_exact_keys(raw, {"session_id", "start_message_id"}, where)
         session_id = _safe_component(
             _required_string(raw.get("session_id"), f"{where}.session_id"),
@@ -694,7 +698,7 @@ class OrcContinuationSpec:
 
     @classmethod
     def from_value(cls, raw: object, where: str) -> OrcContinuationSpec:
-        """Normalize the legacy whole-root string or the bounded object form."""
+        """Normalize a whole-root string or bounded continuation object."""
 
         if isinstance(raw, cls):
             return cls.from_json_obj(raw.to_json_obj(), where)
@@ -2323,7 +2327,7 @@ def _bootstrap_frozen_task_projection(
     source: OrcSourceCopy,
     source_path: Path,
 ) -> tuple[_FrozenTaskNote, ...]:
-    """Load v3 history or losslessly upgrade one immutable legacy snapshot."""
+    """Load v3 history or losslessly upgrade one older immutable snapshot."""
 
     if source.task_projection is not None and (
         source.task_projection.policy == _TASK_HISTORY_POLICY
