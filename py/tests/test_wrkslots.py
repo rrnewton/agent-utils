@@ -557,6 +557,154 @@ def test_crash_after_git_removal_before_journal_update_recovers(tmp_path: Path) 
     assert not (project / "worktrees" / "slot01").exists()
 
 
+def test_process_entering_after_final_scan_before_path_move_is_not_deleted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+    original_assert = wrkslots._assert_slot_unused
+    calls = 0
+    entrant: subprocess.Popen[str] | None = None
+
+    def enter_after_scan(
+        slot_path: Path, record: wrkslots.ActiveRecord | None = None
+    ) -> None:
+        nonlocal calls, entrant
+        original_assert(slot_path, record)
+        calls += 1
+        if calls == 2:
+            entrant = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,sys,time; os.chdir(sys.argv[1]); "
+                    "print(os.getcwd(), flush=True); time.sleep(60)",
+                    str(checkout(project)),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert entrant.stdout is not None
+            assert entrant.stdout.readline().strip() == str(checkout(project))
+
+    monkeypatch.setattr(wrkslots, "_assert_slot_unused", enter_after_scan)
+    try:
+        returncode = wrkslots.main(
+            [
+                "--project-root",
+                str(project),
+                "remove",
+                "slot01",
+                "--coordinator-pid",
+                str(os.getpid()),
+                "--expected-generation",
+                "1",
+            ]
+        )
+
+        assert returncode == 3
+        assert "live process" in capsys.readouterr().err
+        assert entrant is not None
+        assert checkout(project).is_dir()
+        assert Path(os.readlink(f"/proc/{entrant.pid}/cwd")) == checkout(project)
+        assert not list((project / "worktrees").glob(".slot01.fenced.*"))
+        assert not (project / "worktrees" / "ACTIVE.testhost.journal").exists()
+        assert len(active_slots(project)) == 1
+    finally:
+        if entrant is not None:
+            entrant.terminate()
+            entrant.wait(timeout=10)
+
+
+def test_crash_after_path_fence_recovers_from_fenced_storage(tmp_path: Path) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-path-fence-before-journal"},
+    )
+
+    assert interrupted.returncode == 86
+    assert not checkout(project).exists()
+    assert len(list((project / "worktrees").glob(".slot01.fenced.*"))) == 1
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    assert not list((project / "worktrees").glob(".slot01.fenced.*"))
+
+
+def test_crash_after_archive_before_active_delete_recovers_exact_overlap(
+    tmp_path: Path,
+) -> None:
+    project, repository, _remote = make_project(tmp_path)
+    made = create(project)
+    assert made.returncode == 0, made.stderr
+    commit_task(repository, checkout(project), "codex/task")
+    handed_off = finish(project)
+    assert handed_off.returncode == 0, handed_off.stderr
+    mark_owner_dead(project)
+    set_liveness(project, "dead")
+
+    interrupted = command(
+        project,
+        "remove",
+        "slot01",
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--expected-generation",
+        "1",
+        env={"WRKSLOTS_TEST_INTERRUPT": "after-archive-before-active"},
+    )
+
+    assert interrupted.returncode == 86
+    assert len(active_slots(project)) == 1
+    archive_path = project / "worktrees" / "ARCHIVED.testhost.json"
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    assert len(archive["records"]) == 1
+    assert not (project / "worktrees" / "slot01").exists()
+    assert (project / "worktrees" / "ACTIVE.testhost.journal").is_file()
+
+    original_archive = archive_path.read_text(encoding="utf-8")
+    archive["records"][0]["purpose"] = "mismatched archive"
+    archive_path.write_text(json.dumps(archive, indent=2) + "\n", encoding="utf-8")
+    refused = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+    assert refused.returncode == 3
+    assert "active on testhost and archived on testhost" in refused.stderr
+    assert len(active_slots(project)) == 1
+    assert (project / "worktrees" / "ACTIVE.testhost.journal").is_file()
+    archive_path.write_text(original_archive, encoding="utf-8")
+
+    recovered = command(project, "recover", "--coordinator-pid", str(os.getpid()))
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert active_slots(project) == []
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    assert len(archive["records"]) == 1
+    assert not (project / "worktrees" / "ACTIVE.testhost.journal").exists()
+
+
 def test_changed_finish_journal_cannot_redirect_deletion(tmp_path: Path) -> None:
     project, _repository, _remote = make_project(tmp_path)
     first = create(project)

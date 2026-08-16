@@ -626,6 +626,12 @@ def _atomic_write_json(path: Path, payload: object) -> None:
         raise
 
 
+def _json_equal(left: object, right: object) -> bool:
+    return json.dumps(
+        left, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ) == json.dumps(right, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
 def _recover_config_write(path: Path, payload: object) -> None:
     leftovers = sorted(path.parent.glob(f"{path.name}.tmp.*"))
     if not leftovers:
@@ -1181,6 +1187,39 @@ def _validate_global_state(
     return states, archives
 
 
+def _validate_global_state_for_finish_recovery(
+    config: Config, journal: Mapping[str, object]
+) -> tuple[list[ActiveState], list[ArchiveState]]:
+    states = _load_all_active(config)
+    archives = _load_all_archives(config)
+    recorded = _record_from_obj(journal.get("record"), "finish journal.record")
+    expected_entry = _archive_entry(journal, recorded)
+    active = {
+        record.slot: (state.machine, record)
+        for state in states
+        for record in state.slots
+    }
+    for archive in archives:
+        for archived in archive.records:
+            slot = _as_str(archived.get("slot"), "archive slot")
+            current = active.get(slot)
+            if current is None:
+                continue
+            active_machine, active_record = current
+            if (
+                slot == recorded.slot
+                and active_machine == config.machine
+                and archive.machine == config.machine
+                and _record_to_obj(active_record) == _record_to_obj(recorded)
+                and _json_equal(archived, expected_entry)
+            ):
+                continue
+            raise StateError(
+                f"slot {slot!r} is active on {active_machine} and archived on {archive.machine}"
+            )
+    return states, archives
+
+
 def _assert_registry_storage_consistent(
     config: Config,
     states: Sequence[ActiveState],
@@ -1530,6 +1569,11 @@ class GitVcs:
 
     def remove_worktree(self, repository: Path, checkout: Path) -> None:
         self._run(repository, ["worktree", "remove", "--", str(checkout)])
+
+    def repair_worktree(self, repository: Path, checkout: Path) -> None:
+        self._run(repository, ["worktree", "repair", str(checkout)])
+        if checkout.absolute() not in self.listed_worktrees(repository):
+            raise Refusal(f"Git did not repair worktree registration for {checkout}")
 
 
 def _repository_path(config: Config, raw: str) -> tuple[str, Path]:
@@ -3244,6 +3288,11 @@ def _finish_journal_payload(
     phase: str,
 ) -> dict[str, object]:
     archive_id = f"{config.machine}:{record.slot}:{record.generation}:{finished_at}"
+    fenced = (
+        config.worktrees
+        / f".{record.slot}.fenced.{record.generation}.{uuid.uuid4().hex}"
+        / record.slot
+    )
     return {
         "schema": SCHEMA,
         "kind": "finish",
@@ -3254,6 +3303,7 @@ def _finish_journal_payload(
         "finished_at": finished_at,
         "archive_id": archive_id,
         "phase": phase,
+        "fenced": fenced.relative_to(config.root).as_posix(),
         "removed": list(removed),
         "record": _record_to_obj(record),
     }
@@ -3290,7 +3340,7 @@ def _append_archive_once(
     archive_id = _as_str(entry["archive_id"], "archive entry archive_id")
     for existing in archive.records:
         if existing.get("archive_id") == archive_id:
-            if existing != entry:
+            if not _json_equal(existing, entry):
                 raise StateError(
                     f"archive_id {archive_id!r} already exists with different content"
                 )
@@ -3304,6 +3354,163 @@ def _append_archive_once(
     return updated
 
 
+def _finish_fenced_slot(
+    config: Config, record: ActiveRecord, journal: Mapping[str, object]
+) -> Path:
+    relative, fenced = _relative_inside(
+        config.root,
+        _as_str(journal["fenced"], "finish journal.fenced"),
+        "finish journal fenced path",
+    )
+    del relative
+    prefix = f".{record.slot}.fenced.{record.generation}."
+    if (
+        fenced.name != record.slot
+        or fenced.parent.parent != config.worktrees
+        or not fenced.parent.name.startswith(prefix)
+        or len(fenced.parent.name) != len(prefix) + 32
+        or not re.fullmatch(r"[0-9a-f]{32}", fenced.parent.name.removeprefix(prefix))
+    ):
+        raise StateError("finish journal fenced path does not match its slot generation")
+    return fenced
+
+
+def _checkout_at_slot(
+    config: Config, checkout: Checkout, slot_path: Path
+) -> tuple[Checkout, Path]:
+    path = slot_path / checkout.name
+    relative = path.relative_to(config.root).as_posix()
+    return dataclasses.replace(checkout, path=relative), path
+
+
+def _repair_checkout_at_slot(
+    config: Config, checkout: Checkout, slot_path: Path, vcs: GitVcs
+) -> Path:
+    moved, path = _checkout_at_slot(config, checkout, slot_path)
+    _repair_registration_at_slot(config, checkout, slot_path, vcs)
+    current = _assert_checkout_safe(config, moved, vcs)
+    if dataclasses.replace(current, path=checkout.path) != checkout:
+        raise Refusal(
+            f"fenced checkout {checkout.name} changed after finish was prepared; preserve it for inspection"
+        )
+    return path
+
+
+def _repair_registration_at_slot(
+    config: Config, checkout: Checkout, slot_path: Path, vcs: GitVcs
+) -> Path:
+    _moved, path = _checkout_at_slot(config, checkout, slot_path)
+    _relative, repository = _repository_path(config, checkout.repository)
+    vcs.repair_worktree(repository, path)
+    return path
+
+
+def _remove_fenced_directory(config: Config, fenced_slot: Path) -> None:
+    if fenced_slot.exists():
+        try:
+            fenced_slot.rmdir()
+        except OSError as exc:
+            raise Refusal(
+                f"fenced slot directory is not empty after Git removal: {fenced_slot}: {exc}"
+            ) from exc
+    try:
+        fenced_slot.parent.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise Refusal(f"cannot remove fenced slot parent {fenced_slot.parent}: {exc}") from exc
+    _fsync_directory(config.worktrees)
+
+
+def _rollback_path_fence(
+    config: Config,
+    record: ActiveRecord,
+    journal: dict[str, object],
+    vcs: GitVcs,
+) -> None:
+    removed = {
+        _as_str(item, "journal.removed item")
+        for item in _as_list(journal["removed"], "journal.removed")
+    }
+    if removed:
+        raise Refusal("cannot roll back a path fence after a checkout was removed")
+    original = config.worktrees / record.slot
+    fenced = _finish_fenced_slot(config, record, journal)
+    if original.exists() or original.is_symlink():
+        raise Refusal(f"canonical slot reappeared before path-fence rollback: {original}")
+    if not fenced.is_dir() or fenced.is_symlink():
+        raise Refusal(f"fenced slot is missing or unsafe during rollback: {fenced}")
+    try:
+        os.rename(fenced, original)
+        _fsync_directory(config.worktrees)
+    except OSError as exc:
+        raise Refusal(f"cannot restore path fence {fenced} to {original}: {exc}") from exc
+    journal["phase"] = "prepared"
+    _atomic_write_json(_journal_path(config), journal)
+    for checkout in record.checkouts:
+        _repair_checkout_at_slot(config, checkout, original, vcs)
+    _remove_fenced_directory(config, fenced)
+    _remove_control_file(_journal_path(config))
+
+
+def _begin_or_resume_path_fence(
+    config: Config,
+    record: ActiveRecord,
+    journal: dict[str, object],
+    vcs: GitVcs,
+) -> tuple[dict[str, object], Path]:
+    original = config.worktrees / record.slot
+    fenced = _finish_fenced_slot(config, record, journal)
+    original_present = original.exists() or original.is_symlink()
+    fenced_present = fenced.exists() or fenced.is_symlink()
+    if original_present and fenced_present:
+        raise Refusal(f"both canonical and fenced slot paths exist for {record.slot}")
+    if original_present:
+        removed = _as_list(journal["removed"], "journal.removed")
+        if removed:
+            raise StateError("finish journal records removals while the canonical slot still exists")
+        _assert_slot_contents(config, record)
+        for checkout in record.checkouts:
+            current = _assert_checkout_safe(config, checkout, vcs)
+            if current != checkout:
+                raise Refusal(
+                    f"checkout {checkout.name} changed after finish was prepared; preserve it for inspection"
+                )
+        _assert_slot_unused(original, record)
+        try:
+            fenced.parent.mkdir(mode=0o700)
+            _fsync_directory(config.worktrees)
+        except FileExistsError:
+            if not fenced.parent.is_dir() or fenced.parent.is_symlink():
+                raise Refusal(f"fenced slot parent is unsafe: {fenced.parent}")
+            if any(fenced.parent.iterdir()):
+                raise Refusal(f"fenced slot parent is not empty: {fenced.parent}")
+        except OSError as exc:
+            raise Refusal(f"cannot prepare fenced slot parent {fenced.parent}: {exc}") from exc
+        try:
+            os.rename(original, fenced)
+            _fsync_directory(config.worktrees)
+            _fsync_directory(fenced.parent)
+        except OSError as exc:
+            raise Refusal(f"cannot establish path fence {original} -> {fenced}: {exc}") from exc
+        _interrupt_for_test("after-path-fence-before-journal")
+        fenced_present = True
+    if not fenced_present:
+        return journal, fenced
+    if fenced.is_symlink() or not fenced.is_dir():
+        raise Refusal(f"fenced slot is missing or unsafe: {fenced}")
+    if original.exists() or original.is_symlink():
+        raise Refusal(f"canonical slot still exists after path fence: {original}")
+    for checkout in record.checkouts:
+        path = fenced / checkout.name
+        if path.exists() or path.is_symlink():
+            _repair_registration_at_slot(config, checkout, fenced, vcs)
+    journal["phase"] = "fenced"
+    _atomic_write_json(_journal_path(config), journal)
+    _interrupt_for_test("after-path-fence")
+    return journal, fenced
+
+
 def _finish_remove_paths(
     config: Config,
     record: ActiveRecord,
@@ -3315,22 +3522,24 @@ def _finish_remove_paths(
     all_names = {item.name for item in record.checkouts}
     if not removed <= all_names:
         raise StateError("finish journal names a checkout that is not in the active record")
-    slot_path = config.worktrees / record.slot
-    missing_after_remove: list[Checkout] = []
+    journal, fenced_slot = _begin_or_resume_path_fence(config, record, journal, vcs)
     present: list[Checkout] = []
+    missing_after_remove: list[Checkout] = []
     for checkout in record.checkouts:
         if checkout.name in removed:
             continue
-        path = _stored_path(config, checkout.path, "checkout path")
+        _moved, path = _checkout_at_slot(config, checkout, fenced_slot)
         if path.is_symlink():
-            raise Refusal(f"interrupted checkout path became a symlink: {path}")
+            raise Refusal(f"interrupted fenced checkout became a symlink: {path}")
         if path.exists():
             present.append(checkout)
             continue
         _relative, repository = _repository_path(config, checkout.repository)
-        if path.absolute() in vcs.listed_worktrees(repository):
+        canonical = _stored_path(config, checkout.path, "checkout path")
+        listed = vcs.listed_worktrees(repository)
+        if path.absolute() in listed or canonical.absolute() in listed:
             raise Refusal(
-                f"interrupted checkout {checkout.name} is missing but Git still registers {path}"
+                f"interrupted checkout {checkout.name} is missing but Git still registers it"
             )
         missing_after_remove.append(checkout)
     if missing_after_remove:
@@ -3339,55 +3548,60 @@ def _finish_remove_paths(
         _atomic_write_json(_journal_path(config), journal)
     remaining = tuple(present)
     if remaining:
-        if not slot_path.is_dir() or slot_path.is_symlink():
-            raise Refusal(f"partially removed slot directory is missing or unsafe: {slot_path}")
         try:
-            actual = {entry.name for entry in slot_path.iterdir()}
+            actual = {entry.name for entry in fenced_slot.iterdir()}
         except OSError as exc:
-            raise Refusal(f"cannot inspect interrupted slot {slot_path}: {exc}") from exc
+            raise Refusal(f"cannot inspect fenced slot {fenced_slot}: {exc}") from exc
         expected = {item.name for item in remaining}
         if actual != expected:
             raise Refusal(
-                f"interrupted slot contents changed: expected {sorted(expected)}, found {sorted(actual)}"
+                f"fenced slot contents changed: expected {sorted(expected)}, found {sorted(actual)}"
             )
-        for checkout in remaining:
-            current = _assert_checkout_safe(config, checkout, vcs)
-            if current != checkout:
-                raise Refusal(
-                    f"interrupted checkout {checkout.name} changed after finish was prepared; "
-                    "preserve it for inspection"
-                )
-        _assert_slot_unused(slot_path, record)
-    else:
-        if slot_path.exists() and any(slot_path.iterdir()):
-            raise Refusal(f"finished slot contains unexpected files: {slot_path}")
+        try:
+            for checkout in remaining:
+                _repair_checkout_at_slot(config, checkout, fenced_slot, vcs)
+            _assert_slot_unused(fenced_slot, record)
+        except Refusal as exc:
+            if not removed:
+                try:
+                    _rollback_path_fence(config, record, journal, vcs)
+                except Refusal as rollback:
+                    raise Refusal(
+                        f"{exc}; path-fence rollback failed: {rollback}; run 'wrkslots recover'"
+                    ) from rollback
+            raise
+    elif fenced_slot.exists() and any(fenced_slot.iterdir()):
+        raise Refusal(f"finished fenced slot contains unexpected files: {fenced_slot}")
     for checkout in remaining:
         _relative, repository = _repository_path(config, checkout.repository)
-        path = _stored_path(config, checkout.path, "checkout path")
+        _moved, path = _checkout_at_slot(config, checkout, fenced_slot)
         vcs.remove_worktree(repository, path)
         _interrupt_for_test("after-remove-before-journal")
         removed.add(checkout.name)
         journal["removed"] = sorted(removed)
         _atomic_write_json(_journal_path(config), journal)
         _interrupt_for_test("after-remove-worktree")
-    if slot_path.exists():
-        try:
-            slot_path.rmdir()
-        except OSError as exc:
-            raise Refusal(f"slot directory is not empty after Git removal: {slot_path}: {exc}") from exc
-        _fsync_directory(config.worktrees)
+    _remove_fenced_directory(config, fenced_slot)
     journal["phase"] = "removed"
     _atomic_write_json(_journal_path(config), journal)
     return journal
 
 
 def _assert_physical_slot_removed(
-    config: Config, record: ActiveRecord, vcs: GitVcs
+    config: Config,
+    record: ActiveRecord,
+    vcs: GitVcs,
+    journal: Mapping[str, object],
 ) -> None:
     slot_path = config.worktrees / record.slot
+    fenced_slot = _finish_fenced_slot(config, record, journal)
     if slot_path.exists() or slot_path.is_symlink():
         raise Refusal(
             f"cannot archive slot {record.slot}: physical slot still exists at {slot_path}"
+        )
+    if fenced_slot.exists() or fenced_slot.is_symlink() or fenced_slot.parent.exists():
+        raise Refusal(
+            f"cannot archive slot {record.slot}: fenced storage still exists at {fenced_slot.parent}"
         )
     for checkout in record.checkouts:
         path = _stored_path(config, checkout.path, "checkout path")
@@ -3396,9 +3610,11 @@ def _assert_physical_slot_removed(
                 f"cannot archive slot {record.slot}: checkout still exists at {path}"
             )
         _relative, repository = _repository_path(config, checkout.repository)
-        if path.absolute() in vcs.listed_worktrees(repository):
+        _moved, fenced_path = _checkout_at_slot(config, checkout, fenced_slot)
+        listed = vcs.listed_worktrees(repository)
+        if path.absolute() in listed or fenced_path.absolute() in listed:
             raise Refusal(
-                f"cannot archive slot {record.slot}: Git still registers checkout {path}"
+                f"cannot archive slot {record.slot}: Git still registers checkout {checkout.name}"
             )
 
 
@@ -3412,10 +3628,11 @@ def _finish_state_update(
     current = current_slots.get(record.slot)
     if current is not None and _record_to_obj(current) != _record_to_obj(record):
         raise StateError("active record changed during an interrupted finish")
-    _assert_physical_slot_removed(config, record, GitVcs())
+    _assert_physical_slot_removed(config, record, GitVcs(), journal)
     archive = _load_archive(config)
     entry = _archive_entry(journal, record)
     _append_archive_once(config, archive, entry)
+    _interrupt_for_test("after-archive-before-active")
     if current is not None:
         updated_state = _delete_record(state, record.slot)
         _atomic_write_json(_active_path(config), _active_to_obj(updated_state))
@@ -3879,6 +4096,7 @@ def _recover_finish(
         "finished_at",
         "archive_id",
         "phase",
+        "fenced",
         "removed",
         "record",
     }
@@ -3920,9 +4138,9 @@ def _recover_finish(
         matching_entry = next(
             item for item in archive.records if item.get("archive_id") == archive_id
         )
-        if matching_entry != expected_entry:
+        if not _json_equal(matching_entry, expected_entry):
             raise StateError("durable archive entry differs from the finish journal")
-        _assert_physical_slot_removed(config, record, GitVcs())
+        _assert_physical_slot_removed(config, record, GitVcs(), raw)
         _remove_control_file(path)
         print(f"recovered finish: cleared completed journal for {record.slot}")
         return
@@ -3945,14 +4163,14 @@ def _recover_finish(
         raise Refusal(f"recorded owner is {owner_state}: {detail}")
     journal = dict(raw)
     phase = _as_str(journal["phase"], "finish journal.phase")
-    if phase not in ("prepared", "removed"):
+    if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
-    if phase == "prepared":
+    if phase in ("prepared", "fenced"):
         journal = _finish_remove_paths(config, record, journal, GitVcs())
     else:
         if set(removed_names) != {checkout.name for checkout in record.checkouts}:
             raise StateError("removed finish phase does not name every checkout")
-        _assert_physical_slot_removed(config, record, GitVcs())
+        _assert_physical_slot_removed(config, record, GitVcs(), journal)
     _finish_state_update(config, state, record, journal)
     print(f"recovered finish: archived and removed slot={record.slot}")
 
@@ -3975,7 +4193,10 @@ def _cmd_recover(args: argparse.Namespace) -> int:
                 f"journal belongs to machine {machine}; rerun with --machine {machine}"
             )
         kind = _as_str(raw.get("kind"), "journal.kind")
-        states, archives = _validate_global_state(config)
+        if kind == "finish":
+            states, archives = _validate_global_state_for_finish_recovery(config, raw)
+        else:
+            states, archives = _validate_global_state(config)
         before = _global_rows(states, archives)
         state = _load_active(config)
         if kind == "create":
