@@ -15,6 +15,7 @@ Each tool skill points to the installed command's quickstart, help, and embedded
 - `agent-team-timeline` — archive and visualize coordinator and subagent activity.
 - `herdr-run` — run narrowly allowlisted network operations through an out-of-sandbox Herdr pane.
 - `herdr-agent` — durably deliver and inspect prompts for an interactive agent in a Herdr pane.
+- `wrkslots` — manage one isolated Git worktree slot per active agent, record its handoff, and remove it only after verified owner absence.
 
 ## Install in an agent harness
 
@@ -30,6 +31,7 @@ ln -s /path/to/agent-utils/skills/parallel-experiment-runner /path/to/agent-skil
 ln -s /path/to/agent-utils/skills/agent-team-timeline /path/to/agent-skills/agent-team-timeline
 ln -s /path/to/agent-utils/skills/herdr-run /path/to/agent-skills/herdr-run
 ln -s /path/to/agent-utils/skills/herdr-agent /path/to/agent-skills/herdr-agent
+ln -s /path/to/agent-utils/skills/wrkslots /path/to/agent-skills/wrkslots
 ```
 
 Tool commands must be on `PATH`. From a source checkout, `./setup` creates repository-local
