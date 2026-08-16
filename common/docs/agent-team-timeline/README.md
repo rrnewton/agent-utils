@@ -89,6 +89,23 @@ slice. Each bound may use either its date or time form. `--project LABEL=URL` an
 project is primary. Codex archives infer repository labels and links from structured session
 metadata when no override is needed.
 
+Orc coordinator restarts are linked only when explicitly registered. Repeat
+`--continuation-session UUID` for a whole successor root. If Orc reused an older root for unrelated
+work before the restart, pass compact JSON with the first source-native message ID that belongs to
+this logical team:
+
+```bash
+agent-team-timeline ingest-orc \
+  --source-root PROJECT --root-session ORIGINAL_UUID \
+  --continuation-session NEXT_UUID \
+  --continuation-session '{"session_id":"REUSED_UUID","start_message_id":"MESSAGE_UUID"}' \
+  --team example-team --output ./timelines/example-team
+```
+
+The bounded form excludes the reused root's earlier events, agents, spawns, and unrelated task
+databases from normalized data and summary inputs. The first successful ingest freezes the native
+message boundary; later reruns must preserve the recorded ordered prefix.
+
 After ingesting one or more teams, build the combined verbatim transcript projection without any
 model call:
 

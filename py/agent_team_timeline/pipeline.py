@@ -67,6 +67,8 @@ from agent_team_timeline.identity import (
     site_identity_from_json_obj,
 )
 from agent_team_timeline.orc import (
+    OrcContinuationLink,
+    OrcContinuationSpec,
     OrcParseError,
     OrcSourceCopy,
     load_orc_team,
@@ -148,6 +150,7 @@ _ARCHIVE_MARKER = ".agent-team-timeline.json"
 _ARCHIVE_LOCK = ".agent-team-timeline.lock"
 _PROJECT_OVERVIEW_SCHEMA_VERSION = 3
 _GLOSSARY_SCHEMA_VERSION = 3
+_ORC_NORMALIZER_SCHEMA_VERSION = 3
 _OVERVIEW_CONTEXT_CHARS = 48_000
 _TERM_EVIDENCE_LIMIT = 6
 
@@ -790,7 +793,7 @@ def _normalized_generation_value(
     return {
         "schema_version": 1,
         "tool": "agent-team-timeline",
-        "normalizer_schema_version": 1,
+        "normalizer_schema_version": _ORC_NORMALIZER_SCHEMA_VERSION,
         "provider": "orc",
         "source_manifest_sha256": _canonical_json_file_sha256(
             _source_manifest_path(archive, team_slug)
@@ -1036,20 +1039,44 @@ def ingest_claude(
         )
 
 
+@dataclass(frozen=True)
+class _OrcManifestState:
+    sources: tuple[OrcSourceCopy, ...]
+    continuation_links: tuple[OrcContinuationLink, ...]
+    continuation_specs: tuple[OrcContinuationSpec, ...]
+
+
+def _orc_continuation_specs(
+    values: Sequence[str | OrcContinuationSpec], where: str
+) -> tuple[OrcContinuationSpec, ...]:
+    result = tuple(
+        OrcContinuationSpec.from_value(value, f"{where}[{index}]")
+        for index, value in enumerate(values)
+    )
+    session_ids = tuple(spec.session_id for spec in result)
+    if len(set(session_ids)) != len(session_ids):
+        raise OrcParseError(f"{where}: duplicate session ids are not allowed")
+    return result
+
+
 def _load_orc_source_manifest(
     archive: Path,
     team_slug: str,
     root_session_id: str,
     date_window: DateWindow | None,
-) -> tuple[OrcSourceCopy, ...]:
+    requested_continuations: Sequence[str | OrcContinuationSpec] = (),
+) -> _OrcManifestState:
+    requested_specs = _orc_continuation_specs(
+        requested_continuations, "requested continuation sessions"
+    )
     path = _source_manifest_path(archive, team_slug)
     if not path.is_file():
-        return ()
+        return _OrcManifestState((), (), requested_specs)
     obj = as_object(read_json(path), str(path))
     schema_version = as_int(obj.get("schema_version"), f"{path}: schema_version")
-    if schema_version not in (1, 2) or obj.get("provider") != "orc":
+    if schema_version not in (1, 2, 3, 4) or obj.get("provider") != "orc":
         raise OrcParseError(f"invalid Orc source manifest at {path}")
-    if schema_version == 2:
+    if schema_version in (2, 3, 4):
         expected_fields = {
             "schema_version",
             "provider",
@@ -1059,6 +1086,8 @@ def _load_orc_source_manifest(
             "date_window",
             "sources",
         }
+        if schema_version in (3, 4):
+            expected_fields.add("continuation_sessions")
         if set(obj) != expected_fields:
             missing = sorted(expected_fields - set(obj))
             unknown = sorted(set(obj) - expected_fields)
@@ -1096,10 +1125,59 @@ def _load_orc_source_manifest(
             OrcSourceCopy.from_json_obj(
                 source,
                 f"{path}: sources[{index}]",
-                schema_version,
+                2 if schema_version in (3, 4) else schema_version,
             )
         )
-    return tuple(result)
+    links: list[OrcContinuationLink] = []
+    raw_continuations = obj.get("continuation_sessions")
+    if raw_continuations is not None:
+        if schema_version not in (3, 4):
+            raise OrcParseError(
+                f"{path}: continuation_sessions requires manifest schema version 3 or 4"
+            )
+        for index, raw_link in enumerate(
+            as_array(raw_continuations, f"{path}: continuation_sessions")
+        ):
+            link = as_object(
+                raw_link, f"{path}: continuation_sessions[{index}]"
+            )
+            has_bounded_fields = (
+                "start_message_id" in link or "start_source_line" in link
+            )
+            if schema_version == 3 and has_bounded_fields:
+                raise OrcParseError(
+                    f"{path}: schema-v3 continuation record cannot contain bounded fields"
+                )
+            if schema_version == 4 and not (
+                "start_message_id" in link and "start_source_line" in link
+            ):
+                raise OrcParseError(
+                    f"{path}: schema-v4 continuation record lacks bounded fields"
+                )
+            links.append(
+                OrcContinuationLink.from_json_obj(
+                    link, f"{path}: continuation_sessions[{index}]"
+                )
+            )
+    recorded_specs = tuple(
+        OrcContinuationSpec.from_value(
+            {
+                "session_id": link.session_id,
+                "start_message_id": link.start_message_id,
+            },
+            f"{path}: continuation_sessions[{index}]",
+        )
+        for index, link in enumerate(links)
+    )
+    if requested_specs:
+        if recorded_specs != requested_specs[: len(recorded_specs)]:
+            raise OrcParseError(
+                "requested continuation sessions do not extend the recorded ordered prefix"
+            )
+        effective_specs = requested_specs
+    else:
+        effective_specs = recorded_specs
+    return _OrcManifestState(tuple(result), tuple(links), effective_specs)
 
 
 def _ingest_orc_locked(
@@ -1110,13 +1188,18 @@ def _ingest_orc_locked(
     display_timezone: str,
     date_window: DateWindow | None,
     identity_overrides: IdentityOverrides | None,
+    continuation_specs: Sequence[str | OrcContinuationSpec],
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Orc coordinator lineage."""
 
     _ensure_archive(archive, team_slug, create=True)
     changed = int(_ensure_source_snapshots_ignored(archive))
-    previous_sources = _load_orc_source_manifest(
-        archive, team_slug, root_session_id, date_window
+    manifest_state = _load_orc_source_manifest(
+        archive,
+        team_slug,
+        root_session_id,
+        date_window,
+        continuation_specs,
     )
     snapshot_root = _source_snapshot_root(archive, team_slug)
     changed += prune_orc_staging(snapshot_root)
@@ -1124,10 +1207,26 @@ def _ingest_orc_locked(
         source_root,
         root_session_id,
         snapshot_root,
-        previous_sources,
+        manifest_state.sources,
         utc_now(),
+        manifest_state.continuation_specs,
+        manifest_state.continuation_links,
     )
     changed += snapshot.files_changed
+    resolved_specs = tuple(
+        OrcContinuationSpec.from_value(
+            {
+                "session_id": link.session_id,
+                "start_message_id": link.start_message_id,
+            },
+            f"resolved continuation sessions[{index}]",
+        )
+        for index, link in enumerate(snapshot.continuations)
+    )
+    if resolved_specs != manifest_state.continuation_specs:
+        raise OrcParseError(
+            "resolved continuation sessions differ from the requested ordered specs"
+        )
     team = apply_date_window(
         load_orc_team(
             snapshot_root,
@@ -1135,6 +1234,7 @@ def _ingest_orc_locked(
             team_slug,
             display_timezone,
             snapshot.sources,
+            snapshot.continuations,
         ),
         date_window,
     )
@@ -1150,7 +1250,7 @@ def _ingest_orc_locked(
         archive, team, ((), ()), identity_overrides
     )
     source_manifest: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 4 if snapshot.continuations else 2,
         "provider": "orc",
         "root_session_id": root_session_id,
         "source_root": str(source_root.resolve()),
@@ -1158,6 +1258,10 @@ def _ingest_orc_locked(
         "date_window": date_window.to_json_obj() if date_window is not None else None,
         "sources": [source.to_json_obj() for source in snapshot.sources],
     }
+    if snapshot.continuations:
+        source_manifest["continuation_sessions"] = [
+            link.to_json_obj() for link in snapshot.continuations
+        ]
     changed += int(
         _write_json_durable(
             _source_manifest_path(archive, team_slug),
@@ -1188,6 +1292,7 @@ def ingest_orc(
     display_timezone: str,
     date_window: DateWindow | None = None,
     identity_overrides: IdentityOverrides | None = None,
+    continuation_specs: Sequence[str | OrcContinuationSpec] = (),
 ) -> tuple[TeamData, IngestReport]:
     """Snapshot and normalize one Orc lineage as a serialized raw-data transaction."""
 
@@ -1200,6 +1305,7 @@ def ingest_orc(
             display_timezone,
             date_window,
             identity_overrides,
+            continuation_specs,
         )
 
 
@@ -1226,7 +1332,7 @@ def load_archived_team(archive: Path, team_slug: str) -> TeamData:
         )
         if (
             source_manifest.get("provider") == "orc"
-            and source_manifest.get("schema_version") == 2
+            and source_manifest.get("schema_version") in (2, 3, 4)
         ):
             _validate_normalized_generation(archive, team_slug, team)
     return team

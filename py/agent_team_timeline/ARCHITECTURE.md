@@ -236,10 +236,12 @@ the config file's directory, making the command independent of the caller's work
 Every object is an exact schema: unknown and missing fields fail before provider ingestion begins.
 The Codex source variant contains a sessions root, coordinator root UUID, and optional explicitly
 ordered continuation UUIDs. The Claude variant contains its canonical coordinator JSONL. The Orc
-variant contains its archived state root and coordinator session UUID. Team slugs are unique and
-provider-neutral; identity values pass through the same URL, hostname, and IANA-timezone validators
-as individual ingest commands. Optional per-team prompt-authorship rules are part of the exact
-versioned config and its receipt digest; they never inspect message text.
+variant contains its archived state root, coordinator session UUID, and optional ordered
+continuations. An Orc continuation is either a whole-root UUID string or an exact
+`{session_id,start_message_id}` object for a reused root whose earlier history is unrelated. Team
+slugs are unique and provider-neutral; identity values pass through the same URL, hostname, and
+IANA-timezone validators as individual ingest commands. Optional per-team prompt-authorship rules
+are part of the exact versioned config and its receipt digest; they never inspect message text.
 
 Configured teams run in file order through the existing provider snapshot transactions. Successful
 earlier teams and their provider source manifests remain durable if a later provider fails; the
@@ -322,6 +324,22 @@ The transaction is deliberately ordered:
 6. Only after the marker is durable, garbage-collect unreferenced managed objects. A retry removes
    stale managed staging candidates and reconstructs or reuses the generation idempotently.
 
+Modern Orc databases retain a historical `content_blocks` prefix while new records first appear in
+`messages`. Normalization is a stable block-ID union: existing content-block events keep their
+canonical IDs, exact overlaps are deduplicated, and modern-only blocks extend the transcript. The
+append guard and semantic source identity cover both tables. This is essential because either table
+can otherwise change normalized text without changing the other table's digest.
+
+Orc continuations are explicit-only and ordered. A whole-root successor freezes the predecessor's
+last source record, the successor start, and their gap. A bounded successor additionally freezes a
+source-native message ID and resolved row inside a reused root. Source discovery and normalization
+apply that boundary before summary inputs are formed: inactive pre-boundary descendants and
+unrelated task databases are excluded, retained agent lifetimes are clamped, and task notes shared
+across roots are partitioned at the frozen boundaries. Source-manifest schema 4 records bounded
+links; schemas 2 and 3 remain readable. The Orc normalized-generation schema is versioned
+separately so a binary that changes these normalization rules refuses stale generated data until a
+mechanical reingest repairs it.
+
 Schema-v2 manifests and task projections are exact schemas: unknown and missing keys, malformed
 digests, noncanonical projection JSON, duplicate note IDs, unsafe relative paths, symlinked path
 components, and content-address/path mismatches fail closed. This applies to both live `.orc`/`.tg`
@@ -347,11 +365,21 @@ are accepted only when every prior stable spawn fact remains an unchanged subset
 message churn is recorded as degraded rewrite provenance without changing normalized semantics.
 Session names remain semantic because they are user-visible labels.
 
-For tasks, the authoritative append-only prefix is exactly `(id, task_id, content, created_at)`.
-Server synchronization IDs, note authors, current task owners, and titles may be filled or rewritten
-later, so their first observed values are frozen per note in the immutable provenance projection.
-Subsequent drift increments explicit rewrite/degradation metadata but does not silently rewrite old
-events or invalidate summary caches. A new note captures the then-current title and owner. A
+Each normalized source records a canonical semantic digest independently from its raw storage
+prefix. `semantic_sha256` may temporarily preserve an older paid-cache key only when an exact
+content-addressed `semantic_alias_baseline_path` authenticates that key and the baseline's canonical
+semantics equal the current canonical digest. Task sources do not use semantic aliases. This lets
+storage-only materialization and ignored provider noise reuse valid summaries without permitting a
+forged or stale cache key to survive a semantic change.
+
+For tasks, a cumulative content-addressed projection freezes `(id, task_id, content, created_at)`
+plus the first observed server author, task owner, and title. TaskGraph can hard-delete a task and
+cascade-delete notes, so absence from a later live database becomes a retained tombstone rather
+than history loss. Overlapping immutable fields must remain exact; a new ID must exceed both the
+frozen maximum and the prior SQLite allocation sequence, including trailing deleted-ID gaps.
+SQLite sequence regression or ID reuse fails closed. Presence/missing hashes and rewrite metadata
+audit the live observation separately from cumulative semantic identity.
+Mutable enrichment drift does not silently rewrite old events or invalidate summary caches. A
 non-null server author is external/server-authored provenance: it becomes an `external_message` on
 the coordinator, is counted separately from user prompts, and creates no agent or message edge. A
 local note with no owner is retained under a synthetic `Unattributed Task Work` child rather than
@@ -600,8 +628,9 @@ spends tokens.
   growth creates new staged inputs only for affected windows/frontiers.
 - Provider-specific mutable auxiliary indexes are isolated from authoritative transcript prefixes.
   Orc conversation state may be rewritten only when its complete prior stable-spawn projection is
-  proven to remain an unchanged subset; the manifest records the rewrite/degradation while content
-  blocks and task notes retain strict prefix validation.
+  proven to remain an unchanged subset. Task-note deletion is retained as a tombstone in the
+  cumulative frozen projection; immutable overlap, new-ID high-water, and SQLite sequence guards
+  still fail closed on mutation, reuse, or rollback.
 
 ## Required time/backfill behavior
 

@@ -119,7 +119,24 @@ private thinking blocks.
 
 For Orc, pass the project directory containing `.orc/` and `.tg/` as `--source-root`. The root
 coordinator UUID names a directory under `.orc/sessions/`; child sessions with an explicit parent
-identifier are followed as nested coordinators.
+identifier are followed as nested coordinators. Whole-root restarts use repeatable plain
+`--continuation-session UUID` values. When Orc reused a pre-existing root that contains earlier,
+unrelated work, use a source-native message boundary instead:
+
+```bash
+agent-team-timeline ingest-orc \
+  --source-root ~/agent_logs_archive/devbig014 \
+  --root-session ORIGINAL_UUID \
+  --continuation-session NEXT_UUID \
+  --continuation-session '{"session_id":"REUSED_UUID","start_message_id":"MESSAGE_UUID"}' \
+  --team example-orc --output ./timelines/example-orc
+```
+
+The JSON form is deliberately explicit. Its `start_message_id` must resolve exactly once in the
+successor's append-only `messages` table. The snapshot manifest freezes both that native identity
+and its resolved source row/timestamp. Normalization excludes pre-boundary events, inactive agent
+history, spawns, and unrelated task databases; a display `--start-time` is not a substitute because
+display windows do not redefine source lineage.
 
 ## Register a multi-team project
 
@@ -172,7 +189,14 @@ continuations, timezone, and site identity:
       ],
       "source": {
         "source_root": "../devbig014",
-        "root_session": "ORC_SESSION_UUID"
+        "root_session": "ORC_SESSION_UUID",
+        "continuation_sessions": [
+          "NEXT_ORC_SESSION_UUID",
+          {
+            "session_id": "REUSED_ORC_SESSION_UUID",
+            "start_message_id": "SOURCE_NATIVE_MESSAGE_UUID"
+          }
+        ]
       }
     }
   ]
@@ -199,7 +223,8 @@ The parser rejects missing and unknown keys, unknown providers, duplicate team s
 continuations, absolute output paths, invalid identity, and invalid time bounds. Provider `source`
 objects are exact: Codex accepts `sessions_root`, `root_session`, and optional ordered
 `continuation_sessions`; Claude accepts only `session_file`; Orc accepts `source_root` and
-`root_session`.
+`root_session`, plus optional ordered `continuation_sessions`. An Orc continuation is either a
+whole-root session-ID string or an exact object containing `session_id` and `start_message_id`.
 
 Some Web or terminal transports store no sender identity. A team may add
 `prompt_authorship_rules` to refine only those unresolved records. Each rule requires a unique
@@ -749,14 +774,18 @@ final response is counted as a child-to-parent message while still driving its r
 
 ## Orc source semantics and limitations
 
-Orc's append-only content blocks are authoritative for coordinator conversation and tool execution.
+Orc's older `content_blocks` and current append-only `messages` table jointly describe
+coordinator conversation and tool execution. The importer preserves existing content-block
+identities, then unions in modern blocks absent from that table by stable `v2-block-<id>`
+identity. Overlapping records must agree; both tables participate in monotonicity and semantic-cache
+validation so changing either source cannot silently reuse a paid summary.
 Conversation state supplies stable agent spawn records. Local task notes are mapped to the matching
 owner incarnation available at that time. Reused names become separate incarnation IDs while the
 official name remains visible. A local note with no owner is preserved beneath an `Unattributed
 Task Work` worker. A note carrying a server author is shown as an external/server-authored message
 on the coordinator, counted separately from user prompts, and does not invent an agent or edge.
-Each nonempty note appears once; notes are not labeled terminal results because they can represent
-incremental progress.
+Each note row appears once, including an empty-content row; notes are not labeled terminal results
+because they can represent incremental progress.
 
 The TaskGraph database set is reference-driven. A provider-initial session uses its named database,
 or its session UUID when unnamed. Delegated sessions use their UUID even when a name was inherited;
@@ -767,12 +796,13 @@ a stable source ordinal so old event IDs and history remain intact. With an Orc 
 the selected subtree is inspected; without it, only the explicit root is inspected.
 
 Orc may compact or rewrite its auxiliary conversation-state JSON even while content blocks keep
-appending. The source manifest therefore treats content blocks and task notes as strict append-only
-prefixes, but versions mutable projections separately. Task-note prefix identity excludes fields
-that Orc may fill or change later: server synchronization ID, note author, current task owner, and
-title. Their first observed per-note values are frozen in an immutable projection; later drift is
-audited as a rewrite without silently changing old timeline events or paid-summary cache keys. A
-new note captures the owner/title visible when it first appears.
+appending. TaskGraph may also hard-delete a task and cascade-delete its old notes. The archive keeps
+a cumulative content-addressed note projection: immutable note identity/body fields and their first
+observed author, owner, and title survive provider deletion, while genuinely new IDs above the
+recorded note maximum and prior SQLite allocation sequence extend the history. Reused IDs, changed
+note bodies, or a regressed sequence fail closed. Current presence/tombstone and never-captured-gap
+hashes remain auditable without
+silently changing old timeline events or paid-summary cache keys.
 
 A conversation rewrite is accepted only when every recorded AgentBlock spawn identity and value
 remains an unchanged subset; missing or modified spawn evidence still fails before replacing any
@@ -794,6 +824,13 @@ absent. Agent-close timestamps are also not always persisted, so a lifetime ends
 attributed event/tool/turn/spawn or at the next reuse of the same official name. Child end times
 propagate upward so parent lifetimes contain all recorded descendant activity; mutable Orc
 `updated_at` values never extend a lifetime.
+
+Separate parentless Orc roots remain separate unless their ordered relationship is configured.
+Whole-root continuation strings include the complete successor lineage. A bounded continuation
+object starts at one frozen native message inside a reused root. It retains only post-boundary
+lineage evidence and relevant task databases, clamps retained agent lifetimes to the boundary, and
+adds one structural continuation edge from the predecessor. Proximity, matching database names,
+or a display window never infer this relationship.
 
 ## Codex source semantics and limitations
 

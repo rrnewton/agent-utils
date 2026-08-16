@@ -14,6 +14,7 @@ import agent_team_timeline.project_config as project_config_module
 from agent_team_timeline.cli import main as timeline_main
 from agent_team_timeline.identity import IdentityOverrides
 from agent_team_timeline.model import TeamData
+from agent_team_timeline.orc import OrcContinuationSpec
 from agent_team_timeline.pipeline import IngestReport
 from agent_team_timeline.project_config import (
     ClaudeProjectSource,
@@ -78,6 +79,13 @@ def _manifest(output: str = "../summary/hermit") -> dict[str, object]:
                 "source": {
                     "source_root": "../raw/devbig014",
                     "root_session": "orc-root",
+                    "continuation_sessions": [
+                        "orc-next",
+                        {
+                            "session_id": "orc-last",
+                            "start_message_id": "restart-message",
+                        },
+                    ],
                 },
             },
         ],
@@ -93,6 +101,14 @@ def _write_manifest(tmp_path: Path, value: dict[str, object]) -> Path:
 
 def _report(team_slug: str) -> IngestReport:
     return IngestReport(team_slug, "a" * 64, 1, 10, 2, 3, 4, 1, 1)
+
+
+def _orc_spec(value: str | OrcContinuationSpec) -> OrcContinuationSpec:
+    return (
+        value
+        if isinstance(value, OrcContinuationSpec)
+        else OrcContinuationSpec.from_value(value, "test")
+    )
 
 
 def _set_new_schema(value: dict[str, object]) -> None:
@@ -139,6 +155,10 @@ def test_load_project_config_resolves_paths_and_provider_schema(tmp_path: Path) 
     assert isinstance(claude.source, ClaudeProjectSource)
     assert claude.timezone == "UTC"
     assert isinstance(orc.source, OrcProjectSource)
+    assert orc.source.continuation_sessions == (
+        OrcContinuationSpec("orc-next"),
+        OrcContinuationSpec("orc-last", "restart-message"),
+    )
     assert orc.date_window is None
     assert orc.identity_overrides.projects == ()
     assert orc.prompt_authorship_rules[0].rule_id == "legacy-owner-web"
@@ -164,6 +184,154 @@ def test_project_config_rejects_schema_drift(
     path = _write_manifest(tmp_path, value)
     with pytest.raises(ValueError, match=match):
         load_project_ingest_config(path)
+
+
+def test_project_config_rejects_root_repeated_as_orc_continuation(
+    tmp_path: Path,
+) -> None:
+    value = _manifest()
+    teams = cast(list[dict[str, object]], value["teams"])
+    source = cast(dict[str, object], teams[2]["source"])
+    source["continuation_sessions"] = ["orc-next", "orc-root"]
+
+    with pytest.raises(ValueError, match="root_session cannot also be a continuation"):
+        load_project_ingest_config(_write_manifest(tmp_path, value))
+
+
+def test_project_config_keeps_orc_continuations_optional(tmp_path: Path) -> None:
+    value = _manifest()
+    teams = cast(list[dict[str, object]], value["teams"])
+    source = cast(dict[str, object], teams[2]["source"])
+    del source["continuation_sessions"]
+
+    config = load_project_ingest_config(_write_manifest(tmp_path, value))
+    orc = config.teams[2].source
+
+    assert isinstance(orc, OrcProjectSource)
+    assert orc.continuation_sessions == ()
+
+
+@pytest.mark.parametrize(
+    ("continuations", "match"),
+    (
+        (
+            [
+                "orc-next",
+                {
+                    "session_id": "orc-next",
+                    "start_message_id": "restart-message",
+                },
+            ],
+            "duplicate session ids",
+        ),
+        (
+            [{"session_id": "orc-next", "start_message_id": None}],
+            "expected a non-empty string",
+        ),
+    ),
+)
+def test_project_config_rejects_noncanonical_orc_continuation_specs(
+    tmp_path: Path,
+    continuations: list[object],
+    match: str,
+) -> None:
+    value = _manifest()
+    teams = cast(list[dict[str, object]], value["teams"])
+    source = cast(dict[str, object], teams[2]["source"])
+    source["continuation_sessions"] = continuations
+
+    with pytest.raises(ValueError, match=match):
+        load_project_ingest_config(_write_manifest(tmp_path, value))
+
+
+@pytest.mark.parametrize("command", ("ingest-orc", "refresh-orc"))
+def test_orc_cli_accepts_ordered_repeatable_continuation_sessions(
+    command: str,
+) -> None:
+    namespace = cli_module._parser().parse_args(
+        [
+            command,
+            "--output",
+            "/tmp/archive",
+            "--team",
+            "orc-test",
+            "--source-root",
+            "/tmp/source",
+            "--root-session",
+            "orc-root",
+            "--continuation-session",
+            "orc-next",
+            "--continuation-session",
+            "orc-last",
+        ]
+    )
+
+    assert namespace.continuation_session == ["orc-next", "orc-last"]
+
+
+def test_orc_cli_parses_legacy_and_bounded_continuation_specs() -> None:
+    assert cli_module._orc_continuation_arg("orc-next") == OrcContinuationSpec(
+        "orc-next"
+    )
+    assert cli_module._orc_continuation_arg(
+        '{"session_id":"orc-last","start_message_id":"restart-message"}'
+    ) == OrcContinuationSpec("orc-last", "restart-message")
+    with pytest.raises(ValueError, match="expected a non-empty string"):
+        cli_module._orc_continuation_arg(
+            '{"session_id":"orc-last","start_message_id":null}'
+        )
+
+
+def test_orc_cli_dispatches_ordered_continuation_sessions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    received: list[tuple[str, ...]] = []
+
+    def fake_orc(
+        archive: Path,
+        source_root: Path,
+        root_session_id: str,
+        team_slug: str,
+        display_timezone: str,
+        date_window: DateWindow | None = None,
+        identity_overrides: IdentityOverrides | None = None,
+        continuation_specs: Sequence[str | OrcContinuationSpec] = (),
+    ) -> tuple[TeamData, IngestReport]:
+        normalized = tuple(_orc_spec(spec) for spec in continuation_specs)
+        received.append(
+            tuple(
+                spec.session_id
+                + (
+                    "=" + spec.start_message_id
+                    if spec.start_message_id is not None
+                    else ""
+                )
+                for spec in normalized
+            )
+        )
+        return cast(TeamData, object()), _report(team_slug)
+
+    monkeypatch.setattr(cli_module, "ingest_orc", fake_orc)
+
+    assert timeline_main(
+        [
+            "ingest-orc",
+            "--output",
+            str(tmp_path / "archive"),
+            "--team",
+            "orc-test",
+            "--source-root",
+            str(tmp_path / "source"),
+            "--root-session",
+            "orc-root",
+            "--continuation-session",
+            "orc-next",
+            "--continuation-session",
+            '{"session_id":"orc-last","start_message_id":"restart-message"}',
+        ]
+    ) == 0
+    assert received == [("orc-next", "orc-last=restart-message")]
 
 
 def test_project_ingest_dispatches_all_providers_then_extracts_all(
@@ -222,7 +390,9 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
         display_timezone: str,
         date_window: DateWindow | None = None,
         identity_overrides: IdentityOverrides | None = None,
+        continuation_specs: Sequence[str | OrcContinuationSpec] = (),
     ) -> tuple[TeamData, IngestReport]:
+        normalized = tuple(_orc_spec(spec) for spec in continuation_specs)
         calls.append(
             (
                 "orc",
@@ -231,6 +401,15 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
                 root_session_id,
                 team_slug,
                 display_timezone,
+                *(
+                    spec.session_id
+                    + (
+                        "=" + spec.start_message_id
+                        if spec.start_message_id is not None
+                        else ""
+                    )
+                    for spec in normalized
+                ),
             )
         )
         return cast(TeamData, object()), _report(team_slug)
@@ -263,6 +442,7 @@ def test_project_ingest_dispatches_all_providers_then_extracts_all(
         "orc-team",
     )
     assert [call[0] for call in calls] == ["codex", "claude", "orc", "extract"]
+    assert calls[2][-2:] == ("orc-next", "orc-last=restart-message")
     assert calls[-1] == ("extract", str(config.output), "legacy-owner-web")
     assert result.to_json_obj()["model_calls"] == 0
     assert result.to_json_obj()["website_build_performed"] is False

@@ -22,7 +22,7 @@ from agent_team_timeline.glossary_audit import (
 from agent_team_timeline.identity import IdentityOverrides, parse_identity_overrides
 from agent_team_timeline.multi_team import build_combined_archive
 from agent_team_timeline.naming import AgentNameError
-from agent_team_timeline.orc import OrcParseError
+from agent_team_timeline.orc import OrcContinuationSpec, OrcParseError
 from agent_team_timeline.pipeline import (
     IngestReport,
     SummarizeReport,
@@ -94,6 +94,23 @@ calls a model, so formatting and UI changes can be regenerated for free.
 
 def _path(raw: str) -> Path:
     return Path(raw).expanduser()
+
+
+def _orc_continuation_arg(raw: str) -> OrcContinuationSpec:
+    value: object = raw
+    if raw.lstrip().startswith("{"):
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"invalid --continuation-session JSON: {error.msg}"
+            ) from error
+    spec = OrcContinuationSpec.from_value(value, "--continuation-session")
+    if not isinstance(value, str) and spec.start_message_id is None:
+        raise ValueError(
+            "--continuation-session.start_message_id: expected a non-empty string"
+        )
+    return spec
 
 
 def _add_archive(parser: argparse.ArgumentParser) -> None:
@@ -185,6 +202,17 @@ def _add_orc_ingest(parser: argparse.ArgumentParser) -> None:
         help="project root containing Orc .orc/ and task .tg/ directories",
     )
     parser.add_argument("--root-session", required=True, help="Orc coordinator session UUID")
+    parser.add_argument(
+        "--continuation-session",
+        action="append",
+        default=[],
+        metavar="SESSION_OR_JSON",
+        help=(
+            "explicit successor coordinator session; use a session id for the whole "
+            "session or compact JSON with session_id and start_message_id for a reused "
+            "session; repeat in chronological order"
+        ),
+    )
     _add_date_window(parser)
     _add_site_identity(parser)
 
@@ -1269,6 +1297,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     str(ns.timezone),
                     date_window,
                     identity_overrides,
+                    tuple(
+                        _orc_continuation_arg(str(item))
+                        for item in ns.continuation_session
+                    ),
                 )
             else:
                 _, ingest_report = ingest_codex(

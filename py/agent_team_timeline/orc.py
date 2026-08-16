@@ -38,11 +38,17 @@ _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _SNAPSHOT_OBJECT_ROOT = ".objects"
 _TASK_PROJECTION_ROOT = ".projections"
 _TASK_PROJECTION_POLICY = "frozen-note-provenance-v2"
+_TASK_HISTORY_POLICY = "frozen-note-history-v3"
 _TASK_PROJECTION_DEGRADATION_REASON = "task-metadata-rewritten-enrichment-preserved"
+_TASK_HISTORY_DEGRADATION_REASON = "task-source-rewritten-frozen-history-preserved"
+_EMPTY_TASK_REWRITE_SHA256 = hashlib.sha256(b"task-rewrite:none").hexdigest()
 _SEMANTIC_IDENTITY_LEGACY = "legacy-raw-v1"
 _SEMANTIC_IDENTITY_DETERMINISTIC = "normalized-v2"
 _SOURCE_STATE_LIVE = "live"
 _SOURCE_STATE_DETACHED = "detached"
+_SESSION_STATE_SHIFT = 64
+_SESSION_STATE_MASK = (1 << _SESSION_STATE_SHIFT) - 1
+_SESSION_STATE_TAG = 1 << (_SESSION_STATE_SHIFT * 2)
 
 
 class OrcParseError(ValueError):
@@ -177,6 +183,12 @@ class OrcTaskProjection:
     note_count: int
     sha256: str
     observed_enrichment_sha256: str
+    observed_note_rewrite_sha256: str
+    missing_note_count: int
+    missing_note_ids_sha256: str
+    observed_note_sequence: int | None
+    unobserved_note_id_gap_count: int | None
+    unobserved_note_id_gap_sha256: str | None
     rewrite_count: int
     last_rewrite_at: str | None
     degraded: bool
@@ -191,6 +203,12 @@ class OrcTaskProjection:
             "note_count": self.note_count,
             "sha256": self.sha256,
             "observed_enrichment_sha256": self.observed_enrichment_sha256,
+            "observed_note_rewrite_sha256": self.observed_note_rewrite_sha256,
+            "missing_note_count": self.missing_note_count,
+            "missing_note_ids_sha256": self.missing_note_ids_sha256,
+            "observed_note_sequence": self.observed_note_sequence,
+            "unobserved_note_id_gap_count": self.unobserved_note_id_gap_count,
+            "unobserved_note_id_gap_sha256": self.unobserved_note_id_gap_sha256,
             "rewrite_count": self.rewrite_count,
             "last_rewrite_at": self.last_rewrite_at,
             "degraded": self.degraded,
@@ -203,23 +221,36 @@ class OrcTaskProjection:
     ) -> OrcTaskProjection:
         """Strictly decode schema-v2 task evidence."""
 
-        _require_exact_keys(
-            raw,
-            {
-                "policy",
-                "path",
-                "note_count",
-                "sha256",
-                "observed_enrichment_sha256",
-                "rewrite_count",
-                "last_rewrite_at",
-                "degraded",
-                "degradation_reason",
-            },
-            where,
-        )
+        legacy_fields = {
+            "policy",
+            "path",
+            "note_count",
+            "sha256",
+            "observed_enrichment_sha256",
+            "rewrite_count",
+            "last_rewrite_at",
+            "degraded",
+            "degradation_reason",
+        }
+        prior_current_fields = legacy_fields | {
+            "observed_note_rewrite_sha256",
+            "missing_note_count",
+            "missing_note_ids_sha256",
+        }
+        sequence_fields = prior_current_fields | {"observed_note_sequence"}
+        current_fields = sequence_fields | {
+            "unobserved_note_id_gap_count",
+            "unobserved_note_id_gap_sha256",
+        }
+        if set(raw) not in (
+            legacy_fields,
+            prior_current_fields,
+            sequence_fields,
+            current_fields,
+        ):
+            _require_exact_keys(raw, current_fields, where)
         policy = _required_string(raw.get("policy"), f"{where}.policy")
-        if policy != _TASK_PROJECTION_POLICY:
+        if policy not in (_TASK_PROJECTION_POLICY, _TASK_HISTORY_POLICY):
             raise OrcParseError(f"{where}.policy: unsupported policy {policy!r}")
         sha256 = _sha256_string(raw.get("sha256"), f"{where}.sha256")
         path = _required_string(raw.get("path"), f"{where}.path")
@@ -244,7 +275,11 @@ class OrcTaskProjection:
         if rewrite_count > 0 and (
             last_rewrite_at is None
             or not degraded
-            or degradation_reason != _TASK_PROJECTION_DEGRADATION_REASON
+            or degradation_reason
+            not in (
+                _TASK_PROJECTION_DEGRADATION_REASON,
+                _TASK_HISTORY_DEGRADATION_REASON,
+            )
         ):
             raise OrcParseError(
                 f"{where}: rewrite history requires complete degradation metadata"
@@ -259,6 +294,53 @@ class OrcTaskProjection:
             observed_enrichment_sha256=_sha256_string(
                 raw.get("observed_enrichment_sha256"),
                 f"{where}.observed_enrichment_sha256",
+            ),
+            observed_note_rewrite_sha256=(
+                _EMPTY_TASK_REWRITE_SHA256
+                if "observed_note_rewrite_sha256" not in raw
+                else _sha256_string(
+                    raw.get("observed_note_rewrite_sha256"),
+                    f"{where}.observed_note_rewrite_sha256",
+                )
+            ),
+            missing_note_count=(
+                0
+                if "missing_note_count" not in raw
+                else _nonnegative_integer(
+                    raw.get("missing_note_count"), f"{where}.missing_note_count"
+                )
+            ),
+            missing_note_ids_sha256=(
+                hashlib.sha256(b"[]").hexdigest()
+                if "missing_note_ids_sha256" not in raw
+                else _sha256_string(
+                    raw.get("missing_note_ids_sha256"),
+                    f"{where}.missing_note_ids_sha256",
+                )
+            ),
+            observed_note_sequence=(
+                None
+                if "observed_note_sequence" not in raw
+                else _nonnegative_integer(
+                    raw.get("observed_note_sequence"),
+                    f"{where}.observed_note_sequence",
+                )
+            ),
+            unobserved_note_id_gap_count=(
+                None
+                if "unobserved_note_id_gap_count" not in raw
+                else _nonnegative_integer(
+                    raw.get("unobserved_note_id_gap_count"),
+                    f"{where}.unobserved_note_id_gap_count",
+                )
+            ),
+            unobserved_note_id_gap_sha256=(
+                None
+                if "unobserved_note_id_gap_sha256" not in raw
+                else _sha256_string(
+                    raw.get("unobserved_note_id_gap_sha256"),
+                    f"{where}.unobserved_note_id_gap_sha256",
+                )
             ),
             rewrite_count=rewrite_count,
             last_rewrite_at=last_rewrite_at,
@@ -275,6 +357,7 @@ class OrcSourceCopy:
     snapshot_path: str
     kind: str
     owner_session_id: str
+    lineage_root_session_id: str | None
     source_size: int
     snapshot_size: int
     sha256: str
@@ -284,6 +367,9 @@ class OrcSourceCopy:
     semantic_identity_mode: str
     semantic_sha256: str
     semantic_complete_bytes: int
+    canonical_semantic_sha256: str | None
+    canonical_semantic_complete_bytes: int | None
+    semantic_alias_baseline_path: str | None
     semantic_baseline_path: str | None
     source_state: str
     task_source_ordinal: int | None
@@ -299,6 +385,7 @@ class OrcSourceCopy:
             "snapshot_path": self.snapshot_path,
             "kind": self.kind,
             "owner_session_id": self.owner_session_id,
+            "lineage_root_session_id": self.lineage_root_session_id,
             "source_size": self.source_size,
             "snapshot_size": self.snapshot_size,
             "sha256": self.sha256,
@@ -308,6 +395,9 @@ class OrcSourceCopy:
             "semantic_identity_mode": self.semantic_identity_mode,
             "semantic_sha256": self.semantic_sha256,
             "semantic_complete_bytes": self.semantic_complete_bytes,
+            "canonical_semantic_sha256": self.canonical_semantic_sha256,
+            "canonical_semantic_complete_bytes": self.canonical_semantic_complete_bytes,
+            "semantic_alias_baseline_path": self.semantic_alias_baseline_path,
             "semantic_baseline_path": self.semantic_baseline_path,
             "source_state": self.source_state,
             "task_source_ordinal": self.task_source_ordinal,
@@ -336,31 +426,42 @@ class OrcSourceCopy:
         _safe_relative(source_path)
         _safe_relative(snapshot_path)
         if manifest_schema_version == 2:
-            _require_exact_keys(
-                raw,
-                {
-                    "source_path",
-                    "snapshot_path",
-                    "kind",
-                    "owner_session_id",
-                    "source_size",
-                    "snapshot_size",
-                    "sha256",
-                    "append_count",
-                    "append_max_id",
-                    "append_prefix_sha256",
-                    "semantic_identity_mode",
-                    "semantic_sha256",
-                    "semantic_complete_bytes",
-                    "semantic_baseline_path",
-                    "source_state",
-                    "task_source_ordinal",
-                    "auxiliary",
-                    "task_projection",
-                    "captured_at",
-                },
-                where,
-            )
+            legacy_fields = {
+                "source_path",
+                "snapshot_path",
+                "kind",
+                "owner_session_id",
+                "source_size",
+                "snapshot_size",
+                "sha256",
+                "append_count",
+                "append_max_id",
+                "append_prefix_sha256",
+                "semantic_identity_mode",
+                "semantic_sha256",
+                "semantic_complete_bytes",
+                "semantic_baseline_path",
+                "source_state",
+                "task_source_ordinal",
+                "auxiliary",
+                "task_projection",
+                "captured_at",
+            }
+            lineage_fields = legacy_fields | {"lineage_root_session_id"}
+            canonical_fields = lineage_fields | {
+                "canonical_semantic_sha256",
+                "canonical_semantic_complete_bytes",
+            }
+            current_fields = canonical_fields | {
+                "semantic_alias_baseline_path",
+            }
+            if set(raw) not in (
+                legacy_fields,
+                lineage_fields,
+                canonical_fields,
+                current_fields,
+            ):
+                _require_exact_keys(raw, current_fields, where)
         kind = _required_string(raw.get("kind"), f"{where}.kind")
         if kind not in ("session", "task"):
             raise OrcParseError(f"{where}.kind: unsupported Orc database kind {kind!r}")
@@ -397,6 +498,8 @@ class OrcSourceCopy:
             semantic_complete_bytes = _nonnegative_integer(
                 raw.get("snapshot_size"), f"{where}.snapshot_size"
             )
+            canonical_semantic_sha256: str | None = None
+            canonical_semantic_complete_bytes: int | None = None
             semantic_baseline_path: str | None = snapshot_path
             source_state = _SOURCE_STATE_LIVE
             task_source_ordinal: int | None = 0 if kind == "task" else None
@@ -439,6 +542,36 @@ class OrcSourceCopy:
                 raw.get("semantic_complete_bytes"),
                 f"{where}.semantic_complete_bytes",
             )
+            raw_canonical_sha256 = raw.get("canonical_semantic_sha256")
+            canonical_semantic_sha256 = (
+                None
+                if raw_canonical_sha256 is None
+                else _sha256_string(
+                    raw_canonical_sha256,
+                    f"{where}.canonical_semantic_sha256",
+                )
+            )
+            raw_canonical_bytes = raw.get("canonical_semantic_complete_bytes")
+            canonical_semantic_complete_bytes = (
+                None
+                if raw_canonical_bytes is None
+                else _nonnegative_integer(
+                    raw_canonical_bytes,
+                    f"{where}.canonical_semantic_complete_bytes",
+                )
+            )
+            if (canonical_semantic_sha256 is None) != (
+                canonical_semantic_complete_bytes is None
+            ):
+                raise OrcParseError(
+                    f"{where}: canonical semantic identity must be complete"
+                )
+            semantic_alias_baseline_path = _optional_string(
+                raw.get("semantic_alias_baseline_path"),
+                f"{where}.semantic_alias_baseline_path",
+            )
+            if semantic_alias_baseline_path is not None:
+                _safe_relative(semantic_alias_baseline_path)
             semantic_baseline_path = _optional_string(
                 raw.get("semantic_baseline_path"),
                 f"{where}.semantic_baseline_path",
@@ -473,6 +606,10 @@ class OrcSourceCopy:
             or (kind == "session" and task_source_ordinal is not None)
             or (kind == "task" and task_source_ordinal is None)
             or (
+                kind == "task"
+                and raw.get("lineage_root_session_id") is not None
+            )
+            or (
                 semantic_identity_mode == _SEMANTIC_IDENTITY_LEGACY
                 and semantic_baseline_path is None
             )
@@ -491,6 +628,10 @@ class OrcSourceCopy:
             owner_session_id=_required_string(
                 raw.get("owner_session_id"), f"{where}.owner_session_id"
             ),
+            lineage_root_session_id=_optional_string(
+                raw.get("lineage_root_session_id"),
+                f"{where}.lineage_root_session_id",
+            ),
             source_size=_nonnegative_integer(
                 raw.get("source_size"), f"{where}.source_size"
             ),
@@ -508,6 +649,13 @@ class OrcSourceCopy:
             semantic_identity_mode=semantic_identity_mode,
             semantic_sha256=semantic_sha256,
             semantic_complete_bytes=semantic_complete_bytes,
+            canonical_semantic_sha256=canonical_semantic_sha256,
+            canonical_semantic_complete_bytes=canonical_semantic_complete_bytes,
+            semantic_alias_baseline_path=(
+                semantic_alias_baseline_path
+                if manifest_schema_version == 2
+                else None
+            ),
             semantic_baseline_path=semantic_baseline_path,
             source_state=source_state,
             task_source_ordinal=task_source_ordinal,
@@ -518,11 +666,171 @@ class OrcSourceCopy:
 
 
 @dataclass(frozen=True)
+class OrcContinuationSpec:
+    """One explicitly configured whole-root or native-message-bounded successor."""
+
+    session_id: str
+    start_message_id: str | None = None
+
+    def to_json_obj(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "start_message_id": self.start_message_id,
+        }
+
+    @classmethod
+    def from_json_obj(
+        cls, raw: Mapping[str, object], where: str
+    ) -> OrcContinuationSpec:
+        _require_exact_keys(raw, {"session_id", "start_message_id"}, where)
+        session_id = _safe_component(
+            _required_string(raw.get("session_id"), f"{where}.session_id"),
+            f"{where}.session_id",
+        )
+        start_message_id = _optional_string(
+            raw.get("start_message_id"), f"{where}.start_message_id"
+        )
+        return cls(session_id=session_id, start_message_id=start_message_id)
+
+    @classmethod
+    def from_value(cls, raw: object, where: str) -> OrcContinuationSpec:
+        """Normalize the legacy whole-root string or the bounded object form."""
+
+        if isinstance(raw, cls):
+            return cls.from_json_obj(raw.to_json_obj(), where)
+        if isinstance(raw, str):
+            return cls(
+                session_id=_safe_component(
+                    _required_string(raw, where), where
+                )
+            )
+        return cls.from_json_obj(_mapping(raw, where), where)
+
+
+@dataclass(frozen=True)
+class OrcContinuationLink:
+    """One explicit, frozen transition between parentless Orc coordinators."""
+
+    predecessor_session_id: str
+    session_id: str
+    predecessor_source_path: str
+    predecessor_source_line: int
+    predecessor_at_ms: int
+    source_path: str
+    start_message_id: str | None
+    start_source_line: int | None
+    started_at_ms: int
+    gap_ms: int
+
+    def to_json_obj(self) -> dict[str, object]:
+        """Return the exact durable continuation-boundary record."""
+
+        return {
+            "predecessor_session_id": self.predecessor_session_id,
+            "session_id": self.session_id,
+            "predecessor_source_path": self.predecessor_source_path,
+            "predecessor_source_line": self.predecessor_source_line,
+            "predecessor_at_ms": self.predecessor_at_ms,
+            "source_path": self.source_path,
+            "start_message_id": self.start_message_id,
+            "start_source_line": self.start_source_line,
+            "started_at_ms": self.started_at_ms,
+            "gap_ms": self.gap_ms,
+        }
+
+    @classmethod
+    def from_json_obj(
+        cls, raw: Mapping[str, object], where: str
+    ) -> OrcContinuationLink:
+        """Strictly decode one frozen Orc continuation boundary."""
+
+        legacy_fields = {
+            "predecessor_session_id",
+            "session_id",
+            "predecessor_source_path",
+            "predecessor_source_line",
+            "predecessor_at_ms",
+            "source_path",
+            "started_at_ms",
+            "gap_ms",
+        }
+        current_fields = legacy_fields | {"start_message_id", "start_source_line"}
+        if set(raw) not in (legacy_fields, current_fields):
+            _require_exact_keys(raw, current_fields, where)
+        predecessor_session_id = _safe_component(
+            _required_string(
+                raw.get("predecessor_session_id"),
+                f"{where}.predecessor_session_id",
+            ),
+            f"{where}.predecessor_session_id",
+        )
+        session_id = _safe_component(
+            _required_string(raw.get("session_id"), f"{where}.session_id"),
+            f"{where}.session_id",
+        )
+        predecessor_source_path = _required_string(
+            raw.get("predecessor_source_path"),
+            f"{where}.predecessor_source_path",
+        )
+        source_path = _required_string(
+            raw.get("source_path"), f"{where}.source_path"
+        )
+        _safe_relative(predecessor_source_path)
+        _safe_relative(source_path)
+        start_message_id = _optional_string(
+            raw.get("start_message_id"), f"{where}.start_message_id"
+        )
+        raw_start_source_line = raw.get("start_source_line")
+        start_source_line = (
+            None
+            if raw_start_source_line is None
+            else _nonnegative_integer(
+                raw_start_source_line, f"{where}.start_source_line"
+            )
+        )
+        predecessor_source_line = _nonnegative_integer(
+            raw.get("predecessor_source_line"),
+            f"{where}.predecessor_source_line",
+        )
+        predecessor_at_ms = _nonnegative_integer(
+            raw.get("predecessor_at_ms"), f"{where}.predecessor_at_ms"
+        )
+        started_at_ms = _nonnegative_integer(
+            raw.get("started_at_ms"), f"{where}.started_at_ms"
+        )
+        gap_ms = _nonnegative_integer(raw.get("gap_ms"), f"{where}.gap_ms")
+        if (
+            predecessor_session_id == session_id
+            or predecessor_source_line == 0
+            or predecessor_at_ms == 0
+            or started_at_ms == 0
+            or gap_ms == 0
+            or gap_ms != started_at_ms - predecessor_at_ms
+            or (start_message_id is None) != (start_source_line is None)
+            or start_source_line == 0
+        ):
+            raise OrcParseError(f"{where}: malformed Orc continuation record")
+        return cls(
+            predecessor_session_id=predecessor_session_id,
+            session_id=session_id,
+            predecessor_source_path=predecessor_source_path,
+            predecessor_source_line=predecessor_source_line,
+            predecessor_at_ms=predecessor_at_ms,
+            source_path=source_path,
+            start_message_id=start_message_id,
+            start_source_line=start_source_line,
+            started_at_ms=started_at_ms,
+            gap_ms=gap_ms,
+        )
+
+
+@dataclass(frozen=True)
 class OrcSnapshotResult:
     """Summary of source copies retained by one snapshot pass."""
 
     sources: tuple[OrcSourceCopy, ...]
     files_changed: int
+    continuations: tuple[OrcContinuationLink, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -589,6 +897,7 @@ class _DiscoveredSource:
     kind: str
     owner_candidates: tuple[str, ...]
     source_state: str = _SOURCE_STATE_LIVE
+    lineage_root_session_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -620,6 +929,12 @@ class _AuxiliaryObservation:
 
 
 @dataclass(frozen=True)
+class _ModernBlockOrigin:
+    source_line: int
+    native_message_id: str
+
+
+@dataclass(frozen=True)
 class _TaskNoteEnrichment:
     """Frozen normalization metadata for one append-guarded task note."""
 
@@ -636,6 +951,38 @@ class _TaskEnrichmentObservation:
 
     records: tuple[_TaskNoteEnrichment, ...]
     sha256: str
+
+
+@dataclass(frozen=True)
+class _FrozenTaskNote:
+    note_id: int
+    task_id: str
+    content: str
+    created_at: str
+    server_author: str | None
+    task_owner: str | None
+    title: str
+
+    @property
+    def enrichment(self) -> _TaskNoteEnrichment:
+        return _TaskNoteEnrichment(
+            self.note_id,
+            self.task_id,
+            self.server_author,
+            self.task_owner,
+            self.title,
+        )
+
+
+@dataclass(frozen=True)
+class _ObservedTaskNote:
+    note_id: int
+    task_id: str
+    content: str
+    created_at: str
+    server_author: str | None
+    task_owner: str | None
+    title: str | None
 
 
 @dataclass(frozen=True)
@@ -681,6 +1028,12 @@ def _optional_string(value: object, where: str) -> str | None:
     return value
 
 
+def _string_value(value: object, where: str) -> str:
+    if not isinstance(value, str):
+        raise OrcParseError(f"{where}: expected a string")
+    return value
+
+
 def _boolean(value: object, where: str) -> bool:
     if not isinstance(value, bool):
         raise OrcParseError(f"{where}: expected a boolean")
@@ -723,6 +1076,18 @@ def _optional_json_mapping(value: object, where: str) -> dict[str, object]:
     except json.JSONDecodeError as error:
         raise OrcParseError(f"{where}: invalid JSON ({error})") from error
     return _mapping(decoded, where)
+
+
+def _modern_source_mapping(value: object, where: str) -> dict[str, object]:
+    """Decode structured modern message provenance; ignore named system sources."""
+
+    if value is None or value == "":
+        return {}
+    if not isinstance(value, str):
+        raise OrcParseError(f"{where}: expected a string or null")
+    if not value.startswith("{"):
+        return {}
+    return _optional_json_mapping(value, where)
 
 
 def _nested_mapping(raw: Mapping[str, object], key: str) -> dict[str, object]:
@@ -923,7 +1288,14 @@ def _read_only(path: Path) -> sqlite3.Connection:
     if path.is_symlink() or not path.is_file():
         raise OrcParseError(f"Orc SQLite source is missing or not a regular file: {path}")
     try:
-        connection = sqlite3.connect(path.resolve(strict=True).as_uri() + "?mode=ro", uri=True)
+        resolved = path.resolve(strict=True)
+        immutable_object = (
+            resolved.parent.parent.name == _SNAPSHOT_OBJECT_ROOT
+            and re.fullmatch(r"[0-9a-f]{2}", resolved.parent.name) is not None
+            and re.fullmatch(r"[0-9a-f]{64}\.db", resolved.name) is not None
+        )
+        query = "?mode=ro&immutable=1" if immutable_object else "?mode=ro"
+        connection = sqlite3.connect(resolved.as_uri() + query, uri=True)
         connection.execute("PRAGMA query_only = ON")
         return connection
     except sqlite3.Error as error:
@@ -933,13 +1305,32 @@ def _read_only(path: Path) -> sqlite3.Connection:
 def _require_tables(
     connection: sqlite3.Connection, names: Sequence[str], where: str
 ) -> None:
-    rows = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table'"
-    ).fetchall()
-    found = {_required_string(_row(raw, where)[0], where) for raw in rows}
+    found = _table_names(connection, where)
     missing = sorted(set(names) - found)
     if missing:
         raise OrcParseError(f"{where}: missing required tables: {', '.join(missing)}")
+
+
+def _table_names(connection: sqlite3.Connection, where: str) -> frozenset[str]:
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+    ).fetchall()
+    return frozenset(
+        _required_string(_row(raw, where)[0], where) for raw in rows
+    )
+
+
+def _session_storage_table(
+    connection: sqlite3.Connection, where: str
+) -> str:
+    tables = _table_names(connection, where)
+    if "messages" in tables:
+        return "messages"
+    if "conversation_state" in tables:
+        return "content_blocks"
+    raise OrcParseError(
+        f"{where}: missing both modern messages and legacy conversation_state"
+    )
 
 
 def _session_meta(path: Path, source_path: str) -> _SessionMeta:
@@ -947,9 +1338,10 @@ def _session_meta(path: Path, source_path: str) -> _SessionMeta:
     try:
         _require_tables(
             connection,
-            ("session_meta", "content_blocks", "conversation_state"),
+            ("session_meta", "content_blocks"),
             str(path),
         )
+        _session_storage_table(connection, str(path))
         row = _one(
             connection,
             "SELECT id, parent_id, name, db_name, created_at, updated_at "
@@ -1031,6 +1423,123 @@ def _session_task_relatives(
         (path, required, path == primary_path)
         for path, required in sorted(required_by_path.items())
     )
+
+
+def _lineage_roots(
+    root_session_id: str, continuation_session_ids: Sequence[str]
+) -> tuple[str, ...]:
+    roots = tuple(
+        _safe_component(item, "Orc root or continuation session id")
+        for item in (root_session_id, *continuation_session_ids)
+    )
+    if len(set(roots)) != len(roots):
+        raise OrcParseError("Orc root and continuation session IDs must be unique")
+    return roots
+
+
+def _continuation_specs(
+    values: Sequence[str | OrcContinuationSpec],
+) -> tuple[OrcContinuationSpec, ...]:
+    return tuple(
+        OrcContinuationSpec.from_value(value, f"continuation_specs[{index}]")
+        for index, value in enumerate(values)
+    )
+
+
+def _resolve_continuation_start(
+    path: Path, meta: _SessionMeta, spec: OrcContinuationSpec
+) -> tuple[int | None, int]:
+    if spec.start_message_id is None:
+        return None, meta.created_at_ms
+    connection = _read_only(path)
+    try:
+        if _session_storage_table(connection, str(path)) != "messages":
+            raise OrcParseError(
+                f"bounded Orc continuation {spec.session_id!r} requires the "
+                "append-only messages table"
+            )
+        matches: list[tuple[int, int]] = []
+        for raw in connection.execute(
+            "SELECT id, created_at_ms, message_json FROM messages ORDER BY id"
+        ):
+            row = _row(raw, str(path))
+            source_line = _nonnegative_integer(row[0], f"{path}: message id")
+            timestamp_ms = _nonnegative_integer(
+                row[1], f"{path}: message created_at_ms"
+            )
+            raw_json = _required_string(row[2], f"{path}: message_json")
+            try:
+                decoded: object = json.loads(raw_json)
+            except json.JSONDecodeError as error:
+                raise OrcParseError(
+                    f"{path}: invalid message_json at row {source_line}: {error}"
+                ) from error
+            message = _mapping(decoded, f"{path}: message_json[{source_line}]")
+            if message.get("id") == spec.start_message_id:
+                matches.append((source_line, timestamp_ms))
+        if len(matches) != 1 or matches[0][1] <= 0:
+            raise OrcParseError(
+                f"bounded Orc continuation {spec.session_id!r} start message "
+                f"{spec.start_message_id!r} resolved to {len(matches)} valid rows"
+            )
+        return matches[0]
+    except sqlite3.Error as error:
+        raise OrcParseError(
+            f"failed to resolve Orc continuation start in {path}: {error}"
+        ) from error
+    finally:
+        connection.close()
+
+
+def _session_has_activity_at_or_after(
+    source_root: Path,
+    path: Path,
+    meta: _SessionMeta,
+    lineage_root_session_id: str,
+    start_at_ms: int,
+) -> bool:
+    if meta.created_at_ms >= start_at_ms:
+        return True
+    connection = _read_only(path)
+    try:
+        table = _session_storage_table(connection, str(path))
+        maximum = connection.execute(
+            f"SELECT MAX(created_at_ms) FROM {table}"
+        ).fetchone()
+    finally:
+        connection.close()
+    if maximum is not None:
+        row = _row(maximum, str(path))
+        value = row[0]
+        if isinstance(value, int) and not isinstance(value, bool) and value >= start_at_ms:
+            return True
+    if any(
+        spawn.timestamp_ms >= start_at_ms
+        for spawn in _auxiliary_observation(path, meta).stable_spawns
+    ):
+        return True
+    for relative, _, _ in _session_task_relatives(
+        path, meta, lineage_root_session_id
+    ):
+        task_path = _live_source_path(source_root, relative)
+        if not task_path.is_file() or task_path.is_symlink():
+            continue
+        connection = _read_only(task_path)
+        try:
+            _require_tables(connection, ("task_notes",), str(task_path))
+            maximum = connection.execute(
+                "SELECT MAX(created_at) FROM task_notes"
+            ).fetchone()
+        finally:
+            connection.close()
+        if maximum is None:
+            continue
+        value = _row(maximum, str(task_path))[0]
+        if value is not None and _iso_ms(
+            value, f"{task_path}: latest task note created_at"
+        ) >= start_at_ms:
+            return True
+    return False
 
 
 def _discover_sources(
@@ -1168,6 +1677,112 @@ def _discover_sources(
     return tuple(sorted(result, key=lambda source: source.source_path))
 
 
+def _discover_continuation_sources(
+    source_root: Path,
+    root_session_id: str,
+    continuation_specs: Sequence[OrcContinuationSpec],
+    previously_selected_session_ids: frozenset[str] = frozenset(),
+) -> tuple[_DiscoveredSource, ...]:
+    """Discover disjoint session lineages while coalescing shared TaskGraph DBs."""
+
+    merged: dict[str, _DiscoveredSource] = {}
+    root_start: int | None = None
+    selected_sessions: set[str] = set()
+    specs = (OrcContinuationSpec(root_session_id), *continuation_specs)
+    for spec in specs:
+        root = spec.session_id
+        root_relative = f".orc/sessions/{root}/session.db"
+        root_path = _live_source_path(source_root, root_relative)
+        root_meta = _session_meta(root_path, root_relative)
+        if root_meta.session_id != root or root_meta.parent_id is not None:
+            raise OrcParseError(
+                f"configured Orc continuation {root!r} is not a parentless root session"
+            )
+        _, effective_start = _resolve_continuation_start(
+            root_path, root_meta, spec
+        )
+        if root_start is not None and effective_start <= root_start:
+            raise OrcParseError(
+                "Orc root and continuation sessions must be ordered by strictly "
+                "increasing start time"
+            )
+        root_start = effective_start
+        lineage_sources = _discover_sources(source_root, root)
+        if spec.start_message_id is not None:
+            retained_sessions = {root}
+            allowed_task_paths = {
+                path
+                for path, _, is_primary in _session_task_relatives(
+                    root_path, root_meta, root
+                )
+                if is_primary
+            }
+            for session_source in lineage_sources:
+                if session_source.kind != "session":
+                    continue
+                session_path = _live_source_path(
+                    source_root, session_source.source_path
+                )
+                session_meta = _session_meta(
+                    session_path, session_source.source_path
+                )
+                if session_meta.session_id == root:
+                    continue
+                if (
+                    session_meta.session_id not in previously_selected_session_ids
+                    and not _session_has_activity_at_or_after(
+                        source_root,
+                        session_path,
+                        session_meta,
+                        root,
+                        effective_start,
+                    )
+                ):
+                    continue
+                retained_sessions.add(session_meta.session_id)
+                allowed_task_paths.update(
+                    path
+                    for path, _, _ in _session_task_relatives(
+                        session_path, session_meta, root
+                    )
+                )
+            lineage_sources = tuple(
+                source
+                for source in lineage_sources
+                if (
+                    source.kind == "session"
+                    and source.owner_candidates[0] in retained_sessions
+                )
+                or source.source_path in allowed_task_paths
+            )
+        for source in lineage_sources:
+            if source.kind == "session":
+                source = replace(source, lineage_root_session_id=root)
+            prior = merged.get(source.source_path)
+            if source.kind == "session":
+                session_id = source.owner_candidates[0]
+                if session_id in selected_sessions or prior is not None:
+                    raise OrcParseError(
+                        "configured Orc root lineages overlap at session "
+                        f"{session_id!r}"
+                    )
+                selected_sessions.add(session_id)
+                merged[source.source_path] = source
+                continue
+            if prior is None:
+                merged[source.source_path] = source
+                continue
+            if prior.kind != "task":
+                raise OrcParseError(
+                    f"Orc source path has conflicting database kinds: {source.source_path}"
+                )
+            owners = tuple(
+                dict.fromkeys((*prior.owner_candidates, *source.owner_candidates))
+            )
+            merged[source.source_path] = replace(prior, owner_candidates=owners)
+    return tuple(sorted(merged.values(), key=lambda source: source.source_path))
+
+
 def _update_digest(digest: hashlib._Hash, value: object) -> None:
     if value is None:
         digest.update(b"N")
@@ -1209,6 +1824,43 @@ def _query_digest(
 
 
 def _conversation_messages(connection: sqlite3.Connection) -> list[object]:
+    if _session_storage_table(connection, "Orc session") == "messages":
+        result: list[object] = []
+        for index, raw_row in enumerate(
+            connection.execute(
+                "SELECT id, created_at_ms, message_json FROM messages ORDER BY id"
+            )
+        ):
+            row = _row(raw_row, f"messages[{index}]")
+            message_id = _nonnegative_integer(row[0], f"messages[{index}].id")
+            created_at_ms = _nonnegative_integer(
+                row[1], f"messages[{index}].created_at_ms"
+            )
+            raw = _required_string(
+                row[2], f"messages[{index}].message_json"
+            )
+            try:
+                parsed_message: object = json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise OrcParseError(
+                    f"invalid messages.message_json at row {message_id}: {error}"
+                ) from error
+            message = _mapping(
+                parsed_message, f"messages[{index}].message_json"
+            )
+            embedded_at = _nonnegative_integer(
+                message.get("created_at_ms"),
+                f"messages[{index}].message_json.created_at_ms",
+            )
+            if embedded_at != created_at_ms:
+                raise OrcParseError(
+                    f"messages[{index}] timestamp differs from message_json"
+                )
+            normalized = dict(message)
+            normalized["id"] = message_id
+            normalized["created_at_ms"] = created_at_ms
+            result.append(normalized)
+        return result
     row = _one(
         connection,
         "SELECT conversation_json FROM conversation_state WHERE id = 1",
@@ -1339,6 +1991,42 @@ def _validate_stable_spawn_extension(
         )
 
 
+def _validate_stable_spawn_storage_migration(
+    previous: _AuxiliaryObservation,
+    current: _AuxiliaryObservation,
+    relative: str,
+) -> None:
+    """Allow only the message-row renumbering caused by Orc's schema-v5 migration."""
+
+    previous_by_key = {record.key: record for record in previous.stable_spawns}
+    current_by_key = {record.key: record for record in current.stable_spawns}
+    missing = sorted(set(previous_by_key) - set(current_by_key))
+    if missing:
+        raise OrcParseError(
+            f"Orc stable spawn evidence disappeared during storage migration for "
+            f"{relative}: {missing[0]!r}"
+        )
+    for key, prior in previous_by_key.items():
+        current_record = current_by_key[key]
+        if (
+            prior.session_id,
+            prior.parent_session_id,
+            prior.block_id,
+            prior.timestamp_ms,
+            prior.agent_id,
+        ) != (
+            current_record.session_id,
+            current_record.parent_session_id,
+            current_record.block_id,
+            current_record.timestamp_ms,
+            current_record.agent_id,
+        ):
+            raise OrcParseError(
+                f"Orc stable spawn evidence was rewritten during storage migration "
+                f"for {relative}: {key!r}"
+            )
+
+
 def _validate_session_meta_extension(
     previous: _SessionMeta, current: _SessionMeta, relative: str
 ) -> None:
@@ -1370,6 +2058,30 @@ def _task_projection_text(records: Sequence[_TaskNoteEnrichment]) -> str:
             {
                 "note_id": record.note_id,
                 "task_id": record.task_id,
+                "server_author": record.server_author,
+                "task_owner": record.task_owner,
+                "title": record.title,
+            }
+            for record in records
+        ],
+    }
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _frozen_task_projection_text(records: Sequence[_FrozenTaskNote]) -> str:
+    value = {
+        "schema_version": 2,
+        "records": [
+            {
+                "note_id": record.note_id,
+                "task_id": record.task_id,
+                "content": record.content,
+                "created_at": record.created_at,
                 "server_author": record.server_author,
                 "task_owner": record.task_owner,
                 "title": record.title,
@@ -1420,7 +2132,65 @@ def _task_enrichment_observation(path: Path) -> _TaskEnrichmentObservation:
     return _TaskEnrichmentObservation(frozen, digest)
 
 
-def _load_task_projection(
+def _observed_task_notes(path: Path) -> tuple[_ObservedTaskNote, ...]:
+    connection = _read_only(path)
+    try:
+        rows = connection.execute(
+            "SELECT n.id, n.task_id, n.content, n.created_at, n.author_unixname, "
+            "t.owner, t.title FROM task_notes n LEFT JOIN tasks t "
+            "ON t.local_id = n.task_id ORDER BY n.id"
+        ).fetchall()
+    except sqlite3.Error as error:
+        raise OrcParseError(f"failed to inspect Orc tasks at {path}: {error}") from error
+    finally:
+        connection.close()
+    records = tuple(
+        _ObservedTaskNote(
+            _nonnegative_integer(row[0], f"{path}: note id"),
+            _required_string(row[1], f"{path}: note task_id"),
+            _string_value(row[2], f"{path}: note content"),
+            _required_string(row[3], f"{path}: note created_at"),
+            _optional_string(row[4], f"{path}: note author"),
+            _optional_string(row[5], f"{path}: task owner"),
+            _optional_string(row[6], f"{path}: task title"),
+        )
+        for raw in rows
+        for row in [_row(raw, str(path))]
+    )
+    if len({record.note_id for record in records}) != len(records):
+        raise OrcParseError(f"{path}: duplicate task note id")
+    return records
+
+
+def _task_note_sequence(path: Path) -> int:
+    """Return Orc's durable task-note allocation high-water mark."""
+
+    connection = _read_only(path)
+    try:
+        tables = _table_names(connection, str(path))
+        if "sqlite_sequence" in tables:
+            raw = connection.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'task_notes'"
+            ).fetchone()
+            if raw is not None:
+                return _nonnegative_integer(
+                    _row(raw, str(path))[0], f"{path}: task note sequence"
+                )
+        raw = _one(
+            connection,
+            "SELECT COALESCE(MAX(id), 0) FROM task_notes",
+            str(path),
+        )
+        return _nonnegative_integer(raw[0], f"{path}: task note highwater")
+    except sqlite3.Error as error:
+        raise OrcParseError(
+            f"failed to inspect Orc task-note sequence at {path}: {error}"
+        ) from error
+    finally:
+        connection.close()
+
+
+def _load_legacy_task_projection(
     snapshot_root: Path, status: OrcTaskProjection
 ) -> tuple[_TaskNoteEnrichment, ...]:
     path = _snapshot_path(snapshot_root, status.path)
@@ -1477,10 +2247,137 @@ def _load_task_projection(
     return frozen
 
 
+def _load_frozen_task_projection(
+    snapshot_root: Path, status: OrcTaskProjection
+) -> tuple[_FrozenTaskNote, ...]:
+    path = _snapshot_path(snapshot_root, status.path)
+    if path.is_symlink() or not path.is_file():
+        raise OrcParseError(f"task projection is missing or unsafe: {path}")
+    raw_text = path.read_text(encoding="utf-8")
+    if hashlib.sha256(raw_text.encode("utf-8")).hexdigest() != status.sha256:
+        raise OrcParseError(f"task projection hash mismatch: {path}")
+    try:
+        parsed: object = json.loads(raw_text)
+    except json.JSONDecodeError as error:
+        raise OrcParseError(f"invalid task projection JSON at {path}: {error}") from error
+    root = _mapping(parsed, str(path))
+    _require_exact_keys(root, {"schema_version", "records"}, str(path))
+    if root.get("schema_version") != 2:
+        raise OrcParseError(f"unsupported frozen task projection schema at {path}")
+    records: list[_FrozenTaskNote] = []
+    prior_id = -1
+    for index, raw_record in enumerate(_array(root.get("records"), f"{path}.records")):
+        obj = _mapping(raw_record, f"{path}.records[{index}]")
+        _require_exact_keys(
+            obj,
+            {
+                "note_id",
+                "task_id",
+                "content",
+                "created_at",
+                "server_author",
+                "task_owner",
+                "title",
+            },
+            f"{path}.records[{index}]",
+        )
+        record = _FrozenTaskNote(
+            _nonnegative_integer(obj.get("note_id"), f"{path}.records[{index}].note_id"),
+            _required_string(obj.get("task_id"), f"{path}.records[{index}].task_id"),
+            _string_value(obj.get("content"), f"{path}.records[{index}].content"),
+            _required_string(obj.get("created_at"), f"{path}.records[{index}].created_at"),
+            _optional_string(obj.get("server_author"), f"{path}.records[{index}].server_author"),
+            _optional_string(obj.get("task_owner"), f"{path}.records[{index}].task_owner"),
+            _required_string(obj.get("title"), f"{path}.records[{index}].title"),
+        )
+        if record.note_id <= prior_id:
+            raise OrcParseError(f"task projection note IDs are not strictly ordered: {path}")
+        prior_id = record.note_id
+        records.append(record)
+    frozen = tuple(records)
+    if len(frozen) != status.note_count or _frozen_task_projection_text(frozen) != raw_text:
+        raise OrcParseError(f"frozen task projection mismatch: {path}")
+    return frozen
+
+
+def _freeze_current_task_note(
+    record: _ObservedTaskNote, relative: str
+) -> _FrozenTaskNote:
+    if record.title is None:
+        raise OrcParseError(
+            f"new task note {record.note_id} lacks its task row in {relative}"
+        )
+    return _FrozenTaskNote(
+        record.note_id,
+        record.task_id,
+        record.content,
+        record.created_at,
+        record.server_author,
+        record.task_owner,
+        record.title,
+    )
+
+
+def _bootstrap_frozen_task_projection(
+    snapshot_root: Path,
+    source: OrcSourceCopy,
+    source_path: Path,
+) -> tuple[_FrozenTaskNote, ...]:
+    """Load v3 history or losslessly upgrade one immutable legacy snapshot."""
+
+    if source.task_projection is not None and (
+        source.task_projection.policy == _TASK_HISTORY_POLICY
+    ):
+        return _load_frozen_task_projection(snapshot_root, source.task_projection)
+    observed = _observed_task_notes(source_path)
+    if source.task_projection is None:
+        return tuple(
+            _freeze_current_task_note(record, source.source_path)
+            for record in observed
+        )
+    enrichments = _load_legacy_task_projection(
+        snapshot_root, source.task_projection
+    )
+    enrichment_by_id = {record.note_id: record for record in enrichments}
+    if len(observed) != len(enrichments):
+        raise OrcParseError(
+            f"legacy task projection count does not match its snapshot for "
+            f"{source.source_path}"
+        )
+    frozen: list[_FrozenTaskNote] = []
+    for record in observed:
+        enrichment = enrichment_by_id.get(record.note_id)
+        if enrichment is None or enrichment.task_id != record.task_id:
+            raise OrcParseError(
+                f"legacy task projection does not match note {record.note_id} in "
+                f"{source.source_path}"
+            )
+        frozen.append(
+            _FrozenTaskNote(
+                record.note_id,
+                record.task_id,
+                record.content,
+                record.created_at,
+                enrichment.server_author,
+                enrichment.task_owner,
+                enrichment.title,
+            )
+        )
+    return tuple(frozen)
+
+
+def _task_enrichment_sha256(records: Sequence[_FrozenTaskNote]) -> str:
+    return hashlib.sha256(
+        _task_projection_text(tuple(record.enrichment for record in records)).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
 def _stage_task_projection(
-    records: Sequence[_TaskNoteEnrichment], snapshot_root: Path
+    records: Sequence[_FrozenTaskNote], snapshot_root: Path
 ) -> tuple[Path, Path, str, str]:
-    text = _task_projection_text(records)
+    text = _frozen_task_projection_text(records)
     sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
     relative = _task_projection_relative(sha256)
     target = _snapshot_path(snapshot_root, relative)
@@ -1513,10 +2410,15 @@ def _session_semantic_identity(
     state: _LogicalState,
     meta: _SessionMeta,
     auxiliary: _AuxiliaryObservation,
+    schema_version: int = 2,
 ) -> _SemanticIdentity:
+    if schema_version not in (2, 3, 4):
+        raise OrcParseError(
+            f"unsupported Orc session semantic schema {schema_version}"
+        )
     return _semantic_identity(
         {
-            "schema_version": 2,
+            "schema_version": schema_version,
             "kind": "session",
             "source_path": source_path,
             "owner_session_id": owner_session_id,
@@ -1532,16 +2434,51 @@ def _session_semantic_identity(
     )
 
 
+def _session_canonical_state(path: Path, meta: _SessionMeta) -> _LogicalState:
+    """Hash normalized transcript semantics independently of Orc storage layout."""
+
+    events, tools, turns = _content_records(path, meta)
+    ordered_events = tuple(
+        sorted(events, key=lambda item: (item.timestamp_ms, item.event_id))
+    )
+    ordered_tools = tuple(
+        sorted(tools, key=lambda item: (item.started_at_ms, item.call_id))
+    )
+    ordered_turns = tuple(
+        sorted(turns, key=lambda item: (item.started_at_ms, item.turn_id))
+    )
+    payload = json.dumps(
+        {
+            "events": [event.to_json_obj() for event in ordered_events],
+            "tool_calls": [tool.to_json_obj() for tool in ordered_tools],
+            "turns": [turn.to_json_obj() for turn in ordered_turns],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _LogicalState(
+        append_count=len(ordered_events) + len(ordered_tools) + len(ordered_turns),
+        append_max_id=0,
+        append_prefix_sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
 def _task_semantic_identity(
     source_path: str,
     owner_session_id: str,
     task_source_ordinal: int,
     state: _LogicalState,
     projection_sha256: str,
+    schema_version: int = 2,
 ) -> _SemanticIdentity:
+    if schema_version not in (2, 3):
+        raise OrcParseError(
+            f"unsupported Orc task semantic schema {schema_version}"
+        )
     return _semantic_identity(
         {
-            "schema_version": 2,
+            "schema_version": schema_version,
             "kind": "task",
             "source_path": source_path,
             "owner_session_id": owner_session_id,
@@ -1552,6 +2489,76 @@ def _task_semantic_identity(
             "task_projection_sha256": projection_sha256,
         }
     )
+
+
+def _frozen_task_logical_state(
+    records: Sequence[_FrozenTaskNote],
+) -> _LogicalState:
+    digest = hashlib.sha256()
+    for record in records:
+        digest.update(b"R")
+        for value in (
+            record.note_id,
+            record.task_id,
+            record.content,
+            record.created_at,
+        ):
+            _update_digest(digest, value)
+    return _LogicalState(
+        len(records),
+        max((record.note_id for record in records), default=0),
+        digest.hexdigest(),
+    )
+
+
+def _task_rewrite_observation(
+    frozen: Sequence[_FrozenTaskNote],
+    current: Mapping[int, _ObservedTaskNote],
+) -> tuple[str, int, str]:
+    missing_ids = tuple(record.note_id for record in frozen if record.note_id not in current)
+    facts: list[dict[str, object]] = []
+    for record in frozen:
+        observed = current.get(record.note_id)
+        if observed is None:
+            facts.append({"note_id": record.note_id, "state": "missing"})
+            continue
+        observed_enrichment = (
+            observed.server_author,
+            observed.task_owner,
+            observed.title,
+        )
+        frozen_enrichment = (
+            record.server_author,
+            record.task_owner,
+            record.title,
+        )
+        if observed_enrichment != frozen_enrichment:
+            facts.append(
+                {
+                    "note_id": record.note_id,
+                    "state": "enrichment-changed",
+                    "server_author": observed.server_author,
+                    "task_owner": observed.task_owner,
+                    "title": observed.title,
+                }
+            )
+    payload = json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
+    rewrite_sha = (
+        _EMPTY_TASK_REWRITE_SHA256
+        if not facts
+        else hashlib.sha256(payload).hexdigest()
+    )
+    missing_payload = json.dumps(missing_ids, separators=(",", ":")).encode()
+    return rewrite_sha, len(missing_ids), hashlib.sha256(missing_payload).hexdigest()
+
+
+def _task_unobserved_id_gaps(
+    frozen: Sequence[_FrozenTaskNote], sequence: int
+) -> tuple[int, str]:
+    observed = {record.note_id for record in frozen}
+    gaps = tuple(note_id for note_id in range(1, sequence + 1) if note_id not in observed)
+    payload = json.dumps(gaps, separators=(",", ":")).encode()
+    return len(gaps), hashlib.sha256(payload).hexdigest()
 
 
 def _validate_manifest_logical_state(
@@ -1608,9 +2615,10 @@ def _validate_legacy_semantic_identity(
         baseline_identity = _session_semantic_identity(
             source.source_path,
             source.owner_session_id,
-            baseline_state,
+            _session_canonical_state(baseline_path, baseline_meta),
             baseline_meta,
             baseline_auxiliary,
+            4,
         )
     else:
         if projection_sha256 is None:
@@ -1627,6 +2635,91 @@ def _validate_legacy_semantic_identity(
     if baseline_identity != current_identity:
         raise OrcParseError(
             f"legacy Orc semantic state changed without an identity transition: "
+            f"{source.source_path}"
+        )
+
+
+def _validate_semantic_alias(
+    snapshot_root: Path,
+    source: OrcSourceCopy,
+    canonical: _SemanticIdentity,
+) -> None:
+    recorded = (source.semantic_sha256, source.semantic_complete_bytes)
+    expected = (canonical.sha256, canonical.complete_bytes)
+    if source.kind == "task":
+        if recorded != expected or source.semantic_alias_baseline_path is not None:
+            raise OrcParseError(
+                f"task semantic alias differs from canonical history: "
+                f"{source.source_path}"
+            )
+        return
+    if recorded == expected:
+        if source.semantic_alias_baseline_path is not None:
+            raise OrcParseError(
+                f"canonical Orc semantic identity has an unnecessary alias baseline: "
+                f"{source.source_path}"
+            )
+        return
+    relative = source.semantic_alias_baseline_path
+    if relative is None:
+        relative = source.snapshot_path
+    match = re.fullmatch(
+        rf"{re.escape(_SNAPSHOT_OBJECT_ROOT)}/([0-9a-f]{{2}})/"
+        r"([0-9a-f]{64})\.db",
+        relative,
+    )
+    if match is None or match.group(1) != match.group(2)[:2]:
+        raise OrcParseError(
+            f"Orc semantic alias baseline is not a managed object: {relative}"
+        )
+    path = _snapshot_path(snapshot_root, relative)
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or _sha256_file(path) != match.group(2)
+    ):
+        raise OrcParseError(f"Orc semantic alias baseline is missing or unsafe: {path}")
+    meta = _session_meta(path, source.source_path)
+    auxiliary = _auxiliary_observation(path, meta)
+    baseline_canonical = _session_semantic_identity(
+        source.source_path,
+        source.owner_session_id,
+        _session_canonical_state(path, meta),
+        meta,
+        auxiliary,
+        4,
+    )
+    if baseline_canonical != canonical:
+        raise OrcParseError(
+            f"Orc semantic alias baseline has different canonical semantics: "
+            f"{source.source_path}"
+        )
+    states = [_logical_state(path, "session")]
+    if states[0].append_max_id & _SESSION_STATE_TAG:
+        states.extend(
+            _logical_state(path, "session", session_state_mode=mode)
+            for mode in ("content-only", "messages-only")
+        )
+    identities = {
+        (
+            identity.sha256,
+            identity.complete_bytes,
+        )
+        for state in states
+        for identity in (
+            _session_semantic_identity(
+                source.source_path,
+                source.owner_session_id,
+                state,
+                meta,
+                auxiliary,
+                3 if state.append_max_id & _SESSION_STATE_TAG else 2,
+            ),
+        )
+    }
+    if recorded not in identities:
+        raise OrcParseError(
+            f"Orc semantic alias does not match its authenticated baseline: "
             f"{source.source_path}"
         )
 
@@ -1653,34 +2746,166 @@ def _validate_source_semantic_identity(
             raise OrcParseError(
                 f"Orc auxiliary evidence does not match its snapshot: {path}"
             )
-        identity = _session_semantic_identity(
+        legacy_identity = _session_semantic_identity(
             source.source_path,
             source.owner_session_id,
             state,
             meta,
             auxiliary,
+            3 if state.append_max_id & _SESSION_STATE_TAG else 2,
         )
+        accepted_legacy_identities = {
+            (legacy_identity.sha256, legacy_identity.complete_bytes)
+        }
+        if state.append_max_id & _SESSION_STATE_TAG:
+            for storage_mode in ("content-only", "messages-only"):
+                storage_state = _logical_state(
+                    path, "session", session_state_mode=storage_mode
+                )
+                storage_identity = _session_semantic_identity(
+                    source.source_path,
+                    source.owner_session_id,
+                    storage_state,
+                    meta,
+                    auxiliary,
+                    2,
+                )
+                accepted_legacy_identities.add(
+                    (storage_identity.sha256, storage_identity.complete_bytes)
+                )
+        identity = _session_semantic_identity(
+            source.source_path,
+            source.owner_session_id,
+            _session_canonical_state(path, meta),
+            meta,
+            auxiliary,
+            4,
+        )
+        if (
+            source.canonical_semantic_sha256 is None
+            and source.semantic_identity_mode == _SEMANTIC_IDENTITY_DETERMINISTIC
+            and (
+            source.semantic_sha256,
+            source.semantic_complete_bytes,
+            )
+            not in accepted_legacy_identities
+            | {(identity.sha256, identity.complete_bytes)}
+        ):
+            raise OrcParseError(
+                f"Orc deterministic semantic identity does not match artifacts: "
+                f"{source.source_path}"
+            )
     else:
         if source.task_projection is None:
             raise OrcParseError(f"task source lacks frozen enrichment: {source.source_path}")
-        _load_task_projection(snapshot_root, source.task_projection)
-        observation = _task_enrichment_observation(path)
-        if (
-            observation.sha256
-            != source.task_projection.observed_enrichment_sha256
-        ):
-            raise OrcParseError(
-                f"task enrichment observation does not match its snapshot: {path}"
+        if source.task_projection.policy == _TASK_HISTORY_POLICY:
+            frozen = _load_frozen_task_projection(
+                snapshot_root, source.task_projection
             )
-        projection_sha256 = source.task_projection.sha256
-        identity = _task_semantic_identity(
-            source.source_path,
-            source.owner_session_id,
-            source.task_source_ordinal or 0,
-            state,
-            projection_sha256,
+            current_records = _observed_task_notes(path)
+            current_sequence = _task_note_sequence(path)
+            if (
+                source.task_projection.observed_note_sequence is not None
+                and current_sequence
+                != source.task_projection.observed_note_sequence
+            ):
+                raise OrcParseError(
+                    f"task note allocation sequence does not match its "
+                    f"snapshot: {path}"
+                )
+            current = {record.note_id: record for record in current_records}
+            frozen_by_id = {record.note_id: record for record in frozen}
+            unexpected = sorted(set(current) - set(frozen_by_id))
+            if unexpected:
+                raise OrcParseError(
+                    f"task snapshot contains an unfrozen note for "
+                    f"{source.source_path}: {unexpected[0]}"
+                )
+            for note_id, observed in current.items():
+                prior = frozen_by_id[note_id]
+                if (
+                    observed.task_id,
+                    observed.content,
+                    observed.created_at,
+                ) != (prior.task_id, prior.content, prior.created_at):
+                    raise OrcParseError(
+                        f"task note immutable core was rewritten for note "
+                        f"{note_id} in {source.source_path}"
+                    )
+            enrichment_sha256 = _task_enrichment_sha256(frozen)
+            if (
+                enrichment_sha256
+                != source.task_projection.observed_enrichment_sha256
+            ):
+                raise OrcParseError(
+                    f"frozen task enrichment does not match its manifest: {path}"
+                )
+            rewrite_sha256, missing_count, missing_sha256 = (
+                _task_rewrite_observation(frozen, current)
+            )
+            gap_count, gap_sha256 = _task_unobserved_id_gaps(
+                frozen, current_sequence
+            )
+            if (
+                rewrite_sha256
+                != source.task_projection.observed_note_rewrite_sha256
+                or missing_count != source.task_projection.missing_note_count
+                or missing_sha256
+                != source.task_projection.missing_note_ids_sha256
+                or (
+                    source.task_projection.unobserved_note_id_gap_count is not None
+                    and (
+                        gap_count
+                        != source.task_projection.unobserved_note_id_gap_count
+                        or gap_sha256
+                        != source.task_projection.unobserved_note_id_gap_sha256
+                    )
+                )
+            ):
+                raise OrcParseError(
+                    f"task rewrite observation does not match its snapshot: {path}"
+                )
+            projection_sha256 = enrichment_sha256
+            identity = _task_semantic_identity(
+                source.source_path,
+                source.owner_session_id,
+                source.task_source_ordinal or 0,
+                _frozen_task_logical_state(frozen),
+                enrichment_sha256,
+            )
+        else:
+            _load_legacy_task_projection(snapshot_root, source.task_projection)
+            observation = _task_enrichment_observation(path)
+            if (
+                observation.sha256
+                != source.task_projection.observed_enrichment_sha256
+            ):
+                raise OrcParseError(
+                    f"task enrichment observation does not match its snapshot: {path}"
+                )
+            projection_sha256 = source.task_projection.sha256
+            identity = _task_semantic_identity(
+                source.source_path,
+                source.owner_session_id,
+                source.task_source_ordinal or 0,
+                state,
+                projection_sha256,
+            )
+    if source.canonical_semantic_sha256 is not None and (
+        source.canonical_semantic_sha256 != identity.sha256
+        or source.canonical_semantic_complete_bytes != identity.complete_bytes
+    ):
+        raise OrcParseError(
+            f"Orc canonical semantic identity does not match artifacts: "
+            f"{source.source_path}"
         )
-    _validate_recorded_semantic_identity(source, identity, source.source_path)
+    if (
+        source.canonical_semantic_sha256 is not None
+        and source.semantic_identity_mode == _SEMANTIC_IDENTITY_DETERMINISTIC
+    ):
+        _validate_semantic_alias(snapshot_root, source, identity)
+    if source.kind != "session" and source.canonical_semantic_sha256 is None:
+        _validate_recorded_semantic_identity(source, identity, source.source_path)
     _validate_legacy_semantic_identity(
         snapshot_root, source, identity, projection_sha256
     )
@@ -1693,6 +2918,7 @@ def _logical_state(
     *,
     prefix_max_id: int | None = None,
     legacy_task_fields: bool = False,
+    session_state_mode: str | None = None,
 ) -> _LogicalState:
     connection = _read_only(path)
     try:
@@ -1702,9 +2928,137 @@ def _logical_state(
         if kind == "session":
             _require_tables(
                 connection,
-                ("session_meta", "content_blocks", "conversation_state"),
+                ("session_meta", "content_blocks"),
                 str(path),
             )
+            storage_table = _session_storage_table(connection, str(path))
+            if session_state_mode == "messages-only":
+                if storage_table != "messages":
+                    raise OrcParseError(
+                        f"{path}: messages-only legacy state lacks messages table"
+                    )
+                count_row = _one(
+                    connection,
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages",
+                    str(path),
+                )
+                append_count = _nonnegative_integer(
+                    count_row[0], f"{path}: message count"
+                )
+                append_max_id = _nonnegative_integer(
+                    count_row[1], f"{path}: max message id"
+                )
+                limit = append_max_id if prefix_max_id is None else prefix_max_id
+                prefix_count, prefix_digest = _query_digest(
+                    connection,
+                    "SELECT id, session_id, role, created_at_ms, message_json, "
+                    "search_text FROM messages WHERE id <= ? ORDER BY id",
+                    (limit,),
+                )
+                return _LogicalState(
+                    append_count=(
+                        append_count if prefix_max_id is None else prefix_count
+                    ),
+                    append_max_id=append_max_id,
+                    append_prefix_sha256=prefix_digest,
+                )
+            if session_state_mode not in (None, "content-only"):
+                raise OrcParseError(
+                    f"unsupported legacy Orc session state mode {session_state_mode!r}"
+                )
+            if session_state_mode == "content-only":
+                storage_table = "content_blocks"
+            if storage_table == "messages":
+                content_row = _one(
+                    connection,
+                    "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM content_blocks",
+                    str(path),
+                )
+                message_row = _one(
+                    connection,
+                    "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM messages",
+                    str(path),
+                )
+                content_count = _nonnegative_integer(
+                    content_row[0], f"{path}: content count"
+                )
+                content_max_id = _nonnegative_integer(
+                    content_row[1], f"{path}: max content rowid"
+                )
+                message_count = _nonnegative_integer(
+                    message_row[0], f"{path}: message count"
+                )
+                message_max_id = _nonnegative_integer(
+                    message_row[1], f"{path}: max message id"
+                )
+                if (
+                    content_max_id > _SESSION_STATE_MASK
+                    or message_max_id > _SESSION_STATE_MASK
+                ):
+                    raise OrcParseError(f"{path}: session row identity exceeds 64 bits")
+                if prefix_max_id is None:
+                    content_limit = content_max_id
+                    message_limit = message_max_id
+                    legacy_prefix = False
+                elif prefix_max_id & _SESSION_STATE_TAG:
+                    packed = prefix_max_id ^ _SESSION_STATE_TAG
+                    content_limit = packed >> _SESSION_STATE_SHIFT
+                    message_limit = packed & _SESSION_STATE_MASK
+                    legacy_prefix = False
+                else:
+                    content_limit = prefix_max_id
+                    message_limit = 0
+                    legacy_prefix = True
+                content_prefix_count, content_prefix_digest = _query_digest(
+                    connection,
+                    "SELECT rowid, id, message_id, session_id, block_index, "
+                    "created_at_ms, turn_index, role, block_type, content, "
+                    "searchable_text, code_input, code_output, code_exit_code, "
+                    "model, user_source, token_count, extra FROM content_blocks "
+                    "WHERE rowid <= ? ORDER BY rowid",
+                    (content_limit,),
+                )
+                message_prefix_count, message_prefix_digest = _query_digest(
+                    connection,
+                    "SELECT id, session_id, role, created_at_ms, message_json, "
+                    "search_text FROM messages WHERE id <= ? ORDER BY id",
+                    (message_limit,),
+                )
+                if legacy_prefix:
+                    return _LogicalState(
+                        append_count=content_prefix_count,
+                        append_max_id=(
+                            _SESSION_STATE_TAG
+                            | (content_max_id << _SESSION_STATE_SHIFT)
+                            | message_max_id
+                        ),
+                        append_prefix_sha256=content_prefix_digest,
+                    )
+                combined = hashlib.sha256()
+                for value in (
+                    "content_blocks",
+                    content_prefix_count,
+                    content_limit,
+                    content_prefix_digest,
+                    "messages",
+                    message_prefix_count,
+                    message_limit,
+                    message_prefix_digest,
+                ):
+                    _update_digest(combined, value)
+                return _LogicalState(
+                    append_count=(
+                        content_count + message_count
+                        if prefix_max_id is None
+                        else content_prefix_count + message_prefix_count
+                    ),
+                    append_max_id=(
+                        _SESSION_STATE_TAG
+                        | (content_max_id << _SESSION_STATE_SHIFT)
+                        | message_max_id
+                    ),
+                    append_prefix_sha256=combined.hexdigest(),
+                )
             count_row = _one(
                 connection,
                 "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM content_blocks",
@@ -1827,6 +3181,14 @@ def _backup_database(source: Path, destination: Path, snapshot_root: Path) -> No
         try:
             source_connection.backup(destination_connection)
             destination_connection.commit()
+            journal_mode = destination_connection.execute(
+                "PRAGMA journal_mode = DELETE"
+            ).fetchone()
+            if journal_mode is None or str(journal_mode[0]).casefold() != "delete":
+                raise OrcParseError(
+                    f"failed to normalize Orc snapshot journal mode for {source}"
+                )
+            destination_connection.commit()
         finally:
             destination_connection.close()
     except sqlite3.Error as error:
@@ -1909,6 +3271,20 @@ def _prune_managed_objects(
             candidate_mode = candidate.lstat().st_mode
             if stat.S_ISLNK(candidate_mode):
                 raise OrcParseError(f"symlink in Orc snapshot object store: {candidate}")
+            sidecar_match = (
+                re.fullmatch(r"([0-9a-f]{64})\.db-(?:wal|shm)", candidate.name)
+                if extension == ".db"
+                else None
+            )
+            if (
+                stat.S_ISREG(candidate_mode)
+                and sidecar_match is not None
+                and sidecar_match.group(1)[:2] == prefix.name
+            ):
+                candidate.unlink()
+                removed += 1
+                prefix_changed = True
+                continue
             match = re.fullmatch(
                 rf"([0-9a-f]{{64}}){re.escape(extension)}", candidate.name
             )
@@ -1959,6 +3335,22 @@ def prune_orc_snapshot_objects(
                 f"{_SNAPSHOT_OBJECT_ROOT}/"
             ):
                 retained_databases.add(source.semantic_baseline_path)
+        if source.semantic_alias_baseline_path is not None:
+            alias_match = re.fullmatch(
+                rf"{re.escape(_SNAPSHOT_OBJECT_ROOT)}/[0-9a-f]{{2}}/"
+                r"([0-9a-f]{64})\.db",
+                source.semantic_alias_baseline_path,
+            )
+            if alias_match is None:
+                raise OrcParseError(
+                    f"invalid Orc semantic alias baseline: "
+                    f"{source.semantic_alias_baseline_path}"
+                )
+            retained_databases.add(source.semantic_alias_baseline_path)
+            retained_items = (
+                *retained_items,
+                (source.semantic_alias_baseline_path, alias_match.group(1)),
+            )
         if source.task_projection is not None:
             retained_projections.add(source.task_projection.path)
             retained_items = (
@@ -2010,7 +3402,8 @@ def prune_orc_staging(snapshot_root: Path) -> int:
     if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
         raise OrcParseError(f"Orc staging root is unsafe: {staging}")
     managed = re.compile(
-        r"(?:orc|task-projection)-[0-9]+-[0-9a-f]{16}\.(?:db|json)"
+        r"(?:orc-[0-9]+-[0-9a-f]{16}\.db(?:-(?:wal|shm))?"
+        r"|task-projection-[0-9]+-[0-9a-f]{16}\.json)"
     )
     removed = 0
     for candidate in sorted(staging.iterdir(), key=lambda item: item.name):
@@ -2031,8 +3424,25 @@ def _plan_snapshot_sources(
     root_session_id: str,
     snapshot_root: Path,
     previous_sources: Sequence[OrcSourceCopy],
+    continuation_specs: Sequence[OrcContinuationSpec],
 ) -> _DiscoveryPlan:
-    live_discovered = list(_discover_sources(source_root, root_session_id))
+    roots = _lineage_roots(
+        root_session_id, tuple(spec.session_id for spec in continuation_specs)
+    )
+    live_discovered = list(
+        _discover_continuation_sources(
+            source_root,
+            root_session_id,
+            continuation_specs,
+            frozenset(
+                source.owner_session_id
+                for source in previous_sources
+                if source.kind == "session"
+            ),
+        )
+        if continuation_specs
+        else _discover_sources(source_root, root_session_id)
+    )
     discovered_paths = {source.source_path for source in live_discovered}
     if len(discovered_paths) != len(live_discovered):
         raise OrcParseError("Orc source discovery produced duplicate source records")
@@ -2048,6 +3458,12 @@ def _plan_snapshot_sources(
         for source in live_discovered
         if source.kind == "session"
     )
+    selected_task_paths = frozenset(
+        source.source_path for source in live_discovered if source.kind == "task"
+    )
+    restricted_task_sources = any(
+        spec.start_message_id is not None for spec in continuation_specs
+    )
     newly_detached_paths: set[str] = set()
     session_task_paths: dict[str, frozenset[str]] = {}
     for discovered_source in live_discovered:
@@ -2060,6 +3476,7 @@ def _plan_snapshot_sources(
             for path, _, _ in _session_task_relatives(
                 live_path, live_meta, root_session_id
             )
+            if not restricted_task_sources or path in selected_task_paths
         )
         session_task_paths[discovered_source.source_path] = live_task_paths
         previous = previous_by_path.get(discovered_source.source_path)
@@ -2080,6 +3497,7 @@ def _plan_snapshot_sources(
             for path, _, _ in _session_task_relatives(
                 previous_path, prior_meta, root_session_id
             )
+            if not restricted_task_sources or path in selected_task_paths
         }
         newly_detached_paths.update(prior_task_paths - live_task_paths)
 
@@ -2204,10 +3622,58 @@ def _prepare_snapshot_candidate(
     _backup_database(source_path, temporary, snapshot_root)
     state = _logical_state(temporary, discovered.kind)
     previous_state: _LogicalState | None = None
+    previous_session_mode: str | None = None
     if previous is not None:
         if previous_path is None:
             raise AssertionError("validated previous snapshot path is missing")
-        if discovered.kind == "task" and previous.task_projection is None:
+        if (
+            discovered.kind == "session"
+            and previous.append_max_id & _SESSION_STATE_TAG == 0
+        ):
+            candidates: list[tuple[str, _LogicalState]] = [
+                (
+                    "content-only",
+                    _logical_state(
+                        previous_path,
+                        discovered.kind,
+                        session_state_mode="content-only",
+                    ),
+                )
+            ]
+            connection = _read_only(previous_path)
+            try:
+                has_messages = "messages" in _table_names(
+                    connection, str(previous_path)
+                )
+            finally:
+                connection.close()
+            if has_messages:
+                candidates.append(
+                    (
+                        "messages-only",
+                        _logical_state(
+                            previous_path,
+                            discovered.kind,
+                            session_state_mode="messages-only",
+                        ),
+                    )
+                )
+            matches = [
+                (mode, candidate)
+                for mode, candidate in candidates
+                if (
+                    candidate.append_count == previous.append_count
+                    and candidate.append_max_id == previous.append_max_id
+                    and candidate.append_prefix_sha256
+                    == previous.append_prefix_sha256
+                )
+            ]
+            if not matches:
+                raise OrcParseError(
+                    f"legacy Orc session prefix does not match its manifest: {relative}"
+                )
+            previous_session_mode, previous_state = matches[-1]
+        elif discovered.kind == "task" and previous.task_projection is None:
             legacy_state = _logical_state(
                 previous_path, discovered.kind, legacy_task_fields=True
             )
@@ -2223,25 +3689,27 @@ def _prepare_snapshot_candidate(
         else:
             previous_state = _logical_state(previous_path, discovered.kind)
             _validate_manifest_logical_state(previous, previous_state, relative)
-        prefix = _logical_state(
-            temporary,
-            discovered.kind,
-            prefix_max_id=previous.append_max_id,
-        )
-        if state.append_count < previous.append_count:
-            raise OrcParseError(
-                f"Orc {discovered.kind} append history shrank for {relative}: "
-                f"{previous.append_count} to {state.append_count} rows"
+        if discovered.kind == "session":
+            prefix = _logical_state(
+                temporary,
+                discovered.kind,
+                prefix_max_id=previous.append_max_id,
+                session_state_mode=previous_session_mode,
             )
-        if prefix.append_count != previous.append_count:
-            raise OrcParseError(
-                f"Orc {discovered.kind} append prefix lost rows for {relative}"
-            )
-        if prefix.append_prefix_sha256 != previous_state.append_prefix_sha256:
-            raise OrcParseError(
-                f"Orc {discovered.kind} existing append prefix was rewritten for "
-                f"{relative}"
-            )
+            if state.append_count < previous.append_count:
+                raise OrcParseError(
+                    f"Orc {discovered.kind} append history shrank for {relative}: "
+                    f"{previous.append_count} to {state.append_count} rows"
+                )
+            if prefix.append_count != previous.append_count:
+                raise OrcParseError(
+                    f"Orc {discovered.kind} append prefix lost rows for {relative}"
+                )
+            if prefix.append_prefix_sha256 != previous_state.append_prefix_sha256:
+                raise OrcParseError(
+                    f"Orc {discovered.kind} existing append prefix was rewritten for "
+                    f"{relative}"
+                )
     return _PreparedCandidate(
         discovered,
         previous,
@@ -2294,20 +3762,67 @@ def _advance_session_candidate(
             previous_identity = _session_semantic_identity(
                 relative,
                 candidate.owner_session_id,
-                candidate.previous_state,
+                _session_canonical_state(candidate.previous_path, previous_meta),
                 previous_meta,
                 previous_auxiliary,
+                4,
             )
             _validate_legacy_semantic_identity(
                 snapshot_root, previous, previous_identity, None
             )
         else:
-            previous_identity = _validate_source_semantic_identity(
-                snapshot_root, previous
+            if previous.append_max_id & _SESSION_STATE_TAG:
+                previous_identity = _validate_source_semantic_identity(
+                    snapshot_root, previous
+                )
+            else:
+                previous_legacy_identity = _session_semantic_identity(
+                    relative,
+                    candidate.owner_session_id,
+                    candidate.previous_state,
+                    previous_meta,
+                    previous_auxiliary,
+                    2,
+                )
+                previous_identity = _session_semantic_identity(
+                    relative,
+                    candidate.owner_session_id,
+                    _session_canonical_state(
+                        candidate.previous_path, previous_meta
+                    ),
+                    previous_meta,
+                    previous_auxiliary,
+                    4,
+                )
+                if (
+                    previous.semantic_identity_mode
+                    == _SEMANTIC_IDENTITY_DETERMINISTIC
+                    and (
+                        previous.semantic_sha256,
+                        previous.semantic_complete_bytes,
+                    )
+                    != (
+                        previous_identity.sha256,
+                        previous_identity.complete_bytes,
+                    )
+                ):
+                    _validate_recorded_semantic_identity(
+                        previous, previous_legacy_identity, relative
+                    )
+                _validate_legacy_semantic_identity(
+                    snapshot_root, previous, previous_identity, None
+                )
+        if (
+            candidate.previous_state.append_max_id & _SESSION_STATE_TAG == 0
+            and candidate.state.append_max_id & _SESSION_STATE_TAG
+        ):
+            _validate_stable_spawn_storage_migration(
+                previous_auxiliary, current_auxiliary, relative
             )
-        _validate_stable_spawn_extension(
-            previous_auxiliary, current_auxiliary, relative
-        )
+        else:
+            _validate_stable_spawn_extension(
+                previous_auxiliary, current_auxiliary, relative
+            )
         rewrite_detected = not _conversation_is_append_extension(
             previous_auxiliary, current_auxiliary
         )
@@ -2330,9 +3845,10 @@ def _advance_session_candidate(
     current_identity = _session_semantic_identity(
         relative,
         candidate.owner_session_id,
-        candidate.state,
+        _session_canonical_state(candidate.temporary_path, current_meta),
         current_meta,
         current_auxiliary,
+        4,
     )
     return _SourceAdvance(
         auxiliary,
@@ -2363,30 +3879,47 @@ def _advance_task_candidate(
         degraded=False,
         degradation_reason=None,
     )
-    current_enrichment = _task_enrichment_observation(candidate.temporary_path)
-    if len(current_enrichment.records) != candidate.state.append_count:
-        raise OrcParseError(
-            f"task enrichment count does not match guarded notes for {relative}"
-        )
+    current_records = _observed_task_notes(candidate.temporary_path)
+    current_sequence = _task_note_sequence(candidate.temporary_path)
+    if len(current_records) != candidate.state.append_count:
+        raise OrcParseError(f"task note count does not match its source for {relative}")
+    if current_sequence < max((record.note_id for record in current_records), default=0):
+        raise OrcParseError(f"task note allocation sequence is invalid for {relative}")
+    current_by_id = {record.note_id: record for record in current_records}
     previous_identity: _SemanticIdentity | None = None
-    projection_rewrite_count = 0
-    projection_last_rewrite_at: str | None = None
-    projection_degraded = False
     previous = candidate.previous
     if previous is None:
-        merged_records = current_enrichment.records
+        previous_records: tuple[_FrozenTaskNote, ...] = ()
+        prior_allocation_highwater = 0
+        prior_rewrite_sha256 = _EMPTY_TASK_REWRITE_SHA256
+        prior_rewrite_count = 0
+        prior_last_rewrite_at: str | None = None
+        prior_degraded = False
     else:
         if candidate.previous_path is None or candidate.previous_state is None:
             raise AssertionError("validated previous task state is missing")
-        previous_records = (
-            _task_enrichment_observation(candidate.previous_path).records
-            if previous.task_projection is None
-            else _load_task_projection(snapshot_root, previous.task_projection)
+        previous_records = _bootstrap_frozen_task_projection(
+            snapshot_root, previous, candidate.previous_path
         )
-        previous_projection_sha256 = hashlib.sha256(
-            _task_projection_text(previous_records).encode("utf-8")
-        ).hexdigest()
+        previous_sequence = (
+            previous.task_projection.observed_note_sequence
+            if previous.task_projection is not None
+            and previous.task_projection.observed_note_sequence is not None
+            else _task_note_sequence(candidate.previous_path)
+        )
+        prior_allocation_highwater = previous_sequence
+        if current_sequence < max(
+            previous_sequence,
+            max((record.note_id for record in previous_records), default=0),
+        ):
+            raise OrcParseError(
+                f"task note allocation sequence regressed for {relative}: "
+                f"{previous_sequence} to {current_sequence}"
+            )
         if previous.task_projection is None:
+            previous_projection_sha256 = _task_enrichment_sha256(
+                previous_records
+            )
             previous_identity = _task_semantic_identity(
                 relative,
                 candidate.owner_session_id,
@@ -2404,73 +3937,66 @@ def _advance_task_candidate(
             previous_identity = _validate_source_semantic_identity(
                 snapshot_root, previous
             )
-        if len(previous_records) != previous.append_count:
-            raise OrcParseError(
-                f"previous task projection count does not match guarded notes for {relative}"
-            )
-        current_by_id = {
-            record.note_id: record for record in current_enrichment.records
-        }
-        missing = sorted(
-            record.note_id
-            for record in previous_records
-            if record.note_id not in current_by_id
-        )
-        if missing:
-            raise OrcParseError(
-                f"guarded task note is missing from enrichment for {relative}: {missing[0]}"
-            )
-        for record in previous_records:
-            if current_by_id[record.note_id].task_id != record.task_id:
-                raise OrcParseError(
-                    f"guarded task_id changed for note {record.note_id} in {relative}"
+        if previous.task_projection is None:
+            prior_rewrite_sha256 = _EMPTY_TASK_REWRITE_SHA256
+            prior_rewrite_count = 0
+            prior_last_rewrite_at = None
+            prior_degraded = False
+        else:
+            prior_rewrite_count = previous.task_projection.rewrite_count
+            prior_last_rewrite_at = previous.task_projection.last_rewrite_at
+            prior_degraded = previous.task_projection.degraded
+            if previous.task_projection.policy == _TASK_HISTORY_POLICY:
+                prior_rewrite_sha256 = (
+                    previous.task_projection.observed_note_rewrite_sha256
                 )
-        previous_ids = {record.note_id for record in previous_records}
-        appended_records = tuple(
-            record
-            for record in current_enrichment.records
-            if record.note_id not in previous_ids
-        )
-        merged_records = (*previous_records, *appended_records)
-        if any(
-            merged_records[index - 1].note_id >= merged_records[index].note_id
-            for index in range(1, len(merged_records))
-        ):
+            else:
+                prior_current = {
+                    record.note_id: record
+                    for record in _observed_task_notes(candidate.previous_path)
+                }
+                prior_rewrite_sha256, _, _ = _task_rewrite_observation(
+                    previous_records, prior_current
+                )
+
+    previous_by_id = {record.note_id: record for record in previous_records}
+    highwater = max(max(previous_by_id, default=0), prior_allocation_highwater)
+    merged_by_id = dict(previous_by_id)
+    for note_id, observed in current_by_id.items():
+        prior = previous_by_id.get(note_id)
+        if prior is not None:
+            if (
+                observed.task_id,
+                observed.content,
+                observed.created_at,
+            ) != (prior.task_id, prior.content, prior.created_at):
+                raise OrcParseError(
+                    f"task note immutable core was rewritten for note {note_id} "
+                    f"in {relative}"
+                )
+            continue
+        if note_id <= highwater:
             raise OrcParseError(
-                f"new task note IDs do not extend the frozen projection for {relative}"
+                f"task note ID {note_id} was reused below frozen highwater "
+                f"{highwater} in {relative}"
             )
-        current_prior = tuple(
-            current_by_id[record.note_id] for record in previous_records
-        )
-        current_prior_sha256 = hashlib.sha256(
-            _task_projection_text(current_prior).encode("utf-8")
-        ).hexdigest()
-        prior_observed_sha256 = (
-            hashlib.sha256(
-                _task_projection_text(previous_records).encode("utf-8")
-            ).hexdigest()
-            if previous.task_projection is None
-            else previous.task_projection.observed_enrichment_sha256
-        )
-        rewrite_detected = current_prior_sha256 != prior_observed_sha256
-        projection_rewrite_count = (
-            0
-            if previous.task_projection is None
-            else previous.task_projection.rewrite_count
-        ) + int(rewrite_detected)
-        projection_last_rewrite_at = (
-            captured_at
-            if rewrite_detected
-            else (
-                None
-                if previous.task_projection is None
-                else previous.task_projection.last_rewrite_at
-            )
-        )
-        projection_degraded = rewrite_detected or (
-            previous.task_projection is not None
-            and previous.task_projection.degraded
-        )
+        merged_by_id[note_id] = _freeze_current_task_note(observed, relative)
+    merged_records = tuple(merged_by_id[note_id] for note_id in sorted(merged_by_id))
+    enrichment_sha256 = _task_enrichment_sha256(merged_records)
+    rewrite_sha256, missing_count, missing_ids_sha256 = (
+        _task_rewrite_observation(merged_records, current_by_id)
+    )
+    gap_count, gap_sha256 = _task_unobserved_id_gaps(
+        merged_records, current_sequence
+    )
+    rewrite_detected = previous is not None and rewrite_sha256 != prior_rewrite_sha256
+    projection_rewrite_count = prior_rewrite_count + int(rewrite_detected)
+    projection_last_rewrite_at = (
+        captured_at if rewrite_detected else prior_last_rewrite_at
+    )
+    projection_degraded = prior_degraded or (
+        rewrite_sha256 != _EMPTY_TASK_REWRITE_SHA256
+    )
     (
         projection_temporary,
         projection_target,
@@ -2478,16 +4004,22 @@ def _advance_task_candidate(
         projection_relative,
     ) = _stage_task_projection(merged_records, snapshot_root)
     task_projection = OrcTaskProjection(
-        policy=_TASK_PROJECTION_POLICY,
+        policy=_TASK_HISTORY_POLICY,
         path=projection_relative,
         note_count=len(merged_records),
         sha256=projection_sha256,
-        observed_enrichment_sha256=current_enrichment.sha256,
+        observed_enrichment_sha256=enrichment_sha256,
+        observed_note_rewrite_sha256=rewrite_sha256,
+        missing_note_count=missing_count,
+        missing_note_ids_sha256=missing_ids_sha256,
+        observed_note_sequence=current_sequence,
+        unobserved_note_id_gap_count=gap_count,
+        unobserved_note_id_gap_sha256=gap_sha256,
         rewrite_count=projection_rewrite_count,
         last_rewrite_at=projection_last_rewrite_at,
         degraded=projection_degraded,
         degradation_reason=(
-            _TASK_PROJECTION_DEGRADATION_REASON
+            _TASK_HISTORY_DEGRADATION_REASON
             if projection_degraded
             else None
         ),
@@ -2496,8 +4028,8 @@ def _advance_task_candidate(
         relative,
         candidate.owner_session_id,
         task_source_ordinal,
-        candidate.state,
-        projection_sha256,
+        _frozen_task_logical_state(merged_records),
+        enrichment_sha256,
     )
     return _SourceAdvance(
         auxiliary,
@@ -2523,17 +4055,167 @@ def _publish_staged_objects(
     return changed
 
 
+def _session_record_timestamp(
+    connection: sqlite3.Connection, source_line: int, where: str
+) -> int | None:
+    table = _session_storage_table(connection, where)
+    identity = "id" if table == "messages" else "rowid"
+    raw = connection.execute(
+        f"SELECT created_at_ms FROM {table} WHERE {identity} = ?",
+        (source_line,),
+    ).fetchone()
+    if raw is None:
+        return None
+    return _integer(_row(raw, where)[0], f"{where}: created_at_ms")
+
+
+def _latest_session_record_before(
+    connection: sqlite3.Connection, before_ms: int, where: str
+) -> tuple[int, int] | None:
+    table = _session_storage_table(connection, where)
+    identity = "id" if table == "messages" else "rowid"
+    raw = connection.execute(
+        f"SELECT {identity}, created_at_ms FROM {table} "
+        "WHERE created_at_ms > 0 AND created_at_ms < ? "
+        f"ORDER BY created_at_ms DESC, {identity} DESC LIMIT 1",
+        (before_ms,),
+    ).fetchone()
+    if raw is None:
+        return None
+    row = _row(raw, where)
+    return (
+        _integer(row[0], f"{where}: source line"),
+        _integer(row[1], f"{where}: created_at_ms"),
+    )
+
+
+def _continuation_links(
+    root_session_id: str,
+    continuation_specs: Sequence[OrcContinuationSpec],
+    session_databases: Mapping[str, Path],
+    previous: Sequence[OrcContinuationLink],
+) -> tuple[OrcContinuationLink, ...]:
+    """Freeze one reproducible transcript boundary for each explicit successor."""
+
+    roots = (root_session_id, *(spec.session_id for spec in continuation_specs))
+    expected_pairs = tuple(zip(roots, continuation_specs))
+    if len(previous) > len(expected_pairs):
+        raise OrcParseError(
+            "source manifest records more Orc continuations than were configured"
+        )
+    result: list[OrcContinuationLink] = []
+    prior_effective_start = _session_meta(
+        session_databases[f".orc/sessions/{root_session_id}/session.db"],
+        f".orc/sessions/{root_session_id}/session.db",
+    ).created_at_ms
+    for index, (predecessor_id, spec) in enumerate(expected_pairs):
+        successor_id = spec.session_id
+        predecessor_source_path = f".orc/sessions/{predecessor_id}/session.db"
+        successor_source_path = f".orc/sessions/{successor_id}/session.db"
+        predecessor_path = session_databases.get(predecessor_source_path)
+        successor_path = session_databases.get(successor_source_path)
+        if predecessor_path is None or successor_path is None:
+            raise OrcParseError(
+                "configured Orc continuation lacks its root session snapshot"
+            )
+        successor_meta = _session_meta(successor_path, successor_source_path)
+        start_source_line, started_at_ms = _resolve_continuation_start(
+            successor_path, successor_meta, spec
+        )
+        if started_at_ms <= prior_effective_start:
+            raise OrcParseError(
+                "Orc root and continuation sessions are not chronologically ordered"
+            )
+        prior_effective_start = started_at_ms
+        connection = _read_only(predecessor_path)
+        try:
+            if index < len(previous):
+                link = previous[index]
+                if (
+                    link.predecessor_session_id != predecessor_id
+                    or link.session_id != successor_id
+                    or link.predecessor_source_path != predecessor_source_path
+                    or link.source_path != successor_source_path
+                    or link.start_message_id != spec.start_message_id
+                    or link.start_source_line != start_source_line
+                    or link.started_at_ms != started_at_ms
+                ):
+                    raise OrcParseError(
+                        f"recorded Orc continuation {index} no longer matches "
+                        "its configured sessions"
+                    )
+                recorded_at = _session_record_timestamp(
+                    connection,
+                    link.predecessor_source_line,
+                    str(predecessor_path),
+                )
+                if recorded_at is None:
+                    raise OrcParseError(
+                        f"recorded Orc continuation {index} boundary row disappeared"
+                    )
+                if recorded_at != link.predecessor_at_ms:
+                    raise OrcParseError(
+                        f"recorded Orc continuation {index} boundary evidence changed"
+                    )
+                result.append(link)
+                continue
+            boundary = _latest_session_record_before(
+                connection, started_at_ms, str(predecessor_path)
+            )
+            if boundary is None:
+                raise OrcParseError(
+                    f"Orc continuation {successor_id!r} has no predecessor "
+                    "content record before its start"
+                )
+            predecessor_source_line, predecessor_at_ms = boundary
+        except sqlite3.Error as error:
+            raise OrcParseError(
+                f"failed to inspect Orc continuation boundary at "
+                f"{predecessor_path}: {error}"
+            ) from error
+        finally:
+            connection.close()
+        gap_ms = started_at_ms - predecessor_at_ms
+        if predecessor_source_line <= 0 or gap_ms <= 0:
+            raise OrcParseError(
+                f"Orc continuation {successor_id!r} does not follow its predecessor"
+            )
+        result.append(
+            OrcContinuationLink(
+                predecessor_session_id=predecessor_id,
+                session_id=successor_id,
+                predecessor_source_path=predecessor_source_path,
+                predecessor_source_line=predecessor_source_line,
+                predecessor_at_ms=predecessor_at_ms,
+                source_path=successor_source_path,
+                start_message_id=spec.start_message_id,
+                start_source_line=start_source_line,
+                started_at_ms=started_at_ms,
+                gap_ms=gap_ms,
+            )
+        )
+    return tuple(result)
+
+
 def snapshot_orc_lineage(
     source_root: Path,
     root_session_id: str,
     snapshot_root: Path,
     previous_sources: Sequence[OrcSourceCopy],
     captured_at: str,
+    continuation_specs: Sequence[str | OrcContinuationSpec] = (),
+    previous_continuations: Sequence[OrcContinuationLink] = (),
 ) -> OrcSnapshotResult:
     """Publish immutable SQLite objects after validating provider-specific monotonicity."""
 
+    specs = _continuation_specs(continuation_specs)
+    _lineage_roots(root_session_id, tuple(spec.session_id for spec in specs))
     plan = _plan_snapshot_sources(
-        source_root, root_session_id, snapshot_root, previous_sources
+        source_root,
+        root_session_id,
+        snapshot_root,
+        previous_sources,
+        specs,
     )
     discovered = plan.sources
     previous_by_path = plan.previous_by_path
@@ -2543,6 +4225,7 @@ def snapshot_orc_lineage(
     staged_objects: list[tuple[Path, Path, str]] = []
     result_sources: list[OrcSourceCopy] = []
     temporary_paths: list[Path] = []
+    temporary_by_source: dict[str, Path] = {}
     try:
         for discovered_source in discovered:
             relative = discovered_source.source_path
@@ -2553,6 +4236,7 @@ def snapshot_orc_lineage(
                 f"orc-{os.getpid()}-{secrets.token_hex(8)}.db"
             )
             temporary_paths.append(temporary)
+            temporary_by_source[relative] = temporary
             candidate = _prepare_snapshot_candidate(
                 source_root,
                 snapshot_root,
@@ -2573,6 +4257,10 @@ def snapshot_orc_lineage(
                     for path, _, _ in _session_task_relatives(
                         temporary, staged_meta, root_session_id
                     )
+                    if not any(
+                        spec.start_message_id is not None for spec in specs
+                    )
+                    or path in task_ordinals
                 )
                 if staged_task_paths != plan.session_task_paths[relative]:
                     raise OrcParseError(
@@ -2610,18 +4298,30 @@ def snapshot_orc_lineage(
             )
             if (
                 previous is not None
-                and previous.semantic_identity_mode == _SEMANTIC_IDENTITY_LEGACY
                 and not semantic_changed
             ):
-                semantic_identity_mode = _SEMANTIC_IDENTITY_LEGACY
+                semantic_identity_mode = previous.semantic_identity_mode
                 semantic_sha256 = previous.semantic_sha256
                 semantic_complete_bytes = previous.semantic_complete_bytes
                 semantic_baseline_path = previous.semantic_baseline_path
+                semantic_alias_baseline_path = (
+                    previous.semantic_alias_baseline_path
+                    or previous.snapshot_path
+                    if previous.semantic_identity_mode
+                    == _SEMANTIC_IDENTITY_DETERMINISTIC
+                    and (
+                        previous.semantic_sha256,
+                        previous.semantic_complete_bytes,
+                    )
+                    != (current_identity.sha256, current_identity.complete_bytes)
+                    else None
+                )
             else:
                 semantic_identity_mode = _SEMANTIC_IDENTITY_DETERMINISTIC
                 semantic_sha256 = current_identity.sha256
                 semantic_complete_bytes = current_identity.complete_bytes
                 semantic_baseline_path = None
+                semantic_alias_baseline_path = None
             staged_objects.append((temporary, target, snapshot_sha256))
             result_sources.append(
                 OrcSourceCopy(
@@ -2629,6 +4329,11 @@ def snapshot_orc_lineage(
                     snapshot_path=snapshot_relative,
                     kind=kind,
                     owner_session_id=owner_session_id,
+                    lineage_root_session_id=(
+                        candidate.discovered.lineage_root_session_id
+                        if kind == "session"
+                        else None
+                    ),
                     source_size=source_path.stat().st_size,
                     snapshot_size=snapshot_size,
                     sha256=snapshot_sha256,
@@ -2638,6 +4343,9 @@ def snapshot_orc_lineage(
                     semantic_identity_mode=semantic_identity_mode,
                     semantic_sha256=semantic_sha256,
                     semantic_complete_bytes=semantic_complete_bytes,
+                    canonical_semantic_sha256=current_identity.sha256,
+                    canonical_semantic_complete_bytes=current_identity.complete_bytes,
+                    semantic_alias_baseline_path=semantic_alias_baseline_path,
                     semantic_baseline_path=semantic_baseline_path,
                     source_state=discovered_source.source_state,
                     task_source_ordinal=task_source_ordinal,
@@ -2647,9 +4355,14 @@ def snapshot_orc_lineage(
                 )
             )
 
+        continuations = _continuation_links(
+            root_session_id, specs, temporary_by_source, previous_continuations
+        )
         changed = _publish_staged_objects(staged_objects, snapshot_root)
         return OrcSnapshotResult(
-            sources=tuple(result_sources), files_changed=changed
+            sources=tuple(result_sources),
+            files_changed=changed,
+            continuations=continuations,
         )
     finally:
         for temporary in temporary_paths:
@@ -2658,7 +4371,10 @@ def snapshot_orc_lineage(
 
 
 def _conversation_spawns(
-    path: Path, meta: _SessionMeta
+    path: Path,
+    meta: _SessionMeta,
+    start_at_ms: int | None = None,
+    start_source_line: int | None = None,
 ) -> tuple[_Spawn, ...]:
     observation = _auxiliary_observation(path, meta)
     result = [
@@ -2671,14 +4387,67 @@ def _conversation_spawns(
             source_path=meta.source_path,
         )
         for record in observation.stable_spawns
+        if (
+            record.message_id >= start_source_line
+            if start_source_line is not None
+            else start_at_ms is None or record.timestamp_ms >= start_at_ms
+        )
     ]
     return tuple(
         sorted(result, key=lambda item: (item.timestamp_ms, item.source_line))
     )
 
 
-def _content_records(
-    path: Path, meta: _SessionMeta
+def _modern_block_origins(path: Path) -> dict[str, _ModernBlockOrigin]:
+    connection = _read_only(path)
+    try:
+        if _session_storage_table(connection, str(path)) != "messages":
+            return {}
+        rows = connection.execute(
+            "SELECT id, message_json FROM messages ORDER BY id"
+        ).fetchall()
+    finally:
+        connection.close()
+    result: dict[str, _ModernBlockOrigin] = {}
+    for raw in rows:
+        row = _row(raw, str(path))
+        source_line = _nonnegative_integer(row[0], f"{path}: message id")
+        raw_json = _required_string(row[1], f"{path}: message_json")
+        try:
+            decoded: object = json.loads(raw_json)
+        except json.JSONDecodeError as error:
+            raise OrcParseError(
+                f"{path}: invalid message_json at row {source_line}: {error}"
+            ) from error
+        message = _mapping(decoded, f"{path}: message_json[{source_line}]")
+        native_message_id = _required_string(
+            message.get("id"), f"{path}: message_json[{source_line}].id"
+        )
+        for raw_block in _array(
+            message.get("blocks"), f"{path}: message_json[{source_line}].blocks"
+        ):
+            block = _mapping(raw_block, f"{path}: message block")
+            block_id = block.get("id")
+            if not isinstance(block_id, int) or isinstance(block_id, bool):
+                continue
+            identity = f"v2-block-{block_id}"
+            origin = _ModernBlockOrigin(source_line, native_message_id)
+            prior = result.get(identity)
+            if prior is not None and prior != origin:
+                raise OrcParseError(
+                    f"{path}: modern block identity {identity!r} is duplicated"
+                )
+            result[identity] = origin
+    return result
+
+
+def _legacy_content_records(
+    path: Path,
+    meta: _SessionMeta,
+    id_namespace: str = "",
+    start_at_ms: int | None = None,
+    start_source_line: int | None = None,
+    modern_origins: Mapping[str, _ModernBlockOrigin] | None = None,
 ) -> tuple[tuple[Event, ...], tuple[ToolCall, ...], tuple[Turn, ...]]:
     connection = _read_only(path)
     try:
@@ -2690,9 +4459,21 @@ def _content_records(
         ).fetchall()
     finally:
         connection.close()
+    origins = modern_origins or {}
+
+    def row_is_included(row: tuple[object, ...]) -> bool:
+        timestamp_ms = _integer(row[3], f"{path}: created_at_ms")
+        if start_source_line is not None:
+            block_id = _required_string(row[1], f"{path}: block id")
+            origin = origins.get(block_id)
+            return origin is not None and origin.source_line >= start_source_line
+        return start_at_ms is None or timestamp_ms >= start_at_ms
+
     owner_gchat_senders: set[str] = set()
     for raw in rows:
         row = _row(raw, str(path))
+        if not row_is_included(row):
+            continue
         role = _required_string(row[5], f"{path}: role")
         if role != "user":
             continue
@@ -2730,16 +4511,27 @@ def _content_records(
         block_id = _required_string(row[1], f"{path}: block id")
         message_id = _required_string(row[2], f"{path}: message id")
         timestamp_ms = _integer(row[3], f"{path}: created_at_ms")
+        if not row_is_included(row):
+            continue
+        modern_origin = origins.get(block_id)
         turn_index = _integer(row[4], f"{path}: turn_index")
         role = _required_string(row[5], f"{path}: role")
         block_type = _required_string(row[6], f"{path}: block_type")
         content = _optional_string(row[7], f"{path}: content")
-        turn_id = f"orc-turn-{meta.session_id[:8]}-{turn_index}"
+        turn_id = f"{id_namespace}orc-turn-{meta.session_id[:8]}-{turn_index}"
         prior = turn_bounds.get(turn_index)
         if prior is None:
-            turn_bounds[turn_index] = (timestamp_ms, timestamp_ms + 1, content)
+            turn_bounds[turn_index] = (
+                timestamp_ms,
+                timestamp_ms + 1,
+                content if role in ("assistant", "notification") else None,
+            )
         else:
-            last_message = content if role == "assistant" and content else prior[2]
+            last_message = (
+                content
+                if role in ("assistant", "notification") and content
+                else prior[2]
+            )
             turn_bounds[turn_index] = (
                 min(prior[0], timestamp_ms),
                 max(prior[1], timestamp_ms + 1),
@@ -2788,7 +4580,7 @@ def _content_records(
         if event_kind is not None and content:
             events.append(
                 Event(
-                    event_id=f"orc-block-{block_id}",
+                    event_id=f"{id_namespace}orc-block-{block_id}",
                     thread_id=meta.session_id,
                     turn_id=turn_id,
                     timestamp_ms=timestamp_ms,
@@ -2800,10 +4592,18 @@ def _content_records(
                     encrypted_content=None,
                     author=event_author,
                     recipient=event_recipient,
-                    source_line=rowid,
+                    source_line=(
+                        modern_origin.source_line
+                        if modern_origin is not None
+                        else rowid
+                    ),
                     ingress_kind=ingress_kind,
                     author_kind=author_kind,
-                    source_native_id=source_native_id,
+                    source_native_id=(
+                        modern_origin.native_message_id
+                        if modern_origin is not None
+                        else source_native_id
+                    ),
                     classification_version=_CLASSIFICATION_VERSION,
                 )
             )
@@ -2819,8 +4619,8 @@ def _content_records(
             )
             tools.append(
                 ToolCall(
-                    call_id=f"orc-code-{block_id}",
-                    item_id=block_id,
+                    call_id=f"{id_namespace}orc-code-{block_id}",
+                    item_id=f"{id_namespace}{block_id}",
                     thread_id=meta.session_id,
                     turn_id=turn_id,
                     name="code_execution",
@@ -2831,12 +4631,16 @@ def _content_records(
                     input_text=code_input,
                     output_text=code_output,
                     nested_tools=tuple(sorted(counts.items())),
-                    source_line=rowid,
+                    source_line=(
+                        modern_origin.source_line
+                        if modern_origin is not None
+                        else rowid
+                    ),
                 )
             )
     turns = tuple(
         Turn(
-            turn_id=f"orc-turn-{meta.session_id[:8]}-{turn_index}",
+            turn_id=f"{id_namespace}orc-turn-{meta.session_id[:8]}-{turn_index}",
             thread_id=meta.session_id,
             started_at_ms=bounds[0],
             ended_at_ms=bounds[1],
@@ -2848,6 +4652,363 @@ def _content_records(
         for turn_index, bounds in sorted(turn_bounds.items())
     )
     return tuple(events), tuple(tools), turns
+
+
+def _modern_content_records(
+    path: Path,
+    meta: _SessionMeta,
+    id_namespace: str,
+    start_at_ms: int | None,
+    start_source_line: int | None,
+) -> tuple[tuple[Event, ...], tuple[ToolCall, ...], tuple[Turn, ...]]:
+    """Normalize the append-only schema-v5 Orc messages table."""
+
+    connection = _read_only(path)
+    try:
+        rows = connection.execute(
+            "SELECT id, session_id, role, created_at_ms, message_json "
+            "FROM messages ORDER BY id"
+        ).fetchall()
+        content_rows = connection.execute(
+            "SELECT id, turn_index FROM content_blocks ORDER BY rowid"
+        ).fetchall()
+    finally:
+        connection.close()
+    existing_block_turns: dict[int, int] = {}
+    for raw in content_rows:
+        row = _row(raw, f"{path}: content block identity")
+        block_identity = _required_string(row[0], f"{path}: content block id")
+        match = re.fullmatch(r"v2-block-(\d+)", block_identity)
+        if match is None:
+            continue
+        existing_block_turns[int(match.group(1))] = _integer(
+            row[1], f"{path}: content block turn_index"
+        )
+    parsed: list[tuple[int, int, str, dict[str, object]]] = []
+    owner_gchat_senders: set[str] = set()
+
+    def message_is_included(message_id: int, timestamp_ms: int) -> bool:
+        if start_source_line is not None:
+            return message_id >= start_source_line
+        return start_at_ms is None or timestamp_ms >= start_at_ms
+
+    for index, raw in enumerate(rows):
+        row = _row(raw, f"{path}: messages[{index}]")
+        message_id = _nonnegative_integer(row[0], f"{path}: message id")
+        session_id = _required_string(row[1], f"{path}: message session_id")
+        if session_id != meta.session_id:
+            raise OrcParseError(
+                f"{path}: message {message_id} belongs to {session_id!r}, "
+                f"not {meta.session_id!r}"
+            )
+        stored_role = _required_string(row[2], f"{path}: message role")
+        timestamp_ms = _nonnegative_integer(
+            row[3], f"{path}: message created_at_ms"
+        )
+        raw_json = _required_string(row[4], f"{path}: message_json")
+        try:
+            decoded: object = json.loads(raw_json)
+        except json.JSONDecodeError as error:
+            raise OrcParseError(
+                f"{path}: invalid message_json for row {message_id}: {error}"
+            ) from error
+        message = _mapping(decoded, f"{path}: message_json[{message_id}]")
+        role = _required_string(
+            message.get("role"), f"{path}: message_json[{message_id}].role"
+        )
+        if role.casefold() != stored_role.casefold():
+            raise OrcParseError(
+                f"{path}: role differs for message row {message_id}"
+            )
+        embedded_at = _nonnegative_integer(
+            message.get("created_at_ms"),
+            f"{path}: message_json[{message_id}].created_at_ms",
+        )
+        if embedded_at != timestamp_ms:
+            raise OrcParseError(
+                f"{path}: timestamp differs for message row {message_id}"
+            )
+        source = _modern_source_mapping(
+            message.get("source"), f"{path}: message_json[{message_id}].source"
+        )
+        if (
+            message_is_included(message_id, timestamp_ms)
+            and role.casefold() == "user"
+            and "GChat" in source
+        ):
+            gchat = _nested_mapping(source, "GChat")
+            explicit_owner = gchat.get("is_owner")
+            if explicit_owner is True:
+                owner_gchat_senders.update(
+                    value
+                    for value in (
+                        gchat.get("sender_unixname"),
+                        gchat.get("sender_display_name"),
+                        gchat.get("sender_name"),
+                    )
+                    if isinstance(value, str) and value
+                )
+        parsed.append((message_id, timestamp_ms, role, message))
+
+    events: list[Event] = []
+    tools: list[ToolCall] = []
+    turns: list[Turn] = []
+    current_turn_index = 0
+    for message_id, timestamp_ms, role, message in parsed:
+        if timestamp_ms == 0:
+            continue
+        blocks = _array(
+            message.get("blocks"), f"{path}: message_json[{message_id}].blocks"
+        )
+        known_turns = {
+            existing_block_turns[raw_id]
+            for raw_block in blocks
+            for block in [_mapping(raw_block, f"{path}: message block")]
+            for raw_id in [block.get("id")]
+            if isinstance(raw_id, int)
+            and not isinstance(raw_id, bool)
+            and raw_id in existing_block_turns
+        }
+        if len(known_turns) > 1:
+            raise OrcParseError(
+                f"{path}: message row {message_id} spans multiple legacy turns"
+            )
+        if known_turns:
+            turn_index = next(iter(known_turns))
+            current_turn_index = turn_index
+        else:
+            if role.casefold() == "user" or current_turn_index == 0:
+                current_turn_index += 1
+            turn_index = current_turn_index
+        if not message_is_included(message_id, timestamp_ms):
+            continue
+        native_message_id = _required_string(
+            message.get("id"), f"{path}: message_json[{message_id}].id"
+        )
+        turn_id = f"{id_namespace}orc-turn-{meta.session_id[:8]}-{turn_index}"
+        last_agent_message: str | None = None
+        error_text: str | None = None
+        emitted = False
+        source = _modern_source_mapping(
+            message.get("source"), f"{path}: message_json[{message_id}].source"
+        )
+        for block_index, raw_block in enumerate(blocks):
+            block = _mapping(
+                raw_block,
+                f"{path}: message_json[{message_id}].blocks[{block_index}]",
+            )
+            block_type = _required_string(
+                block.get("type"),
+                f"{path}: message_json[{message_id}].blocks[{block_index}].type",
+            )
+            raw_block_id = block.get("id")
+            if not isinstance(raw_block_id, int) or isinstance(raw_block_id, bool):
+                continue
+            block_id = raw_block_id
+            if block_id in existing_block_turns:
+                continue
+            if block_type == "ErrorBlock":
+                error_text = _optional_string(
+                    block.get("message"),
+                    f"{path}: message_json[{message_id}].blocks[{block_index}].message",
+                )
+                emitted = True
+                continue
+            if block_type == "CodeExecutionBlock":
+                code_input = _optional_string(
+                    block.get("code"),
+                    f"{path}: message_json[{message_id}].blocks[{block_index}].code",
+                )
+                code_output = _optional_string(
+                    block.get("output"),
+                    f"{path}: message_json[{message_id}].blocks[{block_index}].output",
+                )
+                is_error = block.get("is_error")
+                if not isinstance(is_error, bool):
+                    raise OrcParseError(
+                        f"{path}: CodeExecutionBlock {block_id} lacks is_error"
+                    )
+                counts = Counter(_ORC_TOOL.findall(code_input or ""))
+                identity = f"v2-block-{block_id}"
+                tools.append(
+                    ToolCall(
+                        call_id=f"{id_namespace}orc-code-{identity}",
+                        item_id=f"{id_namespace}{identity}",
+                        thread_id=meta.session_id,
+                        turn_id=turn_id,
+                        name="code_execution",
+                        namespace="orc",
+                        started_at_ms=timestamp_ms,
+                        ended_at_ms=timestamp_ms + 1,
+                        status="failed" if is_error else "completed",
+                        input_text=code_input,
+                        output_text=code_output,
+                        nested_tools=tuple(sorted(counts.items())),
+                        source_line=message_id,
+                    )
+                )
+                emitted = True
+                continue
+            text_key = (
+                "text"
+                if block_type in ("text", "NotificationBlock")
+                else None
+            )
+            if text_key is None:
+                continue
+            content = _optional_string(
+                block.get(text_key),
+                f"{path}: message_json[{message_id}].blocks[{block_index}].text",
+            )
+            if content is None:
+                continue
+            role_key = role.casefold()
+            event_kind: str
+            event_role: str | None
+            event_author: str | None
+            event_recipient: str | None
+            ingress_kind: str
+            author_kind: str
+            source_native_id: str
+            if role_key == "user":
+                (
+                    event_kind,
+                    event_author,
+                    ingress_kind,
+                    author_kind,
+                    source_native_id,
+                ) = _orc_input_provenance(
+                    source,
+                    {},
+                    content,
+                    native_message_id,
+                    frozenset(owner_gchat_senders),
+                )
+                if event_kind == "inter_agent_message":
+                    event_role = None
+                    event_recipient = meta.session_id
+                elif event_kind == "system_input":
+                    event_role = "system"
+                    event_recipient = None
+                else:
+                    event_role = "user"
+                    event_recipient = None
+            elif role_key == "system":
+                event_kind = "system_input"
+                event_role = "system"
+                event_author = "system"
+                event_recipient = None
+                ingress_kind = "orc"
+                author_kind = "system"
+                source_native_id = native_message_id
+            else:
+                event_kind = "assistant_message"
+                event_role = "assistant"
+                event_author = meta.session_id
+                event_recipient = None
+                ingress_kind = "orc"
+                author_kind = "agent"
+                source_native_id = native_message_id
+                last_agent_message = content
+            events.append(
+                Event(
+                    event_id=(
+                        f"{id_namespace}orc-block-v2-block-{block_id}"
+                    ),
+                    thread_id=meta.session_id,
+                    turn_id=turn_id,
+                    timestamp_ms=timestamp_ms,
+                    kind=event_kind,
+                    role=event_role,
+                    phase=None,
+                    text=content,
+                    content_availability="plaintext",
+                    encrypted_content=None,
+                    author=event_author,
+                    recipient=event_recipient,
+                    source_line=message_id,
+                    ingress_kind=ingress_kind,
+                    author_kind=author_kind,
+                    source_native_id=source_native_id,
+                    classification_version=_CLASSIFICATION_VERSION,
+                )
+            )
+            emitted = True
+        if emitted:
+            turns.append(
+                Turn(
+                    turn_id=turn_id,
+                    thread_id=meta.session_id,
+                    started_at_ms=timestamp_ms,
+                    ended_at_ms=timestamp_ms + 1,
+                    status="failed" if error_text is not None else "completed",
+                    first_token_ms=None,
+                    error=error_text,
+                    last_agent_message=last_agent_message,
+                )
+            )
+    return tuple(events), tuple(tools), tuple(turns)
+
+
+def _content_records(
+    path: Path,
+    meta: _SessionMeta,
+    id_namespace: str = "",
+    start_at_ms: int | None = None,
+    start_source_line: int | None = None,
+) -> tuple[tuple[Event, ...], tuple[ToolCall, ...], tuple[Turn, ...]]:
+    connection = _read_only(path)
+    try:
+        modern = _session_storage_table(connection, str(path)) == "messages"
+    finally:
+        connection.close()
+    modern_origins = _modern_block_origins(path) if modern else {}
+    legacy = _legacy_content_records(
+        path,
+        meta,
+        id_namespace,
+        start_at_ms,
+        start_source_line,
+        modern_origins,
+    )
+    if not modern:
+        return legacy
+    additions = _modern_content_records(
+        path, meta, id_namespace, start_at_ms, start_source_line
+    )
+    turns_by_id = {turn.turn_id: turn for turn in legacy[2]}
+    for turn in additions[2]:
+        prior = turns_by_id.get(turn.turn_id)
+        if prior is None:
+            turns_by_id[turn.turn_id] = turn
+            continue
+        turns_by_id[turn.turn_id] = replace(
+            prior,
+            started_at_ms=min(prior.started_at_ms, turn.started_at_ms),
+            ended_at_ms=max(
+                prior.ended_at_ms or prior.started_at_ms,
+                turn.ended_at_ms or turn.started_at_ms,
+            ),
+            status=(
+                "failed"
+                if prior.status == "failed" or turn.status == "failed"
+                else prior.status
+            ),
+            error=prior.error or turn.error,
+            last_agent_message=(
+                turn.last_agent_message or prior.last_agent_message
+            ),
+        )
+    return (
+        (*legacy[0], *additions[0]),
+        (*legacy[1], *additions[1]),
+        tuple(
+            sorted(
+                turns_by_id.values(),
+                key=lambda item: (item.started_at_ms, item.turn_id),
+            )
+        ),
+    )
 
 
 def _select_spawn(
@@ -2870,40 +5031,37 @@ def _task_records(
     coordinator_id: str,
     task_source_ordinal: int,
     spawns: Mapping[tuple[str, str], Sequence[_Spawn]],
-    enrichments: Mapping[int, _TaskNoteEnrichment],
+    records: Sequence[_FrozenTaskNote],
+    *,
+    start_at_ms: int | None = None,
+    end_at_ms: int | None = None,
+    id_namespace: str = "",
 ) -> tuple[tuple[Event, ...], tuple[Turn, ...], tuple[_Spawn, ...]]:
-    connection = _read_only(path)
-    try:
-        rows = connection.execute(
-            "SELECT id, task_id, content, created_at FROM task_notes "
-            "ORDER BY created_at, id"
-        ).fetchall()
-    finally:
-        connection.close()
     events: list[Event] = []
     turns: list[Turn] = []
     inferred: dict[str, _Spawn] = {}
-    for raw in rows:
-        row = _row(raw, str(path))
-        note_id = _integer(row[0], f"{path}: note id")
-        task_id = _required_string(row[1], f"{path}: task id")
-        enrichment = enrichments.get(note_id)
-        if enrichment is None:
-            raise OrcParseError(f"missing frozen enrichment for task note {note_id}")
-        if enrichment.task_id != task_id:
-            raise OrcParseError(f"frozen task_id mismatch for task note {note_id}")
-        content = _optional_string(row[2], f"{path}: note content")
-        if content is None:
+    for record in sorted(records, key=lambda item: (item.created_at, item.note_id)):
+        note_id = record.note_id
+        task_id = record.task_id
+        content = record.content
+        timestamp_ms = _iso_ms(record.created_at, f"{path}: note created_at")
+        if start_at_ms is not None and timestamp_ms < start_at_ms:
             continue
-        timestamp_ms = _iso_ms(row[3], f"{path}: note created_at")
-        title = enrichment.title
+        if end_at_ms is not None and timestamp_ms >= end_at_ms:
+            continue
+        title = record.title
         namespace = "" if task_source_ordinal == 0 else f"-s{task_source_ordinal}"
-        turn_id = f"orc-note-turn-{coordinator_id[:8]}{namespace}-{note_id}"
-        event_id = f"orc-note-{coordinator_id[:8]}{namespace}-{note_id}"
-        if enrichment.server_author is not None:
+        turn_id = (
+            f"{id_namespace}orc-note-turn-"
+            f"{coordinator_id[:8]}{namespace}-{note_id}"
+        )
+        event_id = (
+            f"{id_namespace}orc-note-{coordinator_id[:8]}{namespace}-{note_id}"
+        )
+        if record.server_author is not None:
             text = (
                 f"[{task_id} · {title} · external author: "
-                f"{enrichment.server_author}]\n\n{content}"
+                f"{record.server_author}]\n\n{content}"
             )
             events.append(
                 Event(
@@ -2917,7 +5075,7 @@ def _task_records(
                     text=text,
                     content_availability="plaintext",
                     encrypted_content=None,
-                    author=enrichment.server_author,
+                    author=record.server_author,
                     recipient=None,
                     source_line=note_id,
                 )
@@ -2935,7 +5093,7 @@ def _task_records(
                 )
             )
             continue
-        owner = enrichment.task_owner
+        owner = record.task_owner
         inferred_key = owner or "__unattributed__"
         spawn = (
             None
@@ -3013,12 +5171,167 @@ def _agent_depth(
     return depth
 
 
+def _validated_continuation_roots(
+    snapshot_root: Path,
+    root_session_id: str,
+    source_copies: Sequence[OrcSourceCopy],
+    metas: Mapping[str, _SessionMeta],
+    continuation_links: Sequence[OrcContinuationLink],
+) -> tuple[str, ...]:
+    continuation_ids = tuple(link.session_id for link in continuation_links)
+    roots = _lineage_roots(root_session_id, continuation_ids)
+    source_by_path = {source.source_path: source for source in source_copies}
+    prior_start: int | None = None
+    for index, root in enumerate(roots):
+        meta = metas.get(root)
+        if meta is None:
+            raise OrcParseError(
+                f"snapshot set does not contain configured Orc root {root!r}"
+            )
+        if meta.parent_id is not None:
+            raise OrcParseError(
+                f"configured Orc continuation {root!r} is not a parentless root"
+            )
+        if index == 0:
+            prior_start = meta.created_at_ms
+            continue
+        link = continuation_links[index - 1]
+        predecessor = roots[index - 1]
+        predecessor_source_path = f".orc/sessions/{predecessor}/session.db"
+        successor_source_path = f".orc/sessions/{root}/session.db"
+        validated = OrcContinuationLink.from_json_obj(
+            link.to_json_obj(), f"continuation_links[{index - 1}]"
+        )
+        if (
+            validated.predecessor_session_id != predecessor
+            or validated.session_id != root
+            or validated.predecessor_source_path != predecessor_source_path
+            or validated.source_path != successor_source_path
+        ):
+            raise OrcParseError(
+                f"Orc continuation {index - 1} does not follow the configured order"
+            )
+        predecessor_source = source_by_path.get(predecessor_source_path)
+        successor_source = source_by_path.get(successor_source_path)
+        if predecessor_source is None or successor_source is None:
+            raise OrcParseError(
+                f"Orc continuation {index - 1} refers to an absent source snapshot"
+            )
+        successor_path = _snapshot_path(
+            snapshot_root, successor_source.snapshot_path
+        )
+        resolved_line, resolved_at = _resolve_continuation_start(
+            successor_path,
+            meta,
+            OrcContinuationSpec(
+                session_id=root,
+                start_message_id=validated.start_message_id,
+            ),
+        )
+        if (
+            resolved_line != validated.start_source_line
+            or resolved_at != validated.started_at_ms
+            or prior_start is None
+            or resolved_at <= prior_start
+        ):
+            raise OrcParseError(
+                f"Orc continuation {index - 1} start boundary changed or is unordered"
+            )
+        prior_start = resolved_at
+        path = _snapshot_path(snapshot_root, predecessor_source.snapshot_path)
+        connection = _read_only(path)
+        try:
+            recorded_at = _session_record_timestamp(
+                connection, validated.predecessor_source_line, str(path)
+            )
+        except sqlite3.Error as error:
+            raise OrcParseError(
+                f"failed to validate Orc continuation boundary at {path}: {error}"
+            ) from error
+        finally:
+            connection.close()
+        if recorded_at != validated.predecessor_at_ms:
+            raise OrcParseError(
+                f"Orc continuation {index - 1} boundary evidence changed"
+            )
+    return roots
+
+
+def _continuation_lineages(
+    metas: Mapping[str, _SessionMeta],
+    roots: Sequence[str],
+    root_start_ms: Mapping[str, int],
+    recorded_roots: Mapping[str, str],
+) -> dict[str, str]:
+    root_set = set(roots)
+    result: dict[str, str] = {}
+
+    def resolve(session_id: str, visiting: frozenset[str]) -> str:
+        known = result.get(session_id)
+        if known is not None:
+            return known
+        recorded = recorded_roots.get(session_id)
+        if recorded is not None:
+            if recorded not in root_set:
+                raise OrcParseError(
+                    f"Orc session {session_id!r} records unknown lineage root "
+                    f"{recorded!r}"
+                )
+            result[session_id] = recorded
+            return recorded
+        if session_id in root_set:
+            result[session_id] = session_id
+            return session_id
+        if session_id in visiting:
+            raise OrcParseError(f"cycle in Orc session lineage at {session_id!r}")
+        meta = metas[session_id]
+        if meta.parent_id is None:
+            raise OrcParseError(
+                f"Orc session {session_id!r} is outside the configured root lineages"
+            )
+        if meta.parent_id not in metas:
+            candidates = [
+                root
+                for root in roots
+                if root_start_ms[root] <= meta.updated_at_ms
+            ]
+            if not candidates:
+                raise OrcParseError(
+                    f"Orc session {session_id!r} has no retained lineage root"
+                )
+            root = max(candidates, key=root_start_ms.__getitem__)
+            result[session_id] = root
+            return root
+        root = resolve(meta.parent_id, visiting | {session_id})
+        result[session_id] = root
+        return root
+
+    for session_id in metas:
+        resolve(session_id, frozenset())
+    for session_id, meta in metas.items():
+        parent_id = meta.parent_id
+        if parent_id is not None and parent_id in metas and result[parent_id] != result[session_id]:
+            raise OrcParseError(
+                f"Orc retained parent/child sessions disagree on lineage root: "
+                f"{parent_id!r} -> {session_id!r}"
+            )
+    return result
+
+
+def _continuation_namespace(
+    lineage_root: str, roots: Sequence[str]
+) -> str:
+    index = roots.index(lineage_root)
+    return "" if index == 0 else f"orc-cont-{index}-{lineage_root[:8]}-"
+
+
 def load_orc_team(
     snapshot_root: Path,
     root_session_id: str,
     team_slug: str,
     display_timezone: str,
     source_copies: Sequence[OrcSourceCopy],
+    continuation_links: Sequence[OrcContinuationLink] = (),
 ) -> TeamData:
     """Normalize validated archive-local Orc SQLite backups into ``TeamData``."""
 
@@ -3061,6 +5374,38 @@ def load_orc_team(
                 f"task source {source.source_path!r} has unknown owner "
                 f"{source.owner_session_id!r}"
             )
+    roots = (
+        _validated_continuation_roots(
+            snapshot_root,
+            root_session_id,
+            source_copies,
+            metas,
+            continuation_links,
+        )
+        if continuation_links
+        else (root_session_id,)
+    )
+    root_start_ms = {root_session_id: metas[root_session_id].created_at_ms}
+    root_start_ms.update(
+        {link.session_id: link.started_at_ms for link in continuation_links}
+    )
+    root_start_source_line = {
+        link.session_id: link.start_source_line for link in continuation_links
+    }
+    lineage_by_session = (
+        _continuation_lineages(
+            metas,
+            roots,
+            root_start_ms,
+            {
+                source.owner_session_id: source.lineage_root_session_id
+                for source in session_sources
+                if source.lineage_root_session_id is not None
+            },
+        )
+        if continuation_links
+        else {session_id: root_session_id for session_id in metas}
+    )
 
     session_events: list[Event] = []
     tools: list[ToolCall] = []
@@ -3069,11 +5414,33 @@ def load_orc_team(
     for session_id in sorted(metas):
         meta = metas[session_id]
         path = _snapshot_path(snapshot_root, session_snapshot_paths[session_id])
-        content_events, session_tools, session_turns = _content_records(path, meta)
+        lineage_root = lineage_by_session[session_id]
+        lineage_start = root_start_ms[lineage_root]
+        source_line_start = (
+            root_start_source_line.get(lineage_root)
+            if session_id == lineage_root
+            else None
+        )
+        content_events, session_tools, session_turns = _content_records(
+            path,
+            meta,
+            _continuation_namespace(lineage_by_session[session_id], roots),
+            lineage_start if lineage_by_session[session_id] != root_session_id else None,
+            source_line_start,
+        )
         session_events.extend(content_events)
         tools.extend(session_tools)
         turns.extend(session_turns)
-        all_spawns.extend(_conversation_spawns(path, meta))
+        all_spawns.extend(
+            _conversation_spawns(
+                path,
+                meta,
+                lineage_start
+                if lineage_by_session[session_id] != root_session_id
+                else None,
+                source_line_start,
+            )
+        )
 
     spawns_by_name: dict[tuple[str, str], list[_Spawn]] = defaultdict(list)
     for spawn in all_spawns:
@@ -3081,26 +5448,85 @@ def load_orc_team(
     for values in spawns_by_name.values():
         values.sort(key=lambda item: (item.timestamp_ms, item.source_line))
 
+    task_roots_by_path: dict[str, tuple[str, ...]] = {}
+    if continuation_links:
+        referenced_roots: dict[str, set[str]] = defaultdict(set)
+        task_source_paths = {source.source_path for source in task_sources}
+        for session_id, meta in metas.items():
+            path = _snapshot_path(snapshot_root, session_snapshot_paths[session_id])
+            for task_path, _, _ in _session_task_relatives(
+                path, meta, lineage_by_session[session_id]
+            ):
+                if task_path in task_source_paths:
+                    referenced_roots[task_path].add(
+                        lineage_by_session[session_id]
+                    )
+        root_order = {session_id: index for index, session_id in enumerate(roots)}
+        task_roots_by_path = {
+            path: tuple(sorted(values, key=root_order.__getitem__))
+            for path, values in referenced_roots.items()
+        }
+
     task_events: list[Event] = []
     inferred_spawns: list[_Spawn] = []
     for source in task_sources:
         path = _snapshot_path(snapshot_root, source.snapshot_path)
-        frozen_records = (
-            _task_enrichment_observation(path).records
-            if source.task_projection is None
-            else _load_task_projection(snapshot_root, source.task_projection)
+        frozen_records = _bootstrap_frozen_task_projection(
+            snapshot_root, source, path
         )
-        note_events, task_turns, inferred = _task_records(
-            path,
-            source.source_path,
-            source.owner_session_id,
-            source.task_source_ordinal or 0,
-            spawns_by_name,
-            {record.note_id: record for record in frozen_records},
-        )
-        task_events.extend(note_events)
-        turns.extend(task_turns)
-        inferred_spawns.extend(inferred)
+        task_roots = task_roots_by_path.get(source.source_path, ())
+        owner_root = lineage_by_session[source.owner_session_id]
+        if task_roots and owner_root not in task_roots:
+            root_order = {session_id: index for index, session_id in enumerate(roots)}
+            task_roots = tuple(
+                sorted((owner_root, *task_roots), key=root_order.__getitem__)
+            )
+        if len(task_roots) <= 1:
+            assignments: tuple[tuple[str, int | None, int | None], ...] = (
+                (
+                    source.owner_session_id,
+                    (
+                        root_start_ms[owner_root]
+                        if owner_root != root_session_id
+                        else None
+                    ),
+                    None,
+                ),
+            )
+        else:
+            assignments = tuple(
+                (
+                    coordinator_id,
+                    (
+                        None
+                        if coordinator_id == root_session_id
+                        else root_start_ms[coordinator_id]
+                    ),
+                    (
+                        root_start_ms[task_roots[index + 1]]
+                        if index + 1 < len(task_roots)
+                        else None
+                    ),
+                )
+                for index, coordinator_id in enumerate(task_roots)
+            )
+        for coordinator_id, start_at_ms, end_at_ms in assignments:
+            note_events, task_turns, inferred = _task_records(
+                path,
+                source.source_path,
+                coordinator_id,
+                source.task_source_ordinal or 0,
+                spawns_by_name,
+                frozen_records,
+                start_at_ms=start_at_ms,
+                end_at_ms=end_at_ms,
+                id_namespace=_continuation_namespace(
+                    lineage_by_session[coordinator_id], roots
+                ),
+            )
+            task_events.extend(note_events)
+            turns.extend(task_turns)
+            inferred_spawns.extend(inferred)
     all_spawns.extend(inferred_spawns)
     spawn_ids: dict[str, _Spawn] = {}
     for spawn in all_spawns:
@@ -3137,17 +5563,104 @@ def load_orc_team(
     for event in normalized_events:
         events_by_thread[event.thread_id].append(event)
 
-    parents: dict[str, str | None] = {
-        meta.session_id: meta.parent_id for meta in metas.values()
+    bounded_roots = {
+        link.session_id
+        for link in continuation_links
+        if link.start_message_id is not None
     }
+    included_sessions: set[str] = set()
+    evidence_sessions = {
+        event.thread_id
+        for event in (*session_events, *task_events)
+        if event.thread_id in metas
+    }
+    evidence_sessions.update(
+        tool.thread_id for tool in tools if tool.thread_id in metas
+    )
+    evidence_sessions.update(
+        turn.thread_id for turn in turns if turn.thread_id in metas
+    )
+    evidence_sessions.update(
+        spawn.parent_thread_id
+        for spawn in all_spawns
+        if spawn.parent_thread_id in metas
+    )
+    for session_id, meta in metas.items():
+        lineage_root = lineage_by_session[session_id]
+        if (
+            lineage_root not in bounded_roots
+            or session_id == lineage_root
+            or meta.created_at_ms >= root_start_ms[lineage_root]
+            or session_id in evidence_sessions
+        ):
+            included_sessions.add(session_id)
+
+    continuation_parents = {
+        link.session_id: link.predecessor_session_id
+        for link in continuation_links
+    }
+    def included_parent(session_id: str) -> str | None:
+        if session_id in continuation_parents:
+            return continuation_parents[session_id]
+        parent = metas[session_id].parent_id
+        seen = {session_id}
+        while parent is not None and parent in metas and parent not in included_sessions:
+            if parent in seen:
+                raise OrcParseError(f"cycle in Orc session parents at {parent!r}")
+            seen.add(parent)
+            parent = metas[parent].parent_id
+        if parent is not None and parent in included_sessions:
+            return parent
+        lineage_root = lineage_by_session[session_id]
+        return lineage_root if lineage_root != session_id else None
+
+    parents: dict[str, str | None] = {
+        session_id: included_parent(session_id)
+        for session_id in included_sessions
+    }
+    all_spawns = [
+        spawn
+        for spawn in all_spawns
+        if spawn.parent_thread_id not in metas
+        or spawn.parent_thread_id in included_sessions
+    ]
     for spawn in all_spawns:
         parents[spawn.thread_id] = spawn.parent_thread_id
 
+    session_agent_paths: dict[str, str] = {}
+
+    def session_agent_path(session_id: str) -> str:
+        known = session_agent_paths.get(session_id)
+        if known is not None:
+            return known
+        if session_id == root_session_id:
+            result = "/root"
+        else:
+            meta = metas[session_id]
+            if not continuation_links:
+                result = f"/root/{meta.name}"
+            else:
+                parent = parents.get(session_id)
+                parent_path = (
+                    session_agent_path(parent)
+                    if parent is not None and parent in included_sessions
+                    else "/root"
+                )
+                component = (
+                    f"continuation-{meta.name}-{session_id[:8]}"
+                    if session_id in continuation_parents
+                    else meta.name
+                )
+                result = f"{parent_path.rstrip('/')}/{component}"
+        session_agent_paths[session_id] = result
+        return result
+
     agents: list[Agent] = []
-    for session_id in sorted(metas):
+    for session_id in sorted(included_sessions):
         meta = metas[session_id]
-        parent = meta.parent_id if meta.parent_id in metas else None
-        agent_path = "/root" if session_id == root_session_id else f"/root/{meta.name}"
+        raw_parent = parents.get(session_id)
+        parent = raw_parent if raw_parent in metas else None
+        agent_path = session_agent_path(session_id)
         own = events_by_thread.get(session_id, [])
         activity_ends = [meta.created_at_ms + 1]
         activity_ends.extend(event.timestamp_ms + 1 for event in own)
@@ -3175,8 +5688,18 @@ def load_orc_team(
                 nickname=meta.name if session_id != root_session_id else None,
                 role="coordinator",
                 depth=_agent_depth(session_id, parents),
-                started_at_ms=meta.created_at_ms,
-                ended_at_ms=max(meta.created_at_ms + 1, ended),
+                started_at_ms=max(
+                    meta.created_at_ms,
+                    root_start_ms[lineage_by_session[session_id]],
+                ),
+                ended_at_ms=max(
+                    max(
+                        meta.created_at_ms,
+                        root_start_ms[lineage_by_session[session_id]],
+                    )
+                    + 1,
+                    ended,
+                ),
                 status="completed",
                 source_path=meta.source_path,
             )
@@ -3243,6 +5766,29 @@ def load_orc_team(
     )
     edges = [
         Edge(
+            edge_id=f"orc-continuation-{link.session_id}",
+            call_id=f"orc-continuation-{link.session_id}",
+            from_thread_id=link.predecessor_session_id,
+            to_thread_id=link.session_id,
+            kind="continuation",
+            timestamp_ms=link.predecessor_at_ms,
+            message_text=(
+                "Explicit Orc session continuation. Predecessor source "
+                f"{link.predecessor_source_path} row "
+                f"{link.predecessor_source_line} was recorded at "
+                f"{link.predecessor_at_ms} ms UTC; successor source "
+                f"{link.source_path} started at {link.started_at_ms} ms UTC "
+                f"({link.gap_ms} ms later)."
+            ),
+            content_availability="plaintext",
+            encrypted_content=None,
+            source_line=link.predecessor_source_line,
+        )
+        for link in continuation_links
+    ]
+    edges.extend(
+        [
+        Edge(
             edge_id=f"orc-spawn-{spawn.thread_id}",
             call_id=f"orc-spawn-{spawn.source_line}",
             from_thread_id=spawn.parent_thread_id,
@@ -3258,7 +5804,8 @@ def load_orc_team(
             all_spawns, key=lambda item: (item.timestamp_ms, item.thread_id)
         )
         if spawn.parent_thread_id in agent_ids
-    ]
+        ]
+    )
     edges.extend(
         Edge(
             edge_id=f"orc-message-{event.event_id}",
@@ -3287,7 +5834,11 @@ def load_orc_team(
             mtime_ns=_snapshot_path(snapshot_root, source.snapshot_path).stat().st_mtime_ns,
             sha256=source.sha256,
             complete_bytes=source.snapshot_size,
-            line_count=source.append_count,
+            line_count=(
+                source.task_projection.note_count
+                if source.kind == "task" and source.task_projection is not None
+                else source.append_count
+            ),
             semantic_sha256=source.semantic_sha256,
             semantic_complete_bytes=source.semantic_complete_bytes,
         )
@@ -3310,6 +5861,8 @@ def load_orc_team(
 
 
 __all__ = [
+    "OrcContinuationLink",
+    "OrcContinuationSpec",
     "OrcParseError",
     "OrcSnapshotResult",
     "OrcSourceCopy",

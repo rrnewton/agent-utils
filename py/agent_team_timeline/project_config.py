@@ -19,6 +19,7 @@ from agent_team_timeline.archive import (
     narrow_json,
 )
 from agent_team_timeline.identity import IdentityOverrides, parse_identity_overrides
+from agent_team_timeline.orc import OrcContinuationSpec, OrcParseError
 from agent_team_timeline.pipeline import (
     IngestReport,
     extract_transcripts_archive,
@@ -56,10 +57,11 @@ class ClaudeProjectSource:
 
 @dataclass(frozen=True)
 class OrcProjectSource:
-    """One Orc state root and coordinator session identifier."""
+    """One Orc coordinator root and its explicitly ordered continuations."""
 
     source_root: Path
     root_session: str
+    continuation_sessions: tuple[OrcContinuationSpec, ...]
 
 
 ProjectSource = CodexProjectSource | ClaudeProjectSource | OrcProjectSource
@@ -212,6 +214,27 @@ def _string_array(value: JsonValue, where: str) -> tuple[str, ...]:
     return result
 
 
+def _orc_continuation_array(
+    value: JsonValue, where: str
+) -> tuple[OrcContinuationSpec, ...]:
+    result: list[OrcContinuationSpec] = []
+    for index, item in enumerate(as_array(value, where)):
+        item_where = f"{where}[{index}]"
+        try:
+            spec = OrcContinuationSpec.from_value(item, item_where)
+        except OrcParseError as error:
+            raise ValueError(str(error)) from error
+        if not isinstance(item, str) and spec.start_message_id is None:
+            raise ValueError(
+                f"{item_where}.start_message_id: expected a non-empty string"
+            )
+        result.append(spec)
+    session_ids = tuple(spec.session_id for spec in result)
+    if len(set(session_ids)) != len(session_ids):
+        raise ValueError(f"{where}: duplicate session ids are not allowed")
+    return tuple(result)
+
+
 def _relative_output(config_path: Path, raw: str) -> Path:
     candidate = Path(raw).expanduser()
     if candidate.is_absolute():
@@ -355,13 +378,29 @@ def _claude_source(
 def _orc_source(
     value: dict[str, JsonValue], where: str, config_path: Path
 ) -> OrcProjectSource:
-    _check_fields(value, where, frozenset({"source_root", "root_session"}))
+    _check_fields(
+        value,
+        where,
+        frozenset({"source_root", "root_session"}),
+        frozenset({"continuation_sessions"}),
+    )
+    root_session = _required_string(value.get("root_session"), where + ".root_session")
+    continuations = (
+        _orc_continuation_array(
+            value["continuation_sessions"], where + ".continuation_sessions"
+        )
+        if "continuation_sessions" in value
+        else ()
+    )
+    if root_session in (spec.session_id for spec in continuations):
+        raise ValueError(f"{where}: root_session cannot also be a continuation")
     return OrcProjectSource(
         _source_path(
             config_path,
             _required_string(value.get("source_root"), where + ".source_root"),
         ),
-        _required_string(value.get("root_session"), where + ".root_session"),
+        root_session,
+        continuations,
     )
 
 
@@ -563,6 +602,7 @@ def ingest_project(
                 team.timezone,
                 team.date_window,
                 team.identity_overrides,
+                source.continuation_sessions,
             )
         results.append(ProjectTeamIngestResult(team.slug, team.provider, report))
     # Always project every normalized team already in the durable archive. The projection is a

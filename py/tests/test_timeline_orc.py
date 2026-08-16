@@ -25,6 +25,8 @@ from agent_team_timeline.archive import (
     write_json_if_changed,
 )
 from agent_team_timeline.orc import (
+    OrcContinuationLink,
+    OrcContinuationSpec,
     OrcParseError,
     OrcSourceCopy,
     load_orc_team,
@@ -43,6 +45,7 @@ from agent_team_timeline.window import apply_date_window, parse_date_window
 
 ROOT = "11111111-1111-1111-1111-111111111111"
 NESTED = "22222222-2222-2222-2222-222222222222"
+SUCCESSOR = "33333333-3333-3333-3333-333333333333"
 
 
 def _ms(value: str) -> int:
@@ -57,6 +60,8 @@ def _session_database(
     db_name: str | None,
     messages: list[dict[str, object]],
     blocks: Sequence[tuple[object, ...]],
+    created_at: str = "2026-07-20T19:00:00+00:00",
+    updated_at: str = "2026-07-22T04:00:00+00:00",
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
@@ -89,14 +94,14 @@ def _session_database(
                 parent_id,
                 "root" if parent_id is None else "nested",
                 db_name,
-                "2026-07-20T19:00:00+00:00",
-                "2026-07-22T04:00:00+00:00",
+                created_at,
+                updated_at,
             ),
         )
         conversation = json.dumps({"messages": messages}, separators=(",", ":"))
         connection.execute(
             "INSERT INTO conversation_state VALUES (1, ?, ?)",
-            (conversation, "2026-07-22T04:00:00+00:00"),
+            (conversation, updated_at),
         )
         connection.executemany(
             "INSERT INTO content_blocks VALUES "
@@ -147,6 +152,37 @@ def _index_database(path: Path, sessions: Sequence[tuple[str, str | None]]) -> N
             "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_id TEXT)"
         )
         connection.executemany("INSERT INTO sessions VALUES (?, ?)", sessions)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _add_messages(
+    path: Path,
+    messages: Sequence[tuple[int, str, int, dict[str, object]]],
+) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, created_at_ms INTEGER NOT NULL, "
+            "message_json TEXT NOT NULL, search_text TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO messages(id, session_id, role, created_at_ms, "
+            "message_json, search_text) VALUES (?, ?, ?, ?, ?, NULL)",
+            (
+                (
+                    row_id,
+                    session_id,
+                    str(message["role"]).lower(),
+                    timestamp_ms,
+                    json.dumps(message, separators=(",", ":")),
+                )
+                for row_id, session_id, timestamp_ms, message in messages
+            ),
+        )
         connection.commit()
     finally:
         connection.close()
@@ -501,6 +537,1185 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     return source, root_db, task_db
 
 
+def _continuation_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    source = tmp_path / "continuation-source"
+    root_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    successor_db = source / ".orc" / "sessions" / SUCCESSOR / "session.db"
+    task_db = source / ".tg" / "project.db"
+    root_messages = [
+        {
+            "id": 1,
+            "role": "System",
+            "created_at_ms": _ms("2026-07-21T09:00:00+00:00"),
+            "blocks": [{"type": "AgentBlock", "id": 10, "agent_id": "worker"}],
+        }
+    ]
+    successor_messages = [
+        {
+            "id": 1,
+            "role": "System",
+            "created_at_ms": _ms("2026-07-21T16:05:00+00:00"),
+            "blocks": [{"type": "AgentBlock", "id": 10, "agent_id": "worker"}],
+        }
+    ]
+    root_blocks = [
+        (
+            "shared-text",
+            "root-message",
+            ROOT,
+            0,
+            _ms("2026-07-21T15:00:00+00:00"),
+            1,
+            "assistant",
+            "text",
+            "Predecessor final status",
+            None,
+            None,
+            None,
+            None,
+            "model",
+            None,
+            None,
+            None,
+        ),
+        (
+            "shared-tool",
+            "root-tool-message",
+            ROOT,
+            0,
+            _ms("2026-07-21T15:01:00+00:00"),
+            1,
+            "assistant",
+            "code_execution",
+            None,
+            None,
+            "await orc.readFile('old')",
+            "old",
+            0,
+            "model",
+            None,
+            None,
+            None,
+        ),
+    ]
+    successor_blocks = [
+        (
+            "shared-text",
+            "successor-message",
+            SUCCESSOR,
+            0,
+            _ms("2026-07-21T16:15:00+00:00"),
+            1,
+            "assistant",
+            "text",
+            "Successor first status",
+            None,
+            None,
+            None,
+            None,
+            "model",
+            None,
+            None,
+            None,
+        ),
+        (
+            "shared-tool",
+            "successor-tool-message",
+            SUCCESSOR,
+            0,
+            _ms("2026-07-21T16:16:00+00:00"),
+            1,
+            "assistant",
+            "code_execution",
+            None,
+            None,
+            "await orc.readFile('new')",
+            "new",
+            0,
+            "model",
+            None,
+            None,
+            None,
+        ),
+    ]
+    _session_database(
+        root_db,
+        ROOT,
+        parent_id=None,
+        db_name="project",
+        messages=root_messages,
+        blocks=root_blocks,
+    )
+    _session_database(
+        successor_db,
+        SUCCESSOR,
+        parent_id=None,
+        db_name="project",
+        messages=successor_messages,
+        blocks=successor_blocks,
+        created_at="2026-07-21T16:00:00+00:00",
+    )
+    _index_database(
+        source / ".orc" / "index.db",
+        ((ROOT, None), (SUCCESSOR, None)),
+    )
+    _task_database(task_db)
+    return source, task_db
+
+
+def test_explicit_orc_continuation_unions_lineages_and_partitions_shared_notes(
+    tmp_path: Path,
+) -> None:
+    source, _ = _continuation_fixture(tmp_path)
+    snapshot = tmp_path / "continuation-snapshot"
+
+    predecessor_only = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    assert {
+        item.owner_session_id
+        for item in predecessor_only.sources
+        if item.kind == "session"
+    } == {ROOT}
+    combined = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        predecessor_only.sources,
+        "second",
+        (SUCCESSOR,),
+    )
+    repeated = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        combined.sources,
+        "third",
+        (SUCCESSOR,),
+        combined.continuations,
+    )
+
+    assert repeated.files_changed == 0
+    assert repeated.sources == combined.sources
+    assert repeated.continuations == combined.continuations
+    assert len(combined.continuations) == 1
+    assert len([item for item in combined.sources if item.kind == "task"]) == 1
+    link = combined.continuations[0]
+    assert link.predecessor_session_id == ROOT
+    assert link.session_id == SUCCESSOR
+    assert link.started_at_ms == _ms("2026-07-21T16:00:00+00:00")
+    assert OrcContinuationLink.from_json_obj(
+        link.to_json_obj(), "continuation"
+    ) == link
+    legacy_link = link.to_json_obj()
+    del legacy_link["start_message_id"]
+    del legacy_link["start_source_line"]
+    assert OrcContinuationLink.from_json_obj(
+        legacy_link, "legacy continuation"
+    ) == link
+
+    team = load_orc_team(
+        snapshot,
+        ROOT,
+        "orc-continuation",
+        "UTC",
+        combined.sources,
+        combined.continuations,
+    )
+    successor = next(item for item in team.agents if item.thread_id == SUCCESSOR)
+    assert successor.parent_thread_id == ROOT
+    assert successor.depth == 1
+    assert "/continuation-" in successor.agent_path
+    continuation = next(item for item in team.edges if item.kind == "continuation")
+    assert continuation.from_thread_id == ROOT
+    assert continuation.to_thread_id == SUCCESSOR
+
+    predecessor_note = next(
+        item for item in team.events if "First incarnation finding" in (item.text or "")
+    )
+    successor_note = next(
+        item for item in team.events if "Second incarnation result" in (item.text or "")
+    )
+    assert predecessor_note.recipient == ROOT
+    assert successor_note.recipient == SUCCESSOR
+    assert not predecessor_note.event_id.startswith("orc-cont-")
+    assert successor_note.event_id.startswith(f"orc-cont-1-{SUCCESSOR[:8]}-")
+    assert len(
+        [item for item in team.events if "First incarnation finding" in (item.text or "")]
+    ) == 1
+    assert len(
+        [item for item in team.events if "Second incarnation result" in (item.text or "")]
+    ) == 1
+    assert len({item.event_id for item in team.events}) == len(team.events)
+    assert len({item.turn_id for item in team.turns}) == len(team.turns)
+    assert len({item.call_id for item in team.tool_calls}) == len(team.tool_calls)
+    assert any(
+        item.event_id == "orc-block-shared-text" for item in team.events
+    )
+    assert any(
+        item.event_id
+        == f"orc-cont-1-{SUCCESSOR[:8]}-orc-block-shared-text"
+        for item in team.events
+    )
+
+
+def test_orc_continuation_rejects_duplicate_or_misordered_roots(
+    tmp_path: Path,
+) -> None:
+    source, _ = _continuation_fixture(tmp_path)
+    snapshot = tmp_path / "invalid-continuation-snapshot"
+    with pytest.raises(OrcParseError, match="must be unique"):
+        snapshot_orc_lineage(
+            source, ROOT, snapshot, (), "duplicate", (ROOT,)
+        )
+    with pytest.raises(OrcParseError, match="strictly increasing"):
+        snapshot_orc_lineage(
+            source, SUCCESSOR, snapshot, (), "misordered", (ROOT,)
+        )
+
+
+def test_modern_messages_extend_legacy_blocks_without_rewriting_ids(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "modern-source"
+    root_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    content = [
+        (
+            "v2-block-10",
+            "v2-message-1",
+            ROOT,
+            0,
+            _ms("2026-08-15T10:00:00+00:00"),
+            1,
+            "user",
+            "text",
+            "Legacy overlap prompt",
+            None,
+            None,
+            None,
+            None,
+            None,
+            json.dumps({"Submitted": {"source": "Tui"}}),
+            None,
+            None,
+        ),
+        (
+            "v2-block-11",
+            "v2-message-2",
+            ROOT,
+            0,
+            _ms("2026-08-15T10:00:01+00:00"),
+            1,
+            "assistant",
+            "code_execution",
+            None,
+            None,
+            "await orc.readFile('overlap')",
+            "overlap",
+            0,
+            "model",
+            None,
+            None,
+            None,
+        ),
+    ]
+    _session_database(
+        root_db,
+        ROOT,
+        parent_id=None,
+        db_name=None,
+        messages=[],
+        blocks=content,
+        created_at="2026-08-15T09:00:00+00:00",
+        updated_at="2026-08-15T11:00:00+00:00",
+    )
+    _add_messages(
+        root_db,
+        (
+            (
+                1,
+                ROOT,
+                _ms("2026-08-15T10:00:00+00:00"),
+                {
+                    "id": "overlap-user",
+                    "role": "User",
+                    "source": json.dumps({"Submitted": {"source": "Tui"}}),
+                    "created_at_ms": _ms("2026-08-15T10:00:00+00:00"),
+                    "blocks": [{"type": "text", "id": 10, "text": "Legacy overlap prompt"}],
+                },
+            ),
+            (
+                2,
+                ROOT,
+                _ms("2026-08-15T10:00:01+00:00"),
+                {
+                    "id": "overlap-tool",
+                    "role": "Assistant",
+                    "source": None,
+                    "created_at_ms": _ms("2026-08-15T10:00:01+00:00"),
+                    "blocks": [
+                        {
+                            "type": "CodeExecutionBlock",
+                            "id": 11,
+                            "code": "await orc.readFile('overlap')",
+                            "output": "overlap",
+                            "is_error": False,
+                        }
+                    ],
+                },
+            ),
+            (
+                3,
+                ROOT,
+                _ms("2026-08-15T10:01:00+00:00"),
+                {
+                    "id": "noise-interjection",
+                    "role": "User",
+                    "source": None,
+                    "created_at_ms": _ms("2026-08-15T10:01:00+00:00"),
+                    "blocks": [
+                        {"type": "InterjectionBlock", "id": 14, "text": "Purpose noise"}
+                    ],
+                },
+            ),
+            (
+                4,
+                ROOT,
+                _ms("2026-08-15T10:02:00+00:00"),
+                {
+                    "id": "new-assistant",
+                    "role": "Assistant",
+                    "source": None,
+                    "created_at_ms": _ms("2026-08-15T10:02:00+00:00"),
+                    "blocks": [
+                        {"type": "NotificationBlock", "id": 12, "text": "New result"},
+                        {
+                            "type": "CodeExecutionBlock",
+                            "id": 13,
+                            "code": "await orc.sendAgent('worker','continue')",
+                            "output": "sent",
+                            "is_error": False,
+                        },
+                        {
+                            "type": "ErrorBlock",
+                            "id": 15,
+                            "message": "provider connection failed",
+                        },
+                    ],
+                },
+            ),
+        ),
+    )
+    _index_database(source / ".orc" / "index.db", ((ROOT, None),))
+
+    snapshot = tmp_path / "modern-snapshot"
+    copied = snapshot_orc_lineage(source, ROOT, snapshot, (), "modern")
+    team = load_orc_team(snapshot, ROOT, "modern", "UTC", copied.sources)
+
+    assert [item.event_id for item in team.events] == [
+        "orc-block-v2-block-10",
+        "orc-block-v2-block-12",
+    ]
+    assert [item.call_id for item in team.tool_calls] == [
+        "orc-code-v2-block-11",
+        "orc-code-v2-block-13",
+    ]
+    assert {item.turn_id for item in team.turns} == {
+        f"orc-turn-{ROOT[:8]}-1",
+        f"orc-turn-{ROOT[:8]}-2",
+    }
+    failed_turn = next(
+        item for item in team.turns if item.turn_id == f"orc-turn-{ROOT[:8]}-2"
+    )
+    assert failed_turn.status == "failed"
+    assert failed_turn.error == "provider connection failed"
+    assert not any("Purpose noise" in (item.text or "") for item in team.events)
+
+    before_materialization = next(
+        item for item in team.events if item.event_id == "orc-block-v2-block-12"
+    )
+    forged_sources = tuple(
+        replace(item, semantic_sha256="0" * 64, semantic_complete_bytes=123)
+        if item.kind == "session"
+        else item
+        for item in copied.sources
+    )
+    with pytest.raises(OrcParseError, match="semantic alias"):
+        snapshot_orc_lineage(
+            source, ROOT, snapshot, forged_sources, "forged-semantic-alias"
+        )
+    materialized = (
+        "v2-block-12",
+        "v2-message-4",
+        ROOT,
+        0,
+        _ms("2026-08-15T10:02:00+00:00"),
+        2,
+        "notification",
+        "text",
+        "New result",
+        None,
+        None,
+        None,
+        None,
+        "model",
+        None,
+        None,
+        None,
+    )
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute(
+            "INSERT INTO content_blocks VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            materialized,
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    advanced = snapshot_orc_lineage(
+        source, ROOT, snapshot, copied.sources, "materialized"
+    )
+    after_team = load_orc_team(snapshot, ROOT, "modern", "UTC", advanced.sources)
+    after_materialization = next(
+        item
+        for item in after_team.events
+        if item.event_id == "orc-block-v2-block-12"
+    )
+    assert after_materialization == before_materialization
+    assert after_materialization.source_native_id == "new-assistant"
+    assert after_materialization.source_line == 4
+    assert source_digest(after_team) == source_digest(team)
+    assert advanced.sources != copied.sources
+
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute("DELETE FROM content_blocks WHERE id = 'v2-block-12'")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(OrcParseError, match="append history shrank|prefix"):
+        snapshot_orc_lineage(source, ROOT, snapshot, advanced.sources, "deleted")
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute(
+            "INSERT INTO content_blocks VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            materialized,
+        )
+        connection.execute(
+            "UPDATE content_blocks SET content = 'rewritten' "
+            "WHERE id = 'v2-block-10'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(OrcParseError, match="prefix was rewritten"):
+        snapshot_orc_lineage(source, ROOT, snapshot, advanced.sources, "rewritten")
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute(
+            "UPDATE content_blocks SET content = 'Legacy overlap prompt' "
+            "WHERE id = 'v2-block-10'"
+        )
+        original_json = connection.execute(
+            "SELECT message_json FROM messages WHERE id = 4"
+        ).fetchone()[0]
+        changed = json.loads(str(original_json))
+        changed["blocks"][0]["text"] = "rewritten modern message"
+        connection.execute(
+            "UPDATE messages SET message_json = ? WHERE id = 4",
+            (json.dumps(changed, separators=(",", ":")),),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(OrcParseError, match="prefix was rewritten"):
+        snapshot_orc_lineage(
+            source, ROOT, snapshot, advanced.sources, "messages-rewritten"
+        )
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute(
+            "UPDATE messages SET message_json = ? WHERE id = 4", (original_json,)
+        )
+        status_message = {
+            "id": "status-append",
+            "role": "Assistant",
+            "source": None,
+            "created_at_ms": _ms("2026-08-15T10:03:00+00:00"),
+            "blocks": [{"type": "StatusBlock", "id": 16, "message": "idle"}],
+        }
+        connection.execute(
+            "INSERT INTO messages(id, session_id, role, created_at_ms, "
+            "message_json, search_text) VALUES (5, ?, 'assistant', ?, ?, NULL)",
+            (
+                ROOT,
+                _ms("2026-08-15T10:03:00+00:00"),
+                json.dumps(status_message, separators=(",", ":")),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    messages_advanced = snapshot_orc_lineage(
+        source, ROOT, snapshot, advanced.sources, "messages-appended"
+    )
+    assert messages_advanced.sources != advanced.sources
+    status_team = load_orc_team(
+        snapshot, ROOT, "modern", "UTC", messages_advanced.sources
+    )
+    assert source_digest(status_team) == source_digest(after_team)
+    connection = sqlite3.connect(root_db)
+    try:
+        connection.execute("DELETE FROM messages WHERE id = 5")
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(OrcParseError, match="append history shrank|prefix"):
+        snapshot_orc_lineage(
+            source, ROOT, snapshot, messages_advanced.sources, "messages-deleted"
+        )
+
+
+def test_bounded_reused_root_is_hermetic_and_excludes_unrelated_task_db(
+    tmp_path: Path,
+) -> None:
+    bounded = "44444444-4444-4444-4444-444444444444"
+    inactive_child = "55555555-5555-5555-5555-555555555555"
+    active_child = "66666666-6666-6666-6666-666666666666"
+    task_only_child = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    source = tmp_path / "bounded-source"
+    root_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    bounded_db = source / ".orc" / "sessions" / bounded / "session.db"
+    inactive_db = source / ".orc" / "sessions" / inactive_child / "session.db"
+    active_db = source / ".orc" / "sessions" / active_child / "session.db"
+    task_only_db = source / ".orc" / "sessions" / task_only_child / "session.db"
+    project_db = source / ".tg" / f"{bounded}.db"
+    hatch_db = source / ".tg" / "hatch2.db"
+    task_only_task_db = source / ".tg" / f"{task_only_child}.db"
+    root_blocks = [
+        (
+            "root-boundary",
+            "root-boundary-message",
+            ROOT,
+            0,
+            _ms("2026-08-15T02:11:00+00:00"),
+            1,
+            "assistant",
+            "text",
+            "Predecessor ending",
+            None,
+            None,
+            None,
+            None,
+            "model",
+            None,
+            None,
+            None,
+        )
+    ]
+    _session_database(
+        root_db,
+        ROOT,
+        parent_id=None,
+        db_name="project",
+        messages=[],
+        blocks=root_blocks,
+        created_at="2026-08-14T00:00:00+00:00",
+        updated_at="2026-08-15T04:00:00+00:00",
+    )
+    _session_database(
+        bounded_db,
+        bounded,
+        parent_id=None,
+        db_name=None,
+        messages=[],
+        blocks=[],
+        created_at="2026-08-07T00:00:00+00:00",
+        updated_at="2026-08-15T04:00:00+00:00",
+    )
+    _session_database(
+        inactive_db,
+        inactive_child,
+        parent_id=bounded,
+        db_name=None,
+        messages=[],
+        blocks=[
+            (
+                "inactive-old",
+                "inactive-old-message",
+                inactive_child,
+                0,
+                _ms("2026-08-10T10:00:00+00:00"),
+                1,
+                "assistant",
+                "text",
+                "Inactive old child",
+                None,
+                None,
+                None,
+                None,
+                "model",
+                None,
+                None,
+                None,
+            )
+        ],
+        created_at="2026-08-08T00:00:00+00:00",
+        updated_at="2026-08-10T11:00:00+00:00",
+    )
+    _session_database(
+        active_db,
+        active_child,
+        parent_id=inactive_child,
+        db_name=None,
+        messages=[],
+        blocks=[
+            (
+                "active-new",
+                "active-new-message",
+                active_child,
+                0,
+                _ms("2026-08-15T03:30:00+00:00"),
+                1,
+                "assistant",
+                "text",
+                "Active bounded child",
+                None,
+                None,
+                None,
+                None,
+                "model",
+                None,
+                None,
+                None,
+            )
+        ],
+        created_at="2026-08-08T01:00:00+00:00",
+        updated_at="2026-08-15T04:00:00+00:00",
+    )
+    _session_database(
+        task_only_db,
+        task_only_child,
+        parent_id=bounded,
+        db_name=None,
+        messages=[],
+        blocks=[
+            (
+                "task-only-old",
+                "task-only-old-message",
+                task_only_child,
+                0,
+                _ms("2026-08-10T12:00:00+00:00"),
+                1,
+                "assistant",
+                "text",
+                "Task-only child old conversation",
+                None,
+                None,
+                None,
+                None,
+                "model",
+                None,
+                None,
+                None,
+            )
+        ],
+        created_at="2026-08-08T02:00:00+00:00",
+        updated_at="2026-08-10T13:00:00+00:00",
+    )
+    connection = sqlite3.connect(bounded_db)
+    try:
+        connection.execute("INSERT INTO associated_dbs VALUES ('hatch2')")
+        connection.commit()
+    finally:
+        connection.close()
+    purpose_at = _ms("2026-08-15T02:14:48+00:00")
+    owner_at = _ms("2026-08-15T02:16:40+00:00")
+    _add_messages(
+        bounded_db,
+        (
+            (
+                0,
+                bounded,
+                _ms("2026-08-15T02:20:00+00:00"),
+                {
+                    "id": "earlier-row-later-clock",
+                    "role": "User",
+                    "source": json.dumps({"Submitted": {"source": "Tui"}}),
+                    "created_at_ms": _ms("2026-08-15T02:20:00+00:00"),
+                    "blocks": [
+                        {
+                            "type": "text",
+                            "id": 99,
+                            "text": "Earlier row must not cross the boundary",
+                        }
+                    ],
+                },
+            ),
+            (
+                1,
+                bounded,
+                _ms("2026-08-10T10:00:00+00:00"),
+                {
+                    "id": "unrelated-old",
+                    "role": "User",
+                    "source": json.dumps({"Submitted": {"source": "Tui"}}),
+                    "created_at_ms": _ms("2026-08-10T10:00:00+00:00"),
+                    "blocks": [{"type": "text", "id": 100, "text": "Old Hatch work"}],
+                },
+            ),
+            (
+                2,
+                bounded,
+                purpose_at,
+                {
+                    "id": "purpose-boundary",
+                    "role": "User",
+                    "source": None,
+                    "created_at_ms": purpose_at,
+                    "blocks": [
+                        {"type": "InterjectionBlock", "id": 101, "text": "# Purpose Hermit"}
+                    ],
+                },
+            ),
+            (
+                3,
+                bounded,
+                owner_at,
+                {
+                    "id": "owner-restart",
+                    "role": "User",
+                    "source": json.dumps(
+                        {"Submitted": {"source": {"Web": {"view": "Transcript"}}}}
+                    ),
+                    "created_at_ms": owner_at,
+                    "blocks": [{"type": "text", "id": 102, "text": "Recover Hermit agents"}],
+                },
+            ),
+        ),
+    )
+    connection = sqlite3.connect(bounded_db)
+    try:
+        connection.execute(
+            "INSERT INTO content_blocks VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "v2-block-100",
+                "v2-message-1",
+                bounded,
+                0,
+                _ms("2026-08-10T10:00:00+00:00"),
+                48,
+                "user",
+                "text",
+                "Old Hatch work",
+                None,
+                None,
+                None,
+                None,
+                None,
+                json.dumps({"Submitted": {"source": "Tui"}}),
+                None,
+                None,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _index_database(
+        source / ".orc" / "index.db",
+        (
+            (ROOT, None),
+            (bounded, None),
+            (inactive_child, bounded),
+            (active_child, inactive_child),
+            (task_only_child, bounded),
+        ),
+    )
+    _task_database(project_db)
+    _task_database(hatch_db)
+    _task_database(task_only_task_db)
+    for path, text in (
+        (project_db, "Hermit result after restart"),
+        (hatch_db, "Unrelated Hatch result after restart"),
+        (task_only_task_db, "Task-only child result after restart"),
+    ):
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute("DELETE FROM task_notes")
+            connection.execute(
+                "INSERT INTO task_notes(task_id, content, created_at) VALUES (?, ?, ?)",
+                ("task-a", text, "2026-08-15T03:00:00+00:00"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    spec = OrcContinuationSpec(bounded, "purpose-boundary")
+    assert OrcContinuationSpec.from_value(spec, "spec") == spec
+    snapshot = tmp_path / "bounded-snapshot"
+    copied = snapshot_orc_lineage(source, ROOT, snapshot, (), "bounded", (spec,))
+    copied_paths = {item.source_path for item in copied.sources}
+    assert f".tg/{bounded}.db" in copied_paths
+    assert ".tg/hatch2.db" not in copied_paths
+    assert f".orc/sessions/{inactive_child}/session.db" not in copied_paths
+    assert f".orc/sessions/{active_child}/session.db" in copied_paths
+    assert f".orc/sessions/{task_only_child}/session.db" in copied_paths
+    assert f".tg/{task_only_child}.db" in copied_paths
+    active_source = next(
+        item for item in copied.sources if item.owner_session_id == active_child
+    )
+    assert active_source.lineage_root_session_id == bounded
+    link = copied.continuations[0]
+    assert link.start_message_id == "purpose-boundary"
+    assert link.start_source_line == 2
+    assert link.started_at_ms == purpose_at
+
+    team = load_orc_team(
+        snapshot, ROOT, "bounded", "UTC", copied.sources, copied.continuations
+    )
+    bounded_agent = next(item for item in team.agents if item.thread_id == bounded)
+    assert bounded_agent.started_at_ms == purpose_at
+    assert not any("Old Hatch work" in (item.text or "") for item in team.events)
+    assert not any(
+        "Earlier row must not cross" in (item.text or "") for item in team.events
+    )
+    assert not any("# Purpose Hermit" in (item.text or "") for item in team.events)
+    owner = next(item for item in team.events if item.source_native_id == "owner-restart")
+    assert owner.kind == "user_prompt"
+    assert owner.timestamp_ms == owner_at
+    assert owner.turn_id == f"orc-cont-1-{bounded[:8]}-orc-turn-{bounded[:8]}-50"
+    active_agent = next(item for item in team.agents if item.thread_id == active_child)
+    assert active_agent.parent_thread_id == bounded
+    assert not any(item.thread_id == inactive_child for item in team.agents)
+    task_only_agent = next(
+        item for item in team.agents if item.thread_id == task_only_child
+    )
+    assert task_only_agent.parent_thread_id == bounded
+    assert task_only_agent.started_at_ms == purpose_at
+    assert any("Hermit result after restart" in (item.text or "") for item in team.events)
+    assert not any(
+        "Unrelated Hatch result" in (item.text or "") for item in team.events
+    )
+    assert any(
+        "Task-only child result after restart" in (item.text or "")
+        for item in team.events
+    )
+
+    connection = sqlite3.connect(bounded_db)
+    try:
+        connection.execute(
+            "INSERT INTO content_blocks VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "v2-block-102",
+                "v2-message-3",
+                bounded,
+                0,
+                owner_at,
+                50,
+                "user",
+                "text",
+                "Recover Hermit agents",
+                None,
+                None,
+                None,
+                None,
+                None,
+                json.dumps(
+                    {"Submitted": {"source": {"Web": {"view": "Transcript"}}}}
+                ),
+                None,
+                None,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    materialized = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        copied.sources,
+        "materialized",
+        (spec,),
+        copied.continuations,
+    )
+    materialized_team = load_orc_team(
+        snapshot,
+        ROOT,
+        "bounded",
+        "UTC",
+        materialized.sources,
+        materialized.continuations,
+    )
+    materialized_owner = next(
+        item
+        for item in materialized_team.events
+        if item.source_native_id == "owner-restart"
+    )
+    assert materialized_owner == owner
+    assert source_digest(materialized_team) == source_digest(team)
+
+    connection = sqlite3.connect(task_only_task_db)
+    try:
+        connection.execute("DELETE FROM task_notes")
+        connection.commit()
+    finally:
+        connection.close()
+    task_note_deleted = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        materialized.sources,
+        "task-note-deleted",
+        (spec,),
+        materialized.continuations,
+    )
+    deleted_team = load_orc_team(
+        snapshot,
+        ROOT,
+        "bounded",
+        "UTC",
+        task_note_deleted.sources,
+        task_note_deleted.continuations,
+    )
+    deleted_paths = {item.source_path for item in task_note_deleted.sources}
+    assert f".orc/sessions/{task_only_child}/session.db" in deleted_paths
+    assert f".tg/{task_only_child}.db" in deleted_paths
+    assert any(
+        "Task-only child result after restart" in (item.text or "")
+        for item in deleted_team.events
+    )
+    deleted_projection = next(
+        item.task_projection
+        for item in task_note_deleted.sources
+        if item.source_path == f".tg/{task_only_child}.db"
+    )
+    assert deleted_projection is not None
+    assert deleted_projection.missing_note_count == 1
+    task_note_repeat = snapshot_orc_lineage(
+        source,
+        ROOT,
+        snapshot,
+        task_note_deleted.sources,
+        "task-note-deleted-repeat",
+        (spec,),
+        task_note_deleted.continuations,
+    )
+    assert task_note_repeat.files_changed == 0
+    assert task_note_repeat.sources == task_note_deleted.sources
+
+
+def test_recorded_lineage_root_beats_latest_root_time_fallback() -> None:
+    roots = (ROOT, SUCCESSOR, "77777777-7777-7777-7777-777777777777")
+    child = "88888888-8888-8888-8888-888888888888"
+    missing_parent = "99999999-9999-9999-9999-999999999999"
+    root_starts = {ROOT: 10, SUCCESSOR: 20, roots[2]: 30}
+    metas = {
+        root: orc_module._SessionMeta(root, None, root, None, start, start, root)
+        for root, start in root_starts.items()
+    }
+    metas[child] = orc_module._SessionMeta(
+        child,
+        missing_parent,
+        "active-grandchild",
+        None,
+        15,
+        40,
+        child,
+    )
+
+    resolved = orc_module._continuation_lineages(
+        metas, roots, root_starts, {child: SUCCESSOR}
+    )
+
+    assert resolved[child] == SUCCESSOR
+
+
+def test_session_state_migrates_content_only_snapshot_to_dual_table(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "storage-migration-source"
+    root_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    timestamp = _ms("2026-08-15T10:00:00+00:00")
+    block = (
+        "v2-block-1",
+        "v2-message-1",
+        ROOT,
+        0,
+        timestamp,
+        1,
+        "user",
+        "text",
+        "Migrated prompt",
+        None,
+        None,
+        None,
+        None,
+        None,
+        json.dumps({"Submitted": {"source": "Tui"}}),
+        None,
+        None,
+    )
+    _session_database(
+        root_db,
+        ROOT,
+        parent_id=None,
+        db_name=None,
+        messages=[],
+        blocks=[block],
+        created_at="2026-08-15T09:00:00+00:00",
+        updated_at="2026-08-15T11:00:00+00:00",
+    )
+    _index_database(source / ".orc" / "index.db", ((ROOT, None),))
+    snapshot = tmp_path / "storage-migration-snapshot"
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "content-only")
+
+    _add_messages(
+        root_db,
+        (
+            (
+                1,
+                ROOT,
+                timestamp,
+                {
+                    "id": "native-migrated-prompt",
+                    "role": "User",
+                    "source": json.dumps({"Submitted": {"source": "Tui"}}),
+                    "created_at_ms": timestamp,
+                    "blocks": [{"type": "text", "id": 1, "text": "Migrated prompt"}],
+                },
+            ),
+        ),
+    )
+    second = snapshot_orc_lineage(
+        source, ROOT, snapshot, first.sources, "dual-table"
+    )
+    repeated = snapshot_orc_lineage(
+        source, ROOT, snapshot, second.sources, "dual-table-repeat"
+    )
+    assert second.files_changed > 0
+    assert repeated.files_changed == 0
+    assert repeated.sources == second.sources
+    team = load_orc_team(snapshot, ROOT, "migration", "UTC", second.sources)
+    event = next(item for item in team.events if item.event_id == "orc-block-v2-block-1")
+    assert event.source_native_id == "native-migrated-prompt"
+    assert event.source_line == 1
+
+
+def test_session_state_migrates_old_messages_only_manifest(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "messages-state-migration-source"
+    root_db = source / ".orc" / "sessions" / ROOT / "session.db"
+    _session_database(
+        root_db,
+        ROOT,
+        parent_id=None,
+        db_name=None,
+        messages=[],
+        blocks=[],
+        created_at="2026-08-15T09:00:00+00:00",
+        updated_at="2026-08-15T11:00:00+00:00",
+    )
+    _add_messages(
+        root_db,
+        (
+            (
+                1,
+                ROOT,
+                _ms("2026-08-15T10:00:00+00:00"),
+                {
+                    "id": "status-only",
+                    "role": "Assistant",
+                    "source": None,
+                    "created_at_ms": _ms("2026-08-15T10:00:00+00:00"),
+                    "blocks": [{"type": "StatusBlock", "id": 1, "message": "idle"}],
+                },
+            ),
+        ),
+    )
+    _index_database(source / ".orc" / "index.db", ((ROOT, None),))
+    snapshot = tmp_path / "messages-state-migration-snapshot"
+    captured = snapshot_orc_lineage(source, ROOT, snapshot, (), "captured")
+    session_source = next(item for item in captured.sources if item.kind == "session")
+    snapshot_path = _snapshot_database(snapshot, session_source)
+    old_state = orc_module._logical_state(
+        snapshot_path, "session", session_state_mode="messages-only"
+    )
+    old_meta = orc_module._session_meta(snapshot_path, session_source.source_path)
+    old_auxiliary = orc_module._auxiliary_observation(snapshot_path, old_meta)
+    old_identity = orc_module._session_semantic_identity(
+        session_source.source_path,
+        session_source.owner_session_id,
+        old_state,
+        old_meta,
+        old_auxiliary,
+        2,
+    )
+    old_source = replace(
+        session_source,
+        append_count=old_state.append_count,
+        append_max_id=old_state.append_max_id,
+        append_prefix_sha256=old_state.append_prefix_sha256,
+        semantic_identity_mode="normalized-v2",
+        semantic_sha256=old_identity.sha256,
+        semantic_complete_bytes=old_identity.complete_bytes,
+        canonical_semantic_sha256=None,
+        canonical_semantic_complete_bytes=None,
+        semantic_baseline_path=None,
+    )
+    previous = tuple(
+        old_source if item.source_path == old_source.source_path else item
+        for item in captured.sources
+    )
+    migrated = snapshot_orc_lineage(
+        source, ROOT, snapshot, previous, "migrated"
+    )
+    repeated = snapshot_orc_lineage(
+        source, ROOT, snapshot, migrated.sources, "repeat"
+    )
+    assert repeated.files_changed == 0
+    assert repeated.sources == migrated.sources
+    before_digest = next(
+        item.semantic_sha256 for item in migrated.sources if item.kind == "session"
+    )
+    connection = sqlite3.connect(root_db)
+    try:
+        ignored = {
+            "id": "second-status-only",
+            "role": "Assistant",
+            "source": None,
+            "created_at_ms": _ms("2026-08-15T10:01:00+00:00"),
+            "blocks": [{"type": "StatusBlock", "id": 2, "message": "still idle"}],
+        }
+        connection.execute(
+            "INSERT INTO messages(id, session_id, role, created_at_ms, "
+            "message_json, search_text) VALUES (2, ?, 'assistant', ?, ?, NULL)",
+            (
+                ROOT,
+                _ms("2026-08-15T10:01:00+00:00"),
+                json.dumps(ignored, separators=(",", ":")),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    ignored_advanced = snapshot_orc_lineage(
+        source, ROOT, snapshot, repeated.sources, "ignored-append"
+    )
+    ignored_repeated = snapshot_orc_lineage(
+        source, ROOT, snapshot, ignored_advanced.sources, "ignored-repeat"
+    )
+    assert next(
+        item.semantic_sha256
+        for item in ignored_advanced.sources
+        if item.kind == "session"
+    ) == before_digest
+    assert ignored_repeated.files_changed == 0
+
+
 def test_snapshot_and_parse_orc_lineage_read_only_and_idempotently(
     tmp_path: Path,
 ) -> None:
@@ -516,6 +1731,20 @@ def test_snapshot_and_parse_orc_lineage_read_only_and_idempotently(
     assert len(first.sources) == 3
     assert second.files_changed == 0
     assert second.sources == first.sources
+    snapshot_databases = tuple(
+        _snapshot_database(snapshot, source_copy) for source_copy in first.sources
+    )
+    for snapshot_database in snapshot_databases:
+        connection = sqlite3.connect(
+            snapshot_database.resolve().as_uri() + "?mode=ro&immutable=1",
+            uri=True,
+        )
+        try:
+            assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        finally:
+            connection.close()
+        assert not snapshot_database.with_name(snapshot_database.name + "-wal").exists()
+        assert not snapshot_database.with_name(snapshot_database.name + "-shm").exists()
     assert stat.S_IMODE(root_db.stat().st_mode) & 0o222 == 0
     assert stat.S_IMODE(task_db.stat().st_mode) & 0o222 == 0
     nested = next(agent for agent in team.agents if agent.thread_id == NESTED)
@@ -887,7 +2116,7 @@ def test_window_excludes_exact_end_but_retains_pre_window_spawn_context(
     assert "Exactly at exclusive end" not in transcript
     assert "Outside the half-open window" not in transcript
     assert any(agent.started_at_ms < window.start_ms for agent in team.agents)
-    assert sum(phase.stats.inter_agent_messages for phase in phases) == 2
+    assert sum(phase.stats.inter_agent_messages for phase in phases) == 3
 
 
 def test_rewritten_task_note_prefix_is_rejected(tmp_path: Path) -> None:
@@ -903,8 +2132,57 @@ def test_rewritten_task_note_prefix_is_rejected(tmp_path: Path) -> None:
     finally:
         connection.close()
 
-    with pytest.raises(OrcParseError, match="existing append prefix was rewritten"):
+    with pytest.raises(OrcParseError, match="immutable core was rewritten"):
         snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+
+
+def test_forged_task_semantic_alias_is_rejected(tmp_path: Path) -> None:
+    source, _, _ = _fixture(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    forged = tuple(
+        replace(item, semantic_sha256="0" * 64, semantic_complete_bytes=123)
+        if item.kind == "task"
+        else item
+        for item in first.sources
+    )
+
+    with pytest.raises(OrcParseError, match="task semantic alias"):
+        snapshot_orc_lineage(source, ROOT, snapshot, forged, "forged")
+
+
+def test_stale_session_semantic_alias_baseline_is_rejected(tmp_path: Path) -> None:
+    source, root_db, _ = _fixture(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    first_root = next(item for item in first.sources if item.owner_session_id == ROOT)
+    first_path = _snapshot_database(snapshot, first_root)
+    first_meta = orc_module._session_meta(first_path, first_root.source_path)
+    first_auxiliary = orc_module._auxiliary_observation(first_path, first_meta)
+    old_raw_identity = orc_module._session_semantic_identity(
+        first_root.source_path,
+        first_root.owner_session_id,
+        orc_module._logical_state(first_path, "session"),
+        first_meta,
+        first_auxiliary,
+        2,
+    )
+    _append_root_message(root_db, "new-semantic-event", "New semantic event")
+    second = snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+    forged = tuple(
+        replace(
+            item,
+            semantic_sha256=old_raw_identity.sha256,
+            semantic_complete_bytes=old_raw_identity.complete_bytes,
+            semantic_alias_baseline_path=first_root.snapshot_path,
+        )
+        if item.owner_session_id == ROOT
+        else item
+        for item in second.sources
+    )
+
+    with pytest.raises(OrcParseError, match="different canonical semantics"):
+        load_orc_team(snapshot, ROOT, "orc-test", "UTC", forged)
 
 
 @pytest.mark.parametrize("field", ("owner", "title"))
@@ -1157,14 +2435,14 @@ def test_unattributed_local_task_notes_are_preserved_on_synthetic_worker(
         agent for agent in team.agents if agent.agent_path.endswith("/Unattributed Task Work")
     )
 
-    assert {event.source_line for event in notes} == {1, 2, 4}
+    assert {event.source_line for event in notes} == {1, 2, 3, 4}
     assert {event.thread_id for event in notes} == {unattributed.thread_id}
     assert all(event.kind == "inter_agent_message" for event in notes)
     assert all("unattributed local task work" in (event.text or "") for event in notes)
     assert sum(
         edge.kind == "message" and edge.from_thread_id == unattributed.thread_id
         for edge in team.edges
-    ) == 3
+    ) == 4
 
 
 def test_new_task_identity_is_a_monotonic_addition(tmp_path: Path) -> None:
@@ -1363,26 +2641,156 @@ def test_session_name_change_is_accepted_as_semantic_change(tmp_path: Path) -> N
     assert any(agent.nickname == "renamed-worker" for agent in after.agents)
 
 
-def test_truncated_task_notes_are_rejected_and_snapshot_is_preserved(
+def test_rewritten_task_history_is_frozen_and_extended_idempotently(
     tmp_path: Path,
 ) -> None:
     source, _, task_db = _fixture(tmp_path)
     snapshot = tmp_path / "snapshot"
     first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
-    snapshot_task = _snapshot_database(
-        snapshot, next(item for item in first.sources if item.kind == "task")
+    before = load_orc_team(
+        snapshot, ROOT, "orc-test", "America/New_York", first.sources
     )
-    prior_bytes = snapshot_task.read_bytes()
+    connection = sqlite3.connect(task_db)
+    try:
+        connection.execute("DELETE FROM task_notes WHERE id = 4")
+        connection.execute("DELETE FROM tasks WHERE local_id = 'task-a'")
+        connection.execute(
+            "INSERT INTO tasks VALUES ('task-b', 'Replacement task', 'reviewer')"
+        )
+        connection.execute(
+            "INSERT INTO task_notes(task_id, content, created_at) VALUES "
+            "('task-b', 'New work after rewrite', '2026-07-22T05:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    live_bytes = task_db.read_bytes()
+
+    second = snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+    after = load_orc_team(
+        snapshot, ROOT, "orc-test", "America/New_York", second.sources
+    )
+    task_source = next(item for item in second.sources if item.kind == "task")
+    source_snapshot = next(item for item in after.sources if item.path == ".tg/project.db")
+
+    assert task_db.read_bytes() == live_bytes
+    assert task_source.append_count == 4
+    assert task_source.task_projection is not None
+    assert task_source.task_projection.note_count == 5
+    assert task_source.task_projection.missing_note_count == 1
+    assert task_source.task_projection.rewrite_count == 1
+    assert task_source.task_projection.degraded is True
+    assert source_snapshot.line_count == 5
+    assert {event.source_line for event in after.events if event.event_id.startswith("orc-note-")} == {
+        1,
+        2,
+        3,
+        4,
+        5,
+    }
+    assert all(event in after.events for event in before.events)
+
+    third = snapshot_orc_lineage(source, ROOT, snapshot, second.sources, "third")
+    third_task = next(item for item in third.sources if item.kind == "task")
+    assert third.files_changed == 0
+    assert third_task.task_projection == task_source.task_projection
+    assert task_db.read_bytes() == live_bytes
+
+
+def test_new_task_note_without_current_task_row_is_rejected(tmp_path: Path) -> None:
+    source, _, task_db = _fixture(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    connection = sqlite3.connect(task_db)
+    try:
+        connection.execute(
+            "INSERT INTO task_notes(task_id, content, created_at) VALUES "
+            "('missing-task', 'Cannot enrich me', '2026-07-22T05:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(OrcParseError, match="lacks its task row"):
+        snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+
+
+def test_task_note_id_reuse_below_frozen_highwater_is_rejected(
+    tmp_path: Path,
+) -> None:
+    source, _, task_db = _fixture(tmp_path)
+    connection = sqlite3.connect(task_db)
+    try:
+        connection.execute("DELETE FROM task_notes WHERE id = 2")
+        connection.commit()
+    finally:
+        connection.close()
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    first_task = next(item for item in first.sources if item.kind == "task")
+    assert first_task.task_projection is not None
+    assert first_task.task_projection.unobserved_note_id_gap_count == 1
+    connection = sqlite3.connect(task_db)
+    try:
+        connection.execute(
+            "INSERT INTO task_notes(id, task_id, content, created_at) VALUES "
+            "(2, 'task-a', 'Reused identity', '2026-07-22T05:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(OrcParseError, match="reused below frozen highwater"):
+        snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
+
+
+def test_task_note_id_reuse_in_prior_trailing_allocation_gap_is_rejected(
+    tmp_path: Path,
+) -> None:
+    source, _, task_db = _fixture(tmp_path)
     connection = sqlite3.connect(task_db)
     try:
         connection.execute("DELETE FROM task_notes WHERE id = 4")
         connection.commit()
     finally:
         connection.close()
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    first_task = next(item for item in first.sources if item.kind == "task")
+    assert first_task.task_projection is not None
+    assert first_task.task_projection.observed_note_sequence == 4
+    assert first_task.task_projection.unobserved_note_id_gap_count == 1
+    connection = sqlite3.connect(task_db)
+    try:
+        connection.execute(
+            "INSERT INTO task_notes(id, task_id, content, created_at) VALUES "
+            "(4, 'task-a', 'Reused trailing allocation', "
+            "'2026-07-22T05:00:00+00:00')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
-    with pytest.raises(OrcParseError, match="append history shrank"):
+    with pytest.raises(OrcParseError, match="reused below frozen highwater"):
         snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
-    assert snapshot_task.read_bytes() == prior_bytes
+
+
+def test_task_note_allocation_sequence_rollback_is_rejected(tmp_path: Path) -> None:
+    source, _, task_db = _fixture(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    first = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    connection = sqlite3.connect(task_db)
+    try:
+        connection.execute("DELETE FROM task_notes WHERE id IN (3, 4)")
+        connection.execute(
+            "UPDATE sqlite_sequence SET seq = 2 WHERE name = 'task_notes'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(OrcParseError, match="allocation sequence regressed"):
+        snapshot_orc_lineage(source, ROOT, snapshot, first.sources, "second")
 
 
 def test_disappeared_task_database_is_rejected(tmp_path: Path) -> None:
@@ -2290,6 +3698,23 @@ def test_managed_object_gc_rejects_symlinks(tmp_path: Path) -> None:
         ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
 
 
+def test_managed_object_gc_removes_legacy_sqlite_sidecars(tmp_path: Path) -> None:
+    source, _, _ = _fixture(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    copied = snapshot_orc_lineage(source, ROOT, snapshot, (), "first")
+    database = _snapshot_database(snapshot, copied.sources[0])
+    wal = database.with_name(database.name + "-wal")
+    shm = database.with_name(database.name + "-shm")
+    wal.write_bytes(b"legacy read sidecar")
+    shm.write_bytes(b"legacy read sidecar")
+
+    removed = orc_module.prune_orc_snapshot_objects(snapshot, copied.sources)
+
+    assert removed == 2
+    assert not wal.exists()
+    assert not shm.exists()
+
+
 def test_post_snapshot_parse_failure_keeps_old_manifest_and_raw_team(
     tmp_path: Path,
 ) -> None:
@@ -2498,14 +3923,23 @@ def test_stale_managed_staging_candidate_is_pruned(tmp_path: Path) -> None:
     ingest_orc(archive, source, ROOT, "orc-test", "America/New_York")
     staging = archive / "teams" / "orc-test" / "source_snapshots" / ".staging"
     stale = staging / "orc-123-0123456789abcdef.db"
+    stale_wal = staging / "orc-123-0123456789abcdef.db-wal"
+    stale_shm = staging / "orc-123-0123456789abcdef.db-shm"
+    unmanaged = staging / "unmanaged.db-wal"
     stale.write_bytes(b"interrupted candidate")
+    stale_wal.write_bytes(b"interrupted WAL")
+    stale_shm.write_bytes(b"interrupted shared memory")
+    unmanaged.write_bytes(b"do not prune")
 
     _, report = ingest_orc(
         archive, source, ROOT, "orc-test", "America/New_York"
     )
 
     assert not stale.exists()
-    assert report.files_changed == 1
+    assert not stale_wal.exists()
+    assert not stale_shm.exists()
+    assert unmanaged.read_bytes() == b"do not prune"
+    assert report.files_changed == 3
 
 
 @pytest.mark.parametrize("unsafe_kind", ("symlink", "directory"))
@@ -2567,7 +4001,7 @@ def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> Non
     }
     assert len(timeline["rollups"]) == 4
     message_edges = [edge for edge in timeline["edges"] if edge["kind"] == "message"]
-    assert len(message_edges) == 2
+    assert len(message_edges) == 3
     assert {
         (edge["source_id"], edge["target_id"])
         for edge in message_edges
@@ -2579,7 +4013,7 @@ def test_orc_pipeline_builds_one_day_archive_idempotently(tmp_path: Path) -> Non
     }
     assert [event["kind"] for event in timeline["events"]].count(
         "inter_agent_message"
-    ) == 2
+    ) == 3
     manifest = json.loads(
         (archive / "teams" / "orc-test" / "raw" / "source-manifest.json").read_text(
             encoding="utf-8"
