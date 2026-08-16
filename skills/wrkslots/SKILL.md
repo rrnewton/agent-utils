@@ -13,20 +13,21 @@ Initialize from the project root with the registered liveness command. Its exit 
 the removal boundary: rc 0 means verified dead, rc 1 means alive, and rc 2 means unverifiable.
 
 ```sh
-agent-utils/py/wrkslots.py init \
+wrkslots init . \
   --liveness-command ci-hub/health/agent_liveness_probe.py
 ```
 
-Create one fresh slot for one agent. Repeat `--repo`, `--remote-url`, and `--branch` for multiple
-repositories. The remote URL is trusted provisioning input; it is not learned from mutable Git
-configuration. Record the coordinator process generation even when the owner will adopt later.
+Create one fresh slot for one agent. Repeat `--repo` and `--branch` for multiple repositories. The
+configured `origin` remote is used by default; use `--remote NAME=REMOTE` to select another
+already-configured remote. Callers never pass a remote URL. Wrkslots records the configured remote
+identity and requires it to remain unchanged. Record the coordinator process generation even when
+the owner will adopt later.
 
 ```sh
 worktrees/wrkslots create slot01 \
   --agent codex-1 --task task-123 --purpose "fix parser" \
   --coordinator-pid "$COORDINATOR_PID" --owner-pid "$OWNER_PID" \
-  --repo product=product --remote-url product=https://github.com/example/product \
-  --branch product=codex/fix-parser
+  --repo product=product --branch product=codex/fix-parser
 ```
 
 Use `status --all-machines` for read-only inspection. A row without its directory, a directory
@@ -48,20 +49,10 @@ liveness rc 0, a dead owner process generation, and independent absence checks f
 file descriptors, memory maps, mount references, and the recorded cgroup. rc 1, rc 2, a live or
 indeterminate owner, or any unreadable proof preserves every row and path.
 
-Before physical deletion, removal atomically moves the canonical slot path to the exact fenced path
-recorded in the recovery journal. It then repairs the Git worktree registrations and repeats the
-complete process-use proof against the moved path. A process that entered before the move follows
-the moved directory and causes refusal; a later canonical-path entry cannot open the absent path.
-When that post-move proof refuses before any checkout was removed, wrkslots restores the canonical
-path and Git registrations.
-
 Use `adopt` only to bind an unbound live owner from that owner's real process ancestry. It never
 replaces a bound historical owner. If a legacy owner never bound and is independently verified
 absent, the recorded coordinator uses `recover-unbound-owner`; this preserves `owner: null`, records
 the recovery note and validation evidence, and prepares the same post-exit removal path.
 
-Use `recover --coordinator-pid PID` whenever a create or removal journal exists. Recovery accepts the
-exact active-plus-archived overlap produced when a crash lands the archive before deleting the active
-row, verifies that both rows exactly match the journal after JSON normalization, and completes
-the active-row deletion. Any unrelated or mismatched overlap still refuses. Preserve every path after
-a refusal and report the exact message. Run `worktrees/wrkslots --help` for the complete CLI.
+Use `recover --coordinator-pid PID` whenever a create or removal journal exists. Preserve every path
+after a refusal and report the exact message. Run `worktrees/wrkslots --help` for the complete CLI.

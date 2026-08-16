@@ -28,6 +28,7 @@ ENTRYPOINT_MODULES = [
     "agent_team_timeline",
     "herdr_run",
     "herdr_run.agent_cli",
+    "wrkslots",
 ]
 
 # Invocations that MUST succeed without importing third-party dependencies.
