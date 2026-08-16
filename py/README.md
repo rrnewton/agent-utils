@@ -12,6 +12,7 @@ own version and documentation, and only the console commands that belong to it.
 | `agent-team-timeline` | `agent_team_timeline` | `agent-team-timeline` | Build a durable, zoomable local timeline from coordinator and subagent transcripts. |
 | `parallel-experiment-runner` | `parallel_experiment_runner` | `parallel-experiment-runner` | Run boxed, resource-bounded concurrent seed sweeps. |
 | `herdr-run` | `herdr_run` | `herdr-run`, `herdr-agent` | Run policy-admitted commands and durably message interactive agents through Herdr panes. |
+| `wrkslots` | `wrkslots` | `wrkslots` | Create, track, hand off, recover, and conservatively remove coding-agent Git worktree slots. |
 
 Install a tool from its project directory during development:
 
@@ -22,6 +23,7 @@ python3 -m pip install ./py/pr_landing_planner
 python3 -m pip install ./py/agent_team_timeline
 python3 -m pip install ./py/parallel_experiment_runner
 python3 -m pip install ./py/herdr_run
+python3 -m pip install ./py/wrkslots
 ```
 
 The root `pyproject.toml` contains shared type-checker configuration only; it is

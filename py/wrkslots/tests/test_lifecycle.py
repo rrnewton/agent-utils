@@ -1,4 +1,4 @@
-"""Focused safety and lifecycle tests for the standalone wrkslots command."""
+"""Focused safety and lifecycle tests for the wrkslots distribution."""
 
 from __future__ import annotations
 
@@ -11,10 +11,22 @@ from pathlib import Path
 import pytest
 
 
-PY_ROOT = Path(__file__).resolve().parents[1]
-WRKSLOTS = PY_ROOT / "wrkslots.py"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+PY_ROOT = PACKAGE_ROOT.parent
+WRKSLOTS = PACKAGE_ROOT / "__main__.py"
 sys.path.insert(0, str(PY_ROOT))
-import wrkslots  # noqa: E402
+from wrkslots import cli as wrkslots  # noqa: E402
+
+
+def source_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    environment = os.environ.copy()
+    previous = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = (
+        str(PY_ROOT) if not previous else f"{PY_ROOT}{os.pathsep}{previous}"
+    )
+    if extra:
+        environment.update(extra)
+    return environment
 
 
 def git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -37,13 +49,11 @@ def command(
     machine: str | None = None,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    argv = [sys.executable, str(WRKSLOTS), "--project-root", str(project)]
+    argv = [sys.executable, "-m", "wrkslots", "--project-root", str(project)]
     if machine is not None:
         argv.extend(("--machine", machine))
     argv.extend(args)
-    process_env = os.environ.copy()
-    if env:
-        process_env.update(env)
+    process_env = source_environment(env)
     return subprocess.run(
         argv,
         text=True,
@@ -71,7 +81,8 @@ def initialize(project: Path, *, machine: str = "testhost", directory: str = "wo
     completed = subprocess.run(
         [
             sys.executable,
-            str(WRKSLOTS),
+            "-m",
+            "wrkslots",
             "--machine",
             machine,
             "init",
@@ -84,6 +95,7 @@ def initialize(project: Path, *, machine: str = "testhost", directory: str = "wo
         text=True,
         capture_output=True,
         check=False,
+        env=source_environment(),
     )
     assert completed.returncode == 0, completed.stderr
 
@@ -129,7 +141,6 @@ def create(
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     pid = os.getpid() if owner_pid is None else owner_pid
-    remote_url = git(project / repository_name, "remote", "get-url", "origin").stdout.strip()
     owner_args = ["--owner-pid", str(pid)] if bind_owner else []
     return command(
         project,
@@ -146,8 +157,6 @@ def create(
         str(os.getpid()),
         "--repo",
         f"{checkout_name}={repository_name}",
-        "--remote-url",
-        f"{checkout_name}={remote_url}",
         "--branch",
         f"{checkout_name}={branch}",
         machine=machine,
@@ -282,7 +291,8 @@ def test_same_slot_race_has_one_winner(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     base = [
         sys.executable,
-        str(WRKSLOTS),
+        "-m",
+        "wrkslots",
         "--project-root",
         str(project),
         "--wait-lock",
@@ -299,20 +309,20 @@ def test_same_slot_race_has_one_winner(tmp_path: Path) -> None:
         str(os.getpid()),
         "--repo",
         "product=repo",
-        "--remote-url",
-        f"product={git(repository, 'remote', 'get-url', 'origin').stdout.strip()}",
     ]
     first = subprocess.Popen(
         [*base, "--agent", "codex-1", "--branch", "product=codex/race-one"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=source_environment(),
     )
     second = subprocess.Popen(
         [*base, "--agent", "codex-2", "--branch", "product=codex/race-two"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=source_environment(),
     )
     first.communicate(timeout=20)
     second.communicate(timeout=20)
@@ -352,7 +362,7 @@ def test_lock_conflict_refuses_without_state_change(tmp_path: Path) -> None:
             "import sys, time",
             "from pathlib import Path",
             f"sys.path.insert(0, {str(PY_ROOT)!r})",
-            "import wrkslots",
+            "from wrkslots import cli as wrkslots",
             f"subject = Path({str(project / 'worktrees' / 'ACTIVE')!r})",
             "with wrkslots._locked(subject, exclusive=True, wait_seconds=0):",
             "    print('locked', flush=True)",
@@ -465,8 +475,6 @@ def test_create_refuses_owner_generation_change_before_publication(
             str(os.getpid()),
             "--repo",
             "product=repo",
-            "--remote-url",
-            f"product={git(project / 'repo', 'remote', 'get-url', 'origin').stdout.strip()}",
             "--branch",
             "product=codex/task",
         ]
@@ -943,6 +951,57 @@ def test_create_fetches_remote_before_selecting_default_start(tmp_path: Path) ->
     assert git(checkout(project), "rev-parse", "HEAD").stdout.strip() == advanced
 
 
+def test_create_defaults_to_origin_and_accepts_a_configured_remote_name(tmp_path: Path) -> None:
+    project, _repository, _remote = make_project(tmp_path)
+
+    defaulted = create(project, slot="slot01", branch="codex/default-origin")
+
+    assert defaulted.returncode == 0, defaulted.stderr
+    default_row = active_slots(project)[0]
+    assert isinstance(default_row, dict)
+    default_checkouts = default_row["checkouts"]
+    assert isinstance(default_checkouts, list)
+    default_checkout = default_checkouts[0]
+    assert isinstance(default_checkout, dict)
+    assert default_checkout["remote"] == "origin"
+
+    second_root = tmp_path / "second"
+    second_root.mkdir()
+    second_project, second_repository, second_remote = make_project(second_root)
+    git(second_repository, "remote", "add", "upstream", str(second_remote))
+    selected = command(
+        second_project,
+        "create",
+        "slot02",
+        "--agent",
+        "codex-2",
+        "--task",
+        "task-slot02",
+        "--purpose",
+        "configured remote selection",
+        "--owner-pid",
+        str(os.getpid()),
+        "--coordinator-pid",
+        str(os.getpid()),
+        "--repo",
+        "product=repo",
+        "--remote",
+        "product=upstream",
+        "--branch",
+        "product=codex/upstream",
+    )
+
+    assert selected.returncode == 0, selected.stderr
+    selected_row = active_slots(second_project)[0]
+    assert isinstance(selected_row, dict)
+    selected_checkouts = selected_row["checkouts"]
+    assert isinstance(selected_checkouts, list)
+    checkout_row = selected_checkouts[0]
+    assert isinstance(checkout_row, dict)
+    assert checkout_row["remote"] == "upstream"
+    assert checkout_row["landed_ref"] == "refs/remotes/upstream/main"
+
+
 def test_ignored_file_is_preserved_by_finish_refusal(tmp_path: Path) -> None:
     project, repository, _remote = make_project(tmp_path)
     (repository / ".gitignore").write_text("ignored.bin\n", encoding="utf-8")
@@ -1387,8 +1446,6 @@ def test_import_existing_is_dry_run_then_registers_verified_live_slot(
         "import existing",
         "--repo",
         "product=repo",
-        "--remote-url",
-        f"product={git(repository, 'remote', 'get-url', 'origin').stdout.strip()}",
     )
 
     dry_run = command(project, *common)
@@ -1452,8 +1509,6 @@ def test_register_refuses_owner_generation_change_before_publication(
             "--verified-live",
             "--repo",
             "product=repo",
-            "--remote-url",
-            f"product={git(repository, 'remote', 'get-url', 'origin').stdout.strip()}",
         ]
     )
     captured = capsys.readouterr()
@@ -1489,8 +1544,6 @@ def test_path_escape_and_symlink_are_refused_without_touching_target(tmp_path: P
         str(os.getpid()),
         "--repo",
         "product=../outside",
-        "--remote-url",
-        "product=file:///outside",
         "--branch",
         "product=codex/escape",
     )

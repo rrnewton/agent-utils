@@ -22,8 +22,9 @@ import uuid
 from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
 
+from wrkslots import __version__
 
-VERSION = "0.3.0"
+VERSION = __version__
 SCHEMA = 2
 CONFIG_NAME = ".wrkslots.yml"
 # Configuration keys that may be absent. Absent is a meaning, not a default to
@@ -48,6 +49,8 @@ class StateError(Refusal):
 
 @dataclasses.dataclass(frozen=True)
 class Config:
+    """Validated project configuration and resolved local paths."""
+
     root: Path
     config_path: Path
     worktrees: Path
@@ -61,6 +64,8 @@ class Config:
 
 @dataclasses.dataclass(frozen=True)
 class ProcessIdentity:
+    """One exact operating-system process generation."""
+
     pid: int
     start_ticks: int
     boot_id: str
@@ -70,6 +75,8 @@ class ProcessIdentity:
 
 @dataclasses.dataclass(frozen=True)
 class Checkout:
+    """Durable Git identity and publication evidence for one checkout."""
+
     name: str
     path: str
     repository: str
@@ -85,6 +92,8 @@ class Checkout:
 
 @dataclasses.dataclass(frozen=True)
 class Handoff:
+    """Owner-recorded evidence that a slot is ready for later removal."""
+
     recorded_at: str
     validation: tuple[str, ...]
     limitations: tuple[str, ...]
@@ -93,6 +102,8 @@ class Handoff:
 
 @dataclasses.dataclass(frozen=True)
 class ActiveRecord:
+    """One active slot row in a machine state file."""
+
     slot: str
     agent: str
     task: str
@@ -111,6 +122,8 @@ class ActiveRecord:
 
 @dataclasses.dataclass(frozen=True)
 class ActiveState:
+    """The complete active-slot state for one machine."""
+
     machine: str
     revision: int
     slots: tuple[ActiveRecord, ...]
@@ -118,6 +131,8 @@ class ActiveState:
 
 @dataclasses.dataclass(frozen=True)
 class ArchiveState:
+    """Completed removal records for one machine."""
+
     machine: str
     revision: int
     records: tuple[dict[str, object], ...]
@@ -125,6 +140,8 @@ class ArchiveState:
 
 @dataclasses.dataclass(frozen=True)
 class PlannedCheckout:
+    """Validated inputs for one checkout during create."""
+
     name: str
     destination: str
     repository: str
@@ -472,6 +489,13 @@ def _active_path(config: Config, machine: str | None = None) -> Path:
     selected = machine or config.machine
     _validate_name(selected, "machine")
     return config.worktrees / f"ACTIVE.{selected}.json"
+
+
+def _landed_ref_for_remote(config: Config, remote: str) -> str:
+    prefix = f"refs/remotes/{config.default_remote}/"
+    if not config.default_landed_ref.startswith(prefix):
+        raise StateError(f"configured landed ref must be under {prefix}")
+    return f"refs/remotes/{remote}/{config.default_landed_ref.removeprefix(prefix)}"
 
 
 def _archive_path(config: Config, machine: str | None = None) -> Path:
@@ -1044,10 +1068,7 @@ def _load_archive(config: Config, machine: str | None = None) -> ArchiveState:
                 raise StateError(
                     f"{label} checkout {checkout.name} path escaped its archived slot"
                 )
-            if (
-                checkout.remote != config.default_remote
-                or checkout.landed_ref != config.default_landed_ref
-            ):
+            if checkout.landed_ref != _landed_ref_for_remote(config, checkout.remote):
                 raise StateError(
                     f"{label} checkout {checkout.name} differs from configured authority"
                 )
@@ -1229,7 +1250,7 @@ def _assert_registry_storage_consistent(
     expected_slots = {record.slot for record in records}
     for record in records:
         _assert_slot_contents(config, record)
-        vcs = GitVcs()
+        vcs = _GitVcs()
         for checkout in record.checkouts:
             path = _stored_path(config, checkout.path, "checkout path")
             _relative, repository = _repository_path(config, checkout.repository)
@@ -1309,7 +1330,7 @@ def _append_record(state: ActiveState, record: ActiveRecord) -> ActiveState:
     return ActiveState(state.machine, state.revision + 1, (*state.slots, record))
 
 
-class GitVcs:
+class _GitVcs:
     """The small Git boundary used by slot operations."""
 
     @staticmethod
@@ -2072,10 +2093,7 @@ def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
     expected_slot = config.worktrees / record.slot
     _ensure_no_symlink_components(config.root, expected_slot, "slot")
     for checkout in record.checkouts:
-        if (
-            checkout.remote != config.default_remote
-            or checkout.landed_ref != config.default_landed_ref
-        ):
+        if checkout.landed_ref != _landed_ref_for_remote(config, checkout.remote):
             raise StateError(
                 f"slot {record.slot} checkout {checkout.name} differs from configured authority"
             )
@@ -2092,7 +2110,7 @@ def _assert_record_paths(config: Config, record: ActiveRecord) -> None:
 
 
 def _assert_checkout_identity_unchanged(
-    config: Config, checkout: Checkout, vcs: GitVcs
+    config: Config, checkout: Checkout, vcs: _GitVcs
 ) -> None:
     path = _stored_path(config, checkout.path, "checkout path")
     _relative, repository = _repository_path(config, checkout.repository)
@@ -2110,7 +2128,7 @@ def _assert_checkout_identity_unchanged(
         )
 
 
-def _assert_checkout_safe(config: Config, checkout: Checkout, vcs: GitVcs) -> Checkout:
+def _assert_checkout_safe(config: Config, checkout: Checkout, vcs: _GitVcs) -> Checkout:
     path = _stored_path(config, checkout.path, "checkout path")
     _relative, repository = _repository_path(config, checkout.repository)
     head = vcs.verify_existing_worktree(repository, path)
@@ -2185,7 +2203,7 @@ def _assert_slot_contents(config: Config, record: ActiveRecord) -> Path:
 
 
 def _handoff_preconditions(
-    config: Config, record: ActiveRecord, vcs: GitVcs
+    config: Config, record: ActiveRecord, vcs: _GitVcs
 ) -> tuple[Path, tuple[Checkout, ...]]:
     _assert_record_paths(config, record)
     slot_path = _assert_slot_contents(config, record)
@@ -2194,7 +2212,7 @@ def _handoff_preconditions(
 
 
 def _remove_preconditions(
-    config: Config, record: ActiveRecord, vcs: GitVcs
+    config: Config, record: ActiveRecord, vcs: _GitVcs
 ) -> tuple[Path, tuple[Checkout, ...]]:
     if record.handoff is None:
         raise Refusal(
@@ -2400,7 +2418,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
                 archive_path, _archive_to_obj(ArchiveState(machine, 0, ()))
             )
         link = worktrees / "wrkslots"
-        executable = Path(__file__).resolve()
+        executable = Path(__file__).with_name("__main__.py").resolve()
         relative_target = Path(os.path.relpath(executable, start=worktrees))
         if link.exists() or link.is_symlink():
             if not link.is_symlink():
@@ -2418,9 +2436,9 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def _create_plan(config: Config, args: argparse.Namespace, vcs: GitVcs) -> tuple[PlannedCheckout, ...]:
+def _create_plan(config: Config, args: argparse.Namespace, vcs: _GitVcs) -> tuple[PlannedCheckout, ...]:
     repositories = _assignments(args.repo, "repository")
-    remote_urls = _assignments(args.remote_url, "trusted remote URL")
+    remotes = _assignments(args.remote, "remote")
     branches = _assignments(args.branch, "branch")
     starts = _assignments(args.start, "start point")
     if not repositories:
@@ -2433,15 +2451,7 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: GitVcs) -> tuple
             + (f"; missing {', '.join(missing)}" if missing else "")
             + (f"; unknown {', '.join(extra)}" if extra else "")
         )
-    if set(remote_urls) != set(repositories):
-        missing = sorted(set(repositories) - set(remote_urls))
-        extra = sorted(set(remote_urls) - set(repositories))
-        raise Refusal(
-            "trusted remote URLs must exactly match repositories"
-            + (f"; missing {', '.join(missing)}" if missing else "")
-            + (f"; unknown {', '.join(extra)}" if extra else "")
-        )
-    for mapping, label in ((starts, "start point"),):
+    for mapping, label in ((starts, "start point"), (remotes, "remote")):
         unknown = sorted(set(mapping) - set(repositories))
         if unknown:
             raise Refusal(f"{label} supplied for unknown repository: {', '.join(unknown)}")
@@ -2459,20 +2469,15 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: GitVcs) -> tuple
         vcs.check_branch_name(repository, branch)
         if vcs.branch_exists(repository, branch):
             raise Refusal(f"local branch already exists: {branch}")
-        remote = config.default_remote
-        landed_ref = config.default_landed_ref
+        remote = _validate_remote(remotes.get(name, config.default_remote))
+        landed_ref = _landed_ref_for_remote(config, remote)
         if not landed_ref.startswith(f"refs/remotes/{remote}/"):
             raise Refusal(
                 f"landed ref for {name} must be under refs/remotes/{remote}/"
             )
-        remote_url_sha256 = vcs.assert_remote_url(
-            repository, remote, remote_urls[name]
-        )
+        remote_url_sha256 = vcs.remote_url_sha256(repository, remote)
         vcs.fetch_remote(repository, remote, landed_ref)
-        if (
-            vcs.assert_remote_url(repository, remote, remote_urls[name])
-            != remote_url_sha256
-        ):
+        if vcs.remote_url_sha256(repository, remote) != remote_url_sha256:
             raise Refusal(f"remote {remote!r} URL changed during fetch")
         start = vcs.verify_ref(
             repository, starts.get(name, landed_ref), "start point"
@@ -2584,7 +2589,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
     coordinator_lease = _capture_caller_process(
         args.coordinator_pid, "coordinator"
     )
-    vcs = GitVcs()
+    vcs = _GitVcs()
     with _mutation_locks(config, args.wait_lock):
         _refuse_partial_state(config)
         _assert_no_journal(config)
@@ -2718,14 +2723,17 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _existing_checkouts(
-    config: Config, args: argparse.Namespace, vcs: GitVcs
+    config: Config, args: argparse.Namespace, vcs: _GitVcs
 ) -> tuple[Checkout, ...]:
     repositories = _assignments(args.repo, "repository")
-    remote_urls = _assignments(args.remote_url, "trusted remote URL")
+    remotes = _assignments(args.remote, "remote")
     if not repositories:
         raise Refusal("at least one --repo NAME=PATH is required")
-    if set(remote_urls) != set(repositories):
-        raise Refusal("trusted remote URLs must exactly match repositories")
+    unknown_remotes = sorted(set(remotes) - set(repositories))
+    if unknown_remotes:
+        raise Refusal(
+            f"remote supplied for unknown repository: {', '.join(unknown_remotes)}"
+        )
     checkouts: list[Checkout] = []
     for name, raw_repository in repositories.items():
         repository_relative, repository = _repository_path(config, raw_repository)
@@ -2734,11 +2742,9 @@ def _existing_checkouts(
             raise Refusal(f"existing checkout is missing or unsafe: {destination}")
         head = vcs.verify_existing_worktree(repository, destination)
         branch = vcs.branch(destination)
-        remote = config.default_remote
-        remote_url_sha256 = vcs.assert_remote_url(
-            destination, remote, remote_urls[name]
-        )
-        landed_ref = config.default_landed_ref
+        remote = _validate_remote(remotes.get(name, config.default_remote))
+        remote_url_sha256 = vcs.remote_url_sha256(destination, remote)
+        landed_ref = _landed_ref_for_remote(config, remote)
         if not landed_ref.startswith(f"refs/remotes/{remote}/"):
             raise Refusal(
                 f"landed ref for {name} must be under refs/remotes/{remote}/"
@@ -2771,7 +2777,7 @@ def _register_existing(
         raise Refusal("task and purpose must be non-empty")
     if not args.verified_live:
         raise Refusal("registration requires --verified-live and a live --owner-pid")
-    vcs = GitVcs()
+    vcs = _GitVcs()
     checkouts = _existing_checkouts(config, args, vcs)
     slot_path = _assert_slot_contents(
         config,
@@ -2858,7 +2864,7 @@ def _cmd_register(args: argparse.Namespace) -> int:
 
 def _cmd_import_existing(args: argparse.Namespace) -> int:
     config = _load_config(args.project_root, args.machine)
-    vcs = GitVcs()
+    vcs = _GitVcs()
     _validate_name(args.slot, "slot")
     checkouts = _existing_checkouts(config, args, vcs)
     print(
@@ -2993,7 +2999,7 @@ def _cmd_recover_unbound_owner(args: argparse.Namespace) -> int:
             )
         _assert_registered_liveness(config, record)
         _slot_path, final_checkouts = _handoff_preconditions(
-            config, record, GitVcs()
+            config, record, _GitVcs()
         )
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
@@ -3384,7 +3390,7 @@ def _checkout_at_slot(
 
 
 def _repair_checkout_at_slot(
-    config: Config, checkout: Checkout, slot_path: Path, vcs: GitVcs
+    config: Config, checkout: Checkout, slot_path: Path, vcs: _GitVcs
 ) -> Path:
     moved, path = _checkout_at_slot(config, checkout, slot_path)
     _repair_registration_at_slot(config, checkout, slot_path, vcs)
@@ -3397,7 +3403,7 @@ def _repair_checkout_at_slot(
 
 
 def _repair_registration_at_slot(
-    config: Config, checkout: Checkout, slot_path: Path, vcs: GitVcs
+    config: Config, checkout: Checkout, slot_path: Path, vcs: _GitVcs
 ) -> Path:
     _moved, path = _checkout_at_slot(config, checkout, slot_path)
     _relative, repository = _repository_path(config, checkout.repository)
@@ -3426,7 +3432,7 @@ def _rollback_path_fence(
     config: Config,
     record: ActiveRecord,
     journal: dict[str, object],
-    vcs: GitVcs,
+    vcs: _GitVcs,
 ) -> None:
     removed = {
         _as_str(item, "journal.removed item")
@@ -3457,7 +3463,7 @@ def _begin_or_resume_path_fence(
     config: Config,
     record: ActiveRecord,
     journal: dict[str, object],
-    vcs: GitVcs,
+    vcs: _GitVcs,
 ) -> tuple[dict[str, object], Path]:
     original = config.worktrees / record.slot
     fenced = _finish_fenced_slot(config, record, journal)
@@ -3515,7 +3521,7 @@ def _finish_remove_paths(
     config: Config,
     record: ActiveRecord,
     journal: dict[str, object],
-    vcs: GitVcs,
+    vcs: _GitVcs,
 ) -> dict[str, object]:
     removed_values = _as_list(journal["removed"], "journal.removed")
     removed = {_as_str(item, "journal.removed item") for item in removed_values}
@@ -3590,7 +3596,7 @@ def _finish_remove_paths(
 def _assert_physical_slot_removed(
     config: Config,
     record: ActiveRecord,
-    vcs: GitVcs,
+    vcs: _GitVcs,
     journal: Mapping[str, object],
 ) -> None:
     slot_path = config.worktrees / record.slot
@@ -3628,7 +3634,7 @@ def _finish_state_update(
     current = current_slots.get(record.slot)
     if current is not None and _record_to_obj(current) != _record_to_obj(record):
         raise StateError("active record changed during an interrupted finish")
-    _assert_physical_slot_removed(config, record, GitVcs(), journal)
+    _assert_physical_slot_removed(config, record, _GitVcs(), journal)
     archive = _load_archive(config)
     entry = _archive_entry(journal, record)
     _append_archive_once(config, archive, entry)
@@ -3647,7 +3653,7 @@ def _begin_finish(
     mode: str,
     actor: str,
 ) -> None:
-    vcs = GitVcs()
+    vcs = _GitVcs()
     _load_archive(config)
     _slot_path, final_checkouts = _remove_preconditions(config, record, vcs)
     final_record = dataclasses.replace(record, checkouts=final_checkouts)
@@ -3692,7 +3698,7 @@ def _cmd_finish(args: argparse.Namespace) -> int:
         if record.handoff is not None:
             raise Refusal(f"slot {record.slot} already has a recorded handoff")
         _slot_path, final_checkouts = _handoff_preconditions(
-            config, record, GitVcs()
+            config, record, _GitVcs()
         )
         continuation = (
             f"wrkslots remove {record.slot} --coordinator-pid "
@@ -3904,11 +3910,11 @@ def _recover_create(
             raise StateError(
                 f"create journal repository for {item.name} is not canonical"
             )
-        if item.remote != config.default_remote or item.landed_ref != config.default_landed_ref:
+        if item.landed_ref != _landed_ref_for_remote(config, item.remote):
             raise StateError(
                 f"create journal target for {item.name} differs from configured authority"
             )
-        if GitVcs().remote_url_sha256(_repository, item.remote) != item.remote_url_sha256:
+        if _GitVcs().remote_url_sha256(_repository, item.remote) != item.remote_url_sha256:
             raise Refusal(
                 f"create journal remote {item.remote!r} URL changed for {item.name}"
             )
@@ -3989,7 +3995,7 @@ def _recover_create(
         for checkout in existing_record.checkouts:
             _relative, repository = _repository_path(config, checkout.repository)
             destination = _stored_path(config, checkout.path, "checkout path")
-            head = GitVcs().verify_existing_worktree(repository, destination)
+            head = _GitVcs().verify_existing_worktree(repository, destination)
             if head != checkout.head:
                 raise Refusal(
                     f"create recovery found changed HEAD for {checkout.name}; preserve it for inspection"
@@ -4004,7 +4010,7 @@ def _recover_create(
     if not slot_path.exists():
         slot_path.mkdir(mode=0o755)
         _fsync_directory(config.worktrees)
-    vcs = GitVcs()
+    vcs = _GitVcs()
     created: list[Checkout] = []
     for item in plan:
         destination = _stored_path(config, item.destination, "checkout destination")
@@ -4140,7 +4146,7 @@ def _recover_finish(
         )
         if not _json_equal(matching_entry, expected_entry):
             raise StateError("durable archive entry differs from the finish journal")
-        _assert_physical_slot_removed(config, record, GitVcs(), raw)
+        _assert_physical_slot_removed(config, record, _GitVcs(), raw)
         _remove_control_file(path)
         print(f"recovered finish: cleared completed journal for {record.slot}")
         return
@@ -4166,11 +4172,11 @@ def _recover_finish(
     if phase not in ("prepared", "fenced", "removed"):
         raise StateError(f"unknown finish journal phase {phase!r}")
     if phase in ("prepared", "fenced"):
-        journal = _finish_remove_paths(config, record, journal, GitVcs())
+        journal = _finish_remove_paths(config, record, journal, _GitVcs())
     else:
         if set(removed_names) != {checkout.name for checkout in record.checkouts}:
             raise StateError("removed finish phase does not name every checkout")
-        _assert_physical_slot_removed(config, record, GitVcs(), journal)
+        _assert_physical_slot_removed(config, record, _GitVcs(), journal)
     _finish_state_update(config, state, record, journal)
     print(f"recovered finish: archived and removed slot={record.slot}")
 
@@ -4230,29 +4236,84 @@ def _add_repo_options(parser: argparse.ArgumentParser) -> None:
         "--repo",
         action="append",
         metavar="NAME=PATH",
-        help="source Git repository relative to the project root (repeatable)",
+        help=(
+            "source Git repository relative to the project root; NAME labels the checkout "
+            "and must match --branch (repeat once per checkout)"
+        ),
     )
     parser.add_argument(
-        "--remote-url",
+        "--remote",
         action="append",
-        required=True,
-        metavar="NAME=URL",
-        help="trusted fetch URL supplied during provisioning (repeatable)",
+        metavar="NAME=REMOTE",
+        help=(
+            "configured Git remote name for one checkout; callers never pass a URL "
+            "(default: the remote recorded by init)"
+        ),
     )
+
+
+_QUICKSTART = """\
+wrkslots manages one durable Git worktree slot for one coding agent.
+
+1. Initialize the project once. The running command is project-owned and is called with the agent
+   name. It must return 0 for dead, 1 for alive, or 2 when it cannot determine the answer.
+
+     wrkslots init . --liveness-command tools/agent-liveness.py
+
+2. Create a new linked worktree and branch from an existing source repository. The repository's
+   configured origin is used by default; add --remote product=upstream to choose another remote.
+
+     wrkslots create slot01 \\
+       --agent codex-1 --task task-123 --purpose "fix parser" \\
+       --coordinator-pid "$COORDINATOR_PID" --owner-pid "$OWNER_PID" \\
+       --repo product=product --branch product=codex/fix-parser
+
+3. The exact recorded owner refreshes its heartbeat while working.
+
+     wrkslots heartbeat slot01 \\
+       --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1
+
+4. Before exiting, the owner records a clean, published handoff. This retains the slot.
+
+     wrkslots finish slot01 \\
+       --agent codex-1 --owner-pid "$OWNER_PID" --expected-generation 1 \\
+       --validation "make test: pass"
+
+5. After the registered running command verifies the agent is dead, the recorded coordinator may
+   remove the slot. Heartbeat expiry and old mtimes never authorize removal.
+
+     wrkslots remove slot01 \\
+       --coordinator-pid "$COORDINATOR_PID" --expected-generation 1
+
+If a create or removal is interrupted, preserve all paths and run:
+
+     wrkslots recover --coordinator-pid "$COORDINATOR_PID"
+
+Use `wrkslots COMMAND --help` for the exact effects and inputs of one command.
+"""
+
+
+def _cmd_quickstart(_args: argparse.Namespace) -> int:
+    print(_QUICKSTART)
+    return 0
+
+
+def _load_userguide() -> str:
+    return Path(__file__).with_name("USER_GUIDE.md").read_text(encoding="utf-8")
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    description = """Safely manage opaque Git worktree slots with one active slot per agent.
+    description = """Create, track, hand off, recover, and remove Git worktree slots for coding agents.
 
-Read-only: status and import-existing without --apply.
-Mutating: init, create, register, import-existing --apply, adopt,
-recover-unbound-owner, heartbeat, finish, remove, and recover. Every mutating command takes a state lock and
-atomically replaces the affected machine shard.
+Each slot binds an agent identity, coordinator process generation, and one or more linked Git
+worktrees to durable machine-sharded state. Removal fails closed unless the registered running
+command, process evidence, Git state, and recovery journal all agree that deletion is safe.
 """
     epilog = """Lifecycle:
-  wrkslots init --liveness-command ci-hub/health/agent_liveness_probe.py
+  wrkslots quickstart
+  wrkslots init . --liveness-command tools/agent-liveness.py
   wrkslots create slot01 --agent codex-1 --task task-123 --purpose "fix parser" \\
-    --repo product=product --remote-url product=URL --branch product=codex/fix-parser \\
+    --repo product=product --branch product=codex/fix-parser \\
     --coordinator-pid PID --owner-pid PID
   wrkslots heartbeat slot01 --agent codex-1 --owner-pid PID --expected-generation 1
   wrkslots finish slot01 --agent codex-1 --owner-pid PID --expected-generation 1 \\
@@ -4281,6 +4342,11 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     )
     parser.add_argument("--version", action="version", version=f"wrkslots {VERSION}")
     parser.add_argument(
+        "--userguide",
+        action="store_true",
+        help="print the complete installed user guide and exit",
+    )
+    parser.add_argument(
         "--project-root",
         help=f"project root containing {CONFIG_NAME}; otherwise search upward",
     )
@@ -4297,23 +4363,68 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    init = subparsers.add_parser(
-        "init",
-        description="initialize config, state shards, directory, and relative command symlink",
-        help="initialize config, state shards, directory, and relative command symlink",
+    quickstart = subparsers.add_parser(
+        "quickstart",
+        help="print the normal end-to-end workflow",
+        description="Print a concise tutorial for init, create, heartbeat, finish, remove, and recovery.",
         formatter_class=_HelpFormatter,
     )
-    init.add_argument("directory", nargs="?", default=".", help="project root (default: .)")
-    init.add_argument(
-        "--worktrees-dir", default="worktrees", help="relative opaque directory (default: worktrees)"
+    quickstart.set_defaults(handler=_cmd_quickstart)
+
+    init = subparsers.add_parser(
+        "init",
+        help="initialize wrkslots for one project",
+        description=(
+            "Initialize wrkslots once at a project root. This creates the configuration, empty "
+            "machine state, managed worktrees directory, and a project-local command symlink. "
+            "It does not create a slot or alter a source repository."
+        ),
+        epilog=(
+            "The running command is project-owned deletion authority. wrkslots invokes it as "
+            "PATH AGENT with recorded identity in WRKSLOTS_* environment variables. Exit 0 means "
+            "dead, 1 means alive, and 2 means unverifiable; every other result refuses removal."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    init.add_argument("--default-remote", default="origin")
-    init.add_argument("--default-landed-ref", default="refs/remotes/origin/main")
-    init.add_argument("--heartbeat-ttl-seconds", type=int, default=3600)
+    init.add_argument(
+        "directory",
+        nargs="?",
+        default=".",
+        help="project root to initialize (default: current directory)",
+    )
+    init.add_argument(
+        "--worktrees-dir",
+        default="worktrees",
+        metavar="PATH",
+        help="managed slot directory relative to the project root (default: worktrees)",
+    )
+    init.add_argument(
+        "--default-remote",
+        default="origin",
+        metavar="REMOTE",
+        help="configured Git remote name used when create omits --remote (default: origin)",
+    )
+    init.add_argument(
+        "--default-landed-ref",
+        default="refs/remotes/origin/main",
+        metavar="REF",
+        help="remote-tracking ref that a finished commit must reach (default: refs/remotes/origin/main)",
+    )
+    init.add_argument(
+        "--heartbeat-ttl-seconds",
+        type=int,
+        default=3600,
+        metavar="SECONDS",
+        help="age after which status diagnoses a heartbeat as expired; never deletion authority (default: 3600)",
+    )
     init.add_argument(
         "--liveness-command",
         required=True,
-        help="executable path relative to the project root; rc 0 dead, 1 alive, 2 unverifiable",
+        metavar="PATH",
+        help=(
+            "executable path relative to the project root; called as PATH AGENT during removal "
+            "and must return 0 dead, 1 alive, or 2 unverifiable"
+        ),
     )
     init.add_argument(
         "--max-active-slots",
@@ -4333,12 +4444,26 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
 
     status = subparsers.add_parser(
         "status",
-        description="show active ownership and diagnoses",
-        help="show active ownership and diagnoses",
+        help="show active slots and safety diagnoses",
+        description=(
+            "Read durable state without mutating it. Reports ownership, heartbeat age, process "
+            "evidence, Git state, journals, and cross-machine conflicts. A diagnosis never "
+            "authorizes deletion."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    status.add_argument("--all-machines", action="store_true", help="read every ACTIVE shard")
-    status.add_argument("--slot", help="show one slot")
-    status.add_argument("--format", choices=("human", "json"), default="human")
+    status.add_argument(
+        "--all-machines",
+        action="store_true",
+        help="read every ACTIVE machine shard instead of only the selected machine",
+    )
+    status.add_argument("--slot", metavar="SLOT", help="limit output to this slot name")
+    status.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="output format (default: human)",
+    )
     status.set_defaults(handler=_cmd_status)
 
     doctor = subparsers.add_parser(
@@ -4355,123 +4480,191 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
 
     create = subparsers.add_parser(
         "create",
-        description="create fresh Git worktrees and register one active owner",
-        help="create fresh Git worktrees and register one active owner",
+        help="create linked worktrees and register a slot",
+        description=(
+            "Create one new branch and linked Git worktree for each --repo, then durably register "
+            "the slot, coordinator, and optional owner. Source repositories and configured "
+            "remotes must already exist. create never reclaims or removes another slot."
+        ),
+        epilog=(
+            "Each NAME must appear once in --repo and --branch. --start, --remote, and later Git "
+            "evidence use the same NAME. The configured origin is used by default, so no remote "
+            "URL is accepted. Omit --owner-pid only when that owner will immediately run adopt."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    create.add_argument("slot")
-    create.add_argument("--agent", required=True)
-    create.add_argument("--task", required=True)
-    create.add_argument("--purpose", required=True)
+    create.add_argument("slot", help="new slot name, such as slot01")
+    create.add_argument("--agent", required=True, metavar="AGENT", help="registered agent name")
+    create.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
+    create.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
     create.add_argument(
         "--owner-pid",
         type=int,
+        metavar="PID",
         help="live owner PID to bind; omit only when the owner will immediately adopt",
     )
-    create.add_argument("--coordinator-pid", type=int, required=True)
+    create.add_argument(
+        "--coordinator-pid",
+        type=int,
+        required=True,
+        metavar="PID",
+        help="live coordinator PID; it must be an ancestor of this command",
+    )
     _add_repo_options(create)
     create.add_argument(
-        "--branch", action="append", required=True, metavar="NAME=BRANCH"
+        "--branch",
+        action="append",
+        required=True,
+        metavar="NAME=BRANCH",
+        help="new local branch for one checkout (repeat once per --repo)",
     )
     create.add_argument(
-        "--start", action="append", metavar="NAME=REF", help="default: configured landed ref"
+        "--start",
+        action="append",
+        metavar="NAME=REF",
+        help="start ref for one checkout (default: landed ref derived for its configured remote)",
     )
     create.set_defaults(handler=_cmd_create)
 
     register = subparsers.add_parser(
         "register",
-        description="register already-created, verified live Git worktrees",
-        help="register already-created, verified live Git worktrees",
+        help="register already-created live worktrees",
+        description=(
+            "Verify linked worktrees already present under the slot path and register their exact "
+            "Git, coordinator, and owner identities. This command does not create or move paths. "
+            "Use only while the owner is demonstrably live."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    register.add_argument("slot")
-    register.add_argument("--agent", required=True)
-    register.add_argument("--task", required=True)
-    register.add_argument("--purpose", required=True)
-    register.add_argument("--owner-pid", type=int, required=True)
-    register.add_argument("--coordinator-pid", type=int, required=True)
-    register.add_argument("--verified-live", action="store_true", required=True)
+    register.add_argument("slot", help="existing managed slot name")
+    register.add_argument("--agent", required=True, metavar="AGENT", help="registered agent name")
+    register.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
+    register.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
+    register.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="live owner PID to bind")
+    register.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="live coordinator PID to bind")
+    register.add_argument(
+        "--verified-live",
+        action="store_true",
+        required=True,
+        help="confirm that the named worktrees are currently owned and in use",
+    )
     _add_repo_options(register)
     register.set_defaults(handler=_cmd_register)
 
     import_existing = subparsers.add_parser(
         "import-existing",
-        description="verify an existing slot and print the registration; dry-run by default",
         help="verify an existing slot and print the registration; dry-run by default",
+        description=(
+            "Inspect worktrees already present under a slot path and print the registry row that "
+            "would describe them. The default is read-only. --apply requires the same explicit "
+            "live-owner evidence as register."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    import_existing.add_argument("slot")
-    import_existing.add_argument("--agent", required=True)
-    import_existing.add_argument("--task", required=True)
-    import_existing.add_argument("--purpose", required=True)
-    import_existing.add_argument("--owner-pid", type=int)
-    import_existing.add_argument("--coordinator-pid", type=int)
-    import_existing.add_argument("--verified-live", action="store_true")
-    import_existing.add_argument("--apply", action="store_true")
+    import_existing.add_argument("slot", help="existing managed slot name")
+    import_existing.add_argument("--agent", required=True, metavar="AGENT", help="agent name to record")
+    import_existing.add_argument("--task", required=True, metavar="TASK", help="task or work-item identifier")
+    import_existing.add_argument("--purpose", required=True, metavar="TEXT", help="short human-readable reason for the slot")
+    import_existing.add_argument("--owner-pid", type=int, metavar="PID", help="live owner PID; required with --apply")
+    import_existing.add_argument("--coordinator-pid", type=int, metavar="PID", help="live coordinator PID; required with --apply")
+    import_existing.add_argument("--verified-live", action="store_true", help="confirm the existing worktrees are live; required with --apply")
+    import_existing.add_argument("--apply", action="store_true", help="write the verified row instead of only printing it")
     _add_repo_options(import_existing)
     import_existing.set_defaults(handler=_cmd_import_existing)
 
     adopt = subparsers.add_parser(
         "adopt",
-        description="bind a live owner process generation",
-        help="bind a live owner process generation",
+        help="bind an unowned slot to its live owner",
+        description=(
+            "Bind the exact live process generation that will own a newly created slot. This is "
+            "only valid for a slot created without --owner-pid and does not transfer an existing "
+            "owner."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    adopt.add_argument("slot")
-    adopt.add_argument("--agent", required=True)
-    adopt.add_argument("--owner-pid", type=int, required=True)
-    adopt.add_argument("--expected-generation", type=int, required=True)
+    adopt.add_argument("slot", help="active slot awaiting an owner")
+    adopt.add_argument("--agent", required=True, metavar="AGENT", help="agent name already recorded on the slot")
+    adopt.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="live owner PID to bind")
+    adopt.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation; refuses stale callers")
     adopt.set_defaults(handler=_cmd_adopt)
 
     recover_unbound = subparsers.add_parser(
         "recover-unbound-owner",
-        description="record coordinator recovery evidence without replacing historical ownership",
         help="record coordinator recovery evidence without replacing historical ownership",
+        description=(
+            "Record explicit coordinator evidence for a historical slot that has no usable owner "
+            "lease. This does not invent or replace an owner identity, and it does not remove the "
+            "slot."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    recover_unbound.add_argument("slot")
-    recover_unbound.add_argument("--coordinator-pid", type=int, required=True)
-    recover_unbound.add_argument("--expected-generation", type=int, required=True)
-    recover_unbound.add_argument("--recovery-note", required=True)
-    recover_unbound.add_argument("--validation", action="append", required=True)
-    recover_unbound.add_argument("--limitation", action="append")
+    recover_unbound.add_argument("slot", help="active slot with no usable owner lease")
+    recover_unbound.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="recorded live coordinator PID")
+    recover_unbound.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
+    recover_unbound.add_argument("--recovery-note", required=True, metavar="TEXT", help="why owner evidence cannot be recovered")
+    recover_unbound.add_argument("--validation", action="append", required=True, metavar="TEXT", help="validation evidence (repeatable)")
+    recover_unbound.add_argument("--limitation", action="append", metavar="TEXT", help="known limitation to retain (repeatable)")
     recover_unbound.set_defaults(handler=_cmd_recover_unbound_owner)
 
     heartbeat = subparsers.add_parser(
         "heartbeat",
-        description="update a bound owner's heartbeat",
-        help="update a bound owner's heartbeat",
+        help="refresh diagnosis data for the exact owner",
+        description=(
+            "Refresh the heartbeat only when the caller, agent, PID, and process start identity "
+            "still match the recorded owner. Expiry is diagnostic and never permits removal."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    heartbeat.add_argument("slot")
-    heartbeat.add_argument("--agent", required=True)
-    heartbeat.add_argument("--owner-pid", type=int, required=True)
-    heartbeat.add_argument("--expected-generation", type=int, required=True)
+    heartbeat.add_argument("slot", help="active slot name")
+    heartbeat.add_argument("--agent", required=True, metavar="AGENT", help="recorded agent name")
+    heartbeat.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="recorded live owner PID")
+    heartbeat.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
     heartbeat.set_defaults(handler=_cmd_heartbeat)
 
     finish = subparsers.add_parser(
         "finish",
-        description="prove landed safety and record the owner-alive handoff",
-        help="prove landed safety and record the owner-alive handoff",
+        help="record a clean, published owner handoff",
+        description=(
+            "Run while the recorded owner is still alive. Verify every checkout is clean, has no "
+            "unfinished Git operation, is published to its recorded remote, and is contained by "
+            "the landed ref; then retain the slot and record the handoff. finish never deletes."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    finish.add_argument("slot")
-    finish.add_argument("--agent", required=True)
-    finish.add_argument("--owner-pid", type=int, required=True)
-    finish.add_argument("--expected-generation", type=int, required=True)
-    finish.add_argument("--validation", action="append", required=True)
-    finish.add_argument("--limitation", action="append")
+    finish.add_argument("slot", help="active slot name")
+    finish.add_argument("--agent", required=True, metavar="AGENT", help="recorded agent name")
+    finish.add_argument("--owner-pid", type=int, required=True, metavar="PID", help="recorded live owner PID")
+    finish.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
+    finish.add_argument("--validation", action="append", required=True, metavar="TEXT", help="command and result evidence (repeatable)")
+    finish.add_argument("--limitation", action="append", metavar="TEXT", help="known limitation to retain (repeatable)")
     finish.set_defaults(handler=_cmd_finish)
 
     remove = subparsers.add_parser(
         "remove",
-        description="finish a slot only after its recorded owner is proven dead",
-        help="finish a slot only after its recorded owner is proven dead",
+        help="remove a handed-off slot after proving its owner dead",
+        description=(
+            "Coordinator-only physical removal. Requires a completed handoff, the registered "
+            "running command to return dead, the exact owner process generation to be absent, and "
+            "independent process, mount, Git, and path checks to agree. Ambiguity refuses."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    remove.add_argument("slot")
-    remove.add_argument("--coordinator-pid", type=int, required=True)
-    remove.add_argument("--expected-generation", type=int, required=True)
+    remove.add_argument("slot", help="finished active slot name")
+    remove.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="recorded live coordinator PID")
+    remove.add_argument("--expected-generation", type=int, required=True, metavar="N", help="current slot generation")
     remove.set_defaults(handler=_cmd_remove)
 
     recover = subparsers.add_parser(
         "recover",
-        description="resume one interrupted create or removal from its journal",
-        help="resume one interrupted create or removal from its journal",
+        help="resume an interrupted mutation from its journal",
+        description=(
+            "Validate and resume one durable create or removal journal. Recovery is bound to the "
+            "recorded coordinator and machine and refuses mismatched registry, path, process, or "
+            "Git evidence. Do not edit a journal by hand."
+        ),
+        formatter_class=_HelpFormatter,
     )
-    recover.add_argument("--coordinator-pid", type=int, required=True)
+    recover.add_argument("--coordinator-pid", type=int, required=True, metavar="PID", help="recorded live coordinator PID")
     recover.add_argument(
         "--discard-partial",
         action="store_true",
@@ -4482,12 +4675,18 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command-line interface and return its process exit status."""
+
     parser = _build_parser()
     values = list(sys.argv[1:] if argv is None else argv)
     if not values:
         parser.print_help()
         return 0
     args = parser.parse_args(values)
+    if args.userguide:
+        guide = _load_userguide()
+        print(guide, end="" if guide.endswith("\n") else "\n")
+        return 0
     if args.wait_lock < 0 or not args.wait_lock < float("inf"):
         parser.error("--wait-lock must be a finite non-negative number")
     if args.command == "init":
