@@ -82,7 +82,7 @@ def test_archive_local_query_implementation_matches_catalog_filter() -> None:
     (
         ({"algorithm": "unknown"}, "unsupported value"),
         ({"bit_count": 65}, "power of two"),
-        ({"hash_count": 0}, "positive integer"),
+        ({"hash_count": 0}, "expected 7"),
         ({"trigram_count": -1}, "non-negative integer"),
         ({"bits_base64": "!"}, "invalid base64"),
         ({"bits_base64": base64.b64encode(b"short").decode("ascii")}, "expected"),

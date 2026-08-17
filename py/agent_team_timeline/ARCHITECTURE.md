@@ -141,12 +141,17 @@ and a second range visit never refetches or reapplies it. Full transcript search
 detail objects. The bootstrap instead catalogs content-addressed `(team, UTC day)` search objects
 whose records come directly from normalized events and condensed tool calls. The browser validates
 each object's team, range, record count, record identities, roles, and known agents before merging
-it. This keeps search complete outside the viewport and makes inclusion independent of phase
-segmentation. Each catalog entry also carries a deterministic Bloom filter over whitespace-compacted
-UTF-8 byte trigrams after ASCII-only case folding. Smart-query terms are tested independently;
-non-ASCII or shorter-than-three-byte terms never reject an object, so a query with no eligible term
-scans all selected objects. The filter may fetch an extra object but can never authorize a match or
-omit one from a correctly built catalog.
+it. Current objects carry identity byte counts and are SHA-256 verified before JSON parsing. This
+keeps search complete outside the viewport and makes inclusion independent of phase segmentation.
+Each catalog entry also carries a deterministic Bloom filter over whitespace-compacted UTF-8 byte
+trigrams after ASCII-only case folding. Exact search uses that same portable ASCII-only case-folding
+contract; non-ASCII characters remain exact. Smart-query terms are tested independently; non-ASCII
+or shorter-than-three-byte terms never reject an object, so a query with no eligible term scans all
+selected objects. The filter may fetch an extra object but can never authorize a match or omit one
+from a correctly built catalog. Compact content-addressed linkage sidecars preserve prompt excerpts
+and response counts independently of text-shard selection, so a response after midnight still opens
+its previous-day prompt. Normal typing is debounced, shard fetches have bounded concurrency, and a
+request-generation guard prevents a stale search from replacing newer results.
 
 This delivery layer is additive. Opening the archive through another static server still serves
 the identity files correctly, while older generated sites without sidecars or schema 2 remain
@@ -170,9 +175,12 @@ When schema 2 is present, the CLI reconstructs its small query projection from t
 content-addressed global object, and phase index instead of parsing the schema-1 timeline monolith.
 The global, phase-index, and search-day objects carry additive source-generation bindings; readers
 accept older immutable objects that predate those fields but reject a present mismatch. Transcript
-search validates and consumes one day object at a time, retaining only prompt linkage metadata and
-actual matches rather than materializing the full corpus. A bootstrap that specifically predates
-the phase index falls back to schema 1; malformed or digest-mismatched schema-2 data fails closed.
+search validates and consumes one day object at a time, retaining actual matches rather than
+materializing the full corpus. Compact per-day linkage sidecars supply candidate-proportional prompt
+excerpts and response counts even when Bloom filtering skips the corresponding text day. Older
+search-enabled archives without those sidecars retain a correct full-scan fallback. A bootstrap that
+specifically predates the phase index falls back to schema 1; malformed or digest-mismatched
+schema-2 data fails closed.
 
 Availability fields are additive to timeline schema 1. Older projections without them are treated
 as available; new projections mark sparse agent/phase records with `summary_available` and each
@@ -281,11 +289,18 @@ individual archive and a combined export. List projections expose references and
 The phase-independent transcript index contains every nonempty normalized textual event, including
 system and lifecycle records, plus condensed tool records without raw tool payloads. Inter-agent
 instructions and final replies are classified directionally from explicit phase and route metadata;
-prompt association uses provider turn identity and `(timestamp, source line, stable ID)` ordering.
+same-thread prompt association uses provider turn identity and `(timestamp, source line, stable ID)`
+ordering. Cross-rollout parent/child returns link only to a strictly earlier instruction because
+equal timestamps have no causal ordering across files. Routed prompts and responses are attributed
+to the child that received or produced the work, while ambiguous routes remain on their physical
+event thread.
 Search objects are split by team and UTC day, content-addressed, and bound to the timeline source
-generation. Both the browser and archive-local CLI use the same catalog Bloom algorithm only as a
-false-positive prefilter, then apply exact matching to full record text. JSON responses use query
-schema version 1, JSONL emits one record per line, and Markdown is presentation-only.
+generation. Parent/child route semantics link receiver-side Codex `FINAL_ANSWER` deliveries back to
+their child instruction even though the two records live on different rollout threads. Both the
+browser and archive-local CLI use the same catalog Bloom algorithm only as a false-positive
+prefilter, then apply the same ASCII-case-insensitive/non-ASCII-exact matching contract to full
+record text. JSON responses use query schema version 1, JSONL emits one record per line, and
+Markdown is presentation-only.
 
 ## Codex snapshot and continuation contract
 

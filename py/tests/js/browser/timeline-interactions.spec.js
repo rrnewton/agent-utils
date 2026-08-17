@@ -1,6 +1,7 @@
 "use strict";
 
 const { test, expect } = require("@playwright/test");
+const { createHash } = require("crypto");
 const {
   AGGREGATE_GAP_START_MS,
   AGGREGATE_LATER_START_MS,
@@ -21,6 +22,20 @@ const {
 
 const phaseSelector = '[data-phase-id="phase-a-1"]';
 const secondPhaseSelector = '[data-phase-id="phase-a-2"]';
+
+function contentAddressedJson(value) {
+  const body = JSON.stringify(value);
+  const bytes = Buffer.byteLength(body, "utf8");
+  const sha256 = createHash("sha256").update(body, "utf8").digest("hex");
+  return {
+    body: body,
+    reference: {
+      url: "data/timeline-v2/objects/" + sha256 + ".json",
+      sha256: sha256,
+      bytes: bytes
+    }
+  };
+}
 
 async function requireContract(locator, reason) {
   test.skip((await locator.count()) === 0, reason);
@@ -115,6 +130,16 @@ function singleDaySchema2Fixture(globalDigest, detailDigest) {
 }
 
 async function routeSingleDaySchema2Fixture(page, fixture, detailHandler) {
+  const storedGlobal = contentAddressedJson(fixture.globalData);
+  const storedDetail = contentAddressedJson(fixture.detail);
+  fixture.globalDigest = storedGlobal.reference.sha256;
+  fixture.detailDigest = storedDetail.reference.sha256;
+  fixture.bootstrap.global = storedGlobal.reference;
+  fixture.bootstrap.detail_shards[0] = Object.assign(
+    {},
+    fixture.bootstrap.detail_shards[0],
+    storedDetail.reference
+  );
   await page.route("**/data/timeline-v2.json", function (route) {
     return route.fulfill({
       contentType: "application/json; charset=utf-8",
@@ -124,7 +149,7 @@ async function routeSingleDaySchema2Fixture(page, fixture, detailHandler) {
   await page.route("**/" + fixture.globalDigest + ".json", function (route) {
     return route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify(fixture.globalData)
+      body: storedGlobal.body
     });
   });
   await page.route("**/" + fixture.detailDigest + ".json", detailHandler);
@@ -244,14 +269,6 @@ test("schema 2 rejects global team and range records outside its bootstrap", asy
 });
 
 test("schema 2 loads visible detail shards once and expands search on demand", async function ({ page }) {
-  const globalDigest = "a".repeat(64);
-  const firstDigest = "b".repeat(64);
-  const remoteDigest = "c".repeat(64);
-  const finalDigest = "2".repeat(64);
-  const globalUrl = "data/timeline-v2/objects/" + globalDigest + ".json";
-  const firstUrl = "data/timeline-v2/objects/" + firstDigest + ".json";
-  const remoteUrl = "data/timeline-v2/objects/" + remoteDigest + ".json";
-  const finalUrl = "data/timeline-v2/objects/" + finalDigest + ".json";
   const firstDayStart = Date.UTC(2026, 2, 9);
   const remoteDayStart = Date.UTC(2026, 2, 19);
   const finalDayStart = Date.UTC(2026, 2, 29);
@@ -304,31 +321,25 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
     range: { start_ms: DATA_START_MS, end_ms: expandedEnd },
     teams: TIMELINE.teams,
     activity_bins: TIMELINE.activity_bins,
-    global: { url: globalUrl, sha256: globalDigest },
+    global: {},
     detail_shards: [
       {
         kind: "utc-day",
         day: "2026-03-09",
         start_ms: firstDayStart,
         end_ms: firstDayStart + 24 * 60 * 60 * 1000,
-        url: firstUrl,
-        sha256: firstDigest
       },
       {
         kind: "utc-day",
         day: "2026-03-19",
         start_ms: remoteDayStart,
         end_ms: remoteDayStart + 24 * 60 * 60 * 1000,
-        url: remoteUrl,
-        sha256: remoteDigest
       },
       {
         kind: "utc-day",
         day: "2026-03-29",
         start_ms: finalDayStart,
         end_ms: expandedEnd,
-        url: finalUrl,
-        sha256: finalDigest
       }
     ]
   };
@@ -369,6 +380,18 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
       kind: "user_prompt"
     }]
   };
+  const storedGlobal = contentAddressedJson(globalData);
+  const storedFirst = contentAddressedJson(detail);
+  const storedRemote = contentAddressedJson(remoteDetail);
+  const storedFinal = contentAddressedJson(finalDetail);
+  Object.assign(bootstrap.global, storedGlobal.reference);
+  Object.assign(bootstrap.detail_shards[0], storedFirst.reference);
+  Object.assign(bootstrap.detail_shards[1], storedRemote.reference);
+  Object.assign(bootstrap.detail_shards[2], storedFinal.reference);
+  const globalDigest = storedGlobal.reference.sha256;
+  const firstDigest = storedFirst.reference.sha256;
+  const remoteDigest = storedRemote.reference.sha256;
+  const finalDigest = storedFinal.reference.sha256;
   const requests = new Map();
   async function fulfillJson(route, name, value) {
     requests.set(name, (requests.get(name) || 0) + 1);
@@ -635,6 +658,8 @@ test("transcript search uses search shards and opens safe linked message context
       })
     ]
   };
+  const storedSearch = contentAddressedJson(searchShard);
+  Object.assign(fixture.bootstrap.search.shards[0], storedSearch.reference);
   let detailRequests = 0;
   let searchRequests = 0;
   const consoleErrors = [];
@@ -654,11 +679,11 @@ test("transcript search uses search shards and opens safe linked message context
       body: JSON.stringify(fixture.detail)
     });
   });
-  await page.route("**/" + searchDigest + ".json", async function (route) {
+  await page.route("**/" + storedSearch.reference.sha256 + ".json", async function (route) {
     searchRequests += 1;
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify(searchShard)
+      body: storedSearch.body
     });
   });
 
@@ -731,6 +756,243 @@ test("transcript search uses search shards and opens safe linked message context
   expect(failedRequests).toEqual([]);
 });
 
+test("linked transcript context loads across Bloom-pruned day shards", async function ({ page }) {
+  const fixture = singleDaySchema2Fixture("0".repeat(64), "1".repeat(64));
+  const dayMs = 24 * 60 * 60 * 1000;
+  const firstStart = fixture.bootstrap.detail_shards[0].start_ms;
+  const secondStart = firstStart + dayMs;
+  const promptRef = "message:codex-hermit::cross-day-prompt";
+  const responseRef = "message:codex-hermit::cross-day-response";
+  const promptBRef = "message:codex-hermit::same-day-prompt";
+  const responseBRef = "message:codex-hermit::same-day-response";
+  const promptAt = firstStart + 23 * 60 * 60 * 1000;
+  const responseAt = secondStart + 60 * 60 * 1000;
+  const promptBAt = secondStart + 30 * 60 * 1000;
+  const responseBAt = secondStart + 2 * 60 * 60 * 1000;
+  const promptDigest = "2".repeat(64);
+  const responseDigest = "3".repeat(64);
+  const promptLinksDigest = "4".repeat(64);
+  const responseLinksDigest = "5".repeat(64);
+  function reference(digest) {
+    return {
+      url: "data/timeline-v2/objects/" + digest + ".json",
+      sha256: digest
+    };
+  }
+  function catalogEntry(day, start, searchDigest, linksDigest, bloom, counts) {
+    return Object.assign({
+      kind: "utc-day",
+      day: day,
+      team: "codex-hermit",
+      start_ms: start,
+      end_ms: start + dayMs,
+      counts: Object.assign({ records: 1 }, counts),
+      linkage: Object.assign(reference(linksDigest), {
+        counts: {
+          prompts: counts.prompts || 0,
+          responses: counts.responses || 0
+        }
+      }),
+      trigram_bloom: bloom
+    }, reference(searchDigest));
+  }
+  fixture.bootstrap.search = {
+    schema_version: 1,
+    strategy: "transcript-message-shards",
+    shards: [
+      catalogEntry("2026-03-09", firstStart, promptDigest, promptLinksDigest, {
+        algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+        bit_count: 128,
+        hash_count: 7,
+        bits_base64: "CpJJrKcNEMHROrAlwPydPQ==",
+        trigram_count: 10
+      }, { prompts: 1, responses: 0 }),
+      catalogEntry("2026-03-10", secondStart, responseDigest, responseLinksDigest, {
+        algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+        bit_count: 128,
+        hash_count: 7,
+        bits_base64: "VIrlptEOBb6e2UEwG9lmrQ==",
+        trigram_count: 11
+      }, { records: 3, prompts: 1, responses: 2 })
+    ]
+  };
+  function searchDay(start, records) {
+    return {
+      schema_version: 1,
+      kind: "timeline-search-day",
+      source_digest: TIMELINE.source_digest,
+      team: "codex-hermit",
+      range: { start_ms: start, end_ms: start + dayMs },
+      records: records
+    };
+  }
+  const promptShard = searchDay(firstStart, [{
+    schema_version: 1,
+    ref: promptRef,
+    record_type: "prompt",
+    role: "user",
+    team: "codex-hermit",
+    agent_id: "agent-a",
+    agent_ref: "agent:codex-hermit::agent-a",
+    event_id: "cross-day-prompt",
+    at_ms: promptAt,
+    text: "Original maturity question",
+    author_kind: "owner_human",
+    prompt_ref: promptRef,
+    prompt_at_ms: promptAt,
+    prompt_in_scope: true
+  }]);
+  const responseShard = searchDay(secondStart, [{
+    schema_version: 1,
+    ref: promptBRef,
+    record_type: "prompt",
+    role: "user",
+    team: "codex-hermit",
+    agent_id: "agent-b",
+    agent_ref: "agent:codex-hermit::agent-b",
+    event_id: "same-day-prompt",
+    at_ms: promptBAt,
+    text: "Second maturity question",
+    author_kind: "owner_human",
+    prompt_ref: promptBRef,
+    prompt_at_ms: promptBAt,
+    prompt_in_scope: true
+  }, {
+    schema_version: 1,
+    ref: responseRef,
+    record_type: "response",
+    role: "assistant",
+    team: "codex-hermit",
+    agent_id: "agent-a",
+    agent_ref: "agent:codex-hermit::agent-a",
+    event_id: "cross-day-response",
+    at_ms: responseAt,
+    text: "The backend reached B3",
+    prompt_ref: promptRef,
+    prompt_at_ms: promptAt,
+    prompt_in_scope: true
+  }, {
+    schema_version: 1,
+    ref: responseBRef,
+    record_type: "response",
+    role: "assistant",
+    team: "codex-hermit",
+    agent_id: "agent-b",
+    agent_ref: "agent:codex-hermit::agent-b",
+    event_id: "same-day-response",
+    at_ms: responseBAt,
+    text: "The backend remains B3",
+    prompt_ref: promptBRef,
+    prompt_at_ms: promptBAt,
+    prompt_in_scope: true
+  }]);
+  function linksDay(start, prompts, responses) {
+    return {
+      schema_version: 1,
+      kind: "timeline-search-links-day",
+      source_digest: TIMELINE.source_digest,
+      team: "codex-hermit",
+      range: { start_ms: start, end_ms: start + dayMs },
+      prompts: prompts,
+      responses: responses
+    };
+  }
+  const promptLinks = linksDay(firstStart, [{
+    ref: promptRef,
+    excerpt: "Original maturity question"
+  }], []);
+  const responseLinks = linksDay(secondStart, [{
+    ref: promptBRef,
+    excerpt: "Second maturity question"
+  }], [{
+    ref: responseRef,
+    prompt_ref: promptRef,
+    at_ms: responseAt,
+    agent_ref: "agent:codex-hermit::agent-a"
+  }, {
+    ref: responseBRef,
+    prompt_ref: promptBRef,
+    at_ms: responseBAt,
+    agent_ref: "agent:codex-hermit::agent-b"
+  }]);
+  const storedPrompt = contentAddressedJson(promptShard);
+  const storedResponse = contentAddressedJson(responseShard);
+  const storedPromptLinks = contentAddressedJson(promptLinks);
+  const storedResponseLinks = contentAddressedJson(responseLinks);
+  Object.assign(fixture.bootstrap.search.shards[0], storedPrompt.reference);
+  Object.assign(
+    fixture.bootstrap.search.shards[0].linkage,
+    storedPromptLinks.reference
+  );
+  Object.assign(fixture.bootstrap.search.shards[1], storedResponse.reference);
+  Object.assign(
+    fixture.bootstrap.search.shards[1].linkage,
+    storedResponseLinks.reference
+  );
+  const requests = new Map();
+  let releasePrompt = function () {};
+  const promptGate = new Promise(function (resolve) {
+    releasePrompt = resolve;
+  });
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await Promise.all([
+    [storedPrompt, "prompt"],
+    [storedResponse, "response"],
+    [storedPromptLinks, "prompt-links"],
+    [storedResponseLinks, "response-links"]
+  ].map(function (entry) {
+    return page.route("**/" + entry[0].reference.sha256 + ".json", async function (route) {
+      requests.set(entry[1], (requests.get(entry[1]) || 0) + 1);
+      if (entry[1] === "prompt") {
+        await promptGate;
+      }
+      await route.fulfill({
+        contentType: "application/json; charset=utf-8",
+        body: entry[0].body
+      });
+    });
+  }));
+
+  await page.reload();
+  await page.getByTestId("search-scope").selectOption("agent-responses");
+  await page.getByTestId("search").fill("backend");
+  const card = page.getByTestId("timeline");
+  await expect(card).toHaveAttribute("data-transcript-search-state", "ready");
+  expect(requests.get("prompt") || 0).toBe(0);
+  expect(requests.get("response")).toBe(1);
+  expect(requests.get("prompt-links")).toBe(1);
+  expect(requests.get("response-links")).toBe(1);
+
+  const resultA = page.locator(
+    '.search-result[data-message-ref="' + responseRef + '"]'
+  );
+  const resultB = page.locator(
+    '.search-result[data-message-ref="' + responseBRef + '"]'
+  );
+  await resultA.getByRole("button", { name: "Open" }).click();
+  await expect.poll(function () { return requests.get("prompt") || 0; }).toBe(1);
+  await resultB.getByRole("button", { name: "Open" }).click();
+  await expect(page.getByTestId("modal")).toBeVisible();
+  await expect(page.getByTestId("modal")).toContainText("The backend remains B3");
+  releasePrompt();
+  await page.waitForTimeout(50);
+  await expect(page.getByTestId("modal")).toContainText("The backend remains B3");
+  await expect(page.getByTestId("modal")).not.toContainText("The backend reached B3");
+  await page.locator("#modal-close").click();
+
+  await resultA.getByRole("button", { name: "Open" }).click();
+  await expect(page.getByTestId("modal")).toBeVisible();
+  await expect(page.getByTestId("modal")).toContainText("The backend reached B3");
+  await page.getByRole("tab", { name: "Prompt & responses" }).click();
+  await expect(page.getByTestId("modal")).toContainText("Original maturity question");
+  await expect(page.getByTestId("modal")).toContainText("The backend reached B3");
+});
+
 test("transcript search rejects a shard whose record count disagrees with its catalog", async function ({ page }) {
   const fixture = singleDaySchema2Fixture("9".repeat(64), "a".repeat(64));
   const searchDigest = "b".repeat(64);
@@ -749,31 +1011,34 @@ test("transcript search rejects a shard whose record count disagrees with its ca
       counts: { records: 2 }
     }]
   };
+  const invalidCountShard = {
+    schema_version: 1,
+    kind: "timeline-search-day",
+    team: "codex-hermit",
+    range: { start_ms: day.start_ms, end_ms: day.end_ms },
+    records: [{
+      schema_version: 1,
+      ref: "message:codex-hermit::one",
+      record_type: "response",
+      role: "assistant",
+      team: "codex-hermit",
+      agent_id: "agent-a",
+      at_ms: BASE_MS + 12 * 60 * 1000,
+      text: "Only one record"
+    }]
+  };
+  const storedInvalidCount = contentAddressedJson(invalidCountShard);
+  Object.assign(fixture.bootstrap.search.shards[0], storedInvalidCount.reference);
   await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
       body: JSON.stringify(fixture.detail)
     });
   });
-  await page.route("**/" + searchDigest + ".json", async function (route) {
+  await page.route("**/" + storedInvalidCount.reference.sha256 + ".json", async function (route) {
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify({
-        schema_version: 1,
-        kind: "timeline-search-day",
-        team: "codex-hermit",
-        range: { start_ms: day.start_ms, end_ms: day.end_ms },
-        records: [{
-          schema_version: 1,
-          ref: "message:codex-hermit::one",
-          record_type: "response",
-          role: "assistant",
-          team: "codex-hermit",
-          agent_id: "agent-a",
-          at_ms: BASE_MS + 12 * 60 * 1000,
-          text: "Only one record"
-        }]
-      })
+      body: storedInvalidCount.body
     });
   });
 
@@ -809,32 +1074,35 @@ test("transcript search rejects a shard from a different source generation", asy
       counts: { records: 1 }
     }]
   };
+  const staleSearchShard = {
+    schema_version: 1,
+    kind: "timeline-search-day",
+    source_digest: "different-generation",
+    team: "codex-hermit",
+    range: { start_ms: day.start_ms, end_ms: day.end_ms },
+    records: [{
+      schema_version: 1,
+      ref: "message:codex-hermit::stale",
+      record_type: "response",
+      role: "assistant",
+      team: "codex-hermit",
+      agent_id: "agent-a",
+      at_ms: BASE_MS + 12 * 60 * 1000,
+      text: "Stale B3 response"
+    }]
+  };
+  const storedStaleSearch = contentAddressedJson(staleSearchShard);
+  Object.assign(fixture.bootstrap.search.shards[0], storedStaleSearch.reference);
   await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
       body: JSON.stringify(fixture.detail)
     });
   });
-  await page.route("**/" + searchDigest + ".json", async function (route) {
+  await page.route("**/" + storedStaleSearch.reference.sha256 + ".json", async function (route) {
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify({
-        schema_version: 1,
-        kind: "timeline-search-day",
-        source_digest: "different-generation",
-        team: "codex-hermit",
-        range: { start_ms: day.start_ms, end_ms: day.end_ms },
-        records: [{
-          schema_version: 1,
-          ref: "message:codex-hermit::stale",
-          record_type: "response",
-          role: "assistant",
-          team: "codex-hermit",
-          agent_id: "agent-a",
-          at_ms: BASE_MS + 12 * 60 * 1000,
-          text: "Stale B3 response"
-        }]
-      })
+      body: storedStaleSearch.body
     });
   });
 
@@ -847,6 +1115,68 @@ test("transcript search rejects a shard from a different source generation", asy
   await expect(page.getByTestId("search-results")).toContainText(
     "source digest does not match the timeline generation"
   );
+});
+
+test("transcript search verifies content-addressed shard bytes", async function ({ page }) {
+  const fixture = singleDaySchema2Fixture("7".repeat(64), "8".repeat(64));
+  const day = fixture.bootstrap.detail_shards[0];
+  const expectedShard = {
+    schema_version: 1,
+    kind: "timeline-search-day",
+    source_digest: TIMELINE.source_digest,
+    team: "codex-hermit",
+    range: { start_ms: day.start_ms, end_ms: day.end_ms },
+    records: [{
+      schema_version: 1,
+      ref: "message:codex-hermit::verified",
+      record_type: "response",
+      role: "assistant",
+      team: "codex-hermit",
+      agent_id: "agent-a",
+      agent_ref: "agent:codex-hermit::agent-a",
+      at_ms: BASE_MS + 12 * 60 * 1000,
+      text: "B3 good"
+    }]
+  };
+  const stored = contentAddressedJson(expectedShard);
+  const legacyReference = Object.assign({}, stored.reference);
+  delete legacyReference.bytes;
+  fixture.bootstrap.search = {
+    schema_version: 1,
+    strategy: "transcript-message-shards",
+    shards: [Object.assign({
+      kind: "utc-day",
+      day: day.day,
+      team: "codex-hermit",
+      start_ms: day.start_ms,
+      end_ms: day.end_ms,
+      counts: { records: 1 }
+    }, legacyReference)]
+  };
+  const tamperedShard = JSON.parse(JSON.stringify(expectedShard));
+  tamperedShard.records[0].text = "B3 evil";
+  expect(Buffer.byteLength(JSON.stringify(tamperedShard), "utf8")).toBe(
+    stored.reference.bytes
+  );
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await page.route("**/" + stored.reference.sha256 + ".json", async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(tamperedShard)
+    });
+  });
+
+  await page.reload();
+  const card = page.getByTestId("timeline");
+  await page.getByTestId("search-scope").selectOption("all-transcript");
+  await page.getByTestId("search").fill("B3");
+  await expect(card).toHaveAttribute("data-transcript-search-state", "error");
+  await expect(page.getByTestId("search-results")).toContainText("SHA-256 mismatch");
 });
 
 test("transcript Bloom filters defer negative shards and load them for a later positive query", async function ({ page }) {
@@ -901,6 +1231,8 @@ test("transcript Bloom filters defer negative shards and load them for a later p
         role: "assistant",
         team: "codex-hermit",
         agent_id: "agent-a",
+        agent_ref: "agent:codex-hermit::agent-a",
+        event_id: eventId,
         at_ms: at,
         text: value
       }]
@@ -918,6 +1250,10 @@ test("transcript Bloom filters defer negative shards and load them for a later p
     secondStart + 60 * 60 * 1000,
     "gamma ptrace"
   );
+  const storedFirstSearch = contentAddressedJson(firstShard);
+  const storedSecondSearch = contentAddressedJson(secondShard);
+  Object.assign(fixture.bootstrap.search.shards[0], storedFirstSearch.reference);
+  Object.assign(fixture.bootstrap.search.shards[1], storedSecondSearch.reference);
   let firstRequests = 0;
   let secondRequests = 0;
   await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
@@ -926,18 +1262,18 @@ test("transcript Bloom filters defer negative shards and load them for a later p
       body: JSON.stringify(fixture.detail)
     });
   });
-  await page.route("**/" + firstDigest + ".json", async function (route) {
+  await page.route("**/" + storedFirstSearch.reference.sha256 + ".json", async function (route) {
     firstRequests += 1;
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify(firstShard)
+      body: storedFirstSearch.body
     });
   });
-  await page.route("**/" + secondDigest + ".json", async function (route) {
+  await page.route("**/" + storedSecondSearch.reference.sha256 + ".json", async function (route) {
     secondRequests += 1;
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify(secondShard)
+      body: storedSecondSearch.body
     });
   });
 
@@ -945,7 +1281,9 @@ test("transcript Bloom filters defer negative shards and load them for a later p
   const card = page.getByTestId("timeline");
   const drawer = page.getByTestId("search-results");
   await page.getByTestId("search-scope").selectOption("all-transcript");
-  await page.getByTestId("search").fill("backend B3");
+  await page.getByTestId("search").pressSequentially("backend B3", { delay: 5 });
+  expect(firstRequests).toBe(0);
+  expect(secondRequests).toBe(0);
   await expect(card).toHaveAttribute("data-transcript-search-state", "ready");
   await expect(card).toHaveAttribute("data-loaded-search-shard-count", "1");
   await expect(drawer.locator(".search-result")).toHaveCount(1);
@@ -959,6 +1297,98 @@ test("transcript Bloom filters defer negative shards and load them for a later p
   await expect(drawer).toContainText("gamma ptrace");
   expect(firstRequests).toBe(1);
   expect(secondRequests).toBe(1);
+});
+
+test("superseded searches share one global shard-load limit", async function ({ page }) {
+  const fixture = singleDaySchema2Fixture("6".repeat(64), "7".repeat(64));
+  const dayMs = 24 * 60 * 60 * 1000;
+  const baseStart = fixture.bootstrap.detail_shards[0].start_ms;
+  const storedObjects = [];
+  fixture.bootstrap.search = {
+    schema_version: 1,
+    strategy: "transcript-message-shards",
+    shards: Array.from({ length: 4 }, function (_value, index) {
+      const start = baseStart + index * dayMs;
+      const eventId = "bounded-" + index;
+      const search = contentAddressedJson({
+        schema_version: 1,
+        kind: "timeline-search-day",
+        source_digest: TIMELINE.source_digest,
+        team: "codex-hermit",
+        range: { start_ms: start, end_ms: start + dayMs },
+        records: [{
+          schema_version: 1,
+          ref: "message:codex-hermit::" + eventId,
+          record_type: "response",
+          role: "assistant",
+          team: "codex-hermit",
+          agent_id: "agent-a",
+          agent_ref: "agent:codex-hermit::agent-a",
+          event_id: eventId,
+          at_ms: start + 1000,
+          text: index % 2 === 0 ? "B3 result" : "B4 result"
+        }]
+      });
+      const links = contentAddressedJson({
+        schema_version: 1,
+        kind: "timeline-search-links-day",
+        source_digest: TIMELINE.source_digest,
+        team: "codex-hermit",
+        range: { start_ms: start, end_ms: start + dayMs },
+        prompts: [],
+        responses: []
+      });
+      storedObjects.push(search, links);
+      return Object.assign({
+        kind: "utc-day",
+        day: "2026-03-" + String(9 + index).padStart(2, "0"),
+        team: "codex-hermit",
+        start_ms: start,
+        end_ms: start + dayMs,
+        counts: { records: 1 },
+        linkage: Object.assign({}, links.reference, {
+          counts: { prompts: 0, responses: 0 }
+        })
+      }, search.reference);
+    })
+  };
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  let active = 0;
+  let maximum = 0;
+  let release = function () {};
+  const gate = new Promise(function (resolve) { release = resolve; });
+  await Promise.all(storedObjects.map(function (stored) {
+    return page.route("**/" + stored.reference.sha256 + ".json", async function (route) {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      await gate;
+      await route.fulfill({
+        contentType: "application/json; charset=utf-8",
+        body: stored.body
+      });
+      active -= 1;
+    });
+  }));
+
+  await page.reload();
+  await page.getByTestId("search-scope").selectOption("agent-responses");
+  await page.getByTestId("search").fill("B3");
+  await expect.poll(function () { return active; }).toBe(6);
+  await page.getByTestId("search").fill("B4");
+  await page.waitForTimeout(300);
+  expect(maximum).toBeLessThanOrEqual(6);
+  release();
+  const card = page.getByTestId("timeline");
+  await expect(card).toHaveAttribute("data-transcript-search-state", "ready");
+  await expect(page.getByTestId("search-results").locator(".search-result")).toHaveCount(2);
+  await expect(page.getByTestId("search-results")).toContainText("B4 result");
+  await expect(page.getByTestId("search-results")).not.toContainText("B3 result");
+  expect(maximum).toBeLessThanOrEqual(6);
 });
 
 test("schema 2 retries a transiently failed detail shard", async function ({ page }) {
@@ -1016,11 +1446,6 @@ test("schema 2 lifetime modal uses the phase index instead of every day shard", 
   page
 }) {
   const fixture = singleDaySchema2Fixture("4".repeat(64), "5".repeat(64));
-  const phaseIndexDigest = "6".repeat(64);
-  fixture.bootstrap.phase_index = {
-    url: "data/timeline-v2/objects/" + phaseIndexDigest + ".json",
-    sha256: phaseIndexDigest
-  };
   const indexedPhases = TIMELINE.phases.map(function (phase) {
     const projected = Object.assign({}, phase);
     delete projected.states;
@@ -1028,6 +1453,12 @@ test("schema 2 lifetime modal uses the phase index instead of every day shard", 
     projected.activity_end_ms = phase.end_ms;
     return projected;
   });
+  const storedPhaseIndex = contentAddressedJson({
+    schema_version: 2,
+    kind: "timeline-phase-index",
+    phases: indexedPhases
+  });
+  fixture.bootstrap.phase_index = storedPhaseIndex.reference;
   let phaseIndexRequests = 0;
   let detailShardRequests = 0;
   await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
@@ -1037,15 +1468,11 @@ test("schema 2 lifetime modal uses the phase index instead of every day shard", 
       body: JSON.stringify(fixture.detail)
     });
   });
-  await page.route("**/" + phaseIndexDigest + ".json", async function (route) {
+  await page.route("**/" + storedPhaseIndex.reference.sha256 + ".json", async function (route) {
     phaseIndexRequests += 1;
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify({
-        schema_version: 2,
-        kind: "timeline-phase-index",
-        phases: indexedPhases
-      })
+      body: storedPhaseIndex.body
     });
   });
 
@@ -1074,11 +1501,13 @@ test("schema 2 rejects a phase index from a different source generation", async 
   page
 }) {
   const fixture = singleDaySchema2Fixture("a".repeat(64), "b".repeat(64));
-  const phaseIndexDigest = "c".repeat(64);
-  fixture.bootstrap.phase_index = {
-    url: "data/timeline-v2/objects/" + phaseIndexDigest + ".json",
-    sha256: phaseIndexDigest
-  };
+  const storedStalePhaseIndex = contentAddressedJson({
+    schema_version: 2,
+    kind: "timeline-phase-index",
+    source_digest: "different-generation",
+    phases: []
+  });
+  fixture.bootstrap.phase_index = storedStalePhaseIndex.reference;
   let detailShardRequests = 0;
   await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
     detailShardRequests += 1;
@@ -1087,15 +1516,10 @@ test("schema 2 rejects a phase index from a different source generation", async 
       body: JSON.stringify(fixture.detail)
     });
   });
-  await page.route("**/" + phaseIndexDigest + ".json", async function (route) {
+  await page.route("**/" + storedStalePhaseIndex.reference.sha256 + ".json", async function (route) {
     await route.fulfill({
       contentType: "application/json; charset=utf-8",
-      body: JSON.stringify({
-        schema_version: 2,
-        kind: "timeline-phase-index",
-        source_digest: "different-generation",
-        phases: []
-      })
+      body: storedStalePhaseIndex.body
     });
   });
 

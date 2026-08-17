@@ -234,6 +234,177 @@ def test_inter_agent_instruction_links_the_child_final_response() -> None:
     assert records[1]["recipient"] == ROOT
 
 
+def test_codex_continuation_routes_use_native_paths_and_receiver_threads() -> None:
+    continuation_a = "continuation-a"
+    child_a = "child-a"
+    continuation_b = "continuation-b"
+    child_b = "child-b"
+    agents = (
+        Agent(ROOT, None, "/root", None, None, 0, START, None, "active", "root"),
+        Agent(
+            continuation_a,
+            ROOT,
+            "/root/continuation-continuation-a",
+            None,
+            "coordinator",
+            1,
+            START + 1_000,
+            START + 5_000,
+            "completed",
+            "continuation-a",
+        ),
+        Agent(
+            child_a,
+            continuation_a,
+            "/root/continuation-continuation-a/worker",
+            None,
+            None,
+            2,
+            START + 2_000,
+            START + 4_000,
+            "completed",
+            "child-a",
+        ),
+        Agent(
+            continuation_b,
+            continuation_a,
+            "/root/continuation-continuation-b",
+            None,
+            "coordinator",
+            2,
+            START + 6_000,
+            None,
+            "active",
+            "continuation-b",
+        ),
+        Agent(
+            child_b,
+            continuation_b,
+            "/root/continuation-continuation-b/worker",
+            None,
+            None,
+            3,
+            START + 7_000,
+            START + 9_000,
+            "completed",
+            "child-b",
+        ),
+    )
+
+    def routed_event(
+        event_id: str,
+        thread_id: str,
+        at_ms: int,
+        text: str,
+        author: str,
+        recipient: str,
+        source_line: int | None = None,
+    ) -> Event:
+        return Event(
+            event_id=event_id,
+            thread_id=thread_id,
+            turn_id=f"turn-{thread_id}",
+            timestamp_ms=at_ms,
+            kind="inter_agent_message",
+            role=None,
+            phase=None,
+            text=text,
+            content_availability="plaintext",
+            encrypted_content=None,
+            author=author,
+            recipient=recipient,
+            source_line=at_ms - START if source_line is None else source_line,
+            author_kind="agent",
+        )
+
+    raw_events = (
+        routed_event(
+            "instruction-a",
+            child_a,
+            START + 2_000,
+            "Message Type: NEW_TASK\nPayload:\nAudit A",
+            "/root",
+            "/root/worker",
+        ),
+        _event(
+            "owner-a",
+            START + 3_000,
+            "user_prompt",
+            "Unrelated coordinator prompt A",
+            turn_id=f"turn-{continuation_a}",
+            author_kind="owner_human",
+        ),
+        routed_event(
+            "return-a",
+            continuation_a,
+            START + 4_000,
+            "Message Type: FINAL_ANSWER\nPayload:\nDone A",
+            "/root/worker",
+            "/root",
+        ),
+        routed_event(
+            "instruction-b",
+            child_b,
+            START + 8_000,
+            "Message Type: NEW_TASK\nPayload:\nAudit B",
+            "/root",
+            "/root/worker",
+            999,
+        ),
+        routed_event(
+            "return-b",
+            continuation_b,
+            START + 8_000,
+            "Message Type: FINAL_ANSWER\nPayload:\nDone B",
+            "/root/worker",
+            "/root",
+            1,
+        ),
+        routed_event(
+            "later-instruction-b",
+            child_b,
+            START + 8_000,
+            "Message Type: FOLLOWUP_TASK\nPayload:\nFuture work B",
+            "/root",
+            "/root/worker",
+            0,
+        ),
+    )
+    events = tuple(
+        replace(event, thread_id=continuation_a)
+        if event.event_id == "owner-a"
+        else event
+        for event in raw_events
+    )
+    team = TeamData(
+        team_slug="codex-continuations",
+        provider="codex",
+        root_thread_id=ROOT,
+        display_timezone="UTC",
+        sources=(),
+        agents=agents,
+        turns=(),
+        events=events,
+        tool_calls=(),
+        edges=(),
+    )
+
+    records = build_search_records(
+        team, frozenset(agent.thread_id for agent in agents)
+    )
+    by_event = {str(record["event_id"]): record for record in records}
+
+    assert by_event["return-a"]["record_type"] == "inter_agent_response"
+    assert by_event["return-a"]["agent_id"] == child_a
+    assert by_event["return-a"]["prompt_author_kind"] == "agent"
+    assert by_event["return-a"]["prompt_ref"] == (
+        "message:codex-continuations::instruction-a"
+    )
+    assert by_event["return-b"]["record_type"] == "inter_agent_response"
+    assert by_event["return-b"]["agent_id"] == child_b
+    assert by_event["return-b"]["prompt_ref"] is None
+
+
 def test_same_timestamp_tool_links_only_to_a_preceding_source_prompt() -> None:
     prompt_a = replace(
         _event(

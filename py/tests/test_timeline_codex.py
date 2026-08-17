@@ -9,6 +9,7 @@ from pathlib import Path
 
 from agent_team_timeline.codex import load_codex_team
 from agent_team_timeline.phases import build_phases
+from agent_team_timeline.search_index import build_search_records
 
 
 ROOT = "root-thread"
@@ -446,6 +447,40 @@ def test_load_codex_team_canonicalizes_lineage_and_transcript(tmp_path: Path) ->
     assert "Message Type: MESSAGE\nPayload:\n" not in transcript_text
     assert "message body unavailable offline" in transcript_text
     assert "from /root to /root/worker" in transcript_text
+
+
+def test_codex_search_uses_parent_child_routes_across_rollouts(tmp_path: Path) -> None:
+    sessions_root = tmp_path / "sessions"
+    _fixture(sessions_root)
+    team = load_codex_team(sessions_root, ROOT, "codex-project", "UTC")
+
+    records = build_search_records(team, frozenset((ROOT, CHILD)))
+    by_event_id = {
+        str(record["event_id"]): record
+        for record in records
+        if record["record_type"] != "tool"
+    }
+
+    instruction = by_event_id["amsg-new-task"]
+    assert instruction["agent_id"] == CHILD
+    assert instruction["record_type"] == "inter_agent_prompt"
+    assert instruction["author_kind"] == "agent"
+    assert instruction["prompt_ref"] == "message:codex-project::amsg-new-task"
+
+    # Codex records delivered collaboration messages on the receiver's rollout. The
+    # receiver thread therefore cannot determine direction or work ownership: resolve the
+    # immutable parent/child route, attribute the return to its child author, and link it.
+    for event_id in ("amsg-encrypted", "amsg-final"):
+        returned = by_event_id[event_id]
+        assert returned["agent_id"] == CHILD
+        assert returned["record_type"] == "inter_agent_response"
+        assert returned["author_kind"] == "agent"
+        assert returned["prompt_author_kind"] == "agent"
+        assert returned["prompt_ref"] == "message:codex-project::amsg-new-task"
+
+    child_final = by_event_id["child-final"]
+    assert child_final["record_type"] == "response"
+    assert child_final["prompt_ref"] == "message:codex-project::amsg-new-task"
 
 
 def test_load_codex_team_joins_tools_edges_and_source_snapshots(tmp_path: Path) -> None:

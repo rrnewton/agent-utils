@@ -47,6 +47,15 @@ keeps stable `message:` references, reports total versus returned matches, disti
 prompts and agent responses, and classifies parent instructions separately from child final
 responses. Phase end derivation now retains the final millisecond event.
 
+A post-facto adversarial review found three additional correctness traps and turned them into
+regressions: Codex records child returns on the receiving parent rollout, Unicode case equivalences
+did not match the ASCII Bloom normalization, and text-shard pruning could hide a previous-day prompt
+or later-day response. Parent/child route classification, one portable ASCII-only case-folding
+contract, and compact relationship sidecars now cover those cases. The real `codex-coord-030`
+archive exposes all 703 `FINAL_ANSWER` messages as agent responses with mechanically linked
+instructions, attributes them to their child agents rather than the receiving coordinator rollout,
+and classifies the linked prompt author as an agent.
+
 ## Remaining limitations exposed by this case
 
 1. **B3 is overloaded.** The archive has hundreds of whole-term `B3` matches because agents also
@@ -57,10 +66,11 @@ responses. Phase end derivation now retains the final millisecond event.
 2. **Short queries cannot use the trigram prefilter.** `B3` is two UTF-8 bytes, so it safely scans
    every selected team/day object. Three-byte terms such as `KVM` and longer combined queries can
    prune definite-miss shards.
-3. **Provider routing is not uniformly explicit.** Claude instruction/final-answer messages are
-   directionally clear. Codex paths and Orc task notes sometimes lack an unambiguous instruction
-   partner; those records remain searchable but may have no `prompt_ref`. The UI must not invent a
-   parent prompt from prose.
+3. **Provider routing is not uniformly explicit.** Claude instruction/final-answer messages and
+   Codex parent/child routes are directionally resolved, including receiver-side Codex returns.
+   Other Codex chatter and Orc task notes can still lack an unambiguous instruction partner; those
+   records remain searchable but may have no `prompt_ref`. The UI must not invent a parent prompt
+   from prose.
 4. **A sliced export may omit linked context.** A response can retain a `prompt_ref` whose prompt
    falls outside the exported time range. `prompt_in_scope` records that condition; clients should
    show a clear unavailable marker rather than treating it as corruption.
@@ -77,22 +87,25 @@ responses. Phase end derivation now retains the final millisecond event.
 ## Scale observation
 
 The final seven-team Hermit website used for this audit has 246,155 search records in 53 team/day
-objects: 119,733 textual events and 126,422 condensed tool records. The objects occupy 332.3 MB as
-identity JSON and 50.45 MB at gzip-6. The 3.84 MB bootstrap is 2.14 MB compressed, including about
-2.93 million base64 characters of Bloom-filter data. Raw normalized teams contain more records, but
-the export deliberately omits pre-window provider context that is already represented by an earlier
-logical team.
+objects: 119,733 textual events and 126,422 condensed tool records. The text objects occupy 333.96
+MB as identity JSON and 50.50 MB at gzip-6. The 53 relationship sidecars add 9.51 MB identity or
+1.13 MB at gzip-6. The 3.87 MB bootstrap is 2.14 MB compressed, including about 2.93 million base64
+characters of Bloom-filter data. Raw normalized teams contain more records, but the export
+deliberately omits pre-window provider context that is already represented by an earlier logical
+team.
 
 The team/day Bloom catalog is therefore important: selective queries avoid downloading and parsing
 objects that definitely cannot match, while broad or short queries still pay the full exact-search
 cost. Common project terms such as `KVM`, `DBI`, and `ptrace` occur on nearly every active day, so the
 prefilter cannot help those searches much. A headless Chromium run of `backend maturity B3` selected
-50 of 53 shards, transferred 50.43 MB of compressed search objects, reached 40 exact matches in
-4.65 seconds, and used about 385 MB of JavaScript heap with no console, request, or runtime failure.
-That is usable for the current local archive but is too expensive to treat as the long-term target.
-Tool-run grouping, an exact term/posting index, or a separate tool corpus are possible next steps;
-the current trigram selector cannot prune a word that genuinely appears somewhere on almost every
-day.
+50 of 53 text shards, loaded all 53 compact relationship sidecars, reached 40 exact matches in about
+6.4 seconds, and used about 403 MB of JavaScript heap with no console, request, or runtime failure.
+The built-in uncompressed Python server transferred about 352 MB across 104 immutable-object
+requests; the generated gzip companions reduce transfer when served by the bundled handler. This is
+usable for the current local archive but is too expensive to treat as the long-term target. Tool-run
+grouping, an exact term/posting index, a consolidated relationship index, or a separate tool corpus
+are possible next steps; the current trigram selector cannot prune a word that genuinely appears
+somewhere on almost every day.
 
 The first archive-local CLI implementation also parsed the 205 MB schema-1 timeline monolith and
 materialized every selected search record, peaking at about 1.32 GB RSS. Switching query startup to

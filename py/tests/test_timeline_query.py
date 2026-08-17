@@ -23,7 +23,12 @@ from agent_team_timeline.archive import (
     read_json,
 )
 from agent_team_timeline.cli import main as timeline_main
-from agent_team_timeline.search_bloom import build_trigram_bloom
+from agent_team_timeline.query import _compile_search_matcher
+from agent_team_timeline.search_bloom import (
+    bloom_might_contain,
+    build_trigram_bloom,
+    compact_search_text,
+)
 from agent_team_timeline.timeline_shards import write_timeline_shards
 
 
@@ -164,15 +169,19 @@ def _site(tmp_path: Path) -> Path:
                     "text": "The second GHC check is outside the requested boundary.",
                     "tools": [],
                     "pull_requests": [],
-                }
+                },
             ],
         },
     )
     technical = root / technical_path
     technical.parent.mkdir(parents=True, exist_ok=True)
-    technical.write_text("# Technical\n\nReproducible GHC builds passed.\n", encoding="utf-8")
+    technical.write_text(
+        "# Technical\n\nReproducible GHC builds passed.\n", encoding="utf-8"
+    )
     plain = root / plain_path
-    plain.write_text("# Plain language\n\nTwo builds produced the same files.\n", encoding="utf-8")
+    plain.write_text(
+        "# Plain language\n\nTwo builds produced the same files.\n", encoding="utf-8"
+    )
     search_records: list[dict[str, JsonValue]] = [
         {
             "schema_version": 1,
@@ -232,7 +241,11 @@ def _site(tmp_path: Path) -> Path:
             "content_fidelity": "verbatim",
         },
     ]
-    write_timeline_shards(root, as_object(narrow_json(timeline), "timeline"), search_records=search_records)
+    write_timeline_shards(
+        root,
+        as_object(narrow_json(timeline), "timeline"),
+        search_records=search_records,
+    )
     return root
 
 
@@ -258,6 +271,22 @@ def _search_counts(records: list[dict[str, JsonValue]]) -> dict[str, JsonValue]:
         "responses": sum(value == "response" for value in record_types),
         "inter_agent": sum(value.startswith("inter_agent") for value in record_types),
         "tools": sum(value == "tool" for value in record_types),
+    }
+
+
+def _write_test_object(root: Path, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    content = canonical_json(value)
+    encoded = content.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    relative = f"data/timeline-v2/objects/{digest}.json"
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encoded)
+    return {
+        "url": relative,
+        "sha256": digest,
+        "bytes": len(encoded),
+        "gzip_bytes": None,
     }
 
 
@@ -296,6 +325,7 @@ def _rewrite_search_records(
     shard["bytes"] = len(encoded)
     shard["gzip_bytes"] = None
     shard["counts"] = counts
+    shard.pop("linkage", None)
     shard["trigram_bloom"] = build_trigram_bloom(
         as_string(record.get("text"), "search record.text") for record in records
     ).catalog_obj()
@@ -335,9 +365,7 @@ def _rewrite_schema_2_object(
     bootstrap_path = root / "data" / "timeline-v2.json"
     bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
     reference = as_object(bootstrap.get(field), f"timeline-v2.{field}")
-    _rewrite_content_addressed_object(
-        root, reference, f"timeline-v2.{field}", mutate
-    )
+    _rewrite_content_addressed_object(root, reference, f"timeline-v2.{field}", mutate)
     bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
 
 
@@ -407,6 +435,10 @@ def test_list_uses_export_independent_stable_refs_and_filters(
     ]
     assert agents[1]["parent_ref"] == "agent:alpha::root"
 
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 0
+    phases = _items(_response(capsys))
+    assert phases[0]["stats"] == {"tool_calls": 3}
+
     assert (
         timeline_main(
             (
@@ -430,9 +462,7 @@ def test_show_expands_relationships_rollups_and_optional_transcript(
     root = _site(tmp_path)
 
     assert (
-        timeline_main(
-            ("query", "--output", str(root), "show", "agent:alpha::root")
-        )
+        timeline_main(("query", "--output", str(root), "show", "agent:alpha::root"))
         == 0
     )
     agent = _items(_response(capsys))[0]
@@ -671,6 +701,19 @@ def test_search_v2_bloom_skips_a_definite_miss_without_fetching_its_object(
     phantom_start = as_int(first.get("start_ms"), "search shard.start_ms") + 86_400_000
     phantom_end = as_int(first.get("end_ms"), "search shard.end_ms") + 86_400_000
     missing_digest = "f" * 64
+    phantom_linkage = _write_test_object(
+        root,
+        {
+            "schema_version": 1,
+            "kind": "timeline-search-links-day",
+            "source_digest": "query-fixture",
+            "team": "alpha",
+            "range": {"start_ms": phantom_start, "end_ms": phantom_end},
+            "prompts": [],
+            "responses": [],
+        },
+    )
+    phantom_linkage["counts"] = {"prompts": 0, "responses": 0}
     shards.append(
         {
             "kind": "utc-day",
@@ -689,6 +732,7 @@ def test_search_v2_bloom_skips_a_definite_miss_without_fetching_its_object(
                 "inter_agent": 0,
                 "tools": 0,
             },
+            "linkage": phantom_linkage,
             "trigram_bloom": build_trigram_bloom(
                 ("unrelated deployment logs",)
             ).catalog_obj(),
@@ -720,6 +764,203 @@ def test_search_v2_bloom_skips_a_definite_miss_without_fetching_its_object(
     response = _response(capsys)
     assert response["total_matches"] == 1
     assert _items(response)[0]["ref"] == "message:alpha::owner-b3"
+
+
+def test_search_matcher_and_bloom_share_ascii_case_normalization() -> None:
+    ascii_matcher = _compile_search_matcher(
+        "Kelvin", match_mode="literal", case_sensitive=False
+    )
+    assert ascii_matcher.match("KELVIN") is not None
+    assert ascii_matcher.match("Kelvin") is None
+    ascii_filter = build_trigram_bloom(("KELVIN",))
+    assert all(
+        bloom_might_contain(ascii_filter, term) for term in ascii_matcher.bloom_terms
+    )
+
+    unicode_matcher = _compile_search_matcher(
+        "Kelvin", match_mode="literal", case_sensitive=False
+    )
+    assert unicode_matcher.match("KELVIN") is not None
+    assert unicode_matcher.match("KELVIN") is None
+    assert (
+        _compile_search_matcher(
+            "réverie", match_mode="literal", case_sensitive=False
+        ).match("RÉVERIE")
+        is None
+    )
+    unicode_filter = build_trigram_bloom(("KELVIN",))
+    assert all(
+        bloom_might_contain(unicode_filter, term)
+        for term in unicode_matcher.bloom_terms
+    )
+    assert compact_search_text("foo\u0085bar") == "foo bar"
+    assert compact_search_text("foo\ufeffbar") == "foo\ufeffbar"
+    assert _compile_search_matcher(
+        "foo\ufeffbar", match_mode="smart", case_sensitive=False
+    ).bloom_terms == ("foo\ufeffbar",)
+    smart_b3 = _compile_search_matcher(
+        "B3", match_mode="smart", case_sensitive=False
+    )
+    assert smart_b3.match("standalone B3 result") is not None
+    assert smart_b3.match("éB3é") is None
+    smart_backend = _compile_search_matcher(
+        "backend", match_mode="smart", case_sensitive=False
+    )
+    assert smart_backend.match("αbackendβ") is None
+
+
+def test_search_v2_rejects_nonportable_bloom_hash_count(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    search = as_object(bootstrap.get("search"), "timeline-v2.search")
+    shard = as_object(
+        as_array(search.get("shards"), "timeline-v2.search.shards")[0],
+        "timeline-v2.search.shards[0]",
+    )
+    bloom = as_object(shard.get("trigram_bloom"), "search shard.trigram_bloom")
+    bloom["hash_count"] = 6
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "backend maturity",
+                "--in",
+                "all-transcript",
+            )
+        )
+        == 2
+    )
+    assert "hash_count: expected 7" in capsys.readouterr().err
+
+
+def test_search_v2_keeps_cross_day_prompt_linkage_when_text_shards_are_pruned(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    timeline = as_object(read_json(root / "data" / "timeline.json"), "timeline")
+    timeline_range = as_object(timeline.get("range"), "timeline.range")
+    timeline_range["end_ms"] = START + 26 * 60 * 60 * 1000
+    prompt_reference = "message:alpha::nightly-protocol"
+    records = [
+        _search_record(
+            event_id="nightly-protocol",
+            record_type="prompt",
+            role="user",
+            text="Explain the nightly protocol.",
+            at_ms=START,
+            author_kind="owner_human",
+            prompt_ref=prompt_reference,
+            prompt_author_kind="owner_human",
+        ),
+        _search_record(
+            event_id="nightly-result",
+            record_type="response",
+            role="assistant",
+            text="QUARTZ completed the overnight verification.",
+            at_ms=START + 23 * 60 * 60 * 1000,
+            agent_id="child",
+            prompt_ref=prompt_reference,
+            prompt_author_kind="owner_human",
+        ),
+    ]
+    write_timeline_shards(root, timeline, search_records=records)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "QUARTZ",
+                "--in",
+                "agent-responses",
+                "--start-time",
+                "2026-08-08T00:00:00Z",
+            )
+        )
+        == 0
+    )
+    response_item = _items(_response(capsys))[0]
+    assert response_item["prompt_ref"] == prompt_reference
+    assert response_item["prompt_excerpt"] == "Explain the nightly protocol."
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "nightly protocol",
+                "--in",
+                "owner-prompts",
+                "--linkage",
+                "linked",
+            )
+        )
+        == 0
+    )
+    prompt_item = _items(_response(capsys))[0]
+    assert prompt_item["ref"] == prompt_reference
+    assert prompt_item["linked_response_count"] == 1
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "nightly protocol",
+                "--in",
+                "owner-prompts",
+                "--linkage",
+                "unlinked",
+                "--end-time",
+                "2026-08-08T00:00:00Z",
+            )
+        )
+        == 0
+    )
+    scoped_prompt = _items(_response(capsys))[0]
+    assert scoped_prompt["linked_response_count"] == 0
+
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    search = as_object(bootstrap.get("search"), "timeline-v2.search")
+    for index, raw_shard in enumerate(
+        as_array(search.get("shards"), "timeline-v2.search.shards")
+    ):
+        as_object(raw_shard, f"search shard {index}").pop("linkage", None)
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "QUARTZ",
+                "--in",
+                "agent-responses",
+                "--start-time",
+                "2026-08-08T00:00:00Z",
+            )
+        )
+        == 0
+    )
+    legacy_item = _items(_response(capsys))[0]
+    assert legacy_item["prompt_excerpt"] == "Explain the nightly protocol."
 
 
 def test_search_v2_reports_paging_and_show_resolves_prompt_response_context(
@@ -800,17 +1041,20 @@ def test_search_v2_ignores_a_newer_partially_published_schema_1_generation(
     timeline["source_digest"] = "replacement-generation"
     timeline_path.write_text(canonical_json(timeline), encoding="utf-8")
 
-    assert timeline_main(
-        (
-            "query",
-            "--output",
-            str(root),
-            "search",
-            "B3",
-            "--in",
-            "all-transcript",
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "B3",
+                "--in",
+                "all-transcript",
+            )
         )
-    ) == 0
+        == 0
+    )
     assert _response(capsys)["total_matches"] == 2
 
 
@@ -1023,6 +1267,7 @@ def test_query_validates_schema_2_team_range_and_phase_index_metadata(
 ) -> None:
     root = _site(tmp_path)
     if corruption == "team":
+
         def replace_team(record: dict[str, JsonValue]) -> None:
             agents = as_array(record.get("agents"), "timeline-global.agents")
             as_object(agents[0], "timeline-global.agents[0]")["team"] = "ghost"
@@ -1405,7 +1650,9 @@ def test_query_rejects_unknown_timeline_schema_and_same_root_path_confusion(
     assert "outside data/details" in capsys.readouterr().err
 
 
-def test_bundled_query_source_runs_without_the_installed_package(tmp_path: Path) -> None:
+def test_bundled_query_source_runs_without_the_installed_package(
+    tmp_path: Path,
+) -> None:
     root = _site(tmp_path)
     source = Path(__file__).resolve().parents[1] / "agent_team_timeline" / "query.py"
     bundled = root / "query.py"

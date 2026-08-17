@@ -9,6 +9,8 @@ import pytest
 
 from agent_team_timeline.archive import JsonValue, as_array, as_object, read_json
 from agent_team_timeline.search_bloom import (
+    TRIGRAM_BLOOM_HASH_COUNT,
+    build_trigram_bloom,
     bloom_might_contain,
     trigram_bloom_from_catalog,
 )
@@ -19,7 +21,9 @@ from agent_team_timeline.timeline_shards import (
 
 
 def _ms(value: str) -> int:
-    return int(datetime.fromisoformat(value).astimezone(timezone.utc).timestamp() * 1000)
+    return int(
+        datetime.fromisoformat(value).astimezone(timezone.utc).timestamp() * 1000
+    )
 
 
 def _timeline() -> dict[str, JsonValue]:
@@ -49,6 +53,7 @@ def _timeline() -> dict[str, JsonValue]:
                 "agent_id": "root",
                 "start_ms": start,
                 "end_ms": end,
+                "stats": {"tool_calls": 2},
                 "states": [],
             },
             {
@@ -56,6 +61,7 @@ def _timeline() -> dict[str, JsonValue]:
                 "agent_id": "root",
                 "start_ms": start,
                 "end_ms": midnight,
+                "stats": {"tool_calls": 1},
                 "states": [],
             },
         ],
@@ -91,7 +97,7 @@ def _timeline() -> dict[str, JsonValue]:
                 "target_id": "root",
                 "source_ms": midnight,
                 "target_ms": midnight,
-            }
+            },
         ],
         "events": [
             {"agent_id": "root", "at_ms": start, "kind": "user_prompt"},
@@ -169,6 +175,7 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
             "end_ms",
             "activity_start_ms",
             "activity_end_ms",
+            "stats",
         }
         for phase in indexed_phases
     )
@@ -293,6 +300,12 @@ def test_schema_2_publishes_content_addressed_transcript_search_shards(
     assert bloom_might_contain(response_filter, "ptrace corpus")
     prompt_shard = _object(tmp_path, catalog[0])
     response_shard = _object(tmp_path, catalog[1])
+    prompt_linkage = _object(
+        tmp_path, as_object(catalog[0]["linkage"], "prompt linkage")
+    )
+    response_linkage = _object(
+        tmp_path, as_object(catalog[1]["linkage"], "response linkage")
+    )
     assert prompt_shard["source_digest"] == "source-digest"
     assert response_shard["source_digest"] == "source-digest"
     assert [
@@ -303,10 +316,34 @@ def test_schema_2_publishes_content_addressed_transcript_search_shards(
         as_object(value, "search record")["ref"]
         for value in as_array(response_shard["records"], "records")
     ] == ["message:test-team::response"]
+    assert prompt_linkage["prompts"] == [
+        {
+            "excerpt": "Where is backend maturity documented?",
+            "ref": "message:test-team::prompt",
+        }
+    ]
+    assert prompt_linkage["responses"] == []
+    assert response_linkage["prompts"] == []
+    assert response_linkage["responses"] == [
+        {
+            "agent_ref": "agent:test-team::root",
+            "at_ms": midnight,
+            "prompt_ref": "message:test-team::prompt",
+            "ref": "message:test-team::response",
+        }
+    ]
 
     second = write_timeline_shards(tmp_path, _timeline(), search_records=records)
     assert second.files_changed == 0
     assert second.generated_files == first.generated_files
+
+
+def test_trigram_bloom_catalog_requires_the_portable_hash_count() -> None:
+    catalog = build_trigram_bloom(("backend maturity",)).catalog_obj()
+    assert catalog["hash_count"] == TRIGRAM_BLOOM_HASH_COUNT
+    catalog["hash_count"] = TRIGRAM_BLOOM_HASH_COUNT - 1
+    with pytest.raises(ValueError, match=r"hash_count: expected 7"):
+        trigram_bloom_from_catalog(catalog)
 
 
 def _shard_manifest(root: Path) -> dict[str, JsonValue]:
@@ -316,9 +353,7 @@ def _shard_manifest(root: Path) -> dict[str, JsonValue]:
 
 def _object_file_set(manifest: dict[str, JsonValue], field: str) -> set[str]:
     return {
-        value
-        for value in as_array(manifest[field], field)
-        if isinstance(value, str)
+        value for value in as_array(manifest[field], field) if isinstance(value, str)
     }
 
 
@@ -342,9 +377,10 @@ def test_schema_2_retains_one_distinct_generation_and_idempotent_reruns(
 
     unchanged = write_timeline_shards(tmp_path, second_timeline)
     assert unchanged.files_changed == 0
-    assert _object_file_set(
-        _shard_manifest(tmp_path), "retained_objects"
-    ) == second_retained
+    assert (
+        _object_file_set(_shard_manifest(tmp_path), "retained_objects")
+        == second_retained
+    )
 
     third_timeline = _timeline()
     third_timeline["project_overview"] = {"text": "generation three"}
@@ -373,7 +409,9 @@ def test_schema_2_narrower_scope_drops_prior_generation_immediately(
     current = _object_file_set(manifest, "current_objects")
 
     assert _object_file_set(manifest, "retained_objects") == set()
-    assert all(not (tmp_path / relative).exists() for relative in wide_objects - current)
+    assert all(
+        not (tmp_path / relative).exists() for relative in wide_objects - current
+    )
 
 
 def test_schema_2_projection_can_skip_sidecars_for_temporary_builds(

@@ -26,6 +26,7 @@ const names = [
   "hasField",
   "validateSchema2ObjectSourceDigest",
   "asciiLowerUtf8SearchBytes",
+  "asciiLowerSearchText",
   "searchTextTrigrams",
   "queryTermBloomEligible",
   "fnv1a32",
@@ -36,12 +37,15 @@ const names = [
   "trigramBloomMightMatchQuery",
   "transcriptSearchRecordCount",
   "validateTranscriptSearchShard",
+  "loadSearchItemsBounded",
   "transcriptRecordMatchesScope",
   "searchRoleLabel",
   "compactSearchText",
   "searchQueryParts",
   "allSearchRanges",
   "searchWordCharacter",
+  "searchCharacterBefore",
+  "searchCharacterAt",
   "wholeSearchRanges",
   "smartSearchMatch",
   "searchExcerpt"
@@ -50,13 +54,19 @@ const context = {
   TextEncoder: global.TextEncoder,
   atob: global.atob,
   TRIGRAM_BLOOM_ALGORITHM: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+  TRIGRAM_BLOOM_HASH_COUNT: 7,
+  SEARCH_EXCERPT_CHARACTERS: 480,
+  SEARCH_LOAD_CONCURRENCY: 6,
   FNV_OFFSET: 2166136261,
   FNV_PRIME: 16777619,
   SECOND_HASH_SEED: 0x9e3779b9,
   app: {
     searchScope: "agent-responses",
     data: { source_digest: "digest-alpha" },
-    agentsById: new Map([["root", { id: "root", team: "alpha" }]])
+    agentsById: new Map([["root", { id: "root", team: "alpha" }]]),
+    searchLoadQueue: [],
+    searchLoadActive: 0,
+    searchRequestGeneration: 1
   }
 };
 vm.createContext(context);
@@ -65,6 +75,11 @@ vm.runInContext(names.map(functionSource).join("\n"), context);
 assert.strictEqual(
   context.compactSearchText("\u001c  Alpha\u0085BETA\u3000"),
   "Alpha BETA"
+);
+assert.strictEqual(context.compactSearchText("foo\ufeffbar"), "foo\ufeffbar");
+assert.strictEqual(
+  JSON.stringify(context.searchQueryParts("foo\ufeffbar")),
+  JSON.stringify([{ value: "foo\ufeffbar", quoted: false }])
 );
 assert.deepStrictEqual(
   Array.from(context.asciiLowerUtf8SearchBytes("AZ az Ä")),
@@ -155,6 +170,15 @@ assert.throws(function () {
   context.decodeTrigramBloom({
     algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
     bit_count: 64,
+    hash_count: 8,
+    bits_base64: "AQoQgAAEIAA=",
+    trigram_count: 1
+  }, "bad bloom");
+}, /expected 7/);
+assert.throws(function () {
+  context.decodeTrigramBloom({
+    algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+    bit_count: 64,
     hash_count: 7,
     bits_base64: "not base64!",
     trigram_count: 1
@@ -162,6 +186,16 @@ assert.throws(function () {
 }, /invalid base64/);
 
 assert.ok(context.smartSearchMatch("DBI is a solid B3 at 130/152.", "B3"));
+assert.strictEqual(
+  context.smartSearchMatch("KVM backend", "KVM"),
+  null,
+  "ASCII-insensitive exact matching must stay aligned with the Bloom normalization"
+);
+assert.strictEqual(
+  context.smartSearchMatch("RÉVERIE", "réverie"),
+  null,
+  "non-ASCII code points remain exact while ASCII letters are folded"
+);
 assert.strictEqual(
   context.smartSearchMatch("artifact hash 7ab3cdef was recorded", "B3"),
   null,
@@ -172,6 +206,9 @@ assert.strictEqual(
   null,
   "whole-term matching must reject longer alphanumeric tokens"
 );
+assert.strictEqual(context.smartSearchMatch("éB3é", "B3"), null);
+assert.strictEqual(context.smartSearchMatch("αbackendβ", "backend"), null);
+assert.strictEqual(context.smartSearchMatch("𐐀B3𐐀", "B3"), null);
 
 assert.ok(
   context.smartSearchMatch("KVM backend maturity is now B3.", "KVM B3"),
@@ -198,6 +235,14 @@ assert.ok(excerpt.leadingOmitted > 0);
 assert.ok(excerpt.trailingOmitted > 0);
 assert.ok(excerpt.ranges.length >= 2);
 assert.ok(excerpt.text.includes("KVM reached maturity B3"));
+assert.ok(excerpt.text.length <= 480);
+
+const distantMatch = context.smartSearchMatch(
+  "B3" + "x".repeat(10000) + " B3",
+  "B3"
+);
+assert.ok(distantMatch);
+assert.ok(context.searchExcerpt(distantMatch).text.length <= 480);
 
 assert.strictEqual(context.transcriptRecordMatchesScope({ record_type: "response" }), true);
 assert.strictEqual(
@@ -206,8 +251,8 @@ assert.strictEqual(
 );
 assert.strictEqual(
   context.transcriptRecordMatchesScope({ record_type: "inter_agent" }),
-  true,
-  "legacy inter-agent records remain searchable as agent responses"
+  false,
+  "ambiguous inter-agent chatter is not presented as a completed response"
 );
 assert.strictEqual(
   context.transcriptRecordMatchesScope({ record_type: "inter_agent_prompt" }),
@@ -229,6 +274,8 @@ const validRecord = {
   role: "agent",
   team: "alpha",
   agent_id: "root",
+  agent_ref: "agent:alpha::root",
+  event_id: "final",
   at_ms: 150,
   text: "Final response"
 };
@@ -284,6 +331,8 @@ assert.throws(function () {
   ["team", "beta"],
   ["ref", "message:beta::final"],
   ["agent_id", "missing-agent"],
+  ["agent_ref", "agent:alpha::missing-agent"],
+  ["event_id", "different"],
   ["role", "mystery"],
   ["prompt_ref", "message:beta::prompt"]
 ].forEach(function (mutation) {
@@ -294,4 +343,34 @@ assert.throws(function () {
   }, /invalid record/);
 });
 
-console.log("timeline transcript search UI tests passed");
+(async function () {
+  let active = 0;
+  let maximum = 0;
+  function delayedLoader(value) {
+    return new Promise(function (resolve) {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      setTimeout(function () {
+        active -= 1;
+        resolve(value);
+      }, 5);
+    });
+  }
+  await Promise.all([
+    context.loadSearchItemsBounded(
+      Array.from({ length: 12 }, function (_value, index) { return "a" + index; }),
+      delayedLoader,
+      1
+    ),
+    context.loadSearchItemsBounded(
+      Array.from({ length: 12 }, function (_value, index) { return "b" + index; }),
+      delayedLoader,
+      1
+    )
+  ]);
+  assert.ok(maximum <= 6, "search loading must share one global concurrency bound");
+  console.log("timeline transcript search UI tests passed");
+}()).catch(function (error) {
+  console.error(error);
+  process.exitCode = 1;
+});

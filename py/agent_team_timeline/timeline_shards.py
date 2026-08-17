@@ -25,7 +25,7 @@ from agent_team_timeline.archive import (
     read_json,
     write_text_if_changed,
 )
-from agent_team_timeline.search_bloom import build_trigram_bloom
+from agent_team_timeline.search_bloom import build_trigram_bloom, compact_search_text
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
     sync_gzip_sidecar,
@@ -116,8 +116,10 @@ def _is_object_file(relative: str) -> bool:
 
 def _safe_output_path(output: Path, relative: str) -> Path:
     path = Path(relative)
-    if path.is_absolute() or not path.parts or any(
-        part in ("", ".", "..") for part in path.parts
+    if (
+        path.is_absolute()
+        or not path.parts
+        or any(part in ("", ".", "..") for part in path.parts)
     ):
         raise ValueError(f"unsafe timeline shard output path: {relative!r}")
     cursor = output
@@ -167,7 +169,9 @@ def _manifest_object_files(
             )
         _safe_output_path(output, relative)
         if relative in values:
-            raise ValueError(f"duplicate timeline shard object path in {field}: {relative!r}")
+            raise ValueError(
+                f"duplicate timeline shard object path in {field}: {relative!r}"
+            )
         values.add(relative)
     return frozenset(values)
 
@@ -605,6 +609,45 @@ def _search_counts(records: Sequence[dict[str, JsonValue]]) -> dict[str, JsonVal
     }
 
 
+def _search_linkage(
+    records: Sequence[dict[str, JsonValue]],
+) -> tuple[list[JsonValue], list[JsonValue]]:
+    """Project compact prompt/response relationships independently of text Bloom filters."""
+
+    prompts: list[JsonValue] = []
+    responses: list[JsonValue] = []
+    for index, record in enumerate(records):
+        where = f"search records[{index}]"
+        record_type = as_string(record.get("record_type"), where + ".record_type")
+        reference = as_string(record.get("ref"), where + ".ref")
+        if record_type in {"prompt", "inter_agent_prompt"}:
+            prompts.append(
+                {
+                    "ref": reference,
+                    "excerpt": compact_search_text(
+                        as_string(record.get("text"), where + ".text")
+                    )[:320],
+                }
+            )
+        if record_type not in {"response", "inter_agent_response"}:
+            continue
+        raw_prompt_reference = record.get("prompt_ref")
+        if raw_prompt_reference is None:
+            continue
+        prompt_reference = as_string(raw_prompt_reference, where + ".prompt_ref")
+        if prompt_reference == reference:
+            continue
+        responses.append(
+            {
+                "ref": reference,
+                "prompt_ref": prompt_reference,
+                "at_ms": _record_int(record, "at_ms", where),
+                "agent_ref": as_string(record.get("agent_ref"), where + ".agent_ref"),
+            }
+        )
+    return prompts, responses
+
+
 def _global_object(
     timeline: dict[str, JsonValue],
     agent_bounds: dict[str, tuple[int, int]],
@@ -669,6 +712,7 @@ def _phase_index_object(
             "paragraph",
             "summary_available",
             "detail_path",
+            "stats",
         }
     )
     phases: list[JsonValue] = []
@@ -787,6 +831,21 @@ def write_timeline_shards(
     for (team, day_start), search_records_for_day in sorted(search_days.items()):
         day_end = day_start + _DAY_MS
         record_values: list[JsonValue] = list(search_records_for_day)
+        prompt_links, response_links = _search_linkage(search_records_for_day)
+        linkage_object: dict[str, JsonValue] = {
+            "schema_version": 1,
+            "kind": "timeline-search-links-day",
+            "source_digest": _required_value(timeline, "source_digest"),
+            "team": team,
+            "range": {"start_ms": day_start, "end_ms": day_end},
+            "prompts": prompt_links,
+            "responses": response_links,
+        }
+        stored_linkage = _store_object(output, linkage_object, precompress=precompress)
+        changed += stored_linkage.changed
+        generated_files.update(stored_linkage.generated_files)
+        object_bytes += stored_linkage.bytes
+        object_gzip_bytes += stored_linkage.gzip_bytes or stored_linkage.bytes
         search_object: dict[str, JsonValue] = {
             "schema_version": 1,
             "kind": "timeline-search-day",
@@ -810,6 +869,13 @@ def write_timeline_shards(
                 "end_ms": day_end,
                 **stored.catalog_obj(),
                 "counts": _search_counts(search_records_for_day),
+                "linkage": {
+                    **stored_linkage.catalog_obj(),
+                    "counts": {
+                        "prompts": len(prompt_links),
+                        "responses": len(response_links),
+                    },
+                },
                 "trigram_bloom": build_trigram_bloom(
                     as_string(
                         record.get("text"),

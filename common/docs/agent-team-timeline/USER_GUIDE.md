@@ -927,10 +927,16 @@ smart query, or select `--match phrase`/`--match literal` when substring behavio
 and returned matches. Search results carry stable `message:` or `tool:` references. `show` resolves
 one of those references and adds the enclosing phase and mechanically linked prompt/responses when
 present. Parent-to-child instructions and child-to-parent final replies are directionally classified
-before linkage, and source order breaks ties when provider timestamps are equal. Each team/day
+before linkage and attributed to the child workstream. Same-thread source order breaks timestamp
+ties; cross-rollout parent/child links require a strictly earlier instruction and leave equal-time
+ties unlinked rather than guessing. Each team/day
 catalog entry has a false-positive-only ASCII trigram filter. Eligible queries fetch only candidate
-day objects; short or non-ASCII terms never reject an object on their own, and exact matching always
-verifies the final result.
+day objects; short or non-ASCII terms never reject an object on their own. Matching is
+ASCII-case-insensitive and non-ASCII-exact so it stays byte-for-byte compatible with that filter.
+Compact linkage sidecars preserve prompt excerpts and linked-response counts across UTC-day
+boundaries even when the prompt's text shard does not match the query. The website loads the full
+linked messages on demand, verifies current content-addressed object bytes before parsing them,
+debounces normal typing, and bounds concurrent shard requests.
 
 The older `--scope summaries|transcripts|all` form remains available for compatibility with phase
 summary/detail search. Search-v2-only flags require `--in`; they are rejected rather than silently

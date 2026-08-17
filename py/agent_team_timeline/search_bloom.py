@@ -1,8 +1,11 @@
 """Deterministic trigram Bloom filters for transcript-search shard catalogs.
 
 The filter is deliberately a prefilter only: a positive result still requires
-the normal transcript matcher.  Search callers must scan a shard when a query
-is not eligible for filtering, which keeps the catalog false-negative-free.
+the normal transcript matcher.  Its portable normalization uses one explicit
+cross-runtime whitespace table followed by ASCII-only lowercasing of UTF-8 bytes.
+Search callers must scan a shard for non-ASCII or sub-trigram terms, and exact
+matchers must use ASCII-only case folding for eligible terms.  Those rules keep
+catalog rejection false-negative-free across Python and browser runtimes.
 """
 
 from __future__ import annotations
@@ -23,7 +26,10 @@ _FNV_OFFSET = 2_166_136_261
 _FNV_PRIME = 16_777_619
 _SECOND_HASH_SEED = 0x9E37_79B9
 _UINT32_MASK = (1 << 32) - 1
-_WHITESPACE = re.compile(r"\s+")
+_WHITESPACE = re.compile(
+    "[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680"
+    "\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+"
+)
 _ASCII_LOWER_TRANSLATION = bytes.maketrans(
     bytes(range(256)),
     bytes(value + 32 if 65 <= value <= 90 else value for value in range(256)),
@@ -93,9 +99,7 @@ def _fnv1a32(value: bytes, seed: int) -> int:
     return digest
 
 
-def _bit_positions(
-    trigram: bytes, bit_count: int, hash_count: int
-) -> tuple[int, ...]:
+def _bit_positions(trigram: bytes, bit_count: int, hash_count: int) -> tuple[int, ...]:
     first = _fnv1a32(trigram, _FNV_OFFSET)
     second = _fnv1a32(trigram, _FNV_OFFSET ^ _SECOND_HASH_SEED) | 1
     mask = bit_count - 1
@@ -113,9 +117,7 @@ def build_trigram_bloom(texts: Iterable[str]) -> TrigramBloom:
     )
     mutable = bytearray(bit_count // 8)
     for trigram in sorted(trigrams):
-        for position in _bit_positions(
-            trigram, bit_count, TRIGRAM_BLOOM_HASH_COUNT
-        ):
+        for position in _bit_positions(trigram, bit_count, TRIGRAM_BLOOM_HASH_COUNT):
             mutable[position // 8] |= 1 << (position % 8)
     return TrigramBloom(
         bit_count=bit_count,
@@ -137,8 +139,8 @@ def trigram_bloom_from_catalog(
     if bit_count < _MINIMUM_BIT_COUNT or bit_count & (bit_count - 1):
         raise ValueError(f"{where}.bit_count: expected a power of two of at least 64")
     hash_count = as_int(value.get("hash_count"), where + ".hash_count")
-    if hash_count <= 0:
-        raise ValueError(f"{where}.hash_count: expected a positive integer")
+    if hash_count != TRIGRAM_BLOOM_HASH_COUNT:
+        raise ValueError(f"{where}.hash_count: expected {TRIGRAM_BLOOM_HASH_COUNT}")
     trigram_count = as_int(value.get("trigram_count"), where + ".trigram_count")
     if trigram_count < 0:
         raise ValueError(f"{where}.trigram_count: expected a non-negative integer")
@@ -170,6 +172,7 @@ def bloom_might_contain(filter_value: TrigramBloom, query: str) -> bool:
 
 __all__ = [
     "TRIGRAM_BLOOM_ALGORITHM",
+    "TRIGRAM_BLOOM_HASH_COUNT",
     "TrigramBloom",
     "ascii_lower_utf8",
     "bloom_might_contain",

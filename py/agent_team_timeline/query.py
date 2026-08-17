@@ -18,8 +18,12 @@ from typing import Protocol
 QUERY_SCHEMA_VERSION = 1
 TIMELINE_SCHEMA_VERSION = 1
 TRANSCRIPT_EXPORT_SCHEMA_VERSION = 1
-_WHITESPACE = re.compile(r"\s+")
+_WHITESPACE = re.compile(
+    "[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680"
+    "\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+"
+)
 _TRIGRAM_BLOOM_ALGORITHM = "ascii-lower-utf8-trigram-fnv1a32-double-v1"
+_TRIGRAM_BLOOM_HASH_COUNT = 7
 _TRIGRAM_BLOOM_FNV_OFFSET = 2_166_136_261
 _TRIGRAM_BLOOM_FNV_PRIME = 16_777_619
 _TRIGRAM_BLOOM_SECOND_SEED = 0x9E37_79B9
@@ -165,6 +169,7 @@ class _TextMatch:
 class _SearchMatcher:
     compact_needle: str
     patterns: tuple[re.Pattern[str], ...]
+    whole_words: tuple[bool, ...]
     bloom_terms: tuple[str, ...]
     case_sensitive: bool
 
@@ -173,8 +178,8 @@ class _SearchMatcher:
 
         compact = _compact_text(text)
         collected: list[tuple[int, int]] = []
-        for pattern in self.patterns:
-            candidate = _pattern_ranges(pattern, compact)
+        for pattern, whole_word in zip(self.patterns, self.whole_words, strict=True):
+            candidate = _pattern_ranges(pattern, compact, whole_word=whole_word)
             if not candidate:
                 return None
             collected.extend(candidate)
@@ -182,11 +187,11 @@ class _SearchMatcher:
         first = min(start for start, _ in ranges)
         last = max(end for _, end in ranges)
         span = max(1, last - first)
-        comparable = compact if self.case_sensitive else compact.casefold()
+        comparable = compact if self.case_sensitive else _ascii_lower_text(compact)
         comparable_needle = (
             self.compact_needle
             if self.case_sensitive
-            else self.compact_needle.casefold()
+            else _ascii_lower_text(self.compact_needle)
         )
         exact = comparable == comparable_needle
         score = (
@@ -196,6 +201,14 @@ class _SearchMatcher:
             - min(first, 10_000)
         )
         return _TextMatch(compact, ranges, score)
+
+
+@dataclass(frozen=True)
+class _SearchLinkContext:
+    """Relationship facts retained independently of text-shard Bloom pruning."""
+
+    prompt_excerpts: dict[str, str]
+    response_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -291,12 +304,16 @@ def _read_jsonl(path: Path) -> tuple[dict[str, JsonValue], ...]:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"transcript export file is missing or unsafe: {path}")
     result: list[dict[str, JsonValue]] = []
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
         if not line:
             continue
         raw: object = json.loads(line)
         result.append(
-            as_object(_narrow_json(raw, f"{path}:{line_number}"), f"{path}:{line_number}")
+            as_object(
+                _narrow_json(raw, f"{path}:{line_number}"), f"{path}:{line_number}"
+            )
         )
     return tuple(result)
 
@@ -414,7 +431,10 @@ class TranscriptQuery:
                 ordinal: int | None = as_int(record.get("ordinal"), "prompt.ordinal")
             elif record_type == "response":
                 prompt_id = record.get("in_reply_to_prompt_id")
-                if not isinstance(prompt_id, str) or prompt_id not in selected_prompt_ids:
+                if (
+                    not isinstance(prompt_id, str)
+                    or prompt_id not in selected_prompt_ids
+                ):
                     continue
                 ordinal = self._prompt_ordinals.get(prompt_id)
             else:
@@ -448,7 +468,10 @@ class TranscriptQuery:
         linked_response_texts: list[str] = []
         unlinked_response_texts: list[str] = []
         for record in self.messages:
-            if as_string(record.get("record_type"), "message.record_type") != "response":
+            if (
+                as_string(record.get("record_type"), "message.record_type")
+                != "response"
+            ):
                 continue
             if not self._selected(record, filters):
                 continue
@@ -471,9 +494,7 @@ def _record_array(
 ) -> tuple[dict[str, JsonValue], ...]:
     return tuple(
         as_object(value, f"timeline.{key}[{index}]")
-        for index, value in enumerate(
-            as_array(timeline.get(key), f"timeline.{key}")
-        )
+        for index, value in enumerate(as_array(timeline.get(key), f"timeline.{key}"))
     )
 
 
@@ -531,7 +552,9 @@ def _interval(record: dict[str, JsonValue], where: str) -> tuple[int, int]:
     return start_ms, end_ms
 
 
-def _overlaps(record: dict[str, JsonValue], where: str, window: TimeWindow | None) -> bool:
+def _overlaps(
+    record: dict[str, JsonValue], where: str, window: TimeWindow | None
+) -> bool:
     if window is None:
         return True
     start_ms, end_ms = _interval(record, where)
@@ -569,11 +592,20 @@ def _compact_text(value: str) -> str:
     return _WHITESPACE.sub(" ", value).strip()
 
 
+def _search_word_character(value: str) -> bool:
+    return bool(value) and (value == "_" or value.isalnum())
+
+
 def _pattern_ranges(
-    pattern: re.Pattern[str], compact: str
+    pattern: re.Pattern[str], compact: str, *, whole_word: bool = False
 ) -> tuple[tuple[int, int], ...]:
     result: list[tuple[int, int]] = []
     for match in pattern.finditer(compact):
+        if whole_word and (
+            _search_word_character(compact[match.start() - 1 : match.start()])
+            or _search_word_character(compact[match.end() : match.end() + 1])
+        ):
+            continue
         result.append((match.start(), match.end()))
         if len(result) == 64:
             break
@@ -582,10 +614,10 @@ def _pattern_ranges(
 
 def _smart_parts(needle: str) -> tuple[tuple[str, bool], ...]:
     parts: list[tuple[str, bool]] = []
-    for match in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"|(\S+)', needle):
+    for match in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"|([^ ]+)', needle):
         quoted = match.group(1)
         if quoted is not None:
-            value = quoted.replace(r'\"', '"').replace(r"\\", "\\")
+            value = quoted.replace(r"\"", '"').replace(r"\\", "\\")
             if value:
                 parts.append((value, True))
         else:
@@ -604,29 +636,58 @@ def _compile_search_matcher(
     compact_needle = _compact_text(needle)
     if not compact_needle:
         raise ValueError("search text must not be empty")
-    flags = 0 if case_sensitive else re.IGNORECASE
+
+    def pattern_flags(value: str) -> int:
+        if case_sensitive:
+            return 0
+        # The portable Bloom format lowercases ASCII only.  Keep non-ASCII
+        # code points exact while folding ASCII letters, avoiding Python's
+        # extra Unicode IGNORECASE equivalences (for example K/Kelvin sign).
+        return re.IGNORECASE | re.ASCII
+
     patterns: tuple[re.Pattern[str], ...]
+    whole_words: tuple[bool, ...]
     bloom_terms: tuple[str, ...]
     if match_mode in {"literal", "phrase"}:
-        patterns = (re.compile(re.escape(compact_needle), flags),)
+        patterns = (
+            re.compile(re.escape(compact_needle), pattern_flags(compact_needle)),
+        )
+        whole_words = (False,)
         bloom_terms = (compact_needle,)
     elif match_mode == "smart":
         parts = _smart_parts(compact_needle)
         if not parts:
             raise ValueError("search text must contain a term")
         compiled: list[re.Pattern[str]] = []
+        whole: list[bool] = []
         for part, quoted in parts:
-            if quoted or re.fullmatch(r"[\w-]+", part, flags=re.UNICODE) is None:
-                compiled.append(re.compile(re.escape(part), flags))
-            else:
-                compiled.append(
-                    re.compile(rf"(?<!\w){re.escape(part)}(?!\w)", flags)
+            flags = pattern_flags(part)
+            compiled.append(re.compile(re.escape(part), flags))
+            whole.append(
+                not quoted
+                and all(
+                    character in {"_", "-"} or character.isalnum()
+                    for character in part
                 )
+            )
         patterns = tuple(compiled)
+        whole_words = tuple(whole)
         bloom_terms = tuple(part for part, _ in parts)
     else:
         raise ValueError(f"unsupported search match mode {match_mode!r}")
-    return _SearchMatcher(compact_needle, patterns, bloom_terms, case_sensitive)
+    return _SearchMatcher(
+        compact_needle,
+        patterns,
+        whole_words,
+        bloom_terms,
+        case_sensitive,
+    )
+
+
+def _ascii_lower_text(value: str) -> str:
+    return value.translate(
+        str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+    )
 
 
 def _ascii_lower_utf8(value: str) -> bytes:
@@ -650,9 +711,7 @@ def _trigram_positions(
     return tuple((first + index * second) & mask for index in range(hash_count))
 
 
-def _bloom_might_match(
-    raw: JsonValue, terms: tuple[str, ...], where: str
-) -> bool:
+def _bloom_might_match(raw: JsonValue, terms: tuple[str, ...], where: str) -> bool:
     """Validate one catalog Bloom filter and reject only definite misses."""
 
     if raw is None:
@@ -665,8 +724,8 @@ def _bloom_might_match(
     if bit_count < 64 or bit_count & (bit_count - 1):
         raise ValueError(f"{where}.bit_count: expected a power of two of at least 64")
     hash_count = as_int(value.get("hash_count"), where + ".hash_count")
-    if hash_count <= 0:
-        raise ValueError(f"{where}.hash_count: expected a positive integer")
+    if hash_count != _TRIGRAM_BLOOM_HASH_COUNT:
+        raise ValueError(f"{where}.hash_count: expected {_TRIGRAM_BLOOM_HASH_COUNT}")
     trigram_count = as_int(value.get("trigram_count"), where + ".trigram_count")
     if trigram_count < 0:
         raise ValueError(f"{where}.trigram_count: expected a non-negative integer")
@@ -801,7 +860,9 @@ class TimelineQuery:
         if hashlib.sha256(encoded).hexdigest() != digest:
             raise ValueError(f"{where}: object digest mismatch for {relative}")
         raw_bytes = reference.get("bytes")
-        if raw_bytes is not None and as_int(raw_bytes, where + ".bytes") != len(encoded):
+        if raw_bytes is not None and as_int(raw_bytes, where + ".bytes") != len(
+            encoded
+        ):
             raise ValueError(f"{where}: object byte count mismatch for {relative}")
         try:
             decoded: object = json.loads(encoded.decode("utf-8"))
@@ -847,7 +908,9 @@ class TimelineQuery:
             as_int(bootstrap.get("schema_version"), "timeline-v2.schema_version") != 2
             or bootstrap.get("kind") != "timeline-bootstrap"
         ):
-            raise ValueError(f"unsupported timeline schema-2 bootstrap at {bootstrap_path}")
+            raise ValueError(
+                f"unsupported timeline schema-2 bootstrap at {bootstrap_path}"
+            )
         source_digest = as_string(
             bootstrap.get("source_digest"), "timeline-v2.source_digest"
         )
@@ -862,16 +925,22 @@ class TimelineQuery:
             bootstrap.get("global"), "timeline-v2.global"
         )
         if (
-            as_int(global_record.get("schema_version"), global_relative + ".schema_version")
+            as_int(
+                global_record.get("schema_version"), global_relative + ".schema_version"
+            )
             != 2
             or global_record.get("kind") != "timeline-global"
         ):
             raise ValueError(f"unsupported timeline global object: {global_relative}")
         global_digest = global_record.get("source_digest")
-        if global_digest is not None and as_string(
-            global_digest, global_relative + ".source_digest"
-        ) != source_digest:
-            raise ValueError("timeline global object belongs to a different source generation")
+        if (
+            global_digest is not None
+            and as_string(global_digest, global_relative + ".source_digest")
+            != source_digest
+        ):
+            raise ValueError(
+                "timeline global object belongs to a different source generation"
+            )
         if "range" in global_record:
             global_range, _global_start, _global_end = self._schema_2_range(
                 global_record, global_relative
@@ -914,7 +983,9 @@ class TimelineQuery:
             raw_values = global_record.get(key)
             if raw_values is None:
                 continue
-            for index, raw in enumerate(as_array(raw_values, f"{global_relative}.{key}")):
+            for index, raw in enumerate(
+                as_array(raw_values, f"{global_relative}.{key}")
+            ):
                 record = as_object(raw, f"{global_relative}.{key}[{index}]")
                 team = _team(record, f"{global_relative}.{key}[{index}]")
                 if team not in team_slugs:
@@ -926,16 +997,22 @@ class TimelineQuery:
             bootstrap.get("phase_index"), "timeline-v2.phase_index"
         )
         if (
-            as_int(phase_index.get("schema_version"), phase_relative + ".schema_version")
+            as_int(
+                phase_index.get("schema_version"), phase_relative + ".schema_version"
+            )
             != 2
             or phase_index.get("kind") != "timeline-phase-index"
         ):
             raise ValueError(f"unsupported timeline phase index: {phase_relative}")
         phase_digest = phase_index.get("source_digest")
-        if phase_digest is not None and as_string(
-            phase_digest, phase_relative + ".source_digest"
-        ) != source_digest:
-            raise ValueError("timeline phase index belongs to a different source generation")
+        if (
+            phase_digest is not None
+            and as_string(phase_digest, phase_relative + ".source_digest")
+            != source_digest
+        ):
+            raise ValueError(
+                "timeline phase index belongs to a different source generation"
+            )
         phases: list[JsonValue] = []
         seen_phase_ids: set[str] = set()
         for index, raw_phase in enumerate(
@@ -961,9 +1038,10 @@ class TimelineQuery:
                     f"{where}.agent_id: no exact global agent match for {agent_id!r}"
                 )
             existing_team = phase.get("team")
-            if existing_team is not None and as_string(
-                existing_team, where + ".team"
-            ) != phase_team:
+            if (
+                existing_team is not None
+                and as_string(existing_team, where + ".team") != phase_team
+            ):
                 raise ValueError(f"{where}.team: does not match phase agent")
             phase["team"] = phase_team
             phases.append(phase)
@@ -1001,9 +1079,7 @@ class TimelineQuery:
                     bootstrap.get("display_timezone"), "timeline-v2.display_timezone"
                 ),
                 "display_timezone_source": as_string(
-                    bootstrap.get(
-                        "display_timezone_source", "legacy_team_data"
-                    ),
+                    bootstrap.get("display_timezone_source", "legacy_team_data"),
                     "timeline-v2.display_timezone_source",
                 ),
                 "range": time_range,
@@ -1043,9 +1119,7 @@ class TimelineQuery:
             content=TextTotals.from_texts(texts),
         )
 
-    def summary_stats(
-        self, filters: QueryFilters
-    ) -> dict[str, SummaryKindStats]:
+    def summary_stats(self, filters: QueryFilters) -> dict[str, SummaryKindStats]:
         """Count available and unavailable summaries in the presentation projection."""
 
         project_texts: list[str] = []
@@ -1132,9 +1206,7 @@ class TimelineQuery:
             "project_overviews": self._summary_kind_stats(
                 project_texts, project_unavailable
             ),
-            "agent_lifetimes": self._summary_kind_stats(
-                agent_texts, agent_unavailable
-            ),
+            "agent_lifetimes": self._summary_kind_stats(agent_texts, agent_unavailable),
             "work_phases": self._summary_kind_stats(phase_texts, phase_unavailable),
             "rollup_technical": self._summary_kind_stats(
                 technical_texts, technical_unavailable
@@ -1379,8 +1451,10 @@ class TimelineQuery:
 
     def _safe_file(self, relative: str) -> tuple[Path, PurePosixPath]:
         pure = PurePosixPath(relative)
-        if pure.is_absolute() or not pure.parts or any(
-            part in {"", ".", ".."} for part in pure.parts
+        if (
+            pure.is_absolute()
+            or not pure.parts
+            or any(part in {"", ".", ".."} for part in pure.parts)
         ):
             raise ValueError(f"archive path escapes root: {relative!r}")
         path = self.root.joinpath(*pure.parts).resolve()
@@ -1440,7 +1514,10 @@ class TimelineQuery:
             raise ValueError(
                 "this archive predates transcript search; rebuild the website"
             )
-        if as_int(search.get("schema_version"), "timeline-v2.search.schema_version") != 1:
+        if (
+            as_int(search.get("schema_version"), "timeline-v2.search.schema_version")
+            != 1
+        ):
             raise ValueError("unsupported transcript search schema")
         source_digest = as_string(
             bootstrap.get("source_digest"), "timeline-v2.source_digest"
@@ -1470,12 +1547,17 @@ class TimelineQuery:
             ):
                 continue
             root, relative = self._content_addressed_object(shard, where)
-            if root.get("schema_version") != 1 or root.get("kind") != "timeline-search-day":
+            if (
+                root.get("schema_version") != 1
+                or root.get("kind") != "timeline-search-day"
+            ):
                 raise ValueError(f"unsupported transcript search shard: {relative}")
             shard_digest = root.get("source_digest")
-            if shard_digest is not None and as_string(
-                shard_digest, relative + ".source_digest"
-            ) != source_digest:
+            if (
+                shard_digest is not None
+                and as_string(shard_digest, relative + ".source_digest")
+                != source_digest
+            ):
                 raise ValueError(
                     f"transcript search shard belongs to a different source generation: {relative}"
                 )
@@ -1490,20 +1572,21 @@ class TimelineQuery:
                 raw_records
             ):
                 raise ValueError(f"transcript search shard count mismatch: {relative}")
-            for record_index, raw_record in enumerate(
-                raw_records
-            ):
-                record = as_object(
-                    raw_record, f"{relative}.records[{record_index}]"
-                )
+            for record_index, raw_record in enumerate(raw_records):
+                record = as_object(raw_record, f"{relative}.records[{record_index}]")
                 reference = as_string(
                     record.get("ref"), f"{relative}.records[{record_index}].ref"
                 )
-                if as_int(
-                    record.get("schema_version"),
-                    f"{relative}.records[{record_index}].schema_version",
-                ) != 1:
-                    raise ValueError(f"unsupported transcript search record: {reference}")
+                if (
+                    as_int(
+                        record.get("schema_version"),
+                        f"{relative}.records[{record_index}].schema_version",
+                    )
+                    != 1
+                ):
+                    raise ValueError(
+                        f"unsupported transcript search record: {reference}"
+                    )
                 record_team = as_string(
                     record.get("team"), f"{relative}.records[{record_index}].team"
                 )
@@ -1511,16 +1594,27 @@ class TimelineQuery:
                     record.get("at_ms"), f"{relative}.records[{record_index}].at_ms"
                 )
                 if record_team != shard_team or not shard_start <= at_ms < shard_end:
-                    raise ValueError(f"transcript search record escapes shard: {reference}")
+                    raise ValueError(
+                        f"transcript search record escapes shard: {reference}"
+                    )
                 message_prefix = f"message:{record_team}::"
                 tool_prefix = f"tool:{record_team}::"
                 if not reference.startswith((message_prefix, tool_prefix)):
-                    raise ValueError(f"invalid transcript search reference {reference!r}")
+                    raise ValueError(
+                        f"invalid transcript search reference {reference!r}"
+                    )
                 record_type = as_string(
                     record.get("record_type"),
                     f"{relative}.records[{record_index}].record_type",
                 )
-                if (record_type == "tool") != reference.startswith(tool_prefix):
+                event_identifier = as_string(
+                    record.get("event_id"),
+                    f"{relative}.records[{record_index}].event_id",
+                )
+                expected_reference = (
+                    tool_prefix if record_type == "tool" else message_prefix
+                ) + event_identifier
+                if reference != expected_reference:
                     raise ValueError(
                         f"transcript search reference kind mismatch: {reference}"
                     )
@@ -1556,6 +1650,13 @@ class TimelineQuery:
                     raise ValueError(
                         f"transcript search prompt reference belongs to another team: {reference}"
                     )
+                prompt_in_scope = record.get("prompt_in_scope")
+                if prompt_in_scope is not None and not isinstance(
+                    prompt_in_scope, bool
+                ):
+                    raise ValueError(
+                        f"{relative}.records[{record_index}].prompt_in_scope: expected a boolean"
+                    )
                 role = as_string(
                     record.get("role"), f"{relative}.records[{record_index}].role"
                 )
@@ -1565,9 +1666,252 @@ class TimelineQuery:
                     record.get("text"), f"{relative}.records[{record_index}].text"
                 )
                 if reference in seen:
-                    raise ValueError(f"duplicate transcript search reference {reference!r}")
+                    raise ValueError(
+                        f"duplicate transcript search reference {reference!r}"
+                    )
                 seen.add(reference)
                 yield record
+
+    def _search_link_context_from_records(
+        self,
+        filters: QueryFilters,
+        selected_agent: str | None,
+        candidate_prompt_refs: frozenset[str],
+        needed_prompt_refs: frozenset[str],
+    ) -> _SearchLinkContext:
+        """Compatibility path for archives written before linkage sidecars."""
+
+        prompt_excerpts: dict[str, str] = {}
+        response_counts: dict[str, int] = {}
+        team_filters = QueryFilters(teams=filters.teams)
+        for record in self._iter_search_records(team_filters):
+            reference = as_string(record.get("ref"), "search record.ref")
+            record_type = as_string(
+                record.get("record_type"), "search record.record_type"
+            )
+            if reference in needed_prompt_refs and record_type in {
+                "prompt",
+                "inter_agent_prompt",
+            }:
+                prompt_excerpts[reference] = _compact_text(
+                    as_string(record.get("text"), "search record.text")
+                )[:320]
+            if record_type not in {"response", "inter_agent_response"}:
+                continue
+            prompt_reference = _optional_string(record, "prompt_ref")
+            if prompt_reference not in candidate_prompt_refs:
+                continue
+            at_ms = as_int(record.get("at_ms"), "search record.at_ms")
+            if filters.window is not None and not filters.window.contains(at_ms):
+                continue
+            agent_reference = as_string(
+                record.get("agent_ref"), "search record.agent_ref"
+            )
+            if selected_agent is not None and agent_reference != selected_agent:
+                continue
+            response_counts[prompt_reference] = (
+                response_counts.get(prompt_reference, 0) + 1
+            )
+        return _SearchLinkContext(prompt_excerpts, response_counts)
+
+    def _search_link_context_from_sidecars(
+        self,
+        shards: list[JsonValue],
+        filters: QueryFilters,
+        selected_agent: str | None,
+        candidate_prompt_refs: frozenset[str],
+        needed_prompt_refs: frozenset[str],
+    ) -> _SearchLinkContext:
+        """Read compact linkage shards while retaining only candidate relationships."""
+
+        bootstrap = self._timeline_v2_bootstrap
+        if bootstrap is None:
+            raise ValueError("missing timeline schema-2 bootstrap")
+        source_digest = as_string(
+            bootstrap.get("source_digest"), "timeline-v2.source_digest"
+        )
+        timeline_teams = frozenset(
+            as_string(team.get("slug"), "timeline team.slug") for team in self.teams
+        )
+        prompt_excerpts: dict[str, str] = {}
+        response_counts: dict[str, int] = {}
+        seen_prompts: set[str] = set()
+        seen_responses: set[str] = set()
+        for shard_index, raw_shard in enumerate(shards):
+            where = f"timeline-v2.search.shards[{shard_index}]"
+            shard = as_object(raw_shard, where)
+            shard_team = as_string(shard.get("team"), where + ".team")
+            shard_start = as_int(shard.get("start_ms"), where + ".start_ms")
+            shard_end = as_int(shard.get("end_ms"), where + ".end_ms")
+            if shard_team not in timeline_teams or shard_end <= shard_start:
+                raise ValueError(f"invalid transcript search shard scope at {where}")
+            if filters.teams and shard_team not in filters.teams:
+                continue
+            raw_linkage = shard.get("linkage")
+            linkage_reference = as_object(raw_linkage, where + ".linkage")
+            linkage, relative = self._content_addressed_object(
+                linkage_reference, where + ".linkage"
+            )
+            if (
+                as_int(linkage.get("schema_version"), relative + ".schema_version") != 1
+                or linkage.get("kind") != "timeline-search-links-day"
+            ):
+                raise ValueError(
+                    f"unsupported transcript search linkage shard: {relative}"
+                )
+            if (
+                as_string(linkage.get("source_digest"), relative + ".source_digest")
+                != source_digest
+            ):
+                raise ValueError(
+                    f"transcript search linkage shard belongs to a different source generation: {relative}"
+                )
+            if as_string(linkage.get("team"), relative + ".team") != shard_team:
+                raise ValueError(
+                    f"transcript search linkage shard team mismatch: {relative}"
+                )
+            linkage_range = as_object(linkage.get("range"), relative + ".range")
+            if linkage_range != {"start_ms": shard_start, "end_ms": shard_end}:
+                raise ValueError(
+                    f"transcript search linkage shard range mismatch: {relative}"
+                )
+            raw_prompts = as_array(linkage.get("prompts"), relative + ".prompts")
+            raw_responses = as_array(linkage.get("responses"), relative + ".responses")
+            catalog_counts = as_object(
+                linkage_reference.get("counts"), where + ".linkage.counts"
+            )
+            if as_int(
+                catalog_counts.get("prompts"), where + ".linkage.counts.prompts"
+            ) != len(raw_prompts):
+                raise ValueError(
+                    f"transcript search linkage prompt count mismatch: {relative}"
+                )
+            if as_int(
+                catalog_counts.get("responses"),
+                where + ".linkage.counts.responses",
+            ) != len(raw_responses):
+                raise ValueError(
+                    f"transcript search linkage response count mismatch: {relative}"
+                )
+            message_prefix = f"message:{shard_team}::"
+            agent_prefix = f"agent:{shard_team}::"
+            for prompt_index, raw_prompt in enumerate(raw_prompts):
+                prompt = as_object(raw_prompt, f"{relative}.prompts[{prompt_index}]")
+                reference = as_string(
+                    prompt.get("ref"), f"{relative}.prompts[{prompt_index}].ref"
+                )
+                if not reference.startswith(message_prefix):
+                    raise ValueError(
+                        f"transcript search linkage prompt belongs to another team: {reference}"
+                    )
+                excerpt = as_string(
+                    prompt.get("excerpt"),
+                    f"{relative}.prompts[{prompt_index}].excerpt",
+                )
+                if reference in needed_prompt_refs:
+                    if reference in seen_prompts:
+                        raise ValueError(
+                            f"duplicate transcript search linkage prompt {reference!r}"
+                        )
+                    seen_prompts.add(reference)
+                    prompt_excerpts[reference] = excerpt
+            for response_index, raw_response in enumerate(raw_responses):
+                response = as_object(
+                    raw_response, f"{relative}.responses[{response_index}]"
+                )
+                reference = as_string(
+                    response.get("ref"),
+                    f"{relative}.responses[{response_index}].ref",
+                )
+                if not reference.startswith(message_prefix):
+                    raise ValueError(
+                        f"transcript search linkage response belongs to another team: {reference}"
+                    )
+                prompt_reference = as_string(
+                    response.get("prompt_ref"),
+                    f"{relative}.responses[{response_index}].prompt_ref",
+                )
+                if not prompt_reference.startswith(message_prefix):
+                    raise ValueError(
+                        f"transcript search linkage prompt belongs to another team: {reference}"
+                    )
+                at_ms = as_int(
+                    response.get("at_ms"),
+                    f"{relative}.responses[{response_index}].at_ms",
+                )
+                if not shard_start <= at_ms < shard_end:
+                    raise ValueError(
+                        f"transcript search linkage response escapes shard: {reference}"
+                    )
+                agent_reference = as_string(
+                    response.get("agent_ref"),
+                    f"{relative}.responses[{response_index}].agent_ref",
+                )
+                if not agent_reference.startswith(agent_prefix):
+                    raise ValueError(
+                        f"transcript search linkage agent belongs to another team: {reference}"
+                    )
+                agent_entry = self._entries.get(agent_reference)
+                if agent_entry is None or agent_entry.kind != "agent":
+                    raise ValueError(
+                        f"transcript search linkage response has unknown agent {agent_reference!r}"
+                    )
+                if (
+                    _team(agent_entry.record, "search linkage response agent")
+                    != shard_team
+                ):
+                    raise ValueError(
+                        f"transcript search linkage agent belongs to another team: {reference}"
+                    )
+                if prompt_reference not in candidate_prompt_refs:
+                    continue
+                if filters.window is not None and not filters.window.contains(at_ms):
+                    continue
+                if selected_agent is not None and agent_reference != selected_agent:
+                    continue
+                if reference in seen_responses:
+                    raise ValueError(
+                        f"duplicate transcript search linkage response {reference!r}"
+                    )
+                seen_responses.add(reference)
+                response_counts[prompt_reference] = (
+                    response_counts.get(prompt_reference, 0) + 1
+                )
+        return _SearchLinkContext(prompt_excerpts, response_counts)
+
+    def _search_link_context(
+        self,
+        filters: QueryFilters,
+        selected_agent: str | None,
+        candidate_prompt_refs: frozenset[str],
+        needed_prompt_refs: frozenset[str],
+    ) -> _SearchLinkContext:
+        """Resolve candidate relationships without reopening pruned text shards."""
+
+        if not candidate_prompt_refs and not needed_prompt_refs:
+            return _SearchLinkContext({}, {})
+        bootstrap = self._timeline_v2_bootstrap
+        if bootstrap is None:
+            raise ValueError("missing timeline schema-2 bootstrap")
+        search = as_object(bootstrap.get("search"), "timeline-v2.search")
+        shards = as_array(search.get("shards"), "timeline-v2.search.shards")
+        if shards and all(
+            "linkage" in as_object(raw, f"timeline-v2.search.shards[{index}]")
+            for index, raw in enumerate(shards)
+        ):
+            return self._search_link_context_from_sidecars(
+                shards,
+                filters,
+                selected_agent,
+                candidate_prompt_refs,
+                needed_prompt_refs,
+            )
+        return self._search_link_context_from_records(
+            filters,
+            selected_agent,
+            candidate_prompt_refs,
+            needed_prompt_refs,
+        )
 
     def _phase_reference_for_search_record(
         self, record: dict[str, JsonValue]
@@ -1592,9 +1936,7 @@ class TimelineQuery:
         prompts: dict[str, dict[str, JsonValue]] = {}
         responses: list[dict[str, JsonValue]] = []
         for candidate in self._iter_search_records(QueryFilters(teams=(team,))):
-            candidate_reference = as_string(
-                candidate.get("ref"), "search record.ref"
-            )
+            candidate_reference = as_string(candidate.get("ref"), "search record.ref")
             candidate_type = as_string(
                 candidate.get("record_type"), "search record.record_type"
             )
@@ -1659,9 +2001,7 @@ class TimelineQuery:
     ) -> None:
         slug = as_string(record.get("slug"), "team.slug")
         result["agent_refs"] = [
-            agent_ref(agent)
-            for agent in self.agents
-            if _team(agent, "agent") == slug
+            agent_ref(agent) for agent in self.agents if _team(agent, "agent") == slug
         ]
         result["rollup_refs"] = [
             rollup_ref(rollup)
@@ -1769,9 +2109,7 @@ class TimelineQuery:
         matches: list[dict[str, JsonValue]] = []
         if scope in {"summaries", "all"}:
             matches.extend(
-                self._search_summaries(
-                    needle, filters, selected_agent, case_sensitive
-                )
+                self._search_summaries(needle, filters, selected_agent, case_sensitive)
             )
         if scope in {"transcripts", "all"}:
             matches.extend(
@@ -1781,9 +2119,7 @@ class TimelineQuery:
             )
         matches.sort(
             key=lambda item: (
-                _optional_int(item, "at_ms")
-                or _optional_int(item, "start_ms")
-                or -1,
+                _optional_int(item, "at_ms") or _optional_int(item, "start_ms") or -1,
                 _optional_string(item, "ref") or "",
                 _optional_string(item, "field") or "",
             )
@@ -1829,11 +2165,7 @@ class TimelineQuery:
             match_mode=match_mode,
             case_sensitive=case_sensitive,
         )
-        prompt_texts: dict[str, str] = {}
-        response_counts: dict[str, int] = {}
-        candidates: list[
-            tuple[int, int, str, dict[str, JsonValue], _TextMatch]
-        ] = []
+        candidates: list[tuple[int, int, str, dict[str, JsonValue], _TextMatch]] = []
         for record in self._iter_search_records(
             filters, bloom_terms=matcher.bloom_terms
         ):
@@ -1843,8 +2175,6 @@ class TimelineQuery:
                 record.get("record_type"), "search record.record_type"
             )
             text = as_string(record.get("text"), "search record.text")
-            if record_type in {"prompt", "inter_agent_prompt"}:
-                prompt_texts[reference] = text
             team = as_string(record.get("team"), "search record.team")
             if not self._selected_team(team, filters):
                 continue
@@ -1856,14 +2186,6 @@ class TimelineQuery:
             )
             if selected_agent is not None and agent_reference != selected_agent:
                 continue
-            if (
-                record_type in {"response", "inter_agent_response"}
-                and prompt_reference is not None
-                and prompt_reference != reference
-            ):
-                response_counts[prompt_reference] = (
-                    response_counts.get(prompt_reference, 0) + 1
-                )
             role = as_string(record.get("role"), "search record.role")
             if roles and role not in roles:
                 continue
@@ -1885,7 +2207,10 @@ class TimelineQuery:
             )
             if prompt_author == "owner" and selected_prompt_kind != "owner_human":
                 continue
-            if prompt_author == "agent" and selected_prompt_kind not in _BOT_AUTHOR_KINDS:
+            if (
+                prompt_author == "agent"
+                and selected_prompt_kind not in _BOT_AUTHOR_KINDS
+            ):
                 continue
             if prompt_author == "unclassified" and selected_prompt_kind in (
                 _HUMAN_AUTHOR_KINDS | _BOT_AUTHOR_KINDS
@@ -1897,6 +2222,28 @@ class TimelineQuery:
             candidates.append(
                 (text_match.score, at_ms, reference, dict(record), text_match)
             )
+
+        candidate_prompt_refs = frozenset(
+            reference
+            for _score, _at_ms, reference, record, _text_match in candidates
+            if as_string(record.get("record_type"), "search record.record_type")
+            in {"prompt", "inter_agent_prompt"}
+        )
+        needed_prompt_refs = frozenset(
+            prompt_reference
+            for _score, _at_ms, reference, record, _text_match in candidates
+            if (
+                (prompt_reference := _optional_string(record, "prompt_ref")) is not None
+                and prompt_reference != reference
+            )
+        )
+        link_context = self._search_link_context(
+            filters,
+            selected_agent,
+            candidate_prompt_refs,
+            needed_prompt_refs,
+        )
+        response_counts = link_context.response_counts
 
         matches: list[tuple[int, int, str, dict[str, JsonValue]]] = []
         for score, at_ms, reference, record, text_match in candidates:
@@ -1920,9 +2267,7 @@ class TimelineQuery:
             )
             prompt_kind = _optional_string(record, "prompt_author_kind")
             excerpt_details = _search_excerpt(text_match)
-            excerpt = as_string(
-                excerpt_details.get("text"), "search excerpt.text"
-            )
+            excerpt = as_string(excerpt_details.get("text"), "search excerpt.text")
             item: dict[str, JsonValue] = {
                 "result_id": reference,
                 "ref": reference,
@@ -1935,6 +2280,7 @@ class TimelineQuery:
                 "at_time": _timestamp(at_ms),
                 "prompt_ref": prompt_reference,
                 "prompt_at_ms": record.get("prompt_at_ms"),
+                "prompt_in_scope": record.get("prompt_in_scope"),
                 "prompt_author_kind": prompt_kind,
                 "linked_response_count": response_counts.get(reference, 0),
                 "score": score,
@@ -1947,9 +2293,9 @@ class TimelineQuery:
             if phase_reference is not None:
                 item["phase_ref"] = phase_reference
             if prompt_reference is not None and prompt_reference != reference:
-                prompt_text = prompt_texts.get(prompt_reference)
-                if prompt_text is not None:
-                    item["prompt_excerpt"] = _compact_text(prompt_text)[:320]
+                prompt_excerpt = link_context.prompt_excerpts.get(prompt_reference)
+                if prompt_excerpt is not None:
+                    item["prompt_excerpt"] = prompt_excerpt
             matches.append((score, at_ms, reference, item))
         if sort == "relevance":
             matches.sort(key=lambda item: (-item[0], -item[1], item[2]))
@@ -2089,9 +2435,7 @@ class TimelineQuery:
                         start_ms=start_ms,
                     )
         if selected_agent is None:
-            results.extend(
-                self._search_rollups(needle, filters, case_sensitive)
-            )
+            results.extend(self._search_rollups(needle, filters, case_sensitive))
         return results
 
     def _search_rollups(
@@ -2323,7 +2667,9 @@ def archive_stats(root: Path, filters: QueryFilters) -> ArchiveStats:
     )
 
 
-def query_envelope(command: str, items: list[dict[str, JsonValue]]) -> dict[str, JsonValue]:
+def query_envelope(
+    command: str, items: list[dict[str, JsonValue]]
+) -> dict[str, JsonValue]:
     """Wrap records in a small versioned response for default JSON output."""
 
     widened_items: list[JsonValue] = [item for item in items]
@@ -2385,10 +2731,18 @@ def _markdown_item(item: dict[str, JsonValue]) -> str:
             lines.extend(("### Transcript", ""))
             for index, raw_message in enumerate(transcript_value):
                 message = as_object(raw_message, f"detail.transcript[{index}]")
-                role = as_string(message.get("role"), f"detail.transcript[{index}].role")
-                at_ms = as_int(message.get("at_ms"), f"detail.transcript[{index}].at_ms")
-                text = as_string(message.get("text"), f"detail.transcript[{index}].text")
-                lines.extend((f"#### {role} · {_timestamp(at_ms)}", "", text.rstrip(), ""))
+                role = as_string(
+                    message.get("role"), f"detail.transcript[{index}].role"
+                )
+                at_ms = as_int(
+                    message.get("at_ms"), f"detail.transcript[{index}].at_ms"
+                )
+                text = as_string(
+                    message.get("text"), f"detail.transcript[{index}].text"
+                )
+                lines.extend(
+                    (f"#### {role} · {_timestamp(at_ms)}", "", text.rstrip(), "")
+                )
     return "\n".join(lines).rstrip()
 
 
@@ -2505,9 +2859,7 @@ def _stats_scope(stats: ArchiveStats) -> str:
     teams = ", ".join(stats.teams) if stats.teams else "all teams"
     time_scope = "filtered time window" if stats.time_filtered else "all time"
     rollups = (
-        ", ".join(stats.rollup_kinds)
-        if stats.rollup_kinds
-        else "all rollup kinds"
+        ", ".join(stats.rollup_kinds) if stats.rollup_kinds else "all rollup kinds"
     )
     return f"{teams}; {time_scope}; {rollups}"
 
@@ -2606,9 +2958,7 @@ def format_stats(stats: ArchiveStats, output_format: str) -> str:
     if output_format == "json":
         return canonical_json(stats.to_mapping())
     if output_format == "jsonl":
-        return json.dumps(
-            stats.to_mapping(), ensure_ascii=False, sort_keys=True
-        ) + "\n"
+        return json.dumps(stats.to_mapping(), ensure_ascii=False, sort_keys=True) + "\n"
     if output_format == "markdown":
         return _format_stats_markdown(stats)
     if output_format == "text":
@@ -2776,7 +3126,9 @@ def _standalone_parser() -> argparse.ArgumentParser:
         ("phases", "list summarized agent work phases"),
         ("rollups", "list hourly, daily, weekly, and longer summaries"),
     ):
-        resource_parser = sub.add_parser(resource, help=help_text, description=help_text)
+        resource_parser = sub.add_parser(
+            resource, help=help_text, description=help_text
+        )
         _standalone_add_filters(resource_parser)
         _standalone_add_common_options(resource_parser, "json")
 
@@ -2912,19 +3264,13 @@ def _standalone_parser() -> argparse.ArgumentParser:
         default=None,
         help="compatibility search scope (default when --in is absent: summaries)",
     )
-    searching.add_argument(
-        "--match", choices=SEARCH_MATCH_MODES, default=None
-    )
+    searching.add_argument("--match", choices=SEARCH_MATCH_MODES, default=None)
     searching.add_argument("--sort", choices=SEARCH_SORTS, default=None)
     searching.add_argument(
         "--prompt-author", choices=SEARCH_PROMPT_AUTHORS, default=None
     )
-    searching.add_argument(
-        "--linkage", choices=SEARCH_LINKAGES, default=None
-    )
-    searching.add_argument(
-        "--role", action="append", choices=SEARCH_ROLES, default=[]
-    )
+    searching.add_argument("--linkage", choices=SEARCH_LINKAGES, default=None)
+    searching.add_argument("--role", action="append", choices=SEARCH_ROLES, default=[])
     searching.add_argument(
         "--case-sensitive", action="store_true", help="preserve letter case"
     )
@@ -3066,9 +3412,7 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
             query_transcripts = TranscriptQuery(output)
             raw_range: object = ns.ordinal_range
             ordinal_range = (
-                parse_ordinal_range(raw_range)
-                if isinstance(raw_range, str)
-                else None
+                parse_ordinal_range(raw_range) if isinstance(raw_range, str) else None
             )
             command = action
             items = (

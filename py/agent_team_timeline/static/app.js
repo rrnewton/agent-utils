@@ -18,7 +18,11 @@
   var MIN_VIEW_MS = 1000;
   var SEARCH_RESULT_LIMIT = 100;
   var SEARCH_JUMP_SPAN_MS = 30 * 60 * 1000;
+  var SEARCH_EXCERPT_CHARACTERS = 480;
+  var SEARCH_INPUT_DEBOUNCE_MS = 250;
+  var SEARCH_LOAD_CONCURRENCY = 6;
   var TRIGRAM_BLOOM_ALGORITHM = "ascii-lower-utf8-trigram-fnv1a32-double-v1";
+  var TRIGRAM_BLOOM_HASH_COUNT = 7;
   var FNV_OFFSET = 2166136261;
   var FNV_PRIME = 16777619;
   var SECOND_HASH_SEED = 0x9e3779b9;
@@ -138,8 +142,17 @@
     searchCatalog: [],
     searchBloomByUrl: new Map(),
     loadedSearchShardUrls: new Set(),
+    loadedSearchLinkUrls: new Set(),
     searchRecords: [],
     searchRecordsByRef: new Map(),
+    searchPromptExcerpts: new Map(),
+    searchResponsesByPrompt: new Map(),
+    searchLinkPromptRefs: new Set(),
+    searchLinkResponseRefs: new Set(),
+    searchLoadQueue: [],
+    searchLoadActive: 0,
+    searchInputTimer: null,
+    searchRequestGeneration: 0,
     transcriptSearchState: "legacy",
     transcriptSearchError: "",
     transcriptSearchResults: [],
@@ -1320,7 +1333,7 @@
   function loadDetailShard(catalogEntry) {
     var url = immutableTimelineObjectUrl(catalogEntry, "detail shard");
     if (!app.detailPromises.has(url)) {
-      var request = fetchJsonCached(url).then(function (raw) {
+      var request = fetchContentAddressedJson(catalogEntry, "detail shard").then(function (raw) {
         mergeDetailShard(raw, url);
         return raw;
       });
@@ -1408,6 +1421,12 @@
     return lowered;
   }
 
+  function asciiLowerSearchText(value) {
+    return compactSearchText(value).replace(/[A-Z]/g, function (character) {
+      return character.toLowerCase();
+    });
+  }
+
   function searchTextTrigrams(value) {
     var encoded = asciiLowerUtf8SearchBytes(value);
     if (encoded.length < 3) {
@@ -1488,8 +1507,10 @@
         !Number.isInteger(Math.log2(bitCount))) {
       throw new Error(where + ".bit_count: expected a power of two of at least 64");
     }
-    if (!Number.isSafeInteger(hashCount) || hashCount <= 0) {
-      throw new Error(where + ".hash_count: expected a positive integer");
+    if (hashCount !== TRIGRAM_BLOOM_HASH_COUNT) {
+      throw new Error(
+        where + ".hash_count: expected " + TRIGRAM_BLOOM_HASH_COUNT
+      );
     }
     if (!Number.isSafeInteger(trigramCount) || trigramCount < 0) {
       throw new Error(where + ".trigram_count: expected a non-negative integer");
@@ -1589,12 +1610,19 @@
       var expectedPrefix = (recordType === "tool" ? "tool:" : "message:") +
         expectedTeam + "::";
       var agentId = text(record.agent_id);
+      var localAgentId = agentId.startsWith(expectedTeam + "::")
+        ? agentId.slice(expectedTeam.length + 2)
+        : agentId;
+      var expectedAgentReference = "agent:" + expectedTeam + "::" + localAgentId;
       var agent = app.agentsById.get(agentId);
       var role = text(record.role);
       var at = number(record.at_ms, NaN);
       var promptReference = text(record.prompt_ref);
+      var eventId = text(record.event_id);
       if (text(record.team) !== expectedTeam || !reference.startsWith(expectedPrefix) ||
-          reference.length <= expectedPrefix.length || !agentId || !agent ||
+          reference.length <= expectedPrefix.length || !eventId ||
+          reference !== expectedPrefix + eventId || !agentId || !agent ||
+          text(record.agent_ref) !== expectedAgentReference ||
           text(agent.team) !== expectedTeam || allowedRoles.indexOf(role) < 0 ||
           !text(record.text) || !Number.isFinite(at) ||
           at < expectedStart || at >= expectedEnd ||
@@ -1635,10 +1663,147 @@
 
   function loadTranscriptSearchShard(catalogEntry) {
     var url = immutableTimelineObjectUrl(catalogEntry, "transcript search shard");
-    return fetchJsonCached(url).then(function (raw) {
+    return fetchContentAddressedJson(
+      catalogEntry,
+      "transcript search shard"
+    ).then(function (raw) {
       mergeTranscriptSearchShard(raw, catalogEntry, url);
       return raw;
     });
+  }
+
+  function validateTranscriptSearchLinkage(raw, catalogEntry, url) {
+    if (!raw || typeof raw !== "object" || number(raw.schema_version, NaN) !== 1 ||
+        text(raw.kind) !== "timeline-search-links-day") {
+      throw new Error("Unsupported transcript search linkage shard: " + url);
+    }
+    validateSchema2ObjectSourceDigest(raw, "Transcript search linkage shard");
+    var expectedTeam = text(catalogEntry && catalogEntry.team);
+    var expectedStart = number(catalogEntry && catalogEntry.start_ms, NaN);
+    var expectedEnd = number(catalogEntry && catalogEntry.end_ms, NaN);
+    var range = raw.range && typeof raw.range === "object" ? raw.range : null;
+    var linkage = catalogEntry && catalogEntry.linkage &&
+      typeof catalogEntry.linkage === "object" ? catalogEntry.linkage : null;
+    var counts = linkage && linkage.counts && typeof linkage.counts === "object"
+      ? linkage.counts
+      : null;
+    var prompts = array(raw.prompts);
+    var responses = array(raw.responses);
+    if (!expectedTeam || text(raw.team) !== expectedTeam ||
+        number(range && range.start_ms, NaN) !== expectedStart ||
+        number(range && range.end_ms, NaN) !== expectedEnd ||
+        number(counts && counts.prompts, NaN) !== prompts.length ||
+        number(counts && counts.responses, NaN) !== responses.length) {
+      throw new Error(
+        "Transcript search linkage shard does not match its catalog entry: " + url
+      );
+    }
+    var messagePrefix = "message:" + expectedTeam + "::";
+    var agentPrefix = "agent:" + expectedTeam + "::";
+    prompts.forEach(function (prompt) {
+      if (!prompt || typeof prompt !== "object" ||
+          !text(prompt.ref).startsWith(messagePrefix) ||
+          typeof prompt.excerpt !== "string") {
+        throw new Error("Transcript search linkage shard has an invalid prompt: " + url);
+      }
+    });
+    responses.forEach(function (response) {
+      var at = number(response && response.at_ms, NaN);
+      if (!response || typeof response !== "object" ||
+          !text(response.ref).startsWith(messagePrefix) ||
+          !text(response.prompt_ref).startsWith(messagePrefix) ||
+          !text(response.agent_ref).startsWith(agentPrefix) ||
+          !Number.isFinite(at) || at < expectedStart || at >= expectedEnd) {
+        throw new Error("Transcript search linkage shard has an invalid response: " + url);
+      }
+    });
+    return { prompts: prompts, responses: responses };
+  }
+
+  function mergeTranscriptSearchLinkage(raw, catalogEntry, url) {
+    if (app.loadedSearchLinkUrls.has(url)) {
+      return;
+    }
+    var linkage = validateTranscriptSearchLinkage(raw, catalogEntry, url);
+    linkage.prompts.forEach(function (prompt) {
+      var reference = text(prompt.ref);
+      if (app.searchLinkPromptRefs.has(reference)) {
+        throw new Error("Duplicate transcript search linkage prompt: " + reference);
+      }
+      app.searchLinkPromptRefs.add(reference);
+      app.searchPromptExcerpts.set(reference, text(prompt.excerpt));
+    });
+    linkage.responses.forEach(function (response) {
+      var reference = text(response.ref);
+      var promptReference = text(response.prompt_ref);
+      if (app.searchLinkResponseRefs.has(reference)) {
+        throw new Error("Duplicate transcript search linkage response: " + reference);
+      }
+      app.searchLinkResponseRefs.add(reference);
+      if (!app.searchResponsesByPrompt.has(promptReference)) {
+        app.searchResponsesByPrompt.set(promptReference, []);
+      }
+      app.searchResponsesByPrompt.get(promptReference).push(response);
+    });
+    app.searchResponsesByPrompt.forEach(function (responses) {
+      responses.sort(function (left, right) {
+        return number(left.at_ms, 0) - number(right.at_ms, 0) ||
+          text(left.ref).localeCompare(text(right.ref));
+      });
+    });
+    app.loadedSearchLinkUrls.add(url);
+  }
+
+  function loadTranscriptSearchLinkage(catalogEntry) {
+    var reference = catalogEntry && catalogEntry.linkage;
+    if (!reference || typeof reference !== "object") {
+      return Promise.resolve(null);
+    }
+    var url = immutableTimelineObjectUrl(reference, "transcript search linkage shard");
+    return fetchContentAddressedJson(
+      reference,
+      "transcript search linkage shard"
+    ).then(function (raw) {
+      mergeTranscriptSearchLinkage(raw, catalogEntry, url);
+      return raw;
+    });
+  }
+
+  function loadSearchItemsBounded(items, loader, generation, isCurrent) {
+    function pump() {
+      while (app.searchLoadActive < SEARCH_LOAD_CONCURRENCY &&
+             app.searchLoadQueue.length) {
+        var job = app.searchLoadQueue.shift();
+        if (job.generation !== null &&
+            job.generation !== app.searchRequestGeneration) {
+          job.resolve(null);
+          continue;
+        }
+        if (job.isCurrent && !job.isCurrent()) {
+          job.resolve(null);
+          continue;
+        }
+        app.searchLoadActive += 1;
+        Promise.resolve().then(job.run).then(job.resolve, job.reject).finally(
+          function () {
+            app.searchLoadActive -= 1;
+            pump();
+          }
+        );
+      }
+    }
+    return Promise.all(items.map(function (item) {
+      return new Promise(function (resolve, reject) {
+        app.searchLoadQueue.push({
+          generation: generation,
+          isCurrent: isCurrent || null,
+          run: function () { return loader(item); },
+          resolve: resolve,
+          reject: reject
+        });
+        pump();
+      });
+    }));
   }
 
   function transcriptSearchShards() {
@@ -1660,13 +1825,26 @@
     app.transcriptSearchError = "";
     updateShardDiagnostics();
     renderTranscriptSearchResults();
-    var promises = transcriptSearchShards().map(loadTranscriptSearchShard);
-    return Promise.all(promises).then(function (values) {
+    var generation = app.searchRequestGeneration;
+    var textShards = transcriptSearchShards();
+    var linkageShards = app.searchCatalog.filter(function (shard) {
+      return !app.selectedTeam || text(shard.team) === app.selectedTeam;
+    });
+    return Promise.all([
+      loadSearchItemsBounded(textShards, loadTranscriptSearchShard, generation),
+      loadSearchItemsBounded(linkageShards, loadTranscriptSearchLinkage, generation)
+    ]).then(function (values) {
+      if (generation !== app.searchRequestGeneration) {
+        return values;
+      }
       app.transcriptSearchState = "ready";
       updateShardDiagnostics();
       updateTranscriptSearch();
       return values;
     }).catch(function (error) {
+      if (generation !== app.searchRequestGeneration) {
+        return [];
+      }
       app.transcriptSearchState = "error";
       app.transcriptSearchError = error instanceof Error ? error.message : String(error);
       updateShardDiagnostics();
@@ -1681,8 +1859,7 @@
       return recordType === "prompt" && text(record.author_kind) === "owner_human";
     }
     if (app.searchScope === "agent-responses") {
-      return recordType === "response" || recordType === "inter_agent_response" ||
-        recordType === "inter_agent";
+      return recordType === "response" || recordType === "inter_agent_response";
     }
     return app.searchScope === "all-transcript";
   }
@@ -1841,13 +2018,13 @@
     main.addEventListener("dblclick", function (event) {
       event.preventDefault();
       jumpToSearchRecord(record);
-      openSearchMessageModal(record);
+      openSearchMessageModal(record).catch(showDetailLoadError);
     });
     var open = htmlElement("button", "button search-result-open", "Open");
     open.type = "button";
     open.addEventListener("click", function () {
       jumpToSearchRecord(record);
-      openSearchMessageModal(record);
+      openSearchMessageModal(record).catch(showDetailLoadError);
     });
     card.append(main, open);
     return card;
@@ -1969,6 +2146,73 @@
     }).catch(showDetailLoadError);
   }
 
+  function searchShardAt(team, at) {
+    return app.searchCatalog.find(function (shard) {
+      return text(shard.team) === team &&
+        number(shard.start_ms, Infinity) <= at &&
+        number(shard.end_ms, -Infinity) > at;
+    }) || null;
+  }
+
+  function ensureSearchContext(record, request) {
+    if (app.schemaMode !== "schema2") {
+      return Promise.resolve([]);
+    }
+    var team = text(record.team);
+    var reference = text(record.ref);
+    var promptReference = text(record.record_type) === "prompt"
+      ? reference
+      : text(record.prompt_ref);
+    if (!team || !promptReference) {
+      return Promise.resolve([]);
+    }
+    var teamShards = app.searchCatalog.filter(function (shard) {
+      return text(shard.team) === team;
+    });
+    var hasLinkage = teamShards.length > 0 && teamShards.every(function (shard) {
+      return shard.linkage && typeof shard.linkage === "object";
+    });
+    var needed = [];
+    if (!hasLinkage) {
+      needed = teamShards;
+    } else {
+      var timestamps = [number(record.at_ms, NaN)];
+      var promptAt = text(record.record_type) === "prompt"
+        ? number(record.at_ms, NaN)
+        : number(record.prompt_at_ms, NaN);
+      if (Number.isFinite(promptAt)) {
+        timestamps.push(promptAt);
+      }
+      array(app.searchResponsesByPrompt.get(promptReference)).forEach(function (response) {
+        var at = number(response && response.at_ms, NaN);
+        if (Number.isFinite(at)) {
+          timestamps.push(at);
+        }
+      });
+      var seen = new Set();
+      timestamps.forEach(function (at) {
+        if (!Number.isFinite(at)) {
+          return;
+        }
+        var shard = searchShardAt(team, at);
+        if (!shard) {
+          return;
+        }
+        var url = immutableTimelineObjectUrl(shard, "transcript search shard");
+        if (!seen.has(url)) {
+          seen.add(url);
+          needed.push(shard);
+        }
+      });
+    }
+    return loadSearchItemsBounded(
+      needed,
+      loadTranscriptSearchShard,
+      null,
+      function () { return request === app.detailRequest; }
+    );
+  }
+
   function linkedSearchContext(record) {
     var reference = text(record.ref);
     var promptReference = text(record.prompt_ref);
@@ -1979,15 +2223,17 @@
       return [];
     }
     var prompt = app.searchRecordsByRef.get(promptReference) || null;
+    if (!prompt) {
+      return [];
+    }
     var responses = app.searchRecords.filter(function (candidate) {
       var candidateReference = text(candidate.ref);
       var recordType = text(candidate.record_type);
       return candidateReference !== promptReference &&
         text(candidate.prompt_ref) === promptReference &&
-        (recordType === "response" || recordType === "inter_agent_response" ||
-          recordType === "inter_agent");
+        (recordType === "response" || recordType === "inter_agent_response");
     });
-    var context = prompt ? [prompt] : [];
+    var context = [prompt];
     responses.sort(function (left, right) {
       return number(left.at_ms, 0) - number(right.at_ms, 0) ||
         text(left.ref).localeCompare(text(right.ref));
@@ -2027,7 +2273,13 @@
     var context = linkedSearchContext(record);
     if (!context.length) {
       container.appendChild(
-        htmlElement("div", "empty-message", "No mechanically linked prompt was recorded.")
+        htmlElement(
+          "div",
+          "empty-message",
+          record.prompt_in_scope === false
+            ? "The mechanically linked prompt is outside this exported time slice."
+            : "No mechanically linked prompt was recorded."
+        )
       );
       return;
     }
@@ -2049,28 +2301,39 @@
   }
 
   function openSearchMessageModal(record) {
-    var context = linkedSearchContext(record);
-    openModalBase(
-      "Transcript · " + formatFullTime(number(record.at_ms, NaN)),
-      searchRecordAgentLabel(record) + " · " + searchRoleLabel(record),
-      "",
-      null
-    );
-    var tabs = [{
-      label: "Message",
-      render: function (container) {
-        renderSearchMessage(container, record, "Exact message");
+    var request = app.detailRequest + 1;
+    app.detailRequest = request;
+    return ensureSearchContext(record, request).then(function () {
+      if (request !== app.detailRequest) {
+        return;
       }
-    }];
-    if (context.length) {
-      tabs.push({
-        label: "Prompt & responses",
+      openModalBase(
+        "Transcript · " + formatFullTime(number(record.at_ms, NaN)),
+        searchRecordAgentLabel(record) + " · " + searchRoleLabel(record),
+        "",
+        null
+      );
+      var tabs = [{
+        label: "Message",
         render: function (container) {
-          renderSearchMessageContext(container, record);
+          renderSearchMessage(container, record, "Exact message");
         }
-      });
-    }
-    activateTabs(tabs, 0);
+      }];
+      if (text(record.record_type) === "prompt" || text(record.prompt_ref)) {
+        tabs.push({
+          label: "Prompt & responses",
+          render: function (container) {
+            renderSearchMessageContext(container, record);
+          }
+        });
+      }
+      activateTabs(tabs, 0);
+    }).catch(function (error) {
+      if (request !== app.detailRequest) {
+        return;
+      }
+      throw error;
+    });
   }
 
   function loadPhaseIndex() {
@@ -2082,7 +2345,10 @@
         app.phaseIndexReference,
         "timeline phase index"
       );
-      var request = fetchJsonCached(url).then(function (raw) {
+      var request = fetchContentAddressedJson(
+        app.phaseIndexReference,
+        "timeline phase index"
+      ).then(function (raw) {
         if (!raw || typeof raw !== "object" || number(raw.schema_version, NaN) !== 2 ||
             text(raw.kind) !== "timeline-phase-index") {
           throw new Error("Unsupported timeline phase index: " + url);
@@ -2198,7 +2464,7 @@
   function searchQueryParts(value) {
     var query = compactSearchText(value);
     var parts = [];
-    var pattern = /"([^"\\]*(?:\\.[^"\\]*)*)"|(\S+)/g;
+    var pattern = /"([^"\\]*(?:\\.[^"\\]*)*)"|([^ ]+)/g;
     var match;
     while ((match = pattern.exec(query)) !== null) {
       if (match[1] !== undefined) {
@@ -2234,10 +2500,40 @@
     return Boolean(value) && /[\p{L}\p{N}_]/u.test(value);
   }
 
+  function searchCharacterBefore(value, index) {
+    if (index <= 0) {
+      return "";
+    }
+    var start = index - 1;
+    var low = value.charCodeAt(start);
+    if (low >= 0xdc00 && low <= 0xdfff && start > 0) {
+      var high = value.charCodeAt(start - 1);
+      if (high >= 0xd800 && high <= 0xdbff) {
+        start -= 1;
+      }
+    }
+    return value.slice(start, index);
+  }
+
+  function searchCharacterAt(value, index) {
+    if (index < 0 || index >= value.length) {
+      return "";
+    }
+    var end = index + 1;
+    var high = value.charCodeAt(index);
+    if (high >= 0xd800 && high <= 0xdbff && end < value.length) {
+      var low = value.charCodeAt(end);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        end += 1;
+      }
+    }
+    return value.slice(index, end);
+  }
+
   function wholeSearchRanges(haystack, needle) {
     return allSearchRanges(haystack, needle).filter(function (range) {
-      return !searchWordCharacter(haystack[range[0] - 1]) &&
-        !searchWordCharacter(haystack[range[1]]);
+      return !searchWordCharacter(searchCharacterBefore(haystack, range[0])) &&
+        !searchWordCharacter(searchCharacterAt(haystack, range[1]));
     });
   }
 
@@ -2247,7 +2543,7 @@
     if (!compact || !compactQuery) {
       return null;
     }
-    var comparable = compact.toLocaleLowerCase();
+    var comparable = asciiLowerSearchText(compact);
     var parts = searchQueryParts(compactQuery);
     if (!parts.length) {
       return null;
@@ -2255,7 +2551,7 @@
     var ranges = [];
     for (var index = 0; index < parts.length; index += 1) {
       var part = parts[index];
-      var sought = part.value.toLocaleLowerCase();
+      var sought = asciiLowerSearchText(part.value);
       var candidate = !part.quoted && /^[\p{L}\p{N}_-]+$/u.test(part.value)
         ? wholeSearchRanges(comparable, sought)
         : allSearchRanges(comparable, sought);
@@ -2274,7 +2570,7 @@
     var first = Math.min.apply(null, ranges.map(function (range) { return range[0]; }));
     var last = Math.max.apply(null, ranges.map(function (range) { return range[1]; }));
     var span = Math.max(1, last - first);
-    var exact = comparable === compactQuery.toLocaleLowerCase();
+    var exact = comparable === asciiLowerSearchText(compactQuery);
     return {
       compact: compact,
       ranges: ranges,
@@ -2285,9 +2581,8 @@
 
   function searchExcerpt(match) {
     var first = Math.min.apply(null, match.ranges.map(function (range) { return range[0]; }));
-    var last = Math.max.apply(null, match.ranges.map(function (range) { return range[1]; }));
     var start = Math.max(0, first - 120);
-    var end = Math.min(match.compact.length, Math.max(last + 180, start + 320));
+    var end = Math.min(match.compact.length, start + SEARCH_EXCERPT_CHARACTERS);
     return {
       text: match.compact.slice(start, end),
       ranges: match.ranges.filter(function (range) {
@@ -5997,6 +6292,60 @@
     return app.resourcePromises.get(url);
   }
 
+  function sha256Hex(bytes) {
+    if (!window.crypto || !window.crypto.subtle) {
+      return Promise.reject(
+        new Error("This browser cannot verify timeline object SHA-256 digests.")
+      );
+    }
+    return window.crypto.subtle.digest("SHA-256", bytes).then(function (digest) {
+      return Array.from(new Uint8Array(digest)).map(function (byte) {
+        return byte.toString(16).padStart(2, "0");
+      }).join("");
+    });
+  }
+
+  function fetchContentAddressedJson(reference, where) {
+    var url = immutableTimelineObjectUrl(reference, where);
+    var expectedBytes = number(reference.bytes, NaN);
+    var checksByteCount = hasField(reference, "bytes");
+    if (checksByteCount &&
+        (!Number.isSafeInteger(expectedBytes) || expectedBytes < 0)) {
+      return Promise.reject(new Error(where + ".bytes must be a non-negative integer."));
+    }
+    if (!app.resourcePromises.has(url)) {
+      var expectedDigest = text(reference.sha256);
+      var request = (async function () {
+        var response = await fetch(url, { credentials: "same-origin" });
+        if (!response.ok) {
+          var error = new Error("HTTP " + response.status + " " + response.statusText);
+          error.httpStatus = response.status;
+          throw error;
+        }
+        var buffer = await response.arrayBuffer();
+        if (checksByteCount && buffer.byteLength !== expectedBytes) {
+          throw new Error(
+            where + " byte count mismatch: expected " + expectedBytes +
+            ", received " + buffer.byteLength + "."
+          );
+        }
+        var actualDigest = await sha256Hex(buffer);
+        if (actualDigest !== expectedDigest) {
+          throw new Error(where + " SHA-256 mismatch.");
+        }
+        return JSON.parse(new TextDecoder("utf-8").decode(buffer));
+      }());
+      var cached = request.catch(function (error) {
+        if (app.resourcePromises.get(url) === cached) {
+          app.resourcePromises.delete(url);
+        }
+        throw error;
+      });
+      app.resourcePromises.set(url, cached);
+    }
+    return app.resourcePromises.get(url);
+  }
+
   async function loadSchema2() {
     var bootstrap;
     try {
@@ -6016,7 +6365,10 @@
     if (bootstrap.phase_index) {
       immutableTimelineObjectUrl(bootstrap.phase_index, "timeline phase index");
     }
-    var globalData = await fetchJsonCached(globalUrl);
+    var globalData = await fetchContentAddressedJson(
+      bootstrap.global,
+      "timeline global"
+    );
     if (!globalData || typeof globalData !== "object" ||
         number(globalData.schema_version, NaN) !== 2 ||
         text(globalData.kind) !== "timeline-global") {
@@ -6059,6 +6411,20 @@
             !Number.isFinite(recordCount) || searchUrls.has(url)) {
           throw new Error("Invalid or duplicate transcript search shard catalog entry.");
         }
+        if (hasField(shard, "linkage")) {
+          var linkage = shard.linkage && typeof shard.linkage === "object"
+            ? shard.linkage
+            : null;
+          var linkageCounts = linkage && linkage.counts &&
+            typeof linkage.counts === "object" ? linkage.counts : null;
+          immutableTimelineObjectUrl(linkage, "transcript search linkage shard");
+          if (!Number.isSafeInteger(number(linkageCounts && linkageCounts.prompts, NaN)) ||
+              number(linkageCounts && linkageCounts.prompts, NaN) < 0 ||
+              !Number.isSafeInteger(number(linkageCounts && linkageCounts.responses, NaN)) ||
+              number(linkageCounts && linkageCounts.responses, NaN) < 0) {
+            throw new Error("Invalid transcript search linkage catalog entry.");
+          }
+        }
         if (hasField(shard, "trigram_bloom")) {
           searchBloomByUrl.set(
             url,
@@ -6083,8 +6449,13 @@
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
     app.loadedSearchShardUrls.clear();
+    app.loadedSearchLinkUrls.clear();
     app.searchRecords = [];
     app.searchRecordsByRef.clear();
+    app.searchPromptExcerpts.clear();
+    app.searchResponsesByPrompt.clear();
+    app.searchLinkPromptRefs.clear();
+    app.searchLinkResponseRefs.clear();
     app.searchShardState = catalog.length ? "unloaded" : "ready";
     app.transcriptSearchState = searchCatalog.length ? "unloaded" : "unavailable";
     app.transcriptSearchError = searchCatalog.length
@@ -6117,8 +6488,13 @@
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
     app.loadedSearchShardUrls.clear();
+    app.loadedSearchLinkUrls.clear();
     app.searchRecords = [];
     app.searchRecordsByRef.clear();
+    app.searchPromptExcerpts.clear();
+    app.searchResponsesByPrompt.clear();
+    app.searchLinkPromptRefs.clear();
+    app.searchLinkResponseRefs.clear();
     app.searchShardState = "legacy";
     app.transcriptSearchState = "unavailable";
     app.transcriptSearchError = "Transcript search requires a schema-2 export.";
@@ -6152,10 +6528,23 @@
   }
 
   function transcriptSearchNeedsLoad() {
-    return transcriptSearchShards().some(function (shard) {
+    var missingText = transcriptSearchShards().some(function (shard) {
       return !app.loadedSearchShardUrls.has(
         immutableTimelineObjectUrl(shard, "transcript search shard")
       );
+    });
+    if (missingText) {
+      return true;
+    }
+    return app.searchCatalog.some(function (shard) {
+      if (app.selectedTeam && text(shard.team) !== app.selectedTeam) {
+        return false;
+      }
+      var reference = shard && shard.linkage;
+      return reference && typeof reference === "object" &&
+        !app.loadedSearchLinkUrls.has(
+          immutableTimelineObjectUrl(reference, "transcript search linkage shard")
+        );
     });
   }
 
@@ -6195,6 +6584,29 @@
     updateTranscriptSearch();
   }
 
+  function invalidateTranscriptSearchRequest() {
+    app.searchRequestGeneration += 1;
+    app.detailRequest += 1;
+    if (app.searchInputTimer !== null) {
+      window.clearTimeout(app.searchInputTimer);
+      app.searchInputTimer = null;
+    }
+  }
+
+  function scheduleSearchRefresh() {
+    invalidateTranscriptSearchRequest();
+    if (!transcriptSearchActive() || !app.query) {
+      refreshSearch();
+      return;
+    }
+    app.transcriptSearchState = "loading";
+    renderTranscriptSearchResults();
+    app.searchInputTimer = window.setTimeout(function () {
+      app.searchInputTimer = null;
+      refreshSearch();
+    }, SEARCH_INPUT_DEBOUNCE_MS);
+  }
+
   function updateSearchPlaceholder() {
     dom.search.placeholder = {
       labels: "Agent, phase, message…",
@@ -6205,6 +6617,7 @@
   }
 
   dom.teamFilter.addEventListener("change", function () {
+    invalidateTranscriptSearchRequest();
     app.selectedTeam = dom.teamFilter.value;
     dom.scroll.scrollTop = 0;
     populateSummaryFiles();
@@ -6216,10 +6629,11 @@
     app.query = dom.search.value.trim();
     dom.scroll.scrollTop = 0;
     app.activeSearchRef = "";
-    refreshSearch();
+    scheduleSearchRefresh();
   });
 
   dom.searchScope.addEventListener("change", function () {
+    invalidateTranscriptSearchRequest();
     app.searchScope = dom.searchScope.value;
     app.activeSearchRef = "";
     updateSearchPlaceholder();
@@ -6232,6 +6646,7 @@
   });
 
   dom.searchResultsClose.addEventListener("click", function () {
+    invalidateTranscriptSearchRequest();
     dom.search.value = "";
     app.query = "";
     app.activeSearchRef = "";

@@ -80,7 +80,10 @@ objects, so it is independent of phase chunking and includes final messages that
 agent lifetime boundary. Search objects contain verbatim message text plus condensed one-line tool
 records; they never contain raw tool inputs or outputs. A false-positive-only trigram filter in the
 catalog skips UTC-day objects that definitely cannot match the query, while exact matching inside
-every selected object remains authoritative.
+every selected object remains authoritative. Compact linkage sidecars keep cross-day prompts and
+responses connected even when only one text day matches, and current browser exports verify each
+content-addressed object's bytes before parsing it. Search input is debounced and shard loading is
+concurrency-bounded so normal typing does not accidentally download the whole corpus.
 
 The `teams`, `agents`, `phases`, `rollups`, and `search` commands return stable `team:`, `agent:`,
 `phase:`, `rollup:`, `message:`, and `tool:` references that can be copied into `show`. Showing a
