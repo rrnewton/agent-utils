@@ -172,9 +172,12 @@ def _thread_end(
     candidates = [agent.started_at_ms + 1000]
     if agent.ended_at_ms is not None:
         candidates.append(agent.ended_at_ms)
-    candidates.extend(event.timestamp_ms for event in events)
+    # Phase intervals are half-open.  Make an instantaneous transcript event extend the
+    # derived lifetime through the millisecond containing that event instead of choosing the
+    # event timestamp itself as an exclusive bound and silently dropping the final message.
+    candidates.extend(event.timestamp_ms + 1 for event in events)
     candidates.extend(
-        (tool.ended_at_ms or tool.started_at_ms)
+        (tool.ended_at_ms or tool.started_at_ms) + 1
         for tool in tools
     )
     candidates.extend(

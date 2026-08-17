@@ -126,3 +126,41 @@ def test_phase_character_limits_must_be_positive(
             context_chars=context_chars,
             transcript_chars=transcript_chars,
         )
+
+
+def test_final_event_at_agent_end_is_included_in_half_open_phase() -> None:
+    final_at = START + 2_000
+    final = _event("final", ROOT, 2_000, "final response must remain searchable")
+    team = TeamData(
+        team_slug="phase-final-event",
+        provider="codex",
+        root_thread_id=ROOT,
+        display_timezone="UTC",
+        sources=(),
+        agents=(
+            Agent(
+                ROOT,
+                None,
+                "/root",
+                None,
+                None,
+                0,
+                START,
+                final_at,
+                "completed",
+                "root",
+            ),
+        ),
+        turns=(),
+        events=(final,),
+        tool_calls=(),
+        edges=(),
+    )
+
+    phases = build_phases(team)
+
+    assert len(phases) == 1
+    assert phases[0].end_ms == final_at + 1
+    assert [entry.text for entry in phases[0].transcript] == [
+        "final response must remain searchable"
+    ]

@@ -461,7 +461,8 @@ def _result_edge_objs(
             continue
         phase_end_ms = max(
             (
-                phase.end_ms for phase in phases_by_agent.get(agent.thread_id, ())
+                phase.end_ms - 1
+                for phase in phases_by_agent.get(agent.thread_id, ())
             ),
             default=agent.ended_at_ms,
         )
