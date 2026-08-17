@@ -49,12 +49,38 @@ for required in cargo cp flock mktemp sha256sum; do
   fi
 done
 
-RUSTC_BIN="${RUSTC:-rustc}"
-if ! command -v "$RUSTC_BIN" >/dev/null 2>&1; then
-  echo "[$TOOL] Rust source launcher requires Rust compiler '$RUSTC_BIN'" >&2
+absolute_command_path() {
+  local requested="$1"
+  local resolved
+  resolved="$(command -v "$requested" 2>/dev/null)" || return 1
+  if [[ "$resolved" != /* ]]; then
+    resolved="$(cd "$(dirname "$resolved")" && pwd -P)/$(basename "$resolved")"
+  fi
+  if [[ ! -f "$resolved" || ! -x "$resolved" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+CARGO_BIN="$(absolute_command_path cargo)" || {
+  echo "[$TOOL] Rust source launcher could not resolve the Cargo executable" >&2
   exit 127
+}
+RUSTC_REQUESTED="${RUSTC:-rustc}"
+RUSTC_BIN="$(absolute_command_path "$RUSTC_REQUESTED")" || {
+  echo "[$TOOL] Rust source launcher requires Rust compiler '$RUSTC_REQUESTED'" >&2
+  exit 127
+}
+if [[ -n "${RUSTC:-}" ]]; then
+  # A caller may provide a checkout-relative compiler wrapper. Cargo itself runs from / below, so
+  # freeze that explicit choice to the absolute path resolved while still in the checkout.
+  RUSTC="$RUSTC_BIN"
+  export RUSTC
 fi
-HOST_TARGET="$("$RUSTC_BIN" -vV | sed -n 's/^host: //p')"
+# Match Cargo's neutral configuration/toolchain discovery below. Otherwise an enclosing consumer
+# rust-toolchain.toml could select one compiler for this target path while Cargo, launched from /,
+# selects another. Explicit RUSTC/RUSTUP_TOOLCHAIN environment choices remain authoritative.
+HOST_TARGET="$(cd / && "$RUSTC_BIN" -vV | sed -n 's/^host: //p')"
 if [[ ! "$HOST_TARGET" =~ ^[A-Za-z0-9_.-]+$ ]]; then
   echo "[$TOOL] could not determine a safe host target from '$RUSTC_BIN -vV'" >&2
   exit 3
@@ -78,6 +104,20 @@ mkdir -p "$LOCK_ROOT"
 # outside rs/target so a coordinated clean cannot unlink the inode while a launcher holds it.
 exec 9>"$LOCK_ROOT/cache.lock"
 flock 9
+
+run_cargo() {
+  # Cargo discovers configuration by walking upward from its PROCESS cwd, not from
+  # --manifest-path.  agent-utils is often checked out inside a consumer repository, whose
+  # .cargo/config.toml may require a different nightly feature, linker, target, or rustc.  Run the
+  # frontend from filesystem root so only system/root and the caller's normal CARGO_HOME settings
+  # apply; every workspace and output path below is absolute.  The built utility still starts in
+  # CALLER_CWD, preserving its public cwd behavior.
+  (
+    cd /
+    env -u AGENT_UTILS_RS_ENSURE_ONLY -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
+      "$CARGO_BIN" "$@"
+  )
+}
 
 cache_state="missing"
 before_binary=""
@@ -107,8 +147,7 @@ refresh_package() {
     rm -f -- "$TARGET_RELEASE/$package_tool" \
       "$TARGET_RELEASE/$package_tool.provenance"
   done
-  if ! env -u AGENT_UTILS_RS_ENSURE_ONLY -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
-      cargo clean --quiet --release \
+  if ! run_cargo clean --quiet --release \
       --manifest-path "$MANIFEST" --package "$PACKAGE" \
       --target-dir "$TARGET_ROOT" --target "$HOST_TARGET"; then
     echo "[$TOOL] Cargo clean failed; no cached Rust artifact was executed" >&2
@@ -131,8 +170,7 @@ while ((attempt <= 3)); do
   if [[ "$force_refresh" == "1" ]]; then
     build_targets=(--bins)
   fi
-  if ! env -u AGENT_UTILS_RS_ENSURE_ONLY -u CARGO_BUILD_TARGET -u CARGO_TARGET_DIR \
-      cargo build --quiet --locked --release \
+  if ! run_cargo build --quiet --locked --release \
       --manifest-path "$MANIFEST" --package "$PACKAGE" \
       --target-dir "$TARGET_ROOT" --target "$HOST_TARGET" "${build_targets[@]}"; then
     echo "[$TOOL] Cargo build failed; no cached Rust artifact was executed" >&2

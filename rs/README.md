@@ -42,6 +42,13 @@ content-addressed copy outside the deletable Cargo cache; containment code can
 therefore safely re-execute its own path while another process cleans or rebuilds.
 Direct invocations cannot silently use a binary from older checked-out source.
 
+Cargo and the host-compiler probe run from filesystem root with absolute
+workspace and target paths. This prevents a consumer repository that contains
+the agent-utils checkout from injecting an enclosing `.cargo/config.toml` or
+`rust-toolchain.toml`. Explicit environment choices and the normal user
+`CARGO_HOME` configuration remain available. After validation, the utility
+itself still starts in the caller's original working directory.
+
 These source-checkout launchers target Linux development hosts and require Git,
 Bash 4+, Cargo/Rust, GNU coreutils (`cp`, `readlink`, and `sha256sum`), and
 util-linux `flock`. This development path does not affect the portability or
