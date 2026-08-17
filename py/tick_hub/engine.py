@@ -21,7 +21,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 
-from tick_hub.cadence import is_due
+from tick_hub.cadence import (
+    MAX_STATE_VALUE,
+    UNRESOLVED_RENDER_COUNT_SUFFIX,
+    UNRESOLVED_RENDER_FIRST_SUFFIX,
+    UNRESOLVED_RENDER_STATE_PREFIX,
+    is_due,
+    unresolved_render_state_keys,
+)
 from tick_hub.emit import (
     format_no_result,
     HEALTH_STATUS_MISSING,
@@ -101,6 +108,10 @@ def evaluate_health(hc: HealthCheck, probe: FileAgeProbe, now: int) -> str:
 #: would render a CRASHED gate as a non-answer. Softening a real failure into
 #: NO_RESULT is the opposite of the point.
 NO_RESULT_EXIT = 75
+
+# Preserve the ordinary retry signal twice; the third consecutive failure adds a distinct
+# escalation without replacing the base ERROR/NO-SIGNAL records.
+REPEATED_RENDER_FAILURE_THRESHOLD = 3
 
 
 class GateOutcome(Enum):
@@ -226,6 +237,86 @@ def _no_signal_action(
     )
 
 
+def _placeholder_names(placeholders: Sequence[str]) -> str:
+    return ",".join(
+        placeholder.removeprefix("{").removesuffix("}")
+        for placeholder in placeholders
+    )
+
+
+def _repeated_render_failure_action(
+    reminder: Reminder,
+    *,
+    consecutive_failures: int,
+    first_failure_epoch: int,
+    missing_placeholders: Sequence[str],
+) -> str:
+    """Repeat a render fault with its persisted count without replacing the base alarm."""
+    missing = _placeholder_names(missing_placeholders)
+    fields = {
+        "component": "tick-hub-reporting",
+        "outcome": "NO-SIGNAL",
+        "gate": reminder.name,
+        "reason": "unresolved-placeholder",
+        "consecutive_failures": str(consecutive_failures),
+        "first_failure_epoch": str(first_failure_epoch),
+        "missing_placeholders": missing,
+    }
+    title = (
+        f"NO-SIGNAL gate={reminder.name}: unresolved-placeholder repeated for "
+        f"{consecutive_failures} consecutive render failures since first_failure_epoch="
+        f"{first_failure_epoch}; missing placeholder(s)={missing}"
+    )
+    return format_action(
+        reminder.emit.skill or "tick-hub-no-signal",
+        fields,
+        title,
+    )
+
+
+def _clear_render_failure_state(state: dict[str, int], reminder_name: str) -> None:
+    count_key, first_key = unresolved_render_state_keys(reminder_name)
+    state.pop(count_key, None)
+    state.pop(first_key, None)
+
+
+def _record_render_failure(
+    state: dict[str, int], reminder_name: str, now: int
+) -> tuple[int, int]:
+    count_key, first_key = unresolved_render_state_keys(reminder_name)
+    previous_count = state.get(count_key, 0)
+    consecutive = min(MAX_STATE_VALUE, max(0, previous_count) + 1)
+    first_failure_epoch = (
+        max(0, now)
+        if previous_count <= 0
+        else max(0, state.get(first_key, max(0, now)))
+    )
+    state[count_key] = consecutive
+    state[first_key] = first_failure_epoch
+    return consecutive, first_failure_epoch
+
+
+def _prune_removed_render_failure_state(
+    state: dict[str, int], reminder_names: set[str]
+) -> None:
+    """Drop this feature's malformed keys and records for reminders no longer configured."""
+    for key in tuple(state):
+        if not key.startswith(UNRESOLVED_RENDER_STATE_PREFIX):
+            continue
+        if key.endswith(UNRESOLVED_RENDER_COUNT_SUFFIX):
+            name = key[
+                len(UNRESOLVED_RENDER_STATE_PREFIX) : -len(UNRESOLVED_RENDER_COUNT_SUFFIX)
+            ]
+        elif key.endswith(UNRESOLVED_RENDER_FIRST_SUFFIX):
+            name = key[
+                len(UNRESOLVED_RENDER_STATE_PREFIX) : -len(UNRESOLVED_RENDER_FIRST_SUFFIX)
+            ]
+        else:
+            name = ""
+        if not name or name not in reminder_names:
+            state.pop(key, None)
+
+
 def _flags_satisfied(required: Sequence[str], flags: Mapping[str, object]) -> bool:
     typed_flags = {k: v for k, v in flags.items() if isinstance(v, (bool, int, str))}
     return all(flag_truthy(typed_flags, name) for name in required)
@@ -255,6 +346,9 @@ def run_tick(
             actions += 1
 
     new_fired = dict(fired)
+    _prune_removed_render_failure_state(
+        new_fired, {reminder.name for reminder in config.reminders}
+    )
     if state.enabled:
         evaluations: list[_ReminderEvaluation] = []
         for rem in config.reminders:
@@ -296,6 +390,7 @@ def run_tick(
             captured = evaluation.captured
             error = evaluation.error
             if error is not None:
+                _clear_render_failure_state(new_fired, rem.name)
                 # The check did not complete. Keep the ERROR for full diagnostic
                 # readers and emit a counted NO-SIGNAL action because production
                 # consumers may intentionally forward ACTION lines only. Retry
@@ -307,6 +402,7 @@ def run_tick(
                 actions += 1
                 continue
             if outcome is GateOutcome.NO_RESULT:
+                _clear_render_failure_state(new_fired, rem.name)
                 # A legitimate verdict, not a reporting fault: the gate ran and
                 # said it could not tell. Emitted as BOTH the explicit
                 # NO_RESULT diagnostic and a counted ACTION, because
@@ -322,6 +418,7 @@ def run_tick(
                 actions += 1
                 continue
             if outcome is GateOutcome.QUIET:
+                _clear_render_failure_state(new_fired, rem.name)
                 unavailable_dependencies = tuple(
                     dependency
                     for dependency in rem.depends_on
@@ -355,7 +452,21 @@ def run_tick(
                     )
                 )
                 actions += 1
+                consecutive, first_failure_epoch = _record_render_failure(
+                    new_fired, rem.name, now
+                )
+                if consecutive >= REPEATED_RENDER_FAILURE_THRESHOLD:
+                    lines.append(
+                        _repeated_render_failure_action(
+                            rem,
+                            consecutive_failures=consecutive,
+                            first_failure_epoch=first_failure_epoch,
+                            missing_placeholders=exc.placeholders,
+                        )
+                    )
+                    actions += 1
                 continue
+            _clear_render_failure_state(new_fired, rem.name)
             new_fired[rem.name] = now
             lines.append(line)
             if line.startswith("ACTION: "):

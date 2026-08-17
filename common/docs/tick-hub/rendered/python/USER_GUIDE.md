@@ -68,7 +68,8 @@ health_checks:
 `cadence_secs: 0` means every tick. A positive cadence means the reminder is
 due when at least that many seconds have elapsed since its last evaluation.
 Names must be non-empty and unique within reminders or health checks. Reminder
-names are fired-state keys and therefore cannot contain whitespace or `=`.
+names are fired-state keys and therefore cannot contain whitespace or `=`, or
+start with the reserved `__tick_hub_internal__.` namespace.
 Unknown fields, wrong types, negative cadences or thresholds, reserved `<<`
 mapping keys, and duplicate mapping keys are errors.
 
@@ -104,6 +105,13 @@ cadence. Both numeric flags are bounded to signed 64-bit values. `--no-header`
 suppresses the explanatory standard-error banner so standard output contains
 only protocol lines.
 
+The same atomic file also carries `__tick_hub_internal__.*` retry diagnostics.
+These keys are managed by tick-hub, are never cadence timestamps, and are
+pruned when their reminder is removed. In particular, unresolved template
+rendering stores a consecutive count and first-failure epoch. As with cadence,
+these updates become durable only with `--flush`; dry runs report what would
+happen without mutating the file.
+
 ## Output records
 
 Every standard-output line begins with a stable record type:
@@ -120,10 +128,19 @@ NOTE: emitted 1 instruction(s) this tick
 - `ACTION:` names one caller-defined handler and carries ordered `key=value`
   fields plus a quoted title.
 - `NOTE:` is informational and requires no dispatch.
-- `ERROR:` means a gate could not complete; that reminder is retried later.
+- `ERROR:` means a gate or its configured emission could not complete; that
+  reminder is retried later.
 - `NO_RESULT:` means a gate could not determine its condition, or a quiet
   dependent is unevaluable because such a gate is its declared dependency. It
   is neither a pass nor a failure and does not consume cadence.
+
+If a fired reminder cannot render because a `{placeholder}` is unresolved,
+tick-hub emits an `ERROR:` and a counted `NO-SIGNAL` action and retries the
+reminder on the next tick without consuming cadence. The third consecutive
+render failure, and every consecutive failure after it, adds another
+`NO-SIGNAL` action carrying the count and first-failure epoch; it does not
+replace or suppress the original records. Any later evaluated outcome that is
+not a render failure clears that reminder's internal failure streak.
 
 Consumers should dispatch only the record types they understand and retain
 unknown fields for forward compatibility.

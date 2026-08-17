@@ -4147,6 +4147,119 @@ def compare_tick_hub(rand_count: int, seed: int) -> int:
                 f"rs={ro.returncode}:{ro.stdout!r}:{rs_dependency_state!r}",
             )
 
+        unresolved_config: dict[str, object] = {
+            "reminders": [
+                {
+                    "name": "unresolved",
+                    "gate": {
+                        "cmd": "exit 1",
+                        "when": "failure",
+                        "capture": True,
+                    },
+                    "emit": {"skill": "warn", "title": "problem: {summary}"},
+                }
+            ]
+        }
+        unresolved_path = os.path.join(tmp, "unresolved.json")
+        with open(unresolved_path, "w", encoding="utf-8") as handle:
+            json.dump(unresolved_config, handle)
+        py_unresolved_fired = os.path.join(tmp, "py-unresolved-fired")
+        rs_unresolved_fired = os.path.join(tmp, "rs-unresolved-fired")
+        repeated_ok = True
+        repeated_detail = []
+        for consecutive, now in enumerate((1000, 1001, 1002), start=1):
+            unresolved_args = (
+                "tick",
+                "--config",
+                unresolved_path,
+                "--state",
+                state_path,
+                "--now",
+                str(now),
+                "--no-header",
+                "--flush",
+            )
+            po = run(py, (*unresolved_args, "--fired-state", py_unresolved_fired))
+            ro = run(rs, (*unresolved_args, "--fired-state", rs_unresolved_fired))
+            with open(py_unresolved_fired, encoding="utf-8") as handle:
+                py_unresolved_state = handle.read()
+            with open(rs_unresolved_fired, encoding="utf-8") as handle:
+                rs_unresolved_state = handle.read()
+            repeated = "consecutive_failures=" in po.stdout
+            expected_repeated = consecutive >= 3
+            step_ok = (
+                po.returncode == ro.returncode == 0
+                and po.stdout == ro.stdout
+                and py_unresolved_state == rs_unresolved_state
+                and repeated == expected_repeated
+                and "reason=unresolved-placeholder" in po.stdout
+                and f".count={consecutive}\n" in py_unresolved_state
+                and ".first_failure_epoch=1000\n" in py_unresolved_state
+                and not any(
+                    line.startswith("unresolved=")
+                    for line in py_unresolved_state.splitlines()
+                )
+            )
+            repeated_ok = repeated_ok and step_ok
+            repeated_detail.append(
+                f"step={consecutive} ok={step_ok} py={po.stdout!r} state={py_unresolved_state!r}"
+            )
+        if repeated_ok:
+            rep.ok("unresolved-render:third-consecutive-escalates")
+        else:
+            rep.bad(
+                "unresolved-render:third-consecutive-escalates",
+                "\n".join(repeated_detail),
+            )
+
+        recovered_config = {
+            "reminders": [
+                {
+                    "name": "unresolved",
+                    "gate": {
+                        "cmd": "printf 'summary=recovered\\n'; exit 1",
+                        "when": "failure",
+                        "capture": True,
+                    },
+                    "emit": {"skill": "warn", "title": "problem: {summary}"},
+                }
+            ]
+        }
+        with open(unresolved_path, "w", encoding="utf-8") as handle:
+            json.dump(recovered_config, handle)
+        recovery_args = (
+            "tick",
+            "--config",
+            unresolved_path,
+            "--state",
+            state_path,
+            "--now",
+            "1003",
+            "--no-header",
+            "--flush",
+        )
+        po = run(py, (*recovery_args, "--fired-state", py_unresolved_fired))
+        ro = run(rs, (*recovery_args, "--fired-state", rs_unresolved_fired))
+        with open(py_unresolved_fired, encoding="utf-8") as handle:
+            py_recovered_state = handle.read()
+        with open(rs_unresolved_fired, encoding="utf-8") as handle:
+            rs_recovered_state = handle.read()
+        if (
+            po.returncode == ro.returncode == 0
+            and po.stdout == ro.stdout
+            and py_recovered_state == rs_recovered_state
+            and "problem: recovered" in po.stdout
+            and "unresolved=1003\n" in py_recovered_state
+            and "__tick_hub_internal__.unresolved_render.unresolved" not in py_recovered_state
+        ):
+            rep.ok("unresolved-render:successful-render-clears-streak")
+        else:
+            rep.bad(
+                "unresolved-render:successful-render-clears-streak",
+                f"py={po.returncode}:{po.stdout!r}:{py_recovered_state!r}\n"
+                f"rs={ro.returncode}:{ro.stdout!r}:{rs_recovered_state!r}",
+            )
+
         po = run(py, (*common_tick, "--fired-state", py_fired, "--flush"))
         ro = run(rs, (*common_tick, "--fired-state", rs_fired, "--flush"))
         with open(py_fired, encoding="utf-8") as handle:

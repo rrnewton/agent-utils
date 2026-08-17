@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     # an installation is damaged.
     import yaml
 
+from tick_hub.cadence import INTERNAL_STATE_PREFIX
 from tick_hub.model import (
     Emit,
     EmitKind,
@@ -93,6 +94,11 @@ def _require_reminder_name(value: str, where: str) -> str:
         raise TickConfigError(
             f"{where}: field 'name' must not contain whitespace or '=' "
             "(it is a fired-state key)"
+        )
+    if value.startswith(INTERNAL_STATE_PREFIX):
+        raise TickConfigError(
+            f"{where}: field 'name' must not start with reserved internal-state prefix "
+            f"{INTERNAL_STATE_PREFIX!r}"
         )
     return value
 

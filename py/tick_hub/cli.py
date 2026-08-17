@@ -103,7 +103,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} tick --config ops.yaml --flush')}      {c.dim('# ...and persist the fired-state')}\n"
         f"  {ex(f'{PROG} list --config ops.yaml')}              {c.dim('# reminders + health checks')}\n"
         f"  {ex(f'{PROG} state --state host.yaml')}             {c.dim('# validate + show the ops-state lines')}\n\n"
-        f"{c.dim('The fired-state (per-reminder last-fired epochs) lives at ./.tick-hub/state by')}\n"
+        f"{c.dim('The fired-state (cadence epochs + reserved retry diagnostics) lives at ./.tick-hub/state by')}\n"
         f"{c.dim(f'default (override with --fired-state or ${STATE_FILE_ENV}); it is written only on --flush.')}"
     )
 
@@ -175,7 +175,7 @@ def _quickstart(c: Palette) -> str:
     benchmark_enabled: true
 
 {h('Cadence + state files')}
-  Per-reminder last-fired epochs live in a tiny key=last_fired_epoch file:
+  Last-fired epochs and reserved __tick_hub_internal__.* retry diagnostics share one atomic file:
     {k('./.tick-hub/state')}   {c.dim('(created on demand; override with --fired-state or $' + STATE_FILE_ENV + ')')}
   It is written ONLY on {k('--flush')}; the default dry-run mutates nothing.
 
@@ -309,7 +309,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fired-state",
         metavar="FILE",
         default=None,
-        help=f"per-reminder last-fired-epoch file (default: ./{DEFAULT_FIRED_STATE} or "
+        help=f"cadence and reserved retry-diagnostic state file (default: ./{DEFAULT_FIRED_STATE} or "
         f"${STATE_FILE_ENV})",
     )
     tick_p.add_argument(

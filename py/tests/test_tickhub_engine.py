@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tick_hub.cadence import unresolved_render_state_keys
 from tick_hub.engine import NO_RESULT_EXIT, TickResult, parse_kv_lines, render_emit, run_tick
 from tick_hub.model import (
     Emit,
@@ -204,7 +205,112 @@ def test_unresolved_placeholder_is_refused_loudly_and_retried() -> None:
         for line in result.lines
     )
     assert "obligation" not in result.fired
+    count_key, first_key = unresolved_render_state_keys("obligation")
+    assert result.fired[count_key] == 1
+    assert result.fired[first_key] == 7
     assert result.actions_emitted == 1
+
+
+def test_third_consecutive_unresolved_placeholder_adds_persistent_escalation() -> None:
+    # Mutation controls: changing >=3 to >3 fails the third-tick assertion; resetting the first
+    # epoch on each failure fails the retained first_failure_epoch=100 assertions.
+    rem = Reminder(
+        "obligation",
+        Emit(
+            EmitKind.ACTION,
+            title="speculative land requires attention: {summary}",
+            skill="hard-warn",
+            fields={"component": "speculative-land-obligation"},
+        ),
+        gate=Gate(cmd="check", when=GateWhen.FAILURE, capture=True),
+    )
+    cfg = TickConfig(reminders=(rem,))
+    count_key, first_key = unresolved_render_state_keys(rem.name)
+    fired: dict[str, int] = {}
+
+    for consecutive, now in enumerate((100, 200, 300), start=1):
+        result = run_tick(
+            cfg,
+            OpsState.default(),
+            now=now,
+            fired=fired,
+            gate_runner=FakeGate({"check": GateResult(1, "", True)}),
+            age_probe=FakeProbe({}),
+        )
+        actions = [line for line in result.lines if line.startswith("ACTION: ")]
+        assert any("reason=unresolved-placeholder" in line for line in actions)
+        assert (len(actions), result.actions_emitted) == (
+            (1, 1) if consecutive < 3 else (2, 2)
+        )
+        if consecutive < 3:
+            assert not any("consecutive_failures=" in line for line in actions)
+        else:
+            repeated = next(line for line in actions if "consecutive_failures=" in line)
+            assert "consecutive_failures=3" in repeated
+            assert "first_failure_epoch=100" in repeated
+            assert "missing_placeholders=summary" in repeated
+        assert result.fired[count_key] == consecutive
+        assert result.fired[first_key] == 100
+        assert rem.name not in result.fired
+        fired = dict(result.fired)
+
+
+def test_any_later_non_render_failure_outcome_clears_render_failure_state() -> None:
+    # Mutation control: deleting any branch's clear call leaves one of these four seeded keys live.
+    rem = Reminder(
+        "obligation",
+        Emit(EmitKind.ACTION, title="problem: {summary}", skill="hard-warn"),
+        gate=Gate(cmd="check", when=GateWhen.FAILURE, capture=True),
+    )
+    cfg = TickConfig(reminders=(rem,))
+    count_key, first_key = unresolved_render_state_keys(rem.name)
+    prior = {count_key: 4, first_key: 10}
+    outcomes = (
+        GateResult(-1, "", False, error="not found"),
+        GateResult(NO_RESULT_EXIT, "", True),
+        GateResult(0, "", True),
+        GateResult(1, "summary=rendered\n", True),
+    )
+
+    for outcome in outcomes:
+        result = run_tick(
+            cfg,
+            OpsState.default(),
+            now=20,
+            fired=prior,
+            gate_runner=FakeGate({"check": outcome}),
+            age_probe=FakeProbe({}),
+        )
+        assert count_key not in result.fired
+        assert first_key not in result.fired
+
+
+def test_removed_reminder_render_failure_state_is_pruned_without_touching_cadence() -> None:
+    count_key, first_key = unresolved_render_state_keys("removed")
+    result = run_tick(
+        TickConfig(),
+        OpsState.default(),
+        now=20,
+        fired={"still-config-independent": 7, count_key: 4, first_key: 10},
+        gate_runner=FakeGate({}),
+        age_probe=FakeProbe({}),
+    )
+    assert result.fired == {"still-config-independent": 7}
+
+
+def test_no_evaluation_keeps_active_reminder_render_failure_state() -> None:
+    rem = Reminder("obligation", Emit(EmitKind.NOTE, title="{summary}"))
+    count_key, first_key = unresolved_render_state_keys(rem.name)
+    prior = {count_key: 2, first_key: 10}
+    result = run_tick(
+        TickConfig(reminders=(rem,)),
+        OpsState(enabled=False, tick_frequency_min=30),
+        now=20,
+        fired=prior,
+        gate_runner=FakeGate({}),
+        age_probe=FakeProbe({}),
+    )
+    assert result.fired == prior
 
 
 def test_gate_run_failure_emits_no_signal_and_no_fired_stamp() -> None:

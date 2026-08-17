@@ -98,7 +98,7 @@ options:\n\
         c.dim("# reminders + health checks"),
         c.cyan("tick-hub state --state host.yaml"),
         c.dim("# validate + show the ops-state lines"),
-        c.dim("The fired-state (per-reminder last-fired epochs) lives at ./.tick-hub/state by"),
+        c.dim("The fired-state (cadence epochs + reserved retry diagnostics) lives at ./.tick-hub/state by"),
         c.dim("default (override with --fired-state or $TICK_HUB_STATE); it is written only on --flush.")
     )
 }
@@ -134,7 +134,8 @@ fn quickstart(c: Palette) -> String {
   NOTE:   <free text>\n\
   ERROR:  <text>\n\n\
 {}\n\
-  Per-reminder last-fired epochs live in ./.tick-hub/state by default. The file is written\n\
+  Last-fired epochs and reserved __tick_hub_internal__.* retry diagnostics share\n\
+  ./.tick-hub/state by default. The file is written\n\
   only with {}; a dry run mutates nothing.\n\n\
 {}  0 = tick ran | 2 = bad usage / bad config or state file",
         banner(c),
@@ -165,7 +166,7 @@ options:\n\
   -h, --help            show this help message and exit\n\
   --config FILE         reminder-set config; .yaml/.yml load as YAML, else JSON\n\
   --state FILE          optional per-host ops-state YAML\n\
-  --fired-state FILE    per-reminder last-fired-epoch file\n\
+  --fired-state FILE    cadence and reserved retry-diagnostic state file\n\
   --now EPOCH           override the clock for deterministic runs\n\
   --current-tick-min N  actually-running tick cadence in minutes\n\
   --flush               persist the advanced fired-state\n\

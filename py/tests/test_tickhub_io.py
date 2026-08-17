@@ -76,6 +76,14 @@ def test_direct_models_are_validated_before_serialization() -> None:
         ),
         TickConfig(
             reminders=(
+                Reminder(
+                    "__tick_hub_internal__.collision",
+                    Emit(EmitKind.ACTION, skill="handler"),
+                ),
+            )
+        ),
+        TickConfig(
+            reminders=(
                 Reminder("same", Emit(EmitKind.ACTION, skill="handler")),
                 Reminder("same", Emit(EmitKind.ACTION, skill="handler")),
             )
@@ -160,6 +168,7 @@ def test_strict_parse_errors() -> None:
         '{"reminders": [{"name": "", "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "two words", "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "key=value", "emit": {"skill": "s"}}]}',
+        '{"reminders": [{"name": "__tick_hub_internal__.collision", "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "cadence_secs": -1, "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "requires_flags": null, "emit": {"skill": "s"}}]}',
         '{"reminders": [{"name": "r", "emit": {"skill": "s", "fields": {"<<": "x"}}}]}',
