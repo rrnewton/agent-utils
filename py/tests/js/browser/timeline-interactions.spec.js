@@ -425,6 +425,193 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   expect(requests.get("schema1") || 0).toBe(0);
 });
 
+test("transcript search uses search shards and opens safe linked message context", async function ({ page }) {
+  const fixture = singleDaySchema2Fixture("6".repeat(64), "7".repeat(64));
+  const searchDigest = "8".repeat(64);
+  const searchUrl = "data/timeline-v2/objects/" + searchDigest + ".json";
+  const day = fixture.bootstrap.detail_shards[0];
+  fixture.bootstrap.search = {
+    schema_version: 1,
+    strategy: "transcript-message-shards",
+    shards: [{
+      kind: "utc-day",
+      day: day.day,
+      team: "codex-hermit",
+      start_ms: day.start_ms,
+      end_ms: day.end_ms,
+      url: searchUrl,
+      sha256: searchDigest
+    }]
+  };
+  const promptARef = "message:codex-hermit::prompt-a";
+  const promptBRef = "message:codex-hermit::prompt-b";
+  const responseARef = "message:codex-hermit::response-a";
+  const responseBRef = "message:codex-hermit::response-b";
+  function record(overrides) {
+    return Object.assign({
+      schema_version: 1,
+      record_type: "response",
+      role: "assistant",
+      team: "codex-hermit",
+      agent_id: "agent-a",
+      agent_ref: "agent:codex-hermit::agent-a",
+      agent_path: "/root/agent-a",
+      event_id: "event",
+      turn_id: "turn",
+      at_ms: BASE_MS + 12 * 60 * 1000,
+      text: "B3",
+      author_kind: "agent",
+      ingress_kind: "assistant",
+      prompt_ref: promptARef,
+      prompt_author_kind: "owner_human",
+      content_fidelity: "verbatim"
+    }, overrides);
+  }
+  const searchShard = {
+    schema_version: 1,
+    kind: "timeline-search-day",
+    team: "codex-hermit",
+    range: { start_ms: day.start_ms, end_ms: day.end_ms },
+    records: [
+      record({
+        ref: promptARef,
+        record_type: "prompt",
+        role: "user",
+        event_id: "prompt-a",
+        at_ms: BASE_MS + 11 * 60 * 1000,
+        text: "How mature is the DBI backend?",
+        author_kind: "owner_human",
+        ingress_kind: "owner",
+        prompt_ref: promptARef
+      }),
+      record({ ref: responseARef, event_id: "response-a" }),
+      record({
+        ref: promptBRef,
+        record_type: "prompt",
+        role: "user",
+        agent_id: "agent-b",
+        agent_ref: "agent:codex-hermit::agent-b",
+        agent_path: "/root/agent-b",
+        event_id: "prompt-b",
+        at_ms: BASE_MS + 31 * 60 * 1000,
+        text: "How mature is the KVM backend?",
+        author_kind: "owner_human",
+        ingress_kind: "owner",
+        prompt_ref: promptBRef
+      }),
+      record({
+        ref: responseBRef,
+        agent_id: "agent-b",
+        agent_ref: "agent:codex-hermit::agent-b",
+        agent_path: "/root/agent-b",
+        event_id: "response-b",
+        at_ms: BASE_MS + 34 * 60 * 1000,
+        text: "KVM reached B3. <img src=x onerror=window.__unsafeSearch=1>",
+        prompt_ref: promptBRef
+      }),
+      record({
+        ref: "message:codex-hermit::hash-only",
+        agent_id: "agent-c",
+        agent_ref: "agent:codex-hermit::agent-c",
+        agent_path: "/root/agent-c",
+        event_id: "hash-only",
+        at_ms: BASE_MS + 40 * 60 * 1000,
+        text: "Recorded artifact hash 12ab3cdef456.",
+        prompt_ref: null,
+        prompt_author_kind: null
+      })
+    ]
+  };
+  let detailRequests = 0;
+  let searchRequests = 0;
+  const consoleErrors = [];
+  const failedRequests = [];
+  page.on("console", function (message) {
+    if (message.type() === "error") {
+      consoleErrors.push(message.text());
+    }
+  });
+  page.on("requestfailed", function (request) {
+    failedRequests.push(request.url());
+  });
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    detailRequests += 1;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await page.route("**/" + searchDigest + ".json", async function (route) {
+    searchRequests += 1;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(searchShard)
+    });
+  });
+
+  await page.reload();
+  // Playwright reports the superseded page's in-flight bootstrap request as aborted
+  // when this test replaces the already-loaded beforeEach page with its routed fixture.
+  failedRequests.length = 0;
+  const card = page.getByTestId("timeline");
+  await page.getByTestId("search-scope").selectOption("agent-responses");
+  await page.getByTestId("search").fill("B3");
+  await expect(card).toHaveAttribute("data-transcript-search-state", "ready");
+  await expect(card).toHaveAttribute("data-loaded-search-shard-count", "1");
+  await expect(card).toHaveAttribute("data-transcript-search-result-count", "2");
+  expect(searchRequests).toBe(1);
+  expect(detailRequests).toBe(0);
+
+  const drawer = page.getByTestId("search-results");
+  await expect(drawer).toBeVisible();
+  await expect(drawer.locator(".search-results-count")).toHaveText("2 matches");
+  await expect(drawer).not.toContainText("12ab3cdef456");
+  await expect(page.locator('.agent-lifetime-group[data-agent-id="agent-a"]')).toHaveClass(
+    /is-search-match/
+  );
+  await expect(page.locator('.agent-lifetime-group[data-agent-id="agent-b"]')).toHaveClass(
+    /is-search-match/
+  );
+  await expect(page.locator('.agent-lifetime-group[data-agent-id="agent-c"]')).toHaveCount(0);
+
+  await expect(drawer.locator(".search-result").first()).toHaveAttribute(
+    "data-message-ref",
+    responseARef
+  );
+  await page.getByTestId("search-sort").selectOption("newest");
+  const newest = drawer.locator('.search-result[data-message-ref="' + responseBRef + '"]');
+  await expect(drawer.locator(".search-result").first()).toHaveAttribute(
+    "data-message-ref",
+    responseBRef
+  );
+  await newest.getByTestId("search-result-main").click();
+  await expect(card).toHaveAttribute("data-selected-agent-id", "agent-b");
+  await expect(card).toHaveAttribute("data-selected-phase-id", "phase-b-1");
+  await expect(newest).toHaveClass(/is-active/);
+  expect(detailRequests).toBe(1);
+
+  await newest.getByRole("button", { name: "Open" }).click();
+  const modal = page.getByTestId("modal");
+  await expect(modal).toBeVisible();
+  const exactMessage = modal.locator(
+    '.search-message-card[data-message-ref="' + responseBRef + '"]'
+  );
+  await expect(exactMessage).toContainText("KVM reached B3");
+  await expect(exactMessage).toContainText("<img src=x onerror=window.__unsafeSearch=1>");
+  await expect(modal.locator("img")).toHaveCount(0);
+  expect(await page.evaluate(function () { return window.__unsafeSearch; })).toBeUndefined();
+
+  await page.getByRole("tab", { name: "Prompt & responses" }).click();
+  await expect(modal.locator(
+    '.search-message-card[data-message-ref="' + promptBRef + '"]'
+  )).toContainText("How mature is the KVM backend?");
+  await expect(modal.locator(
+    '.search-message-card[data-message-ref="' + responseBRef + '"]'
+  )).toContainText("KVM reached B3");
+  expect(consoleErrors).toEqual([]);
+  expect(failedRequests).toEqual([]);
+});
+
 test("schema 2 retries a transiently failed detail shard", async function ({ page }) {
   const fixture = singleDaySchema2Fixture("d".repeat(64), "e".repeat(64));
   let detailRequests = 0;

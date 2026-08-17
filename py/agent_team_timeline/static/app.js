@@ -16,6 +16,8 @@
   var AGGREGATE_WORKER_MAX_HEIGHT = 48;
   var STATE_HEIGHT = 6;
   var MIN_VIEW_MS = 1000;
+  var SEARCH_RESULT_LIMIT = 100;
+  var SEARCH_JUMP_SPAN_MS = 30 * 60 * 1000;
   var PHASE_COLORS = [
     "#287ca3",
     "#555ec4",
@@ -57,6 +59,14 @@
     meta: byId("dataset-meta"),
     teamFilter: byId("team-filter"),
     search: byId("search"),
+    searchScope: byId("search-scope"),
+    searchResults: byId("search-results"),
+    searchResultsTitle: byId("search-results-title"),
+    searchResultsCount: byId("search-results-count"),
+    searchResultsStatus: byId("search-results-status"),
+    searchResultsList: byId("search-results-list"),
+    searchSort: byId("search-sort"),
+    searchResultsClose: byId("search-results-close"),
     fit: byId("fit"),
     glossaryOpen: byId("glossary-open"),
     summaryMenu: byId("summary-menu"),
@@ -119,6 +129,18 @@
     axisTicks: [],
     selectedTeam: "",
     query: "",
+    searchScope: "labels",
+    searchSort: "relevance",
+    searchCatalog: [],
+    loadedSearchShardUrls: new Set(),
+    searchRecords: [],
+    searchRecordsByRef: new Map(),
+    transcriptSearchState: "legacy",
+    transcriptSearchError: "",
+    transcriptSearchResults: [],
+    transcriptSearchTotal: 0,
+    transcriptMatchedAgentIds: new Set(),
+    activeSearchRef: "",
     perAgentTracks: false,
     showGlobalMessages: false,
     showHighlightedMessages: true,
@@ -1012,6 +1034,9 @@
     dom.card.dataset.detailShardCount = String(app.shardCatalog.length);
     dom.card.dataset.loadedShardCount = String(app.loadedShardUrls.size);
     dom.card.dataset.searchShardState = app.searchShardState;
+    dom.card.dataset.transcriptSearchState = app.transcriptSearchState;
+    dom.card.dataset.loadedSearchShardCount = String(app.loadedSearchShardUrls.size);
+    dom.card.dataset.transcriptSearchResultCount = String(app.transcriptSearchTotal);
     dom.card.dataset.phaseIndexState = app.phaseIndexReference
       ? (app.phaseIndexPromise ? "requested" : "unloaded")
       : "legacy";
@@ -1278,6 +1303,482 @@
     });
   }
 
+  function mergeTranscriptSearchShard(raw, url) {
+    if (!raw || typeof raw !== "object" || number(raw.schema_version, NaN) !== 1 ||
+        text(raw.kind) !== "timeline-search-day") {
+      throw new Error("Unsupported transcript search shard: " + url);
+    }
+    if (app.loadedSearchShardUrls.has(url)) {
+      return;
+    }
+    var records = array(raw.records);
+    var pending = [];
+    var localRefs = new Set();
+    records.forEach(function (record) {
+      if (!record || typeof record !== "object" ||
+          number(record.schema_version, NaN) !== 1) {
+        throw new Error("Transcript search records must be schema-1 objects.");
+      }
+      var reference = text(record.ref);
+      var team = text(record.team);
+      var agentId = text(record.agent_id);
+      var role = text(record.role);
+      var at = number(record.at_ms, NaN);
+      if (!reference || !team || !agentId || !role || !text(record.text) ||
+          !Number.isFinite(at) || localRefs.has(reference) ||
+          app.searchRecordsByRef.has(reference)) {
+        throw new Error("Transcript search shard has an invalid or duplicate record.");
+      }
+      localRefs.add(reference);
+      pending.push(record);
+    });
+    pending.forEach(function (record) {
+      app.searchRecords.push(record);
+      app.searchRecordsByRef.set(text(record.ref), record);
+    });
+    app.searchRecords.sort(function (left, right) {
+      return number(left.at_ms, 0) - number(right.at_ms, 0) ||
+        text(left.ref).localeCompare(text(right.ref));
+    });
+    app.loadedSearchShardUrls.add(url);
+    updateShardDiagnostics();
+  }
+
+  function loadTranscriptSearchShard(catalogEntry) {
+    var url = immutableTimelineObjectUrl(catalogEntry, "transcript search shard");
+    return fetchJsonCached(url).then(function (raw) {
+      mergeTranscriptSearchShard(raw, url);
+      return raw;
+    });
+  }
+
+  function transcriptSearchShards() {
+    return app.searchCatalog.filter(function (shard) {
+      return !app.selectedTeam || text(shard.team) === app.selectedTeam;
+    });
+  }
+
+  function requestTranscriptSearchCorpus() {
+    if (app.schemaMode !== "schema2" || !app.searchCatalog.length) {
+      app.transcriptSearchState = "unavailable";
+      app.transcriptSearchError = "This export does not contain transcript search shards.";
+      updateShardDiagnostics();
+      renderTranscriptSearchResults();
+      return Promise.resolve([]);
+    }
+    app.transcriptSearchState = "loading";
+    app.transcriptSearchError = "";
+    updateShardDiagnostics();
+    renderTranscriptSearchResults();
+    var promises = transcriptSearchShards().map(loadTranscriptSearchShard);
+    return Promise.all(promises).then(function (values) {
+      app.transcriptSearchState = "ready";
+      updateShardDiagnostics();
+      updateTranscriptSearch();
+      return values;
+    }).catch(function (error) {
+      app.transcriptSearchState = "error";
+      app.transcriptSearchError = error instanceof Error ? error.message : String(error);
+      updateShardDiagnostics();
+      renderTranscriptSearchResults();
+      throw error;
+    });
+  }
+
+  function transcriptRecordMatchesScope(record) {
+    var recordType = text(record.record_type);
+    if (app.searchScope === "owner-prompts") {
+      return recordType === "prompt" && text(record.author_kind) === "owner_human";
+    }
+    if (app.searchScope === "agent-responses") {
+      return recordType === "response" || recordType === "inter_agent";
+    }
+    return app.searchScope === "all-transcript";
+  }
+
+  function updateTranscriptSearch() {
+    if (!transcriptSearchActive() || !app.query) {
+      app.transcriptSearchResults = [];
+      app.transcriptSearchTotal = 0;
+      app.transcriptMatchedAgentIds.clear();
+      app.activeSearchRef = "";
+      renderTranscriptSearchResults();
+      scheduleRender();
+      return;
+    }
+    if (app.transcriptSearchState !== "ready") {
+      renderTranscriptSearchResults();
+      scheduleRender();
+      return;
+    }
+    var matches = [];
+    var matchedAgents = new Set();
+    app.searchRecords.forEach(function (record) {
+      if (!transcriptRecordMatchesScope(record) || !selectedTeamAllows(record)) {
+        return;
+      }
+      var match = smartSearchMatch(record.text, app.query);
+      if (!match) {
+        return;
+      }
+      var agentId = text(record.agent_id);
+      if (agentId) {
+        matchedAgents.add(agentId);
+      }
+      matches.push({
+        record: record,
+        match: match,
+        excerpt: searchExcerpt(match)
+      });
+    });
+    if (app.searchSort === "newest") {
+      matches.sort(function (left, right) {
+        return number(right.record.at_ms, 0) - number(left.record.at_ms, 0) ||
+          right.match.score - left.match.score ||
+          text(left.record.ref).localeCompare(text(right.record.ref));
+      });
+    } else {
+      matches.sort(function (left, right) {
+        return right.match.score - left.match.score ||
+          number(right.record.at_ms, 0) - number(left.record.at_ms, 0) ||
+          text(left.record.ref).localeCompare(text(right.record.ref));
+      });
+    }
+    app.transcriptSearchTotal = matches.length;
+    app.transcriptSearchResults = matches.slice(0, SEARCH_RESULT_LIMIT);
+    app.transcriptMatchedAgentIds = matchedAgents;
+    if (app.activeSearchRef && !matches.some(function (item) {
+      return text(item.record.ref) === app.activeSearchRef;
+    })) {
+      app.activeSearchRef = "";
+    }
+    renderTranscriptSearchResults();
+    updateShardDiagnostics();
+    scheduleRender();
+  }
+
+  function searchScopeTitle() {
+    return {
+      "owner-prompts": "My prompts",
+      "agent-responses": "Agent responses",
+      "all-transcript": "All transcript"
+    }[app.searchScope] || "Transcript search";
+  }
+
+  function searchRoleLabel(record) {
+    return {
+      user: text(record.author_kind) === "owner_human" ? "owner prompt" : "prompt",
+      assistant: "assistant",
+      agent: "inter-agent",
+      external: "external",
+      goal: "goal",
+      tool: "tool"
+    }[text(record.role)] || text(record.role, "message");
+  }
+
+  function searchRecordAgent(record) {
+    return app.agentsById.get(text(record.agent_id)) || null;
+  }
+
+  function searchRecordAgentLabel(record) {
+    var agent = searchRecordAgent(record);
+    if (agent) {
+      return agentShortName(agent);
+    }
+    var path = text(record.agent_path, text(record.agent_id, "Unknown agent"));
+    var pieces = path.split("/").filter(Boolean);
+    return pieces.length ? pieces[pieces.length - 1] : path;
+  }
+
+  function renderMatchedExcerpt(excerpt) {
+    var container = htmlElement("p", "search-result-excerpt");
+    if (excerpt.leadingOmitted > 0) {
+      container.appendChild(document.createTextNode("…"));
+    }
+    var cursor = 0;
+    excerpt.ranges.forEach(function (range) {
+      var left = clamp(number(range[0], cursor), cursor, excerpt.text.length);
+      var right = clamp(number(range[1], left), left, excerpt.text.length);
+      if (left > cursor) {
+        container.appendChild(document.createTextNode(excerpt.text.slice(cursor, left)));
+      }
+      var marked = document.createElement("mark");
+      marked.textContent = excerpt.text.slice(left, right);
+      container.appendChild(marked);
+      cursor = right;
+    });
+    if (cursor < excerpt.text.length) {
+      container.appendChild(document.createTextNode(excerpt.text.slice(cursor)));
+    }
+    if (excerpt.trailingOmitted > 0) {
+      container.appendChild(document.createTextNode("…"));
+    }
+    return container;
+  }
+
+  function searchResultCard(item) {
+    var record = item.record;
+    var reference = text(record.ref);
+    var card = htmlElement(
+      "article",
+      "search-result" + (reference === app.activeSearchRef ? " is-active" : "")
+    );
+    card.setAttribute("role", "listitem");
+    card.dataset.messageRef = reference;
+    var main = htmlElement("button", "search-result-main");
+    main.type = "button";
+    main.dataset.testid = "search-result-main";
+    var heading = htmlElement("div", "search-result-heading");
+    heading.append(
+      htmlElement("strong", "search-result-agent", searchRecordAgentLabel(record)),
+      htmlElement("span", "search-result-role", searchRoleLabel(record))
+    );
+    var metadata = htmlElement("div", "search-result-meta");
+    metadata.append(
+      htmlElement("time", "", formatFullTime(number(record.at_ms, NaN))),
+      htmlElement("span", "", text(record.team, "unknown team"))
+    );
+    main.append(heading, metadata, renderMatchedExcerpt(item.excerpt));
+    main.addEventListener("click", function (event) {
+      if (event.detail !== 1) {
+        return;
+      }
+      jumpToSearchRecord(record);
+    });
+    main.addEventListener("dblclick", function (event) {
+      event.preventDefault();
+      jumpToSearchRecord(record);
+      openSearchMessageModal(record);
+    });
+    var open = htmlElement("button", "button search-result-open", "Open");
+    open.type = "button";
+    open.addEventListener("click", function () {
+      jumpToSearchRecord(record);
+      openSearchMessageModal(record);
+    });
+    card.append(main, open);
+    return card;
+  }
+
+  function renderTranscriptSearchResults() {
+    var visible = transcriptSearchActive() && Boolean(app.query);
+    dom.searchResults.hidden = !visible;
+    if (!visible) {
+      dom.searchResultsList.replaceChildren();
+      dom.searchResultsStatus.textContent = "";
+      dom.searchResultsCount.textContent = "";
+      return;
+    }
+    dom.searchResultsTitle.textContent = searchScopeTitle();
+    if (app.transcriptSearchState === "loading" ||
+        app.transcriptSearchState === "unloaded") {
+      dom.searchResultsStatus.textContent = "Searching the full transcript…";
+      dom.searchResultsCount.textContent = "";
+      dom.searchResultsList.replaceChildren();
+      return;
+    }
+    if (app.transcriptSearchState === "error" ||
+        app.transcriptSearchState === "unavailable") {
+      dom.searchResultsStatus.textContent = app.transcriptSearchError ||
+        "Transcript search is unavailable.";
+      dom.searchResultsCount.textContent = "";
+      dom.searchResultsList.replaceChildren();
+      return;
+    }
+    var shown = app.transcriptSearchResults.length;
+    dom.searchResultsCount.textContent = app.transcriptSearchTotal > shown
+      ? "Showing " + formatCount(shown) + " of " + formatCount(app.transcriptSearchTotal)
+      : formatCount(app.transcriptSearchTotal) +
+        (app.transcriptSearchTotal === 1 ? " match" : " matches");
+    dom.searchResultsStatus.textContent = app.transcriptSearchTotal > shown
+      ? "Results are truncated; refine the search to see a smaller set."
+      : (shown ? "" : "No transcript messages match this search.");
+    dom.searchResultsList.replaceChildren.apply(
+      dom.searchResultsList,
+      app.transcriptSearchResults.map(searchResultCard)
+    );
+  }
+
+  function phaseForSearchRecord(record) {
+    var at = number(record.at_ms, NaN);
+    if (!Number.isFinite(at)) {
+      return null;
+    }
+    var candidates = (app.phasesByAgent.get(text(record.agent_id)) || []).filter(
+      function (phase) {
+        return number(phase.start_ms, Infinity) <= at &&
+          number(phase.end_ms, -Infinity) > at;
+      }
+    );
+    candidates.sort(function (left, right) {
+      return (number(left.end_ms, 0) - number(left.start_ms, 0)) -
+          (number(right.end_ms, 0) - number(right.start_ms, 0)) ||
+        text(left.id).localeCompare(text(right.id));
+    });
+    return candidates[0] || null;
+  }
+
+  function scrollSearchAgentIntoView(agentId) {
+    window.requestAnimationFrame(function () {
+      var row = app.rowByAgent.get(agentId);
+      if (!row) {
+        return;
+      }
+      var maximum = Math.max(0, dom.scroll.scrollHeight - dom.scroll.clientHeight);
+      var target = row.index * ROW_HEIGHT -
+        Math.max(0, (dom.scroll.clientHeight - ROW_HEIGHT) / 2);
+      dom.scroll.scrollTop = clamp(target, 0, maximum);
+    });
+  }
+
+  function selectSearchRecordLocation(record) {
+    var agentId = text(record.agent_id);
+    var phase = phaseForSearchRecord(record);
+    if (phase) {
+      setSelection({
+        kind: "phase",
+        agent_id: agentId,
+        phase_id: text(phase.id),
+        start_ms: number(phase.start_ms, 0),
+        end_ms: number(phase.end_ms, 0)
+      });
+    } else {
+      setSelection({ kind: "agent", agent_id: agentId });
+    }
+    scrollSearchAgentIntoView(agentId);
+  }
+
+  function jumpToSearchRecord(record) {
+    var reference = text(record.ref);
+    var at = number(record.at_ms, NaN);
+    var agentId = text(record.agent_id);
+    if (!reference || !Number.isFinite(at) || !app.agentsById.has(agentId)) {
+      return;
+    }
+    app.activeSearchRef = reference;
+    renderTranscriptSearchResults();
+    zoomToRange(at - SEARCH_JUMP_SPAN_MS / 2, at + SEARCH_JUMP_SPAN_MS / 2);
+    selectSearchRecordLocation(record);
+    if (app.schemaMode !== "schema2") {
+      return;
+    }
+    var exactShards = app.shardCatalog.filter(function (shard) {
+      return number(shard.start_ms, Infinity) <= at &&
+        number(shard.end_ms, -Infinity) > at;
+    });
+    if (!exactShards.length) {
+      return;
+    }
+    requestDetailShards(exactShards).promise.then(function () {
+      if (app.activeSearchRef === reference) {
+        selectSearchRecordLocation(record);
+      }
+    }).catch(showDetailLoadError);
+  }
+
+  function linkedSearchContext(record) {
+    var reference = text(record.ref);
+    var promptReference = text(record.prompt_ref);
+    if (text(record.record_type) === "prompt") {
+      promptReference = reference;
+    }
+    if (!promptReference) {
+      return [];
+    }
+    var prompt = app.searchRecordsByRef.get(promptReference) || null;
+    var responses = app.searchRecords.filter(function (candidate) {
+      var candidateReference = text(candidate.ref);
+      var recordType = text(candidate.record_type);
+      return candidateReference !== promptReference &&
+        text(candidate.prompt_ref) === promptReference &&
+        (recordType === "response" || recordType === "inter_agent");
+    });
+    var context = prompt ? [prompt] : [];
+    responses.sort(function (left, right) {
+      return number(left.at_ms, 0) - number(right.at_ms, 0) ||
+        text(left.ref).localeCompare(text(right.ref));
+    });
+    context.push.apply(context, responses);
+    return context;
+  }
+
+  function renderSearchMessage(container, record, relationship) {
+    var card = htmlElement("article", "search-message-card");
+    card.dataset.messageRef = text(record.ref);
+    var heading = htmlElement("header", "search-message-heading");
+    var headingLeft = htmlElement("div", "search-message-heading-copy");
+    if (relationship) {
+      headingLeft.appendChild(htmlElement("span", "search-message-relationship", relationship));
+    }
+    headingLeft.appendChild(htmlElement("strong", "search-message-role", searchRoleLabel(record)));
+    heading.append(
+      headingLeft,
+      htmlElement("time", "entry-time", formatFullTime(number(record.at_ms, NaN)))
+    );
+    var metadata = htmlElement("div", "search-message-meta");
+    metadata.append(
+      htmlElement("span", "", text(record.team, "unknown team")),
+      htmlElement("span", "", searchRecordAgentLabel(record))
+    );
+    var fidelity = text(record.content_fidelity);
+    if (fidelity && fidelity !== "verbatim") {
+      metadata.appendChild(htmlElement("span", "", fidelity));
+    }
+    var body = htmlElement("pre", "search-message-text", text(record.text));
+    card.append(heading, metadata, body);
+    container.appendChild(card);
+  }
+
+  function renderSearchMessageContext(container, record) {
+    var context = linkedSearchContext(record);
+    if (!context.length) {
+      container.appendChild(
+        htmlElement("div", "empty-message", "No mechanically linked prompt was recorded.")
+      );
+      return;
+    }
+    container.appendChild(htmlElement(
+      "p",
+      "search-context-note",
+      "These relationships come from provider turn and thread identifiers, not text inference."
+    ));
+    var promptReference = text(record.record_type) === "prompt"
+      ? text(record.ref)
+      : text(record.prompt_ref);
+    context.forEach(function (candidate) {
+      renderSearchMessage(
+        container,
+        candidate,
+        text(candidate.ref) === promptReference ? "Prompt" : "Linked response"
+      );
+    });
+  }
+
+  function openSearchMessageModal(record) {
+    var context = linkedSearchContext(record);
+    openModalBase(
+      "Transcript · " + formatFullTime(number(record.at_ms, NaN)),
+      searchRecordAgentLabel(record) + " · " + searchRoleLabel(record),
+      "",
+      null
+    );
+    var tabs = [{
+      label: "Message",
+      render: function (container) {
+        renderSearchMessage(container, record, "Exact message");
+      }
+    }];
+    if (context.length) {
+      tabs.push({
+        label: "Prompt & responses",
+        render: function (container) {
+          renderSearchMessageContext(container, record);
+        }
+      });
+    }
+    activateTabs(tabs, 0);
+  }
+
   function loadPhaseIndex() {
     if (!app.phaseIndexReference) {
       return Promise.resolve(null);
@@ -1391,6 +1892,121 @@
       .filter(function (value) { return value.length > 0; })
       .join(" ")
       .toLocaleLowerCase();
+  }
+
+  function compactSearchText(value) {
+    return text(value).replace(/\s+/g, " ").trim();
+  }
+
+  function searchQueryParts(value) {
+    var query = compactSearchText(value);
+    var parts = [];
+    var pattern = /"([^"\\]*(?:\\.[^"\\]*)*)"|(\S+)/g;
+    var match;
+    while ((match = pattern.exec(query)) !== null) {
+      if (match[1] !== undefined) {
+        var quoted = match[1].replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+        if (quoted) {
+          parts.push({ value: quoted, quoted: true });
+        }
+      } else if (match[2]) {
+        parts.push({ value: match[2], quoted: false });
+      }
+    }
+    return parts;
+  }
+
+  function allSearchRanges(haystack, needle) {
+    var ranges = [];
+    var cursor = 0;
+    if (!needle) {
+      return ranges;
+    }
+    while (ranges.length < 64) {
+      var position = haystack.indexOf(needle, cursor);
+      if (position < 0) {
+        break;
+      }
+      ranges.push([position, position + needle.length]);
+      cursor = position + Math.max(1, needle.length);
+    }
+    return ranges;
+  }
+
+  function searchWordCharacter(value) {
+    return Boolean(value) && /[\p{L}\p{N}_]/u.test(value);
+  }
+
+  function wholeSearchRanges(haystack, needle) {
+    return allSearchRanges(haystack, needle).filter(function (range) {
+      return !searchWordCharacter(haystack[range[0] - 1]) &&
+        !searchWordCharacter(haystack[range[1]]);
+    });
+  }
+
+  function smartSearchMatch(value, query) {
+    var compact = compactSearchText(value);
+    var compactQuery = compactSearchText(query);
+    if (!compact || !compactQuery) {
+      return null;
+    }
+    var comparable = compact.toLocaleLowerCase();
+    var parts = searchQueryParts(compactQuery);
+    if (!parts.length) {
+      return null;
+    }
+    var ranges = [];
+    for (var index = 0; index < parts.length; index += 1) {
+      var part = parts[index];
+      var sought = part.value.toLocaleLowerCase();
+      var candidate = !part.quoted && /^[\p{L}\p{N}_-]+$/u.test(part.value)
+        ? wholeSearchRanges(comparable, sought)
+        : allSearchRanges(comparable, sought);
+      if (!candidate.length) {
+        return null;
+      }
+      ranges.push.apply(ranges, candidate);
+    }
+    ranges.sort(function (left, right) {
+      return left[0] - right[0] || left[1] - right[1];
+    });
+    ranges = ranges.filter(function (range, index) {
+      return index === 0 || range[0] !== ranges[index - 1][0] ||
+        range[1] !== ranges[index - 1][1];
+    }).slice(0, 64);
+    var first = Math.min.apply(null, ranges.map(function (range) { return range[0]; }));
+    var last = Math.max.apply(null, ranges.map(function (range) { return range[1]; }));
+    var span = Math.max(1, last - first);
+    var exact = comparable === compactQuery.toLocaleLowerCase();
+    return {
+      compact: compact,
+      ranges: ranges,
+      score: (exact ? 100000 : 0) + Math.max(0, 20000 - span) +
+        ranges.length * 100 - Math.min(first, 10000)
+    };
+  }
+
+  function searchExcerpt(match) {
+    var first = Math.min.apply(null, match.ranges.map(function (range) { return range[0]; }));
+    var last = Math.max.apply(null, match.ranges.map(function (range) { return range[1]; }));
+    var start = Math.max(0, first - 120);
+    var end = Math.min(match.compact.length, Math.max(last + 180, start + 320));
+    return {
+      text: match.compact.slice(start, end),
+      ranges: match.ranges.filter(function (range) {
+        return range[1] > start && range[0] < end;
+      }).map(function (range) {
+        return [Math.max(0, range[0] - start), Math.min(end, range[1]) - start];
+      }),
+      fullCharacters: match.compact.length,
+      leadingOmitted: start,
+      trailingOmitted: match.compact.length - end,
+      truncated: start > 0 || end < match.compact.length
+    };
+  }
+
+  function transcriptSearchActive() {
+    return app.searchScope !== "labels";
   }
 
   function selectedTeamAllows(item) {
@@ -1604,7 +2220,11 @@
   }
 
   function buildRows() {
-    var query = app.query.trim().toLocaleLowerCase();
+    var query = app.searchScope === "labels"
+      ? app.query.trim().toLocaleLowerCase()
+      : "";
+    var transcriptQueryReady = transcriptSearchActive() && Boolean(app.query) &&
+      app.transcriptSearchState === "ready";
     var eligible = app.data.agents.filter(function (agent) {
       return !app.selectedTeam || text(agent.team) === app.selectedTeam;
     });
@@ -1614,7 +2234,13 @@
     });
 
     var directMatches = new Set();
-    if (query) {
+    if (transcriptQueryReady) {
+      app.transcriptMatchedAgentIds.forEach(function (id) {
+        if (eligibleById.has(id)) {
+          directMatches.add(id);
+        }
+      });
+    } else if (query) {
       eligible.forEach(function (agent) {
         var id = text(agent.id);
         var phases = app.phasesByAgent.get(id) || [];
@@ -1691,7 +2317,9 @@
         agent: agent,
         treeDepth: treeDepth,
         directMatch: directMatches.has(id),
-        agentTextMatch: !query || agentSearchText(agent).indexOf(query) >= 0
+        agentTextMatch: transcriptQueryReady
+          ? directMatches.has(id)
+          : (!query || agentSearchText(agent).indexOf(query) >= 0)
       });
       (children.get(id) || []).forEach(function (child) {
         visit(child, treeDepth + 1);
@@ -2049,6 +2677,11 @@
     return " is-dimmed";
   }
 
+  function searchMatchClass(agentId) {
+    return transcriptSearchActive() && Boolean(app.query) &&
+      app.transcriptMatchedAgentIds.has(agentId) ? " is-search-match" : "";
+  }
+
   function setSelection(selection) {
     clearRangeSelectionState();
     app.selection = selection;
@@ -2384,6 +3017,9 @@
     if (!app.query) {
       return true;
     }
+    if (transcriptSearchActive()) {
+      return row.directMatch;
+    }
     return row.agentTextMatch ||
       phaseSearchText(phase).indexOf(app.query.toLocaleLowerCase()) >= 0;
   }
@@ -2411,7 +3047,7 @@
     var displayPhrase = phaseDisplayPhrase(phase);
     var group = svgElement("g", {
       class: "phase-group" + (summaryAvailable ? "" : " summary-not-generated") +
-        selectionClass(agentId, phase),
+        selectionClass(agentId, phase) + searchMatchClass(agentId),
       tabindex: "0",
       role: "button",
       "data-phase-id": text(phase.id),
@@ -2515,7 +3151,7 @@
     var labelGroup = svgElement("g", {
       class: "agent-label-group" +
         (agentSummaryAvailable(agent) ? "" : " summary-not-generated") +
-        selectionClass(text(agent.id), null),
+        selectionClass(text(agent.id), null) + searchMatchClass(text(agent.id)),
       role: "button",
       tabindex: "0",
       "data-agent-id": text(agent.id),
@@ -2662,7 +3298,7 @@
     var group = svgElement("g", {
       class: "agent-lifetime-group" +
         (summaryAvailable ? "" : " summary-not-generated") +
-        selectionClass(text(agent.id), null),
+        selectionClass(text(agent.id), null) + searchMatchClass(text(agent.id)),
       role: "button",
       tabindex: "0",
       "data-agent-id": text(agent.id),
@@ -3153,7 +3789,9 @@
     var bufferEnd = app.viewEnd + span * 0.08;
     if (app.renderLod !== "aggregate") {
       app.data.edges.forEach(function (edge) {
-        if (!app.query || edgeSearchText(edge).indexOf(app.query.toLocaleLowerCase()) >= 0 ||
+        var labelMatch = app.searchScope === "labels" && app.query &&
+          edgeSearchText(edge).indexOf(app.query.toLocaleLowerCase()) >= 0;
+        if (!app.query || labelMatch ||
             app.rowByAgent.has(text(edge.source_id)) || app.rowByAgent.has(text(edge.target_id))) {
           renderEdge(edge, edgeLayer, bounds, bufferStart, bufferEnd);
         }
@@ -5102,11 +5740,45 @@
     catalog.sort(function (left, right) {
       return number(left.start_ms, 0) - number(right.start_ms, 0);
     });
+    var searchCatalog = [];
+    var searchConfig = bootstrap.search && typeof bootstrap.search === "object"
+      ? bootstrap.search
+      : null;
+    if (searchConfig && text(searchConfig.strategy) === "transcript-message-shards") {
+      if (number(searchConfig.schema_version, NaN) !== 1) {
+        throw new Error("Unsupported transcript search catalog schema.");
+      }
+      var searchUrls = new Set();
+      searchCatalog = array(searchConfig.shards).slice();
+      searchCatalog.forEach(function (shard) {
+        var url = immutableTimelineObjectUrl(shard, "transcript search shard");
+        var team = text(shard.team);
+        var start = number(shard.start_ms, NaN);
+        var end = number(shard.end_ms, NaN);
+        if (!team || !Number.isFinite(start) || !Number.isFinite(end) || end <= start ||
+            searchUrls.has(url)) {
+          throw new Error("Invalid or duplicate transcript search shard catalog entry.");
+        }
+        searchUrls.add(url);
+      });
+      searchCatalog.sort(function (left, right) {
+        return text(left.team).localeCompare(text(right.team)) ||
+          number(left.start_ms, 0) - number(right.start_ms, 0);
+      });
+    }
     app.schemaMode = "schema2";
     app.shardCatalog = catalog;
+    app.searchCatalog = searchCatalog;
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
+    app.loadedSearchShardUrls.clear();
+    app.searchRecords = [];
+    app.searchRecordsByRef.clear();
     app.searchShardState = catalog.length ? "unloaded" : "ready";
+    app.transcriptSearchState = searchCatalog.length ? "unloaded" : "unavailable";
+    app.transcriptSearchError = searchCatalog.length
+      ? ""
+      : "This export does not contain transcript search shards.";
     app.phaseIndexReference = bootstrap.phase_index || null;
     app.phaseIndexPromise = null;
     app.phaseIndexByAgent.clear();
@@ -5129,9 +5801,15 @@
   async function loadSchema1() {
     app.schemaMode = "schema1";
     app.shardCatalog = [];
+    app.searchCatalog = [];
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
+    app.loadedSearchShardUrls.clear();
+    app.searchRecords = [];
+    app.searchRecordsByRef.clear();
     app.searchShardState = "legacy";
+    app.transcriptSearchState = "unavailable";
+    app.transcriptSearchError = "Transcript search requires a schema-2 export.";
     app.phaseIndexReference = null;
     app.phaseIndexPromise = null;
     app.phaseIndexByAgent.clear();
@@ -5161,22 +5839,95 @@
     }
   }
 
+  function transcriptSearchNeedsLoad() {
+    return transcriptSearchShards().some(function (shard) {
+      return !app.loadedSearchShardUrls.has(
+        immutableTimelineObjectUrl(shard, "transcript search shard")
+      );
+    });
+  }
+
+  function refreshSearch() {
+    if (!app.query) {
+      updateTranscriptSearch();
+      scheduleRender();
+      return;
+    }
+    if (!transcriptSearchActive()) {
+      app.transcriptSearchResults = [];
+      app.transcriptSearchTotal = 0;
+      app.transcriptMatchedAgentIds.clear();
+      app.activeSearchRef = "";
+      renderTranscriptSearchResults();
+      if (app.schemaMode === "schema2" && app.searchShardState !== "ready" &&
+          app.searchShardState !== "loading") {
+        requestSearchCorpus();
+      }
+      scheduleRender();
+      return;
+    }
+    if (app.schemaMode !== "schema2" || !app.searchCatalog.length) {
+      app.transcriptSearchState = "unavailable";
+      app.transcriptSearchError = app.schemaMode === "schema2"
+        ? "This export does not contain transcript search shards."
+        : "Transcript search requires a schema-2 export.";
+      updateShardDiagnostics();
+      renderTranscriptSearchResults();
+      scheduleRender();
+      return;
+    }
+    if (transcriptSearchNeedsLoad() || app.transcriptSearchState !== "ready") {
+      requestTranscriptSearchCorpus().catch(function () { return undefined; });
+      return;
+    }
+    updateTranscriptSearch();
+  }
+
+  function updateSearchPlaceholder() {
+    dom.search.placeholder = {
+      labels: "Agent, phase, message…",
+      "owner-prompts": "Search my prompts…",
+      "agent-responses": "Search agent responses…",
+      "all-transcript": "Search all transcript messages…"
+    }[app.searchScope] || "Search timeline…";
+  }
+
   dom.teamFilter.addEventListener("change", function () {
     app.selectedTeam = dom.teamFilter.value;
     dom.scroll.scrollTop = 0;
     populateSummaryFiles();
     scheduleRender();
+    refreshSearch();
   });
 
   dom.search.addEventListener("input", function () {
     app.query = dom.search.value.trim();
     dom.scroll.scrollTop = 0;
-    if (app.query && app.schemaMode === "schema2" &&
-        app.searchShardState !== "ready" && app.searchShardState !== "loading") {
-      requestSearchCorpus();
-    }
-    scheduleRender();
+    app.activeSearchRef = "";
+    refreshSearch();
   });
+
+  dom.searchScope.addEventListener("change", function () {
+    app.searchScope = dom.searchScope.value;
+    app.activeSearchRef = "";
+    updateSearchPlaceholder();
+    refreshSearch();
+  });
+
+  dom.searchSort.addEventListener("change", function () {
+    app.searchSort = dom.searchSort.value;
+    updateTranscriptSearch();
+  });
+
+  dom.searchResultsClose.addEventListener("click", function () {
+    dom.search.value = "";
+    app.query = "";
+    app.activeSearchRef = "";
+    updateTranscriptSearch();
+    dom.search.focus();
+  });
+
+  updateSearchPlaceholder();
 
   dom.fit.addEventListener("click", fitTimeline);
   dom.zoomOut.addEventListener("click", function () {

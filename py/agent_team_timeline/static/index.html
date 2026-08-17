@@ -45,6 +45,15 @@
             autocomplete="off"
           >
         </label>
+        <label class="control-field search-scope-field">
+          <span>Search in</span>
+          <select id="search-scope" data-testid="search-scope" aria-label="Choose search scope">
+            <option value="labels">Timeline labels</option>
+            <option value="owner-prompts">My prompts</option>
+            <option value="agent-responses">Agent responses</option>
+            <option value="all-transcript">All transcript</option>
+          </select>
+        </label>
         <button id="fit" data-testid="fit" class="button button-primary" type="button">
           Fit timeline
         </button>
@@ -111,6 +120,38 @@
             </label>
           </div>
         </div>
+
+        <aside
+          id="search-results"
+          class="search-results-drawer"
+          data-testid="search-results"
+          aria-label="Transcript search results"
+          hidden
+        >
+          <header class="search-results-header">
+            <div>
+              <strong id="search-results-title">Transcript search</strong>
+              <span id="search-results-count" class="search-results-count"></span>
+            </div>
+            <div class="search-results-actions">
+              <label class="search-sort-field">
+                <span>Sort</span>
+                <select id="search-sort" data-testid="search-sort" aria-label="Sort search results">
+                  <option value="relevance">Relevance</option>
+                  <option value="newest">Newest</option>
+                </select>
+              </label>
+              <button
+                id="search-results-close"
+                class="icon-button search-results-close"
+                type="button"
+                aria-label="Clear transcript search"
+              >×</button>
+            </div>
+          </header>
+          <div id="search-results-status" class="search-results-status" role="status"></div>
+          <div id="search-results-list" class="search-results-list" role="list"></div>
+        </aside>
 
         <div id="rollup-row" class="rollup-row" data-testid="rollups">
           <div class="rollup-label" aria-hidden="true">
