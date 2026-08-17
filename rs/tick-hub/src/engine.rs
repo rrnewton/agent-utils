@@ -1,10 +1,15 @@
 //! Deterministic tick evaluation over injected gate and file-age boundaries.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::error::Error;
+use std::fmt;
 
 use indexmap::IndexMap;
 
-use crate::cadence::is_due;
+use crate::cadence::{
+    is_due, unresolved_render_state_keys, UNRESOLVED_RENDER_COUNT_SUFFIX,
+    UNRESOLVED_RENDER_FIRST_SUFFIX, UNRESOLVED_RENDER_STATE_PREFIX,
+};
 use crate::emit::{
     format_action, format_error, format_health, format_no_result, format_note, format_unevaluable,
     HEALTH_STATUS_MISSING, HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
@@ -24,6 +29,25 @@ pub struct TickResult {
     /// Number of `ACTION:` instructions emitted.
     pub actions_emitted: usize,
 }
+
+/// A rendered action or note still contains one or more template placeholders.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnresolvedPlaceholderError {
+    /// Sorted unique placeholders, including their braces.
+    pub placeholders: Vec<String>,
+}
+
+impl fmt::Display for UnresolvedPlaceholderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "refusing emission with unresolved placeholder(s): {}",
+            self.placeholders.join(", ")
+        )
+    }
+}
+
+impl Error for UnresolvedPlaceholderError {}
 
 /// Parse non-comment `key=value` lines, retaining insertion order.
 pub fn parse_kv_lines(text: &str) -> IndexMap<String, String> {
@@ -64,6 +88,9 @@ pub fn evaluate_health(hc: &HealthCheck, probe: &dyn FileAgeProbe, now: i64) -> 
 /// would render a crashed gate as a non-answer. Softening a real failure into
 /// NO_RESULT is the opposite of the point.
 pub const NO_RESULT_EXIT: i32 = 75;
+
+/// The first consecutive unresolved-render count that adds a distinct escalation action.
+pub const REPEATED_RENDER_FAILURE_THRESHOLD: i64 = 3;
 
 /// What one gate execution concluded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +155,25 @@ fn eval_gate(
     Ok((outcome, captured))
 }
 
-fn no_signal_action(reminder: &crate::model::Reminder, reason: &str, detail: &str) -> String {
+fn placeholder_names(placeholders: &[String]) -> String {
+    placeholders
+        .iter()
+        .map(|placeholder| {
+            placeholder
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .unwrap_or(placeholder)
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn no_signal_action(
+    reminder: &crate::model::Reminder,
+    reason: &str,
+    detail: &str,
+    missing_placeholders: &[String],
+) -> String {
     let mut fields = IndexMap::from([
         ("component".into(), "tick-hub-reporting".into()),
         ("outcome".into(), "NO-SIGNAL".into()),
@@ -145,6 +190,12 @@ fn no_signal_action(reminder: &crate::model::Reminder, reason: &str, detail: &st
     if !detail.is_empty() {
         fields.insert("detail".into(), detail);
     }
+    let mut title = format!("NO-SIGNAL gate={}: {reason}", reminder.name);
+    if !missing_placeholders.is_empty() {
+        let missing = placeholder_names(missing_placeholders);
+        fields.insert("missing_placeholders".into(), missing.clone());
+        title.push_str(&format!("; missing placeholder(s)={missing}"));
+    }
     format_action(
         if reminder.emit.skill.is_empty() {
             "tick-hub-no-signal"
@@ -152,7 +203,44 @@ fn no_signal_action(reminder: &crate::model::Reminder, reason: &str, detail: &st
             &reminder.emit.skill
         },
         &fields,
-        &format!("NO-SIGNAL gate={}: {reason}", reminder.name),
+        &title,
+    )
+}
+
+fn repeated_render_failure_action(
+    reminder: &crate::model::Reminder,
+    consecutive_failures: i64,
+    first_failure_epoch: i64,
+    missing_placeholders: &[String],
+) -> String {
+    let missing = placeholder_names(missing_placeholders);
+    let fields = IndexMap::from([
+        ("component".into(), "tick-hub-reporting".into()),
+        ("outcome".into(), "NO-SIGNAL".into()),
+        ("gate".into(), reminder.name.clone()),
+        ("reason".into(), "unresolved-placeholder".into()),
+        (
+            "consecutive_failures".into(),
+            consecutive_failures.to_string(),
+        ),
+        (
+            "first_failure_epoch".into(),
+            first_failure_epoch.to_string(),
+        ),
+        ("missing_placeholders".into(), missing.clone()),
+    ]);
+    let title = format!(
+        "NO-SIGNAL gate={}: unresolved-placeholder repeated for {consecutive_failures} consecutive render failures since first_failure_epoch={first_failure_epoch}; missing placeholder(s)={missing}",
+        reminder.name
+    );
+    format_action(
+        if reminder.emit.skill.is_empty() {
+            "tick-hub-no-signal"
+        } else {
+            &reminder.emit.skill
+        },
+        &fields,
+        &title,
     )
 }
 
@@ -163,8 +251,44 @@ fn interpolate(mut text: String, values: &IndexMap<String, String>) -> String {
     text
 }
 
+fn unresolved_placeholders(text: &str) -> BTreeSet<String> {
+    let bytes = text.as_bytes();
+    let mut found = BTreeSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'{' || (index > 0 && bytes[index - 1] == b'{') {
+            index += 1;
+            continue;
+        }
+        let first = index + 1;
+        if first >= bytes.len() || !(bytes[first].is_ascii_alphabetic() || bytes[first] == b'_') {
+            index += 1;
+            continue;
+        }
+        let mut end = first + 1;
+        while end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'_' | b'.' | b'-'))
+        {
+            end += 1;
+        }
+        if end < bytes.len()
+            && bytes[end] == b'}'
+            && (end + 1 == bytes.len() || bytes[end + 1] != b'}')
+        {
+            found.insert(text[index..=end].to_string());
+            index = end + 1;
+        } else {
+            index += 1;
+        }
+    }
+    found
+}
+
 /// Render a fired emission, including captured-field interpolation.
-pub fn render_emit(emit: &Emit, captured: &IndexMap<String, String>) -> String {
+pub fn render_emit(
+    emit: &Emit,
+    captured: &IndexMap<String, String>,
+) -> Result<String, UnresolvedPlaceholderError> {
     let mut merged = emit.fields.clone();
     for (key, value) in captured {
         merged.insert(key.clone(), value.clone());
@@ -176,10 +300,58 @@ pub fn render_emit(emit: &Emit, captured: &IndexMap<String, String>) -> String {
         }
     }
     let title = interpolate(emit.title.clone(), &merged);
-    match emit.kind {
+    let mut unresolved = unresolved_placeholders(&title);
+    for value in merged.values() {
+        unresolved.extend(unresolved_placeholders(value));
+    }
+    if !unresolved.is_empty() {
+        return Err(UnresolvedPlaceholderError {
+            placeholders: unresolved.into_iter().collect(),
+        });
+    }
+    Ok(match emit.kind {
         EmitKind::Note => format_note(&title),
         EmitKind::Action => format_action(&emit.skill, &merged, &title),
-    }
+    })
+}
+
+fn clear_render_failure_state(state: &mut BTreeMap<String, i64>, reminder_name: &str) {
+    let (count_key, first_key) = unresolved_render_state_keys(reminder_name);
+    state.remove(&count_key);
+    state.remove(&first_key);
+}
+
+fn record_render_failure(
+    state: &mut BTreeMap<String, i64>,
+    reminder_name: &str,
+    now: i64,
+) -> (i64, i64) {
+    let (count_key, first_key) = unresolved_render_state_keys(reminder_name);
+    let previous_count = state.get(&count_key).copied().unwrap_or(0).max(0);
+    let consecutive = previous_count.saturating_add(1);
+    let first_failure_epoch = if previous_count == 0 {
+        now.max(0)
+    } else {
+        state.get(&first_key).copied().unwrap_or(now.max(0)).max(0)
+    };
+    state.insert(count_key, consecutive);
+    state.insert(first_key, first_failure_epoch);
+    (consecutive, first_failure_epoch)
+}
+
+fn prune_removed_render_failure_state(
+    state: &mut BTreeMap<String, i64>,
+    reminder_names: &BTreeSet<&str>,
+) {
+    state.retain(|key, _| {
+        let Some(rest) = key.strip_prefix(UNRESOLVED_RENDER_STATE_PREFIX) else {
+            return true;
+        };
+        let name = rest
+            .strip_suffix(UNRESOLVED_RENDER_COUNT_SUFFIX)
+            .or_else(|| rest.strip_suffix(UNRESOLVED_RENDER_FIRST_SUFFIX));
+        name.is_some_and(|name| !name.is_empty() && reminder_names.contains(name))
+    });
 }
 
 /// Run one tick using explicit time and injected side-effect boundaries.
@@ -205,6 +377,12 @@ pub fn run_tick(
         lines.push(line);
     }
     let mut new_fired = fired.clone();
+    let reminder_names = config
+        .reminders
+        .iter()
+        .map(|reminder| reminder.name.as_str())
+        .collect::<BTreeSet<_>>();
+    prune_removed_render_failure_state(&mut new_fired, &reminder_names);
     if state.enabled {
         let mut evaluations = Vec::new();
         for reminder in &config.reminders {
@@ -269,10 +447,18 @@ pub fn run_tick(
             let outcome = evaluation.outcome;
             let captured = evaluation.captured;
             if let Some(error) = evaluation.error {
+                clear_render_failure_state(&mut new_fired, &reminder.name);
                 lines.push(format_error(&format!(
                     "reminder {}: {error}",
                     reminder.name
                 )));
+                lines.push(no_signal_action(
+                    reminder,
+                    "gate-execution-error",
+                    &error,
+                    &[],
+                ));
+                actions += 1;
                 continue;
             }
             // A NO_RESULT does NOT consume cadence, matching the existing
@@ -280,13 +466,20 @@ pub fn run_tick(
             // it can determine something. Deliberately noisy -- silence is the
             // hazard here, so repetition is the correct trade.
             if outcome == GateOutcome::NoResult {
+                clear_render_failure_state(&mut new_fired, &reminder.name);
                 let detail = captured.get("summary").map(String::as_str).unwrap_or("");
                 lines.push(format_no_result(&reminder.name, detail));
-                lines.push(no_signal_action(reminder, "could-not-determine", detail));
+                lines.push(no_signal_action(
+                    reminder,
+                    "could-not-determine",
+                    detail,
+                    &[],
+                ));
                 actions += 1;
                 continue;
             }
             if outcome == GateOutcome::Quiet {
+                clear_render_failure_state(&mut new_fired, &reminder.name);
                 let unavailable_dependencies: Vec<String> = reminder
                     .depends_on
                     .iter()
@@ -302,6 +495,7 @@ pub fn run_tick(
                         reminder,
                         "dependency-could-not-determine",
                         &unavailable_dependencies.join(","),
+                        &[],
                     ));
                     actions += 1;
                     continue;
@@ -309,8 +503,36 @@ pub fn run_tick(
                 new_fired.insert(reminder.name.clone(), now);
                 continue;
             }
+            let line = match render_emit(&reminder.emit, &captured) {
+                Ok(line) => line,
+                Err(error) => {
+                    lines.push(format_error(&format!(
+                        "reminder {}: {error}",
+                        reminder.name
+                    )));
+                    lines.push(no_signal_action(
+                        reminder,
+                        "unresolved-placeholder",
+                        "",
+                        &error.placeholders,
+                    ));
+                    actions += 1;
+                    let (consecutive, first_failure_epoch) =
+                        record_render_failure(&mut new_fired, &reminder.name, now);
+                    if consecutive >= REPEATED_RENDER_FAILURE_THRESHOLD {
+                        lines.push(repeated_render_failure_action(
+                            reminder,
+                            consecutive,
+                            first_failure_epoch,
+                            &error.placeholders,
+                        ));
+                        actions += 1;
+                    }
+                    continue;
+                }
+            };
+            clear_render_failure_state(&mut new_fired, &reminder.name);
             new_fired.insert(reminder.name.clone(), now);
-            let line = render_emit(&reminder.emit, &captured);
             if line.starts_with("ACTION: ") {
                 actions += 1;
             }
@@ -451,7 +673,7 @@ mod tests {
         emit.fields.insert("live".into(), "{count}".into());
         let captured = IndexMap::from([("count".into(), "3".into())]);
         assert_eq!(
-            render_emit(&emit, &captured),
+            render_emit(&emit, &captured).unwrap(),
             "ACTION: triage base=7 copy=7 live=3 count=3 title=\"7/3\""
         );
     }
@@ -516,6 +738,11 @@ mod tests {
         assert!(result.lines.iter().any(|line| {
             line == "ERROR: reminder x: gate command could not run ('boom'): not found"
         }));
+        assert!(result
+            .lines
+            .iter()
+            .any(|line| line.contains("reason=gate-execution-error")));
+        assert_eq!(result.actions_emitted, 1);
         assert!(!result.fired.contains_key("x"));
     }
 
@@ -547,6 +774,157 @@ mod tests {
             calls: RefCell::new(Vec::new()),
         };
         (config, runner, FakeProbe(BTreeMap::new()))
+    }
+
+    #[test]
+    fn unresolved_placeholder_is_refused_loudly_and_retried() {
+        let (config, gate, probe) = gated("obligation", "check", GateWhen::Failure, 1, "");
+        let result = run_tick(
+            &config,
+            &OpsState::default(),
+            7,
+            &BTreeMap::new(),
+            &gate,
+            &probe,
+            None,
+        );
+        let actions = result
+            .lines
+            .iter()
+            .filter(|line| line.starts_with("ACTION: "))
+            .collect::<Vec<_>>();
+        assert_eq!(actions.len(), 1, "{:?}", result.lines);
+        assert!(actions[0].contains("outcome=NO-SIGNAL"));
+        assert!(actions[0].contains("reason=unresolved-placeholder"));
+        assert!(actions[0].contains("missing_placeholders=summary"));
+        assert!(result.lines.iter().any(|line| {
+            line == "ERROR: reminder obligation: refusing emission with unresolved placeholder(s): {summary}"
+        }));
+        let (count_key, first_key) = unresolved_render_state_keys("obligation");
+        assert_eq!(result.fired.get(&count_key), Some(&1));
+        assert_eq!(result.fired.get(&first_key), Some(&7));
+        assert!(!result.fired.contains_key("obligation"));
+        assert_eq!(result.actions_emitted, 1);
+    }
+
+    #[test]
+    fn third_consecutive_unresolved_placeholder_adds_persistent_escalation() {
+        // Mutation controls: >=3 -> >3 misses the third tick; resetting the first epoch on each
+        // failure changes the asserted first_failure_epoch=100.
+        let (config, gate, probe) = gated("obligation", "check", GateWhen::Failure, 1, "");
+        let (count_key, first_key) = unresolved_render_state_keys("obligation");
+        let mut fired = BTreeMap::new();
+        for (index, now) in [100, 200, 300].into_iter().enumerate() {
+            let consecutive = i64::try_from(index + 1).unwrap();
+            let result = run_tick(
+                &config,
+                &OpsState::default(),
+                now,
+                &fired,
+                &gate,
+                &probe,
+                None,
+            );
+            let actions = result
+                .lines
+                .iter()
+                .filter(|line| line.starts_with("ACTION: "))
+                .collect::<Vec<_>>();
+            assert!(actions
+                .iter()
+                .any(|line| line.contains("reason=unresolved-placeholder")));
+            assert_eq!(actions.len(), if consecutive < 3 { 1 } else { 2 });
+            assert_eq!(result.actions_emitted, actions.len());
+            if consecutive < 3 {
+                assert!(!actions
+                    .iter()
+                    .any(|line| line.contains("consecutive_failures=")));
+            } else {
+                let repeated = actions
+                    .iter()
+                    .find(|line| line.contains("consecutive_failures="))
+                    .expect("third failure escalation");
+                assert!(repeated.contains("consecutive_failures=3"));
+                assert!(repeated.contains("first_failure_epoch=100"));
+                assert!(repeated.contains("missing_placeholders=summary"));
+            }
+            assert_eq!(result.fired.get(&count_key), Some(&consecutive));
+            assert_eq!(result.fired.get(&first_key), Some(&100));
+            assert!(!result.fired.contains_key("obligation"));
+            fired = result.fired;
+        }
+    }
+
+    #[test]
+    fn any_later_non_render_failure_outcome_clears_render_failure_state() {
+        // Mutation control: deleting any branch's clear call leaves one seeded key live.
+        let (config, _, probe) = gated("obligation", "check", GateWhen::Failure, 1, "");
+        let (count_key, first_key) = unresolved_render_state_keys("obligation");
+        let prior = BTreeMap::from([(count_key.clone(), 4), (first_key.clone(), 10)]);
+        for outcome in [
+            GateResult::failed("not found"),
+            GateResult::completed(NO_RESULT_EXIT, ""),
+            GateResult::completed(0, ""),
+            GateResult::completed(1, "summary=rendered\n"),
+        ] {
+            let gate = FakeGate {
+                outcomes: BTreeMap::from([("check".into(), outcome)]),
+                calls: RefCell::new(Vec::new()),
+            };
+            let result = run_tick(
+                &config,
+                &OpsState::default(),
+                20,
+                &prior,
+                &gate,
+                &probe,
+                None,
+            );
+            assert!(!result.fired.contains_key(&count_key));
+            assert!(!result.fired.contains_key(&first_key));
+        }
+    }
+
+    #[test]
+    fn removed_reminder_render_failure_state_is_pruned_without_touching_cadence() {
+        let (count_key, first_key) = unresolved_render_state_keys("removed");
+        let fired = BTreeMap::from([
+            ("still-config-independent".into(), 7),
+            (count_key, 4),
+            (first_key, 10),
+        ]);
+        let (gate, probe) = fakes();
+        let result = run_tick(
+            &TickConfig::default(),
+            &OpsState::default(),
+            20,
+            &fired,
+            &gate,
+            &probe,
+            None,
+        );
+        assert_eq!(
+            result.fired,
+            BTreeMap::from([("still-config-independent".into(), 7)])
+        );
+    }
+
+    #[test]
+    fn no_evaluation_keeps_active_reminder_render_failure_state() {
+        let reminder = Reminder::new("obligation", Emit::note("{summary}"));
+        let config = TickConfig {
+            reminders: vec![reminder],
+            ..TickConfig::default()
+        };
+        let (count_key, first_key) = unresolved_render_state_keys("obligation");
+        let prior = BTreeMap::from([(count_key, 2), (first_key, 10)]);
+        let (gate, probe) = fakes();
+        let state = OpsState {
+            enabled: false,
+            ..OpsState::default()
+        };
+        let result = run_tick(&config, &state, 20, &prior, &gate, &probe, None);
+        assert_eq!(result.fired, prior);
     }
 
     #[test]

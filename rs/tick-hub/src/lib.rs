@@ -21,7 +21,9 @@ pub use emit::{
     format_action, format_error, format_health, format_note, HEALTH_STATUS_MISSING,
     HEALTH_STATUS_OK, HEALTH_STATUS_STALE,
 };
-pub use engine::{evaluate_health, parse_kv_lines, render_emit, run_tick, TickResult};
+pub use engine::{
+    evaluate_health, parse_kv_lines, render_emit, run_tick, TickResult, UnresolvedPlaceholderError,
+};
 pub use io::{config_from_json, config_from_yaml, config_to_json, config_to_yaml, TickConfigError};
 pub use model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig, EVERY_TICK};
 pub use probes::{

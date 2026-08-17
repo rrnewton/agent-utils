@@ -8,6 +8,24 @@ use std::path::Path;
 use crate::model::{Reminder, EVERY_TICK};
 use crate::text::{is_whitespace, split_lines, trim};
 
+/// Namespace reserved for tick-hub's own persisted diagnostic state.
+pub const INTERNAL_STATE_PREFIX: &str = "__tick_hub_internal__.";
+/// Prefix for consecutive unresolved-render accounting.
+pub const UNRESOLVED_RENDER_STATE_PREFIX: &str = "__tick_hub_internal__.unresolved_render.";
+/// Suffix for the consecutive unresolved-render count.
+pub const UNRESOLVED_RENDER_COUNT_SUFFIX: &str = ".count";
+/// Suffix for the first unresolved-render epoch.
+pub const UNRESOLVED_RENDER_FIRST_SUFFIX: &str = ".first_failure_epoch";
+
+/// Return the reserved `(count, first-failure-epoch)` keys for one reminder.
+pub fn unresolved_render_state_keys(name: &str) -> (String, String) {
+    let base = format!("{UNRESOLVED_RENDER_STATE_PREFIX}{name}");
+    (
+        format!("{base}{UNRESOLVED_RENDER_COUNT_SUFFIX}"),
+        format!("{base}{UNRESOLVED_RENDER_FIRST_SUFFIX}"),
+    )
+}
+
 /// Return whether a reminder should be checked at `now`.
 pub fn is_due(name: &str, cadence_secs: i64, now: i64, last_fired: &BTreeMap<String, i64>) -> bool {
     if cadence_secs <= EVERY_TICK {
@@ -30,7 +48,7 @@ pub fn due_reminders<'a>(
         .collect()
 }
 
-/// Load valid `key=epoch` lines. Missing, unreadable, and malformed data is ignored.
+/// Load valid `key=epoch-or-count` lines. Missing, unreadable, and malformed data is ignored.
 pub fn load_fired_state(path: &Path) -> BTreeMap<String, i64> {
     let Ok(text) = fs::read_to_string(path) else {
         return BTreeMap::new();
@@ -81,7 +99,10 @@ pub fn persist_fired_state(path: &Path, state: &BTreeMap<String, i64>) -> io::Re
     temporary_name.push(".tmp");
     let temporary = path.with_file_name(temporary_name);
     let mut text =
-        String::from("# tick-hub fired-state — key=last_fired_epoch (managed by tick-hub)\n");
+        String::from("# tick-hub fired-state — reminder=last_fired_epoch (managed by tick-hub)\n");
+    text.push_str(&format!(
+        "# {INTERNAL_STATE_PREFIX}* entries are reserved retry diagnostics\n"
+    ));
     for (key, value) in state {
         text.push_str(&format!("{key}={value}\n"));
     }
@@ -135,9 +156,18 @@ mod tests {
     fn fired_state_round_trips_and_ignores_garbage() {
         let root = temporary_path("cadence");
         let path = root.join("sub/state");
-        let state = BTreeMap::from([("a".to_string(), 100), ("b".to_string(), 200)]);
+        let (count_key, first_key) = unresolved_render_state_keys("a");
+        let state = BTreeMap::from([
+            ("a".to_string(), 100),
+            ("b".to_string(), 200),
+            (count_key, 3),
+            (first_key, 50),
+        ]);
         persist_fired_state(&path, &state).unwrap();
         assert_eq!(load_fired_state(&path), state);
+        assert!(fs::read_to_string(&path).unwrap().contains(&format!(
+            "# {INTERNAL_STATE_PREFIX}* entries are reserved retry diagnostics"
+        )));
         fs::write(&path, "# comment\nvalid=42\nbad line\nk=notnum\n").unwrap();
         assert_eq!(
             load_fired_state(&path),

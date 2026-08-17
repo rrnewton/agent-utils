@@ -9,6 +9,7 @@ use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 
+use crate::cadence::INTERNAL_STATE_PREFIX;
 use crate::model::{Emit, EmitKind, Gate, GateWhen, HealthCheck, Reminder, TickConfig};
 use crate::text::{is_whitespace, string_repr, trim};
 
@@ -379,6 +380,11 @@ fn reminder_from(value: &Value, where_: &str) -> Result<Reminder, TickConfigErro
             "{where_}: field 'name' must not contain whitespace or '=' (it is a fired-state key)"
         )));
     }
+    if name.starts_with(INTERNAL_STATE_PREFIX) {
+        return Err(TickConfigError(format!(
+            "{where_}: field 'name' must not start with reserved internal-state prefix {INTERNAL_STATE_PREFIX:?}"
+        )));
+    }
     Ok(Reminder {
         name,
         emit: emit_from(emit, &format!("{where_}.emit"))?,
@@ -671,9 +677,10 @@ fn validate_serializable(config: &TickConfig) -> Result<(), TickConfigError> {
         if trim(&reminder.name).is_empty()
             || reminder.name.contains('=')
             || reminder.name.chars().any(is_whitespace)
+            || reminder.name.starts_with(INTERNAL_STATE_PREFIX)
         {
             return Err(TickConfigError(
-                "reminder names must be valid fired-state keys (nonempty, without whitespace or '=')"
+                "reminder names must be valid fired-state keys (nonempty, without whitespace or '=', and outside the reserved internal-state namespace)"
                     .to_string(),
             ));
         }
@@ -848,6 +855,7 @@ mod tests {
             r#"{"reminders":[{"name":" ","emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"has space","emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"has=equals","emit":{"skill":"s"}}]}"#,
+            r#"{"reminders":[{"name":"__tick_hub_internal__.collision","emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"r","emit":{"skill":"  "}}]}"#,
             r#"{"reminders":[{"name":"r","cadence_secs":-1,"emit":{"skill":"s"}}]}"#,
             r#"{"reminders":[{"name":"r","emit":{"skill":"s"}},{"name":"r","emit":{"kind":"note"}}]}"#,
@@ -974,6 +982,16 @@ mod tests {
         };
         assert!(config_to_json(&invalid_name).is_err());
         assert!(config_to_yaml(&invalid_name).is_err());
+
+        let reserved_name = TickConfig {
+            reminders: vec![Reminder::new(
+                "__tick_hub_internal__.collision",
+                Emit::note("n"),
+            )],
+            ..TickConfig::default()
+        };
+        assert!(config_to_json(&reserved_name).is_err());
+        assert!(config_to_yaml(&reserved_name).is_err());
 
         let mut invalid_action = Reminder::new("r", Emit::action(" ", "invalid"));
         invalid_action.cadence_secs = -1;

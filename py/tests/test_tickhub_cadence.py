@@ -10,10 +10,12 @@ from pathlib import Path
 import pytest
 
 from tick_hub.cadence import (
+    INTERNAL_STATE_PREFIX,
     due_reminders,
     is_due,
     load_fired_state,
     persist_fired_state,
+    unresolved_render_state_keys,
 )
 from tick_hub.model import Emit, EmitKind, Reminder
 
@@ -55,9 +57,11 @@ def test_due_reminders_preserves_order() -> None:
 
 def test_fired_state_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "sub" / "state"
-    state = {"a": 100, "b": 200}
+    count_key, first_key = unresolved_render_state_keys("a")
+    state = {"a": 100, "b": 200, count_key: 3, first_key: 50}
     persist_fired_state(path, state)
     assert load_fired_state(path) == state
+    assert f"# {INTERNAL_STATE_PREFIX}* entries are reserved retry diagnostics" in path.read_text()
     # missing file -> empty map (all reminders treated as never-fired).
     assert load_fired_state(tmp_path / "nope") == {}
 
