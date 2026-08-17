@@ -113,7 +113,7 @@ def _site(tmp_path: Path) -> Path:
             {
                 "id": "alpha::phase-work",
                 "team": "alpha",
-                "agent_id": "child",
+                "agent_id": "alpha::child",
                 "detail_path": detail_path,
                 "phrase": "Verified reproducible GHC builds.",
                 "paragraph": "The verifier compared two builds and found identical artifacts.",
@@ -303,6 +303,44 @@ def _rewrite_search_records(
     bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
 
 
+def _rewrite_content_addressed_object(
+    root: Path,
+    reference: dict[str, JsonValue],
+    where: str,
+    mutate: Callable[[dict[str, JsonValue]], None],
+) -> None:
+    old_relative = as_string(reference.get("url"), where + ".url")
+    record = as_object(read_json(root / old_relative), old_relative)
+    mutate(record)
+    content = canonical_json(record)
+    encoded = content.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    relative = f"data/timeline-v2/objects/{digest}.json"
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(encoded)
+    reference["url"] = relative
+    reference["sha256"] = digest
+    reference["bytes"] = len(encoded)
+    reference["gzip_bytes"] = None
+
+
+def _rewrite_schema_2_object(
+    root: Path,
+    field: str,
+    mutate: Callable[[dict[str, JsonValue]], None],
+) -> None:
+    """Rewrite one content-addressed root object and repoint the bootstrap."""
+
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    reference = as_object(bootstrap.get(field), f"timeline-v2.{field}")
+    _rewrite_content_addressed_object(
+        root, reference, f"timeline-v2.{field}", mutate
+    )
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+
+
 def _search_record(
     *,
     event_id: str,
@@ -457,6 +495,7 @@ def test_sparse_summaries_remain_queryable_without_markdown(
     _write_json(timeline_path, timeline)
     (root / technical_path).unlink()
     (root / plain_path).unlink()
+    (root / "data" / "timeline-v2.json").unlink()
 
     assert timeline_main(("query", "--output", str(root), "list", "phases")) == 0
     listed_phase = _items(_response(capsys))[0]
@@ -752,7 +791,7 @@ def test_search_v2_rejects_mixing_new_corpus_and_compatibility_scope(
     assert "--in and --scope cannot be combined" in capsys.readouterr().err
 
 
-def test_search_v2_rejects_a_different_timeline_generation(
+def test_search_v2_ignores_a_newer_partially_published_schema_1_generation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     root = _site(tmp_path)
@@ -761,21 +800,249 @@ def test_search_v2_rejects_a_different_timeline_generation(
     timeline["source_digest"] = "replacement-generation"
     timeline_path.write_text(canonical_json(timeline), encoding="utf-8")
 
-    assert (
-        timeline_main(
-            (
-                "query",
-                "--output",
-                str(root),
-                "search",
-                "B3",
-                "--in",
-                "all-transcript",
-            )
+    assert timeline_main(
+        (
+            "query",
+            "--output",
+            str(root),
+            "search",
+            "B3",
+            "--in",
+            "all-transcript",
         )
-        == 2
+    ) == 0
+    assert _response(capsys)["total_matches"] == 2
+
+
+def test_query_prefers_complete_schema_2_and_does_not_require_schema_1(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    (root / "data" / "timeline.json").unlink()
+
+    assert timeline_main(("query", "--output", str(root), "list", "teams")) == 0
+    assert [item["ref"] for item in _items(_response(capsys))] == [
+        "team:alpha",
+        "team:beta",
+    ]
+
+
+def test_query_falls_back_to_schema_1_when_schema_2_is_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    (root / "data" / "timeline-v2.json").unlink()
+
+    assert timeline_main(("query", "--output", str(root), "list", "teams")) == 0
+    assert len(_items(_response(capsys))) == 2
+
+
+def test_query_accepts_a_pre_binding_schema_2_global_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+
+    def remove_source_binding(record: dict[str, JsonValue]) -> None:
+        record.pop("source_digest", None)
+
+    _rewrite_schema_2_object(root, "global", remove_source_binding)
+
+    assert timeline_main(("query", "--output", str(root), "list", "teams")) == 0
+    assert len(_items(_response(capsys))) == 2
+
+
+def test_query_accepts_a_pre_binding_schema_2_phase_index(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+
+    def remove_source_binding(record: dict[str, JsonValue]) -> None:
+        record.pop("source_digest", None)
+
+    _rewrite_schema_2_object(root, "phase_index", remove_source_binding)
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 0
+    assert len(_items(_response(capsys))) == 1
+
+
+def test_query_falls_back_for_a_schema_2_bootstrap_predating_phase_index(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    bootstrap.pop("phase_index")
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 0
+    phase = _items(_response(capsys))[0]
+    assert phase["team"] == "alpha"
+
+
+def test_query_does_not_treat_a_malformed_bootstrap_as_pre_phase_index(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    bootstrap.pop("phase_index")
+    bootstrap["schema_version"] = 2.0
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 2
+    assert "timeline-v2.schema_version: expected an integer" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    (
+        ("digest", "object digest mismatch"),
+        ("source", "different source generation"),
+    ),
+)
+def test_query_rejects_schema_2_object_digest_and_source_mismatches(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corruption: str,
+    expected_error: str,
+) -> None:
+    root = _site(tmp_path)
+    bootstrap = as_object(read_json(root / "data" / "timeline-v2.json"), "timeline-v2")
+    global_reference = as_object(bootstrap.get("global"), "timeline-v2.global")
+    if corruption == "digest":
+        relative = as_string(global_reference.get("url"), "timeline-v2.global.url")
+        path = root / relative
+        path.write_bytes(path.read_bytes() + b" ")
+    else:
+        _rewrite_schema_2_object(
+            root,
+            "global",
+            lambda record: record.__setitem__(
+                "source_digest", "different-source-generation"
+            ),
+        )
+
+    assert timeline_main(("query", "--output", str(root), "list", "teams")) == 2
+    assert expected_error in capsys.readouterr().err
+
+
+def test_query_rejects_a_mismatched_phase_index_source_generation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    _rewrite_schema_2_object(
+        root,
+        "phase_index",
+        lambda record: record.__setitem__(
+            "source_digest", "different-source-generation"
+        ),
     )
-    assert "different timeline generation" in capsys.readouterr().err
+
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 2
+    assert "phase index belongs to a different source generation" in (
+        capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("source_digest", (None, "different-source-generation"))
+def test_query_compatibly_validates_search_shard_source_generation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    source_digest: str | None,
+) -> None:
+    root = _site(tmp_path)
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    search = as_object(bootstrap.get("search"), "timeline-v2.search")
+    shards = as_array(search.get("shards"), "timeline-v2.search.shards")
+    reference = as_object(shards[0], "timeline-v2.search.shards[0]")
+
+    def change_binding(record: dict[str, JsonValue]) -> None:
+        if source_digest is None:
+            record.pop("source_digest", None)
+        else:
+            record["source_digest"] = source_digest
+
+    _rewrite_content_addressed_object(
+        root, reference, "timeline-v2.search.shards[0]", change_binding
+    )
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+
+    result = timeline_main(
+        (
+            "query",
+            "--output",
+            str(root),
+            "search",
+            "B3",
+            "--in",
+            "all-transcript",
+        )
+    )
+    if source_digest is None:
+        assert result == 0
+        assert _response(capsys)["total_matches"] == 2
+    else:
+        assert result == 2
+        assert "search shard belongs to a different source generation" in (
+            capsys.readouterr().err
+        )
+
+
+def test_query_maps_phase_team_from_an_exact_global_agent_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 0
+    phase = _items(_response(capsys))[0]
+    assert phase["team"] == "alpha"
+    assert phase["agent_ref"] == "agent:alpha::child"
+
+    def remove_agent_namespace(record: dict[str, JsonValue]) -> None:
+        phases = as_array(record.get("phases"), "phase-index.phases")
+        first = as_object(phases[0], "phase-index.phases[0]")
+        first["agent_id"] = "child"
+
+    _rewrite_schema_2_object(root, "phase_index", remove_agent_namespace)
+    assert timeline_main(("query", "--output", str(root), "list", "phases")) == 2
+    assert "no exact global agent match" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    (
+        ("team", "unknown team 'ghost'"),
+        ("range", "agent interval is outside timeline range"),
+        ("phase-schema", "unsupported timeline phase index"),
+    ),
+)
+def test_query_validates_schema_2_team_range_and_phase_index_metadata(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corruption: str,
+    expected_error: str,
+) -> None:
+    root = _site(tmp_path)
+    if corruption == "team":
+        def replace_team(record: dict[str, JsonValue]) -> None:
+            agents = as_array(record.get("agents"), "timeline-global.agents")
+            as_object(agents[0], "timeline-global.agents[0]")["team"] = "ghost"
+
+        _rewrite_schema_2_object(root, "global", replace_team)
+    elif corruption == "range":
+        bootstrap_path = root / "data" / "timeline-v2.json"
+        bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+        time_range = as_object(bootstrap.get("range"), "timeline-v2.range")
+        time_range["start_ms"] = START + 1
+        bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+    else:
+        _rewrite_schema_2_object(
+            root,
+            "phase_index",
+            lambda record: record.__setitem__("schema_version", 99),
+        )
+
+    assert timeline_main(("query", "--output", str(root), "list", "teams")) == 2
+    assert expected_error in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1102,6 +1369,7 @@ def test_query_fails_closed_on_unknown_refs_and_archive_path_escape(
     first = as_object(rollups[0], "timeline.rollups[0]")
     first["technical_path"] = "../../outside.md"
     timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
+    (root / "data" / "timeline-v2.json").unlink()
     reference = f"rollup:alpha::hourly::{START}"
     assert timeline_main(("query", "--output", str(root), "show", reference)) == 2
     error = capsys.readouterr().err
@@ -1120,6 +1388,7 @@ def test_query_rejects_unknown_timeline_schema_and_same_root_path_confusion(
     invalid_schema = dict(original)
     invalid_schema["schema_version"] = 99
     timeline_path.write_text(json.dumps(invalid_schema), encoding="utf-8")
+    (root / "data" / "timeline-v2.json").unlink()
 
     assert timeline_main(("query", "--output", str(root), "list", "teams")) == 2
     assert "unsupported timeline schema version 99" in capsys.readouterr().err

@@ -23,6 +23,8 @@ function functionSource(name) {
 const names = [
   "text",
   "number",
+  "hasField",
+  "validateSchema2ObjectSourceDigest",
   "asciiLowerUtf8SearchBytes",
   "searchTextTrigrams",
   "queryTermBloomEligible",
@@ -53,6 +55,7 @@ const context = {
   SECOND_HASH_SEED: 0x9e3779b9,
   app: {
     searchScope: "agent-responses",
+    data: { source_digest: "digest-alpha" },
     agentsById: new Map([["root", { id: "root", team: "alpha" }]])
   }
 };
@@ -240,6 +243,18 @@ assert.strictEqual(
   context.validateTranscriptSearchShard(validShard, catalogEntry, "valid.json"),
   validShard.records
 );
+
+const boundShard = JSON.parse(JSON.stringify(validShard));
+boundShard.source_digest = "digest-alpha";
+assert.strictEqual(
+  context.validateTranscriptSearchShard(boundShard, catalogEntry, "bound.json"),
+  boundShard.records
+);
+const staleShard = JSON.parse(JSON.stringify(validShard));
+staleShard.source_digest = "digest-beta";
+assert.throws(function () {
+  context.validateTranscriptSearchShard(staleShard, catalogEntry, "stale.json");
+}, /source digest does not match the timeline generation/);
 
 function copy(value) {
   return JSON.parse(JSON.stringify(value));

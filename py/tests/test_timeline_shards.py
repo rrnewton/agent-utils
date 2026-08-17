@@ -149,6 +149,7 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
     phase_index_reference = as_object(bootstrap["phase_index"], "phase index reference")
     phase_index = _object(tmp_path, phase_index_reference)
     assert phase_index["kind"] == "timeline-phase-index"
+    assert phase_index["source_digest"] == "source-digest"
     indexed_phases = [
         as_object(value, "indexed phase")
         for value in as_array(phase_index["phases"], "indexed phases")
@@ -175,6 +176,7 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
     global_reference = as_object(bootstrap["global"], "global reference")
     global_object = _object(tmp_path, global_reference)
     assert global_object["kind"] == "timeline-global"
+    assert global_object["source_digest"] == "source-digest"
     assert len(as_array(global_object["agents"], "global agents")) == 1
     assert [
         as_object(value, "structural edge")["id"]
@@ -289,13 +291,17 @@ def test_schema_2_publishes_content_addressed_transcript_search_shards(
     assert bloom_might_contain(prompt_filter, "backend maturity")
     assert not bloom_might_contain(prompt_filter, "ptrace corpus")
     assert bloom_might_contain(response_filter, "ptrace corpus")
+    prompt_shard = _object(tmp_path, catalog[0])
+    response_shard = _object(tmp_path, catalog[1])
+    assert prompt_shard["source_digest"] == "source-digest"
+    assert response_shard["source_digest"] == "source-digest"
     assert [
         as_object(value, "search record")["ref"]
-        for value in as_array(_object(tmp_path, catalog[0])["records"], "records")
+        for value in as_array(prompt_shard["records"], "records")
     ] == ["message:test-team::prompt"]
     assert [
         as_object(value, "search record")["ref"]
-        for value in as_array(_object(tmp_path, catalog[1])["records"], "records")
+        for value in as_array(response_shard["records"], "records")
     ] == ["message:test-team::response"]
 
     second = write_timeline_shards(tmp_path, _timeline(), search_records=records)

@@ -643,12 +643,17 @@ def _global_object(
         rollups.append(_with_activity_bounds(record, rollup_bounds[index]))
     projected["agents"] = agents
     projected["rollups"] = rollups
-    return {
+    result: dict[str, JsonValue] = {
         "schema_version": 2,
         "kind": "timeline-global",
         "edges": structural_edges,
         **projected,
     }
+    # This binding is additive so readers can continue to open schema-2 generations written
+    # before it existed.  New readers verify it against the atomically published bootstrap.
+    if "source_digest" in timeline:
+        result["source_digest"] = timeline["source_digest"]
+    return result
 
 
 def _phase_index_object(
@@ -686,6 +691,7 @@ def _phase_index_object(
     return {
         "schema_version": 2,
         "kind": "timeline-phase-index",
+        "source_digest": _required_value(timeline, "source_digest"),
         "phases": phases,
     }
 
@@ -784,6 +790,7 @@ def write_timeline_shards(
         search_object: dict[str, JsonValue] = {
             "schema_version": 1,
             "kind": "timeline-search-day",
+            "source_digest": _required_value(timeline, "source_digest"),
             "team": team,
             "range": {"start_ms": day_start, "end_ms": day_end},
             "records": record_values,

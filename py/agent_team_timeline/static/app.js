@@ -725,6 +725,7 @@
     var normalized = {
       schema_version: raw.schema_version,
       generated_at: text(raw.generated_at),
+      source_digest: text(raw.source_digest),
       display_timezone: text(raw.display_timezone),
       display_timezone_source: text(raw.display_timezone_source, "legacy_team_data"),
       range: raw.range && typeof raw.range === "object" ? raw.range : {},
@@ -1141,6 +1142,96 @@
     return url;
   }
 
+  function validateSchema2Generation(bootstrap, globalData) {
+    var sourceDigest = text(bootstrap.source_digest);
+    if (!sourceDigest) {
+      throw new Error("Schema-2 timeline bootstrap is missing its source digest.");
+    }
+    // Schema-2 globals published before generation binding was introduced do not carry this
+    // field.  Keep those immutable archives readable; every newly generated global does carry
+    // it, and a present value must bind exactly to the bootstrap before any data is installed.
+    if (hasField(globalData, "source_digest") &&
+        text(globalData.source_digest) !== sourceDigest) {
+      throw new Error("Schema-2 timeline global source digest does not match its bootstrap.");
+    }
+
+    var bootstrapRange = bootstrap.range && typeof bootstrap.range === "object"
+      ? bootstrap.range
+      : null;
+    var rangeStart = number(bootstrapRange && bootstrapRange.start_ms, NaN);
+    var rangeEnd = number(bootstrapRange && bootstrapRange.end_ms, NaN);
+    if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd <= rangeStart) {
+      throw new Error("Schema-2 timeline bootstrap has an invalid range.");
+    }
+    if (hasField(globalData, "range")) {
+      var globalRange = globalData.range && typeof globalData.range === "object"
+        ? globalData.range
+        : null;
+      if (number(globalRange && globalRange.start_ms, NaN) !== rangeStart ||
+          number(globalRange && globalRange.end_ms, NaN) !== rangeEnd) {
+        throw new Error("Schema-2 timeline global range does not match its bootstrap.");
+      }
+    }
+
+    var teamSlugs = new Set();
+    array(bootstrap.teams).forEach(function (team) {
+      var slug = text(team && team.slug);
+      if (!slug || teamSlugs.has(slug)) {
+        throw new Error("Schema-2 timeline bootstrap has an invalid or duplicate team.");
+      }
+      teamSlugs.add(slug);
+    });
+    if (!teamSlugs.size) {
+      throw new Error("Schema-2 timeline bootstrap does not identify a team.");
+    }
+    if (hasField(globalData, "teams")) {
+      var globalTeamSlugs = new Set();
+      array(globalData.teams).forEach(function (team) {
+        globalTeamSlugs.add(text(team && team.slug));
+      });
+      if (globalTeamSlugs.size !== teamSlugs.size ||
+          Array.from(globalTeamSlugs).some(function (slug) { return !teamSlugs.has(slug); })) {
+        throw new Error("Schema-2 timeline global teams do not match its bootstrap.");
+      }
+    }
+
+    [
+      "agents",
+      "edges",
+      "rollups",
+      "summary_files",
+      "project_overviews",
+      "projects",
+      "glossary"
+    ].forEach(function (field) {
+      array(globalData[field]).forEach(function (record) {
+        var team = text(record && record.team);
+        if (team && !teamSlugs.has(team)) {
+          throw new Error("Schema-2 timeline global " + field +
+            " contains a team absent from its bootstrap.");
+        }
+      });
+    });
+    array(globalData.agents).forEach(function (agent) {
+      var start = number(agent && agent.start_ms, NaN);
+      var end = number(agent && agent.end_ms, NaN);
+      if (Number.isFinite(start) && Number.isFinite(end) &&
+          (start < rangeStart || end > rangeEnd)) {
+        throw new Error("Schema-2 timeline global agent range is outside its bootstrap.");
+      }
+    });
+  }
+
+  function validateSchema2ObjectSourceDigest(raw, where) {
+    if (!hasField(raw, "source_digest")) {
+      return;
+    }
+    var expected = text(app.data && app.data.source_digest);
+    if (!expected || text(raw.source_digest) !== expected) {
+      throw new Error(where + " source digest does not match the timeline generation.");
+    }
+  }
+
   function mergeDetailShard(raw, url) {
     if (!raw || typeof raw !== "object" || number(raw.schema_version, NaN) !== 2 ||
         text(raw.kind) !== "timeline-detail-day") {
@@ -1470,6 +1561,7 @@
         text(raw.kind) !== "timeline-search-day") {
       throw new Error("Unsupported transcript search shard: " + url);
     }
+    validateSchema2ObjectSourceDigest(raw, "Transcript search shard");
     var expectedTeam = text(catalogEntry && catalogEntry.team);
     var expectedStart = number(catalogEntry && catalogEntry.start_ms, NaN);
     var expectedEnd = number(catalogEntry && catalogEntry.end_ms, NaN);
@@ -1995,6 +2087,7 @@
             text(raw.kind) !== "timeline-phase-index") {
           throw new Error("Unsupported timeline phase index: " + url);
         }
+        validateSchema2ObjectSourceDigest(raw, "Timeline phase index");
         var byAgent = new Map();
         var ids = new Set();
         array(raw.phases).forEach(function (phase) {
@@ -5929,6 +6022,7 @@
         text(globalData.kind) !== "timeline-global") {
       throw new Error("Unsupported schema-2 timeline global object.");
     }
+    validateSchema2Generation(bootstrap, globalData);
     var catalog = array(bootstrap.detail_shards).slice();
     var seenUrls = new Set();
     catalog.forEach(function (shard) {

@@ -69,6 +69,7 @@ function singleDaySchema2Fixture(globalDigest, detailDigest) {
   ].forEach(function (field) { delete globalData[field]; });
   globalData.schema_version = 2;
   globalData.kind = "timeline-global";
+  globalData.source_digest = TIMELINE.source_digest;
   globalData.edges = TIMELINE.edges.filter(function (edge) {
     return edge.kind === "spawn" || edge.kind === "continuation" || edge.kind === "result";
   });
@@ -160,6 +161,88 @@ test.beforeEach(async function ({ page }) {
   await expect(page.locator(".phase-group" + phaseSelector)).toBeVisible();
 });
 
+test("schema 2 keeps immutable legacy globals without a source digest readable", async function ({
+  page
+}) {
+  const fixture = singleDaySchema2Fixture("7".repeat(64), "8".repeat(64));
+  delete fixture.globalData.source_digest;
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+
+  await page.reload();
+  await expect(page.locator(".timeline-card")).toHaveAttribute(
+    "data-timeline-schema-mode",
+    "schema2"
+  );
+  await expect(page.locator("#dataset-meta")).not.toContainText("schema 2 fallback");
+});
+
+test("schema 2 rejects a global object from a different source generation", async function ({
+  page
+}) {
+  const fixture = singleDaySchema2Fixture("9".repeat(64), "a".repeat(64));
+  fixture.globalData.source_digest = "different-generation";
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+
+  await page.reload();
+  await expect(page.locator(".timeline-card")).toHaveAttribute(
+    "data-timeline-schema-mode",
+    "schema1-fallback"
+  );
+  await expect(page.locator("#dataset-meta")).toContainText(
+    "global source digest does not match its bootstrap"
+  );
+});
+
+test("schema 2 rejects global team and range records outside its bootstrap", async function ({
+  page
+}) {
+  const teamFixture = singleDaySchema2Fixture("3".repeat(64), "4".repeat(64));
+  teamFixture.globalData.agents[0].team = "stale-team";
+  await routeSingleDaySchema2Fixture(page, teamFixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(teamFixture.detail)
+    });
+  });
+
+  await page.reload();
+  await expect(page.locator(".timeline-card")).toHaveAttribute(
+    "data-timeline-schema-mode",
+    "schema1-fallback"
+  );
+  await expect(page.locator("#dataset-meta")).toContainText(
+    "contains a team absent from its bootstrap"
+  );
+
+  const rangeFixture = singleDaySchema2Fixture("5".repeat(64), "6".repeat(64));
+  rangeFixture.bootstrap.range.start_ms = rangeFixture.globalData.agents[0].start_ms + 1;
+  await routeSingleDaySchema2Fixture(page, rangeFixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(rangeFixture.detail)
+    });
+  });
+
+  await page.reload();
+  await expect(page.locator(".timeline-card")).toHaveAttribute(
+    "data-timeline-schema-mode",
+    "schema1-fallback"
+  );
+  await expect(page.locator("#dataset-meta")).toContainText(
+    "global agent range is outside its bootstrap"
+  );
+});
+
 test("schema 2 loads visible detail shards once and expands search on demand", async function ({ page }) {
   const globalDigest = "a".repeat(64);
   const firstDigest = "b".repeat(64);
@@ -188,6 +271,7 @@ test("schema 2 loads visible detail shards once and expands search on demand", a
   ].forEach(function (field) { delete globalData[field]; });
   globalData.schema_version = 2;
   globalData.kind = "timeline-global";
+  globalData.source_digest = TIMELINE.source_digest;
   globalData.stats = {
     user_prompts: 41,
     agent_responses: 42,
@@ -705,6 +789,66 @@ test("transcript search rejects a shard whose record count disagrees with its ca
   );
 });
 
+test("transcript search rejects a shard from a different source generation", async function ({
+  page
+}) {
+  const fixture = singleDaySchema2Fixture("c".repeat(64), "d".repeat(64));
+  const searchDigest = "e".repeat(64);
+  const day = fixture.bootstrap.detail_shards[0];
+  fixture.bootstrap.search = {
+    schema_version: 1,
+    strategy: "transcript-message-shards",
+    shards: [{
+      kind: "utc-day",
+      day: day.day,
+      team: "codex-hermit",
+      start_ms: day.start_ms,
+      end_ms: day.end_ms,
+      url: "data/timeline-v2/objects/" + searchDigest + ".json",
+      sha256: searchDigest,
+      counts: { records: 1 }
+    }]
+  };
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await page.route("**/" + searchDigest + ".json", async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        schema_version: 1,
+        kind: "timeline-search-day",
+        source_digest: "different-generation",
+        team: "codex-hermit",
+        range: { start_ms: day.start_ms, end_ms: day.end_ms },
+        records: [{
+          schema_version: 1,
+          ref: "message:codex-hermit::stale",
+          record_type: "response",
+          role: "assistant",
+          team: "codex-hermit",
+          agent_id: "agent-a",
+          at_ms: BASE_MS + 12 * 60 * 1000,
+          text: "Stale B3 response"
+        }]
+      })
+    });
+  });
+
+  await page.reload();
+  const card = page.getByTestId("timeline");
+  await page.getByTestId("search-scope").selectOption("all-transcript");
+  await page.getByTestId("search").fill("B3");
+  await expect(card).toHaveAttribute("data-transcript-search-state", "error");
+  await expect(card).toHaveAttribute("data-loaded-search-shard-count", "0");
+  await expect(page.getByTestId("search-results")).toContainText(
+    "source digest does not match the timeline generation"
+  );
+});
+
 test("transcript Bloom filters defer negative shards and load them for a later positive query", async function ({ page }) {
   const fixture = singleDaySchema2Fixture("0".repeat(64), "1".repeat(64));
   const firstDigest = "2".repeat(64);
@@ -923,6 +1067,44 @@ test("schema 2 lifetime modal uses the phase index instead of every day shard", 
     page.getByTestId("modal").locator('.agent-lifetime-phase[data-phase-id="phase-a-2"]')
   ).toBeVisible();
   expect(phaseIndexRequests).toBe(1);
+  expect(detailShardRequests).toBe(0);
+});
+
+test("schema 2 rejects a phase index from a different source generation", async function ({
+  page
+}) {
+  const fixture = singleDaySchema2Fixture("a".repeat(64), "b".repeat(64));
+  const phaseIndexDigest = "c".repeat(64);
+  fixture.bootstrap.phase_index = {
+    url: "data/timeline-v2/objects/" + phaseIndexDigest + ".json",
+    sha256: phaseIndexDigest
+  };
+  let detailShardRequests = 0;
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    detailShardRequests += 1;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await page.route("**/" + phaseIndexDigest + ".json", async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        schema_version: 2,
+        kind: "timeline-phase-index",
+        source_digest: "different-generation",
+        phases: []
+      })
+    });
+  });
+
+  await page.reload();
+  const agentLifetime = page.locator('.agent-lifetime-group[data-agent-id="agent-a"]');
+  await agentLifetime.dispatchEvent("dblclick", { detail: 2 });
+  await expect(page.getByTestId("modal").locator(".error-message")).toContainText(
+    "source digest does not match the timeline generation"
+  );
   expect(detailShardRequests).toBe(0);
 });
 

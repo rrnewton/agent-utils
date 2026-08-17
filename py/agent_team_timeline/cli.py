@@ -1292,6 +1292,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None,
                 export_report,
                 team_slugs=team_slugs,
+                mechanical={
+                    "website_export": {
+                        "schema_version": 1,
+                        "model_calls": 0,
+                        "model_tokens": 0,
+                        "website_build_performed": True,
+                    }
+                },
             )
             print(
                 f"export: {len(team_slugs)} team(s), "
@@ -1316,6 +1324,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     None,
                     error=str(error),
                     team_slugs=team_slugs,
+                    mechanical={
+                        "website_export": {
+                            "schema_version": 1,
+                            "model_calls": 0,
+                            "model_tokens": 0,
+                            "website_build_performed": False,
+                        }
+                    },
                 )
                 print(f"run metadata: {run_path}", file=sys.stderr)
             except (OSError, ValueError):

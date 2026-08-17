@@ -725,10 +725,30 @@ class TimelineQuery:
 
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
-        timeline_path = self.root / "data" / "timeline.json"
-        if not timeline_path.is_file():
-            raise ValueError(f"no built timeline at {timeline_path}")
-        self.timeline = as_object(read_json(timeline_path), str(timeline_path))
+        self._timeline_v2_bootstrap: dict[str, JsonValue] | None = None
+        bootstrap_path = self.root / "data" / "timeline-v2.json"
+        if bootstrap_path.is_file():
+            bootstrap = as_object(read_json(bootstrap_path), str(bootstrap_path))
+            bootstrap_schema = as_int(
+                bootstrap.get("schema_version"), "timeline-v2.schema_version"
+            )
+            predates_phase_index = (
+                bootstrap_schema == 2
+                and bootstrap.get("kind") == "timeline-bootstrap"
+                and "phase_index" not in bootstrap
+            )
+            if predates_phase_index:
+                self.timeline = self._load_schema_1_timeline()
+            else:
+                self.timeline, self._timeline_v2_bootstrap = (
+                    self._load_schema_2_timeline(bootstrap_path, bootstrap)
+                )
+        else:
+            if bootstrap_path.exists():
+                raise ValueError(
+                    f"timeline schema-2 bootstrap is not a regular file: {bootstrap_path}"
+                )
+            self.timeline = self._load_schema_1_timeline()
         schema_version = as_int(
             self.timeline.get("schema_version"), "timeline.schema_version"
         )
@@ -756,7 +776,244 @@ class TimelineQuery:
         self._search_phase_intervals = {
             key: tuple(sorted(values)) for key, values in phase_intervals.items()
         }
-        self._search_records_cache: tuple[dict[str, JsonValue], ...] | None = None
+
+    def _load_schema_1_timeline(self) -> dict[str, JsonValue]:
+        timeline_path = self.root / "data" / "timeline.json"
+        if not timeline_path.is_file():
+            raise ValueError(f"no built timeline at {timeline_path}")
+        return as_object(read_json(timeline_path), str(timeline_path))
+
+    def _content_addressed_object(
+        self, raw_reference: JsonValue, where: str
+    ) -> tuple[dict[str, JsonValue], str]:
+        reference = as_object(raw_reference, where)
+        digest = as_string(reference.get("sha256"), where + ".sha256")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError(f"{where}.sha256: expected a lowercase SHA-256 digest")
+        relative = as_string(reference.get("url"), where + ".url")
+        expected_relative = f"data/timeline-v2/objects/{digest}.json"
+        if relative != expected_relative:
+            raise ValueError(
+                f"{where}.url: expected content-addressed path {expected_relative!r}"
+            )
+        path, _pure = self._safe_file(relative)
+        encoded = path.read_bytes()
+        if hashlib.sha256(encoded).hexdigest() != digest:
+            raise ValueError(f"{where}: object digest mismatch for {relative}")
+        raw_bytes = reference.get("bytes")
+        if raw_bytes is not None and as_int(raw_bytes, where + ".bytes") != len(encoded):
+            raise ValueError(f"{where}: object byte count mismatch for {relative}")
+        try:
+            decoded: object = json.loads(encoded.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"{where}: invalid JSON object {relative}") from error
+        return as_object(_narrow_json(decoded, relative), relative), relative
+
+    @staticmethod
+    def _schema_2_range(
+        record: dict[str, JsonValue], where: str
+    ) -> tuple[dict[str, JsonValue], int, int]:
+        time_range = as_object(record.get("range"), where + ".range")
+        start_ms = as_int(time_range.get("start_ms"), where + ".range.start_ms")
+        end_ms = as_int(time_range.get("end_ms"), where + ".range.end_ms")
+        if end_ms <= start_ms:
+            raise ValueError(f"{where}.range: end must be after start")
+        return time_range, start_ms, end_ms
+
+    @staticmethod
+    def _schema_2_teams(
+        record: dict[str, JsonValue], where: str
+    ) -> tuple[list[JsonValue], frozenset[str]]:
+        raw_teams = as_array(record.get("teams"), where + ".teams")
+        if not raw_teams:
+            raise ValueError(f"{where}.teams: must contain at least one team")
+        team_slugs: set[str] = set()
+        for index, raw_team in enumerate(raw_teams):
+            team = as_object(raw_team, f"{where}.teams[{index}]")
+            slug = as_string(team.get("slug"), f"{where}.teams[{index}].slug")
+            if not slug:
+                raise ValueError(f"{where}.teams[{index}].slug: must not be empty")
+            if slug in team_slugs:
+                raise ValueError(f"{where}.teams: duplicate team slug {slug!r}")
+            team_slugs.add(slug)
+        return raw_teams, frozenset(team_slugs)
+
+    def _load_schema_2_timeline(
+        self,
+        bootstrap_path: Path,
+        bootstrap: dict[str, JsonValue],
+    ) -> tuple[dict[str, JsonValue], dict[str, JsonValue]]:
+        if (
+            as_int(bootstrap.get("schema_version"), "timeline-v2.schema_version") != 2
+            or bootstrap.get("kind") != "timeline-bootstrap"
+        ):
+            raise ValueError(f"unsupported timeline schema-2 bootstrap at {bootstrap_path}")
+        source_digest = as_string(
+            bootstrap.get("source_digest"), "timeline-v2.source_digest"
+        )
+        if not source_digest:
+            raise ValueError("timeline-v2.source_digest: must not be empty")
+        teams, team_slugs = self._schema_2_teams(bootstrap, "timeline-v2")
+        time_range, timeline_start_ms, timeline_end_ms = self._schema_2_range(
+            bootstrap, "timeline-v2"
+        )
+
+        global_record, global_relative = self._content_addressed_object(
+            bootstrap.get("global"), "timeline-v2.global"
+        )
+        if (
+            as_int(global_record.get("schema_version"), global_relative + ".schema_version")
+            != 2
+            or global_record.get("kind") != "timeline-global"
+        ):
+            raise ValueError(f"unsupported timeline global object: {global_relative}")
+        global_digest = global_record.get("source_digest")
+        if global_digest is not None and as_string(
+            global_digest, global_relative + ".source_digest"
+        ) != source_digest:
+            raise ValueError("timeline global object belongs to a different source generation")
+        if "range" in global_record:
+            global_range, _global_start, _global_end = self._schema_2_range(
+                global_record, global_relative
+            )
+            if global_range != time_range:
+                raise ValueError("timeline global range does not match bootstrap")
+        if "teams" in global_record:
+            _global_teams, global_team_slugs = self._schema_2_teams(
+                global_record, global_relative
+            )
+            if global_team_slugs != team_slugs:
+                raise ValueError("timeline global team set does not match bootstrap")
+
+        agents = tuple(
+            as_object(raw, f"{global_relative}.agents[{index}]")
+            for index, raw in enumerate(
+                as_array(global_record.get("agents"), global_relative + ".agents")
+            )
+        )
+        agent_teams: dict[str, str] = {}
+        for index, agent in enumerate(agents):
+            where = f"{global_relative}.agents[{index}]"
+            identifier = as_string(agent.get("id"), where + ".id")
+            team = _team(agent, where)
+            if team not in team_slugs:
+                raise ValueError(f"{where}.team: unknown team {team!r}")
+            agent_start_ms, agent_end_ms = _interval(agent, where)
+            if (
+                agent_end_ms <= agent_start_ms
+                or agent_start_ms < timeline_start_ms
+                or agent_end_ms > timeline_end_ms
+            ):
+                raise ValueError(f"{where}: agent interval is outside timeline range")
+            if identifier in agent_teams:
+                raise ValueError(
+                    f"{global_relative}.agents: duplicate exact agent id {identifier!r}"
+                )
+            agent_teams[identifier] = team
+        for key in ("rollups", "project_overviews"):
+            raw_values = global_record.get(key)
+            if raw_values is None:
+                continue
+            for index, raw in enumerate(as_array(raw_values, f"{global_relative}.{key}")):
+                record = as_object(raw, f"{global_relative}.{key}[{index}]")
+                team = _team(record, f"{global_relative}.{key}[{index}]")
+                if team not in team_slugs:
+                    raise ValueError(
+                        f"{global_relative}.{key}[{index}].team: unknown team {team!r}"
+                    )
+
+        phase_index, phase_relative = self._content_addressed_object(
+            bootstrap.get("phase_index"), "timeline-v2.phase_index"
+        )
+        if (
+            as_int(phase_index.get("schema_version"), phase_relative + ".schema_version")
+            != 2
+            or phase_index.get("kind") != "timeline-phase-index"
+        ):
+            raise ValueError(f"unsupported timeline phase index: {phase_relative}")
+        phase_digest = phase_index.get("source_digest")
+        if phase_digest is not None and as_string(
+            phase_digest, phase_relative + ".source_digest"
+        ) != source_digest:
+            raise ValueError("timeline phase index belongs to a different source generation")
+        phases: list[JsonValue] = []
+        seen_phase_ids: set[str] = set()
+        for index, raw_phase in enumerate(
+            as_array(phase_index.get("phases"), phase_relative + ".phases")
+        ):
+            where = f"{phase_relative}.phases[{index}]"
+            phase = dict(as_object(raw_phase, where))
+            phase_id = as_string(phase.get("id"), where + ".id")
+            if phase_id in seen_phase_ids:
+                raise ValueError(f"{phase_relative}.phases: duplicate id {phase_id!r}")
+            seen_phase_ids.add(phase_id)
+            agent_id = as_string(phase.get("agent_id"), where + ".agent_id")
+            phase_start_ms, phase_end_ms = _interval(phase, where)
+            if (
+                phase_end_ms <= phase_start_ms
+                or phase_start_ms < timeline_start_ms
+                or phase_end_ms > timeline_end_ms
+            ):
+                raise ValueError(f"{where}: phase interval is outside timeline range")
+            phase_team = agent_teams.get(agent_id)
+            if phase_team is None:
+                raise ValueError(
+                    f"{where}.agent_id: no exact global agent match for {agent_id!r}"
+                )
+            existing_team = phase.get("team")
+            if existing_team is not None and as_string(
+                existing_team, where + ".team"
+            ) != phase_team:
+                raise ValueError(f"{where}.team: does not match phase agent")
+            phase["team"] = phase_team
+            phases.append(phase)
+
+        for index, raw_bin in enumerate(
+            as_array(bootstrap.get("activity_bins"), "timeline-v2.activity_bins")
+        ):
+            activity_bin = as_object(raw_bin, f"timeline-v2.activity_bins[{index}]")
+            team = _team(activity_bin, f"timeline-v2.activity_bins[{index}]")
+            if team not in team_slugs:
+                raise ValueError(
+                    f"timeline-v2.activity_bins[{index}].team: unknown team {team!r}"
+                )
+
+        timeline = {
+            key: value
+            for key, value in global_record.items()
+            if key
+            not in {
+                "schema_version",
+                "kind",
+                "source_digest",
+                "range",
+                "teams",
+            }
+        }
+        timeline.update(
+            {
+                "schema_version": TIMELINE_SCHEMA_VERSION,
+                "generated_at": as_string(
+                    bootstrap.get("generated_at"), "timeline-v2.generated_at"
+                ),
+                "source_digest": source_digest,
+                "display_timezone": as_string(
+                    bootstrap.get("display_timezone"), "timeline-v2.display_timezone"
+                ),
+                "display_timezone_source": as_string(
+                    bootstrap.get(
+                        "display_timezone_source", "legacy_team_data"
+                    ),
+                    "timeline-v2.display_timezone_source",
+                ),
+                "range": time_range,
+                "teams": teams,
+                "activity_bins": bootstrap.get("activity_bins"),
+                "phases": phases,
+                "events": [],
+            }
+        )
+        return timeline, bootstrap
 
     def _project_overviews(self) -> tuple[dict[str, JsonValue], ...]:
         plural = self.timeline.get("project_overviews")
@@ -1157,52 +1414,22 @@ class TimelineQuery:
             )
         return path
 
-    def _search_records(
+    def _iter_search_records(
         self,
         filters: QueryFilters | None = None,
         *,
         bloom_terms: tuple[str, ...] = (),
-    ) -> tuple[dict[str, JsonValue], ...]:
-        cacheable = not bloom_terms and (
-            filters is None or (not filters.teams and filters.window is None)
-        )
-        if cacheable and self._search_records_cache is not None:
-            return self._search_records_cache
-        bootstrap_path = self.root / "data" / "timeline-v2.json"
-        if not bootstrap_path.is_file():
+    ) -> Iterable[dict[str, JsonValue]]:
+        """Yield validated records while retaining at most one decoded day shard."""
+
+        bootstrap = self._timeline_v2_bootstrap
+        if bootstrap is None:
             raise ValueError(
                 "this archive has no transcript search corpus; rebuild the website"
             )
-        bootstrap = as_object(read_json(bootstrap_path), str(bootstrap_path))
-        if (
-            bootstrap.get("schema_version") != 2
-            or bootstrap.get("kind") != "timeline-bootstrap"
-        ):
-            raise ValueError(f"unsupported timeline search bootstrap at {bootstrap_path}")
-        timeline_digest = as_string(
-            self.timeline.get("source_digest"), "timeline.source_digest"
-        )
-        if (
-            as_string(bootstrap.get("source_digest"), "timeline-v2.source_digest")
-            != timeline_digest
-        ):
-            raise ValueError("transcript search corpus belongs to a different timeline generation")
         timeline_teams = sorted(
             as_string(team.get("slug"), "timeline team.slug") for team in self.teams
         )
-        bootstrap_teams = sorted(
-            as_string(
-                as_object(raw_team, "timeline-v2 team").get("slug"),
-                "timeline-v2 team.slug",
-            )
-            for raw_team in as_array(bootstrap.get("teams"), "timeline-v2.teams")
-        )
-        if timeline_teams != bootstrap_teams:
-            raise ValueError("transcript search corpus team set does not match timeline")
-        timeline_range = as_object(self.timeline.get("range"), "timeline.range")
-        bootstrap_range = as_object(bootstrap.get("range"), "timeline-v2.range")
-        if bootstrap_range != timeline_range:
-            raise ValueError("transcript search corpus range does not match timeline")
         raw_search = bootstrap.get("search")
         if raw_search is None:
             raise ValueError(
@@ -1215,7 +1442,9 @@ class TimelineQuery:
             )
         if as_int(search.get("schema_version"), "timeline-v2.search.schema_version") != 1:
             raise ValueError("unsupported transcript search schema")
-        records: list[dict[str, JsonValue]] = []
+        source_digest = as_string(
+            bootstrap.get("source_digest"), "timeline-v2.source_digest"
+        )
         seen: set[str] = set()
         for shard_index, raw_shard in enumerate(
             as_array(search.get("shards"), "timeline-v2.search.shards")
@@ -1240,21 +1469,16 @@ class TimelineQuery:
                 where + ".trigram_bloom",
             ):
                 continue
-            relative = as_string(shard.get("url"), where + ".url")
-            expected_sha = as_string(shard.get("sha256"), where + ".sha256")
-            path, pure = self._safe_file(relative)
-            if (
-                len(pure.parts) != 4
-                or pure.parts[:3] != ("data", "timeline-v2", "objects")
-                or pure.suffix != ".json"
-            ):
-                raise ValueError(f"search shard is outside timeline objects: {relative!r}")
-            encoded = path.read_bytes()
-            if hashlib.sha256(encoded).hexdigest() != expected_sha:
-                raise ValueError(f"search shard digest mismatch: {relative}")
-            root = as_object(read_json(path), relative)
+            root, relative = self._content_addressed_object(shard, where)
             if root.get("schema_version") != 1 or root.get("kind") != "timeline-search-day":
                 raise ValueError(f"unsupported transcript search shard: {relative}")
+            shard_digest = root.get("source_digest")
+            if shard_digest is not None and as_string(
+                shard_digest, relative + ".source_digest"
+            ) != source_digest:
+                raise ValueError(
+                    f"transcript search shard belongs to a different source generation: {relative}"
+                )
             if as_string(root.get("team"), relative + ".team") != shard_team:
                 raise ValueError(f"transcript search shard team mismatch: {relative}")
             root_range = as_object(root.get("range"), relative + ".range")
@@ -1343,17 +1567,7 @@ class TimelineQuery:
                 if reference in seen:
                     raise ValueError(f"duplicate transcript search reference {reference!r}")
                 seen.add(reference)
-                records.append(record)
-        records.sort(
-            key=lambda record: (
-                as_int(record.get("at_ms"), "search record.at_ms"),
-                as_string(record.get("ref"), "search record.ref"),
-            )
-        )
-        result = tuple(records)
-        if cacheable:
-            self._search_records_cache = result
-        return result
+                yield record
 
     def _phase_reference_for_search_record(
         self, record: dict[str, JsonValue]
@@ -1374,12 +1588,26 @@ class TimelineQuery:
         team, team_separator, _ = remainder.partition("::")
         if not separator or not team_separator or not team:
             raise ValueError(f"invalid transcript search reference {reference!r}")
-        records = self._search_records(QueryFilters(teams=(team,)))
-        by_ref = {
-            as_string(record.get("ref"), "search record.ref"): record
-            for record in records
-        }
-        record = by_ref.get(reference)
+        record: dict[str, JsonValue] | None = None
+        prompts: dict[str, dict[str, JsonValue]] = {}
+        responses: list[dict[str, JsonValue]] = []
+        for candidate in self._iter_search_records(QueryFilters(teams=(team,))):
+            candidate_reference = as_string(
+                candidate.get("ref"), "search record.ref"
+            )
+            candidate_type = as_string(
+                candidate.get("record_type"), "search record.record_type"
+            )
+            if candidate_type in {"prompt", "inter_agent_prompt"}:
+                prompts[candidate_reference] = dict(candidate)
+            if candidate_reference == reference:
+                record = dict(candidate)
+            if (
+                _optional_string(candidate, "prompt_ref") == reference
+                and candidate_reference != reference
+                and candidate_type in {"response", "inter_agent_response"}
+            ):
+                responses.append(dict(candidate))
         if record is None:
             raise ValueError(f"unknown stable reference {reference!r}")
         result = dict(record)
@@ -1391,19 +1619,18 @@ class TimelineQuery:
             result["phase_ref"] = phase_reference
         prompt_reference = _optional_string(record, "prompt_ref")
         if prompt_reference is not None and prompt_reference != reference:
-            prompt = by_ref.get(prompt_reference)
+            prompt = prompts.get(prompt_reference)
             result["linked_prompt"] = dict(prompt) if prompt is not None else None
         if record.get("record_type") in {"prompt", "inter_agent_prompt"}:
-            responses: list[JsonValue] = []
-            for candidate in records:
-                if (
-                    _optional_string(candidate, "prompt_ref") == reference
-                    and _optional_string(candidate, "ref") != reference
-                    and _optional_string(candidate, "record_type")
-                    in {"response", "inter_agent_response"}
-                ):
-                    responses.append(dict(candidate))
-            result["linked_responses"] = responses
+            responses.sort(
+                key=lambda candidate: (
+                    as_int(candidate.get("at_ms"), "search response.at_ms"),
+                    as_string(candidate.get("ref"), "search response.ref"),
+                )
+            )
+            linked_responses: list[JsonValue] = []
+            linked_responses.extend(responses)
+            result["linked_responses"] = linked_responses
         return result
 
     def show(self, reference: str, *, transcript: bool = False) -> dict[str, JsonValue]:
@@ -1602,28 +1829,22 @@ class TimelineQuery:
             match_mode=match_mode,
             case_sensitive=case_sensitive,
         )
-        records = self._search_records(filters, bloom_terms=matcher.bloom_terms)
-        by_ref = {
-            as_string(record.get("ref"), "search record.ref"): record
-            for record in records
-        }
+        prompt_texts: dict[str, str] = {}
         response_counts: dict[str, int] = {}
-        for record in records:
+        candidates: list[
+            tuple[int, int, str, dict[str, JsonValue], _TextMatch]
+        ] = []
+        for record in self._iter_search_records(
+            filters, bloom_terms=matcher.bloom_terms
+        ):
             prompt_reference = _optional_string(record, "prompt_ref")
             reference = as_string(record.get("ref"), "search record.ref")
             record_type = as_string(
                 record.get("record_type"), "search record.record_type"
             )
-            if (
-                record_type in {"response", "inter_agent_response"}
-                and prompt_reference is not None
-                and prompt_reference != reference
-            ):
-                response_counts[prompt_reference] = (
-                    response_counts.get(prompt_reference, 0) + 1
-                )
-        matches: list[tuple[int, int, str, dict[str, JsonValue]]] = []
-        for record in records:
+            text = as_string(record.get("text"), "search record.text")
+            if record_type in {"prompt", "inter_agent_prompt"}:
+                prompt_texts[reference] = text
             team = as_string(record.get("team"), "search record.team")
             if not self._selected_team(team, filters):
                 continue
@@ -1635,12 +1856,17 @@ class TimelineQuery:
             )
             if selected_agent is not None and agent_reference != selected_agent:
                 continue
+            if (
+                record_type in {"response", "inter_agent_response"}
+                and prompt_reference is not None
+                and prompt_reference != reference
+            ):
+                response_counts[prompt_reference] = (
+                    response_counts.get(prompt_reference, 0) + 1
+                )
             role = as_string(record.get("role"), "search record.role")
             if roles and role not in roles:
                 continue
-            record_type = as_string(
-                record.get("record_type"), "search record.record_type"
-            )
             author_kind = _optional_string(record, "author_kind")
             prompt_kind = _optional_string(record, "prompt_author_kind")
             if corpus == "owner-prompts" and not (
@@ -1665,7 +1891,18 @@ class TimelineQuery:
                 _HUMAN_AUTHOR_KINDS | _BOT_AUTHOR_KINDS
             ):
                 continue
-            reference = as_string(record.get("ref"), "search record.ref")
+            text_match = matcher.match(text)
+            if text_match is None:
+                continue
+            candidates.append(
+                (text_match.score, at_ms, reference, dict(record), text_match)
+            )
+
+        matches: list[tuple[int, int, str, dict[str, JsonValue]]] = []
+        for score, at_ms, reference, record, text_match in candidates:
+            record_type = as_string(
+                record.get("record_type"), "search record.record_type"
+            )
             prompt_reference = _optional_string(record, "prompt_ref")
             linked = (
                 response_counts.get(reference, 0) > 0
@@ -1676,10 +1913,12 @@ class TimelineQuery:
                 continue
             if linkage == "unlinked" and linked:
                 continue
-            text = as_string(record.get("text"), "search record.text")
-            text_match = matcher.match(text)
-            if text_match is None:
-                continue
+            team = as_string(record.get("team"), "search record.team")
+            role = as_string(record.get("role"), "search record.role")
+            agent_reference = as_string(
+                record.get("agent_ref"), "search record.agent_ref"
+            )
+            prompt_kind = _optional_string(record, "prompt_author_kind")
             excerpt_details = _search_excerpt(text_match)
             excerpt = as_string(
                 excerpt_details.get("text"), "search excerpt.text"
@@ -1698,7 +1937,7 @@ class TimelineQuery:
                 "prompt_at_ms": record.get("prompt_at_ms"),
                 "prompt_author_kind": prompt_kind,
                 "linked_response_count": response_counts.get(reference, 0),
-                "score": text_match.score,
+                "score": score,
                 "ranking_version": "search-rank-v1",
                 "content_fidelity": record.get("content_fidelity"),
                 "excerpt": excerpt,
@@ -1708,12 +1947,10 @@ class TimelineQuery:
             if phase_reference is not None:
                 item["phase_ref"] = phase_reference
             if prompt_reference is not None and prompt_reference != reference:
-                prompt = by_ref.get(prompt_reference)
-                if prompt is not None:
-                    item["prompt_excerpt"] = _compact_text(
-                        as_string(prompt.get("text"), "search prompt.text")
-                    )[:320]
-            matches.append((text_match.score, at_ms, reference, item))
+                prompt_text = prompt_texts.get(prompt_reference)
+                if prompt_text is not None:
+                    item["prompt_excerpt"] = _compact_text(prompt_text)[:320]
+            matches.append((score, at_ms, reference, item))
         if sort == "relevance":
             matches.sort(key=lambda item: (-item[0], -item[1], item[2]))
         elif sort == "newest":

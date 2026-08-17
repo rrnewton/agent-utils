@@ -2310,6 +2310,12 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         )
     )
     assert run["team_slugs"] == ["claude-test", first_team.team_slug]
+    assert run["mechanical"]["website_export"] == {
+        "schema_version": 1,
+        "model_calls": 0,
+        "model_tokens": 0,
+        "website_build_performed": True,
+    }
 
 
 def test_combined_export_builds_two_zero_summary_teams(tmp_path: Path) -> None:

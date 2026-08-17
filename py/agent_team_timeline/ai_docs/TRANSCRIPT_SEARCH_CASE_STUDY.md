@@ -20,6 +20,10 @@ This is a zero-model, post-ingestion task; search must operate on verbatim norma
 - `orc-coord-014`, 2026-07-25 11:05:56Z,
   `message:orc-coord-014::orc-note-4fb50e87-6557` explicitly keeps DBI at B2+ because its full
   ptrace-corpus percentage had not been measured.
+- `orc-coord-014`, 2026-08-04 00:42:38Z,
+  `message:orc-coord-014::orc-note-4fb50e87-15522` later reports DBI at 130/152 (85.5%) of the
+  ptrace strict-verify corpus and calls it a “solid REAL B3.” Several coordinator updates repeat
+  that claim.
 - `orc-coord-014`, 2026-08-07 06:33:23Z,
   `message:orc-coord-014::orc-note-4fb50e87-22179` later invalidates an earlier DBI B3 figure:
   DBI matched only 4/84 of its own detlog ordinals across two runs, so a quoted 130/152 (85.5%)
@@ -72,10 +76,27 @@ responses. Phase end derivation now retains the final millisecond event.
 
 ## Scale observation
 
-The seven-team Hermit snapshot used for this audit has 268,463 search records: 129,000+ textual
-events and 139,273 condensed tool records. Canonical compact JSON measured about 301 MB identity and
-50.4 MB at gzip-6 before per-day object overhead. The team/day Bloom catalog is therefore important:
-selective queries avoid downloading and parsing objects that definitely cannot match, while broad or
-short queries still pay the full exact-search cost. Tool-run grouping or a separate tool corpus is a
-possible future optimization if real-browser measurements show that 139,273 compact tool records
-dominate latency or memory.
+The final seven-team Hermit website used for this audit has 246,155 search records in 53 team/day
+objects: 119,733 textual events and 126,422 condensed tool records. The objects occupy 332.3 MB as
+identity JSON and 50.45 MB at gzip-6. The 3.84 MB bootstrap is 2.14 MB compressed, including about
+2.93 million base64 characters of Bloom-filter data. Raw normalized teams contain more records, but
+the export deliberately omits pre-window provider context that is already represented by an earlier
+logical team.
+
+The team/day Bloom catalog is therefore important: selective queries avoid downloading and parsing
+objects that definitely cannot match, while broad or short queries still pay the full exact-search
+cost. Common project terms such as `KVM`, `DBI`, and `ptrace` occur on nearly every active day, so the
+prefilter cannot help those searches much. A headless Chromium run of `backend maturity B3` selected
+50 of 53 shards, transferred 50.43 MB of compressed search objects, reached 40 exact matches in
+4.65 seconds, and used about 385 MB of JavaScript heap with no console, request, or runtime failure.
+That is usable for the current local archive but is too expensive to treat as the long-term target.
+Tool-run grouping, an exact term/posting index, or a separate tool corpus are possible next steps;
+the current trigram selector cannot prune a word that genuinely appears somewhere on almost every
+day.
+
+The first archive-local CLI implementation also parsed the 205 MB schema-1 timeline monolith and
+materialized every selected search record, peaking at about 1.32 GB RSS. Switching query startup to
+the content-addressed schema-2 global/phase-index generation and then streaming one search-day object
+at a time reduced the same `backend maturity B3` query to about 316 MB RSS. Wall time remains about
+10 seconds because that common query genuinely selects 50 shards and must parse their 332 MB of
+identity JSON; a rare definite-miss query selected eight shards and completed in about three seconds.

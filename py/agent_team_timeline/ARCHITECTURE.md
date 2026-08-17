@@ -166,6 +166,14 @@ objects are accepted only when the bootstrap digest, team set, and time range ma
 timeline generation. Path resolution fails closed on absolute or escaping references. Querying has
 no write path and can never invoke a model.
 
+When schema 2 is present, the CLI reconstructs its small query projection from the bootstrap,
+content-addressed global object, and phase index instead of parsing the schema-1 timeline monolith.
+The global, phase-index, and search-day objects carry additive source-generation bindings; readers
+accept older immutable objects that predate those fields but reject a present mismatch. Transcript
+search validates and consumes one day object at a time, retaining only prompt linkage metadata and
+actual matches rather than materializing the full corpus. A bootstrap that specifically predates
+the phase index falls back to schema 1; malformed or digest-mismatched schema-2 data fails closed.
+
 Availability fields are additive to timeline schema 1. Older projections without them are treated
 as available; new projections mark sparse agent/phase records with `summary_available` and each
 calendar audience with `technical_summary_available` or
