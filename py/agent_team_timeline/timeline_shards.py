@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from bisect import bisect_left
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +58,7 @@ class TimelineShardReport:
     files_changed: int
     generated_files: tuple[str, ...]
     detail_shards: int
+    search_shards: int
     bootstrap_bytes: int
     bootstrap_gzip_bytes: int | None
     object_bytes: int
@@ -548,6 +550,56 @@ def _detail_days(
     return days
 
 
+def _search_days(
+    records: Sequence[dict[str, JsonValue]],
+) -> dict[tuple[str, int], list[dict[str, JsonValue]]]:
+    days: dict[tuple[str, int], list[dict[str, JsonValue]]] = {}
+    seen: set[str] = set()
+    for index, record in enumerate(records):
+        where = f"search_records[{index}]"
+        reference = _record_id(record, "ref")
+        if reference in seen:
+            raise ValueError(f"duplicate search record reference {reference!r}")
+        seen.add(reference)
+        at_ms = _record_int(record, "at_ms", where)
+        team = as_string(record.get("team"), f"{where}.team")
+        days.setdefault((team, _utc_day_start(at_ms)), []).append(record)
+    for values in days.values():
+        values.sort(
+            key=lambda record: (
+                _record_int(record, "at_ms", "search record"),
+                _record_id(record, "ref"),
+            )
+        )
+    return days
+
+
+def _search_counts(records: Sequence[dict[str, JsonValue]]) -> dict[str, JsonValue]:
+    prompts = 0
+    responses = 0
+    inter_agent = 0
+    tools = 0
+    for index, record in enumerate(records):
+        record_type = as_string(
+            record.get("record_type"), f"search records[{index}].record_type"
+        )
+        if record_type == "prompt":
+            prompts += 1
+        elif record_type == "response":
+            responses += 1
+        elif record_type == "inter_agent":
+            inter_agent += 1
+        elif record_type == "tool":
+            tools += 1
+    return {
+        "records": len(records),
+        "prompts": prompts,
+        "responses": responses,
+        "inter_agent": inter_agent,
+        "tools": tools,
+    }
+
+
 def _global_object(
     timeline: dict[str, JsonValue],
     agent_bounds: dict[str, tuple[int, int]],
@@ -643,6 +695,7 @@ def write_timeline_shards(
     output: Path,
     raw_timeline: dict[str, JsonValue],
     *,
+    search_records: Sequence[dict[str, JsonValue]] = (),
     precompress: bool = True,
 ) -> TimelineShardReport:
     """Publish schema-2 objects and then atomically publish their stable bootstrap.
@@ -718,6 +771,36 @@ def write_timeline_shards(
             }
         )
 
+    search_catalog: list[JsonValue] = []
+    search_days = _search_days(search_records)
+    for (team, day_start), search_records_for_day in sorted(search_days.items()):
+        day_end = day_start + _DAY_MS
+        record_values: list[JsonValue] = list(search_records_for_day)
+        search_object: dict[str, JsonValue] = {
+            "schema_version": 1,
+            "kind": "timeline-search-day",
+            "team": team,
+            "range": {"start_ms": day_start, "end_ms": day_end},
+            "records": record_values,
+        }
+        stored = _store_object(output, search_object, precompress=precompress)
+        changed += stored.changed
+        generated_files.update(stored.generated_files)
+        object_bytes += stored.bytes
+        object_gzip_bytes += stored.gzip_bytes or stored.bytes
+        day_label = datetime.fromtimestamp(day_start / 1000, tz=timezone.utc).date()
+        search_catalog.append(
+            {
+                "kind": "utc-day",
+                "team": team,
+                "day": day_label.isoformat(),
+                "start_ms": day_start,
+                "end_ms": day_end,
+                **stored.catalog_obj(),
+                "counts": _search_counts(search_records_for_day),
+            }
+        )
+
     bootstrap: dict[str, JsonValue] = {
         "schema_version": 2,
         "kind": "timeline-bootstrap",
@@ -733,10 +816,27 @@ def write_timeline_shards(
         "global": global_object.catalog_obj(),
         "phase_index": phase_index.catalog_obj(),
         "detail_shards": shard_catalog,
-        "search": {
-            "strategy": "load-all-detail-shards-on-first-query",
-            "fields": ["agent", "phase", "edge"],
-        },
+        "search": (
+            {
+                "schema_version": 1,
+                "strategy": "transcript-message-shards",
+                "fields": [
+                    "owner_prompt",
+                    "agent_response",
+                    "inter_agent",
+                    "external",
+                    "goal",
+                    "tool_name",
+                ],
+                "counts": _search_counts(search_records),
+                "shards": search_catalog,
+            }
+            if search_records
+            else {
+                "strategy": "load-all-detail-shards-on-first-query",
+                "fields": ["agent", "phase", "edge"],
+            }
+        ),
     }
     current_objects = frozenset(
         relative for relative in generated_files if _is_object_file(relative)
@@ -768,6 +868,7 @@ def write_timeline_shards(
         files_changed=changed,
         generated_files=tuple(sorted(generated_files)),
         detail_shards=len(shard_catalog),
+        search_shards=len(search_catalog),
         bootstrap_bytes=bootstrap_bytes,
         bootstrap_gzip_bytes=bootstrap_gzip_bytes,
         object_bytes=object_bytes,

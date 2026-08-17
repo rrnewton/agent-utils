@@ -43,10 +43,17 @@ from agent_team_timeline.project_config import (
 )
 from agent_team_timeline.query import (
     QueryFilters,
+    SEARCH_CORPORA,
+    SEARCH_LINKAGES,
+    SEARCH_MATCH_MODES,
+    SEARCH_PROMPT_AUTHORS,
+    SEARCH_ROLES,
+    SEARCH_SORTS,
     TimelineQuery,
     TranscriptQuery,
     archive_stats,
     format_query,
+    format_search_results,
     format_stats,
     parse_ordinal_range,
 )
@@ -577,16 +584,40 @@ def _parser() -> argparse.ArgumentParser:
     )
     query_show.set_defaults(handler="query_show")
     query_search = query_sub.add_parser(
-        "search", help="search summaries and condensed transcript messages",
-        description="search summaries and condensed transcript messages",
+        "search", help="search prompts, responses, full transcript text, and summaries",
+        description=(
+            "search the canonical transcript corpus with stable message references, "
+            "or use --scope for compatibility phase-transcript search"
+        ),
     )
-    query_search.add_argument("text", help="literal text to find")
+    query_search.add_argument("text", help="text or pattern to find")
+    query_search.add_argument(
+        "--in",
+        dest="search_corpus",
+        choices=SEARCH_CORPORA,
+        help="search-v2 corpus: owner prompts, agent responses, all transcript, or summaries",
+    )
     query_search.add_argument(
         "--scope",
         choices=("summaries", "transcripts", "all"),
-        default="summaries",
+        default=None,
+        help="compatibility search scope (default when --in is absent: summaries)",
+    )
+    query_search.add_argument(
+        "--match", choices=SEARCH_MATCH_MODES, default="smart"
+    )
+    query_search.add_argument("--sort", choices=SEARCH_SORTS, default="relevance")
+    query_search.add_argument(
+        "--prompt-author", choices=SEARCH_PROMPT_AUTHORS, default="any"
+    )
+    query_search.add_argument(
+        "--linkage", choices=SEARCH_LINKAGES, default="any"
+    )
+    query_search.add_argument(
+        "--role", action="append", choices=SEARCH_ROLES, default=[]
     )
     query_search.add_argument("--case-sensitive", action="store_true")
+    query_search.add_argument("--offset", type=int, default=0)
     query_search.add_argument("--limit", type=int, default=50)
     _add_query_filters(query_search)
     query_search.set_defaults(handler="query_search")
@@ -945,9 +976,37 @@ def _run_query(ns: argparse.Namespace, handler: str) -> int:
         query = TimelineQuery(output)
         needle = str(ns.text)
         command = f"search {needle}"
+        raw_corpus: object = ns.search_corpus
+        raw_scope: object = ns.scope
+        if raw_corpus is not None:
+            if raw_scope is not None:
+                raise ValueError("--in and --scope cannot be combined")
+            raw_roles: object = ns.role
+            if not isinstance(raw_roles, list) or not all(
+                isinstance(role, str) for role in raw_roles
+            ):
+                raise ValueError("--role values must be strings")
+            search_results = query.search_v2(
+                needle,
+                corpus=str(raw_corpus),
+                filters=_query_filters(ns),
+                case_sensitive=bool(ns.case_sensitive),
+                match_mode=str(ns.match),
+                sort=str(ns.sort),
+                prompt_author=str(ns.prompt_author),
+                linkage=str(ns.linkage),
+                roles=tuple(raw_roles),
+                offset=int(ns.offset),
+                limit=int(ns.limit),
+            )
+            print(
+                format_search_results(command, search_results, str(ns.format)),
+                end="",
+            )
+            return 0
         items = query.search(
             needle,
-            scope=str(ns.scope),
+            scope=str(raw_scope or "summaries"),
             filters=_query_filters(ns),
             case_sensitive=bool(ns.case_sensitive),
             limit=int(ns.limit),

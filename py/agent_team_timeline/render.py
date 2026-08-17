@@ -35,6 +35,7 @@ from agent_team_timeline.phases import (
     TranscriptEntry,
     phase_agent_ids,
 )
+from agent_team_timeline.search_index import build_search_records
 from agent_team_timeline.summarize import (
     SummaryResult,
     clean_summary_prose,
@@ -1342,6 +1343,12 @@ def render_archive(
         observed_end_ms=end_ms,
     )
     event_objs = _event_objs(team, visible_agent_ids)
+    search_records = build_search_records(
+        team,
+        visible_agent_ids,
+        start_ms=start_ms,
+        end_ms=end_ms,
+    )
     timeline_stats = _event_stats(event_objs, len(visible_agent_ids))
     timeline: dict[str, object] = {
         "schema_version": 1,
@@ -1400,7 +1407,12 @@ def render_archive(
         for relative in sorted(compressible_paths):
             changed += int(sync_gzip_sidecar(_generated_path(archive, relative)))
     shard_report = (
-        write_timeline_shards(archive, timeline_json, precompress=_precompress)
+        write_timeline_shards(
+            archive,
+            timeline_json,
+            search_records=search_records,
+            precompress=_precompress,
+        )
         if _write_shards
         else None
     )
@@ -1459,6 +1471,8 @@ def render_archive(
         "artifacts": len(artifact_catalog.artifacts),
         "projects": len(artifact_catalog.projects),
         "detail_shards": shard_report.detail_shards if shard_report is not None else 0,
+        "search_records": len(search_records),
+        "search_shards": shard_report.search_shards if shard_report is not None else 0,
         "bootstrap_bytes": shard_report.bootstrap_bytes if shard_report is not None else 0,
         "bootstrap_transfer_bytes": (
             (shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes)

@@ -28,6 +28,8 @@ from agent_team_timeline.pipeline import (
     load_archived_team,
 )
 from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
+from agent_team_timeline.model import TeamData
+from agent_team_timeline.search_index import build_search_records
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
     sync_gzip_sidecar,
@@ -60,6 +62,7 @@ _COMMON_FILES = (
 class _RenderedTeam:
     slug: str
     provider: str
+    team: TeamData
     root: Path
     timeline: dict[str, JsonValue]
     artifacts: dict[str, JsonValue]
@@ -544,6 +547,7 @@ def _build_combined_archive_locked(
                 _RenderedTeam(
                     slug=team_slug,
                     provider=team.provider,
+                    team=team,
                     root=team_root,
                     timeline=as_object(read_json(timeline_path), str(timeline_path)),
                     artifacts=as_object(read_json(artifacts_path), str(artifacts_path)),
@@ -705,6 +709,37 @@ def _build_combined_archive_locked(
             _output_path(output, "data/artifacts.json"), artifact_catalog
         )
         compressible_files.add("data/artifacts.json")
+        search_records: list[dict[str, JsonValue]] = []
+        for rendered in rendered_teams:
+            rendered_range = as_object(
+                rendered.timeline.get("range"),
+                f"{rendered.slug}.timeline.range",
+            )
+            visible_agent_ids = frozenset(
+                as_string(
+                    as_object(raw_agent, "timeline agent").get("id"),
+                    "timeline agent.id",
+                )
+                for raw_agent in as_array(
+                    rendered.timeline.get("agents"),
+                    f"{rendered.slug}.timeline.agents",
+                )
+            )
+            search_records.extend(
+                build_search_records(
+                    rendered.team,
+                    visible_agent_ids,
+                    namespace_agents=True,
+                    start_ms=as_int(
+                        rendered_range.get("start_ms"),
+                        f"{rendered.slug}.timeline.range.start_ms",
+                    ),
+                    end_ms=as_int(
+                        rendered_range.get("end_ms"),
+                        f"{rendered.slug}.timeline.range.end_ms",
+                    ),
+                )
+            )
         readme = (
             "# Combined agent-team timeline\n\n"
             "Teams: " + ", ".join(f"`{slug}`" for slug in ordered_slugs) + "\n\n"
@@ -749,7 +784,9 @@ def _build_combined_archive_locked(
                 _safe_generated_path(sidecar_relative)
                 generated_files.add(sidecar_relative)
 
-        shard_report = write_timeline_shards(output, timeline)
+        shard_report = write_timeline_shards(
+            output, timeline, search_records=search_records
+        )
         changed += shard_report.files_changed
         for relative in shard_report.generated_files:
             _safe_generated_path(relative)
@@ -793,6 +830,8 @@ def _build_combined_archive_locked(
         "artifacts": len(merged["artifacts"]),
         "projects": len(merged["projects"]),
         "detail_shards": shard_report.detail_shards,
+        "search_records": len(search_records),
+        "search_shards": shard_report.search_shards,
         "bootstrap_bytes": shard_report.bootstrap_bytes,
         "bootstrap_transfer_bytes": (
             shard_report.bootstrap_gzip_bytes or shard_report.bootstrap_bytes

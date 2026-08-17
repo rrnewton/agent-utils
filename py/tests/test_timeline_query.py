@@ -19,6 +19,7 @@ from agent_team_timeline.archive import (
     read_json,
 )
 from agent_team_timeline.cli import main as timeline_main
+from agent_team_timeline.timeline_shards import write_timeline_shards
 
 
 START = 1_786_068_000_000
@@ -36,6 +37,11 @@ def _site(tmp_path: Path) -> Path:
     plain_path = "teams/alpha/summaries/hourly/plain.md"
     timeline = {
         "schema_version": 1,
+        "generated_at": "2026-08-07T03:00:00Z",
+        "source_digest": "query-fixture",
+        "display_timezone": "America/New_York",
+        "display_timezone_source": "explicit",
+        "range": {"start_ms": START, "end_ms": START + 10_800_000},
         "teams": [
             {
                 "slug": "alpha",
@@ -107,6 +113,7 @@ def _site(tmp_path: Path) -> Path:
                 "phrase": "Verified reproducible GHC builds.",
                 "paragraph": "The verifier compared two builds and found identical artifacts.",
                 "stats": {"tool_calls": 3},
+                "states": [],
                 "start_ms": START + 60_000,
                 "end_ms": START + 1_800_000,
             }
@@ -122,6 +129,13 @@ def _site(tmp_path: Path) -> Path:
                 "end_ms": START + 3_600_000,
             }
         ],
+        "activity_bins": [],
+        "edges": [],
+        "events": [],
+        "glossary": [],
+        "summary_files": [],
+        "artifact_catalog_path": "data/artifacts.json",
+        "project_overviews": [],
     }
     _write_json(root / "data" / "timeline.json", timeline)
     _write_json(
@@ -154,6 +168,66 @@ def _site(tmp_path: Path) -> Path:
     technical.write_text("# Technical\n\nReproducible GHC builds passed.\n", encoding="utf-8")
     plain = root / plain_path
     plain.write_text("# Plain language\n\nTwo builds produced the same files.\n", encoding="utf-8")
+    search_records: list[dict[str, JsonValue]] = [
+        {
+            "schema_version": 1,
+            "ref": "message:alpha::owner-b3",
+            "record_type": "prompt",
+            "role": "user",
+            "team": "alpha",
+            "agent_id": "alpha::root",
+            "agent_ref": "agent:alpha::root",
+            "agent_path": "/root",
+            "event_id": "owner-b3",
+            "turn_id": "turn-b3",
+            "at_ms": START + 90_000,
+            "text": "What does backend maturity B3 require?",
+            "author_kind": "owner_human",
+            "ingress_kind": "web",
+            "prompt_ref": "message:alpha::owner-b3",
+            "prompt_author_kind": "owner_human",
+            "content_fidelity": "verbatim",
+        },
+        {
+            "schema_version": 1,
+            "ref": "message:alpha::answer-b3",
+            "record_type": "response",
+            "role": "assistant",
+            "team": "alpha",
+            "agent_id": "alpha::child",
+            "agent_ref": "agent:alpha::child",
+            "agent_path": "/root/build_verifier",
+            "event_id": "answer-b3",
+            "turn_id": "turn-b3",
+            "at_ms": START + 120_000,
+            "text": "B3 means 50% or more of the ptrace corpus passes.",
+            "author_kind": "agent",
+            "ingress_kind": "codex",
+            "prompt_ref": "message:alpha::owner-b3",
+            "prompt_author_kind": "owner_human",
+            "content_fidelity": "verbatim",
+        },
+        {
+            "schema_version": 1,
+            "ref": "message:alpha::hash-noise",
+            "record_type": "response",
+            "role": "assistant",
+            "team": "alpha",
+            "agent_id": "alpha::child",
+            "agent_ref": "agent:alpha::child",
+            "agent_path": "/root/build_verifier",
+            "event_id": "hash-noise",
+            "turn_id": None,
+            "at_ms": START + 180_000,
+            "text": "Commit 91b3a19 contains no maturity grade.",
+            "author_kind": "agent",
+            "ingress_kind": "codex",
+            "prompt_ref": None,
+            "prompt_author_kind": None,
+            "content_fidelity": "verbatim",
+        },
+    ]
+    write_timeline_shards(root, as_object(narrow_json(timeline), "timeline"), search_records=search_records)
     return root
 
 
@@ -392,6 +466,131 @@ def test_search_supports_summary_transcript_agent_and_jsonl_output(
     assert len(lines) == 1
     line = as_object(narrow_json(json.loads(lines[0])), "JSONL record")
     assert line["record_type"] == "rollup"
+
+
+def test_search_v2_finds_owner_prompts_and_linked_agent_responses_without_hash_noise(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "B3",
+                "--in",
+                "agent-responses",
+                "--prompt-author",
+                "owner",
+            )
+        )
+        == 0
+    )
+    response = _response(capsys)
+    assert response["total_matches"] == 1
+    assert response["returned"] == 1
+    assert response["truncated"] is False
+    items = _items(response)
+    assert items[0]["ref"] == "message:alpha::answer-b3"
+    assert items[0]["prompt_ref"] == "message:alpha::owner-b3"
+    assert items[0]["prompt_excerpt"] == "What does backend maturity B3 require?"
+    assert items[0]["phase_ref"] == "phase:alpha::phase-work"
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "B3",
+                "--in",
+                "all-transcript",
+                "--match",
+                "literal",
+            )
+        )
+        == 0
+    )
+    literal = _response(capsys)
+    assert literal["total_matches"] == 3
+    assert {item["ref"] for item in _items(literal)} == {
+        "message:alpha::owner-b3",
+        "message:alpha::answer-b3",
+        "message:alpha::hash-noise",
+    }
+
+
+def test_search_v2_reports_paging_and_show_resolves_prompt_response_context(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "maturity",
+                "--in",
+                "all-transcript",
+                "--limit",
+                "1",
+            )
+        )
+        == 0
+    )
+    page = _response(capsys)
+    assert page["total_matches"] == 2
+    assert page["returned"] == 1
+    assert page["truncated"] is True
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "show",
+                "message:alpha::answer-b3",
+            )
+        )
+        == 0
+    )
+    shown = _items(_response(capsys))[0]
+    assert shown["text"] == "B3 means 50% or more of the ptrace corpus passes."
+    prompt = as_object(shown["linked_prompt"], "linked prompt")
+    assert prompt["ref"] == "message:alpha::owner-b3"
+    assert shown["phase_ref"] == "phase:alpha::phase-work"
+
+
+def test_search_v2_rejects_mixing_new_corpus_and_compatibility_scope(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "B3",
+                "--in",
+                "all-transcript",
+                "--scope",
+                "transcripts",
+            )
+        )
+        == 2
+    )
+    assert "--in and --scope cannot be combined" in capsys.readouterr().err
 
 
 def test_query_fails_closed_on_unknown_refs_and_archive_path_escape(

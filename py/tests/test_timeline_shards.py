@@ -210,6 +210,86 @@ def test_schema_2_projection_is_content_addressed_range_sharded_and_idempotent(
     assert second.generated_files == first.generated_files
 
 
+def test_schema_2_publishes_content_addressed_transcript_search_shards(
+    tmp_path: Path,
+) -> None:
+    start = _ms("2026-08-11T23:30:00+00:00")
+    midnight = _ms("2026-08-12T00:00:00+00:00")
+    records: list[dict[str, JsonValue]] = [
+        {
+            "schema_version": 1,
+            "ref": "message:test-team::prompt",
+            "record_type": "prompt",
+            "role": "user",
+            "team": "test-team",
+            "agent_id": "root",
+            "agent_ref": "agent:test-team::root",
+            "agent_path": "/root",
+            "event_id": "prompt",
+            "turn_id": "turn-1",
+            "at_ms": start,
+            "text": "Where is backend maturity documented?",
+            "author_kind": "owner_human",
+            "ingress_kind": "web",
+            "prompt_ref": "message:test-team::prompt",
+            "prompt_author_kind": "owner_human",
+            "content_fidelity": "verbatim",
+        },
+        {
+            "schema_version": 1,
+            "ref": "message:test-team::response",
+            "record_type": "response",
+            "role": "assistant",
+            "team": "test-team",
+            "agent_id": "root",
+            "agent_ref": "agent:test-team::root",
+            "agent_path": "/root",
+            "event_id": "response",
+            "turn_id": "turn-1",
+            "at_ms": midnight,
+            "text": "B3 means at least half of the ptrace corpus passes.",
+            "author_kind": "agent",
+            "ingress_kind": "codex",
+            "prompt_ref": "message:test-team::prompt",
+            "prompt_author_kind": "owner_human",
+            "content_fidelity": "verbatim",
+        },
+    ]
+
+    first = write_timeline_shards(tmp_path, _timeline(), search_records=records)
+
+    assert first.search_shards == 2
+    bootstrap = as_object(
+        read_json(tmp_path / SCHEMA_2_BOOTSTRAP_PATH), "search bootstrap"
+    )
+    search = as_object(bootstrap["search"], "search")
+    assert search["strategy"] == "transcript-message-shards"
+    assert search["counts"] == {
+        "inter_agent": 0,
+        "prompts": 1,
+        "records": 2,
+        "responses": 1,
+        "tools": 0,
+    }
+    catalog = [
+        as_object(value, "search shard")
+        for value in as_array(search["shards"], "search shards")
+    ]
+    assert [value["day"] for value in catalog] == ["2026-08-11", "2026-08-12"]
+    assert [
+        as_object(value, "search record")["ref"]
+        for value in as_array(_object(tmp_path, catalog[0])["records"], "records")
+    ] == ["message:test-team::prompt"]
+    assert [
+        as_object(value, "search record")["ref"]
+        for value in as_array(_object(tmp_path, catalog[1])["records"], "records")
+    ] == ["message:test-team::response"]
+
+    second = write_timeline_shards(tmp_path, _timeline(), search_records=records)
+    assert second.files_changed == 0
+    assert second.generated_files == first.generated_files
+
+
 def _shard_manifest(root: Path) -> dict[str, JsonValue]:
     path = root / "data" / "timeline-v2" / "manifest.json"
     return as_object(read_json(path), str(path))
