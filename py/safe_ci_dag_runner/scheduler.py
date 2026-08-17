@@ -224,7 +224,7 @@ class Runner:
         self.aborted: set[str] = set()  # tags killed by eager-exit (labelled ABORTED, not FAIL)
         self.step_profile_rows: list[Mapping[str, object]] = []
         self.failed = False  # a genuine (non-aborted) step failed
-        self.stop = False  # stop scheduling new steps after a failure
+        self.stop = False  # stop scheduling after a fail-fast failure or outer run timeout
         self.wall = 0.0
         # OUTER wall budget for the WHOLE run (None = unbounded). Independent of every per-step
         # budget, and that independence is the point: no combination of individually-legal steps
@@ -369,9 +369,9 @@ class Runner:
         Greedy ready-set loop: each pass launches every currently-ready step (deps satisfied,
         resources free, under the ``-j`` fan-out, in LPT order) on its own daemon supervisor
         thread, then sleeps. Terminates when nothing is running AND either every step has a
-        terminal outcome (done or dep-skipped) OR fail-fast has tripped — the fail-fast clause
-        is REQUIRED: once ``stop`` is set, steps whose deps SUCCEEDED are neither launched nor
-        counted as skipped, so without it the loop would busy-wait forever.
+        terminal outcome (done or dep-skipped) OR fail-fast has tripped. With ``keep_going``, a
+        failure does not trip fail-fast: independent work continues and only true dependents enter
+        the dependency-skip closure.
         """
         threads: list[threading.Thread] = []
         wall_start = time.time()
@@ -723,7 +723,7 @@ class Runner:
                     duration_s=elapsed,
                     summary=summary,
                     returncode=returncode,
-                    reason="ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)",
+                    reason="ABORTED (eager-exit after another step failed; --keep-going would continue independent work)",
                     aborted=True,
                 )
             elif ok:
@@ -752,13 +752,13 @@ class Runner:
                 )
             self.done[step.tag] = outcome
             if not was_aborted and not ok:
-                # A REAL failure. Mark failed + stop launching NEW steps. EAGER-EXIT (default):
-                # reap every step still running in parallel NOW so a fast failure doesn't wait for
-                # a slow in-flight build. keep_going instead lets those in-flight steps finish (so
-                # they report their own pass/fail); it does NOT launch any further steps.
+                # A REAL failure. EAGER-EXIT (default) stops launching NEW steps and reaps every
+                # step still running in parallel NOW so a fast failure does not wait for a slow
+                # in-flight build. keep_going records the failure but leaves scheduling open:
+                # independent ready steps continue, while true dependents are dependency-skipped.
                 self.failed = True
-                self.stop = True
                 if not self.keep_going:
+                    self.stop = True
                     others = list(self.running_procs.items())
                     for other, _other_proc in others:
                         self.aborted.add(other)  # its thread will label itself ABORTED
@@ -783,7 +783,7 @@ class Runner:
         elif outcome.aborted:
             self._emit(
                 f"[{step.tag}] ⊘ ABORT  {step.desc} "
-                f"({dur}s — eager-exit after another step failed; keep_going lets in-flight steps finish)"
+                f"({dur}s — eager-exit after another step failed; --keep-going would continue independent work)"
             )
         elif outcome.ok:
             extra = f"  [{summary}]" if (summary and self.verbosity >= 1) else ""
@@ -831,15 +831,26 @@ class Runner:
         """Assemble the typed :class:`RunResult` after :meth:`run` has returned.
 
         Outcomes are ordered by the LPT dispatch order for stable, readable reporting;
-        ``skipped`` lists tags whose deps failed so they never ran.
+        ``skipped`` lists tags whose deps failed so they never ran. ``not_launched`` names every
+        other configured step with no terminal outcome, so absent work cannot read as passed.
         """
         outcomes = tuple(self.done[tag] for tag in self.order if tag in self.done)
         skipped = tuple(sorted(self._skipped()))
+        not_launched = tuple(
+            sorted(
+                tag
+                for tag in self.order
+                if tag not in self.done
+                and tag not in skipped
+                and tag not in self.intentional_skip_tags
+            )
+        )
         return RunResult(
-            ok=not self.failed,
+            ok=not self.failed and not not_launched,
             wall_s=self.wall,
             outcomes=outcomes,
             skipped=skipped,
+            not_launched=not_launched,
             intentional_skips=self.intentional_skips,
             step_profile_rows=tuple(self.step_profile_rows),
             run_timed_out=self.run_timed_out,
@@ -889,9 +900,8 @@ def run_dag(
         kill). The function does not establish an outer cgroup scope itself. A
         present-but-disabled manager triggers a visible degraded-enforcement warning.
     :param metrics: durable measurement sink, or ``None`` for no recording.
-    :param keep_going: on a failure, let already-running steps finish instead of eager-cancelling
-        them; the scheduler still stops launching new steps (it does NOT run every still-runnable
-        step), so in-flight steps report their own pass/fail rather than ABORTED.
+    :param keep_going: after a failure, continue independent ready work and skip true dependents;
+        running steps finish and report their own pass/fail rather than ABORTED.
     :param verbosity: 0 quiet (+failures), 1 default (+summaries), >=2 stream child stdout.
     :param order: explicit dispatch order (e.g. a critical-path planner's); ``None`` uses the
         built-in longest-processing-time default.

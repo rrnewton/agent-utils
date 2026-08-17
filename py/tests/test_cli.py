@@ -340,6 +340,35 @@ def test_run_only_multiple_steps() -> None:
         assert "2 passed, 0 failed, 0 aborted, 0 skipped" in err
 
 
+def test_keep_going_launches_later_independent_work_and_reports_full_accounting() -> None:
+    dag = (
+        '{"steps": ['
+        '{"group":"g","job":"fail","cmd":"exit 1","hint":{"est_duration_s":100}},'
+        '{"group":"g","job":"dependent","cmd":"true","deps":["g.fail"],"hint":{"est_duration_s":90}},'
+        '{"group":"g","job":"independent","cmd":"true","hint":{"est_duration_s":80}}'
+        "]}"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "dag.json"
+        path.write_text(dag, encoding="utf-8")
+
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "-q", "-j", "1", _ACF]
+        )
+        assert rc == 1
+        assert "0 passed, 1 failed, 0 aborted" in err
+        assert "1 dependency-skipped, 1 not launched" in err
+        assert "not launched: g.independent" in err
+
+        rc, _, err = _capture(
+            ["run", "--dag", str(path), "-q", "-j", "1", "--keep-going", _ACF]
+        )
+        assert rc == 1
+        assert "1 passed, 1 failed, 0 aborted" in err
+        assert "1 dependency-skipped, 0 not launched" in err
+        assert "not launched:" not in err
+
+
 def test_run_only_unknown_tag_exits_2() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
