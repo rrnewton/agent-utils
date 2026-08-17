@@ -14,7 +14,7 @@ import csv
 import tempfile
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, Step, run_dag
+from safe_ci_dag_runner import DagConfig, Step, run_dag, run_dag_limited
 from safe_ci_dag_runner.perflog import (
     CsvMetricsSink,
     append_step_profiles,
@@ -76,6 +76,26 @@ def test_csv_metrics_sink_writes_per_step_and_whole_run() -> None:
 
         # The flock sidecar must not be left behind as stray output.
         assert not list(Path(d).glob("*.lock")), "a stray *.lock file was left in --perf-dir"
+
+
+def test_independent_cpu_budget_keeps_legacy_jobs_columns_as_max_steps() -> None:
+    """The existing profile schema keeps ``jobs``/``outer_jobs`` as active-step ceiling."""
+    with tempfile.TemporaryDirectory() as d:
+        result = run_dag_limited(
+            _tiny_dag(),
+            max_steps=2,
+            cpu_jobs=8,
+            metrics=CsvMetricsSink(d, git_sha="limits"),
+            verbosity=0,
+        )
+        assert result.ok
+        step_csv = next(Path(d).glob("step_profiles_*.csv"))
+        with step_csv.open(newline="") as f:
+            step_rows = list(csv.DictReader(f))
+        assert step_rows and all(row["outer_jobs"] == "2" for row in step_rows)
+        with (Path(d) / f"{machine_id()}.csv").open(newline="") as f:
+            whole_rows = list(csv.DictReader(f))
+        assert whole_rows[-1]["jobs"] == "2"
 
 
 def test_dynamic_cpu_columns_are_sorted_alphabetically() -> None:

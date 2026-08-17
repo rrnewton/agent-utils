@@ -4,7 +4,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[test]
-fn boxed_stdin_dag_runs_requested_copies_concurrently() {
+fn boxed_stdin_dag_keeps_step_and_cpu_limits_independent() {
     let exe = env!("CARGO_BIN_EXE_safe-ci-dag-runner");
     let mut child = Command::new(exe)
         .args([
@@ -13,8 +13,10 @@ fn boxed_stdin_dag_runs_requested_copies_concurrently() {
             "-",
             "--stress",
             "3",
-            "--jobs",
+            "--max-steps",
             "3",
+            "--jobs",
+            "2",
             "--no-profile",
             "--no-profile-feedback",
             "-q",
@@ -44,13 +46,35 @@ fn boxed_stdin_dag_runs_requested_copies_concurrently() {
     }
     assert!(output.status.success(), "{combined}");
     assert!(combined.contains("containment OBSERVED"), "{combined}");
+    assert!(
+        combined.contains("per-run CPU cap: CPUQuota=200%"),
+        "outer CPUQuota was not read back exactly:\n{combined}"
+    );
+    let cpu_max = combined
+        .lines()
+        .find_map(|line| {
+            line.split_once("cpu.max=")
+                .and_then(|(_, tail)| tail.split_once(" (bound)"))
+                .map(|(value, _)| value)
+        })
+        .expect("outer cgroup audit did not report a bound cpu.max");
+    let parts: Vec<i64> = cpu_max
+        .split_whitespace()
+        .map(|part| part.parse::<i64>().expect("numeric cpu.max field"))
+        .collect();
+    assert_eq!(parts.len(), 2, "unexpected cpu.max: {cpu_max}");
+    assert_eq!(
+        parts[0],
+        2 * parts[1],
+        "outer cpu.max must encode exactly two CPUs: {cpu_max}"
+    );
     assert!(!combined.contains("invalid JSON"), "{combined}");
     assert!(
         stdout.contains("stress.singleton: 3/3 passed"),
         "{combined}"
     );
     assert!(
-        stdout.contains("maximum concurrent steps: 3 (--jobs 3)"),
+        stdout.contains("maximum concurrent steps: 2 (--max-steps 3; --jobs 2 aggregate CPU jobs)"),
         "{combined}"
     );
 }

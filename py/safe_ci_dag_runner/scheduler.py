@@ -1,7 +1,7 @@
 """Dependency-aware, resource-aware concurrent DAG execution.
 
-The scheduler gates on dependencies, named resource capacities, memory, and fan-out;
-orders ready work by estimated duration; and stops launching work after a failure.
+The scheduler gates on dependencies, named resource capacities, active-step count, and aggregate
+declared CPU width; orders ready work by estimated duration; and stops launching after a failure.
 Per-step supervision reaps complete process trees and records structured outcomes.
 """
 
@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 
 from safe_ci_dag_runner.ambient import (
     AmbientSnapshot,
@@ -60,7 +61,7 @@ from safe_ci_dag_runner.teardown import (
     reap_many,
 )
 
-__all__ = ["Runner", "run_dag"]
+__all__ = ["Runner", "cap_config_cpu_jobs", "run_dag", "run_dag_limited"]
 
 #: Scheduler idle interval between ready-set sweeps (seconds). Matches the reference's
 #: ``time.sleep(0.05)`` — short enough to keep dispatch latency low, long enough to avoid
@@ -88,6 +89,45 @@ def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
     if pressure is None:
         return None
     return PsiReading(avg10=pressure["avg10"], avg60=pressure["avg60"])
+
+
+def cap_config_cpu_jobs(cfg: DagConfig, cpu_jobs: int) -> DagConfig:
+    """Copy ``cfg`` with every declared per-step CPU width capped to ``cpu_jobs``.
+
+    The clamp is intentionally visible: a caller-authored width changed by the run budget must
+    not look as though it executed unchanged. The undeclared-step ``cpu.max`` default is capped
+    too, so a nominal width-one step cannot silently receive a wider child quota.
+    """
+    budget = max(1, cpu_jobs)
+    default_cpu_count = cfg.default_step_cpu_count
+    if default_cpu_count is not None and default_cpu_count > budget:
+        _warn(
+            f"default_step_cpu_count={default_cpu_count} exceeds the run CPU-job budget "
+            f"--jobs {budget}; capping undeclared steps' per-step cpu.max to {budget}"
+        )
+        default_cpu_count = budget
+
+    steps: list[Step] = []
+    for step in cfg.steps:
+        width = step.hint.preferred_inner_jobs
+        if width is not None and width > budget:
+            _warn(
+                f"step {step.tag} preferred_inner_jobs={width} exceeds the run CPU-job budget "
+                f"--jobs {budget}; capping its command width and per-step cpu.max to {budget}"
+            )
+            step = replace(
+                step,
+                hint=replace(step.hint, preferred_inner_jobs=budget),
+                deps=list(step.deps),
+                env=dict(step.env),
+            )
+        steps.append(step)
+    return replace(
+        cfg,
+        steps=tuple(steps),
+        default_step_cpu_count=default_cpu_count,
+        resource_caps=dict(cfg.resource_caps),
+    )
 
 
 class _NoopRunWindow:
@@ -178,30 +218,28 @@ class Runner:
         self,
         cfg: DagConfig,
         *,
-        jobs: int,
+        max_steps: int,
+        cpu_jobs: int,
         cgroups: CgroupManager,
         keep_going: bool = False,
         verbosity: int = 1,
         order: Sequence[str] | None = None,
-        core_budget: int | None = None,
         run_timeout_s: int | None = None,
     ) -> None:
-        self.cfg = cfg
-        self.jobs = max(1, jobs)
+        self.cpu_jobs = max(1, cpu_jobs)
+        self.cfg = cap_config_cpu_jobs(cfg, self.cpu_jobs)
+        self.max_steps = max(1, max_steps)
         self.cgroups = cgroups
         self.keep_going = keep_going
         # verbosity: 0 quiet(+failures), 1 default(+summaries), >=2 stream child stdout.
         self.verbosity = verbosity
-        # CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set
-        # loop never lets the summed inner-jobs width of concurrently-running steps exceed this
-        # total core budget P, so a boxed run stays true to the measured curves the allocator used.
-        # None (the default, non-CPA planners) disables the gate — behavior is unchanged.
-        self.core_budget = core_budget
+        # Aggregate declared CPU-job budget. Every planner uses the same admission gate: the
+        # summed effective width of concurrently-running steps may never exceed this value.
         self.cores_used = 0
-        self.steps: dict[str, Step] = cfg.by_tag()
+        self.steps: dict[str, Step] = self.cfg.by_tag()
         self.intentional_skips = tuple(
             (step.tag, step.skip_reason)
-            for step in cfg.steps
+            for step in self.cfg.steps
             if step.skip_reason is not None
         )
         self.intentional_skip_tags = {tag for tag, _reason in self.intentional_skips}
@@ -215,12 +253,12 @@ class Runner:
             self.order = list(order)
         else:
             self.order = sorted(
-                (s.tag for s in cfg.steps),
+                (s.tag for s in self.cfg.steps),
                 key=lambda tag: self.steps[tag].hint.est_duration_s,
                 reverse=True,
             )
         # Remaining capacity per named scarce resource (mutable copy of the caps).
-        self.resource_avail: dict[str, int] = dict(cfg.resource_caps)
+        self.resource_avail: dict[str, int] = dict(self.cfg.resource_caps)
         self.lock = threading.Lock()
         self.done: dict[str, StepOutcome] = {}
         self.running: set[str] = set()
@@ -263,20 +301,23 @@ class Runner:
         )
 
     def _step_width(self, step: Step) -> int:
-        """The step's inner-jobs width for the core-budget gate (its ``preferred_inner_jobs``, else
-        1). Under ``--planner cpa`` this is the allocated width baked into the hint."""
-        width = preferred_inner_jobs(step)
+        """The declared CPU width charged to the aggregate admission gate.
+
+        An explicit ``preferred_inner_jobs`` wins; otherwise the DAG's per-step ``cpu.max``
+        default is the effective width. Only a fully unbounded/invalid default falls back to one.
+        The jobs-flag behavior remains separate: an undeclared step does not receive a synthetic
+        command-line ``-j`` merely because its cgroup default is wider than one.
+        """
+        width = effective_cpu_count(step, self.cfg.default_step_cpu_count)
         return width if (width is not None and width > 0) else 1
 
     def _cores_free(self, step: Step) -> bool:
-        """True when the step fits the remaining core budget, OR nothing is running (so a step
-        wider than the whole budget still runs — alone — instead of deadlocking). The gate is
-        inactive (always True) when ``core_budget`` is ``None``."""
-        if self.core_budget is None:
-            return True
-        if self.cores_used == 0:
-            return True
-        return self.cores_used + self._step_width(step) <= self.core_budget
+        """Whether the step fits the remaining aggregate CPU-job budget.
+
+        Construction caps every authored width to ``cpu_jobs``, so an oversized step cannot
+        deadlock and does not need the former "run alone while over budget" escape hatch.
+        """
+        return self.cores_used + self._step_width(step) <= self.cpu_jobs
 
     def _acquire(self, step: Step) -> None:
         for r, n in step.hint.resources.items():
@@ -380,7 +421,8 @@ class Runner:
         """Drive the DAG to completion; returns ``True`` when no genuine failure occurred.
 
         Greedy ready-set loop: each pass launches every currently-ready step (deps satisfied,
-        resources free, under the ``-j`` fan-out, in LPT order) on its own daemon supervisor
+        resources free, under the active-step and CPU-job limits, in LPT order) on its own daemon
+        supervisor
         thread, then sleeps. Terminates when nothing is running AND either every step has a
         terminal outcome (done or dep-skipped) OR fail-fast has tripped — the fail-fast clause
         is REQUIRED: once ``stop`` is set, steps whose deps SUCCEEDED are neither launched nor
@@ -440,7 +482,7 @@ class Runner:
                                 ("done", str(len(self.done))),
                             ],
                         )
-                    for other, _other_proc in cut:
+                    for other in self.running:
                         self.aborted.add(other)
                     reap_many(
                         tuple(
@@ -471,7 +513,7 @@ class Runner:
                             continue  # deps not resolved yet
                         if not self._deps_ok(step):
                             continue  # a dep failed -> handled as skip next pass
-                        if len(self.running) >= self.jobs:
+                        if len(self.running) >= self.max_steps:
                             break
                         if not self._res_free(step):
                             continue
@@ -537,6 +579,13 @@ class Runner:
         # prepare_command has already created the step's child cgroup, so cpu.pressure is readable;
         # bracket the step with two host-load snapshots so contention can be attributed later.
         boxed = self.cgroups.enabled
+        # Profile the width the step ACTUALLY ran under. An undeclared boxed command intentionally
+        # gets no jobs flag but is constrained by the default per-step cpu.max, so it belongs in
+        # that width bucket. Unboxed execution has no applied default cap and must retain the
+        # ambient fallback instead of claiming one-core enforcement that did not exist.
+        profile_inner_jobs = (
+            inner_jobs if inner_jobs is not None else (cpu_count if boxed else None)
+        )
         ambient_start: AmbientSnapshot | None = (
             capture_ambient_snapshot(()) if boxed else None
         )
@@ -544,13 +593,62 @@ class Runner:
         # start_new_session=True gives the step its OWN process group/session (pgid == child
         # pid) so teardown can reap the whole tree (bash leader + any server/browser
         # grandchildren) without ever touching the runner's own group.
-        proc: subprocess.Popen[bytes] = subprocess.Popen(
-            ["bash", "-c", run_cmd],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
+        try:
+            proc: subprocess.Popen[bytes] = subprocess.Popen(
+                ["bash", "-c", run_cmd],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except (OSError, ValueError) as exc:
+            # A thread that dies here without publishing a terminal outcome leaves the tag in
+            # ``running`` forever, so the scheduler busy-waits and the thread traceback is the
+            # only explanation. Convert process-creation failure into an ordinary failed step and
+            # restore every admission-accounting field acquired before this supervisor started.
+            elapsed = time.time() - start
+            summary = f"spawn failed: {exc}"
+            outcome = StepOutcome.failed(
+                step.tag,
+                duration_s=elapsed,
+                summary=summary,
+                returncode=None,
+                oomed=False,
+                oom_kills=0,
+                timed_out=False,
+                timeout=step.timeout,
+                cpu_timed_out=False,
+                cpu_timeout=cpu_budget,
+                pids_guard_tripped=False,
+                pids_guard_reason=None,
+                detail_write_failure=(),
+                cpu_timeout_canonical=cpu_canonical,
+                cpu_timeout_multiplier=self.cfg.cpu_timeout_multiplier,
+                cpu_timeout_platform=self.cfg.cpu_timeout_platform,
+            )
+            self.cgroups.cleanup(step.tag)
+            with self.lock:
+                self.running.discard(step.tag)
+                self.running_procs.pop(step.tag, None)
+                self.running_nonces.pop(step.tag, None)
+                self._release(step)
+                self.cores_used -= self._step_width(step)
+                self.done[step.tag] = outcome
+                self.failed = True
+                self.stop = True
+                if not self.keep_going:
+                    others = list(self.running_procs.items())
+                    for other in self.running:
+                        self.aborted.add(other)
+                    reap_many(
+                        tuple(
+                            (other_proc, other, self.running_nonces.get(other))
+                            for other, other_proc in others
+                        ),
+                        self.cgroups,
+                    )
+            self._emit(f"[{step.tag}] ✗ FAIL   {step.desc} ({summary})")
+            return
         with self.lock:
             self.running_procs[step.tag] = proc
             self.running_nonces[step.tag] = nonce
@@ -558,6 +656,12 @@ class Runner:
             self.max_concurrent_steps = max(
                 self.max_concurrent_steps, self.active_processes
             )
+            abort_after_spawn = step.tag in self.aborted
+        if abort_after_spawn:
+            # A peer can fail after this tag was admitted but before its Popen registered. The
+            # failing thread marks every pre-admitted tag aborted; honor that mark immediately so
+            # the narrow registration race cannot turn eager-exit into a full sibling wait.
+            reap(proc, self.cgroups, step.tag, nonce=nonce)
 
         sink = StepStream(step.tag, self.evidence)
         if self.evidence is not None:
@@ -705,7 +809,7 @@ class Runner:
             "classification": step_classification(step).value,
             # Resolve to a NUMBER (the effective parallelism the step ran in) — never the old
             # "ambient" string — so the speedup model can group samples by parallelism level.
-            "inner_jobs": resolve_effective_inner_jobs(inner_jobs),
+            "inner_jobs": resolve_effective_inner_jobs(profile_inner_jobs),
             "elapsed_s": round(elapsed, 3),
             "returncode": returncode,
             "ok": ok,
@@ -728,7 +832,7 @@ class Runner:
             row.update(
                 step_enrichment_columns(
                     elapsed_s=elapsed,
-                    inner_jobs=inner_jobs,
+                    inner_jobs=profile_inner_jobs,
                     cpu_stats=cpu_stats,
                     ambient_start=ambient_start,
                     ambient_end=ambient_end,
@@ -801,7 +905,7 @@ class Runner:
                 self.stop = True
                 if not self.keep_going:
                     others = list(self.running_procs.items())
-                    for other, _other_proc in others:
+                    for other in self.running:
                         self.aborted.add(other)  # its thread will label itself ABORTED
                     reap_many(
                         tuple(
@@ -925,13 +1029,44 @@ def run_dag(
 ) -> RunResult:
     """Run a whole DAG and return its :class:`RunResult`.
 
-    This is the one-call entry point most callers want. It brackets the run in a
-    :class:`RunWindow` (whole-run metrics), drives the :class:`Runner`, flushes the outer-scope
-    cgroup backstop, records the accumulated per-step profile rows, and returns the typed
-    result.
+    ``jobs`` remains the compatibility combined limit: absent the compatibility ``core_budget``
+    override, it bounds both active DAG steps and their aggregate declared CPU width. New callers
+    that need independent limits should use :func:`run_dag_limited`.
+    """
+    return run_dag_limited(
+        cfg,
+        max_steps=jobs,
+        cpu_jobs=core_budget if core_budget is not None else jobs,
+        cgroups=cgroups,
+        metrics=metrics,
+        keep_going=keep_going,
+        verbosity=verbosity,
+        order=order,
+        run_timeout_s=run_timeout_s,
+    )
+
+
+def run_dag_limited(
+    cfg: DagConfig,
+    *,
+    max_steps: int,
+    cpu_jobs: int,
+    cgroups: CgroupManager | None = None,
+    metrics: MetricsSink | None = None,
+    keep_going: bool = False,
+    verbosity: int = 1,
+    order: Sequence[str] | None = None,
+    run_timeout_s: int | None = None,
+) -> RunResult:
+    """Run a DAG with independent active-step and aggregate CPU-job limits.
+
+    It brackets the run in a :class:`RunWindow` (whole-run metrics), drives the
+    :class:`Runner`, flushes the outer-scope cgroup backstop, records the accumulated per-step
+    profile rows, and returns the typed result.
 
     :param cfg: the DAG plus caller policy (steps, resource caps, memory tunables).
-    :param jobs: outer scheduler fan-out (``-j``); clamped to at least 1.
+    :param max_steps: maximum number of concurrently active DAG steps; clamped to at least 1.
+    :param cpu_jobs: aggregate declared CPU-job budget across active steps; clamped to at least 1.
     :param cgroups: per-step containment manager, or ``None`` for the no-containment path
         (a :class:`_NoopCgroupManager` is substituted; teardown falls back to process-group
         kill). The function does not establish an outer cgroup scope itself. A
@@ -943,9 +1078,6 @@ def run_dag(
     :param verbosity: 0 quiet (+failures), 1 default (+summaries), >=2 stream child stdout.
     :param order: explicit dispatch order (e.g. a critical-path planner's); ``None`` uses the
         built-in longest-processing-time default.
-    :param core_budget: total inner-jobs core budget ``P`` for the CPA dispatch gate; when set the
-        scheduler never lets the summed width of concurrently-running steps exceed it. ``None``
-        disables the gate (the non-CPA default).
     :param run_timeout_s: OUTER wall budget for the WHOLE run. On breach the scheduler stops
         launching, terminates every in-flight step's tree, and RETURNS with
         ``RunResult.run_timed_out`` set — it does not abandon the process to an outside killer,
@@ -986,12 +1118,12 @@ def run_dag(
 
     runner = Runner(
         cfg,
-        jobs=jobs,
+        max_steps=max_steps,
+        cpu_jobs=cpu_jobs,
         cgroups=manager,
         keep_going=keep_going,
         verbosity=verbosity,
         order=order,
-        core_budget=core_budget,
         run_timeout_s=run_timeout_s,
     )
     window: RunWindow = sink.start_run_window()
@@ -1008,8 +1140,12 @@ def run_dag(
             )
 
     result = runner.result()
-    window.finish(result="pass" if ok else "fail", n_steps=len(runner.done), jobs=jobs)
-    location = sink.record_step_profiles(result.step_profile_rows, jobs=jobs)
+    # The persisted ``outer_jobs`` schema retains its historical meaning (active-step ceiling)
+    # for compatibility; the independent CPU budget is intentionally not a schema migration.
+    window.finish(
+        result="pass" if ok else "fail", n_steps=len(runner.done), jobs=max(1, max_steps)
+    )
+    location = sink.record_step_profiles(result.step_profile_rows, jobs=max(1, max_steps))
     if metrics is not None and location is None and result.step_profile_rows:
         # A real sink was supplied yet recording was skipped — surface it (No Silent Failure).
         _warn(

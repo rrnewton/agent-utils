@@ -5,9 +5,9 @@
 // Port of the OBSERVABLE scheduling behavior of `py/safe_ci_dag_runner/scheduler.py` for the
 // no-boxing default path (Python's `cgroups=None`). Reproduced from the reference:
 //
-// * Greedy ready-set loop: each pass launches every ready step (deps satisfied, resources
-//   free, under the `-j` fan-out, in longest-processing-time order) on its own supervisor
-//   thread, then sleeps briefly.
+// * Greedy ready-set loop: each pass launches every ready step (deps satisfied, resources free,
+//   within the active-step and aggregate CPU-job limits, in longest-processing-time order) on its
+//   own supervisor thread, then sleeps briefly.
 // * Dependency gating + dep-FAILURE skip-closure (a failed dep transitively skips dependents).
 // * Named-resource capacity buckets (`hint.resources` vs `cfg.resource_caps`).
 // * Longest-processing-time (LPT) dispatch order (descending `est_duration_s`, stable).
@@ -135,8 +135,8 @@ struct Shared {
     failed: bool,
     /// Stop scheduling new steps after a failure.
     stop: bool,
-    /// Summed inner-jobs width of concurrently-running steps (CPA core-budget gate; see
-    /// [`cores_free`]). Always tracked; only enforced when a `core_budget` is set.
+    /// Summed declared inner-jobs width of concurrently-running steps (see [`cores_free`]).
+    /// Every run enforces this against its aggregate CPU-job budget.
     cores_used: i64,
     /// Accumulated per-step measurement rows (forwarded to a metrics sink after the run).
     step_profile_rows: Vec<ProfileRow>,
@@ -459,24 +459,57 @@ fn res_free(sh: &Shared, step: &Step) -> bool {
         .all(|(r, n)| sh.resource_avail.get(r).copied().unwrap_or(0) >= *n)
 }
 
-/// The step's inner-jobs width for the core-budget gate (its `preferred_inner_jobs`, else 1).
-/// Under `--planner cpa` this is the allocated width baked into the hint.
-fn step_width(step: &Step) -> i64 {
+/// The step's effective width for the CPU-job gate: its declared/CPA-assigned inner width, then
+/// the DAG's undeclared-step cpu.max default, then one. The default is charged even though it does
+/// not append a jobs flag to commands that did not opt into one.
+fn step_width(step: &Step, default_cpu_count: Option<i64>) -> i64 {
     match preferred_inner_jobs(step, None) {
         Some(w) if w > 0 => w,
-        _ => 1,
+        _ => default_cpu_count.filter(|w| *w > 0).unwrap_or(1),
     }
 }
 
-// True when the step fits the remaining core budget, OR nothing is running (so a step wider than
-// the whole budget still runs — alone — instead of deadlocking). Inactive (always true) when
-// `core_budget` is `None` (the non-CPA default). Mirrors Python's `Runner._cores_free`.
-fn cores_free(sh: &Shared, step: &Step, core_budget: Option<i64>) -> bool {
-    match core_budget {
-        None => true,
-        Some(_) if sh.cores_used == 0 => true,
-        Some(p) => sh.cores_used + step_width(step) <= p,
+/// Return a run configuration whose declared per-step CPU widths cannot exceed `cpu_jobs`.
+///
+/// This is intentionally visible: a caller-authored width that the run budget changes must not
+/// look as though it executed unchanged. The top-level undeclared-step cpu.max default is capped
+/// too, and the runtime gate charges that effective default even though no jobs flag is appended.
+pub fn cap_config_cpu_jobs(cfg: &DagConfig, cpu_jobs: i64) -> DagConfig {
+    let cpu_jobs = cpu_jobs.max(1);
+    let mut capped = cfg.clone();
+    if let Some(default) = capped
+        .default_step_cpu_count
+        .filter(|default| *default > cpu_jobs)
+    {
+        eprintln!(
+            "[scheduler] WARNING: default_step_cpu_count={default} exceeds the run CPU-job \
+             budget --jobs {cpu_jobs}; capping undeclared steps' per-step cpu.max to {cpu_jobs}"
+        );
+        capped.default_step_cpu_count = Some(cpu_jobs);
     }
+    for step in &mut capped.steps {
+        if let Some(width) = step
+            .hint
+            .preferred_inner_jobs
+            .filter(|width| *width > cpu_jobs)
+        {
+            eprintln!(
+                "[scheduler] WARNING: step {} preferred_inner_jobs={width} exceeds the run \
+                 CPU-job budget --jobs {cpu_jobs}; capping its command width and per-step \
+                 cpu.max to {cpu_jobs}",
+                step.tag()
+            );
+            step.hint.preferred_inner_jobs = Some(cpu_jobs);
+        }
+    }
+    capped
+}
+
+// True when the step fits the remaining aggregate CPU-job budget. Runner construction caps every
+// positive preferred_inner_jobs width to `cpu_jobs`, so an oversized authored step cannot deadlock
+// here and never needs the old "run alone while over budget" escape hatch.
+fn cores_free(sh: &Shared, step: &Step, default_cpu_count: Option<i64>, cpu_jobs: i64) -> bool {
+    sh.cores_used + step_width(step, default_cpu_count) <= cpu_jobs
 }
 
 fn acquire(sh: &mut Shared, step: &Step) {
@@ -501,7 +534,8 @@ struct Runner {
     steps: Arc<HashMap<String, Step>>,
     order: Vec<String>,
     intentional_skips: Vec<(String, crate::model::IntentionalSkipReason)>,
-    jobs: i64,
+    /// Maximum number of DAG steps that may be active at once.
+    max_steps: i64,
     keep_going: bool,
     verbosity: i64,
     /// Default inner-parallelism flag template (e.g. "-j") for steps without their own.
@@ -518,10 +552,9 @@ struct Runner {
     default_step_cpu_timeout: i64,
     cpu_timeout_multiplier: f64,
     cpu_timeout_platform: String,
-    // CPA core-budget gate (MCPA's insight, PLANNER_DESIGN.md §5.7): when set, the ready-set loop
-    // never lets the summed inner-jobs width of concurrently-running steps exceed this total core
-    // budget `P`. `None` (non-CPA planners) disables the gate — behavior is unchanged.
-    core_budget: Option<i64>,
+    /// Aggregate declared CPU-job budget. The ready-set loop never lets the summed effective
+    /// inner-jobs width of concurrently-running steps exceed this value, for every planner.
+    cpu_jobs: i64,
     /// OUTER wall budget for the WHOLE run, in seconds; `None` leaves the run unbounded.
     ///
     /// Independent of every per-step budget, and that independence is the point: no combination of
@@ -537,21 +570,27 @@ impl Runner {
     #[allow(clippy::too_many_arguments)]
     fn new(
         cfg: &DagConfig,
-        jobs: i64,
+        max_steps: i64,
+        cpu_jobs: i64,
         keep_going: bool,
         verbosity: i64,
         cgroups: BoxedCgroups,
         order_override: Option<Vec<String>>,
-        core_budget: Option<i64>,
         run_timeout_s: Option<i64>,
     ) -> Self {
-        let steps: HashMap<String, Step> = cfg.steps.iter().map(|s| (s.tag(), s.clone())).collect();
+        let cpu_jobs = cpu_jobs.max(1);
+        let capped = cap_config_cpu_jobs(cfg, cpu_jobs);
+        let steps: HashMap<String, Step> = capped
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step.clone()))
+            .collect();
         // Dispatch order. When the caller supplies an explicit order (e.g. a critical-path
         // planner's) use it verbatim; otherwise default to LPT: sort tags by est_duration_s
         // DESCENDING (stable, so ties keep cfg/registration order, matching Python's stable
         // reverse sort).
         let order: Vec<String> = order_override.unwrap_or_else(|| {
-            let mut o: Vec<String> = cfg.steps.iter().map(|s| s.tag()).collect();
+            let mut o: Vec<String> = capped.steps.iter().map(|s| s.tag()).collect();
             o.sort_by(|a, b| {
                 let ea = steps[a].hint.est_duration_s;
                 let eb = steps[b].hint.est_duration_s;
@@ -559,12 +598,12 @@ impl Runner {
             });
             o
         });
-        let resource_avail: HashMap<String, i64> = cfg
+        let resource_avail: HashMap<String, i64> = capped
             .resource_caps
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        let intentional_skips = cfg
+        let intentional_skips = capped
             .steps
             .iter()
             .filter_map(|step| step.skip_reason.map(|reason| (step.tag(), reason)))
@@ -573,18 +612,18 @@ impl Runner {
             steps: Arc::new(steps),
             order,
             intentional_skips,
-            jobs: jobs.max(1),
+            max_steps: max_steps.max(1),
             keep_going,
             verbosity,
-            default_jobs_flag: cfg.default_jobs_flag.clone(),
+            default_jobs_flag: capped.default_jobs_flag.clone(),
             cgroups,
-            mem_cap_factor: cfg.mem_cap_factor,
-            default_step_mem_cap_bytes: cfg.default_step_mem_cap_bytes,
-            default_step_cpu_count: cfg.default_step_cpu_count,
-            default_step_cpu_timeout: cfg.default_step_cpu_timeout,
-            cpu_timeout_multiplier: cfg.cpu_timeout_multiplier,
-            cpu_timeout_platform: cfg.cpu_timeout_platform.clone(),
-            core_budget,
+            mem_cap_factor: capped.mem_cap_factor,
+            default_step_mem_cap_bytes: capped.default_step_mem_cap_bytes,
+            default_step_cpu_count: capped.default_step_cpu_count,
+            default_step_cpu_timeout: capped.default_step_cpu_timeout,
+            cpu_timeout_multiplier: capped.cpu_timeout_multiplier,
+            cpu_timeout_platform: capped.cpu_timeout_platform.clone(),
+            cpu_jobs,
             run_timeout_s,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
             shared: Arc::new(Mutex::new(Shared {
@@ -700,8 +739,9 @@ impl Runner {
                                 ],
                             );
                         }
-                        for (tag, _pid, _nonce) in &cut {
-                            sh.aborted.insert(tag.clone());
+                        let admitted: Vec<String> = sh.running.iter().cloned().collect();
+                        for tag in admitted {
+                            sh.aborted.insert(tag);
                         }
                         reap_many(&self.cgroups, &cut);
                     }
@@ -730,18 +770,18 @@ impl Runner {
                         if !deps_ok(&sh, &step) {
                             continue;
                         }
-                        if sh.running.len() as i64 >= self.jobs {
+                        if sh.running.len() as i64 >= self.max_steps {
                             break;
                         }
                         if !res_free(&sh, &step) {
                             continue;
                         }
-                        if !cores_free(&sh, &step, self.core_budget) {
+                        if !cores_free(&sh, &step, self.default_step_cpu_count, self.cpu_jobs) {
                             continue;
                         }
                         sh.running.insert(tag.clone());
                         acquire(&mut sh, &step);
-                        sh.cores_used += step_width(&step);
+                        sh.cores_used += step_width(&step, self.default_step_cpu_count);
                         launchable.push(step);
                     }
                 }
@@ -1280,6 +1320,10 @@ fn run_step(ctx: StepCtx) {
     // build). prepare_command has created the step's child cgroup, so cpu.pressure is readable;
     // bracket the step with two host-load snapshots so contention can be attributed later.
     let boxed = matches!(&cgroups, Some(cg) if cg.enabled());
+    // Profile the width the step ACTUALLY ran under. An undeclared boxed command intentionally
+    // gets no jobs flag but is constrained by the default per-step cpu.max, so it belongs in that
+    // width bucket. Unboxed execution has no applied default cap and retains the ambient fallback.
+    let profile_inner_jobs = inner_jobs.or(if boxed { cpu_count } else { None });
     let ambient_start = if boxed {
         Some(capture_ambient_snapshot(&[], None))
     } else {
@@ -1322,11 +1366,17 @@ fn run_step(ctx: StepCtx) {
         Err(e) => {
             // Spawn failure: record a failed outcome so the run does not hang.
             let elapsed = start.elapsed().as_secs_f64();
+            if let Some(cg) = &cgroups {
+                if cg.enabled() {
+                    cg.cleanup(&tag);
+                }
+            }
             let mut sh = shared.lock().unwrap();
             sh.running.remove(&tag);
             sh.running_pids.remove(&tag);
             sh.running_nonces.remove(&tag);
             release(&mut sh, &step);
+            sh.cores_used -= step_width(&step, default_step_cpu_count);
             let outcome = StepOutcome::failed(
                 tag.clone(),
                 elapsed,
@@ -1348,6 +1398,20 @@ fn run_step(ctx: StepCtx) {
             sh.done.insert(tag.clone(), outcome);
             sh.failed = true;
             sh.stop = true;
+            if !keep_going {
+                let admitted: Vec<String> = sh.running.iter().cloned().collect();
+                for other in admitted {
+                    sh.aborted.insert(other);
+                }
+                let others: Vec<(String, u32, Option<String>)> = sh
+                    .running_pids
+                    .iter()
+                    .map(|(other, pid)| {
+                        (other.clone(), *pid, sh.running_nonces.get(other).cloned())
+                    })
+                    .collect();
+                reap_many(&cgroups, &others);
+            }
             drop(sh);
             emit(&format!(
                 "[{tag}] \u{2717} FAIL   {} (spawn failed: {e})",
@@ -1357,12 +1421,19 @@ fn run_step(ctx: StepCtx) {
         }
     };
     let pid = child.id();
-    {
+    let abort_after_spawn = {
         let mut sh = shared.lock().unwrap();
         sh.running_pids.insert(tag.clone(), pid);
         sh.running_nonces.insert(tag.clone(), nonce.clone());
         sh.active_processes += 1;
         sh.max_concurrent_steps = sh.max_concurrent_steps.max(sh.active_processes);
+        sh.aborted.contains(&tag)
+    };
+    if abort_after_spawn {
+        // A peer can fail after this tag was admitted but before its Popen registered. The
+        // failing thread marks every pre-admitted tag aborted; honor that mark immediately so the
+        // registration race cannot turn eager-exit into a full sibling wait.
+        reap(&cgroups, &tag, pid, Some(&nonce));
     }
 
     // ONE stream object shared by stdout and stderr, so the tracker sees the step's output in a
@@ -1663,7 +1734,7 @@ fn run_step(ctx: StepCtx) {
     // string — so the speedup model can group samples by parallelism level.
     row.insert(
         "inner_jobs".into(),
-        resolve_effective_inner_jobs(inner_jobs).to_string(),
+        resolve_effective_inner_jobs(profile_inner_jobs).to_string(),
     );
     row.insert("elapsed_s".into(), format!("{elapsed:.3}"));
     row.insert(
@@ -1695,7 +1766,7 @@ fn run_step(ctx: StepCtx) {
     if boxed {
         for (k, v) in step_enrichment_columns(
             elapsed,
-            inner_jobs,
+            profile_inner_jobs,
             cpu_stats.as_ref(),
             ambient_start.as_ref(),
             ambient_end.as_ref(),
@@ -1712,7 +1783,7 @@ fn run_step(ctx: StepCtx) {
         sh.running_pids.remove(&tag);
         sh.running_nonces.remove(&tag);
         release(&mut sh, &step);
-        sh.cores_used -= step_width(&step);
+        sh.cores_used -= step_width(&step, default_step_cpu_count);
         sh.step_profile_rows.push(row);
         let was_aborted = sh.aborted.contains(&tag);
         // Distinguish the two ways a step gets cancelled. "Another step failed" and "the whole run
@@ -1766,14 +1837,15 @@ fn run_step(ctx: StepCtx) {
             sh.failed = true;
             sh.stop = true;
             if !keep_going {
+                let admitted: Vec<String> = sh.running.iter().cloned().collect();
+                for other in admitted {
+                    sh.aborted.insert(other);
+                }
                 let others: Vec<(String, u32, Option<String>)> = sh
                     .running_pids
                     .iter()
                     .map(|(k, v)| (k.clone(), *v, sh.running_nonces.get(k).cloned()))
                     .collect();
-                for (other, _other_pid, _other_nonce) in &others {
-                    sh.aborted.insert(other.clone());
-                }
                 reap_many(&cgroups, &others);
             }
         }
@@ -1864,14 +1936,27 @@ fn run_step(ctx: StepCtx) {
 
 /// Run a whole DAG and return its [`RunResult`] (no cgroup boxing, no metrics recording).
 ///
-/// * `jobs`: outer scheduler fan-out (`-j`), clamped to at least 1.
+/// * `jobs`: ergonomic combined limit: both the maximum active-step count and the aggregate
+///   declared CPU-job budget, clamped to at least 1. Use [`run_dag_limited`] when those limits
+///   differ.
 /// * `keep_going`: on a failure, let already-running steps finish instead of eager-cancelling
 ///   them; the scheduler still stops launching new steps (it does NOT run every still-runnable
 ///   step), so in-flight steps report their own pass/fail rather than ABORTED.
 /// * `verbosity`: 0 quiet (+failures), 1 default (+summaries), 2-4 stream child stdout,
 ///   and >=5 streams with the deepest recognized test identity on every line.
 pub fn run_dag(cfg: &DagConfig, jobs: i64, keep_going: bool, verbosity: i64) -> RunResult {
-    run_dag_boxed(cfg, jobs, keep_going, verbosity, None)
+    run_dag_limited(cfg, jobs, jobs, keep_going, verbosity)
+}
+
+/// Run a whole DAG with independent active-step and aggregate CPU-job limits.
+pub fn run_dag_limited(
+    cfg: &DagConfig,
+    max_steps: i64,
+    cpu_jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+) -> RunResult {
+    run_dag_boxed_limited(cfg, max_steps, cpu_jobs, keep_going, verbosity, None)
 }
 
 /// Run a whole DAG with an optional per-step cgroup manager (the real-work entry point).
@@ -1886,13 +1971,27 @@ pub fn run_dag_boxed(
     verbosity: i64,
     cgroups: BoxedCgroups,
 ) -> RunResult {
-    run_dag_boxed_ordered(cfg, jobs, keep_going, verbosity, cgroups, None, None)
+    run_dag_boxed_limited(cfg, jobs, jobs, keep_going, verbosity, cgroups)
+}
+
+/// Boxed form of [`run_dag_limited`].
+pub fn run_dag_boxed_limited(
+    cfg: &DagConfig,
+    max_steps: i64,
+    cpu_jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+) -> RunResult {
+    run_dag_boxed_ordered_limited(
+        cfg, max_steps, cpu_jobs, keep_going, verbosity, cgroups, None,
+    )
 }
 
 /// Like [`run_dag_boxed`] but with an explicit dispatch `order` (e.g. a critical-path planner's)
-/// and an optional CPA `core_budget` (`P`): when set, the scheduler never lets the summed
-/// inner-jobs width of concurrently-running steps exceed it. `order = None` uses the built-in
-/// longest-processing-time default; `core_budget = None` disables the core gate.
+/// and the compatibility `core_budget` option. The scheduler always has an aggregate CPU-job gate:
+/// `core_budget` supplies it when present, otherwise `jobs` does. New callers that need separate
+/// active-step and CPU-job limits should use [`run_dag_boxed_ordered_limited`].
 pub fn run_dag_boxed_ordered(
     cfg: &DagConfig,
     jobs: i64,
@@ -1902,15 +2001,30 @@ pub fn run_dag_boxed_ordered(
     order: Option<Vec<String>>,
     core_budget: Option<i64>,
 ) -> RunResult {
-    run_dag_boxed_deadline(
+    run_dag_boxed_ordered_limited(
         cfg,
         jobs,
+        core_budget.unwrap_or(jobs),
         keep_going,
         verbosity,
         cgroups,
         order,
-        core_budget,
-        None,
+    )
+}
+
+/// Boxed ordered run with independent active-step and aggregate CPU-job limits.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dag_boxed_ordered_limited(
+    cfg: &DagConfig,
+    max_steps: i64,
+    cpu_jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
+) -> RunResult {
+    run_dag_boxed_deadline_limited(
+        cfg, max_steps, cpu_jobs, keep_going, verbosity, cgroups, order, None,
     )
 }
 
@@ -1954,6 +2068,30 @@ pub fn run_dag_boxed_deadline(
     cgroups: BoxedCgroups,
     order: Option<Vec<String>>,
     core_budget: Option<i64>,
+    run_timeout_s: Option<i64>,
+) -> RunResult {
+    run_dag_boxed_deadline_limited(
+        cfg,
+        jobs,
+        core_budget.unwrap_or(jobs),
+        keep_going,
+        verbosity,
+        cgroups,
+        order,
+        run_timeout_s,
+    )
+}
+
+/// Deadline-aware boxed run with independent active-step and aggregate CPU-job limits.
+#[allow(clippy::too_many_arguments)]
+pub fn run_dag_boxed_deadline_limited(
+    cfg: &DagConfig,
+    max_steps: i64,
+    cpu_jobs: i64,
+    keep_going: bool,
+    verbosity: i64,
+    cgroups: BoxedCgroups,
+    order: Option<Vec<String>>,
     run_timeout_s: Option<i64>,
 ) -> RunResult {
     let domain_errors = write_domain_violations(cfg);
@@ -2012,12 +2150,12 @@ pub fn run_dag_boxed_deadline(
     }
     let runner = Runner::new(
         cfg,
-        jobs,
+        max_steps,
+        cpu_jobs,
         keep_going,
         verbosity,
         cgroups,
         order,
-        core_budget,
         run_timeout_s,
     );
     // ANNOUNCE THE EVIDENCE PATH ONCE, AT THE START. A durable log nobody can find is not
@@ -2399,6 +2537,36 @@ mod tests {
     }
 
     #[test]
+    fn spawn_failure_eager_aborts_an_inflight_sibling() {
+        let slow = step("g", "slow", "sleep 10", &[], 100.0, &[]);
+        let gate = step("g", "gate", "sleep 0.3", &[], 50.0, &[]);
+        let mut invalid = step("g", "invalid-env", "true", &["g.gate"], 0.0, &[]);
+        invalid
+            .env
+            .insert("BAD".to_string(), "embedded\0nul".to_string());
+        let cfg = DagConfig {
+            steps: vec![slow, gate, invalid],
+            ..Default::default()
+        };
+
+        let started = Instant::now();
+        let result = run_dag(&cfg, 2, false, 0);
+        assert!(!result.ok);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "spawn failure should eager-cancel the ten-second sibling"
+        );
+        let outcomes: HashMap<String, StepOutcome> = result
+            .outcomes
+            .iter()
+            .map(|outcome| (outcome.tag.clone(), outcome.clone()))
+            .collect();
+        assert!(outcomes["g.slow"].aborted);
+        assert!(outcomes["g.gate"].ok);
+        assert!(outcomes["g.invalid-env"].summary.contains("spawn failed"));
+    }
+
+    #[test]
     fn resource_cap_serializes_concurrent_steps() {
         let dir = std::env::temp_dir().join(format!("scdr_res_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2438,6 +2606,127 @@ mod tests {
         // A cap of 1 must serialize the two: their run intervals cannot overlap.
         assert!(ends["one"] <= starts["two"] || ends["two"] <= starts["one"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn max_steps_and_cpu_jobs_constrain_independently() {
+        let make_cfg = || {
+            let mut steps = Vec::new();
+            for index in 0..4 {
+                let mut item = step("g", &format!("step{index}"), "sleep 0.15", &[], 0.0, &[]);
+                item.hint.preferred_inner_jobs = Some(1);
+                item.jobs_flag = Some(String::new());
+                steps.push(item);
+            }
+            DagConfig {
+                steps,
+                ..Default::default()
+            }
+        };
+
+        let step_limited = run_dag_limited(&make_cfg(), 2, 4, false, 0);
+        assert!(step_limited.ok);
+        assert_eq!(step_limited.max_concurrent_steps, 2);
+
+        let cpu_limited = run_dag_limited(&make_cfg(), 4, 2, false, 0);
+        assert!(cpu_limited.ok);
+        assert_eq!(cpu_limited.max_concurrent_steps, 2);
+
+        let mut default_width_cfg = make_cfg();
+        for step in &mut default_width_cfg.steps {
+            step.hint.preferred_inner_jobs = None;
+        }
+        default_width_cfg.default_step_cpu_count = Some(4);
+        let default_width_limited = run_dag_limited(&default_width_cfg, 2, 4, false, 0);
+        assert!(default_width_limited.ok);
+        assert_eq!(default_width_limited.max_concurrent_steps, 1);
+    }
+
+    #[derive(Default)]
+    struct ProfileCaptureCgroups {
+        cpu_counts: Mutex<Vec<Option<i64>>>,
+    }
+
+    impl CgroupManager for ProfileCaptureCgroups {
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn prepare_command(
+            &self,
+            _tag: &str,
+            cmd: &str,
+            _mem_max: Option<i64>,
+            cpu_count: Option<i64>,
+        ) -> String {
+            self.cpu_counts.lock().unwrap().push(cpu_count);
+            cmd.to_string()
+        }
+
+        fn kill(&self, _tag: &str) -> bool {
+            true
+        }
+
+        fn cleanup(&self, _tag: &str) {}
+
+        fn oom_kills(&self, _tag: &str) -> i64 {
+            0
+        }
+
+        fn peak_bytes(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn cpu_stats(&self, _tag: &str) -> Option<BTreeMap<String, i64>> {
+            Some(BTreeMap::from([
+                ("usage_usec".to_string(), 0),
+                ("user_usec".to_string(), 0),
+                ("system_usec".to_string(), 0),
+                ("throttled_usec".to_string(), 0),
+            ]))
+        }
+
+        fn cpu_pressure(&self, _tag: &str) -> Option<BTreeMap<String, f64>> {
+            None
+        }
+
+        fn thread_count(&self, _tag: &str) -> Option<i64> {
+            None
+        }
+
+        fn kill_all_remaining(&self) -> i64 {
+            0
+        }
+    }
+
+    #[test]
+    fn undeclared_step_profiles_the_default_cpu_cap_as_inner_jobs() {
+        let cfg = DagConfig {
+            steps: vec![step("g", "default-width", "true", &[], 0.0, &[])],
+            default_step_cpu_count: Some(1),
+            ..Default::default()
+        };
+        let cgroups = Arc::new(ProfileCaptureCgroups::default());
+
+        let result = run_dag_boxed_limited(&cfg, 1, 8, false, 0, Some(cgroups.clone()));
+
+        assert!(result.ok);
+        assert_eq!(
+            cgroups.cpu_counts.lock().unwrap().as_slice(),
+            &[Some(1)],
+            "the undeclared step should be boxed at the configured default"
+        );
+        let row = result
+            .step_profile_rows
+            .iter()
+            .find(|row| row.get("step").is_some_and(|tag| tag == "g.default-width"))
+            .unwrap();
+        assert_eq!(row.get("inner_jobs").map(String::as_str), Some("1"));
+        assert_eq!(
+            row.get("quota_utilization_pct").map(String::as_str),
+            Some("0.00"),
+            "enrichment should use the effective default width as its quota denominator"
+        );
     }
 
     #[test]
@@ -2495,7 +2784,36 @@ mod tests {
             steps: vec![s],
             ..Default::default()
         };
-        let res = run_dag(&cfg, 1, false, 0);
+        let res = run_dag(&cfg, 4, false, 0);
         assert!(res.ok, "expected '-j4' to be appended so the check passes");
+    }
+
+    #[test]
+    fn oversized_width_and_default_cpu_cap_are_clamped_to_run_jobs() {
+        let mut item = step(
+            "g",
+            "wide",
+            "check() { [ \"$*\" = \"-j2\" ]; }; check",
+            &[],
+            0.0,
+            &[],
+        );
+        item.hint.preferred_inner_jobs = Some(8);
+        item.jobs_flag = Some("-j%d".to_string());
+        let cfg = DagConfig {
+            steps: vec![item],
+            default_step_cpu_count: Some(8),
+            ..Default::default()
+        };
+
+        let capped = cap_config_cpu_jobs(&cfg, 2);
+        assert_eq!(capped.steps[0].hint.preferred_inner_jobs, Some(2));
+        assert_eq!(capped.default_step_cpu_count, Some(2));
+
+        let result = run_dag_limited(&cfg, 1, 2, false, 0);
+        assert!(
+            result.ok,
+            "expected the capped '-j2' flag to reach the command"
+        );
     }
 }

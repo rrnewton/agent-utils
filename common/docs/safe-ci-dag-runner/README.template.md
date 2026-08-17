@@ -8,7 +8,8 @@ It provides:
 
 - strict JSON and YAML DAG loading;
 - deterministic list, visualization, conversion, and planning commands;
-- memory- and resource-aware concurrent execution;
+- independent active-step (`--max-steps`) and aggregate CPU-job (`--jobs`) limits;
+- memory- and named-resource-aware concurrent execution;
 - nested cgroup-v2 containment with explicit unboxed opt-outs;
 - profile feedback, parallel-speedup sweeps, and stress copies; and
 - durable, collision-free CPU reservation for benchmark runs.
@@ -51,6 +52,11 @@ safe-ci-dag-runner --help
 safe-ci-dag-runner --userguide
 safe-ci-dag-runner capabilities
 ```
+
+For example, `run -s2 -j200` permits at most two active DAG nodes while
+limiting their combined declared inner width to 200 jobs. Under cgroup boxing,
+the run also receives a verified `cpu.max` bandwidth cap. That quota is not an
+instantaneous CPU-identity bound; use `--cores K` for an exclusive fixed cpuset.
 
 ## Attributable test-runner timeouts
 

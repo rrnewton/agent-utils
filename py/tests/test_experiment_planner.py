@@ -8,6 +8,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from safe_ci_dag_runner import DagConfig, RunResult
+from parallel_experiment_runner import execute
 from parallel_experiment_runner.model import (
     STATUS_COMMAND_ERROR,
     STATUS_HIT,
@@ -67,6 +71,40 @@ def test_lowering_maps_every_hard_limit(tmp_path: Path) -> None:
     assert step.hint.hard_mem_max_bytes == 4 * 1024**3  # -> inner memory.max
     assert step.hint.preferred_inner_jobs == 3  # -> inner cpu.max + width core-unit
     assert step.jobs_flag == ""  # never append -j to a complete workload argv
+
+
+def test_execute_maps_workers_and_per_worker_cores_to_independent_limits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_run(
+        _dag: DagConfig,
+        *,
+        jobs: int,
+        core_budget: int,
+        **_kwargs: object,
+    ) -> RunResult:
+        captured.update(max_steps=jobs, cpu_jobs=core_budget)
+        return RunResult(ok=True, wall_s=0.0)
+
+    monkeypatch.setattr(execute, "run_dag", fake_run)
+    plan = _plan(
+        _spec(worker_limits=WorkerLimits(cpu_cores=3)),
+        (0, 1, 2),
+        tmp_path,
+    )
+    plan = RoundPlan(
+        spec=plan.spec,
+        seeds=plan.seeds,
+        width=2,
+        slice_revision=plan.slice_revision,
+        limiting_dimension=plan.limiting_dimension,
+        log_dir=plan.log_dir,
+        per_worker_estimate=plan.per_worker_estimate,
+    )
+    execute.execute_round(plan, cgroups=None)
+    assert captured == {"max_steps": 2, "cpu_jobs": 6}
 
 
 def test_lowering_cpu_timeout_unset_becomes_zero(tmp_path: Path) -> None:

@@ -16,7 +16,7 @@ use, declare the dependency and import the crate as `safe_ci_dag_runner`:
 
 ```toml
 [dependencies]
-safe-ci-dag-runner = "0.12"
+safe-ci-dag-runner = "0.13"
 ```
 
 ```rust
@@ -32,8 +32,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Public modules cover containment, CPU reservations, resource sizing, profile
 summaries, deterministic planning, scheduling, serialization, and
 visualization. The `run_dag` function is the explicit uncontained scheduler;
-`run_dag_boxed` and the console command establish containment. Enforced
+`run_dag_boxed` applies a caller-supplied cgroup manager when present. The
+console command establishes and verifies the outer systemd scope. Enforced
 containment requires Linux with cgroup v2 and a delegated systemd user scope.
+In 0.13, `run_dag(..., jobs)` and `run_dag_boxed(..., jobs)` treat that argument
+as a compatibility combined active-step and aggregate CPU-job limit. Use
+`run_dag_limited` or a boxed limited variant to choose the two values
+independently.
 
 ## A first DAG
 
@@ -146,15 +151,39 @@ Use `--no-profile-feedback` when only authored hints may influence a plan.
 ## Run safely
 
 ```sh
-safe-ci-dag-runner run --dag pipeline.yaml -j 4
+safe-ci-dag-runner run --dag pipeline.yaml --max-steps 2 --jobs 8
 safe-ci-dag-runner run --dag pipeline.yaml --max-mem 8G
 safe-ci-dag-runner run --dag pipeline.yaml --show-plan --profile
 ```
 
-`-j` sets maximum outer concurrency. `--max-mem` instead chooses the largest
-safe width from the modeled worst-case footprint. Named resources act as
-semaphores in addition to the worker and memory limits. A failed step prevents
-new dependent work; `--keep-going` lets already-running work reach a verdict.
+`-s` / `--max-steps` bounds how many DAG nodes may be active. `-j` / `--jobs`
+independently bounds the sum of their declared inner widths: a step consumes
+`preferred_inner_jobs`, else the runner's undeclared-step CPU default (one in
+the CLI).
+Thus `-s2 -j200`
+allows at most two active nodes whose combined declared width is at most 200;
+either node may itself use many workers. The default job budget is the effective
+container/affinity budget tightened by the shared aggregate slice's 90% host
+budget, and the default step ceiling is that job budget.
+
+`--max-mem` derives a safe `--max-steps` ceiling from the modeled worst-case
+footprint. If an explicit step ceiling is also present, the tighter value wins.
+Named resources act as semaphores in addition to the step, CPU-job, and memory
+limits. A failed step prevents new dependent work; `--keep-going` lets
+already-running work reach a verdict.
+
+Under boxing, the run scope also receives `CPUQuota=<jobs>*100%`, and the live
+`cpu.max` value is read back before work starts. This is a CPU-bandwidth
+backstop, not an instantaneous thread-count or CPU-identity bound: CFS quota may
+briefly run more than `J` runnable tasks on more than `J` CPUs and throttle them
+later in the quota period. An unpinned run may also migrate from CPUs A/B to C/D
+without exceeding its long-window budget. Use `--cores K` when exact eligible
+CPU identities are required. The runner does not use `cpu.weight` as a cap.
+
+This is a deliberate run-CLI change in 0.13. Before 0.13, `run -j N` meant
+maximum active steps. Migrate that intent to `run -s N`; use `-s N -j N` when
+the old single number should bound both dimensions. The separate
+`sweep --jobs RANGE` option still means the inner widths being measured.
 
 Per-step wall and CPU timeouts, memory limits, process-tree teardown, and OOM
 attribution are enforced inside nested cgroups when the host supplies cgroup v2
@@ -227,17 +256,17 @@ Passing `--args` is rejected unless a selected command declares the token.
 Without `--args`, the token is removed. `--stress N` duplicates the selected
 graph at generation into `N` disconnected components with no edges between
 copies. Each copy retains the original graph's internal dependency edges.
-Named-resource scheduling is removed from the generated copies, so `-j`
-controls how many copied steps run at once and may be set high for deliberate
-core over-subscription. The report includes the exact pass ratio and the largest
-number of step child processes measured alive at once. The modeled memory
-footprint must still fit the box.
+Named-resource scheduling is removed from the generated copies, so
+`--max-steps` controls how many copied nodes may be active while `--jobs` bounds
+their summed declared width. The report includes the exact pass ratio and the
+largest number of step child processes measured alive at once. The modeled
+memory footprint must still fit the box.
 
 A singleton DAG can be generated on the fly; no `N`-node file is required:
 
 ```sh
 printf '%s\n' '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 2"}]}' |
-  safe-ci-dag-runner run --dag - --stress 100 --jobs 100 --no-profile
+  safe-ci-dag-runner run --dag - --stress 100 --max-steps 100 --jobs 100 --no-profile
 ```
 
 ## Profiles, sweeps, and portable summaries
@@ -273,6 +302,12 @@ concurrent reservation, release on normal or failing exit, and reclaim records
 whose owning process is dead. Enforcement is fail-closed: the exact reserved set
 must become the effective cgroup cpuset. A process-affinity mask is not accepted
 because a descendant can replace it.
+
+No central daemon is required for the current fixed-slice mode: every allocator
+serializes through the shared durable ledger and claims an explicit set of CPU
+IDs. A future service could provide dynamic or fair machine-wide allocation,
+but ordinary `--jobs` deliberately remains a quota/admission budget rather than
+pretending to hand out exclusive moving CPU slices.
 
 The ledger path is `SAFE_CI_CORE_LEDGER` when that variable is set. Otherwise it
 is `$XDG_RUNTIME_DIR/safe-ci-dag-runner/core-reservations.json` when the runtime

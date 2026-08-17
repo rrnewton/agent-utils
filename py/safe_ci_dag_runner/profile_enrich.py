@@ -7,8 +7,6 @@ co-tenant activity, and peak-memory columns without fabricating unavailable valu
 from __future__ import annotations
 
 from collections.abc import Mapping
-from pathlib import Path
-
 from safe_ci_dag_runner import perflog
 from safe_ci_dag_runner.ambient import (
     AmbientSnapshot,
@@ -26,25 +24,29 @@ __all__ = [
 _USEC = 1_000_000.0
 
 #: cgroup-v2 unified CPU quota file for the whole run's container/machine.
-_CPU_MAX_PATH = Path("/sys/fs/cgroup/cpu.max")
-
-
 def container_core_budget() -> int:
     """The effective core count of the cgroup/container/machine the run is boxed in.
 
-    Prefers the cgroup-v2 CPU quota (``/sys/fs/cgroup/cpu.max`` ``quota period`` -> rounded
-    ``quota/period`` cores) when it is bounded, falling back to :func:`perflog.nproc` (the
-    affinity width) when the quota is ``max`` or unreadable. This is the NUMBER an "ambient"
-    (un-``-j``-capped) step's effective parallelism resolves to — never the string ``"ambient"``.
+    Walks the current cgroup's ancestor chain for the tightest finite CPU quota, floors it to a
+    positive whole-core count, and takes the tighter of that quota and the process affinity
+    width. This is the NUMBER an "ambient" (un-``-j``-capped) step's effective parallelism
+    resolves to — never the string ``"ambient"``.
     """
+    affinity = max(1, perflog.nproc())
+    quota = perflog.effective_cpu_quota()
+    parts = quota.split("_")
+    if len(parts) != 2:
+        return affinity
     try:
-        raw = _CPU_MAX_PATH.read_text().split()
-        quota, period = int(raw[0]), int(raw[1])
-        if quota > 0 and period > 0:
-            return max(1, round(quota / period))
-    except (OSError, ValueError, IndexError):
-        pass
-    return perflog.nproc()
+        quota_us, period_us = (int(part) for part in parts)
+    except ValueError:
+        return affinity
+    if quota_us <= 0 or period_us <= 0:
+        return affinity
+    # A whole-job default must never overstate a fractional bandwidth grant. A positive sub-core
+    # quota still gets one job so the run can make progress.
+    quota_cores = max(1, quota_us // period_us)
+    return min(affinity, quota_cores)
 
 
 def resolve_effective_inner_jobs(inner_jobs: int | None) -> int:

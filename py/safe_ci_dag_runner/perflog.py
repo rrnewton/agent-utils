@@ -59,7 +59,7 @@ CSV_COLUMNS = [
     "total_busy_pct",  # total system busy CPU / (nproc*wall)
     "ipc",             # optional instructions-per-cycle (blank when unavailable)
     "cache_miss_pct",  # optional cache-miss rate % (blank when unavailable)
-    "jobs",            # effective scheduler fan-out (-j)
+    "jobs",            # active-step ceiling (existing schema name; CLI --max-steps / -s)
 ]
 
 #: Standard per-step profile columns, keyed by ``machine_id`` + ``container_class``. These
@@ -576,9 +576,10 @@ class CsvMetricsSink(MetricsSink):
     ) -> str | None:
         """Append per-step profile ``rows`` (accumulated during the run) to durable storage.
 
-        Delegates to :func:`append_step_profiles`; ``jobs`` is stamped as ``outer_jobs`` on
-        every row. Rows are recorded regardless of run outcome. Returns the CSV path as a
-        string, or ``None`` when recording was skipped (a visible warning is emitted)."""
+        Delegates to :func:`append_step_profiles`; ``jobs`` is the active-step ceiling and is
+        stamped as the existing ``outer_jobs`` field on every row. Rows are recorded regardless
+        of run outcome. Returns the CSV path as a string, or ``None`` when recording was skipped
+        (a visible warning is emitted)."""
         path = append_step_profiles(
             self.output_dir,
             rows,

@@ -9,7 +9,7 @@ use, declare the dependency and import the crate as `safe_ci_dag_runner`:
 
 ```toml
 [dependencies]
-safe-ci-dag-runner = "0.12"
+safe-ci-dag-runner = "0.13"
 ```
 
 ```rust
@@ -25,5 +25,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Public modules cover containment, CPU reservations, resource sizing, profile
 summaries, deterministic planning, scheduling, serialization, and
 visualization. The `run_dag` function is the explicit uncontained scheduler;
-`run_dag_boxed` and the console command establish containment. Enforced
+`run_dag_boxed` applies a caller-supplied cgroup manager when present. The
+console command establishes and verifies the outer systemd scope. Enforced
 containment requires Linux with cgroup v2 and a delegated systemd user scope.
+In 0.13, `run_dag(..., jobs)` and `run_dag_boxed(..., jobs)` treat that argument
+as a compatibility combined active-step and aggregate CPU-job limit. Use
+`run_dag_limited` or a boxed limited variant to choose the two values
+independently.

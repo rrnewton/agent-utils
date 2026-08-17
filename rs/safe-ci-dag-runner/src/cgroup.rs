@@ -42,6 +42,8 @@ const ENV_SCOPE_UNIT: &str = "SAFE_CI_SCOPE_UNIT";
 const OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_OUTER_MEMORY_MAX_BYTES";
 /// Exact cap carried across the systemd re-exec for in-scope readback.
 const EXPECTED_OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES";
+/// Exact aggregate CPU-job cap carried across the systemd re-exec for in-scope readback.
+const EXPECTED_OUTER_CPU_COUNT_ENV: &str = "SAFE_CI_EXPECTED_OUTER_CPU_COUNT";
 /// Child cgroup the runner vacates into (cgroup-v2 "no internal processes" rule).
 const SUPERVISOR: &str = "supervisor";
 /// Per-step child cgroup directory prefix (also the normal-exit backstop scan key).
@@ -346,6 +348,15 @@ pub fn expected_outer_memory_max_bytes() -> Option<i64> {
     (value > 0).then_some(value)
 }
 
+/// Aggregate CPU-job cap the parent requested, carried into the re-exec'd scope.
+pub fn expected_outer_cpu_count() -> Option<i64> {
+    let value: i64 = std::env::var(EXPECTED_OUTER_CPU_COUNT_ENV)
+        .ok()?
+        .parse()
+        .ok()?;
+    (value > 0).then_some(value)
+}
+
 /// Whether this process is already running inside the managed cgroup scope (the re-exec set the
 /// `SAFE_CI_IN_SCOPE` sentinel). The CLI checks this to decide whether to re-exec.
 pub fn is_in_scope() -> bool {
@@ -356,6 +367,15 @@ pub fn is_in_scope() -> bool {
 fn cpu_quota_percent(fraction: f64) -> i64 {
     let ncpu = cpu_count().max(1);
     ((ncpu as f64 * fraction * 100.0).round() as i64).max(100)
+}
+
+/// Whole CPU-job budget represented by the shared aggregate slice's quota.
+///
+/// A default per-run budget must not be wider than the parent slice every run is placed under;
+/// otherwise the value changes after scope re-exec and the planner models cores the run cannot
+/// receive. Explicit `--jobs` may still request a wider child quota; the parent remains tighter.
+pub fn aggregate_slice_cpu_jobs() -> i64 {
+    (cpu_quota_percent(DEFAULT_CPU_BUDGET_FRACTION) / 100).max(1)
 }
 
 /// True iff `systemd-run --user --scope` actually works here (cached).
@@ -897,8 +917,23 @@ fn attempt_scope_reexec_inner(
         "MemorySwapMax=0".into(),
     ];
     if let Some(cpu) = cpu_count {
+        let Some(quota_percent) = cpu.checked_mul(100) else {
+            eprintln!(
+                "{LOG_PREFIX} ERROR: requested CPU count {cpu} is too large to encode as a \
+                 systemd CPUQuota percentage."
+            );
+            return ScopeAttempt::Unavailable {
+                detail: format!(
+                    "requested CPU count {cpu} overflows the systemd CPUQuota percentage"
+                ),
+            };
+        };
         args.push("-p".into());
-        args.push(format!("CPUQuota={}%", cpu * 100));
+        args.push(format!("CPUQuota={quota_percent}%"));
+        eprintln!(
+            "{LOG_PREFIX} per-run CPU cap: CPUQuota={quota_percent}% ({cpu} aggregate CPU job{}).",
+            if cpu == 1 { "" } else { "s" }
+        );
     }
     if ensure_aggregate_slice(DEFAULT_CPU_BUDGET_FRACTION) {
         args.push(format!("--slice={SLICE_NAME}"));
@@ -906,7 +941,7 @@ fn attempt_scope_reexec_inner(
             "{LOG_PREFIX} CPU cap: shared {SLICE_NAME} CPUQuota={}% (~90% of {} cores, AGGREGATE \
              across concurrent runs).",
             cpu_quota_percent(DEFAULT_CPU_BUDGET_FRACTION),
-            cpu_count.unwrap_or_else(crate::sizing::cpu_count)
+            crate::sizing::cpu_count()
         );
     }
     if let Some(m) = memory_max {
@@ -934,6 +969,10 @@ fn attempt_scope_reexec_inner(
     args.push(format!(
         "--setenv={EXPECTED_OUTER_MEMORY_MAX_ENV}={}",
         memory_max.map_or_else(String::new, |value| value.to_string())
+    ));
+    args.push(format!(
+        "--setenv={EXPECTED_OUTER_CPU_COUNT_ENV}={}",
+        cpu_count.map_or_else(String::new, |value| value.to_string())
     ));
     args.push("--".into());
 
@@ -984,35 +1023,54 @@ fn scope_cgroup_from_self() -> Option<PathBuf> {
 /// A successful systemd property write is not proof of enforcement. The
 /// re-exec'd child reads the kernel files and refuses containment unless the
 /// numeric cap, swap disable, and group-OOM bit all match.
-pub fn verify_scope_limits(expected_memory_max: i64) -> bool {
+pub fn verify_scope_limits(expected_memory_max: i64, expected_cpu_count: Option<i64>) -> bool {
     let Some(scope) = scope_cgroup_from_self() else {
         eprintln!("{LOG_PREFIX} ERROR: outer cgroup limit audit unavailable: scope not found");
         return false;
     };
-    verify_scope_limits_at(&scope, expected_memory_max)
+    verify_scope_limits_at(&scope, expected_memory_max, expected_cpu_count)
 }
 
-fn verify_scope_limits_at(scope: &Path, expected_memory_max: i64) -> bool {
+fn verify_scope_limits_at(
+    scope: &Path,
+    expected_memory_max: i64,
+    expected_cpu_count: Option<i64>,
+) -> bool {
     let memory_max = read_trim(scope, "memory.max");
     let memory_swap_max = read_trim(scope, "memory.swap.max");
     let memory_oom_group = read_trim(scope, "memory.oom.group");
+    let cpu_max = read_trim(scope, "cpu.max");
     let memory_ok = memory_max
         .as_deref()
         .and_then(|value| value.parse::<i64>().ok())
         .is_some_and(|actual| actual <= expected_memory_max && expected_memory_max - actual < 4096);
     let swap_ok = memory_swap_max.as_deref() == Some("0");
     let oom_group_ok = memory_oom_group.as_deref() == Some("1");
+    let cpu_ok = match expected_cpu_count {
+        None => true,
+        Some(expected) => cpu_max
+            .as_deref()
+            .and_then(|value| {
+                let mut parts = value.split_whitespace();
+                let quota = parts.next()?.parse::<i64>().ok()?;
+                let period = parts.next()?.parse::<i64>().ok()?;
+                (parts.next().is_none() && period > 0).then_some((quota, period))
+            })
+            .is_some_and(|(quota, period)| expected.checked_mul(period) == Some(quota)),
+    };
     eprintln!(
         "{LOG_PREFIX} outer cgroup audit: memory.max={} ({}), memory.swap.max={} ({}), \
-         memory.oom.group={} ({})",
+         memory.oom.group={} ({}), cpu.max={} ({})",
         memory_max.as_deref().unwrap_or("UNREADABLE"),
         if memory_ok { "bound" } else { "MISMATCH" },
         memory_swap_max.as_deref().unwrap_or("UNREADABLE"),
         if swap_ok { "disabled" } else { "MISMATCH" },
         memory_oom_group.as_deref().unwrap_or("UNREADABLE"),
         if oom_group_ok { "enabled" } else { "MISMATCH" },
+        cpu_max.as_deref().unwrap_or("UNREADABLE"),
+        if cpu_ok { "bound" } else { "MISMATCH" },
     );
-    memory_ok && swap_ok && oom_group_ok
+    memory_ok && swap_ok && oom_group_ok && cpu_ok
 }
 
 /// Write and read back `memory.oom.group=1` on the outer scope.
@@ -2483,6 +2541,9 @@ mod tests {
     #[test]
     fn cpu_quota_percent_floor_is_one_core() {
         assert!(cpu_quota_percent(0.90) >= 100);
+        assert!(aggregate_slice_cpu_jobs() >= 1);
+        assert!(aggregate_slice_cpu_jobs() <= cpu_count().max(1));
+        assert!(aggregate_slice_cpu_jobs() * 100 <= cpu_quota_percent(DEFAULT_CPU_BUDGET_FRACTION));
     }
 
     #[test]
@@ -2513,9 +2574,13 @@ mod tests {
         fs::write(scope.join("memory.max"), "104857600").unwrap();
         fs::write(scope.join("memory.swap.max"), "0").unwrap();
         fs::write(scope.join("memory.oom.group"), "1").unwrap();
-        assert!(verify_scope_limits_at(&scope, 104857600));
+        fs::write(scope.join("cpu.max"), "200000 100000").unwrap();
+        assert!(verify_scope_limits_at(&scope, 104857600, Some(2)));
         fs::write(scope.join("memory.oom.group"), "0").unwrap();
-        assert!(!verify_scope_limits_at(&scope, 104857600));
+        assert!(!verify_scope_limits_at(&scope, 104857600, Some(2)));
+        fs::write(scope.join("memory.oom.group"), "1").unwrap();
+        fs::write(scope.join("cpu.max"), "300000 100000").unwrap();
+        assert!(!verify_scope_limits_at(&scope, 104857600, Some(2)));
         fs::remove_dir_all(scope).unwrap();
     }
 }

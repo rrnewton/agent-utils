@@ -67,7 +67,7 @@ def test_jobs_flag_appended_at_runtime() -> None:
             ),
         )
     )
-    assert run_dag(good, jobs=1, verbosity=0).ok
+    assert run_dag(good, jobs=4, verbosity=0).ok
 
     # A wrong expectation fails, proving the append actually happened (not a no-op).
     bad = DagConfig(
@@ -82,4 +82,4 @@ def test_jobs_flag_appended_at_runtime() -> None:
             ),
         )
     )
-    assert not run_dag(bad, jobs=1, verbosity=0).ok
+    assert not run_dag(bad, jobs=4, verbosity=0).ok

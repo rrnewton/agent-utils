@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 
 from safe_ci_dag_runner import perflog
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
+from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step, effective_cpu_count
 from safe_ci_dag_runner.sizing import schedulable_peak_mem_bytes
 
 __all__ = [
@@ -838,8 +838,8 @@ class PlanEntry:
     #: two inner_jobs widths for it (nothing to model).
     speedup: "StepSpeedup | None" = None
     #: The inner-jobs width the CPA allocator assigned this step, or ``None`` for the non-allocating
-    #: planners (greedy-lpt / critical-path). This is the ``-j`` the step actually runs with under
-    #: ``--planner cpa`` (baked into the command via :func:`apply_plan_to_config`).
+    #: planners (greedy-lpt / critical-path). This is the per-step inner width used under
+    #: ``--planner cpa`` (baked into its jobs flag); run-level ``-j`` is the aggregate budget.
     alloc_inner_jobs: int | None = None
 
 
@@ -1017,6 +1017,39 @@ _CPA_MEM_CAPPED = "mem-capped"
 _CPA_FIXED_POINT = "fixed-point"
 
 
+def _speedup_within_budget(
+    speedup: StepSpeedup, core_budget: int
+) -> StepSpeedup | None:
+    """Restrict a learned speedup model's recommendation to the run budget.
+
+    Historical curve points above ``P`` remain visible, but neither the recommended width nor a
+    regression marker may claim a width this run cannot execute. A curve with no measured point
+    at or below ``P`` is unavailable for this run and is omitted from the plan.
+    """
+    budget = max(1, core_budget)
+    measured = [level.inner_jobs for level in speedup.levels if level.inner_jobs <= budget]
+    if not measured:
+        return None
+    recommended = min(speedup.recommended_inner_jobs, max(measured))
+    effective = next(
+        (
+            level.effective_cores
+            for level in speedup.levels
+            if level.inner_jobs == recommended
+        ),
+        None,
+    )
+    regression = speedup.regression_inner_jobs
+    if regression is not None and regression > budget:
+        regression = None
+    return replace(
+        speedup,
+        recommended_inner_jobs=recommended,
+        measured_effective_cores=effective,
+        regression_inner_jobs=regression,
+    )
+
+
 def _cpa_admissible(
     cfg: DagConfig,
     speedups: Mapping[str, StepSpeedup],
@@ -1028,8 +1061,8 @@ def _cpa_admissible(
 
     A step with a measured curve admits its measured widths up to its work-conservation knee
     (``recommended_inner_jobs``) and the core budget ``P``; a curveless step is rigid at
-    ``min(hint or 1, P)`` with ``T_i`` the resolved scalar estimate. ``T_i`` is only ever evaluated
-    at these measured widths — no interpolation or extrapolation."""
+    ``min(hint or default_step_cpu_count or 1, P)`` with ``T_i`` the resolved scalar estimate.
+    ``T_i`` is only ever evaluated at these measured widths — no interpolation or extrapolation."""
     admissible: dict[str, list[int]] = {}
     wall: dict[str, dict[int, float]] = {}
     for step in cfg.steps:
@@ -1038,14 +1071,21 @@ def _cpa_admissible(
         if sp is not None and sp.levels:
             knee_ok = [lvl for lvl in sp.levels if lvl.inner_jobs <= sp.recommended_inner_jobs]
             within_budget = [lvl for lvl in knee_ok if lvl.inner_jobs <= core_budget]
-            # Fall back to the narrowest measured width if EVERY admissible width exceeds P (a
-            # measured-on-a-wider-box curve); T_i then stays on a real measurement.
-            chosen = within_budget if within_budget else knee_ok[:1]
-            admissible[tag] = sorted(lvl.inner_jobs for lvl in chosen)
-            wall[tag] = {lvl.inner_jobs: lvl.wall_s for lvl in chosen}
+            if within_budget:
+                admissible[tag] = sorted(lvl.inner_jobs for lvl in within_budget)
+                wall[tag] = {lvl.inner_jobs: lvl.wall_s for lvl in within_budget}
+            else:
+                # A curve measured only above P cannot justify violating the strict run budget.
+                # Treat it as unavailable and keep the step rigid at its effective configured
+                # width, capped to P, using the resolved scalar estimate.
+                effective = effective_cpu_count(step, cfg.default_step_cpu_count)
+                width = effective if (effective is not None and effective > 0) else 1
+                width = min(width, max(1, core_budget))
+                admissible[tag] = [width]
+                wall[tag] = {width: est.get(tag, 0.0)}
         else:
-            pref = step.hint.preferred_inner_jobs
-            w = pref if (pref is not None and pref > 0) else 1
+            effective = effective_cpu_count(step, cfg.default_step_cpu_count)
+            w = effective if (effective is not None and effective > 0) else 1
             if core_budget > 0 and w > core_budget:
                 w = core_budget
             if w < 1:
@@ -1167,10 +1207,10 @@ def _cpa_simulate_makespan(
     """A deterministic greedy list-schedule of the allocated widths -> the MODELED makespan.
 
     Launches ready steps (deps done, core budget ``Σ running widths + p_i <= P``, named resources
-    free) in ``order`` (critical-path first), advancing to the next finish event; a step wider than
-    the whole budget runs alone (deadlock guard). Respecting deps AND the core budget makes the
-    result ``>= max(T_CP, area/P)`` (PLANNER_DESIGN.md §2). Uses the same f64 ops in canonical
-    ``order`` in both builds, so the 3-decimal makespan is byte-identical."""
+    free) in ``order`` (critical-path first), advancing to the next finish event. Allocated widths
+    are required to lie in ``1..=P``; there is no over-budget run-alone escape. Respecting deps AND
+    the core budget makes the result ``>= max(T_CP, area/P)`` (PLANNER_DESIGN.md §2). Uses the same
+    f64 ops in canonical ``order`` in both builds, so the 3-decimal makespan is byte-identical."""
     P = core_budget if core_budget > 0 else 1
     by_tag = cfg.by_tag()
     done: dict[str, float] = {}
@@ -1179,6 +1219,8 @@ def _cpa_simulate_makespan(
     cores_used = 0
     now = 0.0
     pending: set[str] = {step.tag for step in cfg.steps}
+    if any(widths[tag] < 1 or widths[tag] > P for tag in pending):
+        raise ValueError("CPA width lies outside the aggregate CPU-job budget")
     while pending or running:
         launched = True
         while launched:
@@ -1190,7 +1232,7 @@ def _cpa_simulate_makespan(
                 if not all(d in done for d in step.deps):
                     continue
                 w = widths[tag]
-                if not (cores_used + w <= P or cores_used == 0):
+                if cores_used + w > P:
                     continue
                 if any(res_avail.get(r, 0) < n for r, n in step.hint.resources.items()):
                     continue
@@ -1226,7 +1268,14 @@ def _build_cpa_plan(
     """Two-phase CPA plan: allocate widths (phase 1), then critical-path list-schedule at the
     allocated weights ``T_i(p_i)`` (phase 2). See PLANNER_DESIGN.md §4."""
     P = core_budget if (core_budget is not None and core_budget > 0) else 1
-    widths, _admissible, wall, stop_reason = _cpa_allocate(cfg, speedups, est, P, mem_budget)
+    bounded_speedups = {
+        tag: bounded
+        for tag, speedup in speedups.items()
+        if (bounded := _speedup_within_budget(speedup, P)) is not None
+    }
+    widths, _admissible, wall, stop_reason = _cpa_allocate(
+        cfg, bounded_speedups, est, P, mem_budget
+    )
     weight = {step.tag: wall[step.tag][widths[step.tag]] for step in cfg.steps}
     bottom = _bottom_levels(cfg, weight, successors)
     critical, t_cp = _critical_path(cfg, bottom, successors)
@@ -1250,7 +1299,7 @@ def _build_cpa_plan(
     for step in cfg.steps:
         tag = step.tag
         r = resolved[tag]
-        has_curve = tag in speedups and bool(speedups[tag].levels)
+        has_curve = tag in bounded_speedups and bool(bounded_speedups[tag].levels)
         entries.append(
             PlanEntry(
                 tag=tag,
@@ -1260,7 +1309,7 @@ def _build_cpa_plan(
                 rss_source=r[3],
                 bottom_level_s=bottom[tag],
                 samples=r[4],
-                speedup=speedups.get(tag),
+                speedup=bounded_speedups.get(tag),
                 alloc_inner_jobs=widths[tag],
             )
         )
@@ -1337,9 +1386,10 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
     or unmeasured baseline is preserved). This is what feeds both the scheduler's ordering and the
     memory-aware ``--max-mem`` sizing, so planning improves automatically as runs accumulate.
 
-    For a CPA plan each step also gets ``preferred_inner_jobs = alloc_inner_jobs`` — the width the
-    allocator chose — so the step's command actually runs with that ``-j`` (via
-    :func:`model.command_with_inner_jobs`) and its memory cap scales to that width."""
+    For a CPA plan each step also gets ``preferred_inner_jobs = alloc_inner_jobs`` — the inner
+    width the allocator chose — so its jobs flag carries that width (via
+    :func:`model.command_with_inner_jobs`) and its memory cap scales accordingly. Run-level ``-j``
+    remains the aggregate CPU-job budget."""
     by_tag = plan.by_tag()
     new_steps: list[Step] = []
     for step in cfg.steps:
@@ -1377,17 +1427,10 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
         new_steps.append(
             replace(step, hint=new_hint, deps=list(step.deps), env=dict(step.env))
         )
-    return DagConfig(
-        steps=tuple(new_steps),
-        description=cfg.description,
-        resource_caps=cfg.resource_caps,
-        mem_cap_factor=cfg.mem_cap_factor,
-        mem_cap_floor_bytes=cfg.mem_cap_floor_bytes,
-        outer_mem_safety_factor=cfg.outer_mem_safety_factor,
-        default_step_timeout=cfg.default_step_timeout,
-        default_jobs_flag=cfg.default_jobs_flag,
-        write_domain_policy=cfg.write_domain_policy,
-    )
+    # Clone the top-level policy too. A field-by-field reconstruction silently resets every newly
+    # added DagConfig field; in particular it used to discard default_step_cpu_count immediately
+    # before the run-budget clamp was applied.
+    return replace(cfg, steps=tuple(new_steps), resource_caps=dict(cfg.resource_caps))
 
 
 # --------------------------------------------------------------------------- rendering

@@ -90,23 +90,23 @@ equally cap `"gpu"`, `"db"`, or `"licenses"`.
 safe-ci-dag-runner run --dag examples/03-scarce-resource-browser.json --allow-cgroup-failure
 ```
 
-## 4. `04-memory-aware.json` — memory hints drive a RAM-safe `-j`
+## 4. `04-memory-aware.json` — memory hints bound active DAG steps
 
 Each step carries a memory hint: `build.compile` and `test.integration` set `rss_baseline_bytes`
 (estimated peak RSS), and `test.fuzz` additionally pins a `hard_mem_max_bytes` cap that overrides its
-baseline. With those hints, `--max-mem` picks the largest `-j` whose modeled worst-case footprint fits
-a RAM budget, instead of you hard-coding a number:
+baseline. With those hints, `--max-mem` derives the largest `--max-steps` ceiling whose modeled
+worst-case footprint fits a RAM budget, instead of you hard-coding a number:
 
 ```sh
-safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 4G --allow-cgroup-failure   # -> -j1 (worst case 4 GiB)
-safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 8G --allow-cgroup-failure   # -> -j2 (worst case 7 GiB)
+safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 4G --allow-cgroup-failure   # -> --max-steps 1 (worst case 4 GiB)
+safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 8G --allow-cgroup-failure   # -> --max-steps 2 (worst case 7 GiB)
 ```
 
-A 4 GiB budget only fits one step at a time; 8 GiB fits the two largest that can co-run; a large enough
-budget lets all three run at once (up to the CPU count). Run it with no `--max-mem` and it simply uses
-the CPU count as `-j`. (This example sets `mem_cap_factor: 1.0`, `mem_cap_floor_bytes: 0`, and
-`outer_mem_safety_factor: 1.0` so the modeled numbers are exactly the byte values above; the defaults
-add headroom.)
+A 4 GiB budget only fits one step at a time; 8 GiB fits the two largest that can co-run; a large
+enough budget lets all three run at once, subject to both `--max-steps` and the aggregate `--jobs`
+width. Without `--max-mem`, `--max-steps` defaults to the effective CPU-job budget. (This example
+sets `mem_cap_factor: 1.0`, `mem_cap_floor_bytes: 0`, and `outer_mem_safety_factor: 1.0` so the
+modeled numbers are exactly the byte values above; the defaults add headroom.)
 
 This example also ships as **`04-memory-aware.yaml`** — the same DAG in literate YAML (byte-value
 comments on each memory hint), loading identically to the JSON:
@@ -119,8 +119,8 @@ safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-
 
 `build.app` runs its *own* parallel build (imagine `make -j8`). Declaring
 `"preferred_inner_jobs": 8` tells the runner how wide the step is internally, so it can set an inner
-CPU cap when cgroup boxing is active and account for the extra memory a wide `cpu-bound` step uses in
-the budget model.
+CPU cap when cgroup boxing is active, charge eight jobs against the run's aggregate `--jobs`
+budget, and account for the extra memory a wide `cpu-bound` step uses in the budget model.
 
 By **default** the runner also *appends* an inner-jobs flag to your command derived from that width —
 the default template is `-j`, so a `cmd` of `make build` would be run as `make build -j 8`. This step,

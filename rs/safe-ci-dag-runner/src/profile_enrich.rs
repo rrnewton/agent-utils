@@ -16,28 +16,34 @@
 // that consumes them (`estimates::load_step_speedups`) IS cross-checked byte-identical.
 
 use std::collections::BTreeMap;
-use std::fs;
 
 use crate::ambient::{ambient_bucket, attribute_external_cores, AmbientSnapshot, PsiReading};
-use crate::perflog::nproc;
+use crate::perflog::{effective_cpu_quota, nproc};
 
 const USEC: f64 = 1_000_000.0;
 
 /// Return the effective core budget of the current cgroup or process affinity.
 ///
-/// A finite cgroup-v2 CPU quota takes precedence and is rounded to a positive whole-core count.
+/// Walks the current cgroup's ancestor chain for the tightest finite CPU quota, floors it to a
+/// positive whole-core budget, and takes the tighter of that quota and process affinity. Flooring
+/// is deliberate: a scheduler admission budget must never promise more CPU than the binding
+/// bandwidth cap, and integer arithmetic avoids language-specific rounding at half-core boundaries.
 pub fn container_core_budget() -> i64 {
-    if let Ok(text) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
-        let mut parts = text.split_whitespace();
-        if let (Some(q), Some(p)) = (parts.next(), parts.next()) {
-            if let (Ok(quota), Ok(period)) = (q.parse::<i64>(), p.parse::<i64>()) {
-                if quota > 0 && period > 0 {
-                    return 1.max((quota as f64 / period as f64).round() as i64);
-                }
-            }
-        }
-    }
-    nproc()
+    let affinity = nproc().max(1);
+    core_budget_from_quota(&effective_cpu_quota(), affinity)
+}
+
+fn core_budget_from_quota(quota: &str, affinity: i64) -> i64 {
+    let affinity = affinity.max(1);
+    let mut parts = quota.split('_');
+    let quota_cores = match (parts.next(), parts.next(), parts.next()) {
+        (Some(q), Some(p), None) => match (q.parse::<i64>(), p.parse::<i64>()) {
+            (Ok(q), Ok(p)) if q > 0 && p > 0 => Some((q / p).max(1)),
+            _ => None,
+        },
+        _ => None,
+    };
+    quota_cores.map_or(affinity, |quota| quota.min(affinity))
 }
 
 /// Resolve an optional step width to a concrete positive-environment budget.
@@ -157,4 +163,19 @@ pub fn step_enrichment_columns(
     }
     psi_columns(&mut row, "step_cpu", step_pressure_start, step_pressure_end);
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use super::core_budget_from_quota;
+
+    #[test]
+    fn fractional_cpu_quota_is_conservatively_floored() {
+        assert_eq!(core_budget_from_quota("50000_100000", 64), 1);
+        assert_eq!(core_budget_from_quota("150000_100000", 64), 1);
+        assert_eq!(core_budget_from_quota("250000_100000", 64), 2);
+        assert_eq!(core_budget_from_quota("350000_100000", 2), 2);
+        assert_eq!(core_budget_from_quota("max", 7), 7);
+        assert_eq!(core_budget_from_quota("unknown", 7), 7);
+    }
 }

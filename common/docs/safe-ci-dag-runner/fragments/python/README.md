@@ -18,3 +18,8 @@ from safe_ci_dag_runner import DagConfig, Step, to_ascii
 dag = DagConfig(steps=(Step("build", "app", "compile", "make build"),))
 print(to_ascii(dag))
 ```
+
+In 0.13, `run_dag(..., jobs=N)` keeps a compatibility combined limit: `N`
+bounds both active steps and aggregate declared CPU jobs unless `core_budget`
+is supplied. New code should call `run_dag_limited(..., max_steps=S,
+cpu_jobs=J)` when those limits differ.

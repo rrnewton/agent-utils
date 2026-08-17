@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "safe-ci-dag-runner"
-version = "0.12.0"
-description = "Run resource-aware CI DAGs with cgroup containment, profiling, and deterministic planning."
+version = "0.13.0"
+description = "Run CI DAGs with independent step/CPU-job limits, cgroup containment, and profiling."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

@@ -69,7 +69,15 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
     """`run --help` exits 0, lists its flags, and surfaces --cores CPU pinning discoverably."""
     code, out, _ = _capture_help(["run", "--help"])
     assert code == 0
-    for flag in ("--dag", "--jobs", "--cores", "--only", "--planner", "--keep-going"):
+    for flag in (
+        "--dag",
+        "--max-steps",
+        "--jobs",
+        "--cores",
+        "--only",
+        "--planner",
+        "--keep-going",
+    ):
         assert flag in out, flag
     # Discoverable pinning aliases + intent keywords (greppable).
     assert "--cpuset" in out and "--pin" in out
@@ -247,7 +255,7 @@ def test_missing_and_malformed_dag_exit_2() -> None:
 
 
 def test_run_max_mem_exits_0() -> None:
-    # --max-mem picks a memory-aware -j; a passing DAG still exits 0.
+    # --max-mem picks a memory-aware active-step ceiling; a passing DAG still exits 0.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
         rc, _, err = _capture(["run", "--max-mem", "8G", "--dag", dag, "-q", _ACF])
@@ -257,7 +265,7 @@ def test_run_max_mem_exits_0() -> None:
 
 def test_run_max_mem_no_throttle_note() -> None:
     # A DAG with no per-step rss_baseline_bytes: the modeled footprint collapses to the
-    # mem_cap_floor_bytes floor, so a budget at/above the floor picks the full -j (CPU count)
+    # mem_cap_floor_bytes floor, so a budget at/above the floor picks the full CPU-count ceiling
     # and a note explains why --max-mem did not throttle (No Silent Failure).
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
@@ -282,13 +290,13 @@ def test_run_max_mem_with_baseline_no_note() -> None:
         assert "no step carries rss_baseline_bytes" not in err
 
 
-def test_run_jobs_overrides_max_mem() -> None:
-    # When both --jobs and --max-mem are given, --jobs wins with a visible note.
+def test_run_jobs_and_max_mem_control_independent_limits() -> None:
+    # --jobs remains the CPU-width budget while --max-mem independently derives max active steps.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
         rc, _, err = _capture(["run", "--jobs", "2", "--max-mem", "8G", "--dag", dag, "-q", _ACF])
         assert rc == 0
-        assert "--jobs=2 wins" in err
+        assert "--max-mem 8G -> --max-steps" in err
 
 
 def test_run_perf_dir_writes_csv() -> None:
@@ -690,7 +698,7 @@ def test_boxed_stdin_dag_survives_scope_reexec() -> None:
     assert "containment OBSERVED" in combined
     assert "invalid JSON" not in combined
     assert "stress.singleton: 3/3 passed" in proc.stdout
-    assert "maximum concurrent steps: 3 (--jobs 3)" in proc.stdout
+    assert "maximum concurrent steps: 3 (--max-steps 3; --jobs 3 aggregate CPU jobs)" in proc.stdout
 
 
 # --------------------------------------------------------------------------- --stress
@@ -711,7 +719,7 @@ def test_stress_reports_ratio_all_pass() -> None:
         assert rc == 0
         assert "stress results (3 generated graph copies):" in out
         assert "g.j: 3/3 passed" in out
-        assert "maximum concurrent steps: 3 (--jobs" in out
+        assert "maximum concurrent steps: 3 (--max-steps" in out
         # All 3 copies actually ran (the run summary counts every copy).
         assert "3 passed, 0 failed" in err
         # The memory-safe OK line names the derivation.
@@ -782,7 +790,7 @@ def test_stress_generation_removes_named_resource_serialization() -> None:
         )
         assert rc == 0, err
         assert "g.j: 4/4 passed" in out
-        assert "maximum concurrent steps: 4 (--jobs" in out
+        assert "maximum concurrent steps: 4 (--max-steps" in out
 
 
 def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:
@@ -800,7 +808,7 @@ def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:
     assert result.max_concurrent_steps == 4
 
 
-def test_stress_reports_concurrency_governed_by_jobs() -> None:
+def test_stress_defaults_max_steps_to_jobs() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _one_step_dag(tmp, "sleep 1")
         rc, out, err = _capture(
@@ -808,7 +816,7 @@ def test_stress_reports_concurrency_governed_by_jobs() -> None:
         )
         assert rc == 0, err
         assert "g.j: 4/4 passed" in out
-        assert "maximum concurrent steps: 3 (--jobs 3)" in out
+        assert "maximum concurrent steps: 3 (--max-steps 3; --jobs 3 aggregate CPU jobs)" in out
 
 
 def test_stress_n_must_be_positive() -> None:

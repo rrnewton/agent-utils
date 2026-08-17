@@ -23,17 +23,24 @@ it. "Moldable" (fix the width at launch) is the middle of the three standard cla
 We are moldable: a build's `-j` is chosen when we spawn it and does not change mid-flight.
 
 The goal is to **minimize the makespan** — the wall-clock time from the first step starting to the
-last step finishing — subject to four constraints that all coexist on the one machine:
+last step finishing — subject to five constraints that all coexist on the one machine:
 
 1. **Precedence.** The DAG edges (`Step.deps`).
-2. **A total core budget `P`.** The sum of the widths of the steps running *at the same instant*
-   should not oversubscribe the machine. `P` comes from `container_core_budget()` (the cgroup
-   `cpu.max` quota ÷ period, else `nproc`).
+2. **A total declared CPU-job budget `P`.** `run --jobs P` bounds the sum of the widths of steps
+   running at the same instant. When omitted, `P` is the conservative whole-core floor of the
+   tightest binding ancestor `cpu.max`, capped by process affinity (and by `--cores K` when used).
+   The default is also tightened by the shared aggregate slice's conservative 90% host budget,
+   which prevents concurrent runner invocations from each assuming the whole machine.
+   The boxed run scope also gets `CPUQuota=P*100%` as a bandwidth backstop. CFS quota is not an
+   instantaneous CPU-identity/thread-count cap; exact eligible CPU identities are the separate
+   `--cores K` cpuset feature.
 3. **Per-step memory caps.** Each step has a modeled peak memory footprint; the worst-case sum over
    any set of steps that can co-run must fit a RAM budget. The reachable-concurrent-set model
    (`schedulable_peak_mem_bytes`) accounts for a CPU-bound step's cap growing with
    its width (`step_mem_cap_for_inner_jobs`), so **widening a step costs memory**.
-4. **Named scarce-resource semaphores.** Arbitrary caller-named capacities in `DagConfig.resource_caps`
+4. **An active-step ceiling.** `run --max-steps S` independently bounds how many DAG nodes may be
+   active. It defaults to `P`; `--max-mem` may derive a tighter ceiling.
+5. **Named scarce-resource semaphores.** Arbitrary caller-named capacities in `DagConfig.resource_caps`
    (e.g. `{"browser": 1}`) bound how many demanders co-run — which in turn bounds the *achievable*
    concurrency and therefore how much of `P` can actually be kept busy.
 
@@ -46,7 +53,7 @@ The planner composes three parts:
   smallest measured width. It also computes a **per-step** `recommended_inner_jobs` — the best width
   before that one step's own diminishing-returns knee.
 - **The list scheduler.** `Runner` is a greedy ready-set list scheduler: it launches
-  every ready step (deps met, memory + named resources free, under `-j`) in a caller-supplied
+  every ready step (deps met, below `--max-steps`, and with CPU jobs + named resources free) in a caller-supplied
   dispatch order, and `--planner critical-path` supplies a *critical-path-first* order (highest
   bottom-level first). This is exactly the "list-scheduling" back half of a two-phase moldable
   scheduler.
@@ -214,7 +221,8 @@ behavioral differential compares plan output byte-for-byte.
   `speedup`.
 - `est: Mapping[tag, float]` — the resolved scalar duration per step (store-over-hint-over-default),
   as `build_plan` already computes. Used as the wall time for any step **without** a measured curve.
-- `P: int` — the core budget, `container_core_budget()`.
+- `P: int` — the run's resolved aggregate `--jobs` budget (`container_core_budget()` only when the
+  caller omitted an explicit run budget or uses standalone `plan`).
 - `mem_budget: int | None` — the RAM budget (as `--max-mem` already supplies to `jobs_for_budget`);
   `None` disables the memory constraint on allocation.
 
@@ -226,10 +234,11 @@ For each step `i`, define its **admissible width set** `W_i`:
   `speedup.recommended_inner_jobs`, then keep those no greater than `P`. This reuses the
   work-conservation knee (marginal wall gain `>= 1.15x` and total-CPU-seconds growth `<= 1.5x`) so
   the allocator cannot widen past the useful measurements. If every measured width exceeds `P`,
-  retain only the narrowest knee-admissible measurement rather than inventing a point.
+  that curve is unavailable at this budget; the step remains rigid at its authored width (or one),
+  capped to `P`, using the scalar estimate rather than claiming an unexecutable measured point.
 - If `i` has **no** measured curve, `W_i = { w_i }`, where `w_i` is the positive
-  `preferred_inner_jobs` hint (or `1`) capped at `P`. The step is rigid because no data justifies
-  widening it.
+  `preferred_inner_jobs` hint, else `default_step_cpu_count`, else `1`, capped at `P`. The step is
+  rigid because no data justifies widening it.
 
 Define the **measured wall** `T_i(p)` for `p in W_i` as that level's `wall_s`; for a curveless step,
 `T_i(w_i) = est[i]`. `T_i` is only ever evaluated at admissible widths — **no interpolation or
@@ -285,9 +294,8 @@ constraints:
 
 A tentative widening `p_i -> next(p_i)` is rejected unless **all** hold:
 
-- **Total core budget.** A tentative wider point must not exceed `P`: `next(p_i) <= P`. The only
-  possible wider-than-`P` allocation is the single measured fallback described in §5.2; it is never
-  widened further and runs alone.
+- **Total core budget.** A tentative wider point must not exceed `P`: `next(p_i) <= P`. There is no
+  wider-than-budget escape or "run alone" exception.
 - **Per-step memory cap grows with width.** Recompute the DAG's worst-case concurrent footprint with
   the tentative width using the existing `schedulable_peak_mem_bytes` /
   `step_mem_cap_for_inner_jobs` (a CPU-bound step's cap scales `~ cap * p / 4`). Reject if the new
@@ -311,12 +319,13 @@ The allocator outputs `p_i` per step and passes the result to the runner:
 2. **Order.** Compute the same order as the critical-path planner, using the *allocated* weights
    `T_i(p_i)` rather than the width-one or hinted weights. Highest weighted bottom-level first, ties
    by tag.
-3. **Apply the core-budget gate (MCPA's insight).** Treat cores as a first-class
+3. **Apply both runtime gates (MCPA's insight).** Treat declared CPU jobs as a first-class
    capacity dimension alongside the named-resource semaphores: treat `P` as a built-in `"cpu"` cap and
    each step's demand as `p_i`. The ready-set loop launches a ready step only if
-   `sum(p_j for j running) + p_i <= P`. A wider-than-budget fallback may launch only when no other
-   step is running, which prevents deadlock while preserving serialization. This closes the loop
-   between the allocator's `A/P` assumption and runtime for ordinary admissible widths.
+   `sum(p_j for j running) + p_i <= P` **and** fewer than `S = --max-steps` nodes are active.
+   Authored widths above `P` are visibly capped before planning and execution, including the
+   command's appended jobs flag and per-step `cpu.max`. This closes the loop between the allocator's
+   `A/P` assumption and runtime.
    Named-resource caps continue to gate co-running independently; together they bound the achievable
    concurrency the area term assumes.
 
@@ -365,7 +374,8 @@ core budget, so it is provably `>=` the `max(T_CP, area/P)` lower bound, and the
 
 The `plan` and `--show-plan` output includes `alloc_inner_jobs` and the allocator's stop reason,
 core budget, critical-path length, area term, lower bound, and modeled makespan. Plan JSON exposes
-the same information in its `allocation` object.
+the same information in its `allocation` object. For `run --show-plan`, the core budget is the
+resolved run `--jobs` value; the standalone `plan` command uses the effective ambient budget.
 
 ## 6. Our deviations from the textbook
 
@@ -451,7 +461,8 @@ Load-bearing citations; web-confirmed where noted.
 - Order and bottom-levels: `_bottom_levels`, `_critical_path`, `_plan_order`, and
   `Planner.CRITICAL_PATH`.
 - Memory: `schedulable_peak_mem_bytes`, `step_mem_cap_for_inner_jobs`, and `jobs_for_budget`.
-- Core budget: `container_core_budget`.
+- Core budget: `container_core_budget`, the shared-slice budget, and the run CLI's
+  `_select_cpu_jobs` / `select_cpu_jobs` resolution.
 - Named resources and dispatch: `Runner`, `_res_free`, `_acquire`, and `_release`.
 - Allocation and phase-two configuration: `allocate_widths`, `build_plan`, and
   `apply_plan_to_config`.

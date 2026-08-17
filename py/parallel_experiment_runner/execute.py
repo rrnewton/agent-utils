@@ -265,10 +265,10 @@ def _classify_outcome(
 def execute_round(plan: RoundPlan, *, cgroups: CgroupManager | None) -> RoundResult:
     """Execute one round: lower to a DAG, run it BOXED at the declared width, map every worker.
 
-    ``jobs`` (and the ``core_budget``) come from the plan's width, so the round runs EXACTLY the
-    declared number of workers concurrently — never however many the caller happened to enqueue.
-    ``keep_going=True`` because a hit/crash in one seed must not cancel its siblings: the whole
-    point is to sweep every seed in the batch.
+    ``jobs`` is the plan's worker width and ``core_budget`` is that width times the declared
+    per-worker cores, so the compatibility API receives independent active-step and aggregate
+    CPU-job limits. ``keep_going=True`` because a hit/crash in one seed must not cancel its
+    siblings: the whole point is to sweep every seed in the batch.
     """
     plan.log_dir.mkdir(parents=True, exist_ok=True)
     dag = generate_round_dag(plan)

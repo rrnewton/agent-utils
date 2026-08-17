@@ -5,7 +5,7 @@
 
 // safe-ci-dag-runner library.
 //
-// Load a DAG of CI/build steps from JSON, model it, size it (memory-aware `-j`), visualize
+// Load a DAG of CI/build steps from JSON, model it, size it (memory-aware active-step ceiling), visualize
 // it (Graphviz DOT / ASCII), and RUN it concurrently with dependency + scarce-resource
 // gating and eager-exit on first failure.
 //
@@ -44,10 +44,10 @@ pub use attribution::{
     TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
 };
 pub use cgroup::{
-    attempt_scope_reexec, expected_scope_runtime_max_s, install_scope_teardown,
-    observe_own_containment, promised_unit, run_containment, verify_scope_runtime_max,
-    CgroupManager, Cgroups, ContainmentEvidence, ContainmentProof, RunContainment, ScopeAttempt,
-    FORCE_ATTEMPT_ENV,
+    aggregate_slice_cpu_jobs, attempt_scope_reexec, expected_outer_cpu_count,
+    expected_scope_runtime_max_s, install_scope_teardown, observe_own_containment, promised_unit,
+    run_containment, verify_scope_runtime_max, CgroupManager, Cgroups, ContainmentEvidence,
+    ContainmentProof, RunContainment, ScopeAttempt, FORCE_ATTEMPT_ENV,
 };
 pub use estimates::{
     allocate_widths, apply_plan_to_config, bucketize_rows, build_plan, feedback_identity,
@@ -70,8 +70,9 @@ pub use profile_enrich::{
 };
 pub use reservation::{acquire as reserve_cores, held_cores, reclaim_dead, Reservation};
 pub use scheduler::{
-    run_dag, run_dag_boxed, run_dag_boxed_deadline, run_dag_boxed_ordered,
-    steps_violating_run_timeout,
+    cap_config_cpu_jobs, run_dag, run_dag_boxed, run_dag_boxed_deadline,
+    run_dag_boxed_deadline_limited, run_dag_boxed_limited, run_dag_boxed_ordered,
+    run_dag_boxed_ordered_limited, run_dag_limited, steps_violating_run_timeout,
 };
 pub use sizing::{
     box_mem_budget_bytes, cgroup_mem_max_bytes, jobs_footprint_bytes, jobs_for_budget,
@@ -93,6 +94,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Rust-vs-Python `cpu_timeout` gap). Keys are sorted; values reflect real behavior:
 //   cpu_affinity  opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores
 //                 with an exact verified cgroup cpuset; refuse when unavailable
+//   cpu_bandwidth boxed run: exact outer cpu.max = --jobs x period, read back before execution
 //   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
 //   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
 //   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
@@ -108,4 +110,4 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // anchor these declarations to real behavior wherever a cgroup-v2 + systemd --user scope exists.
 /// Canonical JSON manifest emitted by the `capabilities` subcommand.
 pub const ENFORCEMENT_CAPABILITIES: &str =
-    "{\"cpu_affinity\":true,\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"run_timeout\":true,\"wall_timeout\":true,\"write_domains\":true}";
+    "{\"cpu_affinity\":true,\"cpu_bandwidth\":true,\"cpu_timeout\":true,\"memory_max\":true,\"oom_detection\":true,\"pids_guard\":false,\"run_timeout\":true,\"wall_timeout\":true,\"write_domains\":true}";

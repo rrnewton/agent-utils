@@ -115,6 +115,8 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
             "run",
             "--dag",
             dag.to_str().unwrap(),
+            "--max-steps",
+            &jobs,
             "--jobs",
             &jobs,
             "--keep-going",

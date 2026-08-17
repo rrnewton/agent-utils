@@ -51,6 +51,8 @@ _CONTROLLER_ENABLE_ATTEMPTS = 3
 OUTER_MEMORY_MAX_ENV = "SAFE_CI_OUTER_MEMORY_MAX_BYTES"
 #: Exact cap carried across the systemd re-exec for in-scope readback.
 EXPECTED_OUTER_MEMORY_MAX_ENV = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES"
+#: Exact aggregate CPU-job cap carried across the systemd re-exec for in-scope readback.
+EXPECTED_OUTER_CPU_COUNT_ENV = "SAFE_CI_EXPECTED_OUTER_CPU_COUNT"
 #: Carries the outer scope's requested ``RuntimeMaxSec`` into the in-scope child, so the child can
 #: read the property back off the live unit instead of trusting the argument vector that asked
 #: for it.
@@ -159,6 +161,15 @@ def expected_outer_memory_max_bytes() -> int | None:
     """Cap the parent requested, carried into the re-exec'd scope."""
     try:
         value = int(os.environ.get(EXPECTED_OUTER_MEMORY_MAX_ENV, ""))
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def expected_outer_cpu_count() -> int | None:
+    """Aggregate CPU-job cap the parent requested, carried into the re-exec'd scope."""
+    try:
+        value = int(os.environ.get(EXPECTED_OUTER_CPU_COUNT_ENV, ""))
     except ValueError:
         return None
     return value if value > 0 else None
@@ -372,6 +383,12 @@ def cpu_quota_percent(fraction: float = DEFAULT_CPU_BUDGET_FRACTION) -> int:
     slice. Minimum 100% (one core) so a 1-core box still makes progress."""
     ncpu = os.cpu_count() or 1
     return max(100, int(round(ncpu * fraction * 100)))
+
+
+def aggregate_slice_cpu_jobs() -> int:
+    """Whole CPU-job budget represented by the shared aggregate slice's quota."""
+    # Never claim a whole job the fractional shared-slice quota cannot sustain.
+    return max(1, cpu_quota_percent() // 100)
 
 
 def ensure_aggregate_slice(
@@ -924,9 +941,17 @@ def reexec_in_scope(
         "-p", "MemorySwapMax=0",
     ]
     if cpu_count is not None:
+        if cpu_count > (2**63 - 1) // 100:
+            sys.stderr.write(
+                f"{naming.log_prefix} ERROR: requested CPU count {cpu_count} is too large to "
+                "encode as a systemd CPUQuota percentage.\n"
+            )
+            return False
         props += ["-p", f"CPUQuota={cpu_count * 100}%"]
-        print(f"{naming.log_prefix} per-run CPU cap: CPUQuota={cpu_count * 100}% "
-              f"({cpu_count} CPU{'s' if cpu_count != 1 else ''}).")
+        print(
+            f"{naming.log_prefix} per-run CPU cap: CPUQuota={cpu_count * 100}% "
+            f"({cpu_count} aggregate CPU job{'s' if cpu_count != 1 else ''})."
+        )
 
     # Launch under the SHARED aggregate slice so the kernel shares its CPUQuota
     # across however many runs execute concurrently — bounding the AGGREGATE, not
@@ -969,6 +994,7 @@ def reexec_in_scope(
            f"--setenv={naming.env_in_scope}=1",
            f"--setenv={naming.env_scope_unit}={unit}.scope",
            f"--setenv={EXPECTED_OUTER_MEMORY_MAX_ENV}={memory_max or ''}",
+           f"--setenv={EXPECTED_OUTER_CPU_COUNT_ENV}={cpu_count or ''}",
            "--", *argv]
     print(f"{naming.log_prefix} re-exec inside transient systemd scope {unit}.scope "
           "(two-level cgroup; full-descendant cleanup on exit)…")

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import time
 
+import pytest
+
+from safe_ci_dag_runner.cgroup import NoopCgroups
 from safe_ci_dag_runner.model import (
     DEFAULT_SMALL_CPU_COUNT,
     DEFAULT_SMALL_CPU_TIMEOUT,
@@ -15,7 +19,7 @@ from safe_ci_dag_runner.model import (
     ResourceHint,
     Step,
 )
-from safe_ci_dag_runner.scheduler import run_dag, steps_violating_run_timeout
+from safe_ci_dag_runner.scheduler import Runner, run_dag, steps_violating_run_timeout
 
 
 def _step(
@@ -44,6 +48,87 @@ def test_default_config_enables_small_forcing_caps() -> None:
     assert cfg.default_step_mem_cap_bytes == DEFAULT_SMALL_MEM_CAP_BYTES
     assert cfg.default_step_cpu_count == DEFAULT_SMALL_CPU_COUNT
     assert cfg.default_step_cpu_timeout == DEFAULT_SMALL_CPU_TIMEOUT
+
+
+@pytest.mark.parametrize(
+    "spawn_error",
+    (OSError(2, "planted spawn refusal"), ValueError("planted invalid environment")),
+    ids=("oserror", "valueerror"),
+)
+def test_spawn_failure_releases_admission_state_and_returns_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    spawn_error: Exception,
+) -> None:
+    failing = Step(
+        "g",
+        "spawn",
+        "spawn refusal",
+        "never runs",
+        hint=ResourceHint(resources={"slot": 1}, preferred_inner_jobs=2),
+    )
+    cfg = DagConfig(
+        steps=(failing, _step("g", "dependent", "true", deps=[failing.tag])),
+        resource_caps={"slot": 1},
+    )
+    runner = Runner(
+        cfg,
+        max_steps=1,
+        cpu_jobs=2,
+        cgroups=NoopCgroups(),
+        verbosity=0,
+    )
+
+    def refuse_spawn(*_args: object, **_kwargs: object) -> None:
+        raise spawn_error
+
+    monkeypatch.setattr(subprocess, "Popen", refuse_spawn)
+    started = time.monotonic()
+    assert not runner.run()
+    assert time.monotonic() - started < 5.0
+
+    result = runner.result()
+    assert not result.ok
+    assert len(result.outcomes) == 1
+    assert result.outcomes[0].tag == failing.tag
+    assert "spawn failed" in result.outcomes[0].summary
+    assert str(spawn_error) in result.outcomes[0].summary
+    assert result.max_concurrent_steps == 0
+    assert result.skipped == ("g.dependent",)
+    assert runner.running == set()
+    assert runner.running_procs == {}
+    assert runner.running_nonces == {}
+    assert runner.resource_avail == {"slot": 1}
+    assert runner.cores_used == 0
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "spawn failed" in combined
+    assert "Traceback" not in combined
+    assert "Exception in thread" not in combined
+
+
+def test_spawn_failure_eager_aborts_an_inflight_sibling() -> None:
+    slow = _step("g", "slow", "sleep 10", est=100.0)
+    gate = _step("g", "gate", "sleep 0.3", est=50.0)
+    invalid = Step(
+        "g",
+        "invalid-env",
+        "",
+        "true",
+        deps=[gate.tag],
+        env={"BAD": "embedded\0nul"},
+    )
+    started = time.monotonic()
+    result = run_dag(DagConfig(steps=(slow, gate, invalid)), jobs=2, verbosity=0)
+    elapsed = time.monotonic() - started
+
+    assert not result.ok
+    assert elapsed < 5.0, "spawn failure should eager-cancel the ten-second sibling"
+    outcomes = {outcome.tag: outcome for outcome in result.outcomes}
+    assert outcomes[slow.tag].aborted
+    assert outcomes[gate.tag].ok
+    assert "spawn failed" in outcomes[invalid.tag].summary
 
 
 def test_simple_dag_all_pass_respects_deps() -> None:

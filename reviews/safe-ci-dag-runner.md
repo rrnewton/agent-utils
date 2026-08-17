@@ -82,6 +82,42 @@ This review record entered the repository with implementation commit
     different set of coercions and defaults. Both now require the same complete typed record:
     positive bounded PID/starttime, a nonempty unique bounded integer core list, a string tag, and
     a finite non-negative numeric timestamp. Invalid ledgers fail closed without being rewritten.
+17. **One `-j` number conflated DAG-node fan-out with internal CPU width.** A graph could limit
+    itself to two active nodes only by also pretending each node had one unit of internal
+    parallelism. `run -s/--max-steps` now bounds active DAG nodes, while `run -j/--jobs` bounds the
+    sum of their effective widths. Both gates apply under every planner; `--max-mem` derives the
+    step ceiling, and CPA receives the explicit job budget.
+18. **CPU quota was at risk of being described as instantaneous core containment.** `cpu.weight`
+    is priority, not a cap, and cgroup `cpu.max` is a period-based bandwidth limit that permits
+    short multi-CPU bursts. The implementation now exact-reads the outer run's `cpu.max`; the
+    documentation and tests distinguish long-window bandwidth from CPU identity. Exact eligible
+    CPUs remain the separate `--cores K` cpuset contract.
+19. **Authored widths could exceed the run budget or disappear behind defaults.** Both schedulers
+    now visibly cap a step's preferred width, appended jobs flag, per-step `cpu.max`, and the
+    undeclared-step CPU default to `J`. Admission and CPA charge that effective default, and a
+    speedup curve with no point at or below `J` cannot authorize a wider allocation.
+20. **A union of sampled CPU IDs was not a concurrency measurement.** The shared fork-based guest
+    records step/worker lifetimes, process CPU time, current CPU, and run-scope `cpu.stat`. Exact
+    overlap checks allow A/B to C/D migration across time; a boxed adversarial case deliberately
+    runs more than `J` workers while proving the verified `J`-core bandwidth envelope instead of
+    relabelling migration or a legal quota burst as failure.
+21. **A compatibility wrapper silently collapsed Rust sweep widths.** `sweep --jobs 1..N` set the
+    step's preferred width but invoked the combined-limit wrapper with `J=1`, so every Rust sample
+    above one was actually run at one. The sweep now calls the independent-limit API, and the
+    differential records the guest's received `--workers=N` arguments instead of trusting table
+    labels.
+22. **Process-creation failures could strand scheduler state or defeat fail-fast.** Python let
+    `OSError`/`ValueError` escape a supervisor thread, leaving the tag and CPU/resource reservations
+    live forever; both engines could also miss a sibling admitted before its PID registration.
+    Spawn errors now become typed failed outcomes, clean their prepared cgroup, mark every admitted
+    peer aborted, and make a late-registering peer self-reap. The cross case uses an embedded-NUL
+    environment value and a ten-second sibling to prove prompt eager cancellation without a
+    traceback.
+23. **Default-capped profile rows claimed the wrong width.** A boxed undeclared step ran under the
+    one-core default `cpu.max` but was persisted at the ambient machine width, corrupting speedup
+    buckets and omitting quota utilization. Both engines now record the applied default only when
+    boxing is active, with a one-core denominator; explicitly unboxed runs retain the shared
+    identity-derived ambient width rather than claiming enforcement that did not occur.
 
 ## Cross-implementation evidence
 
@@ -92,7 +128,10 @@ This review record entered the repository with implementation commit
     self-test verdicts, signal status, invalid inputs, wrapped help, and clean missing-executable
     failure, plus 23 malformed-record variants that both refuse without rewriting shared state.
 - `python3 cross/differential.py --tool safe-ci-dag-runner`
-  - Default seed/count completed with **441 checks passed across 41 fixtures**.
+  - Default seed/count completed with **465 checks passed across 42 fixtures**.
+  - Includes independent `S`/`J` admission, jobs-flag clamping, migration-safe worker overlap,
+    guest-observed sweep widths, spawn-failure eager cancellation, profile-width parity, and
+    capability-gated live outer-`cpu.max` bandwidth evidence.
 - `python3 -m mypy cross/differential.py`
   - No issues.
 
@@ -100,15 +139,22 @@ The differential launches compared CLIs in independent sessions/process groups. 
 adversarial CLI or scope manager from taking down the comparison harness and makes signal behavior
 an observed result rather than a harness-level side effect.
 
+## Profile-feedback audit
+
+The independently reviewed [profile feedback and modeling audit](../ai_docs/safe-ci-profile-feedback-audit.md)
+separates collection, model selection, and execution impact. It confirms that Hermit and DeepScry
+currently collect profile evidence without closing the automated feedback loop, and records the
+portable-summary sampling blocker, provenance gaps, memory-model mismatches, and consumer-specific
+evidence without treating a source label as proof that runtime behavior changed.
+
 ## Focused test evidence
 
-- Python: the focused reservation, allocator, attribution, IRQ sampling, and build job-cap suites
-  passed **83 tests**.
-- Rust: the full safe package suite passed **120 unit tests plus 24 integration tests**, including
+- Python: the full repository package suite passed **1,710 tests**.
+- Rust: the full safe package suite passed **156 unit tests plus 27 integration tests**, including
   termination attribution, live cgroup memory, CPU-time, core-box, run-timeout, and containment
   tests.
-- `python3 scripts/embed_userguides.py --check`: all 16 rendered paired documents and four
-  standalone document checks are current and standalone through exact checked links.
+- `python3 scripts/embed_userguides.py --check`: all 16 paired documents and 6 single-language
+  documents are current and standalone through 32 exact checked package links.
 - Isolated wheel/crate artifact checks passed for all packages, including entry points, embedded
   resources, licenses, offline startup, and foreign-documentation checks.
 

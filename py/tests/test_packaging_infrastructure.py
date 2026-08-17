@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -310,6 +311,26 @@ def test_public_api_docs_are_standalone_without_banning_native_package_terms() -
     assert not rust_check._doc_violations(
         rust_check.CRATES[0], "Install this Rust crate with Cargo."
     )
+
+
+def test_safe_ci_rust_dependency_snippets_match_the_published_minor_version() -> None:
+    manifest = (
+        REPO_ROOT / "rs" / "safe-ci-dag-runner" / "Cargo.toml"
+    ).read_text(encoding="utf-8")
+    matched = re.search(r'^version = "(\d+\.\d+)\.\d+"$', manifest, re.MULTILINE)
+    assert matched is not None
+    dependency = f'safe-ci-dag-runner = "{matched.group(1)}"'
+    for name in ("README.md", "USER_GUIDE.md"):
+        fragment = (
+            REPO_ROOT
+            / "common"
+            / "docs"
+            / "safe-ci-dag-runner"
+            / "fragments"
+            / "rust"
+            / name
+        ).read_text(encoding="utf-8")
+        assert dependency in fragment
 
 
 def test_package_indexes_name_real_check_commands() -> None:

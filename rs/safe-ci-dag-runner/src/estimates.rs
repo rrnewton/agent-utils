@@ -781,8 +781,8 @@ pub struct PlanEntry {
     /// two inner_jobs widths for it.
     pub speedup: Option<StepSpeedup>,
     /// The inner-jobs width the CPA allocator assigned this step, or `None` for the non-allocating
-    /// planners. This is the `-j` the step actually runs with under `--planner cpa` (baked into the
-    /// command via [`apply_plan_to_config`]).
+    /// planners. This is the per-step inner width actually used under `--planner cpa` (baked into
+    /// the command via [`apply_plan_to_config`]); run-level `-j` is the aggregate budget.
     pub alloc_inner_jobs: Option<i64>,
 }
 
@@ -1004,10 +1004,35 @@ const CPA_CORE_CAPPED: &str = "core-capped";
 const CPA_MEM_CAPPED: &str = "mem-capped";
 const CPA_FIXED_POINT: &str = "fixed-point";
 
+/// Restrict a learned speedup model's recommendation to the run budget.
+///
+/// Measurements above `P` remain visible as curve points, but neither the recommended
+/// width nor a regression marker can claim a width this run is forbidden to execute. A curve with
+/// no measured point at or below `P` is unavailable at this budget and is omitted from the plan.
+fn speedup_within_budget(speedup: &StepSpeedup, core_budget: i64) -> Option<StepSpeedup> {
+    let p = core_budget.max(1);
+    let recommended = speedup
+        .levels
+        .iter()
+        .filter(|level| level.inner_jobs <= p)
+        .map(|level| level.inner_jobs)
+        .max()?;
+    let mut bounded = speedup.clone();
+    bounded.recommended_inner_jobs = recommended.min(speedup.recommended_inner_jobs);
+    bounded.measured_effective_cores = bounded
+        .levels
+        .iter()
+        .find(|level| level.inner_jobs == bounded.recommended_inner_jobs)
+        .and_then(|level| level.effective_cores);
+    bounded.regression_inner_jobs = bounded.regression_inner_jobs.filter(|width| *width <= p);
+    Some(bounded)
+}
+
 // Per-step admissible width set `W_i` (ascending) and the MEASURED wall `T_i(p)` at each admissible
 // width. Mirrors Python's `_cpa_admissible` (PLANNER_DESIGN.md §5.2): a curve step admits its
 // measured widths up to the knee (`recommended_inner_jobs`) and the core budget `P`; a curveless
-// step is rigid at `min(hint or 1, P)` with `T_i` the resolved scalar estimate.
+// step is rigid at `min(hint or default_step_cpu_count or 1, P)` with `T_i` the resolved scalar
+// estimate.
 #[allow(clippy::type_complexity)]
 fn cpa_admissible(
     cfg: &DagConfig,
@@ -1034,25 +1059,41 @@ fn cpa_admissible(
                     .copied()
                     .filter(|l| l.inner_jobs <= core_budget)
                     .collect();
-                // Fall back to the narrowest measured width if EVERY admissible width exceeds P.
-                let chosen: Vec<&SpeedupLevel> = if within.is_empty() {
-                    knee_ok[..1].to_vec()
+                if within.is_empty() {
+                    // A measured curve entirely above P cannot justify violating the strict run
+                    // budget. Treat it as unavailable at this budget and keep the step rigid at
+                    // its effective configured width, capped to P, using the scalar estimate.
+                    let width = step
+                        .hint
+                        .preferred_inner_jobs
+                        .filter(|value| *value > 0)
+                        .or(cfg.default_step_cpu_count.filter(|value| *value > 0))
+                        .unwrap_or(1)
+                        .min(core_budget.max(1));
+                    admissible.insert(tag.clone(), vec![width]);
+                    wall.insert(
+                        tag.clone(),
+                        HashMap::from([(width, est.get(&tag).copied().unwrap_or(0.0))]),
+                    );
                 } else {
-                    within
-                };
-                let mut widths: Vec<i64> = chosen.iter().map(|l| l.inner_jobs).collect();
-                widths.sort_unstable();
-                let w: HashMap<i64, f64> =
-                    chosen.iter().map(|l| (l.inner_jobs, l.wall_s)).collect();
-                admissible.insert(tag.clone(), widths);
-                wall.insert(tag, w);
+                    let mut widths: Vec<i64> =
+                        within.iter().map(|level| level.inner_jobs).collect();
+                    widths.sort_unstable();
+                    let w: HashMap<i64, f64> = within
+                        .iter()
+                        .map(|level| (level.inner_jobs, level.wall_s))
+                        .collect();
+                    admissible.insert(tag.clone(), widths);
+                    wall.insert(tag, w);
+                }
             }
             _ => {
-                let pref = step.hint.preferred_inner_jobs;
-                let mut ww = match pref {
-                    Some(p) if p > 0 => p,
-                    _ => 1,
-                };
+                let mut ww = step
+                    .hint
+                    .preferred_inner_jobs
+                    .filter(|value| *value > 0)
+                    .or(cfg.default_step_cpu_count.filter(|value| *value > 0))
+                    .unwrap_or(1);
                 if core_budget > 0 && ww > core_budget {
                     ww = core_budget;
                 }
@@ -1213,9 +1254,10 @@ pub fn allocate_widths(
 // A deterministic greedy list-schedule of the allocated widths -> the MODELED makespan (mirrors
 // Python's `_cpa_simulate_makespan`). Launches ready steps (deps done, core budget
 // `Σ running widths + p_i <= P`, named resources free) in `order`, advancing to the next finish
-// event; a step wider than the whole budget runs alone (deadlock guard). Respecting deps AND the
-// core budget makes the result `>= max(T_CP, area/P)` (PLANNER_DESIGN.md §2). Same f64 ops in
-// canonical `order` as the Python build, so the 3-decimal makespan is byte-identical.
+// event. Allocated widths must lie in `1..=P`; there is no over-budget run-alone escape.
+// Respecting deps AND the core budget makes the result `>= max(T_CP, area/P)`
+// (PLANNER_DESIGN.md §2). Same f64 ops in canonical `order` as the Python build, so the
+// 3-decimal makespan is byte-identical.
 fn cpa_simulate_makespan(
     cfg: &DagConfig,
     widths: &HashMap<String, i64>,
@@ -1236,6 +1278,9 @@ fn cpa_simulate_makespan(
     let mut now = 0.0f64;
     let mut pending: std::collections::HashSet<String> =
         cfg.steps.iter().map(|s| s.tag()).collect();
+    assert!(pending
+        .iter()
+        .all(|tag| widths[tag] >= 1 && widths[tag] <= p));
     while !pending.is_empty() || !running.is_empty() {
         let mut launched = true;
         while launched {
@@ -1249,7 +1294,7 @@ fn cpa_simulate_makespan(
                     continue;
                 }
                 let w = widths[tag];
-                if !(cores_used + w <= p || cores_used == 0) {
+                if cores_used + w > p {
                     continue;
                 }
                 let res_free = step
@@ -1304,7 +1349,14 @@ fn build_cpa_plan(
         Some(b) if b > 0 => b,
         _ => 1,
     };
-    let (widths, _admissible, wall, stop_reason) = cpa_allocate(cfg, speedups, est, p, mem_budget);
+    let bounded_speedups: HashMap<String, StepSpeedup> = speedups
+        .iter()
+        .filter_map(|(tag, speedup)| {
+            speedup_within_budget(speedup, p).map(|bounded| (tag.clone(), bounded))
+        })
+        .collect();
+    let (widths, _admissible, wall, stop_reason) =
+        cpa_allocate(cfg, &bounded_speedups, est, p, mem_budget);
     let weight: HashMap<String, f64> = cfg
         .steps
         .iter()
@@ -1340,7 +1392,7 @@ fn build_cpa_plan(
         .map(|s| {
             let tag = s.tag();
             let r = &resolved[&tag];
-            let has_curve = speedups
+            let has_curve = bounded_speedups
                 .get(&tag)
                 .map(|sp| !sp.levels.is_empty())
                 .unwrap_or(false);
@@ -1356,7 +1408,7 @@ fn build_cpa_plan(
                 rss_source: r.rss_source.to_string(),
                 bottom_level_s: bottom.get(&tag).copied().unwrap_or(0.0),
                 samples: r.samples,
-                speedup: speedups.get(&tag).cloned(),
+                speedup: bounded_speedups.get(&tag).cloned(),
                 alloc_inner_jobs: Some(widths[&tag]),
             }
         })
@@ -2168,6 +2220,58 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,4,2.5,0,True,False,0,1000,,,1
         assert_eq!(alloc.stop_reason, "balanced");
         assert!(alloc.modeled_makespan_s >= alloc.lower_bound_s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_never_uses_a_measured_width_above_the_strict_budget() {
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.wide,cpu-bound,4,8.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.wide,cpu-bound,8,4.0,0,True,False,0,1000,,,8.0,0.0,0.0
+";
+        let dir = write_cpa_store("strict-budget", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let mut wide = mk("g", "wide", &[], 12.0);
+        wide.hint.preferred_inner_jobs = Some(8);
+        let cfg = DagConfig {
+            steps: vec![wide],
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(2),
+            None,
+        );
+        assert_eq!(cpa_widths(&plan)["g.wide"], Some(2));
+        assert!(plan.entries[0].speedup.is_none());
+        assert!(plan
+            .entries
+            .iter()
+            .filter_map(|entry| entry.alloc_inner_jobs)
+            .all(|width| width <= 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_charges_the_undeclared_step_cpu_default_as_rigid_width() {
+        let cfg = DagConfig {
+            steps: vec![mk("g", "defaulted", &[], 3.0)],
+            default_step_cpu_count: Some(4),
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &HashMap::new(),
+            Some(8),
+            None,
+        );
+        assert_eq!(cpa_widths(&plan)["g.defaulted"], Some(4));
     }
 
     #[test]

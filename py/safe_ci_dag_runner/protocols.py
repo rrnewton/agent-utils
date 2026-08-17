@@ -179,9 +179,9 @@ class RunWindow(Protocol):
         """Compute window metrics and record the whole-run row.
 
         ``result`` is the run outcome recorded verbatim; ``n_steps`` is the number of steps
-        actually run; ``jobs`` is the
-        effective scheduler fan-out (``-j``). The remaining columns (wall time, our CPU vs
-        other/system CPU contention, cores) are derived from the captured baseline.
+        actually run; ``jobs`` is the active-step ceiling (the existing persisted column name is
+        unchanged). The remaining columns (wall time, our CPU vs other/system CPU contention,
+        cores) are derived from the captured baseline.
 
         Returns the recorded row (heterogeneous, hence ``Mapping[str, object]``) for
         logging, or ``None`` when recording was skipped (e.g. the opt-in destination does
@@ -215,8 +215,8 @@ class MetricsSink(Protocol):
         storage.
 
         Each row is a heterogeneous column→value mapping (``Mapping[str, object]``: strings,
-        ints, floats) whose schema is owned by the caller and sink. ``jobs`` is the outer
-        scheduler fan-out stamped onto every row.
+        ints, floats) whose schema is owned by the caller and sink. ``jobs`` is the active-step
+        ceiling stamped onto every row under the existing ``outer_jobs`` field.
 
         Returns a human-readable location descriptor for the recorded rows (a file-backed
         sink returns the CSV path as a string), or ``None`` when recording was skipped

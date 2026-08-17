@@ -33,11 +33,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::cgroup::{
-    apply_specific_cores, attempt_scope_reexec, enable_outer_oom_group,
-    expected_outer_memory_max_bytes, expected_scope_runtime_max_s, install_scope_teardown,
-    is_in_scope, observe_own_containment, outer_memory_max_bytes, verify_scope_limits,
-    verify_scope_runtime_max, CgroupManager, Cgroups, ScopeAttempt, DIRECT_CGROUP_ENV,
-    FORCE_ATTEMPT_ENV,
+    aggregate_slice_cpu_jobs, apply_specific_cores, attempt_scope_reexec, enable_outer_oom_group,
+    expected_outer_cpu_count, expected_outer_memory_max_bytes, expected_scope_runtime_max_s,
+    install_scope_teardown, is_in_scope, observe_own_containment, outer_memory_max_bytes,
+    verify_scope_limits, verify_scope_runtime_max, CgroupManager, Cgroups, ScopeAttempt,
+    DIRECT_CGROUP_ENV, FORCE_ATTEMPT_ENV,
 };
 use crate::estimates::{
     apply_plan_to_config, build_plan, feedback_identity, load_step_samples, load_step_speedups,
@@ -47,7 +47,9 @@ use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonE
 use crate::model::{step_classification, DagConfig, Step, StepOutcome};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
-use crate::scheduler::{run_dag_boxed, run_dag_boxed_deadline, BoxedCgroups};
+use crate::scheduler::{
+    cap_config_cpu_jobs, run_dag_boxed_deadline_limited, run_dag_boxed_limited, BoxedCgroups,
+};
 use crate::sizing::{
     box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_copy_footprint_bytes,
 };
@@ -192,9 +194,10 @@ jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"
 yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n\n\
 {what}\n  \
 - concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
+  ({maxsteps} bounds active DAG steps; {jobs} bounds their summed declared CPU width)\n  \
 - learned est_duration / rss from the profile store override the DAG hints at plan time\n    (disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
-- {maxmem} picks the largest -j whose modeled worst-case RAM fits the budget\n\n\
+- {maxmem} derives a safe active-step ceiling from the modeled worst-case RAM footprint\n\n\
 {note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. {perfdir} writes per-step + whole-run resource-usage CSVs.\n\n\
 {exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = cgroup\n           boxing required but unavailable (use {acf})\n",
         banner = banner(c),
@@ -250,6 +253,8 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
         schema_note = c.dim("(only group/job/cmd are required per step; everything else has defaults)"),
         what = h("What you get"),
         keepgoing = k("--keep-going"),
+        maxsteps = k("--max-steps"),
+        jobs = k("--jobs"),
         maxmem = k("run --max-mem 8G"),
         acf = k("--allow-cgroup-failure"),
         perfdir = k("run --perf-dir DIR"),
@@ -320,12 +325,13 @@ fn run_help(c: &Palette) -> String {
         "Run a DAG (exit 0 iff every step passes). Boxed per-step with cgroup-v2 by default.",
         &[
             ("--dag FILE", "DAG file to run ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
-            ("-j, --jobs N", "max concurrent steps (default: CPU count); a bare -jN also works"),
+            ("-s, --max-steps N", "maximum active DAG steps; defaults to the effective --jobs budget; a bare -sN also works"),
+            ("-j, --jobs N", "aggregate declared CPU-job budget across active steps (default: effective container/affinity budget tightened by the shared 90% slice); a bare -jN also works"),
             ("--cores/--cpuset/--pin K", "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable"),
-            ("--max-mem SPEC", "RAM budget (e.g. 8G): pick the largest -j whose modeled footprint fits (ignored with --jobs)"),
+            ("--max-mem SPEC", "RAM budget (e.g. 8G): derive a safe --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
             ("--only TAG[,TAG...]", "run EXACTLY the named step(s); dependency edges outside the selection are dropped"),
             ("--args STRING", "replace the opt-in {args} token in selected step commands"),
-            ("--stress N", "duplicate the graph into N disconnected components with no edges between copies; -j controls concurrency"),
+            ("--stress N", "duplicate the graph into N disconnected components with no edges between copies; --max-steps controls active copies and --jobs bounds their aggregate CPU width"),
             ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
             ("--no-profile", "disable the default auto-logging profile store for this run"),
             ("--profile", "after the run, print a per-step profile (timing/memory) table"),
@@ -598,8 +604,13 @@ impl From<DagJsonError> for LoadError {
 
 // --------------------------------------------------------------------------- run subcommand
 
+/// Largest CLI CPU-job budget that remains safe when converted to the fixed 100000-us cgroup
+/// period used for per-step `cpu.max`.
+const MAX_RUN_CPU_JOBS: i64 = i64::MAX / 100_000;
+
 struct RunArgs {
     dag: Option<String>,
+    max_steps: Option<i64>,
     jobs: Option<i64>,
     cores: Option<i64>,
     max_mem: Option<String>,
@@ -628,6 +639,7 @@ struct RunArgs {
 fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
     let mut a = RunArgs {
         dag: None,
+        max_steps: None,
         jobs: None,
         cores: None,
         max_mem: None,
@@ -671,12 +683,28 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
         };
         match key.as_str() {
             "--dag" => a.dag = Some(take_value(inline, &mut i)?),
+            "-s" | "--max-steps" => {
+                let v = take_value(inline, &mut i)?;
+                let max_steps = v
+                    .parse::<i64>()
+                    .map_err(|_| format!("--max-steps: invalid int value: '{v}'"))?;
+                if max_steps < 1 {
+                    return Err("--max-steps: must be >= 1".to_string());
+                }
+                a.max_steps = Some(max_steps);
+            }
             "-j" | "--jobs" => {
                 let v = take_value(inline, &mut i)?;
-                a.jobs = Some(
-                    v.parse::<i64>()
-                        .map_err(|_| format!("--jobs: invalid int value: '{v}'"))?,
-                );
+                let jobs = v
+                    .parse::<i64>()
+                    .map_err(|_| format!("--jobs: invalid int value: '{v}'"))?;
+                if jobs < 1 {
+                    return Err("--jobs: must be >= 1".to_string());
+                }
+                if jobs > MAX_RUN_CPU_JOBS {
+                    return Err(format!("--jobs: must be <= {MAX_RUN_CPU_JOBS}"));
+                }
+                a.jobs = Some(jobs);
             }
             // `--cpuset`/`--pin` are discoverable aliases for `--cores` (identical semantics).
             "--cores" | "--cpuset" | "--pin" => {
@@ -745,12 +773,26 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
             "-v" => a.verbosity += 1,
             "-q" | "--quiet" => a.quiet = true,
             other => {
-                // Handle a bare `-jN` (no space/=).
-                if let Some(n) = other.strip_prefix("-j") {
-                    a.jobs = Some(
-                        n.parse::<i64>()
-                            .map_err(|_| format!("--jobs: invalid int value: '{n}'"))?,
-                    );
+                // Handle bare `-sN` / `-jN` (no space/=).
+                if let Some(n) = other.strip_prefix("-s") {
+                    let max_steps = n
+                        .parse::<i64>()
+                        .map_err(|_| format!("--max-steps: invalid int value: '{n}'"))?;
+                    if max_steps < 1 {
+                        return Err("--max-steps: must be >= 1".to_string());
+                    }
+                    a.max_steps = Some(max_steps);
+                } else if let Some(n) = other.strip_prefix("-j") {
+                    let jobs = n
+                        .parse::<i64>()
+                        .map_err(|_| format!("--jobs: invalid int value: '{n}'"))?;
+                    if jobs < 1 {
+                        return Err("--jobs: must be >= 1".to_string());
+                    }
+                    if jobs > MAX_RUN_CPU_JOBS {
+                        return Err(format!("--jobs: must be <= {MAX_RUN_CPU_JOBS}"));
+                    }
+                    a.jobs = Some(jobs);
                 } else {
                     return Err(format!("unrecognized argument: {other}"));
                 }
@@ -761,46 +803,74 @@ fn parse_run_args(rest: &[String]) -> Result<RunArgs, String> {
     Ok(a)
 }
 
-// Choose the outer scheduler fan-out (`-j`), mirroring Python's `_select_jobs` including the
-// visible stderr notes (both-given, could-not-parse, and the no-throttle note).
-fn select_jobs(cfg: &DagConfig, a: &RunArgs) -> i64 {
-    let max_mem = a.max_mem.as_deref().filter(|s| !s.is_empty());
-    if let Some(jobs) = a.jobs {
-        if max_mem.is_some() {
+/// Resolve the run's aggregate declared CPU-job budget. The ambient container/affinity budget is
+/// the default; an opt-in hard cpuset is always a tighter upper bound.
+fn select_cpu_jobs(a: &RunArgs) -> i64 {
+    let requested = a
+        .jobs
+        .unwrap_or_else(|| container_core_budget().min(aggregate_slice_cpu_jobs()))
+        .max(1);
+    match a.cores {
+        Some(cores) if requested > cores => {
             eprintln!(
-                "{PROG}: both --jobs and --max-mem given; --jobs={jobs} wins, --max-mem sizing skipped"
+                "{PROG}: --cores {cores} is tighter than --jobs {requested}; using aggregate \
+                 CPU-job budget {cores}"
             );
+            cores
         }
-        return jobs;
+        _ => requested,
     }
+}
+
+// Choose the outer active-step ceiling (`-s`). `--max-mem` independently derives a safe ceiling;
+// when the caller supplied both, the tighter value wins and is announced.
+fn select_max_steps(cfg: &DagConfig, a: &RunArgs, cpu_jobs: i64) -> i64 {
+    let max_mem = a.max_mem.as_deref().filter(|s| !s.is_empty());
     if let Some(mm) = max_mem {
         match parse_size(mm) {
             None => {
-                eprintln!("{PROG}: could not parse --max-mem '{mm}'; falling back to CPU count");
+                let fallback = a.max_steps.unwrap_or(cpu_jobs);
+                eprintln!(
+                    "{PROG}: could not parse --max-mem '{mm}'; falling back to --max-steps \
+                     {fallback}"
+                );
+                return fallback;
             }
             Some(budget) => {
-                let (jobs, footprint) = jobs_for_budget(cfg, budget);
+                let (memory_steps, footprint) = jobs_for_budget(cfg, budget);
                 eprintln!(
-                    "{PROG}: --max-mem {mm} -> -j{jobs} (modeled worst-case {footprint} bytes fits budget {budget} bytes)"
+                    "{PROG}: --max-mem {mm} -> --max-steps {memory_steps} (modeled worst-case \
+                     {footprint} bytes fits budget {budget} bytes)"
                 );
                 let ncpu = cpu_count();
                 let modeled = cfg
                     .steps
                     .iter()
                     .any(|s| s.hint.rss_baseline_bytes.is_some() && !s.engine_only);
-                if jobs == ncpu && !modeled {
+                if memory_steps == ncpu && !modeled {
                     eprintln!(
                         "{PROG}: note: no step carries rss_baseline_bytes, so the modeled footprint \
-collapsed to the mem_cap_floor_bytes floor ({} bytes) and --max-mem did not throttle (-j{jobs} = CPU count); \
+collapsed to the mem_cap_floor_bytes floor ({} bytes) and --max-mem did not throttle \
+(--max-steps {memory_steps} = CPU count); \
 add per-step rss_baseline_bytes to enable memory-aware throttling",
                         cfg.mem_cap_floor_bytes
                     );
                 }
-                return jobs;
+                return match a.max_steps {
+                    Some(explicit) => {
+                        let selected = explicit.min(memory_steps);
+                        eprintln!(
+                            "{PROG}: explicit --max-steps {explicit} and memory-derived ceiling \
+                             {memory_steps}; using tighter --max-steps {selected}"
+                        );
+                        selected
+                    }
+                    None => memory_steps,
+                };
             }
         }
     }
-    cpu_count()
+    a.max_steps.unwrap_or(cpu_jobs)
 }
 
 /// Best-effort git SHA of the current working directory's repo (stamps perf-log rows only).
@@ -856,6 +926,7 @@ fn scope_grace_s(run_timeout_s: i64) -> i64 {
 fn resolve_cgroups(
     allow_failure: bool,
     unsafe_no_cgroups: bool,
+    cpu_jobs: Option<i64>,
     run_timeout_s: Option<i64>,
 ) -> Result<BoxedCgroups, i32> {
     if unsafe_no_cgroups {
@@ -902,11 +973,15 @@ fn resolve_cgroups(
             return Err(3);
         }
         let expected_memory_max = expected_outer_memory_max_bytes();
-        if expected_memory_max
-            .is_none_or(|cap| !enable_outer_oom_group() || !verify_scope_limits(cap))
-        {
-            let msg = "outer scope MemoryMax/MemorySwapMax/memory.oom.group readback failed; \
-                       the run is not safely contained";
+        let expected_cpu_count = expected_outer_cpu_count();
+        let cpu_request_matches = cpu_jobs.is_none() || expected_cpu_count == cpu_jobs;
+        if expected_memory_max.is_none_or(|cap| {
+            !cpu_request_matches
+                || !enable_outer_oom_group()
+                || !verify_scope_limits(cap, expected_cpu_count)
+        }) {
+            let msg = "outer scope MemoryMax/MemorySwapMax/memory.oom.group/cpu.max readback \
+                       failed; the run is not safely contained";
             if allow_failure {
                 eprintln!(
                     "{PROG}: warning: {msg}; running best-effort UNBOXED \
@@ -1023,7 +1098,7 @@ fn resolve_cgroups(
     // exit code is unchanged, and so is the policy.
     let attempt = attempt_scope_reexec(
         Some(outer_memory_max),
-        None,
+        cpu_jobs,
         run_timeout_s.map(|s| s + scope_grace_s(s)),
     );
     match &attempt {
@@ -1251,12 +1326,19 @@ fn sync_upload(backend: &dyn SyncBackend, rows: &[std::collections::BTreeMap<Str
 // Resolve the `(core_budget, mem_budget)` the CPA allocator balances against, or `(None, None)`
 // for the non-allocating planners (so they do no cgroup/proc reads). Mirrors Python's
 // `_cpa_budgets`.
-fn cpa_budgets(planner: Planner, max_mem: Option<&str>) -> (Option<i64>, Option<i64>) {
+fn cpa_budgets(
+    planner: Planner,
+    max_mem: Option<&str>,
+    cpu_jobs: Option<i64>,
+) -> (Option<i64>, Option<i64>) {
     if planner != Planner::Cpa {
         return (None, None);
     }
     let mem_budget = max_mem.filter(|s| !s.is_empty()).and_then(parse_size);
-    (Some(container_core_budget()), mem_budget)
+    (
+        Some(cpu_jobs.unwrap_or_else(container_core_budget).max(1)),
+        mem_budget,
+    )
 }
 
 /// Print one visible line naming where profile CSVs were appended (No Silent Failure).
@@ -1453,7 +1535,8 @@ fn print_stress_report(
     rows: &[StepOutcome],
     n: i64,
     max_concurrent_steps: usize,
-    jobs: i64,
+    max_steps: i64,
+    cpu_jobs: i64,
     c: &Palette,
 ) {
     let mut groups: BTreeMap<String, Vec<(String, &StepOutcome)>> = BTreeMap::new();
@@ -1515,7 +1598,10 @@ fn print_stress_report(
         }
         println!("  {base}: {styled}{detail}");
     }
-    println!("  maximum concurrent steps: {max_concurrent_steps} (--jobs {jobs})");
+    println!(
+        "  maximum concurrent steps: {max_concurrent_steps} (--max-steps {max_steps}; --jobs \
+         {cpu_jobs} aggregate CPU jobs)"
+    );
 }
 
 // --------------------------------------------------------------------------- table rendering
@@ -1691,7 +1777,7 @@ fn run_single_step(
     let (u0, s0) = child_cpu_seconds();
     let window = perf_dir.map(|d| PerfWindow::start(Path::new(d), git));
     let start = Instant::now();
-    let result = run_dag_boxed(&one, 1, false, verbosity, cgroups.clone());
+    let result = run_dag_boxed_limited(&one, 1, inner_jobs, false, verbosity, cgroups.clone());
     let measured = start.elapsed().as_secs_f64();
     let (u1, s1) = child_cpu_seconds();
     if let Some(w) = &window {
@@ -1880,7 +1966,7 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     let repeat = a.repeat.max(1);
 
     // Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
-    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups, None) {
+    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups, None, None) {
         Ok(cg) => cg,
         Err(code) => return code,
     };
@@ -2004,7 +2090,7 @@ fn cmd_plan(a: &PlanArgs) -> i32 {
     };
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
-    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref());
+    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref(), None);
     let plan = build_feedback_plan(
         &cfg,
         feedback_dir.as_deref(),
@@ -2062,11 +2148,18 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         }
     }
     let stressed = expand_stress(&with_args, a.stress);
-    let cfg = &stressed;
+
+    // The aggregate CPU-job budget is independent of graph shape, so resolve it before cgroup
+    // bring-up and bind the same value to the outer scope's CPUQuota and the scheduler gate.
+    let cpu_jobs = select_cpu_jobs(a);
 
     // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
-    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups, a.run_timeout)
-    {
+    let cgroups = match resolve_cgroups(
+        a.allow_cgroup_failure,
+        a.unsafe_no_cgroups,
+        Some(cpu_jobs),
+        a.run_timeout,
+    ) {
         Ok(cg) => cg,
         Err(code) => return code,
     };
@@ -2097,12 +2190,18 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         }
     }
 
+    // Make the budget visible in the plan as well as at execution. This caps authored hints and
+    // the undeclared-step cpu.max default before CPA sees the graph, so --show-plan cannot display
+    // a width that the scheduler later changes.
+    let budgeted = cap_config_cpu_jobs(&stressed, cpu_jobs);
+    let cfg = &budgeted;
+
     // Plan-time profile-store feedback: refine each step's est_duration_s
     // and rss_baseline_bytes from the recorded store, then pick the dispatch order for --planner.
-    // The applied cfg (refined hints) feeds both the memory-aware -j sizing and the scheduler.
+    // The applied cfg (refined hints) feeds both memory-aware --max-steps sizing and the scheduler.
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
-    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref());
+    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref(), Some(cpu_jobs));
 
     // Profile-artifact SYNC: parse the backend once; DOWNLOAD seeds the planner, UPLOAD (after the
     // run) publishes this run's samples. A malformed spec fails fast; a backend I/O failure degrades
@@ -2140,7 +2239,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             mem_budget,
         )
     });
-    let mut applied = apply_plan_to_config(cfg, &plan);
+    let mut applied = cap_config_cpu_jobs(&apply_plan_to_config(cfg, &plan), cpu_jobs);
     // Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     // the same values so older callers keep working and announce that the flag is now redundant.
     if a.small_default_cap {
@@ -2187,7 +2286,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         print!("{}", plan_to_text(&plan));
     }
 
-    let jobs = select_jobs(cfg, a);
+    let max_steps = select_max_steps(cfg, a, cpu_jobs);
     let verbosity = if a.quiet { 0 } else { a.verbosity };
 
     let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
@@ -2196,14 +2295,14 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         .as_deref()
         .map(|d| PerfWindow::start(Path::new(d), &git));
 
-    let result = run_dag_boxed_deadline(
+    let result = run_dag_boxed_deadline_limited(
         cfg,
-        jobs,
+        max_steps,
+        cpu_jobs,
         a.keep_going || stress_active,
         verbosity,
         cgroups,
         Some(plan.order.clone()),
-        core_budget,
         a.run_timeout,
     );
     let passed = result.outcomes.iter().filter(|o| o.ok).count();
@@ -2230,14 +2329,14 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             w.finish(
                 if result.ok { "pass" } else { "fail" },
                 result.outcomes.len(),
-                jobs,
+                max_steps,
             );
         }
         append_step_profiles(
             Path::new(d),
             &result.step_profile_rows,
             &git,
-            jobs,
+            max_steps,
             None,
             "unverified",
             "local",
@@ -2256,7 +2355,8 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             &result.outcomes,
             a.stress,
             result.max_concurrent_steps,
-            jobs,
+            max_steps,
+            cpu_jobs,
             c,
         );
     }
@@ -2436,7 +2536,8 @@ pub fn run(argv: &[String]) -> i32 {
                 && !is_in_scope()
                 && std::env::var(DIRECT_CGROUP_ENV).as_deref() != Ok("1")
             {
-                if let Err(code) = resolve_cgroups(false, false, a.run_timeout) {
+                let cpu_jobs = select_cpu_jobs(&a);
+                if let Err(code) = resolve_cgroups(false, false, Some(cpu_jobs), a.run_timeout) {
                     return code;
                 }
             }
@@ -2804,7 +2905,8 @@ fn cmd_summary_plan(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let (core_budget, mem_budget) = cpa_budgets(planner, flags.get("max-mem").map(|s| s.as_str()));
+    let (core_budget, mem_budget) =
+        cpa_budgets(planner, flags.get("max-mem").map(|s| s.as_str()), None);
     let plan = build_plan_from_summary(&cfg, &summary, planner, core_budget, mem_budget);
     if output_format == "json" {
         println!("{}", plan_to_json(&plan));
@@ -2937,9 +3039,69 @@ mod tests {
     fn run_help_exposes_every_run_only_surface() {
         let palette = Palette { enabled: false };
         let help = run_help(&palette);
-        for flag in ["--args", "--stress", "--cores", "--profile-sync"] {
+        for flag in [
+            "--max-steps",
+            "--jobs",
+            "--args",
+            "--stress",
+            "--cores",
+            "--profile-sync",
+        ] {
             assert!(help.contains(flag), "missing {flag} from run help");
         }
+        assert!(help.contains("maximum active DAG steps"));
+        assert!(help.contains("aggregate declared CPU-job budget"));
+    }
+
+    #[test]
+    fn run_parser_separates_bare_max_steps_and_jobs_and_rejects_zero() {
+        let parsed = parse_run_args(&[
+            "--dag".into(),
+            "dag.json".into(),
+            "-s2".into(),
+            "-j8".into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.max_steps, Some(2));
+        assert_eq!(parsed.jobs, Some(8));
+
+        assert_eq!(
+            parse_run_args(&["--max-steps=0".into()]).err().as_deref(),
+            Some("--max-steps: must be >= 1")
+        );
+        assert_eq!(
+            parse_run_args(&["--jobs=0".into()]).err().as_deref(),
+            Some("--jobs: must be >= 1")
+        );
+        assert_eq!(
+            parse_run_args(&["--jobs=9223372036854775807".into()])
+                .err()
+                .as_deref(),
+            Some("--jobs: must be <= 92233720368547")
+        );
+    }
+
+    #[test]
+    fn cores_and_memory_can_only_tighten_run_limits() {
+        let mut args = parse_run_args(&[
+            "--jobs".into(),
+            "8".into(),
+            "--cores".into(),
+            "3".into(),
+            "--max-steps".into(),
+            "9".into(),
+            "--max-mem".into(),
+            "2G".into(),
+        ])
+        .unwrap();
+        assert_eq!(select_cpu_jobs(&args), 3);
+
+        let cfg = tiny();
+        let memory_steps = jobs_for_budget(&cfg, parse_size("2G").unwrap()).0;
+        assert_eq!(select_max_steps(&cfg, &args, 3), 9.min(memory_steps));
+
+        args.max_mem = None;
+        assert_eq!(select_max_steps(&cfg, &args, 3), 9);
     }
 
     #[test]

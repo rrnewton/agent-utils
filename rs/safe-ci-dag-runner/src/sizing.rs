@@ -1,12 +1,13 @@
 //! Memory-footprint modeling and safe concurrency selection.
 
-// Memory footprint model + memory-aware `-j` selection (pure functions over a [`DagConfig`]).
+// Memory footprint model + memory-aware active-step selection (pure functions over a [`DagConfig`]).
 //
 // Direct port of `py/safe_ci_dag_runner/sizing.py`. Rather than a flat per-job RAM estimate,
 // it enumerates which steps can actually co-run (no transitive dependency between them, and
 // their summed scarce-resource demand fits the caps) and takes the worst-case sum of their
-// per-step memory caps. That yields an exact "largest `-jN` that fits budget M". The chosen
-// `-j` and footprint MUST equal the Python build's for the same DAG (cross-tested).
+// per-step memory caps. That yields an exact "largest active-step ceiling that fits budget M". The
+// chosen active-step ceiling and footprint MUST equal the Python build's for the same DAG
+// (cross-tested).
 
 use std::collections::{HashMap, HashSet};
 
@@ -39,7 +40,7 @@ pub fn step_mem_cap_for_inner_jobs(
     inner_jobs: Option<i64>,
     mem_cap_factor: f64,
 ) -> i64 {
-    // The -j sizing model excludes uncharacterized steps (no default here), matching Python.
+    // Active-step sizing excludes uncharacterized steps (no default here), matching Python.
     let cap = step_mem_cap_bytes(step, mem_cap_factor, None).unwrap_or(0);
     match inner_jobs {
         Some(jobs)
@@ -226,7 +227,8 @@ pub fn jobs_footprint_bytes(cfg: &DagConfig, jobs: i64, inner_jobs: Option<i64>)
         .max((peak as f64 * cfg.outer_mem_safety_factor) as i64)
 }
 
-/// Largest `-jN` (`>=1`, capped at CPU count) whose worst-case footprint fits `budget` bytes.
+/// Largest active-step ceiling (`>=1`, capped at CPU count) whose worst-case footprint fits
+/// `budget` bytes.
 /// Returns `(jobs, footprint_at_that_jobs)`. Always `>= 1`.
 pub fn jobs_for_budget(cfg: &DagConfig, budget: i64) -> (i64, i64) {
     let ncpu = cpu_count();

@@ -27,7 +27,11 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   and counts, and an unknown ``--only`` tag exits 2 on both builds. A successful ``sweep`` must
   produce the same width rows and table schema; measured timing cells and the ``--profile`` table
   are not byte-compared because runtimes legitimately differ.
-* The memory-aware ``-j`` decision and modeled footprint from ``--max-mem`` match.
+* The memory-aware ``--max-steps`` decision and modeled footprint from ``--max-mem`` match.
+* ``run`` keeps active-step fan-out (``-s``) independent from aggregate declared CPU jobs
+  (``-j``): the same fork-based guest workload records normalized step/worker overlap under both
+  engines, including authored inner widths capped by the run budget. A capability-gated boxed
+  case additionally proves the live outer ``cpu.max`` and long-window ``cpu.stat`` bandwidth.
 * The auto-logging profile STORE (Feature D) has an identical on-disk schema across builds: an
   unboxed run under each build (into separate ``--perf-dir`` dirs) writes the SAME set of CSV
   filenames — so ``machine_id`` + ``container_class`` (and hence ``nproc``) agree — with
@@ -55,6 +59,7 @@ Exit status is nonzero on any divergence. The module is kept mypy-strict clean.
 from __future__ import annotations
 
 import argparse
+import csv
 import fcntl
 import hashlib
 import json
@@ -62,6 +67,7 @@ import os
 import signal
 import random
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -72,6 +78,13 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from cpu_footprint_analysis import (
+    FootprintStats,
+    analyze as analyze_cpu_footprint,
+    check_cgroup_bandwidth,
+    check_limits as check_cpu_limits,
+    load_events as load_cpu_events,
+)
 from herdr_agent_differential import compare_herdr_agent
 from herdr_differential import compare_herdr_run
 
@@ -104,8 +117,10 @@ _COUNTS_RE = re.compile(
     r"(\d+) intentionally skipped, (\d+) dependency-skipped"
 )
 _SIZING_RE = re.compile(
-    r"-> -j(\d+) \(modeled worst-case (\d+) bytes fits budget (\d+) bytes\)"
+    r"-> --max-steps (\d+) \(modeled worst-case (\d+) bytes fits budget (\d+) bytes\)"
 )
+
+CPU_FOOTPRINT_GUEST = os.path.join(REPO_ROOT, "cross", "cpu_footprint_guest.py")
 
 
 @dataclass(frozen=True)
@@ -129,6 +144,14 @@ class Outcome:
     stdout: str
     stderr: str
     elapsed_s: float = 0.0
+
+
+@dataclass(frozen=True)
+class CpuFootprintFacts:
+    completed_steps: int
+    workers_per_step: tuple[int, ...]
+    max_live_steps: int
+    max_live_workers: int
 
 
 @dataclass
@@ -290,7 +313,11 @@ def _env(extra: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 def run(
-    cmd: Sequence[str], args: Sequence[str], extra_env: Mapping[str, str] | None = None
+    cmd: Sequence[str],
+    args: Sequence[str],
+    extra_env: Mapping[str, str] | None = None,
+    *,
+    timeout_s: float = 120.0,
 ) -> Outcome:
     started = time.monotonic()
     try:
@@ -301,12 +328,17 @@ def run(
             env=_env(extra_env),
             start_new_session=True,
             check=False,
-            timeout=120,
+            timeout=timeout_s,
         )
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return Outcome(124, stdout, stderr + "\nTIMEOUT after 120 seconds", time.monotonic() - started)
+        return Outcome(
+            124,
+            stdout,
+            stderr + f"\nTIMEOUT after {timeout_s:g} seconds",
+            time.monotonic() - started,
+        )
     return Outcome(proc.returncode, proc.stdout, proc.stderr, time.monotonic() - started)
 
 
@@ -465,7 +497,7 @@ def representative_fixtures() -> list[Fixture]:
         )
     )
 
-    # A memory-modeled DAG sized against a tight budget: the chosen -j and footprint are
+    # A memory-modeled DAG sized against a tight budget: the chosen --max-steps and footprint are
     # compared; the budget throttles below any plausible CPU count so the check is
     # CPU-count-independent.
     fixtures.append(
@@ -505,7 +537,8 @@ def representative_fixtures() -> list[Fixture]:
 
     # jobs_flag: the inner-parallelism flag appended to a step's command when it declares
     # preferred_inner_jobs. Each fixture's command PASSES iff exactly the expected appended token(s)
-    # arrive as "$*", so a serial run (-j1) yields 1-passed in BOTH builds only when Python and
+    # arrive as "$*", so a serial run (-s1 with an ample -j budget) yields 1-passed in BOTH builds
+    # only when Python and
     # Rust render + append the flag identically. The `json` check additionally pins schema parity
     # for the jobs_flag / default_jobs_flag fields.
     fixtures.append(
@@ -998,7 +1031,7 @@ def compare_run_timeout(py: list[str], rs: list[str], rep: Report) -> None:
     budget whose breach cannot be attributed.
     """
     with tempfile.TemporaryDirectory() as tmp:
-        # Natural length ~12s (three 4s steps, -j1); budget 6s; every step's own wall budget 5s,
+        # Natural length ~12s (three 4s steps, -s1); budget 6s; every step's own wall budget 5s,
         # strictly under the run budget, so the ordering is legal.
         bounded = os.path.join(tmp, "bounded.json")
         with open(bounded, "w", encoding="utf-8") as fh:
@@ -1040,7 +1073,10 @@ def compare_run_timeout(py: list[str], rs: list[str], rep: Report) -> None:
         def _run(cmd: list[str], dag: str) -> Outcome:
             return run(
                 cmd,
-                ("run", "--dag", dag, "-q", "-j", "1", NOPROF, NOFB, ACF, "--run-timeout", "6"),
+                (
+                    "run", "--dag", dag, "-q", "-s", "1", "-j", "1", NOPROF, NOFB,
+                    ACF, "--run-timeout", "6",
+                ),
             )
 
         po, ro = _run(py, bounded), _run(rs, bounded)
@@ -1134,7 +1170,10 @@ def compare_escapee_teardown(py: list[str], rs: list[str], rep: Report) -> None:
                         }
                     )
                 )
-            return pid_file, run(cmd, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
+            return pid_file, run(
+                cmd,
+                ("run", "--dag", dag_path, "-q", "-s", "1", "-j", "1", NOPROF, NOFB, ACF),
+            )
 
         pid_files: list[str] = []
         survivors: dict[str, bool | None] = {}
@@ -1208,6 +1247,8 @@ def compare_term_attribution(py: list[str], rs: list[str], rep: Report) -> None:
             "--dag",
             dag_path,
             "-q",
+            "-s",
+            "1",
             "-j",
             "1",
             NOPROF,
@@ -1262,6 +1303,8 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
             "--dag",
             dag_path,
             "-q",
+            "-s",
+            "1",
             "-j",
             "1",
             NOPROF,
@@ -1347,6 +1390,8 @@ def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> N
             "--dag",
             dag_path,
             "-q",
+            "-s",
+            "5",
             "-j",
             "5",
             NOPROF,
@@ -1415,22 +1460,30 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
         # here (see cross/README.md). The flag makes both builds run the SAME observable UNBOXED
         # scheduling core deterministically, regardless of whether the host can box. Boxing itself
         # is proven by each build's own tests (Python pytest + the Rust boxing smoke test).
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "4", NOPROF, NOFB, ACF))
+        concurrent_args = (
+            "run", "--dag", dag_path, "-q", "-s", "4", "-j", "64", NOPROF, NOFB, ACF,
+        )
+        po = run(py, concurrent_args)
+        ro = run(rs, concurrent_args)
         label = f"{fx.name}/run(default-exit)"
         if po.returncode != ro.returncode:
             rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
         else:
             rep.ok(label)
 
-        # 4) run serial (-j1): deterministic counts + exit code. With one step at a time the
+        # 4) run serial (-s1): deterministic counts + exit code. Keep an ample -j64 aggregate CPU
+        # budget so serial scheduling does not rewrite an authored inner width or its jobs_flag.
+        # With one step at a time the
         # ready-set loop dispatches in a single deterministic LPT sequence, so the
         # passed/failed/aborted/intentionally-skipped/dependency-skipped counts are fully
         # reproducible between the two builds.
         # (Note: --keep-going only suppresses the eager-abort of in-flight steps; on any
-        # failure BOTH builds set stop and launch no new steps, so counts still race at -j>1.)
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
+        # failure BOTH builds set stop and launch no new steps, so counts still race at -s>1.)
+        serial_args = (
+            "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", NOPROF, NOFB, ACF,
+        )
+        po = run(py, serial_args)
+        ro = run(rs, serial_args)
         label = f"{fx.name}/run(serial-counts)"
         pc, rc = _counts(po.stderr), _counts(ro.stderr)
         if po.returncode != ro.returncode:
@@ -1451,19 +1504,23 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
             if ps is None or rss is None:
                 rep.bad(label, f"missing sizing line py={po.stderr!r} rs={ro.stderr!r}")
             elif ps != rss:
-                rep.bad(label, f"(-j, footprint, budget) py={ps} rs={rss}")
+                rep.bad(label, f"(--max-steps, footprint, budget) py={ps} rs={rss}")
             else:
                 rep.ok(label)
 
         # 6) --only selection parity (Feature A): running EXACTLY the named step(s) must agree on
         # exit code AND the passed/failed/aborted/intentionally-skipped/dependency-skipped counts
         # across both builds. Selecting a
-        # single step at -j1 is deterministic (its deps outside the selection are dropped), so the
+        # single step at -s1 is deterministic (its deps outside the selection are dropped), so the
         # counts are reproducible even though full-DAG timing is not.
         tag = _first_tag(fx)
         if tag is not None:
-            po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, NOFB, ACF))
-            ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--only", tag, NOPROF, NOFB, ACF))
+            only_args = (
+                "run", "--dag", dag_path, "-q", "-s", "1", "-j", "64", "--only", tag,
+                NOPROF, NOFB, ACF,
+            )
+            po = run(py, only_args)
+            ro = run(rs, only_args)
             label = f"{fx.name}/only({tag})"
             pc, rc = _counts(po.stderr), _counts(ro.stderr)
             if po.returncode != ro.returncode:
@@ -1497,13 +1554,49 @@ def _header_and_eol(path: str) -> tuple[str, str]:
     return header, eol
 
 
+def _profile_width_records(directory: str) -> list[tuple[str, str]]:
+    """Read ``(inner_jobs, container_class)`` from the one per-step profile CSV."""
+
+    names = [name for name in _store_csv_names(directory) if name.startswith("step_profiles_")]
+    if len(names) != 1:
+        return []
+    with open(os.path.join(directory, names[0]), newline="", encoding="utf-8") as handle:
+        return [
+            (row.get("inner_jobs", ""), row.get("container_class", ""))
+            for row in csv.DictReader(handle)
+        ]
+
+
+def _ambient_width_from_container_class(container_class: str) -> int | None:
+    """Mirror the conservative whole-core budget encoded in a profile identity."""
+
+    matched = re.fullmatch(
+        r"affinity([0-9]+)_cpu-max-(max|unknown|([0-9]+)_([0-9]+))",
+        container_class,
+    )
+    if matched is None:
+        return None
+    affinity = int(matched.group(1))
+    quota_text = matched.group(2)
+    if quota_text in {"max", "unknown"}:
+        return max(1, affinity)
+    quota = int(matched.group(3))
+    period = int(matched.group(4))
+    if period <= 0:
+        return None
+    return max(1, min(affinity, quota // period))
+
+
 def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
     """Assert the auto-logging profile STORE (Feature D) has an identical on-disk schema in both
     builds. Runs the SAME tiny DAG under each build with ``--perf-dir`` into a fresh temp dir
-    (unboxed via ``--allow-cgroup-failure``, so it is environment-independent), then asserts the two
+    (explicitly unboxed, so it is environment-independent), then asserts the two
     stores agree on: (a) the SET of CSV filenames (proving ``machine_id`` + ``container_class``, and
     hence ``nproc``, agree), (b) each file's HEADER row byte-for-byte, and (c) the line-ending
-    style. Data rows are NOT compared (their timestamps/elapsed/git-SHA legitimately differ)."""
+    style. It also proves that explicitly unboxed undeclared steps retain the same positive ambient
+    width in both engines instead of claiming a cgroup default that was not enforced; boxed
+    default-width behavior is pinned by each engine's scheduler tests. Other data cells are not
+    compared because timestamps/elapsed/git-SHA differ."""
     dag = (
         '{"steps": [{"group": "g", "job": "a", "cmd": "true"}, '
         '{"group": "g", "job": "b", "cmd": "true", "deps": ["g.a"]}]}'
@@ -1514,8 +1607,16 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
             fh.write(dag)
         py_dir = os.path.join(tmp, "py_store")
         rs_dir = os.path.join(tmp, "rs_store")
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", py_dir, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "--perf-dir", rs_dir, NOFB, ACF))
+        po = run(
+            py,
+            ("run", "--dag", dag_path, "-q", "-s", "1", "-j", "4", "--perf-dir", py_dir,
+             NOFB, "--unsafe-no-cgroups"),
+        )
+        ro = run(
+            rs,
+            ("run", "--dag", dag_path, "-q", "-s", "1", "-j", "4", "--perf-dir", rs_dir,
+             NOFB, "--unsafe-no-cgroups"),
+        )
         label = "profile-store"
         if po.returncode != ro.returncode:
             rep.bad(label, f"run exit py={po.returncode} rs={ro.returncode}")
@@ -1532,6 +1633,26 @@ def compare_profile_store(py: list[str], rs: list[str], rep: Report) -> None:
         if not py_names:
             rep.bad(label, "no profile CSVs were written by either build")
             return
+        py_records = _profile_width_records(py_dir)
+        rs_records = _profile_width_records(rs_dir)
+        expected = (
+            _ambient_width_from_container_class(py_records[0][1])
+            if py_records
+            else None
+        )
+        valid_ambient = (
+            len(py_records) == 2
+            and expected is not None
+            and all(width == str(expected) for width, _container in py_records)
+        )
+        if py_records != rs_records or not valid_ambient:
+            rep.bad(
+                f"{label}:unboxed-ambient-inner-jobs",
+                f"unboxed undeclared steps must record their identity-derived ambient width "
+                f"{expected!r}; py={py_records!r} rs={rs_records!r}",
+            )
+        else:
+            rep.ok(f"{label}:unboxed-ambient-inner-jobs")
         for name in py_names:
             py_hdr, py_eol = _header_and_eol(os.path.join(py_dir, name))
             rs_hdr, rs_eol = _header_and_eol(os.path.join(rs_dir, name))
@@ -1568,7 +1689,8 @@ _FEEDBACK_DAG = {
 #: taken under 60% other-work contention, so the reader must DISCOUNT it back to ~8s (matching the
 #: uncontended 8s sample) — proving contention-discounted median duration recovery. peak_bytes give
 #: the memory model its rss estimates (6 GiB for heavy/solo => a tight --max-mem budget throttles to
-#: -j1). Written with the pinned SYNTH identity so the file name matches what the reader loads.
+#: --max-steps 1). Written with the pinned SYNTH identity so the file name matches what the reader
+#: loads.
 _FEEDBACK_STORE_CSV = (
     "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
     "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
@@ -1797,8 +1919,9 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
         else:
             rep.ok("plan-feedback:no-feedback")
 
-        # Memory-aware sizing fed by the store's rss estimates: both builds must pick the same -j
-        # and throttle below the CPU count (the 6 GiB heavy+solo pair overflows an 8 GiB budget).
+        # Memory-aware sizing fed by the store's rss estimates: both builds must pick the same
+        # --max-steps and throttle below the CPU count (the 6 GiB heavy+solo pair overflows an
+        # 8 GiB budget).
         po = run(
             py,
             ("run", "--dag", dag_path, "-q", "-k", "--max-mem", "8G", "--perf-dir", store,
@@ -1818,11 +1941,15 @@ def compare_plan_feedback(py: list[str], rs: list[str], rep: Report) -> None:
                 f"missing sizing line py={po.stderr!r} rs={ro.stderr!r}",
             )
         elif ps != rss:
-            rep.bad("plan-feedback:sizing", f"(-j, footprint, budget) py={ps} rs={rss}")
+            rep.bad(
+                "plan-feedback:sizing",
+                f"(--max-steps, footprint, budget) py={ps} rs={rss}",
+            )
         elif ps[0] != 1:
             rep.bad(
                 "plan-feedback:sizing",
-                f"expected the store's rss estimates to throttle to -j1; got -j{ps[0]}",
+                "expected the store's rss estimates to throttle to --max-steps 1; "
+                f"got --max-steps {ps[0]}",
             )
         else:
             rep.ok("plan-feedback:sizing")
@@ -2248,26 +2375,125 @@ def _sweep_widths(text: str) -> set[int]:
 
 
 def compare_sweep_success(py: list[str], rs: list[str], rep: Report) -> None:
-    """Exercise a successful sweep and compare its deterministic table structure."""
+    """Exercise a sweep and prove each table width is the width the guest actually received."""
 
     with tempfile.TemporaryDirectory(prefix="sweep-success-cross-") as tmp:
+        observed = os.path.join(tmp, "observed-widths")
+        guest = os.path.join(tmp, "record-width.sh")
+        with open(guest, "w", encoding="utf-8") as handle:
+            handle.write('#!/bin/sh\nprintf "%s\\n" "$1" >> "$OBSERVED_WIDTHS"\n')
+        os.chmod(guest, 0o700)
         path = os.path.join(tmp, "dag.json")
         with open(path, "w", encoding="utf-8") as handle:
-            json.dump({"steps": [{"group": "g", "job": "j", "cmd": "true"}]}, handle)
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "j",
+                            "cmd": shlex.quote(guest),
+                            "jobs_flag": "--workers=",
+                            "env": {"OBSERVED_WIDTHS": observed},
+                        }
+                    ]
+                },
+                handle,
+            )
         args = ("sweep", "--dag", path, "--step", "g.j", "--jobs", "1..2", NOPROF, ACF)
         po = run(py, args)
+        try:
+            with open(observed, encoding="utf-8") as handle:
+                py_observed = handle.read().splitlines()
+        except OSError:
+            py_observed = []
+        try:
+            os.unlink(observed)
+        except FileNotFoundError:
+            pass
         ro = run(rs, args)
+        try:
+            with open(observed, encoding="utf-8") as handle:
+                rs_observed = handle.read().splitlines()
+        except OSError:
+            rs_observed = []
         header = "jobs  wall_s  user_s  sys_s  rss_hwm  speedup(vs j1)"
         if (
             po.returncode == ro.returncode == 0
             and header in po.stdout
             and header in ro.stdout
             and _sweep_widths(po.stdout) == _sweep_widths(ro.stdout) == {1, 2}
+            and py_observed == rs_observed == ["--workers=1", "--workers=2"]
         ):
-            rep.ok("sweep:successful-table")
+            rep.ok("sweep:successful-table-and-guest-width")
         else:
             rep.bad(
-                "sweep:successful-table",
+                "sweep:successful-table-and-guest-width",
+                f"py={po.returncode}:{po.stdout!r}:{po.stderr!r}\n"
+                f"rs={ro.returncode}:{ro.stdout!r}:{ro.stderr!r}\n"
+                f"observed py={py_observed!r} rs={rs_observed!r}",
+            )
+
+
+def compare_spawn_failure(py: list[str], rs: list[str], rep: Report) -> None:
+    """Invalid spawn input must fail promptly and eager-cancel an in-flight sibling."""
+
+    with tempfile.TemporaryDirectory(prefix="spawn-failure-cross-") as tmp:
+        path = os.path.join(tmp, "dag.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "slow",
+                            "cmd": "sleep 10",
+                            "hint": {"est_duration_s": 100.0},
+                        },
+                        {
+                            "group": "g",
+                            "job": "gate",
+                            "cmd": "sleep 0.3",
+                            "hint": {"est_duration_s": 50.0},
+                        },
+                        {
+                            "group": "g",
+                            "job": "spawn",
+                            "cmd": "true",
+                            "deps": ["g.gate"],
+                            "env": {"BAD": "embedded\0nul"},
+                        }
+                    ]
+                },
+                handle,
+            )
+        args = (
+            "run",
+            "--dag",
+            path,
+            "-q",
+            "-s2",
+            "-j2",
+            NOPROF,
+            NOFB,
+            "--unsafe-no-cgroups",
+        )
+        po = run(py, args, timeout_s=8.0)
+        ro = run(rs, args, timeout_s=8.0)
+        py_text = po.stdout + po.stderr
+        rs_text = ro.stdout + ro.stderr
+        if (
+            po.returncode == ro.returncode == 1
+            and "spawn failed" in py_text
+            and "spawn failed" in rs_text
+            and "ABORT" in py_text
+            and "ABORT" in rs_text
+            and "Traceback" not in py_text
+            and "Exception in thread" not in py_text
+        ):
+            rep.ok("run:spawn-failure-returns")
+        else:
+            rep.bad(
+                "run:spawn-failure-returns",
                 f"py={po.returncode}:{po.stdout!r}:{po.stderr!r}\n"
                 f"rs={ro.returncode}:{ro.stdout!r}:{ro.stderr!r}",
             )
@@ -2432,7 +2658,8 @@ INVOCATIONS: tuple[Invocation, ...] = (
     # separately; language-specific install/API fragments intentionally differ.
     Invocation("userguide", ("--userguide",)),
     # `capabilities` prints each engine's machine-readable enforcement manifest (which guards it
-    # actually implements: cpu_timeout, memory_max, oom_detection, pids_guard, wall_timeout). The
+    # actually implements: cpu_affinity, cpu_bandwidth, cpu_timeout, memory_max, oom_detection,
+    # pids_guard, run_timeout, wall_timeout, and write_domains). The
     # WHOLE POINT is that the two engines must enforce the SAME set, so the manifests are asserted
     # byte-identical. This is the recurrence guard for the historical gap where the Rust runner
     # silently did NOT enforce `cpu_timeout` while the Python runner did: with this check, that
@@ -2471,7 +2698,8 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
     """
     command_flags: dict[str, tuple[str, ...]] = {
         "run": (
-            "--dag", "--jobs", "--cores", "--cpuset", "--pin", "--max-mem", "--only",
+            "--dag", "--max-steps", "--jobs", "--cores", "--cpuset", "--pin", "--max-mem",
+            "--only",
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
             "--show-plan", "--no-profile-feedback", "--profile-sync",
             "--profile-sync-direction", "--keep-going", "--run-timeout",
@@ -2786,6 +3014,287 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             rep.bad("cores:unboxed-soft-affinity-refused", f"py={po}\nrs={ro}")
 
 
+def _cpu_guest_dag(
+    widths: Sequence[int],
+    *,
+    duration_s: float,
+    hardcoded_workers: int | None = None,
+    cgroup_parent_levels: int | None = None,
+    barrier_participants: int | None = None,
+) -> dict[str, object]:
+    """One shared DAG whose output path is supplied per engine through the environment."""
+
+    steps: list[object] = []
+    for index, width in enumerate(widths):
+        tag = f"footprint.s{index}"
+        command = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(CPU_FOOTPRINT_GUEST)} "
+            f"--output \"$CPU_FOOTPRINT_OUTPUT\" --step {shlex.quote(tag)} "
+            f"--duration-s {duration_s:g} --sample-ms 10 --start-delay-ms 500"
+        )
+        jobs_flag: str | None = "--workers="
+        if hardcoded_workers is not None:
+            command += f" --workers={hardcoded_workers}"
+            jobs_flag = ""
+        if cgroup_parent_levels is not None:
+            command += (
+                f" --cgroup-parent-levels {cgroup_parent_levels} --cgroup-sample-ms 25"
+            )
+        if barrier_participants is not None:
+            command += (
+                " --barrier-file \"$CPU_FOOTPRINT_BARRIER\" "
+                f"--barrier-participants {barrier_participants} --barrier-timeout-s 10"
+            )
+        steps.append(
+            {
+                "group": "footprint",
+                "job": f"s{index}",
+                "desc": f"CPU footprint width {width}",
+                "cmd": command,
+                "jobs_flag": jobs_flag,
+                "timeout": 15,
+                "cpu_timeout": 120,
+                "hint": {
+                    "preferred_inner_jobs": width,
+                    "hard_mem_max_bytes": 536_870_912,
+                    "est_duration_s": duration_s,
+                },
+            }
+        )
+    return {"steps": steps}
+
+
+def _cpu_facts(log_path: str) -> tuple[FootprintStats, CpuFootprintFacts]:
+    events = load_cpu_events([Path(log_path)])
+    stats = analyze_cpu_footprint(events, bucket_ns=25_000_000)
+    workers: dict[str, set[tuple[int, int]]] = {}
+    for record in events:
+        if record.get("event") != "worker_start":
+            continue
+        step, worker, pid = record.get("step"), record.get("worker"), record.get("pid")
+        if not isinstance(step, str):
+            continue
+        if not isinstance(worker, int) or isinstance(worker, bool):
+            continue
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            continue
+        workers.setdefault(step, set()).add((worker, pid))
+    facts = CpuFootprintFacts(
+        completed_steps=len(stats.step_intervals),
+        workers_per_step=tuple(sorted(len(entries) for entries in workers.values())),
+        max_live_steps=stats.max_live_steps,
+        max_live_workers=stats.max_live_workers,
+    )
+    return stats, facts
+
+
+def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> None:
+    """Cross-check independent ``-s`` active-step and ``-j`` aggregate-width enforcement."""
+
+    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-cpu-limits-") as td:
+        invalid_dag = os.path.join(td, "valid.json")
+        Path(invalid_dag).write_text(
+            '{"steps":[{"group":"g","job":"ok","cmd":"true"}]}', encoding="utf-8"
+        )
+        invalid_cases: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("max-steps-spaced-zero", ("-s", "0")),
+            ("max-steps-bare-zero", ("-s0",)),
+            ("max-steps-invalid", ("--max-steps", "nope")),
+            ("max-steps-i64-overflow", ("--max-steps", "9223372036854775808")),
+            ("jobs-spaced-zero", ("-j", "0")),
+            ("jobs-bare-zero", ("-j0",)),
+            ("jobs-invalid", ("--jobs", "nope")),
+            ("jobs-i64-overflow", ("--jobs", "9223372036854775808")),
+        )
+        for label, flags in invalid_cases:
+            args = (
+                "run", "--dag", invalid_dag, *flags, NOPROF, NOFB, "--unsafe-no-cgroups",
+            )
+            po, ro = run(py, args), run(rs, args)
+            if po.returncode == ro.returncode == 2 and po.stderr and ro.stderr:
+                rep.ok(f"run-limits:invalid/{label}")
+            else:
+                rep.bad(f"run-limits:invalid/{label}", f"py={po}\nrs={ro}")
+
+        cases: tuple[
+            tuple[str, tuple[int, ...], tuple[str, ...], CpuFootprintFacts], ...
+        ] = (
+            (
+                "step-cap-two-cpu-budget-four",
+                (2, 2, 2, 2),
+                ("-s", "2", "-j", "4"),
+                CpuFootprintFacts(4, (2, 2, 2, 2), 2, 4),
+            ),
+            (
+                "bare-step-four-cpu-budget-two",
+                (1, 1, 1, 1),
+                ("-s4", "-j2"),
+                CpuFootprintFacts(4, (1, 1, 1, 1), 2, 2),
+            ),
+            (
+                "authored-width-capped-to-j",
+                (5,),
+                ("--max-steps=4", "--jobs=2"),
+                CpuFootprintFacts(1, (2,), 1, 2),
+            ),
+        )
+        for label, widths, flags, expected in cases:
+            dag_path = os.path.join(td, f"{label}.json")
+            barrier_participants = expected.max_live_steps if expected.max_live_steps > 1 else None
+            Path(dag_path).write_text(
+                json.dumps(
+                    _cpu_guest_dag(
+                        widths,
+                        duration_s=1.5 if expected.max_live_steps > 1 else 0.4,
+                        barrier_participants=barrier_participants,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            logs = {name: os.path.join(td, f"{label}-{name}.jsonl") for name in ("py", "rs")}
+            args = (
+                "run", "--dag", dag_path, *flags, "-q", NOPROF, NOFB,
+                "--unsafe-no-cgroups",
+            )
+            extra = {
+                name: {
+                    "CPU_FOOTPRINT_OUTPUT": path,
+                    "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
+                    "CPU_FOOTPRINT_BARRIER": os.path.join(td, f"{label}-{name}.barrier"),
+                }
+                for name, path in logs.items()
+            }
+            outcomes = {"py": run(py, args, extra["py"]), "rs": run(rs, args, extra["rs"])}
+            if any(outcome.returncode != 0 for outcome in outcomes.values()):
+                rep.bad(f"run-limits:{label}", f"py={outcomes['py']}\nrs={outcomes['rs']}")
+                continue
+            try:
+                analyzed = {name: _cpu_facts(path) for name, path in logs.items()}
+            except (OSError, ValueError) as exc:
+                rep.bad(f"run-limits:{label}", f"could not analyze guest evidence: {exc}")
+                continue
+            facts = {name: pair[1] for name, pair in analyzed.items()}
+            verdicts = {
+                name: check_cpu_limits(
+                    pair[0],
+                    max_steps=expected.max_live_steps,
+                    max_workers=expected.max_live_workers,
+                )
+                for name, pair in analyzed.items()
+            }
+            if facts["py"] != facts["rs"]:
+                rep.bad(
+                    f"run-limits:{label}",
+                    f"normalized facts py={facts['py']} rs={facts['rs']}",
+                )
+            elif facts["py"] != expected:
+                rep.bad(
+                    f"run-limits:{label}",
+                    f"expected {expected}, observed {facts['py']} "
+                    "(CPU-ID union intentionally ignored)",
+                )
+            elif not all(verdict.ok for verdict in verdicts.values()):
+                rep.bad(f"run-limits:{label}", f"limit verdicts={verdicts}")
+            else:
+                rep.ok(f"run-limits:{label}")
+
+
+def _boxing_capability_unavailable(outcome: Outcome) -> bool:
+    combined = outcome.stdout + outcome.stderr
+    return outcome.returncode == 3 and (
+        "systemd --user scope is unavailable" in combined
+        or "scope setup was attempted and failed" in combined
+        or ("cgroup boxing could not be established" in combined and "unavailable" in combined)
+    )
+
+
+def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> None:
+    """Where available, anchor ``-j`` to the live run-scope quota and aggregate CPU counters."""
+
+    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-boxed-cpu-") as td:
+        dag_path = os.path.join(td, "dag.json")
+        # The declared width is one, so the scheduler admits both steps under J=2. Each guest then
+        # adversarially creates four workers: live tasks and sampled CPU IDs may exceed J, while
+        # the parent cgroup's long-window CPU bandwidth must not.
+        Path(dag_path).write_text(
+            json.dumps(
+                _cpu_guest_dag(
+                    (1, 1),
+                    duration_s=1.75,
+                    hardcoded_workers=4,
+                    cgroup_parent_levels=1,
+                    barrier_participants=2,
+                )
+            ),
+            encoding="utf-8",
+        )
+        logs = {name: os.path.join(td, f"boxed-{name}.jsonl") for name in ("py", "rs")}
+        args = (
+            "run", "--dag", dag_path, "-s2", "-j2", "-q", NOPROF, NOFB,
+        )
+        extra = {
+            name: {
+                "CPU_FOOTPRINT_OUTPUT": path,
+                "CPU_FOOTPRINT_BARRIER": os.path.join(td, f"boxed-{name}.barrier"),
+                "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS": "1",
+                "SAFE_CI_FORCE_SCOPE_ATTEMPT": "1",
+            }
+            for name, path in logs.items()
+        }
+        outcomes = {"py": run(py, args, extra["py"]), "rs": run(rs, args, extra["rs"])}
+        unavailable = {name: _boxing_capability_unavailable(out) for name, out in outcomes.items()}
+        if all(unavailable.values()):
+            print(
+                "cross[safe-ci-dag-runner]: SKIP boxed CPU-bandwidth differential: "
+                "cgroup-v2 + a working systemd --user scope are unavailable"
+            )
+            rep.ok("boxed-cpu-bandwidth:capability-unavailable")
+            return
+        if any(unavailable.values()) or any(out.returncode != 0 for out in outcomes.values()):
+            rep.bad("boxed-cpu-bandwidth", f"py={outcomes['py']}\nrs={outcomes['rs']}")
+            return
+
+        normalized: dict[str, tuple[bool, ...]] = {}
+        details: dict[str, object] = {}
+        try:
+            for name, path in logs.items():
+                events = load_cpu_events([Path(path)])
+                stats = analyze_cpu_footprint(events, bucket_ns=100_000_000)
+                facts = _cpu_facts(path)[1]
+                limits = check_cpu_limits(stats, max_steps=2)
+                bandwidth = check_cgroup_bandwidth(
+                    events, min_window_periods=10, scheduler_slack_usec=100_000
+                )
+                normalized[name] = (
+                    facts.completed_steps == 2,
+                    facts.workers_per_step == (4, 4),
+                    facts.max_live_steps <= 2,
+                    facts.max_live_workers > 2,
+                    limits.ok,
+                    bandwidth.checkable,
+                    bandwidth.ok,
+                    bandwidth.quota_cores == (2.0,),
+                )
+                details[name] = {
+                    "facts": facts,
+                    "quota_cores": bandwidth.quota_cores,
+                    "checked_windows": bandwidth.checked_windows,
+                    "bandwidth_violations": bandwidth.violations,
+                    # sampled_cpu_union is intentionally absent: migration/CPU identity is not
+                    # an aggregate CPU-bandwidth or simultaneous-worker invariant.
+                }
+        except (OSError, ValueError) as exc:
+            rep.bad("boxed-cpu-bandwidth", f"could not analyze boxed guest evidence: {exc}")
+            return
+        expected = (True,) * 8
+        if normalized.get("py") != normalized.get("rs"):
+            rep.bad("boxed-cpu-bandwidth", f"normalized={normalized}; details={details}")
+        elif normalized.get("py") != expected:
+            rep.bad("boxed-cpu-bandwidth", f"invariants={normalized}; details={details}")
+        else:
+            rep.ok("boxed-cpu-bandwidth")
+
+
 def compare_pin_run(py: list[str], rs: list[str], rep: Report) -> None:
     """Exercise shared reservation semantics through the paired safe-runner wrapper."""
     with tempfile.TemporaryDirectory(prefix="safe-ci-cross-pin-") as td:
@@ -2862,6 +3371,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_test_attribution_evidence(py, rs, rep)
     compare_batch_teardown_grace(py, rs, rep)
     compare_run_timeout(py, rs, rep)
+    compare_spawn_failure(py, rs, rep)
     compare_profile_store(py, rs, rep)
     compare_plan_feedback(py, rs, rep)
     compare_hostile_numeric_cells(py, rs, rep)
@@ -2871,6 +3381,8 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_sweep_success(py, rs, rep)
     compare_sweep_errors(py, rs, rep)
     compare_args_stress(py, rs, rep)
+    compare_run_parallel_limits(py, rs, rep)
+    compare_boxed_cpu_bandwidth(py, rs, rep)
     compare_pin_run(py, rs, rep)
     yaml_paths = yaml_fixture_paths()
     n_fixtures = len(fixtures) + len(examples) + len(yaml_paths)

@@ -165,7 +165,7 @@ pub struct WriteDomainPolicy {
 /// Per-step scheduling knowledge: scarce-resource demand, cost estimate, memory.
 ///
 /// Every field is optional (has a default). With none supplied the runner falls back to a
-/// fixed concurrency with no memory model; supplying them enables memory-aware `-j` sizing and
+/// fixed concurrency with no memory model; supplying them enables memory-aware active-step sizing and
 /// longest-processing-time dispatch ordering.
 #[derive(Debug, Clone, Default)]
 pub struct ResourceHint {
