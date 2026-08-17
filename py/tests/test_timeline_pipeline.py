@@ -53,6 +53,7 @@ from agent_team_timeline.pipeline import (
     record_run,
     summarize_archive,
 )
+from agent_team_timeline.render import prune_retired_query_artifacts
 from agent_team_timeline.server import make_server
 from agent_team_timeline.summarize import PLAIN_LANGUAGE_ROLLUP_STYLE, SummaryResult
 from agent_team_timeline.terminology import GlossaryTerm, glossary_term_id
@@ -295,12 +296,28 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert index_text.index("markdown-it-15.0.0.min.js") < index_text.index("timeline-core.js")
     assert index_text.index("timeline-core.js") < index_text.index("app.js")
     generated_makefile = (tmp_path / "Makefile").read_text(encoding="utf-8")
-    assert generated_makefile.startswith(".PHONY: serve")
-    assert "run-stats:\n\tpython3 run_stats.py\n" in generated_makefile
+    assert generated_makefile.startswith(".DEFAULT_GOAL := help")
+    assert "help:\n" in generated_makefile
+    assert "run-stats:\n\t$(PYTHON) ./run_stats.py\n" in generated_makefile
     assert "query:\n\t@./timeline $(QUERY_ARGS)\n" in generated_makefile
+    make_environment = dict(os.environ)
+    for variable in ("MAKEFLAGS", "MFLAGS", "MAKELEVEL"):
+        make_environment.pop(variable, None)
+    make_help = subprocess.run(
+        ("make", "help"),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=make_environment,
+    )
+    assert make_help.returncode == 0, make_help.stderr
+    assert "Agent timeline archive commands:" in make_help.stdout
+    assert "./timeline --help" in make_help.stdout
     assert (tmp_path / "run_stats.py").is_file()
     assert (tmp_path / "run_stats.py").stat().st_mode & 0o111
     assert (tmp_path / "timeline").stat().st_mode & 0o111
+    assert not (tmp_path / "query.py").exists()
     timeline_gzip = tmp_path / "data" / "timeline.json.gz"
     assert gzip.decompress(timeline_gzip.read_bytes()) == (
         tmp_path / "data" / "timeline.json"
@@ -325,7 +342,10 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     )
     assert "Content-Encoding" in (tmp_path / "serve.py").read_text(encoding="utf-8")
     generated_readme = (tmp_path / "README.md").read_text(encoding="utf-8")
+    assert "## Human-facing methods" in generated_readme
     assert "## Read-only query quickstart" in generated_readme
+    assert "## Top-level map" in generated_readme
+    assert "There is deliberately no second query launcher" in generated_readme
     assert "./timeline agents --team TEAM --format jsonl" in generated_readme
     assert "./timeline show phase:TEAM::PHASE_ID --transcript" in generated_readme
     assert "data/export.json" in generated_readme
@@ -528,6 +548,51 @@ def test_cached_pipeline_builds_self_contained_site_idempotently(tmp_path: Path)
     assert run["summaries"]["service_tier"] is None
     assert run["summaries"]["newly_spent_usage"]["total_tokens"] == 0
     assert run["summaries"]["usage_run_paths"] == list(second.usage_run_paths)
+
+
+def test_rebuild_prunes_retired_query_alias_and_only_its_cache(
+    tmp_path: Path,
+) -> None:
+    team = _team()
+    _write_team(tmp_path, team)
+    build_archive(tmp_path, team.team_slug)
+
+    retired = tmp_path / "query.py"
+    retired.write_bytes((tmp_path / "timeline").read_bytes())
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    retired_cache = cache / "query.cpython-312.pyc"
+    retained_cache = cache / "operator_helper.cpython-312.pyc"
+    retired_cache.write_bytes(b"retired generated cache")
+    retained_cache.write_bytes(b"unrelated cache")
+    export_path = tmp_path / "data" / "export.json"
+    export = json.loads(export_path.read_text(encoding="utf-8"))
+    export["generated_files"].append("query.py")
+    write_json_if_changed(export_path, export)
+
+    rebuilt = build_archive(tmp_path, team.team_slug)
+
+    assert rebuilt["files_changed"] >= 3
+    assert not retired.exists()
+    assert not retired_cache.exists()
+    assert retained_cache.read_bytes() == b"unrelated cache"
+    updated = json.loads(export_path.read_text(encoding="utf-8"))
+    assert "query.py" not in updated["generated_files"]
+
+
+def test_retired_query_cleanup_preserves_unowned_custom_launcher(
+    tmp_path: Path,
+) -> None:
+    custom = tmp_path / "query.py"
+    custom.write_text("print('custom operator helper')\n", encoding="utf-8")
+    cache = tmp_path / "__pycache__"
+    cache.mkdir()
+    custom_cache = cache / "query.cpython-312.pyc"
+    custom_cache.write_bytes(b"custom cache")
+
+    assert prune_retired_query_artifacts(tmp_path) == 0
+    assert custom.read_text(encoding="utf-8") == "print('custom operator helper')\n"
+    assert custom_cache.read_bytes() == b"custom cache"
 
 
 def test_append_catchup_keeps_completed_historical_overview_stable(
@@ -2217,7 +2282,7 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         assert detail_path.is_file()
         assert phase["detail_path"].startswith(f"data/details/{phase['team']}/")
     assert (output / "Makefile").is_file()
-    assert (output / "query.py").is_file()
+    assert not (output / "query.py").exists()
     assert (output / "timeline").stat().st_mode & 0o111
     query_result = subprocess.run(
         (
@@ -2245,7 +2310,9 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
     assert make_query_result.returncode == 0, make_query_result.stderr
     assert json.loads(make_query_result.stdout)["count"] == 2
     exported_readme = (output / "README.md").read_text(encoding="utf-8")
+    assert "## Human-facing methods" in exported_readme
     assert "## Read-only query quickstart" in exported_readme
+    assert "## Top-level map" in exported_readme
     assert "./timeline agents --team TEAM --format jsonl" in exported_readme
     assert "./timeline show phase:TEAM::PHASE_ID --transcript" in exported_readme
     assert "data/export.json" in exported_readme
@@ -2254,6 +2321,7 @@ def test_combined_export_namespaces_teams_and_is_byte_idempotent(
         (output / "data" / "export.json").read_text(encoding="utf-8")
     )
     assert export_manifest["teams"] == ["claude-test", first_team.team_slug]
+    assert "query.py" not in export_manifest["generated_files"]
     assert "data/timeline.json.gz" in export_manifest["generated_files"]
     assert "data/timeline-v2.json" in export_manifest["generated_files"]
     assert any(

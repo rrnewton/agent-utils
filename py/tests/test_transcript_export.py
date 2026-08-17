@@ -102,8 +102,10 @@ def test_export_is_idempotent_and_monotonic_across_missing_source_records(
     assert report.prompts == 2
     assert report.responses == 1
     assert report.system_inputs == 1
-    assert report.files_changed == 9
+    assert report.files_changed == 8
     assert export_transcripts(tmp_path, (first,)).files_changed == 0
+    assert (tmp_path / "timeline").is_file()
+    assert not (tmp_path / "query.py").exists()
 
     # Simulate a provider rewrite that drops an old prompt/response while exposing
     # newly discovered earlier history. The durable occurrence set only grows.

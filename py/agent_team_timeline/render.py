@@ -637,18 +637,102 @@ def standalone_query_source() -> str:
 
 
 def archive_makefile() -> str:
-    """Return optional compatibility wrappers for common archive commands."""
+    """Return discoverable wrappers for the archive's human-facing commands."""
 
     return (
-        ".PHONY: serve open run-stats query prompts\n"
+        ".DEFAULT_GOAL := help\n"
+        ".PHONY: help serve open run-stats query prompts\n"
+        "PYTHON ?= python3\n"
         "PORT ?= 8765\n"
         "QUERY_ARGS ?= teams\n\n"
         "PROMPT_ARGS ?=\n\n"
-        "serve:\n\tpython3 serve.py --port $(PORT)\n\n"
-        "open:\n\tpython3 serve.py --port $(PORT) --open\n\n"
-        "run-stats:\n\tpython3 run_stats.py\n\n"
+        "help:\n"
+        "\t@printf '%s\\n' \\\n"
+        "\t  'Agent timeline archive commands:' \\\n"
+        "\t  '  make serve                 Serve the website on PORT (default 8765)' \\\n"
+        "\t  '  make open                  Serve it and ask Python to open a browser' \\\n"
+        "\t  '  make run-stats             Print recorded pipeline runs and token costs' \\\n"
+        "\t  '  make query QUERY_ARGS=...  Run the read-only ./timeline CLI' \\\n"
+        "\t  '  make prompts PROMPT_ARGS=...  Print owner prompts' \\\n"
+        "\t  '  ./timeline --help          Discover all query and search commands' \\\n"
+        "\t  '' \\\n"
+        "\t  'Variables: PORT, PYTHON, QUERY_ARGS, PROMPT_ARGS'\n\n"
+        "serve:\n\t$(PYTHON) ./serve.py --port $(PORT)\n\n"
+        "open:\n\t$(PYTHON) ./serve.py --port $(PORT) --open\n\n"
+        "run-stats:\n\t$(PYTHON) ./run_stats.py\n\n"
         "query:\n\t@./timeline $(QUERY_ARGS)\n\n"
         "prompts:\n\t@./timeline prompts $(PROMPT_ARGS)\n"
+    )
+
+
+def archive_readme(
+    heading: str,
+    introduction: str,
+    export_window_note: str,
+) -> str:
+    """Return the human guide installed at the root of a generated archive."""
+
+    return (
+        f"# {heading}\n\n"
+        f"{introduction}\n\n"
+        "## Start here\n\n"
+        "```bash\n"
+        "make help\n"
+        "make serve\n"
+        "# open http://127.0.0.1:8765/\n"
+        "```\n\n"
+        "Do not open `index.html` directly: browsers block its JSON requests from `file://`. "
+        "Use `PORT=9000 make serve` to choose another port, or `make open` to ask Python "
+        "to open the browser. The bundled server negotiates deterministic gzip sidecars and "
+        "revalidates cached files.\n\n"
+        "## Human-facing methods\n\n"
+        "- `./timeline`: canonical, dependency-free, read-only CLI for teams, agents, phases, "
+        "prompts, messages, full-text search, and stable references. Start with "
+        "`./timeline --help`.\n"
+        "- `./serve.py`: local static web server used by `make serve` and `make open`. Start "
+        "with `./serve.py --help` when calling it directly.\n"
+        "- `./run_stats.py`: prints pipeline-run status and recorded model-token costs; "
+        "`make run-stats` is the convenient wrapper.\n"
+        "- `Makefile`: discoverable wrappers for those methods. Plain `make` and `make help` "
+        "print the command summary without starting a server.\n\n"
+        "There is deliberately no second query launcher: `./timeline` is the single supported "
+        "archive-local CLI.\n\n"
+        "## Read-only query quickstart\n\n"
+        "Prompt output defaults to readable text; supported formats are `json`, `jsonl`, "
+        "`markdown`, and `text`. Copy a stable reference returned by a list command or "
+        "`search` into `show`; references use `team:TEAM`, `agent:TEAM::ID`, "
+        "`phase:TEAM::ID`, or `rollup:TEAM::KIND::START_MS`.\n\n"
+        "```bash\n"
+        "./timeline teams\n"
+        "./timeline agents --team TEAM --format jsonl\n"
+        "./timeline show agent:TEAM::AGENT_ID --format markdown\n"
+        "./timeline show phase:TEAM::PHASE_ID --transcript --format markdown\n"
+        "./timeline search \"SEARCH TEXT\" --in owner-prompts --limit 20\n"
+        "./timeline search \"SEARCH TEXT\" --in agent-responses --limit 20\n"
+        "./timeline search \"SEARCH TEXT\" --in all-transcript --limit 20\n"
+        "./timeline prompts --range 200-300\n"
+        "./timeline prompts --format jsonl > prompts.jsonl\n"
+        "```\n\n"
+        "When present, `extracted/transcripts/prompts.jsonl` is the complete mechanical prompt "
+        "report and `messages.jsonl` adds mechanically associated responses.\n\n"
+        "## Top-level map\n\n"
+        "- `README.md`, `Makefile`, `timeline`, `serve.py`, and `run_stats.py` are the human "
+        "entrypoints described above.\n"
+        "- `index.html`, `app.js`, `timeline-core.js`, `style.css`, and `vendor/` are the "
+        "generated offline website payload.\n"
+        "- `manifest.json`, when present, is the latest pipeline-run status; `runs/` contains "
+        "append-only per-run receipts and token accounting.\n"
+        "- `data/` is the generated website/query projection; its `export.json` inventories "
+        "presentation-owned files and the selected time window.\n"
+        "- `extracted/` contains zero-token mechanical transcript projections when extraction "
+        "has run.\n"
+        "- `teams/` contains per-team normalized inputs, cached summaries, and published "
+        "Markdown summaries.\n"
+        "- `qa/`, when present, contains human- or automation-produced validation evidence.\n"
+        "- `.agent-team-timeline.json` marks this as a managed archive, "
+        "`.agent-team-timeline.lock` serializes writers, and `.gitignore` identifies local-only "
+        "state. None is a user command.\n\n"
+        f"{export_window_note}\n"
     )
 
 
@@ -754,7 +838,6 @@ _PRESENTATION_COMMON = frozenset(
         "style.css",
         "serve.py",
         "run_stats.py",
-        "query.py",
         "timeline",
         "Makefile",
         "README.md",
@@ -763,6 +846,7 @@ _PRESENTATION_COMMON = frozenset(
         "vendor/markdown-it-LICENSE.txt",
     }
 )
+_PRESENTATION_RETIRED = frozenset({"query.py"})
 
 
 def _safe_presentation_file(relative: str) -> str:
@@ -774,7 +858,7 @@ def _safe_presentation_file(relative: str) -> str:
         part in ("", ".", "..") for part in path.parts
     ):
         raise ValueError(f"unsafe presentation manifest path: {relative!r}")
-    if base in _PRESENTATION_COMMON or base in {
+    if base in _PRESENTATION_COMMON or base in _PRESENTATION_RETIRED or base in {
         _PRESENTATION_MANIFEST,
         "data/timeline.json",
         "data/timeline-v2.json",
@@ -836,6 +920,55 @@ def _remove_stale_presentation_files(
         if path.is_file():
             path.unlink()
             changed += 1
+    return changed
+
+
+def prune_retired_query_artifacts(
+    archive: Path,
+    *,
+    manifest_owned: bool = False,
+) -> int:
+    """Remove the retired generated ``query.py`` alias and only its bytecode cache.
+
+    A manifest-owned launcher is already known to be presentation output. Without that
+    ownership record, the launcher is removed only when its bytes still equal the bundled
+    source. A modified or symlinked user file is left alone. The narrowly named bytecode cache
+    is cleaned only for a managed archive or when this call recognized the generated launcher.
+    """
+
+    launcher = archive / "query.py"
+    recognized_launcher = manifest_owned
+    if launcher.exists() or launcher.is_symlink():
+        if launcher.is_symlink() or not launcher.is_file():
+            if manifest_owned:
+                raise ValueError(f"retired generated query launcher is unsafe: {launcher}")
+            return 0
+        if manifest_owned or launcher.read_bytes() == standalone_query_source().encode("utf-8"):
+            launcher.unlink()
+            recognized_launcher = True
+            changed = 1
+        else:
+            return 0
+    else:
+        changed = 0
+
+    marker = archive / ".agent-team-timeline.json"
+    if not recognized_launcher and (not marker.is_file() or marker.is_symlink()):
+        return changed
+    cache = archive / "__pycache__"
+    if not cache.exists():
+        return changed
+    if cache.is_symlink() or not cache.is_dir():
+        raise ValueError(f"retired query bytecode cache is unsafe: {cache}")
+    for candidate in sorted(cache.glob("query.*.pyc")):
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError(f"retired query bytecode entry is unsafe: {candidate}")
+        candidate.unlink()
+        changed += 1
+    try:
+        cache.rmdir()
+    except OSError:
+        pass
     return changed
 
 
@@ -1099,13 +1232,6 @@ def render_archive(
     )
     changed += int(
         write_text_if_changed(
-            _generated_path(archive, "query.py"),
-            standalone_query_source(),
-            executable=True,
-        )
-    )
-    changed += int(
-        write_text_if_changed(
             _generated_path(archive, "timeline"),
             standalone_query_source(),
             executable=True,
@@ -1120,34 +1246,14 @@ def render_archive(
     changed += int(
         write_text_if_changed(
             _generated_path(archive, "README.md"),
-            f"# {team.team_slug} agent-team timeline\n\n"
-            "This directory is a self-contained, version-controllable timeline archive.\n\n"
-            "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
-            "Use `make open` to ask Python to open the browser and `make run-stats` to print "
-            "every pipeline run and exact recorded model-token costs. Do not open `index.html` "
-            "directly: browsers block the JSON fetch from `file://`. The bundled server "
-            "negotiates deterministic gzip sidecars and revalidates cached files.\n\n"
-            "## Read-only query quickstart\n\n"
-            "Run `./timeline --help` for the archive-local, dependency-free Python CLI. Prompt "
-            "output defaults to readable text; the supported formats are `json`, `jsonl`, "
-            "`markdown`, and `text`. Copy a stable reference returned by a list command or "
-            "`search` into `show`; references use `team:TEAM`, `agent:TEAM::ID`, "
-            "`phase:TEAM::ID`, or `rollup:TEAM::KIND::START_MS`.\n\n"
-            "```bash\n"
-            "./timeline teams\n"
-            "./timeline agents --team TEAM --format jsonl\n"
-            "./timeline show agent:TEAM::AGENT_ID --format markdown\n"
-            "./timeline show phase:TEAM::PHASE_ID --transcript --format markdown\n"
-            "./timeline search \"SEARCH TEXT\" --scope all --limit 20\n"
-            "./timeline prompts --range 200-300\n"
-            "./timeline prompts --format jsonl > prompts.jsonl\n"
-            "```\n\n"
-            "When this package contains the optional mechanical transcript projection, its full "
-            "prompt report is `extracted/transcripts/prompts.jsonl`; `messages.jsonl` adds "
-            "mechanically associated coordinator responses.\n\n"
-            "For an exported package, the requested slice is recorded in `data/export.json` "
-            "under `display_window`; `./timeline` reports the actual team and record intervals. "
-            "Do not infer the slice from file modification times.\n",
+            archive_readme(
+                f"{team.team_slug} agent-team timeline",
+                "This directory is a self-contained, version-controllable timeline archive.",
+                "For an exported package, the requested slice is recorded in "
+                "`data/export.json` under `display_window`; `./timeline` reports the actual "
+                "team and record intervals. Do not infer the slice from file modification "
+                "times.",
+            ),
         )
     )
 
@@ -1435,8 +1541,13 @@ def render_archive(
             generated_files.add(relative + ".gz")
     for relative in generated_files:
         _safe_presentation_file(relative)
+    retired_query_was_managed = "query.py" in previous_presentation_files
     changed += _remove_stale_presentation_files(
         archive, previous_presentation_files, generated_files
+    )
+    changed += prune_retired_query_artifacts(
+        archive,
+        manifest_owned=retired_query_was_managed,
     )
     generated_values: list[JsonValue] = []
     for relative in sorted(generated_files):

@@ -22,7 +22,11 @@ from agent_team_timeline.archive import (
     write_text_if_changed,
 )
 from agent_team_timeline.model import Event, TeamData, source_digest
-from agent_team_timeline.render import archive_makefile, standalone_query_source
+from agent_team_timeline.render import (
+    archive_makefile,
+    prune_retired_query_artifacts,
+    standalone_query_source,
+)
 
 
 TRANSCRIPT_EXPORT_SCHEMA_VERSION = 1
@@ -1118,15 +1122,11 @@ def export_transcripts(
     changed += int(write_text_if_changed(root / "manifest.json", canonical_json(manifest)))
     changed += int(
         write_text_if_changed(
-            archive / "query.py", standalone_query_source(), executable=True
-        )
-    )
-    changed += int(
-        write_text_if_changed(
             archive / "timeline", standalone_query_source(), executable=True
         )
     )
     changed += int(write_text_if_changed(archive / "Makefile", archive_makefile()))
+    changed += prune_retired_query_artifacts(archive)
     return TranscriptExportReport(
         teams=len(ordered_teams),
         prompts=len(prompts),

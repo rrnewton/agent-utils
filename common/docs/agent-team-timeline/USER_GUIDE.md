@@ -681,7 +681,7 @@ example-team/
 ├── .agent-team-timeline.json
 ├── index.html, timeline-core.js, app.js, style.css
 ├── vendor/markdown-it-15.0.0.min.js  # pinned offline Markdown renderer + license
-├── timeline, query.py, Makefile, serve.py, run_stats.py, README.md
+├── timeline, Makefile, serve.py, run_stats.py, README.md
 ├── manifest.json
 ├── runs/<timestamp>-<hash>.json
 ├── extracted/transcripts/
@@ -943,8 +943,10 @@ summary/detail search. Search-v2-only flags require `--in`; they are rejected ra
 ignored. `--agent` restricts work-phase and transcript results to one canonical agent reference.
 Time bounds are half-open RFC3339 instants. Timeline queries read deterministic static projection
 files, while prompt/message queries read the manifest-bound extracted JSONL. Neither invokes a model
-or alters the archive. The older `query.py` and Make targets remain compatibility wrappers; new
-automation should call `./timeline` directly.
+or alters the archive. `./timeline` is the sole generated query launcher. The Make targets are
+documented convenience wrappers, and plain `make` prints their help instead of starting a server.
+Older archives with the retired, byte-identical `query.py` alias remain readable; a rebuild removes
+that generated alias without changing the internal `agent_team_timeline.query` implementation.
 
 ```bash
 agent-team-timeline inspect --output ./timelines/example-team

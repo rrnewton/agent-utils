@@ -164,7 +164,10 @@ in `ai_docs/PAYLOAD_SCALING.md`.
 The installed `agent-team-timeline query` command and the archive-local `./timeline` Python
 entrypoint read the deterministic presentation projection rather than model-cache internals. The
 archive entrypoint is dependency-free, resolves its default archive from its own directory, and is
-copied byte-for-byte with the compatibility `query.py` launcher. Their only inputs are
+the single generated archive-local query launcher. Older archives may still contain the retired,
+byte-identical `query.py` alias; readers remain compatible with it, while the next presentation
+rebuild safely removes the manifest-owned alias and its narrowly named bytecode cache. The CLI's
+only inputs are
 `data/timeline.json`, the generation-matched schema-2 bootstrap and immutable objects, referenced
 `data/details/*.json`, and referenced rollup Markdown beneath the selected archive root. Search
 objects are accepted only when the bootstrap digest, team set, and time range match the loaded

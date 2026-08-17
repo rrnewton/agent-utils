@@ -27,8 +27,9 @@ from agent_team_timeline.pipeline import (
     _ensure_archive,
     load_archived_team,
 )
-from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
 from agent_team_timeline.model import TeamData
+from agent_team_timeline.periods import DEFAULT_ROLLUP_KINDS
+from agent_team_timeline.render import archive_readme, prune_retired_query_artifacts
 from agent_team_timeline.search_index import build_search_records
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
@@ -49,13 +50,13 @@ _COMMON_FILES = (
     "style.css",
     "serve.py",
     "run_stats.py",
-    "query.py",
     "timeline",
     "Makefile",
     "vendor/README.md",
     "vendor/markdown-it-15.0.0.min.js",
     "vendor/markdown-it-LICENSE.txt",
 )
+_RETIRED_COMMON_FILES = frozenset({"query.py"})
 
 
 @dataclass(frozen=True)
@@ -413,7 +414,10 @@ def _safe_generated_path(raw: str) -> PurePosixPath:
             raise ValueError(f"nested gzip sidecar in export manifest: {raw!r}")
         _safe_generated_path(raw.removesuffix(".gz"))
         return path
-    if raw in _COMMON_FILES or raw in {"README.md", _EXPORT_MANIFEST}:
+    if raw in _COMMON_FILES or raw in _RETIRED_COMMON_FILES or raw in {
+        "README.md",
+        _EXPORT_MANIFEST,
+    }:
         return path
     if (
         len(path.parts) >= 4
@@ -740,36 +744,14 @@ def _build_combined_archive_locked(
                     ),
                 )
             )
-        readme = (
-            "# Combined agent-team timeline\n\n"
-            "Teams: " + ", ".join(f"`{slug}`" for slug in ordered_slugs) + "\n\n"
-            "This directory is a self-contained, zero-token export of cached summaries.\n\n"
-            "```bash\nmake serve\n# open http://127.0.0.1:8765/\n```\n\n"
-            "Use `make open` to ask Python to open the browser and `make run-stats` to inspect "
-            "recorded pipeline runs. Do not open `index.html` directly: browsers block the JSON "
-            "fetch from `file://`. The bundled server negotiates deterministic gzip sidecars and "
-            "revalidates cached files.\n\n"
-            "## Read-only query quickstart\n\n"
-            "Run `./timeline --help` for the archive-local, dependency-free Python CLI. Prompt "
-            "output defaults to readable text; the supported formats are `json`, `jsonl`, "
-            "`markdown`, and `text`. Copy a stable reference returned by a list command or "
-            "`search` into `show`; references use `team:TEAM`, `agent:TEAM::ID`, "
-            "`phase:TEAM::ID`, or `rollup:TEAM::KIND::START_MS`.\n\n"
-            "```bash\n"
-            "./timeline teams\n"
-            "./timeline agents --team TEAM --format jsonl\n"
-            "./timeline show agent:TEAM::AGENT_ID --format markdown\n"
-            "./timeline show phase:TEAM::PHASE_ID --transcript --format markdown\n"
-            "./timeline search \"SEARCH TEXT\" --scope all --limit 20\n"
-            "./timeline prompts --range 200-300\n"
-            "./timeline prompts --format jsonl > prompts.jsonl\n"
-            "```\n\n"
-            "When this package contains the optional mechanical transcript projection, its full "
-            "prompt report is `extracted/transcripts/prompts.jsonl`; `messages.jsonl` adds "
-            "mechanically associated coordinator responses.\n\n"
+        readme = archive_readme(
+            "Combined agent-team timeline",
+            "Teams: "
+            + ", ".join(f"`{slug}`" for slug in ordered_slugs)
+            + "\n\nThis directory is a self-contained, zero-token export of cached summaries.",
             "The requested export slice is recorded in `data/export.json` under "
-            "`display_window`; `./timeline` reports the actual team and record intervals. Do not "
-            "infer the slice from file modification times.\n"
+            "`display_window`; `./timeline` reports the actual team and record intervals. "
+            "Do not infer the slice from file modification times.",
         )
         changed += int(
             write_text_if_changed(_output_path(output, "README.md"), readme)
@@ -810,7 +792,12 @@ def _build_combined_archive_locked(
             ),
             "combined export manifest",
         )
+        retired_query_was_managed = "query.py" in previous_files
         changed += _remove_stale_files(output, previous_files, generated_files)
+        changed += prune_retired_query_artifacts(
+            output,
+            manifest_owned=retired_query_was_managed,
+        )
         changed += int(
             write_json_if_changed(
                 _output_path(output, _EXPORT_MANIFEST), export_manifest
