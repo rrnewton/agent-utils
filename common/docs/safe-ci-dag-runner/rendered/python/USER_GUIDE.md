@@ -147,7 +147,8 @@ safe-ci-dag-runner run --dag pipeline.yaml --show-plan --profile
 `-j` sets maximum outer concurrency. `--max-mem` instead chooses the largest
 safe width from the modeled worst-case footprint. Named resources act as
 semaphores in addition to the worker and memory limits. A failed step prevents
-new dependent work; `--keep-going` lets already-running work reach a verdict.
+only dependent work. With `--keep-going`, independent ready work continues to
+launch; without it, the final report names every step that was not launched.
 
 Per-step wall and CPU timeouts, memory limits, process-tree teardown, and OOM
 attribution are enforced inside nested cgroups when the host supplies cgroup v2

@@ -771,7 +771,7 @@ impl StepOutcome {
             executed_tests,
             filtered_tests,
             returncode,
-            reason: "ABORTED (eager-exit after another step failed; keep_going lets in-flight steps finish)"
+            reason: "ABORTED (eager-exit after another step failed; --keep-going would continue independent work)"
                 .to_string(),
             aborted: true,
         }
@@ -789,6 +789,10 @@ pub struct RunResult {
     pub outcomes: Vec<StepOutcome>,
     /// Tags whose dependencies failed so they never ran (sorted).
     pub skipped: Vec<String>,
+    /// Tags that never launched even though they were not dependency-skipped or intentionally
+    /// omitted. This is nonempty after fail-fast termination or an outer run timeout and keeps
+    /// absent work distinct from passing work.
+    pub not_launched: Vec<String>,
     /// `(tag, stable reason)` for nodes deliberately omitted before process spawn.
     pub intentional_skips: Vec<(String, IntentionalSkipReason)>,
     /// Per-step measurement rows (column -> value) to forward to a metrics sink; empty when no

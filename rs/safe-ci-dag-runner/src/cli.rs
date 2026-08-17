@@ -193,7 +193,7 @@ yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi
 {what}\n  \
 - concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
 - learned est_duration / rss from the profile store override the DAG hints at plan time\n    (disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)\n  \
-- a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
+- a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} continues launching independent ready steps; failed dependents are skipped)\n  \
 - {maxmem} picks the largest -j whose modeled worst-case RAM fits the budget\n\n\
 {note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. {perfdir} writes per-step + whole-run resource-usage CSVs.\n\n\
 {exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = cgroup\n           boxing required but unavailable (use {acf})\n",
@@ -334,7 +334,7 @@ fn run_help(c: &Palette) -> String {
             ("--no-profile-feedback", "do NOT read the profile store to refine time/RAM estimates"),
             ("--profile-sync BACKEND", "download+upload the shared profile summary (for ephemeral CI)"),
             ("--profile-sync-direction D", "both (default) | download | upload"),
-            ("-k, --keep-going", "on failure, let running steps finish (stop launching new ones)"),
+            ("-k, --keep-going", "after failure, continue independent work; skip failed dependents"),
             ("--run-timeout SECONDS", "OUTER wall budget for the WHOLE run; cuts in-flight steps and still reports"),
             ("--allow-cgroup-failure", "if cgroup boxing is unavailable, run UNBOXED with a warning instead of erroring"),
             ("--unsafe-no-cgroups", "DELIBERATELY skip cgroup boxing entirely (unsafe)"),
@@ -2219,11 +2219,15 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         c.red("FAIL")
     };
     eprintln!(
-        "{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, {} intentionally skipped, {} dependency-skipped in {:.1}s",
+        "{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, {} intentionally skipped, {} dependency-skipped, {} not launched in {:.1}s",
         result.intentional_skips.len(),
         result.skipped.len(),
+        result.not_launched.len(),
         result.wall_s
     );
+    if !result.not_launched.is_empty() {
+        eprintln!("{PROG}: not launched: {}", result.not_launched.join(", "));
+    }
 
     if let Some(d) = perf_dir.as_deref() {
         if let Some(w) = &window {

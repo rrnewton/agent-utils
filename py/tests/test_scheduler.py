@@ -119,6 +119,39 @@ def test_eager_exit_aborts_inflight_step() -> None:
     assert outcomes["g.slow"].ok is False
 
 
+def test_fail_fast_reports_independent_step_as_not_launched() -> None:
+    cfg = DagConfig(
+        steps=(
+            _step("g", "fail", "exit 1", est=100.0),
+            _step("g", "dependent", "true", deps=["g.fail"], est=90.0),
+            _step("g", "independent", "true", est=80.0),
+        )
+    )
+    res = run_dag(cfg, jobs=1, keep_going=False, verbosity=0)
+    assert not res.ok
+    assert [outcome.tag for outcome in res.outcomes] == ["g.fail"]
+    assert res.skipped == ("g.dependent",)
+    assert res.not_launched == ("g.independent",)
+
+
+def test_keep_going_launches_independent_step_after_failure() -> None:
+    cfg = DagConfig(
+        steps=(
+            _step("g", "fail", "exit 1", est=100.0),
+            _step("g", "dependent", "true", deps=["g.fail"], est=90.0),
+            _step("g", "independent", "true", est=80.0),
+        )
+    )
+    res = run_dag(cfg, jobs=1, keep_going=True, verbosity=0)
+    assert not res.ok
+    outcomes = {outcome.tag: outcome for outcome in res.outcomes}
+    assert outcomes["g.fail"].ok is False
+    assert outcomes["g.independent"].ok is True
+    assert res.skipped == ("g.dependent",)
+    assert res.not_launched == ()
+    assert len(res.outcomes) + len(res.skipped) + len(res.intentional_skips) == len(cfg.steps)
+
+
 def test_resource_cap_serializes_concurrent_steps() -> None:
     with tempfile.TemporaryDirectory() as d:
         log = os.path.join(d, "intervals")

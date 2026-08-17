@@ -20,7 +20,7 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   and Python-json-vs-serde_json divergences that the isomorphism check (which only covers
   documents both builds accept) cannot.
 * ``run`` agrees on exit code, and on the passed/failed/aborted/intentionally-skipped/
-  dependency-skipped counts. Counts are
+  dependency-skipped/not-launched counts. Counts are
   compared under ``--keep-going`` so they are deterministic (the default eager-exit path
   races on which in-flight step is cancelled first, so only its exit code is compared).
 * ``--only`` selection (Feature A) agrees: running EXACTLY one named step matches on exit code
@@ -101,7 +101,7 @@ SYNTH_CONTAINER = "cross_synth_container"
 
 _COUNTS_RE = re.compile(
     r"(\d+) passed, (\d+) failed, (\d+) aborted, "
-    r"(\d+) intentionally skipped, (\d+) dependency-skipped"
+    r"(\d+) intentionally skipped, (\d+) dependency-skipped, (\d+) not launched"
 )
 _SIZING_RE = re.compile(
     r"-> -j(\d+) \(modeled worst-case (\d+) bytes fits budget (\d+) bytes\)"
@@ -874,7 +874,7 @@ def compare_scalar_parity(py: list[str], rs: list[str], rep: Report) -> None:
 # --------------------------------------------------------------------------- comparisons
 
 
-def _counts(stderr: str) -> tuple[int, int, int, int, int] | None:
+def _counts(stderr: str) -> tuple[int, int, int, int, int, int] | None:
     m = _COUNTS_RE.search(stderr)
     if not m:
         return None
@@ -884,6 +884,7 @@ def _counts(stderr: str) -> tuple[int, int, int, int, int] | None:
         int(m.group(3)),
         int(m.group(4)),
         int(m.group(5)),
+        int(m.group(6)),
     )
 
 
@@ -1425,12 +1426,10 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
 
         # 4) run serial (-j1): deterministic counts + exit code. With one step at a time the
         # ready-set loop dispatches in a single deterministic LPT sequence, so the
-        # passed/failed/aborted/intentionally-skipped/dependency-skipped counts are fully
+        # passed/failed/aborted/intentionally-skipped/dependency-skipped/not-launched counts are fully
         # reproducible between the two builds.
-        # (Note: --keep-going only suppresses the eager-abort of in-flight steps; on any
-        # failure BOTH builds set stop and launch no new steps, so counts still race at -j>1.)
-        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
-        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", NOPROF, NOFB, ACF))
+        po = run(py, ("run", "--dag", dag_path, "-q", "-j", "1", "-k", NOPROF, NOFB, ACF))
+        ro = run(rs, ("run", "--dag", dag_path, "-q", "-j", "1", "-k", NOPROF, NOFB, ACF))
         label = f"{fx.name}/run(serial-counts)"
         pc, rc = _counts(po.stderr), _counts(ro.stderr)
         if po.returncode != ro.returncode:
@@ -1456,7 +1455,7 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
                 rep.ok(label)
 
         # 6) --only selection parity (Feature A): running EXACTLY the named step(s) must agree on
-        # exit code AND the passed/failed/aborted/intentionally-skipped/dependency-skipped counts
+        # exit code AND the passed/failed/aborted/intentionally-skipped/dependency-skipped/not-launched counts
         # across both builds. Selecting a
         # single step at -j1 is deterministic (its deps outside the selection are dropped), so the
         # counts are reproducible even though full-DAG timing is not.
@@ -1472,7 +1471,7 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
                 rep.bad(label, f"missing summary counts py={po.stderr!r} rs={ro.stderr!r}")
             elif pc != rc:
                 rep.bad(label, f"counts py={pc} rs={rc}")
-            elif pc != (1, 0, 0, 0, 0) and pc != (0, 1, 0, 0, 0):
+            elif pc != (1, 0, 0, 0, 0, 0) and pc != (0, 1, 0, 0, 0, 0):
                 # --only <one tag> runs exactly one step: it either passes or fails, nothing else.
                 rep.bad(label, f"--only one step should run exactly one step; got counts {pc}")
             else:
