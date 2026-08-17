@@ -874,6 +874,9 @@ cd ./timelines/example-team
 ./timeline show 'agent:example-team::SESSION_OR_AGENT_ID'
 ./timeline show 'phase:example-team::phase-0123456789abcdef' --transcript
 ./timeline search 'reproducible build' --scope all --team example-team --limit 20
+./timeline search 'backend maturity B3' --in owner-prompts
+./timeline search '50% ptrace' --in agent-responses --prompt-author owner
+./timeline search KVM --in all-transcript --sort newest --limit 20
 ./timeline prompts --range 200-300
 ./timeline prompts --which all --format jsonl > all-prompts.jsonl
 ./timeline prompts --format jsonl > prompts.jsonl
@@ -913,14 +916,29 @@ The references deliberately remove the compositor's presentation-only team prefi
 the same when an individual team is later included in a combined export. `show` adds parent,
 children, and work-phase references for an agent; phase transcripts remain excluded unless
 `--transcript` is explicit. Showing a rollup returns each available technical or plain-language
-Markdown audience and reports false availability without trying to open a missing file. Search is
-literal and case-insensitive by default. It can scan `summaries`, `transcripts`, or `all`;
-`--agent` restricts work-phase and transcript results to one canonical agent reference. Time bounds
-are half-open RFC3339 instants and select records whose intervals overlap the requested range.
-Timeline queries only read `data/timeline.json`, `data/details/*.json`, and referenced summary
-Markdown; prompt/message queries only read the manifest-bound extracted JSONL. Neither invokes a
-model or alters the archive. The older `query.py` and Make targets remain compatibility wrappers;
-new automation should call `./timeline` directly.
+Markdown audience and reports false availability without trying to open a missing file.
+
+Use `--in owner-prompts`, `--in agent-responses`, or `--in all-transcript` for the phase-independent
+search corpus. The default `smart` matcher treats unquoted word-like terms as whole terms and
+requires every term, so `B3` does not match a hexadecimal hash fragment. Quote a phrase inside a
+smart query, or select `--match phrase`/`--match literal` when substring behavior is desired.
+`--sort relevance|newest|oldest`, `--offset`, `--limit`, repeatable `--role`, `--prompt-author`, and
+`--linkage` provide deterministic filtering and pagination; the result envelope reports both total
+and returned matches. Search results carry stable `message:` or `tool:` references. `show` resolves
+one of those references and adds the enclosing phase and mechanically linked prompt/responses when
+present. Parent-to-child instructions and child-to-parent final replies are directionally classified
+before linkage, and source order breaks ties when provider timestamps are equal. Each team/day
+catalog entry has a false-positive-only ASCII trigram filter. Eligible queries fetch only candidate
+day objects; short or non-ASCII terms never reject an object on their own, and exact matching always
+verifies the final result.
+
+The older `--scope summaries|transcripts|all` form remains available for compatibility with phase
+summary/detail search. Search-v2-only flags require `--in`; they are rejected rather than silently
+ignored. `--agent` restricts work-phase and transcript results to one canonical agent reference.
+Time bounds are half-open RFC3339 instants. Timeline queries read deterministic static projection
+files, while prompt/message queries read the manifest-bound extracted JSONL. Neither invokes a model
+or alters the archive. The older `query.py` and Make targets remain compatibility wrappers; new
+automation should call `./timeline` directly.
 
 ```bash
 agent-team-timeline inspect --output ./timelines/example-team

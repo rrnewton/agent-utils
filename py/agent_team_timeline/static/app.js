@@ -18,6 +18,10 @@
   var MIN_VIEW_MS = 1000;
   var SEARCH_RESULT_LIMIT = 100;
   var SEARCH_JUMP_SPAN_MS = 30 * 60 * 1000;
+  var TRIGRAM_BLOOM_ALGORITHM = "ascii-lower-utf8-trigram-fnv1a32-double-v1";
+  var FNV_OFFSET = 2166136261;
+  var FNV_PRIME = 16777619;
+  var SECOND_HASH_SEED = 0x9e3779b9;
   var PHASE_COLORS = [
     "#287ca3",
     "#555ec4",
@@ -132,6 +136,7 @@
     searchScope: "labels",
     searchSort: "relevance",
     searchCatalog: [],
+    searchBloomByUrl: new Map(),
     loadedSearchShardUrls: new Set(),
     searchRecords: [],
     searchRecordsByRef: new Map(),
@@ -1303,29 +1308,221 @@
     });
   }
 
-  function mergeTranscriptSearchShard(raw, url) {
+  function asciiLowerUtf8SearchBytes(value) {
+    var encoded = new TextEncoder().encode(compactSearchText(value));
+    var lowered = new Uint8Array(encoded.length);
+    encoded.forEach(function (byte, index) {
+      lowered[index] = byte >= 65 && byte <= 90 ? byte + 32 : byte;
+    });
+    return lowered;
+  }
+
+  function searchTextTrigrams(value) {
+    var encoded = asciiLowerUtf8SearchBytes(value);
+    if (encoded.length < 3) {
+      return [];
+    }
+    var unique = new Map();
+    for (var index = 0; index <= encoded.length - 3; index += 1) {
+      var trigram = new Uint8Array([
+        encoded[index], encoded[index + 1], encoded[index + 2]
+      ]);
+      unique.set(Array.from(trigram).join(","), trigram);
+    }
+    return Array.from(unique.values()).sort(function (left, right) {
+      return left[0] - right[0] || left[1] - right[1] || left[2] - right[2];
+    });
+  }
+
+  function queryTermBloomEligible(value) {
+    var compact = compactSearchText(value);
+    for (var index = 0; index < compact.length; index += 1) {
+      if (compact.charCodeAt(index) > 127) {
+        return false;
+      }
+    }
+    return asciiLowerUtf8SearchBytes(compact).length >= 3;
+  }
+
+  function fnv1a32(value, seed) {
+    var digest = seed >>> 0;
+    value.forEach(function (byte) {
+      digest = Math.imul((digest ^ byte) >>> 0, FNV_PRIME) >>> 0;
+    });
+    return digest;
+  }
+
+  function bloomBitPositions(trigram, bitCount, hashCount) {
+    var first = fnv1a32(trigram, FNV_OFFSET);
+    var second = (fnv1a32(
+      trigram,
+      (FNV_OFFSET ^ SECOND_HASH_SEED) >>> 0
+    ) | 1) >>> 0;
+    var positions = [];
+    for (var index = 0; index < hashCount; index += 1) {
+      positions.push((first + index * second) % bitCount);
+    }
+    return positions;
+  }
+
+  function decodeBase64Bytes(value, where) {
+    var encoded = text(value);
+    var valid = encoded.length % 4 === 0 &&
+      /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded);
+    if (!valid) {
+      throw new Error(where + ".bits_base64: invalid base64");
+    }
+    var decoded;
+    try {
+      decoded = atob(encoded);
+    } catch (_error) {
+      throw new Error(where + ".bits_base64: invalid base64");
+    }
+    var bytes = new Uint8Array(decoded.length);
+    for (var index = 0; index < decoded.length; index += 1) {
+      bytes[index] = decoded.charCodeAt(index);
+    }
+    return bytes;
+  }
+
+  function decodeTrigramBloom(value, where) {
+    if (!value || typeof value !== "object" ||
+        text(value.algorithm) !== TRIGRAM_BLOOM_ALGORITHM) {
+      throw new Error(where + ".algorithm: unsupported trigram Bloom filter");
+    }
+    var bitCount = number(value.bit_count, NaN);
+    var hashCount = number(value.hash_count, NaN);
+    var trigramCount = number(value.trigram_count, NaN);
+    if (!Number.isSafeInteger(bitCount) || bitCount < 64 ||
+        !Number.isInteger(Math.log2(bitCount))) {
+      throw new Error(where + ".bit_count: expected a power of two of at least 64");
+    }
+    if (!Number.isSafeInteger(hashCount) || hashCount <= 0) {
+      throw new Error(where + ".hash_count: expected a positive integer");
+    }
+    if (!Number.isSafeInteger(trigramCount) || trigramCount < 0) {
+      throw new Error(where + ".trigram_count: expected a non-negative integer");
+    }
+    var bits = decodeBase64Bytes(value.bits_base64, where);
+    if (bits.length * 8 !== bitCount) {
+      throw new Error(
+        where + ".bits_base64: decoded " + bits.length * 8 +
+        " bits, expected " + bitCount
+      );
+    }
+    return {
+      bitCount: bitCount,
+      hashCount: hashCount,
+      bits: bits,
+      trigramCount: trigramCount
+    };
+  }
+
+  function trigramBloomMightContain(filterValue, queryTerm) {
+    if (!queryTermBloomEligible(queryTerm)) {
+      return true;
+    }
+    return searchTextTrigrams(queryTerm).every(function (trigram) {
+      return bloomBitPositions(
+        trigram,
+        filterValue.bitCount,
+        filterValue.hashCount
+      ).every(function (position) {
+        return Boolean(
+          filterValue.bits[Math.floor(position / 8)] & (1 << (position % 8))
+        );
+      });
+    });
+  }
+
+  function trigramBloomMightMatchQuery(filterValue, query) {
+    var parts = searchQueryParts(query);
+    var eligible = parts.filter(function (part) {
+      return queryTermBloomEligible(part.value);
+    });
+    if (!eligible.length) {
+      return true;
+    }
+    return eligible.every(function (part) {
+      return trigramBloomMightContain(filterValue, part.value);
+    });
+  }
+
+  function searchShardMightMatch(shard, query) {
+    var url = immutableTimelineObjectUrl(shard, "transcript search shard");
+    var filterValue = app.searchBloomByUrl.get(url);
+    if (!filterValue) {
+      return true;
+    }
+    return trigramBloomMightMatchQuery(filterValue, query);
+  }
+
+  function transcriptSearchRecordCount(catalogEntry) {
+    var counts = catalogEntry && typeof catalogEntry.counts === "object"
+      ? catalogEntry.counts
+      : null;
+    var count = number(counts && counts.records, NaN);
+    return Number.isInteger(count) && count >= 0 ? count : NaN;
+  }
+
+  function validateTranscriptSearchShard(raw, catalogEntry, url) {
     if (!raw || typeof raw !== "object" || number(raw.schema_version, NaN) !== 1 ||
         text(raw.kind) !== "timeline-search-day") {
       throw new Error("Unsupported transcript search shard: " + url);
     }
-    if (app.loadedSearchShardUrls.has(url)) {
-      return;
+    var expectedTeam = text(catalogEntry && catalogEntry.team);
+    var expectedStart = number(catalogEntry && catalogEntry.start_ms, NaN);
+    var expectedEnd = number(catalogEntry && catalogEntry.end_ms, NaN);
+    var expectedCount = transcriptSearchRecordCount(catalogEntry);
+    var range = raw.range && typeof raw.range === "object" ? raw.range : null;
+    var actualStart = number(range && range.start_ms, NaN);
+    var actualEnd = number(range && range.end_ms, NaN);
+    if (!expectedTeam || text(raw.team) !== expectedTeam ||
+        !Number.isFinite(expectedStart) || !Number.isFinite(expectedEnd) ||
+        actualStart !== expectedStart || actualEnd !== expectedEnd ||
+        !Number.isFinite(expectedCount) || !Array.isArray(raw.records) ||
+        raw.records.length !== expectedCount) {
+      throw new Error("Transcript search shard does not match its catalog entry: " + url);
     }
-    var records = array(raw.records);
-    var pending = [];
-    var localRefs = new Set();
-    records.forEach(function (record) {
+    var allowedRoles = [
+      "user", "assistant", "agent", "system", "external", "goal", "tool", "event"
+    ];
+    raw.records.forEach(function (record) {
       if (!record || typeof record !== "object" ||
           number(record.schema_version, NaN) !== 1) {
         throw new Error("Transcript search records must be schema-1 objects.");
       }
       var reference = text(record.ref);
-      var team = text(record.team);
+      var recordType = text(record.record_type);
+      var expectedPrefix = (recordType === "tool" ? "tool:" : "message:") +
+        expectedTeam + "::";
       var agentId = text(record.agent_id);
+      var agent = app.agentsById.get(agentId);
       var role = text(record.role);
       var at = number(record.at_ms, NaN);
-      if (!reference || !team || !agentId || !role || !text(record.text) ||
-          !Number.isFinite(at) || localRefs.has(reference) ||
+      var promptReference = text(record.prompt_ref);
+      if (text(record.team) !== expectedTeam || !reference.startsWith(expectedPrefix) ||
+          reference.length <= expectedPrefix.length || !agentId || !agent ||
+          text(agent.team) !== expectedTeam || allowedRoles.indexOf(role) < 0 ||
+          !text(record.text) || !Number.isFinite(at) ||
+          at < expectedStart || at >= expectedEnd ||
+          (promptReference && !promptReference.startsWith("message:" + expectedTeam + "::"))) {
+        throw new Error("Transcript search shard has an invalid record: " + url);
+      }
+    });
+    return raw.records;
+  }
+
+  function mergeTranscriptSearchShard(raw, catalogEntry, url) {
+    if (app.loadedSearchShardUrls.has(url)) {
+      return;
+    }
+    var records = validateTranscriptSearchShard(raw, catalogEntry, url);
+    var pending = [];
+    var localRefs = new Set();
+    records.forEach(function (record) {
+      var reference = text(record.ref);
+      if (localRefs.has(reference) ||
           app.searchRecordsByRef.has(reference)) {
         throw new Error("Transcript search shard has an invalid or duplicate record.");
       }
@@ -1347,14 +1544,15 @@
   function loadTranscriptSearchShard(catalogEntry) {
     var url = immutableTimelineObjectUrl(catalogEntry, "transcript search shard");
     return fetchJsonCached(url).then(function (raw) {
-      mergeTranscriptSearchShard(raw, url);
+      mergeTranscriptSearchShard(raw, catalogEntry, url);
       return raw;
     });
   }
 
   function transcriptSearchShards() {
     return app.searchCatalog.filter(function (shard) {
-      return !app.selectedTeam || text(shard.team) === app.selectedTeam;
+      return (!app.selectedTeam || text(shard.team) === app.selectedTeam) &&
+        searchShardMightMatch(shard, app.query);
     });
   }
 
@@ -1391,7 +1589,8 @@
       return recordType === "prompt" && text(record.author_kind) === "owner_human";
     }
     if (app.searchScope === "agent-responses") {
-      return recordType === "response" || recordType === "inter_agent";
+      return recordType === "response" || recordType === "inter_agent_response" ||
+        recordType === "inter_agent";
     }
     return app.searchScope === "all-transcript";
   }
@@ -1470,9 +1669,11 @@
       user: text(record.author_kind) === "owner_human" ? "owner prompt" : "prompt",
       assistant: "assistant",
       agent: "inter-agent",
+      system: "system",
       external: "external",
       goal: "goal",
-      tool: "tool"
+      tool: "tool",
+      event: "event"
     }[text(record.role)] || text(record.role, "message");
   }
 
@@ -1691,7 +1892,8 @@
       var recordType = text(candidate.record_type);
       return candidateReference !== promptReference &&
         text(candidate.prompt_ref) === promptReference &&
-        (recordType === "response" || recordType === "inter_agent");
+        (recordType === "response" || recordType === "inter_agent_response" ||
+          recordType === "inter_agent");
     });
     var context = prompt ? [prompt] : [];
     responses.sort(function (left, right) {
@@ -1895,7 +2097,9 @@
   }
 
   function compactSearchText(value) {
-    return text(value).replace(/\s+/g, " ").trim();
+    return text(value)
+      .replace(/[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/g, " ")
+      .replace(/^ +| +$/g, "");
   }
 
   function searchQueryParts(value) {
@@ -5741,6 +5945,7 @@
       return number(left.start_ms, 0) - number(right.start_ms, 0);
     });
     var searchCatalog = [];
+    var searchBloomByUrl = new Map();
     var searchConfig = bootstrap.search && typeof bootstrap.search === "object"
       ? bootstrap.search
       : null;
@@ -5755,9 +5960,20 @@
         var team = text(shard.team);
         var start = number(shard.start_ms, NaN);
         var end = number(shard.end_ms, NaN);
+        var recordCount = transcriptSearchRecordCount(shard);
         if (!team || !Number.isFinite(start) || !Number.isFinite(end) || end <= start ||
-            searchUrls.has(url)) {
+            !Number.isFinite(recordCount) || searchUrls.has(url)) {
           throw new Error("Invalid or duplicate transcript search shard catalog entry.");
+        }
+        if (hasField(shard, "trigram_bloom")) {
+          searchBloomByUrl.set(
+            url,
+            decodeTrigramBloom(
+              shard.trigram_bloom,
+              "transcript search shard " + team + " " + text(shard.day, url) +
+                ".trigram_bloom"
+            )
+          );
         }
         searchUrls.add(url);
       });
@@ -5769,6 +5985,7 @@
     app.schemaMode = "schema2";
     app.shardCatalog = catalog;
     app.searchCatalog = searchCatalog;
+    app.searchBloomByUrl = searchBloomByUrl;
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
     app.loadedSearchShardUrls.clear();
@@ -5802,6 +6019,7 @@
     app.schemaMode = "schema1";
     app.shardCatalog = [];
     app.searchCatalog = [];
+    app.searchBloomByUrl.clear();
     app.detailPromises.clear();
     app.loadedShardUrls.clear();
     app.loadedSearchShardUrls.clear();

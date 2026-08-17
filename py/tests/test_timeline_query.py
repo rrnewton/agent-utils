@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -13,12 +15,15 @@ import pytest
 from agent_team_timeline.archive import (
     JsonValue,
     as_array,
+    as_int,
     as_object,
     as_string,
+    canonical_json,
     narrow_json,
     read_json,
 )
 from agent_team_timeline.cli import main as timeline_main
+from agent_team_timeline.search_bloom import build_trigram_bloom
 from agent_team_timeline.timeline_shards import write_timeline_shards
 
 
@@ -240,6 +245,96 @@ def _items(response: dict[str, JsonValue]) -> list[dict[str, JsonValue]]:
         as_object(value, f"response.items[{index}]")
         for index, value in enumerate(as_array(response["items"], "response.items"))
     ]
+
+
+def _search_counts(records: list[dict[str, JsonValue]]) -> dict[str, JsonValue]:
+    record_types = [
+        as_string(record.get("record_type"), "search record.record_type")
+        for record in records
+    ]
+    return {
+        "records": len(records),
+        "prompts": sum(value == "prompt" for value in record_types),
+        "responses": sum(value == "response" for value in record_types),
+        "inter_agent": sum(value.startswith("inter_agent") for value in record_types),
+        "tools": sum(value == "tool" for value in record_types),
+    }
+
+
+def _rewrite_search_records(
+    root: Path, mutate: Callable[[list[dict[str, JsonValue]]], None]
+) -> None:
+    """Rewrite the fixture's search shard and keep its content-addressed catalog valid."""
+
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    search = as_object(bootstrap.get("search"), "timeline-v2.search")
+    shards = as_array(search.get("shards"), "timeline-v2.search.shards")
+    assert len(shards) == 1
+    shard = as_object(shards[0], "timeline-v2.search.shards[0]")
+    old_relative = as_string(shard.get("url"), "search shard.url")
+    search_object = as_object(read_json(root / old_relative), "search shard")
+    raw_records = as_array(search_object.get("records"), "search shard.records")
+    records = [
+        as_object(value, f"search shard.records[{index}]")
+        for index, value in enumerate(raw_records)
+    ]
+    mutate(records)
+    search_object["records"] = [record for record in records]
+
+    content = canonical_json(search_object)
+    encoded = content.encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    relative = f"data/timeline-v2/objects/{digest}.json"
+    object_path = root / relative
+    object_path.parent.mkdir(parents=True, exist_ok=True)
+    object_path.write_bytes(encoded)
+
+    counts = _search_counts(records)
+    shard["url"] = relative
+    shard["sha256"] = digest
+    shard["bytes"] = len(encoded)
+    shard["gzip_bytes"] = None
+    shard["counts"] = counts
+    shard["trigram_bloom"] = build_trigram_bloom(
+        as_string(record.get("text"), "search record.text") for record in records
+    ).catalog_obj()
+    search["counts"] = counts
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+
+
+def _search_record(
+    *,
+    event_id: str,
+    record_type: str,
+    role: str,
+    text: str,
+    at_ms: int,
+    agent_id: str = "root",
+    author_kind: str | None = "agent",
+    prompt_ref: str | None = None,
+    prompt_author_kind: str | None = None,
+) -> dict[str, JsonValue]:
+    agent_path = "/root" if agent_id == "root" else f"/root/{agent_id}"
+    return {
+        "schema_version": 1,
+        "ref": f"message:alpha::{event_id}",
+        "record_type": record_type,
+        "role": role,
+        "team": "alpha",
+        "agent_id": f"alpha::{agent_id}",
+        "agent_ref": f"agent:alpha::{agent_id}",
+        "agent_path": agent_path,
+        "event_id": event_id,
+        "turn_id": f"turn-{event_id}",
+        "at_ms": at_ms,
+        "text": text,
+        "author_kind": author_kind,
+        "ingress_kind": "test",
+        "prompt_ref": prompt_ref,
+        "prompt_author_kind": prompt_author_kind,
+        "content_fidelity": "verbatim",
+    }
 
 
 def test_list_uses_export_independent_stable_refs_and_filters(
@@ -524,6 +619,70 @@ def test_search_v2_finds_owner_prompts_and_linked_agent_responses_without_hash_n
     }
 
 
+def test_search_v2_bloom_skips_a_definite_miss_without_fetching_its_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    bootstrap_path = root / "data" / "timeline-v2.json"
+    bootstrap = as_object(read_json(bootstrap_path), "timeline-v2")
+    search = as_object(bootstrap.get("search"), "timeline-v2.search")
+    shards = as_array(search.get("shards"), "timeline-v2.search.shards")
+    assert len(shards) == 1
+    first = as_object(shards[0], "timeline-v2.search.shards[0]")
+    phantom_start = as_int(first.get("start_ms"), "search shard.start_ms") + 86_400_000
+    phantom_end = as_int(first.get("end_ms"), "search shard.end_ms") + 86_400_000
+    missing_digest = "f" * 64
+    shards.append(
+        {
+            "kind": "utc-day",
+            "team": "alpha",
+            "day": "2026-08-08",
+            "start_ms": phantom_start,
+            "end_ms": phantom_end,
+            "url": f"data/timeline-v2/objects/{missing_digest}.json",
+            "sha256": missing_digest,
+            "bytes": 1,
+            "gzip_bytes": None,
+            "counts": {
+                "records": 1,
+                "prompts": 0,
+                "responses": 1,
+                "inter_agent": 0,
+                "tools": 0,
+            },
+            "trigram_bloom": build_trigram_bloom(
+                ("unrelated deployment logs",)
+            ).catalog_obj(),
+        }
+    )
+    bootstrap_range = as_object(bootstrap.get("range"), "timeline-v2.range")
+    bootstrap_range["end_ms"] = phantom_end
+    bootstrap_path.write_text(canonical_json(bootstrap), encoding="utf-8")
+    timeline_path = root / "data" / "timeline.json"
+    timeline = as_object(read_json(timeline_path), "timeline")
+    timeline_range = as_object(timeline.get("range"), "timeline.range")
+    timeline_range["end_ms"] = phantom_end
+    timeline_path.write_text(canonical_json(timeline), encoding="utf-8")
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "backend maturity B3",
+                "--in",
+                "all-transcript",
+            )
+        )
+        == 0
+    )
+    response = _response(capsys)
+    assert response["total_matches"] == 1
+    assert _items(response)[0]["ref"] == "message:alpha::owner-b3"
+
+
 def test_search_v2_reports_paging_and_show_resolves_prompt_response_context(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -591,6 +750,339 @@ def test_search_v2_rejects_mixing_new_corpus_and_compatibility_scope(
         == 2
     )
     assert "--in and --scope cannot be combined" in capsys.readouterr().err
+
+
+def test_search_v2_rejects_a_different_timeline_generation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    timeline_path = root / "data" / "timeline.json"
+    timeline = as_object(read_json(timeline_path), "timeline")
+    timeline["source_digest"] = "replacement-generation"
+    timeline_path.write_text(canonical_json(timeline), encoding="utf-8")
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "B3",
+                "--in",
+                "all-transcript",
+            )
+        )
+        == 2
+    )
+    assert "different timeline generation" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_error"),
+    (
+        ("schema", "unsupported transcript search record"),
+        ("team", "transcript search record escapes shard"),
+        ("agent", "transcript search record has unknown agent"),
+    ),
+)
+def test_search_v2_rejects_malformed_records_with_a_valid_object_catalog(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    corruption: str,
+    expected_error: str,
+) -> None:
+    root = _site(tmp_path)
+
+    def corrupt(records: list[dict[str, JsonValue]]) -> None:
+        record = records[0]
+        if corruption == "schema":
+            record["schema_version"] = 99
+        elif corruption == "team":
+            record["team"] = "ghost"
+            record["agent_id"] = "ghost::root"
+            record["agent_ref"] = "agent:ghost::root"
+            record["ref"] = "message:ghost::owner-b3"
+        elif corruption == "agent":
+            record["agent_id"] = "alpha::ghost"
+            record["agent_ref"] = "agent:alpha::ghost"
+        else:
+            raise AssertionError(f"unsupported corruption {corruption}")
+
+    _rewrite_search_records(root, corrupt)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "B3",
+                "--in",
+                "all-transcript",
+            )
+        )
+        == 2
+    )
+    assert expected_error in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "v2_option",
+    (
+        ("--match", "literal"),
+        ("--sort", "newest"),
+        ("--prompt-author", "agent"),
+        ("--linkage", "linked"),
+        ("--role", "user"),
+        ("--offset", "1"),
+    ),
+)
+def test_search_rejects_v2_only_options_without_a_corpus(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    v2_option: tuple[str, str],
+) -> None:
+    root = _site(tmp_path)
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "GHC",
+                *v2_option,
+            )
+        )
+        == 2
+    )
+    assert "search-v2 options require --in" in capsys.readouterr().err
+
+
+def test_standalone_search_rejects_v2_only_options_without_a_corpus(
+    tmp_path: Path,
+) -> None:
+    root = _site(tmp_path)
+    source = Path(__file__).resolve().parents[1] / "agent_team_timeline" / "query.py"
+    bundled = root / "query.py"
+    shutil.copyfile(source, bundled)
+
+    completed = subprocess.run(
+        (
+            sys.executable,
+            str(bundled),
+            "--output",
+            str(root),
+            "search",
+            "GHC",
+            "--offset",
+            "1",
+        ),
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "search-v2 options require --in" in completed.stderr
+
+
+def test_search_v2_caps_excerpts_and_preserves_original_unicode_ranges(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    long_text = "Straße UNIQUE " + "x" * 10_000 + " UNIQUE"
+
+    def replace_text(records: list[dict[str, JsonValue]]) -> None:
+        record = next(value for value in records if value["event_id"] == "hash-noise")
+        record["text"] = long_text
+
+    _rewrite_search_records(root, replace_text)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "unique",
+                "--in",
+                "all-transcript",
+                "--match",
+                "literal",
+            )
+        )
+        == 0
+    )
+    item = _items(_response(capsys))[0]
+    excerpt = as_object(item["excerpt_details"], "search result excerpt")
+    assert len(as_string(excerpt["text"], "excerpt.text")) == 480
+    assert excerpt["match_ranges"] == [[7, 13]]
+    assert excerpt["full_characters"] == len(long_text)
+    assert excerpt["trailing_omitted_characters"] == len(long_text) - 480
+    assert excerpt["is_truncated"] is True
+
+
+def test_search_v2_requires_a_built_search_corpus(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    (root / "data" / "timeline-v2.json").unlink()
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "B3",
+                "--in",
+                "all-transcript",
+            )
+        )
+        == 2
+    )
+    error = capsys.readouterr().err
+    assert "no transcript search corpus" in error
+    assert "rebuild the website" in error
+
+
+def test_show_prompt_excludes_linked_tool_records(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    prompt_ref = "message:alpha::owner-b3"
+
+    def append_tool(records: list[dict[str, JsonValue]]) -> None:
+        tool = _search_record(
+            event_id="call-b3",
+            record_type="tool",
+            role="tool",
+            text="1 tool used: functions.exec_command",
+            at_ms=START + 100_000,
+            prompt_ref=prompt_ref,
+            prompt_author_kind="owner_human",
+        )
+        tool["ref"] = "tool:alpha::call-b3"
+        records.append(tool)
+
+    _rewrite_search_records(root, append_tool)
+
+    assert timeline_main(("query", "--output", str(root), "show", prompt_ref)) == 0
+    shown = _items(_response(capsys))[0]
+    responses = [
+        as_object(value, f"linked_responses[{index}]")
+        for index, value in enumerate(
+            as_array(shown["linked_responses"], "linked_responses")
+        )
+    ]
+    assert [value["record_type"] for value in responses] == ["response"]
+    assert [value["ref"] for value in responses] == ["message:alpha::answer-b3"]
+
+
+def test_search_v2_can_filter_searchable_system_events(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+
+    def append_system(records: list[dict[str, JsonValue]]) -> None:
+        records.append(
+            _search_record(
+                event_id="system-policy",
+                record_type="system",
+                role="system",
+                text="System policy requires deterministic receipts.",
+                at_ms=START + 200_000,
+                author_kind="system",
+            )
+        )
+
+    _rewrite_search_records(root, append_system)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "deterministic receipts",
+                "--in",
+                "all-transcript",
+                "--role",
+                "system",
+            )
+        )
+        == 0
+    )
+    items = _items(_response(capsys))
+    assert [value["ref"] for value in items] == ["message:alpha::system-policy"]
+    assert items[0]["record_type"] == "system"
+    assert items[0]["role"] == "system"
+
+
+def test_search_v2_links_inter_agent_responses_to_agent_prompts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _site(tmp_path)
+    prompt_ref = "message:alpha::delegated-audit"
+
+    def append_inter_agent_exchange(records: list[dict[str, JsonValue]]) -> None:
+        records.extend(
+            (
+                _search_record(
+                    event_id="delegated-audit",
+                    record_type="inter_agent_prompt",
+                    role="agent",
+                    text="Audit the timeline search implementation.",
+                    at_ms=START + 140_000,
+                    agent_id="child",
+                    prompt_ref=prompt_ref,
+                    prompt_author_kind="agent",
+                ),
+                _search_record(
+                    event_id="delegated-audit-response",
+                    record_type="inter_agent_response",
+                    role="agent",
+                    text="Finished the delegated audit with two findings.",
+                    at_ms=START + 150_000,
+                    agent_id="child",
+                    prompt_ref=prompt_ref,
+                    prompt_author_kind="agent",
+                ),
+            )
+        )
+
+    _rewrite_search_records(root, append_inter_agent_exchange)
+
+    assert (
+        timeline_main(
+            (
+                "query",
+                "--output",
+                str(root),
+                "search",
+                "delegated audit",
+                "--in",
+                "agent-responses",
+                "--prompt-author",
+                "agent",
+            )
+        )
+        == 0
+    )
+    items = _items(_response(capsys))
+    assert [value["ref"] for value in items] == [
+        "message:alpha::delegated-audit-response"
+    ]
+    assert items[0]["record_type"] == "inter_agent_response"
+    assert items[0]["prompt_ref"] == prompt_ref
+    assert items[0]["prompt_author_kind"] == "agent"
 
 
 def test_query_fails_closed_on_unknown_refs_and_archive_path_escape(

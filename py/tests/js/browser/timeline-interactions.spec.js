@@ -440,7 +440,14 @@ test("transcript search uses search shards and opens safe linked message context
       start_ms: day.start_ms,
       end_ms: day.end_ms,
       url: searchUrl,
-      sha256: searchDigest
+      sha256: searchDigest,
+      counts: {
+        records: 7,
+        prompts: 2,
+        responses: 1,
+        inter_agent: 1,
+        tools: 0
+      }
     }]
   };
   const promptARef = "message:codex-hermit::prompt-a";
@@ -501,6 +508,8 @@ test("transcript search uses search shards and opens safe linked message context
       }),
       record({
         ref: responseBRef,
+        record_type: "inter_agent_response",
+        role: "agent",
         agent_id: "agent-b",
         agent_ref: "agent:codex-hermit::agent-b",
         agent_path: "/root/agent-b",
@@ -517,6 +526,26 @@ test("transcript search uses search shards and opens safe linked message context
         event_id: "hash-only",
         at_ms: BASE_MS + 40 * 60 * 1000,
         text: "Recorded artifact hash 12ab3cdef456.",
+        prompt_ref: null,
+        prompt_author_kind: null
+      }),
+      record({
+        ref: "message:codex-hermit::system-checkpoint",
+        record_type: "system",
+        role: "system",
+        event_id: "system-checkpoint",
+        at_ms: BASE_MS + 41 * 60 * 1000,
+        text: "Sentinel system checkpoint.",
+        prompt_ref: null,
+        prompt_author_kind: null
+      }),
+      record({
+        ref: "message:codex-hermit::lifecycle-event",
+        record_type: "subagent_started",
+        role: "event",
+        event_id: "lifecycle-event",
+        at_ms: BASE_MS + 42 * 60 * 1000,
+        text: "Sentinel lifecycle event.",
         prompt_ref: null,
         prompt_author_kind: null
       })
@@ -608,8 +637,184 @@ test("transcript search uses search shards and opens safe linked message context
   await expect(modal.locator(
     '.search-message-card[data-message-ref="' + responseBRef + '"]'
   )).toContainText("KVM reached B3");
+  await page.locator("#modal-close").click();
+
+  await page.getByTestId("search-scope").selectOption("all-transcript");
+  await page.getByTestId("search").fill("sentinel");
+  await expect(card).toHaveAttribute("data-transcript-search-result-count", "2");
+  await expect(drawer.locator(".search-result-role")).toHaveText(["event", "system"]);
   expect(consoleErrors).toEqual([]);
   expect(failedRequests).toEqual([]);
+});
+
+test("transcript search rejects a shard whose record count disagrees with its catalog", async function ({ page }) {
+  const fixture = singleDaySchema2Fixture("9".repeat(64), "a".repeat(64));
+  const searchDigest = "b".repeat(64);
+  const day = fixture.bootstrap.detail_shards[0];
+  fixture.bootstrap.search = {
+    schema_version: 1,
+    strategy: "transcript-message-shards",
+    shards: [{
+      kind: "utc-day",
+      day: day.day,
+      team: "codex-hermit",
+      start_ms: day.start_ms,
+      end_ms: day.end_ms,
+      url: "data/timeline-v2/objects/" + searchDigest + ".json",
+      sha256: searchDigest,
+      counts: { records: 2 }
+    }]
+  };
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await page.route("**/" + searchDigest + ".json", async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify({
+        schema_version: 1,
+        kind: "timeline-search-day",
+        team: "codex-hermit",
+        range: { start_ms: day.start_ms, end_ms: day.end_ms },
+        records: [{
+          schema_version: 1,
+          ref: "message:codex-hermit::one",
+          record_type: "response",
+          role: "assistant",
+          team: "codex-hermit",
+          agent_id: "agent-a",
+          at_ms: BASE_MS + 12 * 60 * 1000,
+          text: "Only one record"
+        }]
+      })
+    });
+  });
+
+  await page.reload();
+  const card = page.getByTestId("timeline");
+  await page.getByTestId("search-scope").selectOption("all-transcript");
+  await page.getByTestId("search").fill("record");
+  await expect(card).toHaveAttribute("data-transcript-search-state", "error");
+  await expect(card).toHaveAttribute("data-loaded-search-shard-count", "0");
+  await expect(card).toHaveAttribute("data-transcript-search-result-count", "0");
+  await expect(page.getByTestId("search-results")).toContainText(
+    "does not match its catalog entry"
+  );
+});
+
+test("transcript Bloom filters defer negative shards and load them for a later positive query", async function ({ page }) {
+  const fixture = singleDaySchema2Fixture("0".repeat(64), "1".repeat(64));
+  const firstDigest = "2".repeat(64);
+  const secondDigest = "3".repeat(64);
+  const firstStart = fixture.bootstrap.detail_shards[0].start_ms;
+  const secondStart = firstStart + 24 * 60 * 60 * 1000;
+  function catalogEntry(day, start, digest, bloom) {
+    return {
+      kind: "utc-day",
+      day: day,
+      team: "codex-hermit",
+      start_ms: start,
+      end_ms: start + 24 * 60 * 60 * 1000,
+      url: "data/timeline-v2/objects/" + digest + ".json",
+      sha256: digest,
+      counts: { records: 1 },
+      trigram_bloom: bloom
+    };
+  }
+  fixture.bootstrap.search = {
+    schema_version: 1,
+    strategy: "transcript-message-shards",
+    shards: [
+      catalogEntry("2026-03-09", firstStart, firstDigest, {
+        algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+        bit_count: 256,
+        hash_count: 7,
+        bits_base64: "FIplgEEIAL6PsAAgGYlApEgLw+bQDgUgEEtBEDPQJhk=",
+        trigram_count: 14
+      }),
+      catalogEntry("2026-03-10", secondStart, secondDigest, {
+        algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+        bit_count: 128,
+        hash_count: 7,
+        bits_base64: "CpJJrKcNEMHROrAlwPydPQ==",
+        trigram_count: 10
+      })
+    ]
+  };
+  function searchShard(start, eventId, at, value) {
+    return {
+      schema_version: 1,
+      kind: "timeline-search-day",
+      team: "codex-hermit",
+      range: { start_ms: start, end_ms: start + 24 * 60 * 60 * 1000 },
+      records: [{
+        schema_version: 1,
+        ref: "message:codex-hermit::" + eventId,
+        record_type: "response",
+        role: "assistant",
+        team: "codex-hermit",
+        agent_id: "agent-a",
+        at_ms: at,
+        text: value
+      }]
+    };
+  }
+  const firstShard = searchShard(
+    firstStart,
+    "backend",
+    BASE_MS + 12 * 60 * 1000,
+    "alpha backend B3"
+  );
+  const secondShard = searchShard(
+    secondStart,
+    "ptrace",
+    secondStart + 60 * 60 * 1000,
+    "gamma ptrace"
+  );
+  let firstRequests = 0;
+  let secondRequests = 0;
+  await routeSingleDaySchema2Fixture(page, fixture, async function (route) {
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(fixture.detail)
+    });
+  });
+  await page.route("**/" + firstDigest + ".json", async function (route) {
+    firstRequests += 1;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(firstShard)
+    });
+  });
+  await page.route("**/" + secondDigest + ".json", async function (route) {
+    secondRequests += 1;
+    await route.fulfill({
+      contentType: "application/json; charset=utf-8",
+      body: JSON.stringify(secondShard)
+    });
+  });
+
+  await page.reload();
+  const card = page.getByTestId("timeline");
+  const drawer = page.getByTestId("search-results");
+  await page.getByTestId("search-scope").selectOption("all-transcript");
+  await page.getByTestId("search").fill("backend B3");
+  await expect(card).toHaveAttribute("data-transcript-search-state", "ready");
+  await expect(card).toHaveAttribute("data-loaded-search-shard-count", "1");
+  await expect(drawer.locator(".search-result")).toHaveCount(1);
+  await expect(drawer).toContainText("alpha backend B3");
+  expect(firstRequests).toBe(1);
+  expect(secondRequests).toBe(0);
+
+  await page.getByTestId("search").fill("ptrace");
+  await expect(card).toHaveAttribute("data-loaded-search-shard-count", "2");
+  await expect(drawer.locator(".search-result")).toHaveCount(1);
+  await expect(drawer).toContainText("gamma ptrace");
+  expect(firstRequests).toBe(1);
+  expect(secondRequests).toBe(1);
 });
 
 test("schema 2 retries a transiently failed detail shard", async function ({ page }) {

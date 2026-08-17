@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import re
@@ -18,6 +19,11 @@ QUERY_SCHEMA_VERSION = 1
 TIMELINE_SCHEMA_VERSION = 1
 TRANSCRIPT_EXPORT_SCHEMA_VERSION = 1
 _WHITESPACE = re.compile(r"\s+")
+_TRIGRAM_BLOOM_ALGORITHM = "ascii-lower-utf8-trigram-fnv1a32-double-v1"
+_TRIGRAM_BLOOM_FNV_OFFSET = 2_166_136_261
+_TRIGRAM_BLOOM_FNV_PRIME = 16_777_619
+_TRIGRAM_BLOOM_SECOND_SEED = 0x9E37_79B9
+_UINT32_MASK = (1 << 32) - 1
 _RFC3339_INSTANT = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
@@ -29,14 +35,21 @@ SEARCH_CORPORA = (
     "owner-prompts",
     "agent-responses",
     "all-transcript",
-    "summaries",
-    "all",
 )
-SEARCH_MATCH_MODES = ("smart", "phrase", "literal", "regex")
+SEARCH_MATCH_MODES = ("smart", "phrase", "literal")
 SEARCH_SORTS = ("relevance", "newest", "oldest")
 SEARCH_PROMPT_AUTHORS = ("any", "owner", "agent", "unclassified")
 SEARCH_LINKAGES = ("any", "linked", "unlinked")
-SEARCH_ROLES = ("user", "assistant", "agent", "external", "goal", "tool")
+SEARCH_ROLES = (
+    "user",
+    "assistant",
+    "agent",
+    "system",
+    "external",
+    "goal",
+    "tool",
+    "event",
+)
 
 JsonScalar = str | int | float | bool | None
 JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
@@ -146,6 +159,43 @@ class _TextMatch:
     compact: str
     ranges: tuple[tuple[int, int], ...]
     score: int
+
+
+@dataclass(frozen=True)
+class _SearchMatcher:
+    compact_needle: str
+    patterns: tuple[re.Pattern[str], ...]
+    bloom_terms: tuple[str, ...]
+    case_sensitive: bool
+
+    def match(self, text: str) -> _TextMatch | None:
+        """Return match ranges and a deterministic relevance score."""
+
+        compact = _compact_text(text)
+        collected: list[tuple[int, int]] = []
+        for pattern in self.patterns:
+            candidate = _pattern_ranges(pattern, compact)
+            if not candidate:
+                return None
+            collected.extend(candidate)
+        ranges = tuple(sorted(set(collected)))[:64]
+        first = min(start for start, _ in ranges)
+        last = max(end for _, end in ranges)
+        span = max(1, last - first)
+        comparable = compact if self.case_sensitive else compact.casefold()
+        comparable_needle = (
+            self.compact_needle
+            if self.case_sensitive
+            else self.compact_needle.casefold()
+        )
+        exact = comparable == comparable_needle
+        score = (
+            (100_000 if exact else 0)
+            + max(0, 20_000 - span)
+            + len(ranges) * 100
+            - min(first, 10_000)
+        )
+        return _TextMatch(compact, ranges, score)
 
 
 @dataclass(frozen=True)
@@ -519,20 +569,6 @@ def _compact_text(value: str) -> str:
     return _WHITESPACE.sub(" ", value).strip()
 
 
-def _all_literal_ranges(haystack: str, needle: str) -> tuple[tuple[int, int], ...]:
-    if not needle:
-        return ()
-    result: list[tuple[int, int]] = []
-    cursor = 0
-    while len(result) < 64:
-        position = haystack.find(needle, cursor)
-        if position < 0:
-            break
-        result.append((position, position + len(needle)))
-        cursor = position + max(1, len(needle))
-    return tuple(result)
-
-
 def _pattern_ranges(
     pattern: re.Pattern[str], compact: str
 ) -> tuple[tuple[int, int], ...]:
@@ -559,68 +595,109 @@ def _smart_parts(needle: str) -> tuple[tuple[str, bool], ...]:
     return tuple(parts)
 
 
-def _text_match(
-    text: str,
+def _compile_search_matcher(
     needle: str,
     *,
     match_mode: str,
     case_sensitive: bool,
-) -> _TextMatch | None:
-    compact = _compact_text(text)
+) -> _SearchMatcher:
     compact_needle = _compact_text(needle)
     if not compact_needle:
         raise ValueError("search text must not be empty")
     flags = 0 if case_sensitive else re.IGNORECASE
-    comparable = compact if case_sensitive else compact.casefold()
-    comparable_needle = compact_needle if case_sensitive else compact_needle.casefold()
-    ranges: tuple[tuple[int, int], ...]
+    patterns: tuple[re.Pattern[str], ...]
+    bloom_terms: tuple[str, ...]
     if match_mode in {"literal", "phrase"}:
-        ranges = _all_literal_ranges(comparable, comparable_needle)
-        if not ranges:
-            return None
-    elif match_mode == "regex":
-        try:
-            pattern = re.compile(needle, flags)
-        except re.error as error:
-            raise ValueError(f"invalid search regular expression: {error}") from error
-        ranges = _pattern_ranges(pattern, compact)
-        if not ranges:
-            return None
+        patterns = (re.compile(re.escape(compact_needle), flags),)
+        bloom_terms = (compact_needle,)
     elif match_mode == "smart":
         parts = _smart_parts(compact_needle)
         if not parts:
-            return None
-        collected: list[tuple[int, int]] = []
+            raise ValueError("search text must contain a term")
+        compiled: list[re.Pattern[str]] = []
         for part, quoted in parts:
             if quoted or re.fullmatch(r"[\w-]+", part, flags=re.UNICODE) is None:
-                candidate = _all_literal_ranges(
-                    comparable,
-                    part if case_sensitive else part.casefold(),
-                )
+                compiled.append(re.compile(re.escape(part), flags))
             else:
-                candidate = _pattern_ranges(
-                    re.compile(rf"(?<!\w){re.escape(part)}(?!\w)", flags), compact
+                compiled.append(
+                    re.compile(rf"(?<!\w){re.escape(part)}(?!\w)", flags)
                 )
-            if not candidate:
-                return None
-            collected.extend(candidate)
-        ranges = tuple(sorted(set(collected)))[:64]
+        patterns = tuple(compiled)
+        bloom_terms = tuple(part for part, _ in parts)
     else:
         raise ValueError(f"unsupported search match mode {match_mode!r}")
-    first = min(start for start, _ in ranges)
-    last = max(end for _, end in ranges)
-    span = max(1, last - first)
-    exact = comparable == comparable_needle
-    score = (100_000 if exact else 0) + max(0, 20_000 - span) + len(ranges) * 100
-    score -= min(first, 10_000)
-    return _TextMatch(compact, ranges, score)
+    return _SearchMatcher(compact_needle, patterns, bloom_terms, case_sensitive)
+
+
+def _ascii_lower_utf8(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return bytes(byte + 32 if 65 <= byte <= 90 else byte for byte in encoded)
+
+
+def _trigram_positions(
+    trigram: bytes, bit_count: int, hash_count: int
+) -> tuple[int, ...]:
+    def digest(seed: int) -> int:
+        result = seed
+        for byte in trigram:
+            result ^= byte
+            result = (result * _TRIGRAM_BLOOM_FNV_PRIME) & _UINT32_MASK
+        return result
+
+    first = digest(_TRIGRAM_BLOOM_FNV_OFFSET)
+    second = digest(_TRIGRAM_BLOOM_FNV_OFFSET ^ _TRIGRAM_BLOOM_SECOND_SEED) | 1
+    mask = bit_count - 1
+    return tuple((first + index * second) & mask for index in range(hash_count))
+
+
+def _bloom_might_match(
+    raw: JsonValue, terms: tuple[str, ...], where: str
+) -> bool:
+    """Validate one catalog Bloom filter and reject only definite misses."""
+
+    if raw is None:
+        return True
+    value = as_object(raw, where)
+    algorithm = as_string(value.get("algorithm"), where + ".algorithm")
+    if algorithm != _TRIGRAM_BLOOM_ALGORITHM:
+        raise ValueError(f"{where}.algorithm: unsupported value {algorithm!r}")
+    bit_count = as_int(value.get("bit_count"), where + ".bit_count")
+    if bit_count < 64 or bit_count & (bit_count - 1):
+        raise ValueError(f"{where}.bit_count: expected a power of two of at least 64")
+    hash_count = as_int(value.get("hash_count"), where + ".hash_count")
+    if hash_count <= 0:
+        raise ValueError(f"{where}.hash_count: expected a positive integer")
+    trigram_count = as_int(value.get("trigram_count"), where + ".trigram_count")
+    if trigram_count < 0:
+        raise ValueError(f"{where}.trigram_count: expected a non-negative integer")
+    encoded = as_string(value.get("bits_base64"), where + ".bits_base64")
+    try:
+        bits = base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise ValueError(f"{where}.bits_base64: invalid base64") from error
+    if len(bits) * 8 != bit_count:
+        raise ValueError(
+            f"{where}.bits_base64: decoded {len(bits) * 8} bits, expected {bit_count}"
+        )
+    for term in terms:
+        compact = _compact_text(term)
+        if not compact.isascii():
+            continue
+        term_bytes = _ascii_lower_utf8(compact)
+        if len(term_bytes) < 3:
+            continue
+        for offset in range(len(term_bytes) - 2):
+            trigram = term_bytes[offset : offset + 3]
+            for position in _trigram_positions(trigram, bit_count, hash_count):
+                if not bits[position // 8] & (1 << (position % 8)):
+                    return False
+    return True
 
 
 def _search_excerpt(match: _TextMatch) -> dict[str, JsonValue]:
     first = min(start for start, _ in match.ranges)
-    last = max(end for _, end in match.ranges)
     start = max(0, first - 120)
-    end = min(len(match.compact), max(last + 180, start + 320))
+    end = min(len(match.compact), start + 480)
     excerpt = match.compact[start:end]
     ranges: list[JsonValue] = []
     for left, right in match.ranges:
@@ -665,6 +742,20 @@ class TimelineQuery:
         self.phases = _record_array(self.timeline, "phases")
         self.rollups = _record_array(self.timeline, "rollups")
         self._entries = self._build_index()
+        phase_intervals: dict[tuple[str, str], list[tuple[int, int, str]]] = {}
+        for index, phase in enumerate(self.phases):
+            where = f"timeline.phases[{index}]"
+            team = _team(phase, where)
+            agent_id = _local_identifier(
+                team, as_string(phase.get("agent_id"), where + ".agent_id")
+            )
+            start_ms, end_ms = _interval(phase, where)
+            phase_intervals.setdefault((team, agent_id), []).append(
+                (start_ms, end_ms, phase_ref(phase, where))
+            )
+        self._search_phase_intervals = {
+            key: tuple(sorted(values)) for key, values in phase_intervals.items()
+        }
         self._search_records_cache: tuple[dict[str, JsonValue], ...] | None = None
 
     def _project_overviews(self) -> tuple[dict[str, JsonValue], ...]:
@@ -1066,27 +1157,62 @@ class TimelineQuery:
             )
         return path
 
-    def _search_records(self) -> tuple[dict[str, JsonValue], ...]:
-        if self._search_records_cache is not None:
+    def _search_records(
+        self,
+        filters: QueryFilters | None = None,
+        *,
+        bloom_terms: tuple[str, ...] = (),
+    ) -> tuple[dict[str, JsonValue], ...]:
+        cacheable = not bloom_terms and (
+            filters is None or (not filters.teams and filters.window is None)
+        )
+        if cacheable and self._search_records_cache is not None:
             return self._search_records_cache
         bootstrap_path = self.root / "data" / "timeline-v2.json"
         if not bootstrap_path.is_file():
-            self._search_records_cache = ()
-            return ()
+            raise ValueError(
+                "this archive has no transcript search corpus; rebuild the website"
+            )
         bootstrap = as_object(read_json(bootstrap_path), str(bootstrap_path))
         if (
             bootstrap.get("schema_version") != 2
             or bootstrap.get("kind") != "timeline-bootstrap"
         ):
             raise ValueError(f"unsupported timeline search bootstrap at {bootstrap_path}")
+        timeline_digest = as_string(
+            self.timeline.get("source_digest"), "timeline.source_digest"
+        )
+        if (
+            as_string(bootstrap.get("source_digest"), "timeline-v2.source_digest")
+            != timeline_digest
+        ):
+            raise ValueError("transcript search corpus belongs to a different timeline generation")
+        timeline_teams = sorted(
+            as_string(team.get("slug"), "timeline team.slug") for team in self.teams
+        )
+        bootstrap_teams = sorted(
+            as_string(
+                as_object(raw_team, "timeline-v2 team").get("slug"),
+                "timeline-v2 team.slug",
+            )
+            for raw_team in as_array(bootstrap.get("teams"), "timeline-v2.teams")
+        )
+        if timeline_teams != bootstrap_teams:
+            raise ValueError("transcript search corpus team set does not match timeline")
+        timeline_range = as_object(self.timeline.get("range"), "timeline.range")
+        bootstrap_range = as_object(bootstrap.get("range"), "timeline-v2.range")
+        if bootstrap_range != timeline_range:
+            raise ValueError("transcript search corpus range does not match timeline")
         raw_search = bootstrap.get("search")
         if raw_search is None:
-            self._search_records_cache = ()
-            return ()
+            raise ValueError(
+                "this archive has no transcript search corpus; rebuild the website"
+            )
         search = as_object(raw_search, "timeline-v2.search")
         if search.get("strategy") != "transcript-message-shards":
-            self._search_records_cache = ()
-            return ()
+            raise ValueError(
+                "this archive predates transcript search; rebuild the website"
+            )
         if as_int(search.get("schema_version"), "timeline-v2.search.schema_version") != 1:
             raise ValueError("unsupported transcript search schema")
         records: list[dict[str, JsonValue]] = []
@@ -1096,6 +1222,24 @@ class TimelineQuery:
         ):
             where = f"timeline-v2.search.shards[{shard_index}]"
             shard = as_object(raw_shard, where)
+            shard_team = as_string(shard.get("team"), where + ".team")
+            shard_start = as_int(shard.get("start_ms"), where + ".start_ms")
+            shard_end = as_int(shard.get("end_ms"), where + ".end_ms")
+            if shard_team not in timeline_teams or shard_end <= shard_start:
+                raise ValueError(f"invalid transcript search shard scope at {where}")
+            if filters is not None:
+                if filters.teams and shard_team not in filters.teams:
+                    continue
+                if filters.window is not None and not filters.window.overlaps(
+                    shard_start, shard_end
+                ):
+                    continue
+            if bloom_terms and not _bloom_might_match(
+                shard.get("trigram_bloom"),
+                bloom_terms,
+                where + ".trigram_bloom",
+            ):
+                continue
             relative = as_string(shard.get("url"), where + ".url")
             expected_sha = as_string(shard.get("sha256"), where + ".sha256")
             path, pure = self._safe_file(relative)
@@ -1111,14 +1255,90 @@ class TimelineQuery:
             root = as_object(read_json(path), relative)
             if root.get("schema_version") != 1 or root.get("kind") != "timeline-search-day":
                 raise ValueError(f"unsupported transcript search shard: {relative}")
+            if as_string(root.get("team"), relative + ".team") != shard_team:
+                raise ValueError(f"transcript search shard team mismatch: {relative}")
+            root_range = as_object(root.get("range"), relative + ".range")
+            if root_range != {"start_ms": shard_start, "end_ms": shard_end}:
+                raise ValueError(f"transcript search shard range mismatch: {relative}")
+            raw_records = as_array(root.get("records"), relative + ".records")
+            catalog_counts = as_object(shard.get("counts"), where + ".counts")
+            if as_int(catalog_counts.get("records"), where + ".counts.records") != len(
+                raw_records
+            ):
+                raise ValueError(f"transcript search shard count mismatch: {relative}")
             for record_index, raw_record in enumerate(
-                as_array(root.get("records"), relative + ".records")
+                raw_records
             ):
                 record = as_object(
                     raw_record, f"{relative}.records[{record_index}]"
                 )
                 reference = as_string(
                     record.get("ref"), f"{relative}.records[{record_index}].ref"
+                )
+                if as_int(
+                    record.get("schema_version"),
+                    f"{relative}.records[{record_index}].schema_version",
+                ) != 1:
+                    raise ValueError(f"unsupported transcript search record: {reference}")
+                record_team = as_string(
+                    record.get("team"), f"{relative}.records[{record_index}].team"
+                )
+                at_ms = as_int(
+                    record.get("at_ms"), f"{relative}.records[{record_index}].at_ms"
+                )
+                if record_team != shard_team or not shard_start <= at_ms < shard_end:
+                    raise ValueError(f"transcript search record escapes shard: {reference}")
+                message_prefix = f"message:{record_team}::"
+                tool_prefix = f"tool:{record_team}::"
+                if not reference.startswith((message_prefix, tool_prefix)):
+                    raise ValueError(f"invalid transcript search reference {reference!r}")
+                record_type = as_string(
+                    record.get("record_type"),
+                    f"{relative}.records[{record_index}].record_type",
+                )
+                if (record_type == "tool") != reference.startswith(tool_prefix):
+                    raise ValueError(
+                        f"transcript search reference kind mismatch: {reference}"
+                    )
+                agent_reference = as_string(
+                    record.get("agent_ref"),
+                    f"{relative}.records[{record_index}].agent_ref",
+                )
+                agent_identifier = as_string(
+                    record.get("agent_id"),
+                    f"{relative}.records[{record_index}].agent_id",
+                )
+                if (
+                    self._agent_reference_for_id(record_team, agent_identifier)
+                    != agent_reference
+                ):
+                    raise ValueError(
+                        f"transcript search record agent identity mismatch: {reference}"
+                    )
+                agent_entry = self._entries.get(agent_reference)
+                if agent_entry is None or agent_entry.kind != "agent":
+                    raise ValueError(
+                        f"transcript search record has unknown agent {agent_reference!r}"
+                    )
+                if _team(agent_entry.record, "search record agent") != record_team:
+                    raise ValueError(
+                        f"transcript search record agent belongs to another team: {reference}"
+                    )
+                prompt_reference = record.get("prompt_ref")
+                if prompt_reference is not None and not as_string(
+                    prompt_reference,
+                    f"{relative}.records[{record_index}].prompt_ref",
+                ).startswith(message_prefix):
+                    raise ValueError(
+                        f"transcript search prompt reference belongs to another team: {reference}"
+                    )
+                role = as_string(
+                    record.get("role"), f"{relative}.records[{record_index}].role"
+                )
+                if role not in SEARCH_ROLES:
+                    raise ValueError(f"unsupported transcript search role {role!r}")
+                as_string(
+                    record.get("text"), f"{relative}.records[{record_index}].text"
                 )
                 if reference in seen:
                     raise ValueError(f"duplicate transcript search reference {reference!r}")
@@ -1130,8 +1350,10 @@ class TimelineQuery:
                 as_string(record.get("ref"), "search record.ref"),
             )
         )
-        self._search_records_cache = tuple(records)
-        return self._search_records_cache
+        result = tuple(records)
+        if cacheable:
+            self._search_records_cache = result
+        return result
 
     def _phase_reference_for_search_record(
         self, record: dict[str, JsonValue]
@@ -1140,20 +1362,19 @@ class TimelineQuery:
         agent_id = as_string(record.get("agent_id"), "search record.agent_id")
         at_ms = as_int(record.get("at_ms"), "search record.at_ms")
         candidates: list[tuple[int, str]] = []
-        for index, phase in enumerate(self.phases):
-            where = f"timeline.phases[{index}]"
-            if _team(phase, where) != team:
-                continue
-            phase_agent = as_string(phase.get("agent_id"), where + ".agent_id")
-            if not self._same_agent_identifier(team, phase_agent, agent_id):
-                continue
-            start_ms, end_ms = _interval(phase, where)
+        for start_ms, end_ms, reference in self._search_phase_intervals.get(
+            (team, _local_identifier(team, agent_id)), ()
+        ):
             if start_ms <= at_ms < end_ms:
-                candidates.append((end_ms - start_ms, phase_ref(phase, where)))
+                candidates.append((end_ms - start_ms, reference))
         return min(candidates)[1] if candidates else None
 
     def _show_search_record(self, reference: str) -> dict[str, JsonValue]:
-        records = self._search_records()
+        _, separator, remainder = reference.partition(":")
+        team, team_separator, _ = remainder.partition("::")
+        if not separator or not team_separator or not team:
+            raise ValueError(f"invalid transcript search reference {reference!r}")
+        records = self._search_records(QueryFilters(teams=(team,)))
         by_ref = {
             as_string(record.get("ref"), "search record.ref"): record
             for record in records
@@ -1172,12 +1393,14 @@ class TimelineQuery:
         if prompt_reference is not None and prompt_reference != reference:
             prompt = by_ref.get(prompt_reference)
             result["linked_prompt"] = dict(prompt) if prompt is not None else None
-        if record.get("record_type") == "prompt":
+        if record.get("record_type") in {"prompt", "inter_agent_prompt"}:
             responses: list[JsonValue] = []
             for candidate in records:
                 if (
                     _optional_string(candidate, "prompt_ref") == reference
                     and _optional_string(candidate, "ref") != reference
+                    and _optional_string(candidate, "record_type")
+                    in {"response", "inter_agent_response"}
                 ):
                     responses.append(dict(candidate))
             result["linked_responses"] = responses
@@ -1355,7 +1578,7 @@ class TimelineQuery:
         offset: int,
         limit: int,
     ) -> SearchResults:
-        """Search the canonical phase-independent transcript corpus and summaries."""
+        """Search the canonical phase-independent transcript corpus."""
 
         if corpus not in SEARCH_CORPORA:
             raise ValueError(f"unsupported search corpus {corpus!r}")
@@ -1374,7 +1597,12 @@ class TimelineQuery:
         if limit < 1:
             raise ValueError("--limit must be at least 1")
         selected_agent = self._validated_agent_filter(filters)
-        records = self._search_records()
+        matcher = _compile_search_matcher(
+            needle,
+            match_mode=match_mode,
+            case_sensitive=case_sensitive,
+        )
+        records = self._search_records(filters, bloom_terms=matcher.bloom_terms)
         by_ref = {
             as_string(record.get("ref"), "search record.ref"): record
             for record in records
@@ -1383,120 +1611,109 @@ class TimelineQuery:
         for record in records:
             prompt_reference = _optional_string(record, "prompt_ref")
             reference = as_string(record.get("ref"), "search record.ref")
-            if prompt_reference is not None and prompt_reference != reference:
+            record_type = as_string(
+                record.get("record_type"), "search record.record_type"
+            )
+            if (
+                record_type in {"response", "inter_agent_response"}
+                and prompt_reference is not None
+                and prompt_reference != reference
+            ):
                 response_counts[prompt_reference] = (
                     response_counts.get(prompt_reference, 0) + 1
                 )
         matches: list[tuple[int, int, str, dict[str, JsonValue]]] = []
-        include_transcript = corpus in {
-            "owner-prompts",
-            "agent-responses",
-            "all-transcript",
-            "all",
-        }
-        if include_transcript:
-            for record in records:
-                team = as_string(record.get("team"), "search record.team")
-                if not self._selected_team(team, filters):
-                    continue
-                at_ms = as_int(record.get("at_ms"), "search record.at_ms")
-                if filters.window is not None and not filters.window.contains(at_ms):
-                    continue
-                agent_reference = as_string(
-                    record.get("agent_ref"), "search record.agent_ref"
-                )
-                if selected_agent is not None and agent_reference != selected_agent:
-                    continue
-                role = as_string(record.get("role"), "search record.role")
-                if roles and role not in roles:
-                    continue
-                record_type = as_string(
-                    record.get("record_type"), "search record.record_type"
-                )
-                author_kind = _optional_string(record, "author_kind")
-                prompt_kind = _optional_string(record, "prompt_author_kind")
-                if corpus == "owner-prompts" and not (
-                    record_type == "prompt" and author_kind == "owner_human"
-                ):
-                    continue
-                if corpus == "agent-responses" and record_type not in {
-                    "response",
-                    "inter_agent",
-                }:
-                    continue
-                selected_prompt_kind = (
-                    author_kind if record_type == "prompt" else prompt_kind
-                )
-                if prompt_author == "owner" and selected_prompt_kind != "owner_human":
-                    continue
-                if prompt_author == "agent" and selected_prompt_kind not in _BOT_AUTHOR_KINDS:
-                    continue
-                if prompt_author == "unclassified" and selected_prompt_kind in (
-                    _HUMAN_AUTHOR_KINDS | _BOT_AUTHOR_KINDS
-                ):
-                    continue
-                reference = as_string(record.get("ref"), "search record.ref")
-                prompt_reference = _optional_string(record, "prompt_ref")
-                linked = prompt_reference is not None
-                if linkage == "linked" and not linked:
-                    continue
-                if linkage == "unlinked" and linked:
-                    continue
-                text = as_string(record.get("text"), "search record.text")
-                text_match = _text_match(
-                    text,
-                    needle,
-                    match_mode=match_mode,
-                    case_sensitive=case_sensitive,
-                )
-                if text_match is None:
-                    continue
-                excerpt_details = _search_excerpt(text_match)
-                excerpt = as_string(
-                    excerpt_details.get("text"), "search excerpt.text"
-                )
-                item: dict[str, JsonValue] = {
-                    "result_id": reference,
-                    "ref": reference,
-                    "record_type": record_type,
-                    "role": role,
-                    "team": team,
-                    "agent_ref": agent_reference,
-                    "agent_path": record.get("agent_path"),
-                    "at_ms": at_ms,
-                    "at_time": _timestamp(at_ms),
-                    "prompt_ref": prompt_reference,
-                    "prompt_author_kind": prompt_kind,
-                    "linked_response_count": response_counts.get(reference, 0),
-                    "score": text_match.score,
-                    "ranking_version": "search-rank-v1",
-                    "content_fidelity": record.get("content_fidelity"),
-                    "excerpt": excerpt,
-                    "excerpt_details": excerpt_details,
-                }
-                phase_reference = self._phase_reference_for_search_record(record)
-                if phase_reference is not None:
-                    item["phase_ref"] = phase_reference
-                if prompt_reference is not None and prompt_reference != reference:
-                    prompt = by_ref.get(prompt_reference)
-                    if prompt is not None:
-                        item["prompt_excerpt"] = _compact_text(
-                            as_string(prompt.get("text"), "search prompt.text")
-                        )[:320]
-                matches.append((text_match.score, at_ms, reference, item))
-        if corpus in {"summaries", "all"}:
-            for item in self._search_summaries(
-                needle, filters, selected_agent, case_sensitive
+        for record in records:
+            team = as_string(record.get("team"), "search record.team")
+            if not self._selected_team(team, filters):
+                continue
+            at_ms = as_int(record.get("at_ms"), "search record.at_ms")
+            if filters.window is not None and not filters.window.contains(at_ms):
+                continue
+            agent_reference = as_string(
+                record.get("agent_ref"), "search record.agent_ref"
+            )
+            if selected_agent is not None and agent_reference != selected_agent:
+                continue
+            role = as_string(record.get("role"), "search record.role")
+            if roles and role not in roles:
+                continue
+            record_type = as_string(
+                record.get("record_type"), "search record.record_type"
+            )
+            author_kind = _optional_string(record, "author_kind")
+            prompt_kind = _optional_string(record, "prompt_author_kind")
+            if corpus == "owner-prompts" and not (
+                record_type == "prompt" and author_kind == "owner_human"
             ):
-                at_ms = (
-                    _optional_int(item, "at_ms")
-                    or _optional_int(item, "start_ms")
-                    or -1
-                )
-                reference = _optional_string(item, "ref") or ""
-                item["score"] = 1
-                item["ranking_version"] = "search-rank-v1"
-                matches.append((1, at_ms, reference, item))
+                continue
+            if corpus == "agent-responses" and record_type not in {
+                "response",
+                "inter_agent_response",
+            }:
+                continue
+            selected_prompt_kind = (
+                author_kind
+                if record_type in {"prompt", "inter_agent_prompt"}
+                else prompt_kind
+            )
+            if prompt_author == "owner" and selected_prompt_kind != "owner_human":
+                continue
+            if prompt_author == "agent" and selected_prompt_kind not in _BOT_AUTHOR_KINDS:
+                continue
+            if prompt_author == "unclassified" and selected_prompt_kind in (
+                _HUMAN_AUTHOR_KINDS | _BOT_AUTHOR_KINDS
+            ):
+                continue
+            reference = as_string(record.get("ref"), "search record.ref")
+            prompt_reference = _optional_string(record, "prompt_ref")
+            linked = (
+                response_counts.get(reference, 0) > 0
+                if record_type in {"prompt", "inter_agent_prompt"}
+                else prompt_reference is not None and prompt_reference != reference
+            )
+            if linkage == "linked" and not linked:
+                continue
+            if linkage == "unlinked" and linked:
+                continue
+            text = as_string(record.get("text"), "search record.text")
+            text_match = matcher.match(text)
+            if text_match is None:
+                continue
+            excerpt_details = _search_excerpt(text_match)
+            excerpt = as_string(
+                excerpt_details.get("text"), "search excerpt.text"
+            )
+            item: dict[str, JsonValue] = {
+                "result_id": reference,
+                "ref": reference,
+                "record_type": record_type,
+                "role": role,
+                "team": team,
+                "agent_ref": agent_reference,
+                "agent_path": record.get("agent_path"),
+                "at_ms": at_ms,
+                "at_time": _timestamp(at_ms),
+                "prompt_ref": prompt_reference,
+                "prompt_at_ms": record.get("prompt_at_ms"),
+                "prompt_author_kind": prompt_kind,
+                "linked_response_count": response_counts.get(reference, 0),
+                "score": text_match.score,
+                "ranking_version": "search-rank-v1",
+                "content_fidelity": record.get("content_fidelity"),
+                "excerpt": excerpt,
+                "excerpt_details": excerpt_details,
+            }
+            phase_reference = self._phase_reference_for_search_record(record)
+            if phase_reference is not None:
+                item["phase_ref"] = phase_reference
+            if prompt_reference is not None and prompt_reference != reference:
+                prompt = by_ref.get(prompt_reference)
+                if prompt is not None:
+                    item["prompt_excerpt"] = _compact_text(
+                        as_string(prompt.get("text"), "search prompt.text")
+                    )[:320]
+            matches.append((text_match.score, at_ms, reference, item))
         if sort == "relevance":
             matches.sort(key=lambda item: (-item[0], -item[1], item[2]))
         elif sort == "newest":
@@ -2423,11 +2640,12 @@ def _standalone_parser() -> argparse.ArgumentParser:
 
     showing = sub.add_parser(
         "show",
-        help="resolve one stable team, agent, phase, or rollup reference",
+        help="resolve one stable timeline or transcript reference",
         description="Show one record selected by a stable reference from a list or search.",
     )
     showing.add_argument(
-        "reference", help="team:, agent:, phase:, or rollup: reference"
+        "reference",
+        help="team:, agent:, phase:, rollup:, message:, or tool: reference",
     )
     showing.add_argument(
         "--transcript",
@@ -2449,7 +2667,7 @@ def _standalone_parser() -> argparse.ArgumentParser:
         "--in",
         dest="search_corpus",
         choices=SEARCH_CORPORA,
-        help="search-v2 corpus: owner prompts, agent responses, all transcript, or summaries",
+        help="search-v2 corpus: owner prompts, agent responses, or all transcript",
     )
     searching.add_argument(
         "--scope",
@@ -2458,14 +2676,14 @@ def _standalone_parser() -> argparse.ArgumentParser:
         help="compatibility search scope (default when --in is absent: summaries)",
     )
     searching.add_argument(
-        "--match", choices=SEARCH_MATCH_MODES, default="smart"
+        "--match", choices=SEARCH_MATCH_MODES, default=None
     )
-    searching.add_argument("--sort", choices=SEARCH_SORTS, default="relevance")
+    searching.add_argument("--sort", choices=SEARCH_SORTS, default=None)
     searching.add_argument(
-        "--prompt-author", choices=SEARCH_PROMPT_AUTHORS, default="any"
+        "--prompt-author", choices=SEARCH_PROMPT_AUTHORS, default=None
     )
     searching.add_argument(
-        "--linkage", choices=SEARCH_LINKAGES, default="any"
+        "--linkage", choices=SEARCH_LINKAGES, default=None
     )
     searching.add_argument(
         "--role", action="append", choices=SEARCH_ROLES, default=[]
@@ -2473,7 +2691,7 @@ def _standalone_parser() -> argparse.ArgumentParser:
     searching.add_argument(
         "--case-sensitive", action="store_true", help="preserve letter case"
     )
-    searching.add_argument("--offset", type=int, default=0)
+    searching.add_argument("--offset", type=int, default=None)
     searching.add_argument(
         "--limit", type=int, default=50, help="maximum matches (default: %(default)s)"
     )
@@ -2576,12 +2794,12 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
                     corpus=str(raw_corpus),
                     filters=_standalone_filters(ns),
                     case_sensitive=bool(ns.case_sensitive),
-                    match_mode=str(ns.match),
-                    sort=str(ns.sort),
-                    prompt_author=str(ns.prompt_author),
-                    linkage=str(ns.linkage),
+                    match_mode=str(ns.match or "smart"),
+                    sort=str(ns.sort or "relevance"),
+                    prompt_author=str(ns.prompt_author or "any"),
+                    linkage=str(ns.linkage or "any"),
                     roles=tuple(raw_roles),
-                    offset=int(ns.offset),
+                    offset=int(ns.offset or 0),
                     limit=int(ns.limit),
                 )
                 print(
@@ -2591,6 +2809,15 @@ def _standalone_main(argv: Sequence[str] | None = None) -> int:
                     end="",
                 )
                 return 0
+            if (
+                ns.match is not None
+                or ns.sort is not None
+                or ns.prompt_author is not None
+                or ns.linkage is not None
+                or ns.offset is not None
+                or ns.role
+            ):
+                raise ValueError("search-v2 options require --in")
             items = query.search(
                 needle,
                 scope=str(raw_scope or "summaries"),

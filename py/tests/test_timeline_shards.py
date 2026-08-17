@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 
 from agent_team_timeline.archive import JsonValue, as_array, as_object, read_json
+from agent_team_timeline.search_bloom import (
+    bloom_might_contain,
+    trigram_bloom_from_catalog,
+)
 from agent_team_timeline.timeline_shards import (
     SCHEMA_2_BOOTSTRAP_PATH,
     write_timeline_shards,
@@ -276,6 +280,15 @@ def test_schema_2_publishes_content_addressed_transcript_search_shards(
         for value in as_array(search["shards"], "search shards")
     ]
     assert [value["day"] for value in catalog] == ["2026-08-11", "2026-08-12"]
+    prompt_filter = trigram_bloom_from_catalog(
+        as_object(catalog[0]["trigram_bloom"], "prompt trigram bloom")
+    )
+    response_filter = trigram_bloom_from_catalog(
+        as_object(catalog[1]["trigram_bloom"], "response trigram bloom")
+    )
+    assert bloom_might_contain(prompt_filter, "backend maturity")
+    assert not bloom_might_contain(prompt_filter, "ptrace corpus")
+    assert bloom_might_contain(response_filter, "ptrace corpus")
     assert [
         as_object(value, "search record")["ref"]
         for value in as_array(_object(tmp_path, catalog[0])["records"], "records")

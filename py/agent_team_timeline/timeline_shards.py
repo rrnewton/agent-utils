@@ -25,6 +25,7 @@ from agent_team_timeline.archive import (
     read_json,
     write_text_if_changed,
 )
+from agent_team_timeline.search_bloom import build_trigram_bloom
 from agent_team_timeline.static_assets import (
     gzip_sidecar_path,
     sync_gzip_sidecar,
@@ -583,13 +584,17 @@ def _search_counts(records: Sequence[dict[str, JsonValue]]) -> dict[str, JsonVal
         record_type = as_string(
             record.get("record_type"), f"search records[{index}].record_type"
         )
-        if record_type == "prompt":
+        if record_type in {"prompt", "inter_agent_prompt"}:
             prompts += 1
-        elif record_type == "response":
+        if record_type in {"response", "inter_agent_response"}:
             responses += 1
-        elif record_type == "inter_agent":
+        if record_type in {
+            "inter_agent",
+            "inter_agent_prompt",
+            "inter_agent_response",
+        }:
             inter_agent += 1
-        elif record_type == "tool":
+        if record_type == "tool":
             tools += 1
     return {
         "records": len(records),
@@ -798,6 +803,13 @@ def write_timeline_shards(
                 "end_ms": day_end,
                 **stored.catalog_obj(),
                 "counts": _search_counts(search_records_for_day),
+                "trigram_bloom": build_trigram_bloom(
+                    as_string(
+                        record.get("text"),
+                        f"search shard {team} {day_label}.records[{index}].text",
+                    )
+                    for index, record in enumerate(search_records_for_day)
+                ).catalog_obj(),
             }
         )
 

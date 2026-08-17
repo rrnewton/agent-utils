@@ -22,6 +22,7 @@ _TEXT_ROLES = {
 @dataclass(frozen=True)
 class _PromptLink:
     at_ms: int
+    source_line: int
     event_id: str
     author_kind: str | None
 
@@ -73,17 +74,56 @@ def _tool_text(tool: ToolCall) -> str:
     return f"{count} {noun} used: " + ", ".join(parts)
 
 
-def _record_type(kind: str) -> str:
+def _agent_aliases(team: TeamData) -> dict[str, frozenset[str]]:
+    return {
+        agent.thread_id: frozenset((agent.thread_id, agent.agent_path))
+        for agent in team.agents
+    }
+
+
+def _inter_agent_record_type(
+    aliases_by_thread: dict[str, frozenset[str]], event: Event
+) -> str:
+    aliases = aliases_by_thread.get(event.thread_id, frozenset((event.thread_id,)))
+    author_is_thread = event.author in aliases
+    recipient_is_thread = event.recipient in aliases
+    if event.phase == "instruction" or (recipient_is_thread and not author_is_thread):
+        return "inter_agent_prompt"
+    if event.phase == "final_answer" or (author_is_thread and not recipient_is_thread):
+        return "inter_agent_response"
+    return "inter_agent"
+
+
+def _record_type(
+    aliases_by_thread: dict[str, frozenset[str]], event: Event
+) -> str:
+    if event.kind == "inter_agent_message":
+        return _inter_agent_record_type(aliases_by_thread, event)
     return {
         "user_prompt": "prompt",
         "assistant_message": "response",
-        "inter_agent_message": "inter_agent",
         "external_message": "external",
         "goal_updated": "goal",
-    }[kind]
+        "system_input": "system",
+    }.get(event.kind, event.kind)
 
 
-def _prompt_lists(team: TeamData) -> tuple[
+def _event_role(event: Event) -> str:
+    explicit = _TEXT_ROLES.get(event.kind)
+    if explicit is not None:
+        return explicit
+    if event.kind == "system_input":
+        return "system"
+    if event.kind.startswith("subagent_"):
+        return "agent"
+    if event.role in {"user", "assistant", "agent", "system", "external", "goal"}:
+        return event.role
+    return "event"
+
+
+def _prompt_lists(
+    team: TeamData, aliases_by_thread: dict[str, frozenset[str]]
+) -> tuple[
     dict[tuple[str, str], tuple[_PromptLink, ...]],
     dict[str, tuple[_PromptLink, ...]],
 ]:
@@ -92,9 +132,15 @@ def _prompt_lists(team: TeamData) -> tuple[
     for event in sorted(
         team.events, key=lambda item: (item.timestamp_ms, item.source_line, item.event_id)
     ):
-        if event.kind != "user_prompt":
+        record_type = _record_type(aliases_by_thread, event)
+        if record_type not in {"prompt", "inter_agent_prompt"}:
             continue
-        link = _PromptLink(event.timestamp_ms, event.event_id, event.author_kind)
+        link = _PromptLink(
+            event.timestamp_ms,
+            event.source_line,
+            event.event_id,
+            event.author_kind,
+        )
         by_thread_mutable.setdefault(event.thread_id, []).append(link)
         if event.turn_id is not None:
             by_turn_mutable.setdefault((event.thread_id, event.turn_id), []).append(link)
@@ -108,6 +154,8 @@ def _linked_prompt(
     thread_id: str,
     turn_id: str | None,
     at_ms: int,
+    source_line: int,
+    stable_id: str,
     by_turn: dict[tuple[str, str], tuple[_PromptLink, ...]],
     by_thread: dict[str, tuple[_PromptLink, ...]],
 ) -> _PromptLink | None:
@@ -117,7 +165,11 @@ def _linked_prompt(
         else by_thread.get(thread_id, ())
     )
     for prompt in reversed(candidates):
-        if prompt.at_ms <= at_ms:
+        if (prompt.at_ms, prompt.source_line, prompt.event_id) <= (
+            at_ms,
+            source_line,
+            stable_id,
+        ):
             return prompt
     return None
 
@@ -148,15 +200,15 @@ def build_search_records(
     if start_ms is not None and end_ms is not None and start_ms >= end_ms:
         raise ValueError("search record start must be earlier than end")
     agents = {agent.thread_id: agent for agent in team.agents}
-    by_turn, by_thread = _prompt_lists(team)
+    aliases_by_thread = _agent_aliases(team)
+    by_turn, by_thread = _prompt_lists(team, aliases_by_thread)
     sortable: list[tuple[int, int, str, dict[str, JsonValue]]] = []
     seen: set[str] = set()
 
     for event in team.events:
-        role = _TEXT_ROLES.get(event.kind)
+        role = _event_role(event)
         if (
-            role is None
-            or event.thread_id not in visible_agent_ids
+            event.thread_id not in visible_agent_ids
             or not _in_scope(event.timestamp_ms, start_ms, end_ms)
         ):
             continue
@@ -167,13 +219,21 @@ def build_search_records(
         if reference in seen:
             raise ValueError(f"duplicate transcript search record {reference}")
         seen.add(reference)
+        event_record_type = _record_type(aliases_by_thread, event)
         prompt = (
-            _PromptLink(event.timestamp_ms, event.event_id, event.author_kind)
-            if event.kind == "user_prompt"
+            _PromptLink(
+                event.timestamp_ms,
+                event.source_line,
+                event.event_id,
+                event.author_kind,
+            )
+            if event_record_type in {"prompt", "inter_agent_prompt"}
             else _linked_prompt(
                 event.thread_id,
                 event.turn_id,
                 event.timestamp_ms,
+                event.source_line,
+                event.event_id,
                 by_turn,
                 by_thread,
             )
@@ -182,7 +242,7 @@ def build_search_records(
         record: dict[str, JsonValue] = {
             "schema_version": SEARCH_RECORD_SCHEMA_VERSION,
             "ref": reference,
-            "record_type": _record_type(event.kind),
+            "record_type": event_record_type,
             "role": role,
             "team": team.team_slug,
             "agent_id": _agent_id(
@@ -196,12 +256,19 @@ def build_search_records(
             "text": text,
             "author_kind": event.author_kind,
             "ingress_kind": event.ingress_kind,
+            "author": event.author,
+            "recipient": event.recipient,
+            "phase": event.phase,
             "prompt_ref": (
                 _message_ref(team.team_slug, prompt.event_id)
                 if prompt is not None
                 else None
             ),
             "prompt_author_kind": prompt.author_kind if prompt is not None else None,
+            "prompt_at_ms": prompt.at_ms if prompt is not None else None,
+            "prompt_in_scope": (
+                prompt is not None and _in_scope(prompt.at_ms, start_ms, end_ms)
+            ),
             "content_fidelity": (
                 "encrypted-placeholder"
                 if event.content_availability == "encrypted"
@@ -224,6 +291,8 @@ def build_search_records(
             tool.thread_id,
             tool.turn_id,
             tool.started_at_ms,
+            tool.source_line,
+            tool.call_id,
             by_turn,
             by_thread,
         )
@@ -251,6 +320,10 @@ def build_search_records(
                 else None
             ),
             "prompt_author_kind": prompt.author_kind if prompt is not None else None,
+            "prompt_at_ms": prompt.at_ms if prompt is not None else None,
+            "prompt_in_scope": (
+                prompt is not None and _in_scope(prompt.at_ms, start_ms, end_ms)
+            ),
             "content_fidelity": "condensed",
         }
         sortable.append((tool.started_at_ms, 0, reference, record))

@@ -22,6 +22,20 @@ function functionSource(name) {
 
 const names = [
   "text",
+  "number",
+  "asciiLowerUtf8SearchBytes",
+  "searchTextTrigrams",
+  "queryTermBloomEligible",
+  "fnv1a32",
+  "bloomBitPositions",
+  "decodeBase64Bytes",
+  "decodeTrigramBloom",
+  "trigramBloomMightContain",
+  "trigramBloomMightMatchQuery",
+  "transcriptSearchRecordCount",
+  "validateTranscriptSearchShard",
+  "transcriptRecordMatchesScope",
+  "searchRoleLabel",
   "compactSearchText",
   "searchQueryParts",
   "allSearchRanges",
@@ -30,9 +44,119 @@ const names = [
   "smartSearchMatch",
   "searchExcerpt"
 ];
-const context = {};
+const context = {
+  TextEncoder: global.TextEncoder,
+  atob: global.atob,
+  TRIGRAM_BLOOM_ALGORITHM: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+  FNV_OFFSET: 2166136261,
+  FNV_PRIME: 16777619,
+  SECOND_HASH_SEED: 0x9e3779b9,
+  app: {
+    searchScope: "agent-responses",
+    agentsById: new Map([["root", { id: "root", team: "alpha" }]])
+  }
+};
 vm.createContext(context);
 vm.runInContext(names.map(functionSource).join("\n"), context);
+
+assert.strictEqual(
+  context.compactSearchText("\u001c  Alpha\u0085BETA\u3000"),
+  "Alpha BETA"
+);
+assert.deepStrictEqual(
+  Array.from(context.asciiLowerUtf8SearchBytes("AZ az Ä")),
+  [97, 122, 32, 97, 122, 32, 195, 132]
+);
+assert.deepStrictEqual(
+  context.searchTextTrigrams("  Alpha\n\tBETA  ").map(function (value) {
+    return Array.from(value);
+  }),
+  context.searchTextTrigrams("alpha beta").map(function (value) {
+    return Array.from(value);
+  })
+);
+assert.strictEqual(context.queryTermBloomEligible("backend"), true);
+assert.strictEqual(context.queryTermBloomEligible("B3"), false);
+assert.strictEqual(context.queryTermBloomEligible("Réverie"), false);
+
+const abcBloom = context.decodeTrigramBloom({
+  algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+  bit_count: 64,
+  hash_count: 7,
+  bits_base64: "AQoQgAAEIAA=",
+  trigram_count: 1
+}, "abc bloom");
+assert.strictEqual(context.trigramBloomMightContain(abcBloom, "ABC"), true);
+assert.strictEqual(context.trigramBloomMightContain(abcBloom, "zzzzzz"), false);
+
+const backendBloom = context.decodeTrigramBloom({
+  algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+  bit_count: 128,
+  hash_count: 7,
+  bits_base64: "VIrlptEOBb6e2UEwG9lmrQ==",
+  trigram_count: 11
+}, "backend bloom");
+const ptraceBloom = context.decodeTrigramBloom({
+  algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+  bit_count: 128,
+  hash_count: 7,
+  bits_base64: "CpJJrKcNEMHROrAlwPydPQ==",
+  trigram_count: 10
+}, "ptrace bloom");
+assert.strictEqual(context.trigramBloomMightMatchQuery(backendBloom, "backend"), true);
+assert.strictEqual(context.trigramBloomMightMatchQuery(backendBloom, "zzzzzz"), false);
+assert.strictEqual(
+  context.trigramBloomMightMatchQuery(backendBloom, "backend zzzzzz"),
+  false,
+  "each eligible smart-search term must be Bloom-positive"
+);
+assert.strictEqual(
+  context.trigramBloomMightMatchQuery(backendBloom, "backend B3"),
+  true,
+  "an ineligible term cannot reject a shard that matches another eligible term"
+);
+assert.strictEqual(
+  context.trigramBloomMightMatchQuery(ptraceBloom, "backend B3"),
+  false,
+  "the eligible term still rejects a shard when another term is too short"
+);
+assert.strictEqual(
+  context.trigramBloomMightMatchQuery(ptraceBloom, "backend Réverie"),
+  false,
+  "the eligible term still rejects a shard when another term is non-ASCII"
+);
+assert.strictEqual(
+  context.trigramBloomMightMatchQuery(ptraceBloom, "B3 Réverie"),
+  true,
+  "a query with no eligible terms scans every shard"
+);
+assert.throws(function () {
+  context.decodeTrigramBloom({
+    algorithm: "unknown",
+    bit_count: 64,
+    hash_count: 7,
+    bits_base64: "AQoQgAAEIAA=",
+    trigram_count: 1
+  }, "bad bloom");
+}, /unsupported trigram Bloom filter/);
+assert.throws(function () {
+  context.decodeTrigramBloom({
+    algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+    bit_count: 65,
+    hash_count: 7,
+    bits_base64: "AQoQgAAEIAA=",
+    trigram_count: 1
+  }, "bad bloom");
+}, /power of two/);
+assert.throws(function () {
+  context.decodeTrigramBloom({
+    algorithm: "ascii-lower-utf8-trigram-fnv1a32-double-v1",
+    bit_count: 64,
+    hash_count: 7,
+    bits_base64: "not base64!",
+    trigram_count: 1
+  }, "bad bloom");
+}, /invalid base64/);
 
 assert.ok(context.smartSearchMatch("DBI is a solid B3 at 130/152.", "B3"));
 assert.strictEqual(
@@ -71,5 +195,88 @@ assert.ok(excerpt.leadingOmitted > 0);
 assert.ok(excerpt.trailingOmitted > 0);
 assert.ok(excerpt.ranges.length >= 2);
 assert.ok(excerpt.text.includes("KVM reached maturity B3"));
+
+assert.strictEqual(context.transcriptRecordMatchesScope({ record_type: "response" }), true);
+assert.strictEqual(
+  context.transcriptRecordMatchesScope({ record_type: "inter_agent_response" }),
+  true
+);
+assert.strictEqual(
+  context.transcriptRecordMatchesScope({ record_type: "inter_agent" }),
+  true,
+  "legacy inter-agent records remain searchable as agent responses"
+);
+assert.strictEqual(
+  context.transcriptRecordMatchesScope({ record_type: "inter_agent_prompt" }),
+  false
+);
+assert.strictEqual(context.searchRoleLabel({ role: "system" }), "system");
+assert.strictEqual(context.searchRoleLabel({ role: "event" }), "event");
+
+const catalogEntry = {
+  team: "alpha",
+  start_ms: 100,
+  end_ms: 200,
+  counts: { records: 1 }
+};
+const validRecord = {
+  schema_version: 1,
+  ref: "message:alpha::final",
+  record_type: "inter_agent_response",
+  role: "agent",
+  team: "alpha",
+  agent_id: "root",
+  at_ms: 150,
+  text: "Final response"
+};
+const validShard = {
+  schema_version: 1,
+  kind: "timeline-search-day",
+  team: "alpha",
+  range: { start_ms: 100, end_ms: 200 },
+  records: [validRecord]
+};
+assert.strictEqual(
+  context.validateTranscriptSearchShard(validShard, catalogEntry, "valid.json"),
+  validShard.records
+);
+
+function copy(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+const wrongShardTeam = copy(validShard);
+wrongShardTeam.team = "beta";
+assert.throws(function () {
+  context.validateTranscriptSearchShard(wrongShardTeam, catalogEntry, "team.json");
+}, /does not match its catalog entry/);
+
+const wrongRange = copy(validShard);
+wrongRange.range.end_ms = 201;
+assert.throws(function () {
+  context.validateTranscriptSearchShard(wrongRange, catalogEntry, "range.json");
+}, /does not match its catalog entry/);
+
+assert.throws(function () {
+  context.validateTranscriptSearchShard(
+    validShard,
+    Object.assign({}, catalogEntry, { counts: { records: 2 } }),
+    "count.json"
+  );
+}, /does not match its catalog entry/);
+
+[
+  ["team", "beta"],
+  ["ref", "message:beta::final"],
+  ["agent_id", "missing-agent"],
+  ["role", "mystery"],
+  ["prompt_ref", "message:beta::prompt"]
+].forEach(function (mutation) {
+  const invalid = copy(validShard);
+  invalid.records[0][mutation[0]] = mutation[1];
+  assert.throws(function () {
+    context.validateTranscriptSearchShard(invalid, catalogEntry, mutation[0] + ".json");
+  }, /invalid record/);
+});
 
 console.log("timeline transcript search UI tests passed");

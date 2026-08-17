@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from agent_team_timeline.model import Agent, Event, TeamData, ToolCall
 from agent_team_timeline.search_index import build_search_records
 
@@ -121,7 +123,9 @@ def test_search_records_link_responses_and_condense_tools() -> None:
     assert tool["text"] == "3 tools used: 2 bash, 1 git"
     assert "secret" not in str(tool)
     assert tool["prompt_ref"] == prompt_ref
+    assert tool["prompt_at_ms"] == START + 1_000
     assert response["prompt_ref"] == prompt_ref
+    assert response["prompt_at_ms"] == START + 1_000
     assert response["prompt_author_kind"] == "owner_human"
     assert unlinked["prompt_ref"] is None
 
@@ -155,3 +159,134 @@ def test_search_records_reject_an_empty_window() -> None:
         assert str(error) == "search record start must be earlier than end"
     else:
         raise AssertionError("empty search window should fail")
+
+
+def test_inter_agent_instruction_links_the_child_final_response() -> None:
+    child = "child"
+    instruction = Event(
+        event_id="instruction",
+        thread_id=child,
+        turn_id="child-turn",
+        timestamp_ms=START + 1_000,
+        kind="inter_agent_message",
+        role=None,
+        phase="instruction",
+        text="Audit the backend scorecard.",
+        content_availability="plaintext",
+        encrypted_content=None,
+        author=ROOT,
+        recipient=child,
+        source_line=1,
+        author_kind="agent",
+    )
+    final = Event(
+        event_id="final",
+        thread_id=child,
+        turn_id="child-turn",
+        timestamp_ms=START + 2_000,
+        kind="inter_agent_message",
+        role=None,
+        phase="final_answer",
+        text="The scorecard is source-grounded.",
+        content_availability="plaintext",
+        encrypted_content=None,
+        author=child,
+        recipient=ROOT,
+        source_line=2,
+        author_kind="agent",
+    )
+    team = TeamData(
+        team_slug="alpha",
+        provider="claude",
+        root_thread_id=ROOT,
+        display_timezone="UTC",
+        sources=(),
+        agents=(
+            Agent(ROOT, None, "/root", None, None, 0, START, None, "active", "root"),
+            Agent(
+                child,
+                ROOT,
+                "/root/child",
+                None,
+                None,
+                1,
+                START,
+                START + 2_000,
+                "completed",
+                "child",
+            ),
+        ),
+        turns=(),
+        events=(instruction, final),
+        tool_calls=(),
+        edges=(),
+    )
+
+    records = build_search_records(team, frozenset((ROOT, child)))
+
+    assert [record["record_type"] for record in records] == [
+        "inter_agent_prompt",
+        "inter_agent_response",
+    ]
+    assert records[1]["prompt_ref"] == "message:alpha::instruction"
+    assert records[1]["prompt_author_kind"] == "agent"
+    assert records[1]["author"] == child
+    assert records[1]["recipient"] == ROOT
+
+
+def test_same_timestamp_tool_links_only_to_a_preceding_source_prompt() -> None:
+    prompt_a = replace(
+        _event(
+            "prompt-a",
+            START + 1_000,
+            "user_prompt",
+            "First prompt",
+            turn_id="turn-1",
+            author_kind="owner_human",
+        ),
+        source_line=1,
+    )
+    prompt_b = replace(
+        _event(
+            "prompt-b",
+            START + 1_000,
+            "user_prompt",
+            "Later prompt at the same timestamp",
+            turn_id="turn-1",
+            author_kind="owner_human",
+        ),
+        source_line=3,
+    )
+    tool = ToolCall(
+        call_id="same-time-tool",
+        item_id=None,
+        thread_id=ROOT,
+        turn_id="turn-1",
+        name="exec_command",
+        namespace="functions",
+        started_at_ms=START + 1_000,
+        ended_at_ms=START + 1_000,
+        status="completed",
+        input_text=None,
+        output_text=None,
+        nested_tools=(),
+        source_line=2,
+    )
+    base = _team()
+    team = TeamData(
+        team_slug=base.team_slug,
+        provider=base.provider,
+        root_thread_id=base.root_thread_id,
+        display_timezone=base.display_timezone,
+        sources=base.sources,
+        agents=base.agents,
+        turns=(),
+        events=(prompt_a, prompt_b),
+        tool_calls=(tool,),
+        edges=(),
+    )
+
+    records = build_search_records(team, frozenset({ROOT}))
+    tool_record = next(record for record in records if record["role"] == "tool")
+
+    assert tool_record["prompt_ref"] == "message:alpha::prompt-a"

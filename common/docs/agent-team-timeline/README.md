@@ -27,8 +27,9 @@ web server.
 - Versioned content-addressed model caches, a logical-key artifact catalog with context-quality
   scores, append-only raw-log snapshots, and immutable run receipts.
 - A zero-model, append-only prompt/response projection plus a read-only query CLI with chronological
-  prompt ordinals, inclusive ordinal ranges, stable timeline references, JSON/JSONL/Markdown/text
-  output, time/team filters, relationship traversal, and summary or transcript search.
+  prompt ordinals, inclusive ordinal ranges, stable timeline and message references,
+  JSON/JSONL/Markdown/text output, time/team filters, relationship traversal, and separate search
+  scopes for owner prompts, agent responses, or the complete provider-neutral transcript.
 - A self-contained static website served by a built-in loopback server, with backwards-compatible
   range-sharded timeline loading, deterministic gzip sidecars, immutable digest URLs, strong
   validators, browser revalidation, and no CDN dependency.
@@ -58,6 +59,9 @@ python3 run_stats.py
 ./timeline agents --team example-team --format jsonl
 ./timeline show phase:example-team::PHASE_ID --transcript --format markdown
 ./timeline search "reproducible build" --scope all --limit 10
+./timeline search 'backend maturity B3' --in owner-prompts
+./timeline search '50% ptrace' --in agent-responses --prompt-author owner
+./timeline search KVM --in all-transcript --sort newest --limit 20
 ./timeline prompts --range 200-300
 ./timeline prompts --which all --format jsonl > all-prompts.jsonl
 ./timeline prompts --format jsonl > prompts.jsonl
@@ -71,11 +75,17 @@ selects deterministic gzip-6 companions for large browser assets and uses ETags 
 reuse validated responses; another basic static server can still serve the identity files.
 Modern generated sites start from `data/timeline-v2.json` and fetch immutable UTC-day detail
 objects only as their time ranges become visible. `data/timeline.json` remains present for older
-browsers and the archive-local CLI. The first text-search query loads all remaining detail days so
-search results stay complete rather than being limited to the current viewport.
+browsers and compatibility queries. Full transcript search uses separate content-addressed UTC-day
+objects, so it is independent of phase chunking and includes final messages that fall exactly at an
+agent lifetime boundary. Search objects contain verbatim message text plus condensed one-line tool
+records; they never contain raw tool inputs or outputs. A false-positive-only trigram filter in the
+catalog skips UTC-day objects that definitely cannot match the query, while exact matching inside
+every selected object remains authoritative.
 
 The `teams`, `agents`, `phases`, `rollups`, and `search` commands return stable `team:`, `agent:`,
-`phase:`, and `rollup:` references that can be copied into `show`. In an exported package,
+`phase:`, `rollup:`, `message:`, and `tool:` references that can be copied into `show`. Showing a
+message returns its mechanically linked prompt or responses when those records are available in
+the export. In an exported package,
 `data/export.json` records the requested slice under
 `display_window`; query results report the actual contained team and record intervals. Do not infer
 the slice from file modification times.

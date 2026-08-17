@@ -576,7 +576,10 @@ def _parser() -> argparse.ArgumentParser:
     _add_query_filters(query_list)
     query_list.set_defaults(handler="query_list")
     query_show = query_sub.add_parser("show", help="resolve one stable reference", description="resolve one stable reference")
-    query_show.add_argument("reference", help="team:, agent:, phase:, or rollup: reference")
+    query_show.add_argument(
+        "reference",
+        help="team:, agent:, phase:, rollup:, message:, or tool: reference",
+    )
     query_show.add_argument(
         "--transcript",
         action="store_true",
@@ -595,7 +598,7 @@ def _parser() -> argparse.ArgumentParser:
         "--in",
         dest="search_corpus",
         choices=SEARCH_CORPORA,
-        help="search-v2 corpus: owner prompts, agent responses, all transcript, or summaries",
+        help="search-v2 corpus: owner prompts, agent responses, or all transcript",
     )
     query_search.add_argument(
         "--scope",
@@ -604,20 +607,20 @@ def _parser() -> argparse.ArgumentParser:
         help="compatibility search scope (default when --in is absent: summaries)",
     )
     query_search.add_argument(
-        "--match", choices=SEARCH_MATCH_MODES, default="smart"
+        "--match", choices=SEARCH_MATCH_MODES, default=None
     )
-    query_search.add_argument("--sort", choices=SEARCH_SORTS, default="relevance")
+    query_search.add_argument("--sort", choices=SEARCH_SORTS, default=None)
     query_search.add_argument(
-        "--prompt-author", choices=SEARCH_PROMPT_AUTHORS, default="any"
+        "--prompt-author", choices=SEARCH_PROMPT_AUTHORS, default=None
     )
     query_search.add_argument(
-        "--linkage", choices=SEARCH_LINKAGES, default="any"
+        "--linkage", choices=SEARCH_LINKAGES, default=None
     )
     query_search.add_argument(
         "--role", action="append", choices=SEARCH_ROLES, default=[]
     )
     query_search.add_argument("--case-sensitive", action="store_true")
-    query_search.add_argument("--offset", type=int, default=0)
+    query_search.add_argument("--offset", type=int, default=None)
     query_search.add_argument("--limit", type=int, default=50)
     _add_query_filters(query_search)
     query_search.set_defaults(handler="query_search")
@@ -991,12 +994,12 @@ def _run_query(ns: argparse.Namespace, handler: str) -> int:
                 corpus=str(raw_corpus),
                 filters=_query_filters(ns),
                 case_sensitive=bool(ns.case_sensitive),
-                match_mode=str(ns.match),
-                sort=str(ns.sort),
-                prompt_author=str(ns.prompt_author),
-                linkage=str(ns.linkage),
+                match_mode=str(ns.match or "smart"),
+                sort=str(ns.sort or "relevance"),
+                prompt_author=str(ns.prompt_author or "any"),
+                linkage=str(ns.linkage or "any"),
                 roles=tuple(raw_roles),
-                offset=int(ns.offset),
+                offset=int(ns.offset or 0),
                 limit=int(ns.limit),
             )
             print(
@@ -1004,6 +1007,15 @@ def _run_query(ns: argparse.Namespace, handler: str) -> int:
                 end="",
             )
             return 0
+        if (
+            ns.match is not None
+            or ns.sort is not None
+            or ns.prompt_author is not None
+            or ns.linkage is not None
+            or ns.offset is not None
+            or ns.role
+        ):
+            raise ValueError("search-v2 options require --in")
         items = query.search(
             needle,
             scope=str(raw_scope or "summaries"),

@@ -137,10 +137,16 @@ an incomplete schema-2 publication cannot be read). At aggregate zoom it uses bo
 bins without loading a detail day. Detail zoom loads only UTC-day objects intersecting the visible
 range plus a one-hour-or-eight-percent buffer. Lifetime zoom uses the global lifetimes and
 structural edges without loading detail days. A `Map<URL, Promise>` retains each object request,
-and a second range visit never refetches or reapplies it. Global text search remains
-complete: the first non-empty query deliberately loads every remaining detail shard before
-declaring the search corpus ready. This can be more expensive than ordinary navigation, but it is
-explicit, one-time, and does not silently omit off-screen phase or edge text.
+and a second range visit never refetches or reapplies it. Full transcript search does not scan phase
+detail objects. The bootstrap instead catalogs content-addressed `(team, UTC day)` search objects
+whose records come directly from normalized events and condensed tool calls. The browser validates
+each object's team, range, record count, record identities, roles, and known agents before merging
+it. This keeps search complete outside the viewport and makes inclusion independent of phase
+segmentation. Each catalog entry also carries a deterministic Bloom filter over whitespace-compacted
+UTF-8 byte trigrams after ASCII-only case folding. Smart-query terms are tested independently;
+non-ASCII or shorter-than-three-byte terms never reject an object, so a query with no eligible term
+scans all selected objects. The filter may fetch an extra object but can never authorize a match or
+omit one from a correctly built catalog.
 
 This delivery layer is additive. Opening the archive through another static server still serves
 the identity files correctly, while older generated sites without sidecars or schema 2 remain
@@ -154,9 +160,11 @@ The installed `agent-team-timeline query` command and the archive-local `./timel
 entrypoint read the deterministic presentation projection rather than model-cache internals. The
 archive entrypoint is dependency-free, resolves its default archive from its own directory, and is
 copied byte-for-byte with the compatibility `query.py` launcher. Their only inputs are
-`data/timeline.json`, referenced `data/details/*.json`, and referenced rollup Markdown beneath the
-selected archive root. Path resolution fails closed on absolute or escaping references. Querying
-has no write path and can never invoke a model.
+`data/timeline.json`, the generation-matched schema-2 bootstrap and immutable objects, referenced
+`data/details/*.json`, and referenced rollup Markdown beneath the selected archive root. Search
+objects are accepted only when the bootstrap digest, team set, and time range match the loaded
+timeline generation. Path resolution fails closed on absolute or escaping references. Querying has
+no write path and can never invoke a model.
 
 Availability fields are additive to timeline schema 1. Older projections without them are treated
 as available; new projections mark sparse agent/phase records with `summary_available` and each
@@ -256,13 +264,20 @@ SHA-256. It does not call `build`; presentation regeneration remains an explicit
 auditable zero-token operation.
 
 Canonical references are `team:<slug>`, `agent:<team>::<source-id>`,
-`phase:<team>::<phase-id>`, and `rollup:<team>::<kind>::<start-ms>`. The query loader strips the
+`phase:<team>::<phase-id>`, `rollup:<team>::<kind>::<start-ms>`,
+`message:<team>::<event-id>`, and `tool:<team>::<call-id>`. The query loader strips the
 multi-team compositor's `<team>::` namespace from source and phase IDs before constructing those
 references. Consequently, a reference remains stable when the same team moves between an
 individual archive and a combined export. List projections expose references and concise metadata;
-`show` resolves relationships and optional phase transcripts; literal search scans lifetime,
-phase, calendar, and condensed-transcript text. JSON responses use query schema version 1, JSONL
-emits one record per line, and Markdown is presentation-only.
+`show` resolves relationships, optional phase transcripts, and mechanical prompt/response links.
+The phase-independent transcript index contains every nonempty normalized textual event, including
+system and lifecycle records, plus condensed tool records without raw tool payloads. Inter-agent
+instructions and final replies are classified directionally from explicit phase and route metadata;
+prompt association uses provider turn identity and `(timestamp, source line, stable ID)` ordering.
+Search objects are split by team and UTC day, content-addressed, and bound to the timeline source
+generation. Both the browser and archive-local CLI use the same catalog Bloom algorithm only as a
+false-positive prefilter, then apply exact matching to full record text. JSON responses use query
+schema version 1, JSONL emits one record per line, and Markdown is presentation-only.
 
 ## Codex snapshot and continuation contract
 
