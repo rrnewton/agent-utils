@@ -3,7 +3,7 @@
 Define your graph as :class:`Step` values (each carrying a :class:`ResourceHint`) in a
 :class:`DagConfig`, then call :func:`run_dag_limited`. The runner gives you:
 
-* independent active-step and aggregate CPU-job limits, with memory-aware step sizing,
+* independent active-step and total-CPU limits, with memory-aware step sizing,
 * optional per-step containment and measurement through injected protocols,
 * Graphviz + ASCII DAG visualization.
 
@@ -15,7 +15,7 @@ Metrics are likewise opt-in through :class:`MetricsSink`.
     from safe_ci_dag_runner import Step, ResourceHint, DagConfig, run_dag_limited, to_ascii
     cfg = DagConfig(steps=(Step("build", "app", "compile", "make build"),))
     print(to_ascii(cfg))
-    result = run_dag_limited(cfg, max_steps=2, cpu_jobs=8)  # uncontained library execution
+    result = run_dag_limited(cfg, max_steps=2, max_cpus=8)  # uncontained library execution
 """
 
 from __future__ import annotations
@@ -80,6 +80,7 @@ from safe_ci_dag_runner.protocols import (
 from safe_ci_dag_runner.scheduler import (
     Runner,
     cap_config_cpu_jobs,
+    cap_config_max_cpus,
     run_dag,
     run_dag_limited,
     steps_violating_run_timeout,
@@ -102,13 +103,13 @@ from safe_ci_dag_runner.cgroup import (
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
-__version__: str = "0.13.0"
+__version__: str = "0.13.1"
 
 #: Machine-readable manifest emitted by the ``capabilities`` subcommand. Keys are sorted;
 #: values describe the enforcement guards implemented by this package:
 #:   cpu_affinity  opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores
 #:                 with an exact, verified cgroup cpuset; refuse when unavailable
-#:   cpu_bandwidth boxed run: exact outer cpu.max = --jobs x period, read back before execution
+#:   cpu_bandwidth boxed run: exact outer cpu.max = --max-cpus x period, read back before execution
 #:   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
 #:   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
 #:   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count
@@ -154,6 +155,7 @@ __all__ = [
     # running
     "run_dag",
     "run_dag_limited",
+    "cap_config_max_cpus",
     "cap_config_cpu_jobs",
     "steps_violating_run_timeout",
     "Runner",

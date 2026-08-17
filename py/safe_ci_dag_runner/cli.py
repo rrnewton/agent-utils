@@ -67,7 +67,7 @@ from safe_ci_dag_runner.model import (
 from safe_ci_dag_runner.profile_enrich import container_core_budget
 from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink, StepOutcome
 from safe_ci_dag_runner.reservation import Reservation
-from safe_ci_dag_runner.scheduler import cap_config_cpu_jobs, run_dag_limited
+from safe_ci_dag_runner.scheduler import cap_config_max_cpus, run_dag_limited
 from safe_ci_dag_runner.sizing import jobs_for_budget, parse_size
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
@@ -87,8 +87,10 @@ PROFILE_DIR_ENV = "SAFE_CI_DAG_RUNNER_PROFILE_DIR"
 #: and browsable without any flag.
 DEFAULT_PROFILE_DIR = os.path.join(".safe-ci-dag-runner", "profiles")
 
-# Largest CLI CPU-job budget safe to encode in the fixed 100000-us per-step cpu.max period.
-MAX_RUN_CPU_JOBS = (2**63 - 1) // 100_000
+# Largest total-CPU limit safe to encode in the fixed 100000-us per-step cpu.max period.
+MAX_RUN_CPUS = (2**63 - 1) // 100_000
+# Compatibility name retained for callers that imported the 0.13 module constant directly.
+MAX_RUN_CPU_JOBS = MAX_RUN_CPUS
 
 
 # --------------------------------------------------------------------------- colors
@@ -150,7 +152,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} run --dag dag.json')}               {c.dim('# run it; exit 0 iff all steps pass')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --profile')}     {c.dim('# ...and print a per-step profile table')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --only build.app')} {c.dim('# run EXACTLY one step (not its deps)')}\n"
-        f"  {ex(f'{PROG} run --dag dag.json --only test.unit --stress 10 -s 2 -j 100')} {c.dim('# 2 active copies; aggregate declared width <=100')}\n"
+        f"  {ex(f'{PROG} run --dag dag.json --only test.unit --stress 10 -s 2 -j 100')} {c.dim('# 2 active copies; total CPU width <=100')}\n"
         f"  {ex(f'{PROG} plan --dag dag.json --planner critical-path')} {c.dim('# show learned estimates + the plan')}\n"
         f"  {ex(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')} {c.dim('# parallel-speedup study')}\n"
         f"  {ex(f'{PROG} ascii --dag dag.json')}             {c.dim('# quick ASCII view of the graph')}\n"
@@ -236,7 +238,7 @@ def _quickstart(c: Palette) -> str:
 {h('What you get')}
   - concurrent scheduling honoring deps + resource caps, ordered by the chosen {k('--planner')}
     {c.dim('(greedy-lpt = longest single step first; critical-path = longest remaining path first)')}
-    {c.dim('(--max-steps bounds active DAG steps; --jobs bounds their summed declared CPU width)')}
+    {c.dim('(--max-steps bounds active DAG steps; --max-cpus bounds their total CPU width)')}
   - learned est_duration / rss from the profile store override the DAG hints at plan time
     {c.dim('(disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)')}
   - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps
@@ -251,7 +253,7 @@ def _quickstart(c: Palette) -> str:
 {h('Python API')}  {c.dim('(same engine, in code)')}
   from safe_ci_dag_runner import Step, ResourceHint, DagConfig, run_dag_limited, to_ascii
   cfg = DagConfig(steps=(Step("build","app","compile","echo build && sleep 0.1"),))
-  print(to_ascii(cfg)); result = run_dag_limited(cfg, max_steps=2, cpu_jobs=8)
+  print(to_ascii(cfg)); result = run_dag_limited(cfg, max_steps=2, max_cpus=8)
 
 {h('Exit codes')}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file
              | 3 = cgroup boxing required but unavailable (use {k('--allow-cgroup-failure')})
@@ -307,11 +309,39 @@ def _positive_i64(raw: str) -> int:
     return value
 
 
-def _run_cpu_jobs(raw: str) -> int:
+def _run_max_cpus(raw: str) -> int:
     value = _positive_i64(raw)
-    if value > MAX_RUN_CPU_JOBS:
-        raise argparse.ArgumentTypeError(f"must be <= {MAX_RUN_CPU_JOBS}")
+    if value > MAX_RUN_CPUS:
+        raise argparse.ArgumentTypeError(f"must be <= {MAX_RUN_CPUS}")
     return value
+
+
+class _MaxCpusAction(argparse.Action):
+    """Merge canonical and compatibility spellings while rejecting disagreement."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        if not isinstance(values, int):
+            parser.error(f"{option_string or '--max-cpus'} requires an integer")
+        source = option_string or "--max-cpus"
+        existing = getattr(namespace, self.dest, None)
+        if isinstance(existing, int) and existing != values:
+            existing_source = getattr(
+                namespace, "_max_cpus_source", "an earlier CPU limit"
+            )
+            if source == "--jobs" or existing_source == "--jobs":
+                parser.error("--max-cpus and legacy --jobs disagree")
+            parser.error(
+                f"{source}: conflicts with {existing_source} ({values} != {existing})"
+            )
+        setattr(namespace, self.dest, values)
+        if not hasattr(namespace, "_max_cpus_source"):
+            setattr(namespace, "_max_cpus_source", source)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -348,16 +378,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_i64,
         default=None,
         metavar="N",
-        help="maximum active DAG steps (default: effective --jobs budget)",
+        help="maximum active DAG steps (default: effective --max-cpus limit)",
     )
     run_p.add_argument(
         "-j",
-        "--jobs",
-        type=_run_cpu_jobs,
+        "--max-cpus",
+        dest="max_cpus",
+        action=_MaxCpusAction,
+        type=_run_max_cpus,
         default=None,
         metavar="N",
-        help="aggregate declared CPU-job budget across active steps "
-        "(default: effective container/affinity budget tightened by the shared 90% slice)",
+        help="maximum total CPU cores across all active steps "
+        "(default: effective container/affinity budget tightened by the shared 90%% slice)",
+    )
+    run_p.add_argument(
+        "--jobs",
+        dest="max_cpus",
+        action=_MaxCpusAction,
+        type=_run_max_cpus,
+        default=None,
+        metavar="N",
+        help=argparse.SUPPRESS,
     )
     run_p.add_argument(
         "--cores",
@@ -407,8 +448,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="duplicate the selected graph at generation into N disconnected components with no "
         "edges between copies. Named-resource scheduling is removed from the generated copies; "
-        "--max-steps controls active copies and --jobs bounds their aggregate declared CPU "
-        "width. Reports the largest measured number of overlapping child processes, "
+        "--max-steps controls active copies and --max-cpus bounds their total CPU width. "
+        "Reports the largest measured number of overlapping child processes, "
         "the per-copy PASS/FAIL RATIO (e.g. '7/10 passed'), and which copies failed. Combine with "
         "--only to copy one suspect node (e.g. --only test.unit). The ratio is the finding, so "
         "this implies --keep-going. N is still capped by the box memory budget (N x per-copy "
@@ -862,18 +903,18 @@ def _build_feedback_plan(
 
 
 def _cpa_budgets(
-    planner: Planner, max_mem_arg: str | None, cpu_jobs: int | None = None
+    planner: Planner, max_mem_arg: str | None, max_cpus: int | None = None
 ) -> tuple[int | None, int | None]:
     """Resolve the ``(core_budget, mem_budget)`` the CPA allocator balances against, or
     ``(None, None)`` for the non-allocating planners (so they do no cgroup/proc reads).
 
-    ``core_budget`` is the run's aggregate ``cpu_jobs`` when supplied, otherwise
+    ``core_budget`` is the run's aggregate ``max_cpus`` when supplied, otherwise
     :func:`container_core_budget`; ``mem_budget`` is the parsed ``--max-mem`` RAM budget, or
     ``None`` (no memory constraint on the allocation)."""
     if planner is not Planner.CPA:
         return None, None
     mem_budget = parse_size(max_mem_arg) if max_mem_arg else None
-    return max(1, cpu_jobs if cpu_jobs is not None else container_core_budget()), mem_budget
+    return max(1, max_cpus if max_cpus is not None else container_core_budget()), mem_budget
 
 
 def _build_plan_from_summary(
@@ -1173,7 +1214,7 @@ def _print_stress_report(
     n: int,
     max_concurrent_steps: int,
     max_steps: int,
-    cpu_jobs: int,
+    max_cpus: int,
     c: Palette,
 ) -> None:
     """Print the per-copy PASS/FAIL RATIO for a ``--stress`` run — the ratio IS the finding.
@@ -1210,7 +1251,7 @@ def _print_stress_report(
         print(f"  {base}: {line}{detail}")
     print(
         f"  maximum concurrent steps: {max_concurrent_steps} "
-        f"(--max-steps {max_steps}; --jobs {cpu_jobs} aggregate CPU jobs)"
+        f"(--max-steps {max_steps}; --max-cpus {max_cpus} total cores)"
     )
 
 
@@ -1348,7 +1389,7 @@ def _run_single_step(
     result = run_dag_limited(
         one,
         max_steps=1,
-        cpu_jobs=inner_jobs,
+        max_cpus=inner_jobs,
         cgroups=cgroups,
         metrics=metrics,
         keep_going=False,
@@ -1499,41 +1540,42 @@ def _print_sweep_table(
     print(_render_table(headers, table, c))
 
 
-def _select_cpu_jobs(ns: argparse.Namespace) -> int:
-    """Resolve the aggregate declared CPU-job budget for one run.
+def _select_max_cpus(ns: argparse.Namespace) -> int:
+    """Resolve the maximum total core-equivalents for one run.
 
     The inherited cgroup quota, process affinity, and shared aggregate-slice budget jointly bound
     the default. An opt-in hard ``--cores`` reservation can only tighten either the default or an
-    explicit ``--jobs`` request.
+    explicit ``--max-cpus`` request. ``--jobs`` is a hidden 0.13 compatibility alias.
     """
     from safe_ci_dag_runner import cgroup as cg
 
+    explicit = getattr(ns, "max_cpus", None)
     requested = (
-        int(ns.jobs)
-        if isinstance(ns.jobs, int)
-        else min(container_core_budget(), cg.aggregate_slice_cpu_jobs())
+        int(explicit)
+        if isinstance(explicit, int)
+        else min(container_core_budget(), cg.aggregate_slice_max_cpus())
     )
     requested = max(1, requested)
     if isinstance(ns.cores, int) and requested > ns.cores:
         print(
-            f"{PROG}: --cores {ns.cores} is tighter than --jobs {requested}; using aggregate "
-            f"CPU-job budget {ns.cores}",
+            f"{PROG}: --cores {ns.cores} is tighter than --max-cpus {requested}; using total "
+            f"CPU limit {ns.cores}",
             file=sys.stderr,
         )
         return int(ns.cores)
     return requested
 
 
-def _select_max_steps(cfg: DagConfig, ns: argparse.Namespace, cpu_jobs: int) -> int:
+def _select_max_steps(cfg: DagConfig, ns: argparse.Namespace, max_cpus: int) -> int:
     """Resolve the active-step ceiling, combining explicit and memory-derived limits."""
     explicit = int(ns.max_steps) if isinstance(ns.max_steps, int) else None
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
     if max_mem is None:
-        return explicit if explicit is not None else cpu_jobs
+        return explicit if explicit is not None else max_cpus
 
     budget = parse_size(max_mem)
     if budget is None:
-        fallback = explicit if explicit is not None else cpu_jobs
+        fallback = explicit if explicit is not None else max_cpus
         print(
             f"{PROG}: could not parse --max-mem {max_mem!r}; falling back to --max-steps "
             f"{fallback}",
@@ -1614,7 +1656,7 @@ def _scope_grace_s(run_timeout_s: int) -> int:
 def _resolve_cgroup_manager(
     allow_failure: bool,
     unsafe_no_cgroups: bool = False,
-    cpu_jobs: int | None = None,
+    max_cpus: int | None = None,
     run_timeout_s: int | None = None,
 ) -> tuple[CgroupManager | None, int]:
     """Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose.
@@ -1689,7 +1731,7 @@ def _resolve_cgroup_manager(
             return None, 3
         expected_memory_max = cg.expected_outer_memory_max_bytes()
         expected_cpu_count = cg.expected_outer_cpu_count()
-        cpu_request_matches = cpu_jobs is None or expected_cpu_count == cpu_jobs
+        cpu_request_matches = max_cpus is None or expected_cpu_count == max_cpus
         controls_ok = (
             expected_memory_max is not None
             and cpu_request_matches
@@ -1778,7 +1820,7 @@ def _resolve_cgroup_manager(
     reexeced_or_skipped = cg.reexec_in_scope(
         argv,
         memory_max=outer_memory_max,
-        cpu_count=cpu_jobs,
+        cpu_count=max_cpus,
         runtime_max_s=(
             run_timeout_s + _scope_grace_s(run_timeout_s) if run_timeout_s else None
         ),
@@ -1996,14 +2038,14 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             return code
         cfg = _expand_stress(cfg, stress_n)
 
-    # Resolve the aggregate CPU-job budget before cgroup bring-up and bind the exact same value to
-    # the outer scope's CPUQuota and the scheduler's summed-width admission gate.
-    cpu_jobs = _select_cpu_jobs(ns)
+    # Resolve the maximum total CPU capacity before cgroup bring-up and bind the exact same value
+    # to the outer scope's CPUQuota and the scheduler's summed-width admission gate.
+    max_cpus = _select_max_cpus(ns)
 
     cgroups, code = _resolve_cgroup_manager(
         bool(ns.allow_cgroup_failure),
         bool(getattr(ns, "unsafe_no_cgroups", False)),
-        cpu_jobs=cpu_jobs,
+        max_cpus=max_cpus,
         run_timeout_s=_effective_run_timeout(ns),
     )
     if code != 0:
@@ -2040,7 +2082,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # Make the CPU budget visible to planning as well as execution. Authored widths and the
     # undeclared-step cpu.max default are capped before CPA sees the graph, so --show-plan never
     # advertises a width the scheduler will later change.
-    cfg = cap_config_cpu_jobs(cfg, cpu_jobs)
+    cfg = cap_config_max_cpus(cfg, max_cpus)
 
     # Plan-time profile-store feedback: refine each step's est_duration_s
     # and rss_baseline_bytes from the recorded store, then pick the dispatch order for the chosen
@@ -2049,7 +2091,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
-    core_budget, mem_budget = _cpa_budgets(planner, max_mem, cpu_jobs)
+    core_budget, mem_budget = _cpa_budgets(planner, max_mem, max_cpus)
 
     # Profile-artifact SYNC (close the ephemeral-CI feedback loop): parse the backend once; the
     # DOWNLOAD half seeds the planner from the shared summary, the UPLOAD half publishes this run's
@@ -2079,7 +2121,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         plan = _build_feedback_plan(
             cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
         )
-    cfg = cap_config_cpu_jobs(apply_plan_to_config(cfg, plan), cpu_jobs)
+    cfg = cap_config_max_cpus(apply_plan_to_config(cfg, plan), max_cpus)
     # Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     # the same values so older callers keep working and announce that the flag is now redundant.
     if bool(getattr(ns, "small_default_cap", False)):
@@ -2123,7 +2165,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     if bool(ns.show_plan):
         sys.stdout.write(plan_to_text(plan))
 
-    max_steps = _select_max_steps(cfg, ns, cpu_jobs)
+    max_steps = _select_max_steps(cfg, ns, max_cpus)
     verbosity = 0 if bool(ns.quiet) else int(ns.verbosity)
 
     perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))
@@ -2140,7 +2182,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     result = run_dag_limited(
         cfg,
         max_steps=max_steps,
-        cpu_jobs=cpu_jobs,
+        max_cpus=max_cpus,
         cgroups=cgroups,
         metrics=metrics,
         keep_going=keep_going,
@@ -2169,7 +2211,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
             stress_n,
             result.max_concurrent_steps,
             max_steps,
-            cpu_jobs,
+            max_cpus,
             c,
         )
     # Feature C: --profile prints a per-step profile table to stdout.
@@ -2241,7 +2283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _manager, code = _resolve_cgroup_manager(
             False,
             False,
-            cpu_jobs=_select_cpu_jobs(ns),
+            max_cpus=_select_max_cpus(ns),
             run_timeout_s=_effective_run_timeout(ns),
         )
         if code != 0:

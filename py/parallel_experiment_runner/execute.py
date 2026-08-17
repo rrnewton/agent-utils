@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from safe_ci_dag_runner import CgroupManager, RunResult, StepOutcome, run_dag
+from safe_ci_dag_runner import CgroupManager, RunResult, StepOutcome, run_dag_limited
 from safe_ci_dag_runner.cgroup import ScopeNaming
 
 from parallel_experiment_runner.calibrate import (
@@ -265,24 +265,24 @@ def _classify_outcome(
 def execute_round(plan: RoundPlan, *, cgroups: CgroupManager | None) -> RoundResult:
     """Execute one round: lower to a DAG, run it BOXED at the declared width, map every worker.
 
-    ``jobs`` is the plan's worker width and ``core_budget`` is that width times the declared
-    per-worker cores, so the compatibility API receives independent active-step and aggregate
-    CPU-job limits. ``keep_going=True`` because a hit/crash in one seed must not cancel its
-    siblings: the whole point is to sweep every seed in the batch.
+    ``max_steps`` is the plan's worker width and ``max_cpus`` is that width times the declared
+    per-worker cores, so worker concurrency and total CPU capacity remain independent.
+    ``keep_going=True`` because a hit/crash in one seed must not cancel its siblings: the whole
+    point is to sweep every seed in the batch.
     """
     plan.log_dir.mkdir(parents=True, exist_ok=True)
     dag = generate_round_dag(plan)
     jobs = max(1, min(plan.width, len(plan.seeds)))
-    core_budget = jobs * plan.spec.worker_limits.cpu_cores
+    max_cpus = jobs * plan.spec.worker_limits.cpu_cores
 
     start = time.time()
-    result: RunResult = run_dag(
+    result: RunResult = run_dag_limited(
         dag,
-        jobs=jobs,
+        max_steps=jobs,
+        max_cpus=max_cpus,
         cgroups=cgroups,
         keep_going=True,
         verbosity=1,
-        core_budget=core_budget,
     )
     wall_s = time.time() - start
 

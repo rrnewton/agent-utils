@@ -6,7 +6,7 @@
 // no-boxing default path (Python's `cgroups=None`). Reproduced from the reference:
 //
 // * Greedy ready-set loop: each pass launches every ready step (deps satisfied, resources free,
-//   within the active-step and aggregate CPU-job limits, in longest-processing-time order) on its
+//   within the active-step and total CPU-core limits, in longest-processing-time order) on its
 //   own supervisor thread, then sleeps briefly.
 // * Dependency gating + dep-FAILURE skip-closure (a failed dep transitively skips dependents).
 // * Named-resource capacity buckets (`hint.resources` vs `cfg.resource_caps`).
@@ -136,7 +136,7 @@ struct Shared {
     /// Stop scheduling new steps after a failure.
     stop: bool,
     /// Summed declared inner-jobs width of concurrently-running steps (see [`cores_free`]).
-    /// Every run enforces this against its aggregate CPU-job budget.
+    /// Every run enforces this against its total CPU-core budget.
     cores_used: i64,
     /// Accumulated per-step measurement rows (forwarded to a metrics sink after the run).
     step_profile_rows: Vec<ProfileRow>,
@@ -459,7 +459,7 @@ fn res_free(sh: &Shared, step: &Step) -> bool {
         .all(|(r, n)| sh.resource_avail.get(r).copied().unwrap_or(0) >= *n)
 }
 
-/// The step's effective width for the CPU-job gate: its declared/CPA-assigned inner width, then
+/// The step's effective width for the CPU-core gate: its declared/CPA-assigned inner width, then
 /// the DAG's undeclared-step cpu.max default, then one. The default is charged even though it does
 /// not append a jobs flag to commands that did not opt into one.
 fn step_width(step: &Step, default_cpu_count: Option<i64>) -> i64 {
@@ -469,47 +469,55 @@ fn step_width(step: &Step, default_cpu_count: Option<i64>) -> i64 {
     }
 }
 
-/// Return a run configuration whose declared per-step CPU widths cannot exceed `cpu_jobs`.
+/// Return a run configuration whose declared per-step CPU widths cannot exceed `max_cpus`.
 ///
 /// This is intentionally visible: a caller-authored width that the run budget changes must not
 /// look as though it executed unchanged. The top-level undeclared-step cpu.max default is capped
 /// too, and the runtime gate charges that effective default even though no jobs flag is appended.
-pub fn cap_config_cpu_jobs(cfg: &DagConfig, cpu_jobs: i64) -> DagConfig {
-    let cpu_jobs = cpu_jobs.max(1);
+pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
+    let max_cpus = max_cpus.max(1);
     let mut capped = cfg.clone();
     if let Some(default) = capped
         .default_step_cpu_count
-        .filter(|default| *default > cpu_jobs)
+        .filter(|default| *default > max_cpus)
     {
         eprintln!(
-            "[scheduler] WARNING: default_step_cpu_count={default} exceeds the run CPU-job \
-             budget --jobs {cpu_jobs}; capping undeclared steps' per-step cpu.max to {cpu_jobs}"
+            "[scheduler] WARNING: default_step_cpu_count={default} exceeds the run total CPU-core \
+             budget --max-cpus {max_cpus}; capping undeclared steps' per-step cpu.max to \
+             {max_cpus}"
         );
-        capped.default_step_cpu_count = Some(cpu_jobs);
+        capped.default_step_cpu_count = Some(max_cpus);
     }
     for step in &mut capped.steps {
         if let Some(width) = step
             .hint
             .preferred_inner_jobs
-            .filter(|width| *width > cpu_jobs)
+            .filter(|width| *width > max_cpus)
         {
             eprintln!(
-                "[scheduler] WARNING: step {} preferred_inner_jobs={width} exceeds the run \
-                 CPU-job budget --jobs {cpu_jobs}; capping its command width and per-step \
-                 cpu.max to {cpu_jobs}",
+                "[scheduler] WARNING: step {} preferred_inner_jobs={width} exceeds the run total \
+                 CPU-core budget --max-cpus {max_cpus}; capping its command width and per-step \
+                 cpu.max to {max_cpus}",
                 step.tag()
             );
-            step.hint.preferred_inner_jobs = Some(cpu_jobs);
+            step.hint.preferred_inner_jobs = Some(max_cpus);
         }
     }
     capped
 }
 
-// True when the step fits the remaining aggregate CPU-job budget. Runner construction caps every
-// positive preferred_inner_jobs width to `cpu_jobs`, so an oversized authored step cannot deadlock
+/// Compatibility alias for [`cap_config_max_cpus`].
+#[doc(hidden)]
+#[deprecated(since = "0.13.1", note = "use cap_config_max_cpus")]
+pub fn cap_config_cpu_jobs(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
+    cap_config_max_cpus(cfg, max_cpus)
+}
+
+// True when the step fits the remaining total CPU-core budget. Runner construction caps every
+// positive preferred_inner_jobs width to `max_cpus`, so an oversized authored step cannot deadlock
 // here and never needs the old "run alone while over budget" escape hatch.
-fn cores_free(sh: &Shared, step: &Step, default_cpu_count: Option<i64>, cpu_jobs: i64) -> bool {
-    sh.cores_used + step_width(step, default_cpu_count) <= cpu_jobs
+fn cores_free(sh: &Shared, step: &Step, default_cpu_count: Option<i64>, max_cpus: i64) -> bool {
+    sh.cores_used + step_width(step, default_cpu_count) <= max_cpus
 }
 
 fn acquire(sh: &mut Shared, step: &Step) {
@@ -552,9 +560,9 @@ struct Runner {
     default_step_cpu_timeout: i64,
     cpu_timeout_multiplier: f64,
     cpu_timeout_platform: String,
-    /// Aggregate declared CPU-job budget. The ready-set loop never lets the summed effective
-    /// inner-jobs width of concurrently-running steps exceed this value, for every planner.
-    cpu_jobs: i64,
+    /// Maximum CPU cores total. The ready-set loop never lets the summed effective inner-job
+    /// widths of concurrently-running steps exceed this value, for every planner.
+    max_cpus: i64,
     /// OUTER wall budget for the WHOLE run, in seconds; `None` leaves the run unbounded.
     ///
     /// Independent of every per-step budget, and that independence is the point: no combination of
@@ -571,15 +579,15 @@ impl Runner {
     fn new(
         cfg: &DagConfig,
         max_steps: i64,
-        cpu_jobs: i64,
+        max_cpus: i64,
         keep_going: bool,
         verbosity: i64,
         cgroups: BoxedCgroups,
         order_override: Option<Vec<String>>,
         run_timeout_s: Option<i64>,
     ) -> Self {
-        let cpu_jobs = cpu_jobs.max(1);
-        let capped = cap_config_cpu_jobs(cfg, cpu_jobs);
+        let max_cpus = max_cpus.max(1);
+        let capped = cap_config_max_cpus(cfg, max_cpus);
         let steps: HashMap<String, Step> = capped
             .steps
             .iter()
@@ -623,7 +631,7 @@ impl Runner {
             default_step_cpu_timeout: capped.default_step_cpu_timeout,
             cpu_timeout_multiplier: capped.cpu_timeout_multiplier,
             cpu_timeout_platform: capped.cpu_timeout_platform.clone(),
-            cpu_jobs,
+            max_cpus,
             run_timeout_s,
             evidence: RunEvidence::open(default_log_dir()).map(Arc::new),
             shared: Arc::new(Mutex::new(Shared {
@@ -776,7 +784,7 @@ impl Runner {
                         if !res_free(&sh, &step) {
                             continue;
                         }
-                        if !cores_free(&sh, &step, self.default_step_cpu_count, self.cpu_jobs) {
+                        if !cores_free(&sh, &step, self.default_step_cpu_count, self.max_cpus) {
                             continue;
                         }
                         sh.running.insert(tag.clone());
@@ -1936,27 +1944,32 @@ fn run_step(ctx: StepCtx) {
 
 /// Run a whole DAG and return its [`RunResult`] (no cgroup boxing, no metrics recording).
 ///
-/// * `jobs`: ergonomic combined limit: both the maximum active-step count and the aggregate
-///   declared CPU-job budget, clamped to at least 1. Use [`run_dag_limited`] when those limits
+/// * `combined_limit`: compatibility combined limit: both the maximum active-step count and the
+///   maximum CPU cores total, clamped to at least 1. Use [`run_dag_limited`] when those limits
 ///   differ.
 /// * `keep_going`: on a failure, let already-running steps finish instead of eager-cancelling
 ///   them; the scheduler still stops launching new steps (it does NOT run every still-runnable
 ///   step), so in-flight steps report their own pass/fail rather than ABORTED.
 /// * `verbosity`: 0 quiet (+failures), 1 default (+summaries), 2-4 stream child stdout,
 ///   and >=5 streams with the deepest recognized test identity on every line.
-pub fn run_dag(cfg: &DagConfig, jobs: i64, keep_going: bool, verbosity: i64) -> RunResult {
-    run_dag_limited(cfg, jobs, jobs, keep_going, verbosity)
-}
-
-/// Run a whole DAG with independent active-step and aggregate CPU-job limits.
-pub fn run_dag_limited(
+pub fn run_dag(
     cfg: &DagConfig,
-    max_steps: i64,
-    cpu_jobs: i64,
+    combined_limit: i64,
     keep_going: bool,
     verbosity: i64,
 ) -> RunResult {
-    run_dag_boxed_limited(cfg, max_steps, cpu_jobs, keep_going, verbosity, None)
+    run_dag_limited(cfg, combined_limit, combined_limit, keep_going, verbosity)
+}
+
+/// Run a whole DAG with independent active-step and total CPU-core limits.
+pub fn run_dag_limited(
+    cfg: &DagConfig,
+    max_steps: i64,
+    max_cpus: i64,
+    keep_going: bool,
+    verbosity: i64,
+) -> RunResult {
+    run_dag_boxed_limited(cfg, max_steps, max_cpus, keep_going, verbosity, None)
 }
 
 /// Run a whole DAG with an optional per-step cgroup manager (the real-work entry point).
@@ -1966,45 +1979,52 @@ pub fn run_dag_limited(
 /// rows are always collected into [`RunResult::step_profile_rows`] for a metrics sink to record.
 pub fn run_dag_boxed(
     cfg: &DagConfig,
-    jobs: i64,
+    combined_limit: i64,
     keep_going: bool,
     verbosity: i64,
     cgroups: BoxedCgroups,
 ) -> RunResult {
-    run_dag_boxed_limited(cfg, jobs, jobs, keep_going, verbosity, cgroups)
+    run_dag_boxed_limited(
+        cfg,
+        combined_limit,
+        combined_limit,
+        keep_going,
+        verbosity,
+        cgroups,
+    )
 }
 
 /// Boxed form of [`run_dag_limited`].
 pub fn run_dag_boxed_limited(
     cfg: &DagConfig,
     max_steps: i64,
-    cpu_jobs: i64,
+    max_cpus: i64,
     keep_going: bool,
     verbosity: i64,
     cgroups: BoxedCgroups,
 ) -> RunResult {
     run_dag_boxed_ordered_limited(
-        cfg, max_steps, cpu_jobs, keep_going, verbosity, cgroups, None,
+        cfg, max_steps, max_cpus, keep_going, verbosity, cgroups, None,
     )
 }
 
 /// Like [`run_dag_boxed`] but with an explicit dispatch `order` (e.g. a critical-path planner's)
-/// and the compatibility `core_budget` option. The scheduler always has an aggregate CPU-job gate:
-/// `core_budget` supplies it when present, otherwise `jobs` does. New callers that need separate
-/// active-step and CPU-job limits should use [`run_dag_boxed_ordered_limited`].
+/// and the compatibility `max_cpus` option. The scheduler always has a total CPU-core gate:
+/// `max_cpus` supplies it when present, otherwise `max_steps` does. New callers that need separate
+/// active-step and CPU-core limits should use [`run_dag_boxed_ordered_limited`].
 pub fn run_dag_boxed_ordered(
     cfg: &DagConfig,
-    jobs: i64,
+    max_steps: i64,
     keep_going: bool,
     verbosity: i64,
     cgroups: BoxedCgroups,
     order: Option<Vec<String>>,
-    core_budget: Option<i64>,
+    max_cpus: Option<i64>,
 ) -> RunResult {
     run_dag_boxed_ordered_limited(
         cfg,
-        jobs,
-        core_budget.unwrap_or(jobs),
+        max_steps,
+        max_cpus.unwrap_or(max_steps),
         keep_going,
         verbosity,
         cgroups,
@@ -2012,19 +2032,19 @@ pub fn run_dag_boxed_ordered(
     )
 }
 
-/// Boxed ordered run with independent active-step and aggregate CPU-job limits.
+/// Boxed ordered run with independent active-step and total CPU-core limits.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dag_boxed_ordered_limited(
     cfg: &DagConfig,
     max_steps: i64,
-    cpu_jobs: i64,
+    max_cpus: i64,
     keep_going: bool,
     verbosity: i64,
     cgroups: BoxedCgroups,
     order: Option<Vec<String>>,
 ) -> RunResult {
     run_dag_boxed_deadline_limited(
-        cfg, max_steps, cpu_jobs, keep_going, verbosity, cgroups, order, None,
+        cfg, max_steps, max_cpus, keep_going, verbosity, cgroups, order, None,
     )
 }
 
@@ -2062,18 +2082,18 @@ pub fn steps_violating_run_timeout(cfg: &DagConfig, run_timeout_s: i64) -> Vec<(
 #[allow(clippy::too_many_arguments)]
 pub fn run_dag_boxed_deadline(
     cfg: &DagConfig,
-    jobs: i64,
+    max_steps: i64,
     keep_going: bool,
     verbosity: i64,
     cgroups: BoxedCgroups,
     order: Option<Vec<String>>,
-    core_budget: Option<i64>,
+    max_cpus: Option<i64>,
     run_timeout_s: Option<i64>,
 ) -> RunResult {
     run_dag_boxed_deadline_limited(
         cfg,
-        jobs,
-        core_budget.unwrap_or(jobs),
+        max_steps,
+        max_cpus.unwrap_or(max_steps),
         keep_going,
         verbosity,
         cgroups,
@@ -2082,12 +2102,12 @@ pub fn run_dag_boxed_deadline(
     )
 }
 
-/// Deadline-aware boxed run with independent active-step and aggregate CPU-job limits.
+/// Deadline-aware boxed run with independent active-step and total CPU-core limits.
 #[allow(clippy::too_many_arguments)]
 pub fn run_dag_boxed_deadline_limited(
     cfg: &DagConfig,
     max_steps: i64,
-    cpu_jobs: i64,
+    max_cpus: i64,
     keep_going: bool,
     verbosity: i64,
     cgroups: BoxedCgroups,
@@ -2151,7 +2171,7 @@ pub fn run_dag_boxed_deadline_limited(
     let runner = Runner::new(
         cfg,
         max_steps,
-        cpu_jobs,
+        max_cpus,
         keep_going,
         verbosity,
         cgroups,
@@ -2609,7 +2629,7 @@ mod tests {
     }
 
     #[test]
-    fn max_steps_and_cpu_jobs_constrain_independently() {
+    fn max_steps_and_max_cpus_constrain_independently() {
         let make_cfg = || {
             let mut steps = Vec::new();
             for index in 0..4 {
@@ -2789,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_width_and_default_cpu_cap_are_clamped_to_run_jobs() {
+    fn oversized_width_and_default_cpu_cap_are_clamped_to_max_cpus() {
         let mut item = step(
             "g",
             "wide",
@@ -2806,7 +2826,7 @@ mod tests {
             ..Default::default()
         };
 
-        let capped = cap_config_cpu_jobs(&cfg, 2);
+        let capped = cap_config_max_cpus(&cfg, 2);
         assert_eq!(capped.steps[0].hint.preferred_inner_jobs, Some(2));
         assert_eq!(capped.default_step_cpu_count, Some(2));
 

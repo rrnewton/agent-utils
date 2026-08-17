@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from typing import overload
 
 from safe_ci_dag_runner.ambient import (
     AmbientSnapshot,
@@ -61,7 +62,13 @@ from safe_ci_dag_runner.teardown import (
     reap_many,
 )
 
-__all__ = ["Runner", "cap_config_cpu_jobs", "run_dag", "run_dag_limited"]
+__all__ = [
+    "Runner",
+    "cap_config_max_cpus",
+    "cap_config_cpu_jobs",
+    "run_dag",
+    "run_dag_limited",
+]
 
 #: Scheduler idle interval between ready-set sweeps (seconds). Matches the reference's
 #: ``time.sleep(0.05)`` — short enough to keep dispatch latency low, long enough to avoid
@@ -91,19 +98,19 @@ def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
     return PsiReading(avg10=pressure["avg10"], avg60=pressure["avg60"])
 
 
-def cap_config_cpu_jobs(cfg: DagConfig, cpu_jobs: int) -> DagConfig:
-    """Copy ``cfg`` with every declared per-step CPU width capped to ``cpu_jobs``.
+def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
+    """Copy ``cfg`` with every declared per-step CPU width capped to ``max_cpus``.
 
     The clamp is intentionally visible: a caller-authored width changed by the run budget must
     not look as though it executed unchanged. The undeclared-step ``cpu.max`` default is capped
     too, so a nominal width-one step cannot silently receive a wider child quota.
     """
-    budget = max(1, cpu_jobs)
+    budget = max(1, max_cpus)
     default_cpu_count = cfg.default_step_cpu_count
     if default_cpu_count is not None and default_cpu_count > budget:
         _warn(
-            f"default_step_cpu_count={default_cpu_count} exceeds the run CPU-job budget "
-            f"--jobs {budget}; capping undeclared steps' per-step cpu.max to {budget}"
+            f"default_step_cpu_count={default_cpu_count} exceeds --max-cpus {budget}; "
+            f"capping undeclared steps' per-step cpu.max to {budget}"
         )
         default_cpu_count = budget
 
@@ -112,8 +119,8 @@ def cap_config_cpu_jobs(cfg: DagConfig, cpu_jobs: int) -> DagConfig:
         width = step.hint.preferred_inner_jobs
         if width is not None and width > budget:
             _warn(
-                f"step {step.tag} preferred_inner_jobs={width} exceeds the run CPU-job budget "
-                f"--jobs {budget}; capping its command width and per-step cpu.max to {budget}"
+                f"step {step.tag} preferred_inner_jobs={width} exceeds --max-cpus {budget}; "
+                f"capping its command width and per-step cpu.max to {budget}"
             )
             step = replace(
                 step,
@@ -128,6 +135,25 @@ def cap_config_cpu_jobs(cfg: DagConfig, cpu_jobs: int) -> DagConfig:
         default_step_cpu_count=default_cpu_count,
         resource_caps=dict(cfg.resource_caps),
     )
+
+
+def cap_config_cpu_jobs(cfg: DagConfig, cpu_jobs: int) -> DagConfig:
+    """Compatibility alias for :func:`cap_config_max_cpus`."""
+
+    return cap_config_max_cpus(cfg, cpu_jobs)
+
+
+def _resolve_max_cpus_argument(
+    max_cpus: int | None, cpu_jobs: int | None
+) -> int:
+    """Resolve the canonical keyword and its 0.13 compatibility alias."""
+
+    if max_cpus is not None and cpu_jobs is not None and max_cpus != cpu_jobs:
+        raise TypeError("max_cpus and legacy cpu_jobs disagree")
+    resolved = max_cpus if max_cpus is not None else cpu_jobs
+    if resolved is None:
+        raise TypeError("missing required keyword-only argument: 'max_cpus'")
+    return max(1, resolved)
 
 
 class _NoopRunWindow:
@@ -214,6 +240,37 @@ class Runner:
     typed :class:`RunResult` after :meth:`run`).
     """
 
+    @overload
+    def __init__(
+        self,
+        cfg: DagConfig,
+        *,
+        max_steps: int,
+        max_cpus: int,
+        cgroups: CgroupManager,
+        cpu_jobs: None = None,
+        keep_going: bool = False,
+        verbosity: int = 1,
+        order: Sequence[str] | None = None,
+        run_timeout_s: int | None = None,
+    ) -> None: ...
+
+    @overload
+    def __init__(
+        self,
+        cfg: DagConfig,
+        *,
+        max_steps: int,
+        max_cpus: int,
+        cpu_jobs: int,
+        cgroups: CgroupManager,
+        keep_going: bool = False,
+        verbosity: int = 1,
+        order: Sequence[str] | None = None,
+        run_timeout_s: int | None = None,
+    ) -> None: ...
+
+    @overload
     def __init__(
         self,
         cfg: DagConfig,
@@ -221,20 +278,37 @@ class Runner:
         max_steps: int,
         cpu_jobs: int,
         cgroups: CgroupManager,
+        max_cpus: None = None,
+        keep_going: bool = False,
+        verbosity: int = 1,
+        order: Sequence[str] | None = None,
+        run_timeout_s: int | None = None,
+    ) -> None: ...
+
+    def __init__(
+        self,
+        cfg: DagConfig,
+        *,
+        max_steps: int,
+        max_cpus: int | None = None,
+        cpu_jobs: int | None = None,
+        cgroups: CgroupManager,
         keep_going: bool = False,
         verbosity: int = 1,
         order: Sequence[str] | None = None,
         run_timeout_s: int | None = None,
     ) -> None:
-        self.cpu_jobs = max(1, cpu_jobs)
-        self.cfg = cap_config_cpu_jobs(cfg, self.cpu_jobs)
+        self.max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
+        # Public 0.13 attribute retained for source compatibility; new code uses max_cpus.
+        self.cpu_jobs = self.max_cpus
+        self.cfg = cap_config_max_cpus(cfg, self.max_cpus)
         self.max_steps = max(1, max_steps)
         self.cgroups = cgroups
         self.keep_going = keep_going
         # verbosity: 0 quiet(+failures), 1 default(+summaries), >=2 stream child stdout.
         self.verbosity = verbosity
-        # Aggregate declared CPU-job budget. Every planner uses the same admission gate: the
-        # summed effective width of concurrently-running steps may never exceed this value.
+        # Maximum total CPU-core equivalents across active steps. Every planner uses the same
+        # admission gate: the summed effective width may never exceed this value.
         self.cores_used = 0
         self.steps: dict[str, Step] = self.cfg.by_tag()
         self.intentional_skips = tuple(
@@ -312,12 +386,12 @@ class Runner:
         return width if (width is not None and width > 0) else 1
 
     def _cores_free(self, step: Step) -> bool:
-        """Whether the step fits the remaining aggregate CPU-job budget.
+        """Whether the step fits the remaining total-CPU budget.
 
-        Construction caps every authored width to ``cpu_jobs``, so an oversized step cannot
+        Construction caps every authored width to ``max_cpus``, so an oversized step cannot
         deadlock and does not need the former "run alone while over budget" escape hatch.
         """
-        return self.cores_used + self._step_width(step) <= self.cpu_jobs
+        return self.cores_used + self._step_width(step) <= self.max_cpus
 
     def _acquire(self, step: Step) -> None:
         for r, n in step.hint.resources.items():
@@ -421,7 +495,7 @@ class Runner:
         """Drive the DAG to completion; returns ``True`` when no genuine failure occurred.
 
         Greedy ready-set loop: each pass launches every currently-ready step (deps satisfied,
-        resources free, under the active-step and CPU-job limits, in LPT order) on its own daemon
+        resources free, under the active-step and total-CPU limits, in LPT order) on its own daemon
         supervisor
         thread, then sleeps. Terminates when nothing is running AND either every step has a
         terminal outcome (done or dep-skipped) OR fail-fast has tripped — the fail-fast clause
@@ -1036,7 +1110,7 @@ def run_dag(
     return run_dag_limited(
         cfg,
         max_steps=jobs,
-        cpu_jobs=core_budget if core_budget is not None else jobs,
+        max_cpus=core_budget if core_budget is not None else jobs,
         cgroups=cgroups,
         metrics=metrics,
         keep_going=keep_going,
@@ -1046,10 +1120,31 @@ def run_dag(
     )
 
 
+@overload
 def run_dag_limited(
     cfg: DagConfig,
     *,
     max_steps: int,
+    max_cpus: int,
+    cpu_jobs: None = None,
+    cgroups: CgroupManager | None = None,
+    metrics: MetricsSink | None = None,
+    keep_going: bool = False,
+    verbosity: int = 1,
+    order: Sequence[str] | None = None,
+    run_timeout_s: int | None = None,
+) -> RunResult:
+    """Type signature accepting the canonical total-CPU keyword."""
+
+    ...
+
+
+@overload
+def run_dag_limited(
+    cfg: DagConfig,
+    *,
+    max_steps: int,
+    max_cpus: int,
     cpu_jobs: int,
     cgroups: CgroupManager | None = None,
     metrics: MetricsSink | None = None,
@@ -1058,7 +1153,44 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
 ) -> RunResult:
-    """Run a DAG with independent active-step and aggregate CPU-job limits.
+    """Type signature accepting matching canonical and compatibility keywords."""
+
+    ...
+
+
+@overload
+def run_dag_limited(
+    cfg: DagConfig,
+    *,
+    max_steps: int,
+    cpu_jobs: int,
+    max_cpus: None = None,
+    cgroups: CgroupManager | None = None,
+    metrics: MetricsSink | None = None,
+    keep_going: bool = False,
+    verbosity: int = 1,
+    order: Sequence[str] | None = None,
+    run_timeout_s: int | None = None,
+) -> RunResult:
+    """Type signature accepting the compatibility total-CPU keyword."""
+
+    ...
+
+
+def run_dag_limited(
+    cfg: DagConfig,
+    *,
+    max_steps: int,
+    max_cpus: int | None = None,
+    cpu_jobs: int | None = None,
+    cgroups: CgroupManager | None = None,
+    metrics: MetricsSink | None = None,
+    keep_going: bool = False,
+    verbosity: int = 1,
+    order: Sequence[str] | None = None,
+    run_timeout_s: int | None = None,
+) -> RunResult:
+    """Run a DAG with independent active-step and total-CPU limits.
 
     It brackets the run in a :class:`RunWindow` (whole-run metrics), drives the
     :class:`Runner`, flushes the outer-scope cgroup backstop, records the accumulated per-step
@@ -1066,7 +1198,8 @@ def run_dag_limited(
 
     :param cfg: the DAG plus caller policy (steps, resource caps, memory tunables).
     :param max_steps: maximum number of concurrently active DAG steps; clamped to at least 1.
-    :param cpu_jobs: aggregate declared CPU-job budget across active steps; clamped to at least 1.
+    :param max_cpus: maximum total core-equivalents across active steps; clamped to at least 1.
+    :param cpu_jobs: compatibility alias for ``max_cpus``; if both are passed they must agree.
     :param cgroups: per-step containment manager, or ``None`` for the no-containment path
         (a :class:`_NoopCgroupManager` is substituted; teardown falls back to process-group
         kill). The function does not establish an outer cgroup scope itself. A
@@ -1116,10 +1249,11 @@ def run_dag_limited(
             "(falling back to process-group kill for teardown, no inner memory/CPU caps)."
         )
 
+    resolved_max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
     runner = Runner(
         cfg,
         max_steps=max_steps,
-        cpu_jobs=cpu_jobs,
+        max_cpus=resolved_max_cpus,
         cgroups=manager,
         keep_going=keep_going,
         verbosity=verbosity,

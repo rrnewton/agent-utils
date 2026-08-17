@@ -1220,7 +1220,7 @@ def _cpa_simulate_makespan(
     now = 0.0
     pending: set[str] = {step.tag for step in cfg.steps}
     if any(widths[tag] < 1 or widths[tag] > P for tag in pending):
-        raise ValueError("CPA width lies outside the aggregate CPU-job budget")
+        raise ValueError("CPA width lies outside the total CPU budget")
     while pending or running:
         launched = True
         while launched:
@@ -1389,7 +1389,7 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
     For a CPA plan each step also gets ``preferred_inner_jobs = alloc_inner_jobs`` — the inner
     width the allocator chose — so its jobs flag carries that width (via
     :func:`model.command_with_inner_jobs`) and its memory cap scales accordingly. Run-level ``-j``
-    remains the aggregate CPU-job budget."""
+    remains the total CPU budget."""
     by_tag = plan.by_tag()
     new_steps: list[Step] = []
     for step in cfg.steps:

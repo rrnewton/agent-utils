@@ -84,7 +84,7 @@ def test_independent_cpu_budget_keeps_legacy_jobs_columns_as_max_steps() -> None
         result = run_dag_limited(
             _tiny_dag(),
             max_steps=2,
-            cpu_jobs=8,
+            max_cpus=8,
             metrics=CsvMetricsSink(d, git_sha="limits"),
             verbosity=0,
         )

@@ -128,15 +128,18 @@ def schedulable_peak_mem_bytes(
 
 
 def jobs_footprint_bytes(cfg: DagConfig, jobs: int, inner_jobs: int | None = None) -> int:
-    """Worst-case footprint (bytes) at the given ``-j``, clamped to the configured floor."""
+    """Worst-case footprint at the given active-step count, clamped to the configured floor."""
     peak, _ = schedulable_peak_mem_bytes(cfg, jobs, inner_jobs)
     return max(cfg.mem_cap_floor_bytes, int(peak * cfg.outer_mem_safety_factor))
 
 
 def jobs_for_budget(cfg: DagConfig, budget: int) -> tuple[int, int]:
-    """Largest ``-jN`` (>=1, capped at CPU count) whose worst-case footprint fits ``budget``
-    bytes. Returns ``(jobs, footprint_at_that_jobs)``. Always >= 1: a box too small for even
-    one step is a WAIT/abort decision for the caller, not a ``-j0``."""
+    """Largest active-step count whose worst-case footprint fits ``budget``.
+
+    The count is at least one and capped at the CPU count. Returns ``(max_steps,
+    footprint_at_that_count)``. A box too small for even one step is a WAIT/abort decision for the
+    caller, not a zero-concurrency result.
+    """
     ncpu = os.cpu_count() or 4
     best = 1
     for n in range(1, ncpu + 1):

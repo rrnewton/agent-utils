@@ -109,16 +109,16 @@ fn boxed_oom_does_not_truncate_a_neighbour_artifact() {
     let dag_json = format!(r#"{{"steps": [{}]}}"#, steps.join(","));
     std::fs::write(&dag, dag_json).unwrap();
 
-    let jobs = (NEIGHBOUR_COUNT + 1).to_string();
+    let max_cpus = (NEIGHBOUR_COUNT + 1).to_string();
     let output = Command::new(bin)
         .args([
             "run",
             "--dag",
             dag.to_str().unwrap(),
             "--max-steps",
-            &jobs,
-            "--jobs",
-            &jobs,
+            &max_cpus,
+            "--max-cpus",
+            &max_cpus,
             "--keep-going",
             "--no-profile",
         ])

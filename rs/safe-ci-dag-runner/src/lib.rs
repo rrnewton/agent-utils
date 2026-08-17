@@ -43,11 +43,13 @@ pub use attribution::{
     recognize, Culprit, InFlightTest, ProcessObservation, RunEvidence, StepStream, TestEvent,
     TestTracker, LOG_DIR_ENV, NO_LOGS_ENV, STEP_NONCE_ENV,
 };
+#[allow(deprecated)]
 pub use cgroup::{
-    aggregate_slice_cpu_jobs, attempt_scope_reexec, expected_outer_cpu_count,
-    expected_scope_runtime_max_s, install_scope_teardown, observe_own_containment, promised_unit,
-    run_containment, verify_scope_runtime_max, CgroupManager, Cgroups, ContainmentEvidence,
-    ContainmentProof, RunContainment, ScopeAttempt, FORCE_ATTEMPT_ENV,
+    aggregate_slice_cpu_jobs, aggregate_slice_max_cpus, attempt_scope_reexec,
+    expected_outer_cpu_count, expected_scope_runtime_max_s, install_scope_teardown,
+    observe_own_containment, promised_unit, run_containment, verify_scope_runtime_max,
+    CgroupManager, Cgroups, ContainmentEvidence, ContainmentProof, RunContainment, ScopeAttempt,
+    FORCE_ATTEMPT_ENV,
 };
 pub use estimates::{
     allocate_widths, apply_plan_to_config, bucketize_rows, build_plan, feedback_identity,
@@ -69,8 +71,9 @@ pub use profile_enrich::{
     container_core_budget, resolve_effective_inner_jobs, step_enrichment_columns,
 };
 pub use reservation::{acquire as reserve_cores, held_cores, reclaim_dead, Reservation};
+#[allow(deprecated)]
 pub use scheduler::{
-    cap_config_cpu_jobs, run_dag, run_dag_boxed, run_dag_boxed_deadline,
+    cap_config_cpu_jobs, cap_config_max_cpus, run_dag, run_dag_boxed, run_dag_boxed_deadline,
     run_dag_boxed_deadline_limited, run_dag_boxed_limited, run_dag_boxed_ordered,
     run_dag_boxed_ordered_limited, run_dag_limited, steps_violating_run_timeout,
 };
@@ -94,7 +97,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 // Rust-vs-Python `cpu_timeout` gap). Keys are sorted; values reflect real behavior:
 //   cpu_affinity  opt-in --cores K: constrain the WHOLE run tree to K least-busy free cores
 //                 with an exact verified cgroup cpuset; refuse when unavailable
-//   cpu_bandwidth boxed run: exact outer cpu.max = --jobs x period, read back before execution
+//   cpu_bandwidth boxed run: exact outer cpu.max = --max-cpus x period, read back before execution
 //   cpu_timeout   per-step user+system CPU budget (cgroup cpu.stat), reaped over budget
 //   memory_max    per-step inner memory.max cap (kernel OOM-kills the step at its cap)
 //   oom_detection failure attributed to OOM via cgroup memory.events oom_kill count

@@ -42,7 +42,7 @@ const ENV_SCOPE_UNIT: &str = "SAFE_CI_SCOPE_UNIT";
 const OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_OUTER_MEMORY_MAX_BYTES";
 /// Exact cap carried across the systemd re-exec for in-scope readback.
 const EXPECTED_OUTER_MEMORY_MAX_ENV: &str = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES";
-/// Exact aggregate CPU-job cap carried across the systemd re-exec for in-scope readback.
+/// Exact total CPU-core cap carried across the systemd re-exec for in-scope readback.
 const EXPECTED_OUTER_CPU_COUNT_ENV: &str = "SAFE_CI_EXPECTED_OUTER_CPU_COUNT";
 /// Child cgroup the runner vacates into (cgroup-v2 "no internal processes" rule).
 const SUPERVISOR: &str = "supervisor";
@@ -348,7 +348,7 @@ pub fn expected_outer_memory_max_bytes() -> Option<i64> {
     (value > 0).then_some(value)
 }
 
-/// Aggregate CPU-job cap the parent requested, carried into the re-exec'd scope.
+/// Total CPU-core cap the parent requested, carried into the re-exec'd scope.
 pub fn expected_outer_cpu_count() -> Option<i64> {
     let value: i64 = std::env::var(EXPECTED_OUTER_CPU_COUNT_ENV)
         .ok()?
@@ -369,13 +369,21 @@ fn cpu_quota_percent(fraction: f64) -> i64 {
     ((ncpu as f64 * fraction * 100.0).round() as i64).max(100)
 }
 
-/// Whole CPU-job budget represented by the shared aggregate slice's quota.
+/// Maximum CPU cores represented by the shared aggregate slice's quota.
 ///
 /// A default per-run budget must not be wider than the parent slice every run is placed under;
 /// otherwise the value changes after scope re-exec and the planner models cores the run cannot
-/// receive. Explicit `--jobs` may still request a wider child quota; the parent remains tighter.
-pub fn aggregate_slice_cpu_jobs() -> i64 {
+/// receive. Explicit `--max-cpus` may still request a wider child quota; the parent remains
+/// tighter.
+pub fn aggregate_slice_max_cpus() -> i64 {
     (cpu_quota_percent(DEFAULT_CPU_BUDGET_FRACTION) / 100).max(1)
+}
+
+/// Compatibility alias for [`aggregate_slice_max_cpus`].
+#[doc(hidden)]
+#[deprecated(since = "0.13.1", note = "use aggregate_slice_max_cpus")]
+pub fn aggregate_slice_cpu_jobs() -> i64 {
+    aggregate_slice_max_cpus()
 }
 
 /// True iff `systemd-run --user --scope` actually works here (cached).
@@ -931,7 +939,7 @@ fn attempt_scope_reexec_inner(
         args.push("-p".into());
         args.push(format!("CPUQuota={quota_percent}%"));
         eprintln!(
-            "{LOG_PREFIX} per-run CPU cap: CPUQuota={quota_percent}% ({cpu} aggregate CPU job{}).",
+            "{LOG_PREFIX} per-run CPU cap: CPUQuota={quota_percent}% ({cpu} total core{}).",
             if cpu == 1 { "" } else { "s" }
         );
     }
@@ -2541,9 +2549,9 @@ mod tests {
     #[test]
     fn cpu_quota_percent_floor_is_one_core() {
         assert!(cpu_quota_percent(0.90) >= 100);
-        assert!(aggregate_slice_cpu_jobs() >= 1);
-        assert!(aggregate_slice_cpu_jobs() <= cpu_count().max(1));
-        assert!(aggregate_slice_cpu_jobs() * 100 <= cpu_quota_percent(DEFAULT_CPU_BUDGET_FRACTION));
+        assert!(aggregate_slice_max_cpus() >= 1);
+        assert!(aggregate_slice_max_cpus() <= cpu_count().max(1));
+        assert!(aggregate_slice_max_cpus() * 100 <= cpu_quota_percent(DEFAULT_CPU_BUDGET_FRACTION));
     }
 
     #[test]

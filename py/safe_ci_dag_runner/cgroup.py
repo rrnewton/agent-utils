@@ -51,7 +51,7 @@ _CONTROLLER_ENABLE_ATTEMPTS = 3
 OUTER_MEMORY_MAX_ENV = "SAFE_CI_OUTER_MEMORY_MAX_BYTES"
 #: Exact cap carried across the systemd re-exec for in-scope readback.
 EXPECTED_OUTER_MEMORY_MAX_ENV = "SAFE_CI_EXPECTED_OUTER_MEMORY_MAX_BYTES"
-#: Exact aggregate CPU-job cap carried across the systemd re-exec for in-scope readback.
+#: Exact total-CPU cap carried across the systemd re-exec for in-scope readback.
 EXPECTED_OUTER_CPU_COUNT_ENV = "SAFE_CI_EXPECTED_OUTER_CPU_COUNT"
 #: Carries the outer scope's requested ``RuntimeMaxSec`` into the in-scope child, so the child can
 #: read the property back off the live unit instead of trusting the argument vector that asked
@@ -167,7 +167,7 @@ def expected_outer_memory_max_bytes() -> int | None:
 
 
 def expected_outer_cpu_count() -> int | None:
-    """Aggregate CPU-job cap the parent requested, carried into the re-exec'd scope."""
+    """Total-CPU cap the parent requested, carried into the re-exec'd scope."""
     try:
         value = int(os.environ.get(EXPECTED_OUTER_CPU_COUNT_ENV, ""))
     except ValueError:
@@ -385,10 +385,16 @@ def cpu_quota_percent(fraction: float = DEFAULT_CPU_BUDGET_FRACTION) -> int:
     return max(100, int(round(ncpu * fraction * 100)))
 
 
-def aggregate_slice_cpu_jobs() -> int:
-    """Whole CPU-job budget represented by the shared aggregate slice's quota."""
-    # Never claim a whole job the fractional shared-slice quota cannot sustain.
+def aggregate_slice_max_cpus() -> int:
+    """Whole-core capacity represented by the shared aggregate slice's quota."""
+    # Never claim a whole core the fractional shared-slice quota cannot sustain.
     return max(1, cpu_quota_percent() // 100)
+
+
+def aggregate_slice_cpu_jobs() -> int:
+    """Compatibility alias for :func:`aggregate_slice_max_cpus`."""
+
+    return aggregate_slice_max_cpus()
 
 
 def ensure_aggregate_slice(
@@ -950,7 +956,7 @@ def reexec_in_scope(
         props += ["-p", f"CPUQuota={cpu_count * 100}%"]
         print(
             f"{naming.log_prefix} per-run CPU cap: CPUQuota={cpu_count * 100}% "
-            f"({cpu_count} aggregate CPU job{'s' if cpu_count != 1 else ''})."
+            f"({cpu_count} total core{'s' if cpu_count != 1 else ''})."
         )
 
     # Launch under the SHARED aggregate slice so the kernel shares its CPUQuota

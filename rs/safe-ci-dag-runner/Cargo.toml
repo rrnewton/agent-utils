@@ -1,7 +1,7 @@
 [package]
 name = "safe-ci-dag-runner"
-version = "0.13.0"
-description = "Run a DAG of CI/build steps with independent step/CPU-job limits, nested cgroup boxing, and resource profiling."
+version = "0.13.1"
+description = "Run a DAG of CI/build steps with independent step and total-CPU limits, nested cgroup boxing, and resource profiling."
 readme = "README.md"
 keywords = ["ci", "dag", "cgroup", "scheduler"]
 categories = ["command-line-utilities", "development-tools"]

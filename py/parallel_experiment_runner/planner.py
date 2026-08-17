@@ -85,9 +85,8 @@ def generate_round_dag(plan: RoundPlan) -> DagConfig:
     """Build the ``DagConfig`` for a round: one independent, boxed :class:`Step` per seed.
 
     The steps have no ``deps`` (seeds are independent), so the executor runs up to ``plan.width``
-    of them at once. The caller maps that to ``jobs`` (the compatibility active-step limit) and
-    separately sets ``core_budget = width * per-worker cores``, making both limits declared and
-    enforced without requiring a newer scheduler API at import time.
+    of them at once. The caller maps that to ``max_steps`` and separately sets
+    ``max_cpus = width * per-worker cores``, making both limits declared and enforced.
     """
     limits = plan.spec.worker_limits
     est = plan.per_worker_estimate.wall_s or 0.0

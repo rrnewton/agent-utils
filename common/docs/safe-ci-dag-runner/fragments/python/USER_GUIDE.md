@@ -21,8 +21,9 @@ scheduler unless the caller supplies an enabled `CgroupManager`. Use the
 console command on Linux with cgroup v2 and a delegated systemd user scope when
 the package should establish and verify containment for you.
 
-In 0.13, `run_dag(..., jobs=N)` treats `N` as a compatibility combined
-active-step and aggregate CPU-job limit unless `core_budget` is supplied. Use
-`run_dag_limited(..., max_steps=S, cpu_jobs=J)` for explicit independent
-limits. A pre-0.13 outer-fan-out-only library caller should migrate to that API
-and choose both values deliberately.
+`run_dag(..., jobs=N)` treats `N` as a compatibility combined active-step and
+total-CPU limit unless `core_budget` is supplied. Use
+`run_dag_limited(..., max_steps=S, max_cpus=P)` for explicit independent
+limits; the former `cpu_jobs=P` keyword remains a compatibility alias. A
+pre-0.13 outer-fan-out-only library caller should migrate to the limited API and
+choose both values deliberately.

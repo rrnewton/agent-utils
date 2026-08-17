@@ -72,13 +72,14 @@ def test_run_help_lists_flags_and_cores_pinning() -> None:
     for flag in (
         "--dag",
         "--max-steps",
-        "--jobs",
+        "--max-cpus",
         "--cores",
         "--only",
         "--planner",
         "--keep-going",
     ):
         assert flag in out, flag
+    assert "--jobs" not in out
     # Discoverable pinning aliases + intent keywords (greppable).
     assert "--cpuset" in out and "--pin" in out
     # argparse line-wraps help, so collapse whitespace before substring checks.
@@ -290,11 +291,13 @@ def test_run_max_mem_with_baseline_no_note() -> None:
         assert "no step carries rss_baseline_bytes" not in err
 
 
-def test_run_jobs_and_max_mem_control_independent_limits() -> None:
-    # --jobs remains the CPU-width budget while --max-mem independently derives max active steps.
+def test_run_max_cpus_and_max_mem_control_independent_limits() -> None:
+    # --max-cpus sets total CPU capacity while --max-mem independently derives max active steps.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--jobs", "2", "--max-mem", "8G", "--dag", dag, "-q", _ACF])
+        rc, _, err = _capture(
+            ["run", "--max-cpus", "2", "--max-mem", "8G", "--dag", dag, "-q", _ACF]
+        )
         assert rc == 0
         assert "--max-mem 8G -> --max-steps" in err
 
@@ -677,7 +680,7 @@ def test_boxed_stdin_dag_survives_scope_reexec() -> None:
             "-",
             "--stress",
             "3",
-            "--jobs",
+            "--max-cpus",
             "3",
             "--no-profile",
             "--no-profile-feedback",
@@ -698,7 +701,7 @@ def test_boxed_stdin_dag_survives_scope_reexec() -> None:
     assert "containment OBSERVED" in combined
     assert "invalid JSON" not in combined
     assert "stress.singleton: 3/3 passed" in proc.stdout
-    assert "maximum concurrent steps: 3 (--max-steps 3; --jobs 3 aggregate CPU jobs)" in proc.stdout
+    assert "maximum concurrent steps: 3 (--max-steps 3; --max-cpus 3 total cores)" in proc.stdout
 
 
 # --------------------------------------------------------------------------- --stress
@@ -808,15 +811,15 @@ def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:
     assert result.max_concurrent_steps == 4
 
 
-def test_stress_defaults_max_steps_to_jobs() -> None:
+def test_stress_defaults_max_steps_to_max_cpus() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         dag = _one_step_dag(tmp, "sleep 1")
         rc, out, err = _capture(
-            ["run", "--dag", dag, "--stress", "4", "--jobs", "3", "-q", _ACF]
+            ["run", "--dag", dag, "--stress", "4", "--max-cpus", "3", "-q", _ACF]
         )
         assert rc == 0, err
         assert "g.j: 4/4 passed" in out
-        assert "maximum concurrent steps: 3 (--max-steps 3; --jobs 3 aggregate CPU jobs)" in out
+        assert "maximum concurrent steps: 3 (--max-steps 3; --max-cpus 3 total cores)" in out
 
 
 def test_stress_n_must_be_positive() -> None:

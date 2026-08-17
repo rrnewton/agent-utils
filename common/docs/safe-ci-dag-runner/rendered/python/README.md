@@ -8,7 +8,7 @@ It provides:
 
 - strict JSON and YAML DAG loading;
 - deterministic list, visualization, conversion, and planning commands;
-- independent active-step (`--max-steps`) and aggregate CPU-job (`--jobs`) limits;
+- independent active-step (`--max-steps`) and total CPU (`--max-cpus`) limits;
 - memory- and named-resource-aware concurrent execution;
 - nested cgroup-v2 containment with explicit unboxed opt-outs;
 - profile feedback, parallel-speedup sweeps, and stress copies; and
@@ -35,10 +35,10 @@ dag = DagConfig(steps=(Step("build", "app", "compile", "make build"),))
 print(to_ascii(dag))
 ```
 
-In 0.13, `run_dag(..., jobs=N)` keeps a compatibility combined limit: `N`
-bounds both active steps and aggregate declared CPU jobs unless `core_budget`
-is supplied. New code should call `run_dag_limited(..., max_steps=S,
-cpu_jobs=J)` when those limits differ.
+`run_dag(..., jobs=N)` keeps a compatibility combined limit: `N` bounds both
+active steps and total CPU capacity unless `core_budget` is supplied. New code
+should call `run_dag_limited(..., max_steps=S, max_cpus=P)` when those limits
+differ. The former `cpu_jobs=P` keyword remains a compatibility alias.
 
 ## Quick start
 
@@ -77,10 +77,16 @@ safe-ci-dag-runner --userguide
 safe-ci-dag-runner capabilities
 ```
 
-For example, `run -s2 -j200` permits at most two active DAG nodes while
-limiting their combined declared inner width to 200 jobs. Under cgroup boxing,
-the run also receives a verified `cpu.max` bandwidth cap. That quota is not an
-instantaneous CPU-identity bound; use `--cores K` for an exclusive fixed cpuset.
+For example, `run -s2 -j200` permits at most two active DAG nodes while setting
+the whole run's total CPU budget to 200 core-equivalents. The scheduler limits
+the active steps' combined effective width, and cgroup boxing adds a verified
+`cpu.max` bandwidth cap. That quota is not an instantaneous thread-count or
+CPU-identity bound; use `--cores K` for an exclusive fixed cpuset. The long
+spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
+A hidden compatibility alias keeps existing 0.13 scripts working but is not
+public run vocabulary; differing simultaneous values conflict and are rejected.
+`sweep --jobs RANGE` remains the width-range option for a per-step speedup
+experiment.
 
 ## Attributable test-runner timeouts
 

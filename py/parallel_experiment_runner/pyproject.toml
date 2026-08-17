@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "parallel-experiment-runner"
-version = "0.3.0"
+version = "0.3.1"
 description = "Run boxed, resource-bounded concurrent seed sweeps."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,7 +16,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Operating System :: POSIX :: Linux",
 ]
-dependencies = ["safe-ci-dag-runner"]
+dependencies = ["safe-ci-dag-runner>=0.13.1"]
 
 [project.optional-dependencies]
 dev = ["mypy", "pytest"]

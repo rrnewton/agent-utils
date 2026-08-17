@@ -1,5 +1,5 @@
 {
-  "description": "Memory-aware sizing: per-step RSS hints let --max-mem pick the largest -j whose modeled worst-case footprint fits a RAM budget.",
+  "description": "Memory-aware sizing: per-step RSS hints let --max-mem pick the largest --max-steps whose modeled worst-case footprint fits a RAM budget.",
   "mem_cap_factor": 1.0,
   "mem_cap_floor_bytes": 0,
   "outer_mem_safety_factor": 1.0,

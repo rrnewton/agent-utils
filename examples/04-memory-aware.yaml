@@ -1,16 +1,17 @@
 # 04-memory-aware (literate YAML edition)
 #
 # ISOMORPHIC to examples/04-memory-aware.json (the cross harness asserts identical loading).
-# Each step carries a memory hint; with them, `--max-mem` picks the largest -j whose modeled
-# worst-case footprint fits a RAM budget. This example pins mem_cap_factor / mem_cap_floor_bytes /
-# outer_mem_safety_factor so the modeled numbers are exactly the byte values below.
+# Each step carries a memory hint; with them, `--max-mem` picks the largest --max-steps whose
+# modeled worst-case footprint fits a RAM budget. This example pins mem_cap_factor /
+# mem_cap_floor_bytes / outer_mem_safety_factor so the modeled numbers are exactly the byte values
+# below.
 #
 # Try:
 #   safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 4G --allow-cgroup-failure
 #   safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-cgroup-failure
 
 description: |-
-  Memory-aware sizing: per-step RSS hints let --max-mem pick the largest -j whose modeled worst-case footprint fits a RAM budget.
+  Memory-aware sizing: per-step RSS hints let --max-mem pick the largest --max-steps whose modeled worst-case footprint fits a RAM budget.
 
 # No headroom multipliers, no floor — so the modeled footprint is exactly the summed byte values.
 mem_cap_factor: 1.0

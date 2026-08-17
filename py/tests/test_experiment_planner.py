@@ -81,14 +81,14 @@ def test_execute_maps_workers_and_per_worker_cores_to_independent_limits(
     def fake_run(
         _dag: DagConfig,
         *,
-        jobs: int,
-        core_budget: int,
+        max_steps: int,
+        max_cpus: int,
         **_kwargs: object,
     ) -> RunResult:
-        captured.update(max_steps=jobs, cpu_jobs=core_budget)
+        captured.update(max_steps=max_steps, max_cpus=max_cpus)
         return RunResult(ok=True, wall_s=0.0)
 
-    monkeypatch.setattr(execute, "run_dag", fake_run)
+    monkeypatch.setattr(execute, "run_dag_limited", fake_run)
     plan = _plan(
         _spec(worker_limits=WorkerLimits(cpu_cores=3)),
         (0, 1, 2),
@@ -104,7 +104,7 @@ def test_execute_maps_workers_and_per_worker_cores_to_independent_limits(
         per_worker_estimate=plan.per_worker_estimate,
     )
     execute.execute_round(plan, cgroups=None)
-    assert captured == {"max_steps": 2, "cpu_jobs": 6}
+    assert captured == {"max_steps": 2, "max_cpus": 6}
 
 
 def test_lowering_cpu_timeout_unset_becomes_zero(tmp_path: Path) -> None:

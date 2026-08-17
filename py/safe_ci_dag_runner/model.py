@@ -395,7 +395,7 @@ class DagConfig:
     resource_caps: Mapping[str, int] = field(default_factory=dict)
     # Multiplier from a step's measured RSS baseline to its inner memory cap (headroom).
     mem_cap_factor: float = 1.25
-    # Lower bound (bytes) on the modeled worst-case footprint, so -j selection never
+    # Lower bound (bytes) on the modeled worst-case footprint, so active-step sizing never
     # concludes "0 fits". Default 8 GiB.
     mem_cap_floor_bytes: int = 8 * 1024**3
     # Multiplier applied to the modeled peak to leave headroom. 1.0 = no inflation.

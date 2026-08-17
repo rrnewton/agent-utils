@@ -28,10 +28,11 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   produce the same width rows and table schema; measured timing cells and the ``--profile`` table
   are not byte-compared because runtimes legitimately differ.
 * The memory-aware ``--max-steps`` decision and modeled footprint from ``--max-mem`` match.
-* ``run`` keeps active-step fan-out (``-s``) independent from aggregate declared CPU jobs
-  (``-j``): the same fork-based guest workload records normalized step/worker overlap under both
-  engines, including authored inner widths capped by the run budget. A capability-gated boxed
-  case additionally proves the live outer ``cpu.max`` and long-window ``cpu.stat`` bandwidth.
+* ``run`` keeps active-step fan-out (``-s``) independent from its total CPU budget
+  (``-j`` / ``--max-cpus``): the same fork-based guest workload records normalized step/worker
+  overlap under both engines, including authored inner widths capped by the run budget. A
+  capability-gated boxed case additionally proves the live outer ``cpu.max`` and long-window
+  ``cpu.stat`` bandwidth.
 * The auto-logging profile STORE (Feature D) has an identical on-disk schema across builds: an
   unboxed run under each build (into separate ``--perf-dir`` dirs) writes the SAME set of CSV
   filenames — so ``machine_id`` + ``container_class`` (and hence ``nproc``) agree — with
@@ -2698,7 +2699,8 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
     """
     command_flags: dict[str, tuple[str, ...]] = {
         "run": (
-            "--dag", "--max-steps", "--jobs", "--cores", "--cpuset", "--pin", "--max-mem",
+            "--dag", "--max-steps", "--max-cpus", "--cores", "--cpuset", "--pin",
+            "--max-mem",
             "--only",
             "--args", "--stress", "--perf-dir", "--no-profile", "--profile", "--planner",
             "--show-plan", "--no-profile-feedback", "--profile-sync",
@@ -2712,6 +2714,10 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         ),
         "plan": ("--dag", "--planner", "--max-mem", "--format", "--perf-dir", "--no-profile-feedback"),
         "pin-run": ("--cores", "--tag"),
+    }
+    command_forbidden_flags: dict[str, tuple[str, ...]] = {
+        # Retained as a hidden 0.13 compatibility alias, not as public run vocabulary.
+        "run": ("--jobs",),
     }
     summary_action_contracts: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
         "build": (
@@ -2766,10 +2772,15 @@ def compare_cli_schema(py: list[str], rs: list[str], rep: Report) -> None:
         for subcommand, flags in command_flags.items():
             outcome = run(command, (subcommand, "--help"))
             missing = [flag for flag in flags if flag not in outcome.stdout]
-            if outcome.returncode != 0 or missing:
+            unexpected = [
+                flag for flag in command_forbidden_flags.get(subcommand, ())
+                if flag in outcome.stdout
+            ]
+            if outcome.returncode != 0 or missing or unexpected:
                 rep.bad(
                     f"cli-schema:{engine}/{subcommand}",
-                    f"exit={outcome.returncode}; missing flags={missing}\n{outcome.stdout}",
+                    f"exit={outcome.returncode}; missing flags={missing}; "
+                    f"unexpected flags={unexpected}\n{outcome.stdout}",
                 )
             else:
                 rep.ok(f"cli-schema:{engine}/{subcommand}")
@@ -3089,7 +3100,7 @@ def _cpu_facts(log_path: str) -> tuple[FootprintStats, CpuFootprintFacts]:
 
 
 def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> None:
-    """Cross-check independent ``-s`` active-step and ``-j`` aggregate-width enforcement."""
+    """Cross-check independent active-step and total-CPU enforcement."""
 
     with tempfile.TemporaryDirectory(prefix="safe-ci-cross-cpu-limits-") as td:
         invalid_dag = os.path.join(td, "valid.json")
@@ -3101,10 +3112,10 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
             ("max-steps-bare-zero", ("-s0",)),
             ("max-steps-invalid", ("--max-steps", "nope")),
             ("max-steps-i64-overflow", ("--max-steps", "9223372036854775808")),
-            ("jobs-spaced-zero", ("-j", "0")),
-            ("jobs-bare-zero", ("-j0",)),
-            ("jobs-invalid", ("--jobs", "nope")),
-            ("jobs-i64-overflow", ("--jobs", "9223372036854775808")),
+            ("max-cpus-spaced-zero", ("-j", "0")),
+            ("max-cpus-bare-zero", ("-j0",)),
+            ("max-cpus-invalid", ("--max-cpus", "nope")),
+            ("max-cpus-i64-overflow", ("--max-cpus", "9223372036854775808")),
         )
         for label, flags in invalid_cases:
             args = (
@@ -3115,6 +3126,24 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
                 rep.ok(f"run-limits:invalid/{label}")
             else:
                 rep.bad(f"run-limits:invalid/{label}", f"py={po}\nrs={ro}")
+
+        conflict_args = (
+            "run", "--dag", invalid_dag, "--max-cpus", "2", "--jobs", "3",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
+        )
+        po, ro = run(py, conflict_args), run(rs, conflict_args)
+        conflict_message = "--max-cpus and legacy --jobs disagree"
+        if (
+            po.returncode == ro.returncode == 2
+            and conflict_message in po.stderr
+            and conflict_message in ro.stderr
+        ):
+            rep.ok("run-limits:invalid/max-cpus-legacy-jobs-conflict")
+        else:
+            rep.bad(
+                "run-limits:invalid/max-cpus-legacy-jobs-conflict",
+                f"expected exit 2 with {conflict_message!r}; py={po}\nrs={ro}",
+            )
 
         cases: tuple[
             tuple[str, tuple[int, ...], tuple[str, ...], CpuFootprintFacts], ...
@@ -3134,8 +3163,20 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
             (
                 "authored-width-capped-to-j",
                 (5,),
-                ("--max-steps=4", "--jobs=2"),
+                ("--max-steps=4", "--max-cpus=2"),
                 CpuFootprintFacts(1, (2,), 1, 2),
+            ),
+            (
+                "legacy-hidden-jobs-alias",
+                (1, 1, 1),
+                ("--max-steps=3", "--jobs=2"),
+                CpuFootprintFacts(3, (1, 1, 1), 2, 2),
+            ),
+            (
+                "canonical-and-legacy-equal",
+                (1, 1, 1),
+                ("--max-steps=3", "--max-cpus=2", "--jobs=2"),
+                CpuFootprintFacts(3, (1, 1, 1), 2, 2),
             ),
         )
         for label, widths, flags, expected in cases:
@@ -3209,7 +3250,7 @@ def _boxing_capability_unavailable(outcome: Outcome) -> bool:
 
 
 def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> None:
-    """Where available, anchor ``-j`` to the live run-scope quota and aggregate CPU counters."""
+    """Anchor ``-j`` / ``--max-cpus`` to live quota and aggregate CPU counters."""
 
     with tempfile.TemporaryDirectory(prefix="safe-ci-cross-boxed-cpu-") as td:
         dag_path = os.path.join(td, "dag.json")

@@ -30,9 +30,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-In 0.13, `run_dag(..., jobs)` keeps a compatibility combined limit: that number
-bounds both active steps and aggregate declared CPU jobs. Call `run_dag_limited`
-(or the corresponding boxed limited helper) when those limits differ.
+`run_dag(..., combined_limit)` keeps a compatibility combined limit: that
+number bounds both active steps and the maximum CPU cores total. Call
+`run_dag_limited(..., max_steps, max_cpus, ...)` (or the corresponding boxed
+limited helper) when those limits differ. `cap_config_max_cpus` exposes the same
+total-core capping policy for callers that prepare configurations themselves.
 
 For Rust harnesses, cargo-nextest supplies libtest's `--exact TEST` arguments,
 so the process snapshot can bind each child to its test. Ordinary `cargo test`

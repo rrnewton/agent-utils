@@ -28,7 +28,8 @@ visualization. The `run_dag` function is the explicit uncontained scheduler;
 `run_dag_boxed` applies a caller-supplied cgroup manager when present. The
 console command establishes and verifies the outer systemd scope. Enforced
 containment requires Linux with cgroup v2 and a delegated systemd user scope.
-In 0.13, `run_dag(..., jobs)` and `run_dag_boxed(..., jobs)` treat that argument
-as a compatibility combined active-step and aggregate CPU-job limit. Use
-`run_dag_limited` or a boxed limited variant to choose the two values
-independently.
+`run_dag(..., combined_limit)` and `run_dag_boxed(..., combined_limit)` treat
+that argument as a compatibility combined active-step and total CPU-core limit.
+Use `run_dag_limited(..., max_steps, max_cpus, ...)` or a boxed limited variant
+to choose the two values independently. `cap_config_max_cpus` applies the same
+total-core cap without starting a run.

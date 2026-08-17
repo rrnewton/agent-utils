@@ -26,8 +26,9 @@ The goal is to **minimize the makespan** — the wall-clock time from the first 
 last step finishing — subject to five constraints that all coexist on the one machine:
 
 1. **Precedence.** The DAG edges (`Step.deps`).
-2. **A total declared CPU-job budget `P`.** `run --jobs P` bounds the sum of the widths of steps
-   running at the same instant. When omitted, `P` is the conservative whole-core floor of the
+2. **A total CPU budget `P`.** `run -j P` / `run --max-cpus P` sets the whole run's capacity to
+   `P` core-equivalents and bounds the sum of the effective widths of steps running at the same
+   instant. When omitted, `P` is the conservative whole-core floor of the
    tightest binding ancestor `cpu.max`, capped by process affinity (and by `--cores K` when used).
    The default is also tightened by the shared aggregate slice's conservative 90% host budget,
    which prevents concurrent runner invocations from each assuming the whole machine.
@@ -53,10 +54,10 @@ The planner composes three parts:
   smallest measured width. It also computes a **per-step** `recommended_inner_jobs` — the best width
   before that one step's own diminishing-returns knee.
 - **The list scheduler.** `Runner` is a greedy ready-set list scheduler: it launches
-  every ready step (deps met, below `--max-steps`, and with CPU jobs + named resources free) in a caller-supplied
-  dispatch order, and `--planner critical-path` supplies a *critical-path-first* order (highest
-  bottom-level first). This is exactly the "list-scheduling" back half of a two-phase moldable
-  scheduler.
+  every ready step (deps met, below `--max-steps`, and with CPU capacity + named resources free) in
+  a caller-supplied dispatch order, and `--planner critical-path` supplies a
+  *critical-path-first* order (highest bottom-level first). This is exactly the "list-scheduling"
+  back half of a two-phase moldable scheduler.
 - **The allocator.** It picks each step's width `p_i` to minimize whole-DAG makespan, then hands those
   widths and the allocation-aware ordering to the list scheduler. Unlike an isolated per-step knee,
   the allocation accounts for the DAG and for steps sharing one machine.
@@ -221,7 +222,7 @@ behavioral differential compares plan output byte-for-byte.
   `speedup`.
 - `est: Mapping[tag, float]` — the resolved scalar duration per step (store-over-hint-over-default),
   as `build_plan` already computes. Used as the wall time for any step **without** a measured curve.
-- `P: int` — the run's resolved aggregate `--jobs` budget (`container_core_budget()` only when the
+- `P: int` — the run's resolved total `--max-cpus` budget (`container_core_budget()` only when the
   caller omitted an explicit run budget or uses standalone `plan`).
 - `mem_budget: int | None` — the RAM budget (as `--max-mem` already supplies to `jobs_for_budget`);
   `None` disables the memory constraint on allocation.
@@ -319,9 +320,9 @@ The allocator outputs `p_i` per step and passes the result to the runner:
 2. **Order.** Compute the same order as the critical-path planner, using the *allocated* weights
    `T_i(p_i)` rather than the width-one or hinted weights. Highest weighted bottom-level first, ties
    by tag.
-3. **Apply both runtime gates (MCPA's insight).** Treat declared CPU jobs as a first-class
-   capacity dimension alongside the named-resource semaphores: treat `P` as a built-in `"cpu"` cap and
-   each step's demand as `p_i`. The ready-set loop launches a ready step only if
+3. **Apply both runtime gates (MCPA's insight).** Treat effective step widths as a first-class
+   capacity dimension alongside the named-resource semaphores: treat `P` as a built-in `"cpu"` cap
+   and each step's demand as `p_i`. The ready-set loop launches a ready step only if
    `sum(p_j for j running) + p_i <= P` **and** fewer than `S = --max-steps` nodes are active.
    Authored widths above `P` are visibly capped before planning and execution, including the
    command's appended jobs flag and per-step `cpu.max`. This closes the loop between the allocator's
@@ -375,7 +376,7 @@ core budget, so it is provably `>=` the `max(T_CP, area/P)` lower bound, and the
 The `plan` and `--show-plan` output includes `alloc_inner_jobs` and the allocator's stop reason,
 core budget, critical-path length, area term, lower bound, and modeled makespan. Plan JSON exposes
 the same information in its `allocation` object. For `run --show-plan`, the core budget is the
-resolved run `--jobs` value; the standalone `plan` command uses the effective ambient budget.
+resolved run `--max-cpus` value; the standalone `plan` command uses the effective ambient budget.
 
 ## 6. Our deviations from the textbook
 
@@ -462,7 +463,7 @@ Load-bearing citations; web-confirmed where noted.
   `Planner.CRITICAL_PATH`.
 - Memory: `schedulable_peak_mem_bytes`, `step_mem_cap_for_inner_jobs`, and `jobs_for_budget`.
 - Core budget: `container_core_budget`, the shared-slice budget, and the run CLI's
-  `_select_cpu_jobs` / `select_cpu_jobs` resolution.
+  `_select_max_cpus` / `select_max_cpus` resolution.
 - Named resources and dispatch: `Runner`, `_res_free`, `_acquire`, and `_release`.
 - Allocation and phase-two configuration: `allocate_widths`, `build_plan`, and
   `apply_plan_to_config`.

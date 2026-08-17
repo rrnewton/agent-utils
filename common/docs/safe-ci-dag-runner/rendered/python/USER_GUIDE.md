@@ -28,11 +28,12 @@ scheduler unless the caller supplies an enabled `CgroupManager`. Use the
 console command on Linux with cgroup v2 and a delegated systemd user scope when
 the package should establish and verify containment for you.
 
-In 0.13, `run_dag(..., jobs=N)` treats `N` as a compatibility combined
-active-step and aggregate CPU-job limit unless `core_budget` is supplied. Use
-`run_dag_limited(..., max_steps=S, cpu_jobs=J)` for explicit independent
-limits. A pre-0.13 outer-fan-out-only library caller should migrate to that API
-and choose both values deliberately.
+`run_dag(..., jobs=N)` treats `N` as a compatibility combined active-step and
+total-CPU limit unless `core_budget` is supplied. Use
+`run_dag_limited(..., max_steps=S, max_cpus=P)` for explicit independent
+limits; the former `cpu_jobs=P` keyword remains a compatibility alias. A
+pre-0.13 outer-fan-out-only library caller should migrate to the limited API and
+choose both values deliberately.
 
 ## A first DAG
 
@@ -145,39 +146,44 @@ Use `--no-profile-feedback` when only authored hints may influence a plan.
 ## Run safely
 
 ```sh
-safe-ci-dag-runner run --dag pipeline.yaml --max-steps 2 --jobs 8
+safe-ci-dag-runner run --dag pipeline.yaml --max-steps 2 --max-cpus 8
 safe-ci-dag-runner run --dag pipeline.yaml --max-mem 8G
 safe-ci-dag-runner run --dag pipeline.yaml --show-plan --profile
 ```
 
-`-s` / `--max-steps` bounds how many DAG nodes may be active. `-j` / `--jobs`
-independently bounds the sum of their declared inner widths: a step consumes
-`preferred_inner_jobs`, else the runner's undeclared-step CPU default (one in
-the CLI).
-Thus `-s2 -j200`
-allows at most two active nodes whose combined declared width is at most 200;
-either node may itself use many workers. The default job budget is the effective
-container/affinity budget tightened by the shared aggregate slice's 90% host
-budget, and the default step ceiling is that job budget.
+`-s` / `--max-steps` bounds how many DAG nodes may be active. `-j` /
+`--max-cpus` independently sets the **total CPU capacity for the whole run**, in
+core-equivalents. A running step consumes its `preferred_inner_jobs`, else the
+runner's undeclared-step CPU default (one in the CLI), from that shared total.
+Thus `-s2 -j200` allows at most two active nodes whose combined effective width
+is at most 200; either node may itself use many workers. The default CPU total is
+the effective container/affinity capacity tightened by the shared aggregate
+slice's 90% host budget, and the default step ceiling is that CPU total.
 
 `--max-mem` derives a safe `--max-steps` ceiling from the modeled worst-case
 footprint. If an explicit step ceiling is also present, the tighter value wins.
-Named resources act as semaphores in addition to the step, CPU-job, and memory
+Named resources act as semaphores in addition to the step, total-CPU, and memory
 limits. A failed step prevents new dependent work; `--keep-going` lets
 already-running work reach a verdict.
 
-Under boxing, the run scope also receives `CPUQuota=<jobs>*100%`, and the live
-`cpu.max` value is read back before work starts. This is a CPU-bandwidth
-backstop, not an instantaneous thread-count or CPU-identity bound: CFS quota may
-briefly run more than `J` runnable tasks on more than `J` CPUs and throttle them
+Under boxing, the run scope also receives `CPUQuota=<max-cpus>*100%`, and the
+live `cpu.max` value is read back before work starts. This makes `--max-cpus N`
+an N-core-equivalent **CPU-bandwidth** ceiling as well as the scheduler's width
+budget. It is not an instantaneous thread-count or CPU-identity bound: CFS quota
+may briefly run more than N runnable tasks on more than N CPUs and throttle them
 later in the quota period. An unpinned run may also migrate from CPUs A/B to C/D
 without exceeding its long-window budget. Use `--cores K` when exact eligible
 CPU identities are required. The runner does not use `cpu.weight` as a cap.
 
-This is a deliberate run-CLI change in 0.13. Before 0.13, `run -j N` meant
-maximum active steps. Migrate that intent to `run -s N`; use `-s N -j N` when
-the old single number should bound both dimensions. The separate
-`sweep --jobs RANGE` option still means the inner widths being measured.
+Migration is deliberately explicit. Before 0.13, `run -j N` meant maximum
+active steps; migrate that old intent to `run -s N`, or use `-s N -j N` when N
+should bound both dimensions. In 0.13, the total-CPU long option was
+`run --jobs N`; replace it with `run --max-cpus N`. The `-j N` shorthand keeps
+its 0.13 total-CPU meaning. A hidden `run --jobs N` compatibility alias remains
+temporarily so existing 0.13 scripts do not break, but it is omitted from help
+and should not be combined with `--max-cpus`; differing simultaneous values are
+rejected. New commands should use `--max-cpus`; the public
+`sweep --jobs RANGE` spelling remains the option for inner widths being measured.
 
 Per-step wall and CPU timeouts, memory limits, process-tree teardown, and OOM
 attribution are enforced inside nested cgroups when the host supplies cgroup v2
@@ -251,16 +257,16 @@ Without `--args`, the token is removed. `--stress N` duplicates the selected
 graph at generation into `N` disconnected components with no edges between
 copies. Each copy retains the original graph's internal dependency edges.
 Named-resource scheduling is removed from the generated copies, so
-`--max-steps` controls how many copied nodes may be active while `--jobs` bounds
-their summed declared width. The report includes the exact pass ratio and the
-largest number of step child processes measured alive at once. The modeled
-memory footprint must still fit the box.
+`--max-steps` controls how many copied nodes may be active while `--max-cpus`
+bounds their summed effective width. The report includes the exact pass ratio
+and the largest number of step child processes measured alive at once. The
+modeled memory footprint must still fit the box.
 
 A singleton DAG can be generated on the fly; no `N`-node file is required:
 
 ```sh
 printf '%s\n' '{"steps":[{"group":"stress","job":"singleton","cmd":"sleep 2"}]}' |
-  safe-ci-dag-runner run --dag - --stress 100 --max-steps 100 --jobs 100 --no-profile
+  safe-ci-dag-runner run --dag - --stress 100 --max-steps 100 --max-cpus 100 --no-profile
 ```
 
 ## Profiles, sweeps, and portable summaries
@@ -300,8 +306,8 @@ because a descendant can replace it.
 No central daemon is required for the current fixed-slice mode: every allocator
 serializes through the shared durable ledger and claims an explicit set of CPU
 IDs. A future service could provide dynamic or fair machine-wide allocation,
-but ordinary `--jobs` deliberately remains a quota/admission budget rather than
-pretending to hand out exclusive moving CPU slices.
+but ordinary `--max-cpus` deliberately remains a total bandwidth/admission
+budget rather than pretending to hand out exclusive moving CPU slices.
 
 The ledger path is `SAFE_CI_CORE_LEDGER` when that variable is set. Otherwise it
 is `$XDG_RUNTIME_DIR/safe-ci-dag-runner/core-reservations.json` when the runtime
