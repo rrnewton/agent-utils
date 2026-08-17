@@ -121,6 +121,31 @@ This review record entered the repository with implementation commit
     buckets and omitting quota utilization. Both engines now record the applied default only when
     boxing is active, with a one-core denominator; explicitly unboxed runs retain the shared
     identity-derived ambient width rather than claiming enforcement that did not occur.
+24. **Ordering planners could recommend widths above the run budget.** CPA bounded its learned
+    speedup curves to `P`, but greedy-LPT and critical-path `--show-plan` could still advertise a
+    profile-derived width larger than `--max-cpus`, even though execution later clamped it. Every
+    run planner now receives the same resolved `P`; recommendations and regression markers are
+    bounded while wider measurements remain visible as diagnostic curve points.
+25. **An empty `jobs_flag` made command-width capping fictitious.** The runner rewrote
+    `preferred_inner_jobs=32` to 16 and labeled the profile/memory model as width 16 even though a
+    self-managed command could still execute a hardcoded `-j32`. Such a positive declared fixed
+    width is now left unchanged and refused before any DAG step process when it exceeds `P`
+    (file-backed runs reject before cgroup setup; stdin may already be inside the outer scope).
+    Pure CPA planning preserves the impossible fixed width, publishes no executable allocation for
+    it, and reports `infeasible-fixed-width` rather than laundering it through plan application.
+    The low-level allocator raises/returns a typed `InfeasibleAllocationError`; that Rust API
+    change is released as 0.14. `sweep --jobs` refuses self-managed steps because it cannot vary
+    the guest. Empty and whitespace-only flags share exactly this behavior and never append a bare
+    positional width. Arbitrary undeclared threads remain bounded only by CPU bandwidth, not thread
+    count.
+26. **Diagnostic curves and skipped nodes polluted CPA truth.** A self-managed curve was labeled as
+    the duration source even when CPA actually used a scalar hint, and an intentional skip still
+    consumed critical-path, CPU-area, and memory budget despite never spawning. Fixed commands now
+    use an exact measured level only when their declared width exists in the curve; otherwise the
+    scalar source remains authoritative. Intentional skips have zero executable planning demand,
+    are excluded from memory/stress accounting, retain their authored hints when a plan is applied,
+    and cannot suppress widths for runnable work. Nonpositive library-authored widths consistently
+    fall through to the positive per-step default in both implementations.
 
 ## Cross-implementation evidence
 
@@ -131,7 +156,7 @@ This review record entered the repository with implementation commit
     self-test verdicts, signal status, invalid inputs, wrapped help, and clean missing-executable
     failure, plus 23 malformed-record variants that both refuse without rewriting shared state.
 - `python3 cross/differential.py --tool safe-ci-dag-runner`
-  - Default seed/count completed with **468 checks passed across 42 fixtures**.
+  - Default seed/count completed with **478 checks passed across 42 fixtures**.
   - Includes independent `S`/`P` admission, jobs-flag clamping, migration-safe worker overlap,
     guest-observed sweep widths, spawn-failure eager cancellation, profile-width parity, and
     capability-gated live outer-`cpu.max` bandwidth evidence.
@@ -152,8 +177,11 @@ evidence without treating a source label as proof that runtime behavior changed.
 
 ## Focused test evidence
 
-- Python: the full repository package suite passed **1,713 tests**.
-- Rust: the full safe package suite passed **157 unit tests plus 27 integration tests**, including
+- Python: the full repository package run reached **1,717 passed**; the remaining four cases were
+  blocked by this host's BPF-jailer from executing `git`/`wc`/`tr`, and all four passed on immediate
+  isolated rerun. All **1,721 collected tests** are therefore accounted for without treating a
+  host security denial as a product verdict.
+- Rust: the full safe package suite passed **165 unit tests plus 27 integration tests**, including
   termination attribution, live cgroup memory, CPU-time, core-box, run-timeout, and containment
   tests.
 - `python3 scripts/embed_userguides.py --check`: all 16 paired documents and 6 single-language

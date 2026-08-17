@@ -16,7 +16,7 @@ use, declare the dependency and import the crate as `safe_ci_dag_runner`:
 
 ```toml
 [dependencies]
-safe-ci-dag-runner = "0.13"
+safe-ci-dag-runner = "0.14"
 ```
 
 ```rust
@@ -39,7 +39,13 @@ containment requires Linux with cgroup v2 and a delegated systemd user scope.
 that argument as a compatibility combined active-step and total CPU-core limit.
 Use `run_dag_limited(..., max_steps, max_cpus, ...)` or a boxed limited variant
 to choose the two values independently. `cap_config_max_cpus` applies the same
-total-core cap without starting a run.
+total-core cap to runner-controlled commands without starting a run; it leaves
+self-managed fixed widths unchanged so the run helpers can refuse an
+over-budget command truthfully.
+The low-level `allocate_widths(...)` helper returns
+`Result<HashMap<_, _>, InfeasibleAllocationError>`; 0.14 makes an over-budget
+self-managed fixed command an explicit error rather than an executable-looking
+width map.
 
 ## A first DAG
 
@@ -165,6 +171,25 @@ Thus `-s2 -j200` allows at most two active nodes whose combined effective width
 is at most 200; either node may itself use many workers. The default CPU total is
 the effective container/affinity capacity tightened by the shared aggregate
 slice's 90% host budget, and the default step ceiling is that CPU total.
+
+A non-empty effective `jobs_flag` makes the inner width runner-controlled: when
+an authored or profile-derived width exceeds `--max-cpus`, the planner and
+scheduler cap the recommendation, appended command flag, per-step `cpu.max`, and
+accounted width together. An empty or whitespace-only `jobs_flag` instead
+prevents command rewriting; paired with a positive `preferred_inner_jobs`, it
+declares a self-managed fixed command width. If that declared width
+exceeds the run budget, the run is refused before any DAG step process is
+created because silently throttling (for example) a hardcoded `make -j32`
+inside `--max-cpus 16` would oversubscribe and mislabel its memory/profile data.
+File-backed runs reject before cgroup setup; a stdin DAG may already have
+entered its outer scope before it can be read and validated. A sweep likewise requires a non-empty
+`jobs_flag`, since otherwise changing `sweep --jobs` would not change the guest.
+
+The runner cannot infer hidden concurrency that a command does not declare. An
+arbitrary guest may still create more threads than `--max-cpus`; outer
+`cpu.max` limits their total CPU bandwidth, not their count. Use a controllable
+`jobs_flag`, fix the command's own worker setting, or use `--cores` when fixed
+CPU eligibility is required.
 
 `--max-mem` derives a safe `--max-steps` ceiling from the modeled worst-case
 footprint. If an explicit step ceiling is also present, the tighter value wins.

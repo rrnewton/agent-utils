@@ -9,7 +9,7 @@ use, declare the dependency and import the crate as `safe_ci_dag_runner`:
 
 ```toml
 [dependencies]
-safe-ci-dag-runner = "0.13"
+safe-ci-dag-runner = "0.14"
 ```
 
 ```rust
@@ -32,4 +32,10 @@ containment requires Linux with cgroup v2 and a delegated systemd user scope.
 that argument as a compatibility combined active-step and total CPU-core limit.
 Use `run_dag_limited(..., max_steps, max_cpus, ...)` or a boxed limited variant
 to choose the two values independently. `cap_config_max_cpus` applies the same
-total-core cap without starting a run.
+total-core cap to runner-controlled commands without starting a run; it leaves
+self-managed fixed widths unchanged so the run helpers can refuse an
+over-budget command truthfully.
+The low-level `allocate_widths(...)` helper returns
+`Result<HashMap<_, _>, InfeasibleAllocationError>`; 0.14 makes an over-budget
+self-managed fixed command an explicit error rather than an executable-looking
+width map.

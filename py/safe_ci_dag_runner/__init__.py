@@ -30,6 +30,7 @@ from safe_ci_dag_runner.cgroup import Cgroups, CgroupEnforcementKind, NoopCgroup
 from safe_ci_dag_runner.estimates import (
     DEFAULT_MIN_SAMPLES,
     Allocation,
+    InfeasibleAllocationError,
     Plan,
     PlanEntry,
     Planner,
@@ -103,7 +104,7 @@ from safe_ci_dag_runner.cgroup import (
 from safe_ci_dag_runner.teardown import reap
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
-__version__: str = "0.13.1"
+__version__: str = "0.14.0"
 
 #: Machine-readable manifest emitted by the ``capabilities`` subcommand. Keys are sorted;
 #: values describe the enforcement guards implemented by this package:
@@ -199,6 +200,7 @@ __all__ = [
     "StepSpeedup",
     "PlanEntry",
     "Allocation",
+    "InfeasibleAllocationError",
     "Plan",
     "DEFAULT_MIN_SAMPLES",
     "feedback_identity",

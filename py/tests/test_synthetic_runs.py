@@ -11,7 +11,14 @@ import io
 import tempfile
 from pathlib import Path
 
-from safe_ci_dag_runner import DagConfig, ResourceHint, Step, dag_to_json, run_dag
+from safe_ci_dag_runner import (
+    DagConfig,
+    ResourceHint,
+    Step,
+    dag_to_json,
+    run_dag,
+    run_dag_limited,
+)
 from safe_ci_dag_runner.cli import main
 
 
@@ -109,10 +116,13 @@ def test_chain_is_serial() -> None:
 def test_intra_step_parallelism_runs_concurrently() -> None:
     # Compare like-for-like runner and teardown overhead instead of imposing an absolute wall-time
     # ceiling: ownership sweeps and host load are independent of the inner sleepers themselves.
-    parallel = run_dag(
-        DagConfig(steps=(sleeper("g", "fan", 0.1, inner=4),)), jobs=1, verbosity=0
+    parallel = run_dag_limited(
+        DagConfig(steps=(sleeper("g", "fan", 0.1, inner=4),)),
+        max_steps=1,
+        max_cpus=4,
+        verbosity=0,
     )
-    serial = run_dag(
+    serial = run_dag_limited(
         DagConfig(
             steps=(
                 Step(
@@ -123,7 +133,8 @@ def test_intra_step_parallelism_runs_concurrently() -> None:
                 ),
             )
         ),
-        jobs=1,
+        max_steps=1,
+        max_cpus=4,
         verbosity=0,
     )
     assert parallel.ok and serial.ok

@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::io::json_str;
-use crate::model::{DagConfig, ResourceHint, Step};
+use crate::model::{effective_jobs_flag, DagConfig, ResourceHint, Step};
 use crate::perflog::{container_class, machine_id, parse_csv_line};
 use crate::sizing::schedulable_peak_mem_bytes_widths;
 
@@ -780,9 +780,9 @@ pub struct PlanEntry {
     /// The learned parallel-speedup curve for this step, or `None` when the store has fewer than
     /// two inner_jobs widths for it.
     pub speedup: Option<StepSpeedup>,
-    /// The inner-jobs width the CPA allocator assigned this step, or `None` for the non-allocating
-    /// planners. This is the per-step inner width actually used under `--planner cpa` (baked into
-    /// the command via [`apply_plan_to_config`]); run-level `-j` is the aggregate budget.
+    /// The executable inner-jobs width CPA assigned to a runner-controlled step, or `None` for
+    /// ordering-only planners and self-managed commands whose empty jobs flag prevents rewriting.
+    /// Run-level `-j` is the aggregate budget.
     pub alloc_inner_jobs: Option<i64>,
 }
 
@@ -837,6 +837,15 @@ struct Resolved {
 }
 
 fn resolved_estimate(step: &Step, samples: Option<&StepSamples>, min_samples: i64) -> Resolved {
+    if step.skip_reason.is_some() {
+        return Resolved {
+            est: 0.0,
+            est_source: "skip",
+            rss: None,
+            rss_source: "none",
+            samples: 0,
+        };
+    }
     let n = samples.map(|s| s.samples).unwrap_or(0);
     let store_ok = samples.is_some() && n >= min_samples;
 
@@ -994,16 +1003,6 @@ fn plan_order(
     tags
 }
 
-// --------------------------------------------------------------------------- CPA allocator
-
-// Stop-reason labels the CPA gradient loop can end on (PLANNER_DESIGN.md §5.8). Deterministic
-// given the same store + DAG + budgets, so the two builds report the same one bit-for-bit.
-const CPA_BALANCED: &str = "balanced";
-const CPA_KNEE_EXHAUSTED: &str = "knee-exhausted";
-const CPA_CORE_CAPPED: &str = "core-capped";
-const CPA_MEM_CAPPED: &str = "mem-capped";
-const CPA_FIXED_POINT: &str = "fixed-point";
-
 /// Restrict a learned speedup model's recommendation to the run budget.
 ///
 /// Measurements above `P` remain visible as curve points, but neither the recommended
@@ -1028,6 +1027,77 @@ fn speedup_within_budget(speedup: &StepSpeedup, core_budget: i64) -> Option<Step
     Some(bounded)
 }
 
+// --------------------------------------------------------------------------- CPA allocator
+
+// Stop-reason labels the CPA gradient loop can end on (PLANNER_DESIGN.md §5.8). Deterministic
+// given the same store + DAG + budgets, so the two builds report the same one bit-for-bit.
+const CPA_BALANCED: &str = "balanced";
+const CPA_KNEE_EXHAUSTED: &str = "knee-exhausted";
+const CPA_CORE_CAPPED: &str = "core-capped";
+const CPA_MEM_CAPPED: &str = "mem-capped";
+const CPA_FIXED_POINT: &str = "fixed-point";
+const CPA_INFEASIBLE_FIXED_WIDTH: &str = "infeasible-fixed-width";
+
+/// A CPA allocation cannot fit self-managed fixed command widths inside its core budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InfeasibleAllocationError {
+    /// Total core-equivalent budget supplied to the allocator.
+    pub core_budget: i64,
+    /// Sorted `(step tag, fixed width)` pairs that exceed the budget.
+    pub fixed_widths: Vec<(String, i64)>,
+}
+
+impl std::fmt::Display for InfeasibleAllocationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let detail = self
+            .fixed_widths
+            .iter()
+            .map(|(tag, width)| format!("{tag}={width}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            f,
+            "CPA allocation is infeasible under core budget {}: self-managed fixed width(s) \
+             exceed the budget: {detail}",
+            self.core_budget
+        )
+    }
+}
+
+impl std::error::Error for InfeasibleAllocationError {}
+
+/// A step's positive configured/default width before any runner-controlled budget cap.
+fn cpa_configured_width(cfg: &DagConfig, step: &Step) -> i64 {
+    step.hint
+        .preferred_inner_jobs
+        .filter(|value| *value > 0)
+        .or(cfg.default_step_cpu_count.filter(|value| *value > 0))
+        .unwrap_or(1)
+}
+
+fn infeasible_fixed_widths(
+    cfg: &DagConfig,
+    widths: &HashMap<String, i64>,
+    core_budget: i64,
+) -> Vec<(String, i64)> {
+    let p = core_budget.max(1);
+    let mut bad: Vec<(String, i64)> = cfg
+        .steps
+        .iter()
+        .filter_map(|step| {
+            let width = widths[&step.tag()];
+            (step.skip_reason.is_none()
+                && effective_jobs_flag(step, &cfg.default_jobs_flag)
+                    .trim()
+                    .is_empty()
+                && width > p)
+                .then(|| (step.tag(), width))
+        })
+        .collect();
+    bad.sort_by(|a, b| a.0.cmp(&b.0));
+    bad
+}
+
 // Per-step admissible width set `W_i` (ascending) and the MEASURED wall `T_i(p)` at each admissible
 // width. Mirrors Python's `_cpa_admissible` (PLANNER_DESIGN.md §5.2): a curve step admits its
 // measured widths up to the knee (`recommended_inner_jobs`) and the core budget `P`; a curveless
@@ -1047,8 +1117,18 @@ fn cpa_admissible(
     let mut wall: HashMap<String, HashMap<i64, f64>> = HashMap::new();
     for step in &cfg.steps {
         let tag = step.tag();
+        if step.skip_reason.is_some() {
+            admissible.insert(tag.clone(), vec![1]);
+            wall.insert(tag, HashMap::from([(1, 0.0)]));
+            continue;
+        }
         match speedups.get(&tag) {
-            Some(sp) if !sp.levels.is_empty() => {
+            Some(sp)
+                if !sp.levels.is_empty()
+                    && !effective_jobs_flag(step, &cfg.default_jobs_flag)
+                        .trim()
+                        .is_empty() =>
+            {
                 let knee_ok: Vec<&SpeedupLevel> = sp
                     .levels
                     .iter()
@@ -1063,13 +1143,7 @@ fn cpa_admissible(
                     // A measured curve entirely above P cannot justify violating the strict run
                     // budget. Treat it as unavailable at this budget and keep the step rigid at
                     // its effective configured width, capped to P, using the scalar estimate.
-                    let width = step
-                        .hint
-                        .preferred_inner_jobs
-                        .filter(|value| *value > 0)
-                        .or(cfg.default_step_cpu_count.filter(|value| *value > 0))
-                        .unwrap_or(1)
-                        .min(core_budget.max(1));
+                    let width = cpa_configured_width(cfg, step).min(core_budget.max(1));
                     admissible.insert(tag.clone(), vec![width]);
                     wall.insert(
                         tag.clone(),
@@ -1088,21 +1162,26 @@ fn cpa_admissible(
                 }
             }
             _ => {
-                let mut ww = step
-                    .hint
-                    .preferred_inner_jobs
-                    .filter(|value| *value > 0)
-                    .or(cfg.default_step_cpu_count.filter(|value| *value > 0))
-                    .unwrap_or(1);
-                if core_budget > 0 && ww > core_budget {
-                    ww = core_budget;
-                }
-                if ww < 1 {
-                    ww = 1;
-                }
+                // No curve, or an empty effective jobs_flag: without a way to rewrite the guest
+                // command CPA cannot vary its worker count and must charge it as a rigid step.
+                let self_managed = effective_jobs_flag(step, &cfg.default_jobs_flag)
+                    .trim()
+                    .is_empty();
+                // Preserve a self-managed command's declared width even above P so the allocator
+                // can report infeasibility instead of inventing a guest-width rewrite.
+                let declared = step.hint.preferred_inner_jobs.filter(|value| *value > 0);
+                let ww = match (self_managed, declared) {
+                    (true, Some(width)) => width,
+                    _ => cpa_configured_width(cfg, step).min(core_budget.max(1)),
+                };
                 admissible.insert(tag.clone(), vec![ww]);
                 let mut w: HashMap<i64, f64> = HashMap::new();
-                w.insert(ww, est.get(&tag).copied().unwrap_or(0.0));
+                let modeled_wall = speedups
+                    .get(&tag)
+                    .and_then(|speedup| speedup.levels.iter().find(|level| level.inner_jobs == ww))
+                    .map(|level| level.wall_s)
+                    .unwrap_or_else(|| est.get(&tag).copied().unwrap_or(0.0));
+                w.insert(ww, modeled_wall);
                 wall.insert(tag, w);
             }
         }
@@ -1118,7 +1197,9 @@ fn cpa_next_width(widths: &[i64], current: i64) -> Option<i64> {
 // Worst-case concurrent memory footprint (bytes) with the given PER-STEP widths (PLANNER_DESIGN.md
 // §5.6).
 fn cpa_footprint(cfg: &DagConfig, widths: &HashMap<String, i64>) -> i64 {
-    schedulable_peak_mem_bytes_widths(cfg, cfg.steps.len() as i64, widths).0
+    let mut active = cfg.clone();
+    active.steps.retain(|step| step.skip_reason.is_none());
+    schedulable_peak_mem_bytes_widths(&active, active.steps.len() as i64, widths).0
 }
 
 /// `(widths, admissible, wall, stop_reason)` from the CPA gradient loop.
@@ -1153,6 +1234,14 @@ fn cpa_allocate(
         })
         .collect();
     let succ = successors(cfg);
+    if !infeasible_fixed_widths(cfg, &widths, p).is_empty() {
+        return (
+            widths,
+            admissible,
+            wall,
+            CPA_INFEASIBLE_FIXED_WIDTH.to_string(),
+        );
+    }
     let mut stop_reason = CPA_FIXED_POINT.to_string();
     let max_iters: usize = cfg
         .steps
@@ -1247,8 +1336,16 @@ pub fn allocate_widths(
     est: &HashMap<String, f64>,
     core_budget: i64,
     mem_budget: Option<i64>,
-) -> HashMap<String, i64> {
-    cpa_allocate(cfg, speedups, est, core_budget, mem_budget).0
+) -> Result<HashMap<String, i64>, InfeasibleAllocationError> {
+    let (widths, _admissible, _wall, reason) =
+        cpa_allocate(cfg, speedups, est, core_budget, mem_budget);
+    if reason == CPA_INFEASIBLE_FIXED_WIDTH {
+        return Err(InfeasibleAllocationError {
+            core_budget: core_budget.max(1),
+            fixed_widths: infeasible_fixed_widths(cfg, &widths, core_budget),
+        });
+    }
+    Ok(widths)
 }
 
 // A deterministic greedy list-schedule of the allocated widths -> the MODELED makespan (mirrors
@@ -1349,14 +1446,7 @@ fn build_cpa_plan(
         Some(b) if b > 0 => b,
         _ => 1,
     };
-    let bounded_speedups: HashMap<String, StepSpeedup> = speedups
-        .iter()
-        .filter_map(|(tag, speedup)| {
-            speedup_within_budget(speedup, p).map(|bounded| (tag.clone(), bounded))
-        })
-        .collect();
-    let (widths, _admissible, wall, stop_reason) =
-        cpa_allocate(cfg, &bounded_speedups, est, p, mem_budget);
+    let (widths, _admissible, wall, stop_reason) = cpa_allocate(cfg, speedups, est, p, mem_budget);
     let weight: HashMap<String, f64> = cfg
         .steps
         .iter()
@@ -1376,7 +1466,11 @@ fn build_cpa_plan(
     }
     let t_a = area / p as f64;
     let lower_bound = if t_cp >= t_a { t_cp } else { t_a };
-    let modeled = cpa_simulate_makespan(cfg, &widths, &weight, &order, p);
+    let modeled = if stop_reason == CPA_INFEASIBLE_FIXED_WIDTH {
+        f64::INFINITY
+    } else {
+        cpa_simulate_makespan(cfg, &widths, &weight, &order, p)
+    };
     let allocation = Allocation {
         core_budget: p,
         area_s: area,
@@ -1392,14 +1486,20 @@ fn build_cpa_plan(
         .map(|s| {
             let tag = s.tag();
             let r = &resolved[&tag];
-            let has_curve = bounded_speedups
-                .get(&tag)
-                .map(|sp| !sp.levels.is_empty())
-                .unwrap_or(false);
+            let curve_level = if s.skip_reason.is_none() {
+                speedups.get(&tag).and_then(|sp| {
+                    sp.levels
+                        .iter()
+                        .find(|level| level.inner_jobs == widths[&tag])
+                })
+            } else {
+                None
+            };
+            let uses_curve = curve_level.is_some();
             PlanEntry {
                 tag: tag.clone(),
                 est_duration_s: weight[&tag],
-                est_source: if has_curve {
+                est_source: if uses_curve {
                     "store".to_string()
                 } else {
                     r.est_source.to_string()
@@ -1407,9 +1507,24 @@ fn build_cpa_plan(
                 rss_estimate_bytes: r.rss,
                 rss_source: r.rss_source.to_string(),
                 bottom_level_s: bottom.get(&tag).copied().unwrap_or(0.0),
-                samples: r.samples,
-                speedup: bounded_speedups.get(&tag).cloned(),
-                alloc_inner_jobs: Some(widths[&tag]),
+                samples: curve_level.map(|level| level.samples).unwrap_or(r.samples),
+                speedup: if s.skip_reason.is_some() {
+                    None
+                } else {
+                    speedups.get(&tag).cloned()
+                },
+                // An empty effective jobs flag opts out of command rewriting. CPA still charges
+                // the fixed width in its model, but must not publish a value that
+                // apply_plan_to_config could misrepresent as an executable guest-width change.
+                alloc_inner_jobs: if s.skip_reason.is_some()
+                    || effective_jobs_flag(s, &cfg.default_jobs_flag)
+                        .trim()
+                        .is_empty()
+                {
+                    None
+                } else {
+                    Some(widths[&tag])
+                },
             }
         })
         .collect();
@@ -1425,8 +1540,11 @@ fn build_cpa_plan(
 
 /// Resolve estimates and build a complete execution plan.
 ///
-/// Speedup curves are attached for display. Under [`Planner::Cpa`] they also drive width allocation
-/// within the supplied core and memory budgets; the other planners use only dispatch ordering.
+/// Speedup curves are attached for display, with their recommendation and regression marker
+/// restricted to the supplied core budget for every planner. Under [`Planner::Cpa`] the bounded
+/// curves also drive runner-controlled width allocation within the supplied core and memory
+/// budgets; self-managed commands remain fixed and can make the plan explicitly infeasible. The
+/// other planners use only dispatch ordering.
 pub fn build_plan(
     cfg: &DagConfig,
     store_samples: &HashMap<String, StepSamples>,
@@ -1444,12 +1562,37 @@ pub fn build_plan(
         resolved.insert(step.tag(), r);
     }
     let succ = successors(cfg);
+    // A CPA plan without an explicit budget has always been a one-core allocation. Preserve that
+    // contract while allowing the ordering-only planners to remain unbounded when no run budget
+    // exists (for example, the standalone `plan` command).
+    let speedup_budget = match (planner, core_budget) {
+        (_, Some(budget)) => Some(budget.max(1)),
+        (Planner::Cpa, None) => Some(1),
+        (_, None) => None,
+    };
+    let bounded_speedups: HashMap<String, StepSpeedup> = match speedup_budget {
+        Some(budget) => speedups
+            .iter()
+            .filter_map(|(tag, speedup)| {
+                if let Some(bounded) = speedup_within_budget(speedup, budget) {
+                    return Some((tag.clone(), bounded));
+                }
+                let step = cfg.steps.iter().find(|step| step.tag() == *tag)?;
+                (planner == Planner::Cpa
+                    && effective_jobs_flag(step, &cfg.default_jobs_flag)
+                        .trim()
+                        .is_empty())
+                .then(|| (tag.clone(), speedup.clone()))
+            })
+            .collect(),
+        None => speedups.clone(),
+    };
     if planner == Planner::Cpa {
         return build_cpa_plan(
             cfg,
             &resolved,
             &est,
-            speedups,
+            &bounded_speedups,
             &succ,
             core_budget,
             mem_budget,
@@ -1472,7 +1615,11 @@ pub fn build_plan(
                 rss_source: r.rss_source.to_string(),
                 bottom_level_s: bottom.get(&tag).copied().unwrap_or(0.0),
                 samples: r.samples,
-                speedup: speedups.get(&tag).cloned(),
+                speedup: if step.skip_reason.is_some() {
+                    None
+                } else {
+                    bounded_speedups.get(&tag).cloned()
+                },
                 alloc_inner_jobs: None,
             }
         })
@@ -1490,7 +1637,9 @@ pub fn build_plan(
 /// Return a configuration whose resource hints contain a plan's resolved estimates.
 ///
 /// Stored memory replaces the original hint only when it was selected as the estimate source.
-/// Allocating plans also install each chosen inner-job width as the preferred width.
+/// Allocating plans install each chosen inner-job width only for runner-controlled jobs flags;
+/// self-managed commands retain their declared fixed width so run-budget validation cannot be
+/// bypassed by applying a plan.
 pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
     let by_tag = plan.by_tag();
     let mut new_cfg = cfg.clone();
@@ -1501,12 +1650,22 @@ pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
             let tag = step.tag();
             let mut s = step.clone();
             if let Some(entry) = by_tag.get(&tag) {
+                if step.skip_reason.is_some() {
+                    return s;
+                }
                 let rss = if entry.rss_source == "store" {
                     entry.rss_estimate_bytes
                 } else {
                     step.hint.rss_baseline_bytes
                 };
-                let inner = entry.alloc_inner_jobs.or(step.hint.preferred_inner_jobs);
+                let inner = if effective_jobs_flag(step, &cfg.default_jobs_flag)
+                    .trim()
+                    .is_empty()
+                {
+                    step.hint.preferred_inner_jobs
+                } else {
+                    entry.alloc_inner_jobs.or(step.hint.preferred_inner_jobs)
+                };
                 s.hint = ResourceHint {
                     resources: step.hint.resources.clone(),
                     est_duration_s: entry.est_duration_s,
@@ -1752,7 +1911,7 @@ pub fn plan_to_text(plan: &Plan) -> String {
     let header_cells: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
     let mut lines: Vec<String> = vec![
         format!("plan: {}", plan.planner.value()),
-        "per-step estimates (source: store = learned from the profile store; hint = DAG-authored; default = none):".to_string(),
+        "per-step estimates (source: store = learned from the profile store; hint = DAG-authored; default = none; skip = intentional pre-execution skip):".to_string(),
         fmt_row(&header_cells),
         widths
             .iter()
@@ -1912,7 +2071,7 @@ fn speedup_text_lines(plan: &Plan) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ResourceHint;
+    use crate::model::{IntentionalSkipReason, ResourceHint};
     use std::collections::BTreeMap;
 
     fn mk(group: &str, job: &str, deps: &[&str], est: f64) -> Step {
@@ -2157,12 +2316,12 @@ mod tests {
         assert_ne!(lpt.order, cp.order);
     }
 
-    // ----------------------------------------------------------------- CPA allocator
+    // ----------------------------------------------------------------- Budgeted speedup planning / CPA allocator
 
     /// Write a synthetic multi-inner_jobs speedup store (affinity16 identity) into a unique temp
     /// dir and return that dir.
-    fn write_cpa_store(name: &str, rows: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("scdr_cpa_{}_{name}", std::process::id()));
+    fn write_speedup_store(name: &str, rows: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("scdr_speedup_{}_{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let header = "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,\
                       enforcement_kind,runner_name,step,classification,inner_jobs,elapsed_s,\
@@ -2184,6 +2343,262 @@ mod tests {
     }
 
     #[test]
+    fn every_planner_bounds_profile_recommendations_to_the_run_core_budget() {
+        // The learned curve scales through width 8 and then regresses at 16. With P=4 every
+        // planner may retain the wider measurements for display, but its actionable recommendation
+        // and regression marker must describe only widths this run can execute efficiently.
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.scaling,cpu-bound,1,8.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.scaling,cpu-bound,2,4.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.scaling,cpu-bound,4,2.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.scaling,cpu-bound,8,1.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.scaling,cpu-bound,16,2.0,0,True,False,0,1000,,,16.0,0.0,0.0
+";
+        let dir = write_speedup_store("all-planner-budget", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        assert_eq!(speedups["g.scaling"].recommended_inner_jobs, 8);
+        assert_eq!(speedups["g.scaling"].regression_inner_jobs, Some(16));
+        let cfg = DagConfig {
+            steps: vec![mk("g", "scaling", &[], 8.0)],
+            ..Default::default()
+        };
+
+        for planner in [Planner::GreedyLpt, Planner::CriticalPath, Planner::Cpa] {
+            let plan = build_plan(
+                &cfg,
+                &HashMap::new(),
+                planner,
+                DEFAULT_MIN_SAMPLES,
+                &speedups,
+                Some(4),
+                None,
+            );
+            let bounded = plan.entries[0]
+                .speedup
+                .as_ref()
+                .expect("profile-derived curve should remain available");
+            assert_eq!(bounded.recommended_inner_jobs, 4, "{planner:?}");
+            assert_eq!(bounded.regression_inner_jobs, None, "{planner:?}");
+            assert!(
+                bounded.levels.iter().any(|level| level.inner_jobs == 16),
+                "{planner:?} should retain measurements above P for diagnosis"
+            );
+            if planner == Planner::Cpa {
+                assert!(plan.entries[0].alloc_inner_jobs.unwrap() <= 4);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_planner_omits_a_profile_curve_wholly_above_the_run_core_budget() {
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.wide,cpu-bound,4,8.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.wide,cpu-bound,8,4.0,0,True,False,0,1000,,,8.0,0.0,0.0
+";
+        let dir = write_speedup_store("all-planner-above-budget", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let mut wide = mk("g", "wide", &[], 12.0);
+        wide.hint.preferred_inner_jobs = Some(8);
+        let cfg = DagConfig {
+            steps: vec![wide],
+            ..Default::default()
+        };
+
+        for planner in [Planner::GreedyLpt, Planner::CriticalPath, Planner::Cpa] {
+            let plan = build_plan(
+                &cfg,
+                &HashMap::new(),
+                planner,
+                DEFAULT_MIN_SAMPLES,
+                &speedups,
+                Some(2),
+                None,
+            );
+            assert!(plan.entries[0].speedup.is_none(), "{planner:?}");
+            if planner == Planner::Cpa {
+                assert_eq!(cpa_widths(&plan)["g.wide"], Some(2));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_keeps_an_empty_jobs_flag_step_at_its_rigid_declared_width() {
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.managed,cpu-bound,1,8.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.managed,cpu-bound,2,4.0,0,True,False,0,1000,,,8.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.managed,cpu-bound,4,2.0,0,True,False,0,1000,,,8.0,0.0,0.0
+";
+        let dir = write_speedup_store("empty-jobs-flag-rigid", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let mut managed = mk("g", "managed", &[], 8.0);
+        managed.hint.preferred_inner_jobs = Some(2);
+        managed.jobs_flag = Some(String::new());
+        let cfg = DagConfig {
+            steps: vec![managed],
+            ..Default::default()
+        };
+
+        let plan = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(4),
+            None,
+        );
+        assert_eq!(speedups["g.managed"].recommended_inner_jobs, 4);
+        assert_eq!(cpa_widths(&plan)["g.managed"], None);
+        assert_eq!(plan.entries[0].est_duration_s, 4.0);
+        assert_eq!(plan.entries[0].est_source, "store");
+        assert_eq!(
+            apply_plan_to_config(&cfg, &plan).steps[0]
+                .hint
+                .preferred_inner_jobs,
+            Some(2)
+        );
+        assert!(
+            plan.entries[0].speedup.is_some(),
+            "the measured curve remains diagnostic even though CPA cannot apply it"
+        );
+
+        let mut no_exact = cfg.clone();
+        no_exact.steps[0].hint.est_duration_s = 13.0;
+        no_exact.steps[0].hint.preferred_inner_jobs = Some(3);
+        let no_exact_plan = build_plan(
+            &no_exact,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(4),
+            None,
+        );
+        assert_eq!(no_exact_plan.entries[0].est_duration_s, 13.0);
+        assert_eq!(no_exact_plan.entries[0].est_source, "hint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_excludes_intentional_skips_from_cpu_memory_and_curve_allocation() {
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.live,cpu-bound,1,10.0,0,True,False,0,1000,,,10.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,g.live,cpu-bound,2,5.0,0,True,False,0,1000,,,10.0,0.0,0.0
+";
+        let dir = write_speedup_store("intentional-skip", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let mut skipped = mk("g", "skipped", &[], 100.0);
+        skipped.hint.rss_baseline_bytes = Some(1_000_000_000_000);
+        skipped.hint.preferred_inner_jobs = Some(8);
+        skipped.jobs_flag = Some(String::new());
+        skipped.skip_reason = Some(IntentionalSkipReason::EmptyManifestBucket);
+        let skipped_hint = skipped.hint.clone();
+        let mut live = mk("g", "live", &[], 10.0);
+        live.hint.preferred_inner_jobs = Some(1);
+        live.jobs_flag = Some("-j%d".to_string());
+        let cfg = DagConfig {
+            steps: vec![skipped, live],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            ..Default::default()
+        };
+        let est = HashMap::from([("g.skipped".to_string(), 0.0), ("g.live".to_string(), 10.0)]);
+        let widths = allocate_widths(&cfg, &speedups, &est, 2, None).unwrap();
+        assert_eq!(widths["g.skipped"], 1);
+        assert_eq!(widths["g.live"], 2);
+        assert_eq!(
+            crate::sizing::schedulable_peak_mem_bytes_widths(&cfg, 2, &widths).0,
+            0
+        );
+        assert_eq!(
+            crate::sizing::stress_copy_footprint_bytes(&cfg, Some(123)),
+            123
+        );
+        let plan = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(2),
+            None,
+        );
+        let entries = plan.by_tag();
+        assert_eq!(entries["g.skipped"].est_duration_s, 0.0);
+        assert_eq!(entries["g.skipped"].est_source, "skip");
+        assert_eq!(entries["g.skipped"].alloc_inner_jobs, None);
+        assert!(entries["g.skipped"].speedup.is_none());
+        assert_eq!(entries["g.live"].alloc_inner_jobs, Some(2));
+        assert_eq!(plan.allocation.as_ref().unwrap().modeled_makespan_s, 5.0);
+        let applied = apply_plan_to_config(&cfg, &plan);
+        assert_eq!(
+            applied.steps[0].hint.est_duration_s,
+            skipped_hint.est_duration_s
+        );
+        assert_eq!(
+            applied.steps[0].hint.rss_baseline_bytes,
+            skipped_hint.rss_baseline_bytes
+        );
+        assert_eq!(
+            applied.steps[0].hint.preferred_inner_jobs,
+            skipped_hint.preferred_inner_jobs
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_plan_application_cannot_launder_an_overbudget_self_managed_width() {
+        let dir = std::env::temp_dir().join(format!(
+            "scdr_cpa_fixed_width_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let mut fixed = mk("g", "fixed", &[], 8.0);
+        fixed.cmd = format!("touch {}", marker.display());
+        fixed.hint.preferred_inner_jobs = Some(8);
+        fixed.jobs_flag = Some(String::new());
+        let cfg = DagConfig {
+            steps: vec![fixed],
+            ..Default::default()
+        };
+        let plan = build_plan(
+            &cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &HashMap::new(),
+            Some(2),
+            None,
+        );
+        assert_eq!(plan.entries[0].alloc_inner_jobs, None);
+        let error = allocate_widths(
+            &cfg,
+            &HashMap::new(),
+            &HashMap::from([("g.fixed".to_string(), 8.0)]),
+            2,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.core_budget, 2);
+        assert_eq!(error.fixed_widths, vec![("g.fixed".to_string(), 8)]);
+        let allocation = plan.allocation.as_ref().unwrap();
+        assert_eq!(allocation.stop_reason, CPA_INFEASIBLE_FIXED_WIDTH);
+        assert!(allocation.modeled_makespan_s.is_infinite());
+
+        let applied = apply_plan_to_config(&cfg, &plan);
+        assert_eq!(applied.steps[0].hint.preferred_inner_jobs, Some(8));
+        let result = crate::scheduler::run_dag_limited(&applied, 1, 2, false, 0);
+        assert!(!result.ok);
+        assert!(result.outcomes.is_empty());
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cpa_spreads_cores_on_independent_tasks() {
         // Two INDEPENDENT linear-scaling steps, P=4: the allocator balances T_CP vs area/P and
         // SPREADS cores -> both land at width 2 (not one hogging 4), stopping "balanced".
@@ -2195,7 +2610,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,1,10.0,0,True,False,0,1000,,,
 t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,2,5.0,0,True,False,0,1000,,,10.0,0.0,0.0
 t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,4,2.5,0,True,False,0,1000,,,10.0,0.0,0.0
 ";
-        let dir = write_cpa_store("spread", rows);
+        let dir = write_speedup_store("spread", rows);
         let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
         let cfg = DagConfig {
             steps: vec![mk("g", "a", &[], 10.0), mk("g", "b", &[], 10.0)],
@@ -2223,42 +2638,11 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,g.b,cpu-bound,4,2.5,0,True,False,0,1000,,,1
     }
 
     #[test]
-    fn cpa_never_uses_a_measured_width_above_the_strict_budget() {
-        let rows = "\
-t,m,affinity16_cpu-max-max,a,1,a,u,l,g.wide,cpu-bound,4,8.0,0,True,False,0,1000,,,8.0,0.0,0.0
-t,m,affinity16_cpu-max-max,a,1,a,u,l,g.wide,cpu-bound,8,4.0,0,True,False,0,1000,,,8.0,0.0,0.0
-";
-        let dir = write_cpa_store("strict-budget", rows);
-        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
-        let mut wide = mk("g", "wide", &[], 12.0);
-        wide.hint.preferred_inner_jobs = Some(8);
-        let cfg = DagConfig {
-            steps: vec![wide],
-            ..Default::default()
-        };
-        let plan = build_plan(
-            &cfg,
-            &HashMap::new(),
-            Planner::Cpa,
-            DEFAULT_MIN_SAMPLES,
-            &speedups,
-            Some(2),
-            None,
-        );
-        assert_eq!(cpa_widths(&plan)["g.wide"], Some(2));
-        assert!(plan.entries[0].speedup.is_none());
-        assert!(plan
-            .entries
-            .iter()
-            .filter_map(|entry| entry.alloc_inner_jobs)
-            .all(|width| width <= 2));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn cpa_charges_the_undeclared_step_cpu_default_as_rigid_width() {
+        let mut defaulted = mk("g", "defaulted", &[], 3.0);
+        defaulted.hint.preferred_inner_jobs = Some(0);
         let cfg = DagConfig {
-            steps: vec![mk("g", "defaulted", &[], 3.0)],
+            steps: vec![defaulted],
             default_step_cpu_count: Some(4),
             ..Default::default()
         };
@@ -2272,6 +2656,38 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,g.wide,cpu-bound,8,4.0,0,True,False,0,1000,
             None,
         );
         assert_eq!(cpa_widths(&plan)["g.defaulted"], Some(4));
+
+        let mut self_managed = mk("g", "defaulted", &[], 1.0);
+        self_managed.hint.preferred_inner_jobs = None;
+        self_managed.jobs_flag = Some(String::new());
+        let self_managed_cfg = DagConfig {
+            steps: vec![self_managed],
+            default_step_cpu_count: Some(8),
+            ..Default::default()
+        };
+        let widths = allocate_widths(
+            &self_managed_cfg,
+            &HashMap::new(),
+            &HashMap::from([("g.defaulted".to_string(), 1.0)]),
+            2,
+            None,
+        )
+        .unwrap();
+        assert_eq!(widths["g.defaulted"], 2);
+        let default_plan = build_plan(
+            &self_managed_cfg,
+            &HashMap::new(),
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &HashMap::new(),
+            Some(2),
+            None,
+        );
+        assert_eq!(cpa_widths(&default_plan)["g.defaulted"], None);
+        assert_ne!(
+            default_plan.allocation.as_ref().unwrap().stop_reason,
+            CPA_INFEASIBLE_FIXED_WIDTH
+        );
     }
 
     #[test]
@@ -2288,7 +2704,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,c.test,cpu-bound,4,4.0,0,True,False,0,1000,
 t,m,affinity16_cpu-max-max,a,1,a,u,l,c.side,cpu-bound,1,9.0,0,True,False,0,1000,,,9.0,0.0,0.0
 t,m,affinity16_cpu-max-max,a,1,a,u,l,c.side,cpu-bound,2,8.7,0,True,False,0,1000,,,9.0,0.0,0.0
 ";
-        let dir = write_cpa_store("chain", rows);
+        let dir = write_speedup_store("chain", rows);
         let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
         let cfg = DagConfig {
             steps: vec![
@@ -2330,7 +2746,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,2,20.0,0,True,False,0,100
 t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,4,10.0,0,True,False,0,1000,,,40.0,0.0,0.0
 t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000,,,40.0,0.0,0.0
 ";
-        let dir = write_cpa_store("mem", rows);
+        let dir = write_speedup_store("mem", rows);
         let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
         let heavy = Step {
             group: "m".into(),
@@ -2399,7 +2815,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,2,20.0,0,True,False,0,100
 t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,4,10.0,0,True,False,0,1000,,,40.0,0.0,0.0
 t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,8,5.0,0,True,False,0,1000,,,40.0,0.0,0.0
 ";
-        let dir = write_cpa_store("idem", rows);
+        let dir = write_speedup_store("idem", rows);
         let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
         let cfg = DagConfig {
             steps: vec![
@@ -2415,8 +2831,8 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,c.build,cpu-bound,8,5.0,0,True,False,0,1000
             .iter()
             .map(|s| (s.tag(), s.hint.est_duration_s))
             .collect();
-        let w1 = allocate_widths(&cfg, &speedups, &est, 16, None);
-        let w2 = allocate_widths(&cfg, &speedups, &est, 16, None);
+        let w1 = allocate_widths(&cfg, &speedups, &est, 16, None).unwrap();
+        let w2 = allocate_widths(&cfg, &speedups, &est, 16, None).unwrap();
         assert_eq!(w1, w2);
         assert_eq!(w1["c.build"], 8);
         assert_eq!(w1["c.prep"], 1);

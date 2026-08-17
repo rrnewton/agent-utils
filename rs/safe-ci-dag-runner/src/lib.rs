@@ -54,8 +54,9 @@ pub use cgroup::{
 pub use estimates::{
     allocate_widths, apply_plan_to_config, bucketize_rows, build_plan, feedback_identity,
     load_step_samples, load_step_speedups, plan_to_json, plan_to_text, sample_from_row,
-    step_samples_from_buckets, step_speedups_from_buckets, Allocation, BucketKey, Plan, PlanEntry,
-    Planner, Sample, SpeedupLevel, StepSamples, StepSpeedup, DEFAULT_MIN_SAMPLES,
+    step_samples_from_buckets, step_speedups_from_buckets, Allocation, BucketKey,
+    InfeasibleAllocationError, Plan, PlanEntry, Planner, Sample, SpeedupLevel, StepSamples,
+    StepSpeedup, DEFAULT_MIN_SAMPLES,
 };
 pub use io::{
     dag_from_json, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError,

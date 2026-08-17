@@ -27,3 +27,7 @@ total-CPU limit unless `core_budget` is supplied. Use
 limits; the former `cpu_jobs=P` keyword remains a compatibility alias. A
 pre-0.13 outer-fan-out-only library caller should migrate to the limited API and
 choose both values deliberately.
+The low-level `allocate_widths(...)` helper raises
+`InfeasibleAllocationError` when a self-managed fixed command width exceeds
+its core budget; 0.14 makes that refusal explicit instead of returning a
+fictitious executable width.

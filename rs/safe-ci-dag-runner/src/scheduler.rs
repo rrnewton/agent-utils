@@ -43,9 +43,9 @@ use crate::attribution::{
 };
 use crate::cgroup::CgroupManager;
 use crate::model::{
-    canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, preferred_inner_jobs,
-    scale_cpu_timeout, step_classification, write_domain_violations, DagConfig, RunResult, Step,
-    StepOutcome,
+    canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_jobs_flag,
+    preferred_inner_jobs, scale_cpu_timeout, step_classification, write_domain_violations,
+    DagConfig, RunResult, Step, StepOutcome,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
@@ -474,6 +474,9 @@ fn step_width(step: &Step, default_cpu_count: Option<i64>) -> i64 {
 /// This is intentionally visible: a caller-authored width that the run budget changes must not
 /// look as though it executed unchanged. The top-level undeclared-step cpu.max default is capped
 /// too, and the runtime gate charges that effective default even though no jobs flag is appended.
+/// A declared over-budget width whose effective `jobs_flag` is empty is left unchanged: the runner
+/// cannot rewrite that guest's command, and [`validate_max_cpus_rewrite`] makes execution fail
+/// closed instead of falsely claiming the width was lowered.
 pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
     let max_cpus = max_cpus.max(1);
     let mut capped = cfg.clone();
@@ -488,12 +491,19 @@ pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
         );
         capped.default_step_cpu_count = Some(max_cpus);
     }
+    let default_jobs_flag = capped.default_jobs_flag.clone();
     for step in &mut capped.steps {
         if let Some(width) = step
             .hint
             .preferred_inner_jobs
             .filter(|width| *width > max_cpus)
         {
+            if effective_jobs_flag(step, &default_jobs_flag)
+                .trim()
+                .is_empty()
+            {
+                continue;
+            }
             eprintln!(
                 "[scheduler] WARNING: step {} preferred_inner_jobs={width} exceeds the run total \
                  CPU-core budget --max-cpus {max_cpus}; capping its command width and per-step \
@@ -504,6 +514,45 @@ pub fn cap_config_max_cpus(cfg: &DagConfig, max_cpus: i64) -> DagConfig {
         }
     }
     capped
+}
+
+/// Validate that every declared width above `max_cpus` can be rewritten in the guest command.
+///
+/// An empty effective `jobs_flag` means the step owns its concurrency internally. Lowering only
+/// its scheduling hint and cgroup quota would leave the original worker count running inside a
+/// smaller CPU box, so callers must refuse before any step starts.
+pub(crate) fn validate_max_cpus_rewrite(cfg: &DagConfig, max_cpus: i64) -> Result<(), String> {
+    let max_cpus = max_cpus.max(1);
+    let mut bad: Vec<(String, i64)> = cfg
+        .steps
+        .iter()
+        .filter_map(|step| {
+            if step.skip_reason.is_some() {
+                return None;
+            }
+            let width = step.hint.preferred_inner_jobs?;
+            (width > max_cpus
+                && effective_jobs_flag(step, &cfg.default_jobs_flag)
+                    .trim()
+                    .is_empty())
+            .then(|| (step.tag(), width))
+        })
+        .collect();
+    bad.sort_by(|a, b| a.0.cmp(&b.0));
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let detail = bad
+        .iter()
+        .map(|(tag, width)| format!("{tag} (preferred_inner_jobs={width})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "--max-cpus {max_cpus} cannot lower guest parallelism for step(s) with an empty effective \
+         jobs_flag: {detail}; set each step's jobs_flag to the guest's worker-count option (or \
+         remove the empty override and set default_jobs_flag), reduce preferred_inner_jobs, or \
+         raise --max-cpus"
+    ))
 }
 
 /// Compatibility alias for [`cap_config_max_cpus`].
@@ -2114,6 +2163,19 @@ pub fn run_dag_boxed_deadline_limited(
     order: Option<Vec<String>>,
     run_timeout_s: Option<i64>,
 ) -> RunResult {
+    if let Err(error) = validate_max_cpus_rewrite(cfg, max_cpus) {
+        eprintln!("[scheduler] ERROR: REFUSING to run before any node starts: {error}");
+        return RunResult {
+            ok: false,
+            wall_s: 0.0,
+            outcomes: Vec::new(),
+            skipped: Vec::new(),
+            intentional_skips: Vec::new(),
+            step_profile_rows: Vec::new(),
+            run_timed_out: false,
+            max_concurrent_steps: 0,
+        };
+    }
     let domain_errors = write_domain_violations(cfg);
     if !domain_errors.is_empty() {
         eprintln!(
@@ -2654,7 +2716,7 @@ mod tests {
 
         let mut default_width_cfg = make_cfg();
         for step in &mut default_width_cfg.steps {
-            step.hint.preferred_inner_jobs = None;
+            step.hint.preferred_inner_jobs = Some(0);
         }
         default_width_cfg.default_step_cpu_count = Some(4);
         let default_width_limited = run_dag_limited(&default_width_cfg, 2, 4, false, 0);
@@ -2835,5 +2897,71 @@ mod tests {
             result.ok,
             "expected the capped '-j2' flag to reach the command"
         );
+    }
+
+    #[test]
+    fn over_budget_width_with_empty_jobs_flag_is_not_rewritten_and_refuses_before_spawn() {
+        let dir = std::env::temp_dir().join(format!(
+            "scdr_unrewritable_width_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("ran");
+        let mut item = step(
+            "g",
+            "wide",
+            &format!("touch {}", marker.display()),
+            &[],
+            0.0,
+            &[],
+        );
+        item.hint.preferred_inner_jobs = Some(8);
+        item.jobs_flag = Some(String::new());
+        let cfg = DagConfig {
+            steps: vec![item],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            validate_max_cpus_rewrite(&cfg, 2).unwrap_err(),
+            "--max-cpus 2 cannot lower guest parallelism for step(s) with an empty effective \
+             jobs_flag: g.wide (preferred_inner_jobs=8); set each step's jobs_flag to the guest's \
+             worker-count option (or remove the empty override and set default_jobs_flag), reduce \
+             preferred_inner_jobs, or raise --max-cpus"
+        );
+        let capped = cap_config_max_cpus(&cfg, 2);
+        assert_eq!(
+            capped.steps[0].hint.preferred_inner_jobs,
+            Some(8),
+            "the transformer must not claim it rewrote a command whose jobs_flag is empty"
+        );
+
+        let result = run_dag_limited(&cfg, 1, 2, false, 0);
+        assert!(!result.ok);
+        assert!(result.outcomes.is_empty());
+        assert!(!marker.exists(), "refusal happened after the step spawned");
+
+        // An intentional pre-execution skip can never spawn, so its dormant width must not reject
+        // the run or erase the typed skip record.
+        let mut skipped = cfg.steps[0].clone();
+        skipped.job = "skipped".to_string();
+        skipped.skip_reason = Some(IntentionalSkipReason::EmptyManifestBucket);
+        let skipped_cfg = DagConfig {
+            steps: vec![skipped],
+            ..Default::default()
+        };
+        assert!(validate_max_cpus_rewrite(&skipped_cfg, 2).is_ok());
+        let skipped_result = run_dag_limited(&skipped_cfg, 1, 2, false, 0);
+        assert!(skipped_result.ok);
+        assert_eq!(
+            skipped_result.intentional_skips,
+            vec![(
+                "g.skipped".to_string(),
+                IntentionalSkipReason::EmptyManifestBucket,
+            )]
+        );
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -31,6 +31,8 @@ def test_command_with_inner_jobs() -> None:
     assert command_with_inner_jobs(s2, "-j", 8) == "cargo build -j8"  # step override
     s3 = Step("g", "j", "", "mytool", jobs_flag="")
     assert command_with_inner_jobs(s3, "-j", 4) == "mytool"  # empty template disables append
+    s4 = Step("g", "j", "", "fixed", jobs_flag="   ")
+    assert command_with_inner_jobs(s4, "-j", 4) == "fixed"  # whitespace is also empty
 
 
 def test_jobs_flag_json_roundtrip() -> None:

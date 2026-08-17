@@ -85,8 +85,8 @@ def schedulable_peak_mem_bytes(
     """Maximum per-step-cap sum over any scheduler-reachable concurrent set of size <= jobs.
 
     A set is reachable only when no member transitively depends on another and the summed
-    scarce-resource demand fits ``cfg.resource_caps``. Only non-engine steps with a memory
-    baseline participate.
+    scarce-resource demand fits ``cfg.resource_caps``. Only non-engine, non-skipped steps with a
+    memory baseline participate.
 
     ``inner_jobs`` applies ONE internal-parallelism width to every step (the ``--max-mem``
     sizing path). ``widths`` instead supplies a PER-STEP width map (a step absent from the map
@@ -97,7 +97,9 @@ def schedulable_peak_mem_bytes(
     by_tag = {
         step.tag: step
         for step in cfg.steps
-        if step.hint.rss_baseline_bytes is not None and not step.engine_only
+        if step.hint.rss_baseline_bytes is not None
+        and not step.engine_only
+        and step.skip_reason is None
     }
     dependencies = transitive_deps(list(cfg.steps))
     tags = tuple(by_tag)
@@ -246,15 +248,16 @@ def stress_copy_footprint_bytes(
     derive the safe ``--stress`` fan-out.
 
     Sums each step's per-step inner memory cap (``step_mem_cap_bytes`` — an explicit
-    ``hard_mem_max_bytes`` wins, else ``mem_cap_factor x rss_baseline_bytes``); a step that
+    ``hard_mem_max_bytes`` wins, else ``mem_cap_factor x rss_baseline_bytes``); an active step that
     DECLARES NO memory is charged ``default_step_bytes`` (the SMALL 1-GiB forcing-function
     default the rest of the package uses). Summing every step (rather than the reachable
     concurrent set) is a deliberate UPPER BOUND: it never under-charges, so the derived ceiling
-    errs toward refusing rather than OOMing sibling agents. For the common single-node stress
+    errs toward refusing rather than OOMing sibling agents. Intentional pre-execution skips are
+    excluded because no copy can spawn them. For the common single-node stress
     (``--only dbi.file_metadata --stress N``) the sum is exactly that one node's cap."""
     total = 0
     for step in cfg.steps:
-        if step.engine_only:
+        if step.engine_only or step.skip_reason is not None:
             continue
         cap = step_mem_cap_bytes(
             step, mem_cap_factor=cfg.mem_cap_factor, default_cap_bytes=default_step_bytes

@@ -164,7 +164,9 @@ fn peak_mem_over_sets(
     let participating: Vec<&Step> = cfg
         .steps
         .iter()
-        .filter(|s| s.hint.rss_baseline_bytes.is_some() && !s.engine_only)
+        .filter(|s| {
+            s.hint.rss_baseline_bytes.is_some() && !s.engine_only && s.skip_reason.is_none()
+        })
         .collect();
     let tags: Vec<String> = participating.iter().map(|s| s.tag()).collect();
     let dependencies = transitive_deps(&cfg.steps);
@@ -426,13 +428,14 @@ pub fn box_mem_budget_bytes() -> Option<i64> {
 
 /// Conservative footprint of one complete stress copy.
 ///
-/// Every non-engine-only step is charged its full inner cap; undeclared steps receive the same
-/// small default cap used by the scheduler.  Summing the graph is deliberately an upper bound.
+/// Every active non-engine-only step is charged its full inner cap; undeclared steps receive the
+/// same small default cap used by the scheduler. Intentional pre-execution skips are excluded.
+/// Summing the graph is deliberately an upper bound.
 pub fn stress_copy_footprint_bytes(cfg: &DagConfig, default_step_bytes: Option<i64>) -> i64 {
     let default_step_bytes = default_step_bytes.unwrap_or(DEFAULT_SMALL_MEM_CAP_BYTES);
     cfg.steps
         .iter()
-        .filter(|step| !step.engine_only)
+        .filter(|step| !step.engine_only && step.skip_reason.is_none())
         .map(|step| {
             step_mem_cap_bytes(step, cfg.mem_cap_factor, Some(default_step_bytes)).unwrap_or(0)
         })

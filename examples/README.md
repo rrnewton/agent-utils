@@ -124,15 +124,21 @@ CPU cap when cgroup boxing is active, charge eight core-equivalents against the 
 model.
 
 By **default** the runner also *appends* an inner-jobs flag to your command derived from that width —
-the default template is `-j`, so a `cmd` of `make build` would be run as `make build -j 8`. This step,
-though, already hardcodes its own `make -j8`, so it sets `"jobs_flag": ""` to **opt out** of the
-append (otherwise the runner would tack a redundant `-j 8` onto the command — and appending it to this
-example's `sleep`-based simulated command would even make it error). Set `jobs_flag` to a template
-like `"-j%d"`, `"--jobs="`, or `"--num-threads"` to control the flag's spelling, or `""` (as here)
-when your command manages its own concurrency.
+the default template is `-j`, so a `cmd` of `make build` would be run as `make build -j 8`. This step
+already hardcodes its own `make -j8`, so `"jobs_flag": ""` declares a **self-managed fixed width**.
+That is allowed while the run budget is at least eight, but `--max-cpus 4` refuses before spawning:
+the runner cannot honestly rewrite the command to four workers. Such a step also cannot be swept.
+
+Prefer a command that accepts a runner-controlled template such as `"-j%d"`, `"--jobs="`, or
+`"--num-threads"`. Then a smaller `--max-cpus` caps the appended flag, scheduler accounting,
+planner recommendation, and child `cpu.max` together.
 
 ```sh
-safe-ci-dag-runner run --dag examples/05-inner-jobs.json --allow-cgroup-failure
+# This self-managed fixture declares a fixed width of eight, so make the required budget explicit.
+safe-ci-dag-runner run --dag examples/05-inner-jobs.json --max-cpus 8 --allow-cgroup-failure
+
+# Demonstrate the fail-closed case (exits 2 before the hardcoded -j8 command starts):
+safe-ci-dag-runner run --dag examples/05-inner-jobs.json --max-cpus 4 --allow-cgroup-failure
 ```
 
 ## 6. `06-step-sweep.json` — profile & experiment with individual steps

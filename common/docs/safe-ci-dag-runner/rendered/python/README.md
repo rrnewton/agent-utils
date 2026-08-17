@@ -86,7 +86,9 @@ spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
 `sweep --jobs RANGE` remains the width-range option for a per-step speedup
-experiment.
+experiment. A non-empty `jobs_flag` lets the runner rewrite an inner width down
+to `--max-cpus`; an empty or whitespace-only flag prevents rewriting. When paired with a positive
+declared width, that width is self-managed and the run refuses it if it exceeds the total budget.
 
 ## Attributable test-runner timeouts
 

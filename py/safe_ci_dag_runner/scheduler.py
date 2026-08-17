@@ -37,6 +37,7 @@ from safe_ci_dag_runner.model import (
     Step,
     command_with_inner_jobs,
     effective_cpu_count,
+    effective_jobs_flag,
     canonical_cpu_timeout,
     scale_cpu_timeout,
     preferred_inner_jobs,
@@ -99,11 +100,13 @@ def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
 
 
 def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
-    """Copy ``cfg`` with every declared per-step CPU width capped to ``max_cpus``.
+    """Copy ``cfg`` with every runner-controlled per-step CPU width capped to ``max_cpus``.
 
     The clamp is intentionally visible: a caller-authored width changed by the run budget must
-    not look as though it executed unchanged. The undeclared-step ``cpu.max`` default is capped
-    too, so a nominal width-one step cannot silently receive a wider child quota.
+    not look as though it executed unchanged. A step whose effective ``jobs_flag`` is empty manages
+    its own command width and cannot be rewritten; its declared width is left unchanged so run
+    entry points can refuse an over-budget configuration instead of corrupting scheduling/profile
+    metadata. The undeclared-step ``cpu.max`` default is capped too.
     """
     budget = max(1, max_cpus)
     default_cpu_count = cfg.default_step_cpu_count
@@ -118,6 +121,9 @@ def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
     for step in cfg.steps:
         width = step.hint.preferred_inner_jobs
         if width is not None and width > budget:
+            if not effective_jobs_flag(step, cfg.default_jobs_flag).strip():
+                steps.append(step)
+                continue
             _warn(
                 f"step {step.tag} preferred_inner_jobs={width} exceeds --max-cpus {budget}; "
                 f"capping its command width and per-step cpu.max to {budget}"
@@ -134,6 +140,41 @@ def cap_config_max_cpus(cfg: DagConfig, max_cpus: int) -> DagConfig:
         steps=tuple(steps),
         default_step_cpu_count=default_cpu_count,
         resource_caps=dict(cfg.resource_caps),
+    )
+
+
+def _self_managed_width_violations(
+    cfg: DagConfig, max_cpus: int
+) -> tuple[tuple[str, int], ...]:
+    """Declared over-budget widths the runner cannot rewrite because ``jobs_flag`` is empty."""
+
+    budget = max(1, max_cpus)
+    return tuple(
+        sorted(
+            (step.tag, width)
+            for step in cfg.steps
+            if step.skip_reason is None
+            and (width := step.hint.preferred_inner_jobs) is not None
+            and width > budget
+            and not effective_jobs_flag(step, cfg.default_jobs_flag).strip()
+        )
+    )
+
+
+def _self_managed_width_error(cfg: DagConfig, max_cpus: int) -> str | None:
+    """Actionable refusal text for an unclampable declared width, or ``None`` when safe."""
+
+    violations = _self_managed_width_violations(cfg, max_cpus)
+    if not violations:
+        return None
+    detail = ", ".join(
+        f"{tag} (preferred_inner_jobs={width})" for tag, width in violations
+    )
+    return (
+        f"--max-cpus {max(1, max_cpus)} cannot lower guest parallelism for step(s) with an empty "
+        f"effective jobs_flag: {detail}; set each step's jobs_flag to the guest's worker-count "
+        "option (or remove the empty override and set default_jobs_flag), reduce "
+        "preferred_inner_jobs, or raise --max-cpus"
     )
 
 
@@ -299,6 +340,8 @@ class Runner:
         run_timeout_s: int | None = None,
     ) -> None:
         self.max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
+        if error := _self_managed_width_error(cfg, self.max_cpus):
+            raise ValueError(error)
         # Public 0.13 attribute retained for source compatibility; new code uses max_cpus.
         self.cpu_jobs = self.max_cpus
         self.cfg = cap_config_max_cpus(cfg, self.max_cpus)
@@ -1219,6 +1262,13 @@ def run_dag_limited(
         a bound whose breach cannot be attributed to a node reads like enforcement without being
         usable as one.
     """
+    resolved_max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
+    if error := _self_managed_width_error(cfg, resolved_max_cpus):
+        print(
+            f"[scheduler] ERROR: REFUSING to run before any node starts: {error}",
+            file=sys.stderr,
+        )
+        return RunResult(ok=False, wall_s=0.0)
     domain_errors = write_domain_violations(cfg)
     if domain_errors:
         print(
@@ -1249,7 +1299,6 @@ def run_dag_limited(
             "(falling back to process-group kill for teardown, no inner memory/CPU caps)."
         )
 
-    resolved_max_cpus = _resolve_max_cpus_argument(max_cpus, cpu_jobs)
     runner = Runner(
         cfg,
         max_steps=max_steps,

@@ -44,11 +44,12 @@ use crate::estimates::{
     plan_to_json, plan_to_text, Plan, Planner, DEFAULT_MIN_SAMPLES,
 };
 use crate::io::{dag_from_json, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError};
-use crate::model::{step_classification, DagConfig, Step, StepOutcome};
+use crate::model::{effective_jobs_flag, step_classification, DagConfig, Step, StepOutcome};
 use crate::perflog::{append_step_profiles, child_cpu_seconds, PerfWindow};
 use crate::profile_enrich::container_core_budget;
 use crate::scheduler::{
-    cap_config_max_cpus, run_dag_boxed_deadline_limited, run_dag_boxed_limited, BoxedCgroups,
+    cap_config_max_cpus, run_dag_boxed_deadline_limited, run_dag_boxed_limited,
+    validate_max_cpus_rewrite, BoxedCgroups,
 };
 use crate::sizing::{
     box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_copy_footprint_bytes,
@@ -191,6 +192,7 @@ hint:   resources{{name:int}}, est_duration_s, rss_baseline_bytes, hard_mem_max_
 top:    description, resource_caps{{name:int}}, mem_cap_factor, mem_cap_floor_bytes,\n          outer_mem_safety_factor, default_step_timeout, default_jobs_flag\n  \
 desc = short label; description = long-form docs (often multi-line, great in YAML)\n  \
 jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"->\"-j4\", \"--jobs=\"->\"--jobs=4\"\n  \
+          empty/whitespace means a fixed self-managed width: it cannot be rewritten or swept\n  \
 yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n\n\
 {what}\n  \
 - concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
@@ -1189,8 +1191,8 @@ fn resolve_feedback_dir(perf_dir: Option<&str>, no_feedback: bool) -> Option<Str
 }
 
 // Load the profile store (when feedback is on) and build the plan for `planner`. Mirrors Python's
-// `_build_feedback_plan`. `core_budget` (`P`) and `mem_budget` drive the CPA allocator under
-// `--planner cpa` and are ignored by the other planners.
+// `_build_feedback_plan`. `core_budget` (`P`) bounds every displayed speedup recommendation and,
+// together with `mem_budget`, drives the CPA allocator under `--planner cpa`.
 fn build_feedback_plan(
     cfg: &DagConfig,
     feedback_dir: Option<&str>,
@@ -1340,22 +1342,25 @@ fn sync_upload(backend: &dyn SyncBackend, rows: &[std::collections::BTreeMap<Str
     }
 }
 
-// Resolve the `(core_budget, mem_budget)` the CPA allocator balances against, or `(None, None)`
-// for the non-allocating planners (so they do no cgroup/proc reads). Mirrors Python's
-// `_cpa_budgets`.
-fn cpa_budgets(
+// Resolve the planning budgets. A run passes its already-resolved `--max-cpus` value for every
+// planner so `--show-plan` cannot recommend an inner width the outer cgroup will throttle. The
+// standalone ordering-only planners retain `None` and do no cgroup/proc reads; CPA still needs a
+// default machine budget for allocation. Memory affects CPA allocation only. Mirrors Python's
+// `_planning_budgets`.
+fn planning_budgets(
     planner: Planner,
     max_mem: Option<&str>,
     max_cpus: Option<i64>,
 ) -> (Option<i64>, Option<i64>) {
-    if planner != Planner::Cpa {
-        return (None, None);
-    }
-    let mem_budget = max_mem.filter(|s| !s.is_empty()).and_then(parse_size);
-    (
-        Some(max_cpus.unwrap_or_else(container_core_budget).max(1)),
-        mem_budget,
-    )
+    let core_budget = match max_cpus {
+        Some(value) => Some(value.max(1)),
+        None if planner == Planner::Cpa => Some(container_core_budget().max(1)),
+        None => None,
+    };
+    let mem_budget = (planner == Planner::Cpa)
+        .then(|| max_mem.filter(|s| !s.is_empty()).and_then(parse_size))
+        .flatten();
+    (core_budget, mem_budget)
 }
 
 /// Print one visible line naming where profile CSVs were appended (No Silent Failure).
@@ -1981,6 +1986,23 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
         }
     };
     let repeat = a.repeat.max(1);
+    let base = cfg
+        .steps
+        .iter()
+        .find(|s| s.tag() == step_tag)
+        .expect("tag presence checked above")
+        .clone();
+    if effective_jobs_flag(&base, &cfg.default_jobs_flag)
+        .trim()
+        .is_empty()
+    {
+        eprintln!(
+            "{PROG}: sweep: step '{step_tag}' has an empty effective jobs_flag, so --jobs cannot \
+             change guest parallelism; set the step's jobs_flag to the guest's worker-count \
+             option, or remove the empty override and set default_jobs_flag"
+        );
+        return 2;
+    }
 
     // Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
     let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups, None, None) {
@@ -1989,12 +2011,6 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     };
     let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
     let git = git_sha();
-    let base = cfg
-        .steps
-        .iter()
-        .find(|s| s.tag() == step_tag)
-        .expect("tag presence checked above")
-        .clone();
 
     let mut measures: Vec<(i64, SweepMeasure)> = Vec::new();
     for jobs in lo..=hi {
@@ -2107,7 +2123,7 @@ fn cmd_plan(a: &PlanArgs) -> i32 {
     };
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
-    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref(), None);
+    let (core_budget, mem_budget) = planning_budgets(planner, a.max_mem.as_deref(), None);
     let plan = build_feedback_plan(
         &cfg,
         feedback_dir.as_deref(),
@@ -2169,6 +2185,10 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // The total CPU-core budget is independent of graph shape, so resolve it before cgroup
     // bring-up and bind the same value to the outer scope's CPUQuota and the scheduler gate.
     let max_cpus = select_max_cpus(a);
+    if let Err(error) = validate_max_cpus_rewrite(&stressed, max_cpus) {
+        eprintln!("{PROG}: run: {error}");
+        return 2;
+    }
 
     // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
     let cgroups = match resolve_cgroups(
@@ -2218,7 +2238,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
     // The applied cfg (refined hints) feeds both memory-aware --max-steps sizing and the scheduler.
     let planner = Planner::from_value(&a.planner).unwrap_or(Planner::GreedyLpt);
     let feedback_dir = resolve_feedback_dir(a.perf_dir.as_deref(), a.no_profile_feedback);
-    let (core_budget, mem_budget) = cpa_budgets(planner, a.max_mem.as_deref(), Some(max_cpus));
+    let (core_budget, mem_budget) = planning_budgets(planner, a.max_mem.as_deref(), Some(max_cpus));
 
     // Profile-artifact SYNC: parse the backend once; DOWNLOAD seeds the planner, UPLOAD (after the
     // run) publishes this run's samples. A malformed spec fails fast; a backend I/O failure degrades
@@ -2923,7 +2943,7 @@ fn cmd_summary_plan(args: &[String]) -> i32 {
         }
     };
     let (core_budget, mem_budget) =
-        cpa_budgets(planner, flags.get("max-mem").map(|s| s.as_str()), None);
+        planning_budgets(planner, flags.get("max-mem").map(|s| s.as_str()), None);
     let plan = build_plan_from_summary(&cfg, &summary, planner, core_budget, mem_budget);
     if output_format == "json" {
         println!("{}", plan_to_json(&plan));
@@ -3146,6 +3166,70 @@ mod tests {
 
         args.max_mem = None;
         assert_eq!(select_max_steps(&cfg, &args, 3), 9);
+    }
+
+    #[test]
+    fn run_core_budget_reaches_every_planner_but_memory_remains_cpa_only() {
+        for planner in [Planner::GreedyLpt, Planner::CriticalPath, Planner::Cpa] {
+            let (core_budget, mem_budget) = planning_budgets(planner, Some("2G"), Some(16));
+            assert_eq!(core_budget, Some(16), "{planner:?}");
+            if planner == Planner::Cpa {
+                assert_eq!(mem_budget, Some(2 * 1024i64.pow(3)));
+            } else {
+                assert_eq!(mem_budget, None, "{planner:?}");
+            }
+        }
+
+        // A standalone ordering-only `plan` has no run cgroup to constrain and must not invent a
+        // budget. CPA still resolves its machine budget because allocation requires one.
+        assert_eq!(
+            planning_budgets(Planner::GreedyLpt, None, None),
+            (None, None)
+        );
+        assert_eq!(
+            planning_budgets(Planner::CriticalPath, None, None),
+            (None, None)
+        );
+        assert!(planning_budgets(Planner::Cpa, None, None).0.is_some());
+    }
+
+    #[test]
+    fn run_refuses_an_unrewritable_width_before_cgroup_setup() {
+        let mut cfg = tiny();
+        cfg.steps[0].hint.preferred_inner_jobs = Some(8);
+        cfg.steps[0].jobs_flag = Some(String::new());
+        let args = parse_run_args(&["--max-cpus=2".into()]).unwrap();
+        let palette = Palette { enabled: false };
+
+        assert_eq!(cmd_run(&cfg, &args, &palette), 2);
+    }
+
+    #[test]
+    fn sweep_refuses_a_step_whose_guest_width_cannot_be_varied() {
+        let mut cfg = tiny();
+        cfg.default_jobs_flag.clear();
+        cfg.steps[0].jobs_flag = None;
+        let path = std::env::temp_dir().join(format!(
+            "scdr_sweep_empty_jobs_flag_{}_{}.json",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, dag_to_json(&cfg)).unwrap();
+        let args = SweepArgs {
+            dag: Some(path.display().to_string()),
+            step: Some("build.app".to_string()),
+            jobs: Some("1..2".to_string()),
+            repeat: 1,
+            perf_dir: None,
+            no_profile: true,
+            allow_cgroup_failure: false,
+            unsafe_no_cgroups: false,
+            verbosity: 0,
+        };
+        let palette = Palette { enabled: false };
+
+        assert_eq!(cmd_sweep(&args, &palette), 2);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

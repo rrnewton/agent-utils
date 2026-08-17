@@ -4,35 +4,42 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 from pathlib import Path
 
 import pytest
 
 from safe_ci_dag_runner import (
     DagConfig,
+    InfeasibleAllocationError,
     Runner,
     ResourceHint,
     RunResult,
     SpeedupLevel,
     Step,
     StepSpeedup,
+    allocate_widths,
     apply_plan_to_config,
     build_plan,
     cap_config_cpu_jobs,
     cap_config_max_cpus,
     dag_to_json,
     run_dag_limited,
+    schedulable_peak_mem_bytes,
 )
 from safe_ci_dag_runner import cgroup, perflog, profile_enrich
 from safe_ci_dag_runner.cgroup import NoopCgroups
 from safe_ci_dag_runner.cli import (
     MAX_RUN_CPUS,
+    _planning_budgets,
     _select_max_cpus,
     _select_max_steps,
     build_parser,
     main,
 )
 from safe_ci_dag_runner.estimates import Planner
+from safe_ci_dag_runner.model import IntentionalSkipReason
+from safe_ci_dag_runner.sizing import stress_copy_footprint_bytes
 
 
 def _run_args(**overrides: object) -> argparse.Namespace:
@@ -196,8 +203,20 @@ def test_max_steps_and_max_cpus_constrain_independently() -> None:
 def test_default_step_cpu_count_is_charged_as_effective_width() -> None:
     cfg = DagConfig(
         steps=(
-            Step("g", "one", "", 'check() { [ "$#" -eq 0 ]; }; check; sleep 0.2'),
-            Step("g", "two", "", 'check() { [ "$#" -eq 0 ]; }; check; sleep 0.2'),
+            Step(
+                "g",
+                "one",
+                "",
+                'check() { [ "$#" -eq 0 ]; }; check; sleep 0.2',
+                hint=ResourceHint(preferred_inner_jobs=0),
+            ),
+            Step(
+                "g",
+                "two",
+                "",
+                'check() { [ "$#" -eq 0 ]; }; check; sleep 0.2',
+                hint=ResourceHint(preferred_inner_jobs=0),
+            ),
         ),
         default_step_cpu_count=4,
     )
@@ -280,6 +299,87 @@ def test_oversized_width_jobs_flag_and_default_cpu_cap_are_clamped(
     warnings = capsys.readouterr().err
     assert "preferred_inner_jobs=8" in warnings
     assert "default_step_cpu_count=8" in warnings
+
+
+def test_overbudget_self_managed_width_refuses_before_spawn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    marker = tmp_path / "spawned"
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "fixed",
+                "",
+                f"touch {shlex.quote(str(marker))}",
+                hint=ResourceHint(preferred_inner_jobs=8),
+                jobs_flag="",
+            ),
+        )
+    )
+
+    # A truthful cap helper leaves a self-managed width unchanged: it cannot rewrite the command.
+    capped = cap_config_max_cpus(cfg, 2)
+    assert capped.steps[0].hint.preferred_inner_jobs == 8
+    result = run_dag_limited(cfg, max_steps=1, max_cpus=2, verbosity=0)
+    assert not result.ok
+    assert result.max_concurrent_steps == 0
+    assert not marker.exists()
+    assert "cannot lower guest parallelism" in capsys.readouterr().err
+    with pytest.raises(ValueError, match="empty effective jobs_flag"):
+        Runner(cfg, max_steps=1, max_cpus=2, cgroups=NoopCgroups(), verbosity=0)
+
+    # An intentional pre-execution skip can never spawn, so its dormant width must not reject the
+    # run or erase the typed skip record.
+    skipped = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "skipped",
+                "",
+                f"touch {shlex.quote(str(marker))}",
+                hint=ResourceHint(preferred_inner_jobs=8),
+                jobs_flag="",
+                skip_reason=IntentionalSkipReason.EMPTY_MANIFEST_BUCKET,
+            ),
+        )
+    )
+    skipped_result = run_dag_limited(
+        skipped, max_steps=1, max_cpus=2, verbosity=0
+    )
+    assert skipped_result.ok
+    assert skipped_result.intentional_skips == (
+        ("g.skipped", IntentionalSkipReason.EMPTY_MANIFEST_BUCKET),
+    )
+    assert not marker.exists()
+
+
+def test_run_cli_refuses_overbudget_self_managed_width_before_cgroup(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    marker = tmp_path / "spawned"
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        dag_to_json(
+            DagConfig(
+                steps=(
+                    Step(
+                        "g",
+                        "fixed",
+                        "",
+                        f"touch {shlex.quote(str(marker))}",
+                        hint=ResourceHint(preferred_inner_jobs=8),
+                        jobs_flag="",
+                    ),
+                )
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc = main(["run", "--dag", str(dag), "--max-cpus", "2", "--quiet"])
+    assert rc == 2
+    assert not marker.exists()
+    assert "cannot lower guest parallelism" in capsys.readouterr().err
 
 
 def test_plan_application_preserves_top_level_cpu_policy_before_clamp() -> None:
@@ -410,13 +510,289 @@ def test_cpa_omits_curve_entirely_above_strict_cpu_budget() -> None:
     assert plan.entries[0].speedup is None
 
 
+def test_every_planner_bounds_profile_recommendation_to_run_cpu_budget() -> None:
+    levels = tuple(
+        SpeedupLevel(
+            inner_jobs=width,
+            samples=1,
+            wall_s=16.0 / width,
+            raw_wall_s=16.0 / width,
+            wall_min_s=16.0 / width,
+            wall_max_s=16.0 / width,
+            cpu_s=16.0,
+            effective_cores=float(width),
+            throttled_s=0.0,
+            speedup=float(width),
+        )
+        for width in (1, 2, 4, 8)
+    )
+    speedup = StepSpeedup(
+        step="g.scaling",
+        baseline_inner_jobs=1,
+        recommended_inner_jobs=8,
+        measured_effective_cores=8.0,
+        regression_inner_jobs=None,
+        levels=levels,
+    )
+    cfg = DagConfig(steps=(Step("g", "scaling", "", "true"),))
+
+    for planner in (Planner.GREEDY_LPT, Planner.CRITICAL_PATH, Planner.CPA):
+        plan = build_plan(
+            cfg,
+            {},
+            planner=planner,
+            speedups={"g.scaling": speedup},
+            core_budget=2,
+        )
+        bounded = plan.entries[0].speedup
+        assert bounded is not None
+        assert bounded.recommended_inner_jobs == 2
+        assert any(level.inner_jobs == 8 for level in bounded.levels)
+        if planner is Planner.CPA:
+            assert plan.entries[0].alloc_inner_jobs is not None
+            assert plan.entries[0].alloc_inner_jobs <= 2
+
+
+def test_cpa_keeps_self_managed_step_at_its_declared_width() -> None:
+    levels = tuple(
+        SpeedupLevel(
+            inner_jobs=width,
+            samples=1,
+            wall_s=8.0 / width,
+            raw_wall_s=8.0 / width,
+            wall_min_s=8.0 / width,
+            wall_max_s=8.0 / width,
+            cpu_s=8.0,
+            effective_cores=float(width),
+            throttled_s=0.0,
+            speedup=float(width),
+        )
+        for width in (1, 2, 4)
+    )
+    speedup = StepSpeedup("g.fixed", 1, 4, 4.0, None, levels)
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "fixed",
+                "",
+                "true",
+                hint=ResourceHint(est_duration_s=13.0, preferred_inner_jobs=2),
+                jobs_flag="",
+            ),
+        )
+    )
+    plan = build_plan(
+        cfg,
+        {},
+        planner=Planner.CPA,
+        speedups={"g.fixed": speedup},
+        core_budget=4,
+    )
+    assert plan.entries[0].alloc_inner_jobs is None
+    assert plan.entries[0].est_duration_s == 4.0
+    assert plan.entries[0].est_source == "store"
+    assert apply_plan_to_config(cfg, plan).steps[0].hint.preferred_inner_jobs == 2
+
+    no_exact_cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "fixed",
+                "",
+                "true",
+                hint=ResourceHint(est_duration_s=13.0, preferred_inner_jobs=3),
+                jobs_flag="",
+            ),
+        )
+    )
+    no_exact = build_plan(
+        no_exact_cfg,
+        {},
+        planner=Planner.CPA,
+        speedups={"g.fixed": speedup},
+        core_budget=4,
+    )
+    assert no_exact.entries[0].est_duration_s == 13.0
+    assert no_exact.entries[0].est_source == "hint"
+
+
+def test_cpa_excludes_intentional_skips_from_cpu_memory_and_curve_allocation() -> None:
+    speedup = StepSpeedup(
+        "g.live",
+        1,
+        2,
+        2.0,
+        None,
+        (
+            SpeedupLevel(1, 1, 10.0, 10.0, 10.0, 10.0, 10.0, 1.0, 0.0, 1.0),
+            SpeedupLevel(2, 1, 5.0, 5.0, 5.0, 5.0, 10.0, 2.0, 0.0, 2.0),
+        ),
+    )
+    skipped_hint = ResourceHint(
+        est_duration_s=100.0,
+        rss_baseline_bytes=10**12,
+        preferred_inner_jobs=8,
+    )
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "skipped",
+                "",
+                "false",
+                hint=skipped_hint,
+                jobs_flag="",
+                skip_reason=IntentionalSkipReason.EMPTY_MANIFEST_BUCKET,
+            ),
+            Step(
+                "g",
+                "live",
+                "",
+                "true",
+                hint=ResourceHint(est_duration_s=10.0, preferred_inner_jobs=1),
+                jobs_flag="-j%d",
+            ),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    widths = allocate_widths(cfg, {"g.live": speedup}, {"g.skipped": 0.0, "g.live": 10.0}, 2)
+    assert widths == {"g.skipped": 1, "g.live": 2}
+    assert schedulable_peak_mem_bytes(cfg, 2, widths=widths)[0] == 0
+    assert stress_copy_footprint_bytes(cfg, default_step_bytes=123) == 123
+    plan = build_plan(
+        cfg, {}, planner=Planner.CPA, speedups={"g.live": speedup}, core_budget=2
+    )
+    entries = plan.by_tag()
+    assert entries["g.skipped"].est_duration_s == 0.0
+    assert entries["g.skipped"].est_source == "skip"
+    assert entries["g.skipped"].alloc_inner_jobs is None
+    assert entries["g.skipped"].speedup is None
+    assert entries["g.live"].alloc_inner_jobs == 2
+    assert plan.allocation is not None
+    assert plan.allocation.modeled_makespan_s == 5.0
+    applied = apply_plan_to_config(cfg, plan)
+    assert applied.steps[0].hint == skipped_hint
+
+
+def test_cpa_plan_application_cannot_launder_an_overbudget_self_managed_width(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "spawned"
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "fixed",
+                "",
+                f"touch {shlex.quote(str(marker))}",
+                hint=ResourceHint(preferred_inner_jobs=8),
+                jobs_flag="",
+            ),
+        )
+    )
+    plan = build_plan(cfg, {}, planner=Planner.CPA, core_budget=2)
+    assert plan.entries[0].alloc_inner_jobs is None
+    with pytest.raises(InfeasibleAllocationError) as excinfo:
+        allocate_widths(cfg, {}, {"g.fixed": 8.0}, 2)
+    assert excinfo.value.core_budget == 2
+    assert excinfo.value.fixed_widths == (("g.fixed", 8),)
+    assert plan.allocation is not None
+    assert plan.allocation.stop_reason == "infeasible-fixed-width"
+    assert plan.allocation.modeled_makespan_s == float("inf")
+
+    applied = apply_plan_to_config(cfg, plan)
+    assert applied.steps[0].hint.preferred_inner_jobs == 8
+    result = run_dag_limited(applied, max_steps=1, max_cpus=2, verbosity=0)
+    assert not result.ok
+    assert result.outcomes == ()
+    assert not marker.exists()
+
+
+def test_sweep_refuses_empty_jobs_flag_before_spawn(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    marker = tmp_path / "spawned"
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        dag_to_json(
+            DagConfig(
+                steps=(
+                    Step(
+                        "g",
+                        "fixed",
+                        "",
+                        f"touch {shlex.quote(str(marker))}",
+                        jobs_flag="",
+                    ),
+                )
+            )
+        ),
+        encoding="utf-8",
+    )
+    rc = main(
+        [
+            "sweep",
+            "--dag",
+            str(dag),
+            "--step",
+            "g.fixed",
+            "--jobs",
+            "1..2",
+            "--no-profile",
+        ]
+    )
+    assert rc == 2
+    assert not marker.exists()
+    assert "empty effective jobs_flag" in capsys.readouterr().err
+
+
+def test_run_budget_reaches_every_planner_but_memory_remains_cpa_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("safe_ci_dag_runner.cli.container_core_budget", lambda: 12)
+    for planner in (Planner.GREEDY_LPT, Planner.CRITICAL_PATH, Planner.CPA):
+        core_budget, mem_budget = _planning_budgets(planner, "2G", 16)
+        assert core_budget == 16
+        assert mem_budget == (2 * 1024**3 if planner is Planner.CPA else None)
+
+    assert _planning_budgets(Planner.GREEDY_LPT, None) == (None, None)
+    assert _planning_budgets(Planner.CRITICAL_PATH, None) == (None, None)
+    assert _planning_budgets(Planner.CPA, None) == (12, None)
+
+
 def test_cpa_charges_default_step_cpu_count_for_curveless_step() -> None:
     cfg = DagConfig(
-        steps=(Step("g", "default", "", "true", hint=ResourceHint(est_duration_s=1.0)),),
+        steps=(
+            Step(
+                "g",
+                "default",
+                "",
+                "true",
+                hint=ResourceHint(est_duration_s=1.0, preferred_inner_jobs=0),
+            ),
+        ),
         default_step_cpu_count=4,
     )
     plan = build_plan(cfg, {}, planner=Planner.CPA, core_budget=4)
     assert plan.entries[0].alloc_inner_jobs == 4
+
+    # An empty jobs flag with no positive explicit preferred width is not a hardcoded guest width:
+    # the top-level default is a runner/cgroup cap and may be tightened to P without refusal.
+    self_managed_default = DagConfig(
+        steps=(Step("g", "default", "", "true", jobs_flag=""),),
+        default_step_cpu_count=8,
+    )
+    assert allocate_widths(
+        self_managed_default, {}, {"g.default": 1.0}, 2
+    ) == {"g.default": 2}
+    default_plan = build_plan(
+        self_managed_default, {}, planner=Planner.CPA, core_budget=2
+    )
+    assert default_plan.entries[0].alloc_inner_jobs is None
+    assert default_plan.allocation is not None
+    assert default_plan.allocation.stop_reason != "infeasible-fixed-width"
 
 
 def test_scope_reexec_requests_and_carries_exact_max_cpus(

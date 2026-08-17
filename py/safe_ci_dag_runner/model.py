@@ -153,7 +153,8 @@ class Step:
     cpu_timeout: int = 0
     # Template for the inner-parallelism flag appended to `cmd` when this step declares
     # `preferred_inner_jobs`. None inherits DagConfig.default_jobs_flag; "" disables appending
-    # (the step manages its own concurrency). See render_jobs_flag for the template forms.
+    # (the step manages a fixed declared width, which the planner cannot resize). See
+    # render_jobs_flag for the template forms.
     jobs_flag: str | None = None
     # A typed, pre-execution omission. This is not PASS and is kept separate from
     # dependency-skipped nodes in RunResult. Unknown strings are rejected by the loader.
@@ -201,14 +202,14 @@ def command_with_inner_jobs(
     """The step's shell command with its inner-parallelism flag appended, when applicable.
 
     Appends ``<rendered-flag>`` (see :func:`render_jobs_flag`) to the command when
-    ``inner_jobs`` is set and the effective jobs-flag template is non-empty. A ``None``
-    ``inner_jobs`` or an empty template leaves the command unchanged (the step then declares no
-    inner parallelism, or manages its own).
+    ``inner_jobs`` is set and the effective jobs-flag template contains a non-whitespace token. A
+    ``None`` width or an empty/whitespace-only template leaves the command unchanged (the step then
+    declares no inner parallelism, or manages its own).
     """
     if inner_jobs is None:
         return step.cmd
     template = effective_jobs_flag(step, default_jobs_flag)
-    if not template:
+    if not template.strip():
         return step.cmd
     return f"{step.cmd} {render_jobs_flag(template, inner_jobs)}"
 
@@ -223,10 +224,13 @@ def step_classification(step: Step) -> StepClass:
 
 
 def preferred_inner_jobs(step: Step, experiment_override: int | None = None) -> int | None:
-    """Internal parallelism width for a step: an explicit override wins, else the hint."""
-    if experiment_override is not None:
-        return experiment_override
-    return step.hint.preferred_inner_jobs
+    """Positive internal parallelism width: an explicit override wins, else the hint.
+
+    Zero/negative library-authored values mean undeclared and fall through to the configured
+    per-step CPU default rather than becoming an invalid command flag or admission width.
+    """
+    value = experiment_override if experiment_override is not None else step.hint.preferred_inner_jobs
+    return value if (value is not None and value > 0) else None
 
 
 def canonical_cpu_timeout(step: Step, default_cpu_timeout: int) -> int:
@@ -306,8 +310,10 @@ def effective_cpu_count(step: Step, default_cpu_count: int | None) -> int | None
     wins; otherwise the DAG's SMALL default. Bounds ONLY the cgroup cpu.max, never the command's
     inner ``-j`` flag (which stays keyed to the declared width, so an undeclared step gets a
     1-core box without a bogus ``-j 1`` appended to a command that may not accept it)."""
-    inner = step.hint.preferred_inner_jobs
-    return inner if inner is not None else default_cpu_count
+    inner = preferred_inner_jobs(step)
+    if inner is not None:
+        return inner
+    return default_cpu_count if (default_cpu_count is not None and default_cpu_count > 0) else None
 
 
 def _cpu_timeout_policy_suffix(

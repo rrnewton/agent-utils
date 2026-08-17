@@ -223,7 +223,8 @@ pub struct Step {
     pub cpu_timeout: i64,
     /// Template for the inner-parallelism flag appended to `cmd` when this step declares
     /// `preferred_inner_jobs`. `None` inherits `DagConfig::default_jobs_flag`; an empty string
-    /// disables appending (the step manages its own concurrency). See [`render_jobs_flag`].
+    /// disables appending (the step manages its own concurrency), making that declared width rigid
+    /// rather than planner-adjustable. See [`render_jobs_flag`].
     pub jobs_flag: Option<String>,
     /// Typed pre-execution omission, separate from PASS and dependency skip.
     pub skip_reason: Option<IntentionalSkipReason>,
@@ -263,7 +264,7 @@ pub fn effective_jobs_flag<'a>(step: &'a Step, default_jobs_flag: &'a str) -> &'
 
 /// Return a step command with its effective inner-job flag appended when requested.
 ///
-/// A missing width or empty effective template leaves the command unchanged.
+/// A missing width or empty/whitespace-only effective template leaves the command unchanged.
 pub fn command_with_inner_jobs(
     step: &Step,
     default_jobs_flag: &str,
@@ -273,7 +274,7 @@ pub fn command_with_inner_jobs(
         None => step.cmd.clone(),
         Some(n) => {
             let template = effective_jobs_flag(step, default_jobs_flag);
-            if template.is_empty() {
+            if template.trim().is_empty() {
                 step.cmd.clone()
             } else {
                 format!("{} {}", step.cmd, render_jobs_flag(template, n))
@@ -293,9 +294,14 @@ pub fn step_classification(step: &Step) -> StepClass {
     StepClass::Light
 }
 
-/// Internal parallelism width for a step: an explicit override wins, else the hint.
+/// Positive internal parallelism width: an explicit override wins, else the hint.
+///
+/// Zero/negative library-authored values mean undeclared and fall through to the configured
+/// per-step CPU default rather than becoming an invalid command flag or admission width.
 pub fn preferred_inner_jobs(step: &Step, experiment_override: Option<i64>) -> Option<i64> {
-    experiment_override.or(step.hint.preferred_inner_jobs)
+    experiment_override
+        .or(step.hint.preferred_inner_jobs)
+        .filter(|value| *value > 0)
 }
 
 /// CANONICAL CPU-time budget (seconds) for a step, before any per-platform scaling: its declared
@@ -387,7 +393,7 @@ fn format_multiplier(value: f64) -> String {
 /// otherwise the DAG's SMALL default. Bounds cpu.max ONLY, never the command's inner `-j` flag
 /// (which stays keyed to the declared width).
 pub fn effective_cpu_count(step: &Step, default_cpu_count: Option<i64>) -> Option<i64> {
-    step.hint.preferred_inner_jobs.or(default_cpu_count)
+    preferred_inner_jobs(step, None).or(default_cpu_count.filter(|value| *value > 0))
 }
 
 // Map a Unix signal number to its name (e.g. `9 -> "SIGKILL"`), matching the names Python's
@@ -892,6 +898,8 @@ mod tests {
         // Empty template disables appending.
         let s3 = bare_step("mytool", Some(""));
         assert_eq!(command_with_inner_jobs(&s3, "-j", Some(4)), "mytool");
+        let s4 = bare_step("fixed", Some("   "));
+        assert_eq!(command_with_inner_jobs(&s4, "-j", Some(4)), "fixed");
     }
 
     #[test]

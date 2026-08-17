@@ -30,9 +30,10 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
 * The memory-aware ``--max-steps`` decision and modeled footprint from ``--max-mem`` match.
 * ``run`` keeps active-step fan-out (``-s``) independent from its total CPU budget
   (``-j`` / ``--max-cpus``): the same fork-based guest workload records normalized step/worker
-  overlap under both engines, including authored inner widths capped by the run budget. A
-  capability-gated boxed case additionally proves the live outer ``cpu.max`` and long-window
-  ``cpu.stat`` bandwidth.
+  overlap under both engines, including authored inner widths capped by the run budget. A declared
+  over-budget self-managed width is refused before spawn, and profile-derived recommendations shown
+  by every run planner remain within the same budget. A capability-gated boxed case additionally
+  proves the live outer ``cpu.max`` and long-window ``cpu.stat`` bandwidth.
 * The auto-logging profile STORE (Feature D) has an identical on-disk schema across builds: an
   unboxed run under each build (into separate ``--perf-dir`` dirs) writes the SAME set of CSV
   filenames — so ``machine_id`` + ``container_class`` (and hence ``nproc``) agree — with
@@ -40,7 +41,8 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   SHA) legitimately differ and are not compared. The dynamic cgroup ``cpu.*`` columns only appear
   under boxing (out of scope for the unboxed differential); their alphabetical ordering is pinned
   by each build's own perflog tests.
-* The ``sweep`` ``--jobs`` error text (malformed range / not-an-integer) matches across builds.
+* The ``sweep`` ``--jobs`` error text (malformed range / not-an-integer) matches across builds, and
+  a step with an empty effective ``jobs_flag`` is refused because its guest width cannot vary.
 * The profile-store FEEDBACK loop + ``--planner`` agree (``compare_plan_feedback``): against a FIXED
   synthetic store, ``plan`` output is byte-identical across builds for BOTH planners and BOTH formats
   (so the contention-discounted median durations, high-percentile rss estimates, and dispatch order
@@ -2092,6 +2094,79 @@ def compare_speedup_model(py: list[str], rs: list[str], rep: Report) -> None:
                 f"recommended inner_jobs mismatch: expected {expected}, got {recs}",
             )
 
+        # A run's explicit total CPU budget must also bound profile-derived recommendations shown
+        # by --show-plan under EVERY planner, not only CPA. Measurements above P remain visible in
+        # the curve, but no actionable recommendation may exceed the outer quota.
+        for planner in ("greedy-lpt", "critical-path", "cpa"):
+            run_args: tuple[str, ...] = (
+                "run", "--dag", dag_path, "--perf-dir", store, "--planner", planner,
+                "--show-plan", "--max-steps", "1", "--max-cpus", "2", NOPROF,
+                "--unsafe-no-cgroups", "-q",
+            )
+            po = run(py, run_args, extra)
+            ro = run(rs, run_args, extra)
+            label = f"speedup-model:run-budget/{planner}"
+            if po.returncode != ro.returncode or po.returncode != 0:
+                rep.bad(label, f"py={po}\nrs={ro}")
+                continue
+            if po.stdout != ro.stdout:
+                rep.bad(
+                    label,
+                    f"budgeted --show-plan differs\n--- py ---\n{po.stdout}\n--- rs ---\n{ro.stdout}",
+                )
+                continue
+            table = po.stdout.partition("parallel-speedup model")[2]
+            recommendations: dict[str, int] = {}
+            for step in expected:
+                match = re.search(rf"(?m)^{re.escape(step)}\s+(\d+)\s+", table)
+                if match is not None:
+                    recommendations[step] = int(match.group(1))
+            expected_capped = {"p.lin": 2, "p.knee": 2, "p.plat": 1, "p.bud": 2}
+            if recommendations == expected_capped:
+                rep.ok(label)
+            else:
+                rep.bad(
+                    label,
+                    f"recommendations exceed/miss P=2: expected {expected_capped}, "
+                    f"got {recommendations}\n{po.stdout}",
+                )
+
+        # Positive execution proof for the profile-derived CPA width: the guest accepts exactly
+        # the flag CPA should apply under P=2. This catches a plan/application disconnect even if
+        # both implementations render the same recommendation table.
+        observed_dag = os.path.join(tmp, "observed-width.json")
+        with open(observed_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "p",
+                            "job": "lin",
+                            "cmd": 'check() { [ "$*" = "--workers=2" ]; }; check',
+                            "jobs_flag": "--workers=",
+                            "hint": {
+                                "est_duration_s": 9.0,
+                                "preferred_inner_jobs": 1,
+                            },
+                        }
+                    ]
+                },
+                handle,
+            )
+        applied_args = (
+            "run", "--dag", observed_dag, "--perf-dir", store, "--planner", "cpa",
+            "--max-steps", "1", "--max-cpus", "2", NOPROF, "--unsafe-no-cgroups", "-q",
+        )
+        po = run(py, applied_args, extra)
+        ro = run(rs, applied_args, extra)
+        if po.returncode == ro.returncode == 0:
+            rep.ok("speedup-model:cpa-applied-width")
+        else:
+            rep.bad(
+                "speedup-model:cpa-applied-width",
+                f"profile-derived CPA width did not reach the guest exactly: py={po}\nrs={ro}",
+            )
+
 
 # --------------------------------------------------------------------------- CPA planner
 
@@ -2328,6 +2403,184 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
                         f"{free_w} with stop_reason 'mem-capped'; got width {capped_w} "
                         f"reason {capped_reason!r} (P={capped_budget})")
 
+        # A self-managed command wider than any realistic ambient P is not moldable. Standalone
+        # CPA must preserve that declared width as infeasible, not invent P as a guest width; the
+        # two renderers must agree on the null allocation and infinite modeled makespan.
+        fixed_dag = os.path.join(tmp, "fixed-width.json")
+        with open(fixed_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "f",
+                            "job": "fixed",
+                            "cmd": "true",
+                            "jobs_flag": "",
+                            "hint": {
+                                "est_duration_s": 1.0,
+                                "preferred_inner_jobs": 1_000_000_000,
+                            },
+                        }
+                    ]
+                },
+                handle,
+            )
+        fixed_args = (
+            "plan", "--dag", fixed_dag, "--planner", "cpa", "--format", "json",
+            "--no-profile-feedback",
+        )
+        pfixed = run(py, fixed_args)
+        rfixed = run(rs, fixed_args)
+        fixed_ok = False
+        if pfixed.returncode == rfixed.returncode == 0 and pfixed.stdout == rfixed.stdout:
+            try:
+                fixed_obj = json.loads(pfixed.stdout)
+                fixed_alloc = fixed_obj["allocation"]
+                fixed_step = fixed_obj["steps"][0]
+                fixed_ok = (
+                    fixed_alloc["stop_reason"] == "infeasible-fixed-width"
+                    and fixed_alloc["modeled_makespan_s"] == "inf"
+                    and fixed_step["alloc_inner_jobs"] is None
+                )
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                fixed_ok = False
+        if fixed_ok:
+            rep.ok("cpa:infeasible-fixed-width")
+        else:
+            rep.bad(
+                "cpa:infeasible-fixed-width",
+                "fixed self-managed width was not rendered as the same infeasible CPA plan\n"
+                f"py={pfixed}\nrs={rfixed}",
+            )
+
+        # Intentional skips have zero executable demand. Adding a huge skipped node must not
+        # suppress the live step's width, and both plans must expose the skip as zero/skip/null.
+        control_dag = os.path.join(tmp, "skip-control.json")
+        skipped_dag = os.path.join(tmp, "skip-present.json")
+        live_step = {
+            "group": "c",
+            "job": "build",
+            "cmd": "true",
+            "jobs_flag": "-j%d",
+            "hint": {"est_duration_s": 40.0, "preferred_inner_jobs": 1},
+        }
+        with open(control_dag, "w", encoding="utf-8") as handle:
+            json.dump({"steps": [live_step]}, handle)
+        with open(skipped_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "c",
+                            "job": "skipped",
+                            "cmd": "false",
+                            "jobs_flag": "",
+                            "skip_reason": "empty-manifest-bucket",
+                            "hint": {
+                                "est_duration_s": 100.0,
+                                "rss_baseline_bytes": 1_000_000_000_000,
+                                "preferred_inner_jobs": 1_000_000_000,
+                            },
+                        },
+                        live_step,
+                    ]
+                },
+                handle,
+            )
+        control_args = (
+            "plan", "--dag", control_dag, "--perf-dir", store, "--planner", "cpa",
+            "--format", "json",
+        )
+        skipped_args = (
+            "plan", "--dag", skipped_dag, "--perf-dir", store, "--planner", "cpa",
+            "--format", "json",
+        )
+        pcontrol, rcontrol = run(py, control_args, extra), run(rs, control_args, extra)
+        pskipped, rskipped = run(py, skipped_args, extra), run(rs, skipped_args, extra)
+        skip_ok = False
+        if pcontrol.stdout == rcontrol.stdout and pskipped.stdout == rskipped.stdout:
+            try:
+                control_obj = json.loads(pcontrol.stdout)
+                skipped_obj = json.loads(pskipped.stdout)
+                control_live = next(
+                    step for step in control_obj["steps"] if step["tag"] == "c.build"
+                )
+                skipped_by_tag = {step["tag"]: step for step in skipped_obj["steps"]}
+                skip_entry = skipped_by_tag["c.skipped"]
+                skip_ok = (
+                    skipped_by_tag["c.build"]["alloc_inner_jobs"]
+                    == control_live["alloc_inner_jobs"]
+                    and skip_entry["est_duration_s"] == "0.000"
+                    and skip_entry["est_source"] == "skip"
+                    and skip_entry["alloc_inner_jobs"] is None
+                )
+            except (json.JSONDecodeError, KeyError, StopIteration, TypeError):
+                skip_ok = False
+        if skip_ok:
+            rep.ok("cpa:intentional-skip-zero-demand")
+        else:
+            rep.bad(
+                "cpa:intentional-skip-zero-demand",
+                "intentional skip changed live allocation or was not zero/skip/null\n"
+                f"control py={pcontrol}\ncontrol rs={rcontrol}\n"
+                f"skip py={pskipped}\nskip rs={rskipped}",
+            )
+
+        # A self-managed fixed width uses an exact measured curve level when one exists. With no
+        # exact level it falls back to the independently resolved scalar estimate (store-derived in
+        # this CLI fixture); it must not substitute a neighboring curve width.
+        fixed_curve_dag = os.path.join(tmp, "fixed-curve-source.json")
+        with open(fixed_curve_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "c",
+                            "job": "build",
+                            "cmd": "true",
+                            "jobs_flag": "",
+                            "hint": {"est_duration_s": 13.0, "preferred_inner_jobs": 2},
+                        },
+                        {
+                            "group": "c",
+                            "job": "test",
+                            "cmd": "true",
+                            "jobs_flag": "",
+                            "hint": {"est_duration_s": 13.0, "preferred_inner_jobs": 3},
+                        },
+                    ]
+                },
+                handle,
+            )
+        source_args = (
+            "plan", "--dag", fixed_curve_dag, "--perf-dir", store, "--planner", "cpa",
+            "--format", "json",
+        )
+        psource, rsource = run(py, source_args, extra), run(rs, source_args, extra)
+        source_ok = False
+        if psource.returncode == rsource.returncode == 0 and psource.stdout == rsource.stdout:
+            try:
+                source_obj = json.loads(psource.stdout)
+                source_by_tag = {step["tag"]: step for step in source_obj["steps"]}
+                source_ok = (
+                    source_by_tag["c.build"]["est_duration_s"] == "20.000"
+                    and source_by_tag["c.build"]["est_source"] == "store"
+                    and source_by_tag["c.test"]["est_duration_s"] == "8.000"
+                    and source_by_tag["c.test"]["est_source"] == "store"
+                    and source_by_tag["c.build"]["alloc_inner_jobs"] is None
+                    and source_by_tag["c.test"]["alloc_inner_jobs"] is None
+                )
+            except (json.JSONDecodeError, KeyError, TypeError):
+                source_ok = False
+        if source_ok:
+            rep.ok("cpa:self-managed-curve-source")
+        else:
+            rep.bad(
+                "cpa:self-managed-curve-source",
+                "self-managed exact/scalar curve provenance diverged or was mislabeled\n"
+                f"py={psource}\nrs={rsource}",
+            )
+
 
 def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
     """``sweep --jobs`` malformed inputs must exit 2 with byte-identical stderr in both builds
@@ -2352,6 +2605,41 @@ def compare_sweep_errors(py: list[str], rs: list[str], rep: Report) -> None:
                 )
             else:
                 rep.ok(label)
+
+        fixed = os.path.join(tmp, "self-managed.json")
+        marker = {name: os.path.join(tmp, f"sweep-{name}-spawned") for name in ("py", "rs")}
+        with open(fixed, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "fixed",
+                            "cmd": 'printf spawned > "$SELF_MANAGED_MARKER"',
+                            "jobs_flag": "",
+                        }
+                    ]
+                },
+                handle,
+            )
+        args = (
+            "sweep", "--dag", fixed, "--step", "g.fixed", "--jobs", "1..2", NOPROF,
+        )
+        po = run(py, args, {"SELF_MANAGED_MARKER": marker["py"]})
+        ro = run(rs, args, {"SELF_MANAGED_MARKER": marker["rs"]})
+        phrase = "empty effective jobs_flag"
+        if (
+            po.returncode == ro.returncode == 2
+            and phrase in po.stderr
+            and phrase in ro.stderr
+            and not any(os.path.exists(path) for path in marker.values())
+        ):
+            rep.ok("sweep-jobs-error:self-managed-width")
+        else:
+            rep.bad(
+                "sweep-jobs-error:self-managed-width",
+                f"expected prompt refusal without spawn; py={po}\nrs={ro}\nmarkers={marker}",
+            )
 
 
 def _sweep_widths(text: str) -> set[int]:
@@ -3143,6 +3431,74 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
             rep.bad(
                 "run-limits:invalid/max-cpus-legacy-jobs-conflict",
                 f"expected exit 2 with {conflict_message!r}; py={po}\nrs={ro}",
+            )
+
+        self_managed_dag = os.path.join(td, "self-managed.json")
+        marker = {name: os.path.join(td, f"run-{name}-spawned") for name in ("py", "rs")}
+        Path(self_managed_dag).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "fixed",
+                            "cmd": 'printf spawned > "$SELF_MANAGED_MARKER"',
+                            "jobs_flag": "",
+                            "hint": {"preferred_inner_jobs": 5},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = (
+            "run", "--dag", self_managed_dag, "--max-cpus", "2", NOPROF, NOFB,
+            "--unsafe-no-cgroups", "-q",
+        )
+        po = run(py, args, {"SELF_MANAGED_MARKER": marker["py"]})
+        ro = run(rs, args, {"SELF_MANAGED_MARKER": marker["rs"]})
+        phrase = "cannot lower guest parallelism"
+        if (
+            po.returncode == ro.returncode == 2
+            and phrase in po.stderr
+            and phrase in ro.stderr
+            and not any(os.path.exists(path) for path in marker.values())
+        ):
+            rep.ok("run-limits:self-managed-over-budget-refused")
+        else:
+            rep.bad(
+                "run-limits:self-managed-over-budget-refused",
+                f"expected prompt refusal without spawn; py={po}\nrs={ro}\nmarkers={marker}",
+            )
+
+        whitespace_dag = os.path.join(td, "whitespace-jobs-flag.json")
+        Path(whitespace_dag).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "g",
+                            "job": "fixed",
+                            "cmd": "sh -c 'test \"$#\" -eq 0' _",
+                            "jobs_flag": "   ",
+                            "hint": {"preferred_inner_jobs": 2},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        args = (
+            "run", "--dag", whitespace_dag, "--max-cpus", "2", NOPROF, NOFB,
+            "--unsafe-no-cgroups", "-q",
+        )
+        po, ro = run(py, args), run(rs, args)
+        if po.returncode == ro.returncode == 0:
+            rep.ok("run-limits:whitespace-jobs-flag-does-not-append-width")
+        else:
+            rep.bad(
+                "run-limits:whitespace-jobs-flag-does-not-append-width",
+                f"whitespace-only jobs_flag appended an argument; py={po}\nrs={ro}",
             )
 
         cases: tuple[

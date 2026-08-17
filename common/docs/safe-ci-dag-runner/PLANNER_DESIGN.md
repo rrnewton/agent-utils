@@ -221,9 +221,13 @@ behavioral differential compares plan output byte-for-byte.
   ascending `levels` with `inner_jobs`, `wall_s`, `cpu_s` (may be `None`), and the per-level
   `speedup`.
 - `est: Mapping[tag, float]` — the resolved scalar duration per step (store-over-hint-over-default),
-  as `build_plan` already computes. Used as the wall time for any step **without** a measured curve.
-- `P: int` — the run's resolved total `--max-cpus` budget (`container_core_budget()` only when the
-  caller omitted an explicit run budget or uses standalone `plan`).
+  as `build_plan` already computes. Used when a step has no measured curve and for a self-managed
+  fixed width whose curve has no exact point at that width.
+- `P: int | None` — an explicit run uses its resolved total `--max-cpus` budget (including the
+  inherited container/affinity and shared-slice tightening used by the CLI). Standalone CPA uses
+  `container_core_budget()` because allocation requires a bound. Standalone greedy-LPT and
+  critical-path plans have no run boundary, leave `P=None`, and do not bound display-only speedup
+  recommendations.
 - `mem_budget: int | None` — the RAM budget (as `--max-mem` already supplies to `jobs_for_budget`);
   `None` disables the memory constraint on allocation.
 
@@ -231,6 +235,19 @@ behavioral differential compares plan output byte-for-byte.
 
 For each step `i`, define its **admissible width set** `W_i`:
 
+- If `i` is an intentional pre-execution skip, `W_i = {1}` with zero wall, CPU-area, and memory
+  demand. It remains visible in plan output as `est_source=skip` but cannot suppress allocation for
+  runnable work.
+- If `i` has an empty/whitespace-only effective `jobs_flag`, its command manages a **fixed** width.
+  The run refuses before process creation when its positive declared `preferred_inner_jobs > P`;
+  otherwise `W_i` contains that declared width. With no positive declared width, the configured
+  default is only a runner/cgroup cap (not a hidden guest worker count) and may be tightened to
+  `P`. CPA never pretends it can
+  resize a command that opted out of flag injection, and `sweep` rejects such a step. Pure CPA
+  planning retains an over-budget fixed width and reports `infeasible-fixed-width`; its modeled
+  makespan is infinity and no `alloc_inner_jobs` is published for that self-managed step. If the
+  learned curve contains an exact level at the fixed width, its measured wall is used; otherwise
+  the scalar resolved estimate remains the weight and the curve is diagnostic only.
 - If `i` has a measured curve, begin with the measured widths no greater than
   `speedup.recommended_inner_jobs`, then keep those no greater than `P`. This reuses the
   work-conservation knee (marginal wall gain `>= 1.15x` and total-CPU-seconds growth `<= 1.5x`) so
@@ -314,9 +331,12 @@ A tentative widening `p_i -> next(p_i)` is rejected unless **all** hold:
 
 The allocator outputs `p_i` per step and passes the result to the runner:
 
-1. **Bake widths in.** Produce a `DagConfig` copy whose each `Step.hint.preferred_inner_jobs = p_i`
-   (analogous to `apply_plan_to_config`). This flows through `command_with_inner_jobs` (the `-j`
-   flag actually handed to the step) and through `step_mem_cap_for_inner_jobs` (the memory cap).
+1. **Bake executable widths in.** For each feasible runner-controlled step, produce a `DagConfig`
+   copy whose `Step.hint.preferred_inner_jobs = p_i` (analogous to `apply_plan_to_config`). This
+   flows through `command_with_inner_jobs` (the flag actually handed to the step) and through
+   `step_mem_cap_for_inner_jobs` (the memory cap). Self-managed steps retain their declared width
+   and have `alloc_inner_jobs = null`; intentional skips retain their authored hints when a plan is
+   applied.
 2. **Order.** Compute the same order as the critical-path planner, using the *allocated* weights
    `T_i(p_i)` rather than the width-one or hinted weights. Highest weighted bottom-level first, ties
    by tag.
@@ -324,8 +344,9 @@ The allocator outputs `p_i` per step and passes the result to the runner:
    capacity dimension alongside the named-resource semaphores: treat `P` as a built-in `"cpu"` cap
    and each step's demand as `p_i`. The ready-set loop launches a ready step only if
    `sum(p_j for j running) + p_i <= P` **and** fewer than `S = --max-steps` nodes are active.
-   Authored widths above `P` are visibly capped before planning and execution, including the
-   command's appended jobs flag and per-step `cpu.max`. This closes the loop between the allocator's
+   Runner-controlled authored widths above `P` are visibly capped before planning and execution,
+   including the command's appended jobs flag and per-step `cpu.max`. A self-managed fixed width
+   above `P` is infeasible and cannot be executed. This closes the loop between the allocator's
    `A/P` assumption and runtime.
    Named-resource caps continue to gate co-running independently; together they bound the achievable
    concurrency the area term assumes.
@@ -344,10 +365,15 @@ RAM budget, and concurrent allocated widths stay within the core budget.
   critical-path step has any wider admissible width left — including the per-step `P` cap, which is
   enforced by construction via the `W_i` truncation in §5.2), and `mem-capped` / `core-capped` (a
   wider width exists but every candidate was rejected by the memory budget / the core cap this
-  iteration). Because §5.2 truncates `W_i` to widths `<= P`, `core-capped` is a defensive backstop
-  that does not arise in practice; the P-cap surfaces as `knee-exhausted`.
+  iteration). Runner-controlled `W_i` sets are truncated to widths `<= P`, so `core-capped` is a
+  defensive backstop that does not arise in practice; the P-cap surfaces as `knee-exhausted`.
+  A self-managed fixed width above `P` follows the explicit infeasible case below instead.
 - **Fixed-point safety net:** if the bounded loop ever exhausts without another classified stop,
   report `fixed-point`.
+- **Infeasible fixed width:** a non-skipped self-managed command declares a width above `P` that
+  CPA cannot rewrite. Preserve that width, publish no executable per-step allocation, and report
+  `infeasible-fixed-width` with an infinite modeled makespan. Run entry points reject the same
+  configuration before a DAG step can start.
 
 Because every applied step strictly increases some `p_i` within a finite `W_i`, and area is monotone
 non-decreasing, the loop runs at most `sum_i (|W_i| - 1)` iterations — trivially bounded for CI DAGs.
@@ -373,10 +399,14 @@ The modeled makespan reported alongside the lower bound is a deterministic greed
 the allocated widths (§5.7's phase-2 dispatch, simulated): it respects the DAG dependencies AND the
 core budget, so it is provably `>=` the `max(T_CP, area/P)` lower bound, and the plan asserts this.
 
-The `plan` and `--show-plan` output includes `alloc_inner_jobs` and the allocator's stop reason,
-core budget, critical-path length, area term, lower bound, and modeled makespan. Plan JSON exposes
-the same information in its `allocation` object. For `run --show-plan`, the core budget is the
-resolved run `--max-cpus` value; the standalone `plan` command uses the effective ambient budget.
+The `plan` and `--show-plan` output includes the allocator's stop reason, core budget,
+critical-path length, area term, lower bound, and modeled makespan. It includes
+`alloc_inner_jobs` only for runner-controlled CPA steps; ordering-only planners and self-managed
+fixed commands use null. Plan JSON exposes the same information in its `allocation` object. For
+`run --show-plan`, every planner bounds
+displayed recommendations by the resolved run `--max-cpus` value. Standalone ordering-only plans
+have no run boundary and leave recommendations unbounded; standalone CPA uses the effective
+ambient budget because it must allocate widths.
 
 ## 6. Our deviations from the textbook
 
@@ -411,7 +441,8 @@ resolved run `--max-cpus` value; the standalone `plan` command uses the effectiv
   plateau, and a memory-heavy step. The harness compares widths, order, modeled values, and stop
   reason across implementations.
 - **Unit tests.** Tests cover a balanced linear chain, plateau avoidance, memory-blocked widening,
-  the dispatch core gate, rigid curveless steps, and allocator idempotence.
+  the dispatch core gate, rigid curveless steps, infeasible self-managed widths, plan-application
+  refusal preservation, and allocator idempotence.
 - **Directional benchmarks.** Representative caller-owned DAGs can compare `greedy-lpt`, per-step
   knee allocation, and CPA under controlled resource contention.
 - **Selection.** `cpa` is explicit; the default remains `greedy-lpt`. `--no-profile-feedback`

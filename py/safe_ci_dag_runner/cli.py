@@ -61,13 +61,18 @@ from safe_ci_dag_runner.model import (
     DEFAULT_SMALL_MEM_CAP_BYTES,
     DagConfig,
     Step,
+    effective_jobs_flag,
     resolve_cpu_timeout_multiplier,
     step_classification,
 )
 from safe_ci_dag_runner.profile_enrich import container_core_budget
 from safe_ci_dag_runner.protocols import CgroupManager, MetricsSink, StepOutcome
 from safe_ci_dag_runner.reservation import Reservation
-from safe_ci_dag_runner.scheduler import cap_config_max_cpus, run_dag_limited
+from safe_ci_dag_runner.scheduler import (
+    _self_managed_width_error,
+    cap_config_max_cpus,
+    run_dag_limited,
+)
 from safe_ci_dag_runner.sizing import jobs_for_budget, parse_size
 from safe_ci_dag_runner.viz import to_ascii, to_dot
 
@@ -234,6 +239,7 @@ def _quickstart(c: Palette) -> str:
   {c.dim('resource_caps bound concurrent demand - e.g. {"browser":1} serializes browser steps.')}
   {c.dim('jobs_flag: template appended with a step preferred_inner_jobs, e.g. "-j" -> "-j 4",')}
   {c.dim('  "-j%d" -> "-j4", "--jobs=" -> "--jobs=4", "--num-threads" -> "--num-threads 4".')}
+  {c.dim('  Empty/whitespace means a fixed self-managed width: it cannot be rewritten or swept.')}
 
 {h('What you get')}
   - concurrent scheduling honoring deps + resource caps, ordered by the chosen {k('--planner')}
@@ -883,8 +889,9 @@ def _build_feedback_plan(
     With ``feedback_dir`` set, the store's learned estimates refine each step (store wins when it
     has enough samples; the DAG hint is the fallback) and the per-step parallel-speedup curves are
     attached for the plan display. With ``feedback_dir`` ``None`` the plan reflects the DAG hints
-    only. ``core_budget`` (``P``) and ``mem_budget`` drive the CPA allocator under
-    ``--planner cpa`` and are ignored by the other planners."""
+    only. ``core_budget`` (``P``) bounds every displayed speedup recommendation and drives the CPA
+    allocator under ``--planner cpa``; ``mem_budget`` applies only to CPA allocation.
+    """
     if feedback_dir is not None:
         machine_id, container_class = feedback_identity()
         samples = load_step_samples(feedback_dir, machine_id, container_class)
@@ -902,19 +909,23 @@ def _build_feedback_plan(
     )
 
 
-def _cpa_budgets(
+def _planning_budgets(
     planner: Planner, max_mem_arg: str | None, max_cpus: int | None = None
 ) -> tuple[int | None, int | None]:
-    """Resolve the ``(core_budget, mem_budget)`` the CPA allocator balances against, or
-    ``(None, None)`` for the non-allocating planners (so they do no cgroup/proc reads).
+    """Resolve the ``(core_budget, mem_budget)`` used to build a truthful plan.
 
-    ``core_budget`` is the run's aggregate ``max_cpus`` when supplied, otherwise
-    :func:`container_core_budget`; ``mem_budget`` is the parsed ``--max-mem`` RAM budget, or
-    ``None`` (no memory constraint on the allocation)."""
-    if planner is not Planner.CPA:
-        return None, None
-    mem_budget = parse_size(max_mem_arg) if max_mem_arg else None
-    return max(1, max_cpus if max_cpus is not None else container_core_budget()), mem_budget
+    A run supplies its resolved total ``max_cpus`` under every planner, so ``--show-plan`` cannot
+    recommend a width the run will throttle. A standalone ordering-only plan has no run boundary
+    and remains unbounded; standalone CPA resolves :func:`container_core_budget` because width
+    allocation requires one. ``mem_budget`` is parsed only for CPA.
+    """
+    core_budget = (
+        max(1, max_cpus)
+        if max_cpus is not None
+        else (max(1, container_core_budget()) if planner is Planner.CPA else None)
+    )
+    mem_budget = parse_size(max_mem_arg) if planner is Planner.CPA and max_mem_arg else None
+    return core_budget, mem_budget
 
 
 def _build_plan_from_summary(
@@ -1477,6 +1488,15 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
         print(f"{PROG}: sweep: {exc}", file=sys.stderr)
         return 2
     repeat = max(1, int(ns.repeat))
+    base_step = by_tag[step_tag]
+    if not effective_jobs_flag(base_step, cfg.default_jobs_flag).strip():
+        print(
+            f"{PROG}: sweep: step {step_tag!r} has an empty effective jobs_flag, so --jobs cannot "
+            "change guest parallelism; set the step's jobs_flag to the guest's worker-count "
+            "option, or remove the empty override and set default_jobs_flag",
+            file=sys.stderr,
+        )
+        return 2
 
     # Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
     cgroups, code = _resolve_cgroup_manager(
@@ -1492,7 +1512,6 @@ def _cmd_sweep(ns: argparse.Namespace, c: Palette) -> int:
 
         metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
 
-    base_step = by_tag[step_tag]
     verbosity = int(ns.verbosity)
     measures: list[tuple[int, _SweepMeasure]] = []
     for jobs in range(lo, hi + 1):
@@ -1947,7 +1966,7 @@ def _cmd_summary_plan(ns: argparse.Namespace) -> int:
         return 2
     planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
-    core_budget, mem_budget = _cpa_budgets(planner, max_mem)
+    core_budget, mem_budget = _planning_budgets(planner, max_mem)
     plan = _build_plan_from_summary(
         cfg, summary, planner, core_budget=core_budget, mem_budget=mem_budget
     )
@@ -1988,7 +2007,7 @@ def _cmd_plan(ns: argparse.Namespace) -> int:
     planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
-    core_budget, mem_budget = _cpa_budgets(planner, max_mem)
+    core_budget, mem_budget = _planning_budgets(planner, max_mem)
     plan = _build_feedback_plan(
         cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
     )
@@ -2041,6 +2060,9 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     # Resolve the maximum total CPU capacity before cgroup bring-up and bind the exact same value
     # to the outer scope's CPUQuota and the scheduler's summed-width admission gate.
     max_cpus = _select_max_cpus(ns)
+    if error := _self_managed_width_error(cfg, max_cpus):
+        print(f"{PROG}: run: {error}", file=sys.stderr)
+        return 2
 
     cgroups, code = _resolve_cgroup_manager(
         bool(ns.allow_cgroup_failure),
@@ -2091,7 +2113,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     planner = Planner.from_value(str(ns.planner)) or Planner.GREEDY_LPT
     feedback_dir = _resolve_feedback_dir(ns.perf_dir, bool(ns.no_profile_feedback))
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
-    core_budget, mem_budget = _cpa_budgets(planner, max_mem, max_cpus)
+    core_budget, mem_budget = _planning_budgets(planner, max_mem, max_cpus)
 
     # Profile-artifact SYNC (close the ephemeral-CI feedback loop): parse the backend once; the
     # DOWNLOAD half seeds the planner from the shared summary, the UPLOAD half publishes this run's

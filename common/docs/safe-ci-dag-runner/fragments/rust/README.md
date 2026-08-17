@@ -12,7 +12,7 @@ application:
 
 ```toml
 [dependencies]
-safe-ci-dag-runner = "0.13"
+safe-ci-dag-runner = "0.14"
 ```
 
 ## Rust API
@@ -34,7 +34,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 number bounds both active steps and the maximum CPU cores total. Call
 `run_dag_limited(..., max_steps, max_cpus, ...)` (or the corresponding boxed
 limited helper) when those limits differ. `cap_config_max_cpus` exposes the same
-total-core capping policy for callers that prepare configurations themselves.
+total-core capping policy for runner-controlled commands. It deliberately
+leaves a self-managed fixed width unchanged; the run helpers then reject it if
+it exceeds `max_cpus`.
 
 For Rust harnesses, cargo-nextest supplies libtest's `--exact TEST` arguments,
 so the process snapshot can bind each child to its test. Ordinary `cargo test`
