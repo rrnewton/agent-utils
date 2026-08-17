@@ -315,8 +315,9 @@ class RunResult:
     """Aggregate outcome of a whole DAG run, handed from the scheduler to the harness.
 
     ``ok`` is the overall pass/fail; ``outcomes`` are the per-step terminal results;
-    ``skipped`` are tags whose dependencies failed so they never ran; ``step_profile_rows``
-    are the accumulated per-step measurement rows to forward to
+    ``skipped`` are tags whose dependencies failed so they never ran; ``not_launched`` are tags
+    omitted by fail-fast termination or an outer run timeout; ``step_profile_rows`` are the
+    accumulated per-step measurement rows to forward to
     :meth:`MetricsSink.record_step_profiles`.
     """
 
@@ -324,6 +325,7 @@ class RunResult:
     wall_s: float
     outcomes: tuple[StepOutcome, ...] = ()
     skipped: tuple[str, ...] = ()
+    not_launched: tuple[str, ...] = ()
     intentional_skips: tuple[tuple[str, IntentionalSkipReason], ...] = ()
     step_profile_rows: tuple[Mapping[str, object], ...] = field(default_factory=tuple)
     #: The WHOLE RUN hit its outer wall budget and was cut short. Distinct from a step's own
