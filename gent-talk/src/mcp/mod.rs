@@ -14,14 +14,20 @@
 //! * Barge-in and `skip_turn` are native, so pause/resume needs no UI here.
 //! * MCP is unavailable to accounts in Zero Retention Mode. Channel text transits ElevenLabs.
 //!
-//! # What v0 does and does not do
+//! # What this module is
 //!
-//! v0 does **not** speak the MCP protocol. It publishes this manifest — the tool names,
-//! descriptions, argument schemas, and per-tool approval intent — over an authenticated endpoint,
-//! and implements each tool as an ordinary HTTP route under `/api/v1`. Adding the MCP transport is
-//! then a translation layer over routes that already exist and are already tested, rather than a
-//! redesign. Until it exists, the same routes can be driven by an ElevenLabs *webhook tool*, which
-//! needs no MCP at all.
+//! This file is the **manifest**: the tool names, descriptions, argument schemas, and per-tool
+//! approval intent. It is served as documentation over `GET /api/v1/agent-tools`, and it is the
+//! single source the live MCP endpoint builds its `tools/list` answer from — so the tools a model
+//! actually sees and the tools this project claims to offer cannot drift apart.
+//!
+//! [`protocol`] speaks JSON-RPC and executes the tools; [`transport`] is the Streamable HTTP
+//! endpoint at `/mcp` that carries them. Every tool is implemented over [`crate::ops`], which is
+//! also what the REST routes use, so the channel allowlist and the read/write split are enforced
+//! in one place regardless of which front door a caller arrives at.
+
+pub mod protocol;
+pub mod transport;
 
 use serde::Serialize;
 
@@ -54,6 +60,13 @@ pub struct ToolDescriptor {
     pub arguments: serde_json::Value,
     /// Whether the tool changes anything outside this server.
     pub mutates: bool,
+    /// Whether the live MCP endpoint offers this tool to a model.
+    ///
+    /// A seam that is documented but not implemented stays in the manifest — it is the record of
+    /// the intended shape — but it is NOT put in front of a model, because a tool whose only
+    /// possible outcome is an apology spends the model's attention and the owner's tokens on
+    /// nothing.
+    pub mcp_exposed: bool,
 }
 
 /// The tools this server offers a voice agent, given the configured channels.
@@ -82,6 +95,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
             approval: ApprovalMode::Automatic,
             arguments: serde_json::json!({ "type": "object", "properties": {} }),
             mutates: false,
+            mcp_exposed: true,
         },
         ToolDescriptor {
             name: "digest_channel",
@@ -101,6 +115,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
                 "required": ["channel_id"]
             }),
             mutates: false,
+            mcp_exposed: true,
         },
         ToolDescriptor {
             name: "find_message",
@@ -122,6 +137,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
                 "required": ["channel_id", "query"]
             }),
             mutates: false,
+            mcp_exposed: true,
         },
         ToolDescriptor {
             name: "read_message",
@@ -138,6 +154,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
                 "required": ["channel_id", "message_id"]
             }),
             mutates: false,
+            mcp_exposed: true,
         },
         ToolDescriptor {
             name: "post_reply",
@@ -163,6 +180,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
                 "required": ["channel_id", "text"]
             }),
             mutates: true,
+            mcp_exposed: true,
         },
         ToolDescriptor {
             name: "ask_agent",
@@ -182,6 +200,7 @@ pub fn tool_manifest(channels: &[ChannelInfo]) -> Vec<ToolDescriptor> {
                 "required": ["channel_id", "question"]
             }),
             mutates: true,
+            mcp_exposed: false,
         },
     ]
 }
@@ -295,6 +314,39 @@ mod tests {
                 tool.path
             );
             assert!(matches!(tool.method, "GET" | "POST"), "{}", tool.name);
+        }
+    }
+
+    #[test]
+    fn the_unimplemented_seam_is_not_put_in_front_of_a_model() {
+        let manifest = tool_manifest(&channels());
+        let ask = manifest
+            .iter()
+            .find(|t| t.name == "ask_agent")
+            .expect("the seam is still recorded in the manifest");
+        assert!(
+            !ask.mcp_exposed,
+            "ask_agent answers 501; offering it over MCP would only waste a model's turn"
+        );
+        for tool in manifest.iter().filter(|t| t.name != "ask_agent") {
+            assert!(
+                tool.mcp_exposed,
+                "{} should be reachable over MCP",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn every_exposed_tool_is_backed_by_an_implemented_route() {
+        // A tool put in front of a model must be able to succeed. `/ask` is the one route that
+        // cannot, so nothing exposed may point at it.
+        for tool in tool_manifest(&channels()).iter().filter(|t| t.mcp_exposed) {
+            assert!(
+                !tool.path.ends_with("/ask"),
+                "{} is exposed but backed by the unimplemented slow path",
+                tool.name
+            );
         }
     }
 

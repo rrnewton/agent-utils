@@ -7,6 +7,8 @@
 //!   the operator for an API token at runtime.
 //! * Everything under `/api/` requires a bearer token, and the write scope is required for
 //!   anything that reaches Discord with a message.
+//! * `/mcp` is the Streamable HTTP MCP endpoint. It requires a bearer token too, and answers a
+//!   credential-less caller with a bland 401 before it reads the body at all.
 
 pub mod api;
 
@@ -34,6 +36,13 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))
         .route("/api/v1/channels/{channel_id}/ask", post(api::ask))
+        // One path, three methods: POST carries the whole protocol, and GET/DELETE — which exist
+        // in the spec for server-initiated streams and session teardown — are refused plainly
+        // because this endpoint is stateless and has nothing to push.
+        .route(
+            crate::mcp::transport::MCP_PATH,
+            post(crate::mcp::transport::post).fallback(crate::mcp::transport::method_not_allowed),
+        )
         .fallback(api::not_found)
         .with_state(state)
 }

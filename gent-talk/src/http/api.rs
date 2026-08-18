@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
 use crate::discord::DiscordError;
-use crate::model::{ChannelInfo, Message, MessageId};
-use crate::retrieval::{self, Resolution};
+use crate::model::{ChannelInfo, Message};
+use crate::ops::{self, OpError};
+use crate::retrieval::Resolution;
 use crate::state::AppState;
-use crate::summary::{self, DigestEntry, DEFAULT_SUMMARY_CHARS};
+use crate::summary::DigestEntry;
 use crate::untrusted;
 
 /// A JSON error body.
@@ -83,21 +84,24 @@ impl From<DiscordError> for ApiError {
     }
 }
 
+impl From<OpError> for ApiError {
+    fn from(value: OpError) -> Self {
+        let code = value.code();
+        let status = match value {
+            OpError::UnknownChannel | OpError::UnknownMessage => StatusCode::NOT_FOUND,
+            OpError::EmptyQuery => StatusCode::BAD_REQUEST,
+            OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
+            OpError::Discord(inner) => return Self::from(inner),
+        };
+        Self::new(status, code, value.to_string())
+    }
+}
+
 fn require(headers: &HeaderMap, state: &AppState, scope: Scope) -> Result<Scope, ApiError> {
     let header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     Ok(auth::authorize(header, &state.config.auth, scope)?)
-}
-
-fn channel<'a>(state: &'a AppState, id: &str) -> Result<&'a ChannelInfo, ApiError> {
-    state.channel(id).ok_or_else(|| {
-        ApiError::new(
-            StatusCode::NOT_FOUND,
-            "unknown_channel",
-            "that channel is not configured on this server",
-        )
-    })
 }
 
 /// `GET /healthz` — liveness only. Deliberately says nothing about the configuration.
@@ -195,11 +199,9 @@ pub async fn messages(
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessagesResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let info = channel(&state, &channel_id)?.clone();
-    let limit = state.effective_limit(query.limit);
-    let messages = state.discord.fetch_recent(&info.id, limit).await?;
+    let (channel, messages) = ops::messages(&state, &channel_id, query.limit).await?;
     Ok(Json(MessagesResponse {
-        channel: info,
+        channel,
         messages,
         untrusted_content_notice: untrusted::NOTICE,
     }))
@@ -227,22 +229,10 @@ pub async fn message_by_id(
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let info = channel(&state, &channel_id)?.clone();
-    let limit = state.effective_limit(query.limit);
-    let messages = state.discord.fetch_recent(&info.id, limit).await?;
-    let wanted = MessageId(message_id);
-    let message = messages
-        .into_iter()
-        .find(|m| m.id == wanted)
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::NOT_FOUND,
-                "unknown_message",
-                "that message is not in the recent window for this channel",
-            )
-        })?;
+    let (channel, message) =
+        ops::message_by_id(&state, &channel_id, &message_id, query.limit).await?;
     Ok(Json(MessageResponse {
-        channel: info,
+        channel,
         message,
         untrusted_content_notice: untrusted::NOTICE,
     }))
@@ -267,18 +257,10 @@ pub async fn digest(
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<DigestResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let info = channel(&state, &channel_id)?.clone();
-    let limit = state.effective_limit(query.limit);
-    let messages = state.discord.fetch_recent(&info.id, limit).await?;
-    let width = usize::from(query.width.unwrap_or(0));
-    let width = if width == 0 {
-        DEFAULT_SUMMARY_CHARS
-    } else {
-        width
-    };
+    let (channel, entries) = ops::digest(&state, &channel_id, query.limit, query.width).await?;
     Ok(Json(DigestResponse {
-        channel: info,
-        entries: summary::digest(&messages, width),
+        channel,
+        entries,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }
@@ -318,28 +300,19 @@ pub async fn resolve(
     Json(request): Json<ResolveRequest>,
 ) -> Result<Json<ResolveResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let info = channel(&state, &channel_id)?.clone();
-    if request.query.trim().is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "empty_query",
-            "query must not be empty",
-        ));
-    }
-    let limit = state.effective_limit(request.limit);
-    let messages = state.discord.fetch_recent(&info.id, limit).await?;
-    let max_alternatives = usize::from(request.max_alternatives.unwrap_or(3)).min(10);
-    let resolution = retrieval::resolve(
-        state.ranker.as_ref(),
-        &messages,
+    let (channel, resolution, searched) = ops::resolve(
+        &state,
+        &channel_id,
         &request.query,
-        max_alternatives,
-    );
+        request.limit,
+        request.max_alternatives,
+    )
+    .await?;
     Ok(Json(ResolveResponse {
-        channel: info,
+        channel,
         query: request.query,
         resolution,
-        searched: messages.len(),
+        searched,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }
@@ -368,19 +341,13 @@ pub async fn reply(
     Json(request): Json<ReplyRequest>,
 ) -> Result<Json<ReplyResponse>, ApiError> {
     require(&headers, &state, Scope::Write)?;
-    let info = channel(&state, &channel_id)?.clone();
-    if !info.writable {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "channel_not_writable",
-            "this channel is configured read-only",
-        ));
-    }
-    let reply_to = request.reply_to.map(MessageId);
-    let posted = state
-        .discord
-        .post_message(&info.id, &request.text, reply_to.as_ref())
-        .await?;
+    let (_channel, posted) = ops::reply(
+        &state,
+        &channel_id,
+        &request.text,
+        request.reply_to.as_deref(),
+    )
+    .await?;
     Ok(Json(ReplyResponse { posted }))
 }
 
@@ -399,7 +366,10 @@ pub async fn ask(
     Json(request): Json<AskRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require(&headers, &state, Scope::Write)?;
-    let info = channel(&state, &channel_id)?.clone();
+    let info = state
+        .channel(&channel_id)
+        .cloned()
+        .ok_or(OpError::UnknownChannel)?;
     match state.agent.ask(&info.id, &request.question).await {
         Ok(answer) => Ok(Json(serde_json::json!({ "answer": answer }))),
         Err(error) => Err(ApiError::new(
