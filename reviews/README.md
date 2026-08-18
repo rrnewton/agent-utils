@@ -19,6 +19,7 @@ Supporting design research is kept outside distributable package trees:
 
 - [agent-team-timeline related work](agent-team-timeline-related-work.md)
 - [agent-team-timeline comparative analysis](research/agent-team-timeline-comparative-analysis.md)
+- [voice agent bridge related work](voice-agent-bridge-related-work.md)
 
 The standard reproducibility entry points are:
 
