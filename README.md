@@ -41,6 +41,7 @@ two-language implementation and behavioral-differential contract.
 common/docs/       authoritative documentation sources and rendered editions
 cross/             behavioral differential harnesses and shared fixtures
 examples/          runnable DAG examples
+gent-talk/         a deployable service, outside the workspaces (see below)
 py/                independently publishable Python distributions
 rs/                independently publishable Rust crates
 scripts/           documentation, package, and dependency contract checks
@@ -93,6 +94,15 @@ and randomized inputs. Human-oriented help may use idiomatic wording, while
 machine schemas, normalized results, exit behavior, and state transitions are
 cross-checked as part of the contract. Independent findings and reproducible
 evidence are recorded under [`reviews/`](reviews/README.md).
+
+## Services
+
+`gent-talk/` is a **service**, not a command-line tool: a Rust web server that bridges a voice agent
+to Discord channels, deployed as a container rather than installed from a package index. It is
+therefore an explicit exception to the two-language, two-package contract above — it has one
+implementation, its own Cargo workspace and lockfile, and its own CI workflow rather than a place in
+`make check` / `make test`, so its web-server dependency tree cannot perturb the published tools'
+MSRV or lockfile. See [`gent-talk/README.md`](gent-talk/README.md).
 
 ## Package documentation
 
