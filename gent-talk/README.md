@@ -28,6 +28,13 @@ text-to-speech bot.
 
 **A text tab.** The web app has a plain scrollback view for when you can look at the screen.
 
+## Setting it up
+
+**If you are setting this up for the first time, use [`QUICKSTART.md`](QUICKSTART.md).** It runs
+the six steps — Discord bot, tokens, container, Cloudflare Tunnel, ElevenLabs agent, first
+conversation — in order, with the exact commands and no gaps to fill in from here. This file is
+the reference behind it: what every route does, what the security model is, and where it stops.
+
 ## Status: what works, what is stubbed
 
 | Piece | State |
@@ -44,6 +51,7 @@ text-to-speech bot.
 | ElevenLabs voice agent | **not verified.** The endpoint an agent needs exists and answers; no ElevenLabs agent has been pointed at it. The web app mounts the hosted widget only if an agent id is configured. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
 | TLS | **not here.** Terminate in front (Caddy, nginx, a tunnel, or a cloud load balancer). A Cloudflare Tunnel recipe is below. |
+| Deployment check (`scripts/verify-deployment.sh`) | **works.** One command, pass/fail, exits non-zero and names the failing check. Runs in CI against the container on every push, including a negative control that requires it to go red. |
 
 Honest summary: everything except the two vendor-facing halves — live Discord and ElevenLabs — is
 implemented and tested. Those two are exactly the parts that cannot be tested without credentials.
@@ -55,6 +63,17 @@ Nothing is committed and nothing is hardcoded. You need:
 1. **A second Discord bot**, separate from whatever your coding agents use, invited to the channels
    you want to reach, with `View Channel`, `Read Message History`, and — only if you want to post —
    `Send Messages`. Its token goes in `discord.bot_token` / `GENT_TALK_DISCORD_BOT_TOKEN`.
+
+   > **Turn on MESSAGE CONTENT INTENT** while you are in the Developer Portal: **Bot** tab →
+   > **Privileged Gateway Intents**. It is off by default and it is the highest-cost thing to get
+   > wrong here, because it does not fail — a bot without it is handed messages whose `content` is
+   > **empty**, so the channel is found, the message count is right, and every digest line is
+   > blank, with no error anywhere. It reads as a broken summarizer or a broken server.
+   >
+   > Scope, stated honestly: this server reads over the Discord **REST** API, and the documented
+   > blank-content behaviour is on the **gateway** event path; we have never run against live
+   > Discord and cannot tell you from experience whether REST is affected on your account.
+   > Enabling it is one click and removes the question.
 2. **Two API tokens of your own**, for this server's own callers:
    `openssl rand -base64 33` twice. They must differ and be at least 24 characters; the server
    refuses to start otherwise.
@@ -78,7 +97,10 @@ messages, and logs a warning on every start. It is how you look at the web app w
 The seed is verbose on purpose: two cheerful one-liners make the digest and the scrollback look
 like they work when neither of them had anything to do.
 
-Against real Discord:
+Against real Discord — **note that this is first contact.** The Discord client has never run
+against `discord.com`. It is unit-tested, and the whole server is end-to-end tested against an
+in-memory fake, but no byte of it has ever reached the real API. If something breaks here it is
+the untested seam finally being tested, not a regression:
 
 ```sh
 cargo run -- --config gent-talk.toml
@@ -124,26 +146,61 @@ podman run --rm --name gent-talk -p 127.0.0.1:8080:8080 \
   gent-talk:v0
 ```
 
-Check it, and confirm the credential is actually required — on both front doors:
+The image runs as a non-root user and contains no configuration; a container started with no
+credentials fails immediately rather than coming up with defaults.
+
+## Checking a deployment
+
+One command, against a running server, local or public:
 
 ```sh
-curl -s localhost:8080/healthz
-curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/api/v1/channels          # expect 401
-curl -s -H "Authorization: Bearer $GENT_TALK_READ_TOKEN" localhost:8080/api/v1/channels
+scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <your-channel-snowflake>
+```
 
-# the MCP endpoint: unauthenticated is 401, and the body is deliberately uninformative
+It takes the tokens from `$GENT_TALK_READ_TOKEN` / `$GENT_TALK_WRITE_TOKEN`, or from
+`--read-token` / `--write-token`. Because it takes the base URL as an argument, the **same** checks
+run against `http://127.0.0.1:8080` right after `podman run` and against
+`https://<your-tunnel-hostname>` once `cloudflared` is up — if the second disagrees with the
+first, the tunnel changed something.
+
+What it asserts, in this order:
+
+| # | Check |
+|---|---|
+| 0 | `GET /healthz` answers — nothing below means anything otherwise |
+| 1 | unauthenticated `POST /mcp` → **401**, and the body names no tool, channel, service, or protocol revision; `GET /mcp` → **405** |
+| 2 | read token `tools/list` succeeds, offers the four read tools, and **does not contain `post_reply`** |
+| 3 | read token calling `post_reply` by name → **HTTP 403**, JSON-RPC **-32001** |
+| 4 | a channel outside the allowlist → refused with `unknown_channel` |
+| 5 | read token `digest_channel` → your **real messages**, non-empty |
+| 6 | write token `post_reply` → accepted, and the message is then **read back out of Discord** |
+
+It exits non-zero on the **first** failure and names the check that failed; there is no partial
+pass and no check that can silently no-op. Failures carry the likely cause — an empty digest, for
+instance, points at the Message Content Intent rather than just reporting an empty string.
+
+`--skip-post` drops checks 6 and 7, which are the ones that put a real message in a real channel.
+Using it means the half of the system that speaks in your name is untested.
+
+The script is not shipped untried: the gent-talk CI workflow runs it against the built container
+on every push, and then runs it three more times in conditions where it **must** fail (a channel
+outside the allowlist, a read-only channel, a wrong token) and fails the build if any of those
+passes. A check that cannot go red certifies nothing.
+
+If you would rather do it by hand, the two calls that matter most are:
+
+```sh
+# 401, and the body says nothing useful
 curl -s -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/mcp \
   -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'                             # expect 401
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
+# the read token's tool list — post_reply must NOT be in it
 curl -s -X POST localhost:8080/mcp \
   -H "authorization: Bearer $GENT_TALK_READ_TOKEN" \
   -H 'content-type: application/json' -H 'accept: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'                             # no post_reply
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
-
-The image runs as a non-root user and contains no configuration; a container started with no
-credentials fails immediately rather than coming up with defaults.
 
 ## Configuration
 
@@ -251,18 +308,41 @@ marked (not deleted) and control characters stripped. That is what the model act
 
 ### Registering it with an ElevenLabs agent
 
-In the ElevenLabs dashboard, add a custom MCP server integration:
+**Before anything else, check one blocker.** MCP integrations are **unavailable on ElevenLabs
+workspaces in Zero Retention Mode, and on HIPAA-enabled workspaces.** On those the custom-MCP-server
+option is not offered at all, and this entire integration path is closed — there is no workaround
+here. Check the workspace setting before spending an hour on the rest.
+
+Create a fresh agent and keep ElevenLabs' hosted LLM; nothing in this project needs you to bring
+your own model. Then add a custom MCP server integration:
 
 | Field | Value |
 |---|---|
+| Server URL | `https://<your-tunnel-hostname>/mcp` — the path **must** be `/mcp` |
 | Transport | **Streamable HTTP** |
-| Server URL | `https://<your-tunnel-hostname>/mcp` |
-| Secret token / Authorization header | `Bearer <your gent-talk token>` |
+| Authentication | header `Authorization`, value `Bearer <your gent-talk read token>` |
 | Approval mode | **Fine-Grained Tool Approval** |
 
-Then set per-tool approval: `list_channels`, `digest_channel`, `find_message` and `read_message`
-to **no approval**, and `post_reply` to **require approval**. That is what implements "reading is
-automatic while driving, posting asks first".
+**Streamable HTTP, not SSE.** If the dashboard also offers SSE, do not pick it. HTTP+SSE was MCP's
+original remote transport and was superseded by Streamable HTTP in protocol revision `2025-03-26`;
+this server implements only the current one, so choosing SSE will simply fail to connect.
+
+Then set per-tool approval. This table is the whole policy:
+
+| Tool | Approval setting | Why |
+|---|---|---|
+| `list_channels` | **auto** — no approval | Names the configured channels. Touches Discord not at all. |
+| `digest_channel` | **auto** — no approval | One spoken line per recent message. The main one. |
+| `find_message` | **auto** — no approval | A description in your own words → that message, in full. |
+| `read_message` | **auto** — no approval | One known message by id. |
+| **`post_reply`** | **REQUIRE APPROVAL** | **Speaks in your name, in your channel.** |
+
+That is what implements "reading is automatic while driving, posting asks first". If the agent
+only shows four tools, you gave it the read token — which is correct, deliberate, and means
+posting is off entirely rather than gated.
+
+A starting system prompt for the agent — triage rather than transcription, which is the whole
+reason a digest exists — is in [`QUICKSTART.md`](QUICKSTART.md) under step 5.
 
 **Which token you give it decides the ceiling.** With the read token the agent physically cannot
 post — `post_reply` is not even listed for it. With the write token it can, subject to the
@@ -274,29 +354,15 @@ whether it was later changed. What this server enforces is the scope split and t
 a read token cannot post, and no token can reach a channel outside the configuration. Do not
 mistake the approval prompt for a guarantee we implement.
 
-Verify the endpoint by hand before pointing an agent at it:
+Verify the public endpoint before pointing an agent at it — same script, public URL:
 
 ```sh
-# 401, and the body says nothing useful
-curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<hostname>/mcp \
-  -H 'content-type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-
-# the real thing
-curl -s -X POST https://<hostname>/mcp \
-  -H "authorization: Bearer $GENT_TALK_READ_TOKEN" \
-  -H 'content-type: application/json' \
-  -H 'accept: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
-
-curl -s -X POST https://<hostname>/mcp \
-  -H "authorization: Bearer $GENT_TALK_READ_TOKEN" \
-  -H 'content-type: application/json' -H 'accept: application/json' \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+scripts/verify-deployment.sh --url https://<your-tunnel-hostname> --channel <snowflake>
 ```
 
-The read token's `tools/list` must NOT contain `post_reply`. If it does, something is wrong with
-the deployment, not with the agent.
+The read token's `tools/list` must NOT contain `post_reply`; check 2 is the one that asserts it.
+If it fails there, something is wrong with the deployment, not with the agent, and no amount of
+dashboard configuration will fix it.
 
 ## Putting it on the public internet with a Cloudflare Tunnel
 
@@ -304,39 +370,78 @@ The server speaks plain HTTP and holds a bot token, so it must never be exposed 
 Cloudflare Tunnel gives it a public HTTPS hostname with **no inbound port open** on the host: the
 `cloudflared` daemon dials out and Cloudflare terminates TLS.
 
+You need a domain on Cloudflare; the hostname can be a subdomain of one you already have.
+
 ```sh
 # once, on the host
-cloudflared tunnel login
-cloudflared tunnel create gent-talk
+cloudflared tunnel login                                     # browser; pick the zone
+cloudflared tunnel create gent-talk                          # prints a UUID and a JSON path
 cloudflared tunnel route dns gent-talk gent-talk.<your-domain>
 ```
+
+`tunnel create` prints the two values the next file needs: the **tunnel UUID** and the path to the
+**credentials JSON** it just wrote (normally `~/.cloudflared/<uuid>.json`).
 
 `~/.cloudflared/config.yml`:
 
 ```yaml
-tunnel: gent-talk
-credentials-file: /home/<you>/.cloudflared/<tunnel-uuid>.json
+tunnel: 6f2a1c30-1111-2222-3333-444455556666
+credentials-file: /home/<you>/.cloudflared/6f2a1c30-1111-2222-3333-444455556666.json
+
 ingress:
   - hostname: gent-talk.<your-domain>
     service: http://127.0.0.1:8080
+  # Required, and must be last: cloudflared refuses to start without a catch-all rule.
   - service: http_status:404
 ```
 
+`tunnel:` also accepts the tunnel's name, but the UUID is what `create` handed you and it cannot be
+ambiguous.
+
 ```sh
-cloudflared tunnel run gent-talk
+cloudflared tunnel run gent-talk        # foreground first, so you can watch it connect
+```
+
+Verify the public hostname with the same deployment check you ran locally:
+
+```sh
+scripts/verify-deployment.sh --url https://gent-talk.<your-domain> --channel <snowflake>
+```
+
+Then install it so it survives a reboot:
+
+```sh
+sudo cloudflared service install
+sudo systemctl status cloudflared
 ```
 
 Bind the server to loopback when you do this — `GENT_TALK_BIND=127.0.0.1:8080` — so the only path
 in is the tunnel. With Podman, publish to loopback: `-p 127.0.0.1:8080:8080`.
 
-**A tunnel is transport, not authorization.** It gives you TLS and hides the host; it does not
-decide who may call. This server's bearer tokens do that. If you want a second fence in front,
-Cloudflare Access can require an identity before a request ever reaches `cloudflared` — worth
-doing, and still not a substitute for the token check, which is the one this codebase tests.
+### Do not put Cloudflare Access in front of this
+
+Access is the obvious next fence and it is the wrong one here. **Access expects a human with a
+browser**: an unauthenticated request gets a login redirect. ElevenLabs calls this endpoint
+machine-to-machine, with no browser and nobody to log in, so Access bounces every call — and the
+failure shows up inside ElevenLabs as a vague connection error rather than as "there is an
+identity gate in the way", which is an expensive hour.
+
+If you want Access anyway it has to be a **service token**: create one under Zero Trust → Access →
+Service Auth, write a policy allowing it on this hostname, and add both headers to the ElevenLabs
+MCP server configuration alongside `Authorization`:
+
+```
+CF-Access-Client-Id:     <client id>.access
+CF-Access-Client-Secret: <client secret>
+```
+
+**A tunnel is transport, not authorization.** It gives you TLS and it hides the host's address; it
+does not decide who may call. This server's bearer tokens do that, and that is the part this
+codebase tests.
 
 ## Where ElevenLabs attaches
 
-From the related-work review, and recorded in `src/mcp.rs` so it does not have to be rediscovered:
+From the related-work review, and recorded in `src/mcp/mod.rs` so it does not have to be rediscovered:
 
 * ElevenLabs Agents connect to **remote MCP servers over SSE or streamable HTTP** — so this server
   is the MCP endpoint and the agent is the client.
@@ -345,8 +450,9 @@ From the related-work review, and recorded in `src/mcp.rs` so it does not have t
 * There are **three approval modes**, and the useful one is **per-tool approval**, which maps onto
   the rule this project wants: **reading is automatic, posting asks first.**
 * **Barge-in and `skip_turn` are native**, so pause/resume needs no button.
-* Caveats: MCP is unavailable on Zero Retention Mode accounts, channel text transits ElevenLabs,
-  and conversation costs roughly $0.01/minute.
+* Caveats: MCP is unavailable on Zero Retention Mode **and HIPAA-enabled** workspaces — which
+  would block this integration outright — channel text transits ElevenLabs, and conversation
+  costs roughly $0.01/minute.
 
 `GET /api/v1/agent-tools` serves the tool list with that policy attached, and a test asserts the
 invariant that **every mutating tool requires approval and every read-only tool does not**. The
@@ -477,6 +583,10 @@ cd gent-talk
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+
+# the deployment check, against an in-memory Discord — no bot token needed
+cargo run -- --config gent-talk.toml --fake-discord &
+scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
 141 tests: unit tests beside each module, end-to-end tests in `tests/api.rs` that drive the real
@@ -510,6 +620,8 @@ src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp
 src/agent_backend.rs  the slow-path seam
 src/http/             router and handlers
 web/                  the phone app (plain HTML/CSS/JS, no framework, no build step)
+scripts/verify-deployment.sh   the one-command deployment check, local or public
+QUICKSTART.md         the six-step setup path, start to first conversation
 ```
 
 ## Known gaps
@@ -528,7 +640,10 @@ Beyond the security list above:
   protocol as written and against `curl`; the registration steps above are from the vendor's
   documentation, not from a completed round trip.
 * **The Discord layer has still never run against live Discord.** Adding MCP did not change that:
-  both front doors go through the same untested-against-production client.
+  both front doors go through the same untested-against-production client, and
+  `scripts/verify-deployment.sh` has therefore only ever been exercised against the in-memory
+  fake — in CI and by hand. Its checks are protocol-level and transport-level, so they apply
+  unchanged to a real deployment, but the first real run will also be the script's first real run.
 * The legacy HTTP+SSE MCP transport is not implemented. A client that cannot do Streamable HTTP
   cannot connect.
 * No MCP resources, prompts, sampling, or logging capability — tools only.

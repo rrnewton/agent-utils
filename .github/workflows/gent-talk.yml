@@ -75,7 +75,7 @@ jobs:
             -e GENT_TALK_DISCORD_BOT_TOKEN=not-a-real-token \
             -e GENT_TALK_READ_TOKEN=ci-read-token-0000000000000 \
             -e GENT_TALK_WRITE_TOKEN=ci-write-token-000000000000 \
-            -e "GENT_TALK_CHANNELS=424242:ci channel:rw" \
+            -e "GENT_TALK_CHANNELS=424242:ci channel:rw,515151:ci read-only:ro" \
             gent-talk:ci --fake-discord
           for _ in $(seq 1 30); do
             if curl -fsS localhost:18080/healthz >/dev/null 2>&1; then break; fi
@@ -90,4 +90,41 @@ jobs:
             -H 'Authorization: Bearer ci-read-token-0000000000000' \
             -H 'content-type: application/json' -d '{"text":"no"}' \
             localhost:18080/api/v1/channels/424242/reply)" = 403
+
+      # The script the README tells the owner to run after `podman run` is run here against the
+      # same image, so it cannot rot into a recipe that does not work. It is the deployment check;
+      # a deployment check that has never been executed is worse than none.
+      - name: the documented deployment check passes against the image
+        run: |
+          set -euo pipefail
+          gent-talk/scripts/verify-deployment.sh \
+            --url http://localhost:18080 \
+            --channel 424242 \
+            --read-token ci-read-token-0000000000000 \
+            --write-token ci-write-token-000000000000
+
+      # ...and reports a FAILURE rather than a pass when the thing it checks is untrue. A green
+      # check that cannot go red certifies nothing.
+      - name: the deployment check fails when it should
+        run: |
+          set -euo pipefail
+          # A channel outside the allowlist must be refused, so pointing --channel at one must fail.
+          if gent-talk/scripts/verify-deployment.sh --url http://localhost:18080 \
+              --channel 777777 --read-token ci-read-token-0000000000000 --skip-post; then
+            echo "the check passed against an unconfigured channel" >&2
+            exit 1
+          fi
+          # A read-only channel must refuse post_reply, so the posting half must fail there.
+          if gent-talk/scripts/verify-deployment.sh --url http://localhost:18080 \
+              --channel 515151 --read-token ci-read-token-0000000000000 \
+              --write-token ci-write-token-000000000000; then
+            echo "the check reported a successful post to a read-only channel" >&2
+            exit 1
+          fi
+          # A wrong token must not pass.
+          if gent-talk/scripts/verify-deployment.sh --url http://localhost:18080 \
+              --channel 424242 --read-token wrong-token-0000000000000000 --skip-post; then
+            echo "the check passed with a wrong read token" >&2
+            exit 1
+          fi
           podman stop gent-talk-ci
