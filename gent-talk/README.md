@@ -72,8 +72,10 @@ cd gent-talk
 cargo run -- --config gent-talk.toml --fake-discord
 ```
 
-`--fake-discord` serves an in-memory channel with two seeded messages and logs a warning on every
-start. It is how you look at the web app without a bot.
+`--fake-discord` serves in-memory channels seeded with a dozen deliberately long-winded agent
+messages, and logs a warning on every start. It is how you look at the web app without a bot.
+The seed is verbose on purpose: two cheerful one-liners make the digest and the scrollback look
+like they work when neither of them had anything to do.
 
 Against real Discord:
 

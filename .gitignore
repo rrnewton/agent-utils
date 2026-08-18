@@ -43,6 +43,9 @@ ignored/
 /gent-talk/gent-talk.toml
 /gent-talk/*.local.toml
 /gent-talk/.env
+# Local QA output: screenshots, traces, console/network logs from Playwright runs against
+# a locally running gent-talk. Evidence, never source; images must never be committed.
+/gent-talk/debug/
 
 # --- editor / os ---
 *.swp

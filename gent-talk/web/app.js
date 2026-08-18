@@ -210,6 +210,10 @@ async function loadScrollback() {
   for (const message of payload.messages) {
     list.append(messageNode(message));
   }
+  // The header names the channel you are looking at. Only the digest path used to set it, so
+  // arriving on the Text tab first left the header reading "not connected" over a full,
+  // freshly-fetched scrollback -- the one place the app lied about its own state.
+  el("channel-name").textContent = payload.channel.label;
   setStatus(`${payload.messages.length} message(s)`);
   list.lastElementChild?.scrollIntoView({ block: "end" });
 }

@@ -28,6 +28,84 @@ Every secret is read from the configuration file or from the environment. See th
 for the full list and for the threat model.
 ";
 
+/// The backlog `--fake-discord` seeds into every configured channel.
+///
+/// Deliberately long-winded and repetitive, because that is the problem this project exists for:
+/// a driver returns to a dozen verbose agent messages and cannot skim them. Two cheerful one-liners
+/// would make the digest and the scrollback look like they work when neither had anything to do.
+/// Several entries also share vocabulary ("runner", "cache", "token") so that
+/// `POST /resolve` is exercised against real competition rather than a single obvious hit.
+const SEEDED_BACKLOG: &[(&str, &str)] = &[
+    (
+        "codex-eng",
+        "seeded: starting on the retry-budget work. Branch is codex/retry-budget off integration \
+         at 4f21ab0. I'll push as soon as the first commit is coherent.",
+    ),
+    (
+        "codex-eng",
+        "seeded: first cut pushed. The budget is per-host rather than per-request, which is the \
+         only shape that survives a fan-out; a per-request budget lets N parallel calls each spend \
+         the whole allowance. Focused tests pass locally (14 of 14 in the retry module).",
+    ),
+    (
+        "claude-integ",
+        "seeded: heads up, the mac runner went offline mid-deploy so the arm64 job never reported. \
+         The run shows green at the run level but the job list has one queued job that never \
+         started, so that green is not evidence of anything. Re-firing.",
+    ),
+    (
+        "claude-integ",
+        "seeded: re-fired. Same runner, same stall. I think the runner pool is down to one mac and \
+         it is wedged rather than busy - queue wait is 41 minutes and climbing with nothing \
+         executing.",
+    ),
+    (
+        "codex-review",
+        "seeded: review of the retry-budget branch. One real finding: the budget is consulted \
+         before the jitter is applied, so under contention every caller wakes at the same instant \
+         and the budget is spent in one burst. Suggest consulting it after the sleep.",
+    ),
+    (
+        "codex-eng",
+        "seeded: good catch, fixed and pushed. Also removed the cache-key rewrite I snuck in - it \
+         was unrelated to this branch and it belongs in its own change.",
+    ),
+    (
+        "build-bot",
+        "seeded: nightly cache rebuild finished in 22m14s, 3.1 GB written, 0 evictions. Previous \
+         night was 24m02s so this is noise, not an improvement.",
+    ),
+    (
+        "build-bot",
+        "seeded: WARNING - the token used by the release job expires in 6 days. Rotating it \
+         requires the maintainer account; nothing automated can do it.",
+    ),
+    (
+        "claude-integ",
+        "seeded: the arm64 job finally reported after the runner was recycled by hand. Green, and \
+         this one has a real job list: 11 completed, 0 skipped. Landing the retry-budget branch on \
+         that evidence.",
+    ),
+    (
+        "claude-integ",
+        "seeded: landed. integration is at 9c07d3e and the tip is green. Branch deleted; the PR is \
+         closed as merged rather than closed unmerged, which matters for the changelog script.",
+    ),
+    (
+        "codex-eng",
+        "seeded: next up is the cache-key rewrite I pulled out earlier. It is small but it changes \
+         a durable format, so it is a sequential change - nobody else should touch the cache \
+         version namespace while it is in flight.",
+    ),
+    (
+        "claude-qa",
+        "seeded: filed two issues from the overnight sweep. The first is a genuine flake - a test \
+         that depends on wall-clock ordering between two spawned processes. The second is not a \
+         flake, it is a real ordering bug that only shows up when the machine is loaded, and I \
+         would rather we not label it flaky because that is how it gets ignored.",
+    ),
+];
+
 struct Args {
     config: Option<PathBuf>,
     fake_discord: bool,
@@ -107,16 +185,9 @@ async fn main() -> anyhow::Result<()> {
         );
         let fake = Arc::new(FakeDiscord::new());
         for channel in &config.channels {
-            fake.seed(
-                &channel.id,
-                "codex-eng",
-                "seeded: the release build finished green.",
-            );
-            fake.seed(
-                &channel.id,
-                "codex-integ",
-                "seeded: the mac runner went offline mid-deploy so the arm64 job never reported.",
-            );
+            for (author, content) in SEEDED_BACKLOG {
+                fake.seed(&channel.id, author, content);
+            }
         }
         fake
     } else {
