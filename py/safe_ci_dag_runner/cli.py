@@ -96,6 +96,8 @@ DEFAULT_PROFILE_DIR = os.path.join(".safe-ci-dag-runner", "profiles")
 MAX_RUN_CPUS = (2**63 - 1) // 100_000
 # Compatibility name retained for callers that imported the 0.13 module constant directly.
 MAX_RUN_CPU_JOBS = MAX_RUN_CPUS
+# Hard bound on config objects materialized by --stress before any graph expansion occurs.
+MAX_STRESS_GENERATED_NODES = 100_000
 
 
 # --------------------------------------------------------------------------- colors
@@ -157,7 +159,7 @@ def _epilog(c: Palette) -> str:
         f"  {ex(f'{PROG} run --dag dag.json')}               {c.dim('# run it; exit 0 iff all steps pass')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --profile')}     {c.dim('# ...and print a per-step profile table')}\n"
         f"  {ex(f'{PROG} run --dag dag.json --only build.app')} {c.dim('# run EXACTLY one step (not its deps)')}\n"
-        f"  {ex(f'{PROG} run --dag dag.json --only test.unit --stress 10 -s 2 -j 100')} {c.dim('# 2 active copies; total CPU width <=100')}\n"
+        f"  {ex(f'{PROG} run --dag dag.json --only test.unit --stress 10 -s 2 -j 100')} {c.dim('# 2 active copies sharing 100 CPU-equivalents')}\n"
         f"  {ex(f'{PROG} plan --dag dag.json --planner critical-path')} {c.dim('# show learned estimates + the plan')}\n"
         f"  {ex(f'{PROG} sweep --dag dag.json --step build.app --jobs 1..8')} {c.dim('# parallel-speedup study')}\n"
         f"  {ex(f'{PROG} ascii --dag dag.json')}             {c.dim('# quick ASCII view of the graph')}\n"
@@ -244,7 +246,7 @@ def _quickstart(c: Palette) -> str:
 {h('What you get')}
   - concurrent scheduling honoring deps + resource caps, ordered by the chosen {k('--planner')}
     {c.dim('(greedy-lpt = longest single step first; critical-path = longest remaining path first)')}
-    {c.dim('(--max-steps bounds active DAG steps; --max-cpus bounds their total CPU width)')}
+    {c.dim('(--max-steps bounds active DAG steps; --max-cpus caps each width + outer bandwidth)')}
   - learned est_duration / rss from the profile store override the DAG hints at plan time
     {c.dim('(disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)')}
   - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps
@@ -252,7 +254,7 @@ def _quickstart(c: Palette) -> str:
   - Linux cgroup-v2 per-step memory/CPU boxing is ON BY DEFAULT (the tool's primary purpose):
     {k('run')} re-execs inside a systemd --user scope and caps each step in its own child cgroup
     {c.dim('(no cgroup-v2 + systemd --user scope? the run errors — pass')} {k('--allow-cgroup-failure')} {c.dim('to run un-boxed)')}
-  - {k('run --max-mem 8G')} derives a safe active-step ceiling from modeled worst-case RAM
+  - {k('run --max-mem 8G')} derives a conservative model-based active-step ceiling from RAM hints
     {c.dim('(with explicit --max-steps, the tighter ceiling wins)')}
   - {k('run --perf-dir DIR')} writes per-step + whole-run resource-usage CSVs into DIR
 
@@ -394,7 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=_run_max_cpus,
         default=None,
         metavar="N",
-        help="maximum total CPU cores across all active steps "
+        help="outer CPU-bandwidth limit and maximum width of any one runner-controlled step "
         "(default: effective container/affinity budget tightened by the shared 90%% slice)",
     )
     run_p.add_argument(
@@ -423,7 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-mem",
         metavar="SPEC",
         default=None,
-        help="RAM budget (e.g. 8G, 4096M); derive a safe --max-steps ceiling; with explicit "
+        help="RAM budget (e.g. 8G, 4096M); derive a conservative model-based --max-steps ceiling; with explicit "
         "--max-steps, the tighter value wins",
     )
     run_p.add_argument(
@@ -454,12 +456,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="duplicate the selected graph at generation into N disconnected components with no "
         "edges between copies. Named-resource scheduling is removed from the generated copies; "
-        "--max-steps controls active copies and --max-cpus bounds their total CPU width. "
+        "--max-steps controls active copies; --max-cpus caps each copy's width and their shared "
+        "outer CPU bandwidth. "
         "Reports the largest measured number of overlapping child processes, "
         "the per-copy PASS/FAIL RATIO (e.g. '7/10 passed'), and which copies failed. Combine with "
         "--only to copy one suspect node (e.g. --only test.unit). The ratio is the finding, so "
         "this implies --keep-going. N is still capped by the box memory budget (N x per-copy "
-        "footprint must fit).",
+        "footprint must fit) and expansion may create at most 100,000 DAG nodes/control units.",
     )
     run_p.add_argument(
         "--perf-dir",
@@ -1173,26 +1176,92 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
     return dataclasses.replace(cfg, steps=tuple(new_steps), resource_caps={})
 
 
-def _stress_guard(cfg: DagConfig, n: int) -> int:
-    """Derive the memory-safe ``--stress`` ceiling and REFUSE LOUDLY when ``n`` exceeds it.
+def _stress_expansion_guard(cfg: DagConfig, n: int) -> int:
+    """Refuse stress fan-out that would allocate an excessive generated graph.
 
-    ``cfg`` is the SELECTED (pre-expansion) graph, so its footprint is one copy's. ``n`` copies run
-    concurrently, so ``n x per-copy footprint`` must fit the box memory budget (the min of the
-    cgroup ``memory.max`` cap and ``MemAvailable``). Returns 0 to proceed, or 2 to abort the run
-    (bad usage). When the budget cannot be read, it warns loudly and proceeds (No Silent Failure)
-    rather than blocking a host without the cgroup/proc files."""
-    from safe_ci_dag_runner.sizing import box_mem_budget_bytes, stress_copy_footprint_bytes
+    Empty graphs count one control-plane unit per copy so a huge ``n`` cannot burn time looping
+    without creating steps. Arithmetic saturates to the shared signed-i64 domain.
+    """
+    nodes_per_copy = max(1, len(cfg.steps))
+    generated = min(2**63 - 1, nodes_per_copy * n)
+    if generated <= MAX_STRESS_GENERATED_NODES:
+        return 0
+    print(
+        f"{PROG}: --stress {n}: REFUSED — expansion would create {generated} generated DAG "
+        f"nodes/control units, exceeding safety limit {MAX_STRESS_GENERATED_NODES}; narrow "
+        "--only or lower --stress",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _stress_footprints(cfg: DagConfig, n: int, *, expanded: bool) -> tuple[int, int]:
+    """Return ``(one_graph, total)`` with signed-i64 saturating arithmetic.
+
+    For the authored preflight, total is ``n * one_graph``. A final already-expanded graph carries
+    all step caps directly, while its per-copy control-plane floor still must be charged ``n``
+    times.
+    """
+    from safe_ci_dag_runner.sizing import (
+        stress_control_floor_bytes,
+        stress_copy_footprint_bytes,
+    )
 
     footprint = stress_copy_footprint_bytes(cfg)
+    if expanded:
+        floor_total = min(2**63 - 1, stress_control_floor_bytes(cfg) * n)
+        total = max(footprint, floor_total)
+    else:
+        total = min(2**63 - 1, footprint * n)
+    return footprint, total
+
+
+def _stress_memory_guard(cfg: DagConfig, n: int, *, expanded: bool) -> int:
+    """Check stress memory either before expansion or after final planning.
+
+    The early check receives one selected copy and multiplies its footprint by ``n``. The final
+    check receives the ALREADY-EXPANDED graph after profile feedback / CPA allocation and therefore
+    compares that graph's total directly -- multiplying by ``n`` again would double-count every
+    copy. A missing box budget remains a loud warning for the early advisory preflight, but the
+    final check fails closed because it is the last barrier before guest processes can spawn.
+    """
+    from safe_ci_dag_runner.sizing import box_mem_budget_bytes
+
+    footprint, total = _stress_footprints(cfg, n, expanded=expanded)
+    if footprint >= 2**63 - 1 or total >= 2**63 - 1:
+        subject = "final planned expanded-graph" if expanded else "per-copy"
+        print(
+            f"{PROG}: --stress {n}: REFUSED — {subject} memory footprint is unbounded or "
+            "overflowed; declare finite positive per-step memory caps",
+            file=sys.stderr,
+        )
+        return 2
     budget = box_mem_budget_bytes()
     if budget is None:
+        if expanded:
+            print(
+                f"{PROG}: --stress {n}: REFUSED — could not read the box memory budget for "
+                "the final planned expanded graph; no step was started",
+                file=sys.stderr,
+            )
+            return 2
         print(
             f"{PROG}: --stress {n}: WARNING could not read the box memory budget "
             f"(cgroup memory.max / MemAvailable); proceeding UNCHECKED with "
-            f"{n} x {_human_bytes(footprint)}/copy = {_human_bytes(n * footprint)}. "
+            f"{n} x {_human_bytes(footprint)}/copy = {_human_bytes(total)}. "
             "Watch for OOM.",
             file=sys.stderr,
         )
+        return 0
+    if expanded:
+        if total > budget:
+            print(
+                f"{PROG}: --stress {n}: REFUSED — final planned expanded graph needs "
+                f"{_human_bytes(total)}, exceeding the box memory budget "
+                f"{_human_bytes(budget)}; no step was started",
+                file=sys.stderr,
+            )
+            return 2
         return 0
     max_safe = budget // footprint
     if n > max_safe:
@@ -1201,7 +1270,7 @@ def _stress_guard(cfg: DagConfig, n: int) -> int:
             "budget.\n"
             f"  requested copies:   {n}\n"
             f"  per-copy footprint: {_human_bytes(footprint)}\n"
-            f"  total needed:       {_human_bytes(n * footprint)}\n"
+            f"  total needed:       {_human_bytes(total)}\n"
             f"  box memory budget:  {_human_bytes(budget)} (min of cgroup memory.max + MemAvailable)\n"
             f"  max safe --stress:  {max_safe}\n"
             f"Re-run with --stress <= {max_safe} (cores are plentiful; memory is the binding "
@@ -1212,12 +1281,22 @@ def _stress_guard(cfg: DagConfig, n: int) -> int:
         return 2
     print(
         f"{PROG}: --stress {n}: OK — {n} x {_human_bytes(footprint)}/copy = "
-        f"{_human_bytes(n * footprint)} fits the box memory budget {_human_bytes(budget)} "
+        f"{_human_bytes(total)} fits the box memory budget {_human_bytes(budget)} "
         f"(max safe {max_safe}); actual concurrency will be measured from child-process "
         "lifetimes.",
         file=sys.stderr,
     )
     return 0
+
+
+def _stress_guard(cfg: DagConfig, n: int) -> int:
+    """Early authored-hint preflight over one selected, CPU-capped graph copy."""
+    return _stress_memory_guard(cfg, n, expanded=False)
+
+
+def _final_stress_guard(cfg: DagConfig, n: int) -> int:
+    """Last no-spawn barrier over the already-expanded, finally planned graph."""
+    return _stress_memory_guard(cfg, n, expanded=True)
 
 
 def _print_stress_report(
@@ -1262,7 +1341,7 @@ def _print_stress_report(
         print(f"  {base}: {line}{detail}")
     print(
         f"  maximum concurrent steps: {max_concurrent_steps} "
-        f"(--max-steps {max_steps}; --max-cpus {max_cpus} total cores)"
+        f"(--max-steps {max_steps}; --max-cpus {max_cpus} CPU target/per-step ceiling)"
     )
 
 
@@ -1588,47 +1667,54 @@ def _select_max_cpus(ns: argparse.Namespace) -> int:
 def _select_max_steps(cfg: DagConfig, ns: argparse.Namespace, max_cpus: int) -> int:
     """Resolve the active-step ceiling, combining explicit and memory-derived limits."""
     explicit = int(ns.max_steps) if isinstance(ns.max_steps, int) else None
+    base = explicit if explicit is not None else max_cpus
     max_mem = ns.max_mem if isinstance(ns.max_mem, str) and ns.max_mem else None
     if max_mem is None:
-        return explicit if explicit is not None else max_cpus
+        return base
 
     budget = parse_size(max_mem)
     if budget is None:
-        fallback = explicit if explicit is not None else max_cpus
         print(
             f"{PROG}: could not parse --max-mem {max_mem!r}; falling back to --max-steps "
-            f"{fallback}",
+            f"{base}",
             file=sys.stderr,
         )
-        return fallback
+        return base
 
     memory_steps, footprint = jobs_for_budget(cfg, budget)
+    if memory_steps == 0:
+        print(
+            f"{PROG}: --max-mem {max_mem}: REFUSED — minimum runnable footprint "
+            f"{footprint} bytes cannot fit safely within budget {budget} bytes",
+            file=sys.stderr,
+        )
+        return 0
+    selected = min(base, memory_steps)
     print(
-        f"{PROG}: --max-mem {max_mem} -> --max-steps {memory_steps} "
-        f"(modeled worst-case {footprint} bytes fits budget {budget} bytes)",
+        f"{PROG}: --max-mem {max_mem} -> modeled memory ceiling {memory_steps} active steps "
+        f"(worst-case {footprint} bytes fits budget {budget} bytes); base active-step ceiling "
+        f"{base}; final --max-steps {selected}",
         file=sys.stderr,
     )
     ncpu = os.cpu_count() or 4
     modeled = any(
-        step.hint.rss_baseline_bytes is not None and not step.engine_only
+        step.skip_reason is None
+        and (
+            (step.hint.hard_mem_max_bytes or 0) > 0
+            or (step.hint.rss_baseline_bytes or 0) > 0
+            or (cfg.default_step_mem_cap_bytes or 0) > 0
+        )
         for step in cfg.steps
     )
     if memory_steps == ncpu and not modeled:
         print(
-            f"{PROG}: note: no step carries rss_baseline_bytes, so the modeled footprint "
-            f"collapsed to the mem_cap_floor_bytes floor ({cfg.mem_cap_floor_bytes} bytes) and "
-            f"--max-mem did not throttle (--max-steps {memory_steps} = CPU count); add per-step "
-            "rss_baseline_bytes to enable memory-aware throttling",
+            f"{PROG}: note: no runnable step has a positive hard/RSS/default memory cap, so "
+            f"the modeled footprint is only the mem_cap_floor_bytes floor "
+            f"({cfg.mem_cap_floor_bytes} bytes) and --max-mem did not throttle "
+            f"(modeled memory ceiling {memory_steps} = CPU count; final --max-steps "
+            f"{selected})",
             file=sys.stderr,
         )
-    if explicit is None:
-        return memory_steps
-    selected = min(explicit, memory_steps)
-    print(
-        f"{PROG}: explicit --max-steps {explicit} and memory-derived ceiling {memory_steps}; "
-        f"using tighter --max-steps {selected}",
-        file=sys.stderr,
-    )
     return selected
 
 
@@ -2042,28 +2128,39 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         print(f"{PROG}: run: {exc}", file=sys.stderr)
         return 2
 
+    # Resolve the maximum CPU capacity before stress sizing or cgroup bring-up. The stress guard
+    # must charge the widths that can actually execute under this run's per-step ceiling, not an
+    # authored width which will be clamped later. Self-managed commands cannot be clamped, so
+    # reject those before either sizing or expansion.
+    max_cpus = _select_max_cpus(ns)
+    if error := _self_managed_width_error(cfg, max_cpus):
+        print(f"{PROG}: run: {error}", file=sys.stderr)
+        return 2
+
     # Feature: --stress N — duplicate the selected step(s) N times and run the copies in PARALLEL,
-    # reporting the per-copy ratio. Derive the memory-safe N ceiling and REFUSE LOUDLY when the
-    # requested N would exceed the box memory budget, BEFORE any cgroup bring-up / re-exec (so a
-    # too-large N fails fast without needing a systemd scope).
+    # reporting the per-copy ratio. Derive the memory-safe N ceiling from a CPU-capped,
+    # pre-expansion copy and REFUSE LOUDLY when the requested N would exceed the box memory budget,
+    # BEFORE any cgroup bring-up / re-exec (so a too-large N fails fast without needing a systemd
+    # scope).
     stress_n = int(ns.stress) if getattr(ns, "stress", None) is not None else 1
     if stress_n < 1:
         print(f"{PROG}: run: --stress N must be >= 1 (got {stress_n})", file=sys.stderr)
         return 2
     stress_active = stress_n > 1
     if stress_active:
+        code = _stress_expansion_guard(cfg, stress_n)
+        if code != 0:
+            return code
+        # Clamp once BEFORE expansion: the guard sizes exactly what will be cloned, and the later
+        # post-plan clamp is idempotent instead of warning once for every generated copy.
+        cfg = cap_config_max_cpus(cfg, max_cpus)
         code = _stress_guard(cfg, stress_n)
         if code != 0:
             return code
         cfg = _expand_stress(cfg, stress_n)
 
-    # Resolve the maximum total CPU capacity before cgroup bring-up and bind the exact same value
-    # to the outer scope's CPUQuota and the scheduler's summed-width admission gate.
-    max_cpus = _select_max_cpus(ns)
-    if error := _self_managed_width_error(cfg, max_cpus):
-        print(f"{PROG}: run: {error}", file=sys.stderr)
-        return 2
-
+    # Bind the resolved CPU capacity to the outer scope's CPUQuota. Declared widths are not
+    # reservations: --max-steps, dependencies, and named resources decide which steps overlap.
     cgroups, code = _resolve_cgroup_manager(
         bool(ns.allow_cgroup_failure),
         bool(getattr(ns, "unsafe_no_cgroups", False)),
@@ -2143,6 +2240,15 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         plan = _build_feedback_plan(
             cfg, feedback_dir, planner, core_budget=core_budget, mem_budget=mem_budget
         )
+    if plan.allocation is not None and plan.allocation.stop_reason == "infeasible-memory":
+        print(
+            f"{PROG}: run: CPA allocation is infeasible under --max-mem {max_mem}; "
+            "the minimum runnable footprint exceeds the memory budget",
+            file=sys.stderr,
+        )
+        if core_reservation is not None:
+            core_reservation.release()
+        return 2
     cfg = cap_config_max_cpus(apply_plan_to_config(cfg, plan), max_cpus)
     # Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     # the same values so older callers keep working and announce that the flag is now redundant.
@@ -2187,7 +2293,21 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     if bool(ns.show_plan):
         sys.stdout.write(plan_to_text(plan))
 
+    # The authored-hint preflight ran before cgroup bring-up. Feedback and CPA may have raised RSS
+    # estimates or allocated wider CPU-bound steps since then, so re-check the FINAL, already-
+    # expanded graph without multiplying by stress_n again. This is the last no-spawn barrier.
+    if stress_active:
+        code = _final_stress_guard(cfg, stress_n)
+        if code != 0:
+            if core_reservation is not None:
+                core_reservation.release()
+            return code
+
     max_steps = _select_max_steps(cfg, ns, max_cpus)
+    if max_steps < 1:
+        if core_reservation is not None:
+            core_reservation.release()
+        return 2
     verbosity = 0 if bool(ns.quiet) else int(ns.verbosity)
 
     perf_dir, source = _resolve_profile_dir(ns.perf_dir, bool(ns.no_profile))

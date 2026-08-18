@@ -6,8 +6,11 @@ from safe_ci_dag_runner import estimates
 
 from pathlib import Path
 
+import pytest
+
 from safe_ci_dag_runner import (
     DagConfig,
+    InfeasibleAllocationError,
     ResourceHint,
     Step,
     StepClass,
@@ -27,12 +30,14 @@ from safe_ci_dag_runner.estimates import (
     _parse_int,
     _robust_median,
 )
+from safe_ci_dag_runner.sizing import jobs_for_budget
 
 _HEADER = (
     "timestamp,machine_id,container_class,git_sha,outer_jobs,profile_base_sha,enforcement_kind,"
     "runner_name,step,classification,inner_jobs,elapsed_s,returncode,ok,timed_out,oom_kills,"
     "peak_bytes,thread_peak,pct_other\n"
 )
+GIB = 1024**3
 
 
 def _write_store(tmp_path: Path, rows: list[str], *, machine: str = "m", container: str = "c") -> Path:
@@ -581,6 +586,99 @@ def test_cpa_memory_blocks_widening_even_with_free_cores(tmp_path: Path) -> None
     # With no RAM budget the same step widens all the way to its knee (8).
     free = build_plan(cfg, {}, planner=Planner.CPA, speedups=speedups, core_budget=16)
     assert {e.tag: e.alloc_inner_jobs for e in free.entries}["m.heavy"] == 8
+
+
+def test_cpa_memory_uses_learned_rss_before_allocating(tmp_path: Path) -> None:
+    rows = [
+        _speedup_row("m.heavy", j, w, user_s="40.0", sys_s="0.0")
+        for j, w in ((1, "40.0"), (8, "5.0"))
+    ]
+    speedups = _cpa_speedups(tmp_path, rows)
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "m",
+                "heavy",
+                "",
+                "true",
+                hint=ResourceHint(
+                    est_duration_s=40.0,
+                    rss_baseline_bytes=GIB,
+                    classification=StepClass.CPU_BOUND,
+                    preferred_inner_jobs=1,
+                ),
+            ),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+    )
+    samples = {
+        "m.heavy": estimates.StepSamples("m.heavy", 3, 40.0, 8 * GIB)
+    }
+
+    plan = build_plan(
+        cfg,
+        samples,
+        planner=Planner.CPA,
+        speedups=speedups,
+        core_budget=8,
+        mem_budget=4 * GIB,
+    )
+
+    assert plan.allocation is not None
+    assert plan.allocation.stop_reason == "infeasible-memory"
+    assert plan.allocation.modeled_makespan_s == float("inf")
+    assert plan.entries[0].rss_source == "store"
+    assert plan.entries[0].rss_estimate_bytes == 8 * GIB
+    assert plan.entries[0].alloc_inner_jobs is None
+    assert apply_plan_to_config(cfg, plan) is cfg
+
+
+def test_cpa_seed_applies_outer_memory_envelope_and_raises_typed_error() -> None:
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "m",
+                "heavy",
+                "",
+                "true",
+                hint=ResourceHint(est_duration_s=1.0, rss_baseline_bytes=3 * GIB),
+            ),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=2.0,
+    )
+
+    plan = build_plan(cfg, {}, planner=Planner.CPA, core_budget=8, mem_budget=5 * GIB)
+    assert plan.allocation is not None
+    assert plan.allocation.stop_reason == "infeasible-memory"
+    assert plan.allocation.modeled_makespan_s == float("inf")
+    assert plan.entries[0].alloc_inner_jobs is None
+    assert apply_plan_to_config(cfg, plan) is cfg
+    with pytest.raises(InfeasibleAllocationError) as excinfo:
+        allocate_widths(cfg, {}, _cpa_est(cfg), 8, 5 * GIB)
+    assert excinfo.value.mem_budget == 5 * GIB
+    assert excinfo.value.memory_footprint == 6 * GIB
+
+
+def test_cpa_memory_checks_each_step_then_max_mem_derives_serial_overlap() -> None:
+    cfg = DagConfig(
+        steps=(
+            Step("m", "a", "", "true", hint=ResourceHint(hard_mem_max_bytes=4 * GIB)),
+            Step("m", "b", "", "true", hint=ResourceHint(hard_mem_max_bytes=4 * GIB)),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+    )
+
+    plan = build_plan(cfg, {}, planner=Planner.CPA, core_budget=2, mem_budget=4 * GIB)
+
+    assert plan.allocation is not None
+    assert plan.allocation.stop_reason != "infeasible-memory"
+    assert jobs_for_budget(apply_plan_to_config(cfg, plan), 4 * GIB) == (1, 4 * GIB)
 
 
 def test_cpa_curveless_dag_stays_rigid(tmp_path: Path) -> None:

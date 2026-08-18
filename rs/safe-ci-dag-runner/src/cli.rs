@@ -52,7 +52,8 @@ use crate::scheduler::{
     validate_max_cpus_rewrite, BoxedCgroups,
 };
 use crate::sizing::{
-    box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_copy_footprint_bytes,
+    box_mem_budget_bytes, cpu_count, jobs_for_budget, parse_size, stress_control_floor_bytes,
+    stress_copy_footprint_bytes,
 };
 use crate::summary::{self, Summary, DEFAULT_MAX_BUCKETS, DEFAULT_RESERVOIR_K};
 use crate::sync::{self, SyncBackend};
@@ -196,10 +197,10 @@ jobs_flag: appended with a step preferred_inner_jobs; \"-j\"->\"-j 4\", \"-j%d\"
 yaml: --dag also accepts .yaml/.yml (isomorphic to JSON; allows comments + multi-line block-scalar descriptions); the `yaml` subcommand emits YAML\n\n\
 {what}\n  \
 - concurrent scheduling honoring deps + resource caps, ordered by the chosen --planner\n  \
-  ({maxsteps} bounds active DAG steps; {maxcpus} bounds their total CPU-core width)\n  \
+  ({maxsteps} bounds active DAG steps; {maxcpus} caps each width + outer CPU bandwidth)\n  \
 - learned est_duration / rss from the profile store override the DAG hints at plan time\n    (disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)\n  \
 - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps\n    ({keepgoing} lets already-running steps finish instead; it still stops launching new steps)\n  \
-- {maxmem} derives a safe active-step ceiling from the modeled worst-case RAM footprint\n\n\
+- {maxmem} derives a conservative model-based active-step ceiling from RAM hints\n\n\
 {note}  cgroup-v2 per-step boxing is ON by default; {acf} downgrades to a best-effort\n        unboxed run. {perfdir} writes per-step + whole-run resource-usage CSVs.\n\n\
 {exits}  0 = all steps passed | 1 = a step failed | 2 = bad usage / bad DAG file | 3 = cgroup\n           boxing required but unavailable (use {acf})\n",
         banner = banner(c),
@@ -328,12 +329,12 @@ fn run_help(c: &Palette) -> String {
         &[
             ("--dag FILE", "DAG file to run ('-' = stdin); .yaml/.yml load as YAML, else JSON [required]"),
             ("-s, --max-steps N", "maximum active DAG steps; defaults to the effective --max-cpus budget; a bare -sN also works"),
-            ("-j, --max-cpus N", "maximum number of CPU cores total across active steps (default: effective container/affinity budget tightened by the shared 90% slice); a bare -jN also works"),
+            ("-j, --max-cpus N", "outer CPU-bandwidth limit and maximum width of any one runner-controlled step (default: effective container/affinity budget tightened by the shared 90% slice); a bare -jN also works"),
             ("--cores/--cpuset/--pin K", "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable"),
-            ("--max-mem SPEC", "RAM budget (e.g. 8G): derive a safe --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
+            ("--max-mem SPEC", "RAM budget (e.g. 8G): derive a conservative model-based --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
             ("--only TAG[,TAG...]", "run EXACTLY the named step(s); dependency edges outside the selection are dropped"),
             ("--args STRING", "replace the opt-in {args} token in selected step commands"),
-            ("--stress N", "duplicate the graph into N disconnected components with no edges between copies; --max-steps controls active copies and --max-cpus bounds their total CPU width"),
+            ("--stress N", "duplicate the graph into N disconnected components; --max-steps controls active copies, --max-cpus caps each width/shared bandwidth, and expansion is limited to 100,000 generated nodes"),
             ("--perf-dir DIR", "write per-step + whole-run resource-usage CSVs into DIR"),
             ("--no-profile", "disable the default auto-logging profile store for this run"),
             ("--profile", "after the run, print a per-step profile (timing/memory) table"),
@@ -609,6 +610,7 @@ impl From<DagJsonError> for LoadError {
 /// Largest CLI CPU-core budget that remains safe when converted to the fixed 100000-us cgroup
 /// period used for per-step `cpu.max`.
 const MAX_RUN_CPUS: i64 = i64::MAX / 100_000;
+const MAX_STRESS_GENERATED_NODES: i64 = 100_000;
 
 struct RunArgs {
     dag: Option<String>,
@@ -841,55 +843,62 @@ fn select_max_cpus(a: &RunArgs) -> i64 {
     }
 }
 
-// Choose the outer active-step ceiling (`-s`). `--max-mem` independently derives a safe ceiling;
+// Choose the outer active-step ceiling (`-s`). `--max-mem` independently derives a conservative
+// model-based ceiling;
 // when the caller supplied both, the tighter value wins and is announced.
+fn apply_memory_step_ceiling(base: i64, memory_steps: i64) -> i64 {
+    base.min(memory_steps)
+}
+
 fn select_max_steps(cfg: &DagConfig, a: &RunArgs, max_cpus: i64) -> i64 {
+    let base = a.max_steps.unwrap_or(max_cpus);
     let max_mem = a.max_mem.as_deref().filter(|s| !s.is_empty());
     if let Some(mm) = max_mem {
         match parse_size(mm) {
             None => {
-                let fallback = a.max_steps.unwrap_or(max_cpus);
                 eprintln!(
                     "{PROG}: could not parse --max-mem '{mm}'; falling back to --max-steps \
-                     {fallback}"
+                     {base}"
                 );
-                return fallback;
+                return base;
             }
             Some(budget) => {
                 let (memory_steps, footprint) = jobs_for_budget(cfg, budget);
+                if memory_steps == 0 {
+                    eprintln!(
+                        "{PROG}: --max-mem {mm}: REFUSED — minimum runnable footprint \
+                         {footprint} bytes cannot fit safely within budget {budget} bytes"
+                    );
+                    return 0;
+                }
+                let selected = apply_memory_step_ceiling(base, memory_steps);
                 eprintln!(
-                    "{PROG}: --max-mem {mm} -> --max-steps {memory_steps} (modeled worst-case \
-                     {footprint} bytes fits budget {budget} bytes)"
+                    "{PROG}: --max-mem {mm} -> modeled memory ceiling {memory_steps} active steps \
+                     (worst-case {footprint} bytes fits budget {budget} bytes); base active-step \
+                     ceiling {base}; final --max-steps {selected}"
                 );
                 let ncpu = cpu_count();
-                let modeled = cfg
-                    .steps
-                    .iter()
-                    .any(|s| s.hint.rss_baseline_bytes.is_some() && !s.engine_only);
+                let modeled = cfg.steps.iter().any(|s| {
+                    s.skip_reason.is_none()
+                        && (s.hint.hard_mem_max_bytes.is_some_and(|value| value > 0)
+                            || s.hint.rss_baseline_bytes.is_some_and(|value| value > 0)
+                            || cfg
+                                .default_step_mem_cap_bytes
+                                .is_some_and(|value| value > 0))
+                });
                 if memory_steps == ncpu && !modeled {
                     eprintln!(
-                        "{PROG}: note: no step carries rss_baseline_bytes, so the modeled footprint \
-collapsed to the mem_cap_floor_bytes floor ({} bytes) and --max-mem did not throttle \
-(--max-steps {memory_steps} = CPU count); \
-add per-step rss_baseline_bytes to enable memory-aware throttling",
-                        cfg.mem_cap_floor_bytes
+                        "{PROG}: note: no runnable step has a positive hard/RSS/default memory \
+cap, so the modeled footprint is only the mem_cap_floor_bytes floor ({} bytes) and --max-mem did \
+not throttle (modeled memory ceiling {memory_steps} = CPU count; final --max-steps {selected})",
+                        cfg.mem_cap_floor_bytes,
                     );
                 }
-                return match a.max_steps {
-                    Some(explicit) => {
-                        let selected = explicit.min(memory_steps);
-                        eprintln!(
-                            "{PROG}: explicit --max-steps {explicit} and memory-derived ceiling \
-                             {memory_steps}; using tighter --max-steps {selected}"
-                        );
-                        selected
-                    }
-                    None => memory_steps,
-                };
+                return selected;
             }
         }
     }
-    a.max_steps.unwrap_or(max_cpus)
+    base
 }
 
 /// Best-effort git SHA of the current working directory's repo (stamps perf-log rows only).
@@ -1512,18 +1521,75 @@ fn expand_stress(cfg: &DagConfig, n: i64) -> DagConfig {
     out
 }
 
-fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
+fn stress_expansion_guard(cfg: &DagConfig, n: i64) -> i32 {
+    // Empty graphs count one control-plane unit per copy so an enormous n cannot burn time in the
+    // expansion loop without creating nodes.
+    let nodes_per_copy = i64::try_from(cfg.steps.len()).unwrap_or(i64::MAX).max(1);
+    let generated = nodes_per_copy.saturating_mul(n);
+    if generated <= MAX_STRESS_GENERATED_NODES {
+        return 0;
+    }
+    eprintln!(
+        "{PROG}: --stress {n}: REFUSED — expansion would create {generated} generated DAG \
+         nodes/control units, exceeding safety limit {MAX_STRESS_GENERATED_NODES}; narrow \
+         --only or lower --stress"
+    );
+    2
+}
+
+fn stress_footprints(cfg: &DagConfig, n: i64, expanded: bool) -> (i64, i64) {
     let footprint = stress_copy_footprint_bytes(cfg, None);
+    let total = if expanded {
+        footprint.max(stress_control_floor_bytes(cfg, None).saturating_mul(n))
+    } else {
+        footprint.saturating_mul(n)
+    };
+    (footprint, total)
+}
+
+fn stress_memory_guard(cfg: &DagConfig, n: i64, expanded: bool) -> i32 {
+    let (footprint, total) = stress_footprints(cfg, n, expanded);
+    if footprint == i64::MAX || total == i64::MAX {
+        let subject = if expanded {
+            "final planned expanded-graph"
+        } else {
+            "per-copy"
+        };
+        eprintln!(
+            "{PROG}: --stress {n}: REFUSED — {subject} memory footprint is unbounded or \
+             overflowed; declare finite positive per-step memory caps"
+        );
+        return 2;
+    }
     let Some(budget) = box_mem_budget_bytes() else {
+        if expanded {
+            eprintln!(
+                "{PROG}: --stress {n}: REFUSED — could not read the box memory budget for the \
+                 final planned expanded graph; no step was started"
+            );
+            return 2;
+        }
         eprintln!(
             "{PROG}: --stress {n}: WARNING could not read the box memory budget \
              (cgroup memory.max / MemAvailable); proceeding UNCHECKED with {n} x \
              {}/copy = {}. Watch for OOM.",
             human_bytes(Some(footprint)),
-            human_bytes(Some(n.saturating_mul(footprint)))
+            human_bytes(Some(total))
         );
         return 0;
     };
+    if expanded {
+        if total > budget {
+            eprintln!(
+                "{PROG}: --stress {n}: REFUSED — final planned expanded graph needs {}, \
+                 exceeding the box memory budget {}; no step was started",
+                human_bytes(Some(total)),
+                human_bytes(Some(budget)),
+            );
+            return 2;
+        }
+        return 0;
+    }
     let max_safe = budget / footprint;
     if n > max_safe {
         eprintln!(
@@ -1537,7 +1603,7 @@ fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
              constraint), or lower the per-copy footprint via a tighter per-step \
              rss_baseline_bytes / hard_mem_max_bytes hint.",
             human_bytes(Some(footprint)),
-            human_bytes(Some(n.saturating_mul(footprint))),
+            human_bytes(Some(total)),
             human_bytes(Some(budget)),
         );
         return 2;
@@ -1547,10 +1613,18 @@ fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
          (max safe {max_safe}); actual concurrency will be measured from child-process \
          lifetimes.",
         human_bytes(Some(footprint)),
-        human_bytes(Some(n.saturating_mul(footprint))),
+        human_bytes(Some(total)),
         human_bytes(Some(budget)),
     );
     0
+}
+
+fn stress_guard(cfg: &DagConfig, n: i64) -> i32 {
+    stress_memory_guard(cfg, n, false)
+}
+
+fn final_stress_guard(cfg: &DagConfig, n: i64) -> i32 {
+    stress_memory_guard(cfg, n, true)
 }
 
 fn print_stress_report(
@@ -1622,7 +1696,7 @@ fn print_stress_report(
     }
     println!(
         "  maximum concurrent steps: {max_concurrent_steps} (--max-steps {max_steps}; --max-cpus \
-         {max_cpus} total cores)"
+         {max_cpus} CPU target/per-step ceiling)"
     );
 }
 
@@ -2169,28 +2243,41 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             return 2;
         }
     };
+
+    // Resolve the CPU target before stress sizing or cgroup bring-up. Stress must charge the
+    // runner-controlled widths that can actually execute under this ceiling, while self-managed
+    // commands which cannot be clamped must fail before sizing or expansion.
+    let max_cpus = select_max_cpus(a);
+    if let Err(error) = validate_max_cpus_rewrite(&with_args, max_cpus) {
+        eprintln!("{PROG}: run: {error}");
+        return 2;
+    }
+
     if a.stress < 1 {
         eprintln!("{PROG}: run: --stress N must be >= 1 (got {})", a.stress);
         return 2;
     }
     let stress_active = a.stress > 1;
-    if stress_active {
-        let code = stress_guard(&with_args, a.stress);
+    let stressed = if stress_active {
+        let code = stress_expansion_guard(&with_args, a.stress);
         if code != 0 {
             return code;
         }
-    }
-    let stressed = expand_stress(&with_args, a.stress);
+        // Clamp once before expansion so the guard sizes exactly what gets cloned. The later
+        // post-plan clamp is then idempotent rather than warning for every generated copy.
+        let stress_sized = cap_config_max_cpus(&with_args, max_cpus);
+        let code = stress_guard(&stress_sized, a.stress);
+        if code != 0 {
+            return code;
+        }
+        expand_stress(&stress_sized, a.stress)
+    } else {
+        with_args
+    };
 
-    // The total CPU-core budget is independent of graph shape, so resolve it before cgroup
-    // bring-up and bind the same value to the outer scope's CPUQuota and the scheduler gate.
-    let max_cpus = select_max_cpus(a);
-    if let Err(error) = validate_max_cpus_rewrite(&stressed, max_cpus) {
-        eprintln!("{PROG}: run: {error}");
-        return 2;
-    }
-
-    // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return).
+    // Cgroup boxing is ON by default (may re-exec into a systemd scope and not return). Bind the
+    // same resolved CPU target to the outer scope's CPUQuota and each runner-controlled step's
+    // width ceiling.
     let cgroups = match resolve_cgroups(
         a.allow_cgroup_failure,
         a.unsafe_no_cgroups,
@@ -2276,6 +2363,18 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
             mem_budget,
         )
     });
+    if plan
+        .allocation
+        .as_ref()
+        .is_some_and(|allocation| allocation.stop_reason == "infeasible-memory")
+    {
+        eprintln!(
+            "{PROG}: run: CPA allocation is infeasible under --max-mem {}; the minimum runnable \
+             footprint exceeds the memory budget",
+            a.max_mem.as_deref().unwrap_or("")
+        );
+        return 2;
+    }
     let mut applied = cap_config_max_cpus(&apply_plan_to_config(cfg, &plan), max_cpus);
     // Compatibility flag: the SMALL forcing-function caps are already active by default. Reassert
     // the same values so older callers keep working and announce that the flag is now redundant.
@@ -2323,7 +2422,20 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         print!("{}", plan_to_text(&plan));
     }
 
+    // Feedback and CPA may have raised RSS estimates or widened CPU-bound steps after the early
+    // authored-hint preflight. Re-check the FINAL already-expanded graph directly -- multiplying
+    // by stress again would double-count every generated copy. This is the last no-spawn barrier.
+    if stress_active {
+        let code = final_stress_guard(cfg, a.stress);
+        if code != 0 {
+            return code;
+        }
+    }
+
     let max_steps = select_max_steps(cfg, a, max_cpus);
+    if max_steps < 1 {
+        return 2;
+    }
     let verbosity = if a.quiet { 0 } else { a.verbosity };
 
     let (perf_dir, source) = resolve_profile_dir(a.perf_dir.as_deref(), a.no_profile);
@@ -3073,6 +3185,114 @@ mod tests {
     }
 
     #[test]
+    fn stress_sizing_uses_the_run_cpu_ceiling_before_expansion() {
+        let gib = 1024i64.pow(3);
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        cfg.steps[0].hint.rss_baseline_bytes = Some(gib);
+        cfg.steps[0].hint.classification = crate::model::StepClass::CpuBound;
+        cfg.steps[0].hint.preferred_inner_jobs = Some(128);
+        cfg.steps[0].jobs_flag = Some("-j%d".into());
+        cfg.mem_cap_factor = 1.0;
+        cfg.mem_cap_floor_bytes = 0;
+
+        assert_eq!(stress_copy_footprint_bytes(&cfg, None), 32 * gib);
+        assert!(validate_max_cpus_rewrite(&cfg, 2).is_ok());
+        let capped = cap_config_max_cpus(&cfg, 2);
+        assert_eq!(capped.steps.len(), 1);
+        assert_eq!(capped.steps[0].hint.preferred_inner_jobs, Some(2));
+        assert_eq!(stress_copy_footprint_bytes(&capped, None), gib);
+        let expanded = expand_stress(&capped, 2);
+        assert_eq!(expanded.steps.len(), 2);
+        assert!(expanded
+            .steps
+            .iter()
+            .all(|step| step.hint.preferred_inner_jobs == Some(2)));
+        let recapped = cap_config_max_cpus(&expanded, 2);
+        assert!(recapped
+            .steps
+            .iter()
+            .all(|step| step.hint.preferred_inner_jobs == Some(2)));
+    }
+
+    #[test]
+    fn final_stress_footprint_does_not_multiply_an_expanded_graph_twice() {
+        let gib = 1024i64.pow(3);
+        let mut one = tiny();
+        one.steps.truncate(1);
+        one.steps[0].hint.rss_baseline_bytes = Some(gib);
+        one.mem_cap_factor = 1.0;
+        one.mem_cap_floor_bytes = 0;
+        let expanded = expand_stress(&one, 2);
+
+        assert_eq!(stress_footprints(&one, 2, false), (gib, 2 * gib));
+        assert_eq!(stress_footprints(&expanded, 2, true), (2 * gib, 2 * gib));
+
+        let mut tiny = one.clone();
+        tiny.steps[0].hint.rss_baseline_bytes = None;
+        tiny.steps[0].hint.hard_mem_max_bytes = Some(1);
+        let tiny_expanded = expand_stress(&tiny, 2);
+        assert_eq!(stress_footprints(&tiny, 2, false), (gib, 2 * gib));
+        assert_eq!(stress_footprints(&tiny_expanded, 2, true), (gib, 2 * gib));
+    }
+
+    #[test]
+    fn stress_expansion_guard_bounds_generated_nodes_before_allocation() {
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        assert_eq!(stress_expansion_guard(&cfg, MAX_STRESS_GENERATED_NODES), 0);
+        assert_eq!(
+            stress_expansion_guard(&cfg, MAX_STRESS_GENERATED_NODES + 1),
+            2
+        );
+    }
+
+    #[test]
+    fn final_stress_guard_refuses_profile_raised_rss_before_spawn() {
+        let dir = std::env::temp_dir().join(format!(
+            "scdr_final_stress_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("spawned");
+        let (machine, container) = feedback_identity();
+        let profile = dir.join(format!("step_profiles_{machine}_{container}.csv"));
+        let csv = format!(
+            "step,inner_jobs,elapsed_s,peak_bytes,ok,returncode,timed_out,oom_kills\n\
+             build.app#1,1,1.0,{},True,0,False,0\n\
+             build.app#2,1,1.0,{},True,0,False,0\n",
+            i64::MAX,
+            i64::MAX,
+        );
+        std::fs::write(&profile, csv).unwrap();
+
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        cfg.steps[0].cmd = format!("touch {}", marker.display());
+        cfg.steps[0].hint.rss_baseline_bytes = Some(1);
+        cfg.steps[0].hint.preferred_inner_jobs = Some(1);
+        cfg.steps[0].jobs_flag = Some(String::new());
+        cfg.mem_cap_factor = 1.0;
+        cfg.mem_cap_floor_bytes = 0;
+        let args = parse_run_args(&[
+            "--stress=2".into(),
+            "--max-cpus=1".into(),
+            format!("--perf-dir={}", dir.display()),
+            "--no-profile".into(),
+            "--unsafe-no-cgroups".into(),
+            "--quiet".into(),
+        ])
+        .unwrap();
+        let palette = Palette { enabled: false };
+
+        assert_eq!(cmd_run(&cfg, &args, &palette), 2);
+        assert!(!marker.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn run_help_exposes_every_run_only_surface() {
         let palette = Palette { enabled: false };
         let help = run_help(&palette);
@@ -3088,7 +3308,8 @@ mod tests {
         }
         assert!(!help.contains("--jobs"), "legacy alias must stay hidden");
         assert!(help.contains("maximum active DAG steps"));
-        assert!(help.contains("maximum number of CPU cores total"));
+        assert!(help.contains("outer CPU-bandwidth limit"));
+        assert!(help.contains("maximum width of any one runner-controlled step"));
 
         let sweep = sweep_help(&palette);
         assert!(sweep.contains("--jobs RANGE"));
@@ -3166,6 +3387,24 @@ mod tests {
 
         args.max_mem = None;
         assert_eq!(select_max_steps(&cfg, &args, 3), 9);
+    }
+
+    #[test]
+    fn nonbinding_max_mem_cannot_loosen_default_max_steps_past_max_cpus() {
+        assert_eq!(apply_memory_step_ceiling(2, 316), 2);
+        assert_eq!(apply_memory_step_ceiling(2, 1), 1);
+    }
+
+    #[test]
+    fn max_mem_refuses_when_one_step_cannot_fit() {
+        let mut cfg = tiny();
+        cfg.steps.truncate(1);
+        cfg.steps[0].hint.rss_baseline_bytes = Some(2 * 1024i64.pow(3));
+        cfg.mem_cap_factor = 1.0;
+        cfg.mem_cap_floor_bytes = 0;
+        cfg.outer_mem_safety_factor = 1.0;
+        let args = parse_run_args(&["--max-mem=1G".into()]).unwrap();
+        assert_eq!(select_max_steps(&cfg, &args, 8), 0);
     }
 
     #[test]

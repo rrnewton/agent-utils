@@ -29,14 +29,17 @@ console command on Linux with cgroup v2 and a delegated systemd user scope when
 the package should establish and verify containment for you.
 
 `run_dag(..., jobs=N)` treats `N` as a compatibility combined active-step and
-total-CPU limit unless `core_budget` is supplied. Use
+per-step-width limit unless `core_budget` is supplied. Use
 `run_dag_limited(..., max_steps=S, max_cpus=P)` for explicit independent
 limits; the former `cpu_jobs=P` keyword remains a compatibility alias. A
 pre-0.13 outer-fan-out-only library caller should migrate to the limited API and
-choose both values deliberately.
+choose both values deliberately. These library calls do not establish an outer
+CPU quota: without caller-supplied containment, `max_cpus` caps individual
+runner-controlled widths but does not cap aggregate bandwidth or serialize
+overlapping widths.
 The low-level `allocate_widths(...)` helper raises
 `InfeasibleAllocationError` when a self-managed fixed command width exceeds
-its core budget; 0.14 makes that refusal explicit instead of returning a
+its core budget; 0.15 makes that refusal explicit instead of returning a
 fictitious executable width.
 
 ## A first DAG
@@ -157,17 +160,19 @@ safe-ci-dag-runner run --dag pipeline.yaml --show-plan --profile
 
 `-s` / `--max-steps` bounds how many DAG nodes may be active. `-j` /
 `--max-cpus` independently sets the **total CPU capacity for the whole run**, in
-core-equivalents. A running step consumes its `preferred_inner_jobs`, else the
-runner's undeclared-step CPU default (one in the CLI), from that shared total.
-Thus `-s2 -j200` allows at most two active nodes whose combined effective width
-is at most 200; either node may itself use many workers. The default CPU total is
+core-equivalents, and caps any one runner-controlled step at that width. It does
+not reserve or subtract declared widths as steps start. Thus `-s2 -j8` may run
+two `-j8` steps together: their sixteen workers contend inside the outer
+eight-core-equivalent quota. This oversubscription can help when work stalls or
+parallel phases do not align, and can hurt when both steps are CPU-bound. The default CPU total is
 the effective container/affinity capacity tightened by the shared aggregate
-slice's 90% host budget, and the default step ceiling is that CPU total.
+slice's 90% host budget. `--max-steps` defaults to that value; an undeclared
+step separately keeps `default_step_cpu_count` (one in the CLI defaults).
 
 A non-empty effective `jobs_flag` makes the inner width runner-controlled: when
 an authored or profile-derived width exceeds `--max-cpus`, the planner and
-scheduler cap the recommendation, appended command flag, per-step `cpu.max`, and
-accounted width together. An empty or whitespace-only `jobs_flag` instead
+scheduler cap the recommendation, appended command flag, and per-step `cpu.max`
+together. An empty or whitespace-only `jobs_flag` instead
 prevents command rewriting; paired with a positive `preferred_inner_jobs`, it
 declares a self-managed fixed command width. If that declared width
 exceeds the run budget, the run is refused before any DAG step process is
@@ -183,16 +188,20 @@ arbitrary guest may still create more threads than `--max-cpus`; outer
 `jobs_flag`, fix the command's own worker setting, or use `--cores` when fixed
 CPU eligibility is required.
 
-`--max-mem` derives a safe `--max-steps` ceiling from the modeled worst-case
-footprint. If an explicit step ceiling is also present, the tighter value wins.
-Named resources act as semaphores in addition to the step, total-CPU, and memory
-limits. A failed step prevents new dependent work; `--keep-going` lets
+`--max-mem` derives a conservative, model-based `--max-steps` ceiling from the worst-case
+footprint at each step's applied inner width. If an explicit step ceiling is
+also present, the tighter value wins. Hard caps, learned/authored RSS, runtime
+defaults, the outer safety factor, and selected `engine_only` steps all count;
+intentional skips do not. If even one runnable step or the configured footprint
+floor exceeds the budget, the run refuses instead of claiming one step fits.
+CPA reports the same state as `infeasible-memory`. Named resources act as semaphores in
+addition to the step and memory limits. A failed step prevents new dependent work; `--keep-going` lets
 already-running work reach a verdict.
 
 Under boxing, the run scope also receives `CPUQuota=<max-cpus>*100%`, and the
 live `cpu.max` value is read back before work starts. This makes `--max-cpus N`
 an N-core-equivalent **CPU-bandwidth** ceiling as well as the scheduler's width
-budget. It is not an instantaneous thread-count or CPU-identity bound: CFS quota
+ceiling for any one step. It is not an instantaneous thread-count or CPU-identity bound: CFS quota
 may briefly run more than N runnable tasks on more than N CPUs and throttle them
 later in the quota period. An unpinned run may also migrate from CPUs A/B to C/D
 without exceeding its long-window budget. Use `--cores K` when exact eligible
@@ -207,6 +216,11 @@ temporarily so existing 0.13 scripts do not break, but it is omitted from help
 and should not be combined with `--max-cpus`; differing simultaneous values are
 rejected. New commands should use `--max-cpus`; the public
 `sweep --jobs RANGE` spelling remains the option for inner widths being measured.
+In 0.15, legal per-step widths no longer consume additive scheduler tokens:
+`--max-steps` governs overlap and several steps may request more than
+`--max-cpus` in aggregate while the boxed outer quota arbitrates their shared
+bandwidth. Library callers that relied on 0.14's width-sum serialization should
+use `max_steps`, named resources, or their own admission policy explicitly.
 
 Per-step wall and CPU timeouts, memory limits, process-tree teardown, and OOM
 attribution are enforced inside nested cgroups when the host supplies cgroup v2
@@ -281,9 +295,11 @@ graph at generation into `N` disconnected components with no edges between
 copies. Each copy retains the original graph's internal dependency edges.
 Named-resource scheduling is removed from the generated copies, so
 `--max-steps` controls how many copied nodes may be active while `--max-cpus`
-bounds their summed effective width. The report includes the exact pass ratio
+caps each copy's requested width and their shared outer CPU bandwidth. The report includes the exact pass ratio
 and the largest number of step child processes measured alive at once. The
-modeled memory footprint must still fit the box.
+modeled memory footprint must still fit the box. Expansion is also refused when
+it would create more than 100,000 generated DAG nodes/control units, so a tiny
+guest memory hint cannot turn `--stress` into an unbounded host-side allocation.
 
 A singleton DAG can be generated on the fly; no `N`-node file is required:
 
@@ -329,8 +345,8 @@ because a descendant can replace it.
 No central daemon is required for the current fixed-slice mode: every allocator
 serializes through the shared durable ledger and claims an explicit set of CPU
 IDs. A future service could provide dynamic or fair machine-wide allocation,
-but ordinary `--max-cpus` deliberately remains a total bandwidth/admission
-budget rather than pretending to hand out exclusive moving CPU slices.
+but ordinary `--max-cpus` deliberately remains a shared bandwidth and per-step
+width limit rather than pretending to hand out exclusive moving CPU slices.
 
 The ledger path is `SAFE_CI_CORE_LEDGER` when that variable is set. Otherwise it
 is `$XDG_RUNTIME_DIR/safe-ci-dag-runner/core-reservations.json` when the runtime

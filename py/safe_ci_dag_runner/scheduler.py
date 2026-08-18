@@ -1,7 +1,8 @@
 """Dependency-aware, resource-aware concurrent DAG execution.
 
-The scheduler gates on dependencies, named resource capacities, active-step count, and aggregate
-declared CPU width; orders ready work by estimated duration; and stops launching after a failure.
+The scheduler gates on dependencies, named resource capacities, and active-step count; orders ready
+work by estimated duration; and stops launching after a failure. ``max_cpus`` caps the width of
+each individual step, while concurrent steps may deliberately overcommit that outer bandwidth.
 Per-step supervision reaps complete process trees and records structured outcomes.
 """
 
@@ -55,7 +56,7 @@ from safe_ci_dag_runner.protocols import (
     RunWindow,
     StepOutcome,
 )
-from safe_ci_dag_runner.sizing import step_mem_cap_bytes
+from safe_ci_dag_runner.sizing import _step_mem_cap_for_inner_jobs
 from safe_ci_dag_runner.teardown import (
     STEP_NONCE_ENV,
     mint_step_nonce,
@@ -350,8 +351,9 @@ class Runner:
         self.keep_going = keep_going
         # verbosity: 0 quiet(+failures), 1 default(+summaries), >=2 stream child stdout.
         self.verbosity = verbosity
-        # Maximum total CPU-core equivalents across active steps. Every planner uses the same
-        # admission gate: the summed effective width may never exceed this value.
+        # Requested-width telemetry retained for source compatibility. This is deliberately NOT an
+        # admission budget: concurrent steps may overcommit the outer max_cpus bandwidth, so the
+        # sum can exceed self.max_cpus while --max-steps still bounds active DAG nodes.
         self.cores_used = 0
         self.steps: dict[str, Step] = self.cfg.by_tag()
         self.intentional_skips = tuple(
@@ -418,7 +420,7 @@ class Runner:
         )
 
     def _step_width(self, step: Step) -> int:
-        """The declared CPU width charged to the aggregate admission gate.
+        """The declared CPU width included in :attr:`cores_used` telemetry.
 
         An explicit ``preferred_inner_jobs`` wins; otherwise the DAG's per-step ``cpu.max``
         default is the effective width. Only a fully unbounded/invalid default falls back to one.
@@ -427,14 +429,6 @@ class Runner:
         """
         width = effective_cpu_count(step, self.cfg.default_step_cpu_count)
         return width if (width is not None and width > 0) else 1
-
-    def _cores_free(self, step: Step) -> bool:
-        """Whether the step fits the remaining total-CPU budget.
-
-        Construction caps every authored width to ``max_cpus``, so an oversized step cannot
-        deadlock and does not need the former "run alone while over budget" escape hatch.
-        """
-        return self.cores_used + self._step_width(step) <= self.max_cpus
 
     def _acquire(self, step: Step) -> None:
         for r, n in step.hint.resources.items():
@@ -538,8 +532,7 @@ class Runner:
         """Drive the DAG to completion; returns ``True`` when no genuine failure occurred.
 
         Greedy ready-set loop: each pass launches every currently-ready step (deps satisfied,
-        resources free, under the active-step and total-CPU limits, in LPT order) on its own daemon
-        supervisor
+        resources free, and under the active-step limit, in LPT order) on its own daemon supervisor
         thread, then sleeps. Terminates when nothing is running AND either every step has a
         terminal outcome (done or dep-skipped) OR fail-fast has tripped — the fail-fast clause
         is REQUIRED: once ``stop`` is set, steps whose deps SUCCEEDED are neither launched nor
@@ -634,8 +627,6 @@ class Runner:
                             break
                         if not self._res_free(step):
                             continue
-                        if not self._cores_free(step):
-                            continue
                         launchable.append(step)
                         self.running.add(tag)
                         self._acquire(step)
@@ -661,15 +652,17 @@ class Runner:
         # Runner authority wins over a DAG-supplied environment value.
         env[STEP_NONCE_ENV] = nonce
         inner_jobs = preferred_inner_jobs(step)
+        cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
         # SMALL default caps for an undeclared step (the forcing function): fall back to the
         # DAG's tight 1-GiB memory.max / 1-core cpu.max / 10-s CPU-time floor when the step
-        # declares nothing for that dimension. An explicit hint always wins.
-        mem_max = step_mem_cap_bytes(
+        # declares nothing for that dimension. CPU-bound caps use the same effective preferred /
+        # default width and scaling rule as --max-mem planning; an explicit hard cap still wins.
+        mem_max = _step_mem_cap_for_inner_jobs(
             step,
+            cpu_count,
             mem_cap_factor=self.cfg.mem_cap_factor,
             default_cap_bytes=self.cfg.default_step_mem_cap_bytes,
         )
-        cpu_count = effective_cpu_count(step, self.cfg.default_step_cpu_count)
         cpu_canonical = canonical_cpu_timeout(step, self.cfg.default_step_cpu_timeout)
         # The ENFORCED budget is the canonical one scaled for this platform; both are kept
         # so a breach can name the graph's number and the policy that changed it.
@@ -722,7 +715,7 @@ class Runner:
             # A thread that dies here without publishing a terminal outcome leaves the tag in
             # ``running`` forever, so the scheduler busy-waits and the thread traceback is the
             # only explanation. Convert process-creation failure into an ordinary failed step and
-            # restore every admission-accounting field acquired before this supervisor started.
+            # restore every scheduler-accounting field acquired before this supervisor started.
             elapsed = time.time() - start
             summary = f"spawn failed: {exc}"
             outcome = StepOutcome.failed(
@@ -1147,8 +1140,10 @@ def run_dag(
     """Run a whole DAG and return its :class:`RunResult`.
 
     ``jobs`` remains the compatibility combined limit: absent the compatibility ``core_budget``
-    override, it bounds both active DAG steps and their aggregate declared CPU width. New callers
-    that need independent limits should use :func:`run_dag_limited`.
+    override, it bounds active DAG steps and each individual step's runner-controlled width. New
+    callers that need independent values should use :func:`run_dag_limited`. Concurrent steps may
+    have widths whose sum exceeds that per-step limit; an independently established outer cgroup is
+    what enforces whole-run CPU bandwidth.
     """
     return run_dag_limited(
         cfg,
@@ -1177,7 +1172,7 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
 ) -> RunResult:
-    """Type signature accepting the canonical total-CPU keyword."""
+    """Type signature accepting the canonical per-step-width keyword."""
 
     ...
 
@@ -1215,7 +1210,7 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
 ) -> RunResult:
-    """Type signature accepting the compatibility total-CPU keyword."""
+    """Type signature accepting the compatibility per-step-width keyword."""
 
     ...
 
@@ -1233,7 +1228,7 @@ def run_dag_limited(
     order: Sequence[str] | None = None,
     run_timeout_s: int | None = None,
 ) -> RunResult:
-    """Run a DAG with independent active-step and total-CPU limits.
+    """Run a DAG with independent active-step and per-step CPU-width limits.
 
     It brackets the run in a :class:`RunWindow` (whole-run metrics), drives the
     :class:`Runner`, flushes the outer-scope cgroup backstop, records the accumulated per-step
@@ -1241,7 +1236,9 @@ def run_dag_limited(
 
     :param cfg: the DAG plus caller policy (steps, resource caps, memory tunables).
     :param max_steps: maximum number of concurrently active DAG steps; clamped to at least 1.
-    :param max_cpus: maximum total core-equivalents across active steps; clamped to at least 1.
+    :param max_cpus: maximum runner-controlled width of any individual step; clamped to at least
+        1. Concurrent widths may sum above this value. This library function does not establish an
+        outer CPU-bandwidth cgroup; the CLI does, and callers may supply equivalent containment.
     :param cpu_jobs: compatibility alias for ``max_cpus``; if both are passed they must agree.
     :param cgroups: per-step containment manager, or ``None`` for the no-containment path
         (a :class:`_NoopCgroupManager` is substituted; teardown falls back to process-group

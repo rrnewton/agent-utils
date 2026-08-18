@@ -1,8 +1,9 @@
-"""Focused tests for independent active-step and total-CPU run limits."""
+"""Focused tests for independent active-step and per-step CPU-width run limits."""
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 import shlex
 from pathlib import Path
@@ -31,14 +32,17 @@ from safe_ci_dag_runner import cgroup, perflog, profile_enrich
 from safe_ci_dag_runner.cgroup import NoopCgroups
 from safe_ci_dag_runner.cli import (
     MAX_RUN_CPUS,
+    MAX_STRESS_GENERATED_NODES,
     _planning_budgets,
     _select_max_cpus,
     _select_max_steps,
+    _stress_expansion_guard,
+    _stress_footprints,
     build_parser,
     main,
 )
 from safe_ci_dag_runner.estimates import Planner
-from safe_ci_dag_runner.model import IntentionalSkipReason
+from safe_ci_dag_runner.model import IntentionalSkipReason, StepClass
 from safe_ci_dag_runner.sizing import stress_copy_footprint_bytes
 
 
@@ -75,6 +79,183 @@ def test_run_parser_separates_bare_max_steps_and_max_cpus() -> None:
     assert parsed.max_cpus == 8
 
 
+def test_stress_guard_sizes_the_cpu_capped_pre_expansion_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gib = 1024**3
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "wide",
+                "",
+                "true",
+                hint=ResourceHint(
+                    rss_baseline_bytes=gib,
+                    classification=StepClass.CPU_BOUND,
+                    preferred_inner_jobs=128,
+                ),
+                jobs_flag="-j%d",
+            ),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    assert stress_copy_footprint_bytes(cfg) == 32 * gib
+    dag = tmp_path / "dag.json"
+    dag.write_text(dag_to_json(cfg), encoding="utf-8")
+    observed: list[DagConfig] = []
+
+    def fake_stress_guard(sized: DagConfig, copies: int) -> int:
+        observed.append(sized)
+        assert copies == 2
+        assert len(sized.steps) == 1
+        assert sized.steps[0].hint.preferred_inner_jobs == 2
+        assert stress_copy_footprint_bytes(sized) == gib
+        return 0
+
+    def fake_final_guard(sized: DagConfig, copies: int) -> int:
+        assert copies == 2
+        assert len(sized.steps) == 2
+        assert all(step.hint.preferred_inner_jobs == 2 for step in sized.steps)
+        return 0
+
+    def fake_run(sized: DagConfig, **_kwargs: object) -> RunResult:
+        assert len(sized.steps) == 2
+        assert all(step.hint.preferred_inner_jobs == 2 for step in sized.steps)
+        return RunResult(ok=True, wall_s=0.0)
+
+    monkeypatch.setattr("safe_ci_dag_runner.cli._stress_guard", fake_stress_guard)
+    monkeypatch.setattr("safe_ci_dag_runner.cli._final_stress_guard", fake_final_guard)
+    monkeypatch.setattr("safe_ci_dag_runner.cli.run_dag_limited", fake_run)
+    assert (
+        main(
+            [
+                "run",
+                "--dag",
+                str(dag),
+                "--stress",
+                "2",
+                "--max-cpus",
+                "2",
+                "--unsafe-no-cgroups",
+                "--no-profile",
+                "--no-profile-feedback",
+                "--quiet",
+            ]
+        )
+        == 0
+    )
+    assert len(observed) == 1
+    assert capsys.readouterr().err.count("preferred_inner_jobs=128 exceeds --max-cpus 2") == 1
+
+
+def test_final_stress_footprint_does_not_multiply_an_expanded_graph_twice() -> None:
+    gib = 1024**3
+    one = DagConfig(
+        steps=(Step("g", "one", "", "true", hint=ResourceHint(rss_baseline_bytes=gib)),),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+    )
+    expanded = dataclasses.replace(
+        one,
+        steps=(
+            one.steps[0],
+            dataclasses.replace(one.steps[0], job="two"),
+        ),
+    )
+    assert _stress_footprints(one, 2, expanded=False) == (gib, 2 * gib)
+    assert _stress_footprints(expanded, 2, expanded=True) == (2 * gib, 2 * gib)
+
+    # Even when characterized steps claim one byte, each generated copy retains the configured
+    # 1-GiB control-plane floor in the final already-expanded check.
+    tiny = dataclasses.replace(
+        one,
+        steps=(dataclasses.replace(one.steps[0], hint=ResourceHint(hard_mem_max_bytes=1)),),
+    )
+    tiny_expanded = dataclasses.replace(
+        tiny,
+        steps=(tiny.steps[0], dataclasses.replace(tiny.steps[0], job="two")),
+    )
+    assert _stress_footprints(tiny, 2, expanded=False) == (gib, 2 * gib)
+    assert _stress_footprints(tiny_expanded, 2, expanded=True) == (gib, 2 * gib)
+
+
+def test_stress_expansion_guard_bounds_generated_nodes_before_allocation(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = DagConfig(
+        steps=(Step("g", "tiny", "", "true", hint=ResourceHint(hard_mem_max_bytes=1)),)
+    )
+    assert _stress_expansion_guard(cfg, MAX_STRESS_GENERATED_NODES) == 0
+    assert _stress_expansion_guard(cfg, MAX_STRESS_GENERATED_NODES + 1) == 2
+    assert (
+        f"expansion would create {MAX_STRESS_GENERATED_NODES + 1} generated DAG nodes/control "
+        f"units, exceeding safety limit {MAX_STRESS_GENERATED_NODES}"
+        in capsys.readouterr().err
+    )
+
+
+def test_final_stress_guard_refuses_profile_raised_rss_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_MACHINE_ID", "stress_final")
+    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_CONTAINER_CLASS", "test")
+    perf_dir = tmp_path / "perf"
+    perf_dir.mkdir()
+    profile = perf_dir / "step_profiles_stress_final_test.csv"
+    profile.write_text(
+        "step,inner_jobs,elapsed_s,peak_bytes,ok,returncode,timed_out,oom_kills\n"
+        f"g.learned#1,1,1.0,{2**63 - 1},True,0,False,0\n"
+        f"g.learned#2,1,1.0,{2**63 - 1},True,0,False,0\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "spawned"
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        dag_to_json(
+            DagConfig(
+                steps=(
+                    Step(
+                        "g",
+                        "learned",
+                        "",
+                        f"touch {shlex.quote(str(marker))}",
+                        hint=ResourceHint(rss_baseline_bytes=1, preferred_inner_jobs=1),
+                        jobs_flag="",
+                    ),
+                ),
+                mem_cap_factor=1.0,
+                mem_cap_floor_bytes=0,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    rc = main(
+        [
+            "run",
+            "--dag",
+            str(dag),
+            "--stress",
+            "2",
+            "--max-cpus",
+            "1",
+            "--perf-dir",
+            str(perf_dir),
+            "--no-profile",
+            "--unsafe-no-cgroups",
+            "--quiet",
+        ]
+    )
+
+    assert rc == 2
+    assert not marker.exists()
+    assert "final planned expanded-graph memory footprint is unbounded" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "args",
     [
@@ -95,9 +276,11 @@ def test_run_help_names_both_independent_limits(capsys: pytest.CaptureFixture[st
         build_parser().parse_args(["run", "--help"])
     assert exc.value.code == 0
     help_text = capsys.readouterr().out
+    normalized = " ".join(help_text.split())
     assert "maximum active DAG steps" in help_text
-    assert "maximum total CPU cores" in help_text
-    assert "shared 90% slice" in " ".join(help_text.split())
+    assert "outer CPU-bandwidth limit" in help_text
+    assert "maximum width of any one runner-controlled step" in normalized
+    assert "shared 90% slice" in normalized
     assert "--max-cpus" in help_text
     assert "--jobs" not in help_text
 
@@ -180,7 +363,87 @@ def test_max_mem_and_explicit_max_steps_use_tighter_ceiling(
     assert _select_max_steps(cfg, _run_args(max_steps=9, max_mem="1G"), 7) == 5
 
 
-def test_max_steps_and_max_cpus_constrain_independently() -> None:
+def test_nonbinding_max_mem_cannot_loosen_default_max_steps_past_max_cpus(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _sleep_cfg(count=1)
+    monkeypatch.setattr("safe_ci_dag_runner.cli.jobs_for_budget", lambda _cfg, _budget: (316, 123))
+
+    assert _select_max_steps(cfg, _run_args(max_mem="1G"), 2) == 2
+    evidence = capsys.readouterr().err
+    assert "modeled memory ceiling 316 active steps" in evidence
+    assert "base active-step ceiling 2" in evidence
+    assert "final --max-steps 2" in evidence
+
+
+def test_max_mem_refuses_when_one_step_cannot_fit(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "large",
+                "",
+                "true",
+                hint=ResourceHint(rss_baseline_bytes=2 * 1024**3),
+            ),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+    )
+    assert _select_max_steps(cfg, _run_args(max_mem="1G"), 7) == 0
+    assert "REFUSED" in capsys.readouterr().err
+
+
+def test_cpa_infeasible_memory_never_spawns(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    marker = tmp_path / "spawned"
+    dag = tmp_path / "dag.json"
+    dag.write_text(
+        dag_to_json(
+            DagConfig(
+                steps=(
+                    Step(
+                        "g",
+                        "large",
+                        "",
+                        f"touch {shlex.quote(str(marker))}",
+                        hint=ResourceHint(rss_baseline_bytes=6 * 1024**3),
+                    ),
+                ),
+                mem_cap_factor=1.0,
+                mem_cap_floor_bytes=0,
+                outer_mem_safety_factor=1.0,
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    rc = main(
+        [
+            "run",
+            "--dag",
+            str(dag),
+            "--planner",
+            "cpa",
+            "--max-mem",
+            "4G",
+            "--unsafe-no-cgroups",
+            "--no-profile",
+            "--no-profile-feedback",
+            "-q",
+        ]
+    )
+
+    assert rc == 2
+    assert not marker.exists()
+    assert "infeasible under --max-mem" in capsys.readouterr().err
+
+
+def test_max_steps_governs_overlap_while_max_cpus_caps_each_step() -> None:
     step_limited = run_dag_limited(
         _sleep_cfg(), max_steps=2, max_cpus=4, verbosity=0
     )
@@ -191,16 +454,16 @@ def test_max_steps_and_max_cpus_constrain_independently() -> None:
         _sleep_cfg(), max_steps=4, max_cpus=2, verbosity=0
     )
     assert cpu_limited.ok
-    assert cpu_limited.max_concurrent_steps == 2
+    assert cpu_limited.max_concurrent_steps == 4
 
-    width_limited = run_dag_limited(
+    overcommitted_widths = run_dag_limited(
         _sleep_cfg(width=2), max_steps=4, max_cpus=4, verbosity=0
     )
-    assert width_limited.ok
-    assert width_limited.max_concurrent_steps == 2
+    assert overcommitted_widths.ok
+    assert overcommitted_widths.max_concurrent_steps == 4
 
 
-def test_default_step_cpu_count_is_charged_as_effective_width() -> None:
+def test_default_step_cpu_count_does_not_reduce_step_overlap() -> None:
     cfg = DagConfig(
         steps=(
             Step(
@@ -222,7 +485,7 @@ def test_default_step_cpu_count_is_charged_as_effective_width() -> None:
     )
     result = run_dag_limited(cfg, max_steps=2, max_cpus=4, verbosity=0)
     assert result.ok
-    assert result.max_concurrent_steps == 1
+    assert result.max_concurrent_steps == 2
 
 
 def test_default_step_profiles_the_effective_cpu_width() -> None:
@@ -246,6 +509,7 @@ def test_default_step_profiles_the_effective_cpu_width() -> None:
 class _RecordingCgroups(NoopCgroups):
     def __init__(self) -> None:
         self.cpu_counts: list[int | None] = []
+        self.mem_caps: list[int | None] = []
 
     def prepare_command(
         self,
@@ -255,6 +519,7 @@ class _RecordingCgroups(NoopCgroups):
         cpu_count: int | None = None,
     ) -> str:
         self.cpu_counts.append(cpu_count)
+        self.mem_caps.append(mem_max)
         return cmd
 
 
@@ -299,6 +564,76 @@ def test_oversized_width_jobs_flag_and_default_cpu_cap_are_clamped(
     warnings = capsys.readouterr().err
     assert "preferred_inner_jobs=8" in warnings
     assert "default_step_cpu_count=8" in warnings
+
+
+def test_runtime_memory_caps_scale_with_preferred_and_default_widths() -> None:
+    gib = 1024**3
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "preferred",
+                "",
+                "true",
+                hint=ResourceHint(
+                    rss_baseline_bytes=gib,
+                    classification=StepClass.CPU_BOUND,
+                    preferred_inner_jobs=8,
+                ),
+            ),
+            Step(
+                "g",
+                "defaulted",
+                "",
+                "true",
+                hint=ResourceHint(
+                    rss_baseline_bytes=gib,
+                    classification=StepClass.CPU_BOUND,
+                ),
+            ),
+        ),
+        mem_cap_factor=1.0,
+        default_step_cpu_count=8,
+    )
+    manager = _BoxedRecordingCgroups()
+
+    result = run_dag_limited(
+        cfg, max_steps=2, max_cpus=8, cgroups=manager, verbosity=0
+    )
+
+    assert result.ok
+    assert manager.cpu_counts == [8, 8]
+    assert manager.mem_caps == [2 * gib, 2 * gib]
+
+
+def test_runtime_nonpositive_memory_hints_use_positive_default() -> None:
+    gib = 1024**3
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "invalid",
+                "",
+                "true",
+                hint=ResourceHint(
+                    rss_baseline_bytes=0,
+                    hard_mem_max_bytes=0,
+                    classification=StepClass.CPU_BOUND,
+                    preferred_inner_jobs=8,
+                ),
+            ),
+        ),
+        mem_cap_factor=1.0,
+        default_step_mem_cap_bytes=gib,
+    )
+    manager = _BoxedRecordingCgroups()
+
+    result = run_dag_limited(
+        cfg, max_steps=1, max_cpus=8, cgroups=manager, verbosity=0
+    )
+
+    assert result.ok
+    assert manager.mem_caps == [2 * gib]
 
 
 def test_overbudget_self_managed_width_refuses_before_spawn(
@@ -659,7 +994,7 @@ def test_cpa_excludes_intentional_skips_from_cpu_memory_and_curve_allocation() -
     )
     widths = allocate_widths(cfg, {"g.live": speedup}, {"g.skipped": 0.0, "g.live": 10.0}, 2)
     assert widths == {"g.skipped": 1, "g.live": 2}
-    assert schedulable_peak_mem_bytes(cfg, 2, widths=widths)[0] == 0
+    assert schedulable_peak_mem_bytes(cfg, 2, widths=widths)[0] == 1024**3
     assert stress_copy_footprint_bytes(cfg, default_step_bytes=123) == 123
     plan = build_plan(
         cfg, {}, planner=Planner.CPA, speedups={"g.live": speedup}, core_budget=2

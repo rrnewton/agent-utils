@@ -28,7 +28,7 @@ application:
 
 ```toml
 [dependencies]
-safe-ci-dag-runner = "0.14"
+safe-ci-dag-runner = "0.15"
 ```
 
 ## Rust API
@@ -46,13 +46,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`run_dag(..., combined_limit)` keeps a compatibility combined limit: that
-number bounds both active steps and the maximum CPU cores total. Call
+`run_dag(..., combined_limit)` keeps a compatibility combined setting: that
+number bounds active steps and caps each runner-controlled step's width. Call
 `run_dag_limited(..., max_steps, max_cpus, ...)` (or the corresponding boxed
 limited helper) when those limits differ. `cap_config_max_cpus` exposes the same
-total-core capping policy for runner-controlled commands. It deliberately
+per-step capping policy for runner-controlled commands. It deliberately
 leaves a self-managed fixed width unchanged; the run helpers then reject it if
-it exceeds `max_cpus`.
+it exceeds `max_cpus`. Library helpers do not establish an outer scope, so
+`max_cpus` is a whole-run bandwidth cap only when the caller supplies equivalent
+outer containment; it does not serialize steps whose declared widths sum above
+that value.
 
 For Rust harnesses, cargo-nextest supplies libtest's `--exact TEST` arguments,
 so the process snapshot can bind each child to its test. Ordinary `cargo test`
@@ -97,10 +100,12 @@ safe-ci-dag-runner capabilities
 ```
 
 For example, `run -s2 -j200` permits at most two active DAG nodes while setting
-the whole run's total CPU budget to 200 core-equivalents. The scheduler limits
-the active steps' combined effective width, and cgroup boxing adds a verified
-`cpu.max` bandwidth cap. That quota is not an instantaneous thread-count or
-CPU-identity bound; use `--cores K` for an exclusive fixed cpuset. The long
+the whole run's total CPU-bandwidth budget and each runner-controlled step's
+maximum inner width to 200 core-equivalents. The two active steps may request
+more than 200 workers in aggregate: the verified outer `cpu.max` makes them
+share 200 core-equivalents instead of treating declared widths as reservations.
+That quota is not an instantaneous thread-count or CPU-identity bound; use
+`--cores K` for an exclusive fixed cpuset. The long
 spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
@@ -108,6 +113,12 @@ public run vocabulary; differing simultaneous values conflict and are rejected.
 experiment. A non-empty `jobs_flag` lets the runner rewrite an inner width down
 to `--max-cpus`; an empty or whitespace-only flag prevents rewriting. When paired with a positive
 declared width, that width is self-managed and the run refuses it if it exceeds the total budget.
+
+The current planners do not jointly optimize inner width, co-running load, and
+memory. Greedy-LPT and critical-path choose only dispatch order. CPA chooses
+per-step widths from isolated speedup curves, but its no-overcommit makespan is
+a planning reference; runtime overlap is still governed by `--max-steps` and
+may oversubscribe the outer CPU budget.
 
 ## Attributable test-runner timeouts
 

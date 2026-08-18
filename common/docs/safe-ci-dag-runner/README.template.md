@@ -54,10 +54,12 @@ safe-ci-dag-runner capabilities
 ```
 
 For example, `run -s2 -j200` permits at most two active DAG nodes while setting
-the whole run's total CPU budget to 200 core-equivalents. The scheduler limits
-the active steps' combined effective width, and cgroup boxing adds a verified
-`cpu.max` bandwidth cap. That quota is not an instantaneous thread-count or
-CPU-identity bound; use `--cores K` for an exclusive fixed cpuset. The long
+the whole run's total CPU-bandwidth budget and each runner-controlled step's
+maximum inner width to 200 core-equivalents. The two active steps may request
+more than 200 workers in aggregate: the verified outer `cpu.max` makes them
+share 200 core-equivalents instead of treating declared widths as reservations.
+That quota is not an instantaneous thread-count or CPU-identity bound; use
+`--cores K` for an exclusive fixed cpuset. The long
 spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
@@ -65,6 +67,12 @@ public run vocabulary; differing simultaneous values conflict and are rejected.
 experiment. A non-empty `jobs_flag` lets the runner rewrite an inner width down
 to `--max-cpus`; an empty or whitespace-only flag prevents rewriting. When paired with a positive
 declared width, that width is self-managed and the run refuses it if it exceeds the total budget.
+
+The current planners do not jointly optimize inner width, co-running load, and
+memory. Greedy-LPT and critical-path choose only dispatch order. CPA chooses
+per-step widths from isolated speedup curves, but its no-overcommit makespan is
+a planning reference; runtime overlap is still governed by `--max-steps` and
+may oversubscribe the outer CPU budget.
 
 ## Attributable test-runner timeouts
 

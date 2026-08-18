@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
+from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step, StepClass
 from safe_ci_dag_runner.sizing import (
     PER_BUILD_JOB_MEM_BYTES,
     derive_build_jobs,
@@ -13,6 +13,8 @@ from safe_ci_dag_runner.sizing import (
     parse_size,
     schedulable_peak_mem_bytes,
     step_mem_cap_bytes,
+    step_mem_cap_for_inner_jobs,
+    stress_copy_footprint_bytes,
     transitive_deps,
 )
 
@@ -92,16 +94,193 @@ def test_jobs_for_budget_monotonic_and_at_least_one() -> None:
     assert jobs_footprint_bytes(cfg, 1) == 4 * GIB
     # budget below the -j2 peak (7G) but >= -j1 (4G) yields exactly 1.
     assert jobs_for_budget(cfg, 6 * GIB) == (1, 4 * GIB)
-    # a budget below even -j1 still returns 1 (a WAIT/abort decision for the caller).
-    assert jobs_for_budget(cfg, 1 * GIB)[0] == 1
+    # A budget below even -j1 is infeasible and must refuse rather than running one step anyway.
+    assert jobs_for_budget(cfg, 1 * GIB) == (0, 4 * GIB)
+
+
+def test_jobs_for_budget_scales_each_cpu_bound_steps_effective_width() -> None:
+    preferred = Step(
+        "g",
+        "preferred",
+        "",
+        "true",
+        hint=ResourceHint(
+            rss_baseline_bytes=GIB,
+            classification=StepClass.CPU_BOUND,
+            preferred_inner_jobs=8,
+        ),
+    )
+    defaulted = Step(
+        "g",
+        "defaulted",
+        "",
+        "true",
+        hint=ResourceHint(
+            rss_baseline_bytes=GIB,
+            classification=StepClass.CPU_BOUND,
+        ),
+    )
+    cfg = DagConfig(
+        steps=(preferred, defaulted),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+        default_step_cpu_count=8,
+    )
+
+    # The width model is linear above j4, so each j8 step costs 2 GiB and the pair costs 4 GiB.
+    assert schedulable_peak_mem_bytes(cfg, jobs=2)[0] == 4 * GIB
+    assert jobs_footprint_bytes(cfg, 1) == 2 * GIB
+    assert jobs_for_budget(cfg, 3 * GIB) == (1, 2 * GIB)
+
+
+def test_memory_classes_and_hard_cap_width_rules() -> None:
+    cpu = Step(
+        "g",
+        "cpu",
+        "",
+        "true",
+        hint=ResourceHint(rss_baseline_bytes=GIB, classification=StepClass.CPU_BOUND),
+    )
+    light = Step("g", "light", "", "true", hint=ResourceHint(rss_baseline_bytes=GIB))
+    hard = Step(
+        "g",
+        "hard",
+        "",
+        "true",
+        hint=ResourceHint(
+            rss_baseline_bytes=GIB,
+            hard_mem_max_bytes=3 * GIB,
+            classification=StepClass.CPU_BOUND,
+        ),
+    )
+    assert step_mem_cap_for_inner_jobs(cpu, 4, mem_cap_factor=1.0) == GIB
+    assert step_mem_cap_for_inner_jobs(cpu, 8, mem_cap_factor=1.0) == 2 * GIB
+    assert step_mem_cap_for_inner_jobs(light, 8, mem_cap_factor=1.0) == GIB
+    assert step_mem_cap_for_inner_jobs(hard, 8, mem_cap_factor=1.0) == 3 * GIB
+
+
+def test_sizing_counts_hard_default_and_selected_engine_steps() -> None:
+    hard = Step(
+        "g", "hard", "", "true", hint=ResourceHint(hard_mem_max_bytes=6 * GIB)
+    )
+    defaulted = Step(
+        "g",
+        "defaulted",
+        "",
+        "true",
+        hint=ResourceHint(classification=StepClass.CPU_BOUND),
+        engine_only=True,
+    )
+    cfg = DagConfig(
+        steps=(hard, defaulted),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+        default_step_mem_cap_bytes=GIB,
+        default_step_cpu_count=8,
+    )
+    assert schedulable_peak_mem_bytes(cfg, jobs=2)[0] == 8 * GIB
+    assert jobs_for_budget(cfg, 5 * GIB) == (0, 6 * GIB)
+
+
+def test_sizing_saturates_i64_instead_of_overflowing() -> None:
+    maximum = 2**63 - 1
+    cfg = DagConfig(
+        steps=(
+            Step("g", "a", "", "true", hint=ResourceHint(rss_baseline_bytes=maximum)),
+            Step("g", "b", "", "true", hint=ResourceHint(rss_baseline_bytes=maximum)),
+        ),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+    )
+    assert schedulable_peak_mem_bytes(cfg, jobs=2)[0] == maximum
+    assert jobs_for_budget(cfg, maximum) == (0, maximum)
+    discounted = DagConfig(
+        steps=cfg.steps,
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=0.5,
+    )
+    assert jobs_footprint_bytes(discounted, 2) == maximum
+
+    unknown = DagConfig(
+        steps=(Step("g", "unknown", "", "true"),),
+        default_step_mem_cap_bytes=None,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=0.5,
+    )
+    assert jobs_footprint_bytes(unknown, 1) == maximum
+
+
+def test_stress_footprint_uses_width_aware_runtime_caps() -> None:
+    cfg = DagConfig(
+        steps=(
+            Step(
+                "g",
+                "wide",
+                "",
+                "true",
+                hint=ResourceHint(
+                    rss_baseline_bytes=GIB,
+                    classification=StepClass.CPU_BOUND,
+                    preferred_inner_jobs=8,
+                ),
+            ),
+        ),
+        mem_cap_factor=1.0,
+    )
+    assert stress_copy_footprint_bytes(cfg) == 2 * GIB
+
+
+def test_invalid_nonpositive_memory_hints_fall_back_safely() -> None:
+    invalid = Step(
+        "g",
+        "invalid",
+        "",
+        "true",
+        hint=ResourceHint(rss_baseline_bytes=0, hard_mem_max_bytes=0),
+    )
+    assert step_mem_cap_bytes(invalid, mem_cap_factor=1.0, default_cap_bytes=GIB) == GIB
+    baseline = Step(
+        "g", "factor", "", "true", hint=ResourceHint(rss_baseline_bytes=8 * GIB)
+    )
+    assert step_mem_cap_bytes(baseline, mem_cap_factor=0.0, default_cap_bytes=GIB) == GIB
+    assert step_mem_cap_bytes(baseline, mem_cap_factor=1e-300, default_cap_bytes=GIB) == 1
+    cfg = DagConfig(
+        steps=(baseline,),
+        mem_cap_factor=1.0,
+        mem_cap_floor_bytes=-1,
+        outer_mem_safety_factor=0.0,
+    )
+    assert jobs_for_budget(cfg, 16 * GIB) == (0, 2**63 - 1)
+
+
+def test_wide_dag_uses_bounded_conservative_memory_fallback() -> None:
+    cfg = DagConfig(
+        steps=tuple(
+            Step(
+                "wide",
+                f"s{index:02d}",
+                "",
+                "true",
+                hint=ResourceHint(hard_mem_max_bytes=GIB),
+            )
+            for index in range(51)
+        ),
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+    )
+    total, chosen = schedulable_peak_mem_bytes(cfg, jobs=51)
+    assert total == 51 * GIB
+    assert chosen == tuple(f"wide.s{index:02d}" for index in range(51))
 
 
 def test_stress_copy_footprint_sums_declared_and_default_charges() -> None:
     # Per-copy footprint sums each step's cap: a declared hard cap verbatim, an rss_baseline
     # scaled by mem_cap_factor, and an UNDECLARED step charged the SMALL default (1 GiB).
     from safe_ci_dag_runner.model import DEFAULT_SMALL_MEM_CAP_BYTES, DagConfig, ResourceHint, Step
-    from safe_ci_dag_runner.sizing import stress_copy_footprint_bytes
-
     cfg = DagConfig(
         steps=(
             Step("g", "hard", "d", "true", hint=ResourceHint(hard_mem_max_bytes=2 * 1024**3)),
@@ -117,13 +296,87 @@ def test_stress_copy_footprint_sums_declared_and_default_charges() -> None:
 
 def test_stress_copy_footprint_single_node_is_that_node_cap() -> None:
     from safe_ci_dag_runner.model import DagConfig, ResourceHint, Step
-    from safe_ci_dag_runner.sizing import stress_copy_footprint_bytes
-
     cfg = DagConfig(
         steps=(Step("dbi", "file_metadata", "d", "true",
                     hint=ResourceHint(hard_mem_max_bytes=3 * 1024**3)),)
     )
     assert stress_copy_footprint_bytes(cfg) == 3 * 1024**3
+
+
+def test_stress_copy_footprint_keeps_configured_control_plane_floor() -> None:
+    cfg = DagConfig(
+        steps=(Step("g", "tiny", "", "true", hint=ResourceHint(hard_mem_max_bytes=1)),),
+        default_step_mem_cap_bytes=GIB,
+        mem_cap_floor_bytes=0,
+    )
+    assert stress_copy_footprint_bytes(cfg) == GIB
+
+
+def test_stress_without_default_only_marks_uncharacterized_steps_unbounded() -> None:
+    characterized = DagConfig(
+        steps=(
+            Step("g", "hard", "", "true", hint=ResourceHint(hard_mem_max_bytes=2 * GIB)),
+            Step("g", "rss", "", "true", hint=ResourceHint(rss_baseline_bytes=3 * GIB)),
+        ),
+        mem_cap_factor=1.0,
+        default_step_mem_cap_bytes=None,
+        mem_cap_floor_bytes=0,
+    )
+    assert stress_copy_footprint_bytes(characterized) == 5 * GIB
+
+    uncharacterized = DagConfig(
+        steps=(Step("g", "bare", "", "true"),),
+        default_step_mem_cap_bytes=None,
+    )
+    assert stress_copy_footprint_bytes(uncharacterized) == 2**63 - 1
+
+
+def test_empty_stress_footprint_uses_default_then_floor() -> None:
+    with_default = DagConfig(steps=(), default_step_mem_cap_bytes=GIB, mem_cap_floor_bytes=2 * GIB)
+    assert stress_copy_footprint_bytes(with_default) == GIB
+    floor_only = DagConfig(steps=(), default_step_mem_cap_bytes=None, mem_cap_floor_bytes=2 * GIB)
+    assert stress_copy_footprint_bytes(floor_only) == 2 * GIB
+
+
+def test_transitive_deps_handles_1100_node_reverse_chain_iteratively() -> None:
+    steps = tuple(
+        Step(
+            "chain",
+            f"s{index}",
+            "",
+            "true",
+            deps=[f"chain.s{index - 1}"] if index else [],
+        )
+        for index in reversed(range(1100))
+    )
+    deps = transitive_deps(steps)
+    assert len(deps["chain.s1099"]) == 1099
+    assert "chain.s0" in deps["chain.s1099"]
+    assert deps["chain.s0"] == set()
+
+    # Wide sizing takes the bounded conservative fallback before computing any closure.
+    cfg = DagConfig(
+        steps=steps,
+        default_step_mem_cap_bytes=1,
+        mem_cap_floor_bytes=0,
+        outer_mem_safety_factor=1.0,
+    )
+    assert schedulable_peak_mem_bytes(cfg, 1100)[0] == 1100
+
+
+def test_width_one_sizing_skips_closure_on_5000_node_reverse_chain() -> None:
+    steps = tuple(
+        Step(
+            "wide",
+            f"s{index}",
+            "",
+            "true",
+            deps=[f"wide.s{index - 1}"] if index else [],
+            hint=ResourceHint(hard_mem_max_bytes=2 if index in (4999, 4000) else 1),
+        )
+        for index in reversed(range(5000))
+    )
+    assert schedulable_peak_mem_bytes(DagConfig(steps=steps), 1) == (2, ("wide.s4999",))
 
 
 def test_box_mem_budget_is_min_of_readable_signals() -> None:

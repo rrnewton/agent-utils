@@ -27,13 +27,17 @@ representative and randomized DAG fixtures, this runs BOTH the Python CLI
   and counts, and an unknown ``--only`` tag exits 2 on both builds. A successful ``sweep`` must
   produce the same width rows and table schema; measured timing cells and the ``--profile`` table
   are not byte-compared because runtimes legitimately differ.
-* The memory-aware ``--max-steps`` decision and modeled footprint from ``--max-mem`` match.
+* The memory-aware ``--max-steps`` decision and modeled footprint from ``--max-mem`` match,
+  including effective-width scaling, hard/default/engine-only runnable steps, prompt refusal when
+  even one step cannot fit, CPA infeasibility driven by learned RSS, and signed-64 saturation.
 * ``run`` keeps active-step fan-out (``-s``) independent from its total CPU budget
   (``-j`` / ``--max-cpus``): the same fork-based guest workload records normalized step/worker
-  overlap under both engines, including authored inner widths capped by the run budget. A declared
-  over-budget self-managed width is refused before spawn, and profile-derived recommendations shown
-  by every run planner remain within the same budget. A capability-gated boxed case additionally
-  proves the live outer ``cpu.max`` and long-window ``cpu.stat`` bandwidth.
+  overlap under both engines, including two full-width steps whose aggregate live workers exceed
+  the budget while each individual width remains bounded. A declared over-budget self-managed
+  width is refused before spawn, and profile-derived recommendations shown by every run planner
+  remain within the same per-step ceiling. A capability-gated boxed case additionally proves that
+  this allowed worker oversubscription remains inside the live outer ``cpu.max`` and long-window
+  ``cpu.stat`` bandwidth envelope.
 * The auto-logging profile STORE (Feature D) has an identical on-disk schema across builds: an
   unboxed run under each build (into separate ``--perf-dir`` dirs) writes the SAME set of CSV
   filenames — so ``machine_id`` + ``container_class`` (and hence ``nproc``) agree — with
@@ -120,7 +124,13 @@ _COUNTS_RE = re.compile(
     r"(\d+) intentionally skipped, (\d+) dependency-skipped"
 )
 _SIZING_RE = re.compile(
-    r"-> --max-steps (\d+) \(modeled worst-case (\d+) bytes fits budget (\d+) bytes\)"
+    r"-> modeled memory ceiling (\d+) active steps "
+    r"\(worst-case (\d+) bytes fits budget (\d+) bytes\); "
+    r"base active-step ceiling (\d+); final --max-steps (\d+)"
+)
+_SIZING_REFUSAL_RE = re.compile(
+    r"REFUSED — minimum runnable footprint (\d+) bytes cannot fit safely within budget "
+    r"(\d+) bytes"
 )
 
 CPU_FOOTPRINT_GUEST = os.path.join(REPO_ROOT, "cross", "cpu_footprint_guest.py")
@@ -923,11 +933,35 @@ def _counts(stderr: str) -> tuple[int, int, int, int, int] | None:
     )
 
 
-def _sizing(stderr: str) -> tuple[int, int, int] | None:
+def _sizing_details(stderr: str) -> tuple[int, int, int, int, int] | None:
+    """Return ``(memory_ceiling, footprint, budget, base_ceiling, final_ceiling)``."""
     m = _SIZING_RE.search(stderr)
     if not m:
         return None
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    memory_steps = int(m.group(1))
+    footprint = int(m.group(2))
+    budget = int(m.group(3))
+    base = int(m.group(4))
+    selected = int(m.group(5))
+    if selected != min(base, memory_steps):
+        return None
+    return memory_steps, footprint, budget, base, selected
+
+
+def _sizing(stderr: str) -> tuple[int, int, int] | None:
+    details = _sizing_details(stderr)
+    if details is None:
+        return None
+    _memory_steps, footprint, budget, _base, selected = details
+    return selected, footprint, budget
+
+
+def _sizing_refusal(stderr: str) -> tuple[int, int] | None:
+    """Return ``(minimum_footprint, budget)`` from a fail-closed max-memory refusal."""
+    match = _SIZING_REFUSAL_RE.search(stderr)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
 
 
 def _static_parity(py: list[str], rs: list[str], dag_path: str, name: str, rep: Report) -> None:
@@ -1504,7 +1538,14 @@ def compare_fixture(py: list[str], rs: list[str], fx: Fixture, rep: Report) -> N
             ro = run(rs, ("run", "--dag", dag_path, "-q", "-k", "--max-mem", fx.max_mem, NOPROF, NOFB, ACF))
             label = f"{fx.name}/sizing"
             ps, rss = _sizing(po.stderr), _sizing(ro.stderr)
-            if ps is None or rss is None:
+            prefusal, rrefusal = _sizing_refusal(po.stderr), _sizing_refusal(ro.stderr)
+            if (
+                po.returncode == ro.returncode == 2
+                and prefusal is not None
+                and prefusal == rrefusal
+            ):
+                rep.ok(label)
+            elif ps is None or rss is None:
                 rep.bad(label, f"missing sizing line py={po.stderr!r} rs={ro.stderr!r}")
             elif ps != rss:
                 rep.bad(label, f"(--max-steps, footprint, budget) py={ps} rs={rss}")
@@ -2253,9 +2294,22 @@ _CPA_MEM_DAG = {
 
 
 def _cpa_mem_store_csv() -> str:
-    """Store for :data:`_CPA_MEM_DAG`: m.heavy scales near-linearly to inner-jobs=8 (flat CPU-s)."""
+    """Store for :data:`_CPA_MEM_DAG`: m.heavy scales near-linearly to inner-jobs=8 (flat CPU-s).
+
+    Every row also carries the same measured 3-GiB RSS as the DAG hint. CPA correctly plans from
+    the selected store estimate, so the fixture must not depend on the pre-fix bug where allocation
+    saw the authored 3-GiB hint but execution later installed a tiny learned RSS value.
+    """
     rows = [
-        _cpa_row(_CPA_MACHINE, _CPA_CONTAINER, "m.heavy", j, w, "40.0")
+        _cpa_row(
+            _CPA_MACHINE,
+            _CPA_CONTAINER,
+            "m.heavy",
+            j,
+            w,
+            "40.0",
+            peak_bytes="3221225472",
+        )
         for j, w in ((1, "40.0"), (2, "20.0"), (4, "10.0"), (8, "5.0"))
     ]
     return _CPA_HEADER + "".join(rows)
@@ -2579,6 +2633,460 @@ def compare_cpa_planner(py: list[str], rs: list[str], rep: Report) -> None:
                 "cpa:self-managed-curve-source",
                 "self-managed exact/scalar curve provenance diverged or was mislabeled\n"
                 f"py={psource}\nrs={rsource}",
+            )
+
+
+def compare_memory_hardening(py: list[str], rs: list[str], rep: Report) -> None:
+    """Cross-check the memory semantics that must agree before scheduling begins.
+
+    These cases are intentionally CLI-level rather than duplicate unit tests. They prove that the
+    two independently packaged implementations make the same externally visible decision after
+    config loading, profile enrichment, CPA allocation, and ``--max-mem`` sizing:
+
+    * CPU-bound caps use each step's effective width;
+    * hard-cap-only, default-capped, and selected ``engine_only`` steps remain real memory demand;
+    * an infeasible one-step budget refuses before the guest can spawn;
+    * learned RSS can make a CPA plan explicitly ``infeasible-memory``; and
+    * large concurrent sums saturate in the shared signed-64 domain rather than wrapping or using
+      Python's unbounded integer as a different model.
+    """
+
+    gib = 1024**3
+    i64_max = 2**63 - 1
+
+    def sizing_case(
+        directory: str,
+        label: str,
+        dag: Mapping[str, object],
+        budget: str,
+        max_cpus: int,
+        expected: tuple[int, int, int],
+    ) -> None:
+        dag_path = os.path.join(directory, f"{label}.json")
+        with open(dag_path, "w", encoding="utf-8") as handle:
+            json.dump(dag, handle)
+        args = (
+            "run", "--dag", dag_path, "--max-mem", budget, "--max-cpus", str(max_cpus),
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        po, ro = run(py, args), run(rs, args)
+        py_sizing, rs_sizing = _sizing(po.stderr), _sizing(ro.stderr)
+        if po.returncode != ro.returncode or po.returncode != 0:
+            rep.bad(f"memory:{label}", f"py={po}\nrs={ro}")
+        elif py_sizing is None or rs_sizing is None:
+            rep.bad(
+                f"memory:{label}",
+                f"missing sizing evidence py={po.stderr!r} rs={ro.stderr!r}",
+            )
+        elif py_sizing != rs_sizing:
+            rep.bad(
+                f"memory:{label}",
+                f"sizing differs py={py_sizing} rs={rs_sizing}",
+            )
+        elif py_sizing != expected:
+            rep.bad(
+                f"memory:{label}",
+                f"expected sizing {expected}, got {py_sizing}",
+            )
+        else:
+            rep.ok(f"memory:{label}")
+
+    def refusal_case(
+        directory: str,
+        label: str,
+        step: Mapping[str, object],
+        *,
+        budget: str,
+        budget_bytes: int,
+        footprint: int,
+    ) -> None:
+        marker = {
+            engine: os.path.join(directory, f"{label}-{engine}-spawned")
+            for engine in ("py", "rs")
+        }
+        value: dict[str, object] = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [step],
+        }
+        dag_path = os.path.join(directory, f"{label}.json")
+        with open(dag_path, "w", encoding="utf-8") as handle:
+            json.dump(value, handle)
+        args = (
+            "run", "--dag", dag_path, "--max-mem", budget, "--max-cpus", "2",
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        outcomes = {
+            engine: run(command, args, {"MEMORY_MARKER": marker[engine]})
+            for engine, command in (("py", py), ("rs", rs))
+        }
+        phrase = (
+            f"minimum runnable footprint {footprint} bytes cannot fit safely within budget "
+            f"{budget_bytes} bytes"
+        )
+        if (
+            all(outcome.returncode == 2 for outcome in outcomes.values())
+            and all(phrase in outcome.stderr for outcome in outcomes.values())
+            and not any(os.path.exists(path) for path in marker.values())
+        ):
+            rep.ok(f"memory:{label}")
+        else:
+            rep.bad(
+                f"memory:{label}",
+                f"expected pre-spawn infeasible refusal containing {phrase!r}; "
+                f"outcomes={outcomes} markers={marker}",
+            )
+
+    with tempfile.TemporaryDirectory(prefix="safe-ci-cross-memory-") as tmp:
+        width_scaled = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "width",
+                    "job": "preferred",
+                    "cmd": "sleep 0.05",
+                    "jobs_flag": "",
+                    "hint": {
+                        "rss_baseline_bytes": gib,
+                        "classification": "cpu-bound",
+                        "preferred_inner_jobs": 8,
+                    },
+                },
+                {
+                    "group": "width",
+                    "job": "sibling",
+                    "cmd": "sleep 0.05",
+                    "jobs_flag": "",
+                    "hint": {
+                        "rss_baseline_bytes": gib,
+                        "classification": "cpu-bound",
+                        "preferred_inner_jobs": 8,
+                    },
+                },
+            ],
+        }
+        sizing_case(
+            tmp,
+            "effective-j8",
+            width_scaled,
+            "3G",
+            8,
+            (1, 2 * gib, 3 * gib),
+        )
+
+        # A nonbinding memory model must never loosen the CPU-derived active-step base. Four
+        # independent 1-GiB steps fit the 16-GiB memory budget, so the modeled ceiling reaches the
+        # host CPU count; explicit -j1 still makes the final active-step ceiling exactly one. A
+        # genuinely one-CPU host cannot demonstrate a strictly looser memory ceiling and is
+        # reported as a capability skip after all remaining invariants agree.
+        nonbinding = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "nonbinding",
+                    "job": f"s{index}",
+                    "cmd": "sleep 0.05",
+                    "jobs_flag": "",
+                    "hint": {"hard_mem_max_bytes": gib},
+                }
+                for index in range(4)
+            ],
+        }
+        nonbinding_path = os.path.join(tmp, "nonbinding-max-mem.json")
+        with open(nonbinding_path, "w", encoding="utf-8") as handle:
+            json.dump(nonbinding, handle)
+        nonbinding_args = (
+            "run", "--dag", nonbinding_path, "--max-mem", "16G", "--max-cpus", "1",
+            "--unsafe-no-cgroups", "-q", NOPROF, NOFB,
+        )
+        pnon, rnon = run(py, nonbinding_args), run(rs, nonbinding_args)
+        pdetails, rdetails = _sizing_details(pnon.stderr), _sizing_details(rnon.stderr)
+        common_nonbinding = (
+            pnon.returncode == rnon.returncode == 0
+            and pdetails is not None
+            and pdetails == rdetails
+            and pdetails[1] == min(pdetails[0], 4) * gib
+            and pdetails[2:] == (16 * gib, 1, 1)
+        )
+        if common_nonbinding and pdetails is not None and pdetails[0] > 1:
+            rep.ok("memory:nonbinding-max-mem-keeps-cpu-base")
+        elif common_nonbinding and pdetails is not None and pdetails[0] == 1:
+            print(
+                "cross[safe-ci-dag-runner]: SKIP strict nonbinding max-mem proof: "
+                "host exposes only one online CPU"
+            )
+            rep.ok("memory:nonbinding-max-mem-one-cpu-capability")
+        else:
+            rep.bad(
+                "memory:nonbinding-max-mem-keeps-cpu-base",
+                f"expected memory ceiling >1 (or one-CPU capability) but final S=1; "
+                f"py={pnon} details={pdetails} rs={rnon} details={rdetails}",
+            )
+
+        # Six-exabyte caps overflow an i64 when two siblings co-run. The modeled peak must
+        # saturate to the i64::MAX unbounded sentinel, which fits no finite budget (including MAX),
+        # so sizing safely falls back to one finite-width step. Wrapping could admit both.
+        huge = 6_000_000_000_000_000_000
+        saturated = {
+            "mem_cap_factor": 1.0,
+            "mem_cap_floor_bytes": 0,
+            "outer_mem_safety_factor": 1.0,
+            "steps": [
+                {
+                    "group": "huge",
+                    "job": f"s{index}",
+                    "cmd": "true",
+                    "jobs_flag": "",
+                    "hint": {"hard_mem_max_bytes": huge},
+                }
+                for index in range(2)
+            ],
+        }
+        sizing_case(
+            tmp,
+            "saturating-sum",
+            saturated,
+            str(i64_max),
+            2,
+            (1, huge, i64_max),
+        )
+
+        marker_step = {
+            "group": "memory",
+            "job": "probe",
+            "cmd": 'printf spawned > "$MEMORY_MARKER"',
+            "jobs_flag": "",
+        }
+        refusal_case(
+            tmp,
+            "hard-cap-only-infeasible",
+            {
+                **marker_step,
+                "hint": {"hard_mem_max_bytes": 3 * gib},
+            },
+            budget="2G",
+            budget_bytes=2 * gib,
+            footprint=3 * gib,
+        )
+        refusal_case(
+            tmp,
+            "default-cap-infeasible",
+            marker_step,
+            budget="512M",
+            budget_bytes=gib // 2,
+            footprint=gib,
+        )
+        refusal_case(
+            tmp,
+            "engine-only-infeasible",
+            {
+                **marker_step,
+                "engine_only": True,
+                "hint": {"hard_mem_max_bytes": 3 * gib},
+            },
+            budget="2G",
+            budget_bytes=2 * gib,
+            footprint=3 * gib,
+        )
+        refusal_case(
+            tmp,
+            "unbounded-sentinel-infeasible",
+            {
+                **marker_step,
+                "hint": {"hard_mem_max_bytes": i64_max},
+            },
+            budget=str(i64_max),
+            budget_bytes=i64_max,
+            footprint=i64_max,
+        )
+
+        store = os.path.join(tmp, "store")
+        os.makedirs(store, exist_ok=True)
+        csv_name = f"step_profiles_{_CPA_MACHINE}_{_CPA_CONTAINER}.csv"
+        with open(os.path.join(store, csv_name), "w", encoding="utf-8") as handle:
+            handle.write(
+                _CPA_HEADER
+                + _cpa_row(
+                    _CPA_MACHINE,
+                    _CPA_CONTAINER,
+                    "learn.heavy",
+                    1,
+                    "10.0",
+                    "10.0",
+                    str(5 * gib),
+                )
+            )
+        learned_dag = os.path.join(tmp, "learned-rss.json")
+        learned_marker = {
+            engine: os.path.join(tmp, f"learned-{engine}-spawned")
+            for engine in ("py", "rs")
+        }
+        with open(learned_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "mem_cap_factor": 1.0,
+                    "mem_cap_floor_bytes": 0,
+                    "outer_mem_safety_factor": 1.0,
+                    "steps": [
+                        {
+                            "group": "learn",
+                            "job": "heavy",
+                            "cmd": 'printf spawned > "$MEMORY_MARKER"',
+                            "hint": {
+                                "est_duration_s": 10.0,
+                                "classification": "cpu-bound",
+                                "preferred_inner_jobs": 1,
+                            },
+                        }
+                    ],
+                },
+                handle,
+            )
+        extra = {
+            "SAFE_CI_DAG_RUNNER_MACHINE_ID": _CPA_MACHINE,
+            "SAFE_CI_DAG_RUNNER_CONTAINER_CLASS": _CPA_CONTAINER,
+        }
+        plan_args = (
+            "plan", "--dag", learned_dag, "--perf-dir", store, "--planner", "cpa",
+            "--max-mem", "4G", "--format", "json",
+        )
+        pplan, rplan = run(py, plan_args, extra), run(rs, plan_args, extra)
+        learned_ok = False
+        if pplan.returncode == rplan.returncode == 0 and pplan.stdout == rplan.stdout:
+            try:
+                obj = json.loads(pplan.stdout)
+                step = obj["steps"][0]
+                allocation = obj["allocation"]
+                learned_ok = (
+                    step["rss_estimate_bytes"] == 5 * gib
+                    and step["rss_source"] == "store"
+                    and step["alloc_inner_jobs"] is None
+                    and allocation["stop_reason"] == "infeasible-memory"
+                    and allocation["modeled_makespan_s"] == "inf"
+                )
+            except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+                learned_ok = False
+        if learned_ok:
+            rep.ok("memory:cpa-learned-rss-infeasible-plan")
+        else:
+            rep.bad(
+                "memory:cpa-learned-rss-infeasible-plan",
+                f"learned RSS did not produce one byte-identical infeasible plan\n"
+                f"py={pplan}\nrs={rplan}",
+            )
+
+        run_args = (
+            "run", "--dag", learned_dag, "--perf-dir", store, "--planner", "cpa",
+            "--max-mem", "4G", "--max-cpus", "8", "--unsafe-no-cgroups", "-q", NOPROF,
+        )
+        outcomes = {
+            engine: run(
+                command,
+                run_args,
+                {**extra, "MEMORY_MARKER": learned_marker[engine]},
+            )
+            for engine, command in (("py", py), ("rs", rs))
+        }
+        phrase = "CPA allocation is infeasible under --max-mem 4G"
+        if (
+            all(outcome.returncode == 2 for outcome in outcomes.values())
+            and all(phrase in outcome.stderr for outcome in outcomes.values())
+            and not any(os.path.exists(path) for path in learned_marker.values())
+        ):
+            rep.ok("memory:cpa-learned-rss-run-refusal")
+        else:
+            rep.bad(
+                "memory:cpa-learned-rss-run-refusal",
+                f"expected learned-RSS CPA refusal before spawn; "
+                f"outcomes={outcomes} markers={learned_marker}",
+            )
+
+        # Stress performs an authored preflight before tag expansion, then applies learned RSS to
+        # the expanded tags and runs one final no-spawn footprint guard over that planned graph.
+        # The final guard must neither miss the `#N` profile rows nor multiply the expanded graph
+        # by N a second time.
+        stress_store = os.path.join(tmp, "stress-store")
+        os.makedirs(stress_store, exist_ok=True)
+        stress_csv = f"step_profiles_{_CPA_MACHINE}_{_CPA_CONTAINER}.csv"
+        learned_rss = 4_000_000_000_000_000_000
+        with open(os.path.join(stress_store, stress_csv), "w", encoding="utf-8") as handle:
+            handle.write(
+                _CPA_HEADER
+                + "".join(
+                    _cpa_row(
+                        _CPA_MACHINE,
+                        _CPA_CONTAINER,
+                        f"stress.seeded#{copy}",
+                        1,
+                        "1.0",
+                        "0.1",
+                        str(learned_rss),
+                    )
+                    for copy in (1, 2)
+                )
+            )
+        stress_dag = os.path.join(tmp, "seeded-profile-stress.json")
+        stress_marker = {
+            engine: os.path.join(tmp, f"stress-profile-{engine}-spawned")
+            for engine in ("py", "rs")
+        }
+        with open(stress_dag, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "mem_cap_factor": 1.0,
+                    "mem_cap_floor_bytes": 0,
+                    "outer_mem_safety_factor": 1.0,
+                    "steps": [
+                        {
+                            "group": "stress",
+                            "job": "seeded",
+                            "cmd": 'printf spawned > "$STRESS_MEMORY_MARKER"',
+                            "jobs_flag": "",
+                            "hint": {
+                                "est_duration_s": 1.0,
+                                "rss_baseline_bytes": 1,
+                                "classification": "light",
+                                "preferred_inner_jobs": 1,
+                            },
+                        }
+                    ],
+                },
+                handle,
+            )
+        stress_args = (
+            "run", "--dag", stress_dag, "--stress", "2", "--max-cpus", "2",
+            "--perf-dir", stress_store, "--unsafe-no-cgroups", "-q", NOPROF,
+        )
+        stress_outcomes = {
+            engine: run(
+                command,
+                stress_args,
+                {**extra, "STRESS_MEMORY_MARKER": stress_marker[engine]},
+            )
+            for engine, command in (("py", py), ("rs", rs))
+        }
+        if (
+            all(outcome.returncode == 2 for outcome in stress_outcomes.values())
+            and all("--stress 2: OK" in outcome.stderr for outcome in stress_outcomes.values())
+            and all(
+                "final planned expanded graph needs" in outcome.stderr
+                and "exceeding the box memory budget" in outcome.stderr
+                and "unbounded or overflowed" not in outcome.stderr
+                for outcome in stress_outcomes.values()
+            )
+            and not any(os.path.exists(path) for path in stress_marker.values())
+        ):
+            rep.ok("memory:stress-profile-expanded-final-refusal")
+        else:
+            rep.bad(
+                "memory:stress-profile-expanded-final-refusal",
+                f"expected authored preflight success then finite planned-graph refusal; "
+                f"outcomes={stress_outcomes} markers={stress_marker}",
             )
 
 
@@ -3282,14 +3790,18 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             "--no-profile",
         )
         po, ro = run(py, oversized_stress), run(rs, oversized_stress)
+        expansion_phrase = (
+            "expansion would create 1000000 generated DAG nodes/control units, "
+            "exceeding safety limit 100000"
+        )
         if (
             po.returncode == ro.returncode == 2
-            and "REFUSED" in po.stderr
-            and "REFUSED" in ro.stderr
+            and expansion_phrase in po.stderr
+            and expansion_phrase in ro.stderr
         ):
-            rep.ok("stress:memory-floor-refuses-oversized-fanout")
+            rep.ok("stress:generated-node-cap-refuses-oversized-fanout")
         else:
-            rep.bad("stress:memory-floor-refuses-oversized-fanout", f"py={po}\nrs={ro}")
+            rep.bad("stress:generated-node-cap-refuses-oversized-fanout", f"py={po}\nrs={ro}")
 
         hard_cores = (
             "run",
@@ -3388,7 +3900,7 @@ def _cpu_facts(log_path: str) -> tuple[FootprintStats, CpuFootprintFacts]:
 
 
 def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> None:
-    """Cross-check independent active-step and total-CPU enforcement."""
+    """Cross-check active-step overlap, per-step width caps, and outer CPU bandwidth."""
 
     with tempfile.TemporaryDirectory(prefix="safe-ci-cross-cpu-limits-") as td:
         invalid_dag = os.path.join(td, "valid.json")
@@ -3514,7 +4026,13 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
                 "bare-step-four-cpu-budget-two",
                 (1, 1, 1, 1),
                 ("-s4", "-j2"),
-                CpuFootprintFacts(4, (1, 1, 1, 1), 2, 2),
+                CpuFootprintFacts(4, (1, 1, 1, 1), 4, 4),
+            ),
+            (
+                "two-width-eight-steps-share-eight-core-budget",
+                (8, 8),
+                ("-s2", "-j8"),
+                CpuFootprintFacts(2, (8, 8), 2, 16),
             ),
             (
                 "authored-width-capped-to-j",
@@ -3526,13 +4044,13 @@ def compare_run_parallel_limits(py: list[str], rs: list[str], rep: Report) -> No
                 "legacy-hidden-jobs-alias",
                 (1, 1, 1),
                 ("--max-steps=3", "--jobs=2"),
-                CpuFootprintFacts(3, (1, 1, 1), 2, 2),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
             ),
             (
                 "canonical-and-legacy-equal",
                 (1, 1, 1),
                 ("--max-steps=3", "--max-cpus=2", "--jobs=2"),
-                CpuFootprintFacts(3, (1, 1, 1), 2, 2),
+                CpuFootprintFacts(3, (1, 1, 1), 3, 3),
             ),
         )
         for label, widths, flags, expected in cases:
@@ -3610,15 +4128,14 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
 
     with tempfile.TemporaryDirectory(prefix="safe-ci-cross-boxed-cpu-") as td:
         dag_path = os.path.join(td, "dag.json")
-        # The declared width is one, so the scheduler admits both steps under J=2. Each guest then
-        # adversarially creates four workers: live tasks and sampled CPU IDs may exceed J, while
-        # the parent cgroup's long-window CPU bandwidth must not.
+        # Each runner-controlled step receives the full per-step ceiling J=8. Both steps must be
+        # live together under -s2, so their sixteen requested workers exceed J in aggregate while
+        # the parent cgroup's long-window CPU bandwidth remains bounded to eight core-equivalents.
         Path(dag_path).write_text(
             json.dumps(
                 _cpu_guest_dag(
-                    (1, 1),
+                    (8, 8),
                     duration_s=1.75,
-                    hardcoded_workers=4,
                     cgroup_parent_levels=1,
                     barrier_participants=2,
                 )
@@ -3627,7 +4144,7 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
         )
         logs = {name: os.path.join(td, f"boxed-{name}.jsonl") for name in ("py", "rs")}
         args = (
-            "run", "--dag", dag_path, "-s2", "-j2", "-q", NOPROF, NOFB,
+            "run", "--dag", dag_path, "-s2", "-j8", "-q", NOPROF, NOFB,
         )
         extra = {
             name: {
@@ -3664,13 +4181,13 @@ def compare_boxed_cpu_bandwidth(py: list[str], rs: list[str], rep: Report) -> No
                 )
                 normalized[name] = (
                     facts.completed_steps == 2,
-                    facts.workers_per_step == (4, 4),
-                    facts.max_live_steps <= 2,
-                    facts.max_live_workers > 2,
+                    facts.workers_per_step == (8, 8),
+                    facts.max_live_steps == 2,
+                    facts.max_live_workers == 16,
                     limits.ok,
                     bandwidth.checkable,
                     bandwidth.ok,
-                    bandwidth.quota_cores == (2.0,),
+                    bandwidth.quota_cores == (8.0,),
                 )
                 details[name] = {
                     "facts": facts,
@@ -3774,6 +4291,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_hostile_numeric_cells(py, rs, rep)
     compare_speedup_model(py, rs, rep)
     compare_cpa_planner(py, rs, rep)
+    compare_memory_hardening(py, rs, rep)
     compare_summary_sync(py, rs, rep)
     compare_sweep_success(py, rs, rep)
     compare_sweep_errors(py, rs, rep)

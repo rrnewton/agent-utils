@@ -1,9 +1,15 @@
 # CPA planner specification for safe-ci-dag-runner
 
 The `--planner cpa` mode uses measured speedup curves to allocate each step's inner-parallelism
-width. This document gives the scheduling rationale and the authoritative algorithm. The behavioral
-differential compares the implementations' chosen widths, order, makespan lower bound, modeled
-makespan, and stop reason byte-for-byte.
+width. This document gives the allocation rationale and the authoritative algorithm. The behavioral
+differential compares the implementations' chosen widths, order, capacity-model lower bound,
+no-overcommit reference makespan, and stop reason byte-for-byte.
+
+The runtime deliberately permits oversubscription: `--max-steps`, dependencies, memory sizing, and
+named resources decide which nodes overlap, while the outer cgroup makes them share `P` CPU
+core-equivalents. CPA does **not** yet model the slowdown or benefit of a particular co-running set.
+Its area/lower-bound/reference-schedule values describe a no-overcommit capacity model used to pick
+widths and order; they are not a prediction or guarantee for the opportunistically overlapping run.
 
 ## 1. The problem, in plain language
 
@@ -26,9 +32,10 @@ The goal is to **minimize the makespan** — the wall-clock time from the first 
 last step finishing — subject to five constraints that all coexist on the one machine:
 
 1. **Precedence.** The DAG edges (`Step.deps`).
-2. **A total CPU budget `P`.** `run -j P` / `run --max-cpus P` sets the whole run's capacity to
-   `P` core-equivalents and bounds the sum of the effective widths of steps running at the same
-   instant. When omitted, `P` is the conservative whole-core floor of the
+2. **A shared CPU-bandwidth budget `P`.** `run -j P` / `run --max-cpus P` sets the whole run's
+   outer capacity to `P` core-equivalents and caps each runner-controlled step's width at `P`.
+   Declared widths are not reservations: several active steps may request more than `P` in sum and
+   contend inside the outer quota. When omitted, `P` is the conservative whole-core floor of the
    tightest binding ancestor `cpu.max`, capped by process affinity (and by `--cores K` when used).
    The default is also tightened by the shared aggregate slice's conservative 90% host budget,
    which prevents concurrent runner invocations from each assuming the whole machine.
@@ -54,13 +61,14 @@ The planner composes three parts:
   smallest measured width. It also computes a **per-step** `recommended_inner_jobs` — the best width
   before that one step's own diminishing-returns knee.
 - **The list scheduler.** `Runner` is a greedy ready-set list scheduler: it launches
-  every ready step (deps met, below `--max-steps`, and with CPU capacity + named resources free) in
+  every ready step (deps met, below `--max-steps`, and with named resources free) in
   a caller-supplied dispatch order, and `--planner critical-path` supplies a
   *critical-path-first* order (highest bottom-level first). This is exactly the "list-scheduling"
   back half of a two-phase moldable scheduler.
-- **The allocator.** It picks each step's width `p_i` to minimize whole-DAG makespan, then hands those
+- **The allocator.** It picks each step's width `p_i` from isolated measured curves, then hands those
   widths and the allocation-aware ordering to the list scheduler. Unlike an isolated per-step knee,
-  the allocation accounts for the DAG and for steps sharing one machine.
+  the allocation accounts for the DAG's critical path and a no-overcommit area model. It does not
+  account for the exact sibling set or slowdown when runtime widths overlap.
 
 ## 2. The makespan lower bound that drives everything
 
@@ -140,8 +148,9 @@ on measured-curve shape; the allocator does not synthesize missing measurements 
   main blind spot: CPA can over-allocate a critical-path task even when its *siblings* (tasks that
   will run at the same time) could have used those processors concurrently. MCPA makes the allocation
   **level/concurrency aware** — it limits a task's width by how many tasks are actually runnable
-  alongside it. On a *small-`P` single machine*, where oversubscription directly causes CPU throttling,
-  this insight matters, and we fold a bounded form of it into our core-budget gate (§5).
+  alongside it. On a *small-`P` single machine*, where oversubscription directly causes CPU
+  throttling, this insight matters. The current implementation does not implement MCPA's
+  level-aware allocation; it is a roadmap direction once co-running measurements exist.
 
 ### 3.3 Approximation theory for the precedence case
 
@@ -174,17 +183,26 @@ The order literature is where our existing `--planner` lives:
 ## 4. Implemented algorithm
 
 The planner uses a **CPA-style critical-path / area-balancing moldable allocator**, driven by measured
-`T_i(p)` curves. It feeds the critical-path list scheduler, with memory caps, named-resource
-semaphores, and the total core budget `P` as hard constraints on allocation.
+`T_i(p)` curves. It feeds the critical-path list scheduler, with memory caps and the per-step width
+ceiling `P` as hard constraints on allocation. Runtime overlap is opportunistic rather than part of
+the allocator's model.
+
+No current planner jointly searches inner width, overlap, memory, and load. Greedy-LPT and
+critical-path choose only ready-step order from scalar estimates. CPA chooses widths from per-step
+curves measured at particular widths, but profile rows do not identify the exact sibling set and
+aggregate requested width that overlapped each sample. A future contention-aware planner needs that
+context (plus width-specific memory and CPU-demand estimates) before it can decide whether two
+wide steps should share `P` or run separately.
 
 It has two phases (the Turek-Wolf-Yu / Ludwig-Tiwari structure):
 
-- **Phase 1 — allocation:** a CPA/MCPA-derived gradient loop picks each step's width `p_i`,
+- **Phase 1 — allocation:** a CPA-derived gradient loop picks each step's width `p_i`,
   snapping to the widths we have actually measured, balancing `T_CP` against `A/P` and stopping at
   each step's work-conservation knee or when a constraint binds.
-- **Phase 2 — list scheduling:** recompute bottom-levels using the *allocated* weights
-  `T_i(p_i)`, order ready steps by bottom-level (our `critical-path` planner), and dispatch under the
-  memory, named-resource, and core-budget gates.
+- **Phase 2 — dispatch ordering:** recompute bottom-levels using the *allocated* weights
+  `T_i(p_i)` and order ready steps by bottom-level (our `critical-path` planner). The live scheduler
+  then admits ready work under `--max-steps`, dependencies, and named-resource gates; the outer CPU
+  quota arbitrates overlapping widths.
 
 ### Why this over the alternatives
 
@@ -200,11 +218,10 @@ It has two phases (the Turek-Wolf-Yu / Ludwig-Tiwari structure):
   CPA gives us the same allot-then-schedule structure with a **precedence-aware**, guess-free,
   O(cheap) allocation loop that reads straight off our measured curves. We keep their architecture and
   drop their independence assumption.
-- **vs. MCPA in full.** MCPA's concurrency-awareness is genuinely useful at small `P`, but the full
-  level-by-level machinery adds state and complicates deterministic implementations. The planner
-  takes its **key insight** — never allocate more cores to a step than can be used given
-  what co-runs — via the core-budget gate and a concurrency-aware per-step cap, while keeping CPA's
-  simpler global CP/area loop as the deterministic base.
+- **vs. MCPA in full.** MCPA's concurrency-awareness is genuinely useful at small `P`, but it needs
+  a model of what co-runs and how sharing changes each task. The current planner keeps CPA's simpler
+  global CP/area loop and a per-step `p_i <= P` ceiling; it does not claim MCPA-style overlap
+  optimization.
 - **vs. Jansen-Zhang / Jansen FPTAS.** Constant-factor-optimal but LP-based, complex, and reliant on
   analytic monotone work functions — overkill for tens-of-steps CI DAGs and hard to make deterministic
   and dependency-light. We cite them as the theory that says our objective is the right one.
@@ -314,20 +331,24 @@ A tentative widening `p_i -> next(p_i)` is rejected unless **all** hold:
 
 - **Total core budget.** A tentative wider point must not exceed `P`: `next(p_i) <= P`. There is no
   wider-than-budget escape or "run alone" exception.
-- **Per-step memory cap grows with width.** Recompute the DAG's worst-case concurrent footprint with
-  the tentative width using the existing `schedulable_peak_mem_bytes` /
-  `step_mem_cap_for_inner_jobs` (a CPU-bound step's cap scales `~ cap * p / 4`). Reject if the new
-  worst-case footprint exceeds `mem_budget`. This is the point where "widening costs memory" enters:
-  a CPU-bound step on the critical path may be *memory-blocked* from widening even though cores are
-  free. The allocator reads each step's DAG-declared `rss_baseline_bytes` for this check.
-  `mem_budget` comes from `--max-mem`; absent, the memory constraint is off.
+- **Per-step memory cap grows with width.** Recompute the tentative step's width-aware cap using
+  `step_mem_cap_for_inner_jobs` (a CPU-bound step's cap scales `~ cap * p / 4`) and the same
+  learned-or-authored RSS value that plan application will hand to runtime. Reject a widening when
+  that one-step footprint, after `outer_mem_safety_factor` and `mem_cap_floor_bytes`, exceeds
+  `mem_budget`. This prevents an individually impossible allocation. CPA does not jointly choose
+  width and overlap: after plan application, ordinary `jobs_for_budget` derives `--max-steps` from
+  the complete concurrent footprint, so two individually legal heavy steps may still be serialized.
+  Hard-cap-only, default-capped, and selected `engine_only` steps participate; intentional skips do
+  not. `mem_budget` comes from `--max-mem`; absent, the memory constraint is off. Exact
+  dependency/resource-compatible subset enumeration in the later active-step sizing pass is capped
+  at 100,000 candidates; wider searches conservatively sum the largest caps.
 - **Named-resource feasibility is unchanged by width** (widths do not change `hint.resources`), so
-  named-resource caps never *block a widening* — but they *do* shape the area term's realizability:
-  see §5.7.
+  named-resource caps never *block a widening*. They still serialize live steps that demand the
+  same resource, but CPA does not model that serialization in its area term.
 - **Knee already enforced** by `W_i` truncation (§5.2): the work-conservation guard cannot be
   exceeded because those widths are not admissible in the first place.
 
-### 5.7 Handing allotments to the list scheduler (phase 2)
+### 5.7 Handing allotments to the runtime
 
 The allocator outputs `p_i` per step and passes the result to the runner:
 
@@ -340,20 +361,18 @@ The allocator outputs `p_i` per step and passes the result to the runner:
 2. **Order.** Compute the same order as the critical-path planner, using the *allocated* weights
    `T_i(p_i)` rather than the width-one or hinted weights. Highest weighted bottom-level first, ties
    by tag.
-3. **Apply both runtime gates (MCPA's insight).** Treat effective step widths as a first-class
-   capacity dimension alongside the named-resource semaphores: treat `P` as a built-in `"cpu"` cap
-   and each step's demand as `p_i`. The ready-set loop launches a ready step only if
-   `sum(p_j for j running) + p_i <= P` **and** fewer than `S = --max-steps` nodes are active.
-   Runner-controlled authored widths above `P` are visibly capped before planning and execution,
-   including the command's appended jobs flag and per-step `cpu.max`. A self-managed fixed width
-   above `P` is infeasible and cannot be executed. This closes the loop between the allocator's
-   `A/P` assumption and runtime.
-   Named-resource caps continue to gate co-running independently; together they bound the achievable
-   concurrency the area term assumes.
+3. **Permit bounded oversubscription.** The ready-set loop launches a ready step when dependencies
+   are met, named resources fit, and fewer than `S = --max-steps` nodes are active. It does **not**
+   subtract `p_i` from a shared admission-token pool. Runner-controlled authored widths above `P`
+   are still visibly capped before planning and execution, including the command's appended jobs
+   flag and per-step `cpu.max`; a self-managed fixed width above `P` is infeasible and cannot be
+   executed. Multiple legal widths may therefore sum above `P`, with the verified outer `cpu.max`
+   providing the actual shared-bandwidth boundary.
 
-The result: cores flow to the steps that shorten the whole-DAG critical path and *scale* (per the
-measured curve), steps that plateau keep their cores small, memory-heavy steps are throttled by the
-RAM budget, and concurrent allocated widths stay within the core budget.
+The result: CPA selects useful individual widths and a critical-path-aware order, while runtime may
+overlap those widths beyond `P`. That can improve throughput for stalls and phase mismatch or lose
+throughput to contention; current profiles do not supply enough co-run context for CPA to predict
+which outcome will occur.
 
 ### 5.8 Stop conditions (any one ends the loop)
 
@@ -374,6 +393,11 @@ RAM budget, and concurrent allocated widths stay within the core budget.
   CPA cannot rewrite. Preserve that width, publish no executable per-step allocation, and report
   `infeasible-fixed-width` with an infinite modeled makespan. Run entry points reject the same
   configuration before a DAG step can start.
+- **Infeasible memory:** at least one runnable step's narrowest width-aware footprint (including
+  the run-level floor and safety factor) exceeds `mem_budget`. Report `infeasible-memory`, publish an infinite
+  no-overcommit reference makespan and no executable allocation, and refuse a run before any DAG
+  step starts. The low-level allocator returns its typed infeasibility error instead of an
+  executable-looking width map.
 
 Because every applied step strictly increases some `p_i` within a finite `W_i`, and area is monotone
 non-decreasing, the loop runs at most `sum_i (|W_i| - 1)` iterations — trivially bounded for CI DAGs.
@@ -390,14 +414,16 @@ deterministic and identical across implementations:
   path and dispatch ordering use the equivalent `(-bottom_level, tag)` order.
 - **Canonical iteration order.** Iterate steps in `cfg` registration order for the area sum and use
   a tag-ascending scan that keeps the first maximum for the gradient tie-break.
-- **Integer core arithmetic.** `delta_cores`, `P`, and the core-budget gate are pure integers.
+- **Integer core arithmetic.** `delta_cores` and `P` are pure integers.
 
 The differential checks the resulting plan JSON and text, including chosen widths, area,
 critical-path length, lower bound, modeled makespan, and stop reason.
 
-The modeled makespan reported alongside the lower bound is a deterministic greedy list-schedule of
-the allocated widths (§5.7's phase-2 dispatch, simulated): it respects the DAG dependencies AND the
-core budget, so it is provably `>=` the `max(T_CP, area/P)` lower bound, and the plan asserts this.
+The modeled makespan reported alongside the lower bound is a deterministic **no-overcommit
+reference** list-schedule of the allocated widths: it respects DAG dependencies and packs widths
+within `P`, so it is `>=` the capacity model's `max(T_CP, area/P)` lower bound. The live scheduler
+does not enact that packing. Its actual makespan may be better or worse because concurrent widths
+share the outer quota and the model has no co-run slowdown term.
 
 The `plan` and `--show-plan` output includes the allocator's stop reason, core budget,
 critical-path length, area term, lower bound, and modeled makespan. It includes
@@ -410,7 +436,7 @@ ambient budget because it must allocate widths.
 
 ## 6. Our deviations from the textbook
 
-1. **Empirical curves, not analytic models.** CPA/MCPA/Jansen assume an analytic `T_i(p)` (Amdahl- or
+1. **Empirical curves, not analytic models.** CPA/Jansen assume an analytic `T_i(p)` (Amdahl- or
    Downey-shaped, monotone, concave). We read `T_i(p)` from the **measured** profile store. We
    therefore (a) evaluate `T_i` only at measured widths — no interpolation/extrapolation, so an
    allocation is always backed by a real measurement; and (b) get the knee and the work-conservation
@@ -419,8 +445,9 @@ ambient budget because it must allocate widths.
 2. **Single machine, inner-jobs, cgroup-boxed — not a distributed multiprocessor.** The "processors"
    a task receives are inner `-j` threads inside one machine's cgroup CPU budget, not nodes of a
    cluster. There is no data-redistribution or communication cost term (the classic CPA/mixed-parallel
-   concern); the only cross-step coupling is **shared CPU, RAM, and named semaphores** on the one box.
-   The runtime core-budget gate (§5.7) handles packing rather than assuming it is perfect.
+   concern); the cross-step coupling is **shared CPU, RAM, and named semaphores** on the one box.
+   The outer CPU quota enforces aggregate bandwidth, but the planner does not model contention
+   between a particular set of overlapping steps.
 3. **Two extra constraint classes the textbook omits.** Standard moldable scheduling constrains only
    processors. We additionally constrain **per-step memory** (and, crucially, memory that *grows with
    width* for CPU-bound steps) and **named scarce-resource semaphores**. Both can *block a widening*
@@ -441,7 +468,7 @@ ambient budget because it must allocate widths.
   plateau, and a memory-heavy step. The harness compares widths, order, modeled values, and stop
   reason across implementations.
 - **Unit tests.** Tests cover a balanced linear chain, plateau avoidance, memory-blocked widening,
-  the dispatch core gate, rigid curveless steps, infeasible self-managed widths, plan-application
+  opportunistic runtime overcommit, rigid curveless steps, infeasible self-managed widths, plan-application
   refusal preservation, and allocator idempotence.
 - **Directional benchmarks.** Representative caller-owned DAGs can compare `greedy-lpt`, per-step
   knee allocation, and CPA under controlled resource contention.

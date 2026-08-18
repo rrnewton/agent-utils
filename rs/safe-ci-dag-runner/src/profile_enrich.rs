@@ -26,7 +26,7 @@ const USEC: f64 = 1_000_000.0;
 ///
 /// Walks the current cgroup's ancestor chain for the tightest finite CPU quota, floors it to a
 /// positive whole-core budget, and takes the tighter of that quota and process affinity. Flooring
-/// is deliberate: a scheduler admission budget must never promise more CPU than the binding
+/// is deliberate: a per-step width ceiling must never promise more CPU than the binding
 /// bandwidth cap, and integer arithmetic avoids language-specific rounding at half-core boundaries.
 pub fn container_core_budget() -> i64 {
     let affinity = nproc().max(1);

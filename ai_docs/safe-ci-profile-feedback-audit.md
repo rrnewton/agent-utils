@@ -37,6 +37,10 @@ The end-to-end feedback story is much less reliable than the collector:
   changes outer concurrency only when the caller supplies `--max-mem`.
 - Parallel speedup modeling needs at least two distinct recorded `inner_jobs` widths. Normal repeated
   runs at one width do not create a curve. Only `--planner cpa` uses the curve to assign widths.
+- No current planner jointly optimizes inner width and cross-step overlap. Greedy-LPT and
+  critical-path only order ready steps. CPA chooses widths from isolated per-step curves and its
+  reported makespan is a no-overcommit reference; the live scheduler may oversubscribe the boxed
+  outer CPU bandwidth under `--max-steps`.
 - On the audited code, a boxed step with no explicit `preferred_inner_jobs` is normally constrained
   by the DAG's default one-core `cpu.max`, but its profile row is mislabeled with the ambient
   container width. That can put a one-core observation in a many-core speedup bucket. The
@@ -217,14 +221,14 @@ Learned duration does not change dependencies, named resource capacities, or ste
 
 The plan replaces `rss_baseline_bytes` when the store has a usable peak. That learned baseline can:
 
-- set the per-step memory cap as `mem_cap_factor * rss_baseline_bytes`; and
+- set the per-step memory cap as `mem_cap_factor * rss_baseline_bytes`, with the current CPU-bound
+  width heuristic scaling above four inner jobs; and
 - contribute to the modeled concurrent footprint used by `--max-mem`.
 
 An explicit `hard_mem_max_bytes` wins over the learned baseline in both places. Therefore a DAG in
 which every step has a hard cap can display `rss_source=store` while making no memory decision from
-that value, provided the step also has an RSS baseline and is therefore included in footprint
-enumeration. A hard-cap-only step is currently omitted from modeled concurrency altogether; this
-is a separate correctness defect described below.
+that value. On the audited base a hard-cap-only step was omitted from modeled concurrency; 0.15.0
+fixes that defect as described below.
 
 ### Parallel speedup and CPA
 
@@ -256,7 +260,7 @@ assign widths across the whole DAG under a core and optional memory budget.
 | At least one accepted row exists | Scalar duration/RSS stays authored. |
 | Boxed collection supplied `peak_bytes` | No learned memory value is available. |
 | No explicit hard memory cap overrides RSS | Learned RSS can affect enforcement/sizing. |
-| An RSS baseline exists at all | The step is included in memory-footprint enumeration; today a hard/default cap alone is omitted. |
+| A hard cap, RSS baseline, or positive runtime default exists | Otherwise current sizing treats the runnable step as unbounded and refuses a finite budget. The audited base incorrectly omitted hard/default-only steps. |
 | Caller supplies `--max-mem` | Learned RSS cannot change outer concurrency. |
 | At least two inner widths were measured | No speedup curve exists. |
 | Caller selects `--planner cpa` | A speedup curve is display-only, not an allocator input. |
@@ -397,14 +401,19 @@ directly. A run with either override reads `step_profiles_<override>.csv` and wr
 Existing cross fixtures use overrides to seed readers, not to perform a real write-then-read loop,
 so they do not catch this.
 
-### High: planned width-dependent memory is not the runtime cap
+### High (audited base; fixed in 0.15.0): planned width-dependent memory is not the runtime cap
 
 The CPA footprint model scales CPU-bound memory with inner width through
 `step_mem_cap_for_inner_jobs`. Both schedulers enforce the plain `step_mem_cap_bytes` result at
 runtime instead. The planner can approve a wide allocation using a larger modeled allowance while
 the step is actually boxed into the smaller base cap and OOM-killed.
 
-### High: real runnable steps disappear from `--max-mem` and CPA sizing
+Version 0.15.0 routes both runtime enforcement and ordinary `--max-mem` sizing through the same
+effective preferred/default width and scaling helper. That closes the execution/planning mismatch,
+but does not solve the statistical weakness that the scalar RSS baseline pools observations from
+different widths and is then treated as a width-four base.
+
+### High (audited base; fixed in 0.15.0): real runnable steps disappear from `--max-mem` and CPA sizing
 
 The footprint enumerator first filters participating steps to those with a non-null
 `rss_baseline_bytes`. It then calls a cap function that would honor `hard_mem_max_bytes`, but that
@@ -415,6 +424,11 @@ a zero-memory promise. Consequently `--max-mem` and CPA can admit concurrency th
 enforced caps. The separate stress helper does charge hard caps and runtime defaults, but it shares
 the erroneous `engine_only` exclusion. Hermit happens not to trigger the baseline half because its
 hard-capped steps also carry RSS baselines.
+
+Version 0.15.0 includes every runnable non-skipped step, using hard caps, learned/authored RSS, or
+the runtime default as applicable. Selected `engine_only` steps participate, stress uses the same
+width-aware cap, and an uncharacterized step with no positive default is treated as unbounded
+rather than free.
 
 ### High: success-only filtering creates memory survivorship bias
 
@@ -497,6 +511,16 @@ Duration and RSS aggregate across every `inner_jobs` bucket. A step measured at 
 widths gets one scalar median/p90, which may correspond to no actual width. The separate speedup
 curve does not repair ordinary greedy/critical-path plans or the RSS baseline.
 
+### Medium: profiles cannot model beneficial or harmful co-running widths
+
+Rows record rich load, pressure, throttling, CPU-time, and memory diagnostics, but they do not bind
+an observation to the exact simultaneously active sibling tags and widths or to the aggregate
+requested width at launch. The scalar estimator also discounts ambient contention, which can
+normalize away the effect a co-running model would need to learn. Consequently the current data can
+fit `T_i(p)` for one step at width `p`, but not `T_i(p | siblings, requested load, P)`. Allowing two
+wide steps to share the outer quota is an explicit runtime policy, not a model-derived claim that
+overlap is faster.
+
 ### Medium: feedback absence and ineffectiveness are hard to see
 
 The writer loudly names output files, but a default run does not state that no matching input store
@@ -525,20 +549,41 @@ correction is applied to CPU, I/O, latency, and light steps, and values clamp at
 be reduced to 5% of measured wall time. Several PSI/co-tenant columns written by the collector do
 not match the names consumed by the reader and are currently inert.
 
-### Medium: `--max-mem` can report a schedule that does not fit its budget
+### Medium (audited base; fixed in 0.15.0): `--max-mem` can report a schedule that does not fit its budget
 
 If one step's modeled footprint exceeds the entire requested budget, sizing still returns a
 one-step schedule rather than refusing it. `--max-mem` is also an admission model, not an enforced
 outer `memory.max`. The command therefore means "limit modeled concurrent footprint" rather than
 "the run cannot exceed this many bytes."
 
-### Medium: memory-footprint planning is combinatorial
+Version 0.15.0 returns an explicit zero-step infeasibility sentinel and the CLI refuses it. CPA
+checks every narrowest one-step allocation against learned RSS plus the same floor/safety factor and reports
+`infeasible-memory` instead of applying an executable allocation.
+
+### High (audited base; fixed in 0.15.0): stress sizing could certify a different graph than execution
+
+The original stress guard ran before `--max-cpus` clamping and before profile/CPA application. It
+could overcharge a width that execution would lower, or approve authored RSS before feedback raised
+the final cap. Very small characterized guest caps also provided no host-side control-plane floor,
+so a huge `--stress` value could allocate an enormous generated DAG before the guest memory check
+became relevant.
+
+Version 0.15.0 preflights the CPU-capped authored copy, then rechecks the already-expanded final
+post-feedback graph without multiplying it twice. A positive per-copy control-plane floor remains
+in force, and expansion refuses more than 100,000 generated nodes/control units before allocation.
+
+### Medium (audited base; bounded in 0.15.0): memory-footprint planning is combinatorial
 
 Footprint sizing enumerates every dependency/resource-compatible combination up to the candidate
 step count. `jobs_for_budget` repeats that search for successive counts, and CPA repeats it while
 widening. The Rust helper additionally materializes each combination set eagerly. On a wide,
 lightly constrained DAG this is exponential and can make planning itself unusable or exhaust
 memory; existing correctness fixtures are small and do not establish a practical bound.
+
+Version 0.15.0 bounds exact enumeration to 100,000 subsets, then deterministically falls back to
+the sum of the largest candidate caps while ignoring dependencies/resources. The fallback runs
+before dependency closure; closure is iterative, and one-step probes use an O(n) maximum scan. The
+fallback is less precise but conservative and keeps wide-DAG planning bounded in both implementations.
 
 ### Medium: profile persistence has writer and failure-mode weaknesses
 
@@ -566,11 +611,14 @@ start.
 3. Use one resolved feedback identity for local reads, writes, and sync. Add an override-enabled
    two-run test, and either encode actual placement/NUMA distinctions or document deliberate
    pooling rather than implying affinity width identifies placement.
-4. Make runtime memory enforcement use the same width-dependent function the planner models, with a
-   boxed end-to-end test that would OOM under the old mismatch.
-5. Include hard-cap-only and runtime-default-capped steps in `--max-mem`/CPA footprint enumeration,
-   and include selected `engine_only` steps in every sizing path including stress. Test each case
-   against its actual enforced cap.
+4. Retain the 0.15.0 change that makes runtime memory enforcement and ordinary `--max-mem` sizing
+   use the same width-dependent function, and add a live boxed end-to-end test that would OOM under
+   the old mismatch.
+5. Retain the 0.15.0 coverage of hard-cap-only, runtime-default-capped, and selected `engine_only`
+   steps in every sizing path including stress. Keep each case tested against its actual enforced
+   cap and preserve the conservative bounded-search fallback for wide DAGs.
+   Keep stress's final post-feedback check, per-copy control-plane floor, and generated-node bound
+   paired across implementations.
 6. Split row admission by metric: reject failed wall-time samples, but retain OOM peaks as censored
    lower bounds or at least explicit cap-inadequacy evidence that can safely raise/review memory.
 7. Retain the concurrent 0.13 `replace(cfg, ...)` plan-application fix and cross-test every
@@ -582,12 +630,15 @@ start.
    speedup-bucket identity in both engines.
 9. Replace the contention discount with a model validated by step class and CPU placement, or keep
    the raw measurement when the available telemetry cannot distinguish sibling/disjoint work.
-10. Make `--max-mem` fail when even one required step cannot fit, and clearly separate modeled
-   admission from an enforced outer memory ceiling.
+   Record exact active sibling tags/widths, aggregate requested width, run `P`, and start/end
+   overlap so a future scheduler can model whether oversubscription helps instead of inferring it
+   from host load alone.
+10. Retain the 0.15.0 refusal when even one required step cannot fit, and clearly separate modeled
+    admission from an enforced outer memory ceiling.
 11. Give raw and summary observations stable IDs; make merges idempotent; and make profile lock/read
     failures fail visibly rather than silently dropping history or writing outside mutual exclusion.
-12. Replace exponential footprint enumeration with a bounded conservative algorithm or an explicit
-    safe fallback, and benchmark it on realistic 50-plus-step wide DAGs in both implementations.
+12. Retain the 0.15.0 bounded conservative fallback and benchmark it on realistic 50-plus-step wide
+    DAGs in both implementations.
 
 ### Make model use observable
 

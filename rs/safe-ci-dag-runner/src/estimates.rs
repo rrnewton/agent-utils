@@ -24,7 +24,9 @@ use std::path::Path;
 use crate::io::json_str;
 use crate::model::{effective_jobs_flag, DagConfig, ResourceHint, Step};
 use crate::perflog::{container_class, machine_id, parse_csv_line};
-use crate::sizing::schedulable_peak_mem_bytes_widths;
+use crate::sizing::{
+    memory_footprint_fits, outer_mem_footprint_bytes, schedulable_peak_mem_bytes_widths,
+};
 
 /// Environment variable that overrides the machine component of the feedback identity.
 pub const MACHINE_ID_ENV: &str = "SAFE_CI_DAG_RUNNER_MACHINE_ID";
@@ -782,14 +784,14 @@ pub struct PlanEntry {
     pub speedup: Option<StepSpeedup>,
     /// The executable inner-jobs width CPA assigned to a runner-controlled step, or `None` for
     /// ordering-only planners and self-managed commands whose empty jobs flag prevents rewriting.
-    /// Run-level `-j` is the aggregate budget.
+    /// Run-level `-j` is the outer bandwidth/per-step ceiling, not an admission reservation.
     pub alloc_inner_jobs: Option<i64>,
 }
 
 /// Whole-DAG metrics produced by the parallel-width allocator.
 #[derive(Debug, Clone)]
 pub struct Allocation {
-    /// Total core budget used by allocation and simulation.
+    /// Core budget used by allocation and the no-overcommit reference simulation.
     pub core_budget: i64,
     /// Sum of allocated width multiplied by modeled wall time.
     pub area_s: f64,
@@ -799,7 +801,8 @@ pub struct Allocation {
     pub critical_path_s: f64,
     /// Maximum of the work-area and critical-path lower bounds.
     pub lower_bound_s: f64,
-    /// Makespan from deterministic list-schedule simulation.
+    /// Makespan from the deterministic no-overcommit reference list schedule; not a prediction of
+    /// the live scheduler, which may overlap widths beyond this capacity under the outer quota.
     pub modeled_makespan_s: f64,
     /// Stable reason the allocation loop stopped widening steps.
     pub stop_reason: String,
@@ -1037,18 +1040,30 @@ const CPA_CORE_CAPPED: &str = "core-capped";
 const CPA_MEM_CAPPED: &str = "mem-capped";
 const CPA_FIXED_POINT: &str = "fixed-point";
 const CPA_INFEASIBLE_FIXED_WIDTH: &str = "infeasible-fixed-width";
+const CPA_INFEASIBLE_MEMORY: &str = "infeasible-memory";
 
-/// A CPA allocation cannot fit self-managed fixed command widths inside its core budget.
+/// A CPA seed allocation cannot fit inside its core or memory budget.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InfeasibleAllocationError {
     /// Total core-equivalent budget supplied to the allocator.
     pub core_budget: i64,
     /// Sorted `(step tag, fixed width)` pairs that exceed the budget.
     pub fixed_widths: Vec<(String, i64)>,
+    /// Memory budget for an infeasible seed allocation, when memory is the failed dimension.
+    pub mem_budget: Option<i64>,
+    /// Minimum runnable footprint that exceeded `mem_budget`.
+    pub memory_footprint: Option<i64>,
 }
 
 impl std::fmt::Display for InfeasibleAllocationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let (Some(budget), Some(footprint)) = (self.mem_budget, self.memory_footprint) {
+            return write!(
+                f,
+                "CPA allocation is infeasible under memory budget {budget}: minimum runnable \
+                 footprint is {footprint}"
+            );
+        }
         let detail = self
             .fixed_widths
             .iter()
@@ -1194,12 +1209,14 @@ fn cpa_next_width(widths: &[i64], current: i64) -> Option<i64> {
     widths.iter().copied().find(|&w| w > current)
 }
 
-// Worst-case concurrent memory footprint (bytes) with the given PER-STEP widths (PLANNER_DESIGN.md
-// §5.6).
+// Largest single-step footprint at the given widths, including outer safety/floor policy. CPA
+// checks individual feasibility here; post-plan jobs_for_budget owns aggregate overlap and may
+// derive max_steps=1 for several individually feasible wide steps.
 fn cpa_footprint(cfg: &DagConfig, widths: &HashMap<String, i64>) -> i64 {
     let mut active = cfg.clone();
     active.steps.retain(|step| step.skip_reason.is_none());
-    schedulable_peak_mem_bytes_widths(&active, active.steps.len() as i64, widths).0
+    let peak = schedulable_peak_mem_bytes_widths(&active, 1, widths).0;
+    outer_mem_footprint_bytes(&active, peak)
 }
 
 /// `(widths, admissible, wall, stop_reason)` from the CPA gradient loop.
@@ -1241,6 +1258,10 @@ fn cpa_allocate(
             wall,
             CPA_INFEASIBLE_FIXED_WIDTH.to_string(),
         );
+    }
+    if mem_budget.is_some_and(|budget| !memory_footprint_fits(cpa_footprint(cfg, &widths), budget))
+    {
+        return (widths, admissible, wall, CPA_INFEASIBLE_MEMORY.to_string());
     }
     let mut stop_reason = CPA_FIXED_POINT.to_string();
     let max_iters: usize = cfg
@@ -1291,12 +1312,12 @@ fn cpa_allocate(
         for tag in &widenable {
             let nxt = cpa_next_width(&admissible[tag], widths[tag]).unwrap();
             if nxt > p {
-                continue; // single-step core cap (cross-step budget is the dispatch gate)
+                continue; // defensive per-step ceiling; admissible curves are already truncated
             }
             if let Some(budget) = mem_budget {
                 let mut tentative = widths.clone();
                 tentative.insert(tag.clone(), nxt);
-                if cpa_footprint(cfg, &tentative) > budget {
+                if !memory_footprint_fits(cpa_footprint(cfg, &tentative), budget) {
                     blocked_mem = true;
                     continue;
                 }
@@ -1343,18 +1364,29 @@ pub fn allocate_widths(
         return Err(InfeasibleAllocationError {
             core_budget: core_budget.max(1),
             fixed_widths: infeasible_fixed_widths(cfg, &widths, core_budget),
+            mem_budget: None,
+            memory_footprint: None,
+        });
+    }
+    if reason == CPA_INFEASIBLE_MEMORY {
+        let budget = mem_budget.expect("infeasible-memory requires a memory budget");
+        return Err(InfeasibleAllocationError {
+            core_budget: core_budget.max(1),
+            fixed_widths: Vec::new(),
+            mem_budget: Some(budget),
+            memory_footprint: Some(cpa_footprint(cfg, &widths)),
         });
     }
     Ok(widths)
 }
 
-// A deterministic greedy list-schedule of the allocated widths -> the MODELED makespan (mirrors
+// A deterministic no-overcommit reference schedule of the allocated widths (mirrors
 // Python's `_cpa_simulate_makespan`). Launches ready steps (deps done, core budget
 // `Σ running widths + p_i <= P`, named resources free) in `order`, advancing to the next finish
 // event. Allocated widths must lie in `1..=P`; there is no over-budget run-alone escape.
-// Respecting deps AND the core budget makes the result `>= max(T_CP, area/P)`
-// (PLANNER_DESIGN.md §2). Same f64 ops in canonical `order` as the Python build, so the
-// 3-decimal makespan is byte-identical.
+// Respecting deps AND the reference capacity makes the result `>= max(T_CP, area/P)`
+// (PLANNER_DESIGN.md §2). The live scheduler intentionally permits wider aggregate overlap.
+// Same f64 ops in canonical `order` as the Python build, so the 3-decimal makespan is byte-identical.
 fn cpa_simulate_makespan(
     cfg: &DagConfig,
     widths: &HashMap<String, i64>,
@@ -1446,7 +1478,18 @@ fn build_cpa_plan(
         Some(b) if b > 0 => b,
         _ => 1,
     };
-    let (widths, _admissible, wall, stop_reason) = cpa_allocate(cfg, speedups, est, p, mem_budget);
+    // Allocate against the same learned RSS values that apply_plan_to_config installs for
+    // execution and ordinary --max-mem sizing. Otherwise CPA can approve a width against a stale
+    // authored hint and only afterward replace it with a larger store estimate.
+    let mut memory_cfg = cfg.clone();
+    for step in &mut memory_cfg.steps {
+        let r = &resolved[&step.tag()];
+        if r.rss_source == "store" {
+            step.hint.rss_baseline_bytes = r.rss;
+        }
+    }
+    let (widths, _admissible, wall, stop_reason) =
+        cpa_allocate(&memory_cfg, speedups, est, p, mem_budget);
     let weight: HashMap<String, f64> = cfg
         .steps
         .iter()
@@ -1466,11 +1509,15 @@ fn build_cpa_plan(
     }
     let t_a = area / p as f64;
     let lower_bound = if t_cp >= t_a { t_cp } else { t_a };
-    let modeled = if stop_reason == CPA_INFEASIBLE_FIXED_WIDTH {
+    let modeled = if matches!(
+        stop_reason.as_str(),
+        CPA_INFEASIBLE_FIXED_WIDTH | CPA_INFEASIBLE_MEMORY
+    ) {
         f64::INFINITY
     } else {
         cpa_simulate_makespan(cfg, &widths, &weight, &order, p)
     };
+    let infeasible_memory = stop_reason == CPA_INFEASIBLE_MEMORY;
     let allocation = Allocation {
         core_budget: p,
         area_s: area,
@@ -1478,7 +1525,7 @@ fn build_cpa_plan(
         critical_path_s: t_cp,
         lower_bound_s: lower_bound,
         modeled_makespan_s: modeled,
-        stop_reason,
+        stop_reason: stop_reason.clone(),
     };
     let entries: Vec<PlanEntry> = cfg
         .steps
@@ -1517,6 +1564,7 @@ fn build_cpa_plan(
                 // the fixed width in its model, but must not publish a value that
                 // apply_plan_to_config could misrepresent as an executable guest-width change.
                 alloc_inner_jobs: if s.skip_reason.is_some()
+                    || infeasible_memory
                     || effective_jobs_flag(s, &cfg.default_jobs_flag)
                         .trim()
                         .is_empty()
@@ -1641,6 +1689,13 @@ pub fn build_plan(
 /// self-managed commands retain their declared fixed width so run-budget validation cannot be
 /// bypassed by applying a plan.
 pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
+    if plan
+        .allocation
+        .as_ref()
+        .is_some_and(|allocation| allocation.stop_reason == CPA_INFEASIBLE_MEMORY)
+    {
+        return cfg.clone();
+    }
     let by_tag = plan.by_tag();
     let mut new_cfg = cfg.clone();
     new_cfg.steps = cfg
@@ -1953,7 +2008,7 @@ fn allocation_text_lines(plan: &Plan) -> Vec<String> {
         Some(a) => a,
     };
     vec![format!(
-        "allocator (cpa): {}; P={} cores; critical-path={}s, area/P={}s, lower-bound={}s, modeled-makespan={}s",
+        "allocator (cpa): {}; P={} cores; critical-path={}s, area/P={}s, lower-bound={}s, no-overcommit-model={}s",
         a.stop_reason,
         a.core_budget,
         fmt_secs(a.critical_path_s),
@@ -2510,7 +2565,7 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,g.live,cpu-bound,2,5.0,0,True,False,0,1000,
         assert_eq!(widths["g.live"], 2);
         assert_eq!(
             crate::sizing::schedulable_peak_mem_bytes_widths(&cfg, 2, &widths).0,
-            0
+            1024i64.pow(3)
         );
         assert_eq!(
             crate::sizing::stress_copy_footprint_bytes(&cfg, Some(123)),
@@ -2805,6 +2860,136 @@ t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000
         );
         assert_eq!(cpa_widths(&free)["m.heavy"], Some(8));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_memory_uses_learned_rss_before_allocating() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let rows = "\
+t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,1,40.0,0,True,False,0,1000,,,40.0,0.0,0.0
+t,m,affinity16_cpu-max-max,a,1,a,u,l,m.heavy,cpu-bound,8,5.0,0,True,False,0,1000,,,40.0,0.0,0.0
+";
+        let dir = write_speedup_store("learned-mem", rows);
+        let speedups = load_step_speedups(&dir, "m", "affinity16_cpu-max-max");
+        let mut heavy = mk("m", "heavy", &[], 40.0);
+        heavy.hint.rss_baseline_bytes = Some(GIB);
+        heavy.hint.classification = crate::model::StepClass::CpuBound;
+        heavy.hint.preferred_inner_jobs = Some(1);
+        let cfg = DagConfig {
+            steps: vec![heavy],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 1.0,
+            ..Default::default()
+        };
+        let samples = HashMap::from([(
+            "m.heavy".to_string(),
+            StepSamples {
+                step: "m.heavy".to_string(),
+                samples: 3,
+                est_duration_s: Some(40.0),
+                rss_estimate_bytes: Some(8 * GIB),
+            },
+        )]);
+
+        let plan = build_plan(
+            &cfg,
+            &samples,
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &speedups,
+            Some(8),
+            Some(4 * GIB),
+        );
+
+        let allocation = plan.allocation.as_ref().unwrap();
+        assert_eq!(allocation.stop_reason, CPA_INFEASIBLE_MEMORY);
+        assert!(allocation.modeled_makespan_s.is_infinite());
+        assert_eq!(plan.entries[0].rss_source, "store");
+        assert_eq!(plan.entries[0].rss_estimate_bytes, Some(8 * GIB));
+        assert_eq!(plan.entries[0].alloc_inner_jobs, None);
+        assert_eq!(
+            crate::io::dag_to_json(&apply_plan_to_config(&cfg, &plan)),
+            crate::io::dag_to_json(&cfg)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cpa_seed_applies_outer_memory_envelope_and_returns_typed_error() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let mut heavy = mk("m", "heavy", &[], 1.0);
+        heavy.hint.rss_baseline_bytes = Some(3 * GIB);
+        let cfg = DagConfig {
+            steps: vec![heavy],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 2.0,
+            ..Default::default()
+        };
+        let empty_samples: HashMap<String, StepSamples> = HashMap::new();
+        let empty_speedups: HashMap<String, StepSpeedup> = HashMap::new();
+        let est = HashMap::from([("m.heavy".to_string(), 1.0)]);
+
+        let plan = build_plan(
+            &cfg,
+            &empty_samples,
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &empty_speedups,
+            Some(8),
+            Some(5 * GIB),
+        );
+        let allocation = plan.allocation.as_ref().unwrap();
+        assert_eq!(allocation.stop_reason, CPA_INFEASIBLE_MEMORY);
+        assert!(allocation.modeled_makespan_s.is_infinite());
+        assert_eq!(plan.entries[0].alloc_inner_jobs, None);
+        assert_eq!(
+            crate::io::dag_to_json(&apply_plan_to_config(&cfg, &plan)),
+            crate::io::dag_to_json(&cfg)
+        );
+
+        let error = allocate_widths(&cfg, &empty_speedups, &est, 8, Some(5 * GIB))
+            .expect_err("seed footprint must exceed memory budget");
+        assert_eq!(error.mem_budget, Some(5 * GIB));
+        assert_eq!(error.memory_footprint, Some(6 * GIB));
+    }
+
+    #[test]
+    fn cpa_memory_checks_each_step_then_max_mem_derives_serial_overlap() {
+        const GIB: i64 = 1024 * 1024 * 1024;
+        let mut a = mk("m", "a", &[], 1.0);
+        a.hint.hard_mem_max_bytes = Some(4 * GIB);
+        let mut b = mk("m", "b", &[], 1.0);
+        b.hint.hard_mem_max_bytes = Some(4 * GIB);
+        let cfg = DagConfig {
+            steps: vec![a, b],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 1.0,
+            ..Default::default()
+        };
+        let empty_samples: HashMap<String, StepSamples> = HashMap::new();
+        let empty_speedups: HashMap<String, StepSpeedup> = HashMap::new();
+
+        let plan = build_plan(
+            &cfg,
+            &empty_samples,
+            Planner::Cpa,
+            DEFAULT_MIN_SAMPLES,
+            &empty_speedups,
+            Some(2),
+            Some(4 * GIB),
+        );
+
+        assert_ne!(
+            plan.allocation.as_ref().unwrap().stop_reason,
+            CPA_INFEASIBLE_MEMORY
+        );
+        assert_eq!(
+            crate::sizing::jobs_for_budget(&apply_plan_to_config(&cfg, &plan), 4 * GIB),
+            (1, 4 * GIB)
+        );
     }
 
     #[test]

@@ -297,7 +297,7 @@ pub fn step_classification(step: &Step) -> StepClass {
 /// Positive internal parallelism width: an explicit override wins, else the hint.
 ///
 /// Zero/negative library-authored values mean undeclared and fall through to the configured
-/// per-step CPU default rather than becoming an invalid command flag or admission width.
+/// per-step CPU default rather than becoming an invalid command flag or declared guest width.
 pub fn preferred_inner_jobs(step: &Step, experiment_override: Option<i64>) -> Option<i64> {
     experiment_override
         .or(step.hint.preferred_inner_jobs)

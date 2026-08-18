@@ -85,9 +85,9 @@ This review record entered the repository with implementation commit
 17. **One `-j` number conflated DAG-node fan-out with total CPU capacity.** A graph could limit
     itself to two active nodes only by also pretending each node had one unit of internal
     parallelism. `run -s/--max-steps` now bounds active DAG nodes, while
-    `run -j/--max-cpus` sets the whole run's CPU budget in core-equivalents and bounds the sum of
-    active steps' effective widths. Both gates apply under every planner; `--max-mem` derives the
-    step ceiling, and CPA receives the explicit CPU budget. The ambiguous 0.13 long spelling
+    `run -j/--max-cpus` sets the boxed run's shared CPU-bandwidth budget and the maximum width of
+    any one runner-controlled step. `--max-mem` derives the step ceiling, and CPA receives the
+    explicit per-step/allocation budget. The ambiguous 0.13 long spelling
     `run --jobs` remains only as a hidden compatibility alias and disagreement with the canonical
     option is rejected; `sweep --jobs` remains the public per-step width-range option.
 18. **CPU quota was at risk of being described as instantaneous core containment.** `cpu.weight`
@@ -97,8 +97,8 @@ This review record entered the repository with implementation commit
     CPUs remain the separate `--cores K` cpuset contract.
 19. **Authored widths could exceed the run budget or disappear behind defaults.** Both schedulers
     now visibly cap a step's preferred width, appended jobs flag, per-step `cpu.max`, and the
-    undeclared-step CPU default to total budget `P`. Admission and CPA charge that effective
-    default, and a speedup curve with no point at or below `P` cannot authorize a wider allocation.
+    undeclared-step CPU default to total budget `P`. CPA uses that effective default, and a speedup
+    curve with no point at or below `P` cannot authorize a wider allocation.
 20. **A union of sampled CPU IDs was not a concurrency measurement.** The shared fork-based guest
     records step/worker lifetimes, process CPU time, current CPU, and run-scope `cpu.stat`. Exact
     overlap checks allow A/B to C/D migration across time; a boxed adversarial case deliberately
@@ -134,7 +134,7 @@ This review record entered the repository with implementation commit
     Pure CPA planning preserves the impossible fixed width, publishes no executable allocation for
     it, and reports `infeasible-fixed-width` rather than laundering it through plan application.
     The low-level allocator raises/returns a typed `InfeasibleAllocationError`; that Rust API
-    change is released as 0.14. `sweep --jobs` refuses self-managed steps because it cannot vary
+    change is released as 0.15. `sweep --jobs` refuses self-managed steps because it cannot vary
     the guest. Empty and whitespace-only flags share exactly this behavior and never append a bare
     positional width. Arbitrary undeclared threads remain bounded only by CPU bandwidth, not thread
     count.
@@ -146,6 +146,31 @@ This review record entered the repository with implementation commit
     are excluded from memory/stress accounting, retain their authored hints when a plan is applied,
     and cannot suppress widths for runnable work. Nonpositive library-authored widths consistently
     fall through to the positive per-step default in both implementations.
+27. **Declared inner widths were incorrectly treated as additive CPU reservations.** The ready-set
+    scheduler refused to overlap legal steps when their requested widths summed above `P`, even
+    though the boxed parent already enforces aggregate `cpu.max=P` and beneficial oversubscription
+    is workload-dependent. Both implementations now let `--max-steps`, dependencies, and named
+    resources govern overlap while retaining the individual `p_i <= P` clamp/refusal and the exact
+    outer bandwidth boundary. Width-aware `--max-mem` sizing and per-step `memory.max` now use the
+    same applied width, so removing the implicit serialization does not undercount modeled RAM.
+    Adversarial cross tests run multiple width-`P` steps concurrently and prove their aggregate
+    requested width can exceed `P` while the outer long-window CPU envelope remains within `P`.
+    No current planner claims to optimize this oversubscription: greedy-LPT and critical-path only
+    order work, while CPA's area and makespan values are explicitly a no-overcommit planning
+    reference derived from isolated per-step curves, not a prediction of the live contended run.
+28. **Removing implicit CPU serialization exposed unsafe and divergent memory assumptions.** The
+    ordinary `--max-mem`, CPA, runtime cgroup, and stress paths disagreed about effective width;
+    hard-cap-only, default-capped, and selected `engine_only` work could disappear; learned RSS was
+    applied only after CPA allocation; an impossible one-step budget was reported as runnable; and
+    signed-64 overflow could panic Rust while Python continued with a different value. All paths
+    now share width-aware caps, floor/safety-factor handling, saturating arithmetic, and an explicit
+    unbounded sentinel. CPA uses learned RSS before allocation and reports `infeasible-memory`
+    without executable widths; `jobs_for_budget` returns a zero-step sentinel and the CLI refuses.
+    Aggregate memory then tightens (never loosens) the explicit-or-default active-step ceiling.
+    Stress checks both the CPU-capped authored graph and the final expanded post-feedback graph,
+    retains a per-copy control-plane floor, and refuses expansions above 100,000 generated nodes.
+    Exact subset search is bounded; wide graphs use a conservative largest-caps fallback before
+    dependency closure, and dependency traversal itself is iterative with an O(n) one-step path.
 
 ## Cross-implementation evidence
 
@@ -156,10 +181,11 @@ This review record entered the repository with implementation commit
     self-test verdicts, signal status, invalid inputs, wrapped help, and clean missing-executable
     failure, plus 23 malformed-record variants that both refuse without rewriting shared state.
 - `python3 cross/differential.py --tool safe-ci-dag-runner`
-  - Default seed/count completed with **478 checks passed across 42 fixtures**.
-  - Includes independent `S`/`P` admission, jobs-flag clamping, migration-safe worker overlap,
-    guest-observed sweep widths, spawn-failure eager cancellation, profile-width parity, and
-    capability-gated live outer-`cpu.max` bandwidth evidence.
+  - Default seed/count completed with **489 checks passed across 42 fixtures**.
+  - Includes `S`-governed overlap, per-step `P` clamping, deliberate width oversubscription,
+    migration-safe worker overlap, guest-observed sweep widths, spawn-failure eager cancellation,
+    profile-width parity, fail-closed memory/stress cases, and capability-gated live
+    outer-`cpu.max` bandwidth evidence.
 - `python3 -m mypy cross/differential.py`
   - No issues.
 
@@ -177,11 +203,11 @@ evidence without treating a source label as proof that runtime behavior changed.
 
 ## Focused test evidence
 
-- Python: the full repository package run reached **1,717 passed**; the remaining four cases were
-  blocked by this host's BPF-jailer from executing `git`/`wc`/`tr`, and all four passed on immediate
-  isolated rerun. All **1,721 collected tests** are therefore accounted for without treating a
-  host security denial as a product verdict.
-- Rust: the full safe package suite passed **165 unit tests plus 27 integration tests**, including
+- Python: the full repository package run reached **1,744 passed**; the remaining five cases were
+  blocked by this host's BPF-jailer from executing `git`, and all five passed on immediate isolated
+  rerun. All **1,749 collected tests** are therefore accounted for without treating a host security
+  denial as a product verdict.
+- Rust: the full safe package suite passed **187 unit tests plus 27 integration tests**, including
   termination attribution, live cgroup memory, CPU-time, core-box, run-timeout, and containment
   tests.
 - `python3 scripts/embed_userguides.py --check`: all 16 paired documents and 6 single-language

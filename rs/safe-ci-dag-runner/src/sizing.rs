@@ -5,13 +5,20 @@
 // Direct port of `py/safe_ci_dag_runner/sizing.py`. Rather than a flat per-job RAM estimate,
 // it enumerates which steps can actually co-run (no transitive dependency between them, and
 // their summed scarce-resource demand fits the caps) and takes the worst-case sum of their
-// per-step memory caps. That yields an exact "largest active-step ceiling that fits budget M". The
-// chosen active-step ceiling and footprint MUST equal the Python build's for the same DAG
-// (cross-tested).
+// per-step memory caps. Within a bounded subset-search budget this is exact; wider searches use a
+// conservative largest-caps upper bound so sizing cannot become exponential. The chosen ceiling
+// and footprint MUST equal the Python build's for the same DAG (cross-tested).
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{step_classification, DagConfig, Step, StepClass, DEFAULT_SMALL_MEM_CAP_BYTES};
+use crate::model::{effective_cpu_count, step_classification, DagConfig, Step, StepClass};
+
+const MAX_EXACT_MEM_COMBINATIONS: u128 = 100_000;
+
+fn scaled_for_width_i64(cap: i64, inner_jobs: i64) -> i64 {
+    let scaled = (cap as i128 * inner_jobs as i128) / 4;
+    scaled.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
 
 /// Resolve the inner-cgroup memory cap for a step.
 ///
@@ -22,12 +29,14 @@ pub fn step_mem_cap_bytes(
     mem_cap_factor: f64,
     default_cap_bytes: Option<i64>,
 ) -> Option<i64> {
-    if let Some(hard) = step.hint.hard_mem_max_bytes {
+    if let Some(hard) = step.hint.hard_mem_max_bytes.filter(|value| *value > 0) {
         return Some(hard);
     }
     match step.hint.rss_baseline_bytes {
-        Some(base) if base != 0 => Some((base as f64 * mem_cap_factor) as i64),
-        _ => default_cap_bytes,
+        Some(base) if base > 0 && mem_cap_factor.is_finite() && mem_cap_factor > 0.0 => {
+            Some(((base as f64 * mem_cap_factor) as i64).max(1))
+        }
+        _ => default_cap_bytes.filter(|value| *value > 0),
     }
 }
 
@@ -41,52 +50,61 @@ pub fn step_mem_cap_for_inner_jobs(
     mem_cap_factor: f64,
 ) -> i64 {
     // Active-step sizing excludes uncharacterized steps (no default here), matching Python.
-    let cap = step_mem_cap_bytes(step, mem_cap_factor, None).unwrap_or(0);
+    step_mem_cap_for_inner_jobs_optional(step, inner_jobs, mem_cap_factor, None).unwrap_or(0)
+}
+
+/// Width-scaled cap while preserving an absent cap as `None`.
+///
+/// Sizing maps an uncharacterized step to zero because it is excluded from the footprint sum;
+/// runtime enforcement supplies the DAG's forcing-function default and must retain `None` when
+/// that default is disabled. This shared implementation keeps their scaling arithmetic identical.
+pub(crate) fn step_mem_cap_for_inner_jobs_optional(
+    step: &Step,
+    inner_jobs: Option<i64>,
+    mem_cap_factor: f64,
+    default_cap_bytes: Option<i64>,
+) -> Option<i64> {
+    let cap = step_mem_cap_bytes(step, mem_cap_factor, default_cap_bytes)?;
     match inner_jobs {
         Some(jobs)
-            if step.hint.hard_mem_max_bytes.is_none()
+            if step.hint.hard_mem_max_bytes.is_none_or(|value| value <= 0)
                 && step_classification(step) == StepClass::CpuBound =>
         {
-            // Python: max(cap, int(cap * inner_jobs / 4)) with true (float) division.
-            let scaled = (cap as f64 * jobs as f64 / 4.0) as i64;
-            cap.max(scaled)
+            // Exact integer arithmetic, truncated toward zero and saturated to i64. Python uses
+            // the same operation, avoiding binary64 drift above 2^53.
+            let scaled = scaled_for_width_i64(cap, jobs);
+            Some(cap.max(scaled))
         }
-        _ => cap,
+        _ => Some(cap),
     }
 }
 
-/// Map each step tag to the set of all tags it transitively depends on.
+/// Map each step tag to all transitive dependencies using an explicit deterministic DFS stack.
+///
+/// This cannot overflow the call stack on a reverse-topological chain thousands of nodes deep.
 pub fn transitive_deps(steps: &[Step]) -> HashMap<String, HashSet<String>> {
     let direct: HashMap<String, Vec<String>> =
         steps.iter().map(|s| (s.tag(), s.deps.clone())).collect();
     let mut result: HashMap<String, HashSet<String>> = HashMap::new();
-
-    fn visit(
-        tag: &str,
-        direct: &HashMap<String, Vec<String>>,
-        result: &mut HashMap<String, HashSet<String>>,
-    ) -> HashSet<String> {
-        if let Some(cached) = result.get(tag) {
-            return cached.clone();
-        }
-        let mut deps: HashSet<String> = direct
-            .get(tag)
-            .cloned()
-            .unwrap_or_default()
+    for step in steps {
+        let tag = step.tag();
+        let mut deps: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = direct
+            .get(&tag)
             .into_iter()
+            .flatten()
+            .rev()
+            .cloned()
             .collect();
-        let direct_deps: Vec<String> = deps.iter().cloned().collect();
-        for dep in direct_deps {
-            for t in visit(&dep, direct, result) {
-                deps.insert(t);
+        while let Some(dep) = stack.pop() {
+            if !deps.insert(dep.clone()) {
+                continue;
+            }
+            if let Some(next) = direct.get(&dep) {
+                stack.extend(next.iter().rev().cloned());
             }
         }
-        result.insert(tag.to_string(), deps.clone());
-        deps
-    }
-
-    for tag in direct.keys() {
-        visit(tag, &direct, &mut result);
+        result.insert(tag, deps);
     }
     result
 }
@@ -122,32 +140,65 @@ fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
     }
 }
 
+fn too_many_combinations(n: usize, width: usize) -> bool {
+    let mut term: u128 = 1;
+    let mut total: u128 = 0;
+    for count in 1..=width {
+        term = term.saturating_mul((n - count + 1) as u128) / count as u128;
+        total = total.saturating_add(term);
+        if total > MAX_EXACT_MEM_COMBINATIONS {
+            return true;
+        }
+    }
+    false
+}
+
 /// Maximum per-step-cap sum over any scheduler-reachable concurrent set of size `<= jobs`.
 ///
 /// A set is reachable only when no member transitively depends on another and the summed
-/// scarce-resource demand fits `cfg.resource_caps`. Only steps with a memory baseline and that
-/// are not engine-only participate. Returns `(best_total, chosen_tags)`. `inner_jobs` applies ONE
-/// internal-parallelism width to every step (the `--max-mem` sizing path).
+/// scarce-resource demand fits `cfg.resource_caps`. Every runnable non-skipped step participates:
+/// a hard cap wins, an RSS baseline derives a cap, and an undeclared step uses the configured
+/// default cap. An uncharacterized step with that default disabled is conservatively unbounded.
+/// Returns `(best_total, chosen_tags)`. `inner_jobs` applies ONE internal-parallelism width to every
+/// step; when absent, each step's effective preferred/default width is used so ordinary
+/// `--max-mem` sizing reflects the post-plan configuration.
 pub fn schedulable_peak_mem_bytes(
     cfg: &DagConfig,
     jobs: i64,
     inner_jobs: Option<i64>,
 ) -> (i64, Vec<String>) {
     peak_mem_over_sets(cfg, jobs, &|s| {
-        step_mem_cap_for_inner_jobs(s, inner_jobs, cfg.mem_cap_factor)
+        let width = inner_jobs.or_else(|| effective_cpu_count(s, cfg.default_step_cpu_count));
+        step_mem_cap_for_inner_jobs_optional(
+            s,
+            width,
+            cfg.mem_cap_factor,
+            cfg.default_step_mem_cap_bytes,
+        )
+        .unwrap_or(i64::MAX)
     })
 }
 
 /// Compute peak schedulable memory using a separate inner-job width for each step.
 ///
-/// A step absent from `widths` is evaluated without an explicit inner-job width.
+/// A step absent from `widths` falls back to its effective preferred/default width.
 pub fn schedulable_peak_mem_bytes_widths(
     cfg: &DagConfig,
     jobs: i64,
     widths: &HashMap<String, i64>,
 ) -> (i64, Vec<String>) {
     peak_mem_over_sets(cfg, jobs, &|s| {
-        step_mem_cap_for_inner_jobs(s, widths.get(&s.tag()).copied(), cfg.mem_cap_factor)
+        let width = widths
+            .get(&s.tag())
+            .copied()
+            .or_else(|| effective_cpu_count(s, cfg.default_step_cpu_count));
+        step_mem_cap_for_inner_jobs_optional(
+            s,
+            width,
+            cfg.mem_cap_factor,
+            cfg.default_step_mem_cap_bytes,
+        )
+        .unwrap_or(i64::MAX)
     })
 }
 
@@ -164,17 +215,63 @@ fn peak_mem_over_sets(
     let participating: Vec<&Step> = cfg
         .steps
         .iter()
-        .filter(|s| {
-            s.hint.rss_baseline_bytes.is_some() && !s.engine_only && s.skip_reason.is_none()
-        })
+        .filter(|s| s.skip_reason.is_none())
         .collect();
     let tags: Vec<String> = participating.iter().map(|s| s.tag()).collect();
-    let dependencies = transitive_deps(&cfg.steps);
-
     let width = jobs.max(1).min(tags.len() as i64) as usize;
     let mut best_total: i64 = 0;
     let mut best: Vec<String> = Vec::new();
 
+    if width == 0 {
+        return (0, Vec::new());
+    }
+    if width == 1 {
+        // No dependency closure is needed when only one step may run. Update only on a STRICTLY
+        // larger cap so equal maxima retain authored cfg order, matching Python's stable `max`.
+        let mut chosen_index = 0usize;
+        let mut chosen_cap = cap_of(participating[0]);
+        for (index, step) in participating.iter().enumerate().skip(1) {
+            let cap = cap_of(step);
+            if cap > chosen_cap {
+                chosen_index = index;
+                chosen_cap = cap;
+            }
+        }
+        return (chosen_cap, vec![tags[chosen_index].clone()]);
+    }
+
+    // Exact antichain/resource enumeration is exponential. Above the shared fixed search budget,
+    // conservatively ignore dependencies/resources and sum the largest `jobs` caps. This can only
+    // overestimate reachable memory, never admit unsafe concurrency. Original cfg order breaks
+    // equal-cap ties deterministically, matching Python's stable sort.
+    if too_many_combinations(tags.len(), width) {
+        let mut ranked: Vec<(usize, i64)> = participating
+            .iter()
+            .enumerate()
+            .map(|(index, step)| (index, cap_of(step)))
+            .collect();
+        ranked.sort_by(|(left_index, left_cap), (right_index, right_cap)| {
+            right_cap
+                .cmp(left_cap)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        let chosen_indices: Vec<usize> = ranked
+            .into_iter()
+            .take(width)
+            .map(|(index, _)| index)
+            .collect();
+        let total = chosen_indices
+            .iter()
+            .map(|index| cap_of(participating[*index]))
+            .fold(0, i64::saturating_add);
+        let chosen = chosen_indices
+            .into_iter()
+            .map(|index| tags[index].clone())
+            .collect();
+        return (total, chosen);
+    }
+
+    let dependencies = transitive_deps(&cfg.steps);
     for count in 1..=width {
         for combo in combinations(tags.len(), count) {
             // No two members may have a (transitive) dependency relation, either direction.
@@ -206,13 +303,16 @@ fn peak_mem_over_sets(
                             .copied()
                             .unwrap_or(0)
                     })
-                    .sum();
+                    .fold(0, i64::saturating_add);
                 sum > *cap
             });
             if over_cap {
                 continue;
             }
-            let total: i64 = combo.iter().map(|&i| cap_of(participating[i])).sum();
+            let total: i64 = combo
+                .iter()
+                .map(|&i| cap_of(participating[i]))
+                .fold(0, i64::saturating_add);
             if total > best_total {
                 best_total = total;
                 best = combo.iter().map(|&i| tags[i].clone()).collect();
@@ -225,18 +325,43 @@ fn peak_mem_over_sets(
 /// Worst-case footprint (bytes) at the given `-j`, clamped to the configured floor.
 pub fn jobs_footprint_bytes(cfg: &DagConfig, jobs: i64, inner_jobs: Option<i64>) -> i64 {
     let (peak, _) = schedulable_peak_mem_bytes(cfg, jobs, inner_jobs);
-    cfg.mem_cap_floor_bytes
-        .max((peak as f64 * cfg.outer_mem_safety_factor) as i64)
+    outer_mem_footprint_bytes(cfg, peak)
 }
 
-/// Largest active-step ceiling (`>=1`, capped at CPU count) whose worst-case footprint fits
-/// `budget` bytes.
-/// Returns `(jobs, footprint_at_that_jobs)`. Always `>= 1`.
+/// Apply the run-level floor and safety factor to one modeled peak.
+pub(crate) fn outer_mem_footprint_bytes(cfg: &DagConfig, peak: i64) -> i64 {
+    if peak == i64::MAX {
+        return i64::MAX;
+    }
+    let scaled = if cfg.outer_mem_safety_factor.is_finite() && cfg.outer_mem_safety_factor > 0.0 {
+        if peak > 0 {
+            ((peak as f64 * cfg.outer_mem_safety_factor) as i64).max(1)
+        } else {
+            0
+        }
+    } else {
+        i64::MAX
+    };
+    cfg.mem_cap_floor_bytes.max(0).max(scaled)
+}
+
+/// Whether a finite, non-overflowed footprint fits a finite budget.
+pub(crate) fn memory_footprint_fits(footprint: i64, budget: i64) -> bool {
+    (0..i64::MAX).contains(&footprint) && footprint <= budget
+}
+
+/// Largest active-step ceiling, capped at CPU count, whose worst-case footprint fits `budget`.
+/// Returns `(0, one_step_footprint)` when even one runnable step or the configured floor cannot
+/// fit; callers must refuse rather than execute an infeasible graph.
 pub fn jobs_for_budget(cfg: &DagConfig, budget: i64) -> (i64, i64) {
     let ncpu = cpu_count();
+    let one = jobs_footprint_bytes(cfg, 1, None);
+    if !memory_footprint_fits(one, budget) {
+        return (0, one);
+    }
     let mut best: i64 = 1;
     for n in 1..=ncpu {
-        if jobs_footprint_bytes(cfg, n, None) <= budget {
+        if memory_footprint_fits(jobs_footprint_bytes(cfg, n, None), budget) {
             best = n;
         } else {
             break; // footprint is monotonic non-decreasing in n
@@ -432,15 +557,43 @@ pub fn box_mem_budget_bytes() -> Option<i64> {
 /// same small default cap used by the scheduler. Intentional pre-execution skips are excluded.
 /// Summing the graph is deliberately an upper bound.
 pub fn stress_copy_footprint_bytes(cfg: &DagConfig, default_step_bytes: Option<i64>) -> i64 {
-    let default_step_bytes = default_step_bytes.unwrap_or(DEFAULT_SMALL_MEM_CAP_BYTES);
-    cfg.steps
-        .iter()
-        .filter(|step| !step.engine_only && step.skip_reason.is_none())
-        .map(|step| {
-            step_mem_cap_bytes(step, cfg.mem_cap_factor, Some(default_step_bytes)).unwrap_or(0)
-        })
-        .fold(0i64, i64::saturating_add)
-        .max(default_step_bytes)
+    let default_step_bytes = default_step_bytes
+        .filter(|value| *value > 0)
+        .or(cfg.default_step_mem_cap_bytes)
+        .filter(|value| *value > 0);
+    let control_floor = stress_control_floor_bytes(cfg, default_step_bytes);
+    let mut total = 0i64;
+    let mut runnable = 0usize;
+    for step in cfg.steps.iter().filter(|step| step.skip_reason.is_none()) {
+        runnable += 1;
+        let cap = step_mem_cap_for_inner_jobs_optional(
+            step,
+            effective_cpu_count(step, cfg.default_step_cpu_count),
+            cfg.mem_cap_factor,
+            default_step_bytes,
+        )
+        .unwrap_or(i64::MAX);
+        total = total.saturating_add(cap);
+    }
+    if runnable > 0 {
+        total.max(control_floor)
+    } else {
+        control_floor
+    }
+}
+
+/// Minimum control-plane memory charged to each complete stress graph copy.
+///
+/// A positive configured/explicit default is the conservative SMALL forcing-function allowance
+/// (normally 1 GiB). With that default deliberately disabled, the configured memory floor or one
+/// byte preserves finite hard-cap models. The CLI separately enforces a generated-node cap, which
+/// deterministically bounds config-object allocation.
+pub(crate) fn stress_control_floor_bytes(cfg: &DagConfig, default_step_bytes: Option<i64>) -> i64 {
+    default_step_bytes
+        .filter(|value| *value > 0)
+        .or(cfg.default_step_mem_cap_bytes)
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| cfg.mem_cap_floor_bytes.max(1))
 }
 
 #[cfg(test)]
@@ -534,10 +687,100 @@ mod tests {
     }
 
     #[test]
+    fn stress_without_default_only_marks_uncharacterized_steps_unbounded() {
+        let mut hard = step("g", "hard", None, &[], false);
+        hard.hint.hard_mem_max_bytes = Some(2 * GIB);
+        let rss = step("g", "rss", Some(3 * GIB), &[], false);
+        let characterized = DagConfig {
+            steps: vec![hard, rss],
+            mem_cap_factor: 1.0,
+            default_step_mem_cap_bytes: None,
+            mem_cap_floor_bytes: 0,
+            ..Default::default()
+        };
+        assert_eq!(stress_copy_footprint_bytes(&characterized, None), 5 * GIB);
+
+        let uncharacterized = DagConfig {
+            steps: vec![step("g", "bare", None, &[], false)],
+            default_step_mem_cap_bytes: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            stress_copy_footprint_bytes(&uncharacterized, None),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn empty_stress_footprint_uses_default_then_floor() {
+        let with_default = DagConfig {
+            steps: vec![],
+            default_step_mem_cap_bytes: Some(GIB),
+            mem_cap_floor_bytes: 2 * GIB,
+            ..Default::default()
+        };
+        assert_eq!(stress_copy_footprint_bytes(&with_default, None), GIB);
+        let floor_only = DagConfig {
+            default_step_mem_cap_bytes: None,
+            ..with_default
+        };
+        assert_eq!(stress_copy_footprint_bytes(&floor_only, None), 2 * GIB);
+    }
+
+    #[test]
     fn transitive_deps_cases() {
         let deps = transitive_deps(&cfg().steps);
         assert_eq!(deps["g.B"], HashSet::from(["g.A".to_string()]));
         assert!(deps["g.A"].is_empty());
+    }
+
+    #[test]
+    fn transitive_deps_handles_1100_node_reverse_chain_iteratively() {
+        let steps: Vec<Step> = (0..1100)
+            .rev()
+            .map(|index| {
+                let dep = (index > 0).then(|| format!("chain.s{}", index - 1));
+                let mut value = step("chain", &format!("s{index}"), None, &[], false);
+                value.deps = dep.into_iter().collect();
+                value
+            })
+            .collect();
+        let deps = transitive_deps(&steps);
+        assert_eq!(deps["chain.s1099"].len(), 1099);
+        assert!(deps["chain.s1099"].contains("chain.s0"));
+        assert!(deps["chain.s0"].is_empty());
+
+        let value = DagConfig {
+            steps,
+            default_step_mem_cap_bytes: Some(1),
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(schedulable_peak_mem_bytes(&value, 1100, None).0, 1100);
+    }
+
+    #[test]
+    fn width_one_sizing_skips_closure_on_5000_node_reverse_chain() {
+        let steps: Vec<Step> = (0..5000)
+            .rev()
+            .map(|index| {
+                let dep = (index > 0).then(|| format!("wide.s{}", index - 1));
+                let mut value = step("wide", &format!("s{index}"), None, &[], false);
+                value.deps = dep.into_iter().collect();
+                value.hint.hard_mem_max_bytes =
+                    Some(if index == 4999 || index == 4000 { 2 } else { 1 });
+                value
+            })
+            .collect();
+        let value = DagConfig {
+            steps,
+            ..Default::default()
+        };
+        assert_eq!(
+            schedulable_peak_mem_bytes(&value, 1, None),
+            (2, vec!["wide.s4999".to_string()])
+        );
     }
 
     #[test]
@@ -582,6 +825,151 @@ mod tests {
         let c = cfg();
         assert_eq!(jobs_footprint_bytes(&c, 1, None), 4 * GIB);
         assert_eq!(jobs_for_budget(&c, 6 * GIB), (1, 4 * GIB));
-        assert_eq!(jobs_for_budget(&c, GIB).0, 1);
+        assert_eq!(jobs_for_budget(&c, GIB), (0, 4 * GIB));
+    }
+
+    #[test]
+    fn jobs_for_budget_scales_each_cpu_bound_steps_effective_width() {
+        let mut preferred = step("g", "preferred", Some(GIB), &[], false);
+        preferred.hint.classification = StepClass::CpuBound;
+        preferred.hint.preferred_inner_jobs = Some(8);
+        let mut defaulted = step("g", "defaulted", Some(GIB), &[], false);
+        defaulted.hint.classification = StepClass::CpuBound;
+        let value = DagConfig {
+            steps: vec![preferred, defaulted],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 1.0,
+            default_step_cpu_count: Some(8),
+            ..Default::default()
+        };
+
+        // The width model is linear above j4, so each j8 step costs 2 GiB and the pair costs 4 GiB.
+        assert_eq!(schedulable_peak_mem_bytes(&value, 2, None).0, 4 * GIB);
+        assert_eq!(jobs_footprint_bytes(&value, 1, None), 2 * GIB);
+        assert_eq!(jobs_for_budget(&value, 3 * GIB), (1, 2 * GIB));
+    }
+
+    #[test]
+    fn memory_classes_and_hard_cap_width_rules() {
+        let mut cpu = step("g", "cpu", Some(GIB), &[], false);
+        cpu.hint.classification = StepClass::CpuBound;
+        let light = step("g", "light", Some(GIB), &[], false);
+        let mut hard = step("g", "hard", Some(GIB), &[], false);
+        hard.hint.classification = StepClass::CpuBound;
+        hard.hint.hard_mem_max_bytes = Some(3 * GIB);
+
+        assert_eq!(step_mem_cap_for_inner_jobs(&cpu, Some(4), 1.0), GIB);
+        assert_eq!(step_mem_cap_for_inner_jobs(&cpu, Some(8), 1.0), 2 * GIB);
+        assert_eq!(step_mem_cap_for_inner_jobs(&light, Some(8), 1.0), GIB);
+        assert_eq!(step_mem_cap_for_inner_jobs(&hard, Some(8), 1.0), 3 * GIB);
+    }
+
+    #[test]
+    fn sizing_counts_hard_default_and_selected_engine_steps() {
+        let mut hard = step("g", "hard", None, &[], false);
+        hard.hint.hard_mem_max_bytes = Some(6 * GIB);
+        let mut defaulted = step("g", "defaulted", None, &[], false);
+        defaulted.hint.classification = StepClass::CpuBound;
+        defaulted.engine_only = true;
+        let value = DagConfig {
+            steps: vec![hard, defaulted],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 1.0,
+            default_step_mem_cap_bytes: Some(GIB),
+            default_step_cpu_count: Some(8),
+            ..Default::default()
+        };
+
+        assert_eq!(schedulable_peak_mem_bytes(&value, 2, None).0, 8 * GIB);
+        assert_eq!(jobs_for_budget(&value, 5 * GIB), (0, 6 * GIB));
+    }
+
+    #[test]
+    fn sizing_saturates_i64_instead_of_overflowing() {
+        let value = DagConfig {
+            steps: vec![
+                step("g", "a", Some(i64::MAX), &[], false),
+                step("g", "b", Some(i64::MAX), &[], false),
+            ],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 1.0,
+            ..Default::default()
+        };
+
+        assert_eq!(schedulable_peak_mem_bytes(&value, 2, None).0, i64::MAX);
+        assert_eq!(jobs_for_budget(&value, i64::MAX), (0, i64::MAX));
+
+        let mut discounted = value.clone();
+        discounted.outer_mem_safety_factor = 0.5;
+        assert_eq!(jobs_footprint_bytes(&discounted, 2, None), i64::MAX);
+
+        let unknown = DagConfig {
+            steps: vec![step("g", "unknown", None, &[], false)],
+            default_step_mem_cap_bytes: None,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 0.5,
+            ..Default::default()
+        };
+        assert_eq!(jobs_footprint_bytes(&unknown, 1, None), i64::MAX);
+    }
+
+    #[test]
+    fn stress_footprint_uses_width_aware_runtime_caps() {
+        let mut wide = step("g", "wide", Some(GIB), &[], false);
+        wide.hint.classification = StepClass::CpuBound;
+        wide.hint.preferred_inner_jobs = Some(8);
+        let value = DagConfig {
+            steps: vec![wide],
+            mem_cap_factor: 1.0,
+            ..Default::default()
+        };
+
+        assert_eq!(stress_copy_footprint_bytes(&value, None), 2 * GIB);
+    }
+
+    #[test]
+    fn invalid_nonpositive_memory_hints_fall_back_safely() {
+        let mut invalid = step("g", "invalid", Some(0), &[], false);
+        invalid.hint.hard_mem_max_bytes = Some(0);
+        assert_eq!(step_mem_cap_bytes(&invalid, 1.0, Some(GIB)), Some(GIB));
+        let baseline = step("g", "factor", Some(8 * GIB), &[], false);
+        assert_eq!(step_mem_cap_bytes(&baseline, 0.0, Some(GIB)), Some(GIB));
+        assert_eq!(step_mem_cap_bytes(&baseline, 1e-300, Some(GIB)), Some(1));
+        let value = DagConfig {
+            steps: vec![baseline],
+            mem_cap_factor: 1.0,
+            mem_cap_floor_bytes: -1,
+            outer_mem_safety_factor: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(jobs_for_budget(&value, 16 * GIB), (0, i64::MAX));
+    }
+
+    #[test]
+    fn wide_dag_uses_bounded_conservative_memory_fallback() {
+        let mut steps = Vec::new();
+        for index in 0..51 {
+            let mut item = step("wide", &format!("s{index:02}"), None, &[], false);
+            item.hint.hard_mem_max_bytes = Some(GIB);
+            steps.push(item);
+        }
+        let value = DagConfig {
+            steps,
+            mem_cap_floor_bytes: 0,
+            outer_mem_safety_factor: 1.0,
+            ..Default::default()
+        };
+
+        let (total, chosen) = schedulable_peak_mem_bytes(&value, 51, None);
+        assert_eq!(total, 51 * GIB);
+        assert_eq!(
+            chosen,
+            (0..51)
+                .map(|index| format!("wide.s{index:02}"))
+                .collect::<Vec<_>>()
+        );
     }
 }

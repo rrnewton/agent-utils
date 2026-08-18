@@ -23,7 +23,11 @@ from safe_ci_dag_runner.model import (
     effective_cpu_count,
     effective_jobs_flag,
 )
-from safe_ci_dag_runner.sizing import schedulable_peak_mem_bytes
+from safe_ci_dag_runner.sizing import (
+    _memory_footprint_fits,
+    _outer_mem_footprint_bytes,
+    schedulable_peak_mem_bytes,
+)
 
 __all__ = [
     "MACHINE_ID_ENV",
@@ -846,7 +850,7 @@ class PlanEntry:
     speedup: "StepSpeedup | None" = None
     #: The executable inner-jobs width CPA assigned to a runner-controlled step, or ``None`` for
     #: ordering-only planners and self-managed commands whose empty jobs flag prevents rewriting.
-    #: Run-level ``-j`` is the aggregate budget.
+    #: Run-level ``-j`` is the outer bandwidth/per-step ceiling, not an admission reservation.
     alloc_inner_jobs: int | None = None
 
 
@@ -855,10 +859,10 @@ class Allocation:
     """The CPA allocator's whole-DAG summary (``--planner cpa`` only).
 
     Records the core budget it balanced against, the resulting area and critical-path terms, the
-    makespan LOWER BOUND ``max(T_CP, area/P)`` (Graham/Brent), the achieved MODELED makespan (a
-    deterministic greedy list-schedule of the allocated widths), and WHY the gradient loop stopped
-    — so an operator (or a CI-optimizing agent) can see why each width was chosen. The fields below
-    expose the lower-bound terms, modeled result, and stopping reason directly."""
+    capacity-model LOWER BOUND ``max(T_CP, area/P)`` (Graham/Brent), the no-overcommit reference
+    makespan (a deterministic greedy list-schedule of the allocated widths), and WHY the gradient
+    loop stopped. The live runtime may overlap widths beyond ``P`` under the outer quota, so these
+    values explain allocation rather than predict contended execution."""
 
     core_budget: int
     #: Total core-seconds Σ p_i·T_i(p_i) at the allocated widths.
@@ -869,11 +873,11 @@ class Allocation:
     critical_path_s: float
     #: The makespan lower bound ``max(T_CP, area/P)``.
     lower_bound_s: float
-    #: The modeled makespan from a greedy list-schedule of the allocated widths; always ``>=``
-    #: :attr:`lower_bound_s`.
+    #: The no-overcommit reference makespan from a greedy list-schedule of the allocated widths;
+    #: always ``>=`` :attr:`lower_bound_s`, but not a live-runtime prediction.
     modeled_makespan_s: float
     #: One of ``balanced`` / ``knee-exhausted`` / ``core-capped`` / ``mem-capped`` /
-    #: ``fixed-point`` / ``infeasible-fixed-width``.
+    #: ``fixed-point`` / ``infeasible-fixed-width`` / ``infeasible-memory``.
     stop_reason: str
 
 
@@ -1027,21 +1031,35 @@ _CPA_CORE_CAPPED = "core-capped"
 _CPA_MEM_CAPPED = "mem-capped"
 _CPA_FIXED_POINT = "fixed-point"
 _CPA_INFEASIBLE_FIXED_WIDTH = "infeasible-fixed-width"
+_CPA_INFEASIBLE_MEMORY = "infeasible-memory"
 
 
 class InfeasibleAllocationError(ValueError):
-    """CPA cannot fit one or more self-managed fixed command widths inside ``core_budget``."""
+    """CPA cannot fit the seed allocation inside its core or memory budget."""
 
     def __init__(
-        self, core_budget: int, fixed_widths: Sequence[tuple[str, int]]
+        self,
+        core_budget: int,
+        fixed_widths: Sequence[tuple[str, int]] = (),
+        *,
+        mem_budget: int | None = None,
+        memory_footprint: int | None = None,
     ) -> None:
         self.core_budget = max(1, core_budget)
         self.fixed_widths = tuple(fixed_widths)
-        detail = ", ".join(f"{tag}={width}" for tag, width in self.fixed_widths)
-        super().__init__(
-            f"CPA allocation is infeasible under core budget {self.core_budget}: "
-            f"self-managed fixed width(s) exceed the budget: {detail}"
-        )
+        self.mem_budget = mem_budget
+        self.memory_footprint = memory_footprint
+        if mem_budget is not None and memory_footprint is not None:
+            super().__init__(
+                f"CPA allocation is infeasible under memory budget {mem_budget}: "
+                f"minimum runnable footprint is {memory_footprint}"
+            )
+        else:
+            detail = ", ".join(f"{tag}={width}" for tag, width in self.fixed_widths)
+            super().__init__(
+                f"CPA allocation is infeasible under core budget {self.core_budget}: "
+                f"self-managed fixed width(s) exceed the budget: {detail}"
+            )
 
 
 def _infeasible_fixed_widths(
@@ -1181,12 +1199,16 @@ def _cpa_next_width(widths: Sequence[int], current: int) -> int | None:
 
 
 def _cpa_footprint(cfg: DagConfig, widths: Mapping[str, int]) -> int:
-    """Worst-case concurrent memory footprint (bytes) with the given PER-STEP widths, over all
-    scheduler-reachable concurrent sets (PLANNER_DESIGN.md §5.6)."""
+    """Largest single-step footprint at the given widths, including outer safety/floor policy.
+
+    CPA checks whether each width is individually feasible. Post-plan ``jobs_for_budget`` owns the
+    aggregate-overlap decision and may derive ``max_steps=1`` for several individually feasible
+    wide steps; CPA does not jointly optimize width against overlap.
+    """
     active = tuple(step for step in cfg.steps if step.skip_reason is None)
     active_cfg = replace(cfg, steps=active, resource_caps=dict(cfg.resource_caps))
-    peak, _ = schedulable_peak_mem_bytes(active_cfg, len(active), widths=widths)
-    return peak
+    peak, _ = schedulable_peak_mem_bytes(active_cfg, 1, widths=widths)
+    return _outer_mem_footprint_bytes(active_cfg, peak)
 
 
 def _cpa_allocate(
@@ -1209,6 +1231,10 @@ def _cpa_allocate(
     successors = _successors(cfg)
     if _infeasible_fixed_widths(cfg, widths, P):
         return widths, admissible, wall, _CPA_INFEASIBLE_FIXED_WIDTH
+    if mem_budget is not None and not _memory_footprint_fits(
+        _cpa_footprint(cfg, widths), mem_budget
+    ):
+        return widths, admissible, wall, _CPA_INFEASIBLE_MEMORY
     stop_reason = _CPA_FIXED_POINT
     # Each applied widening strictly increases some p_i within a finite W_i, so the loop is bounded
     # by Σ(|W_i|-1); +2 headroom lets the final balance/exhaustion check run.
@@ -1241,11 +1267,11 @@ def _cpa_allocate(
             nxt = _cpa_next_width(admissible[tag], widths[tag])
             assert nxt is not None
             if nxt > P:
-                continue  # single-step core cap (cross-step budget is the dispatch gate)
+                continue  # defensive per-step ceiling; admissible curves are already truncated
             if mem_budget is not None:
                 tentative = dict(widths)
                 tentative[tag] = nxt
-                if _cpa_footprint(cfg, tentative) > mem_budget:
+                if not _memory_footprint_fits(_cpa_footprint(cfg, tentative), mem_budget):
                     blocked_mem = True
                     continue
             cur = widths[tag]
@@ -1272,8 +1298,8 @@ def allocate_widths(
     against the per-core area over the measured speedup curves, subject to the core budget ``P``
     and (optionally) the RAM budget.
 
-    Raises :class:`InfeasibleAllocationError` when a self-managed fixed command width exceeds
-    ``P``; unlike :func:`build_plan`, this low-level API has no plan summary in which to carry an
+    Raises :class:`InfeasibleAllocationError` when the minimum allocation exceeds either budget;
+    unlike :func:`build_plan`, this low-level API has no plan summary in which to carry an
     infeasibility stop reason. See PLANNER_DESIGN.md and :func:`_cpa_allocate`.
     """
     widths, _admissible, _wall, reason = _cpa_allocate(
@@ -1282,6 +1308,13 @@ def allocate_widths(
     if reason == _CPA_INFEASIBLE_FIXED_WIDTH:
         raise InfeasibleAllocationError(
             core_budget, _infeasible_fixed_widths(cfg, widths, core_budget)
+        )
+    if reason == _CPA_INFEASIBLE_MEMORY:
+        assert mem_budget is not None
+        raise InfeasibleAllocationError(
+            core_budget,
+            mem_budget=mem_budget,
+            memory_footprint=_cpa_footprint(cfg, widths),
         )
     return widths
 
@@ -1293,13 +1326,14 @@ def _cpa_simulate_makespan(
     order: Sequence[str],
     core_budget: int,
 ) -> float:
-    """A deterministic greedy list-schedule of the allocated widths -> the MODELED makespan.
+    """A deterministic no-overcommit reference schedule of the allocated widths.
 
-    Launches ready steps (deps done, core budget ``Σ running widths + p_i <= P``, named resources
+    Launches ready steps (deps done, reference capacity ``Σ running widths + p_i <= P``, named resources
     free) in ``order`` (critical-path first), advancing to the next finish event. Allocated widths
     are required to lie in ``1..=P``; there is no over-budget run-alone escape. Respecting deps AND
-    the core budget makes the result ``>= max(T_CP, area/P)`` (PLANNER_DESIGN.md §2). Uses the same
-    f64 ops in canonical ``order`` in both builds, so the 3-decimal makespan is byte-identical."""
+    the reference capacity makes the result ``>= max(T_CP, area/P)`` (PLANNER_DESIGN.md §2). The
+    live scheduler intentionally permits wider aggregate overlap. Uses the same f64 ops in canonical
+    ``order`` in both builds, so the 3-decimal makespan is byte-identical."""
     P = core_budget if core_budget > 0 else 1
     by_tag = cfg.by_tag()
     done: dict[str, float] = {}
@@ -1369,8 +1403,27 @@ def _build_cpa_plan(
             # A self-managed infeasible step may have measurements only above P. Keep that curve
             # diagnostic and use its exact fixed-width level if present; no allocation is applied.
             bounded_speedups[tag] = speedup
+    # CPA's memory constraint must see the same learned RSS values that execution and ordinary
+    # --max-mem sizing will see after plan application. Duration resolution already feeds `est`;
+    # clone only the memory hints here so width allocation cannot approve against stale authored
+    # baselines and then install a larger store estimate afterward.
+    memory_steps: list[Step] = []
+    for step in cfg.steps:
+        r = resolved[step.tag]
+        rss = r[2] if r[3] == "store" else step.hint.rss_baseline_bytes
+        memory_steps.append(
+            replace(
+                step,
+                hint=replace(step.hint, rss_baseline_bytes=rss),
+                deps=list(step.deps),
+                env=dict(step.env),
+            )
+        )
+    memory_cfg = replace(
+        cfg, steps=tuple(memory_steps), resource_caps=dict(cfg.resource_caps)
+    )
     widths, _admissible, wall, stop_reason = _cpa_allocate(
-        cfg, bounded_speedups, est, P, mem_budget
+        memory_cfg, bounded_speedups, est, P, mem_budget
     )
     weight = {step.tag: wall[step.tag][widths[step.tag]] for step in cfg.steps}
     bottom = _bottom_levels(cfg, weight, successors)
@@ -1383,7 +1436,7 @@ def _build_cpa_plan(
     lower_bound = t_cp if t_cp >= t_a else t_a
     modeled = (
         math.inf
-        if stop_reason == _CPA_INFEASIBLE_FIXED_WIDTH
+        if stop_reason in {_CPA_INFEASIBLE_FIXED_WIDTH, _CPA_INFEASIBLE_MEMORY}
         else _cpa_simulate_makespan(cfg, widths, weight, order, P)
     )
     allocation = Allocation(
@@ -1425,6 +1478,7 @@ def _build_cpa_plan(
                 alloc_inner_jobs=(
                     widths[tag]
                     if step.skip_reason is None
+                    and stop_reason != _CPA_INFEASIBLE_MEMORY
                     and effective_jobs_flag(step, cfg.default_jobs_flag).strip()
                     else None
                 ),
@@ -1523,6 +1577,11 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
     declared fixed width: the planner cannot rewrite that guest command, and preserving the hint
     ensures run-budget validation can still refuse an over-budget command. Run-level ``-j``
     remains the total CPU budget."""
+    if (
+        plan.allocation is not None
+        and plan.allocation.stop_reason == _CPA_INFEASIBLE_MEMORY
+    ):
+        return cfg
     by_tag = plan.by_tag()
     new_steps: list[Step] = []
     for step in cfg.steps:
@@ -1808,7 +1867,7 @@ def _allocation_text_lines(plan: Plan) -> list[str]:
         f"critical-path={_fmt_secs(alloc.critical_path_s)}s, "
         f"area/P={_fmt_secs(alloc.area_bound_s)}s, "
         f"lower-bound={_fmt_secs(alloc.lower_bound_s)}s, "
-        f"modeled-makespan={_fmt_secs(alloc.modeled_makespan_s)}s"
+        f"no-overcommit-model={_fmt_secs(alloc.modeled_makespan_s)}s"
     ]
 
 

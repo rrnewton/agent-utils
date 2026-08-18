@@ -9,7 +9,7 @@ use, declare the dependency and import the crate as `safe_ci_dag_runner`:
 
 ```toml
 [dependencies]
-safe-ci-dag-runner = "0.14"
+safe-ci-dag-runner = "0.15"
 ```
 
 ```rust
@@ -29,13 +29,15 @@ visualization. The `run_dag` function is the explicit uncontained scheduler;
 console command establishes and verifies the outer systemd scope. Enforced
 containment requires Linux with cgroup v2 and a delegated systemd user scope.
 `run_dag(..., combined_limit)` and `run_dag_boxed(..., combined_limit)` treat
-that argument as a compatibility combined active-step and total CPU-core limit.
+that argument as a compatibility combined active-step and per-step-width limit.
 Use `run_dag_limited(..., max_steps, max_cpus, ...)` or a boxed limited variant
-to choose the two values independently. `cap_config_max_cpus` applies the same
-total-core cap to runner-controlled commands without starting a run; it leaves
+to choose the two values independently. Without an externally established outer
+quota, these helpers do not cap aggregate CPU bandwidth or serialize overlapping
+widths. `cap_config_max_cpus` applies the same per-step cap to runner-controlled
+commands without starting a run; it leaves
 self-managed fixed widths unchanged so the run helpers can refuse an
 over-budget command truthfully.
 The low-level `allocate_widths(...)` helper returns
-`Result<HashMap<_, _>, InfeasibleAllocationError>`; 0.14 makes an over-budget
+`Result<HashMap<_, _>, InfeasibleAllocationError>`; 0.15 makes an over-budget
 self-managed fixed command an explicit error rather than an executable-looking
 width map.

@@ -74,7 +74,9 @@ fn boxed_stdin_dag_keeps_step_and_cpu_limits_independent() {
         "{combined}"
     );
     assert!(
-        stdout.contains("maximum concurrent steps: 2 (--max-steps 3; --max-cpus 2 total cores)"),
+        stdout.contains(
+            "maximum concurrent steps: 3 (--max-steps 3; --max-cpus 2 CPU target/per-step ceiling)"
+        ),
         "{combined}"
     );
 }

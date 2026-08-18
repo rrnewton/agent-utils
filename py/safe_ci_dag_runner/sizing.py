@@ -7,18 +7,58 @@ together, then chooses the largest concurrency that fits the supplied memory bud
 from __future__ import annotations
 
 import itertools
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from safe_ci_dag_runner.model import (
-    DEFAULT_SMALL_MEM_CAP_BYTES,
     DagConfig,
     Step,
     StepClass,
+    effective_cpu_count,
     step_classification,
 )
+
+_I64_MIN = -(2**63)
+_I64_MAX = 2**63 - 1
+_MAX_EXACT_MEM_COMBINATIONS = 100_000
+
+
+def _clamp_i64(value: int) -> int:
+    """Clamp arbitrary-precision Python arithmetic to Rust's signed-64-bit domain."""
+    return max(_I64_MIN, min(_I64_MAX, value))
+
+
+def _saturating_add_i64(left: int, right: int) -> int:
+    return _clamp_i64(left + right)
+
+
+def _saturating_sum_i64(values: Sequence[int]) -> int:
+    total = 0
+    for value in values:
+        total = _saturating_add_i64(total, value)
+    return total
+
+
+def _scaled_i64(value: int, factor: float) -> int:
+    """Multiply through IEEE-754 binary64, then truncate/saturate exactly like Rust."""
+    product = float(value) * factor
+    if math.isnan(product):
+        return 0
+    if product >= float(_I64_MAX):
+        return _I64_MAX
+    if product <= float(_I64_MIN):
+        return _I64_MIN
+    return int(product)
+
+
+def _scaled_for_width_i64(cap: int, inner_jobs: int) -> int:
+    """Exact truncating ``cap * inner_jobs / 4`` with an i64-saturated result."""
+    product = cap * inner_jobs
+    scaled = product // 4 if product >= 0 else -((-product) // 4)
+    return _clamp_i64(scaled)
 
 
 def step_mem_cap_bytes(
@@ -27,15 +67,13 @@ def step_mem_cap_bytes(
     """Inner-cgroup MemoryMax for a step. An explicit hard cap wins; otherwise ``factor x`` the
     RSS baseline. When the step declares NEITHER (uncharacterized), fall back to
     ``default_cap_bytes`` — the SMALL forcing-function default the scheduler passes from
-    ``DagConfig.default_step_mem_cap_bytes`` — or None if no default is supplied (the active-step
-    sizing model calls with no default, so an uncharacterized step stays excluded from the
-    footprint sum)."""
-    if step.hint.hard_mem_max_bytes is not None:
+    ``DagConfig.default_step_mem_cap_bytes`` — or None if no default is supplied."""
+    if step.hint.hard_mem_max_bytes is not None and step.hint.hard_mem_max_bytes > 0:
         return step.hint.hard_mem_max_bytes
     base = step.hint.rss_baseline_bytes
-    if base:
-        return int(base * mem_cap_factor)
-    return default_cap_bytes
+    if base is not None and base > 0 and math.isfinite(mem_cap_factor) and mem_cap_factor > 0.0:
+        return max(1, _scaled_i64(base, mem_cap_factor))
+    return default_cap_bytes if default_cap_bytes is not None and default_cap_bytes > 0 else None
 
 
 def step_mem_cap_for_inner_jobs(
@@ -46,33 +84,81 @@ def step_mem_cap_for_inner_jobs(
     Conservative ``P x J`` model pending measured matrices: an explicit hard cap and
     non-CPU-bound steps keep the base cap; CPU-bound steps scale linearly above J=4.
     """
-    cap = step_mem_cap_bytes(step, mem_cap_factor=mem_cap_factor) or 0
+    return (
+        _step_mem_cap_for_inner_jobs(
+            step,
+            inner_jobs,
+            mem_cap_factor=mem_cap_factor,
+            default_cap_bytes=None,
+        )
+        or 0
+    )
+
+
+def _step_mem_cap_for_inner_jobs(
+    step: Step,
+    inner_jobs: int | None,
+    *,
+    mem_cap_factor: float,
+    default_cap_bytes: int | None,
+) -> int | None:
+    """Width-scaled cap while preserving an absent cap as ``None``.
+
+    The public sizing helper historically maps an uncharacterized step to zero because such a
+    step is excluded from its footprint sum. Runtime enforcement instead supplies the DAG's
+    forcing-function default and must retain ``None`` when that default is disabled. Keeping the
+    scaling arithmetic here gives planning and enforcement one implementation.
+    """
+    cap = step_mem_cap_bytes(
+        step,
+        mem_cap_factor=mem_cap_factor,
+        default_cap_bytes=default_cap_bytes,
+    )
+    if cap is None:
+        return None
     if (
-        step.hint.hard_mem_max_bytes is not None
+        (
+            step.hint.hard_mem_max_bytes is not None
+            and step.hint.hard_mem_max_bytes > 0
+        )
         or inner_jobs is None
         or step_classification(step) is not StepClass.CPU_BOUND
     ):
         return cap
-    return max(cap, int(cap * inner_jobs / 4))
+    return max(cap, _scaled_for_width_i64(cap, inner_jobs))
 
 
 def transitive_deps(steps: Sequence[Step]) -> dict[str, set[str]]:
-    """Map each step tag to the set of all tags it transitively depends on."""
-    direct = {step.tag: set(step.deps) for step in steps}
+    """Map each step tag to all transitive dependencies without recursive call depth.
+
+    Each root uses an explicit input-ordered DFS stack. This remains deterministic for reverse-
+    topological graphs thousands of nodes deep and cannot hit Python's recursion limit.
+    """
+    direct = {step.tag: tuple(step.deps) for step in steps}
     result: dict[str, set[str]] = {}
-
-    def visit(tag: str) -> set[str]:
-        if tag in result:
-            return result[tag]
-        deps = set(direct.get(tag, set()))
-        for dep in tuple(deps):
-            deps.update(visit(dep))
-        result[tag] = deps
-        return deps
-
     for tag in direct:
-        visit(tag)
+        deps: set[str] = set()
+        stack = list(reversed(direct[tag]))
+        while stack:
+            dep = stack.pop()
+            if dep in deps:
+                continue
+            deps.add(dep)
+            stack.extend(reversed(direct.get(dep, ())))
+        result[tag] = deps
     return result
+
+
+def _too_many_combinations(n: int, width: int) -> bool:
+    """Whether exact subsets up to ``width`` would exceed the deterministic search budget."""
+    term = 1
+    total = 0
+    for count in range(1, width + 1):
+        term = term * (n - count + 1) // count
+        total += term
+        if total > _MAX_EXACT_MEM_COMBINATIONS:
+            return True
+    return False
 
 
 def schedulable_peak_mem_bytes(
@@ -85,32 +171,59 @@ def schedulable_peak_mem_bytes(
     """Maximum per-step-cap sum over any scheduler-reachable concurrent set of size <= jobs.
 
     A set is reachable only when no member transitively depends on another and the summed
-    scarce-resource demand fits ``cfg.resource_caps``. Only non-engine, non-skipped steps with a
-    memory baseline participate.
+    scarce-resource demand fits ``cfg.resource_caps``. Every runnable, non-skipped step
+    participates: an explicit hard cap wins, an RSS baseline derives a cap, and an undeclared step
+    uses ``default_step_mem_cap_bytes``. If that default is disabled, an uncharacterized runnable
+    step is conservatively treated as unbounded and cannot fit a finite ``--max-mem`` budget.
 
-    ``inner_jobs`` applies ONE internal-parallelism width to every step (the ``--max-mem``
-    sizing path). ``widths`` instead supplies a PER-STEP width map (a step absent from the map
-    falls back to ``inner_jobs``); the CPA allocator uses it so a step widened on the critical
-    path is charged its own scaled memory cap while its siblings keep theirs. Passing both
-    is allowed; ``widths`` wins per tag.
+    ``inner_jobs`` applies ONE internal-parallelism width to every step. ``widths`` instead
+    supplies a PER-STEP width map. If neither supplies a width for a step, its effective applied
+    width (positive ``preferred_inner_jobs``, else ``default_step_cpu_count``) is used. Thus the
+    ordinary ``--max-mem`` path sizes the post-plan configuration it will actually execute, while
+    the CPA allocator can override selected widths explicitly. Passing both is allowed;
+    ``widths`` wins per tag.
     """
-    by_tag = {
-        step.tag: step
-        for step in cfg.steps
-        if step.hint.rss_baseline_bytes is not None
-        and not step.engine_only
-        and step.skip_reason is None
-    }
-    dependencies = transitive_deps(list(cfg.steps))
+    by_tag = {step.tag: step for step in cfg.steps if step.skip_reason is None}
     tags = tuple(by_tag)
     width = min(max(1, jobs), len(tags))
     best_total = 0
     best: tuple[str, ...] = ()
 
     def cap_of(tag: str) -> int:
-        w = widths.get(tag, inner_jobs) if widths is not None else inner_jobs
-        return step_mem_cap_for_inner_jobs(by_tag[tag], w, mem_cap_factor=cfg.mem_cap_factor)
+        step = by_tag[tag]
+        width_for_step: int | None
+        if widths is not None and tag in widths:
+            width_for_step = widths[tag]
+        elif inner_jobs is not None:
+            width_for_step = inner_jobs
+        else:
+            width_for_step = effective_cpu_count(step, cfg.default_step_cpu_count)
+        cap = _step_mem_cap_for_inner_jobs(
+            step,
+            width_for_step,
+            mem_cap_factor=cfg.mem_cap_factor,
+            default_cap_bytes=cfg.default_step_mem_cap_bytes,
+        )
+        return _I64_MAX if cap is None else cap
 
+    if width == 0:
+        return 0, ()
+    if width == 1:
+        # No dependency closure is needed when only one step may run. `max` keeps the first tag on
+        # equal caps, so the tie rule is deterministic authored-config order.
+        chosen_tag = max(tags, key=cap_of)
+        return cap_of(chosen_tag), (chosen_tag,)
+
+    # Exact antichain/resource enumeration is exponential. Above a fixed shared search budget,
+    # conservatively ignore dependencies/resources and sum the largest `jobs` caps. That can only
+    # overestimate reachable memory, never admit unsafe concurrency, and is deterministic in cfg
+    # order for equal caps.
+    if _too_many_combinations(len(tags), width):
+        ranked = sorted(tags, key=cap_of, reverse=True)
+        chosen = tuple(ranked[:width])
+        return _saturating_sum_i64([cap_of(tag) for tag in chosen]), chosen
+
+    dependencies = transitive_deps(list(cfg.steps))
     for count in range(1, width + 1):
         for candidate in itertools.combinations(tags, count):
             if any(
@@ -119,11 +232,16 @@ def schedulable_peak_mem_bytes(
             ):
                 continue
             if any(
-                sum(by_tag[tag].hint.resources.get(resource, 0) for tag in candidate) > cap
+                _saturating_sum_i64(
+                    [by_tag[tag].hint.resources.get(resource, 0) for tag in candidate]
+                )
+                > cap
                 for resource, cap in cfg.resource_caps.items()
             ):
                 continue
-            total = sum(cap_of(tag) for tag in candidate)
+            total = 0
+            for tag in candidate:
+                total = _saturating_add_i64(total, cap_of(tag))
             if total > best_total:
                 best_total, best = total, candidate
     return best_total, best
@@ -132,20 +250,43 @@ def schedulable_peak_mem_bytes(
 def jobs_footprint_bytes(cfg: DagConfig, jobs: int, inner_jobs: int | None = None) -> int:
     """Worst-case footprint at the given active-step count, clamped to the configured floor."""
     peak, _ = schedulable_peak_mem_bytes(cfg, jobs, inner_jobs)
-    return max(cfg.mem_cap_floor_bytes, int(peak * cfg.outer_mem_safety_factor))
+    return _outer_mem_footprint_bytes(cfg, peak)
+
+
+def _outer_mem_footprint_bytes(cfg: DagConfig, peak: int) -> int:
+    """Apply the run-level floor and safety factor to one modeled peak, saturating to i64."""
+    if peak >= _I64_MAX:
+        return _I64_MAX
+    factor = cfg.outer_mem_safety_factor
+    if math.isfinite(factor) and factor > 0.0:
+        scaled = max(1, _scaled_i64(peak, factor)) if peak > 0 else 0
+    else:
+        scaled = _I64_MAX
+    return max(
+        max(0, _clamp_i64(cfg.mem_cap_floor_bytes)),
+        scaled,
+    )
+
+
+def _memory_footprint_fits(footprint: int, budget: int) -> bool:
+    """Whether a finite, non-overflowed footprint fits a finite budget."""
+    return 0 <= footprint < _I64_MAX and footprint <= budget
 
 
 def jobs_for_budget(cfg: DagConfig, budget: int) -> tuple[int, int]:
     """Largest active-step count whose worst-case footprint fits ``budget``.
 
-    The count is at least one and capped at the CPU count. Returns ``(max_steps,
-    footprint_at_that_count)``. A box too small for even one step is a WAIT/abort decision for the
-    caller, not a zero-concurrency result.
+    The count is capped at the CPU count. Returns ``(0, one_step_footprint)`` when even one runnable
+    step (or the configured floor) exceeds ``budget``; callers must refuse rather than silently
+    execute an infeasible graph.
     """
     ncpu = os.cpu_count() or 4
+    one = jobs_footprint_bytes(cfg, 1)
+    if not _memory_footprint_fits(one, budget):
+        return 0, one
     best = 1
     for n in range(1, ncpu + 1):
-        if jobs_footprint_bytes(cfg, n) <= budget:
+        if _memory_footprint_fits(jobs_footprint_bytes(cfg, n), budget):
             best = n
         else:
             break  # footprint is monotonic non-decreasing in n
@@ -194,7 +335,12 @@ def parse_size(spec: str | int | None) -> int | None:
     if not match:
         return None
     value = float(match.group(1))
-    return int(value * _SIZE_MULT[match.group(2).lower()])
+    product = value * _SIZE_MULT[match.group(2).lower()]
+    if math.isnan(product) or product < 0.0:
+        return None
+    if product >= float(_I64_MAX):
+        return _I64_MAX
+    return int(product)
 
 
 def mem_available_bytes() -> int | None:
@@ -242,25 +388,68 @@ def box_mem_budget_bytes() -> int | None:
 
 
 def stress_copy_footprint_bytes(
-    cfg: DagConfig, *, default_step_bytes: int = DEFAULT_SMALL_MEM_CAP_BYTES
+    cfg: DagConfig, *, default_step_bytes: int | None = None
 ) -> int:
     """Conservative worst-case memory footprint (bytes) of ONE copy (shard) of ``cfg``, used to
     derive the safe ``--stress`` fan-out.
 
-    Sums each step's per-step inner memory cap (``step_mem_cap_bytes`` — an explicit
-    ``hard_mem_max_bytes`` wins, else ``mem_cap_factor x rss_baseline_bytes``); an active step that
-    DECLARES NO memory is charged ``default_step_bytes`` (the SMALL 1-GiB forcing-function
-    default the rest of the package uses). Summing every step (rather than the reachable
+    Sums each step's width-aware inner memory cap; an explicit ``hard_mem_max_bytes`` wins, a
+    CPU-bound RSS/default cap scales with its effective preferred/default width, and an active step
+    that declares no memory is charged ``default_step_bytes``. Summing every step (rather than the reachable
     concurrent set) is a deliberate UPPER BOUND: it never under-charges, so the derived ceiling
     errs toward refusing rather than OOMing sibling agents. Intentional pre-execution skips are
     excluded because no copy can spawn them. For the common single-node stress
     (``--only dbi.file_metadata --stress N``) the sum is exactly that one node's cap."""
-    total = 0
-    for step in cfg.steps:
-        if step.engine_only or step.skip_reason is not None:
-            continue
-        cap = step_mem_cap_bytes(
-            step, mem_cap_factor=cfg.mem_cap_factor, default_cap_bytes=default_step_bytes
+    effective_default = (
+        default_step_bytes
+        if default_step_bytes is not None and default_step_bytes > 0
+        else (
+            cfg.default_step_mem_cap_bytes
+            if cfg.default_step_mem_cap_bytes is not None
+            and cfg.default_step_mem_cap_bytes > 0
+            else None
         )
-        total += cap if cap is not None else default_step_bytes
-    return max(total, default_step_bytes)
+    )
+    control_floor = stress_control_floor_bytes(cfg, default_step_bytes=default_step_bytes)
+    total = 0
+    runnable = 0
+    for step in cfg.steps:
+        if step.skip_reason is not None:
+            continue
+        runnable += 1
+        cap = _step_mem_cap_for_inner_jobs(
+            step,
+            effective_cpu_count(step, cfg.default_step_cpu_count),
+            mem_cap_factor=cfg.mem_cap_factor,
+            default_cap_bytes=effective_default,
+        )
+        total = _saturating_add_i64(total, cap if cap is not None else _I64_MAX)
+    if runnable > 0:
+        return max(total, control_floor)
+    return control_floor
+
+
+def stress_control_floor_bytes(
+    cfg: DagConfig, *, default_step_bytes: int | None = None
+) -> int:
+    """Minimum control-plane memory charged to each complete stress graph copy.
+
+    A positive explicit/configured step default is already the repository's conservative SMALL
+    forcing-function allowance (normally 1 GiB), so even a characterized one-byte command cannot
+    make graph/process bookkeeping look free. If the default is deliberately disabled, preserve a
+    positive finite hard-cap model by falling back to ``mem_cap_floor_bytes`` or one byte. The CLI
+    separately caps generated graph nodes, which is the deterministic object-allocation guard.
+    """
+    effective_default = (
+        default_step_bytes
+        if default_step_bytes is not None and default_step_bytes > 0
+        else (
+            cfg.default_step_mem_cap_bytes
+            if cfg.default_step_mem_cap_bytes is not None
+            and cfg.default_step_mem_cap_bytes > 0
+            else None
+        )
+    )
+    if effective_default is not None:
+        return effective_default
+    return max(1, max(0, _clamp_i64(cfg.mem_cap_floor_bytes)))

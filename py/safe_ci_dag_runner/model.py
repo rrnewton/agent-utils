@@ -227,7 +227,7 @@ def preferred_inner_jobs(step: Step, experiment_override: int | None = None) -> 
     """Positive internal parallelism width: an explicit override wins, else the hint.
 
     Zero/negative library-authored values mean undeclared and fall through to the configured
-    per-step CPU default rather than becoming an invalid command flag or admission width.
+    per-step CPU default rather than becoming an invalid command flag or declared guest width.
     """
     value = experiment_override if experiment_override is not None else step.hint.preferred_inner_jobs
     return value if (value is not None and value > 0) else None

@@ -264,16 +264,22 @@ def test_run_max_mem_exits_0() -> None:
         assert "--max-mem 8G" in err  # the sizing decision is surfaced
 
 
-def test_run_max_mem_no_throttle_note() -> None:
-    # A DAG with no per-step rss_baseline_bytes: the modeled footprint collapses to the
-    # mem_cap_floor_bytes floor, so a budget at/above the floor picks the full CPU-count ceiling
-    # and a note explains why --max-mem did not throttle (No Silent Failure).
+def test_run_max_mem_counts_the_undeclared_step_default() -> None:
+    # A bare runnable step still receives the positive default memory cap, so --max-mem models
+    # that real enforced cap rather than pretending the footprint collapsed to zero/the floor.
     with tempfile.TemporaryDirectory() as tmp:
-        dag = _demo_path(tmp)
-        rc, _, err = _capture(["run", "--max-mem", "16G", "--dag", dag, "-q", _ACF])
+        dag = Path(tmp) / "dag.json"
+        dag.write_text(
+            '{"mem_cap_floor_bytes": 0, "steps": '
+            '[{"group": "g", "job": "j", "cmd": "true"}]}',
+            encoding="utf-8",
+        )
+        rc, _, err = _capture(
+            ["run", "--max-mem", "16G", "--dag", str(dag), "-q", _ACF]
+        )
         assert rc == 0
-        assert "no step carries rss_baseline_bytes" in err
-        assert "did not throttle" in err
+        assert "worst-case 1073741824 bytes" in err
+        assert "no runnable step has a positive" not in err
 
 
 def test_run_max_mem_with_baseline_no_note() -> None:
@@ -288,7 +294,7 @@ def test_run_max_mem_with_baseline_no_note() -> None:
         )
         rc, _, err = _capture(["run", "--max-mem", "64G", "--dag", str(dag), "-q", _ACF])
         assert rc == 0
-        assert "no step carries rss_baseline_bytes" not in err
+        assert "no runnable step has a positive" not in err
 
 
 def test_run_max_cpus_and_max_mem_control_independent_limits() -> None:
@@ -299,7 +305,8 @@ def test_run_max_cpus_and_max_mem_control_independent_limits() -> None:
             ["run", "--max-cpus", "2", "--max-mem", "8G", "--dag", dag, "-q", _ACF]
         )
         assert rc == 0
-        assert "--max-mem 8G -> --max-steps" in err
+        assert "--max-mem 8G -> modeled memory ceiling" in err
+        assert "base active-step ceiling 2; final --max-steps 2" in err
 
 
 def test_run_perf_dir_writes_csv() -> None:
@@ -701,7 +708,10 @@ def test_boxed_stdin_dag_survives_scope_reexec() -> None:
     assert "containment OBSERVED" in combined
     assert "invalid JSON" not in combined
     assert "stress.singleton: 3/3 passed" in proc.stdout
-    assert "maximum concurrent steps: 3 (--max-steps 3; --max-cpus 3 total cores)" in proc.stdout
+    assert (
+        "maximum concurrent steps: 3 "
+        "(--max-steps 3; --max-cpus 3 CPU target/per-step ceiling)"
+    ) in proc.stdout
 
 
 # --------------------------------------------------------------------------- --stress
@@ -819,7 +829,10 @@ def test_stress_defaults_max_steps_to_max_cpus() -> None:
         )
         assert rc == 0, err
         assert "g.j: 4/4 passed" in out
-        assert "maximum concurrent steps: 3 (--max-steps 3; --max-cpus 3 total cores)" in out
+        assert (
+            "maximum concurrent steps: 3 "
+            "(--max-steps 3; --max-cpus 3 CPU target/per-step ceiling)"
+        ) in out
 
 
 def test_stress_n_must_be_positive() -> None:

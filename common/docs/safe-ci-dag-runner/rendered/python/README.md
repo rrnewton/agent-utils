@@ -35,10 +35,13 @@ dag = DagConfig(steps=(Step("build", "app", "compile", "make build"),))
 print(to_ascii(dag))
 ```
 
-`run_dag(..., jobs=N)` keeps a compatibility combined limit: `N` bounds both
-active steps and total CPU capacity unless `core_budget` is supplied. New code
+`run_dag(..., jobs=N)` keeps a compatibility combined setting: `N` bounds active
+steps and caps each runner-controlled step's width unless `core_budget` is supplied. New code
 should call `run_dag_limited(..., max_steps=S, max_cpus=P)` when those limits
-differ. The former `cpu_jobs=P` keyword remains a compatibility alias.
+differ. The former `cpu_jobs=P` keyword remains a compatibility alias. Library
+calls do not establish an outer cgroup, so `max_cpus=P` is a whole-run bandwidth
+cap only when the caller supplies equivalent outer containment; it is never a
+summed-width admission gate.
 
 ## Quick start
 
@@ -78,10 +81,12 @@ safe-ci-dag-runner capabilities
 ```
 
 For example, `run -s2 -j200` permits at most two active DAG nodes while setting
-the whole run's total CPU budget to 200 core-equivalents. The scheduler limits
-the active steps' combined effective width, and cgroup boxing adds a verified
-`cpu.max` bandwidth cap. That quota is not an instantaneous thread-count or
-CPU-identity bound; use `--cores K` for an exclusive fixed cpuset. The long
+the whole run's total CPU-bandwidth budget and each runner-controlled step's
+maximum inner width to 200 core-equivalents. The two active steps may request
+more than 200 workers in aggregate: the verified outer `cpu.max` makes them
+share 200 core-equivalents instead of treating declared widths as reservations.
+That quota is not an instantaneous thread-count or CPU-identity bound; use
+`--cores K` for an exclusive fixed cpuset. The long
 spelling of `-j` is `--max-cpus`; migrate the 0.13 `run --jobs` spelling to it.
 A hidden compatibility alias keeps existing 0.13 scripts working but is not
 public run vocabulary; differing simultaneous values conflict and are rejected.
@@ -89,6 +94,12 @@ public run vocabulary; differing simultaneous values conflict and are rejected.
 experiment. A non-empty `jobs_flag` lets the runner rewrite an inner width down
 to `--max-cpus`; an empty or whitespace-only flag prevents rewriting. When paired with a positive
 declared width, that width is self-managed and the run refuses it if it exceeds the total budget.
+
+The current planners do not jointly optimize inner width, co-running load, and
+memory. Greedy-LPT and critical-path choose only dispatch order. CPA chooses
+per-step widths from isolated speedup curves, but its no-overcommit makespan is
+a planning reference; runtime overlap is still governed by `--max-steps` and
+may oversubscribe the outer CPU budget.
 
 ## Attributable test-runner timeouts
 
