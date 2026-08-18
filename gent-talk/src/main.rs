@@ -207,6 +207,17 @@ async fn main() -> anyhow::Result<()> {
             "no ElevenLabs agent configured; the API is reachable but nothing calls it yet"
         );
     }
+    // Say the MCP endpoint out loud at startup: an agent platform has to be told a URL, and the
+    // most common deployment mistake is pointing it at the wrong path and getting a bare 404.
+    tracing::info!(
+        path = gent_talk::mcp::transport::MCP_PATH,
+        protocol = gent_talk::mcp::protocol::PROTOCOL_VERSION,
+        public_base_url = config
+            .public_base_url
+            .as_deref()
+            .unwrap_or("(not configured)"),
+        "MCP Streamable HTTP endpoint mounted; it requires the same bearer tokens as the API"
+    );
 
     let bind = config.bind;
     let state = AppState {
