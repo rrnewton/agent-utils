@@ -1,0 +1,49 @@
+# Build and run gent-talk under Podman (or Docker; nothing here is Podman-specific).
+#
+#   podman build -t gent-talk -f gent-talk/Containerfile gent-talk
+#   podman run --rm -p 8080:8080 \
+#     -e GENT_TALK_DISCORD_BOT_TOKEN=... -e GENT_TALK_READ_TOKEN=... \
+#     -e GENT_TALK_WRITE_TOKEN=... -e GENT_TALK_CHANNELS='123:lead team:rw' \
+#     gent-talk
+#
+# The image contains no configuration and no secret. Everything comes in at run time, from the
+# environment or from a mounted configuration file, so the same image runs on a laptop, on this
+# host, and in a cloud without a rebuild.
+
+FROM docker.io/library/rust:1-slim-bookworm AS build
+WORKDIR /src
+
+# Dependencies first, so an edit to src/ does not refetch and rebuild the whole tree.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src \
+    && printf '//! placeholder\nfn main() {}\n' > src/main.rs \
+    && printf '//! placeholder for dependency caching\n' > src/lib.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+
+COPY src ./src
+COPY web ./web
+# Touch the entry points so cargo cannot reuse the placeholder build above.
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+
+FROM docker.io/library/debian:bookworm-slim
+# TLS roots, for Discord and (later) ElevenLabs. rustls is used, so no OpenSSL runtime is needed.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Never run the bridge as root: it holds a Discord bot token and is meant to face the internet.
+RUN useradd --system --create-home --uid 10001 gent
+USER gent
+WORKDIR /home/gent
+
+COPY --from=build /src/target/release/gent-talk /usr/local/bin/gent-talk
+
+ENV GENT_TALK_BIND=0.0.0.0:8080 \
+    GENT_TALK_CONFIG=/etc/gent-talk/gent-talk.toml \
+    RUST_LOG=info
+EXPOSE 8080
+
+# There is no default configuration file in the image on purpose: starting with no credentials must
+# fail loudly rather than come up with a guessable one.
+ENTRYPOINT ["/usr/local/bin/gent-talk"]

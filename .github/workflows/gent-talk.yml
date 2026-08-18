@@ -1,0 +1,93 @@
+name: gent-talk
+
+# gent-talk is a service, not one of the paired command-line tools, and it lives outside the `rs/`
+# workspace with its own lockfile. The repository-wide `make check` / `make test` targets therefore
+# do not see it, and this workflow is its whole gate.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'gent-talk/**'
+      - '.github/workflows/gent-talk.yml'
+  pull_request:
+    paths:
+      - 'gent-talk/**'
+      - '.github/workflows/gent-talk.yml'
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gent-talk
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --locked
+      - name: smoke --help
+        run: cargo run --locked -- --help
+
+  msrv:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gent-talk
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: check the declared Rust 1.85 MSRV
+        run: cargo check --locked --all-targets
+
+  container:
+    # The image is the deployment artifact; a Containerfile that stopped building would otherwise
+    # only be discovered at deploy time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: build the container image
+        run: podman build -t gent-talk:ci -f gent-talk/Containerfile gent-talk
+      - name: the server refuses to start without credentials
+        run: |
+          set -o pipefail
+          if podman run --rm gent-talk:ci --version | grep -q '^gent-talk '; then
+            echo "version smoke ok"
+          else
+            echo "the image did not report its version" >&2
+            exit 1
+          fi
+          # No credentials in the environment: startup must FAIL rather than come up with defaults.
+          if podman run --rm gent-talk:ci; then
+            echo "the server started with no configuration at all" >&2
+            exit 1
+          fi
+      - name: the running server requires a token
+        run: |
+          set -euo pipefail
+          podman run -d --rm --name gent-talk-ci -p 18080:8080 \
+            -e GENT_TALK_DISCORD_BOT_TOKEN=not-a-real-token \
+            -e GENT_TALK_READ_TOKEN=ci-read-token-0000000000000 \
+            -e GENT_TALK_WRITE_TOKEN=ci-write-token-000000000000 \
+            -e "GENT_TALK_CHANNELS=424242:ci channel:rw" \
+            gent-talk:ci --fake-discord
+          for _ in $(seq 1 30); do
+            if curl -fsS localhost:18080/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS localhost:18080/healthz
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:18080/api/v1/channels)" = 401
+          test "$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Authorization: Bearer ci-read-token-0000000000000' \
+            localhost:18080/api/v1/channels)" = 200
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Authorization: Bearer ci-read-token-0000000000000' \
+            -H 'content-type: application/json' -d '{"text":"no"}' \
+            localhost:18080/api/v1/channels/424242/reply)" = 403
+          podman stop gent-talk-ci

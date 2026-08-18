@@ -1,0 +1,58 @@
+# gent-talk configuration.
+#
+# Copy to gent-talk.toml (which is gitignored) or mount it into the container at
+# /etc/gent-talk/gent-talk.toml. Every value here can also come from the environment, and the
+# environment WINS, so a container can be given its secrets without them ever touching a disk.
+#
+# NEVER commit a filled-in copy of this file.
+
+[server]
+# Address to listen on. In a container this must be 0.0.0.0, not 127.0.0.1.
+# Environment: GENT_TALK_BIND
+bind = "0.0.0.0:8080"
+
+# The URL this server is reachable at from outside, when you know it. Recorded so the deployment is
+# self-describing; nothing depends on it yet.
+# Environment: GENT_TALK_PUBLIC_BASE_URL
+# public_base_url = "https://gent-talk.example.net"
+
+[discord]
+# Bot token for the SECOND, dedicated bot — not the one your coding agents use.
+# Environment: GENT_TALK_DISCORD_BOT_TOKEN
+bot_token = "REPLACE-ME"
+
+# How many messages a read returns by default, and the ceiling a caller may request.
+default_fetch_limit = 50
+max_fetch_limit = 100
+
+[auth]
+# Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.
+# Generate them with:  openssl rand -base64 33
+# The read token goes in your phone and in the voice agent's tool configuration.
+# The write token is what lets something post as your bot: give it out far more carefully.
+# Environment: GENT_TALK_READ_TOKEN / GENT_TALK_WRITE_TOKEN
+read_token = "REPLACE-ME-at-least-24-characters"
+write_token = "REPLACE-ME-different-and-at-least-24-characters"
+
+# Channels this server may touch. This list is an ALLOWLIST: a channel that is not here cannot be
+# read or posted to through the API even with a valid token, however many channels the bot is in.
+# `writable = false` is the safe default; only mark a channel writable if you want the bridge to be
+# able to speak in it.
+# Environment: GENT_TALK_CHANNELS="123:lead team:rw,456:build noise:ro"
+[[channels]]
+id = "000000000000000000"
+label = "lead team"
+writable = true
+
+[[channels]]
+id = "111111111111111111"
+label = "build noise"
+writable = false
+
+[elevenlabs]
+# Optional in v0: nothing calls ElevenLabs yet.
+# agent_id is public (it identifies a widget) and is handed to the web app; api_key is a secret and
+# never leaves the server.
+# Environment: GENT_TALK_ELEVENLABS_AGENT_ID / GENT_TALK_ELEVENLABS_API_KEY
+# agent_id = "agent_..."
+# api_key = "REPLACE-ME"

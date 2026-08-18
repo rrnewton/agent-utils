@@ -35,6 +35,15 @@ dist/
 # it is machine-local runtime output, not source.
 ignored/
 
+# --- gent-talk (Discord/voice bridge service) ---
+# Its own build tree: gent-talk is outside the rs/ workspace and has its own target dir.
+/gent-talk/target/
+# A filled-in configuration holds the Discord bot token and this server's API tokens.
+# Only gent-talk.example.toml is tracked; a real one must never be committed.
+/gent-talk/gent-talk.toml
+/gent-talk/*.local.toml
+/gent-talk/.env
+
 # --- editor / os ---
 *.swp
 .DS_Store
