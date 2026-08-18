@@ -3790,6 +3790,7 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
 
     init = subparsers.add_parser(
         "init",
+        description="initialize config, state shards, directory, and relative command symlink",
         help="initialize config, state shards, directory, and relative command symlink",
         formatter_class=_HelpFormatter,
     )
@@ -3807,14 +3808,20 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     )
     init.set_defaults(handler=_cmd_init)
 
-    status = subparsers.add_parser("status", help="show active ownership and diagnoses")
+    status = subparsers.add_parser(
+        "status",
+        description="show active ownership and diagnoses",
+        help="show active ownership and diagnoses",
+    )
     status.add_argument("--all-machines", action="store_true", help="read every ACTIVE shard")
     status.add_argument("--slot", help="show one slot")
     status.add_argument("--format", choices=("human", "json"), default="human")
     status.set_defaults(handler=_cmd_status)
 
     create = subparsers.add_parser(
-        "create", help="create fresh Git worktrees and register one active owner"
+        "create",
+        description="create fresh Git worktrees and register one active owner",
+        help="create fresh Git worktrees and register one active owner",
     )
     create.add_argument("slot")
     create.add_argument("--agent", required=True)
@@ -3836,7 +3843,9 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     create.set_defaults(handler=_cmd_create)
 
     register = subparsers.add_parser(
-        "register", help="register already-created, verified live Git worktrees"
+        "register",
+        description="register already-created, verified live Git worktrees",
+        help="register already-created, verified live Git worktrees",
     )
     register.add_argument("slot")
     register.add_argument("--agent", required=True)
@@ -3850,6 +3859,7 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
 
     import_existing = subparsers.add_parser(
         "import-existing",
+        description="verify an existing slot and print the registration; dry-run by default",
         help="verify an existing slot and print the registration; dry-run by default",
     )
     import_existing.add_argument("slot")
@@ -3863,7 +3873,11 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     _add_repo_options(import_existing)
     import_existing.set_defaults(handler=_cmd_import_existing)
 
-    adopt = subparsers.add_parser("adopt", help="bind a live owner process generation")
+    adopt = subparsers.add_parser(
+        "adopt",
+        description="bind a live owner process generation",
+        help="bind a live owner process generation",
+    )
     adopt.add_argument("slot")
     adopt.add_argument("--agent", required=True)
     adopt.add_argument("--owner-pid", type=int, required=True)
@@ -3872,6 +3886,7 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
 
     recover_unbound = subparsers.add_parser(
         "recover-unbound-owner",
+        description="record coordinator recovery evidence without replacing historical ownership",
         help="record coordinator recovery evidence without replacing historical ownership",
     )
     recover_unbound.add_argument("slot")
@@ -3882,7 +3897,11 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     recover_unbound.add_argument("--limitation", action="append")
     recover_unbound.set_defaults(handler=_cmd_recover_unbound_owner)
 
-    heartbeat = subparsers.add_parser("heartbeat", help="update a bound owner's heartbeat")
+    heartbeat = subparsers.add_parser(
+        "heartbeat",
+        description="update a bound owner's heartbeat",
+        help="update a bound owner's heartbeat",
+    )
     heartbeat.add_argument("slot")
     heartbeat.add_argument("--agent", required=True)
     heartbeat.add_argument("--owner-pid", type=int, required=True)
@@ -3890,7 +3909,9 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     heartbeat.set_defaults(handler=_cmd_heartbeat)
 
     finish = subparsers.add_parser(
-        "finish", help="prove landed safety and record the owner-alive handoff"
+        "finish",
+        description="prove landed safety and record the owner-alive handoff",
+        help="prove landed safety and record the owner-alive handoff",
     )
     finish.add_argument("slot")
     finish.add_argument("--agent", required=True)
@@ -3901,7 +3922,9 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     finish.set_defaults(handler=_cmd_finish)
 
     remove = subparsers.add_parser(
-        "remove", help="finish a slot only after its recorded owner is proven dead"
+        "remove",
+        description="finish a slot only after its recorded owner is proven dead",
+        help="finish a slot only after its recorded owner is proven dead",
     )
     remove.add_argument("slot")
     remove.add_argument("--coordinator-pid", type=int, required=True)
@@ -3909,7 +3932,9 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     remove.set_defaults(handler=_cmd_remove)
 
     recover = subparsers.add_parser(
-        "recover", help="resume one interrupted create or removal from its journal"
+        "recover",
+        description="resume one interrupted create or removal from its journal",
+        help="resume one interrupted create or removal from its journal",
     )
     recover.add_argument("--coordinator-pid", type=int, required=True)
     recover.add_argument(
