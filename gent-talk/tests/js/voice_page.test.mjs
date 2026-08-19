@@ -1699,6 +1699,43 @@ test("Refresh re-reads the channel rather than appending to it", async () => {
   assert.match(lines[0].text(), /two/);
 });
 
+test("the channel view opens on the NEWEST message, not the top", async () => {
+  const page = newPage();
+  await signIn(page);
+  const area = page.el("scroll-area");
+  // Stand in for layout the fixture cannot do: a channel taller than its box, parked at the top.
+  area.scrollHeight = 5000;
+  area.scrollTop = 0;
+
+  await showDiscord(page, [message({ id: "1", content: "oldest" }), message({ id: "2", content: "newest" })]);
+
+  assert.equal(area.scrollTop, area.scrollHeight, "the channel opened at the top of the history");
+});
+
+test("EVERY visit to the channel view opens on the newest message, not just the first", async () => {
+  // The regression this guards: the only scroll-to-bottom used to live in loadDiscord(), which
+  // runs solely on the FIRST switch. Both panes share one scroll container, so every later
+  // switch inherited whatever scrollTop the voice pane had left behind — the top, usually.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })]);
+
+  await page.el("view-switch").click(); // back to the voice transcript
+  await page.settle();
+  assert.equal(page.tab(), "voice");
+
+  const area = page.el("scroll-area");
+  area.scrollHeight = 5000;
+  area.scrollTop = 0; // the reader scrolled up in the voice pane
+
+  await page.el("view-switch").click(); // and returns to the channel: no reload, the log is populated
+  await page.settle();
+
+  assert.equal(page.tab(), "discord");
+  assert.equal(page.el("discord-log").children.length, 2, "the second visit re-fetched the channel");
+  assert.equal(area.scrollTop, area.scrollHeight, "the second visit to the channel opened at the top");
+});
+
 test("a Discord read that fails reports itself and does NOT hang up on you", async () => {
   const page = newPage();
   await startTalking(page);

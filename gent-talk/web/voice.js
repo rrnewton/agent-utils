@@ -147,6 +147,13 @@ function showView(name) {
   const discord = name === "discord";
   el("view-switch").setAttribute("aria-checked", discord ? "true" : "false");
   el("view-switch-label").textContent = discord ? "Discord" : "Voice";
+  // Both panes share ONE scroll container, so a switch swaps the content out from under a
+  // scrollTop that belonged to the other pane. Landing anywhere but the newest message is
+  // wrong for both views, and it is badly wrong for Discord: arriving at the TOP of a long
+  // channel means scrolling past everything already read to reach the thing you opened it
+  // for. Doing this here rather than in loadDiscord() is deliberate — the load only runs on
+  // the FIRST switch, so a fix that lived there would leave every later switch at the top.
+  scrollToNewest();
 }
 
 // --- connection details -------------------------------------------------------------------------
