@@ -533,6 +533,29 @@ grep -q '127.0.0.1:18091' <<< "$out" \
     || fail "--screenshots needs a configuration file it should never read: $out"
 ok "--screenshots reads none of the owner's configuration"
 
+rc=0; out="$(run_sh --theme dark)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--theme on its own exited 0"
+grep -q -- '--theme only means something together with --screenshots' <<< "$out" \
+    || fail "--theme on its own does not say what it needs: $out"
+ok "--theme on its own refuses, naming the flag it belongs to"
+
+rc=0; out="$(run_sh --screenshots --theme purple)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--theme with a nonsense value exited 0"
+grep -q 'must be dark, light or both' <<< "$out" \
+    || fail "--theme does not name the values it accepts: $out"
+ok "--theme rejects a value it cannot honour, naming the valid ones"
+
+# DARK IS THE DEFAULT, and that is the whole point rather than a preference. The owner's phone is
+# dark; the first run of this harness captured nothing but light frames because that is the browser
+# automation default, so every image reviewed a page he never sees. A silent revert to light would
+# reproduce exactly that, and nothing else in this suite would notice.
+out="$(run_sh --screenshots --dry-run)"
+grep -q 'theme:     dark' <<< "$out" \
+    || fail "--screenshots no longer defaults to the dark theme: $out"
+grep -q -- '--theme dark' <<< "$out" \
+    || fail "--screenshots --dry-run does not pass the theme through to the harness: $out"
+ok "--screenshots defaults to dark and passes the theme through"
+
 # The capture harness's OWN controls, run here for the same reason the smoke test's are: if they
 # fail, a green screenshot run means nothing, because nothing would reject a blank picture.
 rc=0; out="$(timeout 120 python3 "$SCRIPT_DIR/screenshots.py" --self-test 2>&1)" || rc=$?
@@ -544,6 +567,10 @@ grep -q 'record_capture REFUSES to certify a blank frame it wrote' <<< "$out" \
     || fail "the screenshot controls do not check the gate on the path that SAVES files: $out"
 grep -q "unreachable state's error names the state" <<< "$out" \
     || fail "the screenshot controls do not check that a missed state fails by name: $out"
+grep -q 'no state still drives a selector the interface rework retired' <<< "$out" \
+    || fail "the screenshot controls do not guard against stale post-rework selectors: $out"
+grep -q 'dark is the default theme' <<< "$out" \
+    || fail "the screenshot controls do not pin dark as the default theme: $out"
 ok "the screenshot harness's own controls pass (blank, save-path and unreachable-state included)"
 
 # A missing browser must say so BY NAME with the command that fixes it. Pointing the browser

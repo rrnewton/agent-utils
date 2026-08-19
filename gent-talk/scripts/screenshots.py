@@ -533,6 +533,15 @@ STUB_JS = r"""
 """
 
 
+# The owner's phone is DARK, and the first run of this harness captured nothing but light frames
+# because that is Playwright's default -- so the whole set reviewed a theme he never sees. That is
+# the worst kind of wrong picture: every image was real, and every one was of the wrong page.
+# Contrast between the two speakers is exactly what does not survive the swap, so dark is the
+# default here and light is opt-in.
+THEMES = ("dark", "light")
+DEFAULT_THEME = "dark"
+
+
 @dataclass(frozen=True)
 class Profile:
     """One viewport to capture at.
@@ -550,13 +559,16 @@ class Profile:
     mobile: bool
     user_agent: str
 
-    def context_options(self) -> dict:
+    def context_options(self, theme: str) -> dict:
         return {
             "viewport": {"width": self.width, "height": self.height},
             "device_scale_factor": self.scale,
             "is_mobile": self.mobile,
             "has_touch": self.mobile,
             "user_agent": self.user_agent,
+            # The page has no theme switch: it follows the OS through
+            # `@media (prefers-color-scheme: light)`, so this is the only way to reach either one.
+            "color_scheme": theme,
         }
 
 
@@ -623,7 +635,10 @@ class Scene:
 class Driver:
     """Walks one browser page through the scenes, capturing as it goes."""
 
-    def __init__(self, page, base_url: str, token: str, out_dir: Path, profile: Profile) -> None:
+    def __init__(
+        self, page, base_url: str, token: str, out_dir: Path, profile: Profile, theme: str
+    ) -> None:
+        self.theme = theme
         self.page = page
         # A page whose script threw on load still RENDERS: the markup is there, the sign-in screen
         # looks entirely plausible, and every control is inert. That is a photograph of a broken
@@ -695,9 +710,9 @@ class Driver:
         else:
             animations = "disabled" if scene.freeze_animations else "allow"
 
-        path = self.out_dir / f"{self.profile.name}--{scene.name}.png"
+        path = self.out_dir / f"{self.theme}--{self.profile.name}--{scene.name}.png"
         data = self.page.screenshot(animations=animations)
-        verdict = record_capture(path, data, f"{self.profile.name}/{scene.name}")
+        verdict = record_capture(path, data, f"{self.theme}/{self.profile.name}/{scene.name}")
         self.results.append((scene.name, path, verdict))
 
 
@@ -705,6 +720,12 @@ class Driver:
 #
 # Order matters: they are a walk through one session, in the order a person moves through it, so the
 # live-call states really are entered from a real idle screen by real clicks.
+#
+# EVERY selector here was re-derived against web/voice.html after the interface rework (ef24062).
+# The old page's tab buttons, its `li.system` end-of-call paragraph and its always-present Hang up
+# are all gone, and a scene left pointing at any of them would not have failed -- it would have
+# captured whatever happened to be on screen and filed it under the old name. That is the failure
+# this table's expectations exist to prevent, so they are the part that had to be rechecked hardest.
 
 
 def _act_signed_out(driver: Driver) -> None:
@@ -741,18 +762,46 @@ def _act_muted(driver: Driver) -> None:
     driver.settle()
 
 
-def _act_post_call(driver: Driver) -> None:
-    driver.click("talk")  # unmute, so the hang-up happens from a normal live call
+def _act_speaker_silenced(driver: Driver) -> None:
+    driver.click("talk")  # unmute, so this shows the speaker control alone, not two states at once
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=5_000
     )
+    driver.click("speaker")
+    driver.page.wait_for_function("() => window.__text('speaker-label') === 'Silent'", timeout=5_000)
+    driver.js("window.__agentSays('Nothing else is red. The arm64 runner is still wedged.')")
+    driver.settle(300)
+
+
+def _act_post_call(driver: Driver) -> None:
+    driver.click("speaker")  # back to Sound, so the post-call frame is not also a muted-speaker one
+    driver.page.wait_for_function("() => window.__text('speaker-label') === 'Sound'", timeout=5_000)
     driver.click("hang-up")
     driver.page.wait_for_function(
-        "() => [...document.querySelectorAll('#transcript li.system')]"
-        ".some((n) => n.textContent.includes('Call ended'))",
-        timeout=5_000,
+        "() => window.__text('talk-label') === 'Start a new call'", timeout=5_000
     )
     driver.settle()
+
+
+def _act_seam_open(driver: Driver) -> None:
+    # The disclosure inside the end-of-call seam. Its first capture caught it unfolding UNDERNEATH
+    # the dock, where it is invisible -- the page scrolls it into view on `toggle`, and whether that
+    # actually worked is a layout fact no behavioural test can see.
+    driver.page.click("#transcript li.seam summary")
+    driver.page.wait_for_function(
+        "() => !!document.querySelector('#transcript li.seam details[open]')", timeout=5_000
+    )
+    driver.settle(500)  # the scrollIntoView the page runs on toggle has to land before the shutter
+
+
+def _act_clear_armed(driver: Driver) -> None:
+    # One tap ARMS it; a second would clear. It disarms itself after about four seconds, so this
+    # capture is taken promptly and deliberately does not settle for long.
+    driver.click("clear-view")
+    driver.page.wait_for_function(
+        "() => window.__text('clear-view-label') === 'Sure?'", timeout=5_000
+    )
+    driver.settle(120)
 
 
 def _act_settings(driver: Driver) -> None:
@@ -764,7 +813,7 @@ def _act_settings(driver: Driver) -> None:
 def _act_discord(driver: Driver) -> None:
     driver.click("close-settings")
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=5_000)
-    driver.click("tab-discord")
+    driver.click("view-switch")
     # A real read of the real server's channel; --fake-discord seeds it.
     driver.page.wait_for_function(
         "() => document.querySelectorAll('#discord-log li').length > 0", timeout=15_000
@@ -826,14 +875,17 @@ LONG_TRANSCRIPT = [
     ("user", "how many messages are in the channel now"),
     (
         "agent",
-        "Twelve since the run started, from four different authors. The Discord tab has all of "
+        "Twelve since the run started, from four different authors. The Discord view has all of "
         "them with their ids if you want to check one against what I just told you.",
     ),
 ]
 
 
 def _act_long_scroll(driver: Driver) -> None:
-    driver.click("tab-voice")
+    driver.click("view-switch")  # back to the call
+    driver.page.wait_for_function(
+        "() => window.__text('view-switch-label') === 'Voice'", timeout=5_000
+    )
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -846,7 +898,7 @@ def _act_long_scroll(driver: Driver) -> None:
         )
     driver.settle(400)
     # Park the view in the MIDDLE of the scroll range. Pinned to the bottom is the state every other
-    # capture already shows; the middle is what exercises the header and pane edges with content
+    # capture already shows; the middle is what exercises the header and dock edges with content
     # running under them.
     driver.js(
         "(() => { const a = document.getElementById('scroll-area'); "
@@ -854,6 +906,11 @@ def _act_long_scroll(driver: Driver) -> None:
     )
     driver.settle(300)
 
+
+# Hang up is ABSENT, not disabled, whenever there is no call. Asserted as its own expectation on
+# every no-call state, because "dimmed but present" was the defect the rework removed and a
+# screenshot is the only thing that can tell the two apart.
+NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
 SCENES: tuple[Scene, ...] = (
     Scene(
@@ -865,22 +922,20 @@ SCENES: tuple[Scene, ...] = (
             ("the token field is on screen", "window.__visible('api-token')"),
             ("the Save token control is on screen", "window.__visible('save-token')"),
             (
-                "the call controls are NOT on screen (there is nothing to call)",
+                "the dock controls are NOT on screen (there is nothing to call)",
                 "!window.__visible('control-pane')",
             ),
         ),
     ),
     Scene(
         name="02-idle",
-        what="signed in, main screen, no call in progress",
+        what="signed in, no call: the empty state invites the first tap",
         act=_act_idle,
         expect=(
             ("the control pane is on screen", "window.__visible('control-pane')"),
             ("the talk control reads 'Talk'", "window.__text('talk-label') === 'Talk'"),
-            (
-                "the talk control is NOT showing a live call",
-                "!document.getElementById('talk').className.includes('live')",
-            ),
+            ("the empty state is showing", "window.__visible('empty-state')"),
+            NO_HANGUP,
             ("the sign-in screen is gone", "!window.__visible('screen-signin')"),
         ),
     ),
@@ -901,8 +956,14 @@ SCENES: tuple[Scene, ...] = (
                 "document.querySelector('.control-ring').getAnimations().length > 0",
             ),
             (
-                "the transcript has turns from both sides",
-                "document.querySelectorAll('#transcript li').length >= 3",
+                "the status line reports a live call",
+                "document.getElementById('status-line').dataset.state === 'live'",
+            ),
+            ("Hang up is present, because there is a call", "window.__visible('hang-up')"),
+            (
+                "the transcript has turns from both sides, and the empty state is gone",
+                "document.querySelectorAll('#transcript li').length >= 3 && "
+                "!window.__visible('empty-state')",
             ),
         ),
     ),
@@ -920,57 +981,126 @@ SCENES: tuple[Scene, ...] = (
                 "the slash across the microphone is showing",
                 "getComputedStyle(document.getElementById('talk-slash')).opacity === '1'",
             ),
+            ("the call is still open, so Hang up is still there", "window.__visible('hang-up')"),
+        ),
+    ),
+    Scene(
+        name="05-speaker-silenced",
+        what="the agent's VOICE silenced while its text keeps arriving",
+        act=_act_speaker_silenced,
+        expect=(
+            ("the speaker control reads 'Silent'", "window.__text('speaker-label') === 'Silent'"),
             (
-                "the call is still open, so hang up is still there",
-                "window.__visible('hang-up')",
+                "the speaker control carries the off class",
+                "document.getElementById('speaker').className.includes('off')",
+            ),
+            (
+                "the slash across the speaker is showing",
+                "getComputedStyle(document.getElementById('speaker-slash')).opacity === '1'",
+            ),
+            (
+                "the call is live and NOT muted — this is the speaker, not the microphone",
+                "window.__text('talk-label') === 'Listening'",
             ),
         ),
     ),
     Scene(
-        name="05-post-call",
+        name="06-post-call",
         what="just after a hang-up — the state the owner photographed",
         act=_act_post_call,
         expect=(
             (
-                "the transcript carries the line marking the end of the conversation",
-                "[...document.querySelectorAll('#transcript li.system')]"
-                ".some((n) => n.textContent.includes('Call ended'))",
-            ),
-            ("the talk control is back to 'Talk'", "window.__text('talk-label') === 'Talk'"),
-            (
-                "the talk control no longer reads as live",
-                "!document.getElementById('talk').className.includes('live')",
+                "the transcript carries the seam that marks a new conversation",
+                "[...document.querySelectorAll('#transcript li.seam .seam-label')]"
+                ".some((n) => n.textContent.trim() === 'new conversation')",
             ),
             (
-                "the talk control no longer reads as muted",
+                "the large control now offers a NEW call",
+                "window.__text('talk-label') === 'Start a new call'",
+            ),
+            ("the memory caveat rides on that control", "window.__visible('talk-note')"),
+            NO_HANGUP,
+            (
+                "the talk control no longer reads as live or muted",
+                "!document.getElementById('talk').className.includes('live') && "
                 "!document.getElementById('talk').className.includes('muted')",
             ),
         ),
     ),
     Scene(
-        name="06-settings",
-        what="the settings screen",
-        act=_act_settings,
+        name="07-seam-disclosure-open",
+        what="the end-of-call seam opened — the explanation must land ABOVE the dock",
+        act=_act_seam_open,
         expect=(
-            ("the settings screen is up", "window.__visible('screen-settings')"),
-            ("the way back is on screen", "window.__visible('close-settings')"),
             (
-                "the explanation of what the controls do is on screen",
-                "window.__visible('continuity-note')",
+                "the disclosure is open",
+                "!!document.querySelector('#transcript li.seam details[open]')",
             ),
             (
-                "the call controls are not on screen behind it",
-                "!window.__visible('control-pane')",
+                "the explanation has actually been laid out",
+                "document.querySelector('#transcript li.seam .seam-detail')"
+                ".getBoundingClientRect().height > 0",
+            ),
+            # THE point of this state. The page scrolls the seam into view on toggle; whether that
+            # lands is a layout fact, and its first capture caught it opening underneath the dock
+            # where nobody can read it.
+            (
+                "the explanation is not hidden underneath the dock",
+                "(() => { const d = document.querySelector('#transcript li.seam .seam-detail'); "
+                "const r = d.getBoundingClientRect(); "
+                "const dock = document.getElementById('dock').getBoundingClientRect(); "
+                "return r.bottom <= dock.top + 1 && r.top >= 0; })()",
             ),
         ),
     ),
     Scene(
-        name="07-discord-tab",
+        name="08-clear-armed",
+        what="the clear control ARMED — one tap in, asking before it erases anything",
+        act=_act_clear_armed,
+        expect=(
+            ("the clear control asks 'Sure?'", "window.__text('clear-view-label') === 'Sure?'"),
+            (
+                "it carries the armed class, so it looks different as well as reading differently",
+                "document.getElementById('clear-view').className.includes('armed')",
+            ),
+            (
+                "nothing has been cleared yet — arming must not erase",
+                "document.querySelectorAll('#transcript li').length >= 3",
+            ),
+        ),
+    ),
+    Scene(
+        name="09-settings",
+        what="the settings screen, with the header as a real title bar",
+        act=_act_settings,
+        expect=(
+            ("the settings screen is up", "window.__visible('screen-settings')"),
+            ("the header shows a title", "window.__visible('topbar-title')"),
+            ("the way back is in the header", "window.__visible('close-settings')"),
+            (
+                "the view switch is gone, because it acts on a screen that is not up",
+                "!window.__visible('view-switch')",
+            ),
+            (
+                "the explanation of what the controls do is on screen",
+                "window.__visible('continuity-note')",
+            ),
+        ),
+    ),
+    Scene(
+        name="10-discord-view",
         what="the raw Discord view, with real messages from the server",
         act=_act_discord,
         expect=(
             ("the Discord pane is up", "window.__visible('pane-discord')"),
-            ("the channel picker is on screen", "window.__visible('discord-channel')"),
+            (
+                "the switch says which view you are in",
+                "window.__text('view-switch-label') === 'Discord'",
+            ),
+            (
+                "the switch reads as thrown",
+                "document.getElementById('view-switch').getAttribute('aria-checked') === 'true'",
+            ),
             (
                 "there are several real messages rendered",
                 "document.querySelectorAll('#discord-log li').length >= 5",
@@ -982,8 +1112,8 @@ SCENES: tuple[Scene, ...] = (
         ),
     ),
     Scene(
-        name="08-long-transcript-scrolled",
-        what="a long transcript, parked mid-scroll, exercising the header and pane edges",
+        name="11-long-transcript-scrolled",
+        what="a long transcript, parked mid-scroll, exercising the header and dock edges",
         act=_act_long_scroll,
         expect=(
             (
@@ -1088,7 +1218,7 @@ def open_browser(playwright):
 
 
 def run_captures(
-    url: str, token: str, channel: str, out_dir: Path, only: Iterable[str]
+    url: str, token: str, channel: str, out_dir: Path, only: Iterable[str], themes: Iterable[str]
 ) -> list[tuple[str, Path, Verdict]]:
     try:
         from playwright.sync_api import sync_playwright
@@ -1117,42 +1247,43 @@ def run_captures(
     with sync_playwright() as playwright:
         browser = open_browser(playwright)
         try:
-            for profile in PROFILES:
-                context = browser.new_context(**profile.context_options())
-                context.grant_permissions(["microphone"], origin=url)
-                # The vendor boundary, and the ONLY request that is faked. Everything else --
-                # /api/v1/client-config, the channel read -- goes to the real server.
-                context.route(
-                    "**/api/v1/signed-url",
-                    lambda route: route.fulfill(
-                        status=200,
-                        content_type="application/json",
-                        body=json.dumps(signed),
-                    ),
-                )
-                page = context.new_page()
-                driver = Driver(page, url, token, out_dir, profile)
-                print(f"==> {profile.name}: {profile.what}")
-                for scene in scenes:
-                    # A timeout inside the walk is an UNREACHABLE STATE, and it must read as one.
-                    # Left to itself Playwright raises a TimeoutError whose traceback names a line
-                    # number in this file and not the state, which is exactly the report that
-                    # sends the next reader to debug the harness when the page has simply moved.
-                    try:
-                        scene.act(driver)
-                    except Exception as error:
-                        if isinstance(error, (Unreachable, TrivialCapture)):
-                            raise
-                        raise Unreachable(
-                            scene.name,
-                            f"the walk into it did not complete ({type(error).__name__})",
-                            str(error).strip().splitlines()[0] if str(error).strip() else "",
-                        ) from error
-                    driver.capture(scene)
-                    name, path, verdict = driver.results[-1]
-                    print(f"  ok    {name:<28} {verdict.describe()}")
-                everything.extend(driver.results)
-                context.close()
+            for theme in themes:
+                for profile in PROFILES:
+                    context = browser.new_context(**profile.context_options(theme))
+                    context.grant_permissions(["microphone"], origin=url)
+                    # The vendor boundary, and the ONLY request that is faked. Everything else --
+                    # /api/v1/client-config, the channel read -- goes to the real server.
+                    context.route(
+                        "**/api/v1/signed-url",
+                        lambda route: route.fulfill(
+                            status=200,
+                            content_type="application/json",
+                            body=json.dumps(signed),
+                        ),
+                    )
+                    page = context.new_page()
+                    driver = Driver(page, url, token, out_dir, profile, theme)
+                    print(f"==> {theme} · {profile.name}: {profile.what}")
+                    for scene in scenes:
+                        # A timeout inside the walk is an UNREACHABLE STATE and must read as one.
+                        # Left to itself Playwright raises a TimeoutError whose traceback names a
+                        # line number in this file and not the state, which is exactly the report
+                        # that sends the next reader to debug the harness when the page has moved.
+                        try:
+                            scene.act(driver)
+                        except Exception as error:
+                            if isinstance(error, (Unreachable, TrivialCapture)):
+                                raise
+                            raise Unreachable(
+                                scene.name,
+                                f"the walk into it did not complete ({type(error).__name__})",
+                                str(error).strip().splitlines()[0] if str(error).strip() else "",
+                            ) from error
+                        driver.capture(scene)
+                        name, path, verdict = driver.results[-1]
+                        print(f"  ok    {name:<30} {verdict.describe()}")
+                    everything.extend(driver.results)
+                    context.close()
         finally:
             browser.close()
     return everything
@@ -1279,10 +1410,11 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 8:
+    if len(SCENES) < 11:
         problems.append(
-            f"the scene table has only {len(SCENES)} states; the eight that differ visually are "
-            "the point of this script."
+            f"the scene table has only {len(SCENES)} states. The interface rework added three that "
+            "are where the interesting defects now live -- the armed clear control, the seam with "
+            "its disclosure open, and settings with its title bar."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -1304,13 +1436,20 @@ def check_state_controls() -> list[str]:
     # check left every control green.)
     required = {
         "01-signed-out": "save-token",
-        "02-idle": "'Talk'",
+        "02-idle": "empty-state",
         "03-live-call": "Listening",
         "04-muted": "Muted",
-        "05-post-call": "Call ended",
-        "06-settings": "screen-settings",
-        "07-discord-tab": "discord-log",
-        "08-long-transcript-scrolled": "scrollTop",
+        "05-speaker-silenced": "Silent",
+        "06-post-call": "new conversation",
+        # Pinned to the GEOMETRY, not merely to the element. Pinning it to "seam-detail" was
+        # satisfied by the sibling "has it been laid out" check, so the one assertion this state
+        # exists for -- that the explanation does not open underneath the dock, which is the bug
+        # its first capture caught -- could be deleted with every control still green.
+        "07-seam-disclosure-open": "dock.top",
+        "08-clear-armed": "Sure?",
+        "09-settings": "topbar-title",
+        "10-discord-view": "Discord",
+        "11-long-transcript-scrolled": "scrollTop",
     }
     for name, needle in required.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -1323,14 +1462,34 @@ def check_state_controls() -> list[str]:
                 "never reached that state would still write a picture under its name."
             )
 
-    error = Unreachable("05-post-call", "the transcript carries the end-of-conversation line")
+    # The interface rework renamed all of these. A scene still driving one would not fail loudly --
+    # `getElementById` returns null, `__visible` answers false, and the run reports an unreachable
+    # state for a reason that sounds like a page bug. Catching it here says the harness is stale.
+    RETIRED = {
+        "tab-voice": "the two tab buttons became the single #view-switch",
+        "tab-discord": "the two tab buttons became the single #view-switch",
+        "li.system": "the end-of-call marker became li.seam",
+        "Call ended": "the seam is labelled 'new conversation'",
+        "conversation-state": "the state moved onto #status-line as a data attribute",
+        "hangup-label": "Hang up is absent, not relabelled, when there is no call",
+    }
+    for scene in SCENES:
+        for description, expression in scene.expect:
+            for dead, became in RETIRED.items():
+                if dead in expression:
+                    problems.append(
+                        f"scene '{scene.name}' still drives {dead!r}, which the interface rework "
+                        f"removed ({became}). The harness is photographing a page that is gone."
+                    )
+
+    error = Unreachable("06-post-call", "the transcript carries the seam that marks a new conversation")
     text = str(error)
-    if "05-post-call" not in text:
+    if "06-post-call" not in text:
         problems.append(
             "an unreachable state's error does not NAME the state, so a failing run would not say "
             "which picture is missing."
         )
-    if "end-of-conversation" not in text:
+    if "seam that marks" not in text:
         problems.append("an unreachable state's error does not say WHICH expectation failed.")
 
     return problems
@@ -1384,6 +1543,26 @@ def check_profile_controls() -> list[str]:
         problems.append("no desktop-width profile survives; the wide layout would go unseen.")
     if len({p.name for p in PROFILES}) != len(PROFILES):
         problems.append("two profiles share a name, so their captures would collide.")
+    return problems
+
+
+def check_theme_controls() -> list[str]:
+    """Dark must stay the default: the first run of this harness reviewed a theme he never sees."""
+    problems: list[str] = []
+    if DEFAULT_THEME != "dark":
+        problems.append(
+            f"the default theme is {DEFAULT_THEME!r}. The owner's device is dark, and a light-only "
+            "run reviews a page he never looks at -- which is what happened the first time."
+        )
+    if set(THEMES) != {"dark", "light"}:
+        problems.append(f"the theme list is {THEMES!r}; both schemes must remain capturable.")
+    for theme in THEMES:
+        options = PROFILES[0].context_options(theme)
+        if options.get("color_scheme") != theme:
+            problems.append(
+                f"a {theme} context does not set color_scheme, so the page would follow "
+                "Playwright's default (light) whatever the run was asked for."
+            )
     return problems
 
 
@@ -1504,6 +1683,10 @@ SELF_TEST_CHECKS = (
     "an 8x8 frame is rejected as too small to be a page",
     "a 60x60 frame is rejected on its DIMENSIONS, not on its byte count",
     "every state is pinned to its own distinguishing marker",
+    "no state still drives a selector the interface rework retired",
+    "the seam state is pinned to the dock geometry, not just to the element",
+    "dark is the default theme, and both schemes stay capturable",
+    "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",
     "record_capture REFUSES to certify a blank frame it wrote",
     "a rejected capture is still left on disk to look at",
@@ -1531,6 +1714,7 @@ def run_self_test(tmp: Path) -> int:
         + check_blank_gate_controls(tmp)
         + check_state_controls()
         + check_profile_controls()
+        + check_theme_controls()
         + check_dependency_message_controls()
         + check_viewport_meta_controls()
         + check_stub_controls()
@@ -1566,6 +1750,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="STATE",
         help="capture only this state (repeatable); default is all of them",
+    )
+    parser.add_argument(
+        "--theme",
+        choices=("dark", "light", "both"),
+        default=DEFAULT_THEME,
+        help="which colour scheme to capture (default: dark — the owner's phone is dark, and "
+        "contrast that reads on white can vanish on black)",
     )
     parser.add_argument(
         "--self-test",
@@ -1626,7 +1817,8 @@ def main(argv: list[str]) -> int:
         return EXIT_UNREACHABLE
 
     try:
-        results = run_captures(args.url, token, args.channel or "", out_dir, args.only)
+        themes = THEMES if args.theme == "both" else (args.theme,)
+        results = run_captures(args.url, token, args.channel or "", out_dir, args.only, themes)
     except PlaywrightMissing as error:
         print(f"screenshots.py: {error}", file=sys.stderr)
         return EXIT_PLAYWRIGHT_MISSING

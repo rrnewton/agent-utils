@@ -11,7 +11,7 @@
 #
 # Usage:
 #   scripts/run.sh [--shutdown] [--restart] [--logs] [--follow] [--status] [--tunnel-status]
-#                  [--smoke-agent [--nonce]] [--screenshots [--out DIR]]
+#                  [--smoke-agent [--nonce]] [--screenshots [--out DIR] [--theme THEME]]
 #                  [--config FILE] [--tunnel|--no-tunnel] [--tag TAG] [--port PORT]
 #                  [--restart-policy POLICY] [--dry-run] [--help]
 #
@@ -62,8 +62,8 @@
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
-#   --screenshots  Photograph the /voice page in every state that looks different, so an agent can
-#                  LOOK at the interface before the owner does. FREE and offline: no vendor
+#   --screenshots  Photograph the /voice page in all eleven states that look different, so an
+#                  agent can LOOK at the interface before the owner does. FREE and offline: no vendor
 #                  conversation, no microphone, no money. The conversation WebSocket is replaced by
 #                  a fake and the microphone is Chromium's built-in fake capture device, so the
 #                  live-call, muted and post-call states are reached without ElevenLabs ever being
@@ -91,6 +91,12 @@
 #   --out DIR      Only with --screenshots. Where to write the PNGs (default: a timestamped
 #                  directory under gent-talk/debug/screenshots/, which is gitignored). Screenshots
 #                  are evidence, never source, and are never committed.
+#   --theme THEME  Only with --screenshots. dark (the default), light, or both. DARK IS THE
+#                  DEFAULT DELIBERATELY: the owner's phone is dark, and the first run of this
+#                  harness captured nothing but light frames because that is the browser
+#                  automation default — so the whole set reviewed a page he never sees. Contrast
+#                  between the two speakers is exactly what does not survive the swap, so the
+#                  theme that counts is the one captured by default.
 #   --config FILE  Use exactly this configuration file and no other. Missing file is an error.
 #   --tunnel       Force the cloudflared tunnel check ON for this run.
 #   --no-tunnel    Force the cloudflared tunnel check OFF for this run.
@@ -199,6 +205,7 @@ SMOKE_AGENT=0
 SMOKE_NONCE=0
 SCREENSHOTS=0
 SHOTS_OUT=""
+SHOTS_THEME=""
 TUNNEL_OVERRIDE=""
 TAG_OVERRIDE=""
 PORT_OVERRIDE=""
@@ -231,6 +238,7 @@ while [ $# -gt 0 ]; do
         --nonce) SMOKE_NONCE=1; shift ;;
         --screenshots) SCREENSHOTS=1; shift ;;
         --out) SHOTS_OUT="${2:?--out needs a directory}"; shift 2 ;;
+        --theme) SHOTS_THEME="${2:?--theme needs dark, light or both}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unrecognized argument: $1" >&2; echo "" >&2; usage >&2; exit 2 ;;
     esac
@@ -266,6 +274,13 @@ It is the strong form of that check: it posts one unique token to the channel th
 server's own write API and requires the agent to relay it back verbatim. On its own there is
 nothing for it to modify, and accepting it silently would leave you believing you had run the
 strong check when you had not."
+fi
+
+if [ -n "$SHOTS_THEME" ] && [ "$SCREENSHOTS" != 1 ]; then
+    die "--theme only means something together with --screenshots.
+It picks the colour scheme the /voice page is photographed in. On its own there is nothing to
+photograph, and accepting it silently would leave you believing you had chosen a theme for a run
+that never took a picture."
 fi
 
 if [ -n "$SHOTS_OUT" ] && [ "$SCREENSHOTS" != 1 ]; then
@@ -364,7 +379,13 @@ label = "lead team"
 writable = true
 EOF
 
+    case "${SHOTS_THEME:-dark}" in
+        dark|light|both) ;;
+        *) die "--theme must be dark, light or both; got: $SHOTS_THEME" ;;
+    esac
+
     step "Screenshots of /voice — free, offline, no vendor conversation and no microphone."
+    note "theme:     ${SHOTS_THEME:-dark} (dark by default — it is the theme the phone is in)"
     note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
     note "output:    $SHOTS_OUT"
     note "the running gent-talk, its config and its logs are not touched."
@@ -372,7 +393,7 @@ EOF
     if [ "$DRY_RUN" = 1 ]; then
         note "(dry run) cargo build --release --manifest-path $GENT_TALK_DIR/Cargo.toml"
         note "(dry run) $GENT_TALK_DIR/target/release/gent-talk --config $SHOTS_TMP/gent-talk.toml --fake-discord"
-        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT"
+        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT --theme ${SHOTS_THEME:-dark}"
         note "(dry run) nothing was built, started, or photographed."
         exit 0
     fi
@@ -415,7 +436,8 @@ EOF
     "$SHOTS_SCRIPT" \
         --url "http://127.0.0.1:$SHOTS_PORT" \
         --channel "$SHOTS_CHANNEL" \
-        --out "$SHOTS_OUT" || rc=$?
+        --out "$SHOTS_OUT" \
+        --theme "${SHOTS_THEME:-dark}" || rc=$?
     if [ "$rc" -ne 0 ]; then
         echo "" >&2
         echo "The screenshot run FAILED (exit $rc). Nothing above is evidence about how the page" >&2
