@@ -809,10 +809,17 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the eight states that look different — signed out, idle, live
-call, muted, just after a hang-up, settings, the Discord tab, and a long transcript parked
+Photographs the `/voice` page in the eleven states that look different — signed out, idle, live
+call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
+disclosure open, the clear control armed, settings, the Discord view, and a long transcript parked
 mid-scroll — at three viewports: a tall phone, a short phone, and desktop width. It prints the
 absolute path of every image so an agent can open them directly.
+
+**Dark is the default, and that is not a preference.** The owner's phone is dark, and the first run
+of this harness captured nothing but light frames, because light is the browser-automation default
+— so every image was real and every one was of a page he never sees. Contrast between the two
+speakers is exactly what does not survive the swap. `--theme light` or `--theme both` when you want
+the other one.
 
 It costs nothing and needs no hardware. The conversation WebSocket is replaced before any page
 script runs, and the mint request to `/api/v1/signed-url` is answered locally, so the live-call
@@ -823,16 +830,24 @@ including on failure — it refuses port 8080 by name, because that is the live 
 
 The two ways a screenshot harness lies are both closed, and both were verified by mutation:
 
-* **Eight pictures of the same idle screen.** Every state declares what must be true of the live
+* **Eleven pictures of the same idle screen.** Every state declares what must be true of the live
   page before the shutter opens, and each is pinned to its OWN marker — the post-call shot checks
-  for the line that marks the end of a conversation, the muted shot for the muted label. A state
-  whose expectations do not hold fails BY NAME and is not photographed approximately.
+  for the seam labelled "new conversation", the armed shot for the word the control changes to. A
+  state whose expectations do not hold fails BY NAME and is not photographed approximately. A
+  further control rejects any expectation still driving a selector the interface rework retired,
+  because a stale selector does not fail loudly: `getElementById` returns null and the run blames
+  the page.
 * **A picture of a page that never rendered.** A white rectangle is a valid PNG. Every capture is
   decoded (in the standard library — no image dependency) and rejected if it is too small, too
   few bytes, under sixteen distinct colours, or more than 99.5% one flat colour. The check sits on
   the only function that writes a file, so there is no second path that saves an unjudged image.
 
-`scripts/screenshots.py --self-test` runs 27 controls for those checks offline, with no browser and
+Some expectations are load-bearing beyond "did we get here". The opened seam must land ABOVE the
+dock — its first capture caught it unfolding underneath, where it is invisible — so that state
+asserts the explanation's bounding box clears the dock's top edge. That assertion was verified end
+to end by reintroducing the bug in the browser and confirming the run refused.
+
+`scripts/screenshots.py --self-test` runs 31 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.
