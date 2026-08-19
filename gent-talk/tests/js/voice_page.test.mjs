@@ -1,4 +1,4 @@
-// Tests for the /voice page's feedback, run against the REAL web/voice.js.
+// Tests for the /voice page, run against the REAL web/voice.js, web/voice.html and web/voice.css.
 //
 // Why this exists at all: the page's job in a failure is to SAY what went wrong, and the bug it
 // was written for was that it said nothing visible — a 502 naming a missing ElevenLabs permission
@@ -10,7 +10,19 @@
 //   * `getElementById` knows ONLY the ids that really appear in web/voice.html, and THROWS for
 //     anything else. So a script that reaches for an element the page does not have fails loudly
 //     here instead of silently doing nothing in a phone browser at the roadside.
-//   * There is no innerHTML, so a test cannot accidentally certify markup injection as "rendered".
+//   * There is no innerHTML, no insertAdjacentHTML, and no HTML parser anywhere in the fixture. A
+//     test therefore CANNOT accidentally certify markup injection as "rendered" — the only way a
+//     `<script>` in a Discord message could become an element is if the page created that element
+//     itself, and `page.createdTags` records every element the page creates so that is checked
+//     directly.
+//
+// What this fixture CANNOT do, stated so nobody reads more into a green run than is there:
+//
+//   * It does not lay anything out. The frame assertions below read web/voice.css as text and
+//     check that the specific properties which produce the app-like behaviour are present on the
+//     specific selectors that need them. That catches a deletion or a moved rule. It does not and
+//     cannot prove the page looks right on a phone.
+//   * There is no real audio hardware, no real WebSocket, and no real ElevenLabs.
 //
 // No dependencies, no build step, no framework — same rule the page itself follows.
 
@@ -24,6 +36,21 @@ import vm from "node:vm";
 const WEB = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "web");
 const SCRIPT = readFileSync(join(WEB, "voice.js"), "utf8");
 const HTML = readFileSync(join(WEB, "voice.html"), "utf8");
+const CSS = readFileSync(join(WEB, "voice.css"), "utf8");
+
+/**
+ * The same files with their comments removed.
+ *
+ * Load-bearing, and the reason is a trap this suite fell into: several assertions below are of the
+ * form "this string appears NOWHERE in the page". Those files explain at length WHY they avoid
+ * `innerHTML` and WHY they declare no standalone mode — so the forbidden strings are all present,
+ * in prose, and the assertions failed against a page that was entirely correct. Stripping comments
+ * first is what makes those assertions about the CODE rather than about the commentary.
+ */
+const stripJsComments = (text) =>
+  text.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
+const HTML_CODE = HTML.replace(/<!--[\s\S]*?-->/g, " ");
+const SCRIPT_CODE = stripJsComments(SCRIPT);
 
 /**
  * Every id the served page defines, with the label and the initial `hidden` / `checked` state the
@@ -32,7 +59,7 @@ const HTML = readFileSync(join(WEB, "voice.html"), "utf8");
  * toggle off, the tests below change answer.
  */
 const PAGE_ELEMENTS = new Map(
-  [...HTML.matchAll(/<(\w+)([^>]*\bid="([^"]+)"[^>]*)>([^<]*)/g)].map((m) => [
+  [...HTML.matchAll(/<([\w-]+)([^>]*\bid="([^"]+)"[^>]*)>([^<]*)/g)].map((m) => [
     m[3],
     {
       hidden: /\bhidden\b/.test(m[2]),
@@ -47,9 +74,31 @@ const PAGE_IDS = new Set(PAGE_ELEMENTS.keys());
 const CONVAI_WRITE =
   "The API key you used is missing the permission convai_write to execute this operation.";
 
+/**
+ * The declaration block(s) web/voice.css gives one selector.
+ *
+ * Matching whole rules, not grepping the file, so that a property landing on the WRONG selector
+ * cannot satisfy an assertion about this one.
+ */
+function cssBlock(selector) {
+  const blocks = [];
+  for (const rule of CSS.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    const selectors = rule[1]
+      .split(",")
+      .map((part) => part.split("\n").pop().trim())
+      .filter(Boolean);
+    if (selectors.includes(selector)) {
+      blocks.push(rule[2]);
+    }
+  }
+  assert.ok(blocks.length > 0, `web/voice.css has no rule for "${selector}"`);
+  return blocks.join("\n");
+}
+
 class FakeElement {
-  constructor(id) {
+  constructor(id, tagName = "") {
     this.id = id;
+    this.tagName = tagName;
     this.textContent = "";
     this.value = "";
     this.className = "";
@@ -57,7 +106,11 @@ class FakeElement {
     this.checked = false;
     this.disabled = false;
     this.children = [];
+    this.attributes = new Map();
     this.listeners = new Map();
+    // The transcript is the one element that scrolls; the page pins it to the newest line.
+    this.scrollTop = 0;
+    this.scrollHeight = 0;
   }
 
   addEventListener(type, fn) {
@@ -83,11 +136,46 @@ class FakeElement {
     await this.dispatch("change");
   }
 
+  setAttribute(name, value) {
+    this.attributes.set(name, String(value));
+  }
+
+  getAttribute(name) {
+    return this.attributes.has(name) ? this.attributes.get(name) : null;
+  }
+
   append(...kids) {
     this.children.push(...kids);
+    // Growing content is what makes a scroll-to-bottom meaningful.
+    this.scrollHeight += 10;
+  }
+
+  replaceChildren(...kids) {
+    this.children = [...kids];
+    this.scrollHeight = kids.length * 10;
   }
 
   scrollIntoView() {}
+
+  /** Every element at or under this one, so a test can ask what was really rendered. */
+  descendants() {
+    const out = [];
+    const walk = (node) => {
+      out.push(node);
+      for (const kid of node.children) {
+        walk(kid);
+      }
+    };
+    for (const kid of this.children) {
+      walk(kid);
+    }
+    return out;
+  }
+
+  /** The visible text of this subtree, concatenated in document order. */
+  text() {
+    return [this, ...this.descendants()].map((node) => node.textContent).join("");
+  }
 }
 
 /**
@@ -96,7 +184,8 @@ class FakeElement {
  * getting `undefined`.
  */
 class FakeAudioContext {
-  constructor() {
+  constructor(page) {
+    this.page = page;
     this.sampleRate = 48000;
     this.currentTime = 0;
     this.destination = { id: "destination" };
@@ -114,7 +203,11 @@ class FakeAudioContext {
   }
 
   createScriptProcessor() {
-    return { onaudioprocess: null, connect() {}, disconnect() {} };
+    // Kept, because driving `onaudioprocess` by hand is how the mute tests observe whether audio
+    // frames are actually reaching the socket.
+    const processor = { onaudioprocess: null, connect() {}, disconnect() {} };
+    this.page.processors.push(processor);
+    return processor;
   }
 
   createGain() {
@@ -136,6 +229,31 @@ function sameRealm(value) {
   }
   return copy;
 }
+
+/** A JSON response, shaped exactly as the page's `api()` unpacks one. */
+const json = (status, body) => ({
+  ok: status < 400,
+  status,
+  text: async () => JSON.stringify(body),
+});
+
+/** A gent-talk error response, exactly as `ApiError` serializes one. */
+function errorResponse(status, error, detail) {
+  return async () => json(status, { error, detail });
+}
+
+/** A successful mint, exactly as `/api/v1/signed-url` serializes one. */
+const MINTED = async () =>
+  json(200, {
+    signed_url: "wss://example.invalid/convai?sig=test",
+    agent_id: "agent_test",
+    valid_for_seconds: 900,
+  });
+
+const CHANNEL = { id: "1110000000000000001", label: "lead team", writable: true };
+
+/** The three microphone toggles, and the constraint each one drives. */
+const MIC_TOGGLE_IDS = ["mic-echo-cancellation", "mic-noise-suppression", "mic-auto-gain"];
 
 /**
  * Build a page.
@@ -177,17 +295,47 @@ function newPage(store = new Map()) {
       }
       return parts.join("\n");
     },
+    /** Which screen is showing. Exactly one, or this throws — a page with none is a blank app. */
+    screen() {
+      const showing = ["signin", "main", "settings"].filter((s) => !page.el(`screen-${s}`).hidden);
+      assert.equal(showing.length, 1, `exactly one screen must show, not ${showing.join("+")}`);
+      return showing[0];
+    },
+    /** Which tab is showing on the main screen. */
+    tab() {
+      return page.el("pane-discord").hidden ? "voice" : "discord";
+    },
+    /** Let the page's own floating promises (sign-in on load) run to completion. */
+    settle: () => new Promise((resolve) => setTimeout(resolve, 0)),
+    /** The mint handler. `setFetch` replaces it; the other routes keep working. */
+    mint: async () => {
+      throw new Error("this test did not set a mint response");
+    },
+    clientConfig: async () =>
+      json(200, { version: "test", channels: [CHANNEL], elevenlabs_agent_id: "agent_test" }),
+    messages: [],
+    channelMessages: async () => json(200, { channel: CHANNEL, messages: page.messages }),
     setFetch(fn) {
-      page.fetch = fn;
+      page.mint = fn;
     },
     /** Every constraint object the page has handed getUserMedia, in order. */
     micRequests: [],
+    /** Every microphone track it has been given, each counting its own `stop()` calls. */
+    tracks: [],
     /** Every WebSocket the page has opened, in order. */
     sockets: [],
+    /** Every ScriptProcessorNode it has built, in order. */
+    processors: [],
+    /** Every tag name the page has passed to createElement, in order. */
+    createdTags: [],
   };
+
   const document = {
     getElementById: (id) => elements.get(id) || null,
-    createElement: () => new FakeElement(""),
+    createElement: (tag) => {
+      page.createdTags.push(String(tag).toLowerCase());
+      return new FakeElement("", String(tag).toLowerCase());
+    },
   };
   const localStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -227,7 +375,14 @@ function newPage(store = new Map()) {
         // is `undefined`, and "we started sending an extra key" is exactly what these tests
         // exist to catch. So: same keys, same order, host realm.
         page.micRequests.push(sameRealm(constraints));
-        return { getTracks: () => [{ stop() {} }] };
+        const track = {
+          stops: 0,
+          stop() {
+            this.stops += 1;
+          },
+        };
+        page.tracks.push(track);
+        return { getTracks: () => [track] };
       },
     },
   };
@@ -235,47 +390,41 @@ function newPage(store = new Map()) {
   const context = {
     document,
     localStorage,
-    window: { AudioContext: FakeAudioContext },
+    window: { AudioContext: function () { return new FakeAudioContext(page); } },
     navigator,
     console,
-    setTimeout,
+    // Unref'd, so the page's own 8-second banner timer cannot hold the test runner open.
+    setTimeout: (fn, ms) => {
+      const timer = setTimeout(fn, ms);
+      if (typeof timer.unref === "function") {
+        timer.unref();
+      }
+      return timer;
+    },
     clearTimeout,
     atob,
     btoa,
     WebSocket: FakeWebSocket,
-    fetch: (...args) => page.fetch(...args),
+    fetch: async (path, options) => {
+      if (String(path).startsWith("/api/v1/signed-url")) {
+        return page.mint(path, options);
+      }
+      if (String(path).startsWith("/api/v1/client-config")) {
+        return page.clientConfig(path, options);
+      }
+      if (/\/messages$/.test(String(path))) {
+        return page.channelMessages(path, options);
+      }
+      throw new Error(`the page fetched ${path}, which this fixture does not serve`);
+    },
   };
   vm.createContext(context);
   vm.runInContext(SCRIPT, context, { filename: "voice.js" });
   return page;
 }
 
-/** A gent-talk error response, exactly as `ApiError` serializes one. */
-function errorResponse(status, error, detail) {
-  return async () => ({
-    ok: false,
-    status,
-    text: async () => JSON.stringify({ error, detail }),
-  });
-}
-
-/** A successful mint, exactly as `/api/v1/signed-url` serializes one. */
-const MINTED = async () => ({
-  ok: true,
-  status: 200,
-  text: async () =>
-    JSON.stringify({
-      signed_url: "wss://example.invalid/convai?sig=test",
-      agent_id: "agent_test",
-      valid_for_seconds: 900,
-    }),
-});
-
-/** The three microphone toggles, and the constraint each one drives. */
-const MIC_TOGGLE_IDS = ["mic-echo-cancellation", "mic-noise-suppression", "mic-auto-gain"];
-
 /**
- * Drive the whole happy path: save a token, mint, open the microphone, open the socket.
+ * Drive the whole happy path: sign in, mint, open the microphone, open the socket.
  *
  * The assertions here are load-bearing rather than decorative. If `start()` threw anywhere along
  * the way, `teardown()` would clear the session, and every later assertion about a LIVE call would
@@ -284,9 +433,10 @@ const MIC_TOGGLE_IDS = ["mic-echo-cancellation", "mic-noise-suppression", "mic-a
 async function startTalking(page) {
   page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
   await page.el("save-token").click();
+  await page.settle();
   page.setFetch(MINTED);
 
-  await page.el("start").click();
+  await page.el("talk").click();
 
   assert.equal(
     page.el("error").hidden,
@@ -296,8 +446,31 @@ async function startTalking(page) {
   assert.equal(page.sockets.length, 1, "start() opened no websocket");
   page.sockets[0].onopen();
   assert.equal(page.el("conversation-state").textContent, "connected");
+  assert.equal(page.processors.length, 1, "capture never started");
   return page.sockets[0];
 }
+
+/** One buffer of microphone audio arriving from the browser's audio graph. */
+function speakInto(page) {
+  const processor = page.processors[page.processors.length - 1];
+  assert.ok(processor && processor.onaudioprocess, "nothing is capturing the microphone");
+  processor.onaudioprocess({
+    inputBuffer: { getChannelData: () => new Float32Array(4096) },
+  });
+}
+
+/** Just the audio frames, not the initiation message or a pong. */
+const audioFrames = (socket) => socket.sent.filter((s) => s.includes("user_audio_chunk"));
+
+/** Sign in and land on the main screen, without placing a call. */
+async function signIn(page) {
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  assert.equal(page.screen(), "main", "signing in did not reach the main interface");
+}
+
+// --- what the page says when things fail --------------------------------------------------------
 
 test("the page starts with no error showing", () => {
   // From the markup: the panel ships hidden, so its appearance later is itself the signal.
@@ -310,13 +483,12 @@ test("a vendor 502 is shown IN THE PAGE, in the vendor's own words", async () =>
   // The live case: the owner's ElevenLabs key lacks `convai_write`. Nobody should need dev tools
   // to learn that.
   const page = newPage();
-  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
-  await page.el("save-token").click();
+  await signIn(page);
   page.setFetch(
     errorResponse(502, "elevenlabs_error", `elevenlabs returned HTTP 401: ${CONVAI_WRITE}`)
   );
 
-  await page.el("start").click();
+  await page.el("talk").click();
 
   const shown = page.el("error");
   assert.equal(shown.hidden, false, "the error panel stayed hidden");
@@ -332,8 +504,7 @@ test("a vendor 502 is shown IN THE PAGE, in the vendor's own words", async () =>
 
 test("a 503 names the exact setting the operator has not set", async () => {
   const page = newPage();
-  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
-  await page.el("save-token").click();
+  await signIn(page);
   page.setFetch(
     errorResponse(
       503,
@@ -342,7 +513,7 @@ test("a 503 names the exact setting the operator has not set", async () => {
     )
   );
 
-  await page.el("start").click();
+  await page.el("talk").click();
 
   assert.match(page.el("error").textContent, /elevenlabs\.api_key/);
   assert.match(page.el("error").textContent, /503/);
@@ -356,7 +527,7 @@ test("a missing token is reported in the page rather than silently doing nothing
     throw new Error("unreachable");
   });
 
-  await page.el("start").click();
+  await page.el("talk").click();
 
   assert.equal(called, false, "nothing should be requested without a token");
   assert.match(page.el("error").textContent, /token/i);
@@ -370,23 +541,23 @@ test("no credential ever reaches the rendered page, even if the server echoes on
   const page = newPage();
   page.el("api-token").value = TOKEN;
   await page.el("save-token").click();
+  await page.settle();
   page.setFetch(
     errorResponse(502, "elevenlabs_error", `upstream rejected Authorization: Bearer ${TOKEN}`)
   );
 
-  await page.el("start").click();
+  await page.el("talk").click();
 
   const rendered = page.renderedText();
-  assert.ok(
-    !rendered.includes(TOKEN),
-    `the API token was rendered into the page: ${rendered}`
-  );
+  assert.ok(!rendered.includes(TOKEN), `the API token was rendered into the page: ${rendered}`);
   assert.match(rendered, /\[redacted\]/, "the redaction must be visible, not a silent deletion");
   assert.ok(
     rendered.includes("upstream rejected"),
     "redaction must not swallow the rest of the message"
   );
 });
+
+// --- the token, with a button that visibly reacts -----------------------------------------------
 
 test("Save changes the button itself, not only a banner", async () => {
   const page = newPage();
@@ -431,8 +602,7 @@ test("a browser that refuses to store the token says so instead of claiming succ
 
 test("Forget clears the stored token and says what is now true", async () => {
   const page = newPage();
-  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
-  await page.el("save-token").click();
+  await signIn(page);
 
   await page.el("forget-token").click();
 
@@ -448,6 +618,635 @@ test("the page and the script agree about which elements exist", () => {
   assert.ok(PAGE_IDS.has("token-state"));
   const page = newPage();
   assert.throws(() => page.el("no-such-element"), /does not define/);
+});
+
+// --- screens -------------------------------------------------------------------------------------
+
+test("with no token the page IS the sign-in screen, not the interface behind a nag", async () => {
+  const page = newPage();
+  await page.settle();
+
+  assert.equal(page.screen(), "signin");
+  // The two big controls act on a call this visitor cannot place, so they are not on the screen.
+  assert.equal(page.el("control-pane").hidden, true, "the control pane showed before sign-in");
+  assert.equal(page.el("tabs").hidden, true);
+  assert.equal(page.el("clear-view").hidden, true);
+});
+
+test("the explanatory text lives on the sign-in screen, not over the transcript", () => {
+  // The header the owner asked to be moved off the main view. Asserting on the MARKUP, because
+  // the point is where it sits in the page, not what a variable says.
+  const signin = HTML.slice(
+    HTML.indexOf('id="screen-signin"'),
+    HTML.indexOf('id="screen-main"')
+  );
+  assert.match(signin, /Your ElevenLabs agent has authentication enabled/);
+  const main = HTML.slice(HTML.indexOf('id="screen-main"'), HTML.indexOf('id="screen-settings"'));
+  assert.doesNotMatch(main, /Your ElevenLabs agent has authentication enabled/);
+});
+
+test("a token the server accepts leads to the main interface", async () => {
+  const page = newPage();
+  await signIn(page);
+
+  assert.equal(page.screen(), "main");
+  assert.equal(page.el("control-pane").hidden, false, "the controls must be reachable");
+  assert.equal(page.el("tabs").hidden, false);
+});
+
+test("a token the server REFUSES sends you back to sign in, and says which thing was wrong", async () => {
+  const page = newPage();
+  page.clientConfig = async () => json(401, { error: "unauthorized", detail: "unknown token" });
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+
+  await page.el("save-token").click();
+  await page.settle();
+
+  assert.equal(page.screen(), "signin");
+  assert.match(page.el("error").textContent, /refused that token/);
+  assert.match(page.el("error").textContent, /unknown token/);
+});
+
+test("a server that is merely DOWN does not get mistaken for a bad token", async () => {
+  // Bouncing to a sign-in form on a 503 would blame the owner's token for the server's outage,
+  // and they would paste the token again and again while nothing changed.
+  const page = newPage();
+  page.clientConfig = async () => json(503, { error: "unavailable", detail: "still starting" });
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+
+  await page.el("save-token").click();
+  await page.settle();
+
+  assert.equal(page.screen(), "main", "a server outage must not look like a sign-in failure");
+  assert.match(page.el("error").textContent, /did not answer/);
+  assert.equal(page.storage.get("gent-talk.token"), "write-token-aaaaaaaaaaaaaaaa");
+});
+
+test("settings is reachable from the main screen and comes back to it", async () => {
+  const page = newPage();
+  await signIn(page);
+
+  await page.el("open-settings").click();
+  assert.equal(page.screen(), "settings");
+  assert.equal(page.el("control-pane").hidden, true, "the pane must not float over settings");
+
+  await page.el("close-settings").click();
+  assert.equal(page.screen(), "main");
+  assert.equal(page.el("control-pane").hidden, false);
+});
+
+test("connection details appear once in a dismissable banner, and stay in settings", async () => {
+  const page = newPage();
+  assert.equal(
+    PAGE_ELEMENTS.get("connection-banner").hidden,
+    true,
+    "the banner must ship hidden; it is a thing that ARRIVES"
+  );
+
+  await startTalking(page);
+
+  const banner = page.el("connection-banner");
+  assert.equal(banner.hidden, false, "the connection details never appeared");
+  assert.match(page.el("connection-detail").textContent, /agent_test/);
+  assert.match(page.el("settings-detail").textContent, /agent_test/);
+
+  await page.el("dismiss-banner").click();
+
+  assert.equal(banner.hidden, true, "Dismiss did not dismiss");
+  // Dismissing loses nothing: the same text is still in settings, which is the whole reason the
+  // banner is allowed to go away by itself.
+  assert.match(page.el("settings-detail").textContent, /agent_test/);
+});
+
+// --- the frame: what makes it an app rather than a page -----------------------------------------
+
+test("the document itself cannot scroll, and cannot rubber-band", () => {
+  const body = cssBlock("body");
+  assert.match(body, /height:\s*100dvh/, "the frame must use the DYNAMIC viewport unit");
+  assert.match(body, /overflow:\s*hidden/, "the document must not scroll");
+  assert.match(body, /overscroll-behavior:\s*none/, "the page must not rubber-band");
+  assert.match(cssBlock("html"), /overscroll-behavior:\s*none/);
+  assert.doesNotMatch(body, /height:\s*100vh\b/, "100vh is the unit that gets the toolbar wrong");
+});
+
+test("the transcript is the one thing that scrolls, and the control pane is a grid row", () => {
+  const body = cssBlock("body");
+  assert.match(
+    body,
+    /grid-template-rows:\s*auto 1fr auto/,
+    "header / body / pane must be a three-row grid"
+  );
+  const scroll = cssBlock("#scroll-area");
+  assert.match(scroll, /overflow-y:\s*auto/, "the transcript area must be the scrolling element");
+  assert.match(scroll, /overscroll-behavior:\s*contain/, "a flick must not escape the transcript");
+  assert.match(
+    scroll,
+    /min-height:\s*0/,
+    "without min-height:0 the grid row refuses to shrink and the document scrolls again"
+  );
+
+  const pane = cssBlock("#control-pane");
+  assert.doesNotMatch(
+    pane,
+    /position:\s*(fixed|absolute)/,
+    "the pane holds its place by being a grid row, not by being pinned"
+  );
+  assert.doesNotMatch(pane, /overflow-y:\s*(auto|scroll)/, "the pane must never scroll");
+  assert.match(
+    pane,
+    /padding-bottom:\s*calc\([^)]*env\(safe-area-inset-bottom\)/,
+    "the controls must clear the home indicator"
+  );
+});
+
+test("the controls are built to be tapped, not clicked", () => {
+  const control = cssBlock(".control");
+  assert.match(control, /touch-action:\s*manipulation/, "leaves the 300 ms tap delay in place");
+  assert.match(control, /-webkit-tap-highlight-color:\s*transparent/, "grey flash on tap");
+  assert.match(control, /user-select:\s*none/, "a long press would start selecting the label");
+});
+
+test("the page declares no standalone mode and no manifest", () => {
+  // Deliberate, and easy to "helpfully" add back. Keeping the assertion next to the frame tests
+  // so the reason travels with the rule.
+  assert.doesNotMatch(HTML_CODE, /apple-mobile-web-app-capable/);
+  assert.doesNotMatch(HTML_CODE, /rel="manifest"/);
+  assert.doesNotMatch(HTML_CODE, /mobile-web-app-capable/);
+  // The markup does not declare it, and the prose says why — so the comment must survive too.
+  assert.match(HTML, /apple-mobile-web-app-capable/, "the reason it is absent must stay recorded");
+});
+
+test("the page fetches nothing from anywhere but this server", () => {
+  // No framework, no CDN, no build step: the whole reason the frame is CSS.
+  assert.doesNotMatch(HTML_CODE, /https?:\/\//, "web/voice.html reaches off-origin");
+  assert.doesNotMatch(SCRIPT_CODE, /https?:\/\//, "web/voice.js reaches off-origin");
+  assert.doesNotMatch(CSS, /@import|url\(\s*["']?https?:/, "web/voice.css reaches off-origin");
+});
+
+test("hang up sits immediately to the left of talk, and talk is the bigger of the two", () => {
+  const pane = HTML.slice(HTML.indexOf('id="control-pane"'));
+  const hangUp = pane.indexOf('id="hang-up"');
+  const talk = pane.indexOf('id="talk"');
+  assert.ok(hangUp > -1 && talk > -1, "the pane must hold both controls");
+  assert.ok(hangUp < talk, "hang up must come before talk, so talk lands under the right thumb");
+
+  // "Larger, and closer to square." Compared numerically rather than eyeballed.
+  const rem = (block, property) =>
+    Number(new RegExp(`${property}:\\s*([\\d.]+)rem`).exec(block)[1]);
+  const talkCss = cssBlock(".control-talk");
+  const hangUpCss = cssBlock(".control-hangup");
+  const width = rem(talkCss, "width");
+  const height = rem(talkCss, "min-height");
+  assert.ok(width > rem(hangUpCss, "width"), "talk must be the larger control");
+  assert.ok(
+    Math.abs(width - height) / Math.max(width, height) < 0.15,
+    `talk must be close to square, not ${width}x${height}`
+  );
+  assert.match(cssBlock(".control-talk.live .control-ring"), /animation:\s*talk-pulse/);
+});
+
+// --- mute: the whole point ------------------------------------------------------------------------
+
+test("MUTE DOES NOT STOP THE MICROPHONE STREAM", async () => {
+  // The load-bearing assertion in this file.
+  //
+  // Mute exists so the conversation — and with it everything the agent has been told — survives a
+  // pause. `track.stop()` ends the capture, which ends the call, which loses the context; the
+  // vendor documents no way to resume a conversation once it has closed. So this is not a
+  // preference about implementation: reaching `track.stop()` from the mute path destroys the only
+  // behaviour mute has.
+  const page = newPage();
+  await startTalking(page);
+  assert.equal(page.tracks.length, 1, "exactly one microphone stream should be open");
+
+  await page.el("talk").click();
+  // Drive the capture callback too. Muting sets a flag; the flag is read inside `onaudioprocess`,
+  // so a `track.stop()` smuggled into THAT branch would never run in a test that only clicks.
+  speakInto(page);
+  speakInto(page);
+
+  assert.equal(page.tracks[0].stops, 0, "mute stopped the microphone track");
+  assert.equal(page.micRequests.length, 1, "mute re-acquired the microphone");
+  assert.notEqual(page.sockets[0].readyState, 3, "mute closed the conversation");
+  assert.equal(page.sockets.length, 1, "mute opened a second conversation");
+});
+
+test("mute stops audio frames reaching the agent", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  speakInto(page);
+  const heard = audioFrames(socket).length;
+  assert.ok(heard > 0, "the page sent no audio at all, so this test proves nothing");
+
+  await page.el("talk").click();
+  speakInto(page);
+  speakInto(page);
+
+  assert.equal(audioFrames(socket).length, heard, "the agent kept hearing you while muted");
+});
+
+test("unmuting resumes the SAME conversation rather than starting a new one", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  await page.el("talk").click();
+  speakInto(page);
+  await page.el("talk").click();
+  speakInto(page);
+
+  assert.equal(page.sockets.length, 1, "unmuting opened a new conversation");
+  assert.equal(page.sockets[0], socket, "the conversation was replaced");
+  assert.equal(page.micRequests.length, 1, "unmuting re-asked for the microphone");
+  assert.equal(page.tracks[0].stops, 0, "the microphone was released somewhere in the round trip");
+  assert.ok(audioFrames(socket).length > 0, "the agent cannot hear you after unmuting");
+});
+
+test("the talk control says which of its three states it is in", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("talk-label").textContent, "Talk");
+  assert.doesNotMatch(page.el("talk").className, /\blive\b|\bmuted\b/);
+
+  await startTalking(page);
+  assert.equal(page.el("talk-label").textContent, "Listening");
+  assert.match(page.el("talk").className, /\blive\b/, "no animation while the agent can hear you");
+
+  await page.el("talk").click();
+  assert.equal(page.el("talk-label").textContent, "Muted");
+  assert.match(page.el("talk").className, /\bmuted\b/);
+  assert.doesNotMatch(page.el("talk").className, /\blive\b/, "still animating while muted");
+});
+
+test("the muted status says the agent still remembers, and that the microphone is still open", async () => {
+  const page = newPage();
+  await startTalking(page);
+
+  await page.el("talk").click();
+
+  const said = page.el("status").textContent;
+  assert.match(said, /still open/);
+  assert.match(said, /cannot hear you/);
+  assert.match(said, /microphone as in use/, "the phone's own indicator needs explaining");
+});
+
+// --- hang up ------------------------------------------------------------------------------------
+
+test("hang up DOES stop the microphone stream", async () => {
+  const page = newPage();
+  await startTalking(page);
+
+  await page.el("hang-up").click();
+
+  assert.equal(page.tracks[0].stops, 1, "hanging up left the microphone open");
+  assert.equal(page.sockets[0].readyState, 3, "hanging up left the conversation open");
+  assert.equal(page.el("conversation-state").textContent, "idle");
+  assert.equal(page.el("talk-label").textContent, "Talk");
+});
+
+test("hang up marks the break in the transcript instead of implying one long conversation", async () => {
+  // The misleading thing the owner noticed: one continuous message stream over two conversations
+  // that share no context. The stream stays — it is still the record of what was said — but it
+  // now carries a visible seam saying the agent does not remember what is above it.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "agent_response",
+      agent_response_event: { agent_response: "hello" },
+    }),
+  });
+
+  await page.el("hang-up").click();
+
+  const lines = page.el("transcript").children;
+  const last = lines[lines.length - 1];
+  assert.equal(last.className, "system", "the seam must not look like something somebody said");
+  assert.match(last.text(), /does NOT carry this conversation's context/);
+  assert.match(last.text(), /NEW conversation/);
+  assert.match(last.text(), /Mute instead of Hang up/, "it should name the control that does work");
+  // Said once, not once per teardown path.
+  assert.equal(
+    lines.filter((li) => li.className === "system").length,
+    1,
+    "the end-of-call note was written more than once"
+  );
+});
+
+test("a conversation the SERVER closes gets the same honest marker", async () => {
+  const page = newPage();
+  await startTalking(page);
+
+  page.sockets[0].onclose({ code: 1006, reason: "gone" });
+
+  const lines = page.el("transcript").children;
+  assert.match(lines[lines.length - 1].text(), /does NOT carry this conversation's context/);
+  assert.match(page.el("status").textContent, /1006/, "the close code has to be visible");
+});
+
+test("a call that never connected does not claim a conversation ended", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.setFetch(errorResponse(502, "elevenlabs_error", "nope"));
+
+  await page.el("talk").click();
+  await page.el("hang-up").click();
+
+  assert.equal(
+    page.el("transcript").children.length,
+    0,
+    "a failed mint produced an end-of-call marker for a call that never happened"
+  );
+});
+
+// --- clearing the view ----------------------------------------------------------------------------
+
+test("Clear view is labelled as clearing the VIEW", () => {
+  assert.equal(PAGE_ELEMENTS.get("clear-view").text, "Clear view");
+});
+
+test("clearing during a call empties the screen and says the agent has not forgotten", async () => {
+  // The ambiguous middle this must not be: the screen empties and the agent carries on with
+  // everything the operator thought they had removed, with nothing on screen saying so.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "agent_response",
+      agent_response_event: { agent_response: "the secret is 12345" },
+    }),
+  });
+  assert.match(page.el("transcript").children[0].text(), /the secret is 12345/);
+
+  await page.el("clear-view").click();
+
+  const remaining = page.el("transcript").children;
+  assert.ok(
+    !remaining.some((li) => li.text().includes("the secret is 12345")),
+    "the view was not cleared"
+  );
+  assert.equal(remaining.length, 1, "exactly the explanation should remain");
+  assert.equal(remaining[0].className, "system");
+  assert.match(remaining[0].text(), /cleared the screen only/);
+  assert.match(remaining[0].text(), /still has everything said before this point/);
+  assert.match(page.el("status").textContent, /has not forgotten/);
+  // A display action, so it must not have touched the call.
+  assert.equal(page.tracks[0].stops, 0, "clearing the view hung up");
+  assert.notEqual(page.sockets[0].readyState, 3);
+});
+
+test("clearing while idle just clears, with no claim about an agent that is not there", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.el("transcript").append(new FakeElement("", "li"));
+
+  await page.el("clear-view").click();
+
+  assert.equal(page.el("transcript").children.length, 0);
+  assert.equal(page.el("status").textContent, "View cleared.");
+});
+
+test("the newest line is pinned above the controls", async () => {
+  const page = newPage();
+  await startTalking(page);
+  const area = page.el("scroll-area");
+  // Stand in for layout the fixture cannot do: a transcript taller than its box, scrolled up.
+  area.scrollHeight = 5000;
+  area.scrollTop = 0;
+
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "user_transcript",
+      user_transcription_event: { user_transcript: "newest" },
+    }),
+  });
+
+  assert.ok(area.scrollTop > 0, "the transcript did not follow the newest line");
+  assert.equal(area.scrollTop, area.scrollHeight);
+});
+
+// --- the raw Discord view --------------------------------------------------------------------------
+
+/** Load the Discord tab with a given set of channel messages. */
+async function showDiscord(page, messages) {
+  page.messages = messages;
+  await page.el("tab-discord").click();
+  await page.settle();
+  return page.el("discord-log").children;
+}
+
+test("switching tabs does not disturb a live call", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  await page.el("talk").click(); // muted, so the mute state has something to be preserved
+  page.messages = [message({ content: "hi" })];
+
+  await page.el("tab-discord").click();
+  await page.settle();
+  assert.equal(page.tab(), "discord");
+  await page.el("tab-voice").click();
+  assert.equal(page.tab(), "voice");
+
+  assert.equal(page.sockets.length, 1, "a tab switch opened a second conversation");
+  assert.equal(page.sockets[0], socket);
+  assert.notEqual(socket.readyState, 3, "a tab switch hung up");
+  assert.equal(page.tracks[0].stops, 0, "a tab switch released the microphone");
+  assert.equal(page.micRequests.length, 1, "a tab switch re-asked for the microphone");
+  assert.equal(page.el("talk-label").textContent, "Muted", "a tab switch unmuted the call");
+  assert.equal(page.el("control-pane").hidden, false, "the controls left with the transcript");
+});
+
+test("the tab switch and the settings control share one row, to spend no extra height", () => {
+  const row = HTML.slice(HTML.indexOf('class="topbar-row"'), HTML.indexOf('topbar-status'));
+  for (const id of ["open-settings", "tabs", "tab-voice", "tab-discord", "clear-view"]) {
+    assert.ok(row.includes(`id="${id}"`), `#${id} is not in the top row`);
+  }
+});
+
+function message(overrides) {
+  return {
+    id: "1122334455667788990",
+    channel_id: CHANNEL.id,
+    author: "ci-bot",
+    author_id: "1000000000000000001",
+    author_is_bot: true,
+    timestamp: "2026-08-19T04:31:00.000Z",
+    content: "hello",
+    ...overrides,
+  };
+}
+
+test("every raw message shows its author and its message id", async () => {
+  // The entire value of this view: the agent has described messages that did not exist, and the
+  // operator needs to be able to point at a real one — or show that there is none.
+  const page = newPage();
+  await signIn(page);
+
+  const lines = await showDiscord(page, [message({ id: "999888777666555444", author: "rrnewton", author_is_bot: false })]);
+
+  assert.equal(lines.length, 1);
+  const text = lines[0].text();
+  assert.match(text, /rrnewton/);
+  assert.match(text, /999888777666555444/, "the message id is what makes this view worth having");
+  assert.match(text, /2026-08-19 04:31/);
+  assert.match(page.el("status").textContent, /1 message\(s\) from lead team/);
+});
+
+test("a bot author is labelled as one", async () => {
+  const page = newPage();
+  await signIn(page);
+  const lines = await showDiscord(page, [message({ author: "deepscry-bot", author_is_bot: true })]);
+  assert.match(lines[0].text(), /deepscry-bot \(bot\)/);
+});
+
+test("the small markdown subset renders, and renders as ELEMENTS the page made itself", async () => {
+  const page = newPage();
+  await signIn(page);
+
+  const lines = await showDiscord(page, [
+    message({ content: "**bold** and *italic* and `code` and ~~gone~~ and <@123> in <#456>" }),
+  ]);
+
+  const kinds = lines[0].descendants();
+  const of = (tag) => kinds.filter((node) => node.tagName === tag).map((node) => node.textContent);
+  assert.deepStrictEqual(of("strong"), ["bold"]);
+  assert.deepStrictEqual(of("em"), ["italic"]);
+  assert.deepStrictEqual(of("code"), ["code"]);
+  assert.deepStrictEqual(of("s"), ["gone"]);
+  // A mention is shown as the id it really is. Inventing a display name here would be the same
+  // class of mistake this view exists to expose.
+  assert.ok(lines[0].text().includes("@123"), "a user mention should render as its id");
+  assert.ok(lines[0].text().includes("#456"), "a channel mention should render as its id");
+});
+
+test("a fenced code block is taken verbatim, not parsed", async () => {
+  const page = newPage();
+  await signIn(page);
+
+  const lines = await showDiscord(page, [
+    message({ content: "look:\n```\n**not bold** <b>not markup</b>\n```\ndone" }),
+  ]);
+
+  const pre = lines[0].descendants().filter((node) => node.tagName === "pre");
+  assert.equal(pre.length, 1);
+  assert.equal(pre[0].textContent, "**not bold** <b>not markup</b>");
+  assert.equal(
+    lines[0].descendants().filter((node) => node.tagName === "strong").length,
+    0,
+    "markdown inside a code fence was parsed"
+  );
+});
+
+test("a blockquote renders as a quote rather than as a stray angle bracket", async () => {
+  const page = newPage();
+  await signIn(page);
+  const lines = await showDiscord(page, [message({ content: "> quoted line\nplain line" })]);
+  const quotes = lines[0].descendants().filter((node) => node.className === "md-quote");
+  assert.equal(quotes.length, 1);
+  assert.match(quotes[0].text(), /quoted line/);
+  assert.doesNotMatch(quotes[0].text(), /plain line/);
+});
+
+test("HOSTILE MESSAGE TEXT NEVER BECOMES MARKUP", async () => {
+  // Channel text is written by whoever is in the channel, including bots nobody here controls.
+  // The payloads below are the ones that matter: a script tag, an event-handler attribute, and an
+  // image that fires on error. All three must come out as the characters they are.
+  const page = newPage();
+  await signIn(page);
+  const HOSTILE =
+    '<script>alert("xss")</script> <img src=x onerror=alert(1)> ' +
+    '<iframe src="javascript:alert(2)"></iframe> &lt;already escaped&gt;';
+
+  const before = page.createdTags.length;
+  const lines = await showDiscord(page, [message({ content: HOSTILE })]);
+
+  // 1. It is all still there, verbatim, as text the operator can read.
+  assert.ok(
+    lines[0].text().includes('<script>alert("xss")</script>'),
+    `the payload was mangled rather than shown: ${lines[0].text()}`
+  );
+  assert.ok(lines[0].text().includes("<img src=x onerror=alert(1)>"));
+  assert.ok(
+    lines[0].text().includes("&lt;already escaped&gt;"),
+    "text that was already escaped must not be double-unescaped into live markup"
+  );
+
+  // 2. No element of a dangerous kind was ever created. The fixture has no HTML parser, so the
+  //    ONLY way one could exist is if the page created it — and every createElement is recorded.
+  const created = page.createdTags.slice(before);
+  for (const tag of ["script", "img", "iframe", "style", "object", "embed", "link"]) {
+    assert.ok(!created.includes(tag), `rendering a message created a <${tag}>`);
+  }
+
+  // 3. Nothing carried an event-handler or a src attribute out of the message.
+  for (const node of lines[0].descendants()) {
+    for (const name of node.attributes.keys()) {
+      assert.doesNotMatch(name, /^on/i, `an ${name} attribute was set from channel text`);
+      assert.notEqual(name, "src");
+    }
+  }
+
+  // 4. And the page really does have no HTML sink to reach for.
+  assert.doesNotMatch(SCRIPT_CODE, /innerHTML|outerHTML|insertAdjacentHTML|document\.write/);
+});
+
+test("a link is only a link when its scheme is one a tap can be trusted with", async () => {
+  const page = newPage();
+  await signIn(page);
+
+  const lines = await showDiscord(page, [
+    message({
+      content:
+        "[safe](https://example.com/x) [script](javascript:alert(1)) " +
+        "[data](data:text/html,<script>1</script>) [relative](/admin/delete)",
+    }),
+  ]);
+
+  const anchors = lines[0].descendants().filter((node) => node.tagName === "a");
+  assert.equal(anchors.length, 1, "exactly one of those four is safe to make tappable");
+  assert.equal(anchors[0].textContent, "safe");
+  assert.equal(anchors[0].getAttribute("href"), "https://example.com/x");
+  assert.match(anchors[0].getAttribute("rel"), /noopener/);
+
+  // The rejected ones are not silently dropped: the operator gets to SEE what the message said,
+  // which is the point of a verification view.
+  const text = lines[0].text();
+  assert.ok(text.includes("javascript:alert(1)"), "a refused URL must still be visible as text");
+  assert.ok(text.includes("/admin/delete"), "a same-origin URL is not automatically safe");
+});
+
+test("a message with no content at all renders without throwing", async () => {
+  const page = newPage();
+  await signIn(page);
+  const lines = await showDiscord(page, [message({ content: "" }), message({ content: null })]);
+  assert.equal(lines.length, 2);
+});
+
+test("Refresh re-reads the channel rather than appending to it", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1", content: "one" })]);
+
+  page.messages = [message({ id: "2", content: "two" })];
+  await page.el("refresh-discord").click();
+  await page.settle();
+
+  const lines = page.el("discord-log").children;
+  assert.equal(lines.length, 1, "Refresh appended instead of replacing");
+  assert.match(lines[0].text(), /two/);
+});
+
+test("a Discord read that fails reports itself and does NOT hang up on you", async () => {
+  const page = newPage();
+  await startTalking(page);
+  page.channelMessages = async () => json(502, { error: "discord_error", detail: "rate limited" });
+
+  await page.el("tab-discord").click();
+  await page.settle();
+
+  assert.match(page.el("error").textContent, /rate limited/);
+  assert.equal(page.tracks[0].stops, 0, "a failed channel read tore down the call");
+  assert.notEqual(page.sockets[0].readyState, 3, "a failed channel read hung up");
 });
 
 // --- microphone settings -------------------------------------------------------------------------
@@ -500,10 +1299,10 @@ test("turning noise suppression off asks for it off, and moves nothing else", as
 });
 
 test("automatic gain control is stated ONLY when it is switched off", async () => {
-  // The careful one. Today AGC is not in the constraint object at all, so the browser's own
+  // The careful one. AGC is not in the constraint object at all by default, so the browser's own
   // default applies. Sending `autoGainControl: true` would convert an implicit default into an
   // explicit request, and the spec does not promise those are the same thing. So the ON state
-  // stays silent, and only OFF is spoken — which is what keeps today's behaviour bit-for-bit.
+  // stays silent, and only OFF is spoken — which is what keeps the behaviour bit-for-bit.
   const on = newPage();
   await startTalking(on);
   assert.ok(
@@ -618,4 +1417,13 @@ test("a browser that THROWS on write is caught, not left as a rejected promise",
   const said = page.el("mic-settings-state").textContent;
   assert.doesNotMatch(said, /^Saved\b/, `the page claimed a save that threw: ${said}`);
   assert.match(said, /refused to store/);
+});
+
+test("the settings screen explains what each control does to the agent's memory", () => {
+  // Every one of these three sentences corrects a way the interface could otherwise be read as
+  // promising continuity it does not have.
+  const note = HTML.slice(HTML.indexOf('id="continuity-note"'));
+  assert.match(note, /Mute<\/strong> keeps the call open and keeps the agent's context/);
+  assert.match(note, /does not keep its context/);
+  assert.match(note, /never makes the agent forget/);
 });

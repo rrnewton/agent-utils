@@ -429,6 +429,7 @@ pub async fn ask(
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const VOICE_HTML: &str = include_str!("../../web/voice.html");
 const VOICE_JS: &str = include_str!("../../web/voice.js");
+const VOICE_CSS: &str = include_str!("../../web/voice.css");
 const APP_JS: &str = include_str!("../../web/app.js");
 const STYLE_CSS: &str = include_str!("../../web/style.css");
 
@@ -457,6 +458,14 @@ pub async fn voice_html() -> Response {
 /// `GET /voice.js`
 pub async fn voice_js() -> Response {
     asset("text/javascript; charset=utf-8", VOICE_JS)
+}
+
+/// `GET /voice.css`
+///
+/// Held apart from `style.css` on purpose: it turns the document into a fixed application frame
+/// (`100dvh`, no page scroll), and `/` is an ordinary scrolling page that must not inherit that.
+pub async fn voice_css() -> Response {
+    asset("text/css; charset=utf-8", VOICE_CSS)
 }
 
 /// `GET /app.js`

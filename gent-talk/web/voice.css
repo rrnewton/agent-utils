@@ -1,0 +1,370 @@
+/*
+ * The /voice frame.
+ *
+ * style.css gives this page its colours and its shared components; this file makes it behave like
+ * an application rather than a document. Everything here exists to remove one specific web-page
+ * behaviour, and each rule is annotated with which one, because otherwise they look arbitrary and
+ * get "cleaned up" by the next person.
+ *
+ * There is no framework, no build step, and no external request. The app feel is entirely these
+ * properties.
+ */
+
+/* The rigid frame.
+ *
+ * `100dvh` — the DYNAMIC viewport unit — is the one that accounts for a mobile browser's toolbar
+ * sliding in and out. `100vh` does not, which is why a `100vh` app is either clipped or leaves a
+ * gap depending on scroll direction.
+ *
+ * `overflow: hidden` plus `overscroll-behavior: none` is what stops the whole interface moving
+ * when a finger drags: the document has nowhere to go, and there is no rubber-band at the edges
+ * of the one element that does scroll.
+ */
+html {
+  height: 100%;
+  overscroll-behavior: none;
+}
+
+body {
+  height: 100dvh;
+  overflow: hidden;
+  overscroll-behavior: none;
+  /* Three rows: top bar, body, control pane. The control pane holds its place because it is a
+     grid row, not because anything is pinned or absolutely positioned — so it cannot drift over
+     the transcript, and the transcript cannot scroll underneath it. */
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  /* style.css leaves room at the bottom for a fixed status strip this page does not have. */
+  padding-bottom: 0;
+}
+
+/* `hidden` has to beat the layout modes below, all of which set `display`. */
+[hidden] {
+  display: none !important;
+}
+
+/* ---------------------------------------------------------------------------- the top bar --- */
+
+#topbar {
+  display: block;
+  padding: 0.4rem 0.6rem calc(0.4rem + env(safe-area-inset-top));
+  border-bottom: 1px solid var(--edge);
+}
+
+.topbar-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.topbar-status {
+  gap: 0.6rem;
+  font-size: 0.78rem;
+  min-height: 1.2rem;
+  overflow: hidden;
+}
+
+.topbar-status > span {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#status {
+  flex: 1 1 auto;
+}
+
+#conversation-state {
+  flex: 0 0 auto;
+}
+
+/* The tab switch sits in the same row as the settings control on purpose: on a phone the scarce
+   resource is vertical space, and the transcript is what deserves it (issue #41). */
+#tabs {
+  display: flex;
+  flex: 1 1 auto;
+  justify-content: center;
+  gap: 0.25rem;
+}
+
+.tab-button {
+  padding: 0.35rem 0.8rem;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.85rem;
+}
+
+.tab-button.active {
+  color: var(--ink);
+  border-color: var(--accent);
+}
+
+/* Housekeeping controls: deliberately small and quiet, so they do not compete with the two large
+   controls in the pane below. */
+.chip {
+  flex: 0 0 auto;
+  padding: 0.35rem 0.6rem;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+/* ------------------------------------------------------------------------------ the body --- */
+
+#frame-body {
+  /* `min-height: 0` is the load-bearing one: without it a grid item refuses to shrink below its
+     content, the body row grows past the viewport, and the document scrolls again — which is the
+     exact behaviour this whole file removes. */
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  padding: 0;
+}
+
+#screens {
+  min-height: 0;
+  display: grid;
+}
+
+.screen {
+  /* All three screens occupy the same cell; `hidden` chooses. No router, no framework. */
+  grid-area: 1 / 1;
+  min-height: 0;
+}
+
+/* The two secondary screens are ordinary documents and may be longer than the frame, so they get
+   their own scroll — still inside the frame, never the page. */
+#screen-signin,
+#screen-settings {
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.75rem 1rem calc(1rem + env(safe-area-inset-bottom));
+}
+
+#screen-main {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  min-height: 0;
+}
+
+#screen-signin h1 {
+  margin-top: 0;
+}
+
+#screen-settings h2 {
+  font-size: 0.95rem;
+  margin: 1.25rem 0 0.25rem;
+}
+
+/* Shown once and then gone; the same text stays reachable from Settings. */
+#connection-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+#connection-detail {
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+/* THE one scrolling element on the page. Everything else is fixed by construction.
+   `overscroll-behavior: contain` stops a flick that reaches the end of the transcript from
+   becoming a page-level pull-to-refresh. */
+#scroll-area {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 0 0.75rem 0.5rem;
+}
+
+#error {
+  margin: 0.5rem 0.75rem;
+}
+
+/* A transcript line the PAGE wrote, not something anybody said. It has to be visibly a different
+   kind of thing from a message, because its whole job is to correct a false impression the
+   message list would otherwise give. */
+.messages li.system {
+  background: none;
+  border-style: dashed;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.messages li.system .meta {
+  display: none;
+}
+
+/* --------------------------------------------------------------- raw Discord, rendered ----- */
+
+.md-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 0.25rem;
+  padding: 0 0.25em;
+}
+
+.md-pre {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85em;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 0.35rem;
+  padding: 0.4rem 0.5rem;
+  margin: 0.35rem 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.md-quote {
+  border-left: 3px solid var(--edge);
+  padding-left: 0.6rem;
+  margin: 0.2rem 0;
+  color: var(--muted);
+}
+
+.md-mention {
+  color: var(--accent);
+}
+
+/* The message id is the point of this view: it is what lets the operator say "that message does
+   not exist". Monospaced so a snowflake can be read digit by digit. */
+.msg-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+/* --------------------------------------------------------------------- the control pane ---- */
+
+#control-pane {
+  display: flex;
+  align-items: stretch;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  /* Clear of the home indicator on a phone that has one, and zero on one that does not. */
+  padding-bottom: calc(0.6rem + env(safe-area-inset-bottom));
+  border-top: 1px solid var(--edge);
+  background: var(--panel);
+}
+
+.control {
+  /* `manipulation` removes the legacy 300 ms tap delay and double-tap-to-zoom, which is most of
+     what makes a web button feel unlike an app button. */
+  touch-action: manipulation;
+  /* No grey flash on tap. */
+  -webkit-tap-highlight-color: transparent;
+  /* A long press on a control should not start selecting its label. */
+  user-select: none;
+  -webkit-user-select: none;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.2rem;
+  border: none;
+  border-radius: 1.1rem;
+  font: inherit;
+  color: #fff;
+}
+
+.control-label {
+  font-size: 0.8rem;
+  letter-spacing: 0.01em;
+}
+
+.control-glyph {
+  font-size: 1.5rem;
+  line-height: 1;
+}
+
+/* Hang up: immediately to the left of Talk, and smaller, because it is the rarer action and the
+   more expensive mistake. */
+.control-hangup {
+  flex: 0 0 auto;
+  width: 6.5rem;
+  min-height: 5.5rem;
+  background: var(--warn);
+}
+
+/* Talk: lower right, larger, and close to square. */
+.control-talk {
+  flex: 0 0 auto;
+  width: 8.5rem;
+  min-height: 8rem;
+  background: var(--accent);
+}
+
+.control-mic {
+  width: 2.4rem;
+  height: 2.4rem;
+}
+
+/* The slash across the microphone is the muted state, so it is absent by default. */
+.control-slash {
+  opacity: 0;
+}
+
+.control-talk.muted .control-slash {
+  opacity: 1;
+}
+
+.control-talk.muted {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+}
+
+/* The animation while the agent can hear you. A ring that expands and fades out of the button,
+   once a second — visible at arm's length, and unmistakably *live* rather than merely coloured.
+   It is drawn on a child element so it cannot move the button's own layout. */
+.control-ring {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  border: 2px solid currentColor;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.control-talk.live .control-ring {
+  animation: talk-pulse 1.4s ease-out infinite;
+}
+
+@keyframes talk-pulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.55;
+  }
+  100% {
+    transform: scale(1.14);
+    opacity: 0;
+  }
+}
+
+/* Somebody who has asked for less motion gets the state without the movement: the ring simply
+   sits there at a steady opacity rather than pulsing. */
+@media (prefers-reduced-motion: reduce) {
+  .control-talk.live .control-ring {
+    animation: none;
+    opacity: 0.55;
+  }
+}
+
+.control[disabled] {
+  opacity: 0.5;
+}

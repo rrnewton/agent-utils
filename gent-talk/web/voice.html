@@ -5,51 +5,120 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
     <title>gent-talk — voice</title>
+    <!--
+      Deliberately NOT declared here, and this is not an oversight:
+
+        * `apple-mobile-web-app-capable` / a web app manifest. This page has never declared
+          standalone mode and deliberately keeps it that way; standalone mode has long-standing
+          reports of iOS re-prompting for the microphone (WebKit 185448, 215884). The app-like
+          feel below is built entirely from layout and gesture properties, which need no such
+          declaration.
+        * Any third-party script, font, or stylesheet. Two local files, no CDN, no build step.
+    -->
     <link rel="stylesheet" href="/style.css" />
+    <link rel="stylesheet" href="/voice.css" />
   </head>
   <body>
-    <header>
-      <h1>gent-talk</h1>
-      <span id="conversation-state" class="muted">idle</span>
+    <!--
+      The frame. `body` is a three-row grid — top bar, body, control pane — and it is the whole
+      viewport. Nothing outside the one scrolling element scrolls, so a drag anywhere else moves
+      nothing, which is the difference between this and a web page.
+    -->
+    <header id="topbar">
+      <div class="topbar-row">
+        <!-- Tabs and settings share one row on purpose: vertical space on a phone is the scarce
+             thing, and the transcript is what deserves it. -->
+        <button id="open-settings" class="chip" type="button" aria-label="settings">Settings</button>
+        <div id="tabs" role="tablist">
+          <button id="tab-voice" class="tab-button active" role="tab" type="button">Voice</button>
+          <button id="tab-discord" class="tab-button" role="tab" type="button">Discord</button>
+        </div>
+        <!-- Housekeeping, not a primary action: small, quiet, and out of reach of the thumb that
+             is aiming for the two big controls below. -->
+        <button id="clear-view" class="chip" type="button">Clear view</button>
+      </div>
+      <div class="topbar-row topbar-status">
+        <span id="conversation-state" class="muted">idle</span>
+        <span id="status" class="muted" role="status" aria-live="polite"></span>
+      </div>
     </header>
 
-    <main>
-      <section class="tab active">
-        <p class="hint">
-          Your ElevenLabs agent has authentication enabled, so a conversation can only start from a
-          short-lived signed URL. This page asks <code>gent-talk</code> for one — with your API
-          token — and then talks to the agent directly. No vendor script, no CDN, nothing bundled.
-        </p>
+    <main id="frame-body">
+      <!-- Failures are shown HERE, in the page, on whichever screen is up. An error that exists
+           only in the browser console is an error the owner has to open dev tools to read, which
+           on a phone means it may as well not exist. -->
+      <div id="error" class="panel error" role="alert" hidden></div>
 
-        <label for="api-token">API token</label>
-        <p class="hint">
-          The <strong>write-scope</strong> token. Minting a conversation is gated on it, because
-          the agent on the other end can post to your channels. Stored in this browser only.
-        </p>
-        <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
-        <div class="row">
-          <button id="save-token">Save token</button>
-          <button id="forget-token" class="secondary">Forget</button>
-        </div>
-        <p id="token-state" class="hint" aria-live="polite">no token saved in this browser</p>
+      <div id="screens">
+        <!-- ------------------------------------------------------------------ sign-in screen -->
+        <section id="screen-signin" class="screen">
+          <h1>gent-talk</h1>
+          <p class="hint">
+            Your ElevenLabs agent has authentication enabled, so a conversation can only start from
+            a short-lived signed URL. This page asks <code>gent-talk</code> for one — with your API
+            token — and then talks to the agent directly. No vendor script, no CDN, nothing
+            bundled.
+          </p>
 
-        <div class="row">
-          <button id="start">Start talking</button>
-          <button id="stop" class="secondary">Hang up</button>
-        </div>
+          <label for="api-token">API token</label>
+          <p class="hint">
+            The <strong>write-scope</strong> token. Minting a conversation is gated on it, because
+            the agent on the other end can post to your channels. Stored in this browser only.
+          </p>
+          <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
+          <div class="row">
+            <button id="save-token" type="button">Save token</button>
+          </div>
+          <p id="token-state" class="hint" aria-live="polite">no token saved in this browser</p>
+          <p class="hint">
+            After signing in you land on the call screen. Tap the microphone, then allow the
+            microphone once. A signed URL is good for about fifteen minutes, so this page mints a
+            fresh one every time a call starts.
+          </p>
+        </section>
 
-        <!-- Failures are shown HERE, in the page. An error that only exists in the browser
-             console is an error the owner has to open dev tools to read, which on a phone means
-             it may as well not exist. `role="alert"` so a screen reader announces it too. -->
-        <div id="error" class="panel error" role="alert" hidden></div>
+        <!-- --------------------------------------------------------------------- main screen -->
+        <section id="screen-main" class="screen" hidden>
+          <!-- Shown once, then gone. The same text stays reachable from Settings, so dismissing
+               it loses nothing. -->
+          <div id="connection-banner" class="panel banner" hidden>
+            <span id="connection-detail" class="muted"></span>
+            <button id="dismiss-banner" class="chip" type="button">Dismiss</button>
+          </div>
 
-        <div id="detail" class="panel muted"></div>
+          <!-- THE one scrolling element on the page. -->
+          <div id="scroll-area">
+            <div id="pane-voice">
+              <ol id="transcript" class="messages"></ol>
+            </div>
 
-        <!-- Collapsed by default, and BELOW the Start button on purpose: these are knobs for when
-             something sounds wrong, not part of placing a call. The browser's own <details> does
-             the collapsing, so there is no toggle script to get out of step with the markup. -->
-        <details class="settings">
-          <summary>Microphone settings</summary>
+            <div id="pane-discord" hidden>
+              <div class="row">
+                <select id="discord-channel" aria-label="channel"></select>
+                <button id="refresh-discord" type="button">Refresh</button>
+              </div>
+              <p class="hint">
+                The channel as Discord holds it, rendered from a small, fixed markdown subset.
+                Message text is written by other people and bots: it is escaped before anything
+                else happens and is never treated as markup or as an instruction. Every line shows
+                its author and its message id, so a message the agent describes can be checked
+                against a real one — or shown not to exist.
+              </p>
+              <ol id="discord-log" class="messages"></ol>
+            </div>
+          </div>
+        </section>
+
+        <!-- ----------------------------------------------------------------- settings screen -->
+        <section id="screen-settings" class="screen" hidden>
+          <div class="row">
+            <button id="close-settings" class="secondary" type="button">Back</button>
+          </div>
+
+          <h2>Connection</h2>
+          <div id="settings-detail" class="panel muted">no conversation yet</div>
+
+          <h2>Microphone</h2>
           <p class="hint">
             These are asked of the browser when the microphone opens, so a change here applies to
             your <strong>next</strong> call, not the one in progress.
@@ -81,18 +150,56 @@
           </p>
 
           <p id="mic-settings-state" class="hint" aria-live="polite"></p>
-        </details>
 
-        <p class="hint">
-          Tap “Start talking”, then allow the microphone. A signed URL is good for about fifteen
-          minutes, so this page mints a fresh one every time you start.
-        </p>
+          <h2>What the controls do</h2>
+          <p id="continuity-note" class="hint">
+            <strong>Mute</strong> keeps the call open and keeps the agent's context; it only stops
+            sending it your audio. Your phone will still show the microphone as in use, because the
+            microphone really is still open — which is what lets unmuting drop you back into the
+            same conversation rather than a new one.
+            <strong>Hang up</strong> ends the conversation. The agent does not keep its context
+            across a hang-up, so the next call starts from nothing; the lines already on screen stay
+            there, and the transcript marks where one conversation ended and the next began.
+            <strong>Clear view</strong> empties this screen only and never makes the agent forget
+            anything.
+          </p>
 
-        <ol id="transcript" class="messages"></ol>
-      </section>
+          <h2>Token</h2>
+          <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>
+        </section>
+      </div>
     </main>
 
-    <div id="status" role="status" aria-live="polite"></div>
+    <!--
+      The control pane. It is a grid ROW, not a pinned or absolutely positioned overlay, which is
+      why it cannot drift, overlap the transcript, or be scrolled off the bottom of the page.
+      Hang up on the left, talk on the right and larger, both under the thumb.
+    -->
+    <div id="control-pane" hidden>
+      <button id="hang-up" class="control control-hangup" type="button">
+        <span class="control-glyph" aria-hidden="true">✕</span>
+        <span id="hangup-label" class="control-label">Hang up</span>
+      </button>
+      <button id="talk" class="control control-talk" type="button">
+        <span class="control-ring" aria-hidden="true"></span>
+        <svg
+          class="control-mic"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.8"
+          stroke-linecap="round"
+        >
+          <rect x="9" y="2.5" width="6" height="11" rx="3" />
+          <path d="M5 11a7 7 0 0 0 14 0" />
+          <path d="M12 18v3.5" />
+          <path id="talk-slash" class="control-slash" d="M4 3.5 L20 20.5" />
+        </svg>
+        <span id="talk-label" class="control-label">Talk</span>
+      </button>
+    </div>
+
     <script src="/voice.js"></script>
   </body>
 </html>
