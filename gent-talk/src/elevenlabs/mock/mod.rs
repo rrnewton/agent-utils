@@ -34,10 +34,17 @@
 //!
 //! # Determinism is the product
 //!
-//! Ids are counters, audio is a fixed waveform, event order is fixed, and masking keys come from
-//! a seeded xorshift. Anything random here would destroy both the screenshot comparability and
-//! the trace assertions, so the mock deliberately does NOT grow toward being a usable local voice
-//! agent.
+//! Ids are counters, audio is a fixed waveform, and event order is fixed. Anything random here
+//! would destroy both the screenshot comparability and the trace assertions, so the mock
+//! deliberately does NOT grow toward being a usable local voice agent.
+//!
+//! # RFC6455 is a dependency, not a hand-roll
+//!
+//! The socket is [`tokio_tungstenite`]. An earlier plan for this module hand-rolled SHA-1, base64
+//! and the frame codec, on the belief that crates.io was unreachable from the development host;
+//! it is not. Five hundred lines of handshake and framing is the single riskiest thing this
+//! module could contain and it buys nothing, so it is a crate — and the interoperability is
+//! checked against a real Python `websockets` client, not only against our own reader.
 
 pub mod agent;
 pub mod audio;
@@ -550,12 +557,16 @@ async fn get_signed_url(
             api_key_accepted: accepted,
             status: status.as_u16(),
         });
-        state.trace.record(
-            Direction::Inbound,
-            "mint",
-            &format!("agent_id={agent_id} -> {}", status.as_u16()),
-            0,
-        );
+        // A rejection carries its body into the trace, because "the vendor said no" without
+        // saying what it said is the least useful line a diagnostic file can hold. That body
+        // deliberately quotes the presented key back — real upstreams do — so this is also the
+        // line that makes `Trace::keep_secret(api_key)` load-bearing rather than decorative.
+        let detail = if status.is_success() {
+            format!("agent_id={agent_id} -> {}", status.as_u16())
+        } else {
+            format!("agent_id={agent_id} -> {} {body}", status.as_u16())
+        };
+        state.trace.record(Direction::Inbound, "mint", &detail, 0);
         json_response(status, body)
     };
 
@@ -592,6 +603,13 @@ async fn get_signed_url(
         "ws://{}/v1/convai/conversation?agent_id={agent_id}&token={nonce}",
         state.ws_addr
     );
+    // Record WHAT was minted, not merely that something was. Diagnosing "the page connected to
+    // the wrong port" from a trace that only says `200` is guesswork. The nonce inside it is a
+    // credential, so this line is also the thing that makes the nonce redaction load-bearing
+    // rather than decorative — see `Trace::keep_secret` in `mint_nonce`.
+    state
+        .trace
+        .record(Direction::Outbound, "minted", &signed, signed.len());
     finish(StatusCode::OK, json!({ "signed_url": signed }))
 }
 

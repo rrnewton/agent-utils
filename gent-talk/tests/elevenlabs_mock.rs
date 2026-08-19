@@ -224,6 +224,34 @@ async fn the_mint_rejected_scenario_refuses_the_correct_key() {
 }
 
 #[tokio::test]
+async fn a_rejection_that_quotes_the_key_back_reaches_the_trace_redacted() {
+    // The mock's 401 body deliberately quotes the presented key, the way a real upstream does.
+    // The body is recorded, because "the vendor said no" without saying what it said is the least
+    // useful line a diagnostic file can hold — and it must be recorded with the key taken OUT.
+    let harness = Harness::start(Scenario::MintRejected).await;
+    let _ = harness.mint().await.expect_err("the mint is rejected");
+
+    let mints = harness.mock.trace().of_kind("mint");
+    assert_eq!(mints.len(), 1);
+    assert!(mints[0].summary.contains("401"), "{}", mints[0].summary);
+    assert!(
+        mints[0].summary.contains("invalid_api_key"),
+        "a rejection that does not say why is barely worth recording: {}",
+        mints[0].summary
+    );
+    assert!(
+        !mints[0].summary.contains(MOCK_API_KEY),
+        "the vendor quoted the key back and the trace kept it: {}",
+        mints[0].summary
+    );
+    assert!(
+        mints[0].summary.contains(gent_talk::elevenlabs::REDACTED),
+        "{}",
+        mints[0].summary
+    );
+}
+
+#[tokio::test]
 async fn an_unknown_agent_is_a_404_rather_than_a_conversation() {
     let harness = Harness::start(Scenario::Full).await;
     let client = HttpElevenLabsClient::new().expect("client");
@@ -587,6 +615,24 @@ async fn nothing_secret_reaches_the_trace() {
         .expect("uploads");
     socket.ask("what is new?").await.expect("asks");
     wait_for(&mut socket, "agent_response").await;
+
+    // The minted URL IS recorded — a trace that only says "200" cannot tell you the page dialled
+    // the wrong port — and recording it is what makes the nonce redaction load-bearing rather
+    // than decorative.
+    let minted = harness.mock.trace().of_kind("minted");
+    assert_eq!(minted.len(), 1, "the minted URL must be recorded");
+    assert!(
+        minted[0].summary.contains("ws://127.0.0.1:"),
+        "{}",
+        minted[0].summary
+    );
+    assert!(
+        minted[0]
+            .summary
+            .contains(&format!("token={}", gent_talk::elevenlabs::REDACTED)),
+        "the nonce is a credential and must be redacted in place: {}",
+        minted[0].summary
+    );
 
     let rendered = harness.mock.trace().to_json().to_string();
     for secret in [MOCK_API_KEY, WRITE_TOKEN, nonce.as_str()] {
