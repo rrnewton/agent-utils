@@ -215,6 +215,14 @@ async fn main() -> anyhow::Result<()> {
             "configured channel"
         );
     }
+    // Say the zone out loud. Leaving `server.timezone` unset is not an error and must not be, but
+    // it means every time the agent speaks is UTC — and a wrong-but-plausible clock is precisely
+    // the failure this setting exists to prevent, so it should not have to be inferred from a
+    // digest read out in the car.
+    tracing::info!(
+        timezone = config.timezone.name(),
+        "message times will be spoken in this zone"
+    );
     // Say the ElevenLabs wiring out loud, in both directions. An agent with "Enable
     // Authentication" turned on cannot be reached without a signed URL, and the way that failure
     // presents — a conversation that will not start, from a phone, in a car — is about as far as
