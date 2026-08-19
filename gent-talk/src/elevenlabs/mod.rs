@@ -21,6 +21,7 @@
 
 pub mod fake;
 pub mod http;
+pub mod mock;
 
 use async_trait::async_trait;
 

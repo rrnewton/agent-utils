@@ -2047,6 +2047,53 @@ test("the settings screen explains what each control does to the agent's memory"
   assert.match(note, /Sound<\/strong> silences the agent's voice without silencing the agent/);
 });
 
+test("A FORMAT THIS PAGE CANNOT PLAY IS AN ERROR PANEL, NOT AN UNCAUGHT THROW", async () => {
+  // `onmessage` is called by the browser, so it is NOT inside `guard()`. `outputRateFrom` throws
+  // for anything that is not pcm_*, and against the old in-page wire fake that throw was
+  // unreachable. Against a real socket it is one dashboard setting away, and an uncaught throw in
+  // onmessage lands in the console — the one place this page promises never to leave a failure.
+  const page = newPage();
+  await startTalking(page);
+
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "conversation_initiation_metadata",
+      conversation_initiation_metadata_event: {
+        conversation_id: "conv_mock_0001",
+        agent_output_audio_format: "ulaw_8000",
+      },
+    }),
+  });
+
+  assert.equal(page.el("error").hidden, false, "the error panel stayed hidden");
+  assert.match(page.el("error").textContent, /ulaw_8000/, "the panel must name the format");
+  assert.match(
+    page.el("error").textContent,
+    /pcm_16000/,
+    "and must say what to set it to instead"
+  );
+  assert.notEqual(page.el("status").textContent, "", "the status line said nothing");
+});
+
+test("a format the page CAN play leaves the error panel alone", async () => {
+  // The negative half: a guard that swallowed everything would pass the test above while making
+  // every ordinary metadata frame look like a failure.
+  const page = newPage();
+  await startTalking(page);
+
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "conversation_initiation_metadata",
+      conversation_initiation_metadata_event: {
+        conversation_id: "conv_mock_0001",
+        agent_output_audio_format: "pcm_16000",
+      },
+    }),
+  });
+
+  assert.equal(page.el("error").hidden, true, "an ordinary metadata frame raised an error");
+});
+
 // --- the agent's voice, without the agent ---------------------------------------------------------
 
 test("SOUND OFF SILENCES THE VOICE AND KEEPS THE TEXT", async () => {

@@ -14,17 +14,25 @@ FROM docker.io/library/rust:1-slim-bookworm AS build
 WORKDIR /src
 
 # Dependencies first, so an edit to src/ does not refetch and rebuild the whole tree.
+#
+# Every explicit `[[bin]]` in Cargo.toml needs a placeholder here. Cargo refuses to read a
+# manifest whose declared target path does not exist — not "skips that target", refuses the whole
+# manifest — so a missing placeholder fails this stage before a single dependency is fetched.
+# `src/bin/mock_elevenlabs.rs` is the offline ElevenLabs substitute; it is built here only because
+# the manifest mentions it, and it is deliberately NOT copied into the runtime image below.
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src \
+RUN mkdir -p src/bin \
     && printf '//! placeholder\nfn main() {}\n' > src/main.rs \
     && printf '//! placeholder for dependency caching\n' > src/lib.rs \
+    && printf '//! placeholder\nfn main() {}\n' > src/bin/mock_elevenlabs.rs \
     && cargo build --release --locked \
     && rm -rf src
 
 COPY src ./src
 COPY web ./web
-# Touch the entry points so cargo cannot reuse the placeholder build above.
-RUN touch src/main.rs src/lib.rs && cargo build --release --locked
+# Touch the entry points so cargo cannot reuse the placeholder build above. Only the server is
+# built: the image ships a bridge, not a machine that can mint fake conversations.
+RUN touch src/main.rs src/lib.rs && cargo build --release --locked --bin gent-talk
 
 FROM docker.io/library/debian:bookworm-slim
 # TLS roots, for Discord and (later) ElevenLabs. rustls is used, so no OpenSSL runtime is needed.

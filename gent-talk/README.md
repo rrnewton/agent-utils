@@ -811,9 +811,14 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-213 Rust tests plus a 10-test suite for the `/voice` page: unit tests beside each module,
+269 Rust tests plus a 95-test suite for the `/voice` page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
-`tests/mcp.rs` doing the same for the MCP endpoint. The page suite
+`tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
+the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
+substitute, a real WebSocket is opened to it, and the conversation drives real MCP `tools/call`s
+into the in-memory Discord, so the answer the agent speaks is made out of channel text that really
+came back. The scenario that answers WITHOUT calling any tool — the 2026-08-19 production failure
+— is one of its cases, offline and free. The page suite
 (`tests/js/voice_page.test.mjs`) executes `web/voice.js` itself against a small strict DOM whose
 element set is read out of `web/voice.html`, so a script reaching for an element the page does not
 have fails there rather than silently at the roadside; `cargo test` runs it through
@@ -856,8 +861,12 @@ the other one.
 
 It costs nothing and needs no hardware. The conversation WebSocket is replaced before any page
 script runs, and the mint request to `/api/v1/signed-url` is answered locally, so the live-call
-states are reached without ElevenLabs being contacted; the microphone is Chromium's own fake
-capture device, so `getUserMedia`, the AudioContext and the real capture graph all still run. It
+states are reached without ElevenLabs being contacted. (That in-page wire fake is on its way out:
+`src/elevenlabs/mock/` is a real loopback vendor — a real mint endpoint and a real socket — and
+the cargo suite already uses it. Pointing this harness at it, so the photographed states depend on
+a real handshake rather than a page-local stub, is the remaining half of #57 elevenlabs-mock.)
+The microphone is Chromium's own fake capture device, so `getUserMedia`, the AudioContext and the
+real capture graph all still run. It
 stands up its own throwaway native server with `--fake-discord` on port 18091 and stops it again,
 including on failure — it refuses port 8080 by name, because that is the live deployment.
 
@@ -903,6 +912,8 @@ src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
 src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
+src/elevenlabs/mock/  the loopback vendor: a real mint endpoint, a real WebSocket, a real MCP client
+src/bin/mock_elevenlabs.rs     that mock as a process, for a browser or the smoke script
 src/mcp/mod.rs        the tool manifest and per-tool approval policy
 src/mcp/protocol.rs   JSON-RPC 2.0 and the MCP method set
 src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp

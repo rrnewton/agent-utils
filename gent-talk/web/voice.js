@@ -669,7 +669,17 @@ async function start() {
     } catch (_error) {
       return; // a frame we do not understand is not a reason to tear the call down.
     }
-    handle(socket, message);
+    // `handle` throws for a format this page cannot decode, and `onmessage` is not inside
+    // `guard()` — it is called by the browser, not by us — so an unhandled throw here would land
+    // in the console, which is exactly where this page's failures used to go to die. Against the
+    // in-page wire fake that could not happen; against a real socket it is one negotiated setting
+    // away.
+    try {
+      handle(socket, message);
+    } catch (error) {
+      showError(error.message);
+      setStatus("the agent sent something this page cannot handle");
+    }
   };
 
   socket.onerror = () => {

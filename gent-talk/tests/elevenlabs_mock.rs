@@ -1,0 +1,733 @@
+//! The offline gate: signed URL → real WebSocket → MCP `tools/call` → fake Discord → an answer.
+//!
+//! Every other test double in this repository stops at a boundary. The Rust fake mints a URL that
+//! points nowhere; the screenshot harness replaced `window.WebSocket` inside the page; the smoke
+//! script stubbed the conversation loop. This file is the one place where the whole chain runs,
+//! on loopback, deterministically, for free — and where the failure that mattered in production,
+//! *an agent that answers without calling any tool*, is a RED test rather than a story.
+//!
+//! Everything here is real except the two ends: Discord is [`gent_talk::discord::fake`] and the
+//! vendor is [`gent_talk::elevenlabs::mock`]. In between, the production router, the production
+//! MCP dispatcher, the production ops layer and the production ElevenLabs HTTP client all
+//! execute.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use gent_talk::config::{Config, ElevenLabsConfig, Secret};
+use gent_talk::discord::fake::FakeDiscord;
+use gent_talk::elevenlabs::http::HttpElevenLabsClient;
+use gent_talk::elevenlabs::mock::client::{ConversationClient, Incoming};
+use gent_talk::elevenlabs::mock::{
+    MockElevenLabs, MockHandle, MockOptions, Scenario, MOCK_AGENT_ID, MOCK_API_KEY,
+    UNSUPPORTED_FORMAT,
+};
+use gent_talk::elevenlabs::{SignedUrlProvider as _, DOCUMENTED_VALIDITY_SECONDS};
+use gent_talk::model::ChannelId;
+use gent_talk::state::AppState;
+use gent_talk::testing::{READ_CHANNEL, WRITE_TOKEN};
+use serde_json::{json, Value};
+
+/// A line planted in the fake Discord that must survive all the way into what the agent says.
+///
+/// Short enough that the digest summariser does not truncate it, and distinctive enough that its
+/// presence in an `agent_response` cannot be a coincidence.
+const SENTINEL: &str = "the mac runner finally went green";
+
+/// Everything a test needs: a real bridge, a real mock, and the seeded Discord behind them.
+struct Harness {
+    mock: MockHandle,
+    discord: Arc<FakeDiscord>,
+    bridge_base: String,
+}
+
+impl Harness {
+    async fn start(scenario: Scenario) -> Self {
+        Self::start_with(scenario, |options| options).await
+    }
+
+    async fn start_with(scenario: Scenario, tune: impl FnOnce(MockOptions) -> MockOptions) -> Self {
+        let (state, discord) = gent_talk::testing::state();
+        discord.seed(&ChannelId(READ_CHANNEL.to_owned()), "ana", "an older note");
+        discord.seed(&ChannelId(READ_CHANNEL.to_owned()), "bo", SENTINEL);
+        let bridge_base = serve(gent_talk::http::router(state)).await;
+
+        let options = tune(MockOptions {
+            bridge_base: bridge_base.clone(),
+            bridge_token: WRITE_TOKEN.to_owned(),
+            scenario,
+            ..MockOptions::default()
+        });
+        let mock = MockElevenLabs::spawn(options)
+            .await
+            .expect("the mock starts");
+        Self {
+            mock,
+            discord,
+            bridge_base,
+        }
+    }
+
+    /// Mint through the REAL ElevenLabs client, pointed at the mock's HTTP half.
+    async fn mint(&self) -> Result<String, gent_talk::elevenlabs::SignedUrlError> {
+        let client = HttpElevenLabsClient::new().expect("client");
+        let config = ElevenLabsConfig {
+            agent_id: Some(MOCK_AGENT_ID.to_owned()),
+            api_key: Some(Secret::new(MOCK_API_KEY)),
+            api_base: self.mock.api_base(),
+        };
+        client.signed_url(&config).await.map(|url| url.signed_url)
+    }
+
+    /// Mint, connect, and send the initiation the vendor requires.
+    async fn open(&self) -> ConversationClient {
+        let url = self.mint().await.expect("mints");
+        let mut socket = ConversationClient::connect(&url).await.expect("connects");
+        socket.initiate().await.expect("initiates");
+        socket
+    }
+}
+
+/// Serve a router on a real loopback socket and return its base URL.
+///
+/// A real socket, not `tower::oneshot`: the mock's agent brain is a `reqwest` client, so there
+/// has to be something to connect to.
+async fn serve(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let address = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{address}")
+}
+
+/// Wait for one event of a given type, answering pings on the way.
+async fn wait_for(socket: &mut ConversationClient, kind: &str) -> Vec<Incoming> {
+    socket
+        .collect_until(kind, Duration::from_secs(10))
+        .await
+        .unwrap_or_else(|e| panic!("waiting for {kind}: {e}"))
+}
+
+fn agent_said(events: &[Incoming]) -> Option<String> {
+    events.iter().find_map(|event| match event {
+        Incoming::Event { kind, value } if kind == "agent_response" => Some(
+            value["agent_response_event"]["agent_response"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        ),
+        _ => None,
+    })
+}
+
+// --- the mint --------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_real_client_mints_a_url_this_process_can_actually_open() {
+    // The fake mints a URL that points nowhere, so nothing until now has proved that what comes
+    // out of `parse_signed_url` is dialable.
+    let harness = Harness::start(Scenario::Full).await;
+    let client = HttpElevenLabsClient::new().expect("client");
+    let minted = client
+        .signed_url(&ElevenLabsConfig {
+            agent_id: Some(MOCK_AGENT_ID.to_owned()),
+            api_key: Some(Secret::new(MOCK_API_KEY)),
+            api_base: harness.mock.api_base(),
+        })
+        .await
+        .expect("mints");
+
+    assert!(
+        minted.signed_url.starts_with("ws://127.0.0.1:"),
+        "{}",
+        minted.signed_url
+    );
+    assert_eq!(minted.agent_id, MOCK_AGENT_ID);
+    assert_eq!(minted.valid_for_seconds, DOCUMENTED_VALIDITY_SECONDS);
+
+    let mints = harness.mock.trace().mint_requests();
+    assert_eq!(mints.len(), 1, "exactly one call reached the vendor");
+    assert!(mints[0].api_key_header, "the key travelled in a header");
+    assert!(mints[0].api_key_accepted);
+    assert!(
+        !mints[0].url.contains(MOCK_API_KEY),
+        "the account key reached the URL: {}",
+        mints[0].url
+    );
+
+    ConversationClient::connect(&minted.signed_url)
+        .await
+        .expect("the minted URL opens a real socket");
+}
+
+#[tokio::test]
+async fn a_wrong_key_reaches_the_page_as_a_bad_gateway_that_does_not_quote_it() {
+    // The same shape as `signed_url.rs::an_elevenlabs_401_is_surfaced_honestly`, but against a
+    // vendor that really answers over HTTP, so `SignedUrlError::from_response` runs for real on a
+    // body the vendor really wrote — and that body deliberately quotes the key back.
+    let harness = Harness::start(Scenario::Full).await;
+    let toml = gent_talk::testing::config_toml()
+        .replace(gent_talk::elevenlabs::fake::KNOWN_AGENT_ID, MOCK_AGENT_ID)
+        .replace(
+            gent_talk::elevenlabs::fake::VALID_API_KEY,
+            "xi-a-revoked-key-value",
+        )
+        + &format!("api_base = \"{}\"\n", harness.mock.api_base());
+    let config = Config::from_toml_and_env(&toml, &std::collections::BTreeMap::new())
+        .expect("configuration parses");
+    let (base_state, _discord) = gent_talk::testing::state();
+    let state = AppState {
+        config: Arc::new(config),
+        elevenlabs: Arc::new(HttpElevenLabsClient::new().expect("client")),
+        ..base_state
+    };
+    let base = serve(gent_talk::http::router(state)).await;
+
+    let answer = reqwest::Client::new()
+        .get(format!("{base}/api/v1/signed-url"))
+        .bearer_auth(WRITE_TOKEN)
+        .send()
+        .await
+        .expect("the route answers");
+    let status = answer.status();
+    let body = answer.text().await.expect("body");
+
+    assert_eq!(status.as_u16(), 502, "{body}");
+    let parsed: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(parsed["error"], "elevenlabs_error");
+    assert!(parsed["detail"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("401"));
+    assert!(
+        !body.contains("xi-a-revoked-key-value"),
+        "the key leaked through a vendor error body: {body}"
+    );
+    assert!(
+        !body.contains("ws://"),
+        "no fallback URL was invented: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_mint_rejected_scenario_refuses_the_correct_key() {
+    let harness = Harness::start(Scenario::MintRejected).await;
+    let error = harness.mint().await.expect_err("the mint is rejected");
+    assert!(error.to_string().contains("401"), "{error}");
+    assert!(
+        !error.to_string().contains(MOCK_API_KEY),
+        "the mock quotes the key back on purpose; the client must redact it: {error}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_agent_is_a_404_rather_than_a_conversation() {
+    let harness = Harness::start(Scenario::Full).await;
+    let client = HttpElevenLabsClient::new().expect("client");
+    let error = client
+        .signed_url(&ElevenLabsConfig {
+            agent_id: Some("agent_that_does_not_exist".to_owned()),
+            api_key: Some(Secret::new(MOCK_API_KEY)),
+            api_base: harness.mock.api_base(),
+        })
+        .await
+        .expect_err("an unknown agent has no conversation");
+    assert!(error.to_string().contains("404"), "{error}");
+}
+
+// --- the whole chain -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_spoken_question_becomes_a_real_mcp_tool_call_and_an_answer_made_of_its_result() {
+    // THE ONE THAT MATTERS. Nothing between the socket and Discord is stubbed.
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+
+    let metadata = wait_for(&mut socket, "conversation_initiation_metadata").await;
+    match metadata.last().expect("an event") {
+        Incoming::Event { value, .. } => {
+            let meta = &value["conversation_initiation_metadata_event"];
+            assert_eq!(meta["agent_output_audio_format"], "pcm_16000");
+            assert!(
+                meta["conversation_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("conv_mock_"),
+                "the conversation id must be a counter, not a random: {meta}"
+            );
+        }
+        other => panic!("expected metadata, got {other:?}"),
+    }
+
+    socket
+        .ask("what is new in build noise?")
+        .await
+        .expect("asks");
+    let events = wait_for(&mut socket, "agent_response").await;
+
+    let said = agent_said(&events).expect("the agent answered");
+    assert!(
+        said.contains(SENTINEL),
+        "the answer must be MADE OF what the tools returned, not merely follow them: {said}"
+    );
+
+    assert_eq!(
+        harness.mock.trace().mcp_methods(),
+        vec![
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call:list_channels",
+            "tools/call:digest_channel",
+        ],
+        "the whole MCP handshake and both read tools must have run"
+    );
+    assert!(
+        harness.discord.fetch_count() > 0,
+        "the digest must have reached Discord rather than being answered from nothing"
+    );
+
+    // And the audio really came back, in frames a page could play.
+    let audio_frames = events.iter().filter(|e| e.kind() == Some("audio")).count();
+    assert!(audio_frames > 0 || harness.mock.trace().count("audio") > 0);
+}
+
+#[tokio::test]
+async fn the_no_tool_call_scenario_reproduces_the_production_failure_offline() {
+    // 2026-08-19: the agent answered the owner without invoking anything. Free, offline, RED.
+    let harness = Harness::start(Scenario::NoToolCall).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+    socket
+        .ask("what is new in build noise?")
+        .await
+        .expect("asks");
+    let events = wait_for(&mut socket, "agent_response").await;
+
+    let said = agent_said(&events).expect("the agent answered — that is the whole problem");
+    assert!(!said.is_empty(), "it was confident, just wrong");
+    assert!(
+        harness.mock.trace().mcp_methods().is_empty(),
+        "nothing may have reached /mcp: {:?}",
+        harness.mock.trace().mcp_methods()
+    );
+    assert_eq!(
+        harness.discord.fetch_count(),
+        0,
+        "and nothing may have reached Discord"
+    );
+    assert!(
+        !said.contains(SENTINEL),
+        "an answer with no tool call cannot contain channel text: {said}"
+    );
+}
+
+#[tokio::test]
+async fn the_ignored_tool_result_scenario_calls_the_tools_and_then_ignores_them() {
+    let harness = Harness::start(Scenario::IgnoredToolResult).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+    socket.ask("what is new?").await.expect("asks");
+    let events = wait_for(&mut socket, "agent_response").await;
+
+    let said = agent_said(&events).expect("answered");
+    assert!(
+        harness
+            .mock
+            .trace()
+            .mcp_methods()
+            .contains(&"tools/call:digest_channel".to_owned()),
+        "the tools really ran"
+    );
+    assert!(
+        !said.contains(SENTINEL),
+        "and the answer contains none of what they returned: {said}"
+    );
+}
+
+#[tokio::test]
+async fn the_no_reply_scenario_transcribes_and_then_says_nothing() {
+    let harness = Harness::start(Scenario::NoReply).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+    socket.ask("are you there?").await.expect("asks");
+
+    let transcript = wait_for(&mut socket, "user_transcript").await;
+    assert!(transcript
+        .iter()
+        .any(|e| e.kind() == Some("user_transcript")));
+
+    // Nothing follows. The short deadline is the assertion.
+    let error = socket
+        .next_within(Duration::from_millis(300))
+        .await
+        .expect_err("nothing may arrive");
+    assert!(error.to_string().contains("said nothing"), "{error}");
+    assert_eq!(harness.mock.trace().count("agent_response"), 0);
+}
+
+#[tokio::test]
+async fn the_socket_drop_scenario_ends_the_call_without_a_close_frame() {
+    let harness = Harness::start(Scenario::SocketDrop).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+    socket.ask("what is new?").await.expect("asks");
+
+    let events = wait_for(&mut socket, "agent_response").await;
+    let last = events.last().expect("something ended it");
+    assert!(
+        matches!(last, Incoming::Dropped)
+            || matches!(last, Incoming::Closed { code, .. } if *code != 1000),
+        "a dropped connection must not look like a polite goodbye: {last:?}"
+    );
+    assert_eq!(harness.mock.trace().count("agent_response"), 0);
+}
+
+#[tokio::test]
+async fn the_unsupported_audio_scenario_negotiates_something_the_page_cannot_play() {
+    let harness = Harness::start(Scenario::UnsupportedAudio).await;
+    let mut socket = harness.open().await;
+    let events = wait_for(&mut socket, "conversation_initiation_metadata").await;
+    match events.last().expect("metadata") {
+        Incoming::Event { value, .. } => assert_eq!(
+            value["conversation_initiation_metadata_event"]["agent_output_audio_format"],
+            UNSUPPORTED_FORMAT
+        ),
+        other => panic!("expected metadata, got {other:?}"),
+    }
+}
+
+// --- what the client sends -------------------------------------------------------------------
+
+#[tokio::test]
+async fn uploaded_pcm_is_decoded_and_counted_and_a_broken_chunk_is_named() {
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    for _ in 0..3 {
+        socket
+            .send_audio(&gent_talk::elevenlabs::mock::audio::tone(160))
+            .await
+            .expect("uploads");
+    }
+    // Two and a half samples. A page that shipped this is truncating.
+    socket
+        .send(&json!({ "user_audio_chunk": "AAECAwQ=" }))
+        .await
+        .expect("uploads");
+    // Force a round trip so the four frames above are certainly processed.
+    socket.ask("did you get that?").await.expect("asks");
+    wait_for(&mut socket, "agent_response").await;
+
+    let trace = harness.mock.trace();
+    assert_eq!(trace.pcm_frames(), 3, "three good frames");
+    assert_eq!(trace.pcm_bytes(), 3 * 320);
+    assert_eq!(
+        trace.count("malformed_pcm"),
+        1,
+        "an odd-length chunk is REPORTED, never silently accepted"
+    );
+}
+
+#[tokio::test]
+async fn an_event_before_the_initiation_closes_the_socket_as_a_protocol_error() {
+    let harness = Harness::start(Scenario::Full).await;
+    let url = harness.mint().await.expect("mints");
+    let mut socket = ConversationClient::connect(&url).await.expect("connects");
+    socket.ask("hello?").await.expect("sends");
+
+    match socket.next().await.expect("something comes back") {
+        Incoming::Closed { code, reason } => {
+            assert_eq!(code, 1002, "1002 is 'protocol error'");
+            assert_eq!(reason, "initiation_missing");
+        }
+        other => panic!("expected a protocol close, got {other:?}"),
+    }
+    assert!(!harness.mock.trace().initiation_seen());
+    assert_eq!(harness.mock.trace().count("initiation_missing"), 1);
+}
+
+#[tokio::test]
+async fn a_ping_nobody_answers_is_noticed() {
+    let harness = Harness::start_with(Scenario::Full, |options| MockOptions {
+        ping_every: Some(Duration::from_millis(20)),
+        ..options
+    })
+    .await;
+    let mut socket = harness.open().await;
+
+    // `next` deliberately does NOT answer pings, so this is the page that stopped talking.
+    let mut seen = 0;
+    while seen < 2 {
+        if let Incoming::Event { kind, .. } = socket
+            .next_within(Duration::from_secs(5))
+            .await
+            .expect("events keep coming")
+        {
+            if kind == "ping" {
+                seen += 1;
+            }
+        }
+    }
+    assert!(
+        harness.mock.trace().pings_unanswered() >= 1,
+        "an unanswered ping must be visible: {:?}",
+        harness.mock.trace().of_kind("ping").len()
+    );
+}
+
+#[tokio::test]
+async fn a_ping_the_page_answers_is_not_counted_against_it() {
+    let harness = Harness::start_with(Scenario::Full, |options| MockOptions {
+        ping_every: Some(Duration::from_millis(20)),
+        ..options
+    })
+    .await;
+    let mut socket = harness.open().await;
+
+    // Answer exactly one ping, the way `web/voice.js` does, and stop.
+    loop {
+        if let Incoming::Event { kind, value } = socket
+            .next_within(Duration::from_secs(5))
+            .await
+            .expect("events keep coming")
+        {
+            if kind == "ping" {
+                socket.pong(&value).await.expect("pongs");
+                break;
+            }
+        }
+    }
+    // Read one more event so the pong is certainly on the wire and processed.
+    let _ = socket.next_within(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let trace = harness.mock.trace();
+    assert!(
+        trace.count("pong") >= 1,
+        "the page's pong must be recorded; trace was {:?}",
+        trace
+            .events()
+            .iter()
+            .map(|e| e.kind.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        trace.pings_unanswered() < trace.count("ping"),
+        "an answered ping must not still be counted as outstanding"
+    );
+}
+
+// --- the nonce -------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_signed_url_is_single_use() {
+    let harness = Harness::start(Scenario::Full).await;
+    let url = harness.mint().await.expect("mints");
+    let _first = ConversationClient::connect(&url)
+        .await
+        .expect("first opens");
+    let error = ConversationClient::connect(&url)
+        .await
+        .expect_err("a minted URL is a credential, and it is spent");
+    assert!(error.to_string().contains("403"), "{error}");
+    assert_eq!(harness.mock.trace().count("token_reused"), 1);
+}
+
+#[tokio::test]
+async fn a_stale_signed_url_is_refused_by_a_different_name() {
+    // "You already used it" and "you took too long" have different fixes, so they are different
+    // words even though a browser sees the same immediate close for both.
+    let harness = Harness::start_with(Scenario::Full, |options| MockOptions {
+        validity: Duration::from_millis(1),
+        ..options
+    })
+    .await;
+    let url = harness.mint().await.expect("mints");
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let error = ConversationClient::connect(&url)
+        .await
+        .expect_err("a stale URL is refused");
+    assert!(error.to_string().contains("403"), "{error}");
+    assert_eq!(harness.mock.trace().count("token_expired"), 1);
+    assert_eq!(harness.mock.trace().count("token_reused"), 0);
+}
+
+#[tokio::test]
+async fn a_token_that_was_never_minted_is_refused() {
+    let harness = Harness::start(Scenario::Full).await;
+    let url = format!(
+        "ws://{}/v1/convai/conversation?agent_id={MOCK_AGENT_ID}&token=invented",
+        harness.mock.ws_addr()
+    );
+    assert!(ConversationClient::connect(&url).await.is_err());
+    assert_eq!(harness.mock.trace().count("token_unknown"), 1);
+}
+
+// --- the trace -------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn nothing_secret_reaches_the_trace() {
+    let harness = Harness::start(Scenario::Full).await;
+    let url = harness.mint().await.expect("mints");
+    let nonce = url
+        .rsplit_once("token=")
+        .map(|(_, token)| token.to_owned())
+        .expect("the minted URL carries a nonce");
+    let mut socket = ConversationClient::connect(&url).await.expect("connects");
+    socket.initiate().await.expect("initiates");
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+    socket
+        .send_audio(&gent_talk::elevenlabs::mock::audio::tone(160))
+        .await
+        .expect("uploads");
+    socket.ask("what is new?").await.expect("asks");
+    wait_for(&mut socket, "agent_response").await;
+
+    let rendered = harness.mock.trace().to_json().to_string();
+    for secret in [MOCK_API_KEY, WRITE_TOKEN, nonce.as_str()] {
+        assert!(
+            !rendered.contains(secret),
+            "a credential reached the trace, which gets written to a file and pasted into an \
+             issue: {secret}"
+        );
+    }
+    // Audio is a LENGTH, never bytes: the same rule `src/access.rs` states for channel text.
+    let audio = harness.mock.trace().of_kind("audio");
+    assert!(!audio.is_empty(), "audio was sent");
+    for event in audio {
+        assert!(event.summary.is_empty(), "{:?}", event.summary);
+        assert!(event.size > 0, "the length is what is recorded");
+    }
+    let uploaded = harness.mock.trace().of_kind("user_audio_chunk");
+    for event in uploaded {
+        assert!(
+            !event.summary.contains('='),
+            "an uploaded chunk was recorded as base64: {}",
+            event.summary
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_control_plane_lives_under_a_prefix_the_real_vendor_does_not_have() {
+    // A client that accidentally points at api.elevenlabs.io must fail loudly, not half work.
+    let harness = Harness::start(Scenario::Full).await;
+    let client = reqwest::Client::new();
+    let base = harness.mock.control_base();
+
+    let scenario = client
+        .post(format!("{base}/_mock/scenario"))
+        .json(&json!({ "scenario": "no_tool_call" }))
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(scenario.status().as_u16(), 200);
+
+    let unknown = client
+        .post(format!("{base}/_mock/scenario"))
+        .json(&json!({ "scenario": "definitely-not-a-scenario" }))
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(
+        unknown.status().as_u16(),
+        400,
+        "an unknown scenario must not silently run the happy path"
+    );
+
+    let missing = client
+        .get(format!("{base}/v1/text-to-speech/voice"))
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(missing.status().as_u16(), 404);
+    let body = missing.text().await.expect("body");
+    assert!(body.contains("gent-talk"), "{body}");
+}
+
+#[tokio::test]
+async fn saying_something_into_a_closed_conversation_is_refused_rather_than_photographed() {
+    let harness = Harness::start(Scenario::Full).await;
+    let answer = reqwest::Client::new()
+        .post(format!("{}/_mock/say", harness.mock.control_base()))
+        .json(&json!({ "who": "agent", "text": "nobody is listening" }))
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(
+        answer.status().as_u16(),
+        409,
+        "a harness that 'said' something into nothing would photograph an empty screen"
+    );
+}
+
+#[tokio::test]
+async fn the_control_plane_can_drive_a_conversation_the_way_a_screenshot_run_would() {
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    let answer = reqwest::Client::new()
+        .post(format!("{}/_mock/say", harness.mock.control_base()))
+        .json(&json!({ "who": "agent", "text": "byte identical, every run" }))
+        .send()
+        .await
+        .expect("answers");
+    assert_eq!(answer.status().as_u16(), 200);
+
+    let events = wait_for(&mut socket, "agent_response").await;
+    assert_eq!(
+        agent_said(&events).as_deref(),
+        Some("byte identical, every run"),
+        "the harness's exact text must be what the page renders"
+    );
+}
+
+#[tokio::test]
+async fn the_trace_endpoint_reports_what_happened() {
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    let trace: Value = reqwest::Client::new()
+        .get(format!("{}/_mock/trace", harness.mock.control_base()))
+        .send()
+        .await
+        .expect("answers")
+        .json()
+        .await
+        .expect("json");
+    let kinds: Vec<&str> = trace["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|e| e["kind"].as_str())
+        .collect();
+    assert!(
+        kinds.contains(&"conversation_initiation_client_data"),
+        "{kinds:?}"
+    );
+    assert!(
+        kinds.contains(&"conversation_initiation_metadata"),
+        "{kinds:?}"
+    );
+    assert_eq!(trace["mints"].as_array().expect("mints").len(), 1);
+}
+
+#[tokio::test]
+async fn the_bridge_the_mock_was_pointed_at_is_the_one_it_calls() {
+    // A mock that silently fell back to some other bridge would make every assertion above a
+    // statement about the wrong process.
+    let harness = Harness::start(Scenario::Full).await;
+    assert!(
+        harness.bridge_base.starts_with("http://127.0.0.1:"),
+        "{}",
+        harness.bridge_base
+    );
+    assert_ne!(harness.bridge_base, harness.mock.control_base());
+}
