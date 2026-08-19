@@ -9,6 +9,7 @@ use gent_talk::config::{Config, ENV_CONFIG_PATH};
 use gent_talk::discord::fake::FakeDiscord;
 use gent_talk::discord::http::HttpDiscordClient;
 use gent_talk::discord::DiscordClient;
+use gent_talk::probe::{self, ENV_SKIP_STARTUP_PROBE};
 use gent_talk::retrieval::LexicalRanker;
 use gent_talk::state::AppState;
 
@@ -16,13 +17,18 @@ const USAGE: &str = "\
 gent-talk — a Discord bridge for a voice agent
 
 USAGE:
-    gent-talk [--config PATH] [--fake-discord]
+    gent-talk [--config PATH] [--fake-discord] [--skip-startup-probe]
 
 OPTIONS:
-    --config PATH    configuration file (default: $GENT_TALK_CONFIG, else ./gent-talk.toml)
-    --fake-discord   run against an in-memory Discord with seeded messages, for local development
-    --version        print the version and exit
-    --help           print this message and exit
+    --config PATH         configuration file (default: $GENT_TALK_CONFIG, else ./gent-talk.toml)
+    --fake-discord        run against an in-memory Discord with seeded messages, for local
+                          development
+    --skip-startup-probe  do not check at startup that each configured channel is readable.
+                          Also settable as GENT_TALK_SKIP_STARTUP_PROBE=1. The skip is logged
+                          loudly, because an unchecked channel surfaces later as an empty result
+                          that looks like a bug in this server.
+    --version             print the version and exit
+    --help                print this message and exit
 
 Every secret is read from the configuration file or from the environment. See the project README
 for the full list and for the threat model.
@@ -109,12 +115,14 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
 struct Args {
     config: Option<PathBuf>,
     fake_discord: bool,
+    skip_startup_probe: bool,
 }
 
 fn parse_args() -> anyhow::Result<Option<Args>> {
     let mut args = Args {
         config: None,
         fake_discord: false,
+        skip_startup_probe: false,
     };
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -132,6 +140,7 @@ fn parse_args() -> anyhow::Result<Option<Args>> {
                 args.config = Some(PathBuf::from(value));
             }
             "--fake-discord" => args.fake_discord = true,
+            "--skip-startup-probe" => args.skip_startup_probe = true,
             other => anyhow::bail!("unrecognized argument {other:?}\n\n{USAGE}"),
         }
     }
@@ -194,6 +203,8 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(HttpDiscordClient::new(&config.discord).context("building the Discord client")?)
     };
 
+    run_startup_probe(discord.as_ref(), &config, args.skip_startup_probe).await?;
+
     for channel in &config.channels {
         tracing::info!(
             channel = %channel.id,
@@ -236,6 +247,65 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving")?;
+    Ok(())
+}
+
+/// Check at startup that every configured channel can actually be read, and refuse to start if
+/// one cannot.
+///
+/// This is the same posture the configuration already takes toward equal or short tokens: a
+/// single-user tool that comes up in a state the operator did not mean is worse than one that
+/// refuses and says why. The failure it exists for — a bot that was created, tokened, and
+/// configured, but never added to the channel — is invisible at startup today and surfaces later
+/// as an empty digest, which reads like a bug in this code.
+async fn run_startup_probe(
+    discord: &dyn DiscordClient,
+    config: &Config,
+    skip_flag: bool,
+) -> anyhow::Result<()> {
+    let skip_env = std::env::var(ENV_SKIP_STARTUP_PROBE).ok();
+    match probe::startup_check(discord, &config.channels, skip_flag, skip_env.as_deref()).await {
+        // Loudly, and naming which switch did it: a skipped check that says nothing is the same
+        // silent start this probe was added to remove.
+        probe::StartupCheck::Skipped { source } => {
+            tracing::warn!(
+                source,
+                "SKIPPING the startup channel probe. This server has NOT checked that its bot can \
+                 read the configured channels; if it cannot, reads will come back empty rather \
+                 than failing."
+            );
+            eprintln!(
+                "WARNING: startup channel probe SKIPPED via {source}; channel reachability is \
+                 unverified."
+            );
+        }
+        probe::StartupCheck::Passed(report) => {
+            if report.warnings().is_empty() {
+                tracing::info!("{}", report.render());
+            } else {
+                tracing::warn!("{}", report.render());
+            }
+        }
+        probe::StartupCheck::Failed(report) => {
+            let failed = report.failures().len().max(usize::from(report.aborted));
+            // The detail goes to stderr rather than through `tracing`, because RUST_LOG is an
+            // operator-settable filter and a startup refusal must not be suppressible by it. One
+            // structured line still goes to the log, so `podman logs` shows why the container
+            // exited without repeating the whole report twice.
+            tracing::error!(
+                failed,
+                configured = config.channels.len(),
+                "startup channel probe FAILED; the per-channel diagnosis is on stderr"
+            );
+            eprintln!("{}", report.render());
+            anyhow::bail!(
+                "{failed} of {} configured channel(s) could not be read; refusing to start. Fix \
+                 the configuration above, or re-run with {} if you know the check is wrong.",
+                config.channels.len(),
+                probe::SKIP_FLAG
+            );
+        }
+    }
     Ok(())
 }
 

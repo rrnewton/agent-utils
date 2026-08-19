@@ -64,6 +64,13 @@ Nothing is committed and nothing is hardcoded. You need:
    you want to reach, with `View Channel`, `Read Message History`, and — only if you want to post —
    `Send Messages`. Its token goes in `discord.bot_token` / `GENT_TALK_DISCORD_BOT_TOKEN`.
 
+   > **Adding the bot to your server is not the same as adding it to the channel.** Authorizing
+   > the OAuth2 invite puts the bot in the *server*; a **private** channel additionally needs the
+   > bot, or a role it has, added in that channel's own **Edit Channel → Permissions**. Missing
+   > that second step is the most common way this server ends up configured for a channel it
+   > cannot read. The [startup channel probe](#the-startup-channel-probe) now catches it at
+   > startup instead of letting it surface later as an empty digest.
+
    > **Turn on MESSAGE CONTENT INTENT** while you are in the Developer Portal: **Bot** tab →
    > **Privileged Gateway Intents**. It is off by default and it is the highest-cost thing to get
    > wrong here, because it does not fail — a bot without it is handed messages whose `content` is
@@ -97,10 +104,13 @@ messages, and logs a warning on every start. It is how you look at the web app w
 The seed is verbose on purpose: two cheerful one-liners make the digest and the scrollback look
 like they work when neither of them had anything to do.
 
-Against real Discord — **note that this is first contact.** The Discord client has never run
-against `discord.com`. It is unit-tested, and the whole server is end-to-end tested against an
-in-memory fake, but no byte of it has ever reached the real API. If something breaks here it is
-the untested seam finally being tested, not a regression:
+Against real Discord — **note that this is very nearly first contact.** The Discord client is
+unit-tested and the whole server is end-to-end tested against an in-memory fake. Exactly one path
+has been exercised against `discord.com` itself: the startup probe was run with a deliberately
+invalid bot token and Discord answered **401**, which the probe classified and reported correctly.
+Nothing else — no authenticated read, no post, and none of the 403/404 classifications — has ever
+reached the real API. If something breaks here it is the untested seam finally being tested, not
+a regression:
 
 ```sh
 cargo run -- --config gent-talk.toml
@@ -148,6 +158,63 @@ podman run --rm --name gent-talk -p 127.0.0.1:8080:8080 \
 
 The image runs as a non-root user and contains no configuration; a container started with no
 credentials fails immediately rather than coming up with defaults.
+
+## The startup channel probe
+
+At startup, after the configuration is loaded and before the listener is bound, the server reads
+**one message from each configured channel** and refuses to start if it cannot.
+
+This exists because of a real failure. The server was configured, it started cleanly, it logged
+its channels — and the bot had never been added to the channel. Nothing said so. The mistake
+surfaced later as an empty result at first use, which reads exactly like a bug in this code.
+That is a silent failure, and this project's rule is that an expected side effect which cannot
+happen gets reported explicitly rather than skipped quietly.
+
+**It only reads.** One message, per channel, with `limit=1`. It does **not** post, not even to a
+channel configured `rw` — a startup check that wrote to your channel on every restart would be its
+own bug. Nothing in `src/probe.rs` can reach the posting call, and a test asserts the in-memory
+Discord recorded zero posts after a probe.
+
+**It tells the causes apart**, because they have different fixes. Discord's numeric error codes,
+not just the HTTP status, decide which message you get:
+
+| What Discord says | What it means | What to do |
+|---|---|---|
+| 401 | The **bot token** is wrong, expired, or regenerated | Reset the token in the Developer Portal and update `GENT_TALK_DISCORD_BOT_TOKEN`. This one is global, so the probe stops after the first channel instead of repeating itself. |
+| 403, code `50001` (Missing Access) | The bot **cannot see this channel at all**: either it is not in the server, or it has no `View Channel` there | Re-run the OAuth2 invite for the right server; then, for a private channel, add the bot or its role in **Edit Channel → Permissions**. Discord does not distinguish these two, so the message names both. |
+| 403, code `50013` (Missing Permissions) | The bot **can** see the channel but may not read its history | Grant **Read Message History** on that channel. The invite is fine; this is a per-channel override. |
+| 404, code `10003` (Unknown Channel) | Wrong snowflake, or a channel this bot was never invited to | Re-copy the id (Developer Mode → right-click → Copy Channel ID); if the id is right, re-check the invite. |
+| 429 | Rate-limited, so readability was **not** established | Wait and restart. |
+| no response | The process cannot reach `discord.com` | Check egress: DNS, outbound HTTPS, proxy. |
+| success, but every message has **blank content** | Almost certainly **Message Content Intent** is off | Turn it on (Developer Portal → Bot → Privileged Gateway Intents) and restart. |
+
+That last row is a **warning, not a refusal**, and deliberately so: a message can legitimately be
+attachment- or embed-only, so refusing to start on it would be a false alarm the operator cannot
+clear. It is the one misconfiguration Discord reports as a *success*, so it is called out by name
+rather than left to be discovered as "the digest is empty".
+
+**Failure is fatal.** The server names every channel that failed, says why, says what to do, and
+exits non-zero. That is the same posture the configuration already takes toward two identical
+tokens or a token under 24 characters: for a single-user tool, a start in a state you did not mean
+is worse than a refusal.
+
+**Skipping it, for offline development:**
+
+```sh
+cargo run -- --config gent-talk.toml --skip-startup-probe
+# or
+GENT_TALK_SKIP_STARTUP_PROBE=1 cargo run -- --config gent-talk.toml
+```
+
+The skip is logged as a warning on stdout *and* printed on stderr, naming which switch caused it.
+An invisible skip would be the same silent start the probe was added to remove. (`0`, `false`, and
+the empty string do not skip, so a container runtime that renders an unset variable as `""` cannot
+turn the check off by accident.)
+
+Note that `--fake-discord` does **not** skip the probe, and the in-memory Discord does not fake a
+pass: it knows which channels it actually has, and answers anything else with Discord's own
+404 / `Unknown Channel`. If the fake said yes to every channel, the probe would pass against it
+unconditionally and the tests would prove nothing about the real client.
 
 ## Checking a deployment
 
@@ -614,6 +681,7 @@ src/summary.rs        extractive digest lines
 src/retrieval.rs      semantic random access, behind the Ranker trait
 src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
+src/probe.rs          the startup channel reachability probe and its failure taxonomy
 src/mcp/mod.rs        the tool manifest and per-tool approval policy
 src/mcp/protocol.rs   JSON-RPC 2.0 and the MCP method set
 src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp

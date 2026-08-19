@@ -10,9 +10,11 @@ Budget about an hour, most of it waiting on Cloudflare DNS and clicking through 
 Two of these six steps are **first contact with a vendor**, and you should know which ones, so a
 failure there reads as expected rather than as a broken build:
 
-* **Step 3 is the first time this project's Discord client has ever run against live Discord.**
-  Every part of it is unit-tested and the whole server is end-to-end tested against an in-memory
-  fake, but no byte of it has ever reached `discord.com`. If something breaks, step 3 is the
+* **Step 3 is very nearly the first time this project's Discord client has run against live
+  Discord.** Every part of it is unit-tested and the whole server is end-to-end tested against an
+  in-memory fake. Exactly one path has touched `discord.com`: the startup probe was run with a
+  deliberately invalid bot token, and Discord's 401 was classified and reported correctly. No
+  authenticated read and no post has ever reached the real API. If something breaks, step 3 is the
   likeliest place, and it is not a regression — it is the untested seam finally being tested.
 * **Step 5 has never been completed by anyone.** No ElevenLabs agent has ever connected to this
   server. The registration values in step 5 come from ElevenLabs' documentation, not from a round
@@ -60,8 +62,22 @@ reachable from the public internet.
    * Bot permissions: **View Channels**, **Read Message History**, and — only if you want the
      agent to be able to post — **Send Messages**
 5. Open the generated URL, pick your server, authorize.
-6. Make sure the bot can actually see the channels you care about. A private channel needs the bot
-   (or a role it has) added to it explicitly; server-wide permissions do not reach into one.
+6. **Add the bot to each channel you care about. This is a separate step from step 5.**
+
+   > ### ⚠️ Authorizing the invite adds the bot to the SERVER, not to the CHANNEL
+   >
+   > A **private** channel does not inherit it. Open the channel → **Edit Channel** →
+   > **Permissions** → add the bot (or a role it has) → make sure **View Channel** and **Read
+   > Message History** are allowed there. Server-wide permissions do not reach into a private
+   > channel.
+   >
+   > This is the step that actually gets skipped. It was skipped here: the server was configured,
+   > it started cleanly, it listed its channels, and the bot had never been added — which only
+   > showed up later as empty results that looked like a bug in the code.
+   >
+   > **You no longer have to remember it.** As of the startup channel probe, the server reads one
+   > message from every configured channel at startup and **refuses to start** if it cannot,
+   > naming the channel and what to fix. Step 3 is where you will see that.
 7. Get the channel ids: Discord → **User Settings → Advanced → Developer Mode** on, then
    right-click each channel → **Copy Channel ID**. These are the 17–20 digit snowflakes.
 
@@ -110,6 +126,32 @@ podman run -d --rm --name gent-talk -p 127.0.0.1:8080:8080 \
   -e GENT_TALK_WRITE_TOKEN -e GENT_TALK_CHANNELS \
   gent-talk:v0
 ```
+
+**Watch the first few lines of the log.** Before it binds a port, the server reads one message
+from each configured channel and prints a line per channel:
+
+```text
+startup channel probe (a one-message read per configured channel):
+  [ok] channel 123456789012345678 (lead team): readable
+  [ok] channel 987654321098765432 (build noise): readable
+```
+
+If a channel is not readable the server **refuses to start**, exits non-zero, and tells you which
+one and what to do — the bot is not in the server, or it cannot view this channel, or the
+snowflake is wrong, or the token is bad. Those have different fixes, so it does not collapse them
+into "unreachable". A rejected **token** stops the probe after the first channel, since every
+other channel would only repeat the same 401.
+
+It only ever **reads** — never posts, not even to a channel you marked `rw`.
+
+One case is a loud warning rather than a refusal: if the read succeeds but every message comes
+back with **empty content**, that is the Message Content Intent from step 1.3. It is not treated
+as fatal because a message can genuinely be attachment-only, but it is called out by name, because
+it is the one failure Discord reports as a success.
+
+To start without the check — offline development against `--fake-discord`, or if you are certain
+the check is wrong — use `--skip-startup-probe` or `GENT_TALK_SKIP_STARTUP_PROBE=1`. The skip is
+logged loudly; you will not skip it by accident.
 
 Now run the deployment check. This is the one command that tells you whether step 1 through step 3
 actually worked:
@@ -305,7 +347,12 @@ using a hosted voice agent, and it is worth knowing before you point it at a pri
 
 | Symptom | Almost always |
 |---|---|
-| Server exits immediately at startup | The two tokens are equal, or one is under 24 characters. |
+| Server exits immediately at startup | The two tokens are equal, or one is under 24 characters — or the startup channel probe refused. Read the last lines: the probe names each channel it could not read and what to do about it. |
+| Startup says `Missing Access` for a channel | The bot is not in that Discord server, or it cannot view that channel. Re-do step 1.4/1.5, then step 1.6 for a private channel. |
+| Startup says `Missing Permissions` for a channel | The bot can see the channel but lacks **Read Message History** there. Grant it in the channel's permission overrides — the invite is fine. |
+| Startup says `Unknown Channel` (404) | The snowflake in `GENT_TALK_CHANNELS` is wrong, or the bot was never invited to that server. |
+| Startup says the token was rejected (401) | Wrong or regenerated bot token. Reset it in the Developer Portal. |
+| Startup warns every message came back with EMPTY CONTENT | **Message Content Intent** (step 1.3). |
 | `verify-deployment.sh` check 0 fails | Container is not running, or `--url` is wrong. `podman logs gent-talk`. |
 | Check 5 says `unknown_channel` | That snowflake is not in `GENT_TALK_CHANNELS`. |
 | Check 5 returns an **empty** digest | **Message Content Intent** (step 1.3). Second guess: the channel really is empty. |

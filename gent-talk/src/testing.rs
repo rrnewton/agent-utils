@@ -62,9 +62,15 @@ pub fn config() -> Config {
 }
 
 /// A server state backed by an in-memory Discord, plus a handle to that Discord.
+///
+/// Both configured channels are registered on the fake — the equivalent of a bot that really was
+/// invited — so tests exercise a correctly deployed server. A test that wants the
+/// misconfiguration builds its own [`FakeDiscord`] and leaves the channel out.
 #[must_use]
 pub fn state() -> (AppState, Arc<FakeDiscord>) {
     let fake = Arc::new(FakeDiscord::new());
+    fake.register_channel(&crate::model::ChannelId(READ_CHANNEL.to_owned()));
+    fake.register_channel(&crate::model::ChannelId(WRITE_CHANNEL.to_owned()));
     let state = AppState {
         config: Arc::new(config()),
         discord: fake.clone(),
