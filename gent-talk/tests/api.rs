@@ -88,6 +88,7 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
         ("GET", "/api/v1/channels".to_owned(), None),
         ("GET", "/api/v1/client-config".to_owned(), None),
         ("GET", "/api/v1/agent-tools".to_owned(), None),
+        ("GET", "/api/v1/signed-url".to_owned(), None),
         (
             "GET",
             format!("/api/v1/channels/{WRITE_CHANNEL}/messages"),

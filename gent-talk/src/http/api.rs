@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::{self, AuthError, Scope};
 use crate::discord::DiscordError;
+use crate::elevenlabs::{SignedUrl, SignedUrlError};
 use crate::model::{ChannelInfo, Message};
 use crate::ops::{self, OpError};
 use crate::retrieval::Resolution;
@@ -81,6 +82,26 @@ impl From<DiscordError> for ApiError {
             DiscordError::Refused(detail) => Self::new(StatusCode::BAD_REQUEST, "refused", detail),
             other => Self::new(StatusCode::BAD_GATEWAY, "discord_error", other.to_string()),
         }
+    }
+}
+
+impl From<SignedUrlError> for ApiError {
+    fn from(value: SignedUrlError) -> Self {
+        let code = value.code();
+        let status = match value {
+            // Not the caller's fault and not fixable by retrying: the operator has to set a value
+            // and restart. 503 says "this server is not able to do this right now", which is the
+            // truth, and it is distinguishable from ElevenLabs having refused us.
+            SignedUrlError::NotConfigured(_) => StatusCode::SERVICE_UNAVAILABLE,
+            // An upstream failure, reported as one. Not flattened into a 500, and never into a
+            // 200 with a URL that would fail later inside the browser.
+            SignedUrlError::Transport(_)
+            | SignedUrlError::Status { .. }
+            | SignedUrlError::Shape(_) => StatusCode::BAD_GATEWAY,
+        };
+        // `Display` for every variant is already redacted at construction; see
+        // `SignedUrlError::from_response`.
+        Self::new(status, code, value.to_string())
     }
 }
 
@@ -169,6 +190,31 @@ pub async fn client_config(
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         version: env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// `GET /api/v1/signed-url` — mint a short-lived signed conversation URL for the voice agent.
+///
+/// Two things about this route are deliberate.
+///
+/// **It requires the WRITE scope**, even though it reads nothing. What it hands back is a working
+/// conversation with the agent, and that agent is configured with a credential of its own: if it
+/// holds the write token, then anyone holding a signed URL can ask it to post in the owner's name.
+/// The gate on this route therefore has to be at least as strong as the strongest thing the
+/// conversation can do. An unauthenticated version of this route would be strictly worse than the
+/// public `talk-to` link that enabling authentication just closed.
+///
+/// **The answer is `no-store`.** The minted URL is itself a bearer credential for the next fifteen
+/// minutes; it must not sit in a proxy or a browser cache.
+pub async fn signed_url(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let minted: SignedUrl = state
+        .elevenlabs
+        .signed_url(&state.config.elevenlabs)
+        .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(minted)).into_response())
 }
 
 /// Query parameters for the read endpoints.
@@ -381,6 +427,8 @@ pub async fn ask(
 }
 
 const INDEX_HTML: &str = include_str!("../../web/index.html");
+const VOICE_HTML: &str = include_str!("../../web/voice.html");
+const VOICE_JS: &str = include_str!("../../web/voice.js");
 const APP_JS: &str = include_str!("../../web/app.js");
 const STYLE_CSS: &str = include_str!("../../web/style.css");
 
@@ -399,6 +447,16 @@ fn asset(content_type: &'static str, body: &'static str) -> Response {
 /// `GET /` — the phone web app.
 pub async fn index_html() -> Response {
     asset("text/html; charset=utf-8", INDEX_HTML)
+}
+
+/// `GET /voice` — the minimal page that starts an authenticated conversation.
+pub async fn voice_html() -> Response {
+    asset("text/html; charset=utf-8", VOICE_HTML)
+}
+
+/// `GET /voice.js`
+pub async fn voice_js() -> Response {
+    asset("text/javascript; charset=utf-8", VOICE_JS)
 }
 
 /// `GET /app.js`

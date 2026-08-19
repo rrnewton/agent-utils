@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::agent_backend::AgentBackend;
 use crate::config::Config;
 use crate::discord::DiscordClient;
+use crate::elevenlabs::SignedUrlProvider;
 use crate::model::{ChannelId, ChannelInfo};
 use crate::retrieval::Ranker;
 
@@ -17,6 +18,8 @@ pub struct AppState {
     pub discord: Arc<dyn DiscordClient>,
     /// Strategy for semantic random access.
     pub ranker: Arc<dyn Ranker>,
+    /// Mints short-lived signed conversation URLs for the configured ElevenLabs agent.
+    pub elevenlabs: Arc<dyn SignedUrlProvider>,
     /// Slow-path backend (absent in v0).
     pub agent: Arc<dyn AgentBackend>,
 }
