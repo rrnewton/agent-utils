@@ -52,8 +52,14 @@ ignored/
 .DS_Store
 
 # gent-talk local credentials and scratch — never commit these.
-# token1/token2 are the read/write bearer tokens; .gent-talk.env holds the
-# Discord bot token and the ElevenLabs API key.
+# token1/token2 are the read/write bearer tokens.
+#
+# KEEP the .gent-talk.env rule even though nothing reads that path any more:
+# scripts/run.sh no longer has a per-checkout config layer, so a file there is
+# inert — but it is exactly where someone would put credentials out of habit,
+# and an ignore rule costs nothing. Do not "clean this up" as dead config.
+# The *~ rule at the bottom matters for the same reason: an editor backup of a
+# credential file (.gent-talk.env~) is just as sensitive as the original.
 gent-talk/.gent-talk.env
 gent-talk/token1
 gent-talk/token2
