@@ -33,6 +33,8 @@ pub const ENV_ELEVENLABS_API_BASE: &str = "GENT_TALK_ELEVENLABS_API_BASE";
 pub const ENV_CHANNELS: &str = "GENT_TALK_CHANNELS";
 /// Environment variable overriding the externally reachable base URL.
 pub const ENV_PUBLIC_BASE_URL: &str = "GENT_TALK_PUBLIC_BASE_URL";
+/// Environment variable overriding the operator's time zone, as an IANA name.
+pub const ENV_TIMEZONE: &str = "GENT_TALK_TIMEZONE";
 
 /// Shortest API token this server will accept.
 ///
@@ -89,6 +91,11 @@ pub struct Config {
     pub bind: SocketAddr,
     /// Externally reachable base URL, when the deployment knows it.
     pub public_base_url: Option<String>,
+    /// The zone every message timestamp is rendered into before anything speaks it.
+    ///
+    /// Configured, never hard-coded, and validated at load: a name the bundled database does not
+    /// know stops the server rather than quietly becoming UTC. See [`crate::clock`].
+    pub timezone: crate::clock::Zone,
     /// Discord access.
     pub discord: DiscordConfig,
     /// API credentials for callers (the voice agent, and the web app).
@@ -195,6 +202,7 @@ struct FileConfig {
 struct FileServer {
     bind: Option<String>,
     public_base_url: Option<String>,
+    timezone: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -236,6 +244,13 @@ const DEFAULT_BIND: &str = "0.0.0.0:8080";
 pub const DEFAULT_DISCORD_API_BASE: &str = "https://discord.com/api/v10";
 /// Default ElevenLabs API base.
 pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";
+/// Default operator time zone.
+///
+/// UTC because it is the one zone that is right for nobody in particular and therefore cannot be
+/// mistaken for a considered choice — an operator who leaves it alone hears the same instant
+/// Discord reported, correctly labelled, rather than a plausible-looking local time from whichever
+/// datacentre the container happens to run in.
+pub const DEFAULT_TIMEZONE: &str = "UTC";
 const DEFAULT_FETCH_LIMIT: u16 = 50;
 const DEFAULT_MAX_FETCH_LIMIT: u16 = 100;
 
@@ -280,6 +295,16 @@ impl Config {
             .map_err(|e| ConfigError::Invalid {
                 field: "server.bind".to_owned(),
                 detail: format!("{bind_text:?} is not an address:port ({e})"),
+            })?;
+
+        let timezone_name = get(ENV_TIMEZONE)
+            .map(str::to_owned)
+            .or(file.server.timezone)
+            .unwrap_or_else(|| DEFAULT_TIMEZONE.to_owned());
+        let timezone =
+            crate::clock::zone(&timezone_name).map_err(|detail| ConfigError::Invalid {
+                field: "server.timezone".to_owned(),
+                detail,
             })?;
 
         let bot_token = get(ENV_DISCORD_BOT_TOKEN)
@@ -351,6 +376,7 @@ impl Config {
             public_base_url: get(ENV_PUBLIC_BASE_URL)
                 .map(str::to_owned)
                 .or(file.server.public_base_url),
+            timezone,
             discord: DiscordConfig {
                 bot_token,
                 api_base: file
@@ -610,6 +636,37 @@ writable = true
         let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
         assert!(
             matches!(&err, ConfigError::Invalid { field, .. } if field == "discord.default_fetch_limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_timezone_defaults_to_utc_and_can_be_set_from_file_or_environment() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.timezone.name(), DEFAULT_TIMEZONE);
+
+        let text = FULL.replace("[server]", "[server]\ntimezone = \"America/New_York\"");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.timezone.name(), "America/New_York");
+
+        let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_TIMEZONE, "Europe/Berlin")]))
+            .expect("valid config");
+        assert_eq!(
+            cfg.timezone.name(),
+            "Europe/Berlin",
+            "the environment must win, so a container can be told its operator's zone"
+        );
+    }
+
+    #[test]
+    fn an_unknown_timezone_stops_the_server_instead_of_becoming_utc() {
+        // Silently defaulting is the failure this whole feature exists to prevent: the operator
+        // would hear confidently-labelled times in the wrong zone and have no way to notice.
+        let text = FULL.replace("[server]", "[server]\ntimezone = \"America/Nowhere\"");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, detail }
+                if field == "server.timezone" && detail.contains("America/Nowhere")),
             "unexpected error: {err}"
         );
     }

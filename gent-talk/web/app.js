@@ -72,7 +72,12 @@ function messageNode(message, opts = {}) {
   const author = document.createElement("span");
   author.textContent = message.author;
   const stamp = document.createElement("span");
-  stamp.textContent = (message.timestamp || "").replace("T", " ").slice(0, 16);
+  // `#52 operator-timezone`. The server converts once, into the operator's configured zone, and
+  // hands back a string that is already correct — so prefer it. The ISO slice below is the
+  // fallback for a server too old to send `spoken_time`, and it is UTC-as-Discord-reported-it,
+  // which is exactly the value the phone and the voice agent must not disagree about.
+  stamp.textContent =
+    message.spoken_time || (message.timestamp || "").replace("T", " ").slice(0, 16);
   meta.append(author, stamp);
 
   const body = document.createElement("div");
@@ -157,7 +162,12 @@ async function loadDigest() {
   for (const entry of payload.entries) {
     list.append(
       messageNode(
-        { author: entry.author, timestamp: entry.timestamp, content: entry.summary },
+        {
+          author: entry.author,
+          timestamp: entry.timestamp,
+          spoken_time: entry.spoken_time,
+          content: entry.summary,
+        },
         { onSelect: () => readFull(channel, entry.id) }
       )
     );

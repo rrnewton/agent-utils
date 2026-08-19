@@ -66,6 +66,11 @@ pub fn fenced(body: &str) -> String {
 }
 
 /// Render a batch of messages as a fenced, labelled block for a model prompt.
+///
+/// This function PRINTS [`Message::spoken_time`]; it must never compute one. The zone conversion
+/// happens exactly once, in [`crate::ops`], because this is one of four render sites and a
+/// formatter copied into each of them would drift three ways. Both time fields are shown, and the
+/// spoken one comes first and is labelled, so a model reading top to bottom reads the right one.
 #[must_use]
 pub fn render_for_model(messages: &[Message]) -> String {
     let mut body = String::new();
@@ -75,8 +80,9 @@ pub fn render_for_model(messages: &[Message]) -> String {
         // attached to the thing being replied to, so there is nothing to search for and nothing
         // to guess. See `crate::model::Message::author_id`.
         body.push_str(&format!(
-            "[{} | {} | {} {}] {}\n",
+            "[{} | {} | exact {} | {} {}] {}\n",
             message.id.as_str(),
+            message.spoken(),
             message.timestamp,
             neutralize(&message.author),
             neutralize(&message.author_id.mention()),
@@ -99,6 +105,7 @@ mod tests {
             author_id: UserId("2000000000000000001".to_owned()),
             author_is_bot: false,
             timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
+            spoken_time: "08:00:00 EDT".to_owned(),
             content: content.to_owned(),
         }
     }
@@ -169,6 +176,41 @@ mod tests {
             rendered.contains("codex-eng <@2000000000000000001>"),
             "the id must be readable right beside the name that goes with it: {rendered}"
         );
+    }
+
+    #[test]
+    fn the_spoken_time_appears_once_and_the_exact_instant_survives_beside_it() {
+        // The anti-double-formatting check. If a render site ever starts converting on its own,
+        // the spoken form shows up twice, or the exact instant is replaced by a rounded one and
+        // whatever needs sub-second ordering silently loses it.
+        let rendered = render_for_model(&[message("codex-eng", "green")]);
+        assert_eq!(
+            rendered.matches("08:00:00 EDT").count(),
+            1,
+            "the spoken time must be rendered exactly once: {rendered}"
+        );
+        assert!(
+            rendered.contains("exact 2026-08-18T12:00:00+00:00"),
+            "the exact instant must survive, labelled as the one to compute with: {rendered}"
+        );
+        let spoken_at = rendered.find("08:00:00 EDT").expect("spoken form present");
+        let exact_at = rendered.find("exact 2026").expect("exact form present");
+        assert!(
+            spoken_at < exact_at,
+            "the speakable field must come first, or a model reading in order says the wrong one"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_message_shows_the_instant_rather_than_an_empty_slot() {
+        let mut unstamped = message("codex-eng", "green");
+        unstamped.spoken_time = String::new();
+        let rendered = render_for_model(&[unstamped]);
+        assert!(
+            !rendered.contains("[1000000000000000001 |  |"),
+            "an unstamped message must not render a blank time field: {rendered}"
+        );
+        assert_eq!(rendered.matches("2026-08-18T12:00:00+00:00").count(), 2);
     }
 
     #[test]

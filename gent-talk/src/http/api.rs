@@ -512,4 +512,20 @@ mod tests {
             "a server too old to send `complete` must be treated as unknown, not as complete"
         );
     }
+
+    #[test]
+    fn the_phone_app_shows_the_time_the_server_already_converted() {
+        // `#52 operator-timezone`. The phone and the voice agent must say the same thing about
+        // when a message arrived; the only way to guarantee that is for both to render the one
+        // string the server computed, rather than each slicing the ISO value their own way.
+        assert!(
+            APP_JS.contains("message.spoken_time ||"),
+            "web/app.js must prefer the server-converted time, with the ISO slice as fallback"
+        );
+        assert!(
+            APP_JS.contains("spoken_time: entry.spoken_time"),
+            "a digest entry carries the converted time too; dropping it here would make the \
+             digest list silently fall back to UTC while the scrollback shows local time"
+        );
+    }
 }

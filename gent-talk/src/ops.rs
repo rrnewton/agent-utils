@@ -73,6 +73,20 @@ pub fn channels(state: &AppState) -> Vec<ChannelInfo> {
     state.config.channels.clone()
 }
 
+/// Fill in [`Message::spoken_time`] for a freshly fetched batch.
+///
+/// THE ONLY PLACE the zone conversion happens. It sits here rather than at the render sites
+/// because there are four of those — [`crate::untrusted::render_for_model`] and three handlers in
+/// [`crate::mcp::protocol`] — and both front doors already funnel through this module. Formatting
+/// per render site would mean writing the conversion four times and having it drift three ways.
+///
+/// Everything downstream PRINTS this field and must never compute it.
+fn stamp(state: &AppState, messages: &mut [Message]) {
+    for message in messages {
+        message.spoken_time = crate::clock::spoken(&message.timestamp, &state.config.timezone);
+    }
+}
+
 /// One fetched window of a channel, and what it took to fetch it.
 ///
 /// The `limit` is carried alongside the messages for one reason: without it, `messages.len()` is
@@ -122,7 +136,8 @@ pub async fn messages(
     let limit = state
         .effective_limit(limit)
         .min(crate::discord::http::DISCORD_MAX_LIMIT);
-    let messages = state.discord.fetch_recent(&channel.id, limit).await?;
+    let mut messages = state.discord.fetch_recent(&channel.id, limit).await?;
+    stamp(state, &mut messages);
     Ok(Window {
         channel,
         messages,
@@ -202,7 +217,11 @@ pub async fn resolve(
         return Err(OpError::EmptyQuery);
     }
     let limit = state.effective_limit(limit);
-    let messages = state.discord.fetch_recent(&info.id, limit).await?;
+    // This path does NOT go through `messages` above — it fetches directly — so it needs its own
+    // stamping call. `run_find` renders a timestamp for the best match and every alternative, and
+    // without this those lines would be the only ones still speaking raw UTC.
+    let mut messages = state.discord.fetch_recent(&info.id, limit).await?;
+    stamp(state, &mut messages);
     let max_alternatives = usize::from(max_alternatives.unwrap_or(3)).min(10);
     let resolution = retrieval::resolve(state.ranker.as_ref(), &messages, query, max_alternatives);
     let searched = messages.len();
@@ -231,10 +250,11 @@ pub async fn reply(
         return Err(OpError::ChannelNotWritable);
     }
     let reply_to = reply_to.map(|id| MessageId(id.to_owned()));
-    let posted = state
+    let mut posted = state
         .discord
         .post_message(&info.id, text, reply_to.as_ref())
         .await?;
+    stamp(state, std::slice::from_mut(&mut posted));
     Ok((info, posted))
 }
 

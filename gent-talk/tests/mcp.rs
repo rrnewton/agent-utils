@@ -31,6 +31,17 @@ fn harness() -> Harness {
     }
 }
 
+/// The same server, but told which zone its operator lives in.
+fn harness_in_zone(timezone: &str) -> Harness {
+    let toml = gent_talk::testing::config_toml()
+        .replace("[server]", &format!("[server]\ntimezone = \"{timezone}\""));
+    let (state, discord, _elevenlabs) = gent_talk::testing::state_from_toml(&toml);
+    Harness {
+        router: router(state),
+        discord,
+    }
+}
+
 /// One raw request to `/mcp`. Returns the status, the `content-type`, and the body as text.
 async fn raw(
     harness: &Harness,
@@ -347,6 +358,89 @@ async fn a_configured_but_read_only_channel_still_refuses_the_write_token() {
         "{body}"
     );
     assert!(harness.discord.posted().is_empty());
+}
+
+// --- what the clock says ------------------------------------------------------------------------
+
+/// `#52 operator-timezone`. The control the issue asks for, end to end through the real router.
+///
+/// The reported failure was the assistant being handed `13:51:25` in UTC and saying "thirteen
+/// fifty-one Eastern Time" — the right clock with the wrong label. The fix is that the server
+/// converts, so the two halves that have to hold are: the spoken form MOVES when the configured
+/// zone moves, and the exact instant does NOT. Asserting only the first would pass against a
+/// conversion that quietly did nothing; asserting only the second would pass against no feature
+/// at all.
+#[tokio::test]
+async fn the_spoken_time_is_in_the_operators_zone_and_the_exact_instant_survives() {
+    let mut said = Vec::new();
+    for zone in ["UTC", "America/New_York"] {
+        let harness = harness_in_zone(zone);
+        harness
+            .discord
+            .seed(&ChannelId(READ_CHANNEL.to_owned()), "codex-eng", "green");
+        let (_status, body) = rpc(
+            &harness,
+            Some(READ_TOKEN),
+            call("digest_channel", json!({ "channel_id": READ_CHANNEL })),
+        )
+        .await;
+        said.push(tool_text(&body));
+    }
+    let (utc, eastern) = (&said[0], &said[1]);
+
+    // The fake stamps the first seeded message at 12:01:00 UTC.
+    assert!(
+        utc.contains("12:01:00 UTC"),
+        "with the zone set to UTC the spoken form must agree with the instant: {utc}"
+    );
+    assert!(
+        eastern.contains("08:01:00 EDT"),
+        "the same instant in Eastern is four hours earlier, and says so: {eastern}"
+    );
+    assert_eq!(
+        eastern.matches("12:01:00").count(),
+        1,
+        "the UTC digits may appear ONLY inside the exact instant. A second occurrence is the \
+         reported bug — UTC digits sitting where the local time should be: {eastern}"
+    );
+    assert!(
+        !utc.contains("08:01:00"),
+        "and the control in the other direction: a UTC-configured server must not be shifting: \
+         {utc}"
+    );
+
+    // And the machine-readable half is byte-identical in both, unrounded.
+    for text in [utc, eastern] {
+        assert!(
+            text.contains("exact 2026-08-18T12:01:00+00:00"),
+            "the exact instant must survive the conversion untouched: {text}"
+        );
+    }
+}
+
+/// The instruction that tells the model which of the two times to read out.
+#[tokio::test]
+async fn the_server_tells_a_model_which_time_to_read_aloud() {
+    let harness = harness();
+    let (_status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize" }),
+    )
+    .await;
+    let instructions = body["result"]["instructions"]
+        .as_str()
+        .expect("initialize carries instructions")
+        .to_owned();
+    assert!(
+        instructions.contains("READ THE LOCAL ONE ALOUD"),
+        "two undistinguished time fields means the model sometimes picks the wrong one: \
+         {instructions}"
+    );
+    assert!(
+        instructions.contains("do not convert it"),
+        "converting an already-converted time is how the wrong label got attached: {instructions}"
+    );
 }
 
 // --- untrusted content ------------------------------------------------------------------------

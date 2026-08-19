@@ -16,6 +16,14 @@ bind = "0.0.0.0:8080"
 # Environment: GENT_TALK_PUBLIC_BASE_URL
 # public_base_url = "https://gent-talk.example.net"
 
+# YOUR time zone, as an IANA name. Message times are converted into it once, here on the server,
+# and handed onward already formatted and labelled ("09:51:25 EDT") so the voice agent can read one
+# out without converting or relabelling it. The exact UTC instant travels alongside for anything
+# that computes with a time. Defaults to UTC; a name the database does not know stops the server
+# rather than quietly becoming UTC. The zone database is compiled into the binary.
+# Environment: GENT_TALK_TIMEZONE
+# timezone = "America/New_York"
+
 [discord]
 # Bot token for the SECOND, dedicated bot — not the one your coding agents use.
 # Environment: GENT_TALK_DISCORD_BOT_TOKEN

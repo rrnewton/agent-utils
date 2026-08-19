@@ -23,8 +23,11 @@ pub struct DigestEntry {
     /// Author snowflake, so a caller can mention them with `<@id>` without a lookup step.
     /// See [`crate::model::Message::author_id`] for why this rides along instead.
     pub author_id: UserId,
-    /// ISO-8601 timestamp as Discord reported it.
+    /// The EXACT instant, ISO-8601, as Discord reported it. Compute with this one.
     pub timestamp: String,
+    /// The same instant in the operator's zone, already formatted for speech. READ THIS ONE ALOUD.
+    /// Copied from [`crate::model::Message::spoken_time`], which explains why there are two.
+    pub spoken_time: String,
     /// One speakable line. UNTRUSTED text, condensed.
     pub summary: String,
     /// Character length of the full message, so the caller can tell "short" from "a wall".
@@ -55,6 +58,7 @@ pub fn digest_entry(message: &Message, max_chars: usize) -> DigestEntry {
         author: message.author.clone(),
         author_id: message.author_id.clone(),
         timestamp: message.timestamp.clone(),
+        spoken_time: message.spoken().to_owned(),
         truncated: summary.ends_with('…'),
         summary,
         full_length: message.content.chars().count(),
@@ -153,6 +157,7 @@ mod tests {
             author_id: UserId("2000000000000000001".to_owned()),
             author_is_bot: true,
             timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
+            spoken_time: "08:00:00 EDT".to_owned(),
             content: content.to_owned(),
         }
     }
@@ -235,6 +240,23 @@ mod tests {
         let short = digest_entry(&message("done"), 40);
         assert!(!short.truncated);
         assert_eq!(short.summary, "done");
+    }
+
+    #[test]
+    fn a_digest_line_carries_both_the_spoken_time_and_the_exact_instant() {
+        // A digest is what a voice agent reads out, so the speakable form has to survive the
+        // condensing step — and the exact instant has to survive alongside it, unrounded.
+        let entry = digest_entry(&message("done"), 40);
+        assert_eq!(entry.spoken_time, "08:00:00 EDT");
+        assert_eq!(entry.timestamp, "2026-08-18T12:00:00+00:00");
+
+        let mut unstamped = message("done");
+        unstamped.spoken_time = String::new();
+        assert_eq!(
+            digest_entry(&unstamped, 40).spoken_time,
+            "2026-08-18T12:00:00+00:00",
+            "an unstamped message must degrade to the raw instant, never to a blank"
+        );
     }
 
     #[test]

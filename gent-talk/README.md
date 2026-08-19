@@ -278,6 +278,7 @@ curl -s -X POST localhost:8080/mcp \
 |---|---|---|---|
 | Bind address | `server.bind` | `GENT_TALK_BIND` | `0.0.0.0:8080` in a container |
 | Public URL | `server.public_base_url` | `GENT_TALK_PUBLIC_BASE_URL` | informational |
+| Time zone | `server.timezone` | `GENT_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
 | Discord bot token | `discord.bot_token` | `GENT_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `GENT_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `GENT_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -352,6 +353,15 @@ one-message reads, in `resolve` results, in the posted message echoed back by `r
 field on every digest entry. That is what makes a real Discord mention possible: `@coding_agent`
 typed as words notifies nobody, and only `<@1532416065114607829>` does. Bots have ids too, and
 they are included, because addressing another coding agent is a legitimate reply.
+
+**Every message also carries two times, and only one of them is meant to be spoken.**
+`spoken_time` is the instant already converted into `server.timezone` and labelled with it —
+`09:51:25 EDT` — and it is what a voice agent reads out, verbatim, with no conversion of its own.
+`timestamp` is the exact ISO-8601 instant Discord reported, unrounded, and it is what anything
+computing with a time must use. The conversion happens once, in `src/ops.rs`, so the phone and the
+voice agent cannot disagree about when something was said. This exists because handing an
+assistant `13:51:25+00:00` and letting it do the arithmetic produced *"thirteen fifty-one Eastern
+Time"* — the right clock with the wrong label, when nine fifty-one was the answer.
 
 There is deliberately **no user-lookup tool**, and the reason is recorded in `src/model.rs`
 beside the field. First, the id arrives ATTACHED to the message being replied to, so there is no

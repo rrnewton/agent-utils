@@ -195,6 +195,7 @@ mod tests {
                 author_id: UserId(format!("{}", 2_000_000_000_000_000_000_u64 + i as u64)),
                 author_is_bot: true,
                 timestamp: format!("2026-08-18T12:{i:02}:00+00:00"),
+                spoken_time: format!("08:{i:02}:00 EDT"),
                 content: (*content).to_owned(),
             })
             .collect()

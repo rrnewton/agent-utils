@@ -642,6 +642,7 @@ mod tests {
                     author_id: crate::model::UserId("2000000000000000001".to_owned()),
                     author_is_bot: true,
                     timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
+                    spoken_time: String::new(),
                     content: String::new(),
                 }])
             }

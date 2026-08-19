@@ -28,6 +28,9 @@ RUN touch src/main.rs src/lib.rs && cargo build --release --locked
 
 FROM docker.io/library/debian:bookworm-slim
 # TLS roots, for Discord and (later) ElevenLabs. rustls is used, so no OpenSSL runtime is needed.
+# Deliberately NO `tzdata`: the IANA database is compiled into the binary (`jiff`, feature
+# `tzdb-bundle-always`), because a runtime image without one would make `server.timezone` fail —
+# or worse, fall back to UTC — and quietly reproduce the wrong-zone bug it was added to fix.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

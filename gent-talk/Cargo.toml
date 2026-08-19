@@ -29,6 +29,13 @@ axum = { version = "0.8", default-features = false, features = [
     "query",
     "tokio",
 ] }
+# `tzdb-bundle-always` compiles the IANA database into the binary. The runtime image has no
+# `tzdata` package, and a server that fell back to UTC for want of one would silently reproduce
+# the wrong-zone bug this dependency was added to fix. See `src/clock.rs`.
+jiff = { version = "0.2.24", default-features = false, features = [
+    "std",
+    "tzdb-bundle-always",
+] }
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",

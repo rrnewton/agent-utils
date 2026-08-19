@@ -93,6 +93,10 @@ impl FakeDiscord {
             author_id,
             author_is_bot: author.ends_with("-bot"),
             timestamp: format!("2026-08-18T12:{:02}:00+00:00", seq % 60),
+            // Empty for the same reason the real client leaves it empty: this layer knows nothing
+            // about the operator's zone. A fake that pre-filled it would let a test pass with
+            // `ops::stamp` deleted. See `crate::model::Message::spoken_time`.
+            spoken_time: String::new(),
             content: content.to_owned(),
         });
         id

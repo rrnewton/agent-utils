@@ -17,6 +17,7 @@
 pub mod access;
 pub mod agent_backend;
 pub mod auth;
+pub mod clock;
 pub mod config;
 pub mod discord;
 pub mod elevenlabs;

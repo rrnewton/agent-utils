@@ -172,6 +172,10 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, DiscordError>
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         timestamp: field("timestamp")?,
+        // Left EMPTY on purpose. This layer holds no configuration and therefore does not know the
+        // operator's zone; `crate::ops::stamp` is the single place that fills it in. See
+        // `crate::model::Message::spoken_time`.
+        spoken_time: String::new(),
         // A message can legitimately have empty content (an embed or an attachment only), so this
         // one is defaulted rather than required.
         content: value

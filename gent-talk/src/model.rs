@@ -101,10 +101,44 @@ pub struct Message {
     pub author_id: UserId,
     /// Whether Discord flagged the author as a bot.
     pub author_is_bot: bool,
-    /// ISO-8601 timestamp string, as reported by Discord.
+    /// The EXACT instant, ISO-8601, as reported by Discord. Compute with this one.
+    ///
+    /// Unrounded on purpose: sub-second precision is ordering information, and anything that has
+    /// to decide which of two messages came first needs it. This field is never spoken; see
+    /// [`Message::spoken_time`] for the one that is.
     pub timestamp: String,
+    /// The same instant in the operator's configured zone, already formatted for speech:
+    /// `09:51:25 EDT`. READ THIS ONE ALOUD.
+    ///
+    /// Two fields rather than one because they answer different questions, and because a single
+    /// field would force whoever renders it to choose — which is exactly the choice that produced
+    /// the bug. Handed an ISO string in UTC, the assistant said "thirteen fifty-one Eastern Time":
+    /// it kept the digits and relabelled them. A value that is already correct when read verbatim
+    /// requires no conversion and admits no such mistake.
+    ///
+    /// EMPTY means "not yet stamped". The Discord layer constructs it empty because it holds no
+    /// configuration and therefore does not know the operator's zone; [`crate::ops`] is the only
+    /// filler. Use [`Message::spoken`] to read it, which falls back to the exact instant rather
+    /// than to a blank.
+    #[serde(default)]
+    pub spoken_time: String,
     /// Raw message body. UNTRUSTED: written by whoever is in the channel.
     pub content: String,
+}
+
+impl Message {
+    /// The time label to render: the spoken form when it has been stamped, else the raw instant.
+    ///
+    /// Never blank, and never invented. A message that reached a renderer unstamped is a bug in
+    /// the pipeline, but the reader should still learn when it was said.
+    #[must_use]
+    pub fn spoken(&self) -> &str {
+        if self.spoken_time.is_empty() {
+            &self.timestamp
+        } else {
+            &self.spoken_time
+        }
+    }
 }
 
 /// Sort a batch of messages oldest-first, by snowflake where possible.
@@ -138,6 +172,7 @@ mod tests {
             author_id: UserId("7".to_owned()),
             author_is_bot: false,
             timestamp: "t".to_owned(),
+            spoken_time: String::new(),
             content: String::new(),
         }
     }
@@ -170,6 +205,19 @@ mod tests {
         assert_eq!(
             UserId("1532416065114607829".to_owned()).mention(),
             "<@1532416065114607829>"
+        );
+    }
+
+    #[test]
+    fn an_unstamped_message_still_reports_a_time_rather_than_a_blank() {
+        let mut message = msg("7");
+        message.timestamp = "2026-08-19T13:51:25+00:00".to_owned();
+        assert_eq!(message.spoken(), "2026-08-19T13:51:25+00:00");
+        message.spoken_time = "09:51:25 EDT".to_owned();
+        assert_eq!(
+            message.spoken(),
+            "09:51:25 EDT",
+            "once stamped, the spoken form is what a renderer must use"
         );
     }
 

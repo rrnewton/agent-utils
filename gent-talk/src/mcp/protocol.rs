@@ -237,7 +237,11 @@ fn initialize_result(params: Option<&Value>) -> Value {
             "a spoken yes. Every message you read carries its author's mention token beside the ",
             "name, as <@author id>; to notify that person, put that exact token in the reply. ",
             "Writing @their-name instead is plain text and notifies nobody, and there is no tool ",
-            "for looking up someone who has not posted."
+            "for looking up someone who has not posted. Every message also carries two times: a ",
+            "local time already converted to the operator's own zone and labelled with it, such ",
+            "as 09:51:25 EDT, and after it the exact instant marked \"exact\". READ THE LOCAL ONE ",
+            "ALOUD, exactly as written — it is already correct, so do not convert it, do not ",
+            "relabel it, and do not read the exact instant aloud or re-zone it."
         ),
     })
 }
@@ -451,9 +455,13 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         // `author_id` is rendered as the mention token itself rather than as a bare number, so
         // the model copies a working `<@…>` instead of assembling one. See
         // `crate::model::Message::author_id` for why the id travels with the message at all.
+        // The spoken time first, the exact instant after it and labelled as such. Printed, never
+        // computed: `ops::stamp` did the conversion, and doing it again here is how four render
+        // sites end up disagreeing. See `crate::clock`.
         body.push_str(&format!(
-            "[{} | {} | {} {}] {}\n",
+            "[{} | {} | exact {} | {} {}] {}\n",
             entry.id,
+            entry.spoken_time,
             entry.timestamp,
             entry.author,
             entry.author_id.mention(),
@@ -486,8 +494,9 @@ async fn run_find(state: &AppState, args: &Value) -> Result<String, OpError> {
         }
     );
     let mut body = format!(
-        "[BEST | {} | {} | {} {}] {}\n",
+        "[BEST | {} | {} | exact {} | {} {}] {}\n",
         best.message.id.as_str(),
+        best.message.spoken(),
         best.message.timestamp,
         best.message.author,
         best.message.author_id.mention(),
@@ -495,8 +504,9 @@ async fn run_find(state: &AppState, args: &Value) -> Result<String, OpError> {
     );
     for alternative in &resolution.alternatives {
         body.push_str(&format!(
-            "[ALTERNATIVE | {} | {} | {} {}] {}\n",
+            "[ALTERNATIVE | {} | {} | exact {} | {} {}] {}\n",
             alternative.message.id.as_str(),
+            alternative.message.spoken(),
             alternative.message.timestamp,
             alternative.message.author,
             alternative.message.author_id.mention(),
