@@ -68,6 +68,48 @@ jobs:
             echo "the server started with no configuration at all" >&2
             exit 1
           fi
+      # The startup channel probe, proven able to REFUSE in the real image. The unit tests prove it
+      # classifies correctly; only this proves the binary actually runs it before serving.
+      - name: the startup probe refuses a bot that cannot read its channels
+        run: |
+          # No --fake-discord: the real Discord client, a bogus token, and a channel nobody owns.
+          # Whichever way CI's egress falls the answer is a probe failure — a 401 if discord.com is
+          # reachable, "never reached Discord" if it is not — and either way the server must not
+          # come up.
+          if out=$(podman run --rm \
+            -e GENT_TALK_DISCORD_BOT_TOKEN=not-a-real-token \
+            -e GENT_TALK_READ_TOKEN=ci-read-token-0000000000000 \
+            -e GENT_TALK_WRITE_TOKEN=ci-write-token-000000000000 \
+            -e "GENT_TALK_CHANNELS=424242:ci channel:rw" \
+            gent-talk:ci 2>&1); then
+            echo "the server started even though its channel could not be read:" >&2
+            echo "$out" >&2
+            exit 1
+          fi
+          echo "$out"
+          grep -q "startup channel probe" <<<"$out" \
+            || { echo "it refused, but not because of the probe" >&2; exit 1; }
+
+      - name: ...and the skip switch turns it off, loudly
+        run: |
+          set -euo pipefail
+          podman run -d --rm --name gent-talk-skip -p 18081:8080 \
+            -e GENT_TALK_DISCORD_BOT_TOKEN=not-a-real-token \
+            -e GENT_TALK_READ_TOKEN=ci-read-token-0000000000000 \
+            -e GENT_TALK_WRITE_TOKEN=ci-write-token-000000000000 \
+            -e "GENT_TALK_CHANNELS=424242:ci channel:rw" \
+            -e GENT_TALK_SKIP_STARTUP_PROBE=1 \
+            gent-talk:ci
+          for _ in $(seq 1 30); do
+            if curl -fsS localhost:18081/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          curl -fsS localhost:18081/healthz
+          # A skip that says nothing is the same silent start the probe was added to remove.
+          podman logs gent-talk-skip 2>&1 | grep -qi "SKIPPING the startup channel probe" \
+            || { echo "the skip was not announced" >&2; podman logs gent-talk-skip; exit 1; }
+          podman stop gent-talk-skip
+
       - name: the running server requires a token
         run: |
           set -euo pipefail

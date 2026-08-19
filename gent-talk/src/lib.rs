@@ -22,6 +22,7 @@ pub mod http;
 pub mod mcp;
 pub mod model;
 pub mod ops;
+pub mod probe;
 pub mod retrieval;
 pub mod state;
 pub mod summary;

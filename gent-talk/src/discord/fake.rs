@@ -5,7 +5,17 @@
 //! written against it exercises the same refusals and the same oldest-first normalization that
 //! production code takes. The binary never constructs one unless `--fake-discord` is passed, and
 //! that flag logs a warning on every startup.
+//!
+//! # It must be able to say no
+//!
+//! A fake that answers every fetch with an empty success cannot fail a reachability check, so any
+//! check written against it would be self-certifying — green here and worth nothing about the real
+//! client. So this fake tracks which channels it actually *has*: a channel is known once it has
+//! been seeded or explicitly registered, and a fetch or post aimed at any other id answers the way
+//! Discord answers for a channel a bot cannot see — HTTP 404, `Unknown Channel`, code 10003. That
+//! is what makes [`crate::probe`] a real check when it runs against this fake.
 
+use std::collections::BTreeSet;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -33,6 +43,8 @@ pub struct FakeDiscord {
 
 #[derive(Debug, Default)]
 struct State {
+    known: BTreeSet<ChannelId>,
+    fetches: usize,
     messages: Vec<Message>,
     posted: Vec<PostedMessage>,
     next_id: u64,
@@ -46,9 +58,20 @@ impl FakeDiscord {
         Self::default()
     }
 
-    /// Seed a message into a channel. Returns its assigned snowflake.
+    /// Declare that this fake has `channel`, without putting anything in it.
+    ///
+    /// The counterpart of a real bot having been invited to a channel that happens to be empty.
+    /// Anything not registered — and not seeded — is answered exactly as Discord answers for a
+    /// channel a bot cannot see.
+    pub fn register_channel(&self, channel: &ChannelId) {
+        self.lock().known.insert(channel.clone());
+    }
+
+    /// Seed a message into a channel, registering the channel as a side effect. Returns its
+    /// assigned snowflake.
     pub fn seed(&self, channel: &ChannelId, author: &str, content: &str) -> MessageId {
         let mut state = self.lock();
+        state.known.insert(channel.clone());
         state.next_id += 1;
         let seq = state.next_id;
         // Start well above 0 so ids are snowflake-shaped and exercise numeric ordering.
@@ -69,6 +92,15 @@ impl FakeDiscord {
         self.lock().fail_with = Some(detail.to_owned());
     }
 
+    /// How many reads this fake has been asked for.
+    ///
+    /// Lets a test prove a read did *not* happen — "the probe was skipped" is otherwise
+    /// indistinguishable from "the probe ran and happened to pass".
+    #[must_use]
+    pub fn fetch_count(&self) -> usize {
+        self.lock().fetches
+    }
+
     /// Everything that has been posted through this fake, in order.
     #[must_use]
     pub fn posted(&self) -> Vec<PostedMessage> {
@@ -84,6 +116,18 @@ impl FakeDiscord {
     fn take_failure(&self) -> Option<DiscordError> {
         self.lock().fail_with.take().map(DiscordError::Transport)
     }
+
+    /// Discord's own answer for a channel this bot cannot see, byte for byte in shape, so that
+    /// [`crate::probe`] classifies it through exactly the code path a live 404 takes.
+    fn unknown_channel(&self, channel: &ChannelId) -> Option<DiscordError> {
+        if self.lock().known.contains(channel) {
+            return None;
+        }
+        Some(DiscordError::Status {
+            status: 404,
+            body: r#"{"message": "Unknown Channel", "code": 10003}"#.to_owned(),
+        })
+    }
 }
 
 #[async_trait]
@@ -93,8 +137,12 @@ impl DiscordClient for FakeDiscord {
         channel: &ChannelId,
         limit: u16,
     ) -> Result<Vec<Message>, DiscordError> {
+        self.lock().fetches += 1;
         if let Some(failure) = self.take_failure() {
             return Err(failure);
+        }
+        if let Some(unknown) = self.unknown_channel(channel) {
+            return Err(unknown);
         }
         let state = self.lock();
         let mut messages: Vec<Message> = state
@@ -121,7 +169,12 @@ impl DiscordClient for FakeDiscord {
             return Err(failure);
         }
         // Share the real client's validation so a test cannot pass on input Discord would reject.
+        // Validation first, then existence, because Discord also rejects an empty body before it
+        // ever looks the channel up.
         let _ = super::http::post_request(DEFAULT_DISCORD_API_BASE, channel, content, reply_to)?;
+        if let Some(unknown) = self.unknown_channel(channel) {
+            return Err(unknown);
+        }
         let id = self.seed(channel, "gent-talk", content);
         self.lock().posted.push(PostedMessage {
             channel: channel.clone(),
@@ -213,8 +266,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_channel_this_fake_does_not_have_is_refused_the_way_discord_refuses_it() {
+        // The load-bearing property: this fake can FAIL. If it answered an unknown channel with
+        // an empty success, the startup probe would pass against it no matter what, and would be
+        // evidence of nothing.
+        let fake = FakeDiscord::new();
+        let error = fake
+            .fetch_recent(&ChannelId("nope".to_owned()), 1)
+            .await
+            .expect_err("a channel this fake was never given must not read as empty-but-fine");
+        match error {
+            DiscordError::Status { status, body } => {
+                assert_eq!(status, 404);
+                assert!(body.contains("10003"), "{body}");
+            }
+            other => panic!("expected Discord's own 404 shape, got {other:?}"),
+        }
+        assert!(
+            fake.post_message(&ChannelId("nope".to_owned()), "hello", None)
+                .await
+                .is_err(),
+            "posting to a channel this fake does not have must fail too"
+        );
+        // Registering it, with nothing in it, is the empty-but-real channel.
+        fake.register_channel(&ChannelId("nope".to_owned()));
+        assert!(fake
+            .fetch_recent(&ChannelId("nope".to_owned()), 1)
+            .await
+            .expect("a registered channel reads")
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn injected_failures_surface() {
         let fake = FakeDiscord::new();
+        fake.register_channel(&channel());
         fake.fail_next("network down");
         assert!(matches!(
             fake.fetch_recent(&channel(), 10).await,
