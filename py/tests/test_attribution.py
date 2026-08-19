@@ -4,12 +4,17 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from safe_ci_dag_runner.attribution import (
+    DEFAULT_LOG_MAX_BYTES,
+    TRUNCATION_MARKER,
     Culprit,
     ProcessObservation,
     RunEvidence,
     StepStream,
     bind_process_tests,
+    log_max_bytes,
     recognize,
 )
 
@@ -107,3 +112,82 @@ def test_evidence_rejects_overlong_log_name(tmp_path: Path) -> None:
     evidence = RunEvidence.open(tmp_path / "evidence")
     assert evidence is not None
     assert evidence.open_step_log("/" * 100) is None
+
+
+def test_step_log_is_bounded_and_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A capped step log must be truncated EXACTLY, marked, and journaled.
+
+    The marker and journal record are the point. A log that stops early without saying so is
+    a silently incomplete evidence file, and a later reader cannot distinguish "the step
+    printed nothing more" from "we stopped writing" -- which is worse than no evidence at all.
+    """
+    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", "100")
+    directory = tmp_path / "evidence"
+    evidence = RunEvidence.open(directory)
+    assert evidence is not None
+    stream = StepStream("g.j", evidence)
+    stream.ingest(b"A" * 5000)
+
+    log = (directory / "g.j.log").read_bytes()
+    # EXACT: 100 payload bytes, not "the chunk that crossed 100". A ceiling that depends on
+    # the reader's buffer size would differ between the two engines and break `make cross`.
+    assert log[:100] == b"A" * 100
+    assert log == b"A" * 100 + TRUNCATION_MARKER.encode()
+    events = [
+        json.loads(line)
+        for line in (directory / "journal.jsonl").read_text().splitlines()
+    ]
+    truncations = [e for e in events if e["event"] == "step_log_truncated"]
+    assert len(truncations) == 1
+    assert truncations[0]["step"] == "g.j" and truncations[0]["limit_bytes"] == "100"
+
+    # Announced ONCE, however many further chunks arrive.
+    stream.ingest(b"B" * 5000)
+    assert (directory / "g.j.log").read_bytes() == log
+    events = [
+        json.loads(line)
+        for line in (directory / "journal.jsonl").read_text().splitlines()
+    ]
+    assert len([e for e in events if e["event"] == "step_log_truncated"]) == 1
+
+
+def test_classification_survives_a_truncated_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bounding the DISK must not cost the attribution the disk was there to support."""
+    monkeypatch.setenv("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", "10")
+    directory = tmp_path / "evidence"
+    evidence = RunEvidence.open(directory)
+    assert evidence is not None
+    stream = StepStream("g.j", evidence)
+    stream.ingest(b"A" * 500 + b"\n")
+    stream.ingest(b"test mymod::mytest ... ")
+
+    events = [
+        json.loads(line)
+        for line in (directory / "journal.jsonl").read_text().splitlines()
+    ]
+    kinds = [e["event"] for e in events]
+    assert "step_log_truncated" in kinds
+    starts = [e for e in events if e["event"] == "test_start"]
+    assert [e["test"] for e in starts] == ["mymod::mytest"], (
+        "the hung test must still be named after the log stopped being written"
+    )
+
+
+def test_log_ceiling_env_parsing() -> None:
+    """`0` means unlimited; garbage is REPORTED and falls back, never silently unlimited."""
+    saved = os.environ.pop("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", None)
+    try:
+        assert log_max_bytes() == DEFAULT_LOG_MAX_BYTES
+        os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = "0"
+        assert log_max_bytes() is None
+        os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = "4096"
+        assert log_max_bytes() == 4096
+        os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = "  8192  "
+        assert log_max_bytes() == 8192
+        for bad in ("banana", "-1", "1.5"):
+            os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = bad
+            assert log_max_bytes() == DEFAULT_LOG_MAX_BYTES, f"{bad} must fall back, not unlimit"
+    finally:
+        os.environ.pop("SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES", None)
+        if saved is not None:
+            os.environ["SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES"] = saved
