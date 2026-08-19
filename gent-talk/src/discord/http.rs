@@ -10,12 +10,45 @@ use serde_json::json;
 
 use super::{DiscordClient, DiscordError};
 use crate::config::{DiscordConfig, Secret};
-use crate::model::{ChannelId, Message, MessageId};
+use crate::model::{ChannelId, Message, MessageId, UserId};
 
 /// Discord's own ceiling on `GET /channels/{id}/messages?limit=`.
 pub const DISCORD_MAX_LIMIT: u16 = 100;
 /// Discord's ceiling on a single message body.
 pub const DISCORD_MAX_CONTENT_LEN: usize = 2000;
+/// Discord's ceiling on `allowed_mentions.users`.
+pub const DISCORD_MAX_MENTIONED_USERS: usize = 100;
+
+/// The user snowflakes a message body mentions, in order of first appearance, without duplicates.
+///
+/// This reads Discord's own mention syntax — `<@123>`, and `<@!123>` for the legacy nickname form
+/// — and nothing else. A bare `@name` is not a mention to Discord and is not treated as one here.
+#[must_use]
+pub fn mentioned_user_ids(content: &str) -> Vec<UserId> {
+    let mut found: Vec<UserId> = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find("<@") {
+        let after = &rest[start + 2..];
+        // Skip the legacy nickname marker, and refuse `<@&…>`, which is a ROLE mention: allowing
+        // one through here would page a whole team.
+        let digits_start = usize::from(after.starts_with('!'));
+        let body = &after[digits_start..];
+        let end = body
+            .find('>')
+            .filter(|end| *end > 0 && body[..*end].chars().all(|c| c.is_ascii_digit()));
+        match end {
+            Some(end) => {
+                let id = UserId(body[..end].to_owned());
+                if !found.contains(&id) {
+                    found.push(id);
+                }
+                rest = &body[end + 1..];
+            }
+            None => rest = after,
+        }
+    }
+    found
+}
 
 /// A request, described independently of any HTTP client.
 #[derive(Debug, PartialEq, Eq)]
@@ -73,10 +106,22 @@ pub fn post_request(
             content.chars().count()
         )));
     }
+    // Mentions, exactly and only the ones the text itself names.
+    //
+    // `parse: []` disables Discord's own scan of the body, which is what keeps a model that
+    // repeated "@everyone" back from paging the whole server. But it disables user pings too, so
+    // an empty `allowed_mentions` would make `<@123>` render as a mention and notify nobody —
+    // silently, which is the worst of both. Listing the ids found in the body restores the ping
+    // for those users while leaving @everyone, @here, and roles unreachable.
+    let mut mentioned = mentioned_user_ids(content);
+    // Discord's own ceiling; over it the whole request is rejected, so cut here instead.
+    mentioned.truncate(DISCORD_MAX_MENTIONED_USERS);
     let mut body = json!({
         "content": content,
-        // Never let a posted message ping everyone because a model repeated "@everyone" back.
-        "allowed_mentions": { "parse": [] },
+        "allowed_mentions": {
+            "parse": [],
+            "users": mentioned.iter().map(UserId::as_str).collect::<Vec<_>>(),
+        },
     });
     if let Some(target) = reply_to {
         body["message_reference"] = json!({ "message_id": target.as_str() });
@@ -113,10 +158,15 @@ pub fn parse_message(value: &serde_json::Value) -> Result<Message, DiscordError>
         .and_then(serde_json::Value::as_str)
         .or_else(|| author.get("username").and_then(serde_json::Value::as_str))
         .ok_or_else(|| DiscordError::Shape("author has no username".to_owned()))?;
+    let author_id = author
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| DiscordError::Shape("author has no id".to_owned()))?;
     Ok(Message {
         id: MessageId(field("id")?),
         channel_id: ChannelId(field("channel_id")?),
         author: name.to_owned(),
+        author_id: UserId(author_id.to_owned()),
         author_is_bot: author
             .get("bot")
             .and_then(serde_json::Value::as_bool)
@@ -296,10 +346,98 @@ mod tests {
             serde_json::json!([]),
             "a posted message must never be able to ping the server"
         );
+        assert_eq!(
+            body["allowed_mentions"]["users"],
+            serde_json::json!([]),
+            "a message that mentions nobody must not authorize any ping"
+        );
         assert!(body.get("message_reference").is_none());
         assert_eq!(
             request.url,
             "https://discord.com/api/v10/channels/123/messages"
+        );
+    }
+
+    #[test]
+    fn a_user_mention_in_the_body_is_authorized_so_it_actually_notifies() {
+        // The end of the feature: an id read off a message, written back as `<@id>`, has to ping.
+        let request = post_request(
+            BASE,
+            &channel(),
+            "<@1532416065114607829> the mac runner is back",
+            None,
+        )
+        .expect("valid post");
+        let body = request.body.expect("post has a body");
+        assert_eq!(
+            body["allowed_mentions"]["users"],
+            serde_json::json!(["1532416065114607829"]),
+            "the mentioned user must be authorized, or the ping is silently dropped"
+        );
+        assert_eq!(
+            body["allowed_mentions"]["parse"],
+            serde_json::json!([]),
+            "authorizing one user must not re-enable Discord's own scan of the body"
+        );
+    }
+
+    #[test]
+    fn everyone_here_and_role_mentions_stay_unreachable() {
+        let request = post_request(
+            BASE,
+            &channel(),
+            "@everyone @here <@&999888777> deploy is green",
+            None,
+        )
+        .expect("valid post");
+        let body = request.body.expect("post has a body");
+        assert_eq!(
+            body["allowed_mentions"]["parse"],
+            serde_json::json!([]),
+            "the whole-server ping must stay off"
+        );
+        assert_eq!(
+            body["allowed_mentions"]["users"],
+            serde_json::json!([]),
+            "a ROLE mention must not be smuggled through the user allowlist"
+        );
+    }
+
+    #[test]
+    fn mention_scanning_reads_discord_syntax_and_nothing_else() {
+        assert_eq!(mentioned_user_ids("hello @coding_agent"), vec![]);
+        assert_eq!(
+            mentioned_user_ids("<@1> and <@!2> and <@1> again"),
+            vec![UserId("1".to_owned()), UserId("2".to_owned())],
+            "the legacy nickname form counts, and duplicates are not repeated"
+        );
+        assert_eq!(
+            mentioned_user_ids("<@notanid> <@> <@12x> <@#5>"),
+            vec![],
+            "only decimal snowflakes are mentions"
+        );
+        assert_eq!(
+            mentioned_user_ids("<@&7>"),
+            vec![],
+            "a role mention is not a user mention"
+        );
+    }
+
+    #[test]
+    fn the_mention_list_is_capped_at_discords_own_ceiling() {
+        // Over the ceiling Discord rejects the whole message, so the post would fail entirely.
+        let body_text = (0..DISCORD_MAX_MENTIONED_USERS + 20)
+            .map(|i| format!("<@{}>", 1000 + i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let request = post_request(BASE, &channel(), &body_text, None).expect("valid post");
+        let body = request.body.expect("post has a body");
+        assert_eq!(
+            body["allowed_mentions"]["users"]
+                .as_array()
+                .expect("a list")
+                .len(),
+            DISCORD_MAX_MENTIONED_USERS
         );
     }
 
@@ -334,14 +472,14 @@ mod tests {
             "channel_id": "123",
             "content": "second",
             "timestamp": "2026-08-18T12:01:00.000000+00:00",
-            "author": { "username": "coder-bot", "global_name": null, "bot": true }
+            "author": { "id": "300000000000000003", "username": "coder-bot", "global_name": null, "bot": true }
           },
           {
             "id": "1000000000000000001",
             "channel_id": "123",
             "content": "first",
             "timestamp": "2026-08-18T12:00:00.000000+00:00",
-            "author": { "username": "rrnewton", "global_name": "Ryan", "bot": false }
+            "author": { "id": "400000000000000004", "username": "rrnewton", "global_name": "Ryan", "bot": false }
           }
         ])
     }
@@ -360,13 +498,34 @@ mod tests {
         );
         assert!(messages[1].author_is_bot);
         assert_eq!(messages[1].channel_id.as_str(), "123");
+        assert_eq!(
+            messages[0].author_id.as_str(),
+            "400000000000000004",
+            "the author snowflake must survive the mapping; it is what a mention is built from"
+        );
+        assert_eq!(
+            messages[1].author_id.as_str(),
+            "300000000000000003",
+            "a BOT author carries an id too: addressing another agent is a legitimate reply"
+        );
+    }
+
+    #[test]
+    fn a_message_whose_author_has_no_id_fails_loudly() {
+        // Defaulting to an empty id would mint `<@>`, which is not a mention and not an error
+        // either — it would just quietly fail to notify anyone.
+        let value = serde_json::json!({
+            "id": "5", "channel_id": "123", "timestamp": "t",
+            "author": { "username": "u" }
+        });
+        assert!(matches!(parse_message(&value), Err(DiscordError::Shape(_))));
     }
 
     #[test]
     fn a_message_with_no_content_is_kept_not_dropped() {
         let value = serde_json::json!({
             "id": "5", "channel_id": "123", "timestamp": "t",
-            "author": { "username": "u" }
+            "author": { "id": "500000000000000005", "username": "u" }
         });
         let message = parse_message(&value).expect("attachment-only messages still parse");
         assert_eq!(message.content, "");

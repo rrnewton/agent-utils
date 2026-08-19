@@ -15,14 +15,14 @@
 //! Discord answers for a channel a bot cannot see — HTTP 404, `Unknown Channel`, code 10003. That
 //! is what makes [`crate::probe`] a real check when it runs against this fake.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 
 use super::{DiscordClient, DiscordError};
 use crate::config::DEFAULT_DISCORD_API_BASE;
-use crate::model::{sort_oldest_first, ChannelId, Message, MessageId};
+use crate::model::{sort_oldest_first, ChannelId, Message, MessageId, UserId};
 
 /// A message this fake was asked to post.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,6 +48,10 @@ struct State {
     messages: Vec<Message>,
     posted: Vec<PostedMessage>,
     next_id: u64,
+    /// Author display name -> snowflake, so one author keeps one id and two authors never share
+    /// one. A fake that handed every author the same id would let a test pass while the server
+    /// mentioned the wrong person.
+    authors: BTreeMap<String, UserId>,
     fail_with: Option<String>,
 }
 
@@ -76,15 +80,32 @@ impl FakeDiscord {
         let seq = state.next_id;
         // Start well above 0 so ids are snowflake-shaped and exercise numeric ordering.
         let id = MessageId(format!("{}", 1_000_000_000_000_000_000_u64 + seq));
+        let next_author = 2_000_000_000_000_000_000_u64 + state.authors.len() as u64 + 1;
+        let author_id = state
+            .authors
+            .entry(author.to_owned())
+            .or_insert_with(|| UserId(next_author.to_string()))
+            .clone();
         state.messages.push(Message {
             id: id.clone(),
             channel_id: channel.clone(),
             author: author.to_owned(),
+            author_id,
             author_is_bot: author.ends_with("-bot"),
             timestamp: format!("2026-08-18T12:{:02}:00+00:00", seq % 60),
             content: content.to_owned(),
         });
         id
+    }
+
+    /// The snowflake this fake assigned to `author`, if it has ever seen them speak.
+    ///
+    /// Deliberately NOT a general directory: a name this fake has never seen has no id, exactly
+    /// as a real caller can only mention someone who has actually posted in an allowlisted
+    /// channel.
+    #[must_use]
+    pub fn author_id(&self, author: &str) -> Option<UserId> {
+        self.lock().authors.get(author).cloned()
     }
 
     /// Make the next operation fail, so error handling can be tested.
@@ -295,6 +316,48 @@ mod tests {
             .await
             .expect("a registered channel reads")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_author_carries_a_distinct_snowflake_that_survives_a_fetch() {
+        let fake = FakeDiscord::new();
+        fake.seed(&channel(), "codex-eng", "one");
+        fake.seed(&channel(), "coder-bot", "two");
+        fake.seed(&channel(), "codex-eng", "three");
+        let messages = fake.fetch_recent(&channel(), 100).await.expect("fetch");
+        assert_eq!(
+            messages[0].author_id, messages[2].author_id,
+            "the same author must keep the same id"
+        );
+        assert_ne!(
+            messages[0].author_id, messages[1].author_id,
+            "two authors sharing one id would let a test pass while mentioning the wrong person"
+        );
+        assert!(
+            messages[1].author_is_bot,
+            "the bot author is still a bot; it just also has an id"
+        );
+        assert_eq!(
+            fake.author_id("codex-eng"),
+            Some(messages[0].author_id.clone())
+        );
+        assert_eq!(
+            fake.author_id("nobody-here"),
+            None,
+            "this fake is not a user directory: it only knows who has spoken"
+        );
+        // Found by mutation: handing every author its own MESSAGE id kept this fake internally
+        // consistent, so every test still passed while user ids and message ids shared one
+        // namespace. A server that confused the two would then have been certified by the
+        // fixture. The two spaces must not overlap.
+        let message_ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+        for message in &messages {
+            assert!(
+                !message_ids.contains(&message.author_id.as_str()),
+                "author id {} is also a message id: the fake's id spaces overlap",
+                message.author_id
+            );
+        }
     }
 
     #[tokio::test]

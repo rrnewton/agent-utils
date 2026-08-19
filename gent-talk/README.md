@@ -346,6 +346,24 @@ not, and neither reveals anything about the configuration.
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
+**Every message this API renders carries `author_id` next to `author`** — in the scrollback, in
+one-message reads, in `resolve` results, in the posted message echoed back by `reply`, and as a
+field on every digest entry. That is what makes a real Discord mention possible: `@coding_agent`
+typed as words notifies nobody, and only `<@1532416065114607829>` does. Bots have ids too, and
+they are included, because addressing another coding agent is a legitimate reply.
+
+There is deliberately **no user-lookup tool**, and the reason is recorded in `src/model.rs`
+beside the field. First, the id arrives ATTACHED to the message being replied to, so there is no
+lookup step, nothing to search for, and nothing for a model to hallucinate — a wrong snowflake
+pings a stranger. Second, it bounds the capability: the only ids that ever exist here belong to
+people and bots that have actually spoken in an allowlisted channel, whereas a lookup tool would
+let the voice agent ping anyone in the server.
+
+`POST .../reply` authorizes exactly the users the text itself mentions
+(`allowed_mentions: {parse: [], users: [...]}`). `@everyone`, `@here`, and role mentions remain
+unreachable, and an empty `allowed_mentions` — which is what this used to send — would have made
+`<@…>` render as a mention that silently notified nobody.
+
 `resolve` takes `{"query": "...", "limit": 50, "max_alternatives": 3}` and answers with `best`
 (the full message, or `null`), `alternatives`, and `ambiguous`. **A query that matches nothing
 returns `best: null`** rather than the newest message wearing a confident label; a voice interface
@@ -455,6 +473,11 @@ shape.
 **A read credential is not shown `post_reply` at all,** and is refused with HTTP `403` plus
 JSON-RPC `-32001` if it calls it anyway. Hiding and enforcing are separate on purpose: hiding a
 tool is never the thing that keeps it from running.
+
+**Every message a tool renders carries its author's mention token**, written as
+`[id | time | author <@author id>]`, so a model that wants to notify someone copies a working
+token instead of assembling one — and can only ever mention someone who has posted in an
+allowlisted channel. See "The API" above for why there is no lookup tool.
 
 **Every read tool's text output is fenced.** Channel content comes back inside the
 `src/untrusted.rs` fence, with the data-not-instructions notice attached, with any forged fence

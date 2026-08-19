@@ -182,7 +182,7 @@ fn tokenize(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChannelId, MessageId};
+    use crate::model::{ChannelId, MessageId, UserId};
 
     fn messages(bodies: &[(&str, &str)]) -> Vec<Message> {
         bodies
@@ -192,6 +192,7 @@ mod tests {
                 id: MessageId(format!("{}", 1_000_000_000_000_000_000_u64 + i as u64)),
                 channel_id: ChannelId("c".to_owned()),
                 author: (*author).to_owned(),
+                author_id: UserId(format!("{}", 2_000_000_000_000_000_000_u64 + i as u64)),
                 author_is_bot: true,
                 timestamp: format!("2026-08-18T12:{i:02}:00+00:00"),
                 content: (*content).to_owned(),

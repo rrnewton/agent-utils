@@ -579,3 +579,120 @@ async fn the_rest_api_and_the_mcp_endpoint_agree_about_the_allowlist() {
     assert_eq!(body["result"]["isError"], true, "{body}");
     assert!(tool_text(&body).starts_with("unknown_channel"), "{body}");
 }
+
+/// The voice-agent path in full: every tool result hands the model the author's mention token,
+/// and a reply built from that token is authorized to actually notify them.
+///
+/// The failure this prevents is the one that was reported: the agent wrote `@coding_agent`, which
+/// is plain text in Discord and notifies nobody.
+#[tokio::test]
+async fn every_tool_result_carries_a_usable_mention_and_a_reply_built_from_it_pings() {
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    harness
+        .discord
+        .seed(&channel, "rrnewton", "who has the mac runner");
+    harness.discord.seed(
+        &channel,
+        "coder-bot",
+        "the mac runner went offline mid-deploy",
+    );
+    let bot = harness
+        .discord
+        .author_id("coder-bot")
+        .expect("the fake assigned the bot an id");
+    let mention = bot.mention();
+    assert!(
+        mention.starts_with("<@") && mention.ends_with('>'),
+        "the fixture's own mention is malformed: {mention}"
+    );
+
+    let (_status, response) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call("digest_channel", json!({ "channel_id": WRITE_CHANNEL })),
+    )
+    .await;
+    let digest = tool_text(&response);
+    assert!(
+        digest.contains(&format!("coder-bot {mention}")),
+        "the digest must put the id beside the name it belongs to: {digest}"
+    );
+
+    let (_status, response) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call(
+            "find_message",
+            json!({ "channel_id": WRITE_CHANNEL, "query": "the mac runner offline" }),
+        ),
+    )
+    .await;
+    let found = tool_text(&response);
+    assert!(
+        found.contains(&format!("coder-bot {mention}")),
+        "find_message must carry the mention of the author it found: {found}"
+    );
+
+    // The id of the message to read, taken from the digest rather than assumed.
+    let message_id = digest
+        .lines()
+        .find(|line| line.contains("coder-bot"))
+        .and_then(|line| line.trim_start_matches('[').split(" | ").next())
+        .expect("the digest names the message id")
+        .to_owned();
+    let (_status, response) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call(
+            "read_message",
+            json!({ "channel_id": WRITE_CHANNEL, "message_id": message_id }),
+        ),
+    )
+    .await;
+    let read = tool_text(&response);
+    assert!(
+        read.contains(&format!("coder-bot {mention}")),
+        "read_message must carry the mention too: {read}"
+    );
+
+    // ...and the end of the loop: posting that token back reaches Discord unchanged.
+    let (_status, response) = rpc(
+        &harness,
+        Some(WRITE_TOKEN),
+        call(
+            "post_reply",
+            json!({
+                "channel_id": WRITE_CHANNEL,
+                "text": format!("{mention} the runner is back"),
+                "reply_to": message_id,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        response["result"]["isError"], false,
+        "the post failed: {response}"
+    );
+    let posted = harness.discord.posted();
+    assert_eq!(posted.len(), 1);
+    assert!(
+        posted[0].content.starts_with(&mention),
+        "the mention must reach Discord verbatim: {}",
+        posted[0].content
+    );
+    // The request body Discord would receive must authorize exactly that user and nobody else.
+    let request = gent_talk::discord::http::post_request(
+        "https://discord.com/api/v10",
+        &channel,
+        &posted[0].content,
+        None,
+    )
+    .expect("valid post");
+    let body = request.body.expect("a body");
+    assert_eq!(
+        body["allowed_mentions"]["users"],
+        json!([bot.as_str()]),
+        "the ping the whole feature exists for was not authorized: {body}"
+    );
+}

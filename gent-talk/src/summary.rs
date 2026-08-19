@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 
-use crate::model::Message;
+use crate::model::{Message, UserId};
 
 /// Default width of a spoken digest line.
 pub const DEFAULT_SUMMARY_CHARS: usize = 160;
@@ -20,6 +20,9 @@ pub struct DigestEntry {
     pub id: String,
     /// Author display name.
     pub author: String,
+    /// Author snowflake, so a caller can mention them with `<@id>` without a lookup step.
+    /// See [`crate::model::Message::author_id`] for why this rides along instead.
+    pub author_id: UserId,
     /// ISO-8601 timestamp as Discord reported it.
     pub timestamp: String,
     /// One speakable line. UNTRUSTED text, condensed.
@@ -50,6 +53,7 @@ pub fn digest_entry(message: &Message, max_chars: usize) -> DigestEntry {
     DigestEntry {
         id: message.id.0.clone(),
         author: message.author.clone(),
+        author_id: message.author_id.clone(),
         timestamp: message.timestamp.clone(),
         truncated: summary.ends_with('…'),
         summary,
@@ -146,6 +150,7 @@ mod tests {
             id: MessageId("1000000000000000001".to_owned()),
             channel_id: ChannelId("c".to_owned()),
             author: "coder-bot".to_owned(),
+            author_id: UserId("2000000000000000001".to_owned()),
             author_is_bot: true,
             timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
             content: content.to_owned(),
@@ -221,6 +226,11 @@ mod tests {
         assert_eq!(entry.full_length, long.chars().count());
         assert_eq!(entry.author, "coder-bot");
         assert_eq!(entry.id, "1000000000000000001");
+        assert_eq!(
+            entry.author_id.as_str(),
+            "2000000000000000001",
+            "a digest line must carry the id, or replying by mention needs a lookup"
+        );
 
         let short = digest_entry(&message("done"), 40);
         assert!(!short.truncated);

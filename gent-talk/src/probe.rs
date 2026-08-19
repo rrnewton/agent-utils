@@ -639,6 +639,7 @@ mod tests {
                     id: crate::model::MessageId("1".to_owned()),
                     channel_id: channel.clone(),
                     author: "codex-eng".to_owned(),
+                    author_id: crate::model::UserId("2000000000000000001".to_owned()),
                     author_is_bot: true,
                     timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
                     content: String::new(),
