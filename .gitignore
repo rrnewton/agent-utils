@@ -50,3 +50,12 @@ ignored/
 # --- editor / os ---
 *.swp
 .DS_Store
+
+# gent-talk local credentials and scratch — never commit these.
+# token1/token2 are the read/write bearer tokens; .gent-talk.env holds the
+# Discord bot token and the ElevenLabs API key.
+gent-talk/.gent-talk.env
+gent-talk/token1
+gent-talk/token2
+gent-talk/cloudflared.deb
+*~
