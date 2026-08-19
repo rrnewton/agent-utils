@@ -114,6 +114,11 @@ class FakeElement {
     // The transcript is the one element that scrolls; the page pins it to the newest line.
     this.scrollTop = 0;
     this.scrollHeight = 0;
+    // A real browser clamps scrollTop to scrollHeight - clientHeight, so the page cannot ask
+    // "is the reader at the bottom?" without a viewport height. Zero keeps the fixture's
+    // scrollTop === scrollHeight convention meaning "at the bottom"; a test that cares about
+    // being scrolled UP sets it.
+    this.clientHeight = 0;
     this.scrolledIntoView = 0;
   }
 
@@ -1732,8 +1737,121 @@ test("EVERY visit to the channel view opens on the newest message, not just the 
   await page.settle();
 
   assert.equal(page.tab(), "discord");
-  assert.equal(page.el("discord-log").children.length, 2, "the second visit re-fetched the channel");
   assert.equal(area.scrollTop, area.scrollHeight, "the second visit to the channel opened at the top");
+});
+
+// --- keeping the channel view fresh ------------------------------------------------------------
+//
+// The owner opened this view on his phone and was shown a channel HOURS out of date, with nothing
+// on screen admitting it. The load was guarded on the log being empty, so it ran once and never
+// again. These tests are the guard on that never coming back.
+
+/** Count reads of the channel, and let the test change what the next one returns. */
+function countingChannel(page, messages) {
+  page.messages = messages;
+  page.reads = 0;
+  page.channelMessages = async () => {
+    page.reads += 1;
+    return json(200, { channel: CHANNEL, messages: page.messages });
+  };
+}
+
+test("returning to the channel RE-READS it, instead of showing what was true the first time", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, [message({ id: "1", content: "old" })]);
+
+  await page.el("view-switch").click(); // into the channel
+  await page.settle();
+  assert.equal(page.reads, 1);
+
+  await page.el("view-switch").click(); // back to voice
+  await page.settle();
+
+  page.messages = [message({ id: "1", content: "old" }), message({ id: "2", content: "posted while you were away" })];
+  await page.el("view-switch").click(); // and back into the channel
+  await page.settle();
+
+  assert.equal(page.reads, 2, "the channel was not re-read on re-entry — this is the staleness bug");
+  const lines = page.el("discord-log").children;
+  assert.equal(lines.length, 2);
+  assert.match(lines[1].text(), /posted while you were away/);
+});
+
+test("the channel keeps pulling for as long as you are looking at it", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, [message({ id: "1", content: "one" })]);
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.reads, 1);
+
+  page.messages = [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })];
+  assert.equal(page.expireTimers(45000), 1, "no poll was armed after the channel loaded");
+  await page.settle();
+
+  assert.equal(page.reads, 2, "the timer did not re-read the channel");
+  assert.equal(page.el("discord-log").children.length, 2);
+
+  // And it re-arms, so the second poll is not the last one.
+  assert.equal(page.expireTimers(45000), 1, "polling stopped after a single tick");
+});
+
+test("polling stops when the channel is no longer the view you are on", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, [message({ id: "1", content: "one" })]);
+
+  await page.el("view-switch").click();
+  await page.settle();
+  await page.el("view-switch").click(); // back to voice
+  await page.settle();
+
+  const before = page.reads;
+  assert.equal(page.expireTimers(45000), 0, "a poll was left armed after leaving the channel view");
+  await page.settle();
+  assert.equal(page.reads, before, "the channel was read while nobody was looking at it");
+});
+
+test("a background refresh does NOT drag a reader who has scrolled up", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, [message({ id: "1", content: "one" })]);
+  await page.el("view-switch").click();
+  await page.settle();
+
+  const area = page.el("scroll-area");
+  // Reading older messages: a tall channel, parked well above the bottom.
+  area.scrollHeight = 5000;
+  area.clientHeight = 800;
+  area.scrollTop = 1200;
+
+  page.messages = [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })];
+  page.expireTimers(45000);
+  await page.settle();
+
+  assert.equal(page.reads, 2, "the poll did not fire");
+  assert.equal(area.scrollTop, 1200, "a refresh nobody asked for yanked the reader to the bottom");
+});
+
+test("a background refresh DOES follow the newest line for a reader already at the bottom", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, [message({ id: "1", content: "one" })]);
+  await page.el("view-switch").click();
+  await page.settle();
+
+  const area = page.el("scroll-area");
+  area.scrollHeight = 5000;
+  area.clientHeight = 800;
+  area.scrollTop = 4200; // scrollHeight - clientHeight: pinned to the bottom
+
+  page.messages = [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })];
+  page.expireTimers(45000);
+  await page.settle();
+
+  assert.equal(area.scrollTop, area.scrollHeight, "the reader was at the bottom and did not follow");
 });
 
 test("a Discord read that fails reports itself and does NOT hang up on you", async () => {

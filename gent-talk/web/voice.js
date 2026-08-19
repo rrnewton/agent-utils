@@ -1100,21 +1100,94 @@ function discordNode(message) {
   return li;
 }
 
-async function loadDiscord() {
+/**
+ * Was the reader already parked on the newest message?
+ *
+ * A browser clamps scrollTop to scrollHeight - clientHeight, so "at the bottom" is never
+ * scrollTop === scrollHeight however hard `scrollToNewest` pushes. The few pixels of slack
+ * absorb sub-pixel layout.
+ */
+function atNewest(area) {
+  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0) <= 4;
+}
+
+/**
+ * @param {{keepPosition?: boolean}} [options] `keepPosition` marks a refresh the reader did not
+ *   ask for. It must not drag them to the bottom while they are reading older messages — it
+ *   follows the newest line only if that is where they already were.
+ */
+async function loadDiscord(options) {
+  const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
   if (!channel) {
     setStatus("no channel to read — this server has none configured.");
     return;
   }
-  setStatus("fetching the channel…");
-  const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/messages`);
-  const list = el("discord-log");
-  list.replaceChildren();
-  for (const message of payload.messages) {
-    list.append(discordNode(message));
+  if (discordFetchInFlight) return;
+  discordFetchInFlight = true;
+  const area = el("scroll-area");
+  const wasAtNewest = atNewest(area);
+  const previousTop = area.scrollTop;
+  try {
+    if (!keepPosition) {
+      setStatus("fetching the channel…");
+    }
+    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/messages`);
+    const list = el("discord-log");
+    list.replaceChildren();
+    for (const message of payload.messages) {
+      list.append(discordNode(message));
+    }
+    setStatus(`${payload.messages.length} message(s) from ${payload.channel.label}`);
+    if (keepPosition && !wasAtNewest) {
+      area.scrollTop = previousTop;
+    } else {
+      scrollToNewest();
+    }
+  } finally {
+    discordFetchInFlight = false;
   }
-  setStatus(`${payload.messages.length} message(s) from ${payload.channel.label}`);
-  scrollToNewest();
+}
+
+// --- keeping the channel view fresh -----------------------------------------------------------
+//
+// The channel used to be fetched exactly ONCE, on the first switch into the view, because the
+// load was guarded on the log being empty. Everything after that was whatever had been true the
+// first time you looked. On the owner's phone that meant a view hours out of date, presented with
+// no hint that it was stale — which is worse than an empty view, because it reads as current.
+//
+// There is no webhook and no push path yet (#44 live-push), so until there is, the view PULLS:
+// once on every entry, and then on a timer for as long as it is the view being looked at.
+
+const DISCORD_POLL_MS = 45000;
+let discordPollTimer = null;
+let discordFetchInFlight = false;
+
+function stopDiscordPolling() {
+  if (discordPollTimer !== null) {
+    clearTimeout(discordPollTimer);
+    discordPollTimer = null;
+  }
+}
+
+/**
+ * Self-rescheduling rather than setInterval, for two reasons: a slow fetch can never stack a
+ * second one up behind it, and the next delay is armed only once the previous poll has actually
+ * finished. Polling stops the moment the channel stops being the visible view, so a voice call
+ * is never sharing its network with a background refresh nobody is looking at.
+ */
+function scheduleDiscordPoll() {
+  stopDiscordPolling();
+  discordPollTimer = setTimeout(() => {
+    discordPollTimer = null;
+    if (currentView !== "discord") return;
+    guardQuietly(async () => {
+      await loadDiscord({ keepPosition: true });
+      if (currentView === "discord") {
+        scheduleDiscordPoll();
+      }
+    })();
+  }, DISCORD_POLL_MS);
 }
 
 // --- sign-in ---------------------------------------------------------------------------------
@@ -1256,9 +1329,19 @@ el("close-settings").addEventListener("click", () => showScreen(screenBeforeSett
 el("view-switch").addEventListener("click", () => {
   const next = currentView === "voice" ? "discord" : "voice";
   showView(next);
-  if (next === "discord" && el("discord-log").children.length === 0) {
-    guardQuietly(loadDiscord)();
+  if (next !== "discord") {
+    stopDiscordPolling();
+    return;
   }
+  // Deliberately NOT guarded on the log being empty. That guard is what made the view stale:
+  // after the first load it never fetched again, so switching back showed you the channel as it
+  // had been, with nothing on screen admitting it.
+  guardQuietly(async () => {
+    await loadDiscord();
+    if (currentView === "discord") {
+      scheduleDiscordPoll();
+    }
+  })();
 });
 el("refresh-discord").addEventListener("click", guardQuietly(loadDiscord));
 el("discord-channel").addEventListener("change", guardQuietly(loadDiscord));
