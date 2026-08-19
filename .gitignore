@@ -65,3 +65,7 @@ gent-talk/token1
 gent-talk/token2
 gent-talk/cloudflared.deb
 *~
+
+# Agent worktrees created for parallel work. Never tracked: they are checkouts of
+# this same repository, and committing one would nest the repo inside itself.
+/.claude/
