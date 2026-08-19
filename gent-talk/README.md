@@ -377,6 +377,17 @@ an account key and good for about fifteen minutes. `GET /api/v1/signed-url` does
 `/voice` is a plain page — no build step, no CDN, no vendor bundle — that fetches one and opens the
 conversation over a WebSocket.
 
+**Failures are shown in the page, not in the console.** This route answers with a real taxonomy —
+`503 elevenlabs_not_configured` names the exact setting that is unset, `502 elevenlabs_error`
+carries the vendor's status and message, including things only the vendor knows, such as an API
+key that lacks the `convai_write` permission — and `/voice` renders that sentence verbatim in an
+alert panel. Nobody should have to open dev tools to learn a key is missing a scope. The page
+redacts its own stored token before displaying anything, so an error body that echoes the request
+back cannot put a credential on screen; `tests/js/voice_page.test.mjs` asserts both. Saving the
+token changes the **button** — "Saving…", then "Saved ✓" — and the line beneath states what is
+stored right now, because a success banner over an unchanged button leaves it ambiguous whether
+the click even registered.
+
 ```jsonc
 // GET /api/v1/signed-url, with the WRITE-scope bearer token
 {
@@ -766,8 +777,13 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-141 tests: unit tests beside each module, end-to-end tests in `tests/api.rs` that drive the real
-router against the in-memory Discord, and `tests/mcp.rs` doing the same for the MCP endpoint. The fake is not a yes-man — it shares the real client's
+213 Rust tests plus a 10-test suite for the `/voice` page: unit tests beside each module,
+end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
+`tests/mcp.rs` doing the same for the MCP endpoint. The page suite
+(`tests/js/voice_page.test.mjs`) executes `web/voice.js` itself against a small strict DOM whose
+element set is read out of `web/voice.html`, so a script reaching for an element the page does not
+have fails there rather than silently at the roadside; `cargo test` runs it through
+`tests/voice_page.rs`, which FAILS rather than skips when Node is absent. The fake is not a yes-man — it shares the real client's
 request validation and ordering contract, and it records what was posted, so the API tests assert
 the actual channel, content, and reply target that reached it. A handler that dropped a post,
 posted to the wrong channel, or ignored the scope split fails those tests. The parts of the live
@@ -800,6 +816,7 @@ src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp
 src/agent_backend.rs  the slow-path seam
 src/http/             router, handlers, and the access-log middleware
 web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)
+tests/js/             the /voice page's own suite, run from cargo test via tests/voice_page.rs
 scripts/verify-deployment.sh   the one-command deployment check, local or public
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```

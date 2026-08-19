@@ -134,6 +134,24 @@ button.secondary {
   margin: 0.5rem 0;
 }
 
+/* An error the page must not be able to hide: full width, its own colour, and never `muted`. */
+.panel.error {
+  border-color: var(--warn);
+  color: var(--warn);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+button.ok {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--accent);
+}
+
+button[disabled] {
+  opacity: 0.6;
+}
+
 .messages {
   list-style: none;
   margin: 0.75rem 0 0;
