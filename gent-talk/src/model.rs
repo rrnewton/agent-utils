@@ -43,6 +43,36 @@ impl MessageId {
     }
 }
 
+/// A Discord user snowflake, as a string.
+///
+/// Kept distinct from [`MessageId`] and [`ChannelId`] so the three cannot be passed for one
+/// another: they are all decimal snowflakes, and a wrong one is silently plausible.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct UserId(pub String);
+
+impl UserId {
+    /// Borrow the underlying snowflake text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Render the Discord mention that actually notifies this user: `<@123…>`.
+    ///
+    /// Discord notifies on this exact syntax and on nothing else. Writing `@display-name` is plain
+    /// text — it renders as words and pings nobody, which is the failure this exists to prevent.
+    #[must_use]
+    pub fn mention(&self) -> String {
+        format!("<@{}>", self.0)
+    }
+}
+
+impl std::fmt::Display for UserId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// One message as the rest of the server sees it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
@@ -52,6 +82,23 @@ pub struct Message {
     pub channel_id: ChannelId,
     /// Display name of the author, as reported by Discord.
     pub author: String,
+    /// Snowflake of the author.
+    ///
+    /// This travels with every rendered message ON PURPOSE, and the alternative — a
+    /// "look up this display name" tool — was rejected. Two reasons, in order of importance:
+    ///
+    /// 1. **No lookup step, so nothing to guess.** The id arrives ATTACHED to the very message
+    ///    being replied to, so a caller that wants to mention its author already holds the exact
+    ///    snowflake. A lookup tool would put a fuzzy name match between the agent and a real
+    ///    notification, and a hallucinated id pings a stranger.
+    /// 2. **It bounds who can be mentioned.** The only ids a caller ever sees are those of people
+    ///    and bots that have actually spoken in an allowlisted channel. A general user-lookup tool
+    ///    would let the agent ping anyone in the server, which is a strictly larger capability
+    ///    than this project wants to hand a voice model.
+    ///
+    /// Bots have ids too and they are included: addressing another coding agent by mention is a
+    /// legitimate thing to want.
+    pub author_id: UserId,
     /// Whether Discord flagged the author as a bot.
     pub author_is_bot: bool,
     /// ISO-8601 timestamp string, as reported by Discord.
@@ -88,6 +135,7 @@ mod tests {
             id: MessageId(id.to_owned()),
             channel_id: ChannelId("c".to_owned()),
             author: "a".to_owned(),
+            author_id: UserId("7".to_owned()),
             author_is_bot: false,
             timestamp: "t".to_owned(),
             content: String::new(),
@@ -113,6 +161,15 @@ mod tests {
         assert_eq!(
             messages.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
             vec!["7", "42", "not-a-snowflake"]
+        );
+    }
+
+    #[test]
+    fn a_mention_is_the_syntax_discord_actually_notifies_on() {
+        // The whole point of carrying the id: "@coding_agent" is plain text and pings nobody.
+        assert_eq!(
+            UserId("1532416065114607829".to_owned()).mention(),
+            "<@1532416065114607829>"
         );
     }
 

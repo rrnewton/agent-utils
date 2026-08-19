@@ -533,3 +533,116 @@ async fn an_unknown_route_answers_a_json_404() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(payload["error"], "not_found");
 }
+
+/// Every payload that names an author must also carry that author's snowflake.
+///
+/// This is what makes a real Discord mention possible without a user-lookup tool: the id arrives
+/// attached to the message being replied to, so a caller has nothing to search for and nothing to
+/// guess, and the only people it can ever mention are those who have actually spoken in an
+/// allowlisted channel.
+#[tokio::test]
+async fn every_rendered_message_carries_its_authors_snowflake() {
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    harness
+        .discord
+        .seed(&channel, "rrnewton", "who is watching the mac runner");
+    // A BOT author, on purpose: addressing another coding agent by mention is a thing the owner
+    // legitimately wants, and a payload that carried ids only for humans would fail here.
+    harness.discord.seed(
+        &channel,
+        "coder-bot",
+        "the mac runner went offline mid-deploy",
+    );
+    let human = harness
+        .discord
+        .author_id("rrnewton")
+        .expect("the fake assigned the human an id");
+    let bot = harness
+        .discord
+        .author_id("coder-bot")
+        .expect("the fake assigned the bot an id");
+    assert_ne!(human, bot, "the fixture must not conflate the two authors");
+
+    // 1. Full scrollback.
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = payload["messages"].as_array().expect("array");
+    assert_eq!(messages[0]["author"], "rrnewton");
+    assert_eq!(messages[0]["author_id"], human.as_str());
+    assert_eq!(messages[1]["author"], "coder-bot");
+    assert_eq!(
+        messages[1]["author_id"],
+        bot.as_str(),
+        "a bot author needs an id too"
+    );
+
+    // 2. The digest, which is the listing the voice agent hears first.
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/digest"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["entries"].as_array().expect("array");
+    assert_eq!(entries[0]["author_id"], human.as_str());
+    assert_eq!(entries[1]["author_id"], bot.as_str());
+
+    // 3. One message read by id.
+    let id = messages[1]["id"].as_str().expect("id");
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/messages/{id}"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["message"]["author_id"], bot.as_str());
+
+    // 4. Semantic random access — the best match AND the runners-up.
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/resolve"),
+        Some(READ_TOKEN),
+        Some(serde_json::json!({"query": "the mac runner", "max_alternatives": 3})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["best"]["message"]["author_id"], bot.as_str());
+    let alternatives = payload["alternatives"].as_array().expect("array");
+    assert!(
+        !alternatives.is_empty(),
+        "this fixture must produce a runner-up, or the next assertion is vacuous"
+    );
+    assert_eq!(alternatives[0]["message"]["author_id"], human.as_str());
+
+    // 5. The message this server posted itself, echoed back.
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/reply"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"text": format!("{} on it", bot.mention())})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        payload["posted"]["author_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()),
+        "even the posted message reports who posted it: {payload}"
+    );
+}

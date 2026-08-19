@@ -70,11 +70,16 @@ pub fn fenced(body: &str) -> String {
 pub fn render_for_model(messages: &[Message]) -> String {
     let mut body = String::new();
     for message in messages {
+        // The author's mention token rides along with the message it belongs to. That is the
+        // whole reason a caller can ping the right person without a user-lookup tool: the id is
+        // attached to the thing being replied to, so there is nothing to search for and nothing
+        // to guess. See `crate::model::Message::author_id`.
         body.push_str(&format!(
-            "[{} | {} | {}] {}\n",
+            "[{} | {} | {} {}] {}\n",
             message.id.as_str(),
             message.timestamp,
             neutralize(&message.author),
+            neutralize(&message.author_id.mention()),
             neutralize(&message.content)
         ));
     }
@@ -84,13 +89,14 @@ pub fn render_for_model(messages: &[Message]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChannelId, MessageId};
+    use crate::model::{ChannelId, MessageId, UserId};
 
     fn message(author: &str, content: &str) -> Message {
         Message {
             id: MessageId("1000000000000000001".to_owned()),
             channel_id: ChannelId("c".to_owned()),
             author: author.to_owned(),
+            author_id: UserId("2000000000000000001".to_owned()),
             author_is_bot: false,
             timestamp: "2026-08-18T12:00:00+00:00".to_owned(),
             content: content.to_owned(),
@@ -153,6 +159,15 @@ mod tests {
         assert!(
             rendered.ends_with(&format!("\n{FENCE}\n")),
             "the closing fence must not be glued onto the last line: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_rendered_message_carries_the_mention_token_for_its_author() {
+        let rendered = render_for_model(&[message("codex-eng", "the mac runner is back")]);
+        assert!(
+            rendered.contains("codex-eng <@2000000000000000001>"),
+            "the id must be readable right beside the name that goes with it: {rendered}"
         );
     }
 
