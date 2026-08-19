@@ -473,6 +473,123 @@ grep -q 'handshake-only log' <<< "$out" \
     || fail "the smoke test's controls did not include the no-tool-call negative control: $out"
 ok "the smoke test's own controls pass (both negative controls included)"
 
+# --- 9e. --screenshots: the capture harness, and the ports it must never take ------------------
+#
+# The screenshot action is the only check in this project that can SEE the page. Everything here
+# is offline and free; none of it starts a browser or takes a picture. What it guards is the two
+# ways this action could do harm or lie: binding a port that is serving something real, and
+# writing pictures that are not what they say they are.
+
+out="$(run_sh --help)"
+grep -q -- '--screenshots' <<< "$out" || fail "--screenshots is not in the help text: $out"
+grep -q 'FREE and offline' <<< "$out" \
+    || fail "the help text does not say --screenshots costs nothing: $out"
+grep -q -- '--out DIR' <<< "$out" || fail "--out is not documented in the help text: $out"
+ok "--screenshots and --out are documented in the help text"
+
+rc=0; out="$(run_sh --screenshots --shutdown)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--screenshots combined with --shutdown exited 0"
+grep -q 'cannot be combined' <<< "$out" \
+    || fail "--screenshots with --shutdown does not report an action conflict: $out"
+ok "--screenshots refuses to be combined with another action"
+
+rc=0; out="$(run_sh --out "$TMPDIR_TEST/shots")" || rc=$?
+[ "$rc" -ne 0 ] || fail "--out on its own exited 0"
+grep -q -- '--out only means something together with --screenshots' <<< "$out" \
+    || fail "--out on its own does not say what it needs: $out"
+ok "--out on its own refuses, naming the flag it belongs to"
+
+# THE important one. 8080 is the owner's live agent; binding it to take pictures of a fake would
+# take down the real thing. The refusal must name the port, not merely fail to bind.
+rc=0; out="$(run_sh --screenshots --port 8080)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--screenshots --port 8080 exited 0 — it would contend with the LIVE server"
+grep -q '8080' <<< "$out" || fail "--screenshots --port 8080 does not name the port: $out"
+grep -q 'LIVE gent-talk' <<< "$out" \
+    || fail "--screenshots --port 8080 does not say what is on that port: $out"
+ok "--screenshots refuses port 8080, naming the live deployment"
+
+rc=0; out="$(run_sh --screenshots --port 18081)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--screenshots --port 18081 exited 0 — that is the ci container"
+grep -q '18081' <<< "$out" || fail "--screenshots --port 18081 does not name the port: $out"
+ok "--screenshots refuses port 18081, naming the ci container"
+
+# The default must be neither of those, and the plan must say so out loud rather than leaving the
+# reader to trust it.
+out="$(run_sh --screenshots --dry-run)"
+grep -q '127.0.0.1:18091' <<< "$out" \
+    || fail "--screenshots --dry-run does not say which port it would use: $out"
+grep -q -- '--fake-discord' <<< "$out" \
+    || fail "--screenshots --dry-run does not show that the server is a fake: $out"
+grep -q 'nothing was built, started, or photographed' <<< "$out" \
+    || fail "--screenshots --dry-run does not say it did nothing: $out"
+grep -qv ':8080' <<< "$out" || fail "--screenshots --dry-run mentions port 8080: $out"
+ok "--screenshots --dry-run plans a throwaway fake server on 18091 and starts nothing"
+
+# It must need NONE of the owner's configuration: this is the action you reach for on a machine
+# with no deployment at all, and reading ~/.config/gent-talk/env would hand it the real bot token
+# for no reason. run_sh_isolated_config points XDG_CONFIG_HOME at an empty tree.
+out="$(run_sh_isolated_config --screenshots --dry-run)"
+grep -q '127.0.0.1:18091' <<< "$out" \
+    || fail "--screenshots needs a configuration file it should never read: $out"
+ok "--screenshots reads none of the owner's configuration"
+
+# The capture harness's OWN controls, run here for the same reason the smoke test's are: if they
+# fail, a green screenshot run means nothing, because nothing would reject a blank picture.
+rc=0; out="$(timeout 120 python3 "$SCRIPT_DIR/screenshots.py" --self-test 2>&1)" || rc=$?
+printf '%s\n' "$out" >> "$ALL_OUTPUT"
+[ "$rc" -eq 0 ] || fail "the screenshot harness's own controls FAILED: $out"
+grep -q 'a flat WHITE frame is rejected' <<< "$out" \
+    || fail "the screenshot controls do not include the blank-frame negative control: $out"
+grep -q 'record_capture REFUSES to certify a blank frame it wrote' <<< "$out" \
+    || fail "the screenshot controls do not check the gate on the path that SAVES files: $out"
+grep -q "unreachable state's error names the state" <<< "$out" \
+    || fail "the screenshot controls do not check that a missed state fails by name: $out"
+ok "the screenshot harness's own controls pass (blank, save-path and unreachable-state included)"
+
+# A missing browser must say so BY NAME with the command that fixes it. Pointing the browser
+# search path at an empty directory is the real failure a fresh machine hits.
+rc=0
+out="$(timeout 120 env PLAYWRIGHT_BROWSERS_PATH="$TMPDIR_TEST/no-browsers" \
+        GENT_TALK_WRITE_TOKEN=irrelevant-for-this-check \
+        python3 "$SCRIPT_DIR/screenshots.py" --url "http://127.0.0.1:$ABSENT_PORT" \
+        --out "$TMPDIR_TEST/shots" 2>&1)" || rc=$?
+printf '%s\n' "$out" >> "$ALL_OUTPUT"
+[ "$rc" -eq 30 ] || fail "a missing browser should exit 30 (playwright_missing), got $rc: $out"
+grep -q 'playwright install chromium' <<< "$out" \
+    || fail "the missing-browser failure does not carry the install command: $out"
+# Non-vacuity. This run also points at a dead server; if the server were checked FIRST the run
+# would report that instead and this control would be certifying a message it never saw.
+grep -qv 'nothing answered at' <<< "$out" \
+    || fail "the missing-browser check never reached the browser — it reported the server instead: $out"
+ok "a missing browser fails by name, exit 30, with the install command"
+
+rc=0
+out="$(timeout 60 env GENT_TALK_WRITE_TOKEN=irrelevant-for-this-check \
+        python3 "$SCRIPT_DIR/screenshots.py" --url "http://127.0.0.1:$ABSENT_PORT" \
+        --out "$TMPDIR_TEST/shots" 2>&1)" || rc=$?
+printf '%s\n' "$out" >> "$ALL_OUTPUT"
+[ "$rc" -eq 33 ] || fail "an unreachable server should exit 33 (server_unreachable), got $rc: $out"
+grep -q "127.0.0.1:$ABSENT_PORT" <<< "$out" \
+    || fail "the unreachable-server failure does not name the URL it tried: $out"
+ok "the screenshot harness reports an unreachable server as its own failure, naming the URL"
+
+rc=0
+out="$(timeout 60 env -u GENT_TALK_WRITE_TOKEN python3 "$SCRIPT_DIR/screenshots.py" \
+        --url "http://127.0.0.1:$ABSENT_PORT" --out "$TMPDIR_TEST/shots" 2>&1)" || rc=$?
+printf '%s\n' "$out" >> "$ALL_OUTPUT"
+[ "$rc" -eq 2 ] || fail "a missing write token should be a usage error (exit 2), got $rc: $out"
+grep -q 'GENT_TALK_WRITE_TOKEN' <<< "$out" \
+    || fail "the missing-token failure does not name the variable: $out"
+ok "the screenshot harness names GENT_TALK_WRITE_TOKEN when it is not set"
+
+rc=0
+out="$(timeout 60 env GENT_TALK_WRITE_TOKEN=irrelevant-for-this-check \
+        python3 "$SCRIPT_DIR/screenshots.py" --url "http://127.0.0.1:$ABSENT_PORT" \
+        --out "$TMPDIR_TEST/shots" --only no-such-state 2>&1)" || rc=$?
+printf '%s\n' "$out" >> "$ALL_OUTPUT"
+[ "$rc" -ne 0 ] || fail "--only with an unknown state name exited 0: $out"
+ok "the screenshot harness refuses an unknown state name"
+
 # --- 10. already-running detection, by image and by port -------------------------------------
 if command -v "$ENGINE" >/dev/null 2>&1; then
     BASE_IMAGE="$("$ENGINE" images --format '{{.Repository}}:{{.Tag}}' | grep -E '^docker.io/library/debian:' | head -1 || true)"
