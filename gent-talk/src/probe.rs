@@ -597,10 +597,12 @@ mod tests {
         struct AlwaysUnauthorized;
         #[async_trait::async_trait]
         impl DiscordClient for AlwaysUnauthorized {
-            async fn fetch_recent(
+            async fn fetch_page(
                 &self,
                 _channel: &ChannelId,
                 _limit: u16,
+                _before: Option<&crate::model::MessageId>,
+                _after: Option<&crate::model::MessageId>,
             ) -> Result<Vec<crate::model::Message>, DiscordError> {
                 Err(status(401, r#"{"message":"401: Unauthorized","code":0}"#))
             }
@@ -630,10 +632,12 @@ mod tests {
         struct BlankContent;
         #[async_trait::async_trait]
         impl DiscordClient for BlankContent {
-            async fn fetch_recent(
+            async fn fetch_page(
                 &self,
                 channel: &ChannelId,
                 _limit: u16,
+                _before: Option<&crate::model::MessageId>,
+                _after: Option<&crate::model::MessageId>,
             ) -> Result<Vec<crate::model::Message>, DiscordError> {
                 Ok(vec![crate::model::Message {
                     id: crate::model::MessageId("1".to_owned()),

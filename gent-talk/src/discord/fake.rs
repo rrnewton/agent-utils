@@ -102,6 +102,34 @@ impl FakeDiscord {
         id
     }
 
+    /// Seed a message that really was created at `at_ms`, id and timestamp agreeing.
+    ///
+    /// [`FakeDiscord::seed`] mints sequential ids whose embedded snowflake time has nothing to do
+    /// with the `timestamp` it writes — harmless for ordering, useless for a time range, and
+    /// actively misleading if a range test were written against it. Real Discord ids encode their
+    /// own creation instant, and anything walking a time span depends on that; so a test about
+    /// time uses this, and gets a fixture where the two agree to the millisecond.
+    pub fn seed_at(
+        &self,
+        channel: &ChannelId,
+        author: &str,
+        content: &str,
+        at_ms: i64,
+    ) -> MessageId {
+        let id = self.seed(channel, author, content);
+        let mut state = self.lock();
+        let at = MessageId::at_time_ms(at_ms);
+        let iso = crate::clock::iso_from_ms(at_ms);
+        let message = state
+            .messages
+            .iter_mut()
+            .find(|m| m.id == id)
+            .expect("the message just seeded is present");
+        message.id = at.clone();
+        message.timestamp = iso;
+        at
+    }
+
     /// The snowflake this fake assigned to `author`, if it has ever seen them speak.
     ///
     /// Deliberately NOT a general directory: a name this fake has never seen has no id, exactly
@@ -157,29 +185,51 @@ impl FakeDiscord {
 
 #[async_trait]
 impl DiscordClient for FakeDiscord {
-    async fn fetch_recent(
+    async fn fetch_page(
         &self,
         channel: &ChannelId,
         limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
     ) -> Result<Vec<Message>, DiscordError> {
         self.lock().fetches += 1;
         if let Some(failure) = self.take_failure() {
             return Err(failure);
         }
+        // Share the real client's refusal, so a caller cannot get away here with a request
+        // Discord would not define.
+        let _ = super::http::page_request(DEFAULT_DISCORD_API_BASE, channel, limit, before, after)?;
         if let Some(unknown) = self.unknown_channel(channel) {
             return Err(unknown);
         }
+        let cursor = |id: Option<&MessageId>| id.and_then(MessageId::numeric);
+        let (before, after) = (cursor(before), cursor(after));
         let state = self.lock();
         let mut messages: Vec<Message> = state
             .messages
             .iter()
             .filter(|m| &m.channel_id == channel)
+            .filter(|m| {
+                let Some(id) = m.id.numeric() else {
+                    // An unparseable id cannot be placed relative to a cursor, so it is only ever
+                    // returned by an uncursored fetch. Guessing would fabricate an ordering.
+                    return before.is_none() && after.is_none();
+                };
+                before.is_none_or(|b| id < b) && after.is_none_or(|a| id > a)
+            })
             .cloned()
             .collect();
         sort_oldest_first(&mut messages);
         let limit = usize::from(limit.clamp(1, super::http::DISCORD_MAX_LIMIT));
         if messages.len() > limit {
-            messages.drain(..messages.len() - limit);
+            if after.is_some() {
+                // `after` walks FORWARD: Discord answers with the OLDEST messages following the
+                // cursor, not the newest ones. Taking the newest here would make a forward walk
+                // skip everything in between and still look correct in a test.
+                messages.truncate(limit);
+            } else {
+                messages.drain(..messages.len() - limit);
+            }
         }
         Ok(messages)
     }
@@ -243,6 +293,67 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["m3", "m4"],
             "a limited fetch must return the MOST RECENT messages, still oldest-first"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_walks_backwards_and_after_walks_forwards_from_the_oldest() {
+        // The asymmetry that is easy to get wrong. `before` yields the NEWEST messages older than
+        // the cursor; `after` yields the OLDEST messages newer than it. A fake that took the
+        // newest in both directions would certify a forward walk that skips whole spans against
+        // live Discord.
+        let fake = FakeDiscord::new();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            ids.push(fake.seed(&channel(), "a", &format!("m{i}")));
+        }
+        let contents = |messages: &[Message]| {
+            messages
+                .iter()
+                .map(|m| m.content.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let back = fake
+            .fetch_page(&channel(), 2, Some(&ids[4]), None)
+            .await
+            .expect("fetch");
+        assert_eq!(
+            contents(&back),
+            vec!["m2", "m3"],
+            "before must return the newest messages OLDER than the cursor, oldest-first"
+        );
+
+        let forward = fake
+            .fetch_page(&channel(), 2, None, Some(&ids[1]))
+            .await
+            .expect("fetch");
+        assert_eq!(
+            contents(&forward),
+            vec!["m2", "m3"],
+            "after must return the OLDEST messages newer than the cursor, not the newest ones"
+        );
+
+        assert!(
+            fake.fetch_page(&channel(), 2, Some(&ids[0]), Some(&ids[1]))
+                .await
+                .is_err(),
+            "both cursors at once must be refused here exactly as the real client refuses them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_seeded_instant_is_carried_by_the_id_as_well_as_the_timestamp() {
+        let fake = FakeDiscord::new();
+        let at = 1_787_233_885_123;
+        let id = fake.seed_at(&channel(), "a", "on the hour", at);
+        assert_eq!(id.created_at_ms(), Some(at));
+        let messages = fake.fetch_recent(&channel(), 10).await.expect("fetch");
+        assert_eq!(messages[0].id, id);
+        assert_eq!(
+            messages[0].timestamp,
+            crate::clock::iso_from_ms(at),
+            "the id and the timestamp must agree, or a time-range test proves nothing"
         );
     }
 

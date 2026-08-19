@@ -34,7 +34,7 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 ///
 /// The spec's rule is: answer with the client's version when it is supported, otherwise answer
 /// with ours and let the client decide whether to continue. All of these are Streamable-HTTP-era
-/// or earlier revisions whose tool semantics are unchanged for the five tools here.
+/// or earlier revisions whose tool semantics are unchanged for the tools here.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// JSON-RPC error code for a malformed request object.
@@ -341,6 +341,8 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
     let outcome = match tool.name {
         "list_channels" => Ok(list_channels_text(state)),
         "digest_channel" => run_digest(state, &args).await,
+        "read_page" => run_page(state, &args).await,
+        "count_messages" => run_count(state, &args).await,
         "find_message" => run_find(state, &args).await,
         "read_message" => run_read(state, &args).await,
         "post_reply" => run_post(state, &args).await,
@@ -419,11 +421,16 @@ fn list_channels_text(state: &AppState) -> String {
 /// so the owner heard "fifty messages" about a channel holding hundreds. Discord will not tell a
 /// bot how many messages a channel holds, so the number is spoken only when the fetch came back
 /// short, which is the one case in which it is the channel's own count.
+///
+/// Since `#53 stepped-retrieval` it also names the way onward. A response that says "there is
+/// more" without saying how to reach it leaves a model with nothing to do but guess a bigger
+/// `limit`, which is how a page came to be reported as a total in the first place.
 fn digest_header(
     label: &str,
     id: &crate::model::ChannelId,
     count: usize,
     complete: bool,
+    oldest: Option<&crate::model::MessageId>,
 ) -> String {
     if count == 0 {
         return format!("Digest of {label} (id {id}): no messages in this channel.\n");
@@ -432,11 +439,100 @@ fn digest_header(
     if complete {
         format!("Digest of {label} (id {id}): the whole channel, {count} {plural}, oldest first.\n")
     } else {
+        let step_back = oldest.map_or_else(String::new, |id| {
+            format!(" To reach them, call read_page with before={id}.")
+        });
         format!(
             "Digest of {label} (id {id}): the {count} most recent {plural}, oldest first. There \
              are older messages this fetch did not reach, and there is no way to ask Discord how \
-             many — so do not state a total.\n"
+             many — so do not state a total.{step_back}\n"
         )
+    }
+}
+
+/// The first line of one step of a walk. Its whole job is to say that it IS a step.
+fn page_header(page: &ops::Page) -> String {
+    let (label, id) = (&page.channel.label, &page.channel.id);
+    let count = page.returned();
+    if count == 0 {
+        return format!("Page of {label} (id {id}): no messages in that part of the channel.\n");
+    }
+    let plural = if count == 1 { "message" } else { "messages" };
+    let onward = if let Some(cursor) = &page.next_before {
+        format!(
+            " There are older messages beyond this page; call read_page again with \
+             before={cursor} to step back."
+        )
+    } else if let Some(since) = &page.next_since {
+        format!(
+            " There are more messages inside that span; call read_page again with since={since} \
+             to continue."
+        )
+    } else if page.next_before.is_none() && page.next_since.is_none() && page.has_more {
+        " There are more messages beyond this page.".to_owned()
+    } else {
+        " There is nothing beyond this page in that direction.".to_owned()
+    };
+    format!(
+        "Page of {label} (id {id}): {count} {plural} returned, oldest first. This is a PAGE, not \
+         the channel's total.{onward}\n"
+    )
+}
+
+async fn run_page(state: &AppState, args: &Value) -> Result<String, OpError> {
+    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
+    let before = arg_str(args, "before");
+    let since = arg_str(args, "since");
+    let until = arg_str(args, "until");
+    let page = ops::page(
+        state,
+        &channel_id,
+        ops::PageRequest {
+            limit: arg_u16(args, "limit"),
+            before: before.as_deref(),
+            since: since.as_deref(),
+            until: until.as_deref(),
+        },
+    )
+    .await?;
+    let header = page_header(&page);
+    Ok(format!(
+        "{header}{}",
+        untrusted::render_for_model(&page.messages)
+    ))
+}
+
+async fn run_count(state: &AppState, args: &Value) -> Result<String, OpError> {
+    let channel_id = arg_str(args, "channel_id").unwrap_or_default();
+    let since = arg_str(args, "since");
+    let cap = args
+        .get("cap")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok());
+    let tally = ops::count(state, &channel_id, since.as_deref(), cap).await?;
+    let (label, id) = (&tally.channel.label, &tally.channel.id);
+    let scope = match &since {
+        Some(from) => format!(" since {from}"),
+        None => String::new(),
+    };
+    let plural = if tally.counted == 1 {
+        "message"
+    } else {
+        "messages"
+    };
+    if tally.at_least {
+        Ok(format!(
+            "{label} (id {id}) holds AT LEAST {} {plural}{scope}. That is a lower bound, not a \
+             total: the walk stopped once it had passed this server's ceiling of {}, and there \
+             are older messages it never reached. Say \"at least\" when you report it.",
+            tally.counted, tally.cap
+        ))
+    } else {
+        Ok(format!(
+            "{label} (id {id}) holds exactly {} {plural}{scope}. The walk reached the end, so \
+             this is the whole count.",
+            tally.counted
+        ))
     }
 }
 
@@ -449,7 +545,18 @@ async fn run_digest(state: &AppState, args: &Value) -> Result<String, OpError> {
         arg_u16(args, "width"),
     )
     .await?;
-    let header = digest_header(&info.label, &info.id, entries.len(), complete);
+    // The oldest entry is the front of the list, and it is the cursor a caller hands to read_page
+    // to reach what this digest could not.
+    let oldest = entries
+        .first()
+        .map(|e| crate::model::MessageId(e.id.clone()));
+    let header = digest_header(
+        &info.label,
+        &info.id,
+        entries.len(),
+        complete,
+        oldest.as_ref(),
+    );
     let mut body = String::new();
     for entry in &entries {
         // `author_id` is rendered as the mention token itself rather than as a bare number, so
@@ -834,18 +941,28 @@ mod tests {
     #[test]
     fn the_digest_header_says_a_number_only_when_that_number_is_the_channels() {
         let id = ChannelId("111".to_owned());
-        let full = digest_header("lead team", &id, 20, false);
+        let oldest = crate::model::MessageId("1000000000000000001".to_owned());
+        let full = digest_header("lead team", &id, 20, false, Some(&oldest));
         assert!(full.contains("the 20 most recent messages"), "{full}");
         assert!(full.contains("do not state a total"), "{full}");
+        assert!(
+            full.contains("read_page with before=1000000000000000001"),
+            "a partial answer must name the way onward, or a model can only guess a bigger \
+             limit: {full}"
+        );
 
-        let whole = digest_header("lead team", &id, 3, true);
+        let whole = digest_header("lead team", &id, 3, true, Some(&oldest));
         assert!(whole.contains("the whole channel, 3 messages,"), "{whole}");
         assert!(!whole.contains("older messages"), "{whole}");
+        assert!(
+            !whole.contains("read_page"),
+            "there is nothing to step back to, so nothing to offer: {whole}"
+        );
 
-        let one = digest_header("lead team", &id, 1, true);
+        let one = digest_header("lead team", &id, 1, true, Some(&oldest));
         assert!(one.contains("the whole channel, 1 message,"), "{one}");
 
-        let none = digest_header("lead team", &id, 0, true);
+        let none = digest_header("lead team", &id, 0, true, None);
         assert!(none.contains("no messages in this channel"), "{none}");
 
         for header in [full, whole, one, none] {

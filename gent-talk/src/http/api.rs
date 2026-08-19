@@ -110,7 +110,9 @@ impl From<OpError> for ApiError {
         let code = value.code();
         let status = match value {
             OpError::UnknownChannel | OpError::UnknownMessage => StatusCode::NOT_FOUND,
-            OpError::EmptyQuery => StatusCode::BAD_REQUEST,
+            OpError::EmptyQuery | OpError::InvalidCursor | OpError::InvalidRange => {
+                StatusCode::BAD_REQUEST
+            }
             OpError::ChannelNotWritable => StatusCode::FORBIDDEN,
             OpError::Discord(inner) => return Self::from(inner),
         };
@@ -257,6 +259,116 @@ pub async fn messages(
         channel: window.channel,
         messages: window.messages,
         untrusted_content_notice: untrusted::NOTICE,
+    }))
+}
+
+/// Query parameters for one step of a walk.
+#[derive(Debug, Default, Deserialize)]
+pub struct PageQuery {
+    /// How many messages this step should return.
+    pub limit: Option<u16>,
+    /// Step back from this message id, exclusive.
+    pub before: Option<String>,
+    /// Start of a time span, inclusive, ISO-8601.
+    pub since: Option<String>,
+    /// End of a time span, exclusive, ISO-8601. Requires `since`.
+    pub until: Option<String>,
+}
+
+/// One step of a walk, saying plainly that it is one.
+#[derive(Debug, Serialize)]
+pub struct PageResponse {
+    /// Channel that was read.
+    pub channel: ChannelInfo,
+    /// Messages, oldest first.
+    pub messages: Vec<Message>,
+    /// How many this step returned. Never a channel total.
+    pub returned: usize,
+    /// The page size that applied.
+    pub limit: u16,
+    /// Whether messages exist beyond this page in the direction of travel.
+    pub has_more: bool,
+    /// Hand this back as `before` to take the next step back. Absent when there is nothing more.
+    pub next_before: Option<String>,
+    /// Hand this back as `since` to take the next step of a range walk.
+    pub next_since: Option<String>,
+    /// Standing reminder that the content is third-party text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/channels/{channel_id}/page`
+pub async fn page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Query(query): Query<PageQuery>,
+) -> Result<Json<PageResponse>, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let step = ops::page(
+        &state,
+        &channel_id,
+        ops::PageRequest {
+            limit: query.limit,
+            before: query.before.as_deref(),
+            since: query.since.as_deref(),
+            until: query.until.as_deref(),
+        },
+    )
+    .await?;
+    Ok(Json(PageResponse {
+        returned: step.returned(),
+        channel: step.channel,
+        messages: step.messages,
+        limit: step.limit,
+        has_more: step.has_more,
+        next_before: step.next_before.map(|id| id.0),
+        next_since: step.next_since,
+        untrusted_content_notice: untrusted::NOTICE,
+    }))
+}
+
+/// Query parameters for a bounded count.
+#[derive(Debug, Default, Deserialize)]
+pub struct CountQuery {
+    /// Count only messages at or after this ISO-8601 instant.
+    pub since: Option<String>,
+    /// Stop after this many. Clamped by `discord.max_count_scan`.
+    pub cap: Option<u32>,
+}
+
+/// A bounded count, with the honesty flag attached.
+#[derive(Debug, Serialize)]
+pub struct CountResponse {
+    /// Channel that was counted.
+    pub channel: ChannelInfo,
+    /// How many messages were seen.
+    pub counted: usize,
+    /// When true, `counted` is a LOWER BOUND: the cap stopped the walk before the channel ran out.
+    pub at_least: bool,
+    /// The ceiling that applied.
+    pub cap: u32,
+    /// Oldest message the walk reached.
+    pub oldest_seen: Option<String>,
+    /// Newest message the walk started from.
+    pub newest_seen: Option<String>,
+}
+
+/// `GET /api/v1/channels/{channel_id}/count`
+pub async fn count(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Query(query): Query<CountQuery>,
+) -> Result<Json<CountResponse>, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let tally = ops::count(&state, &channel_id, query.since.as_deref(), query.cap).await?;
+    Ok(Json(CountResponse {
+        channel: tally.channel,
+        counted: tally.counted,
+        at_least: tally.at_least,
+        cap: tally.cap,
+        oldest_seen: tally.oldest_seen.map(|id| id.0),
+        newest_seen: tally.newest_seen.map(|id| id.0),
     }))
 }
 

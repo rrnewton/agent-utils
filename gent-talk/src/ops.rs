@@ -36,6 +36,15 @@ pub enum OpError {
     /// The channel is configured, but read-only.
     #[error("this channel is configured read-only")]
     ChannelNotWritable,
+    /// A cursor argument was not a Discord message id.
+    #[error("that cursor is not a message id; use the one the previous page handed back")]
+    InvalidCursor,
+    /// The requested span could not be turned into a single walk.
+    #[error(
+        "that is not a span this server can walk: give either a cursor to step back from, or a \
+         start time and an optional end time, but not both"
+    )]
+    InvalidRange,
     /// Discord itself failed, or refused the request before it was sent.
     #[error(transparent)]
     Discord(#[from] DiscordError),
@@ -50,6 +59,8 @@ impl OpError {
             Self::UnknownMessage => "unknown_message",
             Self::EmptyQuery => "empty_query",
             Self::ChannelNotWritable => "channel_not_writable",
+            Self::InvalidCursor => "invalid_cursor",
+            Self::InvalidRange => "invalid_range",
             Self::Discord(DiscordError::Refused(_)) => "refused",
             Self::Discord(_) => "discord_error",
         }
@@ -195,6 +206,290 @@ pub async fn digest(
         summary::digest(&window.messages, width),
         complete,
     ))
+}
+
+/// The largest page this server will hand back in one step.
+///
+/// One less than Discord's own ceiling, and that is the whole point: the page is fetched with
+/// `limit + 1` and the extra message is dropped, which is the only way to answer "is there more?"
+/// exactly rather than by guessing from a full window. Allowing 100 would make the probe
+/// impossible on the largest page and force `has_more` back into a guess.
+pub const MAX_PAGE: u16 = crate::discord::http::DISCORD_MAX_LIMIT - 1;
+
+/// What a caller wants one step of a walk to cover.
+///
+/// Two modes, and mixing them is an error rather than a precedence rule: `before` steps BACKWARDS
+/// from a cursor (or from the newest message when absent), and `since`/`until` jump to a
+/// half-open time span. A caller that supplied both would have no way to know which it got.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageRequest<'a> {
+    /// How many messages to return. Clamped by the configured ceiling and by [`MAX_PAGE`].
+    pub limit: Option<u16>,
+    /// Step back from this message id, exclusive. Hand back [`Page::next_before`].
+    pub before: Option<&'a str>,
+    /// Start of a time span, inclusive, as an ISO-8601 instant.
+    pub since: Option<&'a str>,
+    /// End of a time span, EXCLUSIVE, as an ISO-8601 instant. Requires `since`.
+    pub until: Option<&'a str>,
+}
+
+/// One step of a walk through a channel, and everything needed to take the next one.
+///
+/// Every field here exists to stop a caller mistaking a page for the whole. The issue this comes
+/// from was reported because a model asked "how many messages are in this channel?" and answered
+/// **100** — the size of the page it had been handed, by a response that never said it was a page.
+#[derive(Clone, Debug)]
+pub struct Page {
+    /// Channel that was read.
+    pub channel: ChannelInfo,
+    /// The messages, oldest first.
+    pub messages: Vec<Message>,
+    /// The page size actually used, after both ceilings.
+    pub limit: u16,
+    /// Whether messages exist beyond this page in the direction of travel.
+    ///
+    /// Decided by over-fetching one and dropping it, so it is a fact rather than an inference from
+    /// a full window.
+    pub has_more: bool,
+    /// The `before` cursor for the next step back. Set only when [`Page::has_more`].
+    pub next_before: Option<MessageId>,
+    /// The `since` instant for the next step of a range walk. Set only when [`Page::has_more`].
+    pub next_since: Option<String>,
+}
+
+impl Page {
+    /// How many messages this page carries.
+    #[must_use]
+    pub fn returned(&self) -> usize {
+        self.messages.len()
+    }
+}
+
+/// Parse a caller-supplied cursor into a message id.
+fn cursor(value: Option<&str>) -> Result<Option<MessageId>, OpError> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(raw) => {
+            let id = MessageId(raw.to_owned());
+            if id.numeric().is_none() {
+                return Err(OpError::InvalidCursor);
+            }
+            Ok(Some(id))
+        }
+    }
+}
+
+fn instant(value: Option<&str>) -> Result<Option<i64>, OpError> {
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(raw) => crate::clock::instant_ms(raw)
+            .map(Some)
+            .ok_or(OpError::InvalidRange),
+    }
+}
+
+/// One step of a walk: a page that knows it is a page. Read scope.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`], [`OpError::InvalidCursor`] for a cursor that is not a snowflake,
+/// [`OpError::InvalidRange`] for an unparseable or contradictory span, or [`OpError::Discord`].
+pub async fn page(
+    state: &AppState,
+    channel_id: &str,
+    request: PageRequest<'_>,
+) -> Result<Page, OpError> {
+    let channel = allowed(state, channel_id)?;
+    let before = cursor(request.before)?;
+    let since = instant(request.since)?;
+    let until = instant(request.until)?;
+    if (since.is_some() || until.is_some()) && before.is_some() {
+        return Err(OpError::InvalidRange);
+    }
+    if until.is_some() && since.is_none() {
+        // An open-ended "everything before this instant" is a `before` walk wearing a time
+        // costume, and answering it would need a cursor this server has no way to place a page
+        // relative to. Say so instead of returning a span that is not the one asked for.
+        return Err(OpError::InvalidRange);
+    }
+    if let (Some(from), Some(to)) = (since, until) {
+        if to <= from {
+            return Err(OpError::InvalidRange);
+        }
+    }
+
+    let limit = state
+        .effective_limit(request.limit)
+        .min(MAX_PAGE)
+        .min(state.config.discord.max_fetch_limit);
+    // The over-fetch. One extra message answers "is there more" outright; the alternative is a
+    // second round trip or the guess that a full window means more exists.
+    let probe = limit + 1;
+
+    let (mut messages, forward) = match since {
+        Some(from) => {
+            // Discord's `after` is EXCLUSIVE, and the `since` edge is inclusive, so the cursor
+            // goes one millisecond earlier. Off by one here silently drops a message that sits
+            // exactly on the boundary — the edge the issue asks be tested.
+            let after = MessageId::at_time_ms(from - 1);
+            let mut fetched = state
+                .discord
+                .fetch_page(&channel.id, probe, None, Some(&after))
+                .await?;
+            // Both edges applied to the message's own creation instant, because the boundary
+            // cursor is only millisecond-accurate: the extra millisecond it lets through at the
+            // bottom is trimmed here, and a message exactly at `until` is deterministically OUT.
+            fetched.retain(|m| {
+                message_ms(m).is_none_or(|ms| ms >= from && until.is_none_or(|to| ms < to))
+            });
+            (fetched, true)
+        }
+        None => {
+            let fetched = state
+                .discord
+                .fetch_page(&channel.id, probe, before.as_ref(), None)
+                .await?;
+            (fetched, false)
+        }
+    };
+
+    let has_more = messages.len() > usize::from(limit);
+    if has_more {
+        if forward {
+            // Walking forward, the extra one is the NEWEST; drop it from that end.
+            messages.truncate(usize::from(limit));
+        } else {
+            let excess = messages.len() - usize::from(limit);
+            messages.drain(..excess);
+        }
+    }
+    stamp(state, &mut messages);
+
+    let (next_before, next_since) = if !has_more {
+        (None, None)
+    } else if forward {
+        // Resume one millisecond after the newest message returned, so the next step covers the
+        // rest of the span without repeating this one's last message.
+        let next = messages
+            .last()
+            .and_then(message_ms)
+            .map(|ms| crate::clock::iso_from_ms(ms + 1));
+        (None, next)
+    } else {
+        (messages.first().map(|m| m.id.clone()), None)
+    };
+
+    Ok(Page {
+        channel,
+        messages,
+        limit,
+        has_more,
+        next_before,
+        next_since,
+    })
+}
+
+/// When a message was created, from its snowflake, falling back to its reported timestamp.
+///
+/// The snowflake is authoritative because it is what Discord's own `before`/`after` compare, so a
+/// range filtered by anything else could disagree with the page it was fetched from.
+fn message_ms(message: &Message) -> Option<i64> {
+    message
+        .id
+        .created_at_ms()
+        .or_else(|| crate::clock::instant_ms(&message.timestamp))
+}
+
+/// A bounded, honest answer to "how many messages are in there?".
+///
+/// Discord publishes no message count for a guild text channel, so a promised total would be
+/// either slow or invented. This walks backwards until the channel runs out or the cap stops it,
+/// and says which happened.
+#[derive(Clone, Debug)]
+pub struct MessageCount {
+    /// Channel that was counted.
+    pub channel: ChannelInfo,
+    /// How many messages were actually seen.
+    pub counted: usize,
+    /// Whether the cap stopped the walk, making `counted` a LOWER BOUND rather than a total.
+    pub at_least: bool,
+    /// The ceiling that applied.
+    pub cap: u32,
+    /// Oldest message reached, so a caller can carry on from there if it wants to.
+    pub oldest_seen: Option<MessageId>,
+    /// Newest message the walk started from.
+    pub newest_seen: Option<MessageId>,
+}
+
+/// Count the messages in a channel, up to a cap, optionally only since an instant. Read scope.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`], [`OpError::InvalidRange`] for an unparseable `since`, or
+/// [`OpError::Discord`].
+pub async fn count(
+    state: &AppState,
+    channel_id: &str,
+    since: Option<&str>,
+    cap: Option<u32>,
+) -> Result<MessageCount, OpError> {
+    let channel = allowed(state, channel_id)?;
+    let since = instant(since)?;
+    let cap = state.effective_count_cap(cap);
+
+    let stride = crate::discord::http::DISCORD_MAX_LIMIT;
+    let mut counted: usize = 0;
+    let mut at_least = false;
+    let mut oldest_seen: Option<MessageId> = None;
+    let mut newest_seen: Option<MessageId> = None;
+    let mut before: Option<MessageId> = None;
+
+    loop {
+        let batch = state
+            .discord
+            .fetch_page(&channel.id, stride, before.as_ref(), None)
+            .await?;
+        if batch.is_empty() {
+            break;
+        }
+        if newest_seen.is_none() {
+            newest_seen = batch.last().map(|m| m.id.clone());
+        }
+        // Oldest first, so the front of the batch is the far end of the walk.
+        let oldest = batch.first().expect("non-empty").clone();
+        let exhausted = batch.len() < usize::from(stride);
+
+        let kept = match since {
+            None => batch.len(),
+            Some(from) => batch
+                .iter()
+                .filter(|m| message_ms(m).is_none_or(|ms| ms >= from))
+                .count(),
+        };
+        counted += kept;
+        oldest_seen = Some(oldest.id.clone());
+
+        // Stop as soon as the walk has passed the `since` boundary: everything older is outside
+        // the question, and continuing would spend requests to count nothing.
+        let passed_since = since.is_some() && kept < batch.len();
+        if passed_since || exhausted {
+            break;
+        }
+        if counted >= usize::try_from(cap).unwrap_or(usize::MAX) {
+            at_least = true;
+            break;
+        }
+        before = Some(oldest.id);
+    }
+
+    Ok(MessageCount {
+        channel,
+        counted,
+        at_least,
+        cap,
+        oldest_seen,
+        newest_seen,
+    })
 }
 
 /// Semantic random access: describe a message, get that message. Read scope.
@@ -382,12 +677,329 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_page_knows_whether_more_remain_without_a_second_round_trip() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        for i in 0..25 {
+            fake.seed(&channel, "agent", &format!("m{i}"));
+        }
+        let before = fake.fetch_count();
+        let step = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                limit: Some(10),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+        assert_eq!(
+            step.returned(),
+            10,
+            "the extra probe message must be dropped"
+        );
+        assert!(step.has_more);
+        assert_eq!(
+            step.next_before.as_ref().map(MessageId::as_str),
+            Some(step.messages[0].id.as_str()),
+            "the cursor to step back from is the OLDEST message this page returned"
+        );
+        assert_eq!(
+            fake.fetch_count() - before,
+            1,
+            "over-fetching by one is the point: answering \"is there more\" must not cost a \
+             second request"
+        );
+        assert_eq!(
+            step.messages.last().expect("non-empty").content,
+            "m24",
+            "an uncursored page starts at the newest message"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_page_says_there_is_nothing_beyond_it() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        for i in 0..4 {
+            fake.seed(&channel, "agent", &format!("m{i}"));
+        }
+        let step = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                limit: Some(10),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+        assert_eq!(step.returned(), 4);
+        assert!(
+            !step.has_more,
+            "a control: an implementation that always claimed more would pass the other test"
+        );
+        assert!(step.next_before.is_none());
+    }
+
+    #[tokio::test]
+    async fn stepping_twice_covers_a_disjoint_span_with_nothing_skipped_at_the_boundary() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        for i in 0..25 {
+            fake.seed(&channel, "agent", &format!("m{i}"));
+        }
+        let first = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                limit: Some(10),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+        let cursor = first.next_before.clone().expect("more remain");
+        let second = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                limit: Some(10),
+                before: Some(cursor.as_str()),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+
+        let ids = |p: &Page| p.messages.iter().map(|m| m.id.clone()).collect::<Vec<_>>();
+        let (a, b) = (ids(&first), ids(&second));
+        assert!(
+            a.iter().all(|id| !b.contains(id)),
+            "the two steps overlap: {a:?} / {b:?}"
+        );
+        let mut union: Vec<_> = b.iter().chain(a.iter()).cloned().collect();
+        assert_eq!(union.len(), 20);
+        let expected: Vec<_> = (5..25).map(|i| format!("m{i}")).collect();
+        let got: Vec<_> = second
+            .messages
+            .iter()
+            .chain(first.messages.iter())
+            .map(|m| m.content.clone())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "the two steps together must be exactly the newest twenty, in order, with nothing \
+             skipped or repeated at the boundary"
+        );
+        union.dedup();
+        assert_eq!(union.len(), 20);
+    }
+
+    #[tokio::test]
+    async fn a_time_range_is_exact_at_both_edges() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        let base = 1_787_000_000_000_i64;
+        for (offset, label) in [
+            (-1_000, "before the window"),
+            (0, "exactly at the start"),
+            (5_000, "inside"),
+            (10_000, "exactly at the end"),
+            (15_000, "after the window"),
+        ] {
+            fake.seed_at(&channel, "agent", label, base + offset);
+        }
+        let since = crate::clock::iso_from_ms(base);
+        let until = crate::clock::iso_from_ms(base + 10_000);
+        let step = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                limit: Some(10),
+                since: Some(&since),
+                until: Some(&until),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+        assert_eq!(
+            step.messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["exactly at the start", "inside"],
+            "the start edge is INCLUSIVE and the end edge is EXCLUSIVE, both exactly"
+        );
+        assert!(!step.has_more);
+    }
+
+    #[tokio::test]
+    async fn a_range_walk_hands_back_where_to_resume() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        let base = 1_787_000_000_000_i64;
+        for i in 0..6 {
+            fake.seed_at(&channel, "agent", &format!("m{i}"), base + i * 1_000);
+        }
+        let since = crate::clock::iso_from_ms(base);
+        let first = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                limit: Some(2),
+                since: Some(&since),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+        assert_eq!(
+            first
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m0", "m1"],
+            "a range walks FORWARD from its start, oldest first"
+        );
+        assert!(first.has_more);
+        let resume = first.next_since.clone().expect("a place to resume");
+        let second = page(
+            &state,
+            READ_CHANNEL,
+            PageRequest {
+                limit: Some(2),
+                since: Some(&resume),
+                ..PageRequest::default()
+            },
+        )
+        .await
+        .expect("reads");
+        assert_eq!(
+            second
+                .messages
+                .iter()
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m2", "m3"],
+            "resuming must continue rather than repeat the last message of the previous step"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_refuses_arguments_it_cannot_honour_instead_of_picking_one() {
+        let (state, _fake) = testing::state();
+        let cases: [(PageRequest<'_>, &str); 4] = [
+            (
+                PageRequest {
+                    before: Some("not-a-snowflake"),
+                    ..PageRequest::default()
+                },
+                "invalid_cursor",
+            ),
+            (
+                PageRequest {
+                    since: Some("yesterday afternoon"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+            (
+                PageRequest {
+                    before: Some("1000000000000000001"),
+                    since: Some("2026-08-19T00:00:00Z"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+            (
+                PageRequest {
+                    since: Some("2026-08-19T10:00:00Z"),
+                    until: Some("2026-08-19T09:00:00Z"),
+                    ..PageRequest::default()
+                },
+                "invalid_range",
+            ),
+        ];
+        for (request, code) in cases {
+            let error = page(&state, READ_CHANNEL, request)
+                .await
+                .expect_err("must refuse");
+            assert_eq!(error.code(), code, "{request:?} -> {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_count_is_not_the_page_size() {
+        // The reported bug, reproduced. The fixture's max_fetch_limit is 50 and Discord's own
+        // page ceiling is 100; a channel of 150 must answer 150, never either of those.
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        for i in 0..150 {
+            fake.seed(&channel, "agent", &format!("m{i}"));
+        }
+        let tally = count(&state, READ_CHANNEL, None, None)
+            .await
+            .expect("counts");
+        assert_eq!(tally.counted, 150);
+        assert!(
+            !tally.at_least,
+            "the walk reached the end, so this is a total and must not be hedged"
+        );
+        assert_ne!(tally.counted, 50);
+        assert_ne!(tally.counted, 100);
+    }
+
+    #[tokio::test]
+    async fn a_count_stopped_by_the_ceiling_says_it_is_a_lower_bound() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        for i in 0..350 {
+            fake.seed(&channel, "agent", &format!("m{i}"));
+        }
+        let tally = count(&state, READ_CHANNEL, None, Some(120))
+            .await
+            .expect("counts");
+        assert!(
+            tally.at_least,
+            "a walk the cap stopped must not be reported as a total"
+        );
+        assert!(tally.counted >= 120, "{}", tally.counted);
+        assert_eq!(tally.cap, 120);
+        assert!(tally.oldest_seen.is_some() && tally.newest_seen.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_count_since_an_instant_counts_only_what_falls_after_it() {
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        let base = 1_787_000_000_000_i64;
+        for i in 0..10 {
+            fake.seed_at(&channel, "agent", &format!("m{i}"), base + i * 1_000);
+        }
+        let since = crate::clock::iso_from_ms(base + 6_000);
+        let tally = count(&state, READ_CHANNEL, Some(&since), None)
+            .await
+            .expect("counts");
+        assert_eq!(
+            tally.counted, 4,
+            "m6 through m9, with the boundary itself counted as inside"
+        );
+        assert!(!tally.at_least);
+    }
+
     #[test]
     fn every_refusal_has_a_stable_code() {
         assert_eq!(OpError::UnknownChannel.code(), "unknown_channel");
         assert_eq!(OpError::UnknownMessage.code(), "unknown_message");
         assert_eq!(OpError::EmptyQuery.code(), "empty_query");
         assert_eq!(OpError::ChannelNotWritable.code(), "channel_not_writable");
+        assert_eq!(OpError::InvalidCursor.code(), "invalid_cursor");
+        assert_eq!(OpError::InvalidRange.code(), "invalid_range");
         assert_eq!(
             OpError::Discord(DiscordError::Refused("too long".to_owned())).code(),
             "refused"

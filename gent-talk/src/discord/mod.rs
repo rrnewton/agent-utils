@@ -36,19 +36,45 @@ pub enum DiscordError {
 /// Read and post access to Discord channels.
 #[async_trait]
 pub trait DiscordClient: Send + Sync {
-    /// Fetch up to `limit` most recent messages, returned OLDEST FIRST.
+    /// Fetch one page of a channel, returned OLDEST FIRST.
     ///
     /// Discord itself returns newest-first; implementations normalize so that everything above
     /// this trait reads in conversation order.
     ///
+    /// `before` and `after` are Discord's own cursors and are **mutually exclusive** — Discord
+    /// does not define what sending both means, so an implementation must refuse rather than pick.
+    /// Their asymmetry matters and is easy to get backwards: `before` walks BACKWARDS and yields
+    /// the newest messages older than the cursor, whereas `after` yields the OLDEST messages newer
+    /// than it. Inverting `after` produces a walk that looks right against a fake and skips
+    /// messages against live Discord.
+    ///
+    /// This is the required method. [`DiscordClient::fetch_recent`] is a thin default over it, so
+    /// a client cannot implement the uncursored case and silently ignore the cursor.
+    ///
     /// # Errors
     ///
-    /// Returns [`DiscordError`] when the request fails, is rejected, or cannot be parsed.
+    /// Returns [`DiscordError`] when the request fails, is rejected, or cannot be parsed, and
+    /// [`DiscordError::Refused`] when both cursors are supplied.
+    async fn fetch_page(
+        &self,
+        channel: &ChannelId,
+        limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
+    ) -> Result<Vec<Message>, DiscordError>;
+
+    /// Fetch up to `limit` most recent messages, returned OLDEST FIRST.
+    ///
+    /// # Errors
+    ///
+    /// As [`DiscordClient::fetch_page`].
     async fn fetch_recent(
         &self,
         channel: &ChannelId,
         limit: u16,
-    ) -> Result<Vec<Message>, DiscordError>;
+    ) -> Result<Vec<Message>, DiscordError> {
+        self.fetch_page(channel, limit, None, None).await
+    }
 
     /// Post `content` to `channel`, optionally as a reply to an existing message.
     ///

@@ -41,7 +41,42 @@ impl MessageId {
     pub fn numeric(&self) -> Option<u64> {
         self.0.parse::<u64>().ok()
     }
+
+    /// When this message was created, in milliseconds since the Unix epoch.
+    ///
+    /// A Discord snowflake carries its own creation time in its top 42 bits. That is what makes a
+    /// time range cheap here: Discord paginates by id and offers no positional index, but an
+    /// instant converts straight into an id boundary, so "since yesterday afternoon" becomes an
+    /// exact `after=` cursor rather than a guess at an offset.
+    #[must_use]
+    pub fn created_at_ms(&self) -> Option<i64> {
+        let raw = self.numeric()?;
+        i64::try_from((raw >> 22) + DISCORD_EPOCH_MS).ok()
+    }
+
+    /// The id that sits exactly at `ms`, for use as a `before`/`after` boundary.
+    ///
+    /// NOT A REAL MESSAGE ID. The worker and sequence bits are zero, so it compares correctly
+    /// against real ids and must never be handed back to a caller as though it identified a
+    /// message. An instant before Discord existed clamps to the epoch, because a negative
+    /// snowflake is not a thing.
+    #[must_use]
+    pub fn at_time_ms(ms: i64) -> Self {
+        let since_epoch = u64::try_from(ms)
+            .unwrap_or(0)
+            .saturating_sub(DISCORD_EPOCH_MS);
+        Self((since_epoch << 22).to_string())
+    }
 }
+
+impl std::fmt::Display for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The first millisecond Discord counts snowflakes from: 2015-01-01T00:00:00Z.
+const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 
 /// A Discord user snowflake, as a string.
 ///
@@ -225,5 +260,49 @@ mod tests {
     fn numeric_rejects_non_numeric_snowflakes() {
         assert_eq!(MessageId("12".to_owned()).numeric(), Some(12));
         assert_eq!(MessageId("12x".to_owned()).numeric(), None);
+    }
+
+    #[test]
+    fn a_known_snowflake_round_trips_to_its_known_millisecond() {
+        // Discord's own documented worked example: 175928847299117063 was created at
+        // 2016-04-30T11:18:25.796Z, which is 1462015105796 ms since the Unix epoch.
+        let id = MessageId("175928847299117063".to_owned());
+        assert_eq!(id.created_at_ms(), Some(1_462_015_105_796));
+        assert_eq!(
+            MessageId("not-a-snowflake".to_owned()).created_at_ms(),
+            None,
+            "an unparseable id has no creation time, and must not be given a plausible one"
+        );
+    }
+
+    #[test]
+    fn a_time_boundary_sorts_strictly_between_the_ids_on_either_side_of_it() {
+        // This is the whole mechanism behind a time range: an instant becomes a cursor that
+        // Discord's own `before`/`after` comparison places correctly among real ids.
+        let earlier = MessageId("175928847299117063".to_owned());
+        let earlier_ms = earlier.created_at_ms().expect("real snowflake");
+        let later = MessageId::at_time_ms(earlier_ms + 60_000);
+        let boundary = MessageId::at_time_ms(earlier_ms + 1);
+
+        let n = |id: &MessageId| id.numeric().expect("numeric");
+        assert!(
+            n(&earlier) < n(&boundary),
+            "the boundary must exclude what came before it"
+        );
+        assert!(n(&boundary) < n(&later), "and include what came after it");
+        assert_eq!(
+            boundary.created_at_ms(),
+            Some(earlier_ms + 1),
+            "a boundary must land on the exact millisecond it was asked for"
+        );
+    }
+
+    #[test]
+    fn an_instant_before_discord_existed_clamps_instead_of_wrapping() {
+        // Unsigned arithmetic on a pre-2015 instant would otherwise produce an enormous id that
+        // sorts AFTER everything, silently turning "since forever" into "since the far future".
+        let ancient = MessageId::at_time_ms(0);
+        assert_eq!(ancient.as_str(), "0");
+        assert_eq!(MessageId::at_time_ms(-1_000).as_str(), "0");
     }
 }

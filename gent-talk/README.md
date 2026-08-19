@@ -48,7 +48,7 @@ the reference behind it: what every route does, what the security model is, and 
 | Digest / summarization | **works**, extractive and deterministic (no model call) |
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
-| **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, five tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
+| **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, seven tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
 | **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
@@ -279,6 +279,7 @@ curl -s -X POST localhost:8080/mcp \
 | Bind address | `server.bind` | `GENT_TALK_BIND` | `0.0.0.0:8080` in a container |
 | Public URL | `server.public_base_url` | `GENT_TALK_PUBLIC_BASE_URL` | informational |
 | Time zone | `server.timezone` | `GENT_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
+| Count ceiling | `discord.max_count_scan` | — | how many messages a count may walk, default `500` |
 | Discord bot token | `discord.bot_token` | `GENT_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `GENT_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `GENT_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -342,6 +343,8 @@ not, and neither reveals anything about the configuration.
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
+| GET | `/api/v1/channels/{id}/page?limit=&before=&since=&until=` | read | **one step of a walk**, saying that it is one |
+| GET | `/api/v1/channels/{id}/count?since=&cap=` | read | a bounded, honest count |
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | post as the bot |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
@@ -353,6 +356,24 @@ one-message reads, in `resolve` results, in the posted message echoed back by `r
 field on every digest entry. That is what makes a real Discord mention possible: `@coding_agent`
 typed as words notifies nobody, and only `<@1532416065114607829>` does. Bots have ids too, and
 they are included, because addressing another coding agent is a legitimate reply.
+
+**A page says that it is a page.** `GET .../page` answers with `returned`, `has_more`, and —
+when there is more — `next_before` or `next_since`, whichever continues the walk it was asked
+for. Two modes, and they cannot be mixed: `before=<id>` steps backwards from a cursor, and
+`since=`/`until=` (ISO-8601, start inclusive, end exclusive) jumps to a period. A page tops out at
+99 rather than 100 on purpose: the server fetches one more than it returns and drops it, which is
+the only way to answer "is there more?" exactly instead of guessing from a full window.
+
+Ranges work because a Discord snowflake carries its own creation time in its top 42 bits, so an
+instant converts straight into a cursor. A numeric offset would have to be synthesised and would
+drift as messages arrive, so there is deliberately no `offset=`.
+
+**A count is bounded and says when it is a floor.** Discord publishes no message count for a guild
+text channel, so `GET .../count` walks backwards a hundred at a time until the channel runs out or
+`discord.max_count_scan` stops it, and sets `at_least` when the ceiling was what stopped it.
+"At least 500" is the honest answer; a confident total would be either slow or wrong. This is the
+defect the count tool exists for: asked how many messages a channel held, an agent answered
+**100** — the size of the page it had been handed.
 
 **Every message also carries two times, and only one of them is meant to be spoken.**
 `spoken_time` is the instant already converted into `server.timezone` and labelled with it —
@@ -474,12 +495,14 @@ JSON-RPC batches are refused with `-32600`. The 2025-06-18 revision removed them
 half-succeeded batch has no coherent HTTP status — which is not a property a write-capable
 endpoint should have.
 
-### The five tools
+### The seven tools
 
 | Tool | Scope | Approval intent | What it does |
 |---|---|---|---|
 | `list_channels` | read | automatic | Names the configured channels and which are postable. |
 | `digest_channel` | read | automatic | One speakable line per recent message. |
+| `read_page` | read | automatic | One step of a walk: a page that says it is a page, plus the cursor for the next one. |
+| `count_messages` | read | automatic | How many, up to a cost ceiling — "at least N" when the ceiling stops it. |
 | `find_message` | read | automatic | Describe a message in your own words, get it back in full. |
 | `read_message` | read | automatic | One known message by id. |
 | `post_reply` | **write** | **requires approval** | Posts as the bot. |

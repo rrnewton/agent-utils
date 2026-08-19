@@ -44,6 +44,18 @@ impl AppState {
             .clamp(1, discord.max_fetch_limit)
     }
 
+    /// Resolve a caller-requested count ceiling against the configured one.
+    ///
+    /// The configured value is a ceiling, never a floor: a caller may ask to look at fewer
+    /// messages than the operator allows, and may not ask to look at more. Counting costs one
+    /// Discord request per hundred messages against a shared rate limit, so this is the knob that
+    /// keeps "how many messages are in there?" from being an expensive question.
+    #[must_use]
+    pub fn effective_count_cap(&self, requested: Option<u32>) -> u32 {
+        let configured = self.config.discord.max_count_scan;
+        requested.map_or(configured, |r| r.clamp(1, configured))
+    }
+
     /// Channel ids this server is configured for, in configuration order.
     #[must_use]
     pub fn channel_ids(&self) -> Vec<ChannelId> {
@@ -74,6 +86,20 @@ mod tests {
             state.effective_limit(Some(u16::MAX)),
             max,
             "a caller must not be able to request an unbounded fetch"
+        );
+    }
+
+    #[test]
+    fn the_count_ceiling_is_a_ceiling_and_not_a_floor() {
+        let (state, _fake) = testing::state();
+        let configured = state.config.discord.max_count_scan;
+        assert_eq!(state.effective_count_cap(None), configured);
+        assert_eq!(state.effective_count_cap(Some(10)), 10);
+        assert_eq!(state.effective_count_cap(Some(0)), 1);
+        assert_eq!(
+            state.effective_count_cap(Some(u32::MAX)),
+            configured,
+            "a caller must not be able to make this server walk a channel's whole history"
         );
     }
 }

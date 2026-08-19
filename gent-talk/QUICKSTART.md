@@ -300,13 +300,15 @@ Keep ElevenLabs' hosted LLM. Nothing in this project needs you to bring your own
 MCP's legacy remote transport, superseded by Streamable HTTP in protocol revision `2025-03-26`,
 and this server deliberately implements only the current one. Choosing SSE will fail to connect.
 
-3. Set per-tool approval. All five tools should appear once the server connects; if only four do,
+3. Set per-tool approval. All seven tools should appear once the server connects; if only six do,
    you gave it the read token, which is the conservative choice and means posting is off entirely.
 
 | Tool | Approval | Why |
 |---|---|---|
 | `list_channels` | **auto** — no approval | Names your channels. Reads nothing from Discord. |
 | `digest_channel` | **auto** — no approval | One spoken line per recent message. This is the main one. |
+| `read_page` | **auto** — no approval | Step further back, ten at a time, or jump to a period. Says it is a page. |
+| `count_messages` | **auto** — no approval | "How many are in there?" — bounded, and says when it is a floor. |
 | `find_message` | **auto** — no approval | "The one about the mac runner" → that message, in full. |
 | `read_message` | **auto** — no approval | One known message by id. |
 | **`post_reply`** | **REQUIRE APPROVAL** | **Speaks in your name, in your channel.** |

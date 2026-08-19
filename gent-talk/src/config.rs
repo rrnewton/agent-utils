@@ -117,6 +117,13 @@ pub struct DiscordConfig {
     pub default_fetch_limit: u16,
     /// Hard ceiling on a caller-requested fetch size.
     pub max_fetch_limit: u16,
+    /// How many messages a count may walk before it gives up and answers "at least this many".
+    ///
+    /// A cost ceiling, not a preference. Discord has no message-count endpoint, so counting means
+    /// paginating at a hundred messages per request against a shared rate limit; without a cap, a
+    /// single spoken "how many messages are in there?" could fire dozens of requests at a busy
+    /// channel and stall every other read behind it.
+    pub max_count_scan: u32,
 }
 
 /// API credentials this server requires of its callers.
@@ -212,6 +219,7 @@ struct FileDiscord {
     api_base: Option<String>,
     default_fetch_limit: Option<u16>,
     max_fetch_limit: Option<u16>,
+    max_count_scan: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -253,6 +261,8 @@ pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";
 pub const DEFAULT_TIMEZONE: &str = "UTC";
 const DEFAULT_FETCH_LIMIT: u16 = 50;
 const DEFAULT_MAX_FETCH_LIMIT: u16 = 100;
+/// Default cost ceiling for a count: five Discord requests' worth.
+const DEFAULT_MAX_COUNT_SCAN: u32 = 500;
 
 impl Config {
     /// Read the configuration file at `path`, then apply process-environment overrides.
@@ -358,10 +368,20 @@ impl Config {
             .discord
             .max_fetch_limit
             .unwrap_or(DEFAULT_MAX_FETCH_LIMIT);
+        let max_count_scan = file
+            .discord
+            .max_count_scan
+            .unwrap_or(DEFAULT_MAX_COUNT_SCAN);
         if default_fetch_limit == 0 || max_fetch_limit == 0 {
             return Err(ConfigError::Invalid {
                 field: "discord.max_fetch_limit".to_owned(),
                 detail: "fetch limits must be at least 1".to_owned(),
+            });
+        }
+        if max_count_scan == 0 {
+            return Err(ConfigError::Invalid {
+                field: "discord.max_count_scan".to_owned(),
+                detail: "must be at least 1, or counting can never answer anything".to_owned(),
             });
         }
         if default_fetch_limit > max_fetch_limit {
@@ -385,6 +405,7 @@ impl Config {
                     .unwrap_or_else(|| DEFAULT_DISCORD_API_BASE.to_owned()),
                 default_fetch_limit,
                 max_fetch_limit,
+                max_count_scan,
             },
             auth: AuthConfig {
                 read_token,
@@ -668,6 +689,23 @@ writable = true
             matches!(&err, ConfigError::Invalid { field, detail }
                 if field == "server.timezone" && detail.contains("America/Nowhere")),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_count_scan_ceiling_defaults_and_must_be_usable() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.discord.max_count_scan, DEFAULT_MAX_COUNT_SCAN);
+
+        let text = FULL.replace("[discord]", "[discord]\nmax_count_scan = 1200");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.discord.max_count_scan, 1200);
+
+        let text = FULL.replace("[discord]", "[discord]\nmax_count_scan = 0");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "discord.max_count_scan"),
+            "a zero ceiling means every count answers \"at least zero\": {err}"
         );
     }
 

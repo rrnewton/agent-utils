@@ -76,6 +76,27 @@ pub fn spoken(iso: &str, zone: &Zone) -> String {
         .to_string()
 }
 
+/// Parse an ISO-8601 instant into milliseconds since the Unix epoch.
+///
+/// Returns `None` for anything that is not an instant, so a caller-supplied time range can be
+/// refused with a named error rather than silently becoming "the beginning of time".
+#[must_use]
+pub fn instant_ms(iso: &str) -> Option<i64> {
+    iso.trim()
+        .parse::<Timestamp>()
+        .ok()
+        .map(Timestamp::as_millisecond)
+}
+
+/// Render milliseconds since the Unix epoch back as an ISO-8601 instant in UTC.
+///
+/// Used for the continuation cursor of a time-range walk: what a caller hands back must be the
+/// same kind of value it passed in, or stepping is not a loop it can write.
+#[must_use]
+pub fn iso_from_ms(ms: i64) -> String {
+    Timestamp::from_millisecond(ms).map_or_else(|_| String::new(), |t| t.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +143,23 @@ mod tests {
         assert!(error.contains("Mars/Olympus_Mons"), "{error}");
         let error = zone("   ").expect_err("a blank zone is not a zone");
         assert!(error.contains("blank"), "{error}");
+    }
+
+    #[test]
+    fn an_instant_converts_to_milliseconds_and_back() {
+        let ms = instant_ms("2026-08-19T13:51:25.123Z").expect("an instant");
+        assert_eq!(ms, 1_787_147_485_123);
+        assert_eq!(instant_ms("2026-08-19T09:51:25.123-04:00"), Some(ms));
+        assert_eq!(
+            instant_ms("yesterday afternoon"),
+            None,
+            "a range this server cannot place must be refused, not defaulted"
+        );
+        assert!(
+            iso_from_ms(ms).starts_with("2026-08-19T13:51:25.123"),
+            "{}",
+            iso_from_ms(ms)
+        );
     }
 
     #[test]

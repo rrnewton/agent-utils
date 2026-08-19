@@ -360,6 +360,120 @@ async fn a_configured_but_read_only_channel_still_refuses_the_write_token() {
     assert!(harness.discord.posted().is_empty());
 }
 
+// --- stepping through a channel -----------------------------------------------------------------
+
+/// `#53 stepped-retrieval`. Asked for ten of a hundred, the answer must say so in words.
+#[tokio::test]
+async fn a_page_says_it_is_a_page() {
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    for i in 0..100 {
+        harness.discord.seed(&channel, "agent", &format!("m{i}"));
+    }
+    let (_status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call(
+            "read_page",
+            json!({ "channel_id": READ_CHANNEL, "limit": 10 }),
+        ),
+    )
+    .await;
+    let text = tool_text(&body);
+    assert!(
+        text.contains("10 messages returned"),
+        "the answer must say how many it returned: {text}"
+    );
+    assert!(
+        text.contains("This is a PAGE, not the channel's total"),
+        "the whole reported bug was a page mistaken for a total: {text}"
+    );
+    assert!(
+        text.contains("There are older messages beyond this page"),
+        "and it must say that more remain: {text}"
+    );
+    assert!(
+        text.contains("call read_page again with before="),
+        "saying more remain without saying how to reach them leaves a model guessing: {text}"
+    );
+}
+
+/// The control: the same call against a channel that really does hold only ten must say the
+/// OPPOSITE, so the assertion above cannot pass against a response that always claims more.
+#[tokio::test]
+async fn a_page_that_is_the_end_says_the_opposite() {
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    for i in 0..10 {
+        harness.discord.seed(&channel, "agent", &format!("m{i}"));
+    }
+    let (_status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call(
+            "read_page",
+            json!({ "channel_id": READ_CHANNEL, "limit": 10 }),
+        ),
+    )
+    .await;
+    let text = tool_text(&body);
+    assert!(text.contains("10 messages returned"), "{text}");
+    assert!(
+        text.contains("nothing beyond this page"),
+        "a page that IS the end must say so: {text}"
+    );
+    assert!(
+        !text.contains("before="),
+        "there is nowhere to step back to, so no cursor may be offered: {text}"
+    );
+}
+
+/// `#53 stepped-retrieval`, the reported bug itself: the count must not be the page size.
+#[tokio::test]
+async fn the_count_is_not_the_page_size() {
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    for i in 0..150 {
+        harness.discord.seed(&channel, "agent", &format!("m{i}"));
+    }
+    let (_status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call("count_messages", json!({ "channel_id": READ_CHANNEL })),
+    )
+    .await;
+    let text = tool_text(&body);
+    assert!(
+        text.contains("exactly 150 messages"),
+        "the walk reached the end, so the answer is the real total: {text}"
+    );
+    assert!(
+        !text.contains(" 50 ") && !text.contains(" 100 "),
+        "neither the configured fetch limit nor Discord's page ceiling may leak out as a \
+         count: {text}"
+    );
+
+    // And with a ceiling in the way, the same tool must hedge rather than round off.
+    let (_status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call(
+            "count_messages",
+            json!({ "channel_id": READ_CHANNEL, "cap": 40 }),
+        ),
+    )
+    .await;
+    let text = tool_text(&body);
+    assert!(
+        text.contains("AT LEAST"),
+        "a count the ceiling stopped must be reported as a lower bound: {text}"
+    );
+    assert!(
+        text.contains("Say \"at least\" when you report it"),
+        "{text}"
+    );
+}
+
 // --- what the clock says ------------------------------------------------------------------------
 
 /// `#52 operator-timezone`. The control the issue asks for, end to end through the real router.
@@ -637,11 +751,13 @@ async fn a_full_handshake_then_list_then_call_works_over_the_endpoint() {
         vec![
             "list_channels",
             "digest_channel",
+            "read_page",
+            "count_messages",
             "find_message",
             "read_message",
             "post_reply"
         ],
-        "the write credential sees exactly the five implemented tools"
+        "the write credential sees exactly the seven implemented tools"
     );
 
     let (_status, found) = rpc(

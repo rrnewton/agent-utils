@@ -69,20 +69,52 @@ pub fn authorization_header(token: &Secret) -> String {
     format!("Bot {}", token.expose())
 }
 
-/// Build the request that reads recent messages.
+/// Build the request that reads one page of messages.
+///
+/// `before` and `after` are Discord's own cursors and are mutually exclusive; sending both is
+/// undefined, so it is refused here rather than resolved by a coin flip.
+///
+/// # Errors
+///
+/// Returns [`DiscordError::Refused`] when both cursors are supplied.
+pub fn page_request(
+    api_base: &str,
+    channel: &ChannelId,
+    limit: u16,
+    before: Option<&MessageId>,
+    after: Option<&MessageId>,
+) -> Result<PreparedRequest, DiscordError> {
+    if before.is_some() && after.is_some() {
+        return Err(DiscordError::Refused(
+            "before and after cannot both be given: discord does not define what that means"
+                .to_owned(),
+        ));
+    }
+    let limit = limit.clamp(1, DISCORD_MAX_LIMIT);
+    let mut url = format!(
+        "{}/channels/{}/messages?limit={}",
+        api_base.trim_end_matches('/'),
+        channel.as_str(),
+        limit
+    );
+    if let Some(cursor) = before {
+        url.push_str(&format!("&before={}", cursor.as_str()));
+    }
+    if let Some(cursor) = after {
+        url.push_str(&format!("&after={}", cursor.as_str()));
+    }
+    Ok(PreparedRequest {
+        method: "GET",
+        url,
+        body: None,
+    })
+}
+
+/// Build the request that reads the most recent messages, with no cursor.
 #[must_use]
 pub fn fetch_request(api_base: &str, channel: &ChannelId, limit: u16) -> PreparedRequest {
-    let limit = limit.clamp(1, DISCORD_MAX_LIMIT);
-    PreparedRequest {
-        method: "GET",
-        url: format!(
-            "{}/channels/{}/messages?limit={}",
-            api_base.trim_end_matches('/'),
-            channel.as_str(),
-            limit
-        ),
-        body: None,
-    }
+    page_request(api_base, channel, limit, None, None)
+        .expect("a request with neither cursor is always buildable")
 }
 
 /// Build the request that posts a message.
@@ -272,14 +304,15 @@ impl HttpDiscordClient {
 
 #[async_trait]
 impl DiscordClient for HttpDiscordClient {
-    async fn fetch_recent(
+    async fn fetch_page(
         &self,
         channel: &ChannelId,
         limit: u16,
+        before: Option<&MessageId>,
+        after: Option<&MessageId>,
     ) -> Result<Vec<Message>, DiscordError> {
-        let value = self
-            .send(fetch_request(&self.api_base, channel, limit))
-            .await?;
+        let request = page_request(&self.api_base, channel, limit, before, after)?;
+        let value = self.send(request).await?;
         parse_message_list(&value)
     }
 
@@ -328,6 +361,50 @@ mod tests {
         assert!(fetch_request(BASE, &channel(), 9999)
             .url
             .ends_with("limit=100"));
+    }
+
+    #[test]
+    fn a_cursor_reaches_the_url_as_discords_own_parameter() {
+        let before = page_request(
+            BASE,
+            &channel(),
+            10,
+            Some(&MessageId("55".to_owned())),
+            None,
+        )
+        .expect("one cursor is fine");
+        assert_eq!(
+            before.url,
+            "https://discord.com/api/v10/channels/123/messages?limit=10&before=55"
+        );
+        let after = page_request(
+            BASE,
+            &channel(),
+            10,
+            None,
+            Some(&MessageId("55".to_owned())),
+        )
+        .expect("one cursor is fine");
+        assert_eq!(
+            after.url,
+            "https://discord.com/api/v10/channels/123/messages?limit=10&after=55"
+        );
+    }
+
+    #[test]
+    fn both_cursors_at_once_are_refused_rather_than_resolved_by_a_coin_flip() {
+        // Discord does not define the behaviour, so a client that picked one would be inventing
+        // a semantics — and the walk built on it would be wrong in a way only live traffic shows.
+        assert!(matches!(
+            page_request(
+                BASE,
+                &channel(),
+                10,
+                Some(&MessageId("1".to_owned())),
+                Some(&MessageId("2".to_owned()))
+            ),
+            Err(DiscordError::Refused(_))
+        ));
     }
 
     #[test]
