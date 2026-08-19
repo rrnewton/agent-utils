@@ -11,6 +11,10 @@ repository = "https://github.com/rrnewton/agent-utils"
 authors = ["Ryan Newton"]
 description = "A voice-agent bridge that reads and answers about Discord channels from a phone."
 publish = false
+# There are two binaries, and every `cargo run` in the README, in scripts/, and in CI means the
+# server. Without this, adding the mock turned all of them into "could not determine which binary
+# to run" — a second target must not change what the first command in the quickstart does.
+default-run = "gent-talk"
 
 [lib]
 name = "gent_talk"
