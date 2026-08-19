@@ -109,6 +109,20 @@ relaunches. Copy `gent-talk.env.example` to `~/.config/gent-talk/env` to configu
 is outside every checkout, so the file cannot be committed by accident — and see
 `scripts/run.sh --help` for the flags and the configuration precedence.
 
+It launches the container **detached**, under the fixed name `gent-talk`, and without `--rm`, so
+the server does not die with the terminal that started it and its log survives a crash instead of
+being destroyed by it. Day to day that gives you four commands:
+
+```sh
+scripts/run.sh --follow          # a tab that watches the server, as if you had run it yourself
+scripts/run.sh --logs            # one-shot dump; works on a stopped container too
+scripts/run.sh --status          # what is running, under what restart policy, with logs kept?
+scripts/run.sh --tunnel-status   # the cloudflared unit: active, since when, which hostname
+```
+
+`--tunnel-status` only reports; it never starts or stops anything. Logs are kept when the
+container stops and are discarded at the next launch, so read them before you relaunch.
+
 ```sh
 cd gent-talk
 podman build -t gent-talk:v0 -f Containerfile .
