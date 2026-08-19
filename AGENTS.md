@@ -47,8 +47,32 @@ signal for a human, not a gate.
 
 ### Validate before you push
 
-Direct-to-main does not mean unvalidated-to-main. Before every push, run the
-repository contract, including the Python/Rust behavioral cross-check:
+Direct-to-main does not mean unvalidated-to-main. Before every push:
+
+```bash
+make validate
+```
+
+That runs **only the checks your change can actually affect**, and prints the
+rest as skipped, by name, with the reason. A change confined to `gent-talk/`
+runs the gent-talk suite and nothing else, because gent-talk is outside the
+Rust workspace and shares no code with it — the workspace build, the
+cross-language differential and the packaging smoke tests cannot observe that
+edit, so running them only makes you wait.
+
+The mapping lives in `scripts/validate.py` and has two safety properties, both
+covered by `make check` via `--self-test`:
+
+- **An unclassified path selects everything.** A new top-level directory cannot
+  silently opt out of validation.
+- **A change spanning two areas is the union**, never the cheaper of the two.
+
+Use `make validate-all` for the entire contract regardless of what changed.
+That is what a release path should use, and what to fall back on the moment you
+are unsure the selection is right — selection is a convenience for the edit-run
+loop, not a new definition of "validated".
+
+The full contract, for reference, is the union of these:
 
 ```bash
 python3 scripts/embed_userguides.py --check
@@ -57,7 +81,6 @@ make both
 make check
 make test
 python3 -m mypy cross/differential.py
-python3 cross/differential.py --tool safe-ci-dag-runner
 make cross
 make check-packages
 ```

@@ -21,7 +21,7 @@ mypy:
 	python3 scripts/check_no_any.py .
 
 # Lint/typecheck gates (what CI runs).
-check: check-deps mypy check-test-suite-selector
+check: check-deps mypy check-test-suite-selector check-validate-selector
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	test -n "$$host_target"; \
 	cargo clippy --release --workspace --all-targets --manifest-path rs/Cargo.toml \
@@ -40,6 +40,19 @@ endif
 ifeq ($(filter all python rust,$(TEST_SUITE)),)
 $(error TEST_SUITE must be exactly one of: all, python, rust)
 endif
+
+# Run only the checks the current change can actually affect, and REPORT the rest as skipped.
+# `--all` is the whole contract and is what CI uses; selection is for the edit-run loop.
+# See scripts/validate.py for the path -> check mapping and why each rule is what it is.
+validate:
+	python3 scripts/validate.py
+
+validate-all:
+	python3 scripts/validate.py --all
+
+# The selector must not be able to silently under-run. Offline, no build, no network.
+check-validate-selector:
+	python3 scripts/validate.py --self-test
 
 check-test-suite-selector:
 	@for valid in all python rust; do \

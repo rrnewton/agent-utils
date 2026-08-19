@@ -3,10 +3,37 @@ name: repository-ci
 # Authoritative repository gate. Run for every change so edits to the Makefile,
 # setup driver, workflows, or a new utility cannot bypass the repository's own
 # build/test contract. The focused workflows remain useful diagnostics.
+#
+# `paths-ignore` is deliberately TINY, and its semantics are what make it safe:
+# GitHub skips the run only when EVERY changed file matches, so a commit that
+# touches one workspace file alongside a hundred ignored ones still runs the
+# whole gate. Nothing can opt out by being bundled with something else.
+#
+# Only two things are listed, and each is here because this gate provably
+# cannot observe it:
+#
+#   * `gent-talk/**` is outside the Rust workspace, has no Python package, is
+#     in neither `make check` nor `make test`, and is covered end to end by its
+#     own `gent-talk.yml`. Building the workspace tells you nothing about it.
+#   * prose directories ship in no distribution and are embedded nowhere.
+#
+# `AGENTS.md`, the Makefile, `setup`, `scripts/**` and every workflow are
+# deliberately NOT ignored. The same mapping, with the same reasoning, is
+# enforced locally by `scripts/validate.py`; keep the two in step.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'gent-talk/**'
+      - 'ai_docs/**'
+      - 'reviews/**'
+      - 'skills/**'
   pull_request:
+    paths-ignore:
+      - 'gent-talk/**'
+      - 'ai_docs/**'
+      - 'reviews/**'
+      - 'skills/**'
   workflow_dispatch:
 
 # Keep checkout's temporary `git init` deterministic and quiet. Without this,
