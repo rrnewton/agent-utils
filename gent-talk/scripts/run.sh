@@ -11,6 +11,7 @@
 #
 # Usage:
 #   scripts/run.sh [--shutdown] [--restart] [--logs] [--follow] [--status] [--tunnel-status]
+#                  [--smoke-agent [--nonce]]
 #                  [--config FILE] [--tunnel|--no-tunnel] [--tag TAG] [--port PORT]
 #                  [--restart-policy POLICY] [--dry-run] [--help]
 #
@@ -31,6 +32,36 @@
 #                  whether it is enabled at boot, and the hostname it serves. STRICTLY READ-ONLY
 #                  — it never starts, stops, or enables anything. Exits 0 when the unit is
 #                  active, 1 when it is not.
+#   --smoke-agent  *** COSTS VENDOR MINUTES. MANUAL ONLY. *** Hold a REAL conversation with the
+#                  deployed ElevenLabs voice agent, headless (typed, not spoken), and fail unless
+#                  the agent actually CALLED A TOOL on this server during it. This is the check
+#                  every other check here cannot make: on 2026-08-19 the owner's session failed
+#                  while every server-side check passed, because the agent completed the MCP
+#                  handshake and then invoked nothing. Nothing asserted that a tool is called, so
+#                  nothing went red.
+#                  It is deliberately NOT part of any suite and NOT run by CI: each run opens a
+#                  billed conversation. Run it when you want to see what the owner sees. It reads
+#                  the channel and never asks the agent to post. The container is only READ from
+#                  (its log); nothing is started, stopped, or rebuilt.
+#                  Needs the python3 'websockets' package; it says so by name if it is missing.
+#
+#                  WHAT A RUN COSTS. A PASSING run is ONE short conversation (about 15 seconds of
+#                  socket time) and writes NOTHING to the channel. A FAILING run costs roughly
+#                  TWICE that: when the agent's reply does not carry the channel message back, the
+#                  test automatically escalates — it posts one unique token to the channel through
+#                  this server's own write API (never through the agent) and asks again, requiring
+#                  the token back verbatim. That second conversation is what separates "the agent
+#                  is not really reading" from "the test's own matching was too strict", which are
+#                  different problems with opposite fixes. The two are reported as different
+#                  results, never as one "smoke failed".
+#                  Some runs are REFUSED rather than decided: an empty channel, or a newest message
+#                  with nothing distinctive in it, cannot decide the question either way, so the
+#                  run stops before opening any conversation and bills nothing.
+#   --nonce        Only with --smoke-agent. Go straight to the token round instead of waiting for
+#                  the cheap check to fail — for when you want that evidence on a run that would
+#                  otherwise pass cheaply, or when the channel's latest message is too plain to
+#                  match on. It always writes one line to the channel. You do not need this to get
+#                  the escalation: that happens by itself when the cheap check fails.
 #   --config FILE  Use exactly this configuration file and no other. Missing file is an error.
 #   --tunnel       Force the cloudflared tunnel check ON for this run.
 #   --no-tunnel    Force the cloudflared tunnel check OFF for this run.
@@ -135,6 +166,8 @@ STATUS_ONLY=0
 LOGS_ONLY=0
 FOLLOW=0
 TUNNEL_STATUS_ONLY=0
+SMOKE_AGENT=0
+SMOKE_NONCE=0
 TUNNEL_OVERRIDE=""
 TAG_OVERRIDE=""
 PORT_OVERRIDE=""
@@ -163,6 +196,8 @@ while [ $# -gt 0 ]; do
         --logs) LOGS_ONLY=1; shift ;;
         --follow) FOLLOW=1; shift ;;
         --tunnel-status) TUNNEL_STATUS_ONLY=1; shift ;;
+        --smoke-agent) SMOKE_AGENT=1; shift ;;
+        --nonce) SMOKE_NONCE=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unrecognized argument: $1" >&2; echo "" >&2; usage >&2; exit 2 ;;
     esac
@@ -183,11 +218,20 @@ if [ "$STATUS_ONLY" = 1 ]; then ACTIONS_GIVEN+=(--status); fi
 if [ "$LOGS_ONLY" = 1 ]; then ACTIONS_GIVEN+=(--logs); fi
 if [ "$FOLLOW" = 1 ]; then ACTIONS_GIVEN+=(--follow); fi
 if [ "$TUNNEL_STATUS_ONLY" = 1 ]; then ACTIONS_GIVEN+=(--tunnel-status); fi
+if [ "$SMOKE_AGENT" = 1 ]; then ACTIONS_GIVEN+=(--smoke-agent); fi
 if [ "${#ACTIONS_GIVEN[@]}" -gt 1 ]; then
     die "these actions cannot be combined: ${ACTIONS_GIVEN[*]}
 Each one ends the run somewhere different. Pick exactly one and re-run.
   --logs dumps output and exits;  --follow streams it;  --status and --tunnel-status report;
   --shutdown stops and exits;     --restart stops and relaunches."
+fi
+
+if [ "$SMOKE_NONCE" = 1 ] && [ "$SMOKE_AGENT" != 1 ]; then
+    die "--nonce only means something together with --smoke-agent.
+It is the strong form of that check: it posts one unique token to the channel through this
+server's own write API and requires the agent to relay it back verbatim. On its own there is
+nothing for it to modify, and accepting it silently would leave you believing you had run the
+strong check when you had not."
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -500,6 +544,84 @@ if [ "$STATUS_ONLY" = 1 ]; then
         done <<< "$STOPPED"
     fi
     exit 0
+fi
+
+# --------------------------------------------------------------------------------------------
+# The agent smoke test. THE ONLY ACTION HERE THAT COSTS MONEY.
+#
+# It is a separate script because it is a different kind of thing from everything else in this
+# file: the rest of run.sh manages a container, this holds a real, billed conversation with a
+# vendor. What run.sh contributes is the three facts it already knows and the operator would
+# otherwise have to repeat — the URL, the channel, and which container holds the access log.
+#
+# Nothing here starts, stops, rebuilds or restarts anything. The container is READ from.
+# --------------------------------------------------------------------------------------------
+
+if [ "$SMOKE_AGENT" = 1 ]; then
+    SMOKE_SCRIPT="$SCRIPT_DIR/smoke-agent.py"
+    [ -x "$SMOKE_SCRIPT" ] || die "the smoke test is missing or not executable: $SMOKE_SCRIPT"
+
+    for var in GENT_TALK_READ_TOKEN GENT_TALK_WRITE_TOKEN GENT_TALK_CHANNELS; do
+        [ -n "${!var:-}" ] || die "--smoke-agent needs $var, and it is not set.
+It reads the channel with the read token and mints a signed conversation URL with the write one
+(minting requires the write scope, because the conversation it opens reaches an agent that can
+post). Set it in ${SOURCED_FILES[*]}."
+    done
+
+    # First configured channel: 'id:label:mode,id:label'. The smoke test asks about ONE channel,
+    # and the first one is the one the owner listed first.
+    SMOKE_CHANNEL="${GENT_TALK_CHANNELS%%,*}"
+    SMOKE_CHANNEL="${SMOKE_CHANNEL%%:*}"
+    SMOKE_CHANNEL="$(printf '%s' "$SMOKE_CHANNEL" | tr -d '[:space:]')"
+    [ -n "$SMOKE_CHANNEL" ] || die "could not read a channel snowflake out of GENT_TALK_CHANNELS."
+
+    # Read the log from the container that is actually serving, not from the name we would use if
+    # we launched one. Those differ exactly when something unexpected is running — which is
+    # precisely when reading the wrong log would mislead.
+    if [ -z "$FOUND" ]; then
+        die "nothing is running on ${HOST_ADDR}:${HOST_PORT} (image $IMAGE_REF), so there is no
+live deployment to hold a conversation against and no access log to check the agent against.
+Start it with: $SCRIPT_DIR/run.sh"
+    fi
+    IFS='|' read -r _smoke_id _smoke_image SMOKE_CONTAINER _smoke_ports _smoke_status <<< "$(head -1 <<< "$FOUND")"
+
+    SMOKE_ARGS=(
+        --url "http://${HOST_ADDR}:${HOST_PORT}"
+        --channel "$SMOKE_CHANNEL"
+        --container "$SMOKE_CONTAINER"
+        --engine "$ENGINE"
+    )
+    if [ "$SMOKE_NONCE" = 1 ]; then SMOKE_ARGS+=(--nonce); fi
+
+    step "Agent smoke test — a REAL conversation with the deployed agent. THIS COSTS VENDOR MINUTES."
+    note "target:    http://${HOST_ADDR}:${HOST_PORT}"
+    note "channel:   $SMOKE_CHANNEL"
+    note "log from:  $SMOKE_CONTAINER  ($_smoke_status)"
+    if [ "$SMOKE_NONCE" = 1 ]; then
+        note "mode:      --nonce — posts ONE unique token to the channel through this server's own"
+        note "           write API (never through the agent) and requires it back verbatim."
+    else
+        note "mode:      default — nothing is written to the channel unless the check FAILS, in"
+        note "           which case it escalates to the token round and holds a second (billed)"
+        note "           conversation to find out whether the agent or this test is at fault."
+    fi
+    note "the agent is never asked to post; this reads."
+
+    # Tokens go through the ENVIRONMENT, never the command line: a command line is readable by
+    # every process on this box, and this script's standing promise is that it never puts a
+    # credential anywhere it can be read.
+    export GENT_TALK_READ_TOKEN GENT_TALK_WRITE_TOKEN
+    # An `if` block rather than `[ ... ] && export ...`: under `set -e` a false test there is the
+    # last command of the AND-list, and the script exits silently. Same trap as the one already
+    # noted at the action-conflict check above.
+    if [ -n "${GENT_TALK_ELEVENLABS_API_KEY:-}" ]; then export GENT_TALK_ELEVENLABS_API_KEY; fi
+
+    if [ "$DRY_RUN" = 1 ]; then
+        note "(dry run) $SMOKE_SCRIPT ${SMOKE_ARGS[*]}"
+        note "(dry run) nothing was connected to and nothing was billed."
+        exit 0
+    fi
+    exec "$SMOKE_SCRIPT" "${SMOKE_ARGS[@]}"
 fi
 
 # --------------------------------------------------------------------------------------------

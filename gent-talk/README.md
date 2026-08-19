@@ -49,10 +49,11 @@ the reference behind it: what every route does, what the security model is, and 
 | Semantic random access (`resolve`) | **works**, lexical ranking behind a `Ranker` trait |
 | Web app: text tab, digest, find-a-message, local speech | **works** |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, five tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
-| ElevenLabs voice agent | **not verified.** The endpoint an agent needs exists and answers; no ElevenLabs agent has been pointed at it. The web app mounts the hosted widget only if an agent id is configured. |
+| ElevenLabs voice agent | **reachable, and currently NOT invoking tools.** A real agent has now been driven headlessly (`scripts/run.sh --smoke-agent`): the signed URL mints, the conversation opens, the agent answers — and it calls no tool, saying its tools "appear to be out of date". In the same conversation ElevenLabs reports our MCP server connected with all five tools visible, so the fault is in the agent's own configuration rather than in this server. |
 | **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
 | TLS | **not here.** Terminate in front (Caddy, nginx, a tunnel, or a cloud load balancer). A Cloudflare Tunnel recipe is below. |
+| Agent smoke test (`scripts/smoke-agent.py`, `run.sh --smoke-agent`) | **works, and it goes red on the real failure.** Holds a real conversation and fails unless a tool invocation appears in this server's own access log. Manual and opt-in: it costs vendor minutes, so it is in no suite and no CI. |
 | Deployment check (`scripts/verify-deployment.sh`) | **works.** One command, pass/fail, exits non-zero and names the failing check. Runs in CI against the container on every push, including a negative control that requires it to go red. |
 
 Honest summary: everything except the two vendor-facing halves — live Discord and ElevenLabs — is
@@ -818,6 +819,7 @@ src/http/             router, handlers, and the access-log middleware
 web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)
 tests/js/             the /voice page's own suite, run from cargo test via tests/voice_page.rs
 scripts/verify-deployment.sh   the one-command deployment check, local or public
+scripts/smoke-agent.py         the manual, billed check that the AGENT really calls us
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```
 

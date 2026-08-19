@@ -415,6 +415,64 @@ for action in --logs --follow; do
     ok "$action with no container fails clearly, naming what it looked for"
 done
 
+# --- 9d. --smoke-agent: the paths that must NOT open a billed conversation ---------------------
+# Every check here is about REFUSING to run, so none of them can cost anything. The one thing this
+# action must never do is start a conversation the operator did not mean to start.
+
+out="$(run_sh --help)"
+grep -qi 'COSTS VENDOR MINUTES' <<< "$out" || fail "--help does not warn that --smoke-agent costs money"
+grep -qi 'MANUAL ONLY\|manual' <<< "$out" || fail "--help does not say --smoke-agent is manual"
+grep -q '2026-08-19' <<< "$out" || fail "--help does not say which failure --smoke-agent exists to catch"
+ok "--help says --smoke-agent costs vendor minutes, is manual, and why it exists"
+
+# The owner asked explicitly for this not to be expensive, and a FAILING run costs about twice a
+# passing one because it escalates to a second conversation. That has to be in the help, or the
+# cost is a surprise discovered from a bill.
+grep -qi 'escalat' <<< "$out" || fail "--help does not mention the automatic escalation"
+grep -qi 'TWICE' <<< "$out" || fail "--help does not say that a failing run costs about twice a passing one"
+grep -qi 'REFUSED' <<< "$out" || fail "--help does not say some runs are refused rather than decided"
+ok "--help states what a passing run costs, what a failing one costs, and when a run is refused"
+
+# --nonce alone is meaningless. Accepting it silently would leave the operator believing they had
+# run the strong, proving check when they had run the weaker one.
+rc=0; out="$(run_sh --config "$GOOD_CONFIG" --nonce)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--nonce on its own was accepted"
+grep -q -- '--smoke-agent' <<< "$out" || fail "the --nonce refusal does not name the flag it belongs to: $out"
+ok "--nonce without --smoke-agent is refused, naming the action it modifies"
+
+rc=0; out="$(run_sh --config "$GOOD_CONFIG" --smoke-agent --status)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--smoke-agent --status together did not fail"
+grep -q 'cannot be combined' <<< "$out" || fail "combined-actions error does not cover --smoke-agent: $out"
+ok "--smoke-agent cannot be combined with another action"
+
+# Nothing running means nothing to converse with AND no access log to check the agent against —
+# and the access-log check is the primary assertion, so a run without it would be worse than no
+# run at all.
+rc=0; out="$(run_sh --config "$GOOD_CONFIG" --tag "$ABSENT_TAG" --port "$ABSENT_PORT" --smoke-agent)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--smoke-agent with nothing running exited 0"
+grep -qi 'nothing is running' <<< "$out" || fail "--smoke-agent with nothing running is not specific: $out"
+grep -q "$ABSENT_PORT" <<< "$out" || fail "--smoke-agent does not name the port it looked at: $out"
+ok "--smoke-agent with nothing running refuses, naming what it looked for"
+
+NO_WRITE_CONFIG="$TMPDIR_TEST/no-write.env"
+write_config "$NO_WRITE_CONFIG" GENT_TALK_WRITE_TOKEN
+rc=0; out="$(run_sh --config "$NO_WRITE_CONFIG" --smoke-agent --dry-run)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--smoke-agent without a write token exited 0"
+grep -q 'GENT_TALK_WRITE_TOKEN' <<< "$out" || fail "--smoke-agent does not name the missing variable: $out"
+ok "--smoke-agent without a write token refuses, naming the variable"
+
+# The smoke test's OWN controls, run here so they are part of a suite the owner already runs.
+# They are offline and cost nothing; if they ever fail, neither of the smoke test's assertions
+# can be trusted and a green smoke run would mean nothing.
+rc=0; out="$(timeout 60 python3 "$SCRIPT_DIR/smoke-agent.py" --self-test 2>&1)" || rc=$?
+printf '%s\n' "$out" >> "$ALL_OUTPUT"
+[ "$rc" -eq 0 ] || fail "the smoke test's own controls FAILED, so its assertions cannot be trusted: $out"
+grep -q 'REJECTS a fluent confabulated reply' <<< "$out" \
+    || fail "the smoke test's controls did not include the confabulation negative control: $out"
+grep -q 'handshake-only log' <<< "$out" \
+    || fail "the smoke test's controls did not include the no-tool-call negative control: $out"
+ok "the smoke test's own controls pass (both negative controls included)"
+
 # --- 10. already-running detection, by image and by port -------------------------------------
 if command -v "$ENGINE" >/dev/null 2>&1; then
     BASE_IMAGE="$("$ENGINE" images --format '{{.Repository}}:{{.Tag}}' | grep -E '^docker.io/library/debian:' | head -1 || true)"
@@ -562,6 +620,47 @@ EOF
         [ "$mode" = "on-failure:5|false" ] \
             || fail "the launched container is not on-failure:5 with logs retained, it is: $mode"
         ok "the launched container has the fixed name, restart policy on-failure:5, and no --rm"
+
+        # --smoke-agent, DRY RUN ONLY. The suite must never hold a real conversation: that costs
+        # the owner vendor minutes. What is checkable for free is everything up to the connection
+        # — that it resolves the URL, the channel and the CONTAINER THAT IS ACTUALLY SERVING out
+        # of the config and the running state, hands them to the smoke script, and bills nothing.
+        out="$(run_sh --config "$GOOD_CONFIG" --smoke-agent --dry-run)"
+        grep -q 'smoke-agent.py' <<< "$out" || fail "--smoke-agent does not reach the smoke script: $out"
+        grep -q -- "--url http://127.0.0.1:$TEST_PORT" <<< "$out" \
+            || fail "--smoke-agent did not pass the configured URL: $out"
+        # The FIRST channel of the config's list, with its label and mode stripped off.
+        grep -q -- '--channel 123456789012345678' <<< "$out" \
+            || fail "--smoke-agent did not pass the first configured channel snowflake: $out"
+        grep -q -- "--container $TEST_CONTAINER_NAME" <<< "$out" \
+            || fail "--smoke-agent did not point the log check at the container that is serving: $out"
+        grep -qi 'costs vendor minutes' <<< "$out" || fail "--smoke-agent does not warn about the cost: $out"
+        grep -q 'nothing was connected to and nothing was billed' <<< "$out" \
+            || fail "--smoke-agent --dry-run does not say it spent nothing: $out"
+        ok "--smoke-agent resolves the URL, channel and serving container, and --dry-run bills nothing"
+
+        # The credential must reach the smoke script through the ENVIRONMENT and never the command
+        # line, which every process on the box can read. Checked here rather than only in the
+        # end-of-suite leak scan, because this is the specific mechanism being relied on.
+        grep -qF -- "$SENTINEL_WRITE_TOKEN" <<< "$out" \
+            && fail "--smoke-agent put the write token on the command line: $out"
+        grep -qF -- "$SENTINEL_READ_TOKEN" <<< "$out" \
+            && fail "--smoke-agent put the read token on the command line: $out"
+        ok "--smoke-agent passes tokens by environment, never on the command line"
+
+        # --nonce is the mode that WRITES to the channel, so it must be visible in the plan.
+        out="$(run_sh --config "$GOOD_CONFIG" --smoke-agent --nonce --dry-run)"
+        grep -q -- '--nonce' <<< "$out" || fail "--nonce did not reach the smoke script: $out"
+        grep -qi 'posts ONE unique token\|posts one unique token' <<< "$out" \
+            || fail "--nonce does not say that it writes to the channel: $out"
+        ok "--smoke-agent --nonce passes the flag on and says out loud that it writes to the channel"
+
+        # And the DEFAULT plan must say that a failure writes to the channel too, via the
+        # escalation. "Nothing is written" would be a promise the run does not keep.
+        out="$(run_sh --config "$GOOD_CONFIG" --smoke-agent --dry-run)"
+        grep -qi 'escalate' <<< "$out" \
+            || fail "the default --smoke-agent plan does not mention the escalation: $out"
+        ok "--smoke-agent's default plan says a failure escalates and holds a second conversation"
 
         sleep 1
         out="$(run_sh --config "$GOOD_CONFIG" --logs)"
