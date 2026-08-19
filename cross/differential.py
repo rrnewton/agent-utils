@@ -1399,7 +1399,12 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
 
 
 def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> None:
-    """Eager cancellation grants one diagnostic window, not one window per sibling."""
+    """Eager cancellation grants one diagnostic window, not one window per sibling.
+
+    Use an outer run timeout as a behavioral tripwire instead of treating shared-host wall time as
+    a performance SLO. Eight serial five-second TERM graces cannot finish before that tripwire,
+    while one shared grace has ample room even under scheduler and `/proc`-scan contention.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         dag_path = os.path.join(tmp, "batch-grace.json")
         steps: list[dict[str, object]] = [
@@ -1419,7 +1424,7 @@ def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> N
                 "timeout": 20,
                 "cpu_timeout": 600,
             }
-            for index in range(4)
+            for index in range(8)
         )
         Path(dag_path).write_text(json.dumps({"steps": steps}), encoding="utf-8")
         args = (
@@ -1428,15 +1433,22 @@ def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> N
             dag_path,
             "-q",
             "-s",
-            "5",
+            "9",
             "-j",
-            "5",
+            "9",
+            "--run-timeout",
+            "25",
             NOPROF,
             NOFB,
             "--unsafe-no-cgroups",
         )
         po, ro = run(py, args), run(rs, args)
-        if po.returncode == ro.returncode != 0 and max(po.elapsed_s, ro.elapsed_s) < 9.0:
+        evidence = (po.stdout + po.stderr, ro.stdout + ro.stderr)
+        if (
+            po.returncode == ro.returncode != 0
+            and all("[scheduler] RUN TIMEOUT" not in text for text in evidence)
+            and max(po.elapsed_s, ro.elapsed_s) < 32.0
+        ):
             rep.ok("teardown:shared-batch-grace")
         else:
             rep.bad(
@@ -3748,21 +3760,36 @@ def compare_args_stress(py: list[str], rs: list[str], rep: Report) -> None:
             "--no-profile", "-q",
         )
         po, ro = run(py, stress), run(rs, stress)
-        # Parallel completion lines are intentionally nondeterministic. Compare only the stable
-        # report block instead of requiring the scheduler trace to finish in the same order.
-        def stress_report(stdout: str) -> str:
+        # Parallel completion lines and the observed peak overlap are intentionally
+        # nondeterministic for three near-instant `true` commands. Compare the stable pass ratio
+        # and configured ceilings while only requiring each observed peak to be in range. Exact
+        # overlap is exercised by the barrier-backed scheduler cases elsewhere in this harness.
+        def stress_report(stdout: str) -> tuple[str, str, int] | None:
             lines = stdout.splitlines()
             start = next(
                 (index for index, line in enumerate(lines) if line.startswith("stress results (")),
                 len(lines),
             )
-            return "\n".join(lines[start:])
+            report = lines[start:]
+            if len(report) != 3:
+                return None
+            match = re.fullmatch(
+                r"  maximum concurrent steps: ([0-9]+) (\(--max-steps .+\))",
+                report[2],
+            )
+            if match is None:
+                return None
+            return report[0] + "\n" + report[1], match.group(2), int(match.group(1))
 
         py_report, rs_report = stress_report(po.stdout), stress_report(ro.stdout)
         if (
             po.returncode == ro.returncode == 0
-            and py_report == rs_report
-            and "3/3 passed" in py_report
+            and py_report is not None
+            and rs_report is not None
+            and py_report[:2] == rs_report[:2]
+            and "3/3 passed" in py_report[0]
+            and 1 <= py_report[2] <= 3
+            and 1 <= rs_report[2] <= 3
         ):
             rep.ok("stress:three-pass-ratio")
         else:
