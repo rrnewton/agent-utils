@@ -73,6 +73,36 @@ pub fn channels(state: &AppState) -> Vec<ChannelInfo> {
     state.config.channels.clone()
 }
 
+/// One fetched window of a channel, and what it took to fetch it.
+///
+/// The `limit` is carried alongside the messages for one reason: without it, `messages.len()` is
+/// an unlabelled number that a caller will render as a channel total. It is not one. Discord's
+/// REST API offers no message count for a guild text channel — `GET /channels/{id}/messages`
+/// accepts `limit` 1..=100 and returns no total, and `message_count` / `total_message_sent` exist
+/// only on THREAD channels — so the only thing this server can honestly say about a full window
+/// is "there are at least this many".
+#[derive(Clone, Debug)]
+pub struct Window {
+    /// Channel that was read.
+    pub channel: ChannelInfo,
+    /// Messages, oldest first.
+    pub messages: Vec<Message>,
+    /// The size actually asked of Discord, already clamped to what Discord will honour.
+    pub limit: u16,
+}
+
+impl Window {
+    /// Whether `messages` is the WHOLE channel rather than a window onto it.
+    ///
+    /// A fetch that comes back with fewer messages than it asked for is Discord saying there is
+    /// nothing older, so the count is the channel's. A fetch that comes back full says nothing
+    /// about how much more there is. This is the only case in which a precise number may be shown.
+    #[must_use]
+    pub fn is_whole_channel(&self) -> bool {
+        self.messages.len() < usize::from(self.limit)
+    }
+}
+
 /// Recent messages of one channel, oldest first. Read scope.
 ///
 /// # Errors
@@ -83,11 +113,21 @@ pub async fn messages(
     state: &AppState,
     channel_id: &str,
     limit: Option<u16>,
-) -> Result<(ChannelInfo, Vec<Message>), OpError> {
-    let info = allowed(state, channel_id)?;
-    let limit = state.effective_limit(limit);
-    let messages = state.discord.fetch_recent(&info.id, limit).await?;
-    Ok((info, messages))
+) -> Result<Window, OpError> {
+    let channel = allowed(state, channel_id)?;
+    // Clamped to Discord's own ceiling, not merely to the configured one. Nothing in
+    // `Config::from_toml_and_env` stops an operator writing `max_fetch_limit = 200`, but both the
+    // real client and the fake clamp the request to 100 — so comparing against the unclamped
+    // number would report a FULL 100-message window as the whole channel.
+    let limit = state
+        .effective_limit(limit)
+        .min(crate::discord::http::DISCORD_MAX_LIMIT);
+    let messages = state.discord.fetch_recent(&channel.id, limit).await?;
+    Ok(Window {
+        channel,
+        messages,
+        limit,
+    })
 }
 
 /// One message in full, by id, within the recent window. Read scope.
@@ -102,16 +142,21 @@ pub async fn message_by_id(
     message_id: &str,
     limit: Option<u16>,
 ) -> Result<(ChannelInfo, Message), OpError> {
-    let (info, messages) = messages(state, channel_id, limit).await?;
+    let window = messages(state, channel_id, limit).await?;
     let wanted = MessageId(message_id.to_owned());
-    let message = messages
+    let message = window
+        .messages
         .into_iter()
         .find(|m| m.id == wanted)
         .ok_or(OpError::UnknownMessage)?;
-    Ok((info, message))
+    Ok((window.channel, message))
 }
 
 /// One speakable line per recent message. Read scope.
+///
+/// The trailing flag is [`Window::is_whole_channel`]: true when the entries are the entire
+/// channel, false when they are a window onto something larger. A caller that renders a count
+/// without consulting it is reporting the fetch size as a channel total.
 ///
 /// # Errors
 ///
@@ -121,15 +166,20 @@ pub async fn digest(
     channel_id: &str,
     limit: Option<u16>,
     width: Option<u16>,
-) -> Result<(ChannelInfo, Vec<DigestEntry>), OpError> {
-    let (info, messages) = messages(state, channel_id, limit).await?;
+) -> Result<(ChannelInfo, Vec<DigestEntry>, bool), OpError> {
+    let window = messages(state, channel_id, limit).await?;
+    let complete = window.is_whole_channel();
     let width = usize::from(width.unwrap_or(0));
     let width = if width == 0 {
         DEFAULT_SUMMARY_CHARS
     } else {
         width
     };
-    Ok((info, summary::digest(&messages, width)))
+    Ok((
+        window.channel,
+        summary::digest(&window.messages, width),
+        complete,
+    ))
 }
 
 /// Semantic random access: describe a message, get that message. Read scope.
@@ -259,6 +309,57 @@ mod tests {
             .await
             .expect_err("an id outside the window must miss");
         assert!(matches!(error, OpError::UnknownMessage), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_short_fetch_is_the_whole_channel_and_a_full_one_is_not() {
+        // The fixture's default_fetch_limit is 20 (see `testing::config_toml`).
+        let (state, fake) = testing::state();
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        for i in 0..5 {
+            fake.seed(&channel, "agent", &format!("line {i}"));
+        }
+        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        assert!(
+            window.is_whole_channel(),
+            "a fetch that came back short is Discord saying there is nothing older"
+        );
+
+        for i in 0..40 {
+            fake.seed(&channel, "agent", &format!("more {i}"));
+        }
+        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        assert_eq!(window.messages.len(), 20);
+        assert!(
+            !window.is_whole_channel(),
+            "a window that filled says nothing about how much more there is"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_configured_limit_above_discords_ceiling_does_not_fake_a_whole_channel() {
+        // The clamp trap. Nothing in configuration validation stops `max_fetch_limit = 200`, but
+        // Discord tops out at 100 — so a 100-message answer to a "200" request is a FULL window,
+        // not a small channel, and comparing against 200 would report the wrong thing.
+        let toml = testing::config_toml()
+            .replace("default_fetch_limit = 20", "default_fetch_limit = 200")
+            .replace("max_fetch_limit = 50", "max_fetch_limit = 200");
+        let (state, fake, _elevenlabs) = testing::state_from_toml(&toml);
+        let channel = crate::model::ChannelId(READ_CHANNEL.to_owned());
+        for i in 0..120 {
+            fake.seed(&channel, "agent", &format!("line {i}"));
+        }
+        let window = messages(&state, READ_CHANNEL, None).await.expect("reads");
+        assert_eq!(
+            window.limit,
+            crate::discord::http::DISCORD_MAX_LIMIT,
+            "the window must record the size Discord was actually asked for"
+        );
+        assert_eq!(window.messages.len(), 100);
+        assert!(
+            !window.is_whole_channel(),
+            "a full 100-message window must never be reported as the whole channel"
+        );
     }
 
     #[test]

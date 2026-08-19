@@ -45,6 +45,25 @@ async function api(path, options = {}) {
   return payload;
 }
 
+// How many messages there are, or an honest refusal to say.
+//
+// The length of what the server returned is the FETCH WINDOW, not a channel total. Discord gives
+// a bot no message count for a guild text channel, so the number is the channel's own only when
+// the server reports `complete` -- the fetch came back short, meaning there is nothing older.
+// Otherwise no digit is shown at all: a confidently wrong count is worse than no count, and this
+// one was wrong in the direction that makes the bridge look like it is losing messages.
+//
+// `!== true` rather than `=== false`, so a server too old to send the field is treated as unknown.
+function messageCount(count, complete) {
+  if (complete !== true) {
+    return "the most recent messages — older ones are not loaded";
+  }
+  if (count === 0) {
+    return "no messages";
+  }
+  return `${count} message${count === 1 ? "" : "s"}`;
+}
+
 function messageNode(message, opts = {}) {
   const li = document.createElement("li");
   const meta = document.createElement("div");
@@ -95,7 +114,7 @@ async function loadConfig() {
   fillChannelSelects();
   el("server-info").textContent =
     `server version ${config.version}; ` +
-    `${config.channels.length} channel(s); ` +
+    `${config.channels.length} channel${config.channels.length === 1 ? "" : "s"}; ` +
     `voice agent ${config.elevenlabs_agent_id ? "configured" : "not configured"}`;
   mountVoiceAgent();
   setStatus("connected");
@@ -144,7 +163,7 @@ async function loadDigest() {
     );
   }
   el("channel-name").textContent = payload.channel.label;
-  setStatus(`${payload.entries.length} message(s)`);
+  setStatus(messageCount(payload.entries.length, payload.complete));
 }
 
 async function readFull(channel, messageId) {
@@ -214,7 +233,7 @@ async function loadScrollback() {
   // arriving on the Text tab first left the header reading "not connected" over a full,
   // freshly-fetched scrollback -- the one place the app lied about its own state.
   el("channel-name").textContent = payload.channel.label;
-  setStatus(`${payload.messages.length} message(s)`);
+  setStatus(messageCount(payload.messages.length, payload.complete));
   list.lastElementChild?.scrollIntoView({ block: "end" });
 }
 

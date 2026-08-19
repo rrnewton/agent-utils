@@ -396,6 +396,74 @@ async fn a_hostile_message_cannot_break_the_fence_on_the_way_to_a_model() {
 }
 
 #[tokio::test]
+async fn the_digest_header_never_reports_the_fetch_window_as_a_channel_total() {
+    // `#62 message-count-accuracy`, on the surface the owner actually HEARS: the header used to
+    // read "{n} message(s)", and n was the fetch window. The fixture's default_fetch_limit is 20.
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    for i in 0..40 {
+        harness
+            .discord
+            .seed(&channel, "agent", &format!("line {i}"));
+    }
+    let (status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call("digest_channel", json!({ "channel_id": READ_CHANNEL })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let header = tool_text(&body)
+        .lines()
+        .next()
+        .expect("a digest has a header")
+        .to_owned();
+    assert!(!header.contains("message(s)"), "{header}");
+    assert!(
+        header.contains("20 most recent messages"),
+        "a full window must be described as a window: {header}"
+    );
+    assert!(
+        header.contains("older messages this fetch did not reach"),
+        "the model must be told the window is not the channel: {header}"
+    );
+    assert!(
+        !header.contains("whole channel"),
+        "a full window is not the whole channel: {header}"
+    );
+}
+
+#[tokio::test]
+async fn a_short_digest_says_it_is_the_whole_channel() {
+    // The control for the test above. A header that always said "there are older messages" would
+    // satisfy that assertion while being just as wrong in the other direction.
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    harness.discord.seed(&channel, "agent", "only one message");
+    let (status, body) = rpc(
+        &harness,
+        Some(READ_TOKEN),
+        call("digest_channel", json!({ "channel_id": READ_CHANNEL })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let header = tool_text(&body)
+        .lines()
+        .next()
+        .expect("a digest has a header")
+        .to_owned();
+    assert!(!header.contains("message(s)"), "{header}");
+    assert!(
+        header.contains("the whole channel, 1 message,"),
+        "one message is one message, singular, and it is the whole channel: {header}"
+    );
+    assert!(
+        !header.contains("older messages this fetch did not reach"),
+        "a short fetch has nothing older to warn about: {header}"
+    );
+}
+
+#[tokio::test]
 async fn control_characters_do_not_survive_into_a_tool_result() {
     let harness = harness();
     harness.discord.seed(

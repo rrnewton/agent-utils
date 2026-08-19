@@ -527,6 +527,58 @@ async fn a_fetch_limit_cannot_exceed_the_configured_ceiling() {
 }
 
 #[tokio::test]
+async fn a_full_window_is_not_reported_as_a_complete_channel() {
+    // `#62 message-count-accuracy`: the owner saw "50 message(s)" and the channel held far more.
+    // 50 was the fetch window. The server now says outright whether the number counts the channel
+    // or only what it fetched, so a client cannot render one as the other.
+    let harness = harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    for i in 0..60 {
+        harness
+            .discord
+            .seed(&channel, "noise", &format!("line {i}"));
+    }
+    for route in ["messages", "digest"] {
+        let (status, payload) = call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/{route}"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{route}: {payload}");
+        assert_eq!(
+            payload["complete"], false,
+            "{route}: a window that filled must not claim to be the whole channel: {payload}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_short_fetch_is_reported_as_the_whole_channel() {
+    // The control. Without this, `complete: false` everywhere would pass the test above while
+    // telling a client it may never show a count at all.
+    let harness = harness();
+    seed_lead_channel(&harness);
+    for route in ["messages", "digest"] {
+        let (status, payload) = call(
+            &harness,
+            "GET",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/{route}"),
+            Some(READ_TOKEN),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{route}: {payload}");
+        assert_eq!(
+            payload["complete"], true,
+            "{route}: a fetch that came back short IS the channel: {payload}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_unknown_route_answers_a_json_404() {
     let harness = harness();
     let (status, payload) = call(&harness, "GET", "/api/v1/nope", Some(READ_TOKEN), None).await;

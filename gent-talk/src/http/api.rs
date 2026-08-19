@@ -233,6 +233,12 @@ pub struct MessagesResponse {
     pub channel: ChannelInfo,
     /// Messages, oldest first.
     pub messages: Vec<Message>,
+    /// Whether the fetch came back short, so `messages.len()` counts the CHANNEL rather than the
+    /// window this server asked for.
+    ///
+    /// A client may show a message count only when this is true. Discord gives no message count
+    /// for a guild text channel, so a full window means "at least this many" and nothing more.
+    pub complete: bool,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -245,10 +251,11 @@ pub async fn messages(
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessagesResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let (channel, messages) = ops::messages(&state, &channel_id, query.limit).await?;
+    let window = ops::messages(&state, &channel_id, query.limit).await?;
     Ok(Json(MessagesResponse {
-        channel,
-        messages,
+        complete: window.is_whole_channel(),
+        channel: window.channel,
+        messages: window.messages,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }
@@ -291,6 +298,9 @@ pub struct DigestResponse {
     pub channel: ChannelInfo,
     /// One line per message, oldest first.
     pub entries: Vec<DigestEntry>,
+    /// Whether the fetch came back short, so `entries.len()` counts the CHANNEL rather than the
+    /// window. See [`MessagesResponse::complete`].
+    pub complete: bool,
     /// Standing reminder that the content is third-party text.
     pub untrusted_content_notice: &'static str,
 }
@@ -303,10 +313,12 @@ pub async fn digest(
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<DigestResponse>, ApiError> {
     require(&headers, &state, Scope::Read)?;
-    let (channel, entries) = ops::digest(&state, &channel_id, query.limit, query.width).await?;
+    let (channel, entries, complete) =
+        ops::digest(&state, &channel_id, query.limit, query.width).await?;
     Ok(Json(DigestResponse {
         channel,
         entries,
+        complete,
         untrusted_content_notice: untrusted::NOTICE,
     }))
 }
@@ -476,4 +488,28 @@ pub async fn app_js() -> Response {
 /// `GET /style.css`
 pub async fn style_css() -> Response {
     asset("text/css; charset=utf-8", STYLE_CSS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::APP_JS;
+
+    #[test]
+    fn the_phone_app_pluralizes_and_never_prints_the_placeholder_form() {
+        // `#62 message-count-accuracy`. `message(s)` is the shape of the defect: it is what a
+        // renderer writes when it has not decided whether it knows the number. The bytes asserted
+        // on here are exactly the bytes `GET /app.js` serves.
+        assert!(
+            !APP_JS.contains("(s)"),
+            "web/app.js still renders a parenthesised plural"
+        );
+        assert!(
+            APP_JS.contains("function messageCount("),
+            "the count helper is what keeps the two call sites honest and identical"
+        );
+        assert!(
+            APP_JS.contains("complete !== true"),
+            "a server too old to send `complete` must be treated as unknown, not as complete"
+        );
+    }
 }
