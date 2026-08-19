@@ -15,11 +15,28 @@ Reviews completed from 2026-08-05 through 2026-08-09:
 - [herdr-agent](herdr-agent.md)
 - [repository-local Rust source launchers](rust-source-launchers.md)
 
-Supporting design research is kept outside distributable package trees:
+## Where a tool's own related-work document lives
 
-- [agent-team-timeline related work](agent-team-timeline-related-work.md)
+A related-work document belongs to one tool, so it lives **in that tool's own folder, beside that
+tool's README, named `RELATED_WORK.md`** — not here. This directory is for review evidence, which
+is not tool-scoped in the same way: a review is a dated record of an audit, and several of the
+reviews below cover more than one command.
+
+| Tool | Its related work |
+| --- | --- |
+| `herdr-run` | [`common/docs/herdr-run/RELATED_WORK.md`](../common/docs/herdr-run/RELATED_WORK.md) |
+| `agent-team-timeline` | [`common/docs/agent-team-timeline/RELATED_WORK.md`](../common/docs/agent-team-timeline/RELATED_WORK.md) |
+| `gent-talk` | [`gent-talk/RELATED_WORK.md`](../gent-talk/RELATED_WORK.md) |
+
+For a paired tool the folder is the one under `common/docs/`, which holds that tool's authoritative
+README source. The published `py/` and `rs/` trees are deliberately not the home: they are the
+distributable package trees, and `scripts/embed_userguides.py --check` requires their contents to
+carry no development-history or sibling-language references. `gent-talk` is a service with a single
+implementation and no `common/docs/` entry, so its document sits next to its own README.
+
+Supporting research too long to live in a tool's document is kept here:
+
 - [agent-team-timeline comparative analysis](research/agent-team-timeline-comparative-analysis.md)
-- [voice agent bridge related work](voice-agent-bridge-related-work.md)
 
 The standard reproducibility entry points are:
 

@@ -10,7 +10,7 @@ it is tied to the machine it currently runs on. It starts in Podman on a laptop 
 move to a small cloud host unchanged.
 
 The design decision behind it, stated plainly: composing hosted products would also work (see
-`../reviews/voice-agent-bridge-related-work.md`, which recommended exactly that), but a server is
+[`RELATED_WORK.md`](RELATED_WORK.md), which recommended exactly that), but a server is
 needed either way to hold the Discord credential, and the owner would rather own that front door
 than hand it to a vendor.
 

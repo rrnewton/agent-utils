@@ -2,7 +2,7 @@
 
 Research checked 2026-08-05 against project repositories, source code, release metadata, and
 package registries. The longer Gemini report that prompted this review is preserved in
-[`research/agent-team-timeline-comparative-analysis.md`](research/agent-team-timeline-comparative-analysis.md).
+[`reviews/research/agent-team-timeline-comparative-analysis.md`](../../../reviews/research/agent-team-timeline-comparative-analysis.md).
 
 ## Direct answer
 
