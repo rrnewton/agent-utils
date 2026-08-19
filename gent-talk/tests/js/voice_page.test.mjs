@@ -64,6 +64,9 @@ const PAGE_ELEMENTS = new Map(
     {
       hidden: /\bhidden\b/.test(m[2]),
       checked: /\bchecked\b/.test(m[2]),
+      // The initial state the MARKUP gives the status line, so a test can read it before the page
+      // has had any reason to change it.
+      state: (/\bdata-state="([^"]+)"/.exec(m[2]) || [])[1],
       text: m[4].trim(),
     },
   ])
@@ -111,6 +114,7 @@ class FakeElement {
     // The transcript is the one element that scrolls; the page pins it to the newest line.
     this.scrollTop = 0;
     this.scrollHeight = 0;
+    this.scrolledIntoView = 0;
   }
 
   addEventListener(type, fn) {
@@ -155,7 +159,11 @@ class FakeElement {
     this.scrollHeight = kids.length * 10;
   }
 
-  scrollIntoView() {}
+  scrollIntoView() {
+    this.scrolledIntoView += 1;
+  }
+
+  focus() {}
 
   /** Every element at or under this one, so a test can ask what was really rendered. */
   descendants() {
@@ -190,6 +198,30 @@ class FakeAudioContext {
     this.currentTime = 0;
     this.destination = { id: "destination" };
     this.closed = false;
+    // How many buffers were actually STARTED. This is what makes "the agent's voice is silenced"
+    // an observation about playback rather than about a flag the page set on itself.
+    this.played = 0;
+    this.stopped = 0;
+    page.audio = this;
+  }
+
+  createBuffer(channels, length, rate) {
+    return { duration: length / rate, getChannelData: () => new Float32Array(length) };
+  }
+
+  createBufferSource() {
+    const context = this;
+    return {
+      buffer: null,
+      onended: null,
+      connect() {},
+      start() {
+        context.played += 1;
+      },
+      stop() {
+        context.stopped += 1;
+      },
+    };
   }
 
   async resume() {}
@@ -268,6 +300,9 @@ function newPage(store = new Map()) {
     element.hidden = markup.hidden;
     element.checked = markup.checked;
     element.textContent = markup.text;
+    if (markup.state !== undefined) {
+      element.setAttribute("data-state", markup.state);
+    }
     elements.set(id, element);
   }
   const page = {
@@ -343,6 +378,20 @@ function newPage(store = new Map()) {
     removeItem: (k) => store.delete(k),
   };
   page.storage = store;
+  page.timers = new Map();
+  let nextTimer = 1;
+  /** Fire — and forget — every pending timer registered for exactly this delay. */
+  page.expireTimers = (ms) => {
+    let fired = 0;
+    for (const [id, timer] of [...page.timers]) {
+      if (timer.ms === ms) {
+        page.timers.delete(id);
+        timer.fn();
+        fired += 1;
+      }
+    }
+    return fired;
+  };
 
   class FakeWebSocket {
     constructor(url) {
@@ -387,21 +436,44 @@ function newPage(store = new Map()) {
     },
   };
 
+  // A clock the test controls, so a timestamp is a fact rather than a race, and so the
+  // "arm, then act within a few seconds" behaviour can be walked past its own deadline.
+  const HostDate = Date;
+  let clockMs = HostDate.UTC(2026, 7, 19, 14, 5, 0);
+  class FixedDate extends HostDate {
+    constructor(...args) {
+      super(...(args.length ? args : [clockMs]));
+    }
+
+    static now() {
+      return clockMs;
+    }
+  }
+  page.setClock = (ms) => {
+    clockMs = ms;
+  };
+  page.clock = () => clockMs;
+
   const context = {
     document,
     localStorage,
+    Date: FixedDate,
     window: { AudioContext: function () { return new FakeAudioContext(page); } },
     navigator,
     console,
-    // Unref'd, so the page's own 8-second banner timer cannot hold the test runner open.
+    // Timers the TEST drives. Nothing is really scheduled, so the page's own 8-second banner timer
+    // cannot hold the runner open — and, more usefully, a delay the page relies on stops being
+    // untestable. `expireTimers` is what lets the "armed for a few seconds" behaviour below be
+    // walked past its own deadline instead of documented and hoped for.
     setTimeout: (fn, ms) => {
-      const timer = setTimeout(fn, ms);
-      if (typeof timer.unref === "function") {
-        timer.unref();
-      }
-      return timer;
+      const id = nextTimer;
+      nextTimer += 1;
+      page.timers.set(id, { fn, ms });
+      return id;
     },
-    clearTimeout,
+    clearTimeout: (id) => {
+      page.timers.delete(id);
+    },
     atob,
     btoa,
     WebSocket: FakeWebSocket,
@@ -445,7 +517,7 @@ async function startTalking(page) {
   );
   assert.equal(page.sockets.length, 1, "start() opened no websocket");
   page.sockets[0].onopen();
-  assert.equal(page.el("conversation-state").textContent, "connected");
+  assert.equal(state(page), "live");
   assert.equal(page.processors.length, 1, "capture never started");
   return page.sockets[0];
 }
@@ -458,6 +530,13 @@ function speakInto(page) {
     inputBuffer: { getChannelData: () => new Float32Array(4096) },
   });
 }
+
+/** The words a seam puts ON THE SCREEN — not the ones it keeps inside its disclosure. */
+const seamLabel = (li) =>
+  li.descendants().find((node) => node.className === "seam-label").textContent;
+
+/** The one status line's machine-readable state, which is what colours its dot. */
+const state = (page) => page.el("status-line").getAttribute("data-state");
 
 /** Just the audio frames, not the initiation message or a pong. */
 const audioFrames = (socket) => socket.sent.filter((s) => s.includes("user_audio_chunk"));
@@ -499,7 +578,7 @@ test("a vendor 502 is shown IN THE PAGE, in the vendor's own words", async () =>
   );
   assert.match(shown.textContent, /502/, "the HTTP status is part of the diagnosis");
   assert.match(shown.textContent, /elevenlabs_error/, "the error code identifies which failure");
-  assert.equal(page.el("conversation-state").textContent, "error");
+  assert.equal(state(page), "error");
 });
 
 test("a 503 names the exact setting the operator has not set", async () => {
@@ -627,10 +706,11 @@ test("with no token the page IS the sign-in screen, not the interface behind a n
   await page.settle();
 
   assert.equal(page.screen(), "signin");
-  // The two big controls act on a call this visitor cannot place, so they are not on the screen.
+  // The controls act on a call this visitor cannot place, so they are not on the screen.
   assert.equal(page.el("control-pane").hidden, true, "the control pane showed before sign-in");
-  assert.equal(page.el("tabs").hidden, true);
-  assert.equal(page.el("clear-view").hidden, true);
+  assert.equal(page.el("view-switch").hidden, true, "there is nothing to switch between yet");
+  // The status line, on the other hand, stays: a refused token has to be able to say so.
+  assert.equal(page.el("status-line").hidden, false);
 });
 
 test("the explanatory text lives on the sign-in screen, not over the transcript", () => {
@@ -651,7 +731,7 @@ test("a token the server accepts leads to the main interface", async () => {
 
   assert.equal(page.screen(), "main");
   assert.equal(page.el("control-pane").hidden, false, "the controls must be reachable");
-  assert.equal(page.el("tabs").hidden, false);
+  assert.equal(page.el("view-switch").hidden, false);
 });
 
 test("a token the server REFUSES sends you back to sign in, and says which thing was wrong", async () => {
@@ -783,26 +863,207 @@ test("the page fetches nothing from anywhere but this server", () => {
   assert.doesNotMatch(CSS, /@import|url\(\s*["']?https?:/, "web/voice.css reaches off-origin");
 });
 
-test("hang up sits immediately to the left of talk, and talk is the bigger of the two", () => {
+test("the control pane is one dense tile, and the two small controls stack to the height of the big ones", () => {
+  // The shape the owner asked for:
+  //
+  //     +----+----------+----------+
+  //     | () |          |          |
+  //     +----+ Hang up  |   Talk   |
+  //     | [] |          |          |
+  //     +----+----------+----------+
+  //
+  // Checked as GEOMETRY rather than as pixels: both large controls span the same two rows the two
+  // small ones occupy one each, so their heights cannot drift apart — there is nothing to keep in
+  // sync. The two large columns are `1fr` each, so the pane fills the width rather than sitting in
+  // it.
+  const pane = cssBlock("#control-pane");
+  assert.match(pane, /display:\s*grid/, "the pane is a tile, not a row of floating buttons");
+  const columns = /grid-template-columns:\s*([^;]+);/.exec(pane);
+  assert.ok(columns, "the pane must state its columns");
+  assert.match(
+    columns[1],
+    /1fr\s+1fr\s*$/,
+    `the two large controls must each take a share of the width, not ${columns[1]}`
+  );
+  assert.match(
+    pane,
+    /grid-template-rows:\s*1fr 1fr/,
+    "two rows: one per small control, and both spanned by each large one"
+  );
+
+  assert.match(cssBlock("#speaker"), /grid-row:\s*1/);
+  assert.match(cssBlock("#clear-view"), /grid-row:\s*2/);
+  assert.match(cssBlock(".control-mini"), /grid-column:\s*1/, "the small controls are the left column");
+  for (const selector of [".control-hangup", ".control-talk"]) {
+    assert.match(
+      cssBlock(selector),
+      /grid-row:\s*1 \/ span 2/,
+      `${selector} must span both rows, which is what makes the stack line up`
+    );
+  }
+  assert.match(cssBlock(".control-hangup"), /grid-column:\s*2/);
+  assert.match(cssBlock(".control-talk"), /grid-column:\s*3/);
+});
+
+test("the large controls are rectangular: nothing pins them to a square-ish fixed width", () => {
+  // They were 8.5rem wide by 8rem tall — near-square slabs taking a third of a phone screen. The
+  // owner asked for less tall and more rectangular. Width is now a share of the pane, so the only
+  // way to regress this is to put a fixed width back.
+  for (const selector of [".control-talk", ".control-hangup"]) {
+    const block = cssBlock(selector);
+    assert.doesNotMatch(block, /(^|[^-])width:\s*[\d.]+rem/, `${selector} pins its own width again`);
+    assert.doesNotMatch(block, /min-height:\s*[\d.]+rem/, `${selector} pins its own height again`);
+  }
+  // Their height is two rows of the small control, and that is the only place a number appears.
+  const mini = Number(/min-height:\s*([\d.]+)rem/.exec(cssBlock(".control-mini"))[1]);
+  assert.ok(mini > 0 && mini * 2 < 6, `two stacked small controls are ${mini * 2}rem, which is not "less tall"`);
+  assert.match(cssBlock(".control-talk.live .control-ring"), /animation:\s*talk-pulse/);
+});
+
+test("hang up comes before talk in the markup, so talk lands under the right thumb", () => {
   const pane = HTML.slice(HTML.indexOf('id="control-pane"'));
   const hangUp = pane.indexOf('id="hang-up"');
   const talk = pane.indexOf('id="talk"');
   assert.ok(hangUp > -1 && talk > -1, "the pane must hold both controls");
-  assert.ok(hangUp < talk, "hang up must come before talk, so talk lands under the right thumb");
+  assert.ok(hangUp < talk, "hang up must come before talk");
+  // And the two small ones come before both, which is the left column.
+  assert.ok(pane.indexOf('id="speaker"') < hangUp);
+  assert.ok(pane.indexOf('id="clear-view"') < hangUp);
+});
 
-  // "Larger, and closer to square." Compared numerically rather than eyeballed.
-  const rem = (block, property) =>
-    Number(new RegExp(`${property}:\\s*([\\d.]+)rem`).exec(block)[1]);
-  const talkCss = cssBlock(".control-talk");
-  const hangUpCss = cssBlock(".control-hangup");
-  const width = rem(talkCss, "width");
-  const height = rem(talkCss, "min-height");
-  assert.ok(width > rem(hangUpCss, "width"), "talk must be the larger control");
-  assert.ok(
-    Math.abs(width - height) / Math.max(width, height) < 0.15,
-    `talk must be close to square, not ${width}x${height}`
+// --- the header ---------------------------------------------------------------------------------
+
+test("the view control is ONE switch carrying the word for the view you are in", async () => {
+  // What this replaces: two text labels, one outlined and one plain, which read as one item having
+  // been disabled rather than as the unselected half of a pair.
+  assert.equal(PAGE_IDS.has("tab-voice"), false, "the two-label pseudo-tabs are gone");
+  assert.equal(PAGE_IDS.has("tab-discord"), false);
+
+  const page = newPage();
+  await signIn(page);
+  const label = page.el("view-switch-label");
+  assert.equal(label.textContent, "Voice", "the switch must name the view you are IN");
+  assert.equal(page.el("view-switch").getAttribute("aria-checked"), "false");
+
+  await page.el("view-switch").click();
+  await page.settle();
+
+  assert.equal(page.tab(), "discord");
+  assert.equal(label.textContent, "Discord", "the word did not follow the switch");
+  assert.equal(page.el("view-switch").getAttribute("aria-checked"), "true");
+
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "voice");
+  assert.equal(label.textContent, "Voice");
+});
+
+test("the switch is a switch: a knob that moves, and a track that changes with it", () => {
+  // Three signals for one state — word, knob position, track colour — so it survives being read
+  // quickly, at arm's length, by somebody who is not looking for it.
+  const html = HTML.slice(HTML.indexOf('id="view-switch"'), HTML.indexOf('id="open-settings"'));
+  assert.match(html, /role="switch"/, "a switch has to announce itself as one");
+  assert.match(html, /class="switch-track"/);
+  assert.match(html, /class="switch-knob"/);
+  assert.match(cssBlock('.switch[aria-checked="true"] .switch-knob'), /transform:\s*translateX/);
+  assert.match(cssBlock('.switch[aria-checked="true"] .switch-track'), /background:\s*var\(--accent\)/);
+});
+
+test("settings is a gear, not the word Settings", () => {
+  const button = HTML.slice(HTML.indexOf('id="open-settings"'), HTML.indexOf("</header>"));
+  assert.match(button, /<svg/, "the settings control must be drawn, not spelled");
+  assert.match(button, /aria-label="Settings"/, "an icon still has to say what it is");
+  assert.equal(
+    PAGE_ELEMENTS.get("open-settings").text,
+    "",
+    "the gear must carry no word; that was the thing being replaced"
   );
-  assert.match(cssBlock(".control-talk.live .control-ring"), /animation:\s*talk-pulse/);
+});
+
+test("the header shows two things at a time, and which two depends on the screen", async () => {
+  // It used to hold four controls in two styles and gave no readable model of which were tabs and
+  // which were actions. Clear has moved to the control pane, where it is honestly grouped with the
+  // other things you DO; the settings screen turns the same row into a title bar with a way back,
+  // rather than leaving it empty and putting a Back button in the body.
+  const row = HTML.slice(HTML.indexOf('class="topbar-row"'), HTML.indexOf("</header>"));
+  const ids = [...row.matchAll(/<button[^>]*\bid="([^"]+)"/g)].map((m) => m[1]);
+  assert.deepStrictEqual(ids, ["close-settings", "view-switch", "open-settings"]);
+
+  const page = newPage();
+  const showing = () =>
+    ["close-settings", "topbar-title", "view-switch", "open-settings"].filter(
+      (id) => !page.el(id).hidden
+    );
+  await signIn(page);
+  assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
+
+  await page.el("open-settings").click();
+  assert.deepStrictEqual(showing(), ["close-settings", "topbar-title"]);
+
+  await page.el("close-settings").click();
+  assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
+});
+
+// --- the one status line -------------------------------------------------------------------------
+
+test("state is reported in ONE place, above the controls", () => {
+  // It used to be two: a small grey word under the header and a sentence at the foot. That split
+  // is how the closed state managed to announce itself three times, in three vocabularies.
+  assert.equal(
+    PAGE_IDS.has("conversation-state"),
+    false,
+    "the second status element is still in the page"
+  );
+  const dock = HTML.slice(HTML.indexOf('id="dock"'));
+  assert.ok(
+    dock.indexOf('id="status-line"') < dock.indexOf('id="control-pane"'),
+    "the status line must sit ABOVE the control pane, out of the corner curvature"
+  );
+  const header = HTML.slice(HTML.indexOf('id="topbar"'), HTML.indexOf("</header>"));
+  assert.doesNotMatch(header, /id="status/, "the header must not report status too");
+});
+
+test("the status line is not pinned to the bottom edge of the screen", () => {
+  // style.css pins #status to the viewport bottom for the OTHER page. Inherited here, that is what
+  // put the line inside the corner curvature of the owner's phone, which ate its first word.
+  assert.match(cssBlock("#status"), /position:\s*static/, "the shared fixed positioning is back");
+});
+
+test("the horizontal safe-area insets are applied, not only the bottom one", () => {
+  // NOT VERIFIABLE BY SCREENSHOT: no browser automation can make Chromium report a non-zero inset,
+  // and a headless browser renders a rectangle with no curved corners at all. This asserts the
+  // declaration, which is the only part that can be checked here.
+  for (const selector of ["#topbar", "#status-line", "#control-pane", "#scroll-area"]) {
+    const block = cssBlock(selector);
+    assert.match(block, /env\(safe-area-inset-left\)/, `${selector} ignores the left inset`);
+    assert.match(block, /env\(safe-area-inset-right\)/, `${selector} ignores the right inset`);
+  }
+});
+
+test("the controls SHOW their state, not merely hold it", () => {
+  // Each of these was a mutation that behaviour tests alone let through: the page can be perfectly
+  // correct about what it will do and still look identical while doing it. That is the whole class
+  // of defect the owner photographed — a control that is dead and looks alive.
+
+  // The status dot must actually differ between states, or the one status line is just a sentence.
+  const dot = (state) => cssBlock(`#status-line[data-state="${state}"] .status-dot`);
+  const colour = (block) => /background:\s*([^;]+);/.exec(block)[1].trim();
+  const shades = new Set([colour(cssBlock(".status-dot")), colour(dot("live")), colour(dot("error"))]);
+  assert.equal(shades.size, 3, `idle, live and error must look different: ${[...shades]}`);
+
+  // An armed Clear that looks like an unarmed one is not a confirmation.
+  const armed = cssBlock("#clear-view.armed");
+  assert.match(armed, /var\(--warn\)/, "the armed state must be visibly different, not just named");
+
+  // A control that cannot act must not keep the loudest fill on the screen.
+  const off = cssBlock(".control[disabled]");
+  assert.doesNotMatch(off, /background:\s*var\(--warn\)/, "a dead control kept its warm fill");
+  assert.match(off, /background:\s*var\(--panel\)/);
+});
+
+test("content fades under the header rather than being sliced off square", () => {
+  const scroll = cssBlock("#scroll-area");
+  assert.match(scroll, /mask-image:\s*linear-gradient/, "the top edge has no fade");
+  assert.match(scroll, /-webkit-mask-image:\s*linear-gradient/, "Safari needs the prefixed one");
 });
 
 // --- mute: the whole point ------------------------------------------------------------------------
@@ -878,16 +1139,23 @@ test("the talk control says which of its three states it is in", async () => {
   assert.doesNotMatch(page.el("talk").className, /\blive\b/, "still animating while muted");
 });
 
-test("the muted status says the agent still remembers, and that the microphone is still open", async () => {
+test("the muted status is ONE short line, and the explanation is in settings", async () => {
+  // It used to be three sentences in the status strip. Multi-sentence explanation is not
+  // user-interface text: the strip is one line tall, so most of it was simply unreadable. What is
+  // left says the one thing a muted caller needs; the rest is under "What the controls do".
   const page = newPage();
   await startTalking(page);
 
   await page.el("talk").click();
 
   const said = page.el("status").textContent;
-  assert.match(said, /still open/);
-  assert.match(said, /cannot hear you/);
-  assert.match(said, /microphone as in use/, "the phone's own indicator needs explaining");
+  assert.match(said, /still remembers/, "the one fact that matters while muted");
+  assert.ok(said.length <= 60, `the status line is one line, not a paragraph: ${said}`);
+  assert.ok(!/\.[^.]*\./.test(said.slice(0, -1)), `more than one sentence on the strip: ${said}`);
+
+  // Not deleted — relocated. This is the whole progressive-disclosure move, so it is asserted.
+  const note = HTML.slice(HTML.indexOf('id="continuity-note"'));
+  assert.match(note, /microphone as in use/, "the phone's own indicator still needs explaining");
 });
 
 // --- hang up ------------------------------------------------------------------------------------
@@ -900,8 +1168,44 @@ test("hang up DOES stop the microphone stream", async () => {
 
   assert.equal(page.tracks[0].stops, 1, "hanging up left the microphone open");
   assert.equal(page.sockets[0].readyState, 3, "hanging up left the conversation open");
-  assert.equal(page.el("conversation-state").textContent, "idle");
+  assert.equal(state(page), "ended");
+});
+
+test("HANG UP IS NOT ON THE SCREEN WHEN THERE IS NO CALL", async () => {
+  // The defect this replaces: the most prominent warm-coloured control on the screen, at full
+  // saturation, doing nothing at all — while three other elements said the call had ended. Dimming
+  // it was not enough; an orange rectangle at half opacity is still the loudest thing in a dark
+  // interface. So there is no Hang up unless there is something to hang up.
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("hang-up").hidden, true, "Hang up is on screen before any call");
+  assert.equal(page.el("control-pane").className, "solo", "the one action must take both columns");
+
+  await startTalking(page);
+  assert.equal(page.el("hang-up").hidden, false, "Hang up vanished during a live call");
+  assert.equal(page.el("control-pane").className, "");
+
+  await page.el("hang-up").click();
+  assert.equal(page.el("hang-up").hidden, true, "Hang up survived the call it ended");
+  assert.equal(page.el("control-pane").className, "solo");
+});
+
+test("after a call the pane offers ONE action, and the memory caveat rides on it", async () => {
+  // Two defects resolved as one moment: the dead control is gone, and the caveat that used to
+  // sprawl as a paragraph across the transcript is a clause attached to the button it is about.
+  const page = newPage();
+  await signIn(page);
   assert.equal(page.el("talk-label").textContent, "Talk");
+  assert.equal(page.el("talk-note").hidden, true, "nothing has ended yet, so there is no caveat");
+
+  await startTalking(page);
+  await page.el("hang-up").click();
+
+  assert.equal(page.el("talk-label").textContent, "Start a new call");
+  const note = page.el("talk-note");
+  assert.equal(note.hidden, false, "the caveat is the reason this is a NEW call");
+  assert.match(note.textContent, /starts fresh/);
+  assert.ok(note.textContent.length <= 40, `a clause, not a paragraph: ${note.textContent}`);
 });
 
 test("hang up marks the break in the transcript instead of implying one long conversation", async () => {
@@ -921,16 +1225,78 @@ test("hang up marks the break in the transcript instead of implying one long con
 
   const lines = page.el("transcript").children;
   const last = lines[lines.length - 1];
-  assert.equal(last.className, "system", "the seam must not look like something somebody said");
-  assert.match(last.text(), /does NOT carry this conversation's context/);
-  assert.match(last.text(), /NEW conversation/);
-  assert.match(last.text(), /Mute instead of Hang up/, "it should name the control that does work");
+  assert.equal(last.className, "seam", "the seam must not look like something somebody said");
+  assert.equal(seamLabel(last), "new conversation");
   // Said once, not once per teardown path.
   assert.equal(
-    lines.filter((li) => li.className === "system").length,
+    lines.filter((li) => li.className === "seam").length,
     1,
-    "the end-of-call note was written more than once"
+    "the end-of-call seam was drawn more than once"
   );
+});
+
+test("THE SEAM IS A LABEL, NOT A PARAGRAPH — the explanation is one tap inside it", async () => {
+  // The finding that started this: four sentences about what a vendor does and does not document,
+  // printed into the transcript and then cut off mid-word behind the control pane. Being cut off
+  // was the screen reporting that they did not belong on it.
+  //
+  // So this test is about what is ON THE SURFACE. The words are still available — they are inside
+  // the <details>, and named by `title` for a pointer device — but they are not standing on the
+  // screen, and no amount of rewriting them would satisfy this assertion.
+  const page = newPage();
+  await startTalking(page);
+  await page.el("hang-up").click();
+
+  const seamLine = page.el("transcript").children.at(-1);
+  const label = seamLabel(seamLine);
+  assert.ok(label.length <= 24, `the surface text must be a label: "${label}"`);
+  assert.ok(label.split(/\s+/).length <= 3, `at most three words on the rule: "${label}"`);
+
+  // The detail exists, is long, and is inside a disclosure — not beside the label.
+  const details = seamLine.descendants().filter((node) => node.tagName === "details");
+  assert.equal(details.length, 1, "the explanation must live in a disclosure");
+  const detail = seamLine.descendants().find((node) => node.className === "seam-detail");
+  assert.ok(detail.textContent.length > 120, "the explanation was deleted rather than disclosed");
+  assert.match(detail.textContent, /has never seen anything above it/);
+  assert.match(detail.textContent, /Mute rather than Hang up/, "name the control that does work");
+  // A pointer device gets it on hover, without opening anything.
+  const summary = seamLine.descendants().find((node) => node.className === "seam-summary");
+  assert.equal(summary.getAttribute("title"), detail.textContent);
+});
+
+test("opening the disclosure brings it into view instead of unfolding it under the dock", async () => {
+  // A disclosure at the bottom of a scrolled list expands DOWNWARD, behind the control pane, so
+  // tapping it appears to do nothing at all. Caught by looking at a screenshot of it open.
+  const page = newPage();
+  await startTalking(page);
+  await page.el("hang-up").click();
+
+  const seamLine = page.el("transcript").children.at(-1);
+  const details = seamLine.descendants().find((node) => node.tagName === "details");
+  const before = seamLine.scrolledIntoView;
+
+  details.open = true;
+  await details.dispatch("toggle");
+  assert.ok(seamLine.scrolledIntoView > before, "the opened explanation was left off-screen");
+
+  // Closing it must not yank the list around.
+  const after = seamLine.scrolledIntoView;
+  details.open = false;
+  await details.dispatch("toggle");
+  assert.equal(seamLine.scrolledIntoView, after, "closing it moved the transcript");
+});
+
+test("the close code is not left showing in the banner on the call screen either", async () => {
+  // The status line is not the only place a number could reach the eye: the connection banner sits
+  // on the main screen and is written from the same string.
+  const page = newPage();
+  await startTalking(page);
+  assert.equal(page.el("connection-banner").hidden, false, "the banner should be up mid-call");
+
+  page.sockets[0].onclose({ code: 1005, reason: "" });
+
+  assert.equal(page.el("connection-banner").hidden, true, "the close code stayed on the screen");
+  assert.match(page.el("settings-detail").textContent, /code 1005/, "and it must not be lost");
 });
 
 test("a conversation the SERVER closes gets the same honest marker", async () => {
@@ -939,9 +1305,33 @@ test("a conversation the SERVER closes gets the same honest marker", async () =>
 
   page.sockets[0].onclose({ code: 1006, reason: "gone" });
 
-  const lines = page.el("transcript").children;
-  assert.match(lines[lines.length - 1].text(), /does NOT carry this conversation's context/);
-  assert.match(page.el("status").textContent, /1006/, "the close code has to be visible");
+  const seamLine = page.el("transcript").children.at(-1);
+  assert.equal(seamLabel(seamLine), "new conversation");
+  assert.equal(state(page), "ended");
+});
+
+test("A RAW CLOSE CODE NEVER REACHES THE USER", async () => {
+  // The owner's screen said "conversation closed (code 1005)". 1005 means the connection gave no
+  // reason at all — so the page was reporting the ABSENCE of information as though it were
+  // information, in a vocabulary only a WebSocket implementer has. Say what happened, or say
+  // nothing.
+  for (const [code, expected] of [
+    [1000, /^Call ended\.$/],
+    [1005, /connection dropped/],
+    [1006, /connection dropped/],
+    [4001, /ended unexpectedly/],
+  ]) {
+    const page = newPage();
+    await startTalking(page);
+    page.sockets[0].onclose({ code, reason: "" });
+
+    const said = page.el("status").textContent;
+    assert.match(said, expected, `close code ${code} was not put into words`);
+    assert.doesNotMatch(said, /\d/, `the number ${code} reached the status line: ${said}`);
+    // Not thrown away, though: whoever is debugging finds it in the connection details, which is
+    // where numbers belong.
+    assert.match(page.el("settings-detail").textContent, new RegExp(`code ${code}`));
+  }
 });
 
 test("a call that never connected does not claim a conversation ended", async () => {
@@ -961,8 +1351,75 @@ test("a call that never connected does not claim a conversation ended", async ()
 
 // --- clearing the view ----------------------------------------------------------------------------
 
-test("Clear view is labelled as clearing the VIEW", () => {
-  assert.equal(PAGE_ELEMENTS.get("clear-view").text, "Clear view");
+test("Clear sits in the control pane, not in the header beside the record it erases", () => {
+  // In the header it stood next to a notice calling the transcript the only surviving record,
+  // which invited exactly the reading it must not have: that the button destroys something
+  // irreplaceable. In the pane it is honestly grouped with the other things you DO.
+  const pane = HTML.slice(HTML.indexOf('id="control-pane"'));
+  assert.ok(pane.includes('id="clear-view"'), "Clear is not in the control pane");
+  const header = HTML.slice(HTML.indexOf('id="topbar"'), HTML.indexOf("</header>"));
+  assert.doesNotMatch(header, /id="clear-view"/, "Clear is still in the header");
+  assert.equal(PAGE_ELEMENTS.get("clear-view-label").text, "Clear");
+});
+
+test("CLEAR ASKS TWICE — one tap arms it, and only the second one erases anything", async () => {
+  // It is destructive, it cannot be undone, and it now sits under a thumb, which makes an
+  // accidental tap likelier rather than less likely. A label does not make that safe; a second tap
+  // does.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "agent_response",
+      agent_response_event: { agent_response: "the secret is 12345" },
+    }),
+  });
+  assert.equal(page.el("transcript").children.length, 1);
+
+  await page.el("clear-view").click();
+
+  assert.equal(page.el("transcript").children.length, 1, "the FIRST tap erased the transcript");
+  assert.equal(page.el("clear-view-label").textContent, "Sure?", "the armed state must be visible");
+  assert.match(page.el("clear-view").className, /\barmed\b/);
+  assert.match(page.el("status").textContent, /again/i, "the status line must say what it wants");
+
+  await page.el("clear-view").click();
+
+  assert.equal(page.el("transcript").children.length, 1, "only the seam should remain");
+  assert.equal(page.el("clear-view-label").textContent, "Clear", "it stayed armed after firing");
+  assert.doesNotMatch(page.el("clear-view").className, /\barmed\b/);
+});
+
+test("an armed Clear disarms itself rather than lying in wait", async () => {
+  // Armed forever would be worse than no confirmation at all: the second tap could arrive minutes
+  // later, from a thumb aiming at something else entirely.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "hi" } }),
+  });
+
+  await page.el("clear-view").click();
+  assert.equal(page.el("clear-view-label").textContent, "Sure?");
+
+  assert.equal(page.expireTimers(4000), 1, "nothing was scheduled to disarm it");
+  assert.equal(page.el("clear-view-label").textContent, "Clear");
+  assert.doesNotMatch(page.el("clear-view").className, /\barmed\b/);
+
+  // And the next tap arms again rather than clearing.
+  await page.el("clear-view").click();
+  assert.equal(page.el("transcript").children.length, 1, "a lapsed arm still cleared");
+});
+
+test("leaving the main screen disarms Clear", async () => {
+  const page = newPage();
+  await signIn(page);
+
+  await page.el("clear-view").click();
+  await page.el("open-settings").click();
+  await page.el("close-settings").click();
+
+  assert.equal(page.el("clear-view-label").textContent, "Clear", "Clear came back still armed");
 });
 
 test("clearing during a call empties the screen and says the agent has not forgotten", async () => {
@@ -979,16 +1436,19 @@ test("clearing during a call empties the screen and says the agent has not forgo
   assert.match(page.el("transcript").children[0].text(), /the secret is 12345/);
 
   await page.el("clear-view").click();
+  await page.el("clear-view").click();
 
   const remaining = page.el("transcript").children;
   assert.ok(
     !remaining.some((li) => li.text().includes("the secret is 12345")),
     "the view was not cleared"
   );
-  assert.equal(remaining.length, 1, "exactly the explanation should remain");
-  assert.equal(remaining[0].className, "system");
-  assert.match(remaining[0].text(), /cleared the screen only/);
-  assert.match(remaining[0].text(), /still has everything said before this point/);
+  assert.equal(remaining.length, 1, "exactly the seam should remain");
+  assert.equal(remaining[0].className, "seam");
+  // Two words on the surface; the sentences are inside it, exactly as at a conversation boundary.
+  assert.equal(seamLabel(remaining[0]), "view cleared");
+  const detail = remaining[0].descendants().find((node) => node.className === "seam-detail");
+  assert.match(detail.textContent, /still has everything said before this point/);
   assert.match(page.el("status").textContent, /has not forgotten/);
   // A display action, so it must not have touched the call.
   assert.equal(page.tracks[0].stops, 0, "clearing the view hung up");
@@ -1001,9 +1461,10 @@ test("clearing while idle just clears, with no claim about an agent that is not 
   page.el("transcript").append(new FakeElement("", "li"));
 
   await page.el("clear-view").click();
+  await page.el("clear-view").click();
 
   assert.equal(page.el("transcript").children.length, 0);
-  assert.equal(page.el("status").textContent, "View cleared.");
+  assert.equal(page.el("status").textContent, "Transcript cleared.");
 });
 
 test("the newest line is pinned above the controls", async () => {
@@ -1030,21 +1491,22 @@ test("the newest line is pinned above the controls", async () => {
 /** Load the Discord tab with a given set of channel messages. */
 async function showDiscord(page, messages) {
   page.messages = messages;
-  await page.el("tab-discord").click();
+  await page.el("view-switch").click();
   await page.settle();
+  assert.equal(page.tab(), "discord", "the switch did not reach the channel view");
   return page.el("discord-log").children;
 }
 
-test("switching tabs does not disturb a live call", async () => {
+test("switching views does not disturb a live call", async () => {
   const page = newPage();
   const socket = await startTalking(page);
   await page.el("talk").click(); // muted, so the mute state has something to be preserved
   page.messages = [message({ content: "hi" })];
 
-  await page.el("tab-discord").click();
+  await page.el("view-switch").click();
   await page.settle();
   assert.equal(page.tab(), "discord");
-  await page.el("tab-voice").click();
+  await page.el("view-switch").click();
   assert.equal(page.tab(), "voice");
 
   assert.equal(page.sockets.length, 1, "a tab switch opened a second conversation");
@@ -1056,9 +1518,10 @@ test("switching tabs does not disturb a live call", async () => {
   assert.equal(page.el("control-pane").hidden, false, "the controls left with the transcript");
 });
 
-test("the tab switch and the settings control share one row, to spend no extra height", () => {
-  const row = HTML.slice(HTML.indexOf('class="topbar-row"'), HTML.indexOf('topbar-status'));
-  for (const id of ["open-settings", "tabs", "tab-voice", "tab-discord", "clear-view"]) {
+test("the header spends one row, because the transcript is what deserves the height", () => {
+  const row = HTML.slice(HTML.indexOf('class="topbar-row"'), HTML.indexOf("</header>"));
+  assert.equal((row.match(/class="topbar-row"/g) || []).length, 1, "the header grew a second row");
+  for (const id of ["view-switch", "open-settings"]) {
     assert.ok(row.includes(`id="${id}"`), `#${id} is not in the top row`);
   }
 });
@@ -1241,7 +1704,7 @@ test("a Discord read that fails reports itself and does NOT hang up on you", asy
   await startTalking(page);
   page.channelMessages = async () => json(502, { error: "discord_error", detail: "rate limited" });
 
-  await page.el("tab-discord").click();
+  await page.el("view-switch").click();
   await page.settle();
 
   assert.match(page.el("error").textContent, /rate limited/);
@@ -1420,10 +1883,147 @@ test("a browser that THROWS on write is caught, not left as a rejected promise",
 });
 
 test("the settings screen explains what each control does to the agent's memory", () => {
-  // Every one of these three sentences corrects a way the interface could otherwise be read as
-  // promising continuity it does not have.
+  // Every one of these sentences corrects a way the interface could otherwise be read as promising
+  // continuity it does not have. They live HERE, one tap away, rather than on the call screen.
   const note = HTML.slice(HTML.indexOf('id="continuity-note"'));
   assert.match(note, /Mute<\/strong> keeps the call open and keeps the agent's context/);
   assert.match(note, /does not keep its context/);
   assert.match(note, /never makes the agent forget/);
+  assert.match(note, /Sound<\/strong> silences the agent's voice without silencing the agent/);
+});
+
+// --- the agent's voice, without the agent ---------------------------------------------------------
+
+test("SOUND OFF SILENCES THE VOICE AND KEEPS THE TEXT", async () => {
+  // The whole point of the control, and the thing that would be silently lost by "simplifying" it
+  // into a mute: the agent keeps talking, and you keep reading it. A test that only checked that
+  // no audio played would pass on a control that dropped the replies entirely.
+  const page = newPage();
+  await startTalking(page);
+  const speak = () =>
+    page.sockets[0].onmessage({
+      data: JSON.stringify({ type: "audio", audio_event: { audio_base_64: btoa("\u0000\u0001") } }),
+    });
+  const reply = (text) =>
+    page.sockets[0].onmessage({
+      data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: text } }),
+    });
+
+  speak();
+  reply("heard me");
+  const played = page.audio.played;
+  assert.ok(played > 0, "no audio played at all, so this test proves nothing");
+
+  await page.el("speaker").click();
+  speak();
+  speak();
+  reply("still talking");
+
+  assert.equal(page.audio.played, played, "the agent's voice kept playing with sound off");
+  const said = page.el("transcript").children.map((li) => li.text()).join(" ");
+  assert.match(said, /still talking/, "sound off swallowed the agent's WORDS as well as its voice");
+  assert.equal(page.el("speaker-label").textContent, "Silent");
+  assert.equal(page.el("speaker").getAttribute("aria-pressed"), "true");
+  assert.match(page.el("status").textContent, /still arrive as text/);
+
+  await page.el("speaker").click();
+  speak();
+  assert.ok(page.audio.played > played, "the agent stayed silent after sound was turned back on");
+  assert.equal(page.el("speaker-label").textContent, "Sound");
+});
+
+test("sound off stops the sentence that is ALREADY playing", async () => {
+  // Found by mutation: dropping incoming frames alone leaves whatever is already scheduled on the
+  // audio clock to finish, so the agent keeps talking for a second or two after being silenced —
+  // which is exactly the moment you reached for the control.
+  const page = newPage();
+  await startTalking(page);
+  const speak = () =>
+    page.sockets[0].onmessage({
+      data: JSON.stringify({ type: "audio", audio_event: { audio_base_64: btoa("\u0000\u0001") } }),
+    });
+  speak();
+  speak();
+  assert.equal(page.audio.stopped, 0, "nothing has been stopped yet");
+
+  await page.el("speaker").click();
+
+  assert.ok(page.audio.stopped > 0, "the agent finished its sentence after being silenced");
+});
+
+test("sound off touches neither the microphone, the call, nor mute", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  speakInto(page);
+  const heard = audioFrames(socket).length;
+
+  await page.el("speaker").click();
+  speakInto(page);
+
+  assert.equal(page.tracks[0].stops, 0, "silencing the agent released the microphone");
+  assert.equal(page.sockets.length, 1, "silencing the agent opened a second conversation");
+  assert.notEqual(socket.readyState, 3, "silencing the agent hung up");
+  assert.ok(audioFrames(socket).length > heard, "silencing the agent also muted YOU");
+  assert.equal(page.el("talk-label").textContent, "Listening", "the talk control changed state");
+});
+
+// --- reading the transcript -----------------------------------------------------------------------
+
+test("the two speakers are visibly different things, not one grey word apart", async () => {
+  // They shared width, background and alignment, and were told apart only by a small grey label.
+  // Now they differ in side, tint and corner — three signals, so the shape of the conversation is
+  // readable before any of it is read.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({ type: "user_transcript", user_transcription_event: { user_transcript: "mine" } }),
+  });
+  page.sockets[0].onmessage({
+    data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "theirs" } }),
+  });
+
+  const [mine, theirs] = page.el("transcript").children;
+  assert.equal(mine.className, "mine");
+  assert.equal(theirs.className, "theirs");
+
+  const mineCss = cssBlock(".messages li.mine");
+  const theirsCss = cssBlock(".messages li.theirs");
+  const property = (block, name) => (new RegExp(`${name}:\\s*([^;]+);`).exec(block) || [])[1];
+  assert.notEqual(property(mineCss, "background"), property(theirsCss, "background"), "same tint");
+  assert.ok(/margin-left/.test(mineCss) && /margin-right/.test(theirsCss), "same alignment");
+});
+
+test("every line says when it was said", async () => {
+  // The surface is also being used as a debugging record, and a record with no clock is hard to
+  // line up against anything else that happened.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "hello" } }),
+  });
+
+  const line = page.el("transcript").children[0];
+  const at = line.descendants().find((node) => node.className === "at");
+  assert.ok(at, "a message carries no timestamp");
+  assert.match(at.textContent, /^\d{2}:\d{2}$/, `not a clock time: ${at.textContent}`);
+});
+
+test("the idle screen puts its invitation in the empty space, not in the bottom strip", async () => {
+  // Most of an idle display was doing nothing while the one strip where a phone shows text worst
+  // carried the instruction. The transcript area is the space that is free.
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("empty-state").hidden, false, "the empty transcript says nothing at all");
+  assert.match(page.el("empty-line").textContent, /Talk/, "the invitation must name the control");
+  assert.ok(
+    page.el("status").textContent.length <= 24,
+    `the strip should be short now: ${page.el("status").textContent}`
+  );
+
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({ type: "agent_response", agent_response_event: { agent_response: "hi" } }),
+  });
+
+  assert.equal(page.el("empty-state").hidden, true, "the invitation stayed under the conversation");
 });

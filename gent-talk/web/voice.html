@@ -20,26 +20,52 @@
   </head>
   <body>
     <!--
-      The frame. `body` is a three-row grid — top bar, body, control pane — and it is the whole
-      viewport. Nothing outside the one scrolling element scrolls, so a drag anywhere else moves
-      nothing, which is the difference between this and a web page.
+      The frame. `body` is a three-row grid — top bar, body, dock — and it is the whole viewport.
+      Nothing outside the one scrolling element scrolls, so a drag anywhere else moves nothing,
+      which is the difference between this and a web page.
+
+      The rule the whole layout serves: the MAJORITY OF THE SPACE BELONGS TO CONTENT — the
+      transcript, and the controls. Anything explanatory is available on request and is not
+      standing on the screen. Where a boundary has to be shown, it is a thin labelled separator,
+      not a paragraph; the paragraph lives one tap inside it.
     -->
     <header id="topbar">
       <div class="topbar-row">
-        <!-- Tabs and settings share one row on purpose: vertical space on a phone is the scarce
-             thing, and the transcript is what deserves it. -->
-        <button id="open-settings" class="chip" type="button" aria-label="settings">Settings</button>
-        <div id="tabs" role="tablist">
-          <button id="tab-voice" class="tab-button active" role="tab" type="button">Voice</button>
-          <button id="tab-discord" class="tab-button" role="tab" type="button">Discord</button>
-        </div>
-        <!-- Housekeeping, not a primary action: small, quiet, and out of reach of the thumb that
-             is aiming for the two big controls below. -->
-        <button id="clear-view" class="chip" type="button">Clear view</button>
-      </div>
-      <div class="topbar-row topbar-status">
-        <span id="conversation-state" class="muted">idle</span>
-        <span id="status" class="muted" role="status" aria-live="polite"></span>
+        <!-- On the settings screen the header becomes a plain title bar with a way back, which is
+             what a phone application does. It used to leave this row empty and put a "Back" button
+             in the body, which reads as an unfinished page. -->
+        <button id="close-settings" class="icon-button" type="button" aria-label="Back" title="Back" hidden>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14.5 5 8 12l6.5 7" />
+          </svg>
+        </button>
+        <span id="topbar-title" class="topbar-title" hidden>Settings</span>
+
+        <!-- ONE switch, not two labels. It carries the word for the view you are in, and a knob
+             that moves, so it reads as a control with two positions rather than as one item that
+             has been disabled. -->
+        <button
+          id="view-switch"
+          class="switch"
+          type="button"
+          role="switch"
+          aria-checked="false"
+          aria-label="switch between the call and the channel"
+        >
+          <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+          <span id="view-switch-label" class="switch-word">Voice</span>
+        </button>
+
+        <span class="topbar-gap"></span>
+
+        <!-- An icon, not a word: settings is a destination, not something you read the label of
+             every time you look at the screen. -->
+        <button id="open-settings" class="icon-button" type="button" aria-label="Settings" title="Settings">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3.1" />
+            <path d="M19.4 14.5a1.6 1.6 0 0 0 .33 1.77l.06.06a1.9 1.9 0 1 1-2.7 2.7l-.06-.06a1.6 1.6 0 0 0-1.77-.33 1.6 1.6 0 0 0-.98 1.47v.17a1.9 1.9 0 1 1-3.82 0v-.09a1.6 1.6 0 0 0-1.05-1.47 1.6 1.6 0 0 0-1.77.33l-.06.06a1.9 1.9 0 1 1-2.7-2.7l.06-.06a1.6 1.6 0 0 0 .33-1.77 1.6 1.6 0 0 0-1.47-.98H3.5a1.9 1.9 0 1 1 0-3.82h.09a1.6 1.6 0 0 0 1.47-1.05 1.6 1.6 0 0 0-.33-1.77l-.06-.06a1.9 1.9 0 1 1 2.7-2.7l.06.06a1.6 1.6 0 0 0 1.77.33h.08a1.6 1.6 0 0 0 .98-1.47V3.5a1.9 1.9 0 1 1 3.82 0v.09a1.6 1.6 0 0 0 .98 1.47 1.6 1.6 0 0 0 1.77-.33l.06-.06a1.9 1.9 0 1 1 2.7 2.7l-.06.06a1.6 1.6 0 0 0-.33 1.77v.08a1.6 1.6 0 0 0 1.47.98h.17a1.9 1.9 0 1 1 0 3.82h-.09a1.6 1.6 0 0 0-1.47.98z" />
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -89,6 +115,17 @@
           <!-- THE one scrolling element on the page. -->
           <div id="scroll-area">
             <div id="pane-voice">
+              <!-- At idle the transcript is the largest empty thing on the screen, so the
+                   invitation belongs HERE, in the space that is doing nothing — not in the one
+                   strip at the bottom edge where the hardware shows text worst. -->
+              <div id="empty-state">
+                <svg class="empty-mark" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                  <rect x="9" y="2.5" width="6" height="11" rx="3" />
+                  <path d="M5 11a7 7 0 0 0 14 0" />
+                  <path d="M12 18v3.5" />
+                </svg>
+                <p id="empty-line">Tap Talk to start a conversation.</p>
+              </div>
               <ol id="transcript" class="messages"></ol>
             </div>
 
@@ -97,13 +134,6 @@
                 <select id="discord-channel" aria-label="channel"></select>
                 <button id="refresh-discord" type="button">Refresh</button>
               </div>
-              <p class="hint">
-                The channel as Discord holds it, rendered from a small, fixed markdown subset.
-                Message text is written by other people and bots: it is escaped before anything
-                else happens and is never treated as markup or as an instruction. Every line shows
-                its author and its message id, so a message the agent describes can be checked
-                against a real one — or shown not to exist.
-              </p>
               <ol id="discord-log" class="messages"></ol>
             </div>
           </div>
@@ -111,10 +141,6 @@
 
         <!-- ----------------------------------------------------------------- settings screen -->
         <section id="screen-settings" class="screen" hidden>
-          <div class="row">
-            <button id="close-settings" class="secondary" type="button">Back</button>
-          </div>
-
           <h2>Connection</h2>
           <div id="settings-detail" class="panel muted">no conversation yet</div>
 
@@ -160,8 +186,19 @@
             <strong>Hang up</strong> ends the conversation. The agent does not keep its context
             across a hang-up, so the next call starts from nothing; the lines already on screen stay
             there, and the transcript marks where one conversation ended and the next began.
-            <strong>Clear view</strong> empties this screen only and never makes the agent forget
-            anything.
+            <strong>Sound</strong> silences the agent's voice without silencing the agent: its
+            replies keep arriving as text in the transcript.
+            <strong>Clear</strong> empties this screen only and never makes the agent forget
+            anything. It asks twice, because it sits under your thumb and it cannot be undone.
+          </p>
+
+          <h2>The channel</h2>
+          <p class="hint">
+            The Discord view shows the channel as Discord holds it, rendered from a small, fixed
+            markdown subset. Message text is written by other people and bots: it is escaped before
+            anything else happens and is never treated as markup or as an instruction. Every line
+            shows its author and its message id, so a message the agent describes can be checked
+            against a real one — or shown not to exist.
           </p>
 
           <h2>Token</h2>
@@ -171,34 +208,89 @@
     </main>
 
     <!--
-      The control pane. It is a grid ROW, not a pinned or absolutely positioned overlay, which is
-      why it cannot drift, overlap the transcript, or be scrolled off the bottom of the page.
-      Hang up on the left, talk on the right and larger, both under the thumb.
+      The dock: the third grid ROW, not a pinned or absolutely positioned overlay, which is why it
+      cannot drift, overlap the transcript, or be scrolled off the bottom of the page.
+
+      Status sits at the TOP of the dock, ABOVE the controls. On a phone with rounded corners the
+      bottom strip of the screen is where text is least legible — the owner's iPhone clipped the
+      first word of a line that lived down there. Moving it above the control pane removes that
+      whole class of defect rather than mitigating it, and the horizontal safe-area insets in
+      voice.css keep it clear of the curve on both sides.
     -->
-    <div id="control-pane" hidden>
-      <button id="hang-up" class="control control-hangup" type="button">
-        <span class="control-glyph" aria-hidden="true">✕</span>
-        <span id="hangup-label" class="control-label">Hang up</span>
-      </button>
-      <button id="talk" class="control control-talk" type="button">
-        <span class="control-ring" aria-hidden="true"></span>
-        <svg
-          class="control-mic"
-          viewBox="0 0 24 24"
-          aria-hidden="true"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="1.8"
-          stroke-linecap="round"
-        >
-          <rect x="9" y="2.5" width="6" height="11" rx="3" />
-          <path d="M5 11a7 7 0 0 0 14 0" />
-          <path d="M12 18v3.5" />
-          <path id="talk-slash" class="control-slash" d="M4 3.5 L20 20.5" />
-        </svg>
-        <span id="talk-label" class="control-label">Talk</span>
-      </button>
-    </div>
+    <footer id="dock">
+      <div id="status-line" data-state="idle">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status" role="status" aria-live="polite"></span>
+      </div>
+
+      <!--
+        A dense tile: two small controls stacked in the left column to exactly the height of the
+        large ones, which each span both rows. Nothing is a fixed pixel width, so the pane fills
+        the screen horizontally as well as vertically.
+
+            ┌────┬──────────┬──────────┐
+            │ 🔊 │          │          │
+            ├────┤ Hang up  │   Talk   │
+            │ 🗑  │          │          │
+            └────┴──────────┴──────────┘
+
+        Hang up is present only while there is a call to hang up. Idle and after a call has ended,
+        the two large columns become ONE action — the thing there actually is to do — rather than
+        a dead warm-coloured button sitting beside a live one.
+      -->
+      <div id="control-pane" hidden>
+        <button id="speaker" class="control control-mini on" type="button" aria-pressed="false" title="Silence the agent's voice. Its replies keep arriving as text in the transcript.">
+          <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z" />
+            <path class="speaker-wave" d="M15.5 9a4 4 0 0 1 0 6" />
+            <path class="speaker-wave" d="M18 6.8a7.5 7.5 0 0 1 0 10.4" />
+            <path id="speaker-slash" class="speaker-slash" d="M15.5 8.5 L21 15.5" />
+          </svg>
+          <span id="speaker-label" class="mini-label">Sound</span>
+        </button>
+
+        <!-- Destructive, and now under a thumb. It arms on the first tap and only clears on the
+             second, because the placement is what makes an accidental tap likely. -->
+        <button id="clear-view" class="control control-mini" type="button" title="Clear the transcript from this screen. It does not end the call and the agent forgets nothing.">
+          <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 6.5h16" />
+            <path d="M9.5 6.5V4.6a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1.9" />
+            <path d="M6.5 6.5 7.4 19a1.4 1.4 0 0 0 1.4 1.3h6.4a1.4 1.4 0 0 0 1.4-1.3l.9-12.5" />
+            <path d="M10.4 10v6.4M13.6 10v6.4" />
+          </svg>
+          <span id="clear-view-label" class="mini-label">Clear</span>
+        </button>
+
+        <button id="hang-up" class="control control-hangup" type="button" hidden>
+          <svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M2.8 13.2a13 13 0 0 1 18.4 0l-2.6 2.6a2 2 0 0 1-2.6.2l-1.4-1a1.4 1.4 0 0 1-.6-1.1v-1.5a10 10 0 0 0-4.4 0v1.5a1.4 1.4 0 0 1-.6 1.1l-1.4 1a2 2 0 0 1-2.6-.2z" />
+          </svg>
+          <span id="hangup-label" class="control-label">Hang up</span>
+        </button>
+
+        <button id="talk" class="control control-talk" type="button">
+          <span class="control-ring" aria-hidden="true"></span>
+          <svg
+            class="control-icon"
+            viewBox="0 0 24 24"
+            aria-hidden="true"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+          >
+            <rect x="9" y="2.5" width="6" height="11" rx="3" />
+            <path d="M5 11a7 7 0 0 0 14 0" />
+            <path d="M12 18v3.5" />
+            <path id="talk-slash" class="control-slash" d="M4 3.5 L20 20.5" />
+          </svg>
+          <span id="talk-label" class="control-label">Talk</span>
+          <!-- The memory caveat, attached to the action it is about, in one clause. It replaces a
+               paragraph that used to sprawl across the transcript after every hang-up. -->
+          <span id="talk-note" class="control-note" hidden></span>
+        </button>
+      </div>
+    </footer>
 
     <script src="/voice.js"></script>
   </body>
