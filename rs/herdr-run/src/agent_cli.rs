@@ -152,7 +152,6 @@ fn run(args: Args) -> Result<i32, CliError> {
     } else {
         None
     };
-    let client = HerdrClient::with_executable("direct", &args.herdr_bin)?;
     let target = Target {
         pane_id: args.pane,
         session_agent: args.session_agent,
@@ -161,6 +160,10 @@ fn run(args: Args) -> Result<i32, CliError> {
         expected_workspace: args.expected_workspace,
         expected_cwd: args.expected_cwd,
     };
+    // Reject an empty target before resolving the environment-dependent Herdr executable.  This
+    // keeps a malformed invocation deterministic on hosts that do and do not have Herdr installed.
+    agent::validate_target_authority(&target)?;
+    let client = HerdrClient::with_executable("direct", &args.herdr_bin)?;
     let queue = absolute_lexical(&args.queue).map_err(|error| {
         CliError::Usage(format!(
             "cannot resolve queue path {}: {error}",
@@ -570,5 +573,24 @@ mod tests {
         args.positional.push("text".to_owned());
         args.file = Some(PathBuf::from("prompt.md"));
         assert!(matches!(message(&args), Err(CliError::Usage(_))));
+    }
+
+    #[test]
+    fn empty_target_is_rejected_before_herdr_executable_resolution() {
+        let args = Args {
+            positional: vec!["status".to_owned()],
+            pane: Some(String::new()),
+            herdr_bin: PathBuf::from("/definitely/missing/herdr"),
+            ..Args::default()
+        };
+        let error = run(args).unwrap_err();
+        let CliError::Agent(error) = error else {
+            panic!("expected target validation error, got {error:?}");
+        };
+        assert_eq!(error.exit_code(), 75);
+        assert_eq!(
+            error.to_string(),
+            "target needs --pane or a stable session value"
+        );
     }
 }

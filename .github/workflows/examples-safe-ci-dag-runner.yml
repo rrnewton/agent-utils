@@ -56,7 +56,13 @@ jobs:
             # (a bare `run` would exit 3). This mirrors how the docs tell newcomers to run anywhere.
             # --no-profile keeps each example from writing a default profile store here (the store
             # itself is exercised by the dedicated step below).
-            python3 -m safe_ci_dag_runner run --dag "$dag" --allow-cgroup-failure --no-profile
+            extra=()
+            if [ "$dag" = examples/05-inner-jobs.json ]; then
+              # This example intentionally declares a fixed, self-managed width of eight. Its
+              # documented successful invocation therefore supplies that per-step ceiling.
+              extra+=(--max-cpus 8)
+            fi
+            python3 -m safe_ci_dag_runner run --dag "$dag" --allow-cgroup-failure --no-profile "${extra[@]}"
             echo "::endgroup::"
           done
       - name: run every example under the Rust build
@@ -71,7 +77,12 @@ jobs:
             echo "::group::rust run $dag"
             # Cgroup boxing is ON by default; CI runners lack a systemd --user scope, so opt out
             # (a bare `run` would exit 3). This mirrors how the docs tell newcomers to run anywhere.
-            rs/target/release/safe-ci-dag-runner run --dag "$dag" --allow-cgroup-failure --no-profile
+            extra=()
+            if [ "$dag" = examples/05-inner-jobs.json ]; then
+              # Mirror the Python invocation and the example's documented fixed-width contract.
+              extra+=(--max-cpus 8)
+            fi
+            rs/target/release/safe-ci-dag-runner run --dag "$dag" --allow-cgroup-failure --no-profile "${extra[@]}"
             echo "::endgroup::"
           done
       - name: exercise --only, --profile, sweep, and the default profile store (both builds)

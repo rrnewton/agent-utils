@@ -751,7 +751,6 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
         ("lines-over-bound", ("read", "--lines", "1000001"), 2),
         ("timeout-underscore", ("status", "--ready-timeout", "1_0"), 2),
         ("timeout-unicode", ("status", "--ready-timeout", "١.0"), 2),
-        ("empty-exact-pane", ("status", "--pane", ""), 75),
     ):
         python, rust = harness.invoke(case, arguments)
         report.require(
@@ -761,6 +760,18 @@ def _invalid_cli(harness: Harness, report: Report) -> None:
             and "panicked" not in (python.stderr + rust.stderr).lower(),
             f"invalid invocation was not a clean usage error: python={python!r} rust={rust!r}",
         )
+
+    python, rust = harness.invoke(case, ("status", "--pane", ""))
+    expected = "target needs --pane or a stable session value"
+    report.require(
+        "cli/empty-exact-pane",
+        python.returncode == rust.returncode == 75
+        and python.stdout == rust.stdout == ""
+        and expected in python.stderr
+        and expected in rust.stderr,
+        "empty exact pane did not fail target validation before Herdr resolution: "
+        f"python={python!r} rust={rust!r}",
+    )
 
 
 def build_report(python_command: Sequence[str], rust_command: Sequence[str]) -> Report:

@@ -1038,7 +1038,7 @@ fn validate_existing_queue(root: &Path) -> AgentResult<()> {
     Ok(())
 }
 
-fn validate_target_authority(target: &Target) -> AgentResult<()> {
+pub(crate) fn validate_target_authority(target: &Target) -> AgentResult<()> {
     let pane = target
         .pane_id
         .as_deref()

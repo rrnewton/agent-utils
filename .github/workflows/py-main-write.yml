@@ -48,19 +48,7 @@ jobs:
       - name: The tracked hook matches what install-hooks writes
         # A drifted checked-in hook would silently stop enforcing while still
         # looking installed.
-        run: |
-          python3 - <<'PY'
-          import importlib.util, pathlib, sys
-          spec = importlib.util.spec_from_file_location("mw", "scripts/main_write.py")
-          assert spec and spec.loader
-          mw = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mw)
-          tracked = pathlib.Path(".githooks/pre-push").read_text()
-          if tracked != mw._HOOK_BODY:
-              print("tracked .githooks/pre-push has drifted from install-hooks output", file=sys.stderr)
-              sys.exit(1)
-          print("hook body matches install-hooks output")
-          PY
+        run: python3 scripts/main_write.py install-hooks --check
 
   pr-exceptions:
     # Separated so a PR-hygiene violation is legible on its own rather than

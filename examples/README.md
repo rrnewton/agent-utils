@@ -103,8 +103,9 @@ safe-ci-dag-runner run --dag examples/04-memory-aware.json --max-mem 8G --allow-
 ```
 
 A 4 GiB budget only fits one step at a time; 8 GiB fits the two largest that can co-run; a large
-enough budget lets all three run at once, subject to both `--max-steps` and the total `--max-cpus`
-capacity. Without `--max-mem`, `--max-steps` defaults to the effective CPU budget. (This example
+enough budget lets all three run at once when `--max-steps` permits it. `--max-cpus` separately caps
+each runner-controlled step width, while a boxed run's outer quota arbitrates their aggregate CPU
+bandwidth. Without `--max-mem`, `--max-steps` defaults to the effective CPU target. (This example
 sets `mem_cap_factor: 1.0`, `mem_cap_floor_bytes: 0`, and `outer_mem_safety_factor: 1.0` so the
 modeled numbers are exactly the byte values above; the defaults add headroom.)
 
@@ -119,9 +120,10 @@ safe-ci-dag-runner run --dag examples/04-memory-aware.yaml --max-mem 8G --allow-
 
 `build.app` runs its *own* parallel build (imagine `make -j8`). Declaring
 `"preferred_inner_jobs": 8` tells the runner how wide the step is internally, so it can set an inner
-CPU cap when cgroup boxing is active, charge eight core-equivalents against the run's total
-`--max-cpus` budget, and account for the extra memory a wide `cpu-bound` step uses in the budget
-model.
+CPU cap when cgroup boxing is active, check that width against the run's per-step `--max-cpus`
+ceiling, and account for the extra memory a wide `cpu-bound` step uses in the budget model. Other
+legal steps may overlap it even when their requested widths sum above `--max-cpus`; the boxed outer
+quota arbitrates the shared CPU bandwidth.
 
 By **default** the runner also *appends* an inner-jobs flag to your command derived from that width —
 the default template is `-j`, so a `cmd` of `make build` would be run as `make build -j 8`. This step

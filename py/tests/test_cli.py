@@ -728,7 +728,21 @@ def test_stress_reports_ratio_all_pass() -> None:
     # per-copy PASS/FAIL ratio (the finding). A passing step gives N/N.
     with tempfile.TemporaryDirectory() as tmp:
         dag = _one_step_dag(tmp, "sleep 0.3")
-        rc, out, err = _capture(["run", "--dag", dag, "--stress", "3", "-q", _ACF])
+        rc, out, err = _capture(
+            [
+                "run",
+                "--dag",
+                dag,
+                "--stress",
+                "3",
+                "--max-steps",
+                "3",
+                "--max-cpus",
+                "3",
+                "-q",
+                _ACF,
+            ]
+        )
         assert rc == 0
         assert "stress results (3 generated graph copies):" in out
         assert "g.j: 3/3 passed" in out
@@ -799,11 +813,26 @@ def test_stress_generation_removes_named_resource_serialization() -> None:
             encoding="utf-8",
         )
         rc, out, err = _capture(
-            ["run", "--dag", str(dag), "--stress", "4", "-q", _ACF]
+            [
+                "run",
+                "--dag",
+                str(dag),
+                "--stress",
+                "4",
+                "--max-steps",
+                "4",
+                "--max-cpus",
+                "4",
+                "-q",
+                _ACF,
+            ]
         )
         assert rc == 0, err
         assert "g.j: 4/4 passed" in out
-        assert "maximum concurrent steps: 4 (--max-steps" in out
+        assert (
+            "maximum concurrent steps: 4 "
+            "(--max-steps 4; --max-cpus 4 CPU target/per-step ceiling)"
+        ) in out
 
 
 def test_stress_generated_graph_has_no_named_resource_scheduling() -> None:

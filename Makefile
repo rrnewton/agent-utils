@@ -24,7 +24,7 @@ mypy:
 check: check-deps mypy check-test-suite-selector
 	@host_target="$$(rustc -vV | sed -n 's/^host: //p')"; \
 	test -n "$$host_target"; \
-	cargo clippy --release --workspace --manifest-path rs/Cargo.toml \
+	cargo clippy --release --workspace --all-targets --manifest-path rs/Cargo.toml \
 		--target "$$host_target" -- -D warnings
 
 # Stdlib-only smoke check: every console entrypoint must start cleanly (--help / --version /

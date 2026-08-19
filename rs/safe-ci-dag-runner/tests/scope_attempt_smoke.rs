@@ -50,13 +50,33 @@ struct Out {
     text: String,
 }
 
+/// Build a runner command without inheriting the scope policy/control knobs that these tests vary.
+///
+/// In particular, GitHub Actions exports `GITHUB_ACTIONS=1` to the test process. Letting that leak
+/// into a child which explicitly sets `CI=1` changes the selected policy reason, while letting it
+/// leak into a child intended to exercise boxing changes the entire path into a policy skip. Keep
+/// the ordinary process environment (notably `PATH`) but make these inputs explicit per case.
+fn runner_command() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_safe-ci-dag-runner"));
+    for key in [
+        "CI",
+        "GITHUB_ACTIONS",
+        "SAFE_CI_FORCE_SCOPE_ATTEMPT",
+        "SAFE_CI_IN_SCOPE",
+        "SAFE_CI_SCOPE_UNIT",
+        "SAFE_CI_DAG_RUNNER_DIRECT_CGROUP",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
 /// Run the built binary with a controlled environment.
 ///
 /// `hide_session` removes the two variables that make a systemd `--user` bus reachable, which is
 /// how a runner with no user manager looks from inside the process.
 fn run(fx: &Fixture, envs: &[(&str, &str)], extra: &[&str], hide_session: bool) -> Out {
-    let bin = env!("CARGO_BIN_EXE_safe-ci-dag-runner");
-    let mut cmd = Command::new(bin);
+    let mut cmd = runner_command();
     cmd.args(["run", "--dag", fx.dag().to_str().unwrap(), "--no-profile"])
         .args(extra)
         // Keep the evidence writer out of this test's way; it is covered elsewhere.
@@ -336,14 +356,13 @@ fn journal_containment(dir: &Path) -> Option<String> {
 
 /// Run once with an explicit evidence directory, returning (output, journal line).
 fn run_recording(name: &str, envs: &[(&str, &str)], extra: &[&str]) -> (String, Option<String>) {
-    let bin = env!("CARGO_BIN_EXE_safe-ci-dag-runner");
     let dir = std::env::temp_dir().join(format!("scdr_rec_{name}_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let dag = dir.join("one.json");
     std::fs::write(&dag, DAG).unwrap();
     let ev = dir.join("evidence");
-    let mut cmd = Command::new(bin);
+    let mut cmd = runner_command();
     cmd.args(["run", "--dag", dag.to_str().unwrap(), "--no-profile"])
         .args(extra)
         .env("SAFE_CI_DAG_RUNNER_LOG_DIR", &ev);

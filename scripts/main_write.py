@@ -790,8 +790,20 @@ exec python3 "$(git rev-parse --show-toplevel)/scripts/main_write.py" hook-pre-p
 def cmd_install_hooks(args: argparse.Namespace) -> int:
     root = repo_root(Path(args.root) if args.root else None)
     hooks = root / ".githooks"
-    hooks.mkdir(parents=True, exist_ok=True)
     hook = hooks / "pre-push"
+    if args.check:
+        try:
+            body = hook.read_text()
+        except OSError as error:
+            raise WriteRefused(f"cannot read tracked pre-push hook {hook}: {error}") from error
+        if body != _HOOK_BODY:
+            raise WriteRefused(
+                "tracked .githooks/pre-push has drifted from install-hooks output"
+            )
+        print(f"{PROG}: tracked hook body matches install-hooks output")
+        return 0
+
+    hooks.mkdir(parents=True, exist_ok=True)
     hook.write_text(_HOOK_BODY)
     hook.chmod(0o755)
     _git(root, "config", "core.hooksPath", ".githooks")
@@ -829,6 +841,11 @@ def build_parser() -> argparse.ArgumentParser:
     exceptions.set_defaults(handler=cmd_pr_exceptions)
 
     install = sub.add_parser("install-hooks", help="install the pre-push guard", description="install the pre-push guard")
+    install.add_argument(
+        "--check",
+        action="store_true",
+        help="verify the tracked hook body without changing the checkout",
+    )
     install.set_defaults(handler=cmd_install_hooks)
     return parser
 

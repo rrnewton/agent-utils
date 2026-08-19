@@ -422,6 +422,25 @@ def test_status_reports_the_queue_predicate_and_its_inputs(world: dict[str, Path
     assert '"unlanded_commits": 1' in busy.stdout
 
 
+def test_install_hooks_check_is_read_only_and_refuses_drift(
+    world: dict[str, Path],
+) -> None:
+    seed = world["seed"]
+    clean_before = _git(seed, "status", "--porcelain")
+
+    checked = _run_tool(seed, "install-hooks", "--check")
+
+    assert checked.returncode == 0, checked.stderr
+    assert "tracked hook body matches install-hooks output" in checked.stdout
+    assert _git(seed, "status", "--porcelain") == clean_before
+
+    (seed / ".githooks" / "pre-push").write_text("#!/bin/sh\nexit 0\n")
+    drifted = _run_tool(seed, "install-hooks", "--check")
+
+    assert drifted.returncode == 1
+    assert "tracked .githooks/pre-push has drifted" in drifted.stderr
+
+
 def test_recorded_exception_reason_requires_an_exact_allowed_slug() -> None:
     assert (
         main_write.recorded_exception_reason("Exception-Reason: high-risk-preland-review")

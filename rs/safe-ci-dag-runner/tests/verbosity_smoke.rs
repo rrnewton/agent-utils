@@ -1,6 +1,6 @@
 //! Two-sided output-contract bracket for validation verbosity.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
@@ -55,7 +55,7 @@ impl Drop for Fixture {
     }
 }
 
-fn run(dag: &PathBuf, extra: &[&str]) -> (i32, String, Duration) {
+fn run(dag: &Path, extra: &[&str]) -> (i32, String, Duration) {
     let start = Instant::now();
     let out = Command::new(env!("CARGO_BIN_EXE_safe-ci-dag-runner"))
         .args([
