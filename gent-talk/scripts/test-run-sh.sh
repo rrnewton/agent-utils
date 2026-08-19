@@ -23,17 +23,47 @@ SENTINEL_EL_KEY="SENTINEL-ELEVENLABS-KEY-51ab7e30"
 TEST_IMAGE_NAME="gent-talk-selftest"
 TEST_IMAGE_TAG="t0"
 TEST_PORT=18099
+# A tag and port that no test ever creates anything under, for the "nothing is there" checks.
+ABSENT_TAG="no-such-tag"
+ABSENT_PORT=18097
+# run.sh names the container after the image, so the self-test's container is
+# 'gent-talk-selftest' and can never be the owner's 'gent-talk'.
+TEST_CONTAINER_NAME="$TEST_IMAGE_NAME"
+# Printed by the test image at startup, so a log check cannot pass on empty output.
+LOG_MARKER="GENT-TALK-SELFTEST-LOG-MARKER-6f2ab913"
+
+# A throwaway user unit of our own, used to prove --tunnel-status does not start what it reports
+# on. It is never the owner's tunnel, and it is removed again in cleanup().
+SELFTEST_UNIT="gent-talk-selftest-tunnel.service"
+SELFTEST_UNIT_PATH="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$SELFTEST_UNIT"
 
 TMPDIR_TEST="$(mktemp -d)"
 ALL_OUTPUT="$TMPDIR_TEST/all-output.txt"
 : > "$ALL_OUTPUT"
 CREATED_CONTAINER=""
+# Every container this suite creates is tracked here, because cleanup() runs on FAILURE
+# too. An untracked one survives a failed run and then matches the next run's image or
+# port, which shows up as an unrelated check failing for a reason that is not there.
+OLDSTYLE_CONTAINER=""
+DECOY_CONTAINER=""
 
 cleanup() {
     if [ -n "$CREATED_CONTAINER" ]; then
         "$ENGINE" rm -f "$CREATED_CONTAINER" >/dev/null 2>&1 || true
     fi
+    if [ -n "$OLDSTYLE_CONTAINER" ]; then
+        "$ENGINE" rm -f "$OLDSTYLE_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$DECOY_CONTAINER" ]; then
+        "$ENGINE" rm -f "$DECOY_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    "$ENGINE" rm -f "$TEST_CONTAINER_NAME" >/dev/null 2>&1 || true
     "$ENGINE" rmi "${TEST_IMAGE_NAME}:${TEST_IMAGE_TAG}" >/dev/null 2>&1 || true
+    if [ -f "$SELFTEST_UNIT_PATH" ]; then
+        systemctl --user stop "$SELFTEST_UNIT" >/dev/null 2>&1 || true
+        rm -f "$SELFTEST_UNIT_PATH"
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+    fi
     rm -rf "$TMPDIR_TEST"
 }
 trap cleanup EXIT
@@ -54,17 +84,23 @@ ok() { PASS=$((PASS + 1)); echo "ok   $*"; }
 #
 # That trap is why the tunnel-from-user-config checks below assert on run.sh's OWN error text
 # rather than on anything podman reports.
+#
+# ENGINE_FOR_RUN lets a check hand run.sh a wrapper around podman (see FAKE_ENGINE below); it
+# defaults to the real engine. The `timeout` is not decoration: a --logs or --follow that waits
+# on a container that is not there would otherwise wedge the whole suite instead of failing, and
+# "fails clearly rather than hanging" is one of the things under test. timeout exits 124.
 TEST_XDG_CONFIG="$TMPDIR_TEST/config"
 run_sh() {
     local out rc=0
-    out="$(env -i \
+    out="$(timeout 120 env -i \
             PATH="$PATH" \
             HOME="$HOME" \
             USER="${USER:-}" \
             XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" \
             DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
-            GENT_TALK_ENGINE="$ENGINE" \
+            GENT_TALK_ENGINE="${ENGINE_FOR_RUN:-$ENGINE}" \
             bash "$RUN_SH" "$@" 2>&1)" || rc=$?
+    [ "$rc" -ne 124 ] || fail "run.sh hung (timed out) on: $*"
     printf '%s\n' "$out" >> "$ALL_OUTPUT"
     printf '%s' "$out"
     return "$rc"
@@ -114,6 +150,27 @@ grep -q -- '--shutdown' <<< "$out" || fail "--help does not document --shutdown"
 grep -q 'Configuration precedence' <<< "$out" || fail "--help does not explain config precedence"
 grep -q 'EXIT' <<< "$out" || fail "--help does not say that --shutdown exits"
 ok "--help documents the flags and the config precedence"
+
+# The header comment IS the help text, so every flag the parser accepts must appear in it. Read
+# the accepted flags out of the case statement rather than listing them here, so a flag added
+# without a line of documentation fails this check instead of quietly shipping undocumented.
+parsed_flags="$(sed -n '/^while \[ \$# -gt 0 \]/,/^done$/p' "$RUN_SH" \
+    | grep -oE '^\s+(-[a-z]\|)?--[a-z-]+\)' | grep -oE -- '--[a-z-]+')"
+[ -n "$parsed_flags" ] || fail "could not read the accepted flags out of run.sh's argument parser"
+for flag in $parsed_flags; do
+    grep -q -- "$flag" <<< "$out" || fail "--help does not document the accepted flag $flag"
+done
+ok "--help documents every flag the parser accepts ($(wc -w <<< "$parsed_flags") of them)"
+
+# The new operator actions, and the restart-policy reasoning, must be IN the help: the owner is
+# told to read --help rather than the source.
+grep -q -- '--follow' <<< "$out" || fail "--help does not document --follow"
+grep -q -- '--tunnel-status' <<< "$out" || fail "--help does not document --tunnel-status"
+grep -q 'on-failure:5' <<< "$out" || fail "--help does not state the default restart policy"
+grep -qi 'crash loop\|crash LOOP' <<< "$out" || fail "--help does not explain the crash-loop trade-off"
+grep -q 'podman-restart.service' <<< "$out" || fail "--help does not say what reboot survival actually takes"
+grep -qi 'READ-ONLY' <<< "$out" || fail "--help does not say --tunnel-status changes nothing"
+ok "--help explains the two log actions, the restart-policy trade, and reboot survival"
 
 # --- 2. no configuration at all -------------------------------------------------------------
 # Run a COPY of run.sh from a temp directory, with an empty HOME and XDG_CONFIG_HOME, so the
@@ -218,9 +275,36 @@ cp "$GOOD_CONFIG" "$TUNNEL_CONFIG"
 # --- 8. a good config reaches build and run, in dry run --------------------------------------
 out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel)"
 grep -q '(dry run).*build -t '"$TEST_IMAGE_NAME:$TEST_IMAGE_TAG" <<< "$out" || fail "dry run did not print the build command"
-grep -q '(dry run).*run --rm -p 127.0.0.1:'"$TEST_PORT" <<< "$out" || fail "dry run did not print the run command"
+grep -q '(dry run).*run -d .*-p 127.0.0.1:'"$TEST_PORT" <<< "$out" || fail "dry run did not print the run command"
 grep -q 'set: .*GENT_TALK_DISCORD_BOT_TOKEN' <<< "$out" || fail "dry run does not report which variables are set"
 ok "a valid config reaches build and run (dry run), reporting variables by name"
+
+# --- 8b. the run command is detached, named, restart-policied, and NOT --rm ------------------
+# --rm is what destroyed the access log of every crash: the container, and its logs with it,
+# disappeared at exactly the moment there was something to read. Assert its ABSENCE, not just
+# the presence of the new flags, or a stray --rm could come back unnoticed.
+runline="$(grep '(dry run).*run -d' <<< "$out")"
+grep -q -- '--name '"$TEST_IMAGE_NAME" <<< "$runline" || fail "run command does not name the container: $runline"
+grep -q -- '--restart on-failure:5' <<< "$runline" || fail "run command does not set the default restart policy: $runline"
+grep -q -- '--rm' <<< "$runline" && fail "run command still uses --rm, so the logs would not survive a stop: $runline"
+ok "the launch is detached, named, restart-policied, and does not use --rm"
+
+# --restart-policy is honoured, and a bad one is refused BEFORE anything is built or stopped.
+out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel --restart-policy always)"
+grep -q -- '--restart always' <<< "$out" || fail "--restart-policy always was not applied"
+ok "--restart-policy overrides the default"
+
+rc=0; out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel --restart-policy sometimes)" || rc=$?
+[ "$rc" -ne 0 ] || fail "an invalid restart policy was accepted"
+grep -q 'sometimes' <<< "$out" || fail "invalid-policy error does not name the value given"
+grep -q 'build -t' <<< "$out" && fail "invalid restart policy was only caught after the build step"
+ok "an invalid restart policy fails early, naming the value and the valid ones"
+
+# Two actions at once is a mistake, and silently honouring one of them is the worst answer.
+rc=0; out="$(run_sh --config "$GOOD_CONFIG" --status --logs)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--status --logs together did not fail"
+grep -q 'cannot be combined' <<< "$out" || fail "combined-actions error is not specific: $out"
+ok "two actions at once is refused, naming both"
 
 # --- 9. tunnel check, both settings ----------------------------------------------------------
 out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel)"
@@ -236,6 +320,101 @@ grep -q 'cloudflared-gent-talk-does-not-exist.service' <<< "$out" || fail "nonex
 grep -qi 'does not exist' <<< "$out" || fail "nonexistent-unit error is not a clear message"
 ok "tunnel enabled with a missing unit: clear error naming the unit, not a crash"
 
+# --- 9b. --tunnel-status ---------------------------------------------------------------------
+# It must REPORT and change nothing. The unit named here cannot exist, so the report has to say
+# so rather than crashing or, worse, trying to create or start something.
+rc=0; out="$(run_sh --config "$nounit" --tunnel-status)" || rc=$?
+[ "$rc" -ne 0 ] || fail "--tunnel-status on a missing unit exited 0 (it must report not-active)"
+grep -q 'cloudflared-gent-talk-does-not-exist.service' <<< "$out" || fail "--tunnel-status does not name the unit"
+grep -qi 'NOT INSTALLED' <<< "$out" || fail "--tunnel-status does not say the unit is absent: $out"
+grep -qi 'read-only' <<< "$out" || fail "--tunnel-status does not state that it changes nothing"
+grep -q 'systemctl --user enable --now' <<< "$out" || fail "--tunnel-status does not say how to install the unit"
+# It must not have gone on to build, run, or check anything else.
+grep -q 'build -t' <<< "$out" && fail "--tunnel-status went on to build"
+grep -q 'Running' <<< "$out" && fail "--tunnel-status went on to launch"
+ok "--tunnel-status on an absent unit reports it, exits nonzero, and does nothing else"
+
+# An INSTALLED but INACTIVE unit. This is the check that really pins "read-only": a unit that is
+# already active stays active whether or not something calls `systemctl start` on it, so only an
+# inactive one can prove the command did not start it. The unit is ours, uniquely named, and
+# removed in cleanup — the owner's tunnel is never used as the guinea pig.
+if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$SELFTEST_UNIT_PATH")"
+    cat > "$SELFTEST_UNIT_PATH" <<'EOF'
+[Unit]
+Description=gent-talk self-test placeholder (safe to delete)
+[Service]
+Type=simple
+ExecStart=/bin/sleep 600
+EOF
+    systemctl --user daemon-reload
+    systemctl --user is-active --quiet "$SELFTEST_UNIT" \
+        && fail "test setup: the placeholder unit was already active"
+
+    inactive="$TMPDIR_TEST/inactive-unit.env"
+    write_config "$inactive"
+    echo "GENT_TALK_TUNNEL_UNIT=$SELFTEST_UNIT" >> "$inactive"
+    rc=0; out="$(run_sh --config "$inactive" --tunnel-status)" || rc=$?
+    [ "$rc" -ne 0 ] || fail "--tunnel-status on an inactive unit exited 0"
+    grep -q 'unit:      installed' <<< "$out" || fail "--tunnel-status did not see the installed unit: $out"
+    grep -q 'active:    NO' <<< "$out" || fail "--tunnel-status did not report the unit as inactive: $out"
+    grep -q "systemctl --user start $SELFTEST_UNIT" <<< "$out" || fail "--tunnel-status does not say how to start it: $out"
+    systemctl --user is-active --quiet "$SELFTEST_UNIT" \
+        && fail "--tunnel-status STARTED the unit it was only asked to report on"
+    ok "--tunnel-status reports an installed-but-inactive unit and provably does not start it"
+
+    systemctl --user stop "$SELFTEST_UNIT" >/dev/null 2>&1 || true
+    rm -f "$SELFTEST_UNIT_PATH"
+    systemctl --user daemon-reload
+else
+    echo "SKIP no usable 'systemctl --user': the inactive-unit check was not run" >&2
+fi
+
+# The real unit, when it is active. The control that matters is that the unit's
+# ActiveEnterTimestamp is IDENTICAL before and after: a report that restarted the tunnel would
+# still print "active", so "it says active" proves nothing on its own.
+REAL_UNIT="cloudflared-gent-talk.service"
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet "$REAL_UNIT"; then
+    since_before="$(systemctl --user show "$REAL_UNIT" -p ActiveEnterTimestamp --value)"
+    realunit="$TMPDIR_TEST/realunit.env"
+    write_config "$realunit"
+    echo "GENT_TALK_TUNNEL_UNIT=$REAL_UNIT" >> "$realunit"
+    out="$(run_sh --config "$realunit" --tunnel-status)"
+    since_after="$(systemctl --user show "$REAL_UNIT" -p ActiveEnterTimestamp --value)"
+    grep -q 'active:    YES' <<< "$out" || fail "--tunnel-status did not report the live unit as active: $out"
+    grep -q "$REAL_UNIT" <<< "$out" || fail "--tunnel-status did not name the live unit"
+    grep -qE 'since: +[A-Za-z]' <<< "$out" || fail "--tunnel-status did not report since-when: $out"
+    grep -qE 'hostname: +[a-z0-9.-]+\.[a-z]{2,}' <<< "$out" || fail "--tunnel-status did not report a tunnel hostname: $out"
+    [ "$since_before" = "$since_after" ] \
+        || fail "--tunnel-status changed the unit's ActiveEnterTimestamp: it restarted the tunnel"
+    systemctl --user is-active --quiet "$REAL_UNIT" || fail "--tunnel-status left the tunnel not active"
+    ok "--tunnel-status reports the live unit (active, since, hostname) and provably does not restart it"
+
+    # Negative control for the hostname line: with the ingress config pointed somewhere empty,
+    # the same command must say the hostname is unknown rather than printing a stale one.
+    hostless="$TMPDIR_TEST/hostless.env"
+    write_config "$hostless"
+    echo "GENT_TALK_TUNNEL_UNIT=$REAL_UNIT" >> "$hostless"
+    echo "GENT_TALK_TUNNEL_CONFIG=$TMPDIR_TEST/no-such-cloudflared.yml" >> "$hostless"
+    out="$(run_sh --config "$hostless" --tunnel-status)"
+    grep -q 'hostname:  unknown' <<< "$out" || fail "a missing tunnel config did not make the hostname unknown: $out"
+    ok "the hostname really comes from the tunnel config (unknown when that file is not there)"
+else
+    echo "SKIP $REAL_UNIT is not active: the live-tunnel checks were not run" >&2
+fi
+
+# --- 9c. --logs and --follow with nothing to read ---------------------------------------------
+# Under a tag and port nothing in this suite ever creates, so the answer cannot be an accident.
+# The `timeout` inside run_sh turns a hang into a failure; here we assert the clear message.
+for action in --logs --follow; do
+    rc=0; out="$(run_sh --config "$GOOD_CONFIG" --tag "$ABSENT_TAG" --port "$ABSENT_PORT" "$action")" || rc=$?
+    [ "$rc" -ne 0 ] || fail "$action with no container exited 0"
+    grep -q 'no gent-talk container to read logs from' <<< "$out" || fail "$action error is not specific: $out"
+    grep -q "$TEST_IMAGE_NAME:$ABSENT_TAG" <<< "$out" || fail "$action error does not name the image looked for: $out"
+    grep -q "$ABSENT_PORT" <<< "$out" || fail "$action error does not name the port looked for: $out"
+    ok "$action with no container fails clearly, naming what it looked for"
+done
+
 # --- 10. already-running detection, by image and by port -------------------------------------
 if command -v "$ENGINE" >/dev/null 2>&1; then
     BASE_IMAGE="$("$ENGINE" images --format '{{.Repository}}:{{.Tag}}' | grep -E '^docker.io/library/debian:' | head -1 || true)"
@@ -243,7 +422,31 @@ if command -v "$ENGINE" >/dev/null 2>&1; then
     if [ -z "$BASE_IMAGE" ]; then
         echo "SKIP no local image to tag for the detection test" >&2
     else
-        "$ENGINE" tag "$BASE_IMAGE" "${TEST_IMAGE_NAME}:${TEST_IMAGE_TAG}" >/dev/null
+        # Built rather than just tagged, so the image has a CMD of its own: run.sh launches an
+        # image with no arguments, and a container that says nothing would let a log check pass
+        # on empty output. Local base image only, --pull=never, so this needs no network.
+        cat > "$TMPDIR_TEST/Containerfile.selftest" <<EOF
+FROM $BASE_IMAGE
+CMD ["sh", "-c", "trap 'exit 0' TERM; echo $LOG_MARKER; sleep 600 & wait"]
+EOF
+        "$ENGINE" build --pull=never -t "${TEST_IMAGE_NAME}:${TEST_IMAGE_TAG}" \
+            -f "$TMPDIR_TEST/Containerfile.selftest" "$TMPDIR_TEST" >/dev/null 2>&1 \
+            || fail "could not build the throwaway self-test image from $BASE_IMAGE"
+        # Port matching has to anchor on ':<port>->', because the Ports column names BOTH sides
+        # of the mapping. Every gent-talk container renders '->8080/tcp', so an unanchored match
+        # on the owner's real port 8080 would sweep up any unrelated container publishing to
+        # 8080 — and under --shutdown this is what decides what gets STOPPED. The decoy maps host
+        # 18096 to container port 18099: its Ports string contains 18099, but never ':18099->'.
+        # (Mutation-tested: relaxing the anchor to a bare substring survived until this existed.)
+        DECOY_CONTAINER="$("$ENGINE" run -d -p "127.0.0.1:18096:${TEST_PORT}" "$BASE_IMAGE" sleep 120)"
+        sleep 1
+        rc=0; out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel --tag decoy-probe)" || rc=$?
+        [ "$rc" -eq 0 ] || fail "a container that mentions $TEST_PORT only on the container side was matched as running: $out"
+        grep -q 'already running' <<< "$out" && fail "port matching is not anchored: the decoy was taken for a running instance"
+        "$ENGINE" rm -f "$DECOY_CONTAINER" >/dev/null
+        DECOY_CONTAINER=""
+        ok "a container that publishes TO our port, rather than ON it, is not mistaken for ours"
+
         CREATED_CONTAINER="$("$ENGINE" run -d -p "127.0.0.1:${TEST_PORT}:8080" \
             "${TEST_IMAGE_NAME}:${TEST_IMAGE_TAG}" sleep 600)"
         sleep 1
@@ -285,22 +488,185 @@ if command -v "$ENGINE" >/dev/null 2>&1; then
         out="$(run_sh --config "$GOOD_CONFIG" --shutdown)"
         grep -q 'Nothing to stop' <<< "$out" || fail "--shutdown on nothing running is not a clean no-op"
         ok "--shutdown is idempotent when nothing is running"
+
+        # --shutdown must KEEP the stopped container. Under the old --rm launch it vanished, and
+        # with it the access log of whatever had just gone wrong.
+        "$ENGINE" ps -a --format '{{.ID}}' | grep -q "${CREATED_CONTAINER:0:12}" \
+            || fail "the container disappeared when it was stopped: its logs are gone"
+        out="$(run_sh --config "$GOOD_CONFIG" --status)"
+        grep -q 'stopped (kept for their logs' <<< "$out" || fail "--status does not report the stopped container: $out"
+        ok "a stopped container survives, and --status says it is being kept for its logs"
+
+        # --- 12. --status reports the new operational facts ----------------------------------
+        out="$(run_sh --config "$GOOD_CONFIG" --status)"
+        grep -q "container name: $TEST_CONTAINER_NAME" <<< "$out" || fail "--status does not report the container name: $out"
+        grep -q 'restart policy: on-failure:5' <<< "$out" || fail "--status does not report the restart policy: $out"
+        grep -qi 'logs: *RETAINED' <<< "$out" || fail "--status does not say whether logs are retained: $out"
+        grep -q -- '--logs' <<< "$out" || fail "--status does not say how to read the logs: $out"
+        ok "--status reports the container name, the restart policy, and that logs are retained"
+
+        # Reboot survival needs BOTH podman-restart.service and a policy of literally 'always',
+        # so --status must report the unit's state rather than let the policy line imply it.
+        grep -q 'podman-restart.service is ' <<< "$out" || fail "--status does not report reboot survival: $out"
+        grep -q "literally 'always'" <<< "$out" || fail "--status does not say which policy podman-restart.service acts on: $out"
+        ok "--status reports what would actually happen to the container after a reboot"
+
+        # --- 13. the cut-over signal on an old-style (--rm) container -------------------------
+        # This is what the owner's live container looks like right now: autoremove, no name, no
+        # policy. --status must say so, because "it is up" hides that its logs are doomed.
+        OLDSTYLE_CONTAINER="$("$ENGINE" run -d --rm -p "127.0.0.1:18096:8080" \
+            "${TEST_IMAGE_NAME}:${TEST_IMAGE_TAG}")"
+        sleep 1
+        out="$(run_sh --config "$GOOD_CONFIG" --status)"
+        grep -q 'autoremove=true' <<< "$out" || fail "--status does not report autoremove on an --rm container: $out"
+        grep -q 'started the OLD way' <<< "$out" || fail "--status does not flag an --rm container for cut-over: $out"
+        grep -q -- '--restart' <<< "$out" || fail "--status does not say how to cut over: $out"
+        ok "--status flags an --rm container as losing its logs, and names the cut-over command"
+        "$ENGINE" rm -f "$OLDSTYLE_CONTAINER" >/dev/null 2>&1 || true
+        OLDSTYLE_CONTAINER=""
+
+        # --- 14. a real launch, with only the image build stubbed out ------------------------
+        # Everything else — detection, stopped-container sweep, the name, the restart policy,
+        # the actual `podman run` — is real, and every assertion below reads real podman state
+        # rather than run.sh's own account of itself. Only `build` is stubbed, because building
+        # the real gent-talk image here would cost minutes and prove nothing about run.sh.
+        FAKE_ENGINE="$TMPDIR_TEST/fake-engine"
+        cat > "$FAKE_ENGINE" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = build ]; then echo "fake-engine: build stubbed (image is pre-built)"; exit 0; fi
+exec "$ENGINE" "\$@"
+EOF
+        chmod +x "$FAKE_ENGINE"
+
+        stopped_before="${CREATED_CONTAINER:0:12}"
+        "$ENGINE" ps -a --format '{{.ID}}' | grep -q "$stopped_before" \
+            || fail "test setup: expected the stopped container to still be present before the launch"
+
+        rc=0
+        out="$(ENGINE_FOR_RUN="$FAKE_ENGINE" run_sh --config "$GOOD_CONFIG" --no-tunnel)" || rc=$?
+        [ "$rc" -eq 0 ] || fail "the launch failed: $out"
+        grep -q "Started $TEST_CONTAINER_NAME" <<< "$out" || fail "the launch did not report starting the container: $out"
+        grep -q -- '--follow' <<< "$out" || fail "the launch does not tell the operator how to follow the output: $out"
+        ok "run.sh launches the container detached and says how to follow it"
+
+        # The leftover stopped container was in the way of both the name and the port. It must
+        # have been removed as part of the launch, not left to collide with it.
+        grep -q 'Removing stopped container' <<< "$out" || fail "the launch did not report sweeping the stopped container: $out"
+        "$ENGINE" ps -a --format '{{.ID}}' | grep -q "$stopped_before" \
+            && fail "the stopped container was not removed, so the relaunch would collide with it"
+        ok "a stopped container present before a launch is swept, not collided with"
+
+        LAUNCHED_ID="$("$ENGINE" ps --filter "name=^${TEST_CONTAINER_NAME}$" --format '{{.ID}}')"
+        [ -n "$LAUNCHED_ID" ] || fail "no running container carries the fixed name $TEST_CONTAINER_NAME"
+        mode="$("$ENGINE" inspect --format '{{.HostConfig.RestartPolicy.Name}}:{{.HostConfig.RestartPolicy.MaximumRetryCount}}|{{.HostConfig.AutoRemove}}' "$TEST_CONTAINER_NAME")"
+        [ "$mode" = "on-failure:5|false" ] \
+            || fail "the launched container is not on-failure:5 with logs retained, it is: $mode"
+        ok "the launched container has the fixed name, restart policy on-failure:5, and no --rm"
+
+        sleep 1
+        out="$(run_sh --config "$GOOD_CONFIG" --logs)"
+        grep -q "$LOG_MARKER" <<< "$out" || fail "--logs did not show the running container's output: $out"
+        ok "--logs dumps the running container's output"
+
+        out="$(run_sh --config "$GOOD_CONFIG" --follow --dry-run)"
+        grep -q "logs -f" <<< "$out" || fail "--follow does not stream (no 'logs -f'): $out"
+        grep -qi 'Ctrl-C stops READING' <<< "$out" || fail "--follow does not say that interrupting it leaves the container up: $out"
+        ok "--follow streams the output, and says that interrupting it does not stop the container"
+
+        # The check above reads a PRINTED command, and a --follow that had lost its -f would
+        # print exactly the same line while dumping and exiting — so it proves nothing about the
+        # path that runs. (Mutation-tested: dropping -f from the exec survived until this check
+        # existed.) Against a RUNNING container, --follow must not return on its own; timeout
+        # ends it, and rc 124 is the evidence that it was still attached when time ran out.
+        rc=0
+        out="$(timeout 6 env -i PATH="$PATH" HOME="$HOME" USER="${USER:-}" \
+                XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}" GENT_TALK_ENGINE="$ENGINE" \
+                bash "$RUN_SH" --config "$GOOD_CONFIG" --follow 2>&1)" || rc=$?
+        printf '%s\n' "$out" >> "$ALL_OUTPUT"
+        [ "$rc" -eq 124 ] \
+            || fail "--follow returned on its own (rc=$rc): it dumped the log and exited instead of following"
+        grep -q "$LOG_MARKER" <<< "$out" || fail "--follow did not stream the container's output: $out"
+        ok "--follow really stays attached to a running container instead of dumping and exiting"
+
+        # THE point of dropping --rm: stop it, and the log is still readable afterwards.
+        out="$(run_sh --config "$GOOD_CONFIG" --shutdown)"
+        sleep 1
+        "$ENGINE" ps -a --filter "name=^${TEST_CONTAINER_NAME}$" --format '{{.ID}}' | grep -q . \
+            || fail "the container vanished when stopped: its logs went with it"
+        out="$(run_sh --config "$GOOD_CONFIG" --logs)"
+        grep -q "$LOG_MARKER" <<< "$out" || fail "--logs on a STOPPED container lost the output: $out"
+        ok "logs survive stopping the container, which is what --rm used to destroy"
+
+        # Relaunch over the stopped one: the fixed name must not collide.
+        rc=0
+        out="$(ENGINE_FOR_RUN="$FAKE_ENGINE" run_sh --config "$GOOD_CONFIG" --no-tunnel)" || rc=$?
+        [ "$rc" -eq 0 ] || fail "relaunch over a stopped same-named container failed: $out"
+        grep -qi 'in use\|already in use\|name is already' <<< "$out" && fail "relaunch hit a name collision: $out"
+        RELAUNCHED_ID="$("$ENGINE" ps --filter "name=^${TEST_CONTAINER_NAME}$" --format '{{.ID}}')"
+        [ -n "$RELAUNCHED_ID" ] || fail "nothing is running under $TEST_CONTAINER_NAME after the relaunch"
+        [ "$RELAUNCHED_ID" != "$LAUNCHED_ID" ] || fail "the relaunch did not actually replace the container"
+        [ "$("$ENGINE" ps -a --filter "name=^${TEST_CONTAINER_NAME}$" --format '{{.ID}}' | wc -l)" -eq 1 ] \
+            || fail "more than one container now carries the name $TEST_CONTAINER_NAME"
+        ok "relaunching over a stopped, same-named container replaces it cleanly"
+
+        # A container can hold the fixed name while matching NEITHER the image nor the port —
+        # someone started one by hand, or the tag moved. Detection is image-or-port by design and
+        # will not see it, so without the name guard `run --name` fails with an engine-level
+        # error that mentions nothing about this script.
+        run_sh --config "$GOOD_CONFIG" --shutdown >/dev/null
+        "$ENGINE" rm -f "$TEST_CONTAINER_NAME" >/dev/null 2>&1 || true
+        FOREIGN="$("$ENGINE" create --name "$TEST_CONTAINER_NAME" -p "127.0.0.1:18095:8080" "$BASE_IMAGE" sleep 5)"
+        rc=0
+        out="$(ENGINE_FOR_RUN="$FAKE_ENGINE" run_sh --config "$GOOD_CONFIG" --no-tunnel)" || rc=$?
+        [ "$rc" -eq 0 ] || fail "a stale container holding the fixed name blocked the launch: $out"
+        grep -q 'holds the name' <<< "$out" || fail "the launch did not report clearing the name: $out"
+        "$ENGINE" ps -a --format '{{.ID}}' | grep -q "${FOREIGN:0:12}" \
+            && fail "the stale name-holder was not removed, so the name is still taken"
+        "$ENGINE" ps --filter "name=^${TEST_CONTAINER_NAME}$" --format '{{.Image}}' | grep -q "$TEST_IMAGE_NAME" \
+            || fail "the relaunched container is not ours"
+        ok "a stale container holding the fixed name is cleared, not collided with"
+
+        run_sh --config "$GOOD_CONFIG" --shutdown >/dev/null || true
+        "$ENGINE" rm -f "$TEST_CONTAINER_NAME" >/dev/null 2>&1 || true
     fi
 else
     echo "SKIP $ENGINE not available: container-detection checks not run" >&2
 fi
 
 # --- 11. no credential ever appears in run.sh's output ----------------------------------------
-for secret in "$SENTINEL_BOT_TOKEN" "$SENTINEL_READ_TOKEN" "$SENTINEL_WRITE_TOKEN" "$SENTINEL_EL_KEY"; do
-    if grep -qF "$secret" "$ALL_OUTPUT"; then
-        fail "a credential value appeared in run.sh output (sentinel ${secret%%-*}...)"
-    fi
+# Every invocation above appended its combined stdout+stderr to $ALL_OUTPUT, so this scans the
+# whole suite's output in one pass — including the new --status, --logs, --follow and
+# --tunnel-status paths, which each print a block of text that did not exist before.
+leaks_in() {  # leaks_in FILE -> prints the sentinels found
+    local file="$1" secret
+    for secret in "$SENTINEL_BOT_TOKEN" "$SENTINEL_READ_TOKEN" "$SENTINEL_WRITE_TOKEN" "$SENTINEL_EL_KEY"; do
+        if grep -qF -- "$secret" "$file"; then printf '%s\n' "${secret%%-*}"; fi
+    done
+}
+
+found_leaks="$(leaks_in "$ALL_OUTPUT")"
+[ -z "$found_leaks" ] || fail "credential value(s) appeared in run.sh output: $found_leaks"
+
+# Vacuity guard. "No credential found" is worthless if the new actions' output never reached the
+# file being scanned, so require each new output path to have actually contributed to it.
+expected_markers=("Tunnel status:" "hostname:")
+if [ -n "${LAUNCHED_ID:-}" ]; then
+    expected_markers+=("container name: $TEST_CONTAINER_NAME" "Started $TEST_CONTAINER_NAME" "$LOG_MARKER")
+else
+    echo "SKIP the launch-path output could not be included in the leak scan ($ENGINE unavailable)" >&2
+fi
+for marker in "${expected_markers[@]}"; do
+    grep -qF -- "$marker" "$ALL_OUTPUT" \
+        || fail "the leak scan never saw output from a new action (missing marker: '$marker')"
 done
-# Positive control: the check above is only meaningful if this file would have caught a leak.
-printf '%s\n' "$SENTINEL_READ_TOKEN" > "$TMPDIR_TEST/control.txt"
-grep -qF "$SENTINEL_READ_TOKEN" "$TMPDIR_TEST/control.txt" \
-    || fail "the leak check itself is broken: it cannot find a value it was just handed"
-ok "no credential value appears anywhere in run.sh's output (across $(wc -l < "$ALL_OUTPUT") lines)"
+
+# Positive control, run through the SAME scanner over a copy of the SAME output: if a credential
+# had been printed anywhere in it, the check above would have said so.
+cp "$ALL_OUTPUT" "$TMPDIR_TEST/control.txt"
+printf '%s\n' "$SENTINEL_READ_TOKEN" >> "$TMPDIR_TEST/control.txt"
+[ -n "$(leaks_in "$TMPDIR_TEST/control.txt")" ] \
+    || fail "the leak check itself is broken: it cannot find a value planted in the very file it scans"
+ok "no credential value appears anywhere in run.sh's output (across $(wc -l < "$ALL_OUTPUT") lines, ${#expected_markers[@]} new output paths included)"
 
 echo ""
 echo "all $PASS checks passed"
