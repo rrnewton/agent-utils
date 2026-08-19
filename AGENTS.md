@@ -87,3 +87,52 @@ ruleset, and Hermit changes must follow `hermit/AGENTS.md`: feature branch,
 pull request, required review and checks, then the permitted merge path. Never
 use an admin bypass, force-push, or direct push to reinterpret this policy as a
 way around Hermit's ruleset.
+
+## Naming: every feature gets a slug
+
+Every issue and pull request names its subject with a **slug**: lowercase
+letters, digits, and hyphens, nothing else. No spaces, no underscores, no
+capitals, typically two to four words.
+
+    voice-page-safe-area
+    elevenlabs-mock
+    container-lifecycle
+    launcher-preflight
+
+**Put the slug first in the title**, then a plain sentence saying what is
+wanted:
+
+    voice-page-safe-area: honour the notch inset on a physical phone
+    elevenlabs-mock: a local agent that really calls the MCP tools
+
+**One slug per feature, and it does not change.** The issue, the branch, the
+pull request, and any follow-up issue all reuse the slug it was given first.
+That is the whole point: the slug, not the number, is what a human recognises
+months later, and it is what makes two references to the same work visibly the
+same work.
+
+### Always say the number AND the slug
+
+When writing to the owner, in a comment, or in a commit body, refer to work as
+`#<number> <slug>` — both, every time:
+
+    #123 voice-page-safe-area
+
+Not `#123` on its own, not `PR 123`, not `pr123`, and not "the hover issue".
+A bare number is unreadable without opening it, and a bare description cannot
+be looked up. The pair is short enough that there is no reason to abbreviate
+it, and it survives being quoted out of context — which is exactly where the
+reference is most needed and least recoverable.
+
+This applies to chat with the owner as much as to anything written down. An
+agent that reports "landed the fix for 123" has told the reader nothing they
+can act on without a round trip.
+
+### What this does not change
+
+Commit **titles** keep the existing `<project>: <sentence>` form —
+`gent-talk: make /voice read as an application`. They are not slugged, because
+the project prefix already does that job and commit titles should stay
+readable as prose. When a commit closes or advances an issue, name it in the
+**body** as `#<number> <slug>`, alongside the agent identifier that
+`gent-talk/AGENTS.md` already requires.
