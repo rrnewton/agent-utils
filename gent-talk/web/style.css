@@ -200,3 +200,39 @@ button[disabled] {
   font-size: 0.85rem;
   min-height: 2rem;
 }
+
+/* Microphone settings: a disclosure, deliberately quieter than the Start button above it. */
+.settings {
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  padding: 0 0.75rem;
+  margin: 0.75rem 0;
+}
+
+.settings[open] {
+  padding-bottom: 0.5rem;
+}
+
+.settings > summary {
+  padding: 0.7rem 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-height: 2.75rem;
+}
+
+/* The generic `input` rule above stretches and pads text fields; a checkbox wants neither. */
+.toggle input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 1.15rem;
+  height: 1.15rem;
+  min-height: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
