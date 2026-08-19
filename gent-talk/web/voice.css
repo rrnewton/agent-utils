@@ -8,7 +8,34 @@
  *
  * There is no framework, no build step, and no external request. The app feel is entirely these
  * properties.
+ *
+ * The governing rule, from the owner: THE MAJORITY OF THE SPACE BELONGS TO CONTENT — the
+ * transcript you want to read, or the controls you want to press. Everything else is small, quiet,
+ * or one tap away.
  */
+
+/* A few tokens this page needs and the shared sheet does not have: the two speakers, and the
+   surfaces the dock is built from. Declared for both schemes here, next to each other, rather
+   than being derived at use-site with a colour function some phone browser may not have. */
+:root {
+  --mine: #24405c; /* what YOU said */
+  --mine-edge: #33587b;
+  --theirs: #1d2026; /* what the AGENT said */
+  --dock: #191c22;
+  --ok: #5bd98a;
+  --idle: #6b7484;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --mine: #dbeaf8;
+    --mine-edge: #b4d0e8;
+    --theirs: #ffffff;
+    --dock: #eef1f5;
+    --ok: #1f8f4c;
+    --idle: #98a1b0;
+  }
+}
 
 /* The rigid frame.
  *
@@ -29,9 +56,9 @@ body {
   height: 100dvh;
   overflow: hidden;
   overscroll-behavior: none;
-  /* Three rows: top bar, body, control pane. The control pane holds its place because it is a
-     grid row, not because anything is pinned or absolutely positioned — so it cannot drift over
-     the transcript, and the transcript cannot scroll underneath it. */
+  /* Three rows: top bar, body, dock. The dock holds its place because it is a grid row, not
+     because anything is pinned or absolutely positioned — so it cannot drift over the transcript,
+     and the transcript cannot scroll underneath it. */
   display: grid;
   grid-template-rows: auto 1fr auto;
   /* style.css leaves room at the bottom for a fixed status strip this page does not have. */
@@ -45,9 +72,15 @@ body {
 
 /* ---------------------------------------------------------------------------- the top bar --- */
 
+/* One row, two things: which view you are in, and the way out to settings. The header used to
+   carry four controls in two styles, and a reader could not tell which of them were tabs and
+   which were actions. */
 #topbar {
   display: block;
-  padding: 0.4rem 0.6rem calc(0.4rem + env(safe-area-inset-top));
+  padding: 0.45rem calc(0.7rem + env(safe-area-inset-right)) 0.45rem
+    calc(0.7rem + env(safe-area-inset-left));
+  padding-top: calc(0.45rem + env(safe-area-inset-top));
+  background: var(--panel);
   border-bottom: 1px solid var(--edge);
 }
 
@@ -55,55 +88,102 @@ body {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  min-height: 2.4rem;
 }
 
-.topbar-status {
-  gap: 0.6rem;
-  font-size: 0.78rem;
-  min-height: 1.2rem;
-  overflow: hidden;
-}
-
-.topbar-status > span {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-#status {
+.topbar-gap {
   flex: 1 1 auto;
 }
 
-#conversation-state {
+.topbar-title {
+  font-size: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* The view switch: ONE control with two positions, carrying the word for the position it is in.
+   Two differently-styled text labels read as one item being disabled, which is what the previous
+   header did. */
+.switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.25rem 0.7rem 0.25rem 0.3rem;
+  background: var(--bg);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 0.9rem;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.switch-track {
+  position: relative;
+  display: inline-block;
+  width: 2.5rem;
+  height: 1.4rem;
+  border-radius: 999px;
+  background: var(--edge);
+  transition: background 140ms ease;
+}
+
+.switch-knob {
+  position: absolute;
+  top: 0.15rem;
+  left: 0.15rem;
+  width: 1.1rem;
+  height: 1.1rem;
+  border-radius: 50%;
+  background: var(--ink);
+  transition: transform 140ms ease;
+}
+
+/* Checked means "the other view": the knob travels, the track lights, and the word changes. All
+   three say the same thing, so the state survives being read quickly. */
+.switch[aria-checked="true"] .switch-track {
+  background: var(--accent);
+}
+
+.switch[aria-checked="true"] .switch-knob {
+  transform: translateX(1.1rem);
+  background: #fff;
+}
+
+.switch-word {
+  min-width: 3.6rem;
+  text-align: left;
+  letter-spacing: 0.01em;
+}
+
+/* A gear, not the word "Settings". A destination does not need to introduce itself every time the
+   screen is looked at. */
+.icon-button {
   flex: 0 0 auto;
-}
-
-/* The tab switch sits in the same row as the settings control on purpose: on a phone the scarce
-   resource is vertical space, and the transcript is what deserves it (issue #41). */
-#tabs {
-  display: flex;
-  flex: 1 1 auto;
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-  gap: 0.25rem;
-}
-
-.tab-button {
-  padding: 0.35rem 0.8rem;
+  width: 2.4rem;
+  height: 2.4rem;
+  padding: 0;
   background: none;
-  border: 1px solid transparent;
+  border: none;
   border-radius: 999px;
   color: var(--muted);
-  font: inherit;
-  font-size: 0.85rem;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.tab-button.active {
-  color: var(--ink);
-  border-color: var(--accent);
+.icon {
+  width: 1.35rem;
+  height: 1.35rem;
 }
 
-/* Housekeeping controls: deliberately small and quiet, so they do not compete with the two large
-   controls in the pane below. */
+/* Housekeeping controls: deliberately small and quiet, so they do not compete with the controls
+   in the pane below. */
 .chip {
   flex: 0 0 auto;
   padding: 0.35rem 0.6rem;
@@ -144,7 +224,8 @@ body {
 #screen-settings {
   overflow-y: auto;
   overscroll-behavior: contain;
-  padding: 0.75rem 1rem calc(1rem + env(safe-area-inset-bottom));
+  padding: 0.75rem calc(1rem + env(safe-area-inset-right)) 1rem
+    calc(1rem + env(safe-area-inset-left));
 }
 
 #screen-main {
@@ -160,6 +241,10 @@ body {
 #screen-settings h2 {
   font-size: 0.95rem;
   margin: 1.25rem 0 0.25rem;
+}
+
+#screen-settings h2:first-child {
+  margin-top: 0.25rem;
 }
 
 /* Shown once and then gone; the same text stays reachable from Settings. */
@@ -178,31 +263,153 @@ body {
 
 /* THE one scrolling element on the page. Everything else is fixed by construction.
    `overscroll-behavior: contain` stops a flick that reaches the end of the transcript from
-   becoming a page-level pull-to-refresh. */
+   becoming a page-level pull-to-refresh.
+
+   The mask is the fade under the header: content used to be sliced off square at the top edge,
+   mid-word, which reads as a rendering fault rather than as a list that continues upward. The
+   gradient makes the top ~1.1rem of the scrolling content dissolve instead. It costs no element
+   and cannot be scrolled out of position. */
 #scroll-area {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
-  padding: 0 0.75rem 0.5rem;
+  padding: 0.35rem calc(0.75rem + env(safe-area-inset-right)) 0.5rem
+    calc(0.75rem + env(safe-area-inset-left));
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 1.1rem);
 }
 
 #error {
   margin: 0.5rem 0.75rem;
 }
 
-/* A transcript line the PAGE wrote, not something anybody said. It has to be visibly a different
-   kind of thing from a message, because its whole job is to correct a false impression the
-   message list would otherwise give. */
-.messages li.system {
-  background: none;
-  border-style: dashed;
+/* The idle screen's largest area is the empty transcript, so the invitation goes there rather
+   than competing for the one strip at the bottom of the display. */
+#empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  min-height: 72vh;
   color: var(--muted);
-  font-size: 0.85rem;
+  text-align: center;
 }
 
-.messages li.system .meta {
+.empty-mark {
+  width: 2.6rem;
+  height: 2.6rem;
+  opacity: 0.5;
+}
+
+#empty-line {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+/* --------------------------------------------------------------- the two speakers ---------- */
+/*
+ * They were distinguished only by a small grey label, on the same width, background and
+ * alignment. Now they differ in three ways at once — side, colour, and the corner that is
+ * squared off — so the shape of the conversation is readable without reading any of it.
+ */
+
+.messages li.mine {
+  background: var(--mine);
+  border-color: var(--mine-edge);
+  margin-left: 15%;
+  border-bottom-right-radius: 0.15rem;
+}
+
+.messages li.theirs {
+  background: var(--theirs);
+  margin-right: 15%;
+  border-bottom-left-radius: 0.15rem;
+}
+
+.messages li .meta {
+  justify-content: space-between;
+}
+
+.who {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+/* A surface that is also a debugging record needs to say WHEN, and the answer is worth exactly
+   this much space. */
+.at {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}
+
+/* ------------------------------------------------------------------- the labelled seam ----- */
+/*
+ * Where one conversation ends and the next begins, the page used to print four sentences about
+ * what a vendor does and does not document. That is not user-interface text: it was cut off
+ * behind the control pane, and being cut off is the screen reporting that it does not belong
+ * there.
+ *
+ * What is left on the surface is a thin rule carrying two or three words. The explanation is
+ * inside the same element, one tap away on a phone, and named by `title` for a pointer device.
+ */
+.messages li.seam {
+  background: none;
+  border: none;
+  padding: 0.25rem 0;
+  margin: 0.35rem 0;
+}
+
+.seam-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  list-style: none;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* Safari draws its own disclosure triangle unless this is said. */
+.seam-summary::-webkit-details-marker {
   display: none;
+}
+
+/* The rule itself: one hairline on each side of the label. */
+.seam-summary::before,
+.seam-summary::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--edge);
+}
+
+.seam-info {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.05rem;
+  height: 1.05rem;
+  border: 1px solid var(--edge);
+  border-radius: 50%;
+  font-size: 0.7rem;
+  font-style: italic;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.seam-detail {
+  margin: 0.5rem 0 0;
+  padding: 0.5rem 0.7rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 0.5rem;
+  color: var(--muted);
+  font-size: 0.82rem;
 }
 
 /* --------------------------------------------------------------- raw Discord, rendered ----- */
@@ -247,18 +454,89 @@ body {
   overflow-wrap: anywhere;
 }
 
-/* --------------------------------------------------------------------- the control pane ---- */
+/* ---------------------------------------------------------------------------- the dock ----- */
 
-#control-pane {
+#dock {
+  background: var(--dock);
+  border-top: 1px solid var(--edge);
+}
+
+/* THE status line, and the only one. The same fact used to be stated under the header and again
+   at the foot of the screen, in two vocabularies, by two mechanisms that did not know about each
+   other. There is one now, and the dot carries the state the second line used to spell out.
+ *
+ * It sits ABOVE the control pane. On a phone with rounded corners the bottom edge is exactly
+ * where a line of text gets eaten by the curve — the owner photographed the first word of this
+ * line missing on an iPhone 16. The horizontal safe-area insets below are the other half of that
+ * fix; only the bottom inset was ever applied. */
+#status-line {
   display: flex;
-  align-items: stretch;
-  justify-content: flex-end;
-  gap: 0.75rem;
-  padding: 0.6rem 0.75rem;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem calc(0.85rem + env(safe-area-inset-right)) 0.45rem
+    calc(0.85rem + env(safe-area-inset-left));
+  min-height: 1.9rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+/* style.css pins #status to the bottom of the viewport for the OTHER page. Here it is a member of
+   the dock, and being fixed is precisely what put it in the curvature zone. */
+#status {
+  position: static;
+  flex: 1 1 auto;
+  padding: 0;
+  background: none;
+  border: none;
+  min-height: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: inherit;
+}
+
+.status-dot {
+  flex: 0 0 auto;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--idle);
+}
+
+#status-line[data-state="live"] .status-dot {
+  background: var(--ok);
+}
+
+#status-line[data-state="working"] .status-dot {
+  background: var(--accent);
+}
+
+#status-line[data-state="ended"] .status-dot {
+  background: var(--muted);
+}
+
+#status-line[data-state="error"] .status-dot {
+  background: var(--warn);
+}
+
+/* --------------------------------------------------------------------- the control pane ---- */
+/*
+ * A dense tile that fills the width and stops there. Two small controls stack in the left column
+ * to exactly the height of the two large ones, because the large ones each SPAN both rows — the
+ * heights cannot drift apart, since they are the same two rows.
+ *
+ * The large controls are shorter and wider than they were: a rectangle under the thumb, not a
+ * pair of tall slabs eating a third of the display.
+ */
+#control-pane {
+  display: grid;
+  grid-template-columns: 3.5rem 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: 0.4rem;
+  padding: 0 calc(0.6rem + env(safe-area-inset-right)) 0.6rem
+    calc(0.6rem + env(safe-area-inset-left));
   /* Clear of the home indicator on a phone that has one, and zero on one that does not. */
   padding-bottom: calc(0.6rem + env(safe-area-inset-bottom));
-  border-top: 1px solid var(--edge);
-  background: var(--panel);
 }
 
 .control {
@@ -275,43 +553,120 @@ body {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.2rem;
+  gap: 0.15rem;
+  padding: 0;
   border: none;
-  border-radius: 1.1rem;
+  border-radius: 0.85rem;
   font: inherit;
   color: #fff;
 }
 
 .control-label {
-  font-size: 0.8rem;
+  font-size: 0.82rem;
   letter-spacing: 0.01em;
 }
 
-.control-glyph {
-  font-size: 1.5rem;
-  line-height: 1;
+.control-icon {
+  width: 1.6rem;
+  height: 1.6rem;
 }
 
-/* Hang up: immediately to the left of Talk, and smaller, because it is the rarer action and the
-   more expensive mistake. */
+/* The two small controls: left column, one per row. Stacked they are exactly as tall as either
+   large control, because all four live in the same two grid rows. */
+.control-mini {
+  grid-column: 1;
+  min-height: 2.4rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  gap: 0.05rem;
+}
+
+/* Named individually rather than by position: a nth-of-type rule silently retargets the moment
+   anything else is added to the pane. */
+#speaker {
+  grid-row: 1;
+}
+
+#clear-view {
+  grid-row: 2;
+}
+
+.mini-icon {
+  width: 1.15rem;
+  height: 1.15rem;
+}
+
+.mini-label {
+  font-size: 0.55rem;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* Armed: the first tap on Clear does not clear. It changes the control — colour AND word — and
+   the second tap within a few seconds is the one that acts. The control is destructive and it now
+   sits under a thumb, which makes an accidental tap more likely, not less. */
+#clear-view.armed {
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+#clear-view.armed .mini-label {
+  color: var(--warn);
+}
+
+/* Sound off: the agent's VOICE is silenced, not the agent. Its replies keep arriving as text, so
+   the control is drawn as a struck-through speaker rather than as anything that suggests the
+   conversation stopped. */
+.speaker-slash {
+  opacity: 0;
+}
+
+.control-mini.off .speaker-slash {
+  opacity: 1;
+}
+
+.control-mini.off .speaker-wave {
+  opacity: 0;
+}
+
+.control-mini.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Hang up: to the left of Talk, spanning both rows, because it is the rarer action and the more
+   expensive mistake. */
 .control-hangup {
-  flex: 0 0 auto;
-  width: 6.5rem;
-  min-height: 5.5rem;
+  grid-column: 2;
+  grid-row: 1 / span 2;
   background: var(--warn);
 }
 
-/* Talk: lower right, larger, and close to square. */
+/* Talk: lower right, under the thumb, spanning both rows. */
 .control-talk {
-  flex: 0 0 auto;
-  width: 8.5rem;
-  min-height: 8rem;
+  grid-column: 3;
+  grid-row: 1 / span 2;
   background: var(--accent);
 }
 
-.control-mic {
-  width: 2.4rem;
-  height: 2.4rem;
+/* With no call to hang up — idle, and after one has ended — there is exactly one thing to do, and
+   it gets both columns. The alternative, which this replaces, was a fully saturated Hang up
+   sitting next to it doing nothing at all. */
+#control-pane.solo .control-talk {
+  grid-column: 2 / -1;
+}
+
+/* The caveat that used to be a paragraph in the transcript: one clause, attached to the action it
+   is about, and only on the screen where it applies. */
+.control-note {
+  max-width: 90%;
+  font-size: 0.62rem;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  opacity: 0.85;
+  text-align: center;
 }
 
 /* The slash across the microphone is the muted state, so it is absent by default. */
@@ -351,7 +706,7 @@ body {
     opacity: 0.55;
   }
   100% {
-    transform: scale(1.14);
+    transform: scale(1.06);
     opacity: 0;
   }
 }
@@ -365,6 +720,13 @@ body {
   }
 }
 
+/* A control that cannot act must not look like the loudest thing on the screen. Hang up is not
+   merely dimmed when there is no call — it is not in the pane at all — but anything that is
+   present and cannot act drops its fill entirely here. Opacity alone would not be enough: an
+   orange rectangle at 50% is still the brightest element in a dark interface. */
 .control[disabled] {
-  opacity: 0.5;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  opacity: 0.75;
 }

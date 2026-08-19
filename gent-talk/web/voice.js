@@ -18,18 +18,26 @@
 // * Agent text and channel text are UNTRUSTED. Nothing from either is ever assigned as markup.
 //   Every visible fragment is built as an element whose text is set with textContent.
 // * The interface does not imply continuity the session does not have. See `noteConversationEnded`
-//   and `clearView`: a hang-up loses the agent's context and says so, and clearing the screen is
-//   labelled and described as clearing the screen.
+//   and `onClear`: a hang-up loses the agent's context and says so, and clearing the screen is
+//   labelled and described as clearing the screen. What it says on the SURFACE, though, is two or
+//   three words on a separator; the sentences live one tap inside it. The majority of the space
+//   belongs to the transcript and the controls.
 
 const TOKEN_KEY = "gent-talk.token"; // shared with the main app on purpose.
 const MIC_SETTINGS_KEY = "gent-talk.voice.mic";
 
 const el = (id) => document.getElementById(id);
+
+// ONE status line, above the control pane. It used to be two — a word under the header and a
+// sentence at the foot — which is how the closed state managed to announce itself three times in
+// three vocabularies. The sentence is the line; the state is the dot beside it.
 const setStatus = (text) => {
   el("status").textContent = redact(text);
 };
-const setState = (text) => {
-  el("conversation-state").textContent = text;
+
+/** One of: idle, working, live, ended, error. web/voice.css colours the dot from this. */
+const setState = (name) => {
+  el("status-line").setAttribute("data-state", name);
 };
 
 // Nothing this page displays may contain a credential.
@@ -73,6 +81,9 @@ const session = {
   socket: null,
   connected: false, // true only between `onopen` and teardown.
   muted: false,
+  // The agent's VOICE is silenced; the agent is not. Its replies keep arriving and keep being
+  // written into the transcript — see `handle`, where only the audio frames are dropped.
+  speakerOff: false,
   audio: null, // AudioContext
   stream: null, // MediaStream
   node: null, // ScriptProcessorNode capturing the microphone
@@ -100,30 +111,42 @@ function showScreen(name) {
     el(`screen-${screen}`).hidden = screen !== name;
   }
   const main = name === "main";
-  // The top-row controls belong to the main screen; on the other two they would act on something
-  // that is not on the screen.
-  el("tabs").hidden = !main;
-  el("clear-view").hidden = !main;
+  // The view switch belongs to the main screen; on the other two it would switch between two
+  // things neither of which is on the screen.
+  el("view-switch").hidden = !main;
   el("open-settings").hidden = name === "settings";
-  // The control pane is a grid ROW. Hiding it collapses the row, so the body grows to fill the
-  // frame rather than leaving a band of empty pane under a sign-in form.
+  // On settings the header is a title bar with a way back; everywhere else those are absent.
+  el("close-settings").hidden = name !== "settings";
+  el("topbar-title").hidden = name !== "settings";
+  // The control pane is a grid ROW inside the dock. Hiding it collapses the row, so the body grows
+  // to fill the frame rather than leaving a band of empty pane under a sign-in form. The status
+  // line above it is NOT hidden: a sign-in failure has to be able to say so.
   el("control-pane").hidden = !main;
+  if (!main) {
+    disarmClear();
+  }
   if (name !== "settings") {
     screenBeforeSettings = name;
   }
   currentScreen = name;
 }
 
-let currentTab = "voice";
+let currentView = "voice";
 
-function showTab(name) {
-  // Deliberately touches NOTHING in `session`. Switching tabs during a call must not disturb the
-  // call: no socket close, no track stop, no re-acquire, no change to the mute state.
-  currentTab = name;
+/**
+ * The call, or the channel. One switch with two positions, and the word on it names the position
+ * it is IN — not a pair of labels one of which has been styled into looking disabled.
+ *
+ * Deliberately touches NOTHING in `session`. Switching views during a call must not disturb the
+ * call: no socket close, no track stop, no re-acquire, no change to the mute state.
+ */
+function showView(name) {
+  currentView = name;
   el("pane-voice").hidden = name !== "voice";
   el("pane-discord").hidden = name !== "discord";
-  el("tab-voice").className = name === "voice" ? "tab-button active" : "tab-button";
-  el("tab-discord").className = name === "discord" ? "tab-button active" : "tab-button";
+  const discord = name === "discord";
+  el("view-switch").setAttribute("aria-checked", discord ? "true" : "false");
+  el("view-switch-label").textContent = discord ? "Discord" : "Voice";
 }
 
 // --- connection details -------------------------------------------------------------------------
@@ -173,37 +196,87 @@ function scrollToNewest() {
   area.scrollTop = area.scrollHeight;
 }
 
+/** The invitation only makes sense while there is nothing else in the transcript. */
+function renderEmptyState() {
+  el("empty-state").hidden = el("transcript").children.length > 0;
+}
+
+/** Wall-clock, as two numbers. A surface used as a debugging record has to say when. */
+function stamp() {
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
+/**
+ * One turn.
+ *
+ * `mine` and `theirs` differ in side, colour and corner — three signals at once — because the two
+ * speakers used to be told apart by nothing but a small grey word.
+ */
 function line(who, text) {
+  const mine = who === "you";
   const li = document.createElement("li");
+  li.className = mine ? "mine" : "theirs";
   const meta = document.createElement("div");
   meta.className = "meta";
   const author = document.createElement("span");
+  author.className = "who";
   author.textContent = who;
-  meta.append(author);
+  const at = document.createElement("span");
+  at.className = "at";
+  at.textContent = stamp();
+  meta.append(author, at);
   const body = document.createElement("div");
   body.className = "body";
   body.textContent = text; // untrusted text: never innerHTML.
   li.append(meta, body);
   el("transcript").append(li);
+  renderEmptyState();
   scrollToNewest();
   return li;
 }
 
 /**
- * A line the PAGE wrote, not something anybody said.
+ * A boundary the PAGE drew, not something anybody said.
  *
  * These exist because a single unbroken list of messages is itself a claim — that it is all one
- * conversation — and that claim is sometimes false. Rendered visibly differently so it cannot be
- * mistaken for a turn.
+ * conversation — and that claim is sometimes false.
+ *
+ * What goes on the SURFACE is a thin rule carrying two or three words. The version before this one
+ * printed four sentences here, about what a vendor does and does not document, and the control
+ * pane cut them off mid-word; being cut off was the screen reporting that they did not belong on
+ * it. The sentences are still available — inside the same element, one tap away on a phone and
+ * named by `title` on a pointer device — and they are not standing on the screen.
  */
-function systemLine(text) {
+function seam(label, detail) {
   const li = document.createElement("li");
-  li.className = "system";
-  const body = document.createElement("div");
-  body.className = "body";
-  body.textContent = text;
-  li.append(body);
+  li.className = "seam";
+  const details = document.createElement("details");
+  const summary = document.createElement("summary");
+  summary.className = "seam-summary";
+  summary.setAttribute("title", detail);
+  const word = document.createElement("span");
+  word.className = "seam-label";
+  word.textContent = label;
+  const mark = document.createElement("span");
+  mark.className = "seam-info";
+  mark.textContent = "i";
+  summary.append(word, mark);
+  const body = document.createElement("p");
+  body.className = "seam-detail";
+  body.textContent = detail;
+  // Opening it must not push the explanation underneath the dock, which is exactly where a
+  // disclosure at the bottom of a scrolled list ends up if nothing moves.
+  details.addEventListener("toggle", () => {
+    if (details.open) {
+      li.scrollIntoView({ block: "end" });
+    }
+  });
+  details.append(summary, body);
+  li.append(details);
   el("transcript").append(li);
+  renderEmptyState();
   scrollToNewest();
   return li;
 }
@@ -228,34 +301,79 @@ function noteConversationEnded() {
     return;
   }
   conversationOpen = false;
-  systemLine(
-    "Call ended. The agent does NOT carry this conversation's context into the next call — the " +
-      "vendor documents no way to resume a conversation once the connection closes. The lines " +
-      "above stay on screen, but anything below this point is a NEW conversation that has never " +
-      "seen them. To pause without losing context, use Mute instead of Hang up."
+  // From here the large control is a different offer — a NEW call, from nothing — and it says so.
+  hasEnded = true;
+  renderControls();
+  seam(
+    "new conversation",
+    "The call ended, and the agent does not carry the earlier conversation into the next one: " +
+      "anything below this line is spoken to an agent that has never seen anything above it. " +
+      "The lines stay on screen because they are still your record of what was said. To pause " +
+      "without losing the agent's memory, use Mute rather than Hang up."
   );
 }
+
+// --- clearing the transcript ---------------------------------------------------------------
+//
+// This control moved out of the header and into the pane, under a thumb. In the header it sat
+// beside a notice calling the transcript the only surviving record, which invited exactly the
+// reading it must not have — that it destroys something irreplaceable. In the pane it is honestly
+// grouped with the other things you DO, and it is the one destructive thing there.
+//
+// So it asks twice. The first tap arms it and changes both its word and its colour; the second,
+// within a few seconds, clears. A control that erases the record on one accidental tap is not made
+// safe by a label.
+
+const CLEAR_ARMED_MS = 4000;
+let clearArmedTimer = null;
+
+function disarmClear() {
+  if (clearArmedTimer !== null) {
+    clearTimeout(clearArmedTimer);
+    clearArmedTimer = null;
+  }
+  el("clear-view").className = "control control-mini";
+  el("clear-view-label").textContent = "Clear";
+}
+
+function armClear() {
+  el("clear-view").className = "control control-mini armed";
+  el("clear-view-label").textContent = "Sure?";
+  if (clearArmedTimer !== null) {
+    clearTimeout(clearArmedTimer);
+  }
+  clearArmedTimer = setTimeout(disarmClear, CLEAR_ARMED_MS);
+}
+
+const clearIsArmed = () => clearArmedTimer !== null;
 
 /**
  * Clear the SCREEN. Nothing else.
  *
  * The ambiguous middle — the screen empties and the agent carries on with everything the operator
- * thought they had removed — is the one outcome this must not have. So the control is labelled
- * "Clear view", and when a call is live the very first thing back on the empty screen is a line
- * saying the agent still remembers. Ending the conversation is a different and heavier action, and
- * it has its own button.
+ * thought they had removed — is the one outcome this must not have. So during a call the very
+ * first thing back on the empty screen is a seam saying so, in two words, with the sentence one
+ * tap inside it. Ending the conversation is a different and heavier action with its own control.
  */
-function clearView() {
+function onClear() {
+  if (!clearIsArmed()) {
+    armClear();
+    setStatus("Tap Clear again to empty the transcript.");
+    return;
+  }
+  disarmClear();
   el("transcript").replaceChildren();
-  el("discord-log").replaceChildren();
+  renderEmptyState();
   if (session.socket) {
-    systemLine(
-      "View cleared. This cleared the screen only: the call is still open and the agent still " +
-        "has everything said before this point in its context. Hang up to end the conversation."
+    seam(
+      "view cleared",
+      "The screen was emptied; nothing else was. The call is still open and the agent still has " +
+        "everything said before this point in its context. Hanging up is what ends the " +
+        "conversation."
     );
-    setStatus("View cleared — the screen only. The agent has not forgotten anything.");
+    setStatus("Transcript cleared. The agent has not forgotten anything.");
   } else {
-    setStatus("View cleared.");
+    setStatus("Transcript cleared.");
   }
 }
 
@@ -505,8 +623,8 @@ async function start() {
     return;
   }
   clearError();
-  setState("minting…");
-  setStatus("asking gent-talk for a signed URL…");
+  setState("working");
+  setStatus("Asking gent-talk for a signed URL…");
   const minted = await mintSignedUrl();
   showDetail(
     `agent ${minted.agent_id}; signed URL valid for about ${Math.round(
@@ -514,26 +632,26 @@ async function start() {
     )} minutes`
   );
 
-  setStatus("asking for the microphone…");
+  setStatus("Asking for the microphone…");
   // Read HERE, at the moment the stream opens — which is why a toggle flipped mid-call cannot
   // reach this one, and why `micSettingsChanged` says so out loud.
   session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(micSettings()));
   session.audio = new (window.AudioContext || window.webkitAudioContext)();
   await session.audio.resume(); // iOS starts it suspended until a gesture.
 
-  setState("connecting…");
+  setState("working");
   const socket = new WebSocket(minted.signed_url);
   session.socket = socket;
   session.muted = false;
-  renderTalk();
+  renderControls();
 
   socket.onopen = () => {
     socket.send(JSON.stringify({ type: "conversation_initiation_client_data" }));
     session.connected = true;
     conversationOpen = true;
-    setState("connected");
+    setState("live");
     setStatus("Connected — say something.");
-    renderTalk();
+    renderControls();
     startCapture(socket);
   };
 
@@ -553,19 +671,41 @@ async function start() {
       "The connection to the voice agent failed. The signed URL was minted, so gent-talk and " +
         "your token are fine; the failure is between this browser and ElevenLabs."
     );
-    setStatus("websocket error");
+    setStatus("The connection to the voice agent failed.");
   };
 
   socket.onclose = (event) => {
-    // A signed-URL failure shows up HERE, as an immediate close, so say the code out loud rather
-    // than leaving the page looking idle for no visible reason.
-    setState("closed");
-    setStatus(
-      `conversation closed (code ${event.code}${event.reason ? `: ${event.reason}` : ""})`
-    );
+    // A signed-URL failure shows up HERE, as an immediate close, so the page has to say something
+    // — but "code 1005" is not something. It says what happened in words; the number goes where
+    // numbers belong, in the connection details on the settings screen.
+    setState("ended");
+    setStatus(closeReason(event.code));
+    // The banner is about a conversation that no longer exists, and the code is the one thing on
+    // this page that must not be read as user-facing. Put the banner away FIRST, then record the
+    // number where numbers belong: the connection details on the settings screen.
+    dismissBanner();
+    addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
     teardown();
     noteConversationEnded();
   };
+}
+
+/**
+ * A close code, in plain words.
+ *
+ * The owner's screen read "conversation closed (code 1005)". 1005 means the connection gave no
+ * reason at all, so the page was reporting the ABSENCE of information as though it were
+ * information, in a vocabulary only a WebSocket implementer has. Say what happened, or say
+ * nothing; the number is still recorded in the connection details for whoever is debugging.
+ */
+function closeReason(code) {
+  if (code === 1000) {
+    return "Call ended.";
+  }
+  if (code === 1001 || code === 1005 || code === 1006) {
+    return "The call ended — the connection dropped.";
+  }
+  return "The call ended unexpectedly. Settings has the details.";
 }
 
 function handle(socket, message) {
@@ -581,7 +721,11 @@ function handle(socket, message) {
       break;
     }
     case "audio":
-      playPcm((message.audio_event || {}).audio_base_64);
+      // Sound off silences the agent's VOICE, not the agent: the frame is dropped here, and the
+      // `agent_response` case below still writes what it said into the transcript.
+      if (!session.speakerOff) {
+        playPcm((message.audio_event || {}).audio_base_64);
+      }
       break;
     case "agent_response":
       line("agent", (message.agent_response_event || {}).agent_response || "");
@@ -677,29 +821,57 @@ function teardown() {
   session.socket = null;
   session.connected = false;
   session.muted = false;
-  renderTalk();
+  renderControls();
 }
 
 function stop() {
-  if (session.socket) {
-    session.socket.close();
-    setStatus("Hung up.");
-  } else {
-    setStatus("Not connected.");
+  // With no call there is no Hang up in the pane at all, so this is unreachable from the screen;
+  // it stays as a guard rather than as a second way to end something that is already over.
+  if (!session.socket) {
+    return;
   }
-  setState("idle");
+  session.socket.close();
+  setStatus("Call ended.");
+  setState("ended");
   teardown();
   noteConversationEnded();
 }
 
-// --- the two controls ---------------------------------------------------------------------------
+// --- the controls --------------------------------------------------------------------------------
+//
+// The pane has three shapes, and each one offers exactly what there is to do:
+//
+//   idle          one action, both large columns:  Talk
+//   live          two actions:                     Hang up · Listening/Muted
+//   after a call  one action, both large columns:  Start a new call, with the memory caveat on it
+//
+// Hang up is ABSENT rather than dimmed when there is no call. It used to sit there fully
+// saturated — the loudest thing on a screen that was simultaneously saying, three times over,
+// that the call had ended.
 
-function renderTalk() {
+// True once a call has ended in this session, so the idle pane can say "Talk" the first time and
+// "Start a new call" afterwards. They are different offers: the second one starts from nothing.
+let hasEnded = false;
+
+function renderControls() {
   const talk = el("talk");
   const label = el("talk-label");
-  if (!session.socket) {
+  const note = el("talk-note");
+  const live = Boolean(session.socket);
+
+  el("hang-up").hidden = !live;
+  el("control-pane").className = live ? "" : "solo";
+
+  note.hidden = true;
+  note.textContent = "";
+
+  if (!live) {
     talk.className = "control control-talk";
-    label.textContent = "Talk";
+    label.textContent = hasEnded ? "Start a new call" : "Talk";
+    if (hasEnded) {
+      note.textContent = "the agent starts fresh";
+      note.hidden = false;
+    }
     return;
   }
   if (!session.connected) {
@@ -720,13 +892,29 @@ function renderTalk() {
 
 function setMuted(muted) {
   session.muted = muted;
-  renderTalk();
+  renderControls();
+  // One line, because there is one line. The three sentences this used to be are in Settings,
+  // under "What the controls do", where somebody who wants them can read them.
+  setStatus(muted ? "Muted — the agent still remembers." : "Listening — say something.");
+}
+
+/**
+ * Silence the agent's VOICE, not the agent.
+ *
+ * Audio frames are dropped in `handle`; `agent_response` keeps writing what the agent said into
+ * the transcript. So this is the control for reading the agent in a room where you cannot listen
+ * to it, and it deliberately does not touch the microphone, the socket, or mute.
+ */
+function setSpeakerOff(off) {
+  session.speakerOff = off;
+  if (off) {
+    stopPlayback(); // whatever is already scheduled would otherwise keep talking.
+  }
+  el("speaker").className = off ? "control control-mini off" : "control control-mini on";
+  el("speaker").setAttribute("aria-pressed", off ? "true" : "false");
+  el("speaker-label").textContent = off ? "Silent" : "Sound";
   setStatus(
-    muted
-      ? "Muted. The call is still open and the agent still has everything said so far; it just " +
-          "cannot hear you. Your phone still shows the microphone as in use, because it really " +
-          "is still open — unmute and it hears you again mid-conversation."
-      : "Listening — say something."
+    off ? "Agent voice off — its replies still arrive as text." : "Agent voice on."
   );
 }
 
@@ -972,7 +1160,9 @@ async function signIn() {
   applyClientConfig(config);
   clearError();
   showScreen("main");
-  setStatus("Ready. Tap the microphone to start talking.");
+  // Short, because the invitation itself now lives in the empty transcript — the largest thing on
+  // an idle screen — rather than competing for the one strip where a phone shows text worst.
+  setStatus("Ready.");
   setState("idle");
   return true;
 }
@@ -1051,14 +1241,15 @@ for (const [id, key] of MIC_TOGGLES) {
 
 el("talk").addEventListener("click", onTalk);
 el("hang-up").addEventListener("click", stop);
-el("clear-view").addEventListener("click", clearView);
+el("clear-view").addEventListener("click", onClear);
+el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff));
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
-el("tab-voice").addEventListener("click", () => showTab("voice"));
-el("tab-discord").addEventListener("click", () => {
-  showTab("discord");
-  if (el("discord-log").children.length === 0) {
+el("view-switch").addEventListener("click", () => {
+  const next = currentView === "voice" ? "discord" : "voice";
+  showView(next);
+  if (next === "discord" && el("discord-log").children.length === 0) {
     guardQuietly(loadDiscord)();
   }
 });
@@ -1077,9 +1268,10 @@ function guardQuietly(fn) {
 }
 
 setTokenState(token() ? "token saved in this browser" : "no token saved in this browser");
-setStatus(token() ? "checking your token…" : "paste your write-scope API token first");
-showTab("voice");
-renderTalk();
+setStatus(token() ? "Checking your token…" : "Paste your write-scope API token first.");
+showView("voice");
+renderEmptyState();
+renderControls();
 // No token means no interface to show yet: the sign-in screen is the whole page until there is
 // one. With a token, prove it before showing the main screen.
 if (token()) {
