@@ -6,42 +6,46 @@ Routine changes to this repository go directly to `rrnewton/agent-utils:main`.
 Do not open a pull request merely out of habit: a PR queue is an unowned wait
 state, and this repository must remain linear and current for its consumers.
 
-Serialize writers. Before changing or publishing anything, establish that no
-other agent is currently landing agent-utils work. Fetch `origin/main`
-immediately before the commit, push only a fast-forward update with an explicit
-`HEAD:refs/heads/main` refspec, then fetch again and ancestry-verify the pushed
-SHA. Never force-push, rewind, amend shared history, or bypass a rejected
-non-fast-forward push.
-
-`scripts/main_write.py` performs that whole sequence and is the sanctioned
-publication path. Run `install-hooks` once per checkout; after that a bare
-`git push` to `main` is refused unless it is running inside a serialized
-`publish`:
+**Use ordinary git.** There is no wrapper, no publication script, and no
+repository-installed hook standing between you and `main`:
 
 ```bash
-python3 scripts/main_write.py install-hooks   # once per checkout
-python3 scripts/main_write.py status          # is the queue clear? exit 0 = yes
-python3 scripts/main_write.py publish         # lock, fetch, CAS, push, re-verify
+git pull --rebase origin main
+git push origin main
 ```
 
-`publish` takes a host-wide exclusive lock, fetches `origin/main`, refuses
-anything that is not a fast-forward from that exact value, pushes, then
-re-fetches and proves the pushed commit is contained. The pre-push hook
-independently requires a live receipt from that operation: the lock must still
-be held, the holder must be an ancestor of the push, and the remote must still
-be at the value the holder fetched. Pushes to any ref other than
-`refs/heads/main` are ordinary work and pass through untouched.
+If the push is rejected as non-fast-forward, someone landed while you were
+working: `git pull --rebase` and push again. Never force-push, never rewind,
+never amend shared history, and never reach for `--no-verify` to get past a
+refusal.
 
-**Know what this does not cover.** It is a client-side control. It covers
-`publish` and a bare push from any checkout that has run `install-hooks` — and
-because the lock is host-wide per uid, every hooked checkout on one machine
-contends on one lock. It does **not** cover `git push --no-verify`, a clone
-that has not run `install-hooks`, another host, or the GitHub web UI and REST
-API. Server-side, `main` carries anti-rewind rules only (`deletion`,
-`non_fast_forward`, `required_linear_history`) with no required status check,
-deliberately, so that direct-to-main keeps working. History loss is therefore
-blocked on every path while serialization is enforced only on the ones listed.
-Do not describe the remaining paths as closed.
+**Keep `main` linear.** Rebase; do not merge. `git pull --rebase` (not a bare
+`git pull`) is the habit that makes this automatic — a merge commit on `main`
+is rejected by the server, so a bare pull will simply waste your time.
+
+### Protection lives on GitHub, not in this checkout
+
+`main` is protected by a repository **ruleset** — `main history protection`,
+active on the default branch with no bypass actors — enforcing:
+
+| Rule | Effect |
+|---|---|
+| `deletion` | `main` cannot be deleted |
+| `non_fast_forward` | no force-push, no rewind |
+| `required_linear_history` | no merge commits |
+
+That is server-side, so it holds on **every** path — every clone, every host,
+every agent, the web UI, and the REST API alike. This is deliberately different
+from the client-side guard that used to live here: a hook only binds checkouts
+that installed it, so it gave the appearance of enforcement while leaving the
+web UI, the API, a fresh clone, and `--no-verify` wide open. Real protection
+belongs where it cannot be opted out of.
+
+There is deliberately **no** `required_status_checks` rule, because that would
+block the direct-to-main workflow this repository is built around. CI is a
+signal for a human, not a gate.
+
+### Validate before you push
 
 Direct-to-main does not mean unvalidated-to-main. Before every push, run the
 repository contract, including the Python/Rust behavioral cross-check:
@@ -58,6 +62,8 @@ make cross
 make check-packages
 ```
 
+### When a PR is warranted
+
 A PR is allowed only for one of these explicit reasons:
 
 1. a genuinely high-risk change needs pre-main review
@@ -69,14 +75,6 @@ Record that reason on the PR **as its own line** in the description, using the
 exact slug above — prose that merely mentions the reason is not a recorded
 reason, because nothing can read it. Keep at most one exceptional PR open, and
 land or close it before opening another.
-
-`python3 scripts/main_write.py pr-exceptions` checks both halves of that rule
-against the live open-PR list (exit 0 satisfied, 1 violated, 2 could not read —
-never treat 2 as satisfied). It is deliberately **not** a precondition of
-`publish`: an unrelated PR-hygiene lapse must not block a legitimate
-publication. The `pr-exceptions` workflow runs it on a schedule, and it is
-advisory rather than a required check, because `main` carries no
-`required_status_checks` rule.
 
 ## Repository Boundary
 

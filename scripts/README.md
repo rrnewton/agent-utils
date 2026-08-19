@@ -16,7 +16,6 @@ through the top-level `bin/` command surface while that family is still evolving
 | `check_rust_packages.py` | Package and inspect each Rust crate in isolation. |
 | `agent-log-archive/fetch_agent_logs.py` | Strict-typed, non-deleting local/SSH archive fetcher with manifests, metrics, and immutable receipts (`.sh` is its compatibility launcher). |
 | `irq_survey.py` | Re-derive the per-CPU interrupt numbers the core allocator's ranking rests on: is there a signal, does it change placement, and how far does an independent window drift. |
-| `main_write.py` | Serialize publication to `main`: lock, fetch, compare-and-swap, fast-forward push, re-fetch ancestry proof, and the `pre-push` hook that refuses an unserialized push. Also checks the PR-exception rule. |
 | `rebase-delta-guard` | Bracket a rebase and prove its complete text and binary delta is unchanged. `record` captures the exact intended onto SHA; recorded series must be linear and descend from their base, while `check` accepts four explicit snapshot revisions. During a stopped rebase, use `conflict-files` instead of raw `git diff --name-only --diff-filter=U`: it reads index modes and omits conflicted submodule gitlinks before file-oriented tools can recurse into them. |
 
 Run the focused checks directly:
@@ -25,13 +24,12 @@ Run the focused checks directly:
 python3 scripts/embed_userguides.py --check
 python3 scripts/check_deps.py
 python3 scripts/check_no_any.py .
-python3 scripts/main_write.py status
 python3 scripts/irq_survey.py distribution
 make check-packages
 ```
 
-Publication itself goes through `scripts/main_write.py publish` (see
-`AGENTS.md` for the policy it enforces and, just as importantly, the write
-paths it does not cover).
+Publication is ordinary git — `git pull --rebase origin main && git push origin
+main`. `main` is protected server-side by a GitHub ruleset (no deletion, no
+force-push, no merge commits); see `AGENTS.md`.
 
 Use `make check`, `make test`, and `make cross` for the wider repository contract.

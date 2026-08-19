@@ -1,4 +1,0 @@
-#!/bin/sh
-# Installed by scripts/main_write.py install-hooks. Refuses an unserialized
-# push to refs/heads/main; every other ref passes straight through.
-exec python3 "$(git rev-parse --show-toplevel)/scripts/main_write.py" hook-pre-push "$@"
