@@ -21,14 +21,50 @@ const TOKEN_KEY = "gent-talk.token"; // shared with the main app on purpose.
 
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => {
-  el("status").textContent = text;
+  el("status").textContent = redact(text);
 };
 const setState = (text) => {
   el("conversation-state").textContent = text;
 };
 const setDetail = (text) => {
-  el("detail").textContent = text;
+  el("detail").textContent = redact(text);
 };
+
+// Nothing this page displays may contain a credential.
+//
+// The server redacts its own secrets before answering, but this page holds one the server has
+// never seen: the API token in this browser. An error message is assembled from whatever came
+// back, and a server — or something in between it and here — is free to echo a request back
+// verbatim. So the last thing before any text reaches the DOM is this: the token, if it is in
+// there, is replaced. It is one line, it costs nothing, and it removes a whole class of "the
+// error message leaked the key" from being possible at all.
+function redact(text) {
+  let out = String(text);
+  const secrets = [localStorage.getItem(TOKEN_KEY) || "", el("api-token").value || ""];
+  for (const secret of secrets) {
+    // Short strings are not credentials, and blanket-replacing one would mangle ordinary words.
+    if (secret.length >= 8) {
+      out = out.split(secret).join("[redacted]");
+    }
+  }
+  return out;
+}
+
+// The whole point of this pass: a failure is SHOWN, in the page, in words the owner can act on.
+// The reported bug was that a 502 naming a missing API-key permission appeared only in the dev
+// console, so the only visible symptom was a page that did nothing.
+function showError(text) {
+  const box = el("error");
+  box.textContent = redact(text);
+  box.hidden = false;
+  setState("error");
+}
+
+function clearError() {
+  const box = el("error");
+  box.textContent = "";
+  box.hidden = true;
+}
 
 const session = {
   socket: null,
@@ -75,11 +111,14 @@ async function mintSignedUrl() {
     throw new Error(`gent-talk returned non-JSON (HTTP ${response.status})`);
   }
   if (!response.ok) {
-    // Pass the server's own words through. They distinguish "you never configured a key" from
-    // "ElevenLabs rejected us", and those have different fixes.
-    const detail = payload && payload.detail ? payload.detail : `HTTP ${response.status}`;
-    const code = payload && payload.error ? ` [${payload.error}]` : "";
-    throw new Error(`${detail}${code}`);
+    // Pass the server's own words through, all of them. gent-talk answers with a real taxonomy —
+    // 503 `elevenlabs_not_configured` names the exact setting that is missing, 502
+    // `elevenlabs_error` carries the vendor's status and message, including things only the
+    // vendor knows, such as an API key that lacks the `convai_write` permission. Flattening that
+    // to "could not start" would throw away the only sentence that says what to fix.
+    const detail = payload && payload.detail ? payload.detail : "(no detail)";
+    const code = payload && payload.error ? payload.error : "error";
+    throw new Error(`HTTP ${response.status} ${code}: ${detail}`);
   }
   if (!payload || !payload.signed_url) {
     throw new Error("gent-talk answered without a signed URL");
@@ -190,6 +229,7 @@ async function start() {
     setStatus("already connected");
     return;
   }
+  clearError();
   setState("minting…");
   setStatus("asking gent-talk for a signed URL…");
   const minted = await mintSignedUrl();
@@ -228,8 +268,12 @@ async function start() {
   };
 
   socket.onerror = () => {
-    setStatus("websocket error — see the browser console");
-    setState("error");
+    // Not "see the console": the console is exactly where this used to die.
+    showError(
+      "The connection to the voice agent failed. The signed URL was minted, so gent-talk and " +
+        "your token are fine; the failure is between this browser and ElevenLabs."
+    );
+    setStatus("websocket error");
   };
 
   socket.onclose = (event) => {
@@ -343,22 +387,79 @@ function stop() {
 function guard(fn) {
   return (...args) =>
     Promise.resolve(fn(...args)).catch((error) => {
-      setState("error");
-      setStatus(`error: ${error.message}`);
+      // Both places: the panel is what the owner reads, the status line is the one-liner. Neither
+      // is the console.
+      showError(error.message);
+      setStatus("could not start the conversation");
       teardown();
     });
 }
 
+// --- token, with a button that visibly reacts ---------------------------------------------------
+
+// A banner that says "saved" while the button looks untouched leaves two questions open at once:
+// did the click register, and did the save work? So the button itself changes — immediately on
+// click, and again on the result — and the line under it states what is stored right now.
+const SAVE_LABEL = "Save token";
+let saveRevert = null;
+
+function setTokenState(text) {
+  el("token-state").textContent = text;
+}
+
+function markSave(label, className, disabled) {
+  const button = el("save-token");
+  button.textContent = label;
+  button.className = className;
+  button.disabled = disabled;
+  if (saveRevert !== null) {
+    clearTimeout(saveRevert);
+    saveRevert = null;
+  }
+}
+
+function saveToken() {
+  clearError();
+  const value = el("api-token").value.trim();
+  markSave("Saving…", "", true);
+  if (!value) {
+    markSave(SAVE_LABEL, "", false);
+    setTokenState("no token saved in this browser");
+    showError("There is nothing to save — paste your write-scope API token first.");
+    setStatus("nothing to save");
+    return;
+  }
+  localStorage.setItem(TOKEN_KEY, value);
+  // Read it back rather than assuming: private browsing and a full quota both make setItem throw
+  // or silently do nothing, and "saved" would then be a lie the owner only discovers later.
+  if (localStorage.getItem(TOKEN_KEY) !== value) {
+    markSave(SAVE_LABEL, "", false);
+    setTokenState("no token saved in this browser");
+    showError(
+      "This browser refused to store the token. Private browsing and a full storage quota both " +
+        "do this; the token was NOT saved."
+    );
+    return;
+  }
+  markSave("Saved ✓", "ok", false);
+  setTokenState("token saved in this browser");
+  setStatus("ready");
+  saveRevert = setTimeout(() => {
+    markSave(SAVE_LABEL, "", false);
+  }, 2500);
+}
+
 el("api-token").value = token();
-el("save-token").addEventListener("click", () => {
-  localStorage.setItem(TOKEN_KEY, el("api-token").value.trim());
-  setStatus("token saved in this browser");
-});
+el("save-token").addEventListener("click", saveToken);
 el("forget-token").addEventListener("click", () => {
+  clearError();
   localStorage.removeItem(TOKEN_KEY);
   el("api-token").value = "";
+  markSave(SAVE_LABEL, "", false);
+  setTokenState("no token saved in this browser");
   setStatus("token forgotten");
 });
 el("start").addEventListener("click", guard(start));
 el("stop").addEventListener("click", stop);
+setTokenState(token() ? "token saved in this browser" : "no token saved in this browser");
 setStatus(token() ? "ready" : "paste your write-scope API token first");

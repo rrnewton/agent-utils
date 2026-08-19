@@ -31,11 +31,17 @@
           <button id="save-token">Save token</button>
           <button id="forget-token" class="secondary">Forget</button>
         </div>
+        <p id="token-state" class="hint" aria-live="polite">no token saved in this browser</p>
 
         <div class="row">
           <button id="start">Start talking</button>
           <button id="stop" class="secondary">Hang up</button>
         </div>
+
+        <!-- Failures are shown HERE, in the page. An error that only exists in the browser
+             console is an error the owner has to open dev tools to read, which on a phone means
+             it may as well not exist. `role="alert"` so a screen reader announces it too. -->
+        <div id="error" class="panel error" role="alert" hidden></div>
 
         <div id="detail" class="panel muted"></div>
 
