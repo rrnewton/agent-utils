@@ -919,6 +919,13 @@ Beyond the security list above:
   A configuration change is picked up by restarting, and the client re-lists on its next connect.
 * This crate is intentionally outside the repository's Rust workspace and is not part of
   `make check` / `make test`; it has its own CI workflow.
+* **No read/unread state, and no "since I last messaged" scoping.** Discord shares read state
+  with clients, not with bots — there is no ack route, no read-state field on the channel
+  object, and no `read_state` in the gateway READY payload — and this server cannot compute
+  the stand-in either: it has no owner identity, its own replies are posted as the bot, and a
+  fetch cannot reach past the 100-message window. So a digest covers "the most recent N
+  messages" and nothing narrower. The evidence, the code anchors, and the honest alternative
+  wordings are in `ai_docs/UNREAD_STATUS_20260819.md`.
 
 ## License
 

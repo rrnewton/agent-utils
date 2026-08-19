@@ -219,6 +219,54 @@ async fn the_read_token_is_not_even_told_the_posting_tool_exists() {
 }
 
 #[tokio::test]
+async fn no_tool_description_claims_a_read_state_the_bot_cannot_have() {
+    // The negative result behind `#61 unread-status`, pinned so no future wording can quietly
+    // re-acquire it: Discord shares no read/unread state with a bot, and this server cannot scope
+    // a digest to "since the owner last messaged". See ai_docs/UNREAD_STATUS_20260819.md.
+    let harness = harness();
+    let (status, body) = rpc(
+        &harness,
+        Some(WRITE_TOKEN),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let tools = body["result"]["tools"].as_array().expect("a tool array");
+    assert!(!tools.is_empty(), "{body}");
+    for tool in tools {
+        let name = tool["name"].as_str().expect("every tool has a name");
+        let description = tool["description"]
+            .as_str()
+            .expect("every tool has a description")
+            .to_lowercase();
+        for claim in [
+            "unread",
+            "read state",
+            "marked read",
+            "since you last",
+            "since i last",
+        ] {
+            assert!(
+                !description.contains(claim),
+                "{name} promises {claim:?}, which Discord does not give a bot: {description}"
+            );
+        }
+    }
+    // The positive half, so the guard cannot be satisfied by emptying every description.
+    let digest = tools
+        .iter()
+        .find(|t| t["name"] == "digest_channel")
+        .expect("digest_channel is offered");
+    assert!(
+        digest["description"]
+            .as_str()
+            .expect("a description")
+            .contains("most recent messages"),
+        "digest_channel must still say what it actually covers: {digest}"
+    );
+}
+
+#[tokio::test]
 async fn the_write_token_can_post_and_it_lands_in_the_channel_that_was_named() {
     let harness = harness();
     let (status, body) = rpc(
