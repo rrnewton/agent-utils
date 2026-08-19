@@ -78,13 +78,17 @@ land or close it before opening another.
 
 ## Repository Boundary
 
-This direct-main policy applies to `agent-utils` and to parent-only tooling in
-`dev-hermit`. It does **not** apply to the Hermit product repository.
-`rrnewton/hermit:main` is protected by a pull-request and required-check
-ruleset, and Hermit changes must follow `hermit/AGENTS.md`: feature branch,
-pull request, required review and checks, then the permitted merge path. Never
-use an admin bypass, force-push, or direct push to reinterpret this policy as a
-way around Hermit's ruleset.
+Everything above describes **this repository** and nothing else.
+
+Other repositories have their own rules, and several of them are stricter than
+this one — a protected branch, a required review, a required check, a merge
+queue. Do not carry this repository's direct-to-main habit across a boundary
+into one of those. Read that repository's own guide and follow it, and never
+use an admin bypass, a force-push, or a direct push to reinterpret a policy you
+found here as permission to skip one you found there.
+
+The converse holds too: a stricter policy encountered elsewhere is not a reason
+to start opening pull requests here.
 
 ## Naming: every feature gets a slug
 
@@ -132,5 +136,44 @@ Commit **titles** keep the existing `<project>: <sentence>` form —
 `gent-talk: make /voice read as an application`. They are not slugged, because
 the project prefix already does that job and commit titles should stay
 readable as prose. When a commit closes or advances an issue, name it in the
-**body** as `#<number> <slug>`, alongside the agent identifier that
-`gent-talk/AGENTS.md` already requires.
+**body** as `#<number> <slug>`, alongside the agent identifier required by
+"Say who is speaking" below.
+
+## Say who is speaking
+
+**Prefix every message you publish externally with an identifier saying it came
+from an agent**, and which one:
+
+    [opus 5] the assistant is reading the channel again; the tool list was stale
+
+"Publish externally" means anything that leaves this conversation and is read
+later by someone who was not in it:
+
+- GitHub issue and pull-request comments
+- pull-request descriptions
+- **commit message bodies**
+
+It does **not** apply to commit message titles, which should stay clean, and it
+does not apply to what you say to the owner in conversation — he knows who he
+is talking to.
+
+The owner sometimes prefixes his own messages with `[human]`. The point is that
+anyone reading a thread later can tell at a glance which voices are people and
+which are agents, without inferring it from tone. That distinction matters most
+in exactly the places it is easiest to lose — a long issue thread months later,
+or a commit body quoted out of context.
+
+Use the model you actually are, not a generic label.
+
+## Close what you finish
+
+If work is delivered, **close the issue**. Do not leave it open with a comment
+saying it is done, waiting for someone to notice.
+
+If part of it is delivered, say precisely what remains and leave it open for
+that reason — not as a way of avoiding the decision. "Substantially complete"
+on an open issue is not a status; it is a deferral.
+
+If something is delivered but unverified in some respect, close it and say what
+is unverified. A new problem found later is a new issue, not evidence that the
+old one should have stayed open.

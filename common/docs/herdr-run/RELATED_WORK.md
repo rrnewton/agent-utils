@@ -8,13 +8,13 @@ tell which parts of this tool are novel and which are reuse.
 
 ---
 
-## 1. Our own ad-hoc Herdr usage — `ci-hub/validate/pane_owner.py` (dev-hermit parent)
+## 1. Our own ad-hoc Herdr usage — a downstream CI harness
 
 The closest prior art, and the reason this utility is shaped the way it is.
 
 `ci-hub validate-run` creates an owner-visible Herdr tab for each boxed validation run
 (`ai_docs/ci-hub-owned-validate-panes-20260806.md`). It maintains one stable workspace
-(`validate-hermit`), creates a titled tab per run, and wraps **every** Herdr control call in
+(one tab per validation run), creates a titled tab per run, and wraps **every** Herdr control call in
 `systemd-run --user --wait --pipe --collect --quiet --setenv HOME=... --setenv PATH=...`.
 
 **Adopted:**
@@ -67,7 +67,7 @@ it is filled with files rather than with screen matching.
 
 ---
 
-## 3. Our own terminal-scraping prior art — `scripts/orc-hermit-msg.py` (dev-hermit parent)
+## 3. Our own terminal-scraping prior art — a coordinator-messaging script
 
 Raw `tmux send-keys` delivery into the ORC coordinator TUI. Not a Herdr consumer, but the closest
 prior art for *"decide whether a terminal is ready to receive input"*, and mostly a cautionary tale.
@@ -88,7 +88,7 @@ positive evidence of dirt**, and reports `abstain` when it cannot understand the
 guessing in either direction. `meta.json` records which verdict each signal gave, so a run never
 implies a check that did not actually happen.
 
-**Not extended.** `orc-hermit-msg.py` messages the Orc coordinator TUI specifically; there is still
+**Not extended.** That script messages one coordinator TUI specifically; there is still
 no supported agent-to-agent relay, and this tool does not become one. It runs shell commands.
 
 ---
@@ -100,7 +100,7 @@ rejected on four independent grounds, each of which is enough on its own:
 
 1. **Wrapping.** A pane is ~80 columns and hard-wraps. Captured live during this search, a single
    `git ls-remote` line came back from `--source visible` split across five rows mid-token
-   (`https://github.com/rrnew` / `ton/hermit`). `--source recent-unwrapped` reassembles it, but that
+   (`https://github.com/rrnew` / `ton/<repo>`). `--source recent-unwrapped` reassembles it, but that
    is a rendering mode, not a guarantee.
 2. **Truncation.** Scrollback is finite. Long output (`git log`, `gh pr list`) is silently cut, and
    silent truncation reads as a complete result.
@@ -117,7 +117,7 @@ The filesystem is shared across the sandbox boundary, so the pane can simply red
 ```
 
 The caller then reads exact bytes and an exact integer. Verified end to end during this search:
-in-jail `with-proxy git ls-remote https://github.com/rrnewton/hermit main` fails with `CONNECT tunnel
+in-jail `with-proxy git ls-remote https://github.com/<org>/<private-repo> main` fails with `CONNECT tunnel
 failed, response 403`; the identical command through a pane wrote `rc=0` and the real SHA
 `2c54dfb5dc9f49423c26fc87c840ebf26570b737`.
 

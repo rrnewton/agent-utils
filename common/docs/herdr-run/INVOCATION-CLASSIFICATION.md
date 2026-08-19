@@ -7,7 +7,7 @@ part that stops us rediscovering this one component at a time.
 
 herdr-run admits a command by matching **the program name it is handed**. Whatever that program then
 spawns inherits the pane's egress without any further check — verified, not assumed: routing
-`git commit` through the relay let hermit's repo-controlled `pre-commit` hook complete its own
+`git commit` through the relay let a consuming repository's own tracked `pre-commit` hook run its
 `git ls-remote` against github, which is exactly the behaviour the in-jail path denies.
 
 Two consequences follow, and they are the whole problem:
@@ -33,10 +33,10 @@ Two consequences follow, and they are the whole problem:
 
 | Program | How it escapes | Status |
 | --- | --- | --- |
-| `git` | Repo-controlled hooks. hermit sets `core.hooksPath = .githooks`, so `git commit`, `git push`, `git merge` execute tracked repository scripts **with pane egress**. Measured today. | **OPEN.** `git` is the first thing we allowlisted and it is the widest hole in the door. |
+| `git` | Repo-controlled hooks. A repository that sets `core.hooksPath` to a tracked directory makes `git commit`, `git push`, `git merge` execute repository-supplied scripts **with pane egress**. Measured against a real consumer. | **OPEN.** `git` is the first thing we allowlisted and it is the widest hole in the door. |
 
 This is not hypothetical and it is not only a security point: it is also *why* routing `git commit`
-through the relay fixed hermit's pin-check hook. The same mechanism that makes it useful makes it
+through the relay fixed a consumer's pin-check hook. The same mechanism that makes it useful makes it
 unbounded. Any tightening must not break that use.
 
 ### (b) WRAPPED — cannot be fixed by adding an allowlist entry
@@ -45,10 +45,10 @@ Counted in this tree, by entry-point shape rather than by file:
 
 | Shape | Count | Examples |
 | --- | --- | --- |
-| `python3 <script>.py` | ~60 | `ci-hub/validate/preflight_anchor.py`, `ci-hub/health/pr_status.py`, `ci-hub/landing/rebase_wrapper.py` |
-| `*.sh` | ~49 | `hermit/ci/test_harness.sh`, `hermit/validate.sh`, `ci-hub/landing/land-pr.sh`, `ci-hub/stress/nightly.sh` |
-| `make <target>` | 37 targets | `make check-agent-utils-pin` → `scripts/check-agent-utils-pin.rs` → `with-proxy git fetch` |
-| `#!/usr/bin/env rust-script` | 21 | `ci-hub/ci-hub`, `scripts/check-agent-utils-pin.rs`, `compat-envelope/collect-envelope.rs` |
+| `python3 <script>.py` | ~60 | `<harness>/validate/preflight_anchor.py`, `<harness>/health/pr_status.py`, `<harness>/landing/rebase_wrapper.py` |
+| `*.sh` | ~49 | `<project>/ci/test_harness.sh`, `<project>/validate.sh`, `<harness>/landing/land-pr.sh`, `<harness>/stress/nightly.sh` |
+| `make <target>` | 37 targets | a pin-check target → `scripts/<pin-check>.rs` → `with-proxy git fetch` |
+| `#!/usr/bin/env rust-script` | 21 | `<harness>/<entrypoint>`, `scripts/<pin-check>.rs`, `compat-envelope/collect-envelope.rs` |
 
 **Roughly 167 wrapped entry points against 3 direct candidates** — one is disabled by default and
 one of the two defaults leaks through hooks. Any sweep
