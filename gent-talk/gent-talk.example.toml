@@ -56,9 +56,22 @@ label = "build noise"
 writable = false
 
 [elevenlabs]
-# Optional in v0: nothing calls ElevenLabs yet.
-# agent_id is public (it identifies a widget) and is handed to the web app; api_key is a secret and
-# never leaves the server.
+# Optional: the Discord half of this server works without them. Set BOTH to use /voice and
+# GET /api/v1/signed-url, which is how you talk to an agent that has "Enable Authentication"
+# turned on: that setting closes the public talk-to link, and a conversation can then only be
+# started from a short-lived signed URL minted with the account API key.
+#
+# agent_id is public (it identifies a widget) and is handed to the web app. api_key is an ACCOUNT
+# secret — it can spend money — and never leaves the server: it goes to ElevenLabs in a header, is
+# never put in a URL, and is redacted out of every error message.
+#
+# With either one unset, /api/v1/signed-url answers 503 and names the setting you are missing. It
+# never falls back to an unsigned URL, because that failure would surface later, in a browser, in
+# a car, as a conversation that silently will not start.
 # Environment: GENT_TALK_ELEVENLABS_AGENT_ID / GENT_TALK_ELEVENLABS_API_KEY
 # agent_id = "agent_..."
 # api_key = "REPLACE-ME"
+
+# Where to mint signed URLs from. Only change this to point at a regional endpoint or a proxy.
+# Environment: GENT_TALK_ELEVENLABS_API_BASE
+# api_base = "https://api.elevenlabs.io/v1"

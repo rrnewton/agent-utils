@@ -49,6 +49,7 @@ the reference behind it: what every route does, what the security model is, and 
 | Web app: text tab, digest, find-a-message, local speech | **works** |
 | **MCP over Streamable HTTP at `/mcp`** | **works.** Bearer-authenticated, stateless, five tools, tested end to end. Never yet driven by a real ElevenLabs agent. |
 | ElevenLabs voice agent | **not verified.** The endpoint an agent needs exists and answers; no ElevenLabs agent has been pointed at it. The web app mounts the hosted widget only if an agent id is configured. |
+| **Signed conversation URLs at `/api/v1/signed-url`** | **works against a fake, unverified against live ElevenLabs.** Mints a short-lived signed URL for an agent that has "Enable Authentication" turned on, and `/voice` is a dependency-free page that uses one. Tested end to end against an in-memory ElevenLabs that refuses a wrong key and an unknown agent, and against a loopback HTTP server that proves the account key travels in a header. |
 | Slow path (ask a coding agent for detail) | **seam only.** The route exists and answers HTTP 501 with an explanation. |
 | TLS | **not here.** Terminate in front (Caddy, nginx, a tunnel, or a cloud load balancer). A Cloudflare Tunnel recipe is below. |
 | Deployment check (`scripts/verify-deployment.sh`) | **works.** One command, pass/fail, exits non-zero and names the failing check. Runs in CI against the container on every push, including a negative control that requires it to go red. |
@@ -280,7 +281,8 @@ curl -s -X POST localhost:8080/mcp \
 | Write token | `auth.write_token` | `GENT_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
 | Channels | `[[channels]]` | `GENT_TALK_CHANNELS` | `id:label:rw` / `id:label:ro`, comma separated |
 | ElevenLabs agent id | `elevenlabs.agent_id` | `GENT_TALK_ELEVENLABS_AGENT_ID` | public |
-| ElevenLabs API key | `elevenlabs.api_key` | `GENT_TALK_ELEVENLABS_API_KEY` | **secret** |
+| ElevenLabs API key | `elevenlabs.api_key` | `GENT_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs |
+| ElevenLabs API base | `elevenlabs.api_base` | `GENT_TALK_ELEVENLABS_API_BASE` | `https://api.elevenlabs.io/v1` |
 | Config file path | — | `GENT_TALK_CONFIG` | or `--config` |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
@@ -298,6 +300,7 @@ not, and neither reveals anything about the configuration.
 | GET | `/api/v1/channels` | read | configured channels |
 | GET | `/api/v1/client-config` | read | what the web app needs at startup |
 | GET | `/api/v1/agent-tools` | read | the voice agent's tool manifest and approval policy |
+| GET | `/api/v1/signed-url` | **write** | mint a short-lived signed conversation URL — see below |
 | GET | `/api/v1/channels/{id}/messages?limit=` | read | full scrollback, oldest first |
 | GET | `/api/v1/channels/{id}/messages/{message_id}` | read | one message in full |
 | GET | `/api/v1/channels/{id}/digest?limit=&width=` | read | one speakable line per message |
@@ -311,6 +314,54 @@ not, and neither reveals anything about the configuration.
 (the full message, or `null`), `alternatives`, and `ambiguous`. **A query that matches nothing
 returns `best: null`** rather than the newest message wearing a confident label; a voice interface
 that guesses is worse than one that says it did not find anything.
+
+## Signed conversation URLs
+
+Turning on **Enable Authentication** on an ElevenLabs agent closes the public `talk-to` link. From
+then on a conversation can only be started from a **signed URL**, minted from ElevenLabs' API with
+an account key and good for about fifteen minutes. `GET /api/v1/signed-url` does that minting, and
+`/voice` is a plain page — no build step, no CDN, no vendor bundle — that fetches one and opens the
+conversation over a WebSocket.
+
+```jsonc
+// GET /api/v1/signed-url, with the WRITE-scope bearer token
+{
+  "signed_url": "wss://api.elevenlabs.io/v1/convai/conversation?agent_id=…&token=…",
+  "agent_id": "agent_…",
+  "valid_for_seconds": 900
+}
+```
+
+Four things about it are deliberate.
+
+**It needs the WRITE scope**, even though it reads nothing. What it hands back is a working
+conversation with your agent, and that agent has a credential of its own: if you gave it the write
+token, then whoever holds a signed URL can ask it to post in your name. The gate on this route has
+to be at least as strong as the strongest thing the conversation can do. An unauthenticated
+`/signed-url` would be strictly worse than the public link that enabling authentication just
+closed.
+
+**The account API key never leaves the server.** It travels to ElevenLabs in an `xi-api-key`
+*header*, never in a URL, and every error built from an ElevenLabs response body is redacted
+first — an upstream is free to quote a credential back in its own error text, and that text ends up
+in a log and in an API response. There is a test that asserts the key appears in no response body
+on any path this route can take, including the vendor-rejection path.
+
+**There is no unsigned fallback.** Three failures are distinguished, because they have three
+different fixes:
+
+| What happened | Status | `error` |
+|---|---|---|
+| `elevenlabs.api_key` or `elevenlabs.agent_id` is not set | `503` | `elevenlabs_not_configured`, naming the setting |
+| ElevenLabs refused us, or is unreachable | `502` | `elevenlabs_error`, carrying the vendor status |
+| The caller has no token, or only the read token | `401` / `403` | `unauthenticated` / `forbidden` |
+
+**The answer is `no-store`.** The minted URL is itself a bearer credential for the next fifteen
+minutes.
+
+The `/voice` page expects the agent's output audio format to be **PCM** (`pcm_16000` is the
+default). It reads the format out of the conversation's initiation metadata and says so plainly if
+it is something it cannot decode, rather than playing noise.
 
 ## The MCP endpoint
 
@@ -682,12 +733,13 @@ src/retrieval.rs      semantic random access, behind the Ranker trait
 src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
+src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
 src/mcp/mod.rs        the tool manifest and per-tool approval policy
 src/mcp/protocol.rs   JSON-RPC 2.0 and the MCP method set
 src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp
 src/agent_backend.rs  the slow-path seam
 src/http/             router and handlers
-web/                  the phone app (plain HTML/CSS/JS, no framework, no build step)
+web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)
 scripts/verify-deployment.sh   the one-command deployment check, local or public
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```
@@ -712,6 +764,15 @@ Beyond the security list above:
   `scripts/verify-deployment.sh` has therefore only ever been exercised against the in-memory
   fake — in CI and by hand. Its checks are protocol-level and transport-level, so they apply
   unchanged to a real deployment, but the first real run will also be the script's first real run.
+* **Signed URLs have never been minted from live ElevenLabs.** The endpoint, the header, and the
+  response shape come from the vendor's current documentation; everything below that is tested
+  against an in-memory ElevenLabs that can refuse, and against a loopback HTTP server that proves
+  the key is sent as a header. The first live call will still be the first live call.
+* The `/voice` page decodes PCM only. If an agent is configured to emit µ-law or MP3, the page says
+  so and stops rather than playing noise — it does not transcode.
+* The `/voice` page captures the microphone through a `ScriptProcessorNode`, which is deprecated
+  (though universally supported). Moving it to an `AudioWorklet` would mean a second asset for no
+  behavioural gain today.
 * The legacy HTTP+SSE MCP transport is not implemented. A client that cannot do Streamable HTTP
   cannot connect.
 * No MCP resources, prompts, sampling, or logging capability — tools only.

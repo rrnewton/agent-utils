@@ -9,6 +9,8 @@ use gent_talk::config::{Config, ENV_CONFIG_PATH};
 use gent_talk::discord::fake::FakeDiscord;
 use gent_talk::discord::http::HttpDiscordClient;
 use gent_talk::discord::DiscordClient;
+use gent_talk::elevenlabs::http::HttpElevenLabsClient;
+use gent_talk::elevenlabs::SignedUrlProvider;
 use gent_talk::probe::{self, ENV_SKIP_STARTUP_PROBE};
 use gent_talk::retrieval::LexicalRanker;
 use gent_talk::state::AppState;
@@ -213,10 +215,21 @@ async fn main() -> anyhow::Result<()> {
             "configured channel"
         );
     }
-    if config.elevenlabs.agent_id.is_none() {
-        tracing::info!(
-            "no ElevenLabs agent configured; the API is reachable but nothing calls it yet"
-        );
+    // Say the ElevenLabs wiring out loud, in both directions. An agent with "Enable
+    // Authentication" turned on cannot be reached without a signed URL, and the way that failure
+    // presents — a conversation that will not start, from a phone, in a car — is about as far as
+    // possible from the setting that causes it.
+    match gent_talk::elevenlabs::credentials(&config.elevenlabs) {
+        Ok((agent_id, _key)) => tracing::info!(
+            agent_id,
+            "ElevenLabs configured; GET /api/v1/signed-url will mint signed conversation URLs, \
+             and /voice is the page that uses them"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "ElevenLabs is NOT fully configured; /api/v1/signed-url will refuse with this exact \
+             message rather than handing out an unsigned URL"
+        ),
     }
     // Say the MCP endpoint out loud at startup: an agent platform has to be told a URL, and the
     // most common deployment mistake is pointing it at the wrong path and getting a bare 404.
@@ -231,11 +244,14 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let bind = config.bind;
+    let elevenlabs: Arc<dyn SignedUrlProvider> =
+        Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
     let state = AppState {
         config: Arc::new(config),
         discord,
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
+        elevenlabs,
     };
     let app = gent_talk::http::router(state);
 

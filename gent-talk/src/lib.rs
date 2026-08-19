@@ -18,6 +18,7 @@ pub mod agent_backend;
 pub mod auth;
 pub mod config;
 pub mod discord;
+pub mod elevenlabs;
 pub mod http;
 pub mod mcp;
 pub mod model;

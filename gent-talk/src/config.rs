@@ -26,6 +26,9 @@ pub const ENV_WRITE_TOKEN: &str = "GENT_TALK_WRITE_TOKEN";
 pub const ENV_ELEVENLABS_API_KEY: &str = "GENT_TALK_ELEVENLABS_API_KEY";
 /// Environment variable carrying the ElevenLabs agent id.
 pub const ENV_ELEVENLABS_AGENT_ID: &str = "GENT_TALK_ELEVENLABS_AGENT_ID";
+/// Environment variable overriding the ElevenLabs API base, so a test or a proxy can point
+/// elsewhere.
+pub const ENV_ELEVENLABS_API_BASE: &str = "GENT_TALK_ELEVENLABS_API_BASE";
 /// Environment variable overriding the channel list, as `id:label:rw` entries separated by commas.
 pub const ENV_CHANNELS: &str = "GENT_TALK_CHANNELS";
 /// Environment variable overriding the externally reachable base URL.
@@ -118,13 +121,31 @@ pub struct AuthConfig {
     pub write_token: Secret,
 }
 
-/// ElevenLabs wiring. Both fields are optional in v0 because no call is made yet.
-#[derive(Debug, Default)]
+/// ElevenLabs wiring.
+///
+/// Both credentials are optional: the Discord half of this server is useful on its own, and a
+/// deployment that has not wired a voice agent yet should still start. What is NOT optional is
+/// what happens when something asks for a signed conversation URL without them — that is a loud,
+/// specific refusal naming the absent setting, never a silent fallback. See
+/// [`crate::elevenlabs::credentials`].
+#[derive(Debug)]
 pub struct ElevenLabsConfig {
-    /// Agent id, recorded so the deployment is self-describing.
+    /// Agent id, recorded so the deployment is self-describing. Public: it identifies a widget.
     pub agent_id: Option<String>,
-    /// API key, for the management calls a later version will make.
+    /// Account API key, used to mint short-lived signed conversation URLs. A secret.
     pub api_key: Option<Secret>,
+    /// API base, so a test or a proxy can point elsewhere.
+    pub api_base: String,
+}
+
+impl Default for ElevenLabsConfig {
+    fn default() -> Self {
+        Self {
+            agent_id: None,
+            api_key: None,
+            api_base: DEFAULT_ELEVENLABS_API_BASE.to_owned(),
+        }
+    }
 }
 
 /// Configuration could not be assembled.
@@ -206,12 +227,15 @@ struct FileChannel {
 struct FileElevenLabs {
     agent_id: Option<String>,
     api_key: Option<Secret>,
+    api_base: Option<String>,
 }
 
 /// Default bind address: every interface inside a container, port 8080.
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
 /// Default Discord API base.
 pub const DEFAULT_DISCORD_API_BASE: &str = "https://discord.com/api/v10";
+/// Default ElevenLabs API base.
+pub const DEFAULT_ELEVENLABS_API_BASE: &str = "https://api.elevenlabs.io/v1";
 const DEFAULT_FETCH_LIMIT: u16 = 50;
 const DEFAULT_MAX_FETCH_LIMIT: u16 = 100;
 
@@ -348,6 +372,10 @@ impl Config {
                 api_key: get(ENV_ELEVENLABS_API_KEY)
                     .map(Secret::new)
                     .or(file.elevenlabs.api_key),
+                api_base: get(ENV_ELEVENLABS_API_BASE)
+                    .map(str::to_owned)
+                    .or(file.elevenlabs.api_base)
+                    .unwrap_or_else(|| DEFAULT_ELEVENLABS_API_BASE.to_owned()),
             },
         })
     }
@@ -597,6 +625,45 @@ writable = true
     }
 
     #[test]
+    fn the_elevenlabs_credentials_come_from_file_or_environment() {
+        let text = format!(
+            "{FULL}\n[elevenlabs]\nagent_id = \"agent_from_file\"\napi_key = \"key-from-file\"\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.elevenlabs.agent_id.as_deref(), Some("agent_from_file"));
+        assert_eq!(
+            cfg.elevenlabs.api_key.as_ref().map(Secret::expose),
+            Some("key-from-file")
+        );
+        assert_eq!(cfg.elevenlabs.api_base, DEFAULT_ELEVENLABS_API_BASE);
+
+        let cfg = Config::from_toml_and_env(
+            &text,
+            &env(&[
+                (ENV_ELEVENLABS_AGENT_ID, "agent_from_env"),
+                (ENV_ELEVENLABS_API_KEY, "key-from-env"),
+                (ENV_ELEVENLABS_API_BASE, "https://proxy.test/v1"),
+            ]),
+        )
+        .expect("valid config");
+        assert_eq!(cfg.elevenlabs.agent_id.as_deref(), Some("agent_from_env"));
+        assert_eq!(
+            cfg.elevenlabs.api_key.as_ref().map(Secret::expose),
+            Some("key-from-env")
+        );
+        assert_eq!(cfg.elevenlabs.api_base, "https://proxy.test/v1");
+    }
+
+    #[test]
+    fn an_unconfigured_elevenlabs_section_still_loads() {
+        // The Discord half of this server is useful on its own; a deployment with no voice agent
+        // must still start, and fail only when something actually asks for a signed URL.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(cfg.elevenlabs.agent_id.is_none());
+        assert!(cfg.elevenlabs.api_key.is_none());
+    }
+
+    #[test]
     fn secret_debug_output_is_redacted() {
         let secret = Secret::new("hunter2-hunter2-hunter2");
         let rendered = format!("{secret:?}");
@@ -609,12 +676,17 @@ writable = true
 
     #[test]
     fn config_debug_output_does_not_leak_tokens() {
-        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        let text = format!("{FULL}\n[elevenlabs]\napi_key = \"xi-key-in-the-file\"\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
         let rendered = format!("{cfg:?}");
         assert!(!rendered.contains("file-discord-token"), "leak: {rendered}");
         assert!(
             !rendered.contains("write-token-that-is-long-enough"),
             "leak: {rendered}"
+        );
+        assert!(
+            !rendered.contains("xi-key-in-the-file"),
+            "the ElevenLabs key leaked through Debug: {rendered}"
         );
     }
 

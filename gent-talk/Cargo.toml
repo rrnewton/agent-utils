@@ -43,6 +43,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
+# The live ElevenLabs client is exercised against a one-shot loopback HTTP server, which is what
+# pins the API key to a HEADER rather than the query string. That needs raw sockets in tests.
+tokio = { version = "1", features = ["io-util", "net"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]

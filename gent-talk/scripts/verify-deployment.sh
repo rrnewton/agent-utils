@@ -312,6 +312,22 @@ If this mentions channel_not_writable, that channel is configured 'ro' — chang
     echo "Look at the channel in Discord now: you should see a message containing $nonce."
 fi
 
+# ---------------------------------------------------------------------------
+# 8. the signed-URL route is not open to strangers
+# ---------------------------------------------------------------------------
+# This route MINTS a credential: a working conversation with your agent. An open one would be
+# strictly worse than the public talk-to link that enabling agent authentication just closed. Both
+# checks are decided by this server's own auth, before ElevenLabs is contacted, so they are
+# meaningful whether or not the ElevenLabs half is configured yet.
+checking "the signed-URL route refuses strangers and refuses the read token"
+request GET /api/v1/signed-url ""
+[ "$STATUS" = "401" ] || fail "check 8 (signed-url): GET /api/v1/signed-url with no token returned $STATUS, expected 401. ANYONE ON THE INTERNET CAN START A CONVERSATION WITH YOUR AGENT. Body was: $BODY"
+ok "unauthenticated GET /api/v1/signed-url → 401"
+
+request GET /api/v1/signed-url "$READ_TOKEN"
+[ "$STATUS" = "403" ] || fail "check 8 (signed-url): the READ token got $STATUS from /api/v1/signed-url, expected 403. Minting a conversation is gated on the write scope, because the agent on the far end can post. Body was: $BODY"
+ok "read token GET /api/v1/signed-url → 403"
+
 echo ""
 echo "PASSED — $checks_run checks against $URL"
 echo ""

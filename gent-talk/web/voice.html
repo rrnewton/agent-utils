@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <title>gent-talk — voice</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>gent-talk</h1>
+      <span id="conversation-state" class="muted">idle</span>
+    </header>
+
+    <main>
+      <section class="tab active">
+        <p class="hint">
+          Your ElevenLabs agent has authentication enabled, so a conversation can only start from a
+          short-lived signed URL. This page asks <code>gent-talk</code> for one — with your API
+          token — and then talks to the agent directly. No vendor script, no CDN, nothing bundled.
+        </p>
+
+        <label for="api-token">API token</label>
+        <p class="hint">
+          The <strong>write-scope</strong> token. Minting a conversation is gated on it, because
+          the agent on the other end can post to your channels. Stored in this browser only.
+        </p>
+        <input id="api-token" type="password" autocomplete="off" placeholder="paste the token" />
+        <div class="row">
+          <button id="save-token">Save token</button>
+          <button id="forget-token" class="secondary">Forget</button>
+        </div>
+
+        <div class="row">
+          <button id="start">Start talking</button>
+          <button id="stop" class="secondary">Hang up</button>
+        </div>
+
+        <div id="detail" class="panel muted"></div>
+
+        <p class="hint">
+          Tap “Start talking”, then allow the microphone. A signed URL is good for about fifteen
+          minutes, so this page mints a fresh one every time you start.
+        </p>
+
+        <ol id="transcript" class="messages"></ol>
+      </section>
+    </main>
+
+    <div id="status" role="status" aria-live="polite"></div>
+    <script src="/voice.js"></script>
+  </body>
+</html>

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use crate::agent_backend::NoAgentBackend;
 use crate::config::Config;
 use crate::discord::fake::FakeDiscord;
+use crate::elevenlabs::fake::{FakeElevenLabs, KNOWN_AGENT_ID, VALID_API_KEY};
 use crate::retrieval::LexicalRanker;
 use crate::state::AppState;
 
@@ -47,8 +48,25 @@ writable = false
 id = "{WRITE_CHANNEL}"
 label = "lead team"
 writable = true
+
+[elevenlabs]
+agent_id = "{KNOWN_AGENT_ID}"
+api_key = "{VALID_API_KEY}"
 "#
     )
+}
+
+/// TOML for a server whose ElevenLabs half was never wired up.
+///
+/// Kept as a first-class fixture rather than a string a test edits inline, because "the operator
+/// forgot the key" is a state this server has to handle explicitly, not an edge case.
+#[must_use]
+pub fn config_toml_without_elevenlabs() -> String {
+    config_toml()
+        .split("[elevenlabs]")
+        .next()
+        .expect("prefix")
+        .to_owned()
 }
 
 /// A parsed test configuration.
@@ -68,14 +86,35 @@ pub fn config() -> Config {
 /// misconfiguration builds its own [`FakeDiscord`] and leaves the channel out.
 #[must_use]
 pub fn state() -> (AppState, Arc<FakeDiscord>) {
+    let (state, discord, _elevenlabs) = state_parts();
+    (state, discord)
+}
+
+/// The same server, plus a handle to its in-memory ElevenLabs.
+#[must_use]
+pub fn state_parts() -> (AppState, Arc<FakeDiscord>, Arc<FakeElevenLabs>) {
+    state_from_toml(&config_toml())
+}
+
+/// A server built from arbitrary configuration text, for the tests that need a server that is
+/// deliberately configured wrong.
+///
+/// # Panics
+///
+/// Panics if `text` is not a valid configuration, which is a failure of the test that wrote it.
+#[must_use]
+pub fn state_from_toml(text: &str) -> (AppState, Arc<FakeDiscord>, Arc<FakeElevenLabs>) {
     let fake = Arc::new(FakeDiscord::new());
     fake.register_channel(&crate::model::ChannelId(READ_CHANNEL.to_owned()));
     fake.register_channel(&crate::model::ChannelId(WRITE_CHANNEL.to_owned()));
+    let elevenlabs = Arc::new(FakeElevenLabs::new());
+    let config = Config::from_toml_and_env(text, &BTreeMap::new()).expect("test config is valid");
     let state = AppState {
-        config: Arc::new(config()),
+        config: Arc::new(config),
         discord: fake.clone(),
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
+        elevenlabs: elevenlabs.clone(),
     };
-    (state, fake)
+    (state, fake, elevenlabs)
 }
