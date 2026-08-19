@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod access;
 pub mod agent_backend;
 pub mod auth;
 pub mod config;

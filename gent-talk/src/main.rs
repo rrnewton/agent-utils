@@ -243,6 +243,17 @@ async fn main() -> anyhow::Result<()> {
         "MCP Streamable HTTP endpoint mounted; it requires the same bearer tokens as the API"
     );
 
+    // Say the access log exists, at startup, in the log itself. It is what makes an EMPTY log a
+    // finding rather than an ambiguity: a reader who sees no request lines below this banner
+    // knows that no client called, rather than wondering whether this server logs requests at all.
+    tracing::info!(
+        target: "gent_talk::access",
+        "per-request access logging is ON at INFO. Every HTTP request, every MCP JSON-RPC \
+         message, and every tool call leaves a line below. If you see NO lines below this one, \
+         nothing called this server -- that is a finding, not a gap in the log. Tokens are never \
+         logged; message content is DEBUG only."
+    );
+
     let bind = config.bind;
     let elevenlabs: Arc<dyn SignedUrlProvider> =
         Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);

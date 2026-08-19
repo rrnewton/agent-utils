@@ -8,9 +8,12 @@
 //! * Everything under `/api/` requires a bearer token, and the write scope is required for
 //!   anything that reaches Discord with a message — and for minting a signed conversation URL,
 //!   which is a credential for talking to an agent that can itself post.
+//! * Every request — routed or not, authorized or not — leaves exactly ONE line in the access
+//!   log at INFO. See [`crate::access`] for why that is load-bearing rather than nice to have.
 //! * `/mcp` is the Streamable HTTP MCP endpoint. It requires a bearer token too, and answers a
 //!   credential-less caller with a bland 401 before it reads the body at all.
 
+pub mod access_layer;
 pub mod api;
 
 use axum::routing::{get, post};
@@ -48,5 +51,9 @@ pub fn router(state: AppState) -> Router {
             post(crate::mcp::transport::post).fallback(crate::mcp::transport::method_not_allowed),
         )
         .fallback(api::not_found)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            access_layer::log_requests,
+        ))
         .with_state(state)
 }

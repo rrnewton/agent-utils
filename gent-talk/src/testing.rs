@@ -4,7 +4,8 @@
 //! [`crate::discord::fake::FakeDiscord`]. The binary never calls it.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use crate::agent_backend::NoAgentBackend;
 use crate::config::Config;
@@ -117,4 +118,98 @@ pub fn state_from_toml(text: &str) -> (AppState, Arc<FakeDiscord>, Arc<FakeEleve
         elevenlabs: elevenlabs.clone(),
     };
     (state, fake, elevenlabs)
+}
+
+/// A `tracing` writer that keeps everything in memory.
+#[derive(Clone, Debug, Default)]
+pub struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedBuffer {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuffer {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Captures everything logged on THIS THREAD for as long as it is alive.
+///
+/// Scoped rather than global on purpose: `tracing`'s global subscriber can be set once per
+/// process, so a global capture would make the logging tests order-dependent and unable to run
+/// beside anything else. `#[tokio::test]` uses a current-thread runtime, so a handler driven
+/// through `oneshot` logs on the same thread this guard is installed on.
+pub struct LogCapture {
+    buffer: SharedBuffer,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl LogCapture {
+    /// Start capturing at DEBUG and below.
+    ///
+    /// DEBUG rather than INFO so a test can assert on what is INFO-only by *level filtering*
+    /// instead of by absence — see [`Self::info_only`].
+    #[must_use]
+    pub fn start() -> Self {
+        Self::at(tracing::Level::DEBUG)
+    }
+
+    /// Start capturing at INFO, which is the level a deployment actually runs at.
+    #[must_use]
+    pub fn info_only() -> Self {
+        Self::at(tracing::Level::INFO)
+    }
+
+    fn at(level: tracing::Level) -> Self {
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_max_level(level)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        Self {
+            buffer,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    /// Everything captured so far.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the captured bytes are not UTF-8, which would itself be a defect.
+    #[must_use]
+    pub fn text(&self) -> String {
+        let guard = self
+            .buffer
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8(guard.clone()).expect("log output is UTF-8")
+    }
+
+    /// The captured lines that came from the access log.
+    #[must_use]
+    pub fn access_lines(&self) -> Vec<String> {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(crate::access::TARGET))
+            .map(str::to_owned)
+            .collect()
+    }
 }
