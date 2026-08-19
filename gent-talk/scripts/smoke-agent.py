@@ -1017,6 +1017,73 @@ class Runner:
         self.out.emit(f"  ok    posted a unique token to the channel through OUR write API: {nonce}")
         return nonce, latest
 
+    def tools_offered(self, token: str) -> int | None:
+        """How many tools this server offers a given credential. None if it cannot be asked."""
+        status, body = http_json(
+            f"{self.base}/mcp",
+            token,
+            method="POST",
+            payload={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+        if status != 200 or not isinstance(body, dict):
+            return None
+        tools = (body.get("result") or {}).get("tools")
+        return len(tools) if isinstance(tools, list) else None
+
+    def report_agent_scope(self, conversation: Conversation) -> None:
+        """Say which of our credentials the agent is holding, and so whether it could post.
+
+        This is worth the two extra requests because it is the ONE way to answer the question on
+        a run where the agent invokes nothing: with no tool line in the access log there is no
+        `credential=` field to read, and the credential itself lives inside the agent's
+        configuration at the vendor, where we cannot see it. But ElevenLabs tells us how many
+        tools it can see, and this server offers a different NUMBER of tools to each scope --
+        post_reply is the difference. So the count identifies the credential.
+
+        The counts are asked of this server rather than written down here, so adding or removing
+        a tool cannot silently turn this into a confident wrong answer."""
+        counts = {
+            name: number
+            for name, number in (
+                ("read", self.tools_offered(self.read_token)),
+                ("write", self.tools_offered(self.write_token)),
+            )
+            if number is not None
+        }
+        seen: int | None = None
+        for raw in conversation.diagnostics:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            for entry in (payload.get("mcp_connection_status") or {}).get("integrations") or []:
+                if isinstance(entry, dict) and isinstance(entry.get("tool_count"), int):
+                    seen = entry["tool_count"]
+        if seen is None or len(counts) != 2 or counts["read"] == counts["write"]:
+            return
+        matches = [name for name, number in counts.items() if number == seen]
+        if matches == ["write"]:
+            self.out.emit(
+                f"  FINDING  ElevenLabs can see {seen} tools, and this server offers "
+                f"{counts['write']} to the WRITE credential and {counts['read']} to the read one. "
+                "So the agent is configured with the WRITE token and post_reply IS reachable: it "
+                "can post in your name. Nothing here asked it to, and the access log shows it did "
+                "not. Give it the read token if you want that to be impossible rather than "
+                "merely unasked-for."
+            )
+        elif matches == ["read"]:
+            self.out.emit(
+                f"  ok    ElevenLabs can see {seen} tools, which is what this server offers the "
+                "READ credential. post_reply is not reachable by the agent at all."
+            )
+        else:
+            self.out.emit(
+                f"  NOTE  ElevenLabs can see {seen} tools, which matches neither what this server "
+                f"offers the read credential ({counts['read']}) nor the write one "
+                f"({counts['write']}). The agent may be pointed at a different server, or at a "
+                "stale cached manifest."
+            )
+
     def mint(self) -> str:
         status, body = http_json(f"{self.base}/api/v1/signed-url", self.write_token)
         if status != 200 or not isinstance(body, dict) or not body.get("signed_url"):
@@ -1057,6 +1124,7 @@ class Runner:
         )
         seen = ", ".join(f"{k}x{v}" for k, v in sorted(conversation.event_types.items())) or "none"
         self.out.emit(f"        events seen: {seen}")
+        self.report_agent_scope(conversation)
 
         if not conversation.responses_after_ask:
             raise SmokeFailure(
