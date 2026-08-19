@@ -101,6 +101,13 @@ conservative first deployment gives ElevenLabs the **read** token.
 
 ## Step 3 — Build and run it, against real Discord for the first time
 
+The commands below are spelled out so you can see what each piece does. Once you have done it
+once, `scripts/run.sh` is the repeatable version of this whole step: it refuses to start on top
+of an already-running instance, checks that every required variable is really set before it
+builds anything, optionally makes sure the cloudflared tunnel unit is up, then rebuilds and
+relaunches. Copy `gent-talk.env.example` to `.gent-talk.env` (gitignored) to configure it, and
+see `scripts/run.sh --help` for the flags and the configuration precedence.
+
 ```sh
 cd gent-talk
 podman build -t gent-talk:v0 -f Containerfile .
