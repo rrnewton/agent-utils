@@ -20,6 +20,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use crate::access::{self, Credential, ToolOutcome};
 use crate::auth::Scope;
 use crate::mcp::tool_manifest;
 use crate::ops::{self, OpError};
@@ -157,7 +158,9 @@ pub fn tools_for(state: &AppState, scope: Scope) -> Vec<Value> {
 /// `scope` is the authority the transport already established for this request. This function
 /// never sees a token.
 pub async fn dispatch(state: &AppState, scope: Scope, raw: &Value) -> Outcome {
+    let credential = Credential::from(scope);
     if raw.is_array() {
+        access::rpc("(batch)", credential, false);
         return Outcome::Reply(Box::new(RpcResponse::err(
             Value::Null,
             RpcError::new(
@@ -169,10 +172,13 @@ pub async fn dispatch(state: &AppState, scope: Scope, raw: &Value) -> Outcome {
     let request: RpcRequest = match serde_json::from_value(raw.clone()) {
         Ok(request) => request,
         Err(error) => {
+            // Logged too: "the agent sent us something we could not parse" and "the agent never
+            // called" are different findings, and only one of them is a client bug.
+            access::rpc("(unparseable)", credential, false);
             return Outcome::Reply(Box::new(RpcResponse::err(
                 Value::Null,
                 RpcError::new(INVALID_REQUEST, format!("malformed request: {error}")),
-            )))
+            )));
         }
     };
     if request.jsonrpc != "2.0" {
@@ -183,10 +189,13 @@ pub async fn dispatch(state: &AppState, scope: Scope, raw: &Value) -> Outcome {
     }
 
     let Some(id) = request.id.clone() else {
-        // A notification. Nothing is ever sent back, including for an unknown one.
+        // A notification. Nothing is ever sent back, including for an unknown one — which is
+        // exactly why it gets a log line: otherwise it is indistinguishable from silence.
+        access::rpc(&request.method, credential, true);
         return Outcome::Accepted;
     };
 
+    access::rpc(&request.method, credential, false);
     match request.method.as_str() {
         "initialize" => Outcome::Reply(Box::new(RpcResponse::ok(
             id,
@@ -251,8 +260,17 @@ fn arg_u16(args: &Value, key: &str) -> Option<u16> {
 }
 
 async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Value>) -> Outcome {
+    let credential = Credential::from(scope);
     let params = params.unwrap_or_else(|| json!({}));
     let Some(name) = params.get("name").and_then(Value::as_str) else {
+        access::tool_call(
+            "(unnamed)",
+            None,
+            credential,
+            ToolOutcome::Refused,
+            Some("missing_tool_name"),
+            None,
+        );
         return Outcome::Reply(Box::new(RpcResponse::err(
             id,
             RpcError::new(INVALID_PARAMS, "tools/call requires a tool name"),
@@ -262,11 +280,33 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    // Ids, not content, at INFO. `channel` answers "which channel did it claim to read?"; the
+    // arguments themselves — which for post_reply carry the message text — are DEBUG only.
+    let channel = args
+        .get("channel_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let text_len = args
+        .get("text")
+        .and_then(Value::as_str)
+        .map(|t| t.chars().count());
+    access::tool_arguments(name, &args);
 
     let Some(tool) = tool_manifest(&state.config.channels)
         .into_iter()
         .find(|t| t.name == name && t.mcp_exposed)
     else {
+        // The line that would have settled the confabulation question outright: a model inventing
+        // `web_scraper` either never called, or called and was refused HERE, and those look
+        // identical from the channel side.
+        access::tool_call(
+            name,
+            channel.as_deref(),
+            credential,
+            ToolOutcome::Refused,
+            Some("unknown_tool"),
+            text_len,
+        );
         return Outcome::Reply(Box::new(RpcResponse::err(
             id,
             RpcError::new(INVALID_PARAMS, format!("unknown tool: {name}")),
@@ -277,6 +317,14 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
     // enforcement, and it is deliberately a separate check so that hiding a tool is never the
     // thing that keeps it from running.
     if tool.mutates && scope < Scope::Write {
+        access::tool_call(
+            tool.name,
+            channel.as_deref(),
+            credential,
+            ToolOutcome::Refused,
+            Some("forbidden_scope"),
+            text_len,
+        );
         return Outcome::Forbidden(Box::new(RpcResponse::err(
             id,
             RpcError::new(FORBIDDEN, "this credential may read but not post"),
@@ -290,22 +338,50 @@ async fn call_tool(state: &AppState, scope: Scope, id: Value, params: Option<Val
         "read_message" => run_read(state, &args).await,
         "post_reply" => run_post(state, &args).await,
         other => {
+            access::tool_call(
+                other,
+                channel.as_deref(),
+                credential,
+                ToolOutcome::Refused,
+                Some("unknown_tool"),
+                text_len,
+            );
             return Outcome::Reply(Box::new(RpcResponse::err(
                 id,
                 RpcError::new(INVALID_PARAMS, format!("unknown tool: {other}")),
-            )))
+            )));
         }
     };
 
     match outcome {
-        Ok(text) => Outcome::Reply(Box::new(RpcResponse::ok(id, text_result(text, false)))),
+        Ok(text) => {
+            access::tool_call(
+                tool.name,
+                channel.as_deref(),
+                credential,
+                ToolOutcome::Ok,
+                None,
+                text_len,
+            );
+            Outcome::Reply(Box::new(RpcResponse::ok(id, text_result(text, false))))
+        }
         // An operational refusal is a tool RESULT, not a protocol error: the model is supposed to
         // hear "that channel is not configured" and say so, rather than see the call machinery
         // break.
-        Err(error) => Outcome::Reply(Box::new(RpcResponse::ok(
-            id,
-            text_result(format!("{}: {error}", error.code()), true),
-        ))),
+        Err(error) => {
+            access::tool_call(
+                tool.name,
+                channel.as_deref(),
+                credential,
+                ToolOutcome::Refused,
+                Some(error.code()),
+                text_len,
+            );
+            Outcome::Reply(Box::new(RpcResponse::ok(
+                id,
+                text_result(format!("{}: {error}", error.code()), true),
+            )))
+        }
     }
 }
 

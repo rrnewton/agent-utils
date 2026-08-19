@@ -42,6 +42,7 @@ the reference behind it: what every route does, what the security model is, and 
 | HTTP server, routing, JSON API | **works** |
 | Config file + environment overrides, with validation | **works** |
 | Bearer-token auth, read scope vs write scope | **works** |
+| **Per-request access log** | **works.** One INFO line per HTTP request, per MCP JSON-RPC message, and per tool call. No credential ever, no channel text above DEBUG. |
 | Discord read + post behind a trait | **written, unit-tested; never run against live Discord** |
 | In-memory Discord for tests and `--fake-discord` | **works** |
 | Digest / summarization | **works**, extractive and deterministic (no model call) |
@@ -288,6 +289,41 @@ curl -s -X POST localhost:8080/mcp \
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
 an error, not a shrug — a typo'd section name should not silently disable a setting.
+
+## The access log
+
+At `RUST_LOG=info` this server used to log **nothing per request**. That gap has a specific cost,
+and it was paid: a voice agent reported that it had read a Discord channel and posted a reply, and
+it had done neither — it invented a digest, and it named tools this server does not have
+(`file_system_read`, `code_execution_sandbox`, `web_scraper`). The claim could only be disproved
+by opening Discord and looking, because "the agent never called us" and "the agent called us and
+we answered" produced identical output: none.
+
+So every request now leaves exactly one line, and **an empty log is a finding rather than an
+ambiguity**. The server says so in a banner at startup, because a reader has to know the log would
+have spoken.
+
+```text
+INFO gent_talk::access: request method="POST" path="/mcp" credential="write" status=200 millis=12
+INFO gent_talk::access: mcp rpc_method="tools/call" credential="write" is_notification=false
+INFO gent_talk::access: tool tool="post_reply" channel="123…" credential="write" outcome="ok" reason="-" text_len=48
+```
+
+Filter for just these: `RUST_LOG=gent_talk::access=info`. Three lines answer the question that
+started this: *did the agent call, which tool, which channel, and was it allowed?*
+
+What a line never contains:
+
+* **No credential.** Not the token, not a prefix, not a hash. Only the *class* that arrived:
+  `absent`, `unrecognized`, `read`, or `write`. "Absent" and "unrecognized" are kept apart because
+  they are different incidents — a misconfigured client versus a stale token or a stranger.
+* **No channel text at INFO.** Message content is written by other people; it does not belong in
+  an operator's log or in whatever ships that log onward. A post records its *length*, which is
+  what answers "did the whole message go through?". The full arguments of a tool call are
+  available at `RUST_LOG=debug` and only there.
+
+A refused request is logged as loudly as an accepted one, including a request to a path that does
+not exist — a client pointed at the wrong URL is exactly the case this log exists to catch.
 
 ## The API
 
@@ -726,6 +762,7 @@ write-scope fence in the MCP dispatcher (1). All four were reverted; the suite i
 ```text
 src/config.rs         configuration, environment overrides, secret redaction
 src/auth.rs           bearer tokens, read vs write scope
+src/access.rs         the access log: what one line says, and what it must never say
 src/model.rs          Message/Channel types, snowflake ordering
 src/discord/          the DiscordClient trait, the live HTTP client, the in-memory fake
 src/summary.rs        extractive digest lines
@@ -738,7 +775,7 @@ src/mcp/mod.rs        the tool manifest and per-tool approval policy
 src/mcp/protocol.rs   JSON-RPC 2.0 and the MCP method set
 src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp
 src/agent_backend.rs  the slow-path seam
-src/http/             router and handlers
+src/http/             router, handlers, and the access-log middleware
 web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)
 scripts/verify-deployment.sh   the one-command deployment check, local or public
 QUICKSTART.md         the six-step setup path, start to first conversation
