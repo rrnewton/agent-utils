@@ -105,8 +105,9 @@ The commands below are spelled out so you can see what each piece does. Once you
 once, `scripts/run.sh` is the repeatable version of this whole step: it refuses to start on top
 of an already-running instance, checks that every required variable is really set before it
 builds anything, optionally makes sure the cloudflared tunnel unit is up, then rebuilds and
-relaunches. Copy `gent-talk.env.example` to `.gent-talk.env` (gitignored) to configure it, and
-see `scripts/run.sh --help` for the flags and the configuration precedence.
+relaunches. Copy `gent-talk.env.example` to `~/.config/gent-talk/env` to configure it — that path
+is outside every checkout, so the file cannot be committed by accident — and see
+`scripts/run.sh --help` for the flags and the configuration precedence.
 
 ```sh
 cd gent-talk

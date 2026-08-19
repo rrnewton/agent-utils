@@ -29,11 +29,9 @@
 # Configuration precedence, HIGHEST first:
 #   1. Variables already exported in your shell environment. These always win.
 #   2. --config FILE, if given. When passed, no other file is read.
-#   3. gent-talk/.gent-talk.env        — per-checkout overlay (gitignored).
-#   4. ~/.config/gent-talk/env         — per-user base.
-# Files 3 and 4 are LAYERED: the base is read first and the per-checkout file overrides individual
-# variables in it. An empty or partial per-checkout file therefore cannot break a working per-user
-# setup. Copy gent-talk/gent-talk.env.example to get started; it documents every variable.
+#   3. ~/.config/gent-talk/env         — per-user base, shared by every checkout on this machine.
+# There is exactly ONE default configuration file, so there is never a question of which copy is
+# live. Copy gent-talk/gent-talk.env.example to it to get started; it documents every variable.
 #
 # This script never prints the value of a credential. It reports variables by NAME only.
 
@@ -43,7 +41,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 GENT_TALK_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 USER_CONFIG_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}/gent-talk/env"
-LOCAL_CONFIG_DEFAULT="$GENT_TALK_DIR/.gent-talk.env"
+USER_CONFIG_DIR="$(dirname -- "$USER_CONFIG_DEFAULT")"
 EXAMPLE_CONFIG="$GENT_TALK_DIR/gent-talk.env.example"
 
 # Required for the server to work at all. A container that starts without one of these is the
@@ -115,8 +113,8 @@ fi
 # 2 (first half). Load configuration.
 #
 # Precedence is implemented by remembering which variables the CALLING environment already set,
-# sourcing the files lowest-precedence first, then restoring the caller's values on top. That is
-# what makes an empty per-checkout file harmless.
+# sourcing the config file, then restoring the caller's values on top. That is what makes an
+# exported variable beat the file without the file having to know about it.
 # ---------------------------------------------------------------------------------------------
 
 ALL_VARS=("${REQUIRED_VARS[@]}" "${OPTIONAL_VARS[@]}" "${LAUNCHER_VARS[@]}")
@@ -144,7 +142,6 @@ if [ -n "$CONFIG_FILE" ]; then
     source_config "$CONFIG_FILE"
 else
     if [ -f "$USER_CONFIG_DEFAULT" ]; then source_config "$USER_CONFIG_DEFAULT"; fi
-    if [ -f "$LOCAL_CONFIG_DEFAULT" ]; then source_config "$LOCAL_CONFIG_DEFAULT"; fi
 fi
 
 for var in "${!PRESET_VALUES[@]}"; do
@@ -154,16 +151,16 @@ done
 if [ "${#SOURCED_FILES[@]}" -eq 0 ]; then
     die "no configuration file found.
 
-Looked for, in increasing precedence:
+Looked for:
   $USER_CONFIG_DEFAULT
-  $LOCAL_CONFIG_DEFAULT
 
-Create one with:
-  cp $EXAMPLE_CONFIG $LOCAL_CONFIG_DEFAULT
-  \$EDITOR $LOCAL_CONFIG_DEFAULT
+Create it with:
+  mkdir -p $USER_CONFIG_DIR
+  cp $EXAMPLE_CONFIG $USER_CONFIG_DEFAULT
+  \$EDITOR $USER_CONFIG_DEFAULT
 
-That example documents every variable and marks which are required. The per-checkout file is
-gitignored; never commit a filled-in copy."
+That example documents every variable and marks which are required. That file holds credentials:
+it lives outside any git checkout on purpose, so keep it there and readable only by you."
 fi
 
 # ---------------------------------------------------------------------------------------------
@@ -232,7 +229,7 @@ if [ "$STATUS_ONLY" = 1 ]; then
     step "gent-talk status"
     note "image:        $IMAGE_REF"
     note "publish:      ${HOST_ADDR}:${HOST_PORT}"
-    note "config files: ${SOURCED_FILES[*]}"
+    note "config file:  ${SOURCED_FILES[*]}"
     note "tunnel check: $([ "$TUNNEL_ENABLED" = 1 ] && echo "enabled (unit $TUNNEL_UNIT)" || echo "disabled")"
     if [ -n "$FOUND" ]; then
         note "running:"
@@ -278,7 +275,7 @@ fi
 # ---------------------------------------------------------------------------------------------
 
 step "Configuration"
-note "read (low to high precedence): ${SOURCED_FILES[*]}"
+note "config file: ${SOURCED_FILES[*]}"
 
 MISSING=()
 PLACEHOLDER=()

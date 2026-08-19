@@ -50,7 +50,10 @@ ok() { PASS=$((PASS + 1)); echo "ok   $*"; }
 # makes podman read a different, empty configuration and report ZERO running containers without
 # any error — which would turn the already-running checks below into silent false passes. Tests
 # that must not see the real ~/.config/gent-talk/env therefore either pass --config (which
-# replaces the whole file layer) or use run_sh_isolated_config, which does not need podman.
+# replaces the file layer) or use run_sh_isolated_config, which does not need podman.
+#
+# That trap is why the tunnel-from-user-config checks below assert on run.sh's OWN error text
+# rather than on anything podman reports.
 TEST_XDG_CONFIG="$TMPDIR_TEST/config"
 run_sh() {
     local out rc=0
@@ -113,8 +116,8 @@ grep -q 'EXIT' <<< "$out" || fail "--help does not say that --shutdown exits"
 ok "--help documents the flags and the config precedence"
 
 # --- 2. no configuration at all -------------------------------------------------------------
-# Run a COPY of run.sh from a temp directory, so that neither the real ~/.config/gent-talk/env
-# (already excluded by the temp HOME) nor this checkout's own .gent-talk.env is in scope.
+# Run a COPY of run.sh from a temp directory, with an empty HOME and XDG_CONFIG_HOME, so the
+# real ~/.config/gent-talk/env is out of scope and no config file exists at all.
 mkdir -p "$TMPDIR_TEST/isolated/scripts"
 cp "$RUN_SH" "$TMPDIR_TEST/isolated/scripts/run.sh"
 rc=0
@@ -126,6 +129,23 @@ printf '%s\n' "$out" >> "$ALL_OUTPUT"
 grep -q 'no configuration file found' <<< "$out" || fail "missing config error is not specific"
 grep -q 'gent-talk.env.example' <<< "$out" || fail "missing config error does not name the example file"
 ok "missing configuration fails, naming the paths searched and the example to copy"
+
+# --- 2b. a file at the REMOVED per-checkout path is not read --------------------------------
+# gent-talk/.gent-talk.env used to be a config layer. It is not one any more. A complete, valid
+# config sitting at that exact path next to run.sh must therefore change nothing: the run still
+# fails for want of a config file. Asserting the failure (rather than just "it launched") is what
+# makes this check impossible to pass by accident.
+write_config "$TMPDIR_TEST/isolated/.gent-talk.env"
+rc=0
+out="$(env -i PATH="$PATH" HOME="$TMPDIR_TEST/home-empty" \
+        XDG_CONFIG_HOME="$TMPDIR_TEST/config-empty" GENT_TALK_ENGINE="$ENGINE" \
+        bash "$TMPDIR_TEST/isolated/scripts/run.sh" --dry-run 2>&1)" || rc=$?
+printf '%s\n' "$out" >> "$ALL_OUTPUT"
+[ "$rc" -ne 0 ] || fail "a config at the removed gent-talk/.gent-talk.env path was still honoured"
+grep -q 'no configuration file found' <<< "$out" || fail "removed-overlay run failed for some other reason: $out"
+grep -q '\.gent-talk\.env' <<< "$out" && fail "run.sh still mentions the removed .gent-talk.env path"
+rm -f "$TMPDIR_TEST/isolated/.gent-talk.env"
+ok "a config file at the removed per-checkout path is ignored, and never mentioned"
 
 # --- 3. --config pointing at a file that is not there ----------------------------------------
 rc=0; out="$(run_sh --config "$TMPDIR_TEST/nope.env" --dry-run)" || rc=$?
@@ -161,12 +181,39 @@ rc=0; out="$(run_sh --config "$badch" --dry-run)" || rc=$?
 grep -q 'GENT_TALK_CHANNELS entry is malformed' <<< "$out" || fail "malformed channels error is not specific"
 ok "a malformed GENT_TALK_CHANNELS entry fails before anything is built"
 
-# --- 7. layering: an empty per-checkout overlay must not break a working base -----------------
+# --- 7. the per-user config location is the one that works ------------------------------------
 mkdir -p "$TEST_XDG_CONFIG/gent-talk"
 cp "$GOOD_CONFIG" "$TEST_XDG_CONFIG/gent-talk/env"
 out="$(run_sh_isolated_config --dry-run --no-tunnel)"
-grep -q 'Running' <<< "$out" || fail "base-only config did not reach the run step"
-ok "the per-user base config alone is enough (the owner's current setup keeps working)"
+grep -q 'Running' <<< "$out" || fail "user config did not reach the run step"
+grep -q "config file: $TEST_XDG_CONFIG/gent-talk/env" <<< "$out" \
+    || fail "run.sh did not report reading the per-user config file"
+ok "~/.config/gent-talk/env alone is enough (the owner's current setup keeps working)"
+
+# --- 7b. GENT_TALK_TUNNEL_ENABLED is honoured FROM the per-user config file -------------------
+# This flag lived only in the deleted per-checkout overlay, and losing it silently turned the
+# tunnel check off. The per-user file is now the only place it can live, so prove it is read
+# from there: not from the environment, not from --config, and not from a flag on the command
+# line. The proof is that run.sh reaches the tunnel step and fails on a unit that cannot exist.
+TUNNEL_CONFIG="$TEST_XDG_CONFIG/gent-talk/env"
+cp "$GOOD_CONFIG" "$TUNNEL_CONFIG"
+echo "GENT_TALK_TUNNEL_ENABLED=1" >> "$TUNNEL_CONFIG"
+echo "GENT_TALK_TUNNEL_UNIT=cloudflared-gent-talk-not-a-real-unit.service" >> "$TUNNEL_CONFIG"
+rc=0; out="$(run_sh_isolated_config --dry-run)" || rc=$?
+[ "$rc" -ne 0 ] || fail "GENT_TALK_TUNNEL_ENABLED=1 in the per-user config did not enable the tunnel check"
+grep -q 'cloudflared-gent-talk-not-a-real-unit.service' <<< "$out" \
+    || fail "tunnel check ran but did not name the unit from the per-user config"
+ok "GENT_TALK_TUNNEL_ENABLED=1 in ~/.config/gent-talk/env turns the tunnel check ON"
+
+# Negative control: same file, flag flipped to 0. Without this, the check above would still pass
+# if run.sh had started failing at the tunnel step for some reason unrelated to the flag.
+sed -i "s/^GENT_TALK_TUNNEL_ENABLED=.*/GENT_TALK_TUNNEL_ENABLED=0/" "$TUNNEL_CONFIG"
+out="$(run_sh_isolated_config --dry-run)"
+grep -q 'Running' <<< "$out" || fail "tunnel flag 0 in the per-user config should have reached the run step"
+grep -q 'systemctl' <<< "$out" && fail "tunnel flag 0 but the tunnel check still ran"
+ok "GENT_TALK_TUNNEL_ENABLED=0 in the same file turns it back OFF (the flag is what decides)"
+
+cp "$GOOD_CONFIG" "$TUNNEL_CONFIG"
 
 # --- 8. a good config reaches build and run, in dry run --------------------------------------
 out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel)"
