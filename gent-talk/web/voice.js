@@ -18,6 +18,7 @@
 //   textContent, never innerHTML.
 
 const TOKEN_KEY = "gent-talk.token"; // shared with the main app on purpose.
+const MIC_SETTINGS_KEY = "gent-talk.voice.mic";
 
 const el = (id) => document.getElementById(id);
 const setStatus = (text) => {
@@ -222,6 +223,108 @@ function stopPlayback() {
   session.playAt = 0;
 }
 
+// --- microphone settings ------------------------------------------------------------------------
+
+// Three knobs on the audio the browser hands us. They are exposed because each one has a failure
+// mode the owner has actually hit, and none of them is guessable from the outside: the agent
+// answering its own voice on speakerphone, background noise reaching the transcriber, and — the
+// awkward one — automatic gain amplifying a silent room until a phone being set down crosses the
+// speech threshold and gets transcribed as a word.
+//
+// The DEFAULTS here are today's behaviour, unchanged. This is an exposure change, not a
+// behaviour change.
+const MIC_TOGGLES = [
+  ["mic-echo-cancellation", "echoCancellation"],
+  ["mic-noise-suppression", "noiseSuppression"],
+  ["mic-auto-gain", "autoGainControl"],
+];
+
+const DEFAULT_MIC_SETTINGS = {
+  echoCancellation: true, // stated explicitly today.
+  noiseSuppression: true, // stated explicitly today.
+  autoGainControl: true, // NOT stated today; see `audioConstraints`.
+};
+
+/** What the checkboxes say right now. The DOM is the live truth; storage only carries it across reloads. */
+function micSettings() {
+  const settings = {};
+  for (const [id, key] of MIC_TOGGLES) {
+    settings[key] = el(id).checked === true;
+  }
+  return settings;
+}
+
+/** What was stored, defaulted per key. A corrupt or partial entry falls back to today's behaviour. */
+function storedMicSettings() {
+  const settings = { ...DEFAULT_MIC_SETTINGS };
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(MIC_SETTINGS_KEY) || "null");
+  } catch (_error) {
+    stored = null;
+  }
+  if (stored && typeof stored === "object") {
+    for (const key of Object.keys(settings)) {
+      if (typeof stored[key] === "boolean") {
+        settings[key] = stored[key];
+      }
+    }
+  }
+  return settings;
+}
+
+// The constraint object handed to getUserMedia.
+//
+// Echo cancellation and noise suppression are already stated explicitly today, so a toggle simply
+// supplies the value that was hard-coded.
+//
+// Automatic gain control is the careful one. Today it is NOT in the constraint object at all, so
+// whatever the browser's own default is, is what applies — in practice on, but the spec makes that
+// the implementation's choice, not a promise. Passing `autoGainControl: true` would convert an
+// implicit default into an explicit request, and those are not guaranteed to be the same thing on
+// every browser. Since the point of this change is to add a knob without moving anything, the ON
+// state — the default — says nothing at all, exactly as today, and only the OFF state is stated.
+// So with every toggle in its default position this returns the byte-for-byte constraint object
+// the page has always sent.
+function audioConstraints(settings) {
+  const audio = {
+    channelCount: 1,
+    echoCancellation: settings.echoCancellation,
+    noiseSuppression: settings.noiseSuppression,
+  };
+  if (!settings.autoGainControl) {
+    audio.autoGainControl = false;
+  }
+  return { audio };
+}
+
+function persistMicSettings(settings) {
+  const encoded = JSON.stringify(settings);
+  try {
+    localStorage.setItem(MIC_SETTINGS_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  // Read it back rather than assuming, exactly as saving the token does: private browsing accepts
+  // setItem and stores nothing, and "saved" would then be a lie found out only after a reload.
+  return localStorage.getItem(MIC_SETTINGS_KEY) === encoded;
+}
+
+// A toggle flipped mid-call does NOT reach the open microphone — the constraints were read when
+// the stream opened. Saying "saved" and stopping there would leave a control that looks like it
+// did something; so the line under the toggles states which call the change lands on.
+function micSettingsChanged() {
+  const saved = persistMicSettings(micSettings());
+  const when = session.stream
+    ? "The microphone is already open, so this does NOT change the call in progress — hang up " +
+      "and start again to apply it."
+    : "It applies the next time you start talking.";
+  el("mic-settings-state").textContent = saved
+    ? `Saved. ${when}`
+    : "This browser refused to store the setting, so it will be forgotten when you reload " +
+      `(private browsing does this). ${when}`;
+}
+
 // --- step 2 and 3: connect, stream -------------------------------------------------------------
 
 async function start() {
@@ -240,9 +343,9 @@ async function start() {
   );
 
   setStatus("asking for the microphone…");
-  session.stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-  });
+  // Read HERE, at the moment the stream opens — which is why a toggle flipped mid-call cannot
+  // reach this one, and why `micSettingsChanged` says so out loud.
+  session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(micSettings()));
   session.audio = new (window.AudioContext || window.webkitAudioContext)();
   await session.audio.resume(); // iOS starts it suspended until a gesture.
 
@@ -459,6 +562,12 @@ el("forget-token").addEventListener("click", () => {
   setTokenState("no token saved in this browser");
   setStatus("token forgotten");
 });
+// The checkboxes are the live truth `start()` reads, so they are what gets restored on load.
+const restoredMicSettings = storedMicSettings();
+for (const [id, key] of MIC_TOGGLES) {
+  el(id).checked = restoredMicSettings[key];
+  el(id).addEventListener("change", micSettingsChanged);
+}
 el("start").addEventListener("click", guard(start));
 el("stop").addEventListener("click", stop);
 setTokenState(token() ? "token saved in this browser" : "no token saved in this browser");

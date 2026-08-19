@@ -54,8 +54,10 @@ fn the_voice_page_suite_passes() {
         "the /voice page suite failed:\n{text}"
     );
     assert_eq!(failed, 0, "the /voice page suite failed:\n{text}");
+    // Raise this with the suite. It is a floor against a suite that stopped COLLECTING, so it has
+    // to track the real count; left behind, it would keep passing while half the file went missing.
     assert!(
-        passed >= 10,
+        passed >= 21,
         "the /voice page suite ran only {passed} tests, so something stopped collecting them:\n\
          {text}"
     );

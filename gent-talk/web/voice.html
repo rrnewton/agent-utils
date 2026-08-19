@@ -45,6 +45,44 @@
 
         <div id="detail" class="panel muted"></div>
 
+        <!-- Collapsed by default, and BELOW the Start button on purpose: these are knobs for when
+             something sounds wrong, not part of placing a call. The browser's own <details> does
+             the collapsing, so there is no toggle script to get out of step with the markup. -->
+        <details class="settings">
+          <summary>Microphone settings</summary>
+          <p class="hint">
+            These are asked of the browser when the microphone opens, so a change here applies to
+            your <strong>next</strong> call, not the one in progress.
+          </p>
+
+          <label class="toggle">
+            <input id="mic-echo-cancellation" type="checkbox" checked />
+            Echo cancellation
+          </label>
+          <p class="hint">
+            Stops the agent hearing itself through your speaker and answering its own voice.
+            Headphones solve this too; leave it on if you are on speakerphone.
+          </p>
+
+          <label class="toggle">
+            <input id="mic-noise-suppression" type="checkbox" checked />
+            Noise suppression
+          </label>
+          <p class="hint">Filters steady background noise — a fan, road noise, a room's hum.</p>
+
+          <label class="toggle">
+            <input id="mic-auto-gain" type="checkbox" checked />
+            Automatic gain control
+          </label>
+          <p class="hint">
+            Amplifies quiet input. In a near-silent room it boosts small incidental sounds — a
+            phone being set down — until they cross the speech threshold and get transcribed as
+            words. Turn it <strong>off</strong> if you are getting phantom transcripts.
+          </p>
+
+          <p id="mic-settings-state" class="hint" aria-live="polite"></p>
+        </details>
+
         <p class="hint">
           Tap “Start talking”, then allow the microphone. A signed URL is good for about fifteen
           minutes, so this page mints a fresh one every time you start.
