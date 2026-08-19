@@ -201,7 +201,15 @@ running_containers() {
     "$ENGINE" ps --format '{{.ID}}|{{.Image}}|{{.Names}}|{{.Ports}}|{{.Status}}' 2>/dev/null \
         | awk -F'|' -v img="$IMAGE_REF" -v port="$HOST_PORT" '
             {
-                image_match = ($2 == img) || (index($2, "/" img) == length($2) - length(img))
+                # A registry-qualified image reads "localhost/gent-talk:v0", so accept an exact
+                # match or a "/"-prefixed suffix match. The index() > 0 guard is load-bearing:
+                # index() returns 0 when the substring is ABSENT, and 0 also equals
+                # length($2) - length(img) whenever the two references happen to be the same
+                # length -- so without it, "gent-talk:dryrun-probe" matched the unrelated
+                # "localhost/gent-talk:ci". A false match here is not cosmetic: under --shutdown
+                # or --restart this function decides what gets STOPPED.
+                slash_at = index($2, "/" img)
+                image_match = ($2 == img) || (slash_at > 0 && slash_at == length($2) - length(img))
                 # A published port renders as e.g. "127.0.0.1:8080->8080/tcp"; requiring the
                 # colon immediately before the number keeps ":8080->" from matching ":18080->".
                 port_match = (index($4, ":" port "->") > 0)

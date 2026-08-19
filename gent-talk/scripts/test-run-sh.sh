@@ -259,6 +259,19 @@ if command -v "$ENGINE" >/dev/null 2>&1; then
         grep -q "${CREATED_CONTAINER:0:12}" <<< "$out" || fail "--status did not list the running container"
         ok "--status lists the running container"
 
+        # An image reference of the SAME LENGTH as the running one must not match it. This
+        # is the regression test for a real false match: index() returns 0 when the substring
+        # is absent, and the old code compared that 0 against length(image) - length(target),
+        # which is also 0 for equal-length references. "gent-talk-selftest:samelength12" is 31
+        # characters, exactly like the running "localhost/gent-talk-selftest:t0". The port is
+        # moved off the running one too, so the image comparison is what is under test.
+        rc=0; out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel \
+                        --tag samelength12 --port 18098)" || rc=$?
+        [ "$rc" -eq 0 ] || fail "an equal-length, unrelated image reference was matched as running: $out"
+        grep -q 'already running' <<< "$out" && fail "equal-length image reference falsely matched the running container"
+        grep -q 'Running' <<< "$out" || fail "equal-length-image run did not reach the run step"
+        ok "an unrelated image of the same reference length is not mistaken for a running instance"
+
         # The owner's real container is on port 8080 with image gent-talk:v0. Neither the
         # throwaway image name nor the throwaway port can match it.
         out="$(run_sh --config "$GOOD_CONFIG" --shutdown)"
