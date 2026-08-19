@@ -797,6 +797,50 @@ bearer check in the MCP transport (3 failures), removing the channel allowlist i
 (3), removing the fence-forgery neutralization in `src/untrusted.rs` (5), and removing the
 write-scope fence in the MCP dispatcher (1). All four were reverted; the suite is green.
 
+### Looking at the page
+
+Every test above drives behaviour. **Not one of them lays anything out**, so not one of them can
+tell you the page looks right — the `/voice` suite says so about itself. That gap is not
+theoretical: a single photograph of the owner's phone showed three defects the whole suite had
+passed over, because a clipped paragraph and a control that reads as active on a dead call are
+layout facts and a fixture with no layout engine has no opinion about them.
+
+```sh
+scripts/run.sh --screenshots
+```
+
+Photographs the `/voice` page in the eight states that look different — signed out, idle, live
+call, muted, just after a hang-up, settings, the Discord tab, and a long transcript parked
+mid-scroll — at three viewports: a tall phone, a short phone, and desktop width. It prints the
+absolute path of every image so an agent can open them directly.
+
+It costs nothing and needs no hardware. The conversation WebSocket is replaced before any page
+script runs, and the mint request to `/api/v1/signed-url` is answered locally, so the live-call
+states are reached without ElevenLabs being contacted; the microphone is Chromium's own fake
+capture device, so `getUserMedia`, the AudioContext and the real capture graph all still run. It
+stands up its own throwaway native server with `--fake-discord` on port 18091 and stops it again,
+including on failure — it refuses port 8080 by name, because that is the live deployment.
+
+The two ways a screenshot harness lies are both closed, and both were verified by mutation:
+
+* **Eight pictures of the same idle screen.** Every state declares what must be true of the live
+  page before the shutter opens, and each is pinned to its OWN marker — the post-call shot checks
+  for the line that marks the end of a conversation, the muted shot for the muted label. A state
+  whose expectations do not hold fails BY NAME and is not photographed approximately.
+* **A picture of a page that never rendered.** A white rectangle is a valid PNG. Every capture is
+  decoded (in the standard library — no image dependency) and rejected if it is too small, too
+  few bytes, under sixteen distinct colours, or more than 99.5% one flat colour. The check sits on
+  the only function that writes a file, so there is no second path that saves an unjudged image.
+
+`scripts/screenshots.py --self-test` runs 27 controls for those checks offline, with no browser and
+no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
+the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
+only requirement, and a missing one fails by name with the install command.
+
+The harness is opt-in and in no default suite. It rebuilds the binary first, because `web/` is
+compiled into it with `include_str!` — without that you photograph the last build's markup and
+believe it is today's.
+
 ## Layout
 
 ```text
@@ -820,6 +864,7 @@ web/                  the phone app and the /voice page (plain HTML/CSS/JS, no f
 tests/js/             the /voice page's own suite, run from cargo test via tests/voice_page.rs
 scripts/verify-deployment.sh   the one-command deployment check, local or public
 scripts/smoke-agent.py         the manual, billed check that the AGENT really calls us
+scripts/screenshots.py         photographs /voice in every state, so an agent can SEE the page
 QUICKSTART.md         the six-step setup path, start to first conversation
 ```
 

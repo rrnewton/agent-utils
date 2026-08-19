@@ -11,7 +11,7 @@
 #
 # Usage:
 #   scripts/run.sh [--shutdown] [--restart] [--logs] [--follow] [--status] [--tunnel-status]
-#                  [--smoke-agent [--nonce]]
+#                  [--smoke-agent [--nonce]] [--screenshots [--out DIR]]
 #                  [--config FILE] [--tunnel|--no-tunnel] [--tag TAG] [--port PORT]
 #                  [--restart-policy POLICY] [--dry-run] [--help]
 #
@@ -62,6 +62,35 @@
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
+#   --screenshots  Photograph the /voice page in every state that looks different, so an agent can
+#                  LOOK at the interface before the owner does. FREE and offline: no vendor
+#                  conversation, no microphone, no money. The conversation WebSocket is replaced by
+#                  a fake and the microphone is Chromium's built-in fake capture device, so the
+#                  live-call, muted and post-call states are reached without ElevenLabs ever being
+#                  contacted.
+#
+#                  Why it exists: the /voice page's own suite drives the real script and asserts
+#                  that the right properties sit on the right selectors, but it lays NOTHING out,
+#                  so it cannot tell you the page looks right. One photograph of a phone showed
+#                  three defects the whole suite had passed over. This is the check that can see.
+#
+#                  It starts its OWN throwaway server, native (not a container), with
+#                  --fake-discord, on port 18091 by default — never 8080, and it refuses to use it.
+#                  It never touches the running gent-talk, or its config, or its logs. The server
+#                  is stopped again when the run ends, including on failure.
+#
+#                  Each capture is checked: the expected state must actually be on screen before
+#                  the shutter opens, and the resulting image must not be blank or a single flat
+#                  colour. A state that cannot be reached FAILS BY NAME rather than being
+#                  photographed approximately.
+#
+#                  It is opt-in and is in no suite. Needs the python3 'playwright' package and its
+#                  Chromium; it says so by name, with the install command, if either is missing.
+#                  It rebuilds the binary first, because web/ is compiled INTO it — without that
+#                  you photograph the last build's markup and believe it is today's.
+#   --out DIR      Only with --screenshots. Where to write the PNGs (default: a timestamped
+#                  directory under gent-talk/debug/screenshots/, which is gitignored). Screenshots
+#                  are evidence, never source, and are never committed.
 #   --config FILE  Use exactly this configuration file and no other. Missing file is an error.
 #   --tunnel       Force the cloudflared tunnel check ON for this run.
 #   --no-tunnel    Force the cloudflared tunnel check OFF for this run.
@@ -168,6 +197,8 @@ FOLLOW=0
 TUNNEL_STATUS_ONLY=0
 SMOKE_AGENT=0
 SMOKE_NONCE=0
+SCREENSHOTS=0
+SHOTS_OUT=""
 TUNNEL_OVERRIDE=""
 TAG_OVERRIDE=""
 PORT_OVERRIDE=""
@@ -198,6 +229,8 @@ while [ $# -gt 0 ]; do
         --tunnel-status) TUNNEL_STATUS_ONLY=1; shift ;;
         --smoke-agent) SMOKE_AGENT=1; shift ;;
         --nonce) SMOKE_NONCE=1; shift ;;
+        --screenshots) SCREENSHOTS=1; shift ;;
+        --out) SHOTS_OUT="${2:?--out needs a directory}"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unrecognized argument: $1" >&2; echo "" >&2; usage >&2; exit 2 ;;
     esac
@@ -219,6 +252,7 @@ if [ "$LOGS_ONLY" = 1 ]; then ACTIONS_GIVEN+=(--logs); fi
 if [ "$FOLLOW" = 1 ]; then ACTIONS_GIVEN+=(--follow); fi
 if [ "$TUNNEL_STATUS_ONLY" = 1 ]; then ACTIONS_GIVEN+=(--tunnel-status); fi
 if [ "$SMOKE_AGENT" = 1 ]; then ACTIONS_GIVEN+=(--smoke-agent); fi
+if [ "$SCREENSHOTS" = 1 ]; then ACTIONS_GIVEN+=(--screenshots); fi
 if [ "${#ACTIONS_GIVEN[@]}" -gt 1 ]; then
     die "these actions cannot be combined: ${ACTIONS_GIVEN[*]}
 Each one ends the run somewhere different. Pick exactly one and re-run.
@@ -232,6 +266,163 @@ It is the strong form of that check: it posts one unique token to the channel th
 server's own write API and requires the agent to relay it back verbatim. On its own there is
 nothing for it to modify, and accepting it silently would leave you believing you had run the
 strong check when you had not."
+fi
+
+if [ -n "$SHOTS_OUT" ] && [ "$SCREENSHOTS" != 1 ]; then
+    die "--out only means something together with --screenshots.
+It names the directory the /voice screenshots are written to. On its own there is nothing to
+write, and accepting it silently would leave you believing you had chosen an output directory for
+a run that never took a picture."
+fi
+
+# ---------------------------------------------------------------------------------------------
+# Screenshots of the /voice page. FREE, offline, and deliberately self-contained.
+#
+# It is handled HERE, before any configuration is loaded, because it needs NONE of the owner's
+# configuration and must never read it: it stands up its own throwaway server with its own
+# throwaway credentials against an in-memory Discord. Reading ~/.config/gent-talk/env would give
+# this action the real bot token for no reason, and would make it fail on a machine that has no
+# deployment at all — which is exactly the machine where you most want to look at the page.
+#
+# Nothing here touches the owner's container. It publishes no port the deployment uses, builds no
+# image, stops nothing and starts no container.
+# ---------------------------------------------------------------------------------------------
+
+if [ "$SCREENSHOTS" = 1 ]; then
+    SHOTS_SCRIPT="$SCRIPT_DIR/screenshots.py"
+    [ -x "$SHOTS_SCRIPT" ] || die "the screenshot harness is missing or not executable: $SHOTS_SCRIPT"
+
+    SHOTS_PORT="${PORT_OVERRIDE:-18091}"
+    case "$SHOTS_PORT" in
+        ''|*[!0-9]*) die "--port must be a number, got: $SHOTS_PORT" ;;
+    esac
+    # Named, not merely "in use". 8080 serves the owner's live agent and 18081 is the unrelated
+    # gent-talk:ci container; a screenshot run that bound either would take down something real to
+    # photograph something fake. The refusal says which one and why, because "port in use" would
+    # send the reader looking for a stale process that is not the problem.
+    if [ "$SHOTS_PORT" = 8080 ]; then
+        die "--screenshots refuses port 8080. That is the LIVE gent-talk, serving the owner's
+agent. This action stands up a throwaway server of its own and must never contend with it.
+Leave --port off to use $((18091)), or pass a different one."
+    fi
+    if [ "$SHOTS_PORT" = 18081 ]; then
+        die "--screenshots refuses port 18081. That is the unrelated gent-talk:ci container.
+Leave --port off to use 18091, or pass a different one."
+    fi
+    # Anything else already listening is a stale run or a coincidence, and binding on top of it
+    # would photograph somebody else's server.
+    if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -Eq "[:.]${SHOTS_PORT}[[:space:]]"; then
+        die "something is already listening on port $SHOTS_PORT.
+Screenshots would then be taken against whatever that is, not against the server this action
+starts. Stop it, or choose another port with --port."
+    fi
+
+    command -v cargo >/dev/null 2>&1 || die "--screenshots needs cargo, and it is not on PATH.
+The /voice page is compiled INTO the server binary (web/voice.html and web/voice.js are
+include_str! constants), so a stale binary serves last build's markup. Install Rust, or build
+the binary yourself and re-run."
+
+    SHOTS_STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+    if [ -z "$SHOTS_OUT" ]; then
+        SHOTS_OUT="$GENT_TALK_DIR/debug/screenshots/$SHOTS_STAMP"
+    fi
+
+    # Throwaway credentials. They are 24+ characters because the server refuses shorter ones, and
+    # they are visibly not real so that finding one in a log is never confusing. Nothing they
+    # authenticate against exists outside this run.
+    SHOTS_READ_TOKEN="screenshot-run-read-token-not-a-real-credential"
+    SHOTS_WRITE_TOKEN="screenshot-run-write-token-not-a-real-credential"
+    SHOTS_CHANNEL="100000000000000001"
+
+    SHOTS_TMP="$(mktemp -d)"
+    SHOTS_PID=""
+    shots_cleanup() {
+        if [ -n "$SHOTS_PID" ] && kill -0 "$SHOTS_PID" 2>/dev/null; then
+            kill "$SHOTS_PID" 2>/dev/null || true
+            wait "$SHOTS_PID" 2>/dev/null || true
+        fi
+        rm -rf "$SHOTS_TMP"
+    }
+    # On failure too: a throwaway server left running would hold the port and the next run would
+    # refuse to start, for a reason that looks nothing like the failure that caused it.
+    trap shots_cleanup EXIT
+
+    cat > "$SHOTS_TMP/gent-talk.toml" <<EOF
+[server]
+bind = "127.0.0.1:$SHOTS_PORT"
+
+[discord]
+bot_token = "screenshot-run-bot-token-never-sent-anywhere"
+
+[auth]
+read_token = "$SHOTS_READ_TOKEN"
+write_token = "$SHOTS_WRITE_TOKEN"
+
+[[channels]]
+id = "$SHOTS_CHANNEL"
+label = "lead team"
+writable = true
+EOF
+
+    step "Screenshots of /voice — free, offline, no vendor conversation and no microphone."
+    note "server:    throwaway, native, --fake-discord, 127.0.0.1:$SHOTS_PORT (never 8080)"
+    note "output:    $SHOTS_OUT"
+    note "the running gent-talk, its config and its logs are not touched."
+
+    if [ "$DRY_RUN" = 1 ]; then
+        note "(dry run) cargo build --release --manifest-path $GENT_TALK_DIR/Cargo.toml"
+        note "(dry run) $GENT_TALK_DIR/target/release/gent-talk --config $SHOTS_TMP/gent-talk.toml --fake-discord"
+        note "(dry run) $SHOTS_SCRIPT --url http://127.0.0.1:$SHOTS_PORT --channel $SHOTS_CHANNEL --out $SHOTS_OUT"
+        note "(dry run) nothing was built, started, or photographed."
+        exit 0
+    fi
+
+    step "Rebuilding the server, because web/ is compiled into it"
+    cargo build --release --manifest-path "$GENT_TALK_DIR/Cargo.toml" \
+        || die "the build failed, so there is no binary serving today's web/ to photograph."
+    SHOTS_BIN="$GENT_TALK_DIR/target/release/gent-talk"
+    [ -x "$SHOTS_BIN" ] || die "the build reported success but $SHOTS_BIN is not there."
+
+    step "Starting the throwaway server"
+    (
+        cd "$SHOTS_TMP" || exit 1
+        exec "$SHOTS_BIN" --config "$SHOTS_TMP/gent-talk.toml" --fake-discord \
+            > "$SHOTS_TMP/server.log" 2>&1
+    ) &
+    SHOTS_PID=$!
+
+    SHOTS_UP=0
+    for _ in $(seq 1 60); do
+        if ! kill -0 "$SHOTS_PID" 2>/dev/null; then break; fi
+        if curl -fsS -o /dev/null "http://127.0.0.1:$SHOTS_PORT/healthz" 2>/dev/null; then
+            SHOTS_UP=1
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$SHOTS_UP" != 1 ]; then
+        echo "" >&2
+        echo "--- throwaway server output ---" >&2
+        cat "$SHOTS_TMP/server.log" >&2 || true
+        die "the throwaway server never answered on 127.0.0.1:$SHOTS_PORT. Its output is above."
+    fi
+    note "up on 127.0.0.1:$SHOTS_PORT (pid $SHOTS_PID)"
+
+    # Through the environment, never the command line, for the same reason as the smoke test: a
+    # command line is readable by every process on this box.
+    export GENT_TALK_WRITE_TOKEN="$SHOTS_WRITE_TOKEN"
+    rc=0
+    "$SHOTS_SCRIPT" \
+        --url "http://127.0.0.1:$SHOTS_PORT" \
+        --channel "$SHOTS_CHANNEL" \
+        --out "$SHOTS_OUT" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "" >&2
+        echo "The screenshot run FAILED (exit $rc). Nothing above is evidence about how the page" >&2
+        echo "looks; see the exit-code table in $SHOTS_SCRIPT for what this one means." >&2
+        exit "$rc"
+    fi
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------------------------
