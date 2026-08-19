@@ -109,9 +109,12 @@ import zlib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Literal, TypedDict, cast
 from urllib.error import URLError
 from urllib.request import urlopen
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Browser, Page, Playwright
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -538,8 +541,27 @@ STUB_JS = r"""
 # the worst kind of wrong picture: every image was real, and every one was of the wrong page.
 # Contrast between the two speakers is exactly what does not survive the swap, so dark is the
 # default here and light is opt-in.
-THEMES = ("dark", "light")
-DEFAULT_THEME = "dark"
+Theme = Literal["dark", "light"]
+THEMES: tuple[Theme, ...] = ("dark", "light")
+DEFAULT_THEME: Theme = "dark"
+
+
+class Viewport(TypedDict):
+    """The viewport dimensions Playwright accepts."""
+
+    width: int
+    height: int
+
+
+class ContextOptions(TypedDict):
+    """The exact subset of browser-context options a capture profile supplies."""
+
+    viewport: Viewport
+    device_scale_factor: float
+    is_mobile: bool
+    has_touch: bool
+    user_agent: str
+    color_scheme: Theme
 
 
 @dataclass(frozen=True)
@@ -559,7 +581,7 @@ class Profile:
     mobile: bool
     user_agent: str
 
-    def context_options(self, theme: str) -> dict:
+    def context_options(self, theme: Theme) -> ContextOptions:
         return {
             "viewport": {"width": self.width, "height": self.height},
             "device_scale_factor": self.scale,
@@ -636,7 +658,7 @@ class Driver:
     """Walks one browser page through the scenes, capturing as it goes."""
 
     def __init__(
-        self, page, base_url: str, token: str, out_dir: Path, profile: Profile, theme: str
+        self, page: Page, base_url: str, token: str, out_dir: Path, profile: Profile, theme: Theme
     ) -> None:
         self.theme = theme
         self.page = page
@@ -674,8 +696,8 @@ class Driver:
     def settle(self, ms: int = 250) -> None:
         self.page.wait_for_timeout(ms)
 
-    def js(self, expression: str):
-        return self.page.evaluate(f"() => ({expression})")
+    def js(self, expression: str) -> object:
+        return cast(object, self.page.evaluate(f"() => ({expression})"))
 
     # -- capture ---------------------------------------------------------------------------------
 
@@ -697,6 +719,7 @@ class Driver:
             if not held:
                 raise Unreachable(scene.name, description, f"check: {expression}")
 
+        animations: Literal["allow", "disabled"]
         if scene.animation_offset_ms is not None:
             # Freeze the pulse at a chosen point of its cycle rather than at whatever instant the
             # shutter happened to fall on. The ring animates from opacity 0.55 to 0, so an
@@ -1196,7 +1219,7 @@ def ensure_playwright() -> None:
             )
 
 
-def open_browser(playwright):
+def open_browser(playwright: Playwright) -> Browser:
     try:
         return playwright.chromium.launch(
             args=[
@@ -1218,7 +1241,7 @@ def open_browser(playwright):
 
 
 def run_captures(
-    url: str, token: str, channel: str, out_dir: Path, only: Iterable[str], themes: Iterable[str]
+    url: str, token: str, channel: str, out_dir: Path, only: Iterable[str], themes: Iterable[Theme]
 ) -> list[tuple[str, Path, Verdict]]:
     try:
         from playwright.sync_api import sync_playwright
@@ -1452,11 +1475,11 @@ def check_state_controls() -> list[str]:
         "11-long-transcript-scrolled": "scrollTop",
     }
     for name, needle in required.items():
-        scene = next((s for s in SCENES if s.name == name), None)
-        if scene is None:
+        required_scene = next((s for s in SCENES if s.name == name), None)
+        if required_scene is None:
             problems.append(f"the '{name}' state is gone from the scene table.")
             continue
-        if not any(needle in expression for _description, expression in scene.expect):
+        if not any(needle in expression for _description, expression in required_scene.expect):
             problems.append(
                 f"scene '{name}' no longer checks for {needle!r} before capturing, so a run that "
                 "never reached that state would still write a picture under its name."
@@ -1817,7 +1840,7 @@ def main(argv: list[str]) -> int:
         return EXIT_UNREACHABLE
 
     try:
-        themes = THEMES if args.theme == "both" else (args.theme,)
+        themes = THEMES if args.theme == "both" else (cast(Theme, args.theme),)
         results = run_captures(args.url, token, args.channel or "", out_dir, args.only, themes)
     except PlaywrightMissing as error:
         print(f"screenshots.py: {error}", file=sys.stderr)

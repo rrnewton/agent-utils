@@ -151,7 +151,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Sequence
+from typing import Iterable, Sequence, TypeAlias, cast
+from unittest.mock import patch
+
+JsonValue: TypeAlias = (
+    str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+)
 
 # --- exit codes ---------------------------------------------------------------------------------
 
@@ -1119,8 +1124,12 @@ def check_diagnostics_controls() -> list[str]:
 
 
 def http_json(
-    url: str, token: str, method: str = "GET", payload: dict[str, Any] | None = None, timeout: int = 30
-) -> tuple[int, Any]:
+    url: str,
+    token: str,
+    method: str = "GET",
+    payload: dict[str, JsonValue] | None = None,
+    timeout: int = 30,
+) -> tuple[int, JsonValue]:
     """One request to our own API. Returns (status, parsed-body-or-raw-text)."""
     data = json.dumps(payload).encode() if payload is not None else None
     request = urllib.request.Request(url, data=data, method=method)
@@ -1142,7 +1151,7 @@ def http_json(
             f"could not reach {url}: {error}. Is the container running, and is --url right?",
         ) from error
     try:
-        return status, json.loads(body)
+        return status, cast(JsonValue, json.loads(body))
     except json.JSONDecodeError:
         return status, body
 
@@ -1418,7 +1427,7 @@ class Runner:
                 f"reading the channel ourselves returned {status}: {body}. Without our own copy of "
                 "the message there is nothing to compare the agent's reply against.",
             )
-        messages = body.get("messages") or []
+        messages = cast(list[dict[str, JsonValue]], body.get("messages") or [])
         if not messages:
             # A REFUSAL, not a verdict. With nothing to relay, the grounding assertion has nothing
             # to match: depending only on how it happens to be written it would trivially pass or
@@ -1485,7 +1494,8 @@ class Runner:
         )
         if status != 200 or not isinstance(body, dict):
             return None
-        tools = (body.get("result") or {}).get("tools")
+        result = cast(dict[str, JsonValue], body.get("result") or {})
+        tools = result.get("tools")
         return len(tools) if isinstance(tools, list) else None
 
     def report_agent_scope(self, conversation: Conversation) -> None:
@@ -1552,7 +1562,7 @@ class Runner:
                 "503 elevenlabs_not_configured names the setting that is missing; 502 "
                 "elevenlabs_error carries what ElevenLabs said. No conversation was attempted.",
             )
-        signed_url = body["signed_url"]
+        signed_url = cast(str, body["signed_url"])
         self.signed_urls.append(signed_url)
         host = urllib.parse.urlsplit(signed_url).netloc
         # The URL itself is a bearer credential for the next fifteen minutes. Its HOST is what an
@@ -1707,48 +1717,64 @@ def check_exit_status_controls() -> list[str]:
     bottom of the file turns that into the process status.
     """
     problems = []
-    latest = Latest(
+    expected_latest = Latest(
         author="owner",
         timestamp=SPOKEN_EASTERN_INSTANT,
         content="Rebuilt the container after the sparkplug refactor; digest looks right now.",
     )
-    nonce = "gtverify-1755607000-a3f9c1"
+    expected_nonce = "gtverify-1755607000-a3f9c1"
 
-    class StubConversation:
+    class StubConversation(Conversation):
         def __init__(self, reply: str) -> None:
-            self.reply = reply
-            self.responses_after_ask = [reply]
-            self.seconds = 0.0
-            self.conversation_id = "self-test"
-            self.close_code = 1000
-            self.event_types: dict[str, int] = {}
-            self.diagnostics: list[str] = []
-            self.mcp_tool_calls: list[str] = []
+            super().__init__(
+                conversation_id="self-test",
+                responses_after_ask=[reply],
+                seconds=0.0,
+                close_code=1000,
+            )
 
-    def stub_hold_round(self: Runner, name: str, latest_: Latest, nonce_: str | None) -> Round:
-        reply = "I had a look and it all seems fine." if name == "cheap" else f"It says {nonce}."
-        round_ = Round(name=name, nonce=nonce_, latest=latest_, conversation=StubConversation(reply))
+    def stub_http_json(
+        url: str,
+        token: str,
+        method: str = "GET",
+        payload: dict[str, JsonValue] | None = None,
+        timeout: int = 30,
+    ) -> tuple[int, JsonValue]:
+        return 200, {}
+
+    def stub_read_latest(self: Runner) -> Latest:
+        return expected_latest
+
+    def stub_post_nonce(self: Runner) -> tuple[str, Latest]:
+        return expected_nonce, expected_latest
+
+    def stub_hold_round(self: Runner, name: str, latest: Latest, nonce: str | None) -> Round:
+        reply = (
+            "I had a look and it all seems fine."
+            if name == "cheap"
+            else f"It says {expected_nonce}."
+        )
+        round_ = Round(name=name, nonce=nonce, latest=latest, conversation=StubConversation(reply))
         self.rounds.append(round_)
         return round_
 
-    saved = (http_json, Runner.read_latest, Runner.post_nonce, Runner.hold_round)
     environment = {
         key: os.environ.get(key)
         for key in ("GENT_TALK_READ_TOKEN", "GENT_TALK_WRITE_TOKEN")
     }
-    module = sys.modules[__name__]
     try:
-        module.http_json = lambda *a, **k: (200, {})  # type: ignore[assignment]
-        Runner.read_latest = lambda self: latest  # type: ignore[assignment]
-        Runner.post_nonce = lambda self: (nonce, latest)  # type: ignore[assignment]
-        Runner.hold_round = stub_hold_round  # type: ignore[assignment]
         os.environ["GENT_TALK_READ_TOKEN"] = "self-test-read-credential"
         os.environ["GENT_TALK_WRITE_TOKEN"] = "self-test-write-credential"
         buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
+        with (
+            patch(f"{__name__}.http_json", stub_http_json),
+            patch.object(Runner, "read_latest", stub_read_latest),
+            patch.object(Runner, "post_nonce", stub_post_nonce),
+            patch.object(Runner, "hold_round", stub_hold_round),
+            contextlib.redirect_stdout(buffer),
+        ):
             code = main(["--url", "http://self-test.invalid", "--channel", "c", "--no-log-check"])
     finally:
-        module.http_json, Runner.read_latest, Runner.post_nonce, Runner.hold_round = saved  # type: ignore[assignment]
         for key, value in environment.items():
             if value is None:
                 os.environ.pop(key, None)
