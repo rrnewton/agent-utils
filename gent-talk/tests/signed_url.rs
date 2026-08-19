@@ -265,6 +265,10 @@ async fn the_voice_page_is_public_code_and_carries_no_credential() {
     for (path, needle) in [
         ("/voice", "<title>gent-talk — voice</title>"),
         ("/voice.js", "/api/v1/signed-url"),
+        // The page LINKS this file. A missing route would not error anywhere — it would serve a
+        // 404 into a <link> and render the app frame as a plain scrolling document, which is
+        // exactly the regression the frame exists to remove, and it would look like a CSS bug.
+        ("/voice.css", "100dvh"),
     ] {
         let response = harness
             .router
