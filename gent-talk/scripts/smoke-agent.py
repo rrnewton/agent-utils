@@ -79,9 +79,18 @@ THE TWO ASSERTIONS
    a run stops BEFORE any conversation is opened, with exit 20 -- neither a pass nor a fail --
    and nothing is billed.
 
+   THAT ESCALATION HAS ALREADY FIRED ONCE, on 2026-08-19, and it was right: the agent was reading
+   and this script was wrong. It is a VOICE agent, so it SPEAKS the timestamp -- "thirteen
+   fifty-one Eastern Time on August nineteenth, two thousand twenty-six" -- and a digit-only
+   matcher rejects that. The matcher now accepts spoken numerals and a time rendered in any real
+   zone; what it did NOT do is stop requiring a timestamp, because that is the half that forces
+   the reply to commit to WHICH message it is relaying. See RelayVerdict.grounded for the argument
+   and check_spoken_timestamp_controls() for the controls that keep the leniency honest.
+
    Each assertion ships with its controls, run every time (--self-test runs them alone, offline):
    the log scanner must find a real captured tool line and must NOT fire on a handshake-only log,
-   and the relay check must reject a fluent confabulated reply.
+   the relay check must reject a fluent confabulated reply AND a different time spoken in the same
+   style, and a FAILED run must return the exit code documented below rather than 0.
 
 WHAT IT WILL NOT DO
 ===================
@@ -129,6 +138,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
+import io
 import json
 import os
 import random
@@ -427,27 +438,223 @@ def despace(text: str) -> str:
     return re.sub(r"[^0-9a-z]", "", text.lower())
 
 
+def parse_hm(iso: str) -> tuple[str, str, str, int, int] | None:
+    """(year, month, day, hour, minute) from an ISO-8601 timestamp, or None if it is not one."""
+    match = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", iso)
+    if not match:
+        return None
+    year, month, day, hour24, minute = match.groups()
+    return year, month, day, int(hour24), int(minute)
+
+
 def timestamp_forms(iso: str) -> list[str]:
-    """Renderings of an ISO-8601 timestamp an agent might plausibly speak it back as.
+    """WRITTEN renderings of an ISO-8601 timestamp, in the zone we hold it in.
 
     Matching is to the MINUTE. A minute is already far beyond what a model can invent -- there are
     1440 of them in a day and the reply would have to land on the right one -- while insisting on
     the second would fail honestly-grounded replies that round, which is a false alarm, not rigour.
+
+    This is only half the matcher; a VOICE agent usually speaks the time instead of writing it, and
+    spoken_timestamp_hit() below handles that. This function is also what Latest.assertable asks
+    "is there a timestamp here at all?", so it stays cheap and total.
     """
-    match = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})", iso)
-    if not match:
+    parsed = parse_hm(iso)
+    if not parsed:
         return []
-    year, month, day, hour24, minute = match.groups()
-    hour = int(hour24)
+    year, month, day, hour, minute = parsed
     hour12 = hour % 12 or 12
     forms = [
-        f"{year}-{month}-{day}t{hour24}:{minute}",
-        f"{year}-{month}-{day} {hour24}:{minute}",
-        f"{hour24}:{minute}",
-        f"{hour12}:{minute}",
+        f"{year}-{month}-{day}t{hour:02d}:{minute:02d}",
+        f"{year}-{month}-{day} {hour:02d}:{minute:02d}",
+        f"{hour:02d}:{minute:02d}",
+        f"{hour12}:{minute:02d}",
     ]
     # Deduplicated, longest first, so the report names the most specific form that matched.
     return sorted(dict.fromkeys(forms), key=len, reverse=True)
+
+
+# --- spoken, and possibly re-zoned, timestamps ---------------------------------------------------
+#
+# It is a VOICE agent, so it SPEAKS the time rather than writing it. Two replies it actually gave:
+#
+#   "thirteen ten and fifty-two seconds UTC on August nineteenth, twenty twenty-six"
+#   "thirteen fifty-one Eastern Time on August nineteenth, two thousand twenty-six"
+#
+# A digit-only matcher rejects both. That is a false negative about THIS SCRIPT, not a finding
+# about the agent -- it is the failure the token round diagnosed on 2026-08-19 (exit 18).
+#
+# Two separate things have to be accepted here, and they do NOT cost the same:
+#
+#   * SPOKEN NUMERALS -- free. "thirteen fifty-one" and "13:51" are the same claim in different
+#     notation. Accepting the words gives up no discrimination whatsoever.
+#   * A CONVERTED TIME ZONE -- not free, and worth stating plainly rather than glossing. Once any
+#     real UTC offset is allowed, the HOUR carries essentially no information: some offset maps our
+#     instant onto almost any hour of the day. What is left discriminating is the MINUTE -- one
+#     chance in sixty, loosened to three-in-sixty by the offsets that are not whole hours (:30,
+#     :45). The hour is still REQUIRED to be spoken adjacent to the minute, because that is what
+#     makes it a time rather than a number that happens to appear in a sentence, but it is not
+#     itself evidence.
+#
+# The consequence is recorded in RelayVerdict.grounded: the BODY quote is the evidence and the
+# timestamp is corroboration. The conjunct is kept anyway; see that docstring for why.
+
+_UNITS = (
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+    "fifteen sixteen seventeen eighteen nineteen"
+).split()
+_TENS = {20: "twenty", 30: "thirty", 40: "forty", 50: "fifty"}
+
+#: Words that can CONTINUE a number to the left or right of a match. "twenty twenty-six" (the year)
+#: must not be read as 20:20, and "two thousand twenty-six" must not be read as 20:06.
+_UNIT_WORDS = frozenset(_UNITS[1:10])
+_TENS_WORDS = frozenset(_TENS.values())
+_SCALE_WORDS = frozenset({"hundred", "thousand"})
+
+#: Every UTC offset in real-world use, in minutes. Written out rather than derived so that the
+#: breadth of the leniency is visible to whoever reads this next.
+_UTC_OFFSETS: tuple[int, ...] = tuple(
+    sorted(
+        {h * 60 for h in range(-12, 15)}
+        | {-570, -210, 210, 270, 330, 390, 570, 630}  # the :30 zones
+        | {345, 525, 765}  # the :45 zones (Nepal, Chatham, Chatham DST)
+    )
+)
+
+
+def spoken_number(value: int) -> str:
+    """0-59 as it is said: 7 -> 'seven', 51 -> 'fifty one'."""
+    if value < 20:
+        return _UNITS[value]
+    tens, unit = divmod(value, 10)
+    return _TENS[tens * 10] + (f" {_UNITS[unit]}" if unit else "")
+
+
+def speech_tokens(text: str) -> list[str]:
+    """The reply as spoken words: lowercased, and every non-alphanumeric run a separator.
+
+    Transcription choices are the model's, and must not be evidence about what it read. Hyphens
+    ("fifty-one") and apostrophes ("o\'clock") are both just separators here, so "fifty one",
+    "fifty-one", "o clock" and "o'clock" all arrive as the same tokens; "oclock" written solid
+    arrives as one, which is why _minute_words offers both spellings.
+
+    It looked as though hyphens and apostrophes each needed their own normalising pass, and both
+    were written. Mutation testing removed each in turn and NO control noticed, because the
+    character class below had already done the work. They are gone; the two on-the-hour controls
+    are what would notice if this stopped handling "o\'clock".
+    """
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _hour_words(hour: int) -> list[str]:
+    """How an hour hand might be said.
+
+    Only the 24-hour word, which looks too thin and is not. A 12-hour rendering ("one fifty-one")
+    needs no form of its own, because the offsets below already span more than a day: whatever
+    hour%12 is, some real zone reads this instant as exactly that hour, so the 12-hour form is
+    matched by the zone loop instead. The military "oh eight hundred" needs none either -- it
+    CONTAINS "eight hundred", and the leading "oh" is not a word that can extend a number, so the
+    plain form matches inside it.
+
+    Both were written out here first. Mutation testing removed each and no control noticed, which
+    is what redundant code looks like from the outside; the reasons above are why no control
+    COULD notice, so they were deleted rather than pinned.
+    """
+    return [spoken_number(hour)]
+
+
+def _minute_words(minute: int) -> list[str]:
+    """How the minutes might be said, including the on-the-hour idioms."""
+    if minute == 0:
+        return ["oclock", "o clock", "hundred", "hundred hours", "zero zero", "oh oh", "double oh"]
+    if minute < 10:
+        word = _UNITS[minute]
+        return [f"oh {word}", f"o {word}", f"zero {word}", word]
+    return [spoken_number(minute)]
+
+
+def _is_standalone(tokens: Sequence[str], start: int, end: int) -> bool:
+    """Is tokens[start:end] a time, or a fragment of a longer spoken number?
+
+    This is the guard that stops "August nineteenth, twenty twenty-six" from reading as 20:20 and
+    "two thousand twenty-six" from reading as 20:06. It rejects ONLY the continuations that could
+    actually extend the number -- a tens word followed by a unit, or a scale word beside it -- so a
+    genuine "thirteen fifty-one, two thousand twenty-six" still matches on the time.
+    """
+    before = tokens[start - 1] if start > 0 else ""
+    after = tokens[end] if end < len(tokens) else ""
+    if tokens[end - 1] in _TENS_WORDS and after in _UNIT_WORDS:
+        return False
+    if after in _SCALE_WORDS:
+        return False
+    if before in _SCALE_WORDS:
+        return False
+    if before in _TENS_WORDS and tokens[start] in _UNIT_WORDS:
+        return False
+    return True
+
+
+def _offset_label(offset: int) -> str:
+    if offset == 0:
+        return "UTC"
+    sign = "+" if offset > 0 else "-"
+    hours, minutes = divmod(abs(offset), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def spoken_timestamp_hit(reply: str, iso: str) -> str | None:
+    """The same instant, SPOKEN, in any real time zone -- or None.
+
+    Returns a description of what matched, naming the offset, so the transcript says which
+    rendering was accepted rather than just "yes".
+    """
+    parsed = parse_hm(iso)
+    if not parsed:
+        return None
+    _, _, _, hour, minute = parsed
+    tokens = speech_tokens(reply)
+    if not tokens:
+        return None
+    utc_minutes = hour * 60 + minute
+    # UTC first, so an unconverted reply is reported as the plain reading rather than as some
+    # coincidentally-equal offset.
+    for offset in sorted(_UTC_OFFSETS, key=lambda o: (o != 0, abs(o))):
+        local = (utc_minutes + offset) % (24 * 60)
+        local_hour, local_minute = divmod(local, 60)
+        for hour_form in _hour_words(local_hour):
+            hour_tokens = hour_form.split()
+            for minute_form in _minute_words(local_minute):
+                sequence = hour_tokens + minute_form.split()
+                width = len(sequence)
+                for start in range(len(tokens) - width + 1):
+                    if tokens[start : start + width] != sequence:
+                        continue
+                    if not _is_standalone(tokens, start, start + width):
+                        continue
+                    spoken = " ".join(sequence)
+                    return f"{local_hour:02d}:{local_minute:02d} spoken as {spoken!r} ({_offset_label(offset)})"
+    return None
+
+
+def written_timestamp_hit(reply: str, iso: str) -> str | None:
+    """A written rendering, in the zone we hold it in or converted to another one."""
+    haystack = normalize(reply)
+    for form in timestamp_forms(iso):
+        if form in haystack:
+            return form
+    parsed = parse_hm(iso)
+    if not parsed:
+        return None
+    _, _, _, hour, minute = parsed
+    utc_minutes = hour * 60 + minute
+    for offset in _UTC_OFFSETS:
+        if offset == 0:
+            continue
+        local = (utc_minutes + offset) % (24 * 60)
+        local_hour, local_minute = divmod(local, 60)
+        pattern = rf"(?<!\d){local_hour:02d}:{local_minute:02d}(?!\d)"
+        if re.search(pattern, haystack):
+            return f"{local_hour:02d}:{local_minute:02d} ({_offset_label(offset)})"
+    return None
 
 
 def body_evidence(content: str, minimum_length: int = 6) -> list[str]:
@@ -488,7 +695,22 @@ class RelayVerdict:
 
     @property
     def grounded(self) -> bool:
-        """A nonce alone settles it; without one, both halves of the relay are required."""
+        """A nonce alone settles it; without one, both halves of the relay are required.
+
+        WHY THE CONJUNCT SURVIVED the 2026-08-19 loosening, since the obvious move was to drop it.
+        The body quote is now much the stronger half: it is a distinctive run of the message's own
+        words, which cannot be guessed, while the timestamp -- once a converted time zone is
+        accepted -- is worth about the minute alone. The tempting conclusion is "require the body,
+        treat the timestamp as corroboration".
+
+        It was not taken, for one reason: the body-only control. A reply that repeats some of the
+        message's words while placing it vaguely ("some time ago") is what a partial or
+        second-hand answer looks like, and this check is supposed to reject it. Making the body
+        sufficient would pass it. The timestamp's job is not to be strong evidence on its own; it
+        is to force the reply to commit to WHICH message it is relaying. So the conjunct stays and
+        the LOOSENING IS CONFINED TO RENDERING -- how the timestamp is said, not whether one is
+        required. Every negative control that stood before still stands.
+        """
         if self.nonce_hit:
             return True
         return bool(self.timestamp_hit and self.body_hit)
@@ -499,10 +721,9 @@ def check_relay(reply: str, timestamp: str, content: str, nonce: str | None) -> 
     haystack = normalize(reply)
     verdict = RelayVerdict()
 
-    for form in timestamp_forms(timestamp):
-        if form in haystack:
-            verdict.timestamp_hit = form
-            break
+    verdict.timestamp_hit = written_timestamp_hit(reply, timestamp) or spoken_timestamp_hit(
+        reply, timestamp
+    )
 
     for evidence in body_evidence(content):
         if normalize(evidence) in haystack:
@@ -598,6 +819,243 @@ def check_relay_controls() -> list[str]:
     # --nonce" rather than silently asserting nothing and passing.
     if body_evidence("ok"):
         problems.append("negative control: 'ok' was treated as distinctive channel content.")
+
+    problems += check_spoken_timestamp_controls()
+    return problems
+
+
+#: WHAT THE AGENT ACTUALLY SAID on 2026-08-19, verbatim, in the run that exited 18. These are the
+#: ground truth for what a correct answer looks like from a VOICE agent, and they are the reason
+#: the timestamp matcher was loosened at all -- so they are fixtures here rather than a note in a
+#: commit message, and a future tightening has to walk past them.
+SPOKEN_UTC_REPLY = "thirteen ten and fifty-two seconds UTC on August nineteenth, twenty twenty-six"
+SPOKEN_UTC_INSTANT = "2026-08-19T13:10:52.000000+00:00"
+
+#: The same shape, but with a ZONE NAME on it. Read this one carefully, because the obvious
+#: interpretation is not what the live run showed.
+#:
+#: It looks like a conversion: 13:51 Eastern (EDT, UTC-04:00) is 17:51 UTC, and an agent that
+#: converted our stored UTC into the owner's local zone would be doing the right thing. The
+#: verification run of 2026-08-19 says otherwise. The channel's latest message was stamped
+#: 13:51:25 UTC and the agent said "thirteen fifty-one EASTERN TIME" -- the DIGITS were the UTC
+#: ones and the ZONE LABEL was simply wrong. (The other reply above labelled its digits UTC, and
+#: that one was right.)
+#:
+#: So the spoken zone name is NOT checked, and this is the evidence for that decision rather than
+#: a guess: an agent that names the zone wrongly while reading the clock correctly would be failed
+#: by a matcher that trusted the label, and that is a false negative about a reply which did carry
+#: the message back. Conversion is still accepted -- a future agent may genuinely convert -- so
+#: both readings of this sentence are asserted below, the converted one and the literal one.
+SPOKEN_EASTERN_REPLY = (
+    "thirteen fifty-one Eastern Time on August nineteenth, two thousand twenty-six"
+)
+SPOKEN_EASTERN_INSTANT = "2026-08-19T17:51:07.000000+00:00"
+
+
+def check_spoken_timestamp_controls() -> list[str]:  # noqa: PLR0912 - a flat list of controls
+    """Controls for the spoken-timestamp leniency added on 2026-08-19.
+
+    The danger with this particular loosening is specific and worth naming: "accepts a spoken
+    timestamp" degrades very easily into "accepts any sentence with number words in it", and the
+    degraded version passes the confabulation control too, because that reply happens to contain no
+    numbers. So the negative controls below are about the leniency itself -- a DIFFERENT time in
+    the SAME spoken style, and number words that are not a time at all.
+    """
+    problems = []
+
+    hit = spoken_timestamp_hit(SPOKEN_UTC_REPLY, SPOKEN_UTC_INSTANT)
+    if not hit:
+        problems.append(
+            "positive control: the agent's REAL spoken reply of 2026-08-19 "
+            f"({SPOKEN_UTC_REPLY!r}) was not recognised as 13:10 UTC. This is the exact false "
+            "negative that made the run escalate and exit 18."
+        )
+    elif "(UTC)" not in hit:
+        problems.append(
+            f"positive control: an UNCONVERTED spoken time matched as {hit!r} rather than as the "
+            "plain UTC reading. The report would send the next reader looking at the wrong zone."
+        )
+
+    hit = spoken_timestamp_hit(SPOKEN_EASTERN_REPLY, SPOKEN_EASTERN_INSTANT)
+    if not hit:
+        problems.append(
+            "positive control: the agent's REAL spoken reply of 2026-08-19 "
+            f"({SPOKEN_EASTERN_REPLY!r}) was not recognised as 17:51 UTC rendered in Eastern time. "
+            "Converting the zone is correct behaviour, not evidence of not having read."
+        )
+    elif "UTC-04:00" not in hit:
+        problems.append(
+            f"positive control: the Eastern reply matched, but as {hit!r} rather than as the "
+            "UTC-04:00 rendering it is. The report would name the wrong zone."
+        )
+
+    # The same sentence, read the way the live run of 2026-08-19 actually produced it: UTC digits
+    # under a wrong zone label. Both readings have to pass, because we cannot tell them apart and
+    # both carry the message back.
+    literal = spoken_timestamp_hit(SPOKEN_EASTERN_REPLY, "2026-08-19T13:51:25.635000+00:00")
+    if not literal:
+        problems.append(
+            "positive control: the agent's real reply was rejected against the timestamp it was "
+            "actually given (13:51:25 UTC, spoken as 'thirteen fifty-one Eastern Time'). This is "
+            "the live case, not a hypothetical one."
+        )
+    elif "(UTC)" not in literal:
+        problems.append(
+            f"positive control: the live case matched as {literal!r} rather than as the plain UTC "
+            "reading it is. The spoken zone label must not steer the reported zone."
+        )
+
+    # -- the leniency's OWN negative controls ----------------------------------------------------
+    wrong_time = "fourteen twenty-two Eastern Time on August nineteenth, twenty twenty-six"
+    if spoken_timestamp_hit(wrong_time, SPOKEN_UTC_INSTANT):
+        problems.append(
+            "negative control: a DIFFERENT time spoken in the same style was accepted as the "
+            f"message's timestamp ({wrong_time!r} against 13:10:52 UTC). The matcher is reacting "
+            "to the spoken style rather than to the time."
+        )
+    if spoken_timestamp_hit(wrong_time, SPOKEN_EASTERN_INSTANT):
+        problems.append(
+            "negative control: a DIFFERENT time spoken in the same style was accepted against "
+            "17:51 UTC. The matcher is reacting to the spoken style rather than to the time."
+        )
+
+    # The hour must be spoken ADJACENT to the minute. Otherwise the check collapses into "does any
+    # number word in the reply happen to equal the minute", which a long reply satisfies by chance.
+    loose_number = "There were fifty-one messages in the channel, and August nineteenth was busy."
+    if spoken_timestamp_hit(loose_number, SPOKEN_EASTERN_INSTANT):
+        problems.append(
+            "negative control: a bare quantity ('fifty-one messages') was read as the MINUTE of "
+            "the timestamp. Without an hour beside it that is a number, not a time."
+        )
+
+    # A spoken YEAR is two number words in a row and looks exactly like a spoken time. 20:20 UTC
+    # against "twenty twenty-six" is the collision that actually bites.
+    year_only = "The message was posted in twenty twenty-six, some time back."
+    if spoken_timestamp_hit(year_only, "2026-08-19T20:20:00+00:00"):
+        problems.append(
+            "negative control: the spoken YEAR 'twenty twenty-six' was read as the time 20:20."
+        )
+    if spoken_timestamp_hit("posted in two thousand twenty-six", "2026-08-19T20:06:00+00:00"):
+        problems.append(
+            "negative control: the spoken year 'two thousand twenty-six' was read as 20:06."
+        )
+
+    # The same leniency exists for a WRITTEN time the agent converted ("13:51 Eastern"), and it
+    # needs its own pair: a hit on the converted time, a miss on a different one.
+    written = written_timestamp_hit("posted at 13:51 Eastern Time", SPOKEN_EASTERN_INSTANT)
+    if not written:
+        problems.append(
+            "positive control: a WRITTEN time converted to another zone ('13:51 Eastern' for "
+            "17:51 UTC) was not recognised."
+        )
+    elif "UTC-04:00" not in written:
+        problems.append(
+            f"positive control: the converted written time matched as {written!r} rather than as "
+            "the UTC-04:00 rendering it is."
+        )
+    if written_timestamp_hit("posted at 13:22 Eastern Time", SPOKEN_EASTERN_INSTANT):
+        problems.append(
+            "negative control: a DIFFERENT written time was accepted as a zone conversion of "
+            "17:51 UTC. Allowing any offset must not amount to allowing any time."
+        )
+
+    # On the hour is said with an idiom rather than a minute word, and the apostrophe in
+    # "o'clock" is transcribed at least three ways. This control is what makes the
+    # apostrophe-closing in speech_tokens() load-bearing rather than decorative.
+    for said in ("nine o'clock", "nine oclock", "nine o clock", "twenty one hundred"):
+        if not spoken_timestamp_hit(f"it came in at {said} last night", "2026-08-19T21:00:00+00:00"):
+            problems.append(
+                f"positive control: an on-the-hour time spoken as {said!r} was not recognised as "
+                "21:00 UTC."
+            )
+    if spoken_timestamp_hit("it came in at nine o'clock last night", "2026-08-19T21:07:00+00:00"):
+        problems.append(
+            "negative control: 'nine o'clock' was accepted for 21:07. On-the-hour idioms must "
+            "still mean minute zero."
+        )
+
+    # A 12-hour rendering ("one fifty-one in the afternoon") must be accepted. It is matched as
+    # the UTC+08:00 reading rather than by a 12-hour form of its own; see _hour_words.
+    if not spoken_timestamp_hit("at one fifty-one in the afternoon", SPOKEN_EASTERN_INSTANT):
+        problems.append(
+            "positive control: a time spoken on the 12-hour clock ('one fifty-one') was not "
+            "recognised as a reading of 17:51 UTC."
+        )
+    # Capitalisation is the transcriber's choice, not evidence. The written matcher already has a
+    # control for this; the spoken one needs its own, because it tokenises separately.
+    if not spoken_timestamp_hit(SPOKEN_EASTERN_REPLY.upper(), SPOKEN_EASTERN_INSTANT):
+        problems.append(
+            "positive control: the agent's real reply was rejected once TRANSCRIBED IN CAPITALS. "
+            "The spoken matcher is comparing presentation rather than content."
+        )
+    # When a reply gives BOTH readings, the plain UTC one is what the report should name -- the
+    # next reader should not be sent looking at a zone the message was never stored in.
+    both = "thirteen fifty-one Eastern Time, which is seventeen fifty-one UTC"
+    hit = spoken_timestamp_hit(both, SPOKEN_EASTERN_INSTANT)
+    if not hit or "(UTC)" not in hit:
+        problems.append(
+            f"positive control: a reply giving BOTH readings was reported as {hit!r} rather than "
+            "as the plain UTC one."
+        )
+    # Minutes one to nine are spoken with a filler ("thirteen oh five"), or bare.
+    for said in ("thirteen oh five", "thirteen zero five", "thirteen five", "one oh five"):
+        if not spoken_timestamp_hit(f"at {said} today", "2026-08-19T13:05:00+00:00"):
+            problems.append(
+                f"positive control: a single-digit minute spoken as {said!r} was not recognised "
+                "as 13:05."
+            )
+    if spoken_timestamp_hit("at thirteen oh five today", "2026-08-19T13:50:00+00:00"):
+        problems.append("negative control: 'thirteen oh five' was accepted for 13:50.")
+
+    # The two remaining halves of the longer-number guard. Each blocks a spoken number that is not
+    # a time but reads as one once the tokens are laid flat.
+    if spoken_timestamp_hit("the rebuild cost twenty six hundred seconds", "2026-08-19T20:06:00+00:00"):
+        problems.append(
+            "negative control: 'twenty six hundred' was read as the time 20:06. A number followed "
+            "by a scale word is a quantity, not a clock reading."
+        )
+    if spoken_timestamp_hit("there were twenty six thirty-second clips", "2026-08-19T06:30:00+00:00"):
+        problems.append(
+            "negative control: 'twenty SIX THIRTY second' was read as the time 06:30. The hour "
+            "must start the number, not sit in the middle of one."
+        )
+
+    # The written matcher's digit boundaries. Contrived on purpose -- the point is that the
+    # shifted-numeric branch searches for a bare "hh:mm" and must not find it inside a longer run
+    # of digits, which is the one way that branch could match something that is not a time.
+    if written_timestamp_hit("in trace 913:517 the retry fired", SPOKEN_EASTERN_INSTANT):
+        problems.append(
+            "negative control: '13:51' found INSIDE a longer digit run was accepted as the "
+            "message's timestamp."
+        )
+
+    # The confabulated reply must still fail against a timestamp whose spoken form is ordinary.
+    if spoken_timestamp_hit(CONFABULATED_REPLY, SPOKEN_EASTERN_INSTANT):
+        problems.append(
+            "negative control: the fluent confabulated reply matched a SPOKEN timestamp. The "
+            "spoken matcher is finding something incidental."
+        )
+
+    # And the whole relay verdict, end to end, on a real spoken reply that also quotes the body:
+    # loosening the rendering must not have loosened what is REQUIRED.
+    content = "Rebuilt the container after the sparkplug refactor; digest looks right now."
+    spoken_relay = (
+        "The most recent message came in at " + SPOKEN_EASTERN_REPLY + ", and it reads: Rebuilt "
+        "the container after the sparkplug refactor; digest looks right now."
+    )
+    verdict = check_relay(spoken_relay, SPOKEN_EASTERN_INSTANT, content, None)
+    if not verdict.grounded:
+        problems.append(
+            "positive control: a spoken, zone-converted relay that ALSO quotes the body was "
+            f"rejected (timestamp_hit={verdict.timestamp_hit!r} body_hit={verdict.body_hit!r})."
+        )
+    spoken_timestamp_only = "The most recent message came in at " + SPOKEN_EASTERN_REPLY + "."
+    verdict = check_relay(spoken_timestamp_only, SPOKEN_EASTERN_INSTANT, content, None)
+    if verdict.grounded:
+        problems.append(
+            "negative control: a SPOKEN timestamp with none of the message body was accepted as a "
+            "relay. The loosening removed the body requirement, not just the notation."
+        )
 
     return problems
 
@@ -1235,6 +1693,81 @@ class Runner:
             )
 
 
+def check_exit_status_controls() -> list[str]:
+    """Does a FAILED run actually leave a non-zero PROCESS STATUS?
+
+    This exists because the question came up and could not be answered from the transcript: the
+    2026-08-19 run was invoked through a pipe, so the status the operator saw was the pipe's, not
+    the script's. A script that prints "FAILED" and exits 0 is worse than one that says nothing --
+    every automated caller reads it as a pass -- and it is invisible in exactly the situation where
+    someone would look.
+
+    So the escalation path is driven end to end here, offline, with the network stubbed, and the
+    RETURN VALUE of main() is asserted against the documented code. `sys.exit(main(...))` at the
+    bottom of the file turns that into the process status.
+    """
+    problems = []
+    latest = Latest(
+        author="owner",
+        timestamp=SPOKEN_EASTERN_INSTANT,
+        content="Rebuilt the container after the sparkplug refactor; digest looks right now.",
+    )
+    nonce = "gtverify-1755607000-a3f9c1"
+
+    class StubConversation:
+        def __init__(self, reply: str) -> None:
+            self.reply = reply
+            self.responses_after_ask = [reply]
+            self.seconds = 0.0
+            self.conversation_id = "self-test"
+            self.close_code = 1000
+            self.event_types: dict[str, int] = {}
+            self.diagnostics: list[str] = []
+            self.mcp_tool_calls: list[str] = []
+
+    def stub_hold_round(self: Runner, name: str, latest_: Latest, nonce_: str | None) -> Round:
+        reply = "I had a look and it all seems fine." if name == "cheap" else f"It says {nonce}."
+        round_ = Round(name=name, nonce=nonce_, latest=latest_, conversation=StubConversation(reply))
+        self.rounds.append(round_)
+        return round_
+
+    saved = (http_json, Runner.read_latest, Runner.post_nonce, Runner.hold_round)
+    environment = {
+        key: os.environ.get(key)
+        for key in ("GENT_TALK_READ_TOKEN", "GENT_TALK_WRITE_TOKEN")
+    }
+    module = sys.modules[__name__]
+    try:
+        module.http_json = lambda *a, **k: (200, {})  # type: ignore[assignment]
+        Runner.read_latest = lambda self: latest  # type: ignore[assignment]
+        Runner.post_nonce = lambda self: (nonce, latest)  # type: ignore[assignment]
+        Runner.hold_round = stub_hold_round  # type: ignore[assignment]
+        os.environ["GENT_TALK_READ_TOKEN"] = "self-test-read-credential"
+        os.environ["GENT_TALK_WRITE_TOKEN"] = "self-test-write-credential"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = main(["--url", "http://self-test.invalid", "--channel", "c", "--no-log-check"])
+    finally:
+        module.http_json, Runner.read_latest, Runner.post_nonce, Runner.hold_round = saved  # type: ignore[assignment]
+        for key, value in environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    if code != EXIT_RELAY_TOO_STRICT:
+        problems.append(
+            "control: a run whose cheap round misses and whose token round hits returned "
+            f"{code}, not the documented {EXIT_RELAY_TOO_STRICT} (relay_check_too_strict). "
+            + (
+                "It returned SUCCESS, so every automated caller would read this failure as a pass."
+                if code == EXIT_OK
+                else "The exit code no longer names the failure it documents."
+            )
+        )
+    return problems
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="smoke-agent.py",
@@ -1287,6 +1820,9 @@ def run_self_test(out: Transcript) -> int:
         + check_relay_controls()
         + check_credential_scanner_controls()
         + check_diagnostics_controls()
+        # Only here, never in main()'s pre-flight: this one CALLS main(), and running it from
+        # inside main()'s own control block would recurse.
+        + check_exit_status_controls()
     )
     checks = [
         "the log scanner finds a REAL captured tool line",
@@ -1304,11 +1840,24 @@ def run_self_test(out: Transcript) -> int:
         "the relay check recognises a nonce broken up by punctuation",
         "the relay check does not invent a nonce that is not there",
         "an undistinctive body yields no evidence to assert on",
+        "the relay check accepts the agent's REAL spoken reply, 'thirteen ten and fifty-two ...'",
+        "the relay check accepts a spoken time the agent CONVERTED to Eastern, and names the zone",
+        "the relay check REJECTS a different time spoken in the same style",
+        "the relay check REJECTS a bare quantity that happens to equal the minute",
+        "the relay check REJECTS a spoken YEAR read as a time ('twenty twenty-six')",
+        "the relay check accepts a WRITTEN time converted to another zone, and rejects another",
+        "the relay check understands the 12-hour clock and single-digit minutes ('thirteen oh five')",
+        "the relay check REJECTS spoken quantities that flatten into a clock reading",
+        "the relay check accepts a spoken time TRANSCRIBED IN CAPITALS",
+        "the relay check names the plain UTC reading when a reply gives two",
+        "the relay check understands on-the-hour idioms (\"nine o'clock\") and holds them to :00",
+        "the relay check REJECTS a spoken timestamp carrying none of the message body",
         "the credential scanner finds a planted token",
         "the credential scanner does not report a token that is absent",
         "a blank secret does not match everything",
         "the MCP-status reader understands a real captured payload",
         "the MCP-status reader invents nothing from unrelated events",
+        "a FAILED run returns the documented exit code, not 0",
     ]
     if problems:
         for problem in problems:
