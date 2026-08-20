@@ -988,6 +988,14 @@ SCENES: tuple[Scene, ...] = (
                 "document.querySelectorAll('#transcript li').length >= 3 && "
                 "!window.__visible('empty-state')",
             ),
+            # `#45 post-call-state`. The voice is labelled "assistant", because the sibling view on
+            # this same page is a channel full of coding agents posting under their own names. The
+            # word is a rendered fact, so it is pinned where it can be SEEN as well as asserted.
+            (
+                "the other speaker is labelled 'assistant', not 'agent'",
+                "(() => { const w = [...document.querySelectorAll('#transcript li.theirs .who')]; "
+                "return w.length > 0 && w.every((n) => n.textContent.trim() === 'assistant'); })()",
+            ),
         ),
     ),
     Scene(

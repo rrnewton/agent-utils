@@ -1352,6 +1352,35 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
   );
 });
 
+test("the voice on this page is the ASSISTANT, not one more 'agent'", async () => {
+  // The sibling view on this very page is a channel full of coding agents posting under their own
+  // names. Labelling the voice "agent" in the transcript beside it invites the reader to think one
+  // of those is talking. Only the WORD moves: the two speakers are still told apart by side, tint
+  // and corner, which is what `line()`'s `who === "you"` drives.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "user_transcript",
+      user_transcription_event: { user_transcript: "mine" },
+    }),
+  });
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "agent_response",
+      agent_response_event: { agent_response: "theirs" },
+    }),
+  });
+
+  const [mine, theirs] = page.el("transcript").children;
+  const who = (li) => li.descendants().find((node) => node.className === "who").textContent;
+  assert.equal(who(mine), "you", "the reader's own label was not the complaint and must not move");
+  assert.notEqual(who(theirs), "agent", "the voice is still labelled as one more agent");
+  assert.equal(who(theirs), "assistant");
+  assert.equal(mine.className, "mine", "the rename must not have touched which side a turn is on");
+  assert.equal(theirs.className, "theirs");
+});
+
 test("opening the disclosure brings it into view instead of unfolding it under the dock", async () => {
   // A disclosure at the bottom of a scrolled list expands DOWNWARD, behind the control pane, so
   // tapping it appears to do nothing at all. Caught by looking at a screenshot of it open.

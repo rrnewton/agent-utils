@@ -747,7 +747,12 @@ function handle(socket, message) {
       }
       break;
     case "agent_response":
-      line("agent", (message.agent_response_event || {}).agent_response || "");
+      // "assistant", not "agent". This page's sibling view is a channel full of CODING agents
+      // posting under their own names, and a transcript that labels the voice as "agent" invites
+      // the reader to think one of those is talking. Only the displayed word changes: `line()`
+      // still tells the two speakers apart by `who === "you"`, so side, tint and corner are
+      // untouched.
+      line("assistant", (message.agent_response_event || {}).agent_response || "");
       break;
     case "user_transcript":
       line("you", (message.user_transcription_event || {}).user_transcript || "");
