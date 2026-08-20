@@ -197,8 +197,14 @@ function showScreen(name) {
   // permanent and is on whichever screen is up, and the sign-in screen states what to paste in its
   // own body. `#63 status-line-placement`.
   el("control-pane").hidden = !main;
+  // The composer acts on the conversation, so it belongs to the screen the conversation is on.
+  // `#43 typed-input`.
+  el("composer").hidden = !main;
   if (!main) {
     disarmClear();
+    // Collapsed, not merely hidden: coming back to the call screen should show the dock as it
+    // rests, not with a text field standing open from a visit to Settings.
+    setComposerOpen(false);
   }
   if (name !== "settings") {
     screenBeforeSettings = name;
@@ -739,6 +745,139 @@ function onClear() {
     setStatus("Transcript cleared. The agent has not forgotten anything.");
   } else {
     setStatus("Transcript cleared.");
+  }
+}
+
+// --- typing to the agent ------------------------------------------------------------------------
+//
+// `#43 typed-input`. Sometimes speaking is not available — a quiet room, a name the transcriber
+// keeps mangling, a commit hash — and the vendor's own client offers typing. So does this one, and
+// it costs no second connection and no mode switch: `user_message` is a CLIENT EVENT on the
+// conversation socket that is already open, documented as processed exactly like speech. A typed
+// turn and a spoken turn are therefore the same thing to the conversation, and they land in the
+// same transcript.
+//
+// Everything below is a named module-scope function rather than logic inside a click handler, and
+// that is load-bearing: `#59 text-entry-button` moves this control into the control bar and `#60
+// canned-prompt-buttons` adds buttons that send a fixed sentence. Both are then one call each, and
+// neither is a second implementation of the send path that can drift from this one.
+
+/**
+ * The ONE place a JSON client event is written to the conversation socket.
+ *
+ * Returns whether it went. A socket that exists is not a socket that is open — `readyState` is the
+ * only thing that knows — and a send on a closing socket throws, which from a click handler would
+ * reach the console and nowhere else.
+ *
+ * The per-frame `user_audio_chunk` send in `startCapture()` deliberately does NOT come through
+ * here. It is a hot path called every 4096 samples, it holds the socket in a closure and does its
+ * own `readyState` check, and routing it through a shared function would put a lookup and a branch
+ * in the middle of the audio thread for no gain.
+ */
+function sendClientEvent(payload) {
+  const socket = session.socket;
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return false;
+  }
+  socket.send(JSON.stringify(payload));
+  return true;
+}
+
+/** Is there a live conversation for typed text to reach? */
+function canSendText() {
+  return Boolean(session.socket) && session.connected;
+}
+
+// The vendor does not document whether a typed `user_message` is echoed back as a
+// `user_transcript` the way speech is. If it is, the same sentence would appear twice: once because
+// this page rendered it at the moment it was sent, and once when the echo arrives. So a typed turn
+// is remembered briefly and a transcript matching it inside that window is dropped.
+//
+// UNVERIFIED, and stated as such rather than presented as knowledge: settling it costs one billed
+// run of `scripts/run.sh --smoke-agent`, whose `converse()` already sends `user_message`, and that
+// run has not been made. The window is a guess. It is short enough that a reader who genuinely says
+// the same sentence twice a minute later still sees both.
+const TYPED_ECHO_WINDOW_MS = 10000;
+
+let lastTyped = { text: "", at: 0 };
+
+/** Would this arriving transcript be the echo of something just typed? */
+function isEchoOfTyped(said) {
+  return (
+    lastTyped.text !== "" &&
+    said.trim() === lastTyped.text &&
+    Date.now() - lastTyped.at < TYPED_ECHO_WINDOW_MS
+  );
+}
+
+/**
+ * Say something to the agent in writing. Returns whether it went.
+ *
+ * REFUSING IS VISIBLE. A tap that does nothing at all is the failure this whole page is written
+ * against, and with no call open there is nothing for the text to reach — so it says which control
+ * would fix that, and it does not throw away what was typed.
+ */
+function sendUserMessage(text) {
+  const said = String(text === null || text === undefined ? "" : text).trim();
+  if (said === "") {
+    return false;
+  }
+  if (!canSendText() || !sendClientEvent({ type: "user_message", text: said })) {
+    setStatus("Start a call first — typed messages reach the agent in a live conversation.");
+    return false;
+  }
+  // Rendered HERE rather than waited for: the vendor may or may not echo it (see above), and a
+  // turn that only appears if the vendor chooses to reflect it is a turn that can silently vanish.
+  line("you", said);
+  recordTurn("you", said);
+  lastTyped = { text: said, at: Date.now() };
+  el("composer-input").value = "";
+  el("composer-input").focus();
+  setStatus("Sent.");
+  return true;
+}
+
+// How often composing pings the agent. The vendor documents `user_activity` as resetting the turn
+// timeout without touching conversation content, which is exactly the complaint it answers: someone
+// typing is PRESENT, and without this the agent reads the silence as absence and starts asking
+// whether anyone is still there.
+const ACTIVITY_INTERVAL_MS = 30000;
+
+let lastActivityAt = 0;
+
+/** A keystroke. Tell the agent someone is there, at most once every interval. */
+function noteComposing() {
+  if (!canSendText()) {
+    return false;
+  }
+  const now = Date.now();
+  if (now - lastActivityAt < ACTIVITY_INTERVAL_MS) {
+    return false;
+  }
+  // Sent BEFORE the clock is advanced only if it actually went: a frame that never reached a
+  // half-closed socket must not silence the next thirty seconds of pings.
+  if (!sendClientEvent({ type: "user_activity" })) {
+    return false;
+  }
+  lastActivityAt = now;
+  return true;
+}
+
+let composerOpen = false;
+
+/**
+ * Show or hide the text field.
+ *
+ * KEEPS WHAT WAS TYPED. Closing the composer is not the same act as discarding a half-written
+ * message, and a control that quietly does both is the kind of thing this page keeps removing.
+ */
+function setComposerOpen(open) {
+  composerOpen = Boolean(open);
+  el("composer").setAttribute("data-open", composerOpen ? "true" : "false");
+  el("composer-row").hidden = !composerOpen;
+  el("composer-toggle").setAttribute("aria-expanded", composerOpen ? "true" : "false");
+  if (composerOpen) {
+    el("composer-input").focus();
   }
 }
 
@@ -1545,6 +1684,11 @@ function handle(socket, message) {
     case "user_transcript":
       {
         const said = (message.user_transcription_event || {}).user_transcript || "";
+        // A typed turn was already rendered when it was sent, so an echo of it is the same turn
+        // arriving a second time — not a second turn. `#43 typed-input`.
+        if (isEchoOfTyped(said)) {
+          break;
+        }
         line("you", said);
         recordTurn("you", said);
       }
@@ -1637,6 +1781,11 @@ function teardown() {
   session.socket = null;
   session.connected = false;
   session.muted = false;
+  // A fresh call pings on its first keystroke rather than inheriting the last call's throttle
+  // window, which would leave the agent up to thirty seconds of unexplained silence. And a typed
+  // turn from the dead conversation cannot suppress a transcript in the new one.
+  lastActivityAt = 0;
+  lastTyped = { text: "", at: 0 };
   renderControls();
 }
 
@@ -1683,6 +1832,10 @@ function renderControls() {
 
   el("hang-up").hidden = !live;
   el("control-pane").className = live ? "" : "solo";
+  // Send is dead without a conversation to send into. Drawn as disabled rather than hidden: the
+  // composer is a stable shape, and a button that comes and goes under a thumb is worse than one
+  // that is visibly inert. `.control[disabled]` drops its fill, so it does not look live.
+  el("composer-send").disabled = !canSendText();
 
   note.hidden = true;
   note.textContent = "";
@@ -1732,6 +1885,30 @@ function setMuted(muted) {
  * Audio frames are dropped in `handle`; `agent_response` keeps writing what the agent said into
  * the transcript. So this is the control for reading the agent in a room where you cannot listen
  * to it, and it deliberately does not touch the microphone, the socket, or mute.
+ *
+ * THE DECISION, WRITTEN DOWN, because `#43 typed-input` asks for it explicitly and because the two
+ * options are indistinguishable to the reader and very different on the wire:
+ *
+ *     THIS PAGE KEEPS RECEIVING THE AGENT'S AUDIO AND THROWS IT AWAY.
+ *
+ * It does not renegotiate the conversation into a text-only response mode. Three reasons, in the
+ * order they decide it:
+ *
+ *   1. A text-only mode is an INITIATION-TIME negotiation, not a setting. This page sends
+ *      `conversation_initiation_client_data` exactly once, in `socket.onopen`, and reads
+ *      `agent_output_audio_format` exactly once, out of `conversation_initiation_metadata`.
+ *      Switching mid-call therefore means closing the socket and opening a new one — and
+ *      `noteConversationEnded` records what that costs: the vendor documents no way to resume a
+ *      conversation, so the agent on the other side of the reconnect has never heard a word of
+ *      this one. Silencing the speaker would then destroy exactly the context that Mute exists to
+ *      preserve, and it would do it invisibly, because the button looks like a speaker.
+ *   2. The control has to be instantly reversible. Dropping frames is reversible in the time it
+ *      takes to set a boolean; a reconnect is not reversible at all.
+ *   3. The only cost of the choice is downstream bandwidth on a socket that is already carrying
+ *      microphone audio upstream, continuously, in the same call.
+ *
+ * The suite makes the decision CHECKABLE rather than merely recorded: toggling this control must
+ * leave exactly one `conversation_initiation_client_data` frame on the socket.
  */
 function setSpeakerOff(off) {
   session.speakerOff = off;
@@ -2577,6 +2754,25 @@ el("clear-view").addEventListener("click", onClear);
 // `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.
 el("forget-conversations").addEventListener("click", guardQuietly(forgetConversations));
 el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff));
+// `#43 typed-input`. The composer, in four listeners and no logic: everything they call is a named
+// function above, so `#59 text-entry-button` can move the control without moving the send path.
+el("composer-toggle").addEventListener("click", () => setComposerOpen(!composerOpen));
+// `guardQuietly`, NOT `guard`. `guard()` calls `teardown()`, so a send that failed would hang up on
+// the owner — which is the one thing a failed message must never do.
+el("composer-send").addEventListener(
+  "click",
+  guardQuietly(() => sendUserMessage(el("composer-input").value))
+);
+el("composer-input").addEventListener("input", noteComposing);
+el("composer-input").addEventListener("keydown", (event) => {
+  if (!event || event.key !== "Enter") {
+    return;
+  }
+  if (event.preventDefault) {
+    event.preventDefault(); // a bare Enter in a lone text input would submit and reload the page.
+  }
+  sendUserMessage(el("composer-input").value);
+});
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);
 el("open-settings").addEventListener("click", () => showScreen("settings"));

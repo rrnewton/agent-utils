@@ -450,6 +450,18 @@ class FakeElement {
     await this.dispatch("change");
   }
 
+  /**
+   * Type into a field the way a finger does: set the value, then fire `input`.
+   *
+   * Both halves, because the page hangs behaviour off BOTH — the value is what a send reads, and
+   * the event is what tells the agent someone is composing. A test that only assigned `.value`
+   * would silently stop exercising the second one. `#43 typed-input`.
+   */
+  async setValue(value) {
+    this.value = value;
+    await this.dispatch("input");
+  }
+
   setAttribute(name, value) {
     this.attributes.set(name, String(value));
   }
@@ -1108,6 +1120,15 @@ const TUNING_BANDS = {
   DISCORD_POLL_MS: [5000, 600000,
     "the unasked re-read: often enough to be fresh, rare enough that a voice call is not sharing " +
     "its network with it"],
+  ACTIVITY_INTERVAL_MS: [1000, 60000,
+    "how often composing tells the agent someone is there. The vendor's turn timeout is the thing " +
+    "being held off, so above a minute the agent starts asking whether anyone is still there — " +
+    "the complaint this exists for — and at a second it is a keystroke-rate ping on the same " +
+    "socket the call is running on"],
+  TYPED_ECHO_WINDOW_MS: [1000, 60000,
+    "how long a typed turn suppresses an identical transcript. Below a second a slow echo lands " +
+    "as a duplicate line; above a minute a reader who really says the same short sentence twice " +
+    "has the second one silently swallowed"],
 };
 test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
   for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
@@ -4683,6 +4704,316 @@ test("sound off touches neither the microphone, the call, nor mute", async () =>
   assert.notEqual(socket.readyState, 3, "silencing the agent hung up");
   assert.ok(audioFrames(socket).length > heard, "silencing the agent also muted YOU");
   assert.equal(page.el("talk-label").textContent, "Listening", "the talk control changed state");
+});
+
+test("SILENCING THE AGENT DOES NOT RENEGOTIATE THE CONVERSATION", async () => {
+  // `#43 typed-input` asks for the choice between "receive the audio and discard it" and "switch
+  // to a text-only response mode" to be made and WRITTEN DOWN, because the two are
+  // indistinguishable to the reader and very different on the wire. The decision is recorded on
+  // `setSpeakerOff`; this is what makes it checkable rather than merely stated.
+  //
+  // The observable difference is the handshake. A text-only mode is negotiated in
+  // `conversation_initiation_client_data`, which this page sends exactly once, in `socket.onopen`
+  // — so an implementation that renegotiated would have to close and reopen the socket, and the
+  // agent behind the new one would remember nothing. Two initiations, or two sockets, is that
+  // implementation.
+  const page = newPage();
+  const socket = await startTalking(page);
+  assistantSays(page, "the tip is green");
+
+  await page.el("speaker").click();
+  assistantSays(page, "and integration is at 9c07d3e");
+  await page.el("speaker").click();
+
+  assert.equal(
+    socket.sent.filter((s) => s.includes("conversation_initiation_client_data")).length,
+    1,
+    "the speaker control renegotiated the conversation, which loses everything the agent knows"
+  );
+  assert.equal(page.sockets.length, 1, "the speaker control opened a second conversation");
+  assert.equal(session_lines(page).length, 2, "the agent's TEXT stopped arriving while silenced");
+  // And the reason is on the record, in the page's own source, where the next person to "tidy"
+  // this will read it.
+  assert.match(
+    SCRIPT,
+    /THIS PAGE KEEPS RECEIVING THE AGENT'S AUDIO AND THROWS IT AWAY/,
+    "the decision the issue asks for is not written down beside the control that made it"
+  );
+});
+
+/** Every rendered turn in the transcript, seams excluded. */
+const session_lines = (page) =>
+  page.el("transcript").children.filter((li) => li.className !== "seam");
+
+// --- typing to the agent (#43 typed-input) --------------------------------------------------------
+
+/** Open the composer and put text in the field, the way a finger does. */
+async function compose(page, text) {
+  if (page.el("composer-row").hidden) {
+    await page.el("composer-toggle").click();
+  }
+  await page.el("composer-input").setValue(text);
+}
+
+/** Just the typed client events, so a `user_audio_chunk` cannot be mistaken for one. */
+const typedFrames = (socket) => socket.sent.filter((s) => s.includes('"user_message"'));
+const activityFrames = (socket) => socket.sent.filter((s) => s.includes('"user_activity"'));
+
+test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  speakInto(page);
+  const heard = audioFrames(socket).length;
+
+  await compose(page, "did the retry-budget branch land");
+  await page.el("composer-send").click();
+
+  const sent = typedFrames(socket);
+  assert.equal(sent.length, 1, `exactly one typed frame, not ${sent.length}`);
+  assert.deepStrictEqual(JSON.parse(sent[0]), {
+    type: "user_message",
+    text: "did the retry-budget branch land",
+  });
+  // It is a client event on the conversation that is already open — not a second connection, not
+  // a mode switch, and not something that disturbs the microphone.
+  assert.equal(page.sockets.length, 1, "typing opened a second conversation");
+  assert.equal(page.tracks[0].stops, 0, "typing released the microphone");
+  assert.equal(audioFrames(socket).length, heard, "typing changed what the microphone was sending");
+  assert.equal(page.el("talk-label").textContent, "Listening", "typing changed the call's state");
+  // ...and the field is empty again, so a second message does not start with the first one in it.
+  assert.equal(page.el("composer-input").value, "", "the sent text was left in the box");
+});
+
+test("a typed turn and a spoken turn land in the SAME transcript", async () => {
+  // The whole reason this is a client event rather than a second mode: as far as the conversation
+  // is concerned, typing and speaking are the same act, so the record of them must be one record.
+  const page = newPage();
+  await startTalkingNamed(page);
+
+  youSay(page, "morning");
+  await compose(page, "and what about the nightly");
+  await page.el("composer-send").click();
+  assistantSays(page, "it passed at 04:12");
+  await page.settle();
+
+  const said = session_lines(page).map((li) => [li.className, li.text()]);
+  assert.equal(said.length, 3, "the three turns are not all in one list");
+  assert.equal(said[0][0], "mine");
+  assert.match(said[0][1], /morning/);
+  assert.equal(said[1][0], "mine", "the typed turn is not attributed to you");
+  assert.match(said[1][1], /and what about the nightly/);
+  assert.equal(said[2][0], "theirs");
+  assert.match(said[2][1], /04:12/);
+  // Recorded on the server too, exactly as a spoken turn is: a typed turn that survives only in
+  // the DOM is a turn a reload loses.
+  assert.ok(
+    page.storeCalls.some((call) => call.startsWith("POST /api/v1/conversations/")),
+    "the typed turn was never recorded"
+  );
+});
+
+test("THE VENDOR ECHOING A TYPED MESSAGE BACK DOES NOT RENDER IT TWICE", async () => {
+  // Whether ElevenLabs reflects a typed `user_message` as a `user_transcript` is UNVERIFIED — the
+  // vendor does not document it either way — so the page renders the turn when it sends it and
+  // drops a matching transcript that follows. Without this the same sentence appears twice, in
+  // the reader's own voice, seconds apart.
+  const page = newPage();
+  await startTalking(page);
+  await compose(page, "did the retry-budget branch land");
+  await page.el("composer-send").click();
+  assert.equal(session_lines(page).length, 1);
+
+  youSay(page, "did the retry-budget branch land");
+
+  assert.equal(session_lines(page).length, 1, "the typed sentence was rendered twice");
+
+  // ...and the suppression is a WINDOW, not a permanent filter on that sentence. A reader who
+  // really says the same thing again a minute later has said it again.
+  page.setClock(page.clock() + 60_000);
+  youSay(page, "did the retry-budget branch land");
+  assert.equal(session_lines(page).length, 2, "a genuinely repeated sentence was swallowed");
+});
+
+test("sending with no call SAYS SO instead of silently doing nothing", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.el("status-line").hidden = true;
+
+  await compose(page, "are you there");
+  await page.el("composer-send").click();
+
+  assert.equal(page.sockets.length, 0, "a typed message opened a conversation by itself");
+  assert.equal(page.el("status-line").hidden, false, "the refusal was silent");
+  assert.match(
+    page.el("status").textContent,
+    /call/i,
+    "the refusal does not name the thing that would fix it"
+  );
+  // AND IT KEEPS THE TEXT. Losing what somebody typed because there was nowhere to send it is a
+  // second failure on top of the first.
+  assert.equal(page.el("composer-input").value, "are you there", "the refusal ate the message");
+  // The control also SHOWS that it cannot act, rather than looking live and doing nothing.
+  assert.equal(page.el("composer-send").disabled, true, "a dead Send looks exactly like a live one");
+});
+
+test("COMPOSING TELLS THE AGENT SOMEONE IS THERE, AT MOST ONCE EVERY THIRTY SECONDS", async () => {
+  // The complaint this answers: the agent grows impatient during silence and starts asking whether
+  // anyone is still there. Somebody typing is present, and `user_activity` is documented as
+  // resetting the turn timeout without touching conversation content.
+  const page = newPage();
+  const socket = await startTalking(page);
+  const throttle = sourceConstant("ACTIVITY_INTERVAL_MS");
+
+  await compose(page, "d");
+  await page.el("composer-input").setValue("di");
+  await page.el("composer-input").setValue("did");
+  assert.equal(activityFrames(socket).length, 1, "every keystroke pinged the agent");
+
+  page.setClock(page.clock() + throttle - 1);
+  await page.el("composer-input").setValue("did ");
+  assert.equal(activityFrames(socket).length, 1, "the throttle window is not honoured");
+
+  page.setClock(page.clock() + 2);
+  await page.el("composer-input").setValue("did t");
+  assert.equal(activityFrames(socket).length, 2, "composing stopped pinging after the first burst");
+});
+
+test("user_activity carries no content — it is a presence signal, not a message", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  await compose(page, "a commit hash I would rather not read aloud");
+
+  const [frame] = activityFrames(socket);
+  assert.ok(frame, "composing told the agent nothing at all");
+  assert.deepStrictEqual(
+    JSON.parse(frame),
+    { type: "user_activity" },
+    "the presence ping is carrying what the reader has typed so far"
+  );
+});
+
+test("a fresh call pings on its FIRST keystroke, not thirty seconds in", async () => {
+  // The throttle is per-conversation. Carrying the last call's clock across would leave the new
+  // agent up to half a minute of unexplained silence — the exact thing the ping exists to prevent.
+  const page = newPage();
+  const first = await startTalking(page);
+  await compose(page, "hello");
+  assert.equal(activityFrames(first).length, 1);
+
+  await page.el("hang-up").click();
+  await page.el("talk").click();
+  page.sockets[1].onopen();
+  await page.el("composer-input").setValue("hello again");
+
+  assert.equal(activityFrames(page.sockets[1]).length, 1, "the new call inherited the old throttle");
+});
+
+test("THE COMPOSER IS COLLAPSED UNTIL IT IS ASKED FOR", async () => {
+  // A permanent text field would be a fourth band of dock on a 375x667 phone, competing with the
+  // transcript on every frame — the rent `#63 status-line-placement` just stopped paying.
+  assert.equal(
+    PAGE_ELEMENTS.get("composer-row").hidden,
+    true,
+    "the markup ships the field open, so it holds space before anyone asks for it"
+  );
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("composer-row").hidden, true);
+  assert.equal(page.el("composer-toggle").getAttribute("aria-expanded"), "false");
+
+  await page.el("composer-toggle").click();
+  assert.equal(page.el("composer-row").hidden, false, "the toggle did not open the field");
+  assert.equal(page.el("composer-toggle").getAttribute("aria-expanded"), "true");
+  assert.equal(page.el("composer").getAttribute("data-open"), "true");
+
+  // Half-typed text SURVIVES closing it. Closing the composer is not the same act as discarding a
+  // message, and a control that quietly does both is what this page keeps removing.
+  page.el("composer-input").value = "half a thought";
+  await page.el("composer-toggle").click();
+  assert.equal(page.el("composer-row").hidden, true, "the toggle did not close the field");
+  assert.equal(page.el("composer-toggle").getAttribute("aria-expanded"), "false");
+  assert.equal(page.el("composer-input").value, "half a thought", "closing it ate the draft");
+});
+
+test("the composer is not on the sign-in or settings screens", async () => {
+  const page = newPage();
+  assert.equal(page.el("composer").hidden, true, "the composer is up before anyone has signed in");
+
+  await signIn(page);
+  assert.equal(page.el("composer").hidden, false);
+  await page.el("composer-toggle").click();
+  assert.equal(page.el("composer-row").hidden, false);
+
+  await page.el("open-settings").click();
+  assert.equal(page.el("composer").hidden, true, "the composer followed you into Settings");
+
+  await page.el("close-settings").click();
+  assert.equal(page.el("composer").hidden, false);
+  assert.equal(
+    page.el("composer-row").hidden,
+    true,
+    "coming back from Settings left the field standing open"
+  );
+});
+
+test("whitespace-only text sends nothing at all", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  await compose(page, "   ");
+  await page.el("composer-send").click();
+
+  assert.equal(typedFrames(socket).length, 0, "a blank message went to the agent");
+  assert.equal(session_lines(page).length, 0, "a blank message landed in the transcript");
+});
+
+test("Enter sends, and does not reload the page out from under the call", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  await compose(page, "anything red anywhere else");
+
+  let defaulted = true;
+  await page.el("composer-input").dispatch("keydown", {
+    key: "Enter",
+    preventDefault: () => {
+      defaulted = false;
+    },
+  });
+
+  assert.equal(typedFrames(socket).length, 1, "Enter did not send");
+  assert.equal(defaulted, false, "a bare Enter in a lone text input submits and reloads the page");
+
+  // ...and an ordinary key does not. Written against a field with text in it, because after the
+  // send above the field is empty and an empty send is refused for a different reason entirely —
+  // which would make this pass with the key check deleted.
+  await page.el("composer-input").setValue("half a th");
+  await page.el("composer-input").dispatch("keydown", { key: "a", preventDefault: () => {} });
+  assert.equal(typedFrames(socket).length, 1, "every keystroke sends the message");
+  assert.equal(page.el("composer-input").value, "half a th", "an ordinary key cleared the field");
+});
+
+test("the composer states its own layout rules: safe area, and the size iOS will not zoom", () => {
+  // NEITHER IS VERIFIABLE BY SCREENSHOT. Chromium under automation reports zero safe-area insets
+  // and has no iOS text-zoom behaviour at all, so the declaration is the only part checkable here.
+  const composer = cssBlock("#composer");
+  assert.match(composer, /env\(safe-area-inset-left\)/, "#composer ignores the left inset");
+  assert.match(composer, /env\(safe-area-inset-right\)/, "#composer ignores the right inset");
+  // 16px, not a rem: iOS Safari zooms the whole frame when a smaller input takes focus, and this
+  // page is a fixed 100dvh grid — the zoom pushes the dock off a viewport that cannot scroll back.
+  assert.match(
+    cssBlock("#composer-input"),
+    /font-size:\s*16px/,
+    "the field is small enough that iOS Safari will zoom the frame when it takes focus"
+  );
+  // Sized like the pane's own small controls, and deliberately not BY being one: `.control-mini`
+  // carries `grid-column: 1`, which belongs to #control-pane's grid.
+  const composerButton = cssBlock(".composer-button");
+  assert.doesNotMatch(composerButton, /grid-column/, "the composer buttons joined the pane's grid");
+  assert.equal(
+    /min-height:\s*([\d.]+)rem/.exec(composerButton)[1],
+    /min-height:\s*([\d.]+)rem/.exec(cssBlock(".control-mini"))[1],
+    "the composer buttons are not the same size as Sound and Clear"
+  );
 });
 
 // --- reading the transcript -----------------------------------------------------------------------

@@ -1483,6 +1483,32 @@ def _act_restored_conversation(driver: Driver) -> None:
     driver.settle(400)
 
 
+def _act_typed_turn(driver: Driver) -> None:
+    """`#43 typed-input`: the composer open, with a turn that was TYPED rather than spoken.
+
+    Entered from a real live call, because a typed message is a client event on the conversation
+    socket and a composer with no call behind it is a picture of the refusal, not of the feature.
+
+    The two things only a browser can settle are pinned below: whether a fourth dock band fits at
+    all on the 375x667 profile, and whether it lands ABOVE the big controls rather than over them.
+    A fixture with no layout engine has no opinion about either.
+    """
+    driver.click("talk")
+    driver.page.wait_for_function(
+        "() => window.__text('talk-label') === 'Listening'", timeout=10_000
+    )
+    driver.click("composer-toggle")
+    driver.page.wait_for_function("() => window.__visible('composer-input')", timeout=5_000)
+    driver.page.fill("#composer-input", "and 9c07d3e — did that land on integration")
+    driver.click("composer-send")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#transcript li.mine').length > 0", timeout=5_000
+    )
+    # Typing again, so the field in the photograph is not the empty one a send leaves behind.
+    driver.page.fill("#composer-input", "and the nightly")
+    driver.settle(300)
+
+
 NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
 SCENES: tuple[Scene, ...] = (
@@ -2049,6 +2075,39 @@ SCENES: tuple[Scene, ...] = (
             NO_HANGUP,
         ),
     ),
+    Scene(
+        name="23-typed-turn",
+        what="the composer open during a live call, with a turn that was typed rather than spoken",
+        act=_act_typed_turn,
+        expect=(
+            (
+                "the composer's field and its Send are really on screen",
+                "window.__visible('composer-input') && window.__visible('composer-send')",
+            ),
+            (
+                "the typed turn is in the transcript, attributed to you",
+                "[...document.querySelectorAll('#transcript li.mine .body')]"
+                ".some((n) => (n.textContent || '').includes('9c07d3e'))",
+            ),
+            # THE claim no fixture can make. A fourth band in the dock competes with the transcript
+            # on a 375x667 phone, and the failure mode is not "it looks cramped" -- it is the
+            # composer overlapping the controls the reader is trying to hit. Measured, not eyeballed.
+            (
+                "the composer sits ABOVE the big controls, not over them",
+                "(() => { const c = document.getElementById('composer').getBoundingClientRect(); "
+                "const p = document.getElementById('control-pane').getBoundingClientRect(); "
+                "return c.height > 0 && c.bottom <= p.top + 1; })()",
+            ),
+            (
+                "...and it did not push the transcript off the screen",
+                "document.getElementById('scroll-area').getBoundingClientRect().height > 80",
+            ),
+            (
+                "the call is still live — typing did not disturb it",
+                "window.__text('talk-label') === 'Listening'",
+            ),
+        ),
+    ),
 )
 
 
@@ -2365,7 +2424,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 22:
+    if len(SCENES) < 23:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2381,7 +2440,10 @@ def check_state_controls() -> list[str]:
             "message-hover-highlight` added the row picked out under a pointer -- the only place "
             "that treatment can be looked at at all -- and `#65 scrollback-paging` added a step "
             "further back through the channel, which is where the anchored prepend is judged. "
-            "`#48 transcript-storage` added the one scene that RELOADS the page."
+            "`#48 transcript-storage` added the one scene that RELOADS the page, and `#43 "
+            "typed-input` added the composer open during a live call -- the only place the "
+            "question 'does a fourth dock band fit on a 375x667 phone without eating the "
+            "transcript or overlapping the controls' can be answered at all."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2489,6 +2551,11 @@ def check_state_controls() -> list[str]:
         # screen": every other scene in this walk also has lines on screen, so only the label
         # distinguishes a restored conversation from the live one it was captured after.
         "22-restored-conversation": "earlier conversation",
+        # `#43 typed-input`. Two needles, because the two facts are independent and only one of
+        # them is reachable from anywhere else. `li.mine` says the typed turn really landed in the
+        # transcript; `control-pane` is the GEOMETRY check -- the composer above the big controls
+        # rather than over them -- and it is the only thing in the repository that can see it.
+        "23-typed-turn": ("li.mine", "control-pane"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2760,6 +2827,7 @@ SELF_TEST_CHECKS = (
     "the long-target state is pinned to the target really overflowing its own box",
     "the hover state is pinned to the rendered colour, not to the row being hovered",
     "the older-step state is pinned to the anchor holding, not to the list being longer",
+    "the typed-turn state is pinned to the dock geometry, not just to the composer being up",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",

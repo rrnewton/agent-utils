@@ -311,7 +311,14 @@
             there because they are still your own record of what was said, and the transcript marks
             where one conversation ended and the next began.
             <strong>Sound</strong> silences the agent's voice without silencing the agent: its
-            replies keep arriving as text in the transcript.
+            replies keep arriving as text in the transcript. It keeps receiving that audio and
+            throws it away rather than asking for a text-only conversation, because the response
+            format is settled once when the conversation opens — switching it would mean closing
+            and reopening the socket, and a reopened socket is a new conversation that remembers
+            nothing. Silencing the agent must not cost you its memory.
+            <strong>Type</strong> opens a text box that sends what you write into the same
+            conversation you are speaking in, so a typed turn and a spoken one land in the same
+            transcript and the agent answers either one out loud.
             <strong>Clear</strong> empties this screen only and never makes the agent forget
             anything. It asks twice, because it sits under your thumb and it cannot be undone.
             It also leaves the stored record on the server untouched, so the conversation comes
@@ -376,6 +383,58 @@
       voice.css keep it clear of the curve on both sides.
     -->
     <footer id="dock">
+      <!--
+        `#43 typed-input`. Typing is the other way to say something to the agent, and it is a
+        client event on the SAME conversation socket — no second connection and no mode switch, so
+        a typed turn and a spoken one are the same thing as far as the conversation is concerned
+        and land in the same transcript.
+
+        COLLAPSED BY DEFAULT, and that is the whole reason it is affordable. A permanent text field
+        here would be a fourth band of dock on a 375x667 phone, competing with the transcript on
+        every frame — the same rent `#63 status-line-placement` just stopped paying. What stands on
+        the screen is one small button; the field appears when it is asked for and the half-typed
+        text survives closing it again.
+      -->
+      <div id="composer" data-open="false" hidden>
+        <button
+          id="composer-toggle"
+          class="control composer-button"
+          type="button"
+          aria-expanded="false"
+          aria-controls="composer-row"
+          title="Type a message to the agent instead of speaking it. It reaches the same conversation."
+        >
+          <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M4 5.5h16v10.5H9.5L5.5 19.5V16H4z" />
+            <path d="M8 10.5h8M8 13h5" />
+          </svg>
+          <span id="composer-toggle-label" class="mini-label">Type</span>
+        </button>
+        <div id="composer-row" hidden>
+          <input
+            id="composer-input"
+            type="text"
+            autocomplete="off"
+            enterkeyhint="send"
+            placeholder="Message the agent"
+            aria-label="Message the agent"
+          />
+          <button
+            id="composer-send"
+            class="control composer-button"
+            type="button"
+            aria-label="Send"
+            title="Send this message into the live conversation."
+            disabled
+          >
+            <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 12 20 4.5 15.5 20l-4-6.5z" />
+              <path d="M4 12l7.5 1.5" />
+            </svg>
+          </button>
+        </div>
+      </div>
+
       <!--
         A dense tile: two small controls stacked in the left column to exactly the height of the
         large ones, which each span both rows. Nothing is a fixed pixel width, so the pane fills

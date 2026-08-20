@@ -798,6 +798,50 @@ coming back still counts as part of the suspension, because iOS commonly deliver
 switch, which is why the page suite carries the negative control both ways — a visible failure must
 still raise the banner, and a page with the suspension check removed must fail the suspension test.
 
+### Typing is the other way to say something, on the same conversation
+
+Speaking is not always available — a quiet room, a commit hash the transcriber keeps mangling, a
+name it will never get right — so `/voice` has a text composer, and it is deliberately **not** a
+second mode or a second connection. `{"type": "user_message", "text": "…"}` is a client event on
+the conversation socket that is already open, documented by the vendor as processed exactly like
+speech. A typed turn and a spoken turn are therefore the same thing to the conversation, they land
+in the same transcript, and the agent answers either one out loud.
+
+**It is collapsed by default**, which is what makes it affordable. A permanent text field is a
+fourth band of dock on a 375x667 phone, competing with the transcript on every frame — the rent
+"The status line is a message, not a fixture" above just stopped paying. What stands on the screen
+is one small button; the field appears when it is asked for, and a half-typed message survives
+closing it again.
+
+**Composing pings the agent.** `{"type": "user_activity"}` is documented as resetting the turn
+timeout without touching conversation content, and it is sent at most once every thirty seconds
+while somebody is typing. That is the direct answer to the complaint that the agent grows impatient
+during silence and starts asking whether anyone is still there: a person composing a message is
+present, and this is how the connection is told so. The frame carries no content — the suite
+asserts it is exactly `{"type":"user_activity"}` — so what is half-typed never leaves the browser.
+
+**Two things about it are unverified, and are written down as unverified rather than as knowledge.**
+Whether ElevenLabs echoes a typed `user_message` back as a `user_transcript` is not documented
+either way. If it does, the sentence would appear twice — once because the page rendered it when it
+was sent, and once when the echo arrived — so a typed turn is remembered for ten seconds and a
+matching transcript inside that window is dropped. The window is a guess; settling it costs one
+billed `scripts/run.sh --smoke-agent` run, whose `converse()` already sends `user_message`, and
+**that run has not been made**. The second is the on-screen keyboard: the dock is a grid row of a
+`100dvh` frame, so the composer should ride above an iOS keyboard, but Chromium under Playwright
+has no soft keyboard and no screenshot in this repository can prove it.
+
+**Sound silences the agent's voice by receiving the audio and throwing it away**, and this is the
+decision `#43 typed-input` asks to have recorded, because the alternative — renegotiating into a
+text-only response mode — is indistinguishable to the reader and very different on the wire. A
+text-only mode is settled at initiation: the page sends `conversation_initiation_client_data` once,
+in `socket.onopen`, and reads the output format once, out of the initiation metadata. Switching
+mid-call therefore means closing the socket and opening a new one, and the vendor documents no way
+to resume a conversation — so the agent behind the reconnect would remember nothing, which is
+exactly the context Mute exists to preserve. Dropping frames is reversible in the time it takes to
+set a boolean; a reconnect is not reversible at all. The only cost is downstream bandwidth on a
+socket already carrying microphone audio upstream. The suite makes that decision *checkable*:
+toggling Sound must leave exactly one initiation frame on the socket.
+
 ### The page has two compositions, and a capability query picks between them
 
 The phone is the device this page is used on, so the phone layout is the one everything above
@@ -1224,7 +1268,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-two states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty-three states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1232,8 +1276,9 @@ arrives while the reader is up in the history, the desktop reading column at eac
 range, and the two connection outcomes that used to look identical — a call suspended by the
 phone, and one that really failed — the reply screen with a short target and with one longer
 than the frame, one channel row picked out under the pointer, a step further back through the
-channel, and the earlier conversation restored from the server after a reload — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
-desktop. It prints the absolute path of every image so an agent can open them directly.
+channel, the earlier conversation restored from the server after a reload, and the text composer
+open during a live call with a turn that was typed rather than spoken — at four viewports: a tall
+phone, a short phone, a small laptop window and a maximised desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
 (pointer: fine)` is what puts the reading column on the page at all, so on a phone there is no
@@ -1284,7 +1329,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 42 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 43 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.
@@ -1357,6 +1402,13 @@ Beyond the security list above:
   the key is sent as a header. The first live call will still be the first live call.
 * The `/voice` page decodes PCM only. If an agent is configured to emit µ-law or MP3, the page says
   so and stops rather than playing noise — it does not transcode.
+* **Press-and-hold on the talk control does not offer hang-up**, and `#43 typed-input` asks for it
+  as a possibility rather than a requirement: it is worth doing only if a true *pause* exists, and
+  whether one does is still open — see `#40`. Mute is what stands in for a pause today, and hang-up
+  is its own control in the pane. Deferred deliberately, not dropped.
+* **Whether a typed `user_message` is echoed back as a `user_transcript` has never been observed.**
+  The `/voice` page assumes it may be and suppresses a matching transcript for ten seconds; one
+  billed `--smoke-agent` run would settle it, and that run has not been made.
 * The `/voice` page captures the microphone through a `ScriptProcessorNode`, which is deprecated
   (though universally supported). Moving it to an `AudioWorklet` would mean a second asset for no
   behavioural gain today.

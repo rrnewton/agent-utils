@@ -716,6 +716,57 @@ mod tests {
     }
 
     #[test]
+    fn typed_input_on_the_voice_page_has_exactly_one_send_path() {
+        // `#43 typed-input`. The same argument as the folding guard above, one issue later. Three
+        // things now put a client event on the conversation socket — the composer's Send, the
+        // Enter key, and the presence ping while somebody is typing — and `#59 text-entry-button`
+        // and `#60 canned-prompt-buttons` add more. Each one that grows its own
+        // `socket.send(JSON.stringify(...))` is a place the guards can drift: the readyState
+        // check, the visible refusal when there is no call, the local echo of the turn and the
+        // de-duplication of the vendor's echo all live in these two functions, and a second copy
+        // gets some subset of them.
+        //
+        // So: one writer, and the composer's callers go through it.
+        assert!(
+            VOICE_JS.contains("function sendClientEvent("),
+            "the one place a JSON client event reaches the conversation socket is gone"
+        );
+        for caller in ["function sendUserMessage(", "function noteComposing("] {
+            assert!(
+                function_body(VOICE_JS, caller).contains("sendClientEvent("),
+                "`{caller}` in web/voice.js writes to the socket by some other route, so the \
+                 readyState guard and the visible refusal are no longer on every send"
+            );
+        }
+        // The audio path is the ONE deliberate exception, and it is documented as one in
+        // web/voice.js: it is called every 4096 samples, holds the socket in a closure and does
+        // its own readyState check. Pinned so that "the exception" cannot quietly become "the
+        // rule" by a second hot-path send appearing beside it.
+        assert!(
+            function_body(VOICE_JS, "function startCapture(").contains("user_audio_chunk"),
+            "the microphone frames no longer go out from startCapture"
+        );
+        assert_eq!(
+            VOICE_JS.matches("user_audio_chunk:").count(),
+            1,
+            "web/voice.js writes microphone frames from more than one place"
+        );
+        // A typed turn is rendered locally because the vendor may never echo it back, which makes
+        // suppressing the echo — if there is one — the other half of the same decision. Losing
+        // either half puts the sentence on screen twice or not at all.
+        let typed = function_body(VOICE_JS, "function sendUserMessage(");
+        assert!(
+            typed.contains("line(\"you\""),
+            "a typed turn is no longer rendered when it is sent, so it exists only if the vendor \
+             chooses to echo it"
+        );
+        assert!(
+            VOICE_JS.contains("function isEchoOfTyped("),
+            "nothing suppresses the vendor's echo of a typed turn, so it can render twice"
+        );
+    }
+
+    #[test]
     fn the_phone_app_pluralizes_and_never_prints_the_placeholder_form() {
         // `#62 message-count-accuracy`. `message(s)` is the shape of the defect: it is what a
         // renderer writes when it has not decided whether it knows the number. The bytes asserted
