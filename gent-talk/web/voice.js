@@ -177,10 +177,6 @@ function showScreen(name) {
   // Settings and Reply are both destinations: the header becomes a title bar with a way back, and
   // the controls that act on the screen you have left are absent.
   const destination = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, name);
-  // The view switch belongs to the main screen; anywhere else it would switch between two things
-  // neither of which is on the screen.
-  el("view-switch").hidden = !main;
-  el("open-settings").hidden = destination;
   // Two separate ways back, because they go to two different places — and because
   // scripts/screenshots.py drives #close-settings by name.
   el("close-settings").hidden = name !== "settings";
@@ -210,6 +206,9 @@ function showScreen(name) {
     screenBeforeSettings = name;
   }
   currentScreen = name;
+  // LAST, and after `currentScreen` is set: the bar decides what it shows from the screen that is
+  // now up, and it is also what collapses the header when nothing is left in it. `#58 control-bar`.
+  renderControlBar();
 }
 
 let currentView = "voice";
@@ -1287,6 +1286,98 @@ function micSettingsChanged() {
     ? `Saved. ${when}`
     : "This browser refused to store the setting, so it will be forgotten when you reload " +
       `(private browsing does this). ${when}`;
+}
+
+// --- the control bar ------------------------------------------------------------------------
+//
+// `#58 control-bar`. The strip carrying the gear and the Voice/Discord switch, and — from `#59
+// text-entry-button` and `#60 canned-prompt-buttons` onward — every other small button.
+//
+// ONE bar, TWO possible parents. `#control-bar-top` sits in the header and `#control-bar-bottom`
+// sits in the dock directly above the big buttons; `setPlacement` moves the single element between
+// them. Two copies would be two sets of ids, and the page would then have to keep two gears and
+// two switches agreeing about which screen is up.
+//
+// The bar is declared in the BOTTOM mount in web/voice.html rather than being created here, so the
+// default placement is a fact about the served markup: a page whose script dies still shows the
+// controls where they belong.
+
+const BAR_PLACEMENT_KEY = "gent-talk.voice.bar-placement";
+
+// Bottom, because that is where the thumb already is — and because with the bar down there the
+// header holds nothing on the main screen and can be collapsed entirely, which is the vertical
+// space the issue is actually about.
+const DEFAULT_PLACEMENT = "bottom";
+
+const PLACEMENTS = ["bottom", "top"];
+
+/** Where the reader last put the bar, validated. Anything else is somebody else's data. */
+function storedPlacement() {
+  let stored = null;
+  try {
+    stored = localStorage.getItem(BAR_PLACEMENT_KEY);
+  } catch (_error) {
+    stored = null;
+  }
+  return PLACEMENTS.includes(stored) ? stored : DEFAULT_PLACEMENT;
+}
+
+function persistPlacement(where) {
+  try {
+    localStorage.setItem(BAR_PLACEMENT_KEY, where);
+  } catch (_error) {
+    return false;
+  }
+  // Read back rather than assume, exactly as the microphone settings do: private browsing accepts
+  // setItem and stores nothing, so "Saved" would be a lie discovered only after a reload.
+  return localStorage.getItem(BAR_PLACEMENT_KEY) === where;
+}
+
+let placement = DEFAULT_PLACEMENT;
+
+/** Move the bar. The re-parent is the whole mechanism; everything else follows from it. */
+function setPlacement(where) {
+  placement = PLACEMENTS.includes(where) ? where : DEFAULT_PLACEMENT;
+  el("control-bar").setAttribute("data-placement", placement);
+  el(placement === "top" ? "control-bar-top" : "control-bar-bottom").append(el("control-bar"));
+  renderControlBar();
+}
+
+function placementChanged() {
+  const chosen = el("bar-placement").value;
+  const saved = persistPlacement(chosen);
+  setPlacement(chosen);
+  el("bar-placement-state").textContent = saved
+    ? placement === "top"
+      ? "Saved. The bar is under the title again."
+      : "Saved. The bar sits directly above the big buttons, and the header takes no room."
+    : "This browser refused to store the setting, so it will be back at the bottom when you " +
+      "reload (private browsing does this). The bar has moved for now.";
+}
+
+/**
+ * What is ON the bar right now, and whether the header is worth a row.
+ *
+ * ONE function owns both, because they are the same question asked twice: `#59` and `#60` extend
+ * this and nothing else. It used to live inline in `showScreen`, which is how a second caller ends
+ * up with a different opinion about whether the gear is reachable.
+ */
+function renderControlBar() {
+  // PER MEMBER, not the bar as a whole. The gear is reachable from the sign-in screen today and
+  // must stay so — hiding the bar wholesale off the main screen would take it away.
+  el("view-switch").hidden = currentScreen !== "main";
+  el("open-settings").hidden = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, currentScreen);
+  const members = [el("open-settings"), el("view-switch"), ...el("bar-pack").children];
+  el("control-bar").hidden = members.every((member) => member.hidden);
+  // The header collapses when it holds nothing. With the bar at the bottom that is the ordinary
+  // case on the main screen, and an empty 2.4rem strip across the top of a phone is exactly the
+  // real estate `#58 control-bar` exists to reclaim. It is a hide of the whole grid row, so the
+  // body grows into it rather than leaving a band of empty panel.
+  el("topbar").hidden =
+    el("close-settings").hidden &&
+    el("close-reply").hidden &&
+    el("topbar-title").hidden &&
+    (placement !== "top" || el("control-bar").hidden);
 }
 
 // --- the reading column ---------------------------------------------------------------------
@@ -2732,6 +2823,11 @@ for (const [id, key] of MIC_TOGGLES) {
   el(id).addEventListener("change", micSettingsChanged);
 }
 
+// `#58 control-bar`. Where the reader last put the bar, restored before the first screen is drawn
+// — the select carries the live truth, exactly as the microphone checkboxes do.
+el("bar-placement").value = storedPlacement();
+el("bar-placement").addEventListener("change", placementChanged);
+
 // The column the reader last chose, restored before anything is drawn into it. Applied
 // unconditionally: on a phone the stylesheet never consults the value, so there is nothing to
 // branch on here and no second definition of "is this a desktop" to drift.
@@ -2865,6 +2961,9 @@ setTokenState(token() ? "token saved in this browser" : NO_TOKEN_YET);
 if (token()) {
   setStatus("Checking your token…");
 }
+// Before the first screen is shown, so the bar is in its home from the first frame rather than
+// visibly jumping out of the header once script catches up. `#58 control-bar`.
+setPlacement(storedPlacement());
 showView("voice");
 renderEmptyState();
 renderControls();

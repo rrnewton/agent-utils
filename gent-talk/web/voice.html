@@ -30,7 +30,7 @@
       not a paragraph; the paragraph lives one tap inside it.
     -->
     <header id="topbar">
-      <div class="topbar-row">
+      <div id="topbar-row" class="topbar-row">
         <!-- On the settings screen the header becomes a plain title bar with a way back, which is
              what a phone application does. It used to leave this row empty and put a "Back" button
              in the body, which reads as an unfinished page. -->
@@ -48,31 +48,16 @@
         </button>
         <span id="topbar-title" class="topbar-title" hidden>Settings</span>
 
-        <!-- ONE switch, not two labels. It carries the word for the view you are in, and a knob
-             that moves, so it reads as a control with two positions rather than as one item that
-             has been disabled. -->
-        <button
-          id="view-switch"
-          class="switch"
-          type="button"
-          role="switch"
-          aria-checked="false"
-          aria-label="switch between the call and the channel"
-        >
-          <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
-          <span id="view-switch-label" class="switch-word">Voice</span>
-        </button>
+        <!--
+          `#58 control-bar`. The TOP home of the control bar, and empty in the markup on purpose:
+          the bar itself is declared in the dock below, which is where it lives by default. This is
+          a mount point, and `setPlacement()` moves the one bar between the two.
 
-        <span class="topbar-gap"></span>
-
-        <!-- An icon, not a word: settings is a destination, not something you read the label of
-             every time you look at the screen. -->
-        <button id="open-settings" class="icon-button" type="button" aria-label="Settings" title="Settings">
-          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="3.1" />
-            <path d="M19.4 14.5a1.6 1.6 0 0 0 .33 1.77l.06.06a1.9 1.9 0 1 1-2.7 2.7l-.06-.06a1.6 1.6 0 0 0-1.77-.33 1.6 1.6 0 0 0-.98 1.47v.17a1.9 1.9 0 1 1-3.82 0v-.09a1.6 1.6 0 0 0-1.05-1.47 1.6 1.6 0 0 0-1.77.33l-.06.06a1.9 1.9 0 1 1-2.7-2.7l.06-.06a1.6 1.6 0 0 0 .33-1.77 1.6 1.6 0 0 0-1.47-.98H3.5a1.9 1.9 0 1 1 0-3.82h.09a1.6 1.6 0 0 0 1.47-1.05 1.6 1.6 0 0 0-.33-1.77l-.06-.06a1.9 1.9 0 1 1 2.7-2.7l.06.06a1.6 1.6 0 0 0 1.77.33h.08a1.6 1.6 0 0 0 .98-1.47V3.5a1.9 1.9 0 1 1 3.82 0v.09a1.6 1.6 0 0 0 .98 1.47 1.6 1.6 0 0 0 1.77-.33l.06-.06a1.9 1.9 0 1 1 2.7 2.7l-.06.06a1.6 1.6 0 0 0-.33 1.77v.08a1.6 1.6 0 0 0 1.47.98h.17a1.9 1.9 0 1 1 0 3.82h-.09a1.6 1.6 0 0 0-1.47.98z" />
-          </svg>
-        </button>
+          Two mounts rather than two copies of the bar. A second copy would be a second set of ids,
+          and the page would then have to keep two gears and two switches agreeing about which
+          screen is up — which is the defect, not the layout.
+        -->
+        <div id="control-bar-top"></div>
       </div>
     </header>
 
@@ -300,6 +285,21 @@
 
           <p id="mic-settings-state" class="hint" aria-live="polite"></p>
 
+          <h2>Control bar</h2>
+          <p class="hint">
+            The strip carrying the gear and the Voice/Discord switch. It can sit under the title at
+            the top of the screen, or in the dock directly above the big buttons —
+            <strong>bottom is the default</strong>, because that is where your thumb already is and
+            because the header then costs no row at all. The gear is deliberately at the far
+            <strong>left</strong> of it: it is the control you least want to hit by accident.
+          </p>
+          <label for="bar-placement">Where the control bar sits</label>
+          <select id="bar-placement" aria-describedby="bar-placement-state">
+            <option value="bottom">Bottom — above the big buttons</option>
+            <option value="top">Top — under the title</option>
+          </select>
+          <p id="bar-placement-state" class="hint" aria-live="polite"></p>
+
           <h2>What the controls do</h2>
           <p id="continuity-note" class="hint">
             <strong>Mute</strong> keeps the call open and keeps the agent's context; it only stops
@@ -431,6 +431,63 @@
               <path d="M4 12 20 4.5 15.5 20l-4-6.5z" />
               <path d="M4 12l7.5 1.5" />
             </svg>
+          </button>
+        </div>
+      </div>
+
+      <!--
+        `#58 control-bar`. The BOTTOM home, and the default one — so the bar is where it belongs
+        even if web/voice.js never runs. The bar is declared here rather than in the header for
+        exactly that reason: a mount point that is empty until script moves something into it is a
+        control that does not exist on a page whose script died.
+
+        DIRECTLY ABOVE THE BIG BUTTON BAR, which is what the owner asked for and is not the same
+        thing as "at the bottom": below #control-pane would put small icons under the thumb that is
+        reaching for Talk, and pinning it to the viewport floor would put it in the corner
+        curvature that ate the first word of the status line on the owner's iPhone.
+
+        The order inside the bar is the owner's too, and it is a right-handed thumb argument rather
+        than a symmetry one:
+
+          * the GEAR is leftmost — the control you least want to hit by accident, so it is the one
+            furthest from where the thumb rests;
+          * #bar-pack takes the space between them and is where every later button goes;
+          * the Voice/Discord SWITCH is rightmost, under the thumb, because it is the one you
+            actually flick.
+      -->
+      <div id="control-bar-bottom">
+        <div id="control-bar" data-placement="bottom">
+          <!-- An icon, not a word: settings is a destination, not something you read the label of
+               every time you look at the screen. -->
+          <button id="open-settings" class="bar-button" type="button" aria-label="Settings" title="Settings">
+            <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3.1" />
+              <path d="M19.4 14.5a1.6 1.6 0 0 0 .33 1.77l.06.06a1.9 1.9 0 1 1-2.7 2.7l-.06-.06a1.6 1.6 0 0 0-1.77-.33 1.6 1.6 0 0 0-.98 1.47v.17a1.9 1.9 0 1 1-3.82 0v-.09a1.6 1.6 0 0 0-1.05-1.47 1.6 1.6 0 0 0-1.77.33l-.06.06a1.9 1.9 0 1 1-2.7-2.7l.06-.06a1.6 1.6 0 0 0 .33-1.77 1.6 1.6 0 0 0-1.47-.98H3.5a1.9 1.9 0 1 1 0-3.82h.09a1.6 1.6 0 0 0 1.47-1.05 1.6 1.6 0 0 0-.33-1.77l-.06-.06a1.9 1.9 0 1 1 2.7-2.7l.06.06a1.6 1.6 0 0 0 1.77.33h.08a1.6 1.6 0 0 0 .98-1.47V3.5a1.9 1.9 0 1 1 3.82 0v.09a1.6 1.6 0 0 0 .98 1.47 1.6 1.6 0 0 0 1.77-.33l.06-.06a1.9 1.9 0 1 1 2.7 2.7l-.06.06a1.6 1.6 0 0 0-.33 1.77v.08a1.6 1.6 0 0 0 1.47.98h.17a1.9 1.9 0 1 1 0 3.82h-.09a1.6 1.6 0 0 0-1.47.98z" />
+            </svg>
+          </button>
+
+          <!--
+            THE PACK POINT. Empty today and deliberately so: `#59 text-entry-button` and `#60
+            canned-prompt-buttons` add buttons HERE, and the bar was built as a container that
+            packs rather than as a two-item layout that has to be rewritten the first time a third
+            button arrives. It takes the space left over, and it scrolls sideways rather than
+            wrapping or clipping when the buttons outgrow a narrow phone.
+          -->
+          <div id="bar-pack"></div>
+
+          <!-- ONE switch, not two labels. It carries the word for the view you are in, and a knob
+               that moves, so it reads as a control with two positions rather than as one item that
+               has been disabled. -->
+          <button
+            id="view-switch"
+            class="switch"
+            type="button"
+            role="switch"
+            aria-checked="false"
+            aria-label="switch between the call and the channel"
+          >
+            <span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span>
+            <span id="view-switch-label" class="switch-word">Voice</span>
           </button>
         </div>
       </div>

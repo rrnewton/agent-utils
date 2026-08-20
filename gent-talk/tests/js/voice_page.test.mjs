@@ -470,8 +470,23 @@ class FakeElement {
     return this.attributes.has(name) ? this.attributes.get(name) : null;
   }
 
+  /**
+   * Append, and DETACH from wherever the child was before.
+   *
+   * The detach is not tidiness. `#58 control-bar` moves one element between two mounts, and an
+   * `append` that only set `parentNode` would leave the bar in both parents' `children` at once —
+   * so "the bar is in the top mount and not in the bottom one" would be satisfied by an
+   * implementation that never moved anything, and the placement test would certify nothing.
+   */
   append(...kids) {
     for (const kid of kids) {
+      if (kid.parentNode) {
+        const held = kid.parentNode.children;
+        const at = held.indexOf(kid);
+        if (at >= 0) {
+          held.splice(at, 1);
+        }
+      }
       kid.parentNode = this;
     }
     this.children.push(...kids);
@@ -1626,7 +1641,24 @@ test("hang up comes before talk in the markup, so talk lands under the right thu
   assert.ok(pane.indexOf('id="clear-view"') < hangUp);
 });
 
-// --- the header ---------------------------------------------------------------------------------
+// --- the header, and the control bar that moved out of it ---------------------------------------
+
+/**
+ * The markup of the control bar, from `at` to the end of the element.
+ *
+ * `#58 control-bar` broke four tests that sliced web/voice.html between `id="open-settings"` and
+ * `</header>`, or between the switch and the gear. Both pairs of bounds stopped bracketing the
+ * elements when they moved into the dock, and `String.slice` with an end before its start returns
+ * "" rather than throwing — so those tests would have gone green by having nothing to assert
+ * against. One named helper, used by all of them, so the next move breaks them loudly.
+ */
+function barSlice(at = HTML.indexOf('id="control-bar"')) {
+  const start = HTML.indexOf('id="control-bar"');
+  const end = HTML.indexOf('id="control-pane"');
+  assert.ok(start > -1 && end > start, "web/voice.html no longer declares the control bar in the dock");
+  assert.ok(at >= start && at < end, "the element being sliced for is not inside the control bar");
+  return HTML.slice(at, end);
+}
 
 test("the view control is ONE switch carrying the word for the view you are in", async () => {
   // What this replaces: two text labels, one outlined and one plain, which read as one item having
@@ -1655,7 +1687,10 @@ test("the view control is ONE switch carrying the word for the view you are in",
 test("the switch is a switch: a knob that moves, and a track that changes with it", () => {
   // Three signals for one state — word, knob position, track colour — so it survives being read
   // quickly, at arm's length, by somebody who is not looking for it.
-  const html = HTML.slice(HTML.indexOf('id="view-switch"'), HTML.indexOf('id="open-settings"'));
+  // RE-SLICED by `#58 control-bar`: the switch and the gear both live in the bar now, and the gear
+  // comes FIRST, so the old bounds (from the switch to the gear) run backwards and would silently
+  // return an empty string — a test that passes by having nothing to look at.
+  const html = barSlice(HTML.indexOf('id="view-switch"'));
   assert.match(html, /role="switch"/, "a switch has to announce itself as one");
   assert.match(html, /class="switch-track"/);
   assert.match(html, /class="switch-knob"/);
@@ -1664,7 +1699,9 @@ test("the switch is a switch: a knob that moves, and a track that changes with i
 });
 
 test("settings is a gear, not the word Settings", () => {
-  const button = HTML.slice(HTML.indexOf('id="open-settings"'), HTML.indexOf("</header>"));
+  // RE-SLICED by `#58 control-bar`: the gear is in the dock now, so `</header>` no longer closes
+  // the region it sits in and the old slice would have been empty.
+  const button = barSlice(HTML.indexOf('id="open-settings"'));
   assert.match(button, /<svg/, "the settings control must be drawn, not spelled");
   assert.match(button, /aria-label="Settings"/, "an icon still has to say what it is");
   assert.equal(
@@ -1679,13 +1716,17 @@ test("the header shows two things at a time, and which two depends on the screen
   // which were actions. Clear has moved to the control pane, where it is honestly grouped with the
   // other things you DO; the settings screen turns the same row into a title bar with a way back,
   // rather than leaving it empty and putting a Back button in the body.
-  const row = HTML.slice(HTML.indexOf('class="topbar-row"'), HTML.indexOf("</header>"));
+  //
+  // REWRITTEN BY `#58 control-bar`. The switch and the gear are not in this row any anymore, and
+  // the id list below says so rather than being relaxed to accommodate them: what is left in the
+  // header markup is the two ways back and the title, and the loop underneath — which is the part
+  // that was always doing the work — is unchanged and still asserts that at most two of the five
+  // are up at once.
+  const row = HTML.slice(HTML.indexOf('id="topbar-row"'), HTML.indexOf("</header>"));
   const ids = [...row.matchAll(/<button[^>]*\bid="([^"]+)"/g)].map((m) => m[1]);
   // `#51 reply-view` added a SECOND way back, deliberately rather than by generalising the first:
   // the two go to different places, and scripts/screenshots.py drives #close-settings by name.
-  // Both are hidden on every screen but their own, which is what the loop below asserts — the
-  // header still shows two things at a time.
-  assert.deepStrictEqual(ids, ["close-settings", "close-reply", "view-switch", "open-settings"]);
+  assert.deepStrictEqual(ids, ["close-settings", "close-reply"]);
 
   const page = newPage();
   const showing = () =>
@@ -1708,6 +1749,142 @@ test("the header shows two things at a time, and which two depends on the screen
 
   await page.el("close-reply").click();
   assert.deepStrictEqual(showing(), ["view-switch", "open-settings"]);
+});
+
+// --- the control bar (#58 control-bar) ------------------------------------------------------------
+
+test("THE BAR'S DEFAULT HOME IS THE DOCK, DIRECTLY ABOVE THE BIG BUTTONS", () => {
+  // The owner's words, and "bottom" is the half that is easy to get wrong: not below the big
+  // buttons, and not pinned to the viewport floor — DIRECTLY ABOVE them. In the markup that is an
+  // ordering fact, and it is asserted here because it is also the default, so it has to hold on a
+  // page whose script never ran.
+  const dock = HTML.slice(HTML.indexOf('id="dock"'));
+  const bar = dock.indexOf('id="control-bar-bottom"');
+  const pane = dock.indexOf('id="control-pane"');
+  assert.ok(bar > -1, "the bar's default home is not in the dock at all");
+  assert.ok(bar < pane, "the control bar is below the big buttons rather than above them");
+  assertMarkupContains("control-bar-bottom", "control-bar");
+  // ...and it is a grid row of the dock like everything else there, not something positioned over
+  // the top of the controls.
+  assert.doesNotMatch(cssBlock("#control-bar"), /position:\s*(fixed|absolute)/);
+  // The top mount exists and is EMPTY in the markup: two mounts, one bar. A second copy would be a
+  // second gear and a second switch to keep in agreement.
+  const header = HTML.slice(HTML.indexOf('id="topbar"'), HTML.indexOf("</header>"));
+  assert.ok(header.includes('id="control-bar-top"'), "there is nowhere to put the bar at the top");
+  assert.doesNotMatch(header, /id="view-switch"/, "a second switch is declared in the header");
+  assert.doesNotMatch(header, /id="open-settings"/, "a second gear is declared in the header");
+});
+
+test("the gear is LEFT and the switch is RIGHT, which is a right-handed thumb argument", () => {
+  // The owner's reasoning, not a symmetry: the gear is the control you least want to hit by
+  // accident, so it goes as far as possible from where the thumb rests, and the switch — the one
+  // you actually flick — goes under it.
+  const bar = barSlice();
+  const gear = bar.indexOf('id="open-settings"');
+  const pack = bar.indexOf('id="bar-pack"');
+  const swtch = bar.indexOf('id="view-switch"');
+  assert.ok(gear > -1 && pack > -1 && swtch > -1, "the bar is missing one of its three parts");
+  assert.ok(gear < pack, "the gear is not the leftmost thing in the bar");
+  assert.ok(pack < swtch, "the switch is not the rightmost thing in the bar");
+  // And it is the PACK that pins them to the two ends: it takes the leftover width, so the gear
+  // cannot drift right nor the switch left as buttons are added between them.
+  assert.match(cssBlock("#bar-pack"), /flex:\s*1 1 auto/, "nothing holds the two ends apart");
+});
+
+test("THE BAR IS A CONTAINER THAT PACKS, NOT A TWO-ITEM LAYOUT", () => {
+  // The issue is explicit that this is built for a bar that fills up: `#59 text-entry-button` and
+  // `#60 canned-prompt-buttons` both add buttons to it, and the failure it is asking to avoid is a
+  // layout that has to be rewritten the first time a third button arrives.
+  const pack = cssBlock("#bar-pack");
+  assert.match(pack, /display:\s*flex/);
+  assert.match(pack, /min-width:\s*0/, "a flex item without this refuses to shrink and clips");
+  // The pack, stated: extra buttons SCROLL. Wrapping would spend a second row of vertical space —
+  // the exact thing this issue exists to save — and clipping would push the switch off the right
+  // edge of a 375px phone, where it cannot be tapped at all. The switch is the widest item in the
+  // bar, so that is arithmetic rather than a worry.
+  assert.match(pack, /overflow-x:\s*auto/, "the bar clips or wraps once it is full");
+  assert.doesNotMatch(pack, /flex-wrap:\s*wrap/);
+  const track = Number(/width:\s*([\d.]+)rem/.exec(cssBlock(".switch-track"))[1]);
+  const word = Number(/min-width:\s*([\d.]+)rem/.exec(cssBlock(".switch-word"))[1]);
+  assert.ok(track + word > 5, `the switch is ${track + word}rem wide; the packing claim above is stale`);
+
+  // "Sized like the existing Sound / Clear controls", which is the issue's own phrase. Derived
+  // from `.control-mini` rather than restated, so the two cannot drift apart silently.
+  const height = (block) => /min-height:\s*([\d.]+)rem/.exec(block)[1];
+  assert.equal(
+    height(cssBlock(".bar-button")),
+    height(cssBlock(".control-mini")),
+    "a bar button is not the same size as Sound and Clear"
+  );
+  // ...and deliberately NOT by being one of them: `.control-mini` carries `grid-column: 1`, which
+  // belongs to #control-pane's 3x2 grid.
+  assert.doesNotMatch(cssBlock(".bar-button"), /grid-column/, "the bar joined the pane's grid");
+  // The tap ergonomics the rest of this page's controls have. A button that is one only in the DOM
+  // still feels like a web page.
+  for (const property of [/touch-action:\s*manipulation/, /-webkit-tap-highlight-color/, /user-select/]) {
+    assert.match(cssBlock(".bar-button"), property, "the bar buttons are not built to be tapped");
+  }
+});
+
+test("CHOOSING TOP REALLY MOVES THE BAR, AND THE CHOICE SURVIVES A RELOAD", async () => {
+  const page = newPage();
+  await signIn(page);
+  const bar = page.el("control-bar");
+  assert.equal(bar.parentNode, page.el("control-bar-bottom"), "the default home is not the dock");
+  assert.equal(bar.getAttribute("data-placement"), "bottom");
+  assert.equal(page.el("bar-placement").value, "bottom", "the setting does not show where it is");
+
+  page.el("bar-placement").value = "top";
+  await page.el("bar-placement").dispatch("change");
+
+  assert.equal(bar.parentNode, page.el("control-bar-top"), "the bar did not move into the header");
+  assert.equal(
+    page.el("control-bar-bottom").children.includes(bar),
+    false,
+    "the bar is in BOTH homes at once, so nothing was moved"
+  );
+  assert.equal(bar.getAttribute("data-placement"), "top");
+  assert.match(page.el("bar-placement-state").textContent, /Saved/);
+
+  // A reload: same storage, a brand new execution of the page.
+  const again = newPage(page.storage);
+  await signIn(again);
+  assert.equal(again.el("control-bar").parentNode, again.el("control-bar-top"), "the choice was lost");
+  assert.equal(again.el("bar-placement").value, "top", "the setting does not show the stored choice");
+});
+
+test("a browser that refuses to store the placement says so instead of claiming saved", async () => {
+  // Same shape as the microphone toggles and the token: private browsing accepts setItem and
+  // stores nothing, and "Saved" would be a lie found out only after a reload.
+  const page = newPage();
+  await signIn(page);
+  page.storage.set = () => page.storage;
+
+  page.el("bar-placement").value = "top";
+  await page.el("bar-placement").dispatch("change");
+
+  assert.doesNotMatch(page.el("bar-placement-state").textContent, /Saved/, "it claimed success");
+  assert.match(page.el("bar-placement-state").textContent, /refused to store/);
+  // ...and it still moved, because the reader asked for it. Refusing to store is not refusing to act.
+  assert.equal(page.el("control-bar").parentNode, page.el("control-bar-top"));
+});
+
+test("the bar hides PER MEMBER, so the gear stays reachable before anyone has signed in", async () => {
+  // Hiding the whole bar off the main screen would be the easy implementation and would take the
+  // gear away from the sign-in screen, where it is reachable today.
+  const page = newPage();
+  assert.equal(page.screen(), "signin");
+  assert.equal(page.el("open-settings").hidden, false, "settings became unreachable when signed out");
+  assert.equal(page.el("view-switch").hidden, true, "the view switch is offered with no views");
+  assert.equal(page.el("control-bar").hidden, false, "the bar went away and took the gear with it");
+
+  await page.el("open-settings").click();
+  assert.equal(page.el("open-settings").hidden, true, "the gear offers the screen you are on");
+  assert.equal(
+    page.el("control-bar").hidden,
+    true,
+    "an empty bar still stands in the dock on the settings screen"
+  );
 });
 
 // --- the one status line -------------------------------------------------------------------------
@@ -1883,7 +2060,16 @@ test("the horizontal safe-area insets are applied, not only the bottom one", () 
   // NOT VERIFIABLE BY SCREENSHOT: no browser automation can make Chromium report a non-zero inset,
   // and a headless browser renders a rectangle with no curved corners at all. This asserts the
   // declaration, which is the only part that can be checked here.
-  for (const selector of ["#topbar", "#status-line", "#control-pane", "#scroll-area"]) {
+  // `#58 control-bar` added the fifth: in the dock the bar is not inside anything that already
+  // applies the insets, so without its own the same curve that ate the first word of the status
+  // line would eat the gear.
+  for (const selector of [
+    "#topbar",
+    "#status-line",
+    "#control-pane",
+    "#scroll-area",
+    '#control-bar[data-placement="bottom"]',
+  ]) {
     const block = cssBlock(selector);
     assert.match(block, /env\(safe-area-inset-left\)/, `${selector} ignores the left inset`);
     assert.match(block, /env\(safe-area-inset-right\)/, `${selector} ignores the right inset`);
@@ -1978,6 +2164,14 @@ test("on a desktop both lists are held to a reading column, and the phone is lef
   // pinned. The frame test above asserts the pane is still a grid row; this is the other half.
   assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane"), /max-width:\s*var\(--reading-width\)/);
   assert.doesNotMatch(cssBlock("#control-pane"), /position:\s*(fixed|absolute)/);
+  // `#58 control-bar` put a second band in the dock, and it follows the column for the same
+  // reason: a bar spanning a metre of desk above a column-width pane puts the switch a screen away
+  // from the transcript it switches.
+  assert.match(
+    cssBlockIn(DESKTOP_QUERY, '#control-bar[data-placement="bottom"]'),
+    /max-width:\s*var\(--reading-width\)/,
+    "the control bar spans the whole desktop while everything under it is a column"
+  );
   // The width is a token with a default, so a browser that never enters the regime still parses.
   assert.match(cssBlock(":root"), /--reading-width:\s*\d+ch/, "the column has no default width");
 });
@@ -3209,11 +3403,40 @@ test("switching views does not disturb a live call", async () => {
 });
 
 test("the header spends one row, because the transcript is what deserves the height", () => {
-  const row = HTML.slice(HTML.indexOf('class="topbar-row"'), HTML.indexOf("</header>"));
+  // REWRITTEN BY `#58 control-bar`, which is the reason the two ids it used to look for are not in
+  // this row any more. The claim it was making — the header never becomes two bands — is unchanged
+  // and is asserted more strictly than before: whatever the header holds, including the control
+  // bar when the reader has asked for it at the top, it holds on ONE row.
+  const row = HTML.slice(HTML.indexOf('id="topbar-row"'), HTML.indexOf("</header>"));
   assert.equal((row.match(/class="topbar-row"/g) || []).length, 1, "the header grew a second row");
-  for (const id of ["view-switch", "open-settings"]) {
-    assert.ok(row.includes(`id="${id}"`), `#${id} is not in the top row`);
-  }
+  assert.ok(row.includes('id="control-bar-top"'), "the header has nowhere to put the control bar");
+  assert.match(cssBlock(".topbar-row"), /display:\s*flex/, "the row is no longer one line of items");
+  // And the mount takes the leftover width, so a bar placed up here spans the row rather than
+  // huddling beside the title.
+  assert.match(cssBlock("#control-bar-top"), /flex:\s*1 1 auto/);
+});
+
+test("AT THE BOTTOM THE HEADER COSTS NO ROW AT ALL", async () => {
+  // The point of the move, and the thing that makes it worth doing rather than merely different:
+  // with the bar in the dock the header on the main screen holds NOTHING, and an empty 2.4rem
+  // strip across the top of a phone is exactly the real estate `#58 control-bar` is about. It is
+  // hidden outright — a grid row that collapses — not merely emptied.
+  const page = newPage();
+  assert.equal(page.el("topbar").hidden, true, "an empty header stands on the sign-in screen");
+  await signIn(page);
+  assert.equal(page.el("topbar").hidden, true, "an empty header stands on the main screen");
+
+  // ...but never when it has something to say. Settings turns it back into a title bar.
+  await page.el("open-settings").click();
+  assert.equal(page.el("topbar").hidden, false, "the way back out of Settings was hidden");
+  assert.equal(page.el("topbar-title").textContent, "Settings");
+  await page.el("close-settings").click();
+  assert.equal(page.el("topbar").hidden, true);
+
+  // ...and never when the reader has asked for the bar to be up there.
+  page.el("bar-placement").value = "top";
+  await page.el("bar-placement").dispatch("change");
+  assert.equal(page.el("topbar").hidden, false, "the bar moved to a header that is not shown");
 });
 
 function message(overrides) {

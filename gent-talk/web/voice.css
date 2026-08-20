@@ -91,9 +91,11 @@ body {
 
 /* ---------------------------------------------------------------------------- the top bar --- */
 
-/* One row, two things: which view you are in, and the way out to settings. The header used to
-   carry four controls in two styles, and a reader could not tell which of them were tabs and
-   which were actions. */
+/* A title bar and a way back, and — only when the reader has asked for it there — the control bar.
+   `#58 control-bar` moved the gear and the view switch out of here into a strip of their own, so
+   on the main screen with the default placement this header holds NOTHING and web/voice.js hides
+   it outright. An empty 2.4rem row at the top of a phone is exactly the rent that issue exists to
+   stop paying. */
 #topbar {
   display: block;
   padding: 0.45rem calc(0.7rem + env(safe-area-inset-right)) 0.45rem
@@ -108,10 +110,6 @@ body {
   align-items: center;
   gap: 0.5rem;
   min-height: 2.4rem;
-}
-
-.topbar-gap {
-  flex: 1 1 auto;
 }
 
 .topbar-title {
@@ -848,6 +846,91 @@ body {
   background: var(--paused);
 }
 
+/* ----------------------------------------------------------------------- the control bar --- */
+/*
+ * `#58 control-bar`. The strip carrying the gear, the Voice/Discord switch, and — from `#59` and
+ * `#60` onward — every other small button. Two things about it are load-bearing.
+ *
+ * IT PACKS. `#bar-pack` takes the leftover width and scrolls sideways, which is what makes "add
+ * another button" a one-line change rather than a re-layout. Without it a third button either
+ * wraps the bar onto two rows (spending the vertical space this whole issue exists to save) or
+ * pushes the switch off the right-hand edge, where it cannot be tapped at all. The `.switch` is
+ * the widest thing in the bar on a 375px phone, so that is not a hypothetical.
+ *
+ * IT SITS IN EITHER HOME. The bar is one element with two possible parents, so nothing here may
+ * assume which one it is in; the only placement-dependent rule is the padding below, because the
+ * header already carries its own insets and the dock does not.
+ */
+#control-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-width: 0;
+}
+
+/* THE property that makes the bar a container rather than a row of two things: it takes the space
+   between the gear and the switch, which is what pins one left and the other right, and it is
+   where every later button goes. `overflow-x: auto` is the pack: buttons past the edge scroll,
+   they do not wrap onto a second row and they do not clip the switch off the end. The scrollbar
+   itself is hidden — on a phone there is no scrollbar, and on a desktop a horizontal one inside a
+   2.4rem strip is furniture. */
+#bar-pack {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+#bar-pack::-webkit-scrollbar {
+  display: none;
+}
+
+/* In the header the mount takes the rest of the row, so the bar spans it the way the switch and
+   the gear used to. */
+#control-bar-top {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* In the dock it needs its own horizontal safe-area insets, because unlike the header it is not
+   inside anything that already applies them — the same curve that ate the first word of the status
+   line on the owner's iPhone would eat the gear. The bottom padding is small: the control pane
+   below supplies the separation, and this strip must not become a band. */
+#control-bar[data-placement="bottom"] {
+  padding: 0.35rem calc(0.6rem + env(safe-area-inset-right)) 0.1rem
+    calc(0.6rem + env(safe-area-inset-left));
+}
+
+/* Sized like Sound and Clear, which is what the issue means by "sized like the existing small
+   controls" — the same metrics, deliberately, so a bar button and a pane button read as the same
+   kind of thing. NOT `.control-mini` itself: that class carries `grid-column: 1`, which belongs to
+   #control-pane's 3x2 grid and would mean something quite different out here. */
+.bar-button {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.05rem;
+  min-height: 2.4rem;
+  min-width: 2.75rem;
+  padding: 0 0.4rem;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.85rem;
+  font: inherit;
+  /* The same tap ergonomics as `.control`: no 300ms delay, no grey flash, no text selection from
+     a long press. A control that is a button only in the DOM feels like a web page. */
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 /* ------------------------------------------------------------------------- the composer ---- */
 /*
  * `#43 typed-input`. One small button at rest; a text field only once it has been asked for.
@@ -1159,8 +1242,12 @@ body {
 
   /* The dock follows the column, so the controls sit under the thing they act on instead of
      spanning a metre of desk. `max-width` and an auto margin, NOT `position` — the pane holds its
-     place by being a grid row, and the suite asserts that it still does. */
+     place by being a grid row, and the suite asserts that it still does.
+     `#58 control-bar` joined the group: a bar spanning the whole desk above a column-width pane is
+     the same "phone layout stretched sideways" this block exists to remove, and it would push the
+     switch a screen away from the transcript it switches. */
   #control-pane,
+  #control-bar[data-placement="bottom"],
   #status-line {
     max-width: var(--reading-width);
     margin-inline: auto;

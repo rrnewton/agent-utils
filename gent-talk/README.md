@@ -798,6 +798,41 @@ coming back still counts as part of the suspension, because iOS commonly deliver
 switch, which is why the page suite carries the negative control both ways — a visible failure must
 still raise the banner, and a page with the suspension check removed must fail the suspension test.
 
+### The control bar is a container, and it sits where your thumb is
+
+The gear and the Voice/Discord switch used to be the whole of the header. They are now a **control
+bar**: one strip that can sit in either of two homes, and that is built to fill up.
+
+**Bottom is the default, and "bottom" means directly above the big buttons** — not below them,
+where small icons would sit under the thumb reaching for Talk, and not pinned to the viewport
+floor, which is the corner curvature that ate the first word of the status line on the owner's
+phone. Top — under the title, where it used to be — is a setting, kept in `localStorage` under
+`gent-talk.voice.bar-placement` and offered in Settings. There is **one** bar and two mount points,
+and `setPlacement()` moves the element between them; two copies would be two gears and two switches
+for the page to keep in agreement, which is the defect rather than the layout.
+
+**The bar is declared in the dock in `web/voice.html`**, not created from script, so the default
+placement is a fact about the served markup: a page whose JavaScript died still shows the controls
+where they belong.
+
+**The gear is at the far left and the switch at the far right**, and that asymmetry is deliberate:
+the gear is the control you least want to hit by accident, so it goes furthest from where a
+right-handed thumb rests, and the switch — the one you actually flick — goes under it. What holds
+them at the two ends is `#bar-pack`, the empty container between them, which takes all the leftover
+width. That is also what makes the bar **pack**: buttons added to it scroll sideways rather than
+wrapping onto a second row (which would spend the vertical space this is all about) or clipping the
+switch off the right-hand edge of a 375px phone, where it could not be tapped at all. The switch is
+the widest item in the bar, so that is arithmetic, not a worry.
+
+**With the bar at the bottom the header holds nothing on the main screen, so it is hidden
+outright** — the grid row collapses and the transcript grows into it. That is the real estate the
+whole change is about; an empty 2.4rem strip across the top of a phone is exactly the rent this
+project keeps refusing to pay. The header comes back the moment it has something to say: a title
+and a way back on Settings or Reply, or the bar itself when the reader has chosen top.
+
+Members hide **individually**, not the bar as a whole, which is what keeps the gear reachable from
+the sign-in screen; the bar hides only when every member is hidden.
+
 ### Typing is the other way to say something, on the same conversation
 
 Speaking is not always available — a quiet room, a commit hash the transcriber keeps mangling, a
@@ -1268,7 +1303,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-three states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty-five states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1277,8 +1312,9 @@ range, and the two connection outcomes that used to look identical — a call su
 phone, and one that really failed — the reply screen with a short target and with one longer
 than the frame, one channel row picked out under the pointer, a step further back through the
 channel, the earlier conversation restored from the server after a reload, and the text composer
-open during a live call with a turn that was typed rather than spoken — at four viewports: a tall
-phone, a short phone, a small laptop window and a maximised desktop. It prints the absolute path of every image so an agent can open them directly.
+open during a live call with a turn that was typed rather than spoken, and the control bar in
+each of its two homes — at four viewports: a tall phone, a short phone, a small laptop window and
+a maximised desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
 (pointer: fine)` is what puts the reading column on the page at all, so on a phone there is no
@@ -1329,7 +1365,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 43 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 44 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.

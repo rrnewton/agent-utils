@@ -735,7 +735,7 @@ class Driver:
 
     # -- page-level helpers ----------------------------------------------------------------------
 
-    def load(self, with_token: bool) -> None:
+    def load(self, with_token: bool, placement: str | None = None) -> None:
         script = STUB_JS
         if with_token:
             script += (
@@ -755,8 +755,19 @@ class Driver:
             "\ntry {\n"
             "  localStorage.removeItem('gent-talk.voice.width');\n"
             "  localStorage.removeItem('gent-talk.voice.drafts');\n"
+            "  localStorage.removeItem('gent-talk.voice.bar-placement');\n"
             "} catch (e) {}\n"
         )
+        # `#58 control-bar`. Where the control bar sits is a stored preference, so it is cleared
+        # above with the others and SEEDED here when a state is about to be a picture of it. Seeded
+        # rather than clicked, because the alternative -- walking into Settings and back out -- is
+        # a different state's subject and would put the previous scene's screen in the way.
+        if placement is not None:
+            script += (
+                "\ntry { localStorage.setItem('gent-talk.voice.bar-placement', "
+                + json.dumps(placement)
+                + "); } catch (e) {}\n"
+            )
         self.page.add_init_script(script)
         self.page.goto(f"{self.base_url}/voice", wait_until="load")
 
@@ -1509,6 +1520,33 @@ def _act_typed_turn(driver: Driver) -> None:
     driver.settle(300)
 
 
+def _act_control_bar_top(driver: Driver) -> None:
+    """`#58 control-bar`: the bar in its OTHER home, under the title.
+
+    Seeded through storage rather than reached by clicking, because a reader who has chosen top
+    gets it from the first frame — which is the thing worth photographing — and because clicking
+    it would make this a picture of the settings screen instead.
+    """
+    driver.load(with_token=True, placement="top")
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.settle(300)
+
+
+def _act_control_bar_bottom(driver: Driver) -> None:
+    """`#58 control-bar`: the default home, reached THROUGH the setting that chooses it.
+
+    Entered from the state above, so this photograph is also the proof that the Settings control
+    really moves the bar rather than merely remembering a word — the scene before it left the bar
+    in the header.
+    """
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('bar-placement')", timeout=5_000)
+    driver.page.select_option("#bar-placement", "bottom")
+    driver.click("close-settings")
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=5_000)
+    driver.settle(300)
+
+
 NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
 SCENES: tuple[Scene, ...] = (
@@ -2108,6 +2146,54 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="24-control-bar-top",
+        what="the control bar in its other home, under the title at the top of the screen",
+        act=_act_control_bar_top,
+        expect=(
+            (
+                "the bar is really up there: above the scrolling body, not in the dock",
+                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "const s = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "return b.height > 0 && b.bottom <= s.top + 1; })()",
+            ),
+            (
+                "the header is showing, because it has something in it again",
+                "window.__visible('topbar')",
+            ),
+            (
+                "the gear and the switch came with it",
+                "window.__visible('open-settings') && window.__visible('view-switch')",
+            ),
+        ),
+    ),
+    Scene(
+        name="25-control-bar-bottom",
+        what="the default: the control bar in the dock, directly above the big buttons",
+        act=_act_control_bar_bottom,
+        expect=(
+            # THE claim, and the half of it that is easy to get wrong. "Bottom" is not "below the
+            # big buttons" and not "pinned to the viewport floor": it is the band BETWEEN the
+            # transcript and the controls. Only a browser can measure that.
+            (
+                "the bar sits below the transcript and directly above the big buttons",
+                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "const s = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "const p = document.getElementById('control-pane').getBoundingClientRect(); "
+                "return b.height > 0 && b.top >= s.bottom - 1 && b.bottom <= p.top + 1; })()",
+            ),
+            # ...and the payoff. With nothing left in the header it is not merely empty, it is gone,
+            # and the body has grown into the row it used to hold.
+            (
+                "the header costs no row at all",
+                "!window.__visible('topbar')",
+            ),
+            (
+                "the switch is still reachable down there",
+                "window.__visible('view-switch') && window.__visible('open-settings')",
+            ),
+        ),
+    ),
 )
 
 
@@ -2424,7 +2510,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 23:
+    if len(SCENES) < 25:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2443,7 +2529,9 @@ def check_state_controls() -> list[str]:
             "`#48 transcript-storage` added the one scene that RELOADS the page, and `#43 "
             "typed-input` added the composer open during a live call -- the only place the "
             "question 'does a fourth dock band fit on a 375x667 phone without eating the "
-            "transcript or overlapping the controls' can be answered at all."
+            "transcript or overlapping the controls' can be answered at all. `#58 control-bar` "
+            "added the bar in BOTH of its homes, because 'directly above the big buttons' is a "
+            "measurement and nothing without a layout engine has an opinion about it."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2556,6 +2644,11 @@ def check_state_controls() -> list[str]:
         # transcript; `control-pane` is the GEOMETRY check -- the composer above the big controls
         # rather than over them -- and it is the only thing in the repository that can see it.
         "23-typed-turn": ("li.mine", "control-pane"),
+        # `#58 control-bar`. Both placements are pinned to the GEOMETRY rather than to the bar
+        # merely existing -- `scroll-area` in each is the edge the bar has to be on the right side
+        # of, and `topbar` is the row that is supposed to disappear underneath it.
+        "24-control-bar-top": ("scroll-area", "topbar"),
+        "25-control-bar-bottom": ("control-pane", "topbar"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2828,6 +2921,7 @@ SELF_TEST_CHECKS = (
     "the hover state is pinned to the rendered colour, not to the row being hovered",
     "the older-step state is pinned to the anchor holding, not to the list being longer",
     "the typed-turn state is pinned to the dock geometry, not just to the composer being up",
+    "both control-bar states are pinned to where the bar IS, not to the bar existing",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",

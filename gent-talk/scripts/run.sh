@@ -78,7 +78,7 @@
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
-#   --screenshots  Photograph the /voice page in all twenty-three states that look different, so an
+#   --screenshots  Photograph the /voice page in all twenty-five states that look different, so an
 #                  agent can LOOK at the interface before the owner does. FREE and offline: no vendor
 #                  conversation, no microphone, no money. The conversation WebSocket is replaced by
 #                  a fake and the microphone is Chromium's built-in fake capture device, so the
