@@ -944,6 +944,33 @@ body {
   color: var(--warn);
 }
 
+/* `#83 channel-selector-in-bar`. The channel picker, sized to live in the bar rather than in a row
+ * of its own.
+ *
+ * `flex: 0 1 auto` with a CEILING, which is the whole of the layout argument: style.css gives every
+ * `select` `flex: 1`, and a member of the pack that grows would take the leftover width the pack
+ * exists to hold — pushing the buttons `#59` and `#60` put here off the right-hand edge on a 375px
+ * phone. It may SHRINK, because a long channel name must cost the other members nothing; a `select`
+ * elides its own label, so shrinking costs characters rather than reachability.
+ *
+ * SIXTEEN PIXELS, for exactly the reason `#compose-text` below is: iOS Safari zooms the whole frame
+ * when a control smaller than 16px takes focus, and this page is a fixed 100dvh grid — a zoomed
+ * frame does not scroll, it pushes the dock off a viewport that cannot scroll back to it. */
+.bar-select {
+  flex: 0 1 auto;
+  min-width: 5rem;
+  max-width: 9rem;
+  min-height: 2.4rem;
+  padding: 0 0.5rem;
+  font-size: 16px;
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--edge);
+  border-radius: 0.85rem;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
 /* style.css dresses `select` and `input` but not `textarea`, so the prompt fields on the settings
    screen would otherwise be unstyled system boxes sitting between two that are not. */
 textarea {

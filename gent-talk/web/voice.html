@@ -147,8 +147,18 @@
             </div>
 
             <div id="pane-discord" hidden>
+              <!--
+                `#83 channel-selector-in-bar`. The channel PICKER used to be the other half of
+                this row, and being in here is what made it useless: this is inside #scroll-area,
+                so the control for choosing what you are reading scrolled away the moment you read
+                anything — and `#65 scrollback-paging` then made scrolling toward it PREPEND more
+                history, so it receded as you approached. It lives on the control bar now.
+
+                Refresh stays. It is a re-read of what is already on screen rather than a choice
+                about what to read, it keeps your place, and it is the desktop and keyboard path a
+                gesture cannot be — a keyboard reaches it wherever the list is scrolled to.
+              -->
               <div class="row">
-                <select id="discord-channel" aria-label="channel"></select>
                 <button id="refresh-discord" type="button">Refresh</button>
               </div>
               <!--
@@ -521,6 +531,23 @@
             wrapping or clipping when the buttons outgrow a narrow phone.
           -->
           <div id="bar-pack">
+            <!--
+              `#83 channel-selector-in-bar`. WHICH CHANNEL you are reading, chosen from the bar
+              rather than from a row at the top of the scrollback.
+
+              FIRST in the pack, immediately right of the gear, and that is the reachability
+              argument rather than a taste one: the pack scrolls sideways when it is full, so the
+              member at its left edge is the one that is on screen without scrolling anything —
+              and "this control cannot be reached" is the entire defect being fixed. It also
+              displaces nothing: flex lays the pack out from the left, so the buttons that were
+              already here keep their distance from the switch.
+
+              A `select`, not a button that opens something: the platform's own picker is the one
+              a thumb already knows, and it needs no menu of this page's invention.
+            -->
+            <select id="discord-channel" class="bar-select" aria-label="channel"
+                    title="Which channel this view is reading. Changing it starts that channel at its newest message."></select>
+
             <!--
               `#59 text-entry-button`. Typing costs ONE small button's worth of the bar, not a
               permanent field: pressing it converts the bar into a text field, and pressing it

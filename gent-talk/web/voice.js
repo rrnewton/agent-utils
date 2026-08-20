@@ -237,6 +237,11 @@ function showView(name) {
   jumpNewestWanted[name] = false;
   // The chips belong to the list you are looking at, and you are now looking at a different one.
   renderScrollTools();
+  // ...and so does the channel picker, which is a member of the bar now rather than a row at the
+  // top of the scrollback. LAST, and after `currentView` is set, for the same reason `showScreen`
+  // ends this way: the bar decides what it shows from the view that is now up. `#83
+  // channel-selector-in-bar`.
+  renderControlBar();
 }
 
 // --- connection details -------------------------------------------------------------------------
@@ -1535,8 +1540,15 @@ function renderControlBar() {
   // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
   // members here, and every one of them belongs to the call and gets out of the way of the field.
   // The toggle is the exception, because it is the way back out of the mode.
+  //
+  // `#83 channel-selector-in-bar` adds the one member that belongs to a VIEW rather than to the
+  // screen: a channel picker on the call view names a channel you are not looking at, and it is
+  // the widest thing in the pack. So it is offered where it acts, and the rule is stated as a
+  // question about the member rather than as a branch, so a second view-scoped member is one
+  // entry rather than a second code path.
+  const forThisView = (member) => member.id !== "discord-channel" || currentView === "discord";
   for (const member of el("bar-pack").children) {
-    member.hidden = !main || (typing && member.id !== "text-entry");
+    member.hidden = !main || !forThisView(member) || (typing && member.id !== "text-entry");
   }
   el("text-entry").setAttribute("aria-pressed", typing ? "true" : "false");
   el("compose-text").hidden = !typing;

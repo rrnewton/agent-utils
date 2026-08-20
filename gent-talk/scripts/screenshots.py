@@ -1413,6 +1413,67 @@ def _act_channel_older(driver: Driver) -> None:
     )
 
 
+def _act_channel_picker_reachable(driver: Driver) -> None:
+    """`#83 channel-selector-in-bar`: the picker on the bar, several pages deep in the history.
+
+    The owner's complaint was that the picker was unreachable, and unreachability is a MEASUREMENT
+    on a real 375px screen -- is the control inside the viewport, clear of the edges, at a scroll
+    position the reader can actually be in. No fixture has an opinion about that, which is why this
+    state exists rather than a third unit test.
+
+    The walk is what makes it the owner's case rather than a friendly one. It goes back several
+    pages first, so the history above the reader is exactly the thing that used to push the picker
+    further away with every scroll toward it.
+    """
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { const r = document.getElementById('discord-channel').getBoundingClientRect(); "
+        "window.__pickerBefore = { top: r.top, left: r.left }; return window.__pickerBefore; })()"
+    )
+    # Scrolled, not clicked, for the same reason `_act_whole_channel` scrolls: #load-older lives at
+    # the top of the list and Playwright scrolls a control into view before clicking it, which
+    # would itself take the step this is trying to take.
+    steps = 0
+    for _ in range(4):
+        if not bool(driver.js("window.__visible('load-older')")):
+            break
+        driver.js(
+            "(() => { window.__walkFrom = "
+            "document.querySelectorAll('#discord-log li').length; "
+            "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()"
+        )
+        driver.page.wait_for_function(
+            "() => document.querySelectorAll('#discord-log li').length > window.__walkFrom",
+            timeout=10_000,
+        )
+        driver.settle(120)
+        steps += 1
+    if steps < 3:
+        raise Unreachable(
+            "30-channel-picker-in-bar",
+            "the channel walks back several pages, so the picker has history above it",
+            f"only {steps} step(s) were available",
+        )
+    # Parked mid-history: not at the top, where the walk left the reader, and not at the newest
+    # line either. This is the position the picker was unreachable FROM.
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); "
+        "a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) * 0.45); return a.scrollTop; })()"
+    )
+    driver.settle(250)
+    driver.js(
+        "(() => { const r = document.getElementById('discord-channel').getBoundingClientRect(); "
+        "window.__pickerAfter = { top: r.top, left: r.left, right: r.right, bottom: r.bottom, "
+        "width: r.width, height: r.height }; "
+        "window.__pickerMoved = Math.max(Math.abs(r.top - window.__pickerBefore.top), "
+        "Math.abs(r.left - window.__pickerBefore.left)); "
+        "window.__pickerInScroll = document.getElementById('scroll-area')"
+        ".contains(document.getElementById('discord-channel')); "
+        "window.__loadedAfter = document.querySelectorAll('#discord-log li').length; "
+        "return window.__pickerMoved; })()"
+    )
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -2542,6 +2603,43 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="30-channel-picker-in-bar",
+        what="the channel picker on the control bar, with the channel walked back several pages",
+        act=_act_channel_picker_reachable,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the channel really is several pages deep, which is where it was unreachable",
+                "window.__loadedAfter >= 12",
+            ),
+            (
+                "the reader is parked in the history rather than at either end of it",
+                "(() => { const a = document.getElementById('scroll-area'); "
+                "return a.scrollTop > 50 && a.scrollTop < a.scrollHeight - a.clientHeight - 50; })()",
+            ),
+            # THE claim, and the one only a layout engine can settle: the picker is ON the 375px
+            # screen, whole, at a scroll position several pages into the history. Clipped off the
+            # right-hand edge of the packing bar would satisfy "it is in the markup" and would be
+            # the same defect wearing a different coat.
+            (
+                "the picker is on screen entire, inside the viewport on all four sides",
+                "(() => { const r = window.__pickerAfter; return r.width > 20 && r.height > 20 && "
+                "r.top >= 0 && r.left >= 0 && r.right <= window.innerWidth && "
+                "r.bottom <= window.innerHeight; })()",
+            ),
+            (
+                # The regression half of `#83`: prepending history moved the picker, because the
+                # picker was in the thing being prepended to. Measured across the whole walk.
+                "walking the channel back did not move the picker at all",
+                "window.__pickerMoved <= 1",
+            ),
+            (
+                "and it is not inside the scrolling element, which is WHY it did not move",
+                "window.__pickerInScroll === false",
+            ),
+        ),
+    ),
 )
 
 
@@ -2858,7 +2956,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 29:
+    if len(SCENES) < 30:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2886,7 +2984,11 @@ def check_state_controls() -> list[str]:
             "is the same kind of question, and no fixture can answer it. `#44 live-push` added "
             "the one where a row appears because the SERVER said so rather than because the page "
             "asked, and `#46 conversation-replay` the one where a resumed call admits its "
-            "reconstruction was only partial."
+            "reconstruction was only partial. `#83 channel-selector-in-bar` added the last one: "
+            "the channel picker on the bar with the history walked back several pages, because "
+            "'this control cannot be reached' is a measurement on a real 375px screen -- whether "
+            "the picker is inside the viewport, whole, at a scroll position the reader can be in "
+            "-- and nothing without a layout engine can answer it."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -3018,6 +3120,11 @@ def check_state_controls() -> list[str]:
         # every post-call state is idle, and only this sentence distinguishes a reconstruction
         # that lost its beginning from one that did not.
         "29-resume-partial": ("replayed in part", "IN PART"),
+        # `#83 channel-selector-in-bar`. Pinned to the GEOMETRY and to the walk, not to the picker
+        # existing: it existed before this issue too, on a row at the top of the scrollback, and a
+        # scene pinned to `window.__visible('discord-channel')` would have been green throughout
+        # the whole time the owner could not reach it.
+        "30-channel-picker-in-bar": ("window.innerWidth", "__pickerMoved", "__pickerInScroll"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

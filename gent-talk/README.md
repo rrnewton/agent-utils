@@ -937,6 +937,38 @@ The throwaway server the screenshot harness starts sets `discord.max_fetch_limit
 `--fake-discord` seeds about a dozen messages, so at the default ceiling the channel arrives in one
 read and none of this is exercised by any picture.
 
+### Choosing the channel is a control, not a line of the scrollback
+
+The picker used to be a row at the **top of the scrolling region**, above the log. That is the
+whole of the defect the owner reported: the control for choosing *what you are reading* scrolled
+away the moment you read anything, and getting back to it meant scrolling a channel to its
+beginning.
+
+**Paging made it worse, and that half was ours.** Once reaching the top loaded another page,
+scrolling toward the picker prepended history above it — so it receded as you approached, and on a
+channel of any size it could not be reached by scrolling at all. `#83 channel-selector-in-bar`.
+
+So it moved onto the **control bar**, which `#58 control-bar` built as a packing container for
+exactly this, and the fix is placement rather than tuning: with the picker out of the scrolling
+element, the automatic step back is free to keep working as designed and nothing here touches
+`OLDER_TRIGGER_PX`.
+
+It is the **first** member of the pack, and that is the reachability argument rather than a taste
+one — the pack scrolls sideways when it is full, so the member at its left edge is the one on
+screen without scrolling anything. It may shrink but never grow (`flex: 0 1 auto` against the
+`flex: 1` every `select` inherits from `style.css`), because a member that grew would take the
+width the pack holds for the buttons beside it. And it is offered **only on the channel view**: on
+the call view it names a channel you are not looking at, and it is the widest thing in the bar.
+
+**Refresh stays where it is.** It is a re-read of what is already on screen rather than a choice
+about what to read, it keeps your place, and a keyboard reaches it wherever the list is scrolled
+to.
+
+The screenshot state `30-channel-picker-in-bar` is what settles the acceptance criterion, because
+"unreachable" is a measurement: it walks the channel back several pages, parks mid-history, and
+asserts the picker is inside a 375px viewport on all four sides and did not move by so much as a
+pixel across the whole walk. Nothing without a layout engine has an opinion about that.
+
 ### One channel row at a time, but only where a pointer exists
 
 A long channel is a wall of blocks, and Discord picks out the row under the pointer because a mouse
@@ -1577,7 +1609,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-nine states that look different — signed out, idle, live
+Photographs the `/voice` page in the thirty states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1588,8 +1620,9 @@ than the frame, one channel row picked out under the pointer, a step further bac
 channel, the earlier conversation restored from the server after a reload, a turn that was typed
 rather than spoken, the control bar in each of its two homes, that same bar converted into a
 text field, the bar packed with every button it has, a channel message that arrived because the
-SERVER pushed it rather than because the page asked, and a resumed call whose reconstruction was
-only partial and says so — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+SERVER pushed it rather than because the page asked, a resumed call whose reconstruction was
+only partial and says so, and the channel picker on the bar with the history walked back several
+pages — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
 desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and

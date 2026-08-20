@@ -261,7 +261,12 @@ const FIXTURE_TREE = {
   // web/voice.js hides and shows them by ITERATING it rather than by name — which is what makes a
   // third button one list entry rather than a new code path. So the fixture has to really nest
   // them, or that loop runs over nothing and every test of it certifies an empty set.
-  "bar-pack": ["text-entry", "canned-summary", "canned-blockers"],
+  //
+  // The channel picker is FIRST, and its being here at all is `#83 channel-selector-in-bar`: it
+  // used to sit inside #scroll-area above the log, where reading anything scrolled it away and
+  // scrolling back toward it loaded more history. `assertMarkupContains` below is what stops this
+  // list from describing a page that put it back.
+  "bar-pack": ["discord-channel", "text-entry", "canned-summary", "canned-blockers"],
   // ...and the bar itself, in markup order, because "the toggle is the leftmost thing on the bar
   // once the gear has gone" is an ordering claim and a fixture that held the members in a flat
   // list could not check it. It is also what `setPlacement` re-parents, so the move has something
@@ -283,7 +288,7 @@ function markupPlace(id) {
  * Answered from the file's own indentation, which is uniform because the file is hand-kept that
  * way: the parent's element ends at the first later non-blank line indented no further than it.
  */
-function assertMarkupContains(parent, child) {
+function markupHolds(parent, child) {
   const outer = markupPlace(parent);
   const inner = markupPlace(child);
   let closesAt = outer.lines.length;
@@ -297,8 +302,19 @@ function assertMarkupContains(parent, child) {
       break;
     }
   }
+  return inner.at > outer.at && inner.at < closesAt;
+}
+
+/**
+ * ...and the assertion built on it.
+ *
+ * Split from `markupHolds` above by `#83 channel-selector-in-bar`, which needs the NEGATIVE: the
+ * whole content of that issue is that one control is no longer inside the scrolling element, and
+ * "it is somewhere else as well" is not the same claim.
+ */
+function assertMarkupContains(parent, child) {
   assert.ok(
-    inner.at > outer.at && inner.at < closesAt,
+    markupHolds(parent, child),
     `web/voice.html no longer nests #${child} inside #${parent}, so the fixture's layout model ` +
       "describes a page that does not exist"
   );
@@ -2051,6 +2067,139 @@ test("the bar hides PER MEMBER, so the gear stays reachable before anyone has si
     true,
     "an empty bar still stands in the dock on the settings screen"
   );
+});
+
+// --- the channel picker, on the bar (#83 channel-selector-in-bar) --------------------------------
+//
+// The owner's complaint, in his words: "the crazy thread selector buried at the TOP of the
+// scrollback window (useless) is still there. It's worse now because it seems to auto-load past
+// history making it even more unreachable."
+//
+// Two facts, and the second is a regression this project introduced. The picker sat inside
+// #scroll-area above the log, so the control for choosing WHAT YOU ARE READING scrolled away as
+// soon as you read anything — and `#65 scrollback-paging` then made arriving at the top load
+// another page, so scrolling toward the picker prepended history above it and it receded as you
+// approached. On a channel of any size it could not be reached by scrolling at all.
+//
+// The fix is placement, not tuning: out of the scrolling element entirely and onto the bar `#58
+// control-bar` built for exactly this. Auto-load is then free to keep working as designed, which
+// is why nothing below touches OLDER_TRIGGER_PX.
+
+test("THE CHANNEL PICKER IS ON THE BAR, AND OUT OF THE SCROLLING ELEMENT ENTIRELY", () => {
+  assertMarkupContains("bar-pack", "discord-channel");
+  // The half that is the issue. "It is on the bar" is satisfied by a page with a picker in both
+  // places, and the one in the scrollback is the one the owner keeps finding.
+  assert.equal(
+    markupHolds("scroll-area", "discord-channel"),
+    false,
+    "the channel picker is still inside the scrolling element, where prepending history moves it"
+  );
+  assert.equal(
+    (HTML_CODE.match(/id="discord-channel"/g) || []).length,
+    1,
+    "there are two channel pickers, so the page has two opinions about which channel is up"
+  );
+  // FIRST in the pack. The pack scrolls sideways when it is full, so the member at its left edge
+  // is the one on screen without scrolling anything — and being unreachable is the whole defect.
+  const pack = HTML.indexOf('id="bar-pack"');
+  const picker = HTML.indexOf('id="discord-channel"');
+  for (const later of ["text-entry", "canned-summary", "canned-blockers"]) {
+    assert.ok(
+      picker < HTML.indexOf(`id="${later}"`),
+      `#${later} is packed before the channel picker, so the picker is what scrolls off the bar`
+    );
+  }
+  assert.ok(picker > pack, "the picker is not in the pack at all");
+});
+
+test("the picker cannot take the width the pack holds for everything else", () => {
+  // style.css gives every `select` `flex: 1`, and a pack member that GROWS takes the leftover
+  // width the pack exists to distribute — pushing the buttons `#59` and `#60` put here off the
+  // right-hand edge of a 375px phone, which is the clipping `#58 control-bar` was built to avoid.
+  const rule = cssBlock(".bar-select");
+  assert.match(rule, /flex:\s*0 1 auto/, "the picker grows into the bar");
+  assert.match(rule, /max-width:/, "nothing caps how much of the bar a long channel name takes");
+  // ...and it shrinks rather than clipping, which is what makes a long channel name cost
+  // characters instead of costing the buttons beside it.
+  assert.match(rule, /min-width:\s*[\d.]+rem/);
+  const shared = cssRules(SHARED_CSS, "select").join("\n");
+  assert.match(shared, /flex:\s*1/, "the rule above is overriding something that is no longer there");
+  // Sixteen pixels, the same iOS rule `#compose-text` states: a control smaller than that zooms
+  // the whole frame on focus, and this page is a fixed 100dvh grid that cannot scroll back.
+  assert.match(rule, /font-size:\s*16px/, "focusing the picker will zoom the frame on iOS");
+});
+
+test("WALKING BACK THROUGH THE CHANNEL CANNOT MOVE THE PICKER", async () => {
+  // The regression half of `#83`, stated as the thing the reader experiences: take several steps
+  // back through the history — each one prepending above the viewport, exactly as `#65
+  // scrollback-paging` intends — and the picker must be exactly where it was.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 5, size: 4, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(page, []);
+  const area = page.el("scroll-area");
+  const picker = page.el("discord-channel");
+  assert.equal(picker.hidden, false, "the picker is not on screen in the channel view");
+
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const summaryBefore = page.el("channel-summary").getBoundingClientRect().top;
+
+  for (let step = 0; step < 3; step += 1) {
+    await page.el("load-older").click();
+    await page.settle();
+  }
+
+  assert.equal(page.el("discord-log").children.length, 16, "the walk did not really go back");
+  // The control group the picker used to be part of DID recede: the summary sits at the head of
+  // the scrolling content, and three steps of prepended history have pushed it far above the
+  // viewport. That is the fate the picker escaped, measured rather than asserted by analogy.
+  const summaryAfter = page.el("channel-summary").getBoundingClientRect().top;
+  assert.ok(
+    summaryAfter < summaryBefore - 100,
+    `the head of the scrollback only moved ${summaryBefore - summaryAfter}px, so this test is not ` +
+      "walking the channel back far enough to say anything"
+  );
+  // ...and the picker is not in that box at all, which is WHY it did not move. `scrollBox()` is
+  // the fixture's own answer to "which scrolling element lays this out", so this is a claim about
+  // where the element really is rather than about a number that happens to be equal.
+  assert.equal(picker.scrollBox(), null, "the picker is laid out inside the scrolling element");
+  assert.equal(
+    area.descendants().includes(picker),
+    false,
+    "the picker is a descendant of #scroll-area, so prepending history moves it"
+  );
+  assert.equal(picker.parentNode, page.el("bar-pack"), "the picker left the bar");
+  assert.equal(picker.hidden, false, "the walk back took the picker off the screen");
+});
+
+test("the picker is offered where there is a channel to pick, and nowhere else", async () => {
+  // It is the widest member of the pack and it names a channel the call view is not showing, so
+  // it belongs to the VIEW rather than to the screen. Everything else on the bar is the other
+  // rule, which is why this one is written as a question about the member.
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.tab(), "voice");
+  assert.equal(page.el("discord-channel").hidden, true, "a channel picker over the call view");
+
+  await showDiscord(page, [message({ content: "hi" })]);
+  assert.equal(page.el("discord-channel").hidden, false, "the picker is missing from its own view");
+
+  // The bar's other rule still applies to it: text entry takes the bar, and every member that is
+  // not the way back out of the mode gets out of the way.
+  await page.el("text-entry").click();
+  assert.equal(page.el("discord-channel").hidden, true, "the picker crowded the text field");
+  await page.el("text-entry").click();
+  assert.equal(page.el("discord-channel").hidden, false);
+
+  // ...and so does the screen rule.
+  await page.el("open-settings").click();
+  assert.equal(page.el("discord-channel").hidden, true, "the picker followed you into Settings");
+  await page.el("close-settings").click();
+  assert.equal(page.el("discord-channel").hidden, false, "coming back lost the picker");
+
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "voice");
+  assert.equal(page.el("discord-channel").hidden, true, "the picker stayed after leaving its view");
 });
 
 // --- the one status line -------------------------------------------------------------------------
