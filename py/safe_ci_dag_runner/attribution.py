@@ -21,6 +21,11 @@ LOG_DIR_ENV = "SAFE_CI_DAG_RUNNER_LOG_DIR"
 NO_LOGS_ENV = "SAFE_CI_DAG_RUNNER_NO_STEP_LOGS"
 _MAX_COMPONENT_BYTES = 255
 
+#: Hard ceiling on ONE step's raw log. Separate from the in-memory tail bound in
+#: scheduler.py: this bounds the DISK cost, that one bounds RSS, and a runaway
+#: threatens both independently.
+STEP_LOG_CAP_BYTES = 1024 * 1024 * 1024
+
 
 def sanitize(tag: str) -> str:
     """Injectively encode a UTF-8 tag as an ASCII filename component."""
@@ -434,10 +439,14 @@ def bind_process_tests(
 class StepStream:
     """One step's raw log, unterminated output tail, and test tracker."""
 
-    def __init__(self, tag: str, evidence: RunEvidence | None):
+    def __init__(self, tag: str, evidence: RunEvidence | None,
+                 log_cap_bytes: int = STEP_LOG_CAP_BYTES):
         self.tag = tag
         self.evidence = evidence
         self._log = evidence.open_step_log(tag) if evidence is not None else None
+        self._log_cap = log_cap_bytes
+        self._log_written = 0
+        self._log_dropped = 0
         self._partial = ""
         self._tracker = TestTracker()
         self._tail_announced: str | None = None
@@ -447,11 +456,34 @@ class StepStream:
         """Persist and classify one raw output chunk."""
         with self._lock:
             if self._log is not None:
-                try:
-                    self._log.write(data)
-                    self._log.flush()
-                except OSError:
-                    pass
+                # CAPPED. The step log had no size limit at all: a runaway step
+                # wrote until the filesystem was full, which is how 767 GiB of one
+                # hermit stderr ended up on disk. Past the cap the bytes are
+                # counted and dropped -- never buffered, so this cannot become the
+                # memory problem it is replacing.
+                #
+                # The write stays inside try/except OSError and the caller keeps
+                # draining REGARDLESS. That is load-bearing: if a sink failure
+                # could stop the drain, the producer would block on a full pipe,
+                # and a hung run is worse than a full disk. A full disk crashes;
+                # a hang burns CPU for 28 hours looking like a product bug.
+                room = self._log_cap - self._log_written
+                if room > 0:
+                    take = data[:room]
+                    try:
+                        self._log.write(take)
+                        self._log.flush()
+                        self._log_written += len(take)
+                    except OSError:
+                        pass
+                    dropped_now = len(data) - len(take)
+                else:
+                    dropped_now = len(data)
+                if dropped_now:
+                    first = self._log_dropped == 0
+                    self._log_dropped += dropped_now
+                    if first:
+                        self._note_log_capped()
             self._partial += data.decode(errors="replace")
             while "\n" in self._partial:
                 line, self._partial = self._partial.split("\n", 1)
@@ -464,6 +496,29 @@ class StepStream:
                 self._tracker.observe(event)
                 if self.evidence is not None:
                     self.evidence.record("test_start", [("step", self.tag), ("test", event.name)])
+
+    def _note_log_capped(self) -> None:
+        """Stamp the cap into the log and the journal, the first time it bites.
+
+        Written the moment it happens rather than at close: a capped step is
+        exactly the step most likely to be SIGKILLed later, and a kill runs no
+        cleanup. A capped log that reads as complete is worse than a missing one.
+        """
+        notice = (
+            f"\n[dag-runner] *** STEP LOG CAPPED *** {self.tag}: this log stops at "
+            f"{self._log_cap} bytes. The step CONTINUED past this point and its "
+            f"later output is NOT below.\n"
+        ).encode()
+        try:
+            self._log.write(notice)
+            self._log.flush()
+        except OSError:
+            pass
+        if self.evidence is not None:
+            self.evidence.record(
+                "step_log_capped",
+                [("step", self.tag), ("cap_bytes", str(self._log_cap))],
+            )
 
     def _classify(self, line: str) -> None:
         event = recognize(line)

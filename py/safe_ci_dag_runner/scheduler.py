@@ -784,7 +784,19 @@ class Runner:
                     ("cmd", run_cmd),
                 ],
             )
-        captured: list[bytes] = []
+        # BOUNDED, not a plain list. This used to be `list[bytes]` with an
+        # unconditional append per chunk, so a step held its ENTIRE output in the
+        # runner's RSS for the step's whole lifetime -- and the `b"".join()` on the
+        # failure path below doubled that peak at exactly the moment things were
+        # already going wrong. A 4.5 TB runaway step (which is a real number here:
+        # three hermit runs did that on 2026-08-17) would OOM the runner before it
+        # filled the disk, turning a disk incident into a fleet incident.
+        #
+        # Everything `captured` feeds is a TAIL: `_last_line` for the one-line
+        # summary, and a failure dump. A ring buffer of the last
+        # CAPTURE_TAIL_BYTES serves both identically. Dropping the head is
+        # recorded so the dump cannot read as complete.
+        captured = _BoundedCapture(CAPTURE_TAIL_BYTES)
 
         def _pump() -> None:
             # A step may spawn grandchildren (servers, browsers) that outlive it and hold the
@@ -803,6 +815,23 @@ class Runner:
                     sink.ingest(raw)
                     if stream:
                         pending.extend(raw)
+                        # A SECOND unbounded buffer, and it sat outside the
+                        # `captured` bound: `pending` is drained only while it
+                        # CONTAINS a newline, so newline-free output grew it
+                        # without limit on the verbosity>=2 path. Bounding
+                        # `captured` alone would have left the memory hole open
+                        # on exactly the path that streams a runaway to a human.
+                        # Flush an over-long unterminated run as a partial line
+                        # rather than hoarding it waiting for a newline that may
+                        # never come.
+                        if len(pending) > _MAX_PENDING_LINE_BYTES:
+                            self._emit(
+                                f"[{step.tag}] "
+                                + bytes(pending).decode(errors="replace")
+                                + "  <-- [dag-runner] unterminated output flushed at "
+                                f"{_MAX_PENDING_LINE_BYTES} bytes"
+                            )
+                            pending.clear()
                         while b"\n" in pending:
                             index = pending.index(b"\n")
                             line = bytes(pending[: index + 1])
@@ -1067,7 +1096,7 @@ class Runner:
                 )
             # Self-contained failure: dump the captured child output, tagged.
             self._emit(f"[{step.tag}] ----- detail -----")
-            for line in b"".join(captured).decode(errors="replace").splitlines():
+            for line in captured.joined().decode(errors="replace").splitlines():
                 self._emit(f"[{step.tag}] {line}")
             self._emit(f"[{step.tag}] ----- end detail -----")
 
@@ -1333,6 +1362,80 @@ def run_dag_limited(
             "profile row(s); the rows may have been dropped."
         )
     return result
+
+
+#: How much of a step's output is kept in memory for the failure dump and the
+#: one-line summary. Both only ever read the TAIL, so this is a ring buffer, not
+#: a truncation of the evidence -- the full stream still goes to the step log on
+#: disk (which has its own, separate cap).
+CAPTURE_TAIL_BYTES = 4 * 1024 * 1024
+
+#: Longest unterminated run the live-stream path will hold before flushing it as
+#: a partial line. Separate from CAPTURE_TAIL_BYTES: that bounds what is KEPT,
+#: this bounds what is BUFFERED WAITING FOR A NEWLINE.
+_MAX_PENDING_LINE_BYTES = 1024 * 1024
+
+
+class _BoundedCapture:
+    """Keeps the last ``limit`` bytes of a stream, and counts what it dropped.
+
+    Deliberately NOT a `deque` of chunks: chunk sizes vary, so a chunk-count
+    bound gives an unbounded byte bound. This bounds BYTES.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._buf = bytearray()
+        self.dropped = 0
+
+    def append(self, chunk: bytes) -> None:
+        # A chunk at or over the limit REPLACES the buffer with its own tail,
+        # instead of being concatenated and then trimmed. Without this the peak
+        # tracks the CALLER's chunk size, not the bound: measured, a single
+        # 256 MiB write drove a 4 MiB bound to a 260 MiB peak. The reader happens
+        # to use os.read(fd, 8192) today, but a bound that only holds for small
+        # chunks is a bound that holds until someone changes an unrelated buffer
+        # size.
+        if len(chunk) >= self._limit:
+            self.dropped += len(self._buf) + len(chunk) - self._limit
+            self._buf = bytearray(memoryview(chunk)[-self._limit:])
+            return
+        self._buf += chunk
+        excess = len(self._buf) - self._limit
+        if excess > 0:
+            del self._buf[:excess]
+            self.dropped += excess
+
+    # _last_line() takes a Sequence[bytes] and calls reversed() on it, so the
+    # sequence protocol is required, not just __iter__. Getting this wrong would
+    # have raised TypeError only on the summary path, i.e. at the end of a step.
+    def __len__(self) -> int:
+        return 1 if self._buf else 0
+
+    def __getitem__(self, index: int) -> bytes:
+        if index not in (0, -1) or not self._buf:
+            raise IndexError(index)
+        return bytes(self._buf)
+
+    def __iter__(self):
+        return iter((bytes(self._buf),) if self._buf else ())
+
+    def __reversed__(self):
+        return iter((bytes(self._buf),) if self._buf else ())
+
+    def __bool__(self) -> bool:
+        return bool(self._buf)
+
+    def joined(self) -> bytes:
+        """The retained tail, prefixed with a notice when the head was dropped."""
+        if not self.dropped:
+            return bytes(self._buf)
+        notice = (
+            f"[dag-runner] ... {self.dropped} earlier byte(s) of this step's output "
+            f"are NOT shown: only the last {self._limit} bytes are kept in memory. "
+            f"The complete stream is in the step log on disk.\n"
+        ).encode()
+        return notice + bytes(self._buf)
 
 
 def _last_line(chunks: Sequence[bytes]) -> str:
