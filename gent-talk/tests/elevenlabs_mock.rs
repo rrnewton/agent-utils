@@ -777,3 +777,131 @@ async fn the_bridge_the_mock_was_pointed_at_is_the_one_it_calls() {
     );
     assert_ne!(harness.bridge_base, harness.mock.control_base());
 }
+
+// --- the mute announcement, offline ------------------------------------------------------------
+//
+// `#73 mute-is-invisible`. `/voice`'s mute withholds audio and nothing else, which is byte-identical
+// to the reader going quiet — and going quiet is what makes an agent start asking whether anyone is
+// there. So the page now says it, as a `contextual_update` client event on the conversation socket.
+//
+// WHAT THIS FILE CAN AND CANNOT SETTLE. It can settle our half: the frame the page ships is
+// well-formed, a vendor-shaped server accepts it in the middle of a live conversation, it does not
+// consume a turn, and the conversation still works afterwards. It CANNOT settle the vendor's half —
+// whether ElevenLabs implements `contextual_update` at all, and whether a real agent reading it
+// holds instead of prompting. The mock is our model of the vendor, not the vendor. One billed
+// `scripts/run.sh --smoke-agent` conversation answers that, and it has not been run.
+
+/// The page's own source, so the frame under test is the frame that ships.
+const VOICE_JS: &str = include_str!("../web/voice.js");
+
+/// One string constant from `web/voice.js`, with its `+`-joined pieces put back together.
+///
+/// Reading the real sentence is the point. A test that invented its own wording would prove that
+/// the mock accepts *some* contextual update, which nobody was in doubt about; what is worth
+/// pinning is that the bytes `/voice` actually puts on the socket are accepted. It is deliberately
+/// strict: a constant it cannot parse is a failure, never a quietly empty string.
+fn page_notice(name: &str) -> String {
+    let anchor = format!("const {name} =");
+    let start = VOICE_JS.find(&anchor).unwrap_or_else(|| {
+        panic!("web/voice.js no longer defines `{name}`, so mute tells the agent nothing")
+    });
+    let rest = &VOICE_JS[start + anchor.len()..];
+    let end = rest
+        .find(";\n")
+        .unwrap_or_else(|| panic!("`{name}` in web/voice.js is not a terminated declaration"));
+    let text: String = rest[..end].split('"').skip(1).step_by(2).collect();
+    assert!(
+        !text.is_empty(),
+        "`{name}` in web/voice.js is not a plain string literal this test can read"
+    );
+    text
+}
+
+#[tokio::test]
+async fn the_pages_mute_notice_is_accepted_mid_call_and_answered_with_silence() {
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    let notice = page_notice("MUTE_NOTICE");
+    assert!(
+        notice.contains("muted"),
+        "the page's mute notice does not mention muting: {notice}"
+    );
+    socket
+        .send(&json!({ "type": "contextual_update", "text": notice }))
+        .await
+        .expect("the page's mute frame goes on the wire");
+
+    // The short deadline IS the assertion, exactly as in the no-reply scenario above: an update
+    // that consumed a turn would come back as an agent_response, spoken over a reader who muted
+    // precisely because they did not want to be spoken to.
+    let quiet = socket.next_within(Duration::from_millis(300)).await;
+    assert!(
+        quiet.is_err(),
+        "a contextual update was answered out loud: {quiet:?}"
+    );
+    assert_eq!(harness.mock.trace().count("agent_response"), 0);
+
+    // The control, without which "this server never says anything" would pass the assertion above.
+    // It also proves the socket survived the frame rather than being closed as a protocol error.
+    socket.ask("what is new?").await.expect("asks");
+    let events = wait_for(&mut socket, "agent_response").await;
+    assert!(
+        agent_said(&events).is_some(),
+        "the conversation stopped working after a contextual update: {events:?}"
+    );
+
+    // And it is on the record rather than silently swallowed.
+    let seen = harness.mock.trace().of_kind("client_event");
+    assert!(
+        seen.iter().any(|e| e.summary == "contextual_update"),
+        "the update never reached the vendor side: {:?}",
+        seen.iter().map(|e| e.summary.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[tokio::test]
+async fn the_unmute_notice_is_the_other_sentence_and_lifts_the_hold() {
+    // Both halves ship or neither is worth shipping: an agent told to hold and never told to stop
+    // is a worse conversation than one that occasionally asks whether you are there.
+    let muted = page_notice("MUTE_NOTICE");
+    let back = page_notice("UNMUTE_NOTICE");
+    assert_ne!(
+        muted, back,
+        "mute and unmute say the same thing to the agent"
+    );
+    assert!(
+        back.contains("unmuted"),
+        "the page's unmute notice does not say the pause ended: {back}"
+    );
+    assert!(
+        !back.contains("Do not ask"),
+        "the unmute notice repeats the hold instruction, so the agent keeps waiting: {back}"
+    );
+
+    let harness = Harness::start(Scenario::Full).await;
+    let mut socket = harness.open().await;
+    wait_for(&mut socket, "conversation_initiation_metadata").await;
+
+    for text in [&muted, &back] {
+        socket
+            .send(&json!({ "type": "contextual_update", "text": text }))
+            .await
+            .expect("sends");
+    }
+    socket.ask("still with me?").await.expect("asks");
+    let events = wait_for(&mut socket, "agent_response").await;
+    assert!(agent_said(&events).is_some(), "{events:?}");
+    assert_eq!(
+        harness
+            .mock
+            .trace()
+            .of_kind("client_event")
+            .iter()
+            .filter(|e| e.summary == "contextual_update")
+            .count(),
+        2,
+        "a mute and an unmute are two announcements, not one"
+    );
+}

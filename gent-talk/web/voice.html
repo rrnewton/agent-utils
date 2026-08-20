@@ -407,7 +407,11 @@
             <strong>Mute</strong> keeps the call open and keeps the agent's context; it only stops
             sending it your audio. Your phone will still show the microphone as in use, because the
             microphone really is still open — which is what lets unmuting drop you back into the
-            same conversation rather than a new one.
+            same conversation rather than a new one. Muting and unmuting each send the agent a note
+            saying the pause is deliberate, because withholding your audio looks to it exactly like
+            you going quiet, and that is what makes it start asking whether you are still there.
+            Whether it honours that note has not been tested against the live service yet. The call
+            is billed while muted either way: what is metered is the conversation being open.
             <strong>Hang up</strong> ends the conversation. The vendor cannot resume a call once
             it has closed, so the next call is always a new one; the lines already on screen stay
             there because they are still your own record of what was said, and the transcript marks

@@ -1378,6 +1378,45 @@ set a boolean; a reconnect is not reversible at all. The only cost is downstream
 socket already carrying microphone audio upstream. The suite makes that decision *checkable*:
 toggling Sound must leave exactly one initiation frame on the socket.
 
+### Mute says so out loud
+
+`#73 mute-is-invisible`, and it is the owner's own complaint: during a long mute the agent "gets
+very annoying about asking 'Are you there?'", and turning the prompting down in the ElevenLabs
+dashboard did not help.
+
+**The cause is ours.** Mute withholds `user_audio_chunk` frames and does nothing else, which is the
+right pause — the socket stays open, so the agent keeps its context. But it means that on the
+vendor's side a muted caller and a caller who simply stopped talking are the *same bytes*, and
+going quiet is exactly the condition that makes an agent check whether anyone is listening. No
+dashboard setting can separate two cases that arrive identical.
+
+So the page says it. Muting and unmuting each put one `contextual_update` client event on the
+conversation socket that is already open — a fourth client event beside
+`conversation_initiation_client_data`, `pong` and `user_audio_chunk`, not a new mechanism. It
+**cannot** be an MCP tool: MCP here is request/response with the agent as the client, and this
+server issues no `Mcp-Session-Id` and answers `GET`/`DELETE /mcp` with 405 precisely because it
+has nothing to push. The conversation socket is the only door.
+
+**Half of this is unverified, and it is the vendor's half.** `contextual_update` is believed to
+inject context without consuming a turn — the same event `#46 conversation-replay` uses — but that
+belief came from a recon plan rather than from the vendor's protocol reference. Two questions are
+open: whether ElevenLabs accepts the frame, and whether an agent that reads it *holds* rather than
+prompts. **One billed `scripts/run.sh --smoke-agent` conversation answers both** — mute for a
+minute and listen — **and that run has not been made.** What is checked offline is our half:
+`tests/js/voice_page.test.mjs` pins what the page puts on the wire, and `tests/elevenlabs_mock.rs`
+sends the page's own sentence, read out of `web/voice.js`, to a vendor-shaped server and pins that
+it is accepted mid-call, answered with silence, and followed by a conversation that still works.
+The fallback if the event does not exist is a short `user_message`, which is definitely in the
+protocol and *does* consume a turn — the agent would say "understood, I'll wait" out loud, which is
+more interruption than the prompting it replaces.
+
+Pair it with the agent's system prompt: the starting prompt in
+[`QUICKSTART.md`](QUICKSTART.md) now tells the agent to hold, and to use `skip_turn`, when it is
+told the microphone is muted.
+
+**None of this makes a mute cheaper.** Billing continues while muted; the vendor discounts silent
+periods but does not stop the meter. This makes a long mute quieter, not free.
+
 ### The page has two compositions, and a capability query picks between them
 
 The phone is the device this page is used on, so the phone layout is the one everything above
@@ -1622,7 +1661,8 @@ From the related-work review, and recorded in `src/mcp/mod.rs` so it does not ha
   while muted** (a conversation is billed for being open, though the vendor discounts silent
   periods), and **the agent will start asking whether you are still there**, because a
   client-side mute is invisible to it — from the vendor's side, muted and "went quiet" are the
-  same thing.
+  same thing. See *Mute says so out loud* above for what the page does about the second one, and
+  for the part of it that is still unverified. The first one has no fix: a muted call is a call.
 * Caveats: MCP is unavailable on Zero Retention Mode **and HIPAA-enabled** workspaces — which
   would block this integration outright — channel text transits ElevenLabs, and conversation
   costs roughly $0.01/minute.
@@ -2000,6 +2040,11 @@ Beyond the security list above:
 * **Whether a typed `user_message` is echoed back as a `user_transcript` has never been observed.**
   The `/voice` page assumes it may be and suppresses a matching transcript for ten seconds; one
   billed `--smoke-agent` run would settle it, and that run has not been made.
+* **Whether ElevenLabs implements `contextual_update` at all has never been observed**, and two
+  features now depend on it: `#46 conversation-replay`'s default transport, and `#73
+  mute-is-invisible`'s announcement that a mute is deliberate. The page's half is tested offline
+  against the mock vendor; whether a real agent accepts the frame, and whether reading it actually
+  stops it asking "are you there?", takes one billed `--smoke-agent` run that has not been made.
 * The `/voice` page captures the microphone through a `ScriptProcessorNode`, which is deprecated
   (though universally supported). Moving it to an `AudioWorklet` would mean a second asset for no
   behavioural gain today.

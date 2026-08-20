@@ -2455,8 +2455,72 @@ function renderControls() {
   label.textContent = "Listening";
 }
 
+// --- telling the agent that the silence is deliberate --------------------------------------------
+//
+// `#73 mute-is-invisible`, and it is the owner's own complaint: during a long mute the agent "gets
+// very annoying about asking 'Are you there?'", and turning the prompting down in the ElevenLabs
+// dashboard did not help.
+//
+// THE CAUSE IS OURS. Mute withholds `user_audio_chunk` frames and nothing else — see the long note
+// in `startCapture`, which is where mute lives and where it must stay. That is the right pause: the
+// socket stays open, so the agent keeps everything it has been told. But it means that from the
+// vendor's side a muted caller and a caller who simply stopped talking are the SAME BYTES: in both
+// cases no audio arrives. Going quiet is exactly the condition that makes an agent check whether
+// anyone is still listening, so no dashboard setting can fix this — there is nothing there to tell
+// the two apart from. The only cure is to say it out loud.
+//
+// It is a client event on the socket that is already open, which is the whole reason this is a
+// small change: the page already sends `conversation_initiation_client_data`, `pong`,
+// `user_audio_chunk`, `user_message` and `user_activity`. It CANNOT be an MCP tool — MCP here is
+// request/response with the agent as the client, and this server issues no `Mcp-Session-Id` and
+// answers `GET`/`DELETE /mcp` with 405 precisely because it has nothing to push. The conversation
+// socket is the only door.
+//
+// UNVERIFIED AGAINST THE LIVE VENDOR, and read this before trusting it. `contextual_update` is
+// believed to be an ElevenLabs client event that injects context WITHOUT consuming a turn, and this
+// page already sends one for `#46 conversation-replay` — but that belief came from a recon plan
+// rather than from the vendor's protocol reference, and nothing in this repository can settle it.
+// Two separate questions are open: whether ElevenLabs accepts the frame at all, and whether an
+// agent that reads it actually HOLDS instead of prompting. Both are answered by one billed
+// `scripts/run.sh --smoke-agent` conversation — mute for a minute and listen — and THAT RUN HAS NOT
+// BEEN MADE. What is checked offline is our half: `tests/js/voice_page.test.mjs` pins what this page
+// puts on the wire, and `tests/elevenlabs_mock.rs` pins that a vendor-shaped server accepts the
+// frame mid-conversation, answers no turn to it, and keeps talking afterwards.
+//
+// The fallback, if the event turns out not to exist, is a short `user_message`, which is definitely
+// in the protocol — and which consumes a turn, so the agent would ANSWER the announcement out loud.
+// That is worse than the complaint, which is why it is the fallback and not the first choice.
+//
+// Worth knowing, and the owner established it: BILLING CONTINUES WHILE MUTED. A conversation is
+// billed for being open; the vendor discounts silent periods but does not stop the meter. Telling
+// the agent to hold makes a long mute quieter, not free.
+const MUTE_NOTICE =
+  "The user has muted their microphone deliberately and has stopped speaking on purpose. This is " +
+  "a pause they chose, not a connection that failed. Do not ask whether they are still there and " +
+  "do not prompt them to speak: hold, and skip your turn, until you are told they have unmuted.";
+
+const UNMUTE_NOTICE =
+  "The user has unmuted their microphone and can be heard again. Carry on normally.";
+
+/**
+ * Tell the live conversation which of the two silences this is. Returns whether the frame went.
+ *
+ * Routed through `sendClientEvent`, so a socket that is not OPEN is a no-op rather than a throw.
+ * That ordering is deliberate: mute is a LOCAL fact first — it withholds audio whatever the vendor
+ * does with this frame — and a mute that refused to engage because an announcement could not be
+ * delivered would be strictly worse than a mute the agent cannot see.
+ */
+function announceMute(muted) {
+  return sendClientEvent({
+    type: "contextual_update",
+    text: muted ? MUTE_NOTICE : UNMUTE_NOTICE,
+  });
+}
+
 function setMuted(muted) {
   session.muted = muted;
+  // The flag above is invisible to the agent; this line is the only thing that is not.
+  announceMute(muted);
   renderControls();
   // One line, because there is one line. The three sentences this used to be are in Settings,
   // under "What the controls do", where somebody who wants them can read them.

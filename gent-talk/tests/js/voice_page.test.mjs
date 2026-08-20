@@ -3185,6 +3185,122 @@ test("unmuting resumes the SAME conversation rather than starting a new one", as
   assert.ok(audioFrames(socket).length > 0, "the agent cannot hear you after unmuting");
 });
 
+// --- mute is invisible unless we say it -----------------------------------------------------------
+//
+// `#73 mute-is-invisible`. Everything above is about what mute does NOT do to our side of the call.
+// This is about the one thing it has to do to the other side: withholding audio is byte-identical
+// to going quiet, and going quiet is what makes the agent ask whether anyone is there.
+
+/** Every JSON frame of one `type` this page has put on the conversation socket. */
+const framesOfType = (socket, type) =>
+  socket.sent
+    .map((raw) => {
+      try {
+        return JSON.parse(raw);
+      } catch (_error) {
+        return null;
+      }
+    })
+    .filter((frame) => frame && frame.type === type);
+
+test("MUTING TELLS THE AGENT, because nothing else can", async () => {
+  // The owner's complaint: the agent "gets very annoying about asking 'Are you there?'" during a
+  // mute, and turning the prompting down in the vendor's dashboard did not help. It cannot help.
+  // The vendor sees no audio, which is exactly what it sees when somebody stops talking, so a mute
+  // that says nothing is a mute the agent is entitled to interrupt.
+  const page = newPage();
+  const socket = await startTalking(page);
+  assert.equal(framesOfType(socket, "contextual_update").length, 0, "something announced itself");
+
+  await page.el("talk").click();
+
+  const sent = framesOfType(socket, "contextual_update");
+  assert.equal(sent.length, 1, "muting put nothing on the socket, so the agent cannot see it");
+  assert.match(sent[0].text, /muted/i, "the announcement never says what happened");
+  assert.match(sent[0].text, /deliberately|on purpose/i, "a deliberate pause must read as chosen");
+  assert.match(
+    sent[0].text,
+    /do not ask whether they are still there/i,
+    "the announcement does not ask for the one behaviour this whole issue is about"
+  );
+});
+
+test("unmuting says so too, or the agent holds for the rest of the call", async () => {
+  // The other half, and the one it is easy to forget: an agent told to hold and never told to stop
+  // holding is a worse conversation than one that occasionally asks.
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  await page.el("talk").click();
+  await page.el("talk").click();
+
+  const sent = framesOfType(socket, "contextual_update");
+  assert.equal(sent.length, 2, "unmuting did not tell the agent the pause was over");
+  assert.match(sent[1].text, /unmuted/i, "the second announcement does not say the pause ended");
+  assert.doesNotMatch(
+    sent[1].text,
+    /do not ask/i,
+    "unmuting repeated the hold instruction, so the agent is still waiting"
+  );
+});
+
+test("the announcement is context, NOT a turn the agent has to answer", async () => {
+  // `user_message` is the fallback if `contextual_update` turns out not to exist, and it is a
+  // fallback rather than the choice because it consumes a turn: the agent would answer "understood,
+  // I'll wait" out loud, which is more interruption than the prompting it replaces. It also must
+  // carry nothing but the two documented keys — an invented field is a frame the vendor may reject.
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  await page.el("talk").click();
+
+  assert.equal(
+    socket.sent.filter((raw) => raw.includes('"user_message"')).length,
+    0,
+    "muting spent a conversational turn on housekeeping"
+  );
+  const [sent] = framesOfType(socket, "contextual_update");
+  assert.deepStrictEqual(Object.keys(sent).sort(), ["text", "type"]);
+  assert.equal(sent.type, "contextual_update");
+});
+
+test("announcing a mute uses the call already open — no re-initiation, no second socket", async () => {
+  // A mid-call renegotiation would close and reopen the conversation, and a reopened conversation
+  // has never heard a word of this one. That would destroy exactly the context mute exists to keep.
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  await page.el("talk").click();
+  await page.el("talk").click();
+
+  assert.equal(page.sockets.length, 1, "announcing the mute opened a second conversation");
+  assert.equal(
+    socket.sent.filter((raw) => raw.includes("conversation_initiation_client_data")).length,
+    1,
+    "the announcement re-initiated the conversation"
+  );
+});
+
+test("a mute still mutes when the announcement cannot be delivered", async () => {
+  // Mute is a LOCAL fact first. If the socket is closing, the frame cannot go — and the microphone
+  // must still stop being uploaded, because the alternative is a control that silently declines to
+  // silence you at the exact moment the connection is already misbehaving.
+  const page = newPage();
+  const socket = await startTalking(page);
+  speakInto(page);
+  const heard = audioFrames(socket).length;
+  assert.ok(heard > 0, "the page sent no audio at all, so this test proves nothing");
+  socket.readyState = 2; // CLOSING: not OPEN, and a send would throw on a real socket.
+
+  await page.el("talk").click();
+
+  assert.equal(page.el("talk-label").textContent, "Muted", "the control refused to mute");
+  assert.equal(framesOfType(socket, "contextual_update").length, 0, "sent on a closing socket");
+  socket.readyState = 1;
+  speakInto(page);
+  assert.equal(audioFrames(socket).length, heard, "the agent kept hearing you while muted");
+});
+
 test("the talk control says which of its three states it is in", async () => {
   const page = newPage();
   await signIn(page);
