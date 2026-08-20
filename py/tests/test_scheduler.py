@@ -429,6 +429,42 @@ def test_absent_cap_reads_differently_from_a_declared_zero() -> None:
 def test_ungrantable_cap_refuses_instead_of_sleeping_forever(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
+    # A DECLARED cap that is too small, deliberately — not an undeclared resource.
+    #
+    # `undeclared_resource_demands` (recovered from `fix/absent-cap-is-not-zero`) now refuses an
+    # UNDECLARED resource in pre-flight, before any step runs, so it would preempt this detector
+    # and there would be no starve left to detect. The two mechanisms overlap on that one case and
+    # the earlier one is the better answer: refusing before any side effect beats running half the
+    # graph and then discovering the rest can never be admitted.
+    #
+    # This detector still earns its place for every starve pre-flight cannot see: a cap that is
+    # declared but can never grant the demand, a dangling dependency, a cycle. That is what is
+    # exercised here.
+    cfg = DagConfig(
+        steps=(
+            _step("g", "needs_gpu", "true", resources={"gpu": 4}),
+            _step("g", "plain", "true"),
+        ),
+        resource_caps={"gpu": 1},
+    )
+    res = _run_dag_bounded(cfg)
+    assert res.ok is False, "an ungrantable demand must REFUSE, not hang"
+    assert len(res.outcomes) == 1, "the satisfiable step still ran"
+    assert all(o.ok for o in res.outcomes)
+    err = capsys.readouterr().err
+    assert "terminal starve" in err, err
+    assert "starved step(s) (1): g.needs_gpu" in err, err
+
+
+def test_an_undeclared_resource_is_refused_before_anything_runs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The overlapping case, pinned to the EARLIER mechanism so the two cannot silently swap.
+
+    Recovered from two different abandoned branches that each addressed the same silent-hang
+    defect. Pre-flight wins: nothing runs, so nothing has written partial state by the time the
+    operator is told.
+    """
     cfg = DagConfig(
         steps=(
             _step("g", "needs_gpu", "true", resources={"gpu": 1}),
@@ -437,13 +473,11 @@ def test_ungrantable_cap_refuses_instead_of_sleeping_forever(
         resource_caps={"hg": 4},
     )
     res = _run_dag_bounded(cfg)
-    assert res.ok is False, "an ungrantable demand must REFUSE, not hang"
-    assert len(res.outcomes) == 1, "the satisfiable step still ran"
-    assert all(o.ok for o in res.outcomes)
+    assert res.ok is False
+    assert len(res.outcomes) == 0, "pre-flight refused, so NOTHING may have run"
     err = capsys.readouterr().err
-    assert "terminal starve" in err, err
-    assert _ABSENT in err, f"the refusal must name the undeclared resource distinctly: {err}"
-    assert "starved step(s) (1): g.needs_gpu" in err, err
+    assert "REFUSING to run before any node starts" in err, err
+    assert "g.needs_gpu: gpu" in err, err
 
 
 def test_dependency_cycle_refuses_instead_of_sleeping_forever() -> None:
