@@ -129,6 +129,15 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             format!("/api/v1/channels/{WRITE_CHANNEL}/ask"),
             Some(serde_json::json!({"question": "why?"})),
         ),
+        // `#44 live-push`. A stream is the easiest route on this server to leave open by accident,
+        // so it is in this table like everything else. `call()` collects the body, which would
+        // HANG on a successful stream — that is fine and is part of the assertion: the only way
+        // this entry finishes is by being refused before a body exists.
+        (
+            "GET",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/stream"),
+            None,
+        ),
         ("GET", "/api/v1/conversations".to_owned(), None),
         ("DELETE", "/api/v1/conversations".to_owned(), None),
         ("GET", "/api/v1/conversations/abc".to_owned(), None),

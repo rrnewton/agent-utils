@@ -6,6 +6,7 @@ use crate::agent_backend::AgentBackend;
 use crate::config::Config;
 use crate::discord::DiscordClient;
 use crate::elevenlabs::SignedUrlProvider;
+use crate::live::LiveHub;
 use crate::model::{ChannelId, ChannelInfo};
 use crate::retrieval::Ranker;
 use crate::store::StateStore;
@@ -42,6 +43,14 @@ pub struct AppState {
     /// [`crate::store::disabled::DisabledStore`], which refuses every call and names the setting
     /// to add — it is deliberately not a silent in-memory substitute. See [`crate::store`].
     pub store: Arc<dyn StateStore>,
+    /// The live fan-out: where inbound Discord messages are published, and where the SSE route
+    /// subscribes.
+    ///
+    /// Always present, even when ingestion is off. An absent hub would make the stream route
+    /// conditional on configuration, and a route that 404s for a reason unrelated to the channel
+    /// allowlist is the kind of ambiguity this server spends effort avoiding. With ingestion off
+    /// nobody publishes, so a subscriber simply waits — and the startup banner says which it is.
+    pub live: Arc<LiveHub>,
 }
 
 impl AppState {

@@ -20,6 +20,12 @@
 //!   `/inbox`, because how far HE has read is what the agent has to be able to say out loud.
 //! * Every request — routed or not, authorized or not — leaves exactly ONE line in the access
 //!   log at INFO. See [`crate::access`] for why that is load-bearing rather than nice to have.
+//!   **The one line for `/stream` is written at ATTACH, with `millis=0`**, because the middleware
+//!   returns as soon as the status is known and a streaming body has not started yet. A stream
+//!   held open for an hour still logs zero; see [`api::stream`].
+//! * `/api/v1/channels/{id}/stream` is a long-lived Server-Sent Events response and is otherwise
+//!   an ordinary read: same bearer token, same read scope, same channel allowlist. A stream is the
+//!   easiest thing here to leave accidentally open, so it is deliberately NOT a special case.
 //! * `/mcp` is the Streamable HTTP MCP endpoint. It requires a bearer token too, and answers a
 //!   credential-less caller with a bland 401 before it reads the body at all.
 
@@ -60,6 +66,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/channels/{channel_id}/resolve", post(api::resolve))
         .route("/api/v1/channels/{channel_id}/reply", post(api::reply))
         .route("/api/v1/channels/{channel_id}/ask", post(api::ask))
+        .route("/api/v1/channels/{channel_id}/stream", get(api::stream))
         // Durable state. The conversation routes all require the WRITE scope, reads included —
         // see the block comment above them in `api` for why a transcript is more sensitive than
         // a digest. `/inbox` is a read; moving a mark is a write, because it mutates state

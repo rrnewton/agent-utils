@@ -185,6 +185,11 @@ fn state_pieces_with(
         agent: Arc::new(NoAgentBackend),
         elevenlabs: elevenlabs.clone(),
         store: Arc::clone(&store),
+        // A real hub, never a stub: a test drives `live::poll_once` or `AppState::live.publish`
+        // directly and then reads the SSE route, which is the whole ingestion path minus the
+        // timer. Sleeping for a poll interval would make the suite slow and flaky for no extra
+        // coverage — the timer is `live::poll_forever`, and what it does per tick is `poll_once`.
+        live: Arc::new(crate::live::LiveHub::new()),
         summarizer: Arc::clone(&summarizer),
         summary_version: crate::summarize::policy_version(
             &config_for_version,

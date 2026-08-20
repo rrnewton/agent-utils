@@ -2,8 +2,17 @@
 //!
 //! The server owns the front door. A hosted voice agent (ElevenLabs, in the first intended
 //! deployment) reaches this process over HTTP, asks it what has been said in a Discord channel,
-//! and — with explicit approval — asks it to post a reply. Nothing here pushes: every read is
-//! pulled at the moment the owner asks a question.
+//! and — with explicit approval — asks it to post a reply.
+//!
+//! # One thing here pushes
+//!
+//! This used to say "nothing here pushes: every read is pulled at the moment the owner asks a
+//! question", and that stopped being true with [`live`]. When `discord.live_poll_seconds` is set,
+//! a background task reads each configured channel on a timer and fans what is new out to
+//! `GET /api/v1/channels/{id}/stream`, so a page learns about a message without asking. It is OFF
+//! unless configured, because polling multiplies request volume against Discord rate limits this
+//! server does not handle. Everything else is still pulled, and the read/write scope split and the
+//! channel allowlist apply to the stream exactly as they do to a fetch.
 //!
 //! # What is kept
 //!
@@ -33,6 +42,7 @@ pub mod config;
 pub mod discord;
 pub mod elevenlabs;
 pub mod http;
+pub mod live;
 pub mod mcp;
 pub mod model;
 pub mod ops;

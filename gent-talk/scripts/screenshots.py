@@ -563,6 +563,77 @@ STUB_JS = r"""
     const node = document.getElementById(id);
     return node ? (node.textContent || "").trim() : null;
   };
+
+  // `#44 live-push`. TWO things are stubbed here and nothing else, and both are about the SERVER
+  // rather than about the page:
+  //
+  //   * The throwaway server this harness starts has live ingestion OFF -- that is the default,
+  //     and it is the default for a reason (see src/live.rs). So the client-config answer is
+  //     patched to say the server IS watching, which is the only thing that answer is used for.
+  //   * The stream route is served from here, as a real ReadableStream this script feeds. The
+  //     server runs with --fake-discord, so no real message can ever arrive in a channel and no
+  //     poll tick could ever publish one; waiting for a real interval would be waiting for
+  //     nothing.
+  //
+  // Everything downstream is the page's own code: the frame parsing, the de-duplication, the
+  // rendering through discordNode, and the relay guards.
+  const __realFetch = window.fetch.bind(window);
+  let __liveController = null;
+  window.__streamOpens = 0;
+  window.fetch = async (input, init) => {
+    const url = String(typeof input === "string" ? input : (input && input.url) || "");
+    if (url.includes("/api/v1/client-config")) {
+      const response = await __realFetch(input, init);
+      const text = await response.text();
+      let body = {};
+      try {
+        body = JSON.parse(text);
+      } catch (e) {
+        body = {};
+      }
+      body.live_poll_seconds = 30;
+      return new Response(JSON.stringify(body), {
+        status: response.status,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (/\/stream(\?|$)/.test(url)) {
+      window.__streamOpens += 1;
+      const body = new ReadableStream({
+        start(controller) {
+          __liveController = controller;
+        },
+      });
+      return new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream", "cache-control": "no-store" },
+      });
+    }
+    return __realFetch(input, init);
+  };
+
+  // Put one message on the live stream, exactly as src/live.rs frames one.
+  window.__channelSays = (id, author, content, selfPosted) => {
+    if (!__liveController) return false;
+    const message = {
+      id: String(id),
+      channel_id: document.getElementById("discord-channel").value,
+      author,
+      author_id: "2000000000000000099",
+      author_is_bot: false,
+      timestamp: "2026-08-20T11:04:00.000Z",
+      spoken_time: "07:04:00 PDT",
+      content,
+    };
+    const frame =
+      "id: " +
+      message.id +
+      "\nevent: message\ndata: " +
+      JSON.stringify({ message, self_posted: selfPosted === true }) +
+      "\n\n";
+    __liveController.enqueue(new TextEncoder().encode(frame));
+    return true;
+  };
 })();
 """
 
@@ -1580,6 +1651,33 @@ def _act_canned_prompts(driver: Driver) -> None:
 
 NO_HANGUP = ("Hang up is absent, not merely dimmed", "!window.__visible('hang-up')")
 
+def _act_live_message(driver: Driver) -> None:
+    """A message arrives on the stream while the reader is looking at the channel.
+
+    No Refresh click anywhere in here, and that is the whole subject: the list has to grow because
+    the server told the page, not because the page asked again. The 45-second background re-read
+    is far longer than this scene takes, so a row appearing within it cannot be that.
+    """
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { window.__loadedBefore = "
+        "document.querySelectorAll('#discord-log li').length; "
+        "window.__refreshes = 0; "
+        "document.getElementById('refresh-discord').addEventListener("
+        "'click', () => { window.__refreshes += 1; }); "
+        "return window.__loadedBefore; })()"
+    )
+    driver.js(
+        "window.__channelSays('9990000000000000001', 'claude-integ', "
+        "'the arm64 runner came back by itself -- 11 jobs completed, 0 skipped, and the tag is cut')"
+    )
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log li').length > window.__loadedBefore",
+        timeout=10_000,
+    )
+    driver.settle(250)
+
+
 SCENES: tuple[Scene, ...] = (
     Scene(
         name="01-signed-out",
@@ -2295,6 +2393,38 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="28-live-message-arrived",
+        what="a message pushed by the server appears in the channel with no Refresh click",
+        act=_act_live_message,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the page really attached to the stream rather than falling back to the timer",
+                "window.__streamOpens >= 1",
+            ),
+            (
+                "the list grew",
+                "document.querySelectorAll('#discord-log li').length > window.__loadedBefore",
+            ),
+            (
+                # THE claim. A scene that only asserted the list grew would be satisfied by the
+                # background re-read, which is the very thing this feature replaces.
+                "and it grew without anybody pressing Refresh",
+                "window.__refreshes === 0",
+            ),
+            (
+                "the arriving row carries its id, exactly as a fetched one does",
+                "!!document.querySelector("
+                "'#discord-log li[data-id=\"9990000000000000001\"]')",
+            ),
+            (
+                "and its text is on screen",
+                "(document.getElementById('discord-log').textContent || '')"
+                ".includes('the arm64 runner came back by itself')",
+            ),
+        ),
+    ),
 )
 
 
@@ -2611,7 +2741,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 27:
+    if len(SCENES) < 28:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2636,7 +2766,9 @@ def check_state_controls() -> list[str]:
             "text-entry-button` added the bar converted into a text field, and `#60 "
             "canned-prompt-buttons` added the bar with every button it has on it at once -- "
             "whether a whole composer, or five controls, fit inside one strip on a 375px phone "
-            "is the same kind of question, and no fixture can answer it."
+            "is the same kind of question, and no fixture can answer it. `#44 live-push` added "
+            "the one where a row appears because the SERVER said so rather than because the page "
+            "asked."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2760,6 +2892,10 @@ def check_state_controls() -> list[str]:
         # `#60 canned-prompt-buttons`. `canned-blockers` is the pack, `control-bar` is the geometry
         # -- nothing clipped past the edge, and still one strip rather than two rows.
         "27-canned-prompts": ("canned-blockers", "control-bar"),
+        # `#44 live-push`. Pinned to the ABSENCE of a refresh as well as to the row, because "the
+        # list has one more message in it" is satisfied by the 45-second background re-read this
+        # feature exists to replace.
+        "28-live-message-arrived": ("__refreshes === 0", "9990000000000000001"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

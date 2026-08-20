@@ -382,6 +382,38 @@
           />
           <p id="reading-width-state" class="hint" aria-live="polite"></p>
 
+          <h2>Live messages</h2>
+          <!--
+            `#44 live-push`. Two separate facts, and the screen must not let them blur into one
+            "live" light: whether the CHANNEL VIEW updates by itself, and whether an arriving
+            message is spoken into a call in progress. The first costs nothing and is on whenever
+            the server is ingesting; the second spends money and interrupts, and is off until it
+            is asked for.
+          -->
+          <p id="live-state" class="hint" aria-live="polite"></p>
+          <p class="hint">
+            When this server is set to watch the channel, new messages appear here on their own
+            rather than at the next refresh. It is a poll, not a push from Discord: the newest
+            message can be up to one interval old, and the interval is set on the server.
+          </p>
+
+          <label class="toggle">
+            <input id="relay-to-agent" type="checkbox" />
+            Tell the agent about arriving messages
+          </label>
+          <p class="hint">
+            While a call is live, each arriving channel message is sent to the agent as background
+            information, so it can mention a reply that lands mid-conversation instead of waiting
+            to be asked. This <strong>sends channel text to the voice vendor</strong> and it costs
+            conversation time, so it is off by default. Replies this server posted are never sent
+            back — otherwise the agent would hear its own answer and reply to it.
+          </p>
+          <p class="hint">
+            It only works <strong>while this page is open</strong>. The conversation socket belongs
+            to this browser, not to the server, so closing the tab ends the relay even though the
+            server keeps watching the channel.
+          </p>
+
           <h2>Stored conversations</h2>
           <p class="hint">
             This server keeps the transcript of each call in a database file on the machine it

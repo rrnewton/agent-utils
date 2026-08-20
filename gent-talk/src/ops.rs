@@ -558,7 +558,38 @@ pub async fn reply(
         .post_message(&info.id, text, reply_to.as_ref())
         .await?;
     stamp(state, std::slice::from_mut(&mut posted));
+    // Remember that WE posted this, before anything can observe it. `#44 live-push`: the poller
+    // will see this message a few seconds from now, and relaying it into the live conversation
+    // would make the agent hear its own reply as new information — which it would then answer.
+    // See [`crate::live::LiveEvent::self_posted`].
+    state.live.note_self_posted(&posted.id);
     Ok((info, posted))
+}
+
+/// Attach to a channel's live feed. Read scope.
+///
+/// The reason this is here rather than in the handler is the allowlist. [`allowed`] is private to
+/// this module on purpose — the module doc says both front doors go through it — and a stream is
+/// the easiest thing on this server to leave accidentally open, so it goes through the same gate
+/// as a fetch and gets the same refusal for a channel outside the configuration. Never a 200 with
+/// an empty stream: that reads as "this channel is quiet" rather than "there is no such channel".
+///
+/// `after` is a resume point, taken from the caller's `Last-Event-ID`.
+///
+/// Not `async`, unlike everything else here: subscribing touches no network and no store, and
+/// making it await nothing would be a promise about future cost that this does not have.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] for a channel outside the allowlist.
+pub fn watch(
+    state: &AppState,
+    channel_id: &str,
+    after: Option<&MessageId>,
+) -> Result<(ChannelInfo, crate::live::Subscription), OpError> {
+    let channel = allowed(state, channel_id)?;
+    let subscription = state.live.subscribe(&channel.id, after);
+    Ok((channel, subscription))
 }
 
 /// One channel's inbox state, as far as THIS SERVER is concerned.

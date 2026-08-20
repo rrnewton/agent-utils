@@ -19,6 +19,10 @@ pub const ENV_CONFIG_PATH: &str = "GENT_TALK_CONFIG";
 pub const ENV_BIND: &str = "GENT_TALK_BIND";
 /// Environment variable carrying the Discord bot token.
 pub const ENV_DISCORD_BOT_TOKEN: &str = "GENT_TALK_DISCORD_BOT_TOKEN";
+/// Environment variable overriding how often each channel is polled for inbound messages.
+///
+/// `0` turns live ingestion off, which is the default. See [`crate::live`].
+pub const ENV_LIVE_POLL_SECONDS: &str = "GENT_TALK_LIVE_POLL_SECONDS";
 /// Environment variable carrying the read-scope API token.
 pub const ENV_READ_TOKEN: &str = "GENT_TALK_READ_TOKEN";
 /// Environment variable carrying the write-scope API token.
@@ -189,6 +193,13 @@ pub struct DiscordConfig {
     /// single spoken "how many messages are in there?" could fire dozens of requests at a busy
     /// channel and stall every other read behind it.
     pub max_count_scan: u32,
+    /// How often each configured channel is polled for messages nobody asked for. `0` is OFF.
+    ///
+    /// **Off by default.** Every tick is one Discord request per channel against a rate limit this
+    /// server does not handle — no `Retry-After`, and a 429 surfaces as HTTP 502 — so turning it
+    /// on is a decision an operator makes with that in front of them, not a thing that happens
+    /// because they upgraded. Refused below [`crate::live::MIN_POLL_SECONDS`].
+    pub live_poll_seconds: u64,
 }
 
 /// API credentials this server requires of its callers.
@@ -289,6 +300,7 @@ struct FileDiscord {
     default_fetch_limit: Option<u16>,
     max_fetch_limit: Option<u16>,
     max_count_scan: Option<u32>,
+    live_poll_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -472,6 +484,27 @@ impl Config {
                 detail: "must be at least 1, or counting can never answer anything".to_owned(),
             });
         }
+        let live_poll_seconds = match get(ENV_LIVE_POLL_SECONDS) {
+            Some(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| ConfigError::Invalid {
+                    field: "discord.live_poll_seconds".to_owned(),
+                    detail: format!("{raw:?} is not a whole number of seconds ({e})"),
+                })?,
+            None => file.discord.live_poll_seconds.unwrap_or(0),
+        };
+        if live_poll_seconds != 0 && live_poll_seconds < crate::live::MIN_POLL_SECONDS {
+            return Err(ConfigError::Invalid {
+                field: "discord.live_poll_seconds".to_owned(),
+                detail: format!(
+                    "{live_poll_seconds} is below the {} second floor. Every tick is one Discord \
+                     request per channel against a rate limit this server does not handle; use 0 \
+                     to turn live ingestion off.",
+                    crate::live::MIN_POLL_SECONDS
+                ),
+            });
+        }
         if default_fetch_limit > max_fetch_limit {
             return Err(ConfigError::Invalid {
                 field: "discord.default_fetch_limit".to_owned(),
@@ -497,6 +530,7 @@ impl Config {
                 default_fetch_limit,
                 max_fetch_limit,
                 max_count_scan,
+                live_poll_seconds,
             },
             auth: AuthConfig {
                 read_token,
@@ -901,6 +935,46 @@ writable = true
         assert!(
             matches!(&err, ConfigError::Invalid { field, .. } if field == "discord.max_count_scan"),
             "a zero ceiling means every count answers \"at least zero\": {err}"
+        );
+    }
+
+    #[test]
+    fn live_ingestion_is_off_unless_asked_for_and_refuses_a_reckless_interval() {
+        // OFF by default is the whole safety property here: upgrading this server must not start
+        // a new, permanent stream of Discord requests on an operator's account without them
+        // having typed anything.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert_eq!(cfg.discord.live_poll_seconds, 0);
+
+        let text = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 30");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.discord.live_poll_seconds, 30);
+
+        // The environment wins over the file, like every other setting here.
+        let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_LIVE_POLL_SECONDS, "60")]))
+            .expect("valid config");
+        assert_eq!(cfg.discord.live_poll_seconds, 60);
+
+        // ...including turning it back OFF, which is the one an operator reaches for in a hurry.
+        let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_LIVE_POLL_SECONDS, "0")]))
+            .expect("valid config");
+        assert_eq!(cfg.discord.live_poll_seconds, 0);
+
+        // Refused, not clamped. A silently-corrected 1 would look like it was honoured.
+        let text = FULL.replace("[discord]", "[discord]\nlive_poll_seconds = 1");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, detail }
+                if field == "discord.live_poll_seconds" && detail.contains("rate limit")),
+            "unexpected error: {err}"
+        );
+
+        let err = Config::from_toml_and_env(FULL, &env(&[(ENV_LIVE_POLL_SECONDS, "soon")]))
+            .expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. }
+                if field == "discord.live_poll_seconds"),
+            "unexpected error: {err}"
         );
     }
 

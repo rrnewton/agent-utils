@@ -340,19 +340,55 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // `#44 live-push`. Say the ingestion posture out loud in both directions, for the same reason
+    // the MCP path and the access log are announced: a page waiting on a stream that nobody
+    // publishes to is indistinguishable from a quiet channel, and the setting that causes it is
+    // one line in a file the operator is not looking at.
+    let live = Arc::new(gent_talk::live::LiveHub::new());
+    let poll_seconds = config.discord.live_poll_seconds;
+    if poll_seconds == 0 {
+        tracing::info!(
+            setting = "discord.live_poll_seconds",
+            "live ingestion is OFF. GET /api/v1/channels/{{id}}/stream accepts subscribers and \
+             nothing publishes to them, so the page falls back to its own timed re-read. Set an \
+             interval to turn it on; every tick is one Discord request per channel."
+        );
+    } else {
+        tracing::info!(
+            interval_seconds = poll_seconds,
+            channels = config.channels.len(),
+            "live ingestion is ON: each configured channel is polled on this interval and what is \
+             new is pushed to GET /api/v1/channels/{{id}}/stream. This is POLLING, not a Discord \
+             Gateway connection -- see the module doc of src/live.rs for why -- and it spends one \
+             Discord request per channel per tick against rate limits this server does not handle."
+        );
+    }
+
     let bind = config.bind;
     let elevenlabs: Arc<dyn SignedUrlProvider> =
         Arc::new(HttpElevenLabsClient::new().context("building the ElevenLabs client")?);
+    let live_channels: Vec<_> = config.channels.iter().map(|c| c.id.clone()).collect();
+    let live_limit = config.discord.default_fetch_limit;
     let state = AppState {
         config: Arc::new(config),
-        discord,
+        discord: Arc::clone(&discord),
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs,
         store,
+        live: Arc::clone(&live),
         summarizer,
         summary_version: summary_version.into(),
     };
+    if poll_seconds > 0 {
+        tokio::spawn(gent_talk::live::poll_forever(
+            discord,
+            live,
+            live_channels,
+            live_limit,
+            std::time::Duration::from_secs(poll_seconds),
+        ));
+    }
     let app = gent_talk::http::router(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

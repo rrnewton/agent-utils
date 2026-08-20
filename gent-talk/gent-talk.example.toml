@@ -38,6 +38,16 @@ max_fetch_limit = 100
 # stops and answers "at least N" instead of spending more requests.
 max_count_scan = 500
 
+# LIVE INGESTION: how often, in seconds, each allowlisted channel is read for messages nobody
+# asked for. `0` — the default — turns it OFF, and off means the /voice page's live stream
+# attaches and receives nothing until you set this.
+#
+# Off by default on purpose. Every tick is ONE Discord request PER CHANNEL, forever, whether or
+# not anybody is looking; this server does not yet honour `Retry-After`, and a 429 from Discord
+# reaches the caller as HTTP 502. Under 5 seconds is refused outright rather than clamped.
+# 30 is a reasonable place to start. Environment: GENT_TALK_LIVE_POLL_SECONDS
+live_poll_seconds = 0
+
 [auth]
 # Credentials THIS server demands of its callers. Not Discord's, not ElevenLabs'.
 # Generate them with:  openssl rand -base64 33

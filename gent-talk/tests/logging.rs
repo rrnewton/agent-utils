@@ -404,3 +404,56 @@ async fn a_server_nobody_called_logs_nothing_which_is_the_whole_point() {
         capture.access_lines()
     );
 }
+
+#[tokio::test]
+async fn a_stream_leaves_one_line_at_attach_and_it_reads_as_instant() {
+    // `#44 live-push`. The access-log middleware returns as soon as the status is known, and for a
+    // streaming body that is BEFORE a single event has gone out — so a stream held open for an
+    // hour logs `millis=0`. That is not a defect and it is not going to be fixed here; it is a
+    // thing a reader of the log will otherwise misread as an instant request, so it is pinned.
+    //
+    // What is a defect and what this also rules out: a stream logging nothing at all, or logging
+    // again per event. The `#41`-era question "did the client call us?" has to be answerable for
+    // the route that stays connected, not only for the ones that answer and go.
+    let capture = LogCapture::info_only();
+    let harness = harness();
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/api/v1/channels/{READ_CHANNEL}/stream"))
+        .header("authorization", format!("Bearer {READ_TOKEN}"))
+        .body(Body::empty())
+        .expect("request");
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("router responds");
+    assert_eq!(response.status(), StatusCode::OK);
+    // The body is deliberately NOT read: it never ends, and the point is that the line is already
+    // there before anything is read from it.
+    let lines: Vec<String> = capture
+        .access_lines()
+        .into_iter()
+        .filter(|l| l.contains("request"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "a stream must leave exactly one line, at attach: {lines:?}"
+    );
+    assert!(
+        lines[0].contains("path=\"/api/v1/channels/1111111111/stream\""),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].contains("status=200"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("millis=0"),
+        "the attach line is written before the first event, so it must read as zero — if this \
+         ever becomes non-zero the log has started waiting for the stream to END, which would \
+         delay every line by however long the reader stayed connected: {}",
+        lines[0]
+    );
+    drop(response);
+}

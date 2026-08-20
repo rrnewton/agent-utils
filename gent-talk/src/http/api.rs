@@ -206,6 +206,14 @@ pub struct ClientConfigResponse {
     pub elevenlabs_agent_id: Option<String>,
     /// Server version, so a stale cached page is visible.
     pub version: &'static str,
+    /// Seconds between live ingestion ticks, or `0` when live ingestion is OFF.
+    ///
+    /// The page needs this to tell the truth about its own channel view. With ingestion off the
+    /// SSE stream attaches and delivers nothing, which is indistinguishable from a quiet channel;
+    /// a page that showed a "live" indicator on that basis would be claiming a freshness it does
+    /// not have. Not a secret: it is a property of this deployment, and the caller already holds
+    /// a token.
+    pub live_poll_seconds: u64,
 }
 
 /// `GET /api/v1/client-config`
@@ -218,6 +226,7 @@ pub async fn client_config(
         channels: state.config.channels.clone(),
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         version: env!("CARGO_PKG_VERSION"),
+        live_poll_seconds: state.config.discord.live_poll_seconds,
     }))
 }
 
@@ -575,6 +584,58 @@ pub async fn ask(
             error.to_string(),
         )),
     }
+}
+
+/// `GET /api/v1/channels/{channel_id}/stream` — Server-Sent Events for one channel.
+///
+/// Read scope, and the same allowlist as every other channel route: see [`ops::watch`] for why the
+/// gate is there rather than here. A channel outside the configuration answers `404
+/// unknown_channel`, never a 200 that streams nothing.
+///
+/// **`Last-Event-ID` is honoured.** A browser reconnecting sends back the last `id:` it saw and
+/// gets only what came after it, out of the hub's bounded replay tail. That is what "reconnection
+/// must not duplicate or drop messages" means in practice, and the two failure directions are
+/// treated differently on purpose: a repeat is de-duplicated by id on the page, and a subscriber
+/// that fell too far behind gets one `event: reset` and the stream ENDS, so the page re-reads
+/// through `/messages` rather than silently skipping the gap.
+///
+/// **`Cache-Control: no-store`** because the body is channel text belonging to one credential, and
+/// **`X-Accel-Buffering: no`** because an nginx-shaped reverse proxy in front of this will
+/// otherwise buffer the response and deliver nothing until it is large enough — which presents as
+/// a stream that works locally and is dead behind the tunnel.
+///
+/// One more thing a reader of the access log needs: **this route leaves exactly one line, at
+/// attach, with `millis=0`**. [`crate::http::access_layer::log_requests`] returns as soon as the
+/// status is known, and for a streaming body that is before a single event has gone out — so a
+/// stream held open for an hour still logs zero milliseconds. A test in `tests/logging.rs` pins
+/// that rather than leaving it to be misread as an instant request.
+pub async fn stream(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let after = headers
+        .get("last-event-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| crate::model::MessageId(value.to_owned()));
+    let (_channel, subscription) = ops::watch(&state, &channel_id, after.as_ref())?;
+    let body = axum::response::sse::Sse::new(crate::live::events(subscription)).keep_alive(
+        axum::response::sse::KeepAlive::new().interval(std::time::Duration::from_secs(15)),
+    );
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (
+                axum::http::HeaderName::from_static("x-accel-buffering"),
+                "no",
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 const INDEX_HTML: &str = include_str!("../../web/index.html");

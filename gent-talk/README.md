@@ -300,6 +300,7 @@ curl -s -X POST localhost:8080/mcp \
 | Public URL | `server.public_base_url` | `GENT_TALK_PUBLIC_BASE_URL` | informational |
 | Time zone | `server.timezone` | `GENT_TALK_TIMEZONE` | IANA name, default `UTC`; an unknown one refuses to start |
 | Count ceiling | `discord.max_count_scan` | — | how many messages a count may walk, default `500` |
+| Live poll interval | `discord.live_poll_seconds` | `GENT_TALK_LIVE_POLL_SECONDS` | seconds between inbound reads per channel; **`0` (default) is OFF**, and under `5` is refused |
 | Discord bot token | `discord.bot_token` | `GENT_TALK_DISCORD_BOT_TOKEN` | **secret** |
 | Read token | `auth.read_token` | `GENT_TALK_READ_TOKEN` | **secret**, ≥ 24 chars |
 | Write token | `auth.write_token` | `GENT_TALK_WRITE_TOKEN` | **secret**, ≥ 24 chars, must differ |
@@ -504,6 +505,7 @@ not, and neither reveals anything about the configuration.
 | POST | `/api/v1/channels/{id}/resolve` | read | **semantic random access** |
 | POST | `/api/v1/channels/{id}/reply` | **write** | post as the bot |
 | POST | `/api/v1/channels/{id}/ask` | **write** | slow path — answers 501 in v0 |
+| GET | `/api/v1/channels/{id}/stream` | read | **Server-Sent Events**: messages as they arrive — see "Live push" |
 | GET | `/api/v1/conversations` | **write** | stored `/voice` transcripts, most recent first |
 | DELETE | `/api/v1/conversations` | **write** | erase every stored transcript |
 | GET | `/api/v1/conversations/{id}` | **write** | one stored transcript, oldest turn first |
@@ -583,6 +585,108 @@ unreachable, and an empty `allowed_mentions` — which is what this used to send
 (the full message, or `null`), `alternatives`, and `ambiguous`. **A query that matches nothing
 returns `best: null`** rather than the newest message wearing a confident label; a voice interface
 that guesses is worse than one that says it did not find anything.
+
+## Live push
+
+Everything else here is pulled: a question arrives, a channel is read, an answer goes back. This
+is the exception, and it exists for two things — the channel view on `/voice` should update as
+messages arrive rather than when something happens to poll, and a reply that lands mid-conversation
+should be able to reach the voice agent on its own instead of waiting to be asked about.
+
+Two design decisions sit under it. Both were made before any of it was built, and both are written
+here and in the module documentation of `src/live.rs` rather than left to be inferred from a diff.
+
+### Decision one: ingestion is bounded POLLING, not a Discord Gateway connection
+
+Discord's real-time mechanism is the Gateway. **This server does not use it.** With
+`discord.live_poll_seconds` set, a background task reads each allowlisted channel on that interval
+and publishes whatever is newer than a per-channel snowflake cursor.
+
+That is deliberately the less capable option:
+
+* **A Gateway is three new things at once.** A WebSocket client for Discord (there is one for
+  ElevenLabs and none for Discord), a heartbeat / resume / session-invalidate state machine, and
+  the privileged `MESSAGE_CONTENT` intent — which the application has to be granted, and without
+  which every message arrives with an empty body.
+* **Polling reuses what is already tested.** `DiscordClient::fetch_recent`, `sort_oldest_first`
+  and `MessageId::numeric` are the whole mechanism, and all three already have tests — including
+  the string-versus-numeric snowflake ordering trap, which is exactly the bug a hand-rolled cursor
+  reintroduces.
+* **The fake can genuinely fail.** `FakeDiscord::fail_next` and its unknown-channel refusal mean
+  the poll loop's failure path is exercised by the suite rather than reasoned about.
+
+And one reason that is about sequencing rather than design: **the Discord layer here has still
+never run against live Discord.** Making first contact and introducing a stateful always-connected
+client in the same change is two untested things at once, and when it misbehaves there is no way
+to tell which one is wrong.
+
+**The Gateway is the upgrade path, behind this same seam.** Everything above `src/live.rs` sees a
+`LiveHub` — a channel-keyed publish/subscribe with a bounded replay tail. A Gateway implementation
+would publish into exactly that and delete the poll loop; no route, no page and no test above the
+hub would change.
+
+Two rules in the loop are correctness, not tuning:
+
+* **The first tick seeds the cursor and publishes nothing.** Otherwise the first poll after a
+  restart republishes the whole recent window, and a page that attaches a second later is shown
+  existing history labelled as newly arrived — and relays it into a paid conversation as news.
+* **A failed fetch does not advance the cursor.** Whatever arrived during the outage is published
+  once it recovers, rather than skipped.
+
+### Decision two: the PAGE keeps the ElevenLabs conversation socket
+
+The server relays nothing to the vendor. It mints a signed URL and that is the end of its
+involvement; the browser holds the conversation. Moving that socket server-side would turn
+gent-talk into an always-connected, **billed** conversation holder whose cost accrues while nobody
+is in the car, and would put third-party channel text on a vendor socket no human is looking at.
+
+**The cost of that decision, stated plainly: contextual updates reach the agent only while the
+page is open.** Close the tab and the channel keeps moving, this server keeps ingesting, and the
+agent hears nothing until somebody opens `/voice` again and asks.
+
+### The stream
+
+`GET /api/v1/channels/{id}/stream` is Server-Sent Events, and is an ordinary read in every other
+respect: same bearer token, same read scope, same channel allowlist. A channel outside the
+allowlist gets `404 unknown_channel`, never a `200` that streams nothing — on a stream those two
+are indistinguishable forever.
+
+* Every event carries `id: <message id>` and `event: message`, and a payload of
+  `{message, self_posted, untrusted_content_notice}`. The notice is the same one `/messages`
+  carries: a pushed message is third-party text exactly as a fetched one is.
+* **Reconnection.** The browser sends `Last-Event-ID`; the server replays only what came after it,
+  from a bounded tail of the last 200 published messages per channel. The receiver is attached
+  *before* the tail is read, under one lock, so nothing can slip between the two.
+* **Falling behind.** A subscriber further behind than the broadcast buffer gets one
+  `event: reset` and the stream **ends**. The page re-reads through the paged route rather than
+  resuming short: a silent gap is the one outcome this design must not produce.
+* `Cache-Control: no-store`, and `X-Accel-Buffering: no` so an nginx-shaped proxy does not buffer
+  the response into nothing.
+* **In the access log it leaves exactly one line, at attach, with `millis=0`.** The middleware
+  returns as soon as the status is known, which for a streaming body is before the first event.
+  A stream held open for an hour still logs zero. That is pinned by a test so nobody reads it as
+  an instant request.
+
+### What the page does with it
+
+`/voice` reads the stream with `fetch` and a reader over the response body, **not** `EventSource`:
+`EventSource` cannot carry an `Authorization` header, and the usual workaround puts a bearer
+credential in a query string — in every proxy log and in the browser's own history, which is the
+exact thing `/api/v1/signed-url`'s `no-store` and the page's `redact()` exist to prevent.
+
+Arriving messages are rendered by the same element construction as fetched ones, de-duplicated
+against the rows actually on screen, and — only if the reader has turned it on — relayed into a
+live conversation as a `contextual_update`. Three guards on that relay, all load-bearing:
+
+* **Self-posted messages are never relayed.** `ops::reply` posts as the bot and the poller reads
+  that post back; relaying it would have the agent hear its own answer as news and answer it, in a
+  loop that bills. The ids this server posted are recorded and travel with the message as
+  `self_posted`. It is deliberately not an author comparison — this server does not know its own
+  bot's user id, because `HttpDiscordClient` never calls `/users/@me`.
+* **A Settings toggle, off by default.** Every channel message reaching a live conversation is
+  both a cost and an interruption.
+* **A live socket.** There is nowhere to send it otherwise, and queuing it for the next call would
+  deliver stale news at the start of a conversation about something else.
 
 ## Signed conversation URLs
 
@@ -1354,7 +1458,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-seven states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty-eight states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1437,6 +1541,7 @@ src/summary.rs        extractive digest lines
 src/retrieval.rs      semantic random access, behind the Ranker trait
 src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
+src/live.rs           inbound ingestion (bounded polling), the per-channel fan-out, and the SSE body
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
 src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
 src/elevenlabs/mock/  the loopback vendor: a real mint endpoint, a real WebSocket, a real MCP client
@@ -1473,7 +1578,20 @@ Beyond the security list above:
 * No caching of channel content: every question is a fresh Discord fetch, and Discord's rate
   limits are not handled. The summary cache is the one exception and it is a cache of DERIVED
   text, bounded and purgeable — see "Durable state".
-* No `Retry-After` handling; a 429 from Discord surfaces as HTTP 502.
+* No `Retry-After` handling; a 429 from Discord surfaces as HTTP 502. **Live push makes this
+  matter more than it used to**: with `discord.live_poll_seconds` set, this server spends one
+  Discord request per channel per interval whether or not anybody is listening, on top of every
+  question asked. That is why the setting defaults to OFF, why an interval under five seconds is
+  refused outright rather than clamped, and why a channel whose read fails backs off (doubling, up
+  to sixteen intervals) instead of retrying at the same rate. It is still not `Retry-After`
+  handling, and a 429 during a poll tick is a WARN line and a backoff, not a queued retry.
+* **Live push has never run against live Discord either, and neither has the poller.** The seeding
+  rule, the cursor, the failure path and the SSE framing are all tested against the in-memory
+  fake; the first real deployment with an interval set will be the first time the poll loop meets
+  Discord's rate limiter.
+* **A contextual update reaches the agent only while `/voice` is open.** The conversation socket
+  belongs to the browser, not to this server (see "Live push"), so closing the tab ends the relay
+  even though the server keeps ingesting.
 * The web app has no service worker and no offline mode.
 * **The MCP endpoint has never been driven by a real ElevenLabs agent.** It is tested against the
   protocol as written and against `curl`; the registration steps above are from the vendor's
