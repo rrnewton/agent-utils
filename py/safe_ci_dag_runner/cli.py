@@ -250,7 +250,7 @@ def _quickstart(c: Palette) -> str:
   - learned est_duration / rss from the profile store override the DAG hints at plan time
     {c.dim('(disable with --no-profile-feedback; inspect with the plan subcommand / --show-plan)')}
   - a failing step fails the run (exit 1) and, by default, eager-cancels in-flight steps
-    ({k('--keep-going')} lets already-running steps finish instead; it still stops launching new steps)
+    ({k('--keep-going')} continues launching independent ready steps; failed dependents are skipped)
   - Linux cgroup-v2 per-step memory/CPU boxing is ON BY DEFAULT (the tool's primary purpose):
     {k('run')} re-execs inside a systemd --user scope and caps each step in its own child cgroup
     {c.dim('(no cgroup-v2 + systemd --user scope? the run errors — pass')} {k('--allow-cgroup-failure')} {c.dim('to run un-boxed)')}
@@ -525,7 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
         "-k",
         "--keep-going",
         action="store_true",
-        help="on a failure, let already-running steps finish instead of eager-cancelling them (still stops launching new steps)",
+        help="after a failure, continue launching independent ready steps and skip true dependents",
     )
     run_p.add_argument(
         "--run-timeout",
@@ -2317,9 +2317,8 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
 
         metrics = CsvMetricsSink(perf_dir, git_sha=_git_sha())
 
-    # --stress implies --keep-going: a failing copy must NOT eager-cancel its siblings, or the
-    # per-copy ratio (the whole point) collapses to a single early failure. With a wide enough
-    # active-step and CPU budget all copies launch together, so keep_going lets every copy finish.
+    # --stress implies --keep-going: a failing copy must not cancel, nor prevent the launch of,
+    # its siblings — or the per-copy ratio (the whole point) becomes a partial measurement.
     keep_going = bool(ns.keep_going) or stress_active
     result = run_dag_limited(
         cfg,
@@ -2339,9 +2338,12 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
     print(
         f"{PROG}: {verdict} - {passed} passed, {failed} failed, {aborted} aborted, "
         f"{len(result.intentional_skips)} intentionally skipped, "
-        f"{len(result.skipped)} dependency-skipped in {result.wall_s:.1f}s",
+        f"{len(result.skipped)} dependency-skipped, "
+        f"{len(result.not_launched)} not launched in {result.wall_s:.1f}s",
         file=sys.stderr,
     )
+    if result.not_launched:
+        print(f"{PROG}: not launched: {', '.join(result.not_launched)}", file=sys.stderr)
     if perf_dir is not None:
         _report_profile_written(perf_dir, source)
     if do_upload and backend is not None:

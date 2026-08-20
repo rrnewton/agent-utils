@@ -204,6 +204,67 @@ def test_eager_exit_aborts_inflight_step() -> None:
     assert outcomes["g.slow"].ok is False
 
 
+def test_fail_fast_reports_independent_step_as_not_launched() -> None:
+    """Under the default eager-exit, later independent work lands in NO existing bucket.
+
+    That is the coverage hole this feature is about: ``g.independent`` is neither an outcome nor
+    dependency-skipped, so a caller counting only those two would read the run as fully accounted
+    for. ``not_launched`` names it.
+    """
+    cfg = DagConfig(
+        steps=(
+            _step("g", "fail", "exit 1", est=100.0),
+            _step("g", "dependent", "true", deps=["g.fail"], est=90.0),
+            _step("g", "independent", "true", est=80.0),
+        )
+    )
+    res = run_dag(cfg, jobs=1, keep_going=False, verbosity=0)
+    assert not res.ok
+    assert [o.tag for o in res.outcomes] == ["g.fail"]
+    assert res.skipped == ("g.dependent",)
+    assert res.not_launched == ("g.independent",)
+
+
+def test_keep_going_launches_independent_step_after_failure() -> None:
+    cfg = DagConfig(
+        steps=(
+            _step("g", "fail", "exit 1", est=100.0),
+            _step("g", "dependent", "true", deps=["g.fail"], est=90.0),
+            _step("g", "independent", "true", est=80.0),
+        )
+    )
+    res = run_dag(cfg, jobs=1, keep_going=True, verbosity=0)
+    assert not res.ok  # the genuine failure still fails the run
+    outcomes = {o.tag: o for o in res.outcomes}
+    assert outcomes["g.fail"].ok is False
+    assert outcomes["g.independent"].ok is True  # launched AFTER the failure
+    assert res.skipped == ("g.dependent",)  # a true dependent is still not run
+    assert res.not_launched == ()
+    # Every configured step is now accounted for in exactly one bucket.
+    assert len(res.outcomes) + len(res.skipped) + len(res.intentional_skips) == len(
+        cfg.steps
+    )
+
+
+def test_keep_going_collects_every_independent_failure_in_one_run() -> None:
+    """The point of the option: one run, every independent failure, not just the first."""
+    cfg = DagConfig(
+        steps=(
+            _step("g", "fail_a", "exit 1", est=100.0),
+            _step("g", "fail_b", "exit 1", est=90.0),
+            _step("g", "fail_c", "exit 1", est=80.0),
+        )
+    )
+    res = run_dag(cfg, jobs=1, keep_going=True, verbosity=0)
+    assert not res.ok
+    assert sorted(o.tag for o in res.outcomes if not o.ok and not o.aborted) == [
+        "g.fail_a",
+        "g.fail_b",
+        "g.fail_c",
+    ]
+    assert res.not_launched == ()
+
+
 def test_resource_cap_serializes_concurrent_steps() -> None:
     with tempfile.TemporaryDirectory() as d:
         log = os.path.join(d, "intervals")

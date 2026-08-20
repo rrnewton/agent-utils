@@ -202,8 +202,9 @@ defaults, the outer safety factor, and selected `engine_only` steps all count;
 intentional skips do not. If even one runnable step or the configured footprint
 floor exceeds the budget, the run refuses instead of claiming one step fits.
 CPA reports the same state as `infeasible-memory`. Named resources act as semaphores in
-addition to the step and memory limits. A failed step prevents new dependent work; `--keep-going` lets
-already-running work reach a verdict.
+addition to the step and memory limits. A failed step prevents only dependent work. With
+`--keep-going`, independent ready work continues to launch; without it, the final report names
+every step that was not launched.
 
 Under boxing, the run scope also receives `CPUQuota=<max-cpus>*100%`, and the
 live `cpu.max` value is read back before work starts. This makes `--max-cpus N`

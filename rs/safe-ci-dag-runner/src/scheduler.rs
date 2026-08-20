@@ -12,10 +12,10 @@
 // * Named-resource capacity buckets (`hint.resources` vs `cfg.resource_caps`).
 // * Longest-processing-time (LPT) dispatch order (descending `est_duration_s`, stable).
 // * Per-step supervision via `bash -c` in its own process group (whole-tree teardown).
-// * Fail-fast (eager-exit): the first genuine failure stops launching NEW steps; by default it
-//   also eager-cancels in-flight steps (labelled ABORTED, not FAILED). `keep_going` only
-//   suppresses that eager-cancel so already-running steps finish — it does NOT keep launching
-//   still-runnable steps.
+// * Fail-fast (eager-exit): by default the first genuine failure stops launching NEW steps and
+//   eager-cancels in-flight steps (labelled ABORTED, not FAILED). `keep_going` instead continues
+//   launching independent ready steps while dependency-failure closure skips only true
+//   dependents.
 // * Failure classification via [`crate::model::step_failure_reason`].
 //
 // Boxing: when a [`crate::cgroup::CgroupManager`] is supplied (the default `run` path), each
@@ -174,7 +174,7 @@ struct Shared {
     resource_avail: HashMap<String, i64>,
     /// A genuine (non-aborted) step failed.
     failed: bool,
-    /// Stop scheduling new steps after a failure.
+    /// Stop scheduling new steps after a fail-fast failure or outer run timeout.
     stop: bool,
     /// Accumulated per-step measurement rows (forwarded to a metrics sink after the run).
     step_profile_rows: Vec<ProfileRow>,
@@ -915,13 +915,31 @@ impl Runner {
             .iter()
             .filter_map(|t| sh.done.get(t).cloned())
             .collect();
-        let mut skipped: Vec<String> = self.skipped(&sh).into_iter().collect();
+        let skipped_set = self.skipped(&sh);
+        let intentional_skip_tags: HashSet<&str> = self
+            .intentional_skips
+            .iter()
+            .map(|(tag, _)| tag.as_str())
+            .collect();
+        let mut not_launched: Vec<String> = self
+            .order
+            .iter()
+            .filter(|tag| {
+                !sh.done.contains_key(*tag)
+                    && !skipped_set.contains(*tag)
+                    && !intentional_skip_tags.contains(tag.as_str())
+            })
+            .cloned()
+            .collect();
+        not_launched.sort();
+        let mut skipped: Vec<String> = skipped_set.into_iter().collect();
         skipped.sort();
         RunResult {
-            ok: !sh.failed,
+            ok: !sh.failed && not_launched.is_empty(),
             wall_s: wall,
             outcomes,
             skipped,
+            not_launched,
             intentional_skips: self.intentional_skips.clone(),
             step_profile_rows: sh.step_profile_rows.clone(),
             run_timed_out: sh.run_timed_out,
@@ -1506,8 +1524,8 @@ fn run_step(ctx: StepCtx) {
             );
             sh.done.insert(tag.clone(), outcome);
             sh.failed = true;
-            sh.stop = true;
             if !keep_going {
+                sh.stop = true;
                 let admitted: Vec<String> = sh.running.iter().cloned().collect();
                 for other in admitted {
                     sh.aborted.insert(other);
@@ -1959,12 +1977,13 @@ fn run_step(ctx: StepCtx) {
         let reason = outcome.reason.clone();
         sh.done.insert(tag.clone(), outcome);
         if !was_aborted && !ok {
-            // A REAL failure: mark failed + stop launching NEW steps. Eager-exit (default): reap
-            // every step still running so a fast failure doesn't wait for a slow in-flight build.
-            // keep_going instead lets those in-flight steps finish; it does NOT launch further steps.
+            // A REAL failure. Eager-exit (default) stops launching NEW steps and reaps every
+            // step still running so a fast failure does not wait for a slow in-flight build.
+            // keep_going records the failure but leaves scheduling open: independent ready steps
+            // continue, while dependency-failure closure skips only true dependents.
             sh.failed = true;
-            sh.stop = true;
             if !keep_going {
+                sh.stop = true;
                 let admitted: Vec<String> = sh.running.iter().cloned().collect();
                 for other in admitted {
                     sh.aborted.insert(other);
@@ -1989,7 +2008,7 @@ fn run_step(ctx: StepCtx) {
         ));
     } else if was_aborted {
         emit(&format!(
-            "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} eager-exit after another step failed; keep_going lets in-flight steps finish)",
+            "[{tag}] \u{2298} ABORT  {} ({dur}s \u{2014} eager-exit after another step failed; --keep-going would continue independent work)",
             step.desc
         ));
     } else if ok {
@@ -2074,9 +2093,8 @@ fn run_step(ctx: StepCtx) {
 /// * `combined_limit`: compatibility combined limit: both the maximum active-step count and the
 ///   maximum runner-controlled width of each individual step, clamped to at least 1. Concurrent
 ///   widths may sum above it. Use [`run_dag_limited`] when those values differ.
-/// * `keep_going`: on a failure, let already-running steps finish instead of eager-cancelling
-///   them; the scheduler still stops launching new steps (it does NOT run every still-runnable
-///   step), so in-flight steps report their own pass/fail rather than ABORTED.
+/// * `keep_going`: after a failure, keep launching independent ready steps and let running steps
+///   finish; only true dependents are skipped.
 /// * `verbosity`: 0 quiet (+failures), 1 default (+summaries), 2-4 stream child stdout,
 ///   and >=5 streams with the deepest recognized test identity on every line.
 pub fn run_dag(
@@ -2252,6 +2270,7 @@ pub fn run_dag_boxed_deadline_limited(
             wall_s: 0.0,
             outcomes: Vec::new(),
             skipped: Vec::new(),
+            not_launched: Vec::new(),
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
@@ -2270,6 +2289,7 @@ pub fn run_dag_boxed_deadline_limited(
             wall_s: 0.0,
             outcomes: Vec::new(),
             skipped: Vec::new(),
+            not_launched: Vec::new(),
             intentional_skips: Vec::new(),
             step_profile_rows: Vec::new(),
             run_timed_out: false,
@@ -2320,6 +2340,7 @@ pub fn run_dag_boxed_deadline_limited(
                 wall_s: 0.0,
                 outcomes: Vec::new(),
                 skipped: Vec::new(),
+                not_launched: Vec::new(),
                 intentional_skips: Vec::new(),
                 step_profile_rows: Vec::new(),
                 run_timed_out: false,
@@ -2722,6 +2743,83 @@ mod tests {
         assert!(!outcomes["g.fast"].ok);
         assert!(outcomes["g.slow"].aborted);
         assert!(!outcomes["g.slow"].ok);
+    }
+
+    /// Under the default eager-exit, later independent work lands in NO existing bucket: it is
+    /// neither an outcome nor dependency-skipped. `not_launched` names it, so a caller counting
+    /// only the first two cannot read the run as fully accounted for.
+    #[test]
+    fn fail_fast_reports_independent_step_as_not_launched() {
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "fail", "exit 1", &[], 100.0, &[]),
+                step("g", "dependent", "true", &["g.fail"], 90.0, &[]),
+                step("g", "independent", "true", &[], 80.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 1, false, 0);
+        assert!(!res.ok);
+        assert_eq!(
+            res.outcomes
+                .iter()
+                .map(|o| o.tag.as_str())
+                .collect::<Vec<_>>(),
+            vec!["g.fail"]
+        );
+        assert_eq!(res.skipped, vec!["g.dependent"]);
+        assert_eq!(res.not_launched, vec!["g.independent"]);
+    }
+
+    #[test]
+    fn keep_going_launches_independent_step_after_failure() {
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "fail", "exit 1", &[], 100.0, &[]),
+                step("g", "dependent", "true", &["g.fail"], 90.0, &[]),
+                step("g", "independent", "true", &[], 80.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 1, true, 0);
+        assert!(!res.ok); // the genuine failure still fails the run
+        let outcomes: HashMap<String, StepOutcome> = res
+            .outcomes
+            .iter()
+            .map(|o| (o.tag.clone(), o.clone()))
+            .collect();
+        assert!(!outcomes["g.fail"].ok);
+        assert!(outcomes["g.independent"].ok); // launched AFTER the failure
+        assert_eq!(res.skipped, vec!["g.dependent"]); // a true dependent is still not run
+        assert!(res.not_launched.is_empty());
+        assert_eq!(
+            res.outcomes.len() + res.skipped.len() + res.intentional_skips.len(),
+            cfg.steps.len()
+        );
+    }
+
+    /// The point of the option: one run, every independent failure, not just the first.
+    #[test]
+    fn keep_going_collects_every_independent_failure_in_one_run() {
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "fail_a", "exit 1", &[], 100.0, &[]),
+                step("g", "fail_b", "exit 1", &[], 90.0, &[]),
+                step("g", "fail_c", "exit 1", &[], 80.0, &[]),
+            ],
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 1, true, 0);
+        assert!(!res.ok);
+        let mut failures: Vec<&str> = res
+            .outcomes
+            .iter()
+            .filter(|o| !o.ok && !o.aborted)
+            .map(|o| o.tag.as_str())
+            .collect();
+        failures.sort();
+        assert_eq!(failures, vec!["g.fail_a", "g.fail_b", "g.fail_c"]);
+        assert!(res.not_launched.is_empty());
     }
 
     #[test]
