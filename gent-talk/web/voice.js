@@ -154,6 +154,9 @@ function showView(name) {
   // for. Doing this here rather than in loadDiscord() is deliberate — the load only runs on
   // the FIRST switch, so a fix that lived there would leave every later switch at the top.
   scrollToNewest();
+  // Entering a view lands on its newest message, so any offer to jump there has been taken.
+  // Leaving the flag set would show a chip pointing at where the reader already is.
+  jumpNewestWanted[name] = false;
   // The chips belong to the list you are looking at, and you are now looking at a different one.
   renderScrollTools();
 }
@@ -290,7 +293,9 @@ function followIfPinned(pinned) {
     scrollToNewest();
     return;
   }
-  setJumpNewest(true);
+  // Named explicitly: this is only ever reached from `line()` and `seam()`, which append to the
+  // transcript. Letting it default to `currentView` would raise a chip over the channel list.
+  setJumpNewest(true, "voice");
 }
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
@@ -390,10 +395,14 @@ function foldable(li, meta, body, text) {
 // when there is no call: a control that is always there and usually inert teaches the eye to skip
 // the corner it lives in.
 
-let jumpNewestWanted = false;
+// PER LIST, not per page. Both lists live in one #scroll-area, so a single flag would raise the
+// chip for a voice turn while the reader is looking at the channel — offering to jump them to the
+// bottom of a list nothing arrived in — and would leave a channel arrival with no chip at all.
+// The chip belongs to the list it is about.
+const jumpNewestWanted = { voice: false, discord: false };
 
-function setJumpNewest(wanted) {
-  jumpNewestWanted = wanted;
+function setJumpNewest(wanted, view = currentView) {
+  jumpNewestWanted[view] = wanted;
   renderScrollTools();
 }
 
@@ -404,7 +413,7 @@ function visibleFolds() {
 }
 
 function renderScrollTools() {
-  el("jump-newest").hidden = !jumpNewestWanted;
+  el("jump-newest").hidden = !jumpNewestWanted[currentView];
   // "Collapse all" appears only once something IS expanded. Everything arrives folded, so until
   // the reader opens one there is nothing for it to collapse.
   el("collapse-all").hidden = !visibleFolds().some((entry) => !isFolded(entry));
@@ -1360,6 +1369,9 @@ function channelSummary(count, complete, label) {
  *   where they already were. The FIRST load of a channel is the other case and does not pass it:
  *   arriving at the top of a long history means scrolling past everything already read.
  */
+/** The id of the newest message the channel list is currently showing, or null. */
+let discordNewestId = null;
+
 async function loadDiscord(options) {
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
@@ -1383,10 +1395,22 @@ async function loadDiscord(options) {
       list.append(discordNode(message));
     }
     setStatus(channelSummary(payload.messages.length, payload.complete, payload.channel.label));
+    const newest = payload.messages.length
+      ? payload.messages[payload.messages.length - 1].id
+      : null;
+    // Something ARRIVED only if the newest id moved. A refresh that returns the same messages must
+    // not raise the chip, or a background poll every 45 seconds would offer to jump the reader to
+    // a bottom that has not changed since the last time they declined.
+    const arrived = newest !== null && discordNewestId !== null && newest !== discordNewestId;
+    discordNewestId = newest;
     if (keepPosition && !wasAtNewest) {
       area.scrollTop = previousTop;
+      if (arrived) {
+        setJumpNewest(true, "discord");
+      }
     } else {
       scrollToNewest();
+      setJumpNewest(false, "discord");
     }
     renderScrollTools();
   } finally {
@@ -1606,7 +1630,7 @@ el("jump-newest").addEventListener("click", scrollToNewest);
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
 // has nothing left to say, so it takes itself away rather than waiting to be tapped.
 el("scroll-area").addEventListener("scroll", () => {
-  if (jumpNewestWanted && atBottom(el("scroll-area"))) {
+  if (jumpNewestWanted[currentView] && atBottom(el("scroll-area"))) {
     setJumpNewest(false);
   }
 });

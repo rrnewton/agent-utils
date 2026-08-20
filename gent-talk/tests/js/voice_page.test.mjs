@@ -116,7 +116,7 @@ function cssBlock(selector) {
 //   * an element's top is the sum of the heights before it, minus the scroll position.
 //
 // It is deliberately dumber than a renderer, and being dumber is not the same as being honest. The
-// thing that keeps it honest is that every anchoring assertion below is ALSO run against a copy of
+// thing that keeps the strongest two honest is that they are ALSO run against a copy of
 // web/voice.js with the anchoring deleted, and has to fail there. A model that could not tell the
 // two apart would fail its own negative control.
 const LINE_PX = 20;
@@ -755,8 +755,17 @@ const longMessage = (mark = "long") =>
   );
 const SHORT_MESSAGE = "it landed at 9c07d3e";
 
-/** The page's own definition of "the reader is at the bottom", restated once for the tests. */
-const atBottomOf = (area) => area.scrollHeight - area.scrollTop - area.clientHeight <= 24;
+/**
+ * The page's own definition of "the reader is at the bottom". Derived from the source for the same
+ * reason `COLLAPSE_OVER_CHARS` is: a hard-coded 24 goes green-but-vacuous the day the slack moves,
+ * and the two constants were treated inconsistently until this was pointed out.
+ */
+const BOTTOM_SLACK_PX = Number(
+  /BOTTOM_SLACK_PX = (\d+)/.exec(SCRIPT_CODE)?.[1] ??
+    assert.fail("web/voice.js no longer states a bottom slack")
+);
+const atBottomOf = (area) =>
+  area.scrollHeight - area.scrollTop - area.clientHeight <= BOTTOM_SLACK_PX;
 
 /** The fold control on a rendered message, or undefined when it has none. */
 const foldButton = (li) => li.descendants().find((node) => node.className === "fold");
@@ -1826,8 +1835,10 @@ test("clearing while idle just clears, with no claim about an agent that is not 
 //
 // The new rule is conditional, and both halves of it are load-bearing. A page that never follows
 // the newest line passes "it did not move me" perfectly and is useless, so every test below that
-// says the view held still has a counterpart saying it still follows, and a NEGATIVE CONTROL: the
-// same scenario against a copy of web/voice.js with the anchoring removed, which must fail.
+// says the view held still has a counterpart saying it still follows. TWO of them — the
+// followIfPinned test and the scrollTop-restore test — additionally carry a NEGATIVE CONTROL: the
+// same scenario against a copy of web/voice.js with the anchoring removed, which must fail. The
+// others do not, and saying otherwise here would be claiming coverage that is not present.
 
 /** A conversation long enough that the scroll area really overflows its viewport. */
 function fillTranscript(page, turns = 8) {
@@ -2921,4 +2932,90 @@ test("the idle screen puts its invitation in the empty space, not in the bottom 
   });
 
   assert.equal(page.el("empty-state").hidden, true, "the invitation stayed under the conversation");
+});
+
+/** A channel tall enough to actually scroll: folded messages are capped at three lines each. */
+const channelOf = (n, extra = 0) =>
+  Array.from({ length: n + extra }, (_, i) =>
+    message({ id: String(i + 1), content: longMessage(`m${i + 1}`) })
+  );
+
+// --- the "Newest" chip belongs to the list it is about ------------------------------------------
+//
+// Both lists live inside one #scroll-area, so a single page-wide flag gets this wrong in two
+// directions at once: a voice turn raises a chip while you are reading the channel, offering to
+// jump you to the bottom of a list nothing arrived in — and a channel message arriving during a
+// background poll raises nothing at all, which is the very defect the chip exists to prevent.
+
+test("a message arriving in the CHANNEL while you have scrolled up raises the chip", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, channelOf(12));
+  await page.el("view-switch").click();
+  await page.settle();
+
+  const area = page.el("scroll-area");
+  area.scrollTop = 0; // reading older messages, not pinned to the bottom
+
+  page.messages = channelOf(12, 1);
+  page.expireTimers(45000);
+  await page.settle();
+
+  assert.equal(page.reads, 2, "the poll did not fire");
+  assert.equal(area.scrollTop, 0, "a background poll moved the reader");
+  assert.equal(
+    page.el("jump-newest").hidden,
+    false,
+    "the channel gained a message and said nothing — the reader cannot tell"
+  );
+});
+
+test("a poll that returns the SAME messages does not offer to jump anywhere", async () => {
+  const page = newPage();
+  await signIn(page);
+  countingChannel(page, channelOf(12));
+  await page.el("view-switch").click();
+  await page.settle();
+
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  page.expireTimers(45000); // same page.messages: nothing new
+  await page.settle();
+
+  assert.equal(page.reads, 2);
+  assert.equal(
+    page.el("jump-newest").hidden,
+    true,
+    "an unchanged channel raised a chip; every 45 seconds it would nag about nothing"
+  );
+});
+
+test("a VOICE turn does not raise a chip over the channel list", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  countingChannel(page, channelOf(12));
+  await page.el("view-switch").click(); // now reading the channel
+  await page.settle();
+  assert.equal(page.tab(), "discord");
+
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+
+  socket.onmessage({
+    data: JSON.stringify({
+      type: "user_transcript",
+      user_transcription_event: { user_transcript: longMessage("spoken while reading the channel") },
+    }),
+  });
+
+  assert.equal(
+    page.el("jump-newest").hidden,
+    true,
+    "a transcript turn offered to jump the reader to the bottom of the CHANNEL"
+  );
+
+  // ...and the offer is waiting for them when they go back to the list it was about.
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.equal(page.tab(), "voice");
 });
