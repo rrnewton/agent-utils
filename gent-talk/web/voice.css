@@ -84,6 +84,60 @@ body {
   padding-bottom: 0;
 }
 
+/*
+ * EVERY ROW OF EVERY GRID ON THIS PAGE IS ASSIGNED BY NAME, NEVER BY SOURCE ORDER.
+ *
+ * This is not tidiness. `display: none` REMOVES an element from its grid's item list, so a track
+ * list written as `auto 1fr auto` silently becomes a different layout the moment the first child is
+ * hidden — every remaining child slides up one row, and the one that was meant to be elastic is not
+ * the one that gets `1fr` any more.
+ *
+ * That is the defect this block fixes, and it was visible: web/voice.js hides #topbar outright when
+ * the control bar is in its default bottom placement (`#58 control-bar` — an empty 2.4rem strip at
+ * the top of a phone is rent nobody is paying). With the header gone, #frame-body took the `auto`
+ * row and THE DOCK TOOK `1fr` — so the dock stretched to whatever space the content left over, and
+ * the controls sat at the TOP of that stretched box. The owner saw the effect exactly as it is:
+ * switching from a long channel to an empty transcript walked the button bar up the screen, because
+ * the bar's position was tracking the height of the content above it. Measured before the fix, on a
+ * 900px-tall desktop window: the bar sat at y=752 on the channel and y=675 on the empty transcript.
+ *
+ * The same trap is set twice more, and both are disarmed here rather than left for the next person
+ * to rediscover from a screenshot: #error and #connection-banner are hidden most of the time, so
+ * #screens and #scroll-area were landing in `auto` rows and being sized by their content instead of
+ * filling the frame — which is also why a scrolling element could grow past its container rather
+ * than scroll inside it.
+ *
+ * Assigning the row explicitly makes a hidden sibling a non-event: the row it would have occupied
+ * collapses to zero and nothing else moves.
+ */
+#topbar {
+  grid-row: 1;
+}
+
+#frame-body {
+  grid-row: 2;
+}
+
+#dock {
+  grid-row: 3;
+}
+
+#error {
+  grid-row: 1;
+}
+
+#screens {
+  grid-row: 2;
+}
+
+#connection-banner {
+  grid-row: 1;
+}
+
+#scroll-area {
+  grid-row: 2;
+}
+
 /* `hidden` has to beat the layout modes below, all of which set `display`. */
 [hidden] {
   display: none !important;
@@ -1044,17 +1098,23 @@ body {
   -webkit-user-select: none;
 }
 
-/* `#60 canned-prompt-buttons`. One of the two canned buttons asks the voice agent to read; the
-   other spends CODING-AGENT work on one tap. The issue asks for that difference in weight to be
-   legible rather than merely documented, so the heavier one is drawn in the same warm colour an
-   armed Clear uses — this page's existing way of saying "this one is not like its neighbours". */
-.bar-button.heavy {
-  border-color: var(--warn);
-  color: var(--warn);
-}
-
-.bar-button.heavy .mini-label {
-  color: var(--warn);
+/*
+ * A bar button with nothing to act on.
+ *
+ * `aria-disabled`, NOT the `disabled` attribute, and the difference is the whole point: the owner
+ * asked for a greyed button whose HOVER TOOLTIP SAYS WHY. A genuinely disabled control is not
+ * reliably a hover target — the tooltip is a browser decision and Firefox has historically declined
+ * to show one — so the requirement and the attribute are in direct conflict. `aria-disabled` keeps
+ * the element a real, focusable, hoverable button that announces itself as unavailable, and the
+ * refusal is enforced where it was already enforced: `sendUserMessage` reports "Start a call first"
+ * and sends nothing. Nothing is gated on appearance alone.
+ *
+ * `pointer-events` is deliberately NOT set to `none` here. That would take the tooltip away again,
+ * which is the one thing this state exists to deliver.
+ */
+.bar-button[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* `#83 channel-selector-in-bar`. The channel picker, sized to live in the bar rather than in a row

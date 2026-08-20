@@ -764,20 +764,33 @@ function visibleFolds() {
 
 function renderScrollTools() {
   el("jump-newest").hidden = !jumpNewestWanted[currentView];
-  // "Collapse all" appears only once something IS expanded. Everything arrives folded, so until
-  // the reader opens one there is nothing for it to collapse.
-  el("collapse-all").hidden = !visibleFolds().some((entry) => !isFolded(entry));
+  // ONE snapshot for all three chips, so they cannot disagree about a list that changed between
+  // two queries.
+  const folds = visibleFolds();
+  // Collapse and Expand are a PAIR: each appears only when it has work to do. Everything arrives
+  // folded, so at rest only Expand is offered; once every fold is open only Collapse is; in
+  // between, both. Expand was missing, which made the fold a one-way door at the list level.
+  el("collapse-all").hidden = !folds.some((entry) => !isFolded(entry));
+  el("expand-all").hidden = !folds.some((entry) => isFolded(entry));
   // ...and summary mode only where a summary can exist at all: the channel, with something long
   // enough in it to be worth condensing. Offering it over the voice transcript would be offering
   // a mode that changes nothing, since a voice turn has no message id to key a summary under.
   el("summarise").hidden =
-    currentView !== "discord" || !visibleFolds().some((entry) => entry.id !== null);
+    currentView !== "discord" || !folds.some((entry) => entry.id !== null);
 }
 
-function collapseAll() {
+/**
+ * Fold or unfold every message in the list being looked at.
+ *
+ * ONE function for both directions rather than two that drift apart: the scroll-preservation, the
+ * choice of list and the redraw afterwards are identical, and only the boolean differs. Expanding
+ * is the direction that was missing — Collapse all shipped without it, which made folding a
+ * one-way door at the list level.
+ */
+function setAllFolded(folded) {
   preservingScroll(() => {
     for (const entry of visibleFolds()) {
-      setFolded(entry, true);
+      setFolded(entry, folded);
     }
   });
   renderScrollTools();
@@ -1222,6 +1235,13 @@ const CANNED_PROMPTS = [
     key: "summary",
     button: "canned-summary",
     field: "prompt-summary",
+    // The resting tooltip, HERE rather than in web/voice.html, for the same reason the default
+    // prompt text is here: `renderCannedPrompts` swaps the title for "Start a call first" and back,
+    // so a copy in the markup would be a second answer to "what does this button say" that goes
+    // stale the first time the swap runs.
+    title:
+      "Ask the agent to summarize the recent messages from the coding agent in this channel. " +
+      "Editable in Settings.",
     // WEAKER THAN THE ISSUE FILED, ON PURPOSE. The wording asked for was "Summarize my unread
     // messages from the coding agent since I last messaged them", and `#61 unread-status` reported
     // that both halves of that scoping are impossible here: Discord gives a bot no read state, and
@@ -1238,6 +1258,9 @@ const CANNED_PROMPTS = [
     key: "blockers",
     button: "canned-blockers",
     field: "prompt-blockers",
+    title:
+      "Ask the agent to make the CODING AGENT report its progress and anything waiting on you. " +
+      "This spends coding-agent work. Editable in Settings.",
     // Unaffected by the above: it makes no claim about read state, it asks the coding agent to
     // report on itself.
     text:
@@ -1296,6 +1319,36 @@ function promptsChanged() {
     ? "Saved. The buttons send this from now on."
     : "This browser refused to store the prompts, so they will be back to the defaults when you " +
       "reload (private browsing does this). The buttons send what is in the boxes for now.";
+}
+
+/** What a canned button says when there is no conversation for its sentence to reach. */
+const CANNED_DISABLED_TITLE =
+  "Start a call first — this sends a message into a live conversation, and there is not one.";
+
+/**
+ * Grey the canned buttons when there is no call, and say why on hover.
+ *
+ * The owner's report: Sumry and Blockers looked live at idle and did nothing when pressed. That was
+ * true only in the narrowest sense — `sendUserMessage` has always refused and put a sentence on the
+ * status line — but a refusal you discover by pressing is not the same as a control that tells you
+ * beforehand, and the status line is transient and lives at the other end of the screen.
+ *
+ * The choice recorded, because the issue offered two: grey them out, or have them START a call the
+ * way Type does. Greyed, for now, and deliberately — a tap on a five-letter button silently opening
+ * a billed vendor conversation is a surprise with a price on it, and Blockers additionally spends
+ * CODING-AGENT work. Type may auto-start because typing is the thing the reader just asked to do;
+ * these two are not that.
+ *
+ * `aria-disabled` rather than `disabled`: see the note in web/voice.css. The button stays hoverable
+ * so the tooltip the owner asked for actually appears.
+ */
+function renderCannedPrompts() {
+  const live = canSendText();
+  for (const entry of CANNED_PROMPTS) {
+    const button = el(entry.button);
+    button.setAttribute("aria-disabled", live ? "false" : "true");
+    button.setAttribute("title", live ? entry.title : CANNED_DISABLED_TITLE);
+  }
 }
 
 // --- the server ------------------------------------------------------------------------------
@@ -2441,6 +2494,10 @@ function renderControls() {
   // text mode is a stable shape, and a control that comes and goes under a thumb is worse than one
   // that is visibly inert.
   el("send-text").disabled = !canSendText();
+  // Same fact, same moment, two controls further along the bar. `renderControls` is called from
+  // every transition that can change whether a conversation exists — open, close, mute, teardown —
+  // so hanging the canned buttons off it is what keeps them from going stale.
+  renderCannedPrompts();
 
   note.hidden = true;
   note.textContent = "";
@@ -4852,7 +4909,8 @@ el("alias-channel").addEventListener("change", renderAliasEditor);
 el("save-alias").addEventListener("click", guardQuietly(saveAlias));
 el("clear-alias").addEventListener("click", guardQuietly(clearChannelAlias));
 el("load-older").addEventListener("click", guardQuietly(loadOlder));
-el("collapse-all").addEventListener("click", collapseAll);
+el("collapse-all").addEventListener("click", () => setAllFolded(true));
+el("expand-all").addEventListener("click", () => setAllFolded(false));
 el("todo-filter").addEventListener("click", () => setTodoMode(!todoMode));
 el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
 el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));

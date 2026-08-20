@@ -8132,28 +8132,81 @@ test("a browser that refuses to store the prompts says so instead of claiming sa
   assert.match(page.el("prompt-state").textContent, /refused to store/);
 });
 
-test("the heavier button is VISIBLY heavier, because one of them spends coding-agent work", () => {
-  // Sumry asks the voice agent to read; Blockers goes and makes the coding agent do work. The
-  // issue asks for that difference to be legible, and a difference that exists only in a `title`
-  // is not legible at arm's length.
+test("NEITHER canned button is drawn as a warning, because neither is reporting a fault", () => {
+  // REVERSES an earlier decision, on the owner's report, and the reversal is the assertion.
+  //
+  // Blockers used to be outlined in `--warn` to say "this one spends coding-agent work". On a
+  // desktop screen that did not read as expense, it read as an ORANGE WARNING SYMBOL — a button
+  // announcing something was wrong. The cost is real and is still stated, in the `title` and in
+  // Settings; what is gone is drawing an action as an alarm.
   assert.ok(
     PAGE_ELEMENTS.get("canned-blockers") && HTML.includes('id="canned-blockers"'),
     "the heavier button is gone"
   );
   const bar = barSlice();
   const blockers = bar.slice(bar.indexOf('id="canned-blockers"'));
-  assert.match(blockers.slice(0, 200), /class="bar-button heavy"/, "the heavy button is not marked");
-  const heavy = cssBlock(".bar-button.heavy");
-  assert.match(heavy, /var\(--warn\)/, "the heavier button looks exactly like the lighter one");
-  assert.doesNotMatch(
-    cssBlock(".bar-button"),
-    /var\(--warn\)/,
-    "every bar button is warm, so the difference says nothing"
+  assert.match(
+    blockers.slice(0, 200),
+    /class="bar-button"/,
+    "Blockers is not drawn as an ordinary bar button"
   );
+  assert.equal(
+    cssRules(CSS, ".bar-button.heavy").length,
+    0,
+    "the warning treatment is still in the stylesheet"
+  );
+  assert.doesNotMatch(HTML, /class="bar-button heavy"/, "something is still marked heavy");
+  // What DOES still distinguish it: the sentence saying what it costs. That lives in the script
+  // now, with the prompt text, because `renderCannedPrompts` swaps the title and back.
+  assert.match(SCRIPT_CODE, /CODING AGENT/, "nothing says what the heavier button spends");
   // The issue does NOT ask for an arm-twice confirm like #clear-view, so there is deliberately not
   // one. Recorded here so that adding one later is a decision somebody makes rather than drifts
   // into — and so that its absence is not mistaken for an oversight.
   assert.doesNotMatch(SCRIPT_CODE, /armCanned|cannedArmed/, "a confirm step appeared unannounced");
+});
+
+test("with no call, the canned buttons are visibly dead and say why on hover", async () => {
+  // The owner's report: they looked live at idle and did nothing when pressed. `sendUserMessage`
+  // did refuse — but a refusal you only discover by pressing is not a control telling you first.
+  const page = newPage();
+  await signIn(page);
+
+  for (const id of ["canned-summary", "canned-blockers"]) {
+    assert.equal(page.el(id).getAttribute("aria-disabled"), "true", `${id} still looks live`);
+    assert.match(
+      page.el(id).getAttribute("title"),
+      /Start a call first/,
+      `${id} does not say why it cannot be used`
+    );
+  }
+
+  // `aria-disabled`, NOT `disabled`, and that is load-bearing rather than incidental: a genuinely
+  // disabled button is not a reliable hover target, and the hover tooltip is the whole requirement.
+  assert.notEqual(page.el("canned-summary").disabled, true, "a real disable took the tooltip away");
+  const dead = cssBlock('.bar-button[aria-disabled="true"]');
+  assert.match(dead, /opacity/, "the dead state is not actually drawn");
+  assert.doesNotMatch(dead, /pointer-events\s*:\s*none/, "pointer-events:none kills the tooltip");
+});
+
+test("starting a call brings the canned buttons back to life, tooltip and all", async () => {
+  const page = newPage();
+  await startTalking(page);
+
+  for (const id of ["canned-summary", "canned-blockers"]) {
+    assert.equal(page.el(id).getAttribute("aria-disabled"), "false", `${id} is still dead in a call`);
+    assert.doesNotMatch(
+      page.el(id).getAttribute("title"),
+      /Start a call first/,
+      `${id} still tells a caller to start the call they are already in`
+    );
+  }
+  // The markup's own sentence is what comes back, rather than a second copy kept in the script.
+  assert.match(page.el("canned-blockers").getAttribute("title"), /CODING AGENT/);
+
+  // And it goes dead again when the call does, which is the half a one-way render would miss.
+  page.sockets[0].onclose({ code: 1000 });
+  await page.settle();
+  assert.equal(page.el("canned-summary").getAttribute("aria-disabled"), "true");
 });
 
 test("the canned buttons get out of the way of the text field, like everything else in the pack", async () => {

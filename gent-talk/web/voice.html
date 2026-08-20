@@ -282,6 +282,13 @@
             <button id="undo-dismiss" class="chip" type="button" hidden>
               <span id="undo-dismiss-label">Undo</span>
             </button>
+            <!-- The pair. Collapse all shipped alone, which made the fold a one-way door at the
+                 list level: you could put every message away and then had to open them one at a
+                 time. Each is present only when it has work to do, so at rest neither is here, in a
+                 fully-folded list only Expand is, and in a mixed list both are. -->
+            <button id="expand-all" class="chip" type="button" hidden>
+              <span id="expand-all-label">Expand all</span>
+            </button>
             <button id="collapse-all" class="chip" type="button" hidden>
               <span id="collapse-all-label">Collapse all</span>
             </button>
@@ -698,18 +705,28 @@
               nothing here is a second way of talking to the agent — only a shorter way of saying
               the same sentence.
 
-              They differ in WEIGHT and the difference is drawn, not merely documented: Sumry asks
-              the voice agent to read and summarize, while Blockers spends CODING-AGENT work on one
-              tap. That is what `heavy` colours in warm, the same idiom an armed Clear uses.
+              They differ in WEIGHT — Sumry asks the voice agent to read and summarize, while
+              Blockers spends CODING-AGENT work on one tap — and that difference used to be drawn,
+              in the warm colour an armed Clear uses. IT NO LONGER IS, at the owner's request: on a
+              desktop screen the warm outline did not read as "this one is expensive", it read as a
+              WARNING SYMBOL — as though the button were reporting a fault rather than offering an
+              action. A control that looks broken is worse than one whose cost is only in its
+              tooltip, so both are drawn as ordinary bar buttons and the weight difference lives in
+              the `title` and in the Settings text.
+
+              What they DO carry visually is whether they can be pressed at all: with no call open
+              there is nothing for either sentence to reach, so both grey out and say why. See
+              `renderCannedPrompts` in web/voice.js.
 
               What each one says is EDITABLE, in Settings, and the defaults are filled in from
-              script rather than typed into the markup — see `CANNED_PROMPTS` in web/voice.js.
+              script rather than typed into the markup — see `CANNED_PROMPTS` in web/voice.js. The
+              TOOLTIPS live there too, and for the same reason: `renderCannedPrompts` swaps them for
+              the disabled sentence and back, so a copy here would go stale on the first swap.
             -->
             <button
               id="canned-summary"
               class="bar-button"
               type="button"
-              title="Ask the agent to summarize the recent messages from the coding agent in this channel. Editable in Settings."
             >
               <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M5.5 4.5h13v15h-13z" />
@@ -720,13 +737,20 @@
 
             <button
               id="canned-blockers"
-              class="bar-button heavy"
+              class="bar-button"
               type="button"
-              title="Ask the agent to make the CODING AGENT report its progress and anything waiting on you. This spends coding-agent work. Editable in Settings."
             >
+              <!-- A CLIPBOARD, not a warning triangle, and the change is the point. The triangle
+                   with an exclamation in it is the universal "something is wrong" mark, so at a
+                   glance the bar looked like it was reporting a fault rather than offering an
+                   action — the owner read it exactly that way. What this button actually asks for
+                   is a STATUS REPORT from the coding agent, which is what a clipboard says. It
+                   stays visibly distinct from Sumry's plain document. -->
               <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M12 4.5 21 19.5H3z" />
-                <path d="M12 10v4.2M12 17h.01" />
+                <path d="M9.5 4.5h5a1 1 0 0 1 1 1v1h-7v-1a1 1 0 0 1 1-1z" />
+                <path d="M8.5 6h-2v13.5h11V6h-2" />
+                <path d="m9.5 11.5 1.5 1.5 3-3" />
+                <path d="M9.5 16.5h5" />
               </svg>
               <span id="canned-blockers-label" class="mini-label">Blockers</span>
             </button>
