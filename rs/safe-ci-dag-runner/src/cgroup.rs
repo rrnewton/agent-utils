@@ -321,22 +321,57 @@ fn in_scope() -> bool {
 /// override can tighten the cap for a constrained host or mutation test, but
 /// cannot widen the derived 90%-of-MemAvailable boundary.
 pub fn outer_memory_max_bytes() -> Option<i64> {
-    let available = mem_available_bytes()?;
+    outer_memory_max_bytes_capped(None)
+}
+
+/// The outer-scope cap: the SMALLEST of availability, the environment, and an explicit request.
+///
+/// `requested` is the caller's own ceiling — `--max-mem` — and obeys the same one-way rule as the
+/// environment override: it can tighten the derived boundary, never widen it. Without it
+/// `--max-mem 20G` only *sized* the schedule and the scope still admitted 90% of the host, so two
+/// 20 GiB runs on one machine were 20 GiB each by arithmetic and by nothing else. A budget that is
+/// a modelling input but not a containment limit is a share of a host nobody is holding.
+///
+/// A non-positive request is REFUSED (`None`) exactly like a non-positive environment value: the
+/// caller asked for a ceiling this function cannot express, and silently ignoring it would hand
+/// back an unbounded run under the name of a bounded one.
+pub fn outer_memory_max_bytes_capped(requested: Option<i64>) -> Option<i64> {
+    outer_memory_max_from(
+        mem_available_bytes()?,
+        std::env::var(OUTER_MEMORY_MAX_ENV).ok().as_deref(),
+        requested,
+    )
+}
+
+/// The pure core of [`outer_memory_max_bytes_capped`]: the smallest of the three ceilings.
+///
+/// Split out because the other two inputs are `/proc/meminfo` and the process environment, and a
+/// rule about which ceiling wins is not worth much if it can only be exercised by arranging a
+/// host.
+fn outer_memory_max_from(
+    available: i64,
+    env_raw: Option<&str>,
+    requested: Option<i64>,
+) -> Option<i64> {
     if available <= 0 {
         return None;
     }
     let derived = ((available as f64) * DEFAULT_MEMORY_BUDGET_FRACTION) as i64;
-    let requested = match std::env::var(OUTER_MEMORY_MAX_ENV) {
-        Ok(raw) => {
-            let value: i64 = raw.parse().ok()?;
-            if value <= 0 {
-                return None;
-            }
-            Some(value)
+    let mut cap = derived.max(1);
+    if let Some(raw) = env_raw {
+        let value: i64 = raw.parse().ok()?;
+        if value <= 0 {
+            return None;
         }
-        Err(_) => None,
-    };
-    Some(requested.map_or(derived, |value| value.min(derived)).max(1))
+        cap = cap.min(value);
+    }
+    if let Some(value) = requested {
+        if value <= 0 {
+            return None;
+        }
+        cap = cap.min(value);
+    }
+    Some(cap.max(1))
 }
 
 /// Cap the parent requested, carried into the re-exec'd scope.
@@ -2590,5 +2625,56 @@ mod tests {
         fs::write(scope.join("cpu.max"), "300000 100000").unwrap();
         assert!(!verify_scope_limits_at(&scope, 104857600, Some(2)));
         fs::remove_dir_all(scope).unwrap();
+    }
+
+    // ------------------------------------------------- --max-mem as a real ceiling (#33)
+
+    #[test]
+    fn max_mem_becomes_the_outer_scope_ceiling_and_can_only_tighten() {
+        // `--max-mem 20G` used to feed the sizing model only: the outer scope was still created
+        // with 90% of MemAvailable, so "two runs with 20 GiB each" held for the arithmetic and
+        // for nothing on the machine.
+        assert_eq!(
+            outer_memory_max_from(1_000_000, None, Some(400_000)),
+            Some(400_000),
+            "a request below the derived boundary must become the cap"
+        );
+        assert_eq!(
+            outer_memory_max_from(1_000_000, None, Some(5_000_000)),
+            Some(900_000),
+            "a request above the derived boundary must NOT widen it"
+        );
+        assert_eq!(
+            outer_memory_max_from(1_000_000, None, None),
+            Some(900_000),
+            "no request is byte-for-byte the previous behaviour"
+        );
+    }
+
+    #[test]
+    fn the_environment_override_and_max_mem_compose_to_the_smallest() {
+        // They do not override each other; each is a one-way tightening.
+        assert_eq!(
+            outer_memory_max_from(1_000_000, Some("500000"), Some(400_000)),
+            Some(400_000)
+        );
+        assert_eq!(
+            outer_memory_max_from(1_000_000, Some("500000"), Some(700_000)),
+            Some(500_000)
+        );
+        assert_eq!(
+            outer_memory_max_from(1_000_000, Some("2000000"), Some(5_000_000)),
+            Some(900_000)
+        );
+    }
+
+    #[test]
+    fn a_nonpositive_max_mem_request_is_refused_not_ignored() {
+        // Same treatment as a non-positive environment value: the caller asked for a ceiling
+        // this cannot express, and dropping it silently would hand back an unbounded run under
+        // the name of a bounded one.
+        assert_eq!(outer_memory_max_from(1_000_000, None, Some(0)), None);
+        assert_eq!(outer_memory_max_from(1_000_000, None, Some(-1)), None);
+        assert_eq!(outer_memory_max_from(1_000_000, Some("0"), None), None);
     }
 }

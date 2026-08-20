@@ -195,7 +195,16 @@ arbitrary guest may still create more threads than `--max-cpus`; outer
 `jobs_flag`, fix the command's own worker setting, or use `--cores` when fixed
 CPU eligibility is required.
 
-`--max-mem` derives a conservative, model-based `--max-steps` ceiling from the worst-case
+`--max-mem` is a containment limit as well as a sizing input. Under boxing it becomes the
+outer scope's `MemoryMax`, obeying the same one-way rule as
+`SAFE_CI_OUTER_MEMORY_MAX_BYTES`: it can tighten the derived 90%-of-`MemAvailable`
+boundary, never widen it. The binding ceiling is named on stderr and the live value is read
+back before work starts, so `--max-mem 20G` twice on one host is two 20 GiB shares rather
+than two arithmetics. It is a whole-run ceiling, not an admission gate: two steps whose
+caps each fit the budget can still be admitted together when their sum does not, and the
+scope's own `memory.max` is then what stops the run.
+
+`--max-mem` also derives a conservative, model-based `--max-steps` ceiling from the worst-case
 footprint at each step's applied inner width. If an explicit step ceiling is
 also present, the tighter value wins. Hard caps, learned/authored RSS, runtime
 defaults, the outer safety factor, and selected `engine_only` steps all count;

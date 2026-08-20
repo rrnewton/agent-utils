@@ -35,7 +35,7 @@ use std::time::Instant;
 use crate::cgroup::{
     aggregate_slice_max_cpus, apply_specific_cores, attempt_scope_reexec, enable_outer_oom_group,
     expected_outer_cpu_count, expected_outer_memory_max_bytes, expected_scope_runtime_max_s,
-    install_scope_teardown, is_in_scope, observe_own_containment, outer_memory_max_bytes,
+    install_scope_teardown, is_in_scope, observe_own_containment, outer_memory_max_bytes_capped,
     verify_scope_limits, verify_scope_runtime_max, CgroupManager, Cgroups, ScopeAttempt,
     DIRECT_CGROUP_ENV, FORCE_ATTEMPT_ENV,
 };
@@ -331,7 +331,7 @@ fn run_help(c: &Palette) -> String {
             ("-s, --max-steps N", "maximum active DAG steps; defaults to the effective --max-cpus budget; a bare -sN also works"),
             ("-j, --max-cpus N", "outer CPU-bandwidth limit and maximum width of any one runner-controlled step (default: effective container/affinity budget tightened by the shared 90% slice); a bare -jN also works"),
             ("--cores/--cpuset/--pin K", "hard CPU PINNING, opt-in: reserve K least-busy free cores and require an exact cgroup cpuset; fail closed when unavailable"),
-            ("--max-mem SPEC", "RAM budget (e.g. 8G): derive a conservative model-based --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
+            ("--max-mem SPEC", "RAM budget (e.g. 8G): becomes the outer scope's MemoryMax (it can tighten the derived host boundary, never widen it) and derives a conservative model-based --max-steps ceiling; with explicit --max-steps, the tighter value wins"),
             ("--only TAG[,TAG...]", "run EXACTLY the named step(s); dependency edges outside the selection are dropped"),
             ("--args STRING", "replace the opt-in {args} token in selected step commands"),
             ("--stress N", "duplicate the graph into N disconnected components; --max-steps controls active copies, --max-cpus caps each width/shared bandwidth, and expansion is limited to 100,000 generated nodes"),
@@ -951,11 +951,24 @@ fn scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
 }
 
+/// The `--max-mem` spec as an outer-scope ceiling in bytes, or `None` when absent/unparseable.
+///
+/// An unparseable spec is NOT an error here: `select_max_steps` already reports it by name and
+/// falls back to `--max-steps`, and duplicating the refusal at scope bring-up would turn one
+/// typo into two different exit paths depending on which ran first.
+fn requested_max_mem_bytes(max_mem: Option<&str>) -> Option<i64> {
+    max_mem
+        .filter(|s| !s.is_empty())
+        .and_then(parse_size)
+        .filter(|bytes| *bytes > 0)
+}
+
 fn resolve_cgroups(
     allow_failure: bool,
     unsafe_no_cgroups: bool,
     max_cpus: Option<i64>,
     run_timeout_s: Option<i64>,
+    max_mem_bytes: Option<i64>,
 ) -> Result<BoxedCgroups, i32> {
     if unsafe_no_cgroups {
         // Deliberate opt-out (--unsafe-no-cgroups): skip scope bring-up entirely and run unboxed
@@ -1113,13 +1126,28 @@ fn resolve_cgroups(
     }
     // Default: boxing is required -> re-exec into a transient systemd --user scope (never returns
     // on success).
-    let Some(outer_memory_max) = outer_memory_max_bytes() else {
+    let Some(outer_memory_max) = outer_memory_max_bytes_capped(max_mem_bytes) else {
         eprintln!(
             "{PROG}: ERROR: cannot derive a positive outer MemoryMax from MemAvailable/\
-             $SAFE_CI_OUTER_MEMORY_MAX_BYTES; refusing an unbounded run."
+             $SAFE_CI_OUTER_MEMORY_MAX_BYTES/--max-mem; refusing an unbounded run."
         );
         return Err(3);
     };
+    // SAY WHICH CEILING WON. --max-mem used to size the schedule and nothing else, so a run could
+    // report a 20 GiB budget while its scope admitted 90% of the host. Naming the binding ceiling
+    // is what makes the containment claim checkable against the live unit.
+    if let Some(requested) = max_mem_bytes {
+        if outer_memory_max == requested {
+            eprintln!(
+                "{PROG}: --max-mem is the outer scope ceiling: MemoryMax={outer_memory_max} bytes."
+            );
+        } else {
+            eprintln!(
+                "{PROG}: --max-mem {requested} bytes did not bind; the derived/environment \
+                 boundary is smaller: MemoryMax={outer_memory_max} bytes."
+            );
+        }
+    }
     // NAME WHAT ACTUALLY HAPPENED. This used to pick between two sentences from a bool, and on the
     // policy-skip path it chose "boxing was skipped (e.g. CI without a systemd --user scope)" — a
     // claim about a capability nothing had tested. Reporting the real outcome is the whole fix: the
@@ -2079,7 +2107,13 @@ fn cmd_sweep(a: &SweepArgs, c: &Palette) -> i32 {
     }
 
     // Cgroup boxing is ON by default here too (so the sweep measures under real boxing).
-    let cgroups = match resolve_cgroups(a.allow_cgroup_failure, a.unsafe_no_cgroups, None, None) {
+    let cgroups = match resolve_cgroups(
+        a.allow_cgroup_failure,
+        a.unsafe_no_cgroups,
+        None,
+        None,
+        None,
+    ) {
         Ok(cg) => cg,
         Err(code) => return code,
     };
@@ -2283,6 +2317,7 @@ fn cmd_run(cfg: &DagConfig, a: &RunArgs, c: &Palette) -> i32 {
         a.unsafe_no_cgroups,
         Some(max_cpus),
         a.run_timeout,
+        requested_max_mem_bytes(a.max_mem.as_deref()),
     ) {
         Ok(cg) => cg,
         Err(code) => return code,
@@ -2690,7 +2725,13 @@ pub fn run(argv: &[String]) -> i32 {
                 && std::env::var(DIRECT_CGROUP_ENV).as_deref() != Ok("1")
             {
                 let max_cpus = select_max_cpus(&a);
-                if let Err(code) = resolve_cgroups(false, false, Some(max_cpus), a.run_timeout) {
+                if let Err(code) = resolve_cgroups(
+                    false,
+                    false,
+                    Some(max_cpus),
+                    a.run_timeout,
+                    requested_max_mem_bytes(a.max_mem.as_deref()),
+                ) {
                     return code;
                 }
             }
@@ -3391,6 +3432,26 @@ mod tests {
 
         args.max_mem = None;
         assert_eq!(select_max_steps(&cfg, &args, 3), 9);
+    }
+
+    #[test]
+    fn the_parsed_max_mem_flag_is_what_the_outer_scope_ceiling_is_built_from() {
+        // #33: --max-mem used to feed the sizing model ONLY. This is the accessor scope bring-up
+        // reads, so a rename that stopped feeding the scope would fail here rather than quietly
+        // restoring a 90%-of-host boundary under the name of a 20 GiB budget.
+        let args = parse_run_args(&["--max-mem".into(), "20G".into()]).unwrap();
+        assert_eq!(
+            requested_max_mem_bytes(args.max_mem.as_deref()),
+            Some(20 * 1024i64.pow(3))
+        );
+        // Absent, empty and unparseable are all "no outer ceiling requested": select_max_steps
+        // already names an unparseable spec, and refusing it twice would give one typo two exit
+        // paths depending on which check ran first.
+        let none = parse_run_args(&[]).unwrap();
+        assert_eq!(requested_max_mem_bytes(none.max_mem.as_deref()), None);
+        assert_eq!(requested_max_mem_bytes(Some("")), None);
+        assert_eq!(requested_max_mem_bytes(Some("twenty gigs")), None);
+        assert_eq!(requested_max_mem_bytes(Some("0")), None);
     }
 
     #[test]

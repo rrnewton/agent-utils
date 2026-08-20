@@ -91,6 +91,44 @@ def test_outer_memory_cap_is_derived_and_override_only_tightens(
     assert cgroup.outer_memory_max_bytes() == 500_000
 
 
+def test_max_mem_becomes_the_outer_scope_ceiling_and_can_only_tighten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--max-mem`` is a CONTAINMENT limit, not just a sizing input.
+
+    Before this, ``--max-mem 20G`` sized the schedule and the outer scope still admitted 90% of
+    the host, so "two validates with 20 GiB each" held only for as long as the arithmetic did.
+    It obeys the same one-way rule as the environment override: tighten, never widen.
+    """
+    monkeypatch.setattr(cgroup, "mem_available_bytes", lambda: 1_000_000)
+    monkeypatch.delenv(cgroup.OUTER_MEMORY_MAX_ENV, raising=False)
+
+    # Tightens: the request is below the derived 90% boundary and becomes the cap.
+    assert cgroup.outer_memory_max_bytes(400_000) == 400_000
+    # Cannot widen: a request above the derived boundary leaves the boundary in place.
+    assert cgroup.outer_memory_max_bytes(5_000_000) == 900_000
+    # Absent request is byte-for-byte the previous behaviour.
+    assert cgroup.outer_memory_max_bytes(None) == 900_000
+
+    # The SMALLEST of the three wins, whichever it is -- the env override and --max-mem do not
+    # override each other, they compose.
+    monkeypatch.setenv(cgroup.OUTER_MEMORY_MAX_ENV, "500000")
+    assert cgroup.outer_memory_max_bytes(400_000) == 400_000
+    assert cgroup.outer_memory_max_bytes(700_000) == 500_000
+
+
+def test_a_nonpositive_max_mem_request_is_refused_not_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Same treatment as a non-positive environment value: the caller asked for a ceiling this
+    # cannot express, and silently dropping it would hand back an unbounded run under the name
+    # of a bounded one.
+    monkeypatch.setattr(cgroup, "mem_available_bytes", lambda: 1_000_000)
+    monkeypatch.delenv(cgroup.OUTER_MEMORY_MAX_ENV, raising=False)
+    assert cgroup.outer_memory_max_bytes(0) is None
+    assert cgroup.outer_memory_max_bytes(-1) is None
+
+
 def test_outer_oom_group_write_is_read_back(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -133,28 +133,57 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
-def outer_memory_max_bytes() -> int | None:
-    """Generous outer-scope cap derived from current non-swap availability.
+def outer_memory_max_bytes(requested_bytes: int | None = None) -> int | None:
+    """Outer-scope cap: the SMALLEST of availability, the environment, and an explicit request.
 
     The outer scope is a correctness boundary, not a per-step sizing model: it
     gets 90% of ``MemAvailable`` so the coordinator, neighbours, and kernel keep
     headroom. ``SAFE_CI_OUTER_MEMORY_MAX_BYTES`` can tighten this for a smaller
     host or container, but cannot widen the derived boundary.
+
+    ``requested_bytes`` is the caller's own ceiling — ``--max-mem`` — and obeys the same
+    one-way rule: it can tighten the boundary, never widen it.  Without it ``--max-mem 20G``
+    only *sized* the schedule and the scope still admitted 90% of the host, so two 20 GiB
+    validates on one machine were 20 GiB each by arithmetic and by nothing else.  A budget that
+    is a modelling input but not a containment limit is a share of a host nobody is holding.
+
+    A non-positive request is REFUSED (``None``) exactly like a non-positive environment value:
+    the caller asked for a ceiling this function cannot express, and silently ignoring it would
+    hand back an unbounded run under the name of a bounded one.
     """
     available = mem_available_bytes()
-    if available is None or available <= 0:
+    if available is None:
         return None
-    derived = max(1, int(available * DEFAULT_MEMORY_BUDGET_FRACTION))
-    raw = os.environ.get(OUTER_MEMORY_MAX_ENV)
-    if not raw:
-        return derived
-    try:
-        requested = int(raw)
-    except ValueError:
+    return _outer_memory_max_from(
+        available, os.environ.get(OUTER_MEMORY_MAX_ENV), requested_bytes
+    )
+
+
+def _outer_memory_max_from(
+    available: int, env_raw: str | None, requested: int | None
+) -> int | None:
+    """The pure core of :func:`outer_memory_max_bytes`: the smallest of the three ceilings.
+
+    Split out because the other two inputs are ``/proc/meminfo`` and the process environment, and
+    a rule about which ceiling wins is not worth much if it can only be exercised by arranging a
+    host.
+    """
+    if available <= 0:
         return None
-    if requested <= 0:
-        return None
-    return min(derived, requested)
+    ceilings = [max(1, int(available * DEFAULT_MEMORY_BUDGET_FRACTION))]
+    if env_raw:
+        try:
+            from_env = int(env_raw)
+        except ValueError:
+            return None
+        if from_env <= 0:
+            return None
+        ceilings.append(from_env)
+    if requested is not None:
+        if requested <= 0:
+            return None
+        ceilings.append(requested)
+    return min(ceilings)
 
 
 def expected_outer_memory_max_bytes() -> int | None:

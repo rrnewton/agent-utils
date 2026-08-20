@@ -425,7 +425,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-mem",
         metavar="SPEC",
         default=None,
-        help="RAM budget (e.g. 8G, 4096M); derive a conservative model-based --max-steps ceiling; with explicit "
+        help="RAM budget (e.g. 8G, 4096M): becomes the outer scope's MemoryMax (it can tighten the derived host "
+        "boundary, never widen it) and derives a conservative model-based --max-steps ceiling; with explicit "
         "--max-steps, the tighter value wins",
     )
     run_p.add_argument(
@@ -1758,11 +1759,25 @@ def _scope_grace_s(run_timeout_s: int) -> int:
     return max(60, run_timeout_s // 10)
 
 
+def _requested_max_mem_bytes(max_mem: str | None) -> int | None:
+    """The ``--max-mem`` spec as an outer-scope ceiling in bytes, or ``None`` when absent.
+
+    An unparseable spec is NOT an error here: :func:`_select_max_steps` already reports it by
+    name and falls back to ``--max-steps``, and duplicating the refusal at scope bring-up would
+    turn one typo into two different exit paths depending on which ran first.
+    """
+    if not isinstance(max_mem, str) or not max_mem:
+        return None
+    parsed = parse_size(max_mem)
+    return parsed if parsed is not None and parsed > 0 else None
+
+
 def _resolve_cgroup_manager(
     allow_failure: bool,
     unsafe_no_cgroups: bool = False,
     max_cpus: int | None = None,
     run_timeout_s: int | None = None,
+    max_mem_bytes: int | None = None,
 ) -> tuple[CgroupManager | None, int]:
     """Establish the two-level cgroup-v2 boxing that is this tool's PRIMARY purpose.
 
@@ -1914,14 +1929,30 @@ def _resolve_cgroup_manager(
     # validate.sh), not just in Actions where boxing is skipped.
     _main_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "__main__.py")
     argv = [sys.executable, _main_py, *sys.argv[1:]]
-    outer_memory_max = cg.outer_memory_max_bytes()
+    outer_memory_max = cg.outer_memory_max_bytes(max_mem_bytes)
     if outer_memory_max is None:
         print(
             f"{PROG}: ERROR: cannot derive a positive outer MemoryMax from MemAvailable/"
-            f"${cg.OUTER_MEMORY_MAX_ENV}; refusing an unbounded run.",
+            f"${cg.OUTER_MEMORY_MAX_ENV}/--max-mem; refusing an unbounded run.",
             file=sys.stderr,
         )
         return None, 3
+    # SAY WHICH CEILING WON. --max-mem used to size the schedule and nothing else, so a run could
+    # report a 20 GiB budget while its scope admitted 90% of the host. Naming the binding ceiling
+    # is what makes the containment claim checkable against the live unit.
+    if max_mem_bytes is not None:
+        if outer_memory_max == max_mem_bytes:
+            print(
+                f"{PROG}: --max-mem is the outer scope ceiling: "
+                f"MemoryMax={outer_memory_max} bytes.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"{PROG}: --max-mem {max_mem_bytes} bytes did not bind; the derived/environment "
+                f"boundary is smaller: MemoryMax={outer_memory_max} bytes.",
+                file=sys.stderr,
+            )
     reexeced_or_skipped = cg.reexec_in_scope(
         argv,
         memory_max=outer_memory_max,
@@ -2166,6 +2197,7 @@ def _run(cfg: DagConfig, ns: argparse.Namespace, c: Palette) -> int:
         bool(getattr(ns, "unsafe_no_cgroups", False)),
         max_cpus=max_cpus,
         run_timeout_s=_effective_run_timeout(ns),
+        max_mem_bytes=_requested_max_mem_bytes(getattr(ns, "max_mem", None)),
     )
     if code != 0:
         return code
@@ -2429,6 +2461,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             False,
             max_cpus=_select_max_cpus(ns),
             run_timeout_s=_effective_run_timeout(ns),
+            max_mem_bytes=_requested_max_mem_bytes(getattr(ns, "max_mem", None)),
         )
         if code != 0:
             return code
