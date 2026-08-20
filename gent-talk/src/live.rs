@@ -6,9 +6,10 @@
 //!
 //! # Decision one: ingestion is bounded POLLING, not a Gateway connection
 //!
-//! Discord's real-time mechanism is the Gateway, and this server does not use it. It polls
-//! [`crate::discord::DiscordClient::fetch_recent`] on an interval and keeps a per-channel
-//! snowflake cursor.
+//! Discord's real-time mechanism is the Gateway, and this server does not use it. It keeps a
+//! per-channel snowflake cursor, seeds it with
+//! [`crate::discord::DiscordClient::fetch_recent`], and thereafter walks forward from it with
+//! [`crate::discord::DiscordClient::fetch_page`]'s `after` on an interval.
 //!
 //! That is a deliberate choice against the more capable option, for three reasons:
 //!
@@ -17,10 +18,11 @@
 //!    session-invalidate state machine, and the PRIVILEGED `MESSAGE_CONTENT` intent — which a
 //!    Discord application has to be granted, and without which every message arrives with an
 //!    empty body. Polling needs none of those.
-//! 2. **Polling reuses what is already tested.** `fetch_recent`, [`crate::model::sort_oldest_first`]
+//! 2. **Polling reuses what is already tested.** `fetch_page`, [`crate::model::sort_oldest_first`]
 //!    and [`crate::model::MessageId::numeric`] are the whole mechanism, and all three already have
 //!    tests — including the string-versus-numeric ordering trap, which is exactly the bug a
-//!    hand-rolled cursor would reintroduce.
+//!    hand-rolled cursor would reintroduce, and the `before`/`after` asymmetry, which is the other
+//!    one.
 //! 3. **The fake can genuinely fail.** [`crate::discord::fake::FakeDiscord`] has `fail_next` and an
 //!    unknown-channel refusal, so the failure path of the poll loop is exercised in the suite
 //!    rather than reasoned about. A Gateway fake would be a second protocol implementation whose
@@ -44,6 +46,25 @@
 //! So ingestion is **off unless configured** (`discord.live_poll_seconds`, default 0), the
 //! interval has a floor the configuration refuses to go below, and a failing channel backs off
 //! rather than hammering — see [`backoff`].
+//!
+//! **The backoff is not decoration, and it is not left to be read.** [`poll_loop`] sleeping longer
+//! after a failure is pinned by a test that measures the loop's own elapsed time against a healthy
+//! control, because deleting the one line that applies it changes no other assertion in this
+//! suite: a hammering loop still fetches, still publishes and still recovers.
+//!
+//! ## What a busy channel costs, also stated plainly
+//!
+//! A tick walks FORWARD from its cursor with Discord's `after` parameter rather than re-reading
+//! the most recent window, which is the difference between "at most `limit` messages per tick get
+//! through" and "nothing is ever skipped". Reading the newest `limit` messages and then moving the
+//! cursor to the newest of them SILENTLY DROPS everything in between when a channel produces more
+//! than `limit` in one interval — no gap, no warning, and a page and an agent that are simply
+//! missing lines.
+//!
+//! Forward paging cannot lose them: whatever is not read this tick is still after the cursor on
+//! the next one. What it can do is fall behind, so the work per tick is bounded at
+//! [`MAX_PAGES_PER_TICK`] pages and [`Tick::backlog`] says when that bound is what stopped it. The
+//! loop logs that, once, on the way into it.
 //!
 //! # Decision two: the PAGE keeps the ElevenLabs conversation socket
 //!
@@ -248,6 +269,14 @@ pub const EVENT_RESET: &str = "reset";
 /// `id: <message id>` so a reconnecting browser's `Last-Event-ID` has something to send back, and
 /// `event: message` so the page branches on the type rather than on the payload's shape.
 ///
+/// **Every event says whether it came out of the tail (`replayed: true`) or arrived live
+/// (`replayed: false`).** Without that the two are indistinguishable on the wire, and a page that
+/// attaches with no `Last-Event-ID` — a fresh sign-in, a channel change, the reconnect after an
+/// `event: reset` — is handed up to [`REPLAY_TAIL`] messages it must render but must NOT announce.
+/// Announcing them means relaying stale channel text into a live, BILLED conversation as "a
+/// message was just posted", which is the same "existing history labelled as new" failure that
+/// [`poll_once`]'s seeding tick exists to prevent, arriving through the other door.
+///
 /// A subscriber that falls further behind than [`BROADCAST_CAPACITY`] gets one
 /// [`EVENT_RESET`] and the stream ENDS. See its documentation for why that is better than
 /// resuming.
@@ -267,13 +296,13 @@ pub fn events(
     };
     futures_util::stream::unfold(start, |mut state| async move {
         if let Some(held) = state.replay.pop_front() {
-            return Some((Ok(message_event(&held)), state));
+            return Some((Ok(message_event(&held, true)), state));
         }
         if state.done {
             return None;
         }
         match state.receiver.recv().await {
-            Ok(live) => Some((Ok(message_event(&live)), state)),
+            Ok(live) => Some((Ok(message_event(&live, false)), state)),
             Err(broadcast::error::RecvError::Lagged(missed)) => {
                 state.done = true;
                 Some((Ok(reset_event(missed)), state))
@@ -283,7 +312,7 @@ pub fn events(
     })
 }
 
-fn message_event(live: &LiveMessage) -> axum::response::sse::Event {
+fn message_event(live: &LiveMessage, replayed: bool) -> axum::response::sse::Event {
     let event = axum::response::sse::Event::default()
         .id(live.message.id.as_str())
         .event(EVENT_MESSAGE);
@@ -291,6 +320,9 @@ fn message_event(live: &LiveMessage) -> axum::response::sse::Event {
         .json_data(serde_json::json!({
             "message": live.message,
             "self_posted": live.self_posted,
+            // Whether this came out of the replay tail rather than off the wire just now. See
+            // [`events`]: the page renders both and announces only the second.
+            "replayed": replayed,
             // The SAME standing reminder `MessagesResponse` carries. A pushed message is
             // third-party text exactly as a fetched one is, and a stream is not a reason for the
             // boundary to go quiet.
@@ -316,6 +348,32 @@ fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// How many pages one tick will walk forward before leaving the rest for the next tick.
+///
+/// The bound exists because "catch up completely, whatever that costs" is a request storm against
+/// a rate limit this server does not handle: a channel that has been busy for an hour would be
+/// fetched a hundred times in one tick. Four pages of `discord.default_fetch_limit` is 200
+/// messages per channel per interval at the default, which is far more than a human channel
+/// produces and still a fixed ceiling on the damage.
+///
+/// Being stopped by it loses NOTHING — the cursor only ever moves past what was actually published
+/// — it just means the next tick continues. [`Tick::backlog`] says when that happened.
+pub const MAX_PAGES_PER_TICK: usize = 4;
+
+/// What one call to [`poll_once`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tick {
+    /// How many messages were published to the hub.
+    pub published: usize,
+    /// Whether [`MAX_PAGES_PER_TICK`] is what stopped this tick rather than running out of
+    /// messages.
+    ///
+    /// **Not a gap.** Everything unread is still after the cursor and is published by a later
+    /// tick; this says the channel is arriving faster than one tick reads it, which is a latency
+    /// fact worth a log line and not a loss.
+    pub backlog: bool,
+}
+
 /// Read one channel once, publishing whatever is newer than `cursor`.
 ///
 /// **The first tick seeds and publishes nothing.** `cursor` starts as `None`, and on that tick
@@ -324,50 +382,88 @@ fn lock<T>(cell: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// be shown existing history labelled as newly arrived — messages the reader had already read,
 /// announced as though they had just been said, and relayed into a paid conversation as news.
 ///
+/// **Every tick after that walks FORWARD from the cursor**, with Discord's `after`, and keeps
+/// walking while pages come back full — up to [`MAX_PAGES_PER_TICK`]. Reading the most recent
+/// `limit` messages instead would silently drop everything between the cursor and that window the
+/// moment a channel produced more than `limit` in one interval: the cursor would jump to the
+/// newest id and the messages in between would never be published, never be relayed, and never be
+/// reported. `after` walks the OLDEST messages newer than the cursor, so the worst a burst can do
+/// is take several ticks.
+///
 /// Messages whose id does not parse as a snowflake are skipped rather than guessed at: there is no
 /// honest way to place them relative to the cursor, and publishing them on every tick would be a
 /// permanent duplicate.
 ///
-/// Returns how many messages were published.
-///
 /// # Errors
 ///
-/// [`DiscordError`] from the fetch. **The cursor is not advanced on failure**, so the next
-/// successful tick publishes everything that arrived in the meantime rather than skipping it.
+/// [`DiscordError`] from the fetch. **The cursor is not advanced past anything that was not
+/// published**, so the next successful tick publishes everything that arrived in the meantime
+/// rather than skipping it. It IS advanced past what this tick already published before the
+/// failure, because republishing that would relay the same message into a paid conversation twice.
 pub async fn poll_once(
     discord: &dyn DiscordClient,
     hub: &LiveHub,
     channel: &ChannelId,
     limit: u16,
     cursor: &mut Option<u64>,
-) -> Result<usize, DiscordError> {
-    let mut messages = discord.fetch_recent(channel, limit).await?;
-    sort_oldest_first(&mut messages);
-    let newest = messages.iter().filter_map(|m| m.id.numeric()).max();
-
+) -> Result<Tick, DiscordError> {
     let Some(seen) = *cursor else {
+        let messages = discord.fetch_recent(channel, limit).await?;
         // Seed. `unwrap_or(0)` rather than leaving the cursor unset: an EMPTY channel is a
         // perfectly good starting point, and leaving it `None` would make the next tick seed
         // again and publish nothing for as long as the channel stayed quiet.
-        *cursor = Some(newest.unwrap_or(0));
-        return Ok(0);
+        *cursor = Some(
+            messages
+                .iter()
+                .filter_map(|m| m.id.numeric())
+                .max()
+                .unwrap_or(0),
+        );
+        return Ok(Tick::default());
     };
 
+    let page_size = usize::from(limit.max(1));
     let mut published = 0;
-    for message in messages {
-        let Some(id) = message.id.numeric() else {
-            continue;
+    let mut at = seen;
+    let mut backlog = false;
+    for page in 0..MAX_PAGES_PER_TICK {
+        let after = MessageId(at.to_string());
+        let mut messages = match discord.fetch_page(channel, limit, None, Some(&after)).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                // Whatever went out in an earlier page of this tick really went out. Rewinding to
+                // where the tick started would republish it, and the page cannot tell a
+                // republished message from a new one once it has scrolled away.
+                *cursor = Some(at);
+                return Err(error);
+            }
         };
-        if id <= seen {
-            continue;
+        sort_oldest_first(&mut messages);
+        let full = messages.len() >= page_size;
+        let before = at;
+        for message in messages {
+            let Some(id) = message.id.numeric() else {
+                continue;
+            };
+            if id <= at {
+                continue;
+            }
+            at = id;
+            hub.publish(channel, message);
+            published += 1;
         }
-        hub.publish(channel, message);
-        published += 1;
+        // `at == before` means the page held nothing this cursor can move past — an empty answer,
+        // or one made entirely of ids that do not parse. Walking again would fetch the same page
+        // forever.
+        if !full || at == before {
+            break;
+        }
+        if page + 1 == MAX_PAGES_PER_TICK {
+            backlog = true;
+        }
     }
-    if let Some(newest) = newest {
-        *cursor = Some(seen.max(newest));
-    }
-    Ok(published)
+    *cursor = Some(at);
+    Ok(Tick { published, backlog })
 }
 
 /// How long to wait after `failures` consecutive failures on a channel.
@@ -436,6 +532,7 @@ async fn poll_loop(
 ) {
     let max_backoff = interval.saturating_mul(MAX_BACKOFF_INTERVALS);
     let mut failures: BTreeMap<ChannelId, u32> = BTreeMap::new();
+    let mut behind: BTreeMap<ChannelId, bool> = BTreeMap::new();
     let mut remaining = ticks;
     loop {
         let mut wait = interval;
@@ -443,7 +540,7 @@ async fn poll_loop(
             let cursor = cursors.entry(channel.clone()).or_default();
             let failed = failures.entry(channel.clone()).or_insert(0);
             match poll_once(discord, hub, channel, limit, cursor).await {
-                Ok(published) => {
+                Ok(tick) => {
                     if *failed > 0 {
                         tracing::info!(
                             channel = %channel,
@@ -452,9 +549,36 @@ async fn poll_loop(
                         );
                         *failed = 0;
                     }
-                    if published > 0 {
-                        tracing::debug!(channel = %channel, published, "published live messages");
+                    if tick.published > 0 {
+                        tracing::debug!(
+                            channel = %channel,
+                            published = tick.published,
+                            "published live messages"
+                        );
                     }
+                    // Said out loud, and said once — on the transition, exactly as a failure is.
+                    // A channel arriving faster than one tick reads it is not losing anything, but
+                    // it IS delivering late, and a reader who cannot see that will read the delay
+                    // as the bridge being broken.
+                    let was_behind = behind.entry(channel.clone()).or_insert(false);
+                    if tick.backlog && !*was_behind {
+                        tracing::warn!(
+                            channel = %channel,
+                            pages = MAX_PAGES_PER_TICK,
+                            limit,
+                            "live ingestion is BEHIND this channel: one tick read its {} page \
+                             ceiling and more was still waiting. Nothing is skipped — the cursor \
+                             only moved past what was published — but delivery is running late \
+                             until it catches up.",
+                            MAX_PAGES_PER_TICK
+                        );
+                    } else if !tick.backlog && *was_behind {
+                        tracing::info!(
+                            channel = %channel,
+                            "live ingestion caught up with this channel"
+                        );
+                    }
+                    *was_behind = tick.backlog;
                 }
                 Err(error) => {
                     // ONCE at WARN, on the transition into failure. A channel that has been
@@ -515,12 +639,12 @@ mod tests {
         let hub = hub_for(&channel);
         let mut cursor = None;
 
-        let published = poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
+        let tick = poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
             .await
             .expect("poll");
 
         assert_eq!(
-            published, 0,
+            tick.published, 0,
             "the first tick must publish nothing: existing history is not news"
         );
         assert!(cursor.is_some(), "the first tick must SEED the cursor");
@@ -546,13 +670,15 @@ mod tests {
         assert_eq!(
             poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
                 .await
-                .expect("poll"),
+                .expect("poll")
+                .published,
             1
         );
         assert_eq!(
             poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
                 .await
-                .expect("poll"),
+                .expect("poll")
+                .published,
             0,
             "a second tick with nothing new must publish nothing"
         );
@@ -578,11 +704,14 @@ mod tests {
         );
         let mut cursor = older.numeric();
 
-        let published = poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
+        let tick = poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
             .await
             .expect("poll");
 
-        assert_eq!(published, 1, "only the numerically newer message is new");
+        assert_eq!(
+            tick.published, 1,
+            "only the numerically newer message is new"
+        );
         let subscription = hub.subscribe(&channel, None);
         assert_eq!(subscription.replay.len(), 1);
         assert_eq!(subscription.replay[0].message.content, "newer");
@@ -611,7 +740,8 @@ mod tests {
         assert_eq!(
             poll_once(fake.as_ref(), &hub, &channel, 50, &mut cursor)
                 .await
-                .expect("recovered"),
+                .expect("recovered")
+                .published,
             1,
             "what arrived during the failure must be published once it recovers, not skipped"
         );
@@ -670,6 +800,163 @@ mod tests {
             receiver.try_recv().is_err(),
             "and it must be published ONCE, not once per tick"
         );
+    }
+
+    /// Run `ticks` ticks of the loop against `channel` and answer how long the loop WAITED.
+    ///
+    /// The clock is paused by the caller, so this is exact rather than approximate: tokio advances
+    /// virtual time to the next timer deadline whenever everything is idle, and nothing here is
+    /// idle for any other reason.
+    async fn elapsed_over(
+        fake: &FakeDiscord,
+        hub: &LiveHub,
+        channel: &ChannelId,
+        interval: Duration,
+        ticks: u32,
+    ) -> Duration {
+        let mut cursors = BTreeMap::new();
+        let started = tokio::time::Instant::now();
+        poll_loop(
+            fake,
+            hub,
+            std::slice::from_ref(channel),
+            50,
+            interval,
+            &mut cursors,
+            Some(ticks),
+        )
+        .await;
+        started.elapsed()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_channel_really_backs_off_and_a_healthy_one_is_not_slowed_down() {
+        // THE HEADLINE SAFETY CLAIM OF `#44 live-push`, and the one that had no test: the module
+        // doc, the README and the commit body all say a failing channel backs off rather than
+        // hammering a rate limit this server does not handle. Deleting the single line in
+        // `poll_loop` that applies `backoff` changed NOTHING else in this suite — the loop still
+        // fetched, still published, still recovered, still logged. So the assertion has to be
+        // about the one observable that changes: how long the loop actually waited.
+        let interval = Duration::from_secs(10);
+
+        let healthy = ChannelId("1111".to_owned());
+        let good = fake_with(&healthy);
+        let hub = LiveHub::new();
+        let quiet = elapsed_over(good.as_ref(), &hub, &healthy, interval, 3).await;
+        assert_eq!(
+            quiet,
+            interval * 2,
+            "three ticks of a healthy channel are two ordinary sleeps and nothing else"
+        );
+
+        // Never registered, so every fetch answers Discord's own 404 — a channel that keeps
+        // failing rather than one that fails once.
+        let broken = ChannelId("2222".to_owned());
+        let bad = Arc::new(FakeDiscord::new());
+        let noisy = elapsed_over(bad.as_ref(), &hub, &broken, interval, 3).await;
+
+        // 20s after the first failure and 40s after the second: doubling, as `backoff` says.
+        assert_eq!(
+            noisy,
+            Duration::from_secs(60),
+            "a channel that keeps failing must be retried FURTHER apart each time; polling on the \
+             ordinary interval through an outage is the request storm the interval floor and this \
+             backoff exist together to prevent"
+        );
+        assert!(
+            noisy > quiet,
+            "a failing channel waited no longer than a healthy one: the backoff is not applied"
+        );
+        assert!(
+            bad.fetch_count() >= 3,
+            "and it must still be RETRIED — backing off is not giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_burst_larger_than_one_page_is_published_in_full_rather_than_silently_dropped() {
+        // The silent-loss bug this walk exists to rule out. Reading the most recent `limit`
+        // messages and then moving the cursor to the newest of them drops everything in between
+        // whenever a channel produces more than `limit` between two ticks: no gap event, no WARN,
+        // and a page and an agent quietly missing lines while the README says nothing is skipped.
+        let channel = ChannelId("1111".to_owned());
+        let fake = fake_with(&channel);
+        let hub = hub_for(&channel);
+        let mut cursor = None;
+        fake.seed(&channel, "codex", "before anyone was listening");
+        poll_once(fake.as_ref(), &hub, &channel, 5, &mut cursor)
+            .await
+            .expect("seed tick");
+
+        // Twelve messages, a page of five: two and a bit pages, well inside the tick ceiling.
+        for n in 0..12 {
+            fake.seed(&channel, "codex", &format!("burst {n}"));
+        }
+        let tick = poll_once(fake.as_ref(), &hub, &channel, 5, &mut cursor)
+            .await
+            .expect("poll");
+
+        assert_eq!(
+            tick.published, 12,
+            "everything that arrived between two ticks must be published, not just the last page"
+        );
+        assert!(
+            !tick.backlog,
+            "twelve messages is not a backlog at four pages"
+        );
+        let replay = hub.subscribe(&channel, None).replay;
+        assert_eq!(
+            replay
+                .iter()
+                .map(|m| m.message.content.clone())
+                .collect::<Vec<_>>(),
+            (0..12).map(|n| format!("burst {n}")).collect::<Vec<_>>(),
+            "and in order, oldest first, with none missing from the middle"
+        );
+        assert_eq!(
+            poll_once(fake.as_ref(), &hub, &channel, 5, &mut cursor)
+                .await
+                .expect("poll")
+                .published,
+            0,
+            "walking forward must not leave the cursor behind and republish the burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tick_stopped_by_its_page_ceiling_says_so_and_the_next_tick_continues() {
+        // The honest bound. The walk is capped so that catching up cannot become a request storm,
+        // and being capped has to be VISIBLE — otherwise "nothing is skipped" and "delivery is an
+        // interval late" are the same silence.
+        let channel = ChannelId("1111".to_owned());
+        let fake = fake_with(&channel);
+        let hub = hub_for(&channel);
+        let mut cursor = None;
+        poll_once(fake.as_ref(), &hub, &channel, 2, &mut cursor)
+            .await
+            .expect("seed tick");
+
+        let ceiling = MAX_PAGES_PER_TICK * 2;
+        for n in 0..(ceiling + 3) {
+            fake.seed(&channel, "codex", &format!("m{n}"));
+        }
+        let first = poll_once(fake.as_ref(), &hub, &channel, 2, &mut cursor)
+            .await
+            .expect("poll");
+        assert_eq!(first.published, ceiling, "the tick is bounded at {ceiling}");
+        assert!(
+            first.backlog,
+            "a tick that stopped at its ceiling with more waiting must SAY it is behind"
+        );
+
+        let second = poll_once(fake.as_ref(), &hub, &channel, 2, &mut cursor)
+            .await
+            .expect("poll");
+        assert_eq!(
+            second.published, 3,
+            "and the next tick continues from the cursor rather than skipping the remainder"
+        );
+        assert!(!second.backlog, "which is then no longer behind");
     }
 
     #[test]

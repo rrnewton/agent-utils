@@ -2896,8 +2896,11 @@ function scheduleDiscordPoll() {
 // transcript, so a new call can be handed the earlier exchange as text.
 //
 // THIS IS A RECONSTRUCTION AND THE SCREEN MUST NEVER SAY OTHERWISE. That is the whole risk of the
-// feature, and it is why there are four states here rather than an on/off light: resuming can be
-// off, armed, PARTIAL, or FAILED, and each of those is a different sentence.
+// feature, and it is why there are six states here rather than an on/off light: resuming can be
+// off, armed, PARTIAL, FAILED, or one of the two that send nothing — an earlier conversation that
+// held nothing to replay, and one the budget could not fit a single line of. Each is a different
+// sentence, and the last two matter most because they look identical from `included` alone and
+// mean opposite things about what the reader said earlier.
 //
 // A failed replay never aborts the call. It degrades to a fresh one and says so — the point of a
 // call is the call, and a lost reconstruction is not a reason to refuse to connect.
@@ -2917,6 +2920,12 @@ let resumeConversationId = null;
  * is easy to miss: the fetch WORKED and came back with nothing to replay — an earlier conversation
  * in which nothing was actually said. That must not be reported as a resumption, and it must not
  * be reported as a failure either.
+ *
+ * `dropped` is kept in that fourth case too, and it is what splits it in two. Nothing went out
+ * either way, but `dropped > 0` means the budget threw the WHOLE transcript away — a conversation
+ * too long to replay, not an empty one. Saying "there was nothing to replay" about it asserts
+ * something false about what was said earlier, which is the exact class of lie this feature is
+ * written against; it just happens to be a lie about the past rather than about the present.
  */
 let resumeLast = { attempted: false, armed: false, dropped: 0, failed: false };
 
@@ -2937,8 +2946,10 @@ const resumeArmed = () =>
 /**
  * The clause under the large control, and the one place this feature could lie.
  *
- * Four answers, and the failed one is deliberately the same PROMISE as the off one with the reason
- * attached: both mean the agent starts fresh, and only one of them is what the reader asked for.
+ * Five answers, and every one that begins "the agent starts fresh" carries a different reason:
+ * both the off state and the failed one mean the agent starts fresh, and only one of them is what
+ * the reader asked for. The two empty ones are split the same way — an earlier conversation that
+ * held nothing and one the budget could not fit are the same silence with opposite meanings.
  */
 function resumeNote() {
   if (!resumeAllowed || !resumeWanted() || !resumeConversationId) {
@@ -2948,7 +2959,9 @@ function resumeNote() {
     return "the agent starts fresh — the earlier conversation could not be read";
   }
   if (resumeLast.attempted && !resumeLast.armed) {
-    return "the agent starts fresh — there was nothing to replay";
+    return resumeLast.dropped > 0
+      ? "the agent starts fresh — the earlier conversation was too long to replay"
+      : "the agent starts fresh — there was nothing to replay";
   }
   if (resumeLast.armed && resumeLast.dropped > 0) {
     return "the earlier conversation is replayed in part";
@@ -2979,6 +2992,14 @@ function renderResumeState() {
       "told so.";
   } else if (resumeLast.armed) {
     state.textContent = "The last call was resumed from the earlier conversation.";
+  } else if (resumeLast.attempted && resumeLast.dropped > 0) {
+    // Not "there was nothing to replay". There was; none of it fitted. Reporting that as an empty
+    // conversation would tell the reader something false about a call they remember having.
+    state.textContent =
+      `The last call started fresh, but NOT because there was nothing to say: all ` +
+      `${resumeLast.dropped} earlier line${resumeLast.dropped === 1 ? "" : "s"} were dropped to ` +
+      "stay inside the server's length budget, so nothing was left to send. Raise " +
+      "replay.max_chars or replay.max_turns to resume a conversation this long.";
   } else if (resumeLast.attempted) {
     state.textContent =
       "The last call started fresh: the earlier conversation held nothing to replay.";
@@ -3022,6 +3043,15 @@ async function fetchResume() {
   // on purpose, and sending a "you are resuming" preamble with no record behind it is the false
   // continuity claim this whole feature is written against.
   if (!payload || payload.enabled !== true || !(payload.included > 0) || !payload.text) {
+    // Nothing goes out — but `dropped` still has to be carried, because it is the only thing that
+    // separates "the earlier conversation was empty" from "the budget dropped all of it". The
+    // screen says opposite things about those two and only one of them can be true.
+    resumeLast = {
+      attempted: true,
+      armed: false,
+      dropped: Number((payload && payload.dropped) || 0),
+      failed: false,
+    };
     renderResumeState();
     return null;
   }
@@ -3306,7 +3336,7 @@ function onStreamFrame(frame) {
   if (!message || message.id === undefined || message.id === null) {
     return;
   }
-  receiveLiveMessage(message, payload.self_posted === true);
+  receiveLiveMessage(message, payload.self_posted === true, payload.replayed === true);
 }
 
 /**
@@ -3317,7 +3347,7 @@ function onStreamFrame(frame) {
  * when it mattered — after a refresh, which is the moment a replayed message is most likely to
  * arrive twice.
  */
-function receiveLiveMessage(message, selfPosted) {
+function receiveLiveMessage(message, selfPosted, replayed) {
   if (String(message.channel_id) !== String(el("discord-channel").value)) {
     return;
   }
@@ -3340,7 +3370,7 @@ function receiveLiveMessage(message, selfPosted) {
     setJumpNewest(true, "discord");
   }
   renderScrollTools();
-  relayToAgent(message, selfPosted);
+  relayToAgent(message, selfPosted, replayed);
 }
 
 /** Can this page put text on the conversation socket right now? */
@@ -3376,10 +3406,19 @@ function relayLine(message) {
 }
 
 /**
- * Tell the agent, if all three guards allow it.
+ * Tell the agent, if all four guards allow it.
  *
- * Each of the three is load-bearing and none of them is polish:
+ * Each of the four is load-bearing and none of them is polish:
  *
+ *   * REPLAYED. The server's stream opens with its replay tail — up to two hundred messages it
+ *     already published — and every attach that carries no `Last-Event-ID` gets the whole of it:
+ *     a fresh sign-in, a channel change, the reconnect after an `event: reset`. Those belong on
+ *     screen and they are NOT news. Relaying them says "a message was just posted" about text
+ *     that may be hours old, in a burst, into a conversation billed by the minute — the same
+ *     "existing history labelled as new" failure the server's seeding tick exists to prevent,
+ *     arriving through the other door. The cost of the rule, stated: a message that lands while
+ *     this page is between streams reaches the list but not the agent, exactly as one that lands
+ *     while the tab is shut does.
  *   * SELF-POSTED. `ops::reply` posts as the bot and the server's own poller reads it back. Relay
  *     that and the agent hears its own answer as news and answers it — a loop that bills.
  *   * THE TOGGLE. Every channel message reaching a live conversation is both a cost and an
@@ -3387,8 +3426,8 @@ function relayLine(message) {
  *   * A LIVE SOCKET. There is nowhere to send it otherwise, and queuing it for the next call
  *     would deliver stale news at the start of a conversation about something else.
  */
-function relayToAgent(message, selfPosted) {
-  if (selfPosted || !relayWanted() || !canSendText()) {
+function relayToAgent(message, selfPosted, replayed) {
+  if (replayed || selfPosted || !relayWanted() || !canSendText()) {
     return false;
   }
   return sendClientEvent({ type: "contextual_update", text: relayLine(message) });

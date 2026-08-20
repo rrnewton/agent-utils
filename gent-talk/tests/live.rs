@@ -53,6 +53,7 @@ async fn tick(harness: &Harness, channel: &ChannelId, cursor: &mut Option<u64>) 
     )
     .await
     .expect("the fake reads")
+    .published
 }
 
 async fn open(
@@ -94,6 +95,28 @@ async fn read_events(body: &mut Body, want: usize) -> String {
         }
     }
     text
+}
+
+/// Read frames until the stream ENDS, or fail by timing out.
+///
+/// The counterpart of [`read_events`], and the only way to assert that a stream stopped: reading
+/// for a fixed number of events cannot tell "there are no more" from "the next one is late".
+async fn read_to_end(body: &mut Body) -> String {
+    let mut text = String::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the stream was still open after five seconds; so far: {text:?}")
+            });
+        let Some(frame) = frame else {
+            return text;
+        };
+        let frame = frame.expect("the frame is readable");
+        if let Some(data) = frame.data_ref() {
+            text.push_str(&String::from_utf8_lossy(data));
+        }
+    }
 }
 
 /// The `data:` payloads of every complete event in `text`, parsed.
@@ -256,6 +279,110 @@ async fn a_reconnect_with_no_last_event_id_gets_the_whole_replay_tail() {
         .filter_map(|p| p["message"]["content"].as_str().map(str::to_owned))
         .collect();
     assert_eq!(seen, vec!["one".to_owned(), "two".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_replayed_message_is_labelled_as_replayed_and_a_live_one_is_not() {
+    // The burst this exists to stop: a page that attaches with no `Last-Event-ID` — a fresh
+    // sign-in, a channel change, the reconnect after an `event: reset` — is handed the whole tail,
+    // up to two hundred messages. They belong on screen. They must NOT be announced to a live,
+    // billed conversation as "a message was just posted", and the page cannot tell them from a
+    // live arrival unless this server says which is which.
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut cursor = None;
+    tick(&harness, &channel, &mut cursor).await;
+    harness
+        .discord
+        .seed(&channel, "a", "said before you got here");
+    assert_eq!(tick(&harness, &channel, &mut cursor).await, 1);
+
+    let response = open(
+        &harness,
+        &format!("/api/v1/channels/{READ_CHANNEL}/stream"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    let mut body = response.into_body();
+    let tail = read_events(&mut body, 1).await;
+    let held = payloads(&tail).pop().expect("the tail event");
+    assert_eq!(held["message"]["content"], "said before you got here");
+    assert_eq!(
+        held["replayed"], true,
+        "a message out of the replay tail must say so, or the page relays stale channel text into \
+         a paid conversation as news: {tail:?}"
+    );
+
+    harness
+        .discord
+        .seed(&channel, "a", "and this just happened");
+    assert_eq!(tick(&harness, &channel, &mut cursor).await, 1);
+    let live = read_events(&mut body, 1).await;
+    let arrived = payloads(&live).pop().expect("the live event");
+    assert_eq!(arrived["message"]["content"], "and this just happened");
+    assert_eq!(
+        arrived["replayed"], false,
+        "and a message that really did just arrive must NOT be marked replayed, or the feature \
+         relays nothing at all: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_subscriber_that_falls_behind_gets_one_reset_and_the_stream_ends() {
+    // The lag path, which had no server-side test at all: the page branches on the event NAME, and
+    // the whole argument for `reset` over a short resume is that the stream STOPS so the page has
+    // to re-read. Both halves are pinned here — a stream that carried on after the reset would
+    // leave a page reading a feed with a hole in it and no way to know.
+    let harness = harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    let mut cursor = None;
+    tick(&harness, &channel, &mut cursor).await;
+
+    // Attached and then never read, which is exactly what a stalled browser looks like.
+    let response = open(
+        &harness,
+        &format!("/api/v1/channels/{READ_CHANNEL}/stream"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    let overflow = gent_talk::live::BROADCAST_CAPACITY + 8;
+    for n in 0..overflow {
+        harness.discord.seed(&channel, "a", &format!("m{n}"));
+    }
+    // Two ticks, because one tick is bounded by `MAX_PAGES_PER_TICK`; between them everything
+    // seeded is published, and the subscriber has read none of it.
+    let mut published = tick(&harness, &channel, &mut cursor).await;
+    while published < overflow {
+        let more = tick(&harness, &channel, &mut cursor).await;
+        assert!(more > 0, "the walk stalled with {published} of {overflow}");
+        published += more;
+    }
+
+    let text = read_to_end(&mut body).await;
+    assert!(
+        text.contains("event: reset"),
+        "a subscriber this far behind must be told to re-read, by the event name the page branches \
+         on: {text:?}"
+    );
+    assert!(
+        !text.contains(&format!("m{}", overflow - 1)),
+        "and the reset must be the LAST thing on the stream — carrying on afterwards resumes short \
+         over a gap the page cannot see: {text:?}"
+    );
+    // `read_to_end` returning at all is the other half: the body ENDED rather than parking.
+    let after_reset = text
+        .split("event: reset")
+        .nth(1)
+        .expect("the reset is in there");
+    assert!(
+        !after_reset.contains("event: message"),
+        "nothing may follow the reset: {after_reset:?}"
+    );
 }
 
 #[tokio::test]

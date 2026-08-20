@@ -606,6 +606,11 @@ pub async fn ask(
 /// that fell too far behind gets one `event: reset` and the stream ENDS, so the page re-reads
 /// through `/messages` rather than silently skipping the gap.
 ///
+/// **Every event says whether it is `replayed`.** An attach with no `Last-Event-ID` gets the whole
+/// tail, and on the wire a replayed message is otherwise indistinguishable from one that arrived a
+/// moment ago — so a page could not avoid announcing two hundred old messages to a live, billed
+/// conversation as news. See [`crate::live::events`].
+///
 /// **`Cache-Control: no-store`** because the body is channel text belonging to one credential, and
 /// **`X-Accel-Buffering: no`** because an nginx-shaped reverse proxy in front of this will
 /// otherwise buffer the response and deliver nothing until it is large enough — which presents as

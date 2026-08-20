@@ -443,6 +443,14 @@
             to this browser, not to the server, so closing the tab ends the relay even though the
             server keeps watching the channel.
           </p>
+          <p class="hint">
+            <strong>Only messages that arrive while the feed is connected are sent.</strong> When
+            this page attaches to the channel it is first handed what the server already published,
+            so the list catches up; that catch-up is never announced to the agent, because a burst
+            of older messages read out as though they had just been said is worse than not hearing
+            them at all. Anything that landed while the feed was reconnecting is on screen but was
+            not spoken.
+          </p>
 
           <h2>Stored conversations</h2>
           <p class="hint">

@@ -69,7 +69,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 http-body-util = "0.1"
 # The live ElevenLabs client is exercised against a one-shot loopback HTTP server, which is what
 # pins the API key to a HEADER rather than the query string. That needs raw sockets in tests.
-tokio = { version = "1", features = ["io-util", "net"] }
+#
+# `test-util` is what makes the poll loop's rate-limit BACKOFF assertable: the assertion is about
+# how long the loop waited, and against the real clock that is either a slow test or a flaky one.
+# With a paused clock the elapsed time is exact and the suite still finishes instantly.
+tokio = { version = "1", features = ["io-util", "net", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints.rust]

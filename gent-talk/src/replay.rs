@@ -15,6 +15,13 @@
 //! [`Replay::text`]: a "you are resuming" preamble with no record behind it is exactly the false
 //! claim this module exists to prevent, so the caller sends NOTHING.
 //!
+//! There is a fourth state hiding inside the third, and it is the one an interface gets wrong.
+//! Sending nothing because the transcript was empty and sending nothing because the budget dropped
+//! ALL of it look identical from `included` alone — and the sentences they justify are opposites.
+//! "There was nothing to replay" said about a long conversation is a claim about what the reader
+//! said earlier, made with no evidence. So `included == 0` always comes with `dropped`, and the
+//! caller has to read both.
+//!
 //! # The transcript is untrusted text
 //!
 //! A stored turn is the owner's own speech AND whatever channel text the agent read aloud to him —
@@ -102,6 +109,12 @@ pub struct Replay {
     /// The whole payload: [`PREAMBLE`], then the fenced record. EMPTY when nothing is included.
     pub text: String,
     /// How many turns are in it.
+    ///
+    /// **Zero is two different states and a caller must not collapse them.** With `dropped == 0`
+    /// there was nothing to replay; with `dropped > 0` there was a great deal and the budget fitted
+    /// none of it. Both send nothing, and an interface that says "there was nothing to replay"
+    /// about the second one is asserting that an earlier conversation was empty when it was merely
+    /// too large.
     pub included: usize,
     /// How many older turns were left out to stay inside the budget.
     ///
@@ -256,6 +269,31 @@ mod tests {
             !built.text.contains(PREAMBLE),
             "and specifically the preamble must not go out alone"
         );
+    }
+
+    #[test]
+    fn a_transcript_the_budget_drops_entirely_is_not_reported_as_an_empty_one() {
+        // Same `included: 0` and same empty `text` as the test above, and it means the OPPOSITE
+        // thing. One is "the two of you had not said anything yet"; this is "you said a great deal
+        // and none of it fitted". A caller that can only see `included` reads the second as the
+        // first and tells the reader their earlier conversation was empty — which is an assertion
+        // about the past, made by an interface that has no basis for it.
+        let built = build(&[turn(Speaker::You, &"x".repeat(500))], &policy(20, 40));
+        assert_eq!(built.included, 0);
+        assert!(built.text.is_empty(), "still nothing to send");
+        assert_eq!(
+            built.dropped, 1,
+            "a turn the budget could not fit is DROPPED, and the count is what the screen needs"
+        );
+        assert!(
+            built.truncated,
+            "and the budget, not the transcript running out, is what stopped it"
+        );
+
+        // The control, so the two states cannot collapse into each other: a genuinely empty
+        // transcript reports zero dropped and nothing truncated.
+        let empty = build(&[], &policy(20, 40));
+        assert_eq!((empty.dropped, empty.truncated), (0, false));
     }
 
     #[test]

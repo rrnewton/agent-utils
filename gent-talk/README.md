@@ -601,7 +601,7 @@ old one, so the agent can carry on from it.
 one.** `replay.enabled` is off by default; when it is on, `GET /api/v1/conversations/{id}/replay`
 renders the stored transcript and the page sends it on the new socket.
 
-### The four states, which are four different sentences
+### The states, which are that many different sentences
 
 The failure to avoid is not that this breaks; it is that it half-works and the screen keeps saying
 it worked. So the clause under the large control is derived rather than written:
@@ -612,6 +612,14 @@ it worked. So the clause under the large control is derived rather than written:
 | armed, whole record sent | "the earlier conversation is replayed" |
 | armed, budget dropped some | "the earlier conversation is replayed **in part**" |
 | the fetch failed | "the agent starts fresh — the earlier conversation could not be read" |
+| nothing was said in it | "the agent starts fresh — there was nothing to replay" |
+| the budget dropped ALL of it | "the agent starts fresh — the earlier conversation was too long to replay" |
+
+**The last two are the same `included: 0` and they mean opposite things.** Both send nothing, and
+only `dropped` tells them apart. "There was nothing to replay" said about a conversation that was
+merely too large is a claim about what the reader said earlier, made with no basis for it — so the
+page reads `dropped` as well as `included`, and Settings names the two budget settings that would
+fix it rather than leaving the reader to conclude their conversation vanished.
 
 The end-of-call seam changes with it. Every version of it asserted that the agent below the line
 has never seen anything above it, and that stops being true the moment resuming is armed; with it
@@ -690,10 +698,10 @@ That is deliberately the less capable option:
   ElevenLabs and none for Discord), a heartbeat / resume / session-invalidate state machine, and
   the privileged `MESSAGE_CONTENT` intent — which the application has to be granted, and without
   which every message arrives with an empty body.
-* **Polling reuses what is already tested.** `DiscordClient::fetch_recent`, `sort_oldest_first`
+* **Polling reuses what is already tested.** `DiscordClient::fetch_page`, `sort_oldest_first`
   and `MessageId::numeric` are the whole mechanism, and all three already have tests — including
   the string-versus-numeric snowflake ordering trap, which is exactly the bug a hand-rolled cursor
-  reintroduces.
+  reintroduces, and the `before`/`after` asymmetry, which is the other one.
 * **The fake can genuinely fail.** `FakeDiscord::fail_next` and its unknown-channel refusal mean
   the poll loop's failure path is exercised by the suite rather than reasoned about.
 
@@ -707,13 +715,30 @@ to tell which one is wrong.
 would publish into exactly that and delete the poll loop; no route, no page and no test above the
 hub would change.
 
-Two rules in the loop are correctness, not tuning:
+Three rules in the loop are correctness, not tuning:
 
 * **The first tick seeds the cursor and publishes nothing.** Otherwise the first poll after a
   restart republishes the whole recent window, and a page that attaches a second later is shown
   existing history labelled as newly arrived — and relays it into a paid conversation as news.
-* **A failed fetch does not advance the cursor.** Whatever arrived during the outage is published
-  once it recovers, rather than skipped.
+* **A failed fetch does not advance the cursor** past anything it did not publish. Whatever
+  arrived during the outage is published once it recovers, rather than skipped.
+* **Every tick after the first walks FORWARD from its cursor**, with Discord's `after`, rather
+  than re-reading the most recent `default_fetch_limit` messages. Re-reading the newest window and
+  then moving the cursor to the newest of them drops everything in between the moment a channel
+  produces more than one window between two ticks — silently: no gap event, no warning, and a page
+  and an agent simply missing lines. Walking forward cannot lose them.
+
+**And a bound on catching up, because "read until caught up, whatever it costs" is a request storm
+against a rate limit this server does not handle.** One tick walks at most four pages per channel
+— 200 messages at the default — and stops. Nothing is skipped: the cursor only ever moves past
+what was actually published, so the next tick continues where this one stopped. Being stopped by
+that ceiling is logged **once**, at WARN, on the way into it, and the recovery is logged too;
+delivery is running late and that is worth seeing, but it is lateness, not loss.
+
+**A failing channel backs off** by doubling up to sixteen intervals, and that is pinned by a test
+that measures how long the loop actually waited against a healthy control. It has to be measured,
+because deleting the line that applies the backoff changes nothing else observable: the loop still
+fetches, still publishes, still recovers, still logs.
 
 ### Decision two: the PAGE keeps the ElevenLabs conversation socket
 
@@ -734,8 +759,13 @@ allowlist gets `404 unknown_channel`, never a `200` that streams nothing — on 
 are indistinguishable forever.
 
 * Every event carries `id: <message id>` and `event: message`, and a payload of
-  `{message, self_posted, untrusted_content_notice}`. The notice is the same one `/messages`
-  carries: a pushed message is third-party text exactly as a fetched one is.
+  `{message, self_posted, replayed, untrusted_content_notice}`. The notice is the same one
+  `/messages` carries: a pushed message is third-party text exactly as a fetched one is.
+* **`replayed` says whether the event came out of the tail or off the wire just now**, because on
+  the wire those are otherwise identical. Every attach that carries no `Last-Event-ID` — a fresh
+  sign-in, a channel change, the reconnect after an `event: reset` — is handed the whole tail, and
+  a page that could not tell would announce up to two hundred old messages to a live conversation
+  as news. See "What the page does with it".
 * **Reconnection.** The browser sends `Last-Event-ID`; the server replays only what came after it,
   from a bounded tail of the last 200 published messages per channel. The receiver is attached
   *before* the tail is read, under one lock, so nothing can slip between the two.
@@ -758,8 +788,15 @@ exact thing `/api/v1/signed-url`'s `no-store` and the page's `redact()` exist to
 
 Arriving messages are rendered by the same element construction as fetched ones, de-duplicated
 against the rows actually on screen, and — only if the reader has turned it on — relayed into a
-live conversation as a `contextual_update`. Three guards on that relay, all load-bearing:
+live conversation as a `contextual_update`. Four guards on that relay, all load-bearing:
 
+* **A replay tail is never relayed.** The stream opens with what the server already published, up
+  to 200 messages, and every attach without a `Last-Event-ID` gets all of it. Those rows belong on
+  screen; announcing them says "a message was just posted" about text that may be hours old, in a
+  burst, into a conversation billed by the minute — the same "existing history labelled as new"
+  failure the seeding tick exists to prevent, arriving through the other door. The cost of the
+  rule, stated: a message that lands while the page is between streams reaches the list but not
+  the agent, exactly as one that lands while the tab is shut does.
 * **Self-posted messages are never relayed.** `ops::reply` posts as the bot and the poller reads
   that post back; relaying it would have the agent hear its own answer as news and answer it, in a
   loop that bills. The ids this server posted are recorded and travel with the message as
