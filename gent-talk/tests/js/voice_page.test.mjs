@@ -3937,6 +3937,16 @@ test("switching channel starts the walk again rather than stepping back from a s
     true,
     "after a failed channel change the page still offers to step back from the old channel"
   );
+  // ...and the SUMMARY goes with the rows it counts. The list is emptied by the change and the
+  // summary is only ever rewritten inside a read that succeeded, so leaving it alone means an
+  // empty screen headed "6 messages from lead team" — a confident count of messages that are not
+  // there, about a channel the reader has left.
+  assert.equal(page.el("discord-log").children.length, 0, "a failed change left rows on screen");
+  assert.deepStrictEqual(
+    page.el("channel-summary").children.map((line) => line.text()),
+    [],
+    "a failed change of channel left the previous channel's count standing over an empty list"
+  );
 });
 
 // --- one channel row at a time --------------------------------------------------------------
@@ -4160,6 +4170,41 @@ test("a draft survives leaving without sending, and survives a reload", async ()
     "half a thought about the first one",
     "the draft did not survive a reload"
   );
+});
+
+test("a browser that refuses to store a DRAFT says so, rather than promising a reload", async () => {
+  // The read-after-write check was written here and its answer thrown away, which made it a
+  // comment: the page checked, learned the draft had not been stored, and told nobody. The test
+  // above is exactly the promise being broken — "it survives a reload" — so a reader in private
+  // browsing has to be told it will not, in the place they typed it.
+  const page = newPage();
+  await signIn(page);
+  await openReplyOn(page, [message({ id: "777", content: "answer me" })]);
+  // Private browsing: setItem is accepted and then does nothing.
+  page.storage.set = () => page.storage;
+
+  page.el("reply-text").value = "something I would rather not retype";
+  await page.el("reply-text").dispatch("input");
+
+  const said = page.el("reply-state").textContent;
+  assert.match(
+    said,
+    /refused to store/,
+    `the page said nothing about a draft it did not keep: ${said}`
+  );
+  assert.match(said, /reload/);
+  // ...and it is still here for THIS screen, which the page must not muddle with the warning.
+  assert.equal(page.el("reply-text").value, "something I would rather not retype");
+
+  // The other direction: a browser that really stores it must NOT be accused of losing it, or the
+  // warning becomes a decoration everybody learns to ignore.
+  delete page.storage.set;
+  const kept = newPage();
+  await signIn(kept);
+  await openReplyOn(kept, [message({ id: "888", content: "answer me too" })]);
+  kept.el("reply-text").value = "this one is safe";
+  await kept.el("reply-text").dispatch("input");
+  assert.equal(kept.el("reply-state").textContent, "", "a stored draft was reported as lost");
 });
 
 test("A SEND THAT FAILS LOSES NOTHING THE READER TYPED", async () => {

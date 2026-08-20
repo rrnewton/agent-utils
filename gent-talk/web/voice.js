@@ -2105,7 +2105,18 @@ function rememberDraft() {
   } else {
     drafts.delete(replyTarget.id);
   }
-  persistDrafts();
+  // ...and SAY SO when the browser refuses. The read-back was here from the start and its answer
+  // was thrown away, which made it a comment: a reader in private browsing was told a draft was
+  // kept by the fact that nothing said otherwise, and lost it on reload. Same idiom as the reading
+  // width and the microphone settings, which both report the refusal where the control is.
+  //
+  // On failure only. This line also carries "Not posted: …", and typing after a failed send is not
+  // a reason to take the reason away.
+  if (!persistDrafts()) {
+    el("reply-state").textContent =
+      "This browser refused to store the draft, so it will be lost if you reload (private " +
+      "browsing does this). It is still here until then.";
+  }
 }
 
 /** Open the reply screen on one specific message. */
@@ -2427,6 +2438,11 @@ el("discord-channel").addEventListener(
     discordOlderCursor = null;
     discordNewestId = null;
     el("discord-log").replaceChildren();
+    // The summary goes with the rows it is about. It is written only inside `loadDiscord`, which
+    // THROWS when the read fails — so leaving it standing means a failed change of channel shows
+    // the previous channel's name and a count of messages that are no longer on the screen, which
+    // is the most confident possible way of being wrong.
+    el("channel-summary").replaceChildren();
     renderOlderControl();
     return loadDiscord();
   })
