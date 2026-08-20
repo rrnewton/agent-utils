@@ -32,6 +32,7 @@ from herdr_run.allowlist import Admission, reject_terminal_controls
 from herdr_run.client import HerdrClient
 from herdr_run.config import MAX_TIMEOUT_SECONDS, Config
 from herdr_run.errors import ConfigError, HerdrUnavailable, PaneBusy, RunTimeout
+from herdr_run.identity import current_boot_id, process_start_ticks
 from herdr_run.readiness import Readiness, assess, infer_prompt_tail
 from herdr_run.retention import prune_runs, runs_root
 from herdr_run.session import Target
@@ -411,7 +412,14 @@ def execute(
 
 
 def write_meta(result: RunResult, admission: Admission, config: Config, agent: str) -> str:
-    """Record what ran, where, and on what evidence it was allowed to. Returns the file path."""
+    """Record what ran, where, and on what evidence it was allowed to. Returns the file path.
+
+    The readiness block records the pane shell's ``boot_id`` and ``shell_start_ticks`` alongside its
+    pid. That triple is not decoration: :mod:`herdr_run.reap` refuses to call a tab stale on a bare
+    pid, so a record without it can never authorise anything, and the reaper would be inert no
+    matter how many runs it had to look at. Either field may be ``null`` when ``/proc`` could not be
+    read, which the policy reads as UNKNOWN — the safe direction.
+    """
     path = os.path.join(result.spool.directory, "meta.json")
     document = {
         "run_id": result.run_id,
@@ -432,6 +440,8 @@ def write_meta(result: RunResult, admission: Admission, config: Config, agent: s
             "process_idle": result.readiness.process.idle,
             "process_reason": result.readiness.process.reason,
             "shell_pid": result.readiness.process.shell_pid,
+            "boot_id": current_boot_id(),
+            "shell_start_ticks": process_start_ticks(result.readiness.process.shell_pid),
             "foreground_pgid": result.readiness.process.foreground_pgid,
             "prompt_verdict": result.readiness.prompt.verdict,
             "prompt_reason": result.readiness.prompt.reason,

@@ -49,6 +49,10 @@ both `herdr-run` and `herdr-agent`.
 - **Serialized account-wide use.** An account-global resolution lock prevents duplicate first-run
   workspaces/tabs, and an account-global per-pane lock spans readiness, launch, and collection, so
   callers from different projects cannot inject into the same pane concurrently.
+- **Bounded tab growth.** Every agent that runs a command leaves a tab behind and nothing closes
+  it, so the workspace grows until the Herdr server is the bottleneck (measured: 260 panes, >1000%
+  CPU, every control call timing out). `max_panes` refuses to open a NEW tab past a ceiling -- never
+  an existing one -- and `herdr-run reap` reports which tabs are provably finished with.
 - **Visible, best-effort audit.** Refusals, admissions, failures, and completions are appended to a
   private JSONL log. Storage failures warn but never replace a completed command's exit status.
 
@@ -71,6 +75,7 @@ tab_name: "{agent}"       # one tab per agent
 allow: [git, gh]          # cooperative policy rail - keep it small
 prefixes: [with-proxy]    # wrappers that may precede an allowlisted program
 spool_dir: .herdr-run     # git-ignored: holds command output, not source
+max_panes: 64             # refuse a NEW tab once the workspace holds this many panes (0 = off)
 ```
 
 ## Quick reference
@@ -80,6 +85,7 @@ herdr-run <agent> '<command>'    run the command; exits with the command's own e
 herdr-run check '<command>'      policy only: allowed or refused. Touches no pane.
 herdr-run target                 resolve/bring up the pane; print ids and readiness
 herdr-run config                 print the effective configuration
+herdr-run reap                   report which command tabs are provably finished. Closes nothing.
 herdr-run doctor                 verify the sandbox-crossing actually works, both directions
 herdr-run userguide              the full user guide
 herdr-agent send ...             durably submit one prompt to an interactive agent

@@ -15,8 +15,9 @@ use crate::error::{ErrorKind, HerdrRunError, Result, EXIT_BUSY};
 use crate::readiness::{assess, infer_prompt_tail};
 use crate::runner::{execute, result_json, write_meta, RunResult};
 use crate::session::{resolve_target, tab_label_for};
+use crate::sweep::sweep;
 
-const SUBCOMMANDS: [&str; 5] = ["check", "doctor", "config", "target", "userguide"];
+const SUBCOMMANDS: [&str; 6] = ["check", "doctor", "config", "target", "reap", "userguide"];
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Args {
@@ -228,6 +229,7 @@ fn run(mut args: Args) -> Result<i32> {
     match subcommand.as_deref() {
         Some("config") => command_config(&config, &agent),
         Some("target") => command_target(&config, &agent, !args.no_cache),
+        Some("reap") => command_reap(&config),
         Some("doctor") => command_doctor(&config, &agent),
         Some("check") => {
             if let Some(command) = command {
@@ -275,6 +277,7 @@ fn command_config(config: &Config, agent: &str) -> Result<i32> {
         "project_root": config.project_root,
         "prompt_tail": config.prompt_tail,
         "prefixes": config.prefixes,
+        "max_panes": config.max_panes,
         "readiness": config.readiness,
         "retention_days": config.retention_days,
         "ready_timeout_seconds": config.ready_timeout_seconds,
@@ -511,6 +514,38 @@ fn write_meta_best_effort(
             (None, Some(error.message().to_owned()))
         }
     }
+}
+
+/// Report which command tabs are PROVABLY finished with. Closes nothing.
+///
+/// Report-only is the point, not a limitation. The expensive mistake is closing a tab whose agent
+/// is merely thinking, and a reaper that is wrong once in that direction is switched off for good;
+/// so the first version of this has to be checkable against a known-good population before anyone
+/// lets it act. Every declined pane carries its reason, and every verdict is counted including the
+/// zeros, because "reaped 0 because nothing was stale" and "reaped 0 because the detector is inert"
+/// are otherwise the same output.
+fn command_reap(config: &Config) -> Result<i32> {
+    let client = HerdrClient::new(&config.broker)?;
+    let plan = sweep(&client, config, Path::new("/proc"));
+    let entry = |decision: &crate::reap::ReapDecision, with_verdict: bool| {
+        let mut object = Map::new();
+        object.insert("pane_id".to_owned(), json!(decision.pane_id));
+        object.insert("reason".to_owned(), json!(decision.reason));
+        object.insert("tab_id".to_owned(), json!(decision.tab_id));
+        object.insert("tab_label".to_owned(), json!(decision.tab_label));
+        if with_verdict {
+            object.insert("verdict".to_owned(), json!(decision.verdict.as_str()));
+        }
+        Value::Object(object)
+    };
+    let document = json!({
+        "counts": plan.counts(),
+        "declined": plan.declined().into_iter().map(|d| entry(d, true)).collect::<Vec<_>>(),
+        "reapable": plan.reapable().into_iter().map(|d| entry(d, false)).collect::<Vec<_>>(),
+        "workspace": config.workspace,
+    });
+    print_json(&document)?;
+    Ok(0)
 }
 
 fn command_doctor(config: &Config, agent: &str) -> Result<i32> {
@@ -757,7 +792,7 @@ fn usage_line() -> &'static str {
 fn print_help() {
     println!("usage: {}", usage_line());
     println!("\nRun an allowlisted command in a Herdr pane outside the agent sandbox.");
-    println!("\npositional arguments:\n  ARG                   '<agent> <command>', '<command>', or check/doctor/config/target/userguide");
+    println!("\npositional arguments:\n  ARG                   '<agent> <command>', '<command>', or check/doctor/config/target/reap/userguide");
     println!("\noptions:\n  -h, --help            show this help message and exit\n  --version             show version and exit\n  --userguide           print the full embedded user guide\n  --config PATH         explicit configuration file\n  --agent NAME          override the invoking agent\n  --cwd PATH            command working directory\n  --timeout SECONDS     command completion timeout\n  --wait-ready SECONDS  pane readiness timeout\n  --no-cache            re-resolve session labels\n  --json                emit a JSON result\n  --dry-run             admit and render without execution");
     println!("\nFull documentation: herdr-run userguide");
 }

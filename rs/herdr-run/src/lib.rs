@@ -11,10 +11,13 @@ pub mod cli;
 pub mod client;
 pub mod config;
 pub mod error;
+pub mod identity;
 pub mod readiness;
+pub mod reap;
 pub mod retention;
 pub mod runner;
 pub mod session;
+pub mod sweep;
 
 mod state;
 mod timefmt;

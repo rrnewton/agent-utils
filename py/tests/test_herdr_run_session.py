@@ -278,3 +278,83 @@ def test_unknown_placeholder_is_a_clear_error() -> None:
     config = Config(tab_name="{nope}")
     with pytest.raises(ConfigError, match=r"plain \{agent\} and \{project\}"):
         tab_label_for(config, "agent")
+
+
+# --- the pane cap ----------------------------------------------------------------------------------
+#
+# Two directions, because a cap that refuses everything also passes a refusal test. The positive
+# control is "the cap fires when a NEW tab would exceed it"; the negative controls are "an agent
+# that already has its tab is never locked out" and "one below the cap still gets a tab".
+
+
+def _fill_workspace(fake: FakeHerdrClient, config: Config, agents: int) -> str:
+    """Bring up ``agents`` tabs (one pane each) and return the workspace id."""
+    workspace_id = ""
+    for index in range(agents):
+        target = resolve_target(_client(fake), config, f"filler-{index}", use_cache=False)
+        workspace_id = target.workspace_id
+    return workspace_id
+
+
+def test_pane_cap_refuses_a_new_tab_once_the_workspace_is_full(tmp_path: object) -> None:
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root, max_panes=3)
+    _fill_workspace(fake, config, 3)
+
+    creates_before = [call for call in fake.calls if call.startswith("create_")]
+    with pytest.raises(HerdrUnavailable, match="max_panes is 3"):
+        resolve_target(_client(fake), config, "one-agent-too-many", use_cache=False)
+    # Refused BEFORE creating anything: the workspace must not grow past the cap even by one, and
+    # the refusal must not leave a half-built tab behind for the next sweep to puzzle over.
+    assert len(fake.panes()) == 3
+    assert [call for call in fake.calls if call.startswith("create_")] == creates_before
+
+
+def test_pane_cap_leaves_room_up_to_the_limit(tmp_path: object) -> None:
+    """The cap must not be off-by-one: the Nth tab is allowed, the (N+1)th is not."""
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root, max_panes=3)
+    _fill_workspace(fake, config, 2)
+
+    target = resolve_target(_client(fake), config, "third-agent", use_cache=False)
+    assert target.created == ("tab",)
+    assert len(fake.panes()) == 3
+
+
+def test_pane_cap_never_locks_an_agent_out_of_its_existing_tab(tmp_path: object) -> None:
+    """A cap that can break work in progress is a cap that gets switched off."""
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root, max_panes=3)
+    _fill_workspace(fake, config, 3)
+
+    again = resolve_target(_client(fake), config, "filler-0", use_cache=False)
+    assert again.created == ()
+    assert again.tab_label == "filler-0"
+
+
+def test_pane_cap_of_zero_is_unlimited(tmp_path: object) -> None:
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root, max_panes=0)
+    _fill_workspace(fake, config, 5)
+
+    target = resolve_target(_client(fake), config, "sixth-agent", use_cache=False)
+    assert target.created == ("tab",)
+    assert len(fake.panes()) == 6
+
+
+def test_pane_cap_names_the_remedy_rather_than_only_refusing(tmp_path: object) -> None:
+    """A refusal an agent cannot act on just becomes a stuck agent."""
+    root = str(tmp_path)
+    fake = FakeHerdrClient()
+    config = _config(root, max_panes=1)
+    _fill_workspace(fake, config, 1)
+
+    with pytest.raises(HerdrUnavailable) as caught:
+        resolve_target(_client(fake), config, "another", use_cache=False)
+    message = str(caught.value)
+    assert "herdr-run reap" in message
+    assert "max_panes" in message

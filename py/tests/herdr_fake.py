@@ -53,6 +53,11 @@ class FakeHerdrClient:
         self._next_pane = 1
         #: Panes reported as running a job rather than sitting at a prompt.
         self.busy_panes: set[str] = set()
+        #: Per-pane shell pid, so a sweep can plant a shell that /proc does or does not know.
+        self.shell_pids: dict[str, int] = {}
+        #: When true, ``panes`` fails the way an unreachable server does. Distinguishing that from
+        #: an empty listing is the difference between "reap nothing" and "reap everything".
+        self.fail_pane_list = False
         #: Every call made, in order — lets a test assert on idempotency rather than infer it.
         self.calls: list[str] = []
         self.commands: list[tuple[str, str]] = []
@@ -124,6 +129,8 @@ class FakeHerdrClient:
 
     def panes(self, workspace_id: str | None = None) -> tuple[Pane, ...]:
         """Every pane, optionally restricted to one workspace."""
+        if self.fail_pane_list:
+            raise HerdrUnavailable("pane list: herdr is not answering")
         out: list[Pane] = []
         for workspace in self.workspaces.values():
             if workspace_id is not None and workspace.workspace_id != workspace_id:
@@ -139,9 +146,10 @@ class FakeHerdrClient:
 
     def process_info(self, pane_id: str) -> ProcessInfo:
         """Report the pane as idle, or as running a job when listed in ``busy_panes``."""
+        shell_pid = self.shell_pids.get(pane_id, 100)
         if pane_id in self.busy_panes:
-            return ProcessInfo(pane_id=pane_id, shell_pid=100, foreground_pgid=200, foreground=((200, "git", "git push"),))
-        return ProcessInfo(pane_id=pane_id, shell_pid=100, foreground_pgid=100, foreground=((100, "bash", "/bin/bash"),))
+            return ProcessInfo(pane_id=pane_id, shell_pid=shell_pid, foreground_pgid=shell_pid + 100, foreground=((shell_pid + 100, "git", "git push"),))
+        return ProcessInfo(pane_id=pane_id, shell_pid=shell_pid, foreground_pgid=shell_pid, foreground=((shell_pid, "bash", "/bin/bash"),))
 
     def read(self, pane_id: str, *, source: str = "recent-unwrapped", lines: int | None = None) -> str:
         """Return the canned pane text."""

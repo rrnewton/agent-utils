@@ -289,6 +289,7 @@ def _bootstrap(harness: Harness, report: Report) -> None:
         "doctor",
         "config",
         "target",
+        "reap",
         "userguide",
         "--version",
         "--userguide",
@@ -464,7 +465,8 @@ def _config_success(harness: Harness, report: Report) -> None:
         "config/default-fields",
         '"source": "(built-in defaults)"' in python.stdout
         and '"project_root": "<ROOT>"' in python.stdout
-        and '"tab_label": "fixture-agent"' in python.stdout,
+        and '"tab_label": "fixture-agent"' in python.stdout
+        and '"max_panes": 64' in python.stdout,
         f"default config omitted resolved fields: {_describe(python)}",
     )
 
@@ -509,6 +511,7 @@ value_options:
 spool_dir: .state/herdr
 timeout_seconds: 12.5
 retention_days: 7
+max_panes: 12
 ready_timeout_seconds: 3
 readiness: process
 prompt_tail: "$ "
@@ -604,6 +607,10 @@ def _config_malformed(harness: Harness, report: Report) -> None:
         ("excessive-timeout", "timeout_seconds: 1e300\n"),
         ("negative-retention", "retention_days: -1\n"),
         ("fractional-retention", "retention_days: 1.5\n"),
+        ("negative-max-panes", "max_panes: -1\n"),
+        ("fractional-max-panes", "max_panes: 1.5\n"),
+        ("boolean-max-panes", "max_panes: true\n"),
+        ("excessive-max-panes", "max_panes: 1000001\n"),
         ("malformed-tab-template", 'tab_name: "{agent"\n'),
         ("attribute-tab-template", 'tab_name: "{agent.__class__}"\n'),
         ("format-tab-template", 'tab_name: "{agent:>10}"\n'),

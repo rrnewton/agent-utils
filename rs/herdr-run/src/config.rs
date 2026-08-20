@@ -13,6 +13,18 @@ use crate::error::{HerdrRunError, Result};
 /// Accepted configuration basenames, in preference order at each directory.
 pub const CONFIG_FILENAMES: [&str; 2] = [".herdr-run.yaml", ".herdr-run.yml"];
 
+/// Default ceiling on panes in the command workspace before a NEW tab is refused.
+///
+/// Every agent that ever runs a command leaves a tab behind and nothing closes it, so without a
+/// ceiling the workspace grows for as long as agents are coined. The number is not arbitrary:
+/// measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to >1000% CPU
+/// with every control call timing out. 64 keeps a fourfold margin below that while being far more
+/// tabs than a project's agents legitimately need.
+pub const DEFAULT_MAX_PANES: u64 = 64;
+
+/// Largest accepted `max_panes`. A shared finite bound keeps the two implementations identical.
+pub const MAX_PANE_CAP: u64 = 1_000_000;
+
 /// Largest command/readiness timeout accepted from configuration or the CLI.
 ///
 /// This deliberately stays far below platform monotonic-clock limits so a finite timeout cannot
@@ -48,6 +60,11 @@ pub struct Config {
     pub timeout_seconds: f64,
     /// Days of per-run spool output to retain, pruned when a new run is written.
     pub retention_days: u64,
+    /// Ceiling on panes in `workspace` before a NEW tab is refused; `0` disables the cap.
+    ///
+    /// Checked only when a tab has to be created, so an agent that already has its tab is never
+    /// locked out of it. A cap that can break work in progress is a cap that gets switched off.
+    pub max_panes: u64,
     /// Maximum seconds to wait for a pane to become ready.
     pub ready_timeout_seconds: f64,
     /// Readiness policy: `both` or `process`.
@@ -128,6 +145,7 @@ impl Default for Config {
             spool_dir: ".herdr-run".to_owned(),
             timeout_seconds: 900.0,
             retention_days: crate::retention::RETENTION_DAYS,
+            max_panes: DEFAULT_MAX_PANES,
             ready_timeout_seconds: 0.0,
             readiness: "both".to_owned(),
             prompt_tail: None,
@@ -429,6 +447,10 @@ pub fn parse_config(
         config.retention_days =
             require_nonnegative_integer(value, &format!("{what}.retention_days"))?;
     }
+    if let Some(value) = mapping.get("max_panes") {
+        config.max_panes =
+            require_bounded_count(value, &format!("{what}.max_panes"), MAX_PANE_CAP)?;
+    }
     if let Some(value) = mapping.get("ready_timeout_seconds") {
         config.ready_timeout_seconds =
             require_number(value, &format!("{what}.ready_timeout_seconds"))?;
@@ -466,7 +488,7 @@ pub fn parse_config(
 }
 
 fn reject_unknown_keys(mapping: &Map<String, Value>, what: &str) -> Result<()> {
-    const KNOWN: [&str; 19] = [
+    const KNOWN: [&str; 20] = [
         "workspace",
         "tab_name",
         "cwd",
@@ -480,6 +502,7 @@ fn reject_unknown_keys(mapping: &Map<String, Value>, what: &str) -> Result<()> {
         "spool_dir",
         "timeout_seconds",
         "retention_days",
+        "max_panes",
         "ready_timeout_seconds",
         "readiness",
         "prompt_tail",
@@ -638,6 +661,21 @@ fn require_nonnegative_integer(value: &Value, what: &str) -> Result<u64> {
         return Err(HerdrRunError::config(format!(
             "{what}: must not exceed {} days",
             crate::retention::MAX_RETENTION_DAYS
+        )));
+    }
+    Ok(number)
+}
+
+fn require_bounded_count(value: &Value, what: &str, limit: u64) -> Result<u64> {
+    let number = value.as_u64().ok_or_else(|| {
+        HerdrRunError::config(format!(
+            "{what}: must be a non-negative integer, got {}",
+            value_type(value)
+        ))
+    })?;
+    if number > limit {
+        return Err(HerdrRunError::config(format!(
+            "{what}: must not exceed {limit}"
         )));
     }
     Ok(number)

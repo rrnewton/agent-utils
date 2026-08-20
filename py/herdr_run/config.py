@@ -24,6 +24,8 @@ from herdr_run.yamlcore import core_load
 
 __all__ = [
     "CONFIG_FILENAMES",
+    "DEFAULT_MAX_PANES",
+    "MAX_PANE_CAP",
     "MAX_RETENTION_DAYS",
     "MAX_TIMEOUT_SECONDS",
     "Config",
@@ -33,6 +35,18 @@ __all__ = [
 
 #: Accepted config basenames, in search order, looked up from the working directory upward.
 CONFIG_FILENAMES: tuple[str, ...] = (".herdr-run.yaml", ".herdr-run.yml")
+
+#: Default ceiling on how many panes the command workspace may hold before herdr-run refuses to
+#: open ANOTHER tab. Every agent that ever runs a command leaves a tab behind and nothing closes it,
+#: so without a ceiling the workspace grows for as long as agents are coined. The number is not
+#: arbitrary: measured on devbig014 2026-08-10, a session with 260 panes drove the Herdr server to
+#: >1000% CPU with every control call timing out (see ``client.SERVER_WORKER_THREADS``). 64 keeps a
+#: fourfold margin below that while being far more tabs than a project's agents legitimately need.
+DEFAULT_MAX_PANES = 64
+
+#: Largest accepted ``max_panes``. A shared finite bound keeps the two implementations identical and
+#: keeps an absurd integer out of the comparison.
+MAX_PANE_CAP = 1_000_000
 
 #: Largest command/readiness timeout accepted from either configuration or the CLI. Keeping this
 #: comfortably below platform ``Instant``/``time.monotonic`` limits means a finite value can never
@@ -162,6 +176,11 @@ class Config:
     #: Days of run spools to keep. Pruned when a new run is written; see :mod:`herdr_run.retention`.
     retention_days: int = 4
 
+    #: Ceiling on panes in :attr:`workspace` before a NEW tab is refused. ``0`` disables the cap.
+    #: Checked only when a tab has to be created: an agent that already has its tab is never locked
+    #: out of it, because a cap that could break work in progress would be turned off immediately.
+    max_panes: int = DEFAULT_MAX_PANES
+
     #: Seconds to wait for the pane to become idle before giving up with :class:`PaneBusy`.
     ready_timeout_seconds: float = 0.0
 
@@ -256,6 +275,16 @@ def _nonnegative_integer(raw: object, what: str) -> int:
     return raw
 
 
+def _bounded_count(raw: object, what: str, limit: int) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise ConfigError(
+            f"{what}: must be a non-negative integer, got {type(raw).__name__}"
+        )
+    if raw > limit:
+        raise ConfigError(f"{what}: must not exceed {limit}")
+    return raw
+
+
 def _text(raw: object, what: str) -> str:
     if not isinstance(raw, str):
         raise ConfigError(f"{what}: must be a string, got {type(raw).__name__}")
@@ -335,6 +364,7 @@ def _parse_config(
         "spool_dir",
         "timeout_seconds",
         "retention_days",
+        "max_panes",
         "ready_timeout_seconds",
         "readiness",
         "prompt_tail",
@@ -416,6 +446,11 @@ def _parse_config(
             retention_days=_nonnegative_integer(
                 mapping["retention_days"], f"{what}.retention_days"
             ),
+        )
+    if "max_panes" in mapping:
+        config = replace(
+            config,
+            max_panes=_bounded_count(mapping["max_panes"], f"{what}.max_panes", MAX_PANE_CAP),
         )
     if "ready_timeout_seconds" in mapping:
         config = replace(

@@ -7,6 +7,7 @@ are actually executed.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import threading
@@ -19,6 +20,7 @@ from herdr_run.allowlist import admit
 from herdr_run.client import HerdrClient
 from herdr_run.config import MAX_TIMEOUT_SECONDS, Config
 from herdr_run.errors import ConfigError, HerdrUnavailable, PaneBusy, RunTimeout
+from herdr_run.reap import evidence_from_runs
 from herdr_run.runner import (
     RunResult,
     build_shell_command,
@@ -662,3 +664,29 @@ def test_zero_day_retention_does_not_delete_the_run_being_created(tmp_path: obje
 
     assert result.exit_code == 0  # type: ignore[attr-defined]
     assert os.path.isdir(result.spool.directory)  # type: ignore[attr-defined]
+
+
+def test_meta_records_the_identity_the_reaper_needs(tmp_path: object) -> None:
+    """A run record with only a shell PID can never authorise closing anything.
+
+    ``herdr_run.reap`` requires ``(pid, boot_id, start_ticks)`` before it will call a tab stale, so
+    a writer that records the pid alone makes the whole reaper inert -- it would answer UNKNOWN for
+    every pane forever, and "reaped 0" would look exactly like a healthy workspace.
+    """
+    root = str(tmp_path)
+    config = _config(root)
+    fake = FakeHerdrClient()
+    # Report our own pid as the pane shell, so the recorded identity binds against a real /proc.
+    fake.shell_pids["w1:p1"] = os.getpid()
+    result = cast(RunResult, _run(fake, config, "echo identity"))
+    meta_path = write_meta(result, admit("echo identity", config), config, "agent")
+
+    with open(meta_path, encoding="utf-8") as handle:
+        document = cast(dict[str, object], json.load(handle))
+    readiness = cast(dict[str, object], document["readiness"])
+    flags, identity = evidence_from_runs(cast(str, document["pane_id"]), [document])
+    assert readiness["shell_pid"] == os.getpid()
+    assert isinstance(readiness["boot_id"], str) and readiness["boot_id"]
+    assert isinstance(readiness["shell_start_ticks"], int)
+    assert flags == (True,)
+    assert identity is not None and identity.is_bound()

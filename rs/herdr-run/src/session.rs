@@ -137,6 +137,7 @@ fn resolve_target_locked<A: HerdrApi + ?Sized>(
             let tab_id = match client.tab_id_for_label(&workspace_id, &tab_label)? {
                 Some(tab_id) => tab_id,
                 None => {
+                    enforce_pane_cap(client, config, &workspace_id)?;
                     let tab_id = client.create_tab(&workspace_id, &tab_label, cwd)?;
                     created.push("tab".to_owned());
                     tab_id
@@ -169,6 +170,39 @@ fn resolve_target_locked<A: HerdrApi + ?Sized>(
     // usable live Herdr session into a failed command.
     let _ = store_cache(&path, &key, &target);
     Ok(target)
+}
+
+/// Refuse to open ANOTHER tab once the workspace is already at `max_panes`.
+///
+/// Agents are coined continuously and every one that runs a command leaves a tab behind; nothing
+/// closes them, so the command workspace grows without bound until the Herdr server itself becomes
+/// the bottleneck (measured: 260 panes, >1000% CPU, every control call timing out). A ceiling turns
+/// that slow collapse into one legible refusal naming the tool that fixes it.
+///
+/// Checked ONLY on the create path. An agent whose tab already exists must never be locked out of
+/// it -- a cap that can break work in progress is a cap that gets switched off -- and a cap that
+/// refused an existing tab would also make the failure arrive at a random later moment rather than
+/// when a new tab is actually being added.
+fn enforce_pane_cap<A: HerdrApi + ?Sized>(
+    client: &A,
+    config: &Config,
+    workspace_id: &str,
+) -> Result<()> {
+    if config.max_panes == 0 {
+        return Ok(());
+    }
+    let existing = client.panes(Some(workspace_id))?.len() as u64;
+    if existing < config.max_panes {
+        return Ok(());
+    }
+    let source = config
+        .source_path
+        .as_deref()
+        .unwrap_or("your .herdr-run.yaml");
+    Err(HerdrRunError::unavailable(format!(
+        "workspace '{}' already holds {existing} pane(s) and max_panes is {}; refusing to open a tab for this agent. Run 'herdr-run reap' to see which tabs are provably finished and can be closed, or raise max_panes in {source} (0 disables the cap).",
+        config.workspace, config.max_panes
+    )))
 }
 
 fn resolved_cwd(config: &Config) -> Result<PathBuf> {
@@ -570,6 +604,172 @@ mod tests {
             project_root: root.to_string_lossy().into_owned(),
             ..Config::default()
         }
+    }
+
+    /// A workspace holding a fixed pane population, so the cap can be checked in both directions.
+    ///
+    /// The shared `FakeHerdr` above models one tab at a time, which cannot express "the workspace
+    /// is already full"; this one carries a pane list and records whether a tab was created.
+    struct CapFake {
+        panes: Mutex<Vec<Pane>>,
+        created: AtomicUsize,
+    }
+
+    impl CapFake {
+        fn holding(count: usize) -> Self {
+            Self {
+                panes: Mutex::new(
+                    (0..count)
+                        .map(|index| Pane {
+                            pane_id: format!("p{index}"),
+                            tab_id: format!("t{index}"),
+                            workspace_id: "w1".to_owned(),
+                        })
+                        .collect(),
+                ),
+                created: AtomicUsize::new(0),
+            }
+        }
+
+        fn creates(&self) -> usize {
+            self.created.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl HerdrApi for CapFake {
+        fn ensure_server(&self) -> Result<bool> {
+            Ok(false)
+        }
+
+        fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
+            Ok(Some("w1".to_owned()))
+        }
+
+        fn workspace_label_for_id(&self, _workspace_id: &str) -> Result<Option<String>> {
+            Ok(Some("agent-cmds".to_owned()))
+        }
+
+        fn create_workspace(&self, _label: &str, _cwd: &str) -> Result<(String, String, String)> {
+            unreachable!("the workspace already exists")
+        }
+
+        fn tab_id_for_label(&self, _workspace_id: &str, label: &str) -> Result<Option<String>> {
+            let panes = self.panes.lock().expect("panes");
+            Ok(panes
+                .iter()
+                .find(|pane| pane.tab_id == format!("t{}", label.trim_start_matches("filler-")))
+                .filter(|_| label.starts_with("filler-"))
+                .map(|pane| pane.tab_id.clone()))
+        }
+
+        fn create_tab(&self, workspace_id: &str, _label: &str, _cwd: &str) -> Result<String> {
+            let mut panes = self.panes.lock().expect("panes");
+            let index = panes.len();
+            self.created.fetch_add(1, AtomicOrdering::SeqCst);
+            panes.push(Pane {
+                pane_id: format!("p{index}"),
+                tab_id: format!("t{index}"),
+                workspace_id: workspace_id.to_owned(),
+            });
+            Ok(format!("t{index}"))
+        }
+
+        fn rename_tab(&self, _tab_id: &str, _label: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn panes(&self, _workspace_id: Option<&str>) -> Result<Vec<Pane>> {
+            Ok(self.panes.lock().expect("panes").clone())
+        }
+
+        fn pane_exists(&self, pane_id: &str) -> bool {
+            self.panes
+                .lock()
+                .expect("panes")
+                .iter()
+                .any(|pane| pane.pane_id == pane_id)
+        }
+
+        fn process_info(&self, _pane_id: &str) -> Result<ProcessInfo> {
+            unreachable!()
+        }
+
+        fn read(&self, _pane_id: &str, _source: &str, _lines: Option<usize>) -> Result<String> {
+            unreachable!()
+        }
+
+        fn run(&self, _pane_id: &str, _command: &str) -> Result<()> {
+            unreachable!()
+        }
+
+        fn send_keys(&self, _pane_id: &str, _keys: &str) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    // Two directions, because a cap that refuses everything also passes a refusal test.
+
+    #[test]
+    fn pane_cap_refuses_a_new_tab_once_the_workspace_is_full() {
+        let root = temporary_root("cap-full");
+        let mut config = config(&root);
+        config.max_panes = 3;
+        let fake = CapFake::holding(3);
+        let error = resolve_target(&fake, &config, "one-too-many", false)
+            .expect_err("the cap must refuse a fourth tab");
+        assert!(error.to_string().contains("max_panes is 3"), "{error}");
+        // Refused BEFORE creating anything: the workspace must not grow past the cap even by one.
+        assert_eq!(fake.creates(), 0);
+        assert_eq!(fake.panes(None).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pane_cap_leaves_room_up_to_the_limit() {
+        let root = temporary_root("cap-room");
+        let mut config = config(&root);
+        config.max_panes = 3;
+        let fake = CapFake::holding(2);
+        let target = resolve_target(&fake, &config, "third-agent", false).expect("third tab");
+        assert_eq!(target.created, ["tab"]);
+        assert_eq!(fake.panes(None).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pane_cap_never_locks_an_agent_out_of_its_existing_tab() {
+        let root = temporary_root("cap-existing");
+        let mut config = config(&root);
+        config.max_panes = 3;
+        let fake = CapFake::holding(3);
+        let target = resolve_target(&fake, &config, "filler-1", false).expect("existing tab");
+        assert_eq!(target.created, Vec::<String>::new());
+        assert_eq!(fake.creates(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pane_cap_of_zero_is_unlimited() {
+        let root = temporary_root("cap-zero");
+        let mut config = config(&root);
+        config.max_panes = 0;
+        let fake = CapFake::holding(9);
+        let target = resolve_target(&fake, &config, "tenth-agent", false).expect("tenth tab");
+        assert_eq!(target.created, ["tab"]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pane_cap_names_the_remedy_rather_than_only_refusing() {
+        let root = temporary_root("cap-remedy");
+        let mut config = config(&root);
+        config.max_panes = 1;
+        let fake = CapFake::holding(1);
+        let error = resolve_target(&fake, &config, "another", false).expect_err("cap refusal");
+        let message = error.to_string();
+        assert!(message.contains("herdr-run reap"), "{message}");
+        assert!(message.contains("max_panes"), "{message}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

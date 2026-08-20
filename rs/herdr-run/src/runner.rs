@@ -456,6 +456,12 @@ fn read_exit_code(path: &Path) -> Option<i32> {
 }
 
 /// Write the completed run's structured evidence and return its path.
+///
+/// The readiness block records the pane shell's `boot_id` and `shell_start_ticks` alongside its
+/// pid. That triple is not decoration: [`crate::reap`] refuses to call a tab stale on a bare pid,
+/// so a record without it can never authorise anything, and the reaper would be inert no matter how
+/// many runs it had to look at. Either field may be `null` when `/proc` could not be read, which
+/// the policy reads as UNKNOWN — the safe direction.
 pub fn write_meta(
     result: &RunResult,
     admission: &Admission,
@@ -475,6 +481,7 @@ pub fn write_meta(
         "prefix": admission.prefix,
         "program": admission.program,
         "readiness": {
+            "boot_id": crate::identity::current_boot_id(std::path::Path::new("/proc")),
             "foreground_pgid": result.readiness.process.foreground_pgid,
             "process_idle": result.readiness.process.idle,
             "process_reason": result.readiness.process.reason,
@@ -482,6 +489,10 @@ pub fn write_meta(
             "prompt_tail": result.readiness.prompt.tail,
             "prompt_verdict": result.readiness.prompt.verdict,
             "shell_pid": result.readiness.process.shell_pid,
+            "shell_start_ticks": crate::identity::process_start_ticks(
+                result.readiness.process.shell_pid,
+                std::path::Path::new("/proc"),
+            ),
         },
         "rendered": admission.rendered(),
         "run_id": result.run_id,
@@ -686,6 +697,107 @@ mod tests {
         let second = acquire_pane_lock(&target, 0.0).unwrap_err();
         assert_eq!(second.kind(), crate::error::ErrorKind::Busy);
         drop(first);
+    }
+
+    /// A pane whose shell is THIS process, so a recorded identity binds against the real `/proc`.
+    struct SelfShellApi;
+
+    impl HerdrApi for SelfShellApi {
+        fn ensure_server(&self) -> Result<bool> {
+            FakeApi.ensure_server()
+        }
+        fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
+            FakeApi.workspace_id_for_label(label)
+        }
+        fn workspace_label_for_id(&self, id: &str) -> Result<Option<String>> {
+            FakeApi.workspace_label_for_id(id)
+        }
+        fn create_workspace(&self, label: &str, cwd: &str) -> Result<(String, String, String)> {
+            FakeApi.create_workspace(label, cwd)
+        }
+        fn tab_id_for_label(&self, workspace: &str, label: &str) -> Result<Option<String>> {
+            FakeApi.tab_id_for_label(workspace, label)
+        }
+        fn create_tab(&self, workspace: &str, label: &str, cwd: &str) -> Result<String> {
+            FakeApi.create_tab(workspace, label, cwd)
+        }
+        fn rename_tab(&self, tab: &str, label: &str) -> Result<()> {
+            FakeApi.rename_tab(tab, label)
+        }
+        fn panes(&self, workspace: Option<&str>) -> Result<Vec<Pane>> {
+            FakeApi.panes(workspace)
+        }
+        fn pane_exists(&self, pane: &str) -> bool {
+            FakeApi.pane_exists(pane)
+        }
+        fn process_info(&self, pane: &str) -> Result<ProcessInfo> {
+            let shell_pid = i64::from(std::process::id());
+            Ok(ProcessInfo {
+                pane_id: pane.to_owned(),
+                shell_pid,
+                foreground_pgid: shell_pid,
+                foreground: vec![(shell_pid, "bash".to_owned(), "bash".to_owned())],
+            })
+        }
+        fn read(&self, pane: &str, source: &str, lines: Option<usize>) -> Result<String> {
+            FakeApi.read(pane, source, lines)
+        }
+        fn run(&self, pane: &str, command: &str) -> Result<()> {
+            FakeApi.run(pane, command)
+        }
+        fn send_keys(&self, pane: &str, keys: &str) -> Result<()> {
+            FakeApi.send_keys(pane, keys)
+        }
+    }
+
+    /// A run record with only a shell PID can never authorise closing anything.
+    ///
+    /// [`crate::reap`] requires `(pid, boot_id, start_ticks)` before it will call a tab stale, so a
+    /// writer that records the pid alone makes the whole reaper inert -- it would answer UNKNOWN
+    /// for every pane forever, and "reaped 0" would look exactly like a healthy workspace.
+    #[test]
+    fn meta_records_the_identity_the_reaper_needs() {
+        let root = std::env::temp_dir().join(format!("herdr-meta-identity-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let config = Config {
+            project_root: root.to_string_lossy().into_owned(),
+            spool_dir: "spool".to_owned(),
+            allow: vec!["printf".to_owned()],
+            ..Config::default()
+        };
+        let admission = admit("printf ok", &config).expect("admitted");
+        let mut isolated_target = target();
+        isolated_target.pane_id = "p-meta-identity".to_owned();
+        let result = execute(
+            &SelfShellApi,
+            &config,
+            &isolated_target,
+            &admission,
+            "agent",
+            &root,
+            0.0,
+            5.0,
+        )
+        .expect("run");
+        let path = write_meta(&result, &admission, &config, "agent").expect("metadata");
+        let document: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).expect("read meta")).expect("parse");
+
+        assert_eq!(
+            document["readiness"]["shell_pid"].as_i64(),
+            Some(i64::from(std::process::id()))
+        );
+        assert!(document["readiness"]["boot_id"]
+            .as_str()
+            .is_some_and(|boot| !boot.is_empty()));
+        assert!(document["readiness"]["shell_start_ticks"]
+            .as_u64()
+            .is_some());
+
+        let (flags, identity) = crate::sweep::evidence_from_runs("p-meta-identity", &[document]);
+        assert_eq!(flags, [true]);
+        assert!(identity.is_some_and(|identity| identity.is_bound()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -150,6 +150,33 @@ def _pane_of_tab(client: HerdrClient, workspace_id: str, tab_id: str) -> str:
     return panes[0].pane_id
 
 
+def _enforce_pane_cap(client: HerdrClient, config: Config, workspace_id: str) -> None:
+    """Refuse to open ANOTHER tab once the workspace is already at ``max_panes``.
+
+    Agents are coined continuously and every one that runs a command leaves a tab behind; nothing
+    closes them, so the command workspace grows without bound until the Herdr server itself becomes
+    the bottleneck (measured: 260 panes, >1000% CPU, every control call timing out). A ceiling turns
+    that slow collapse into one legible refusal naming the tool that fixes it.
+
+    Checked ONLY on the create path. An agent whose tab already exists must never be locked out of
+    it -- a cap that can break work in progress is a cap that gets switched off -- and a cap that
+    refused an existing tab would also make the failure arrive at a random later moment rather than
+    when a new tab is actually being added.
+    """
+    if config.max_panes <= 0:
+        return
+    existing = len(client.panes(workspace_id))
+    if existing < config.max_panes:
+        return
+    source = config.source_path or "your .herdr-run.yaml"
+    raise HerdrUnavailable(
+        f"workspace {config.workspace!r} already holds {existing} pane(s) and max_panes is "
+        f"{config.max_panes}; refusing to open a tab for this agent. Run 'herdr-run reap' to see "
+        f"which tabs are provably finished and can be closed, or raise max_panes in {source} "
+        "(0 disables the cap)."
+    )
+
+
 def _cache_still_valid(
     client: HerdrClient,
     cached: tuple[str, str, str],
@@ -247,6 +274,7 @@ def _resolve_target_locked(
     else:
         tab_id = client.tab_id_for_label(workspace_id, tab_label)
         if tab_id is None:
+            _enforce_pane_cap(client, config, workspace_id)
             tab_id = client.create_tab(
                 workspace_id=workspace_id, label=tab_label, cwd=cwd
             )

@@ -19,6 +19,7 @@ from herdr_run.audit import audit_path, record
 import herdr_run.cli as cli_module
 from herdr_run.cli import _default_agent, build_parser, main
 from herdr_run.config import Config
+from herdr_run.reap import ReapDecision, ReapPlan, Verdict
 from herdr_run.errors import (
     EXIT_CONFIG,
     EXIT_REFUSED,
@@ -135,6 +136,33 @@ def test_config_subcommand_reports_the_effective_policy(
     assert document["workspace"] == "agent-cmds"
     assert document["tab_label"] == "hermit-lander"
     assert document["allow"] == ["git", "gh"]
+    assert document["max_panes"] == 64
+
+
+def test_reap_subcommand_reports_both_sides_and_closes_nothing(
+    tmp_path: object,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The production caller for the reaping policy. Report-only, and counted on both sides."""
+    root = str(tmp_path)
+    monkeypatch.chdir(root)
+    decisions = (
+        ReapDecision("w1:p1", "w1:t1", "kvm", Verdict.STALE, "shell is gone"),
+        ReapDecision("w1:p2", "w1:t2", "amd", Verdict.SHELL_ALIVE, "still the original process"),
+    )
+    monkeypatch.setattr(cli_module, "_client", lambda *_args: object())
+    monkeypatch.setattr(cli_module, "sweep", lambda *_args, **_kwargs: ReapPlan(decisions))
+
+    assert main(["reap"]) == 0
+    document = json.loads(capsys.readouterr().out)
+    assert document["counts"]["STALE"] == 1
+    assert document["counts"]["SHELL_ALIVE"] == 1
+    # Both halves are printed: a report listing only what it would close cannot be audited for
+    # the refusals, which are the expensive direction to get wrong.
+    assert [entry["pane_id"] for entry in document["reapable"]] == ["w1:p1"]
+    assert [entry["pane_id"] for entry in document["declined"]] == ["w1:p2"]
+    assert all(entry["reason"] for entry in document["declined"])
 
 
 class _CapturedText(io.StringIO):

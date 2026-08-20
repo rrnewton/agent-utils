@@ -5,9 +5,9 @@ Default shape, matching how an agent actually uses it::
     herdr-run <agent> '<command>'          # run; stdout/stderr/exit code are the command's own
     herdr-run '<command>'                  # agent inferred from $DG_AGENT_NAME
 
-Subcommands (``check``, ``doctor``, ``config``, ``target``) are opt-in and never shadow an agent
-name, because the agent argument is only interpreted as a subcommand when it is the FIRST token and
-no command string follows.
+Subcommands (``check``, ``doctor``, ``config``, ``target``, ``reap``) are opt-in and never shadow an
+agent name, because the agent argument is only interpreted as a subcommand when it is the FIRST
+token and no command string follows.
 """
 
 from __future__ import annotations
@@ -37,10 +37,11 @@ from herdr_run.errors import (
 from herdr_run.readiness import assess, infer_prompt_tail
 from herdr_run.runner import RunResult, execute, read_output_bytes, write_meta
 from herdr_run.session import resolve_target, tab_label_for
+from herdr_run.sweep import sweep
 
 __all__ = ["main", "build_parser"]
 
-_SUBCOMMANDS = ("check", "doctor", "config", "target", "userguide")
+_SUBCOMMANDS = ("check", "doctor", "config", "target", "reap", "userguide")
 
 
 def _nonnegative_finite(value: str) -> float:
@@ -191,6 +192,7 @@ def _cmd_config(config: Config, agent: str) -> int:
         "spool_dir": config.spool_dir,
         "timeout_seconds": config.timeout_seconds,
         "retention_days": config.retention_days,
+        "max_panes": config.max_panes,
         "ready_timeout_seconds": config.ready_timeout_seconds,
         "readiness": config.readiness,
         "prompt_tail": config.prompt_tail,
@@ -237,6 +239,46 @@ def _cmd_target(
     json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0 if readiness.ready else EXIT_BUSY
+
+
+def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
+    """Report which command tabs are PROVABLY finished with. Closes nothing.
+
+    Report-only is the point, not a limitation. The expensive mistake is closing a tab whose agent
+    is merely thinking, and a reaper that is wrong once in that direction is switched off for good;
+    so the first version of this has to be checkable against a known-good population before anyone
+    lets it act. Every declined pane carries its reason, and every verdict is counted including the
+    zeros, because "reaped 0 because nothing was stale" and "reaped 0 because the detector is inert"
+    are otherwise the same output.
+    """
+    client = _client(config, environ)
+    plan = sweep(client, config)
+    document = {
+        "workspace": config.workspace,
+        "counts": plan.counts(),
+        "reapable": [
+            {
+                "pane_id": decision.pane_id,
+                "tab_id": decision.tab_id,
+                "tab_label": decision.tab_label,
+                "reason": decision.reason,
+            }
+            for decision in plan.reapable
+        ],
+        "declined": [
+            {
+                "pane_id": decision.pane_id,
+                "tab_id": decision.tab_id,
+                "tab_label": decision.tab_label,
+                "verdict": decision.verdict,
+                "reason": decision.reason,
+            }
+            for decision in plan.declined
+        ],
+    }
+    json.dump(document, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
+    sys.stdout.write("\n")
+    return 0
 
 
 def _cmd_doctor(config: Config, agent: str, environ: dict[str, str]) -> int:
@@ -643,6 +685,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_config(config, agent)
         if subcommand == "target":
             return _cmd_target(config, agent, environ, use_cache=not args.no_cache)
+        if subcommand == "reap":
+            return _cmd_reap(config, environ)
         if subcommand == "doctor":
             return _cmd_doctor(config, agent, environ)
         if subcommand == "check":

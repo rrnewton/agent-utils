@@ -45,6 +45,7 @@ herdr-run '<command>'              # agent taken from $DG_AGENT_NAME / $HERDR_RU
 herdr-run check '<command>'        # policy only: allowed or refused. Touches no pane.
 herdr-run target                   # resolve/bring up the pane; print ids and readiness
 herdr-run config                   # print the effective configuration
+herdr-run reap                     # report which command tabs are provably finished. Closes nothing.
 herdr-run doctor                   # bracket the premise in both directions (see below)
 herdr-run userguide                # this document
 ```
@@ -132,6 +133,7 @@ spool_dir: .herdr-run
 
 timeout_seconds: 900          # wait for the command's exit code
 retention_days: 4             # completed run spools older than this are pruned on a later write
+max_panes: 64                 # refuse to open a NEW tab once the workspace holds this many panes
 ready_timeout_seconds: 0      # wait for the pane to go idle (0 = refuse immediately)
 
 readiness: both               # 'both' = process signal AND prompt veto; 'process' = drop the veto
@@ -141,8 +143,9 @@ broker: direct                # 'direct' | 'systemd-run' (see Brokering)
 ```
 
 Unknown or duplicate keys, merge keys, non-finite/excessive timeouts, fractional/negative retention
-days, retention beyond 365,000 days, control characters, and unsupported tab placeholders are hard
-errors. A typo'd policy key must not silently fall back to defaults.
+days, retention beyond 365,000 days, a fractional/negative/oversized `max_panes`, control
+characters, and unsupported tab placeholders are hard errors. A typo'd policy key must not silently
+fall back to defaults.
 
 ---
 
@@ -251,6 +254,44 @@ that prune pass; entry symlinks are skipped; only directories whose lexical and 
 the exact runs root are considered; and the root itself is never removed. The **audit log is never
 pruned**: it is a separate best-effort evidence trail, and a record that deletes itself would be
 misleading.
+
+### The pane cap and `reap`
+
+Every agent that ever runs a command leaves a tab behind, and **nothing closes it**. Agents are
+coined and destroyed continuously, so the command workspace grows for as long as agents are coined
+— until the Herdr server itself becomes the bottleneck. That end state is measured, not feared: on
+a 316-core host a session with 260 panes drove the server to over 1000% CPU, with roughly 98% of
+cycles in the allocator's futex spinlock and every control call timing out.
+
+`max_panes` (64 by default) turns that slow collapse into one legible refusal. When the workspace
+already holds that many panes and this agent has **no tab yet**, bring-up fails with exit 69 and a
+message naming the remedy. The check is deliberately only on the create path: an agent whose tab
+already exists is never locked out of it, because a cap that can break work in progress is a cap
+that gets switched off. Set `max_panes: 0` to disable it.
+
+`herdr-run reap` says which tabs can go. It considers only panes **this tool has run a command in**
+(read from the run spool, not from `herdr pane list`, so a human's tab in the same workspace is not
+a candidate), and it re-derives scope from the current configuration: the recorded workspace label
+must equal `workspace`, and the recorded tab label must equal what `tab_name` renders today for the
+recorded agent. Retarget either and the old tabs immediately fall out of scope.
+
+A tab is reported STALE only when all three hold, each of them positive evidence:
+
+1. **No in-flight work** — every run naming the pane recorded an `exit_code`. A run without one is
+   the agent-is-thinking case, and it wins over every other signal.
+2. **The pane's shell is gone** — herdr still lists the pane, but `/proc` says the shell pid it
+   reports does not exist. Note this is the PANE shell, not the trailing PID in the run directory
+   name: that one is the short-lived `herdr-run` CLI and is dead for every completed run, so a
+   policy anchored on it would classify every healthy idle agent as stale.
+3. **Reuse and reboot are excluded** — identity is the triple `(pid, boot_id, start_ticks)` from
+   field 22 of `/proc/<pid>/stat`, recorded in `meta.json` at run time and compared against the live
+   process. A recycled pid, a new pane incarnation, or a record from a previous boot is UNKNOWN.
+
+Everything else — unreadable `/proc`, a pane herdr no longer lists, a control call that fails — is
+UNKNOWN, and UNKNOWN is never reaped. **`reap` closes nothing**; it prints the plan, with a reason
+for every pane it declined and a count for every verdict including the zeros, because "reaped 0
+because nothing was stale" and "reaped 0 because the detector is inert" are otherwise the same
+output.
 
 ### Audit log
 
