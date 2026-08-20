@@ -951,11 +951,20 @@ fn scope_grace_s(run_timeout_s: i64) -> i64 {
     60.max(run_timeout_s / 10)
 }
 
-/// The `--max-mem` spec as an outer-scope ceiling in bytes, or `None` when absent/unparseable.
+/// The `--max-mem` spec as an outer-scope ceiling in bytes, or `None` when it is absent,
+/// unparseable, or NON-POSITIVE.
 ///
-/// An unparseable spec is NOT an error here: `select_max_steps` already reports it by name and
-/// falls back to `--max-steps`, and duplicating the refusal at scope bring-up would turn one
-/// typo into two different exit paths depending on which ran first.
+/// A bad spec is NOT an error here, and non-positive is treated exactly like unparseable:
+/// `select_max_steps` already reports both by name and the run exits 2 before any step starts
+/// (`--max-mem 0`: "REFUSED — minimum runnable footprint … cannot fit safely within budget 0
+/// bytes"). Refusing again at scope bring-up would turn one typo into two different exit codes
+/// depending on whether boxing was attempted — a run with `--allow-cgroup-failure` would exit 2
+/// and the same command without it would exit 3.
+///
+/// SO THE SPEC IS DROPPED HERE AND REFUSED THERE; it is not accepted and it is not ignored.
+/// `outer_memory_max_bytes_capped`'s own refusal of a non-positive request is a contract for
+/// library callers, which this function is not one of; the end-to-end behaviour is pinned in
+/// tests/max_mem_outer_scope_smoke.rs.
 fn requested_max_mem_bytes(max_mem: Option<&str>) -> Option<i64> {
     max_mem
         .filter(|s| !s.is_empty())
@@ -1525,12 +1534,18 @@ fn stress_suffix(index: i64, count: i64) -> String {
 }
 
 /// Duplicate a selected graph into disconnected copies with no edges between copies.
+///
+/// The top-level policy travels with the expanded step list by construction, via
+/// [`DagConfig::with_steps`] — this is one of the two places in the product that rebuilds a
+/// `DagConfig` around new steps, and writing it as a literal is how the dropped-field bug in
+/// #21 scarce-resource-deadlock gets written every time. `resource_caps` is then cleared
+/// DELIBERATELY and visibly: a stress expansion removes named-resource scheduling so `-j`
+/// governs concurrency.
 fn expand_stress(cfg: &DagConfig, n: i64) -> DagConfig {
     if n <= 1 {
         return cfg.clone();
     }
-    let mut out = cfg.clone();
-    out.steps.clear();
+    let mut steps: Vec<Step> = Vec::new();
     for index in 1..=n {
         let suffix = stress_suffix(index, n);
         for original in &cfg.steps {
@@ -1542,9 +1557,10 @@ fn expand_stress(cfg: &DagConfig, n: i64) -> DagConfig {
                 .map(|dependency| format!("{dependency}{suffix}"))
                 .collect();
             step.hint.resources.clear();
-            out.steps.push(step);
+            steps.push(step);
         }
     }
+    let mut out = cfg.with_steps(steps);
     out.resource_caps.clear();
     out
 }
@@ -3201,6 +3217,37 @@ mod tests {
         assert_eq!(applied.steps[0].cmd, "echo --case xyz");
         let selected = filter_only(&cfg, &["test.unit".to_string()]).unwrap();
         assert!(apply_passthrough_args(&selected, Some("x")).is_err());
+    }
+
+    /// A stress expansion is one of the two places the PRODUCT rebuilds a `DagConfig` around a
+    /// new step list, and it is on the default `run` path (`--stress N`). The carry assertion is
+    /// worth nothing if the only configs it ever compares are built inside a test, so apply it
+    /// here: a lane's timeouts, caps and memory policy must survive the expansion, and only the
+    /// two fields the expansion is FOR may move.
+    #[test]
+    fn the_stress_expansion_carries_the_whole_lane_policy_forward() {
+        let mut cfg = tiny();
+        cfg.description = "a real lane".to_string();
+        cfg.resource_caps.insert("exclusive".to_string(), 1);
+        cfg.mem_cap_factor = 1.5;
+        cfg.mem_cap_floor_bytes = 4 * 1024i64.pow(3);
+        cfg.outer_mem_safety_factor = 1.2;
+        cfg.default_step_timeout = 600;
+        cfg.default_jobs_flag = "--jobs {n}".to_string();
+        cfg.default_step_cpu_count = Some(4);
+        cfg.default_step_cpu_timeout = 120;
+        cfg.cpu_timeout_multiplier = 2.0;
+        cfg.cpu_timeout_platform = "github-hosted".to_string();
+
+        let expanded = expand_stress(&cfg, 3);
+        let named: Vec<String> = crate::model::dag_config_carry_diff(&cfg, &expanded)
+            .iter()
+            .map(|line| line.split(':').next().unwrap_or("").to_string())
+            .collect();
+        assert_eq!(named, vec!["steps", "resource_caps"], "{expanded:?}");
+        assert_eq!(expanded.steps.len(), 6);
+        assert_eq!(expanded.default_step_timeout, 600);
+        assert_eq!(expanded.cpu_timeout_multiplier, 2.0);
     }
 
     #[test]

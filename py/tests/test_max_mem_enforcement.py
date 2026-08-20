@@ -32,14 +32,58 @@ def test_a_max_mem_spec_becomes_a_positive_byte_ceiling() -> None:
     assert cli._requested_max_mem_bytes("1024") == 1024
 
 
-def test_an_absent_or_unparseable_max_mem_is_not_an_outer_ceiling() -> None:
-    # An unparseable spec is reported by _select_max_steps and falls back to --max-steps; making
-    # scope bring-up refuse it too would give one typo two different exit paths depending on
-    # which check ran first.
+def test_an_absent_unparseable_or_nonpositive_max_mem_is_not_an_outer_ceiling() -> None:
+    # A bad spec is reported by _select_max_steps and the run exits 2 there; making scope
+    # bring-up refuse it too would give one typo two different exit codes depending on whether
+    # boxing was attempted.  "0" is in this list, not in the refusing one: see the end-to-end
+    # test below for what a caller actually gets.
     assert cli._requested_max_mem_bytes(None) is None
     assert cli._requested_max_mem_bytes("") is None
     assert cli._requested_max_mem_bytes("twenty gigs") is None
     assert cli._requested_max_mem_bytes("0") is None
+
+
+def test_a_nonpositive_max_mem_is_refused_by_name_and_no_step_runs(
+    tmp_path: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """WHAT ``--max-mem 0`` ACTUALLY DOES, end to end.
+
+    The ceiling helper refuses a non-positive request, but the CLI never hands it one: the flag
+    is dropped at scope bring-up and refused by ``_select_max_steps`` instead, so that one bad
+    spec has ONE exit path.  That is worth an executable check rather than a comment, because
+    the comment that used to describe this said the opposite ("a non-positive request is
+    REFUSED, not dropped" — at the CLI it is dropped, and then the run is refused for a
+    different reason).
+
+    The two properties that actually matter to a caller are asserted: the run is REFUSED by
+    name, and it refuses BEFORE running anything — a budget of 0 must never be quietly upgraded
+    to 90% of the host and then executed.
+    """
+    import pathlib
+
+    directory = pathlib.Path(str(tmp_path))
+    marker = directory / "ran"
+    dag = directory / "ok.json"
+    dag.write_text(
+        '{"steps": [{"group": "g", "job": "ok", "cmd": "touch %s"}]}' % marker
+    )
+
+    code = cli.main(
+        [
+            "run",
+            "--dag",
+            str(dag),
+            "-q",
+            "--no-profile",
+            "--allow-cgroup-failure",
+            "--max-mem",
+            "0",
+        ]
+    )
+    err = capsys.readouterr().err
+    assert code == 2, err
+    assert "--max-mem 0: REFUSED" in err, err
+    assert not marker.exists(), "the run must refuse before any step executes"
 
 
 def _capture_reexec(

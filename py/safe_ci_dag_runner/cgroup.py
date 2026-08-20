@@ -148,8 +148,17 @@ def outer_memory_max_bytes(requested_bytes: int | None = None) -> int | None:
     is a modelling input but not a containment limit is a share of a host nobody is holding.
 
     A non-positive request is REFUSED (``None``) exactly like a non-positive environment value:
-    the caller asked for a ceiling this function cannot express, and silently ignoring it would
-    hand back an unbounded run under the name of a bounded one.
+    the caller asked for a ceiling this function cannot express, and returning the derived
+    boundary instead would hand back a WIDER scope than was asked for.
+
+    THAT IS A LIBRARY CONTRACT, NOT THE CLI'S BEHAVIOUR, and the difference is worth stating
+    plainly because the first version of this docstring did not.  ``--max-mem 0`` never reaches
+    here: :func:`cli._requested_max_mem_bytes` drops a non-positive spec, and the run is then
+    refused by name by :func:`cli._select_max_steps` ("``--max-mem 0``: REFUSED — minimum
+    runnable footprint … cannot fit safely within budget 0 bytes", exit 2, before any step
+    starts).  One bad spec, one refusal: refusing here as well would give the same typo two
+    different exit codes depending on whether boxing was attempted.  The ``requested <= 0`` arm
+    exists for callers of this function that are not the CLI.
     """
     available = mem_available_bytes()
     if available is None:

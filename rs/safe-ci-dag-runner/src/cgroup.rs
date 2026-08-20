@@ -333,8 +333,17 @@ pub fn outer_memory_max_bytes() -> Option<i64> {
 /// a modelling input but not a containment limit is a share of a host nobody is holding.
 ///
 /// A non-positive request is REFUSED (`None`) exactly like a non-positive environment value: the
-/// caller asked for a ceiling this function cannot express, and silently ignoring it would hand
-/// back an unbounded run under the name of a bounded one.
+/// caller asked for a ceiling this function cannot express, and returning the derived boundary
+/// instead would hand back a WIDER scope than was asked for.
+///
+/// THAT IS A LIBRARY CONTRACT, NOT THE CLI'S BEHAVIOUR, and the difference is worth stating
+/// plainly because the first version of this comment did not. `--max-mem 0` never reaches here:
+/// `cli::requested_max_mem_bytes` drops a non-positive spec, and the run is then refused
+/// by name by `select_max_steps` ("`--max-mem 0`: REFUSED — minimum runnable footprint … cannot
+/// fit safely within budget 0 bytes", exit 2, before any step starts). One bad spec, one refusal:
+/// refusing here as well would give the same typo two different exit codes depending on whether
+/// boxing was attempted. The `requested <= 0` arm exists for callers of this function that are
+/// not the CLI.
 pub fn outer_memory_max_bytes_capped(requested: Option<i64>) -> Option<i64> {
     outer_memory_max_from(
         mem_available_bytes()?,
@@ -2669,10 +2678,16 @@ mod tests {
     }
 
     #[test]
-    fn a_nonpositive_max_mem_request_is_refused_not_ignored() {
+    fn a_nonpositive_ceiling_request_is_refused_rather_than_widened() {
         // Same treatment as a non-positive environment value: the caller asked for a ceiling
-        // this cannot express, and dropping it silently would hand back an unbounded run under
-        // the name of a bounded one.
+        // this cannot express, and returning the derived boundary instead would hand back a
+        // WIDER scope than was asked for.
+        //
+        // This is the LIBRARY contract for a caller of outer_memory_max_bytes_capped, not a
+        // statement about `--max-mem 0`: the CLI drops a non-positive spec before this point and
+        // refuses the run by name in select_max_steps instead. The end-to-end behaviour of
+        // `--max-mem 0` is pinned in tests/max_mem_outer_scope_smoke.rs, because a rule stated
+        // only in a comment is how the previous version of this one came to be wrong.
         assert_eq!(outer_memory_max_from(1_000_000, None, Some(0)), None);
         assert_eq!(outer_memory_max_from(1_000_000, None, Some(-1)), None);
         assert_eq!(outer_memory_max_from(1_000_000, Some("0"), None), None);

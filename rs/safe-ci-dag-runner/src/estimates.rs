@@ -1688,6 +1688,12 @@ pub fn build_plan(
 /// Allocating plans install each chosen inner-job width only for runner-controlled jobs flags;
 /// self-managed commands retain their declared fixed width so run-budget validation cannot be
 /// bypassed by applying a plan.
+///
+/// THE TOP-LEVEL POLICY IS CARRIED BY CONSTRUCTION, via [`DagConfig::with_steps`]. This is one of
+/// the two places in the product that rebuilds a `DagConfig` around a new step list, and it is
+/// exactly the shape of the dropped-field bug in #21 scarce-resource-deadlock: a field-by-field
+/// reconstruction here once discarded `default_step_cpu_count` immediately before the run-budget
+/// clamp read it.
 pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
     if plan
         .allocation
@@ -1697,8 +1703,7 @@ pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
         return cfg.clone();
     }
     let by_tag = plan.by_tag();
-    let mut new_cfg = cfg.clone();
-    new_cfg.steps = cfg
+    let planned_steps: Vec<Step> = cfg
         .steps
         .iter()
         .map(|step| {
@@ -1735,7 +1740,7 @@ pub fn apply_plan_to_config(cfg: &DagConfig, plan: &Plan) -> DagConfig {
             s
         })
         .collect();
-    new_cfg
+    cfg.with_steps(planned_steps)
 }
 
 // --------------------------------------------------------------------------- rendering
@@ -2195,6 +2200,55 @@ mod tests {
         assert_eq!(out.jobs_flag.as_deref(), Some("-J"));
         assert_eq!(out.cmd, "while :; do :; done");
         assert_eq!(out.env.get("K").map(String::as_str), Some("V"));
+    }
+
+    #[test]
+    fn applying_a_plan_carries_the_whole_lane_policy_forward() {
+        // Applying a plan is one of the two places the PRODUCT rebuilds a `DagConfig` around a
+        // new step list, and it happens on EVERY run. The test above guards the per-STEP fields;
+        // this guards the TOP-LEVEL policy with the same carry assertion the Python edition
+        // applies, because a field-by-field rebuild here once discarded `default_step_cpu_count`
+        // immediately before the run-budget clamp read it (#21 scarce-resource-deadlock).
+        let mut caps = BTreeMap::new();
+        caps.insert("hermit_guest".to_string(), 1);
+        let cfg = DagConfig {
+            steps: vec![mk("g", "burn", &[], 3.0)],
+            description: "a real lane".to_string(),
+            resource_caps: caps,
+            mem_cap_factor: 1.5,
+            mem_cap_floor_bytes: 4 * 1024i64.pow(3),
+            outer_mem_safety_factor: 1.2,
+            default_step_timeout: 600,
+            default_jobs_flag: "--jobs {n}".to_string(),
+            default_step_mem_cap_bytes: None,
+            default_step_cpu_count: Some(4),
+            default_step_cpu_timeout: 120,
+            cpu_timeout_multiplier: 2.0,
+            cpu_timeout_platform: "github-hosted".to_string(),
+            write_domain_policy: Default::default(),
+        };
+        let empty: HashMap<String, StepSamples> = HashMap::new();
+        let no_speedups: HashMap<String, StepSpeedup> = HashMap::new();
+        let plan = build_plan(
+            &cfg,
+            &empty,
+            Planner::GreedyLpt,
+            DEFAULT_MIN_SAMPLES,
+            &no_speedups,
+            None,
+            None,
+        );
+        let applied = apply_plan_to_config(&cfg, &plan);
+        // Only the steps may differ (the plan writes their hints); every top-level field carries.
+        assert_eq!(
+            crate::model::dag_config_carry_diff(&cfg, &applied),
+            Vec::<String>::new()
+        );
+        // ...and the plan really was applied, so handing the argument straight back cannot pass.
+        assert_eq!(applied.steps[0].hint.est_duration_s, 3.0);
+        // The field that a rebuild here actually dropped once, spelled out.
+        assert_eq!(applied.default_step_cpu_count, Some(4));
+        assert_eq!(applied.default_step_timeout, 600);
     }
 
     #[test]

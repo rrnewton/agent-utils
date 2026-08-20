@@ -450,8 +450,11 @@ class DagConfig:
         reverted fields appear in no diff, no warning and no failure.  Take a lane's steps and
         call this on the config they came from, and the caps, timeouts and memory policy travel
         with them by construction.
+
+        ``resource_caps`` is copied rather than aliased: the result is a configuration of its
+        own, not one that changes when the original's cap table is mutated afterwards.
         """
-        return replace(self, steps=tuple(steps))
+        return replace(self, steps=tuple(steps), resource_caps=dict(self.resource_caps))
 
 
 #: Every top-level :class:`DagConfig` field, in declaration order — the checklist

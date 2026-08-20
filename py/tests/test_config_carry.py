@@ -98,6 +98,49 @@ def test_with_steps_carries_every_field_the_default_rebuild_drops() -> None:
     assert dag_config_carry_diff(cfg, cfg.with_steps(())) == ["steps: g.j -> "]
 
 
+# ------------------------------------- the product's own rebuild sites (#21)
+#
+# The carry assertion is worth nothing if the only configs it ever compares are built in a test.
+# These two functions are the ENTIRE set of places the product rebuilds a DagConfig around a new
+# step list, they both go through `with_steps`, and both are on the default `run` path: a plan is
+# applied on every run, and `--stress N` expands the graph. Assert the policy survives them.
+
+
+def test_applying_a_plan_carries_the_whole_lane_policy_forward() -> None:
+    from safe_ci_dag_runner.estimates import apply_plan_to_config, build_plan
+
+    base = configured()
+    cfg = dataclasses.replace(
+        base,
+        steps=(dataclasses.replace(base.steps[0], hint=ResourceHint(est_duration_s=3.0)),),
+    )
+    applied = apply_plan_to_config(cfg, build_plan(cfg, {}))
+    # Only the steps may differ (the plan writes their hints); every top-level field is carried.
+    assert dag_config_carry_diff(cfg, applied) == []
+    # ...and the plan really was applied: this is a rebuilt config carrying the plan's estimate,
+    # not the argument handed back.
+    assert applied is not cfg
+    assert applied.steps[0].hint.est_duration_s == 3.0
+    # The field that a field-by-field rebuild here actually dropped once, spelled out: the
+    # run-budget clamp reads it immediately afterwards.
+    assert applied.default_step_cpu_count == 4
+    assert applied.default_step_timeout == 600
+
+
+def test_the_stress_expansion_carries_the_whole_lane_policy_forward() -> None:
+    from safe_ci_dag_runner.cli import _expand_stress
+
+    cfg = configured()
+    expanded = _expand_stress(cfg, 3)
+    diff = dag_config_carry_diff(cfg, expanded)
+    named = [line.split(":")[0] for line in diff]
+    # `steps` and `resource_caps` are what a stress expansion is FOR; nothing else may move.
+    assert named == ["steps", "resource_caps"], diff
+    assert len(expanded.steps) == 3
+    assert expanded.default_step_timeout == 600
+    assert expanded.cpu_timeout_multiplier == 2.0
+
+
 def test_an_absent_default_cap_is_reported_as_absent_not_as_zero() -> None:
     # ABSENT IS NOT ZERO: "disable the cap" and "cap at 0" are opposite instructions, so the
     # report must not collapse them into the same line.
@@ -129,13 +172,41 @@ def test_the_field_checklist_is_exactly_the_dataclass() -> None:
 # --------------------------------------------- uncarried top-level config keys (#21)
 
 
-@pytest.mark.parametrize("key", UNCARRIED_CONFIG_KEYS)
+#: The six keys the loader must refuse, WRITTEN OUT rather than read from the production
+#: constant.
+#:
+#: Parametrising over :data:`UNCARRIED_CONFIG_KEYS` was a tautology: deleting two names from the
+#: production tuple deleted the two cases that would have caught it, and the suite stayed green
+#: (1821 -> 1819 passed, 0 failed) while two previously-refused keys went back to silently
+#: defaulting.  A literal list is the only kind that can fail.  It is the same list the Rust
+#: edition's ``io.rs`` tests write out, and the cross differential drives both binaries with each
+#: of these keys — so the "byte for byte in both editions" claim in the two doc comments is now
+#: something a check can break.
+REFUSED_KEYS = (
+    "default_step_mem_cap_bytes",
+    "default_step_cpu_count",
+    "default_step_cpu_timeout",
+    "cpu_timeout_multiplier",
+    "cpu_timeout_platform",
+    "known_failures",
+)
+
+
+@pytest.mark.parametrize("key", REFUSED_KEYS)
 def test_a_top_level_key_the_format_cannot_carry_is_refused_by_name(key: str) -> None:
     with pytest.raises(DagJsonError) as excinfo:
         dag_from_json('{"%s": 5, "steps": []}' % key)
     message = str(excinfo.value)
     assert key in message
     assert "SILENTLY replaced by a default" in message
+
+
+def test_the_refused_key_set_is_exactly_the_six_names_the_contract_lists() -> None:
+    # The other direction, so the literal list cannot silently GROW either: a key added to the
+    # production tuple without being added to the shared contract (and to the Rust edition, and
+    # to the cross differential) is a document that loads on one build and is rejected on the
+    # other.
+    assert UNCARRIED_CONFIG_KEYS == REFUSED_KEYS
 
 
 def test_the_refusal_counts_and_names_every_offending_key_at_once() -> None:

@@ -1045,6 +1045,70 @@ def compare_only_errors(py: list[str], rs: list[str], rep: Report) -> None:
             rep.ok(label)
 
 
+#: Top-level DAG-document keys that name a real ``DagConfig`` field the format cannot carry, and
+#: that BOTH editions must therefore refuse by name rather than silently default.
+#:
+#: Written out here, in the one mechanism that can see both builds at once.  Each edition's own
+#: suite pins its own copy, but "both editions refuse the same keys byte for byte" — which both
+#: loaders' doc comments claim — is a statement about the PAIR, and nothing was checking it: a
+#: key dropped from one edition alone left every test in both suites green and made a document
+#: that loads on one build and is rejected on the other.
+UNCARRIED_CONFIG_KEYS = (
+    "default_step_mem_cap_bytes",
+    "default_step_cpu_count",
+    "default_step_cpu_timeout",
+    "cpu_timeout_multiplier",
+    "cpu_timeout_platform",
+    "known_failures",
+)
+
+
+def compare_uncarried_config_keys(py: list[str], rs: list[str], rep: Report) -> None:
+    """Both builds must refuse the same uncarried top-level keys, with the same message.
+
+    ``known_failures`` is in the set although only the Python edition has such a field: the key
+    set is a portability contract, and a document is not more portable for being accepted by one
+    build and rejected by the other.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        for key in UNCARRIED_CONFIG_KEYS:
+            path = os.path.join(tmp, f"{key}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write('{"%s": 5, "steps": []}' % key)
+            po = run(py, ("plan", "--dag", path))
+            ro = run(rs, ("plan", "--dag", path))
+            label = f"uncarried-key:{key}"
+            if po.returncode != ro.returncode:
+                rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+            elif po.returncode != 2:
+                rep.bad(
+                    label,
+                    f"a key naming an uncarried DagConfig field must be REFUSED (exit 2), not "
+                    f"silently defaulted; both builds exited {po.returncode}",
+                )
+            elif po.stderr != ro.stderr:
+                rep.bad(label, f"stderr py={po.stderr!r} rs={ro.stderr!r}")
+            elif key not in po.stderr or "SILENTLY replaced by a default" not in po.stderr:
+                rep.bad(label, f"the refusal must name the key: {po.stderr!r}")
+            else:
+                rep.ok(label)
+        # The other side of the contract, so "refuse everything" cannot pass the cases above: a
+        # key naming nothing at all cannot masquerade as a setting that took effect, so both
+        # builds still accept it.
+        path = os.path.join(tmp, "unknown.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"future_thing": 5, "steps": []}')
+        po = run(py, ("plan", "--dag", path))
+        ro = run(rs, ("plan", "--dag", path))
+        label = "uncarried-key:unimplemented-key-still-tolerated"
+        if po.returncode != ro.returncode:
+            rep.bad(label, f"exit py={po.returncode} rs={ro.returncode}")
+        elif po.returncode != 0:
+            rep.bad(label, f"an unimplemented key must stay tolerated; got {po.returncode}")
+        else:
+            rep.ok(label)
+
+
 #: How long the planted escapee lives. It MUST exceed `run`'s own expiry, or the case cannot
 #: distinguish a build that finishes from one that blocks: a self-limiting escapee releases the
 #: pipes on its own, the blocked build returns just before the harness gives up, and the two builds
@@ -4392,6 +4456,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_yaml_isomorphism(py, rs, rep)
     compare_scalar_parity(py, rs, rep)
     compare_only_errors(py, rs, rep)
+    compare_uncarried_config_keys(py, rs, rep)
     compare_escapee_teardown(py, rs, rep)
     compare_term_attribution(py, rs, rep)
     compare_test_attribution_evidence(py, rs, rep)

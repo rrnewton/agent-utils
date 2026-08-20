@@ -117,12 +117,18 @@ def test_max_mem_becomes_the_outer_scope_ceiling_and_can_only_tighten(
     assert cgroup.outer_memory_max_bytes(700_000) == 500_000
 
 
-def test_a_nonpositive_max_mem_request_is_refused_not_ignored(
+def test_a_nonpositive_ceiling_request_is_refused_rather_than_widened(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Same treatment as a non-positive environment value: the caller asked for a ceiling this
-    # cannot express, and silently dropping it would hand back an unbounded run under the name
-    # of a bounded one.
+    # cannot express, and returning the derived boundary instead would hand back a WIDER scope
+    # than was asked for.
+    #
+    # This is the LIBRARY contract for a caller of outer_memory_max_bytes, not a statement about
+    # `--max-mem 0`: the CLI drops a non-positive spec before this point and refuses the run by
+    # name in _select_max_steps instead.  The end-to-end behaviour of `--max-mem 0` is pinned in
+    # test_max_mem_enforcement.py, because a rule stated only in a comment is how the previous
+    # version of this one came to be wrong.
     monkeypatch.setattr(cgroup, "mem_available_bytes", lambda: 1_000_000)
     monkeypatch.delenv(cgroup.OUTER_MEMORY_MAX_ENV, raising=False)
     assert cgroup.outer_memory_max_bytes(0) is None

@@ -1159,7 +1159,13 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
     Each copy has a distinct ``#NN`` suffix and its internal dependency edges point only to steps
     in that same copy. There are no edges between copies. Named-resource scheduling is removed
     from the generated graph so ``-j`` governs how many copied steps the scheduler starts at once;
-    stress runs deliberately permit over-subscription. ``n <= 1`` is a no-op."""
+    stress runs deliberately permit over-subscription. ``n <= 1`` is a no-op.
+
+    The top-level policy travels with the expanded step list by construction, via
+    :meth:`DagConfig.with_steps` — this is one of the two places in the product that rebuilds a
+    ``DagConfig`` around new steps, and writing that as a literal is how the dropped-field bug in
+    #21 scarce-resource-deadlock gets written every time. ``resource_caps`` is then cleared
+    DELIBERATELY and visibly."""
     if n <= 1:
         return cfg
     new_steps: list[Step] = []
@@ -1174,7 +1180,7 @@ def _expand_stress(cfg: DagConfig, n: int) -> DagConfig:
                     hint=dataclasses.replace(step.hint, resources={}),
                 )
             )
-    return dataclasses.replace(cfg, steps=tuple(new_steps), resource_caps={})
+    return dataclasses.replace(cfg.with_steps(new_steps), resource_caps={})
 
 
 def _stress_expansion_guard(cfg: DagConfig, n: int) -> int:
@@ -1760,11 +1766,20 @@ def _scope_grace_s(run_timeout_s: int) -> int:
 
 
 def _requested_max_mem_bytes(max_mem: str | None) -> int | None:
-    """The ``--max-mem`` spec as an outer-scope ceiling in bytes, or ``None`` when absent.
+    """The ``--max-mem`` spec as an outer-scope ceiling in bytes, or ``None`` when it is absent,
+    unparseable, or NON-POSITIVE.
 
-    An unparseable spec is NOT an error here: :func:`_select_max_steps` already reports it by
-    name and falls back to ``--max-steps``, and duplicating the refusal at scope bring-up would
-    turn one typo into two different exit paths depending on which ran first.
+    A bad spec is NOT an error here, and non-positive is treated exactly like unparseable:
+    :func:`_select_max_steps` already reports both by name and the run exits 2 before any step
+    starts (``--max-mem 0``: "REFUSED — minimum runnable footprint … cannot fit safely within
+    budget 0 bytes").  Refusing again at scope bring-up would turn one typo into two different
+    exit codes depending on whether boxing was attempted — a run with ``--allow-cgroup-failure``
+    would exit 2 and the same command without it would exit 3.
+
+    SO THE SPEC IS DROPPED HERE AND REFUSED THERE; it is not accepted and it is not ignored.
+    :func:`cgroup.outer_memory_max_bytes`'s own refusal of a non-positive request is a contract
+    for library callers, which this function is not one of; the end-to-end behaviour is pinned in
+    ``tests/test_max_mem_enforcement.py``.
     """
     if not isinstance(max_mem, str) or not max_mem:
         return None

@@ -1626,10 +1626,12 @@ def apply_plan_to_config(cfg: DagConfig, plan: Plan) -> DagConfig:
         new_steps.append(
             replace(step, hint=new_hint, deps=list(step.deps), env=dict(step.env))
         )
-    # Clone the top-level policy too. A field-by-field reconstruction silently resets every newly
-    # added DagConfig field; in particular it used to discard default_step_cpu_count immediately
-    # before the run-budget clamp was applied.
-    return replace(cfg, steps=tuple(new_steps), resource_caps=dict(cfg.resource_caps))
+    # Carry the top-level policy BY CONSTRUCTION. A field-by-field reconstruction silently resets
+    # every newly added DagConfig field; in particular it used to discard default_step_cpu_count
+    # immediately before the run-budget clamp was applied. `with_steps` is the safe spelling
+    # (#21 scarce-resource-deadlock), and this is one of the two places in the product that
+    # rebuilds a DagConfig around a new step list.
+    return cfg.with_steps(new_steps)
 
 
 # --------------------------------------------------------------------------- rendering

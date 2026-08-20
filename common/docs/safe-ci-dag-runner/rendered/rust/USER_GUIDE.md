@@ -91,6 +91,26 @@ JSON and YAML express the same strict schema. File names ending in `.yaml` or
 input. Unknown fields, invalid types, duplicate step tags, missing dependencies,
 cycles, and impossible resource demands are rejected before execution.
 
+#### Six top-level keys the document format does not carry (breaking change)
+
+A DAG document is **refused at load** (exit 2) if it sets any of:
+
+    default_step_mem_cap_bytes   default_step_cpu_timeout   cpu_timeout_platform
+    default_step_cpu_count       cpu_timeout_multiplier     known_failures
+
+These name real runner-configuration fields, but the document format has never
+carried them: writing one had **no effect whatsoever**, and nothing said so — a
+cap you thought you had set was silently the default. That is the reader's side
+of the dropped-field bug, so the loader now names the key instead of ignoring
+it. Both language editions refuse exactly the same six.
+
+**This can break a document that loaded before.** Set these at the call site
+(they are caller/platform policy, not properties of the graph — several have
+`--cpu-timeout-multiplier`-style flags or environment variables), or delete
+them: deleting changes nothing, because they were never in effect. A key that
+names *nothing* at all is still tolerated, so forward-compatible additions keep
+loading.
+
 ### Fail closed on protected artifact writes
 
 An opt-in `write_domain_policy` turns per-step write declarations into a
@@ -206,8 +226,11 @@ CPU eligibility is required.
 outer scope's `MemoryMax`, obeying the same one-way rule as
 `SAFE_CI_OUTER_MEMORY_MAX_BYTES`: it can tighten the derived 90%-of-`MemAvailable`
 boundary, never widen it. The binding ceiling is named on stderr and the live value is read
-back before work starts, so `--max-mem 20G` twice on one host is two 20 GiB shares rather
-than two arithmetics. It is a whole-run ceiling, not an admission gate: two steps whose
+back before work starts, so `--max-mem 20G` bounds what the run can actually take from the
+host rather than only what its arithmetic assumed. A `MemoryMax` is a CEILING, not a
+reservation: two such runs on one 32 GiB host are each bounded at 20 GiB, and neither is
+holding 20 GiB — sizing a host for concurrent runs is still the caller's arithmetic. It is
+a whole-run ceiling, not an admission gate either: two steps whose
 caps each fit the budget can still be admitted together when their sum does not, and the
 scope's own `memory.max` is then what stops the run.
 
