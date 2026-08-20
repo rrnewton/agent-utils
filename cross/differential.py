@@ -1401,6 +1401,87 @@ def compare_test_attribution_evidence(py: list[str], rs: list[str], rep: Report)
                 rep.ok("attribution:evidence")
 
 
+def compare_step_log_ceiling(py: list[str], rs: list[str], rep: Report) -> None:
+    """The per-step durable-log ceiling truncates at the SAME byte in both engines.
+
+    Byte-for-byte, deliberately. Both the cut position and the truncation marker are public
+    evidence-file content, and the marker is a long literal duplicated in two languages: without
+    a paired check, one engine can be edited and the drift is invisible until someone diffs two
+    incidents' logs. Compared here where a divergence is a failing check, not a footnote.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        dag_path = os.path.join(tmp, "log-ceiling.json")
+        Path(dag_path).write_text(
+            json.dumps(
+                {
+                    "steps": [
+                        {
+                            "group": "flood",
+                            "job": "stdout",
+                            # Far past the 100-byte ceiling set below, and emitted in several
+                            # writes so the cut lands mid-stream rather than on a chunk boundary.
+                            "cmd": "for i in $(seq 1 40); do printf 'ABCDEFGHIJ'; done",
+                            "timeout": 30,
+                            "cpu_timeout": 600,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        dirs = {name: os.path.join(tmp, name) for name in ("py", "rs")}
+        args = (
+            "run", "--dag", dag_path, "-q", "-s", "1", "-j", "1",
+            NOPROF, NOFB, "--unsafe-no-cgroups",
+        )
+        outs = {
+            name: run(
+                cmd,
+                args,
+                {
+                    "SAFE_CI_DAG_RUNNER_LOG_DIR": dirs[name],
+                    "SAFE_CI_DAG_RUNNER_LOG_MAX_BYTES": "100",
+                },
+            )
+            for name, cmd in (("py", py), ("rs", rs))
+        }
+        label = "attribution:log-ceiling"
+        if outs["py"].returncode != outs["rs"].returncode:
+            rep.bad(label, f"exit py={outs['py'].returncode} rs={outs['rs'].returncode}")
+            return
+        try:
+            logs = {
+                name: Path(directory, "flood.stdout.log").read_bytes()
+                for name, directory in dirs.items()
+            }
+            journals = {
+                name: Path(directory, "journal.jsonl").read_text(encoding="utf-8")
+                for name, directory in dirs.items()
+            }
+        except OSError as exc:
+            rep.bad(label, str(exc))
+            return
+        # Drop `ts`: it is a wall-clock reading, so it legitimately differs between two runs.
+        truncations = {
+            name: [
+                {k: v for k, v in row.items() if k != "ts"}
+                for row in (json.loads(line) for line in text.splitlines())
+                if row.get("event") == "step_log_truncated"
+            ]
+            for name, text in journals.items()
+        }
+        if logs["py"] != logs["rs"]:
+            rep.bad(label, f"capped log py={logs['py']!r} rs={logs['rs']!r}")
+        elif logs["py"][:100] != b"ABCDEFGHIJ" * 10 or len(logs["py"]) <= 100:
+            rep.bad(label, f"ceiling did not bite: {logs['py']!r}")
+        elif truncations["py"] != truncations["rs"]:
+            rep.bad(label, f"journal py={truncations['py']!r} rs={truncations['rs']!r}")
+        elif len(truncations["py"]) != 1:
+            rep.bad(label, f"expected exactly one truncation record; got {truncations['py']!r}")
+        else:
+            rep.ok(label)
+
+
 def compare_batch_teardown_grace(py: list[str], rs: list[str], rep: Report) -> None:
     """Eager cancellation grants one diagnostic window, not one window per sibling.
 
@@ -4314,6 +4395,7 @@ def compare_safe_ci_dag_runner(rand_count: int, seed: int) -> int:
     compare_escapee_teardown(py, rs, rep)
     compare_term_attribution(py, rs, rep)
     compare_test_attribution_evidence(py, rs, rep)
+    compare_step_log_ceiling(py, rs, rep)
     compare_batch_teardown_grace(py, rs, rep)
     compare_run_timeout(py, rs, rep)
     compare_spawn_failure(py, rs, rep)
