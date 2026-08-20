@@ -964,10 +964,13 @@ const youSay = (page, text) =>
  * Derived from the page's OWN threshold rather than restated: a test that hard-coded 281 would go
  * green-but-vacuous the day the constant moved.
  */
-const COLLAPSE_OVER_CHARS = Number(
-  /COLLAPSE_OVER_CHARS = (\d+)/.exec(SCRIPT_CODE)?.[1] ??
-    assert.fail("web/voice.js no longer states a fold threshold")
-);
+const sourceConstant = (name) =>
+  Number(
+    new RegExp(`^const ${name} = (\\d+);$`, "m").exec(SCRIPT_CODE)?.[1] ??
+      assert.fail(`web/voice.js no longer states a ${name}`)
+  );
+
+const COLLAPSE_OVER_CHARS = sourceConstant("COLLAPSE_OVER_CHARS");
 const longMessage = (mark = "long") =>
   `${mark}: ` + "a sentence about the overnight run. ".repeat(
     Math.ceil((COLLAPSE_OVER_CHARS + 60) / 36)
@@ -979,12 +982,104 @@ const SHORT_MESSAGE = "it landed at 9c07d3e";
  * reason `COLLAPSE_OVER_CHARS` is: a hard-coded 24 goes green-but-vacuous the day the slack moves,
  * and the two constants were treated inconsistently until this was pointed out.
  */
-const BOTTOM_SLACK_PX = Number(
-  /BOTTOM_SLACK_PX = (\d+)/.exec(SCRIPT_CODE)?.[1] ??
-    assert.fail("web/voice.js no longer states a bottom slack")
-);
+const BOTTOM_SLACK_PX = sourceConstant("BOTTOM_SLACK_PX");
 const atBottomOf = (area) =>
   area.scrollHeight - area.scrollTop - area.clientHeight <= BOTTOM_SLACK_PX;
+
+/** How often the channel view re-reads itself, unasked. Derived, for the same reason. */
+const DISCORD_POLL_MS = sourceConstant("DISCORD_POLL_MS");
+
+// --- the numbers this page is tuned by ----------------------------------------------------------
+//
+// Deriving a constant from the source is what makes a behavioural test mean something the day the
+// constant moves — and it is also what makes the test SILENT about the constant itself. A check
+// written against the page's own grace window moves with the window: widen it to ten minutes and
+// both edges move with it and the test stays green. The same escape exists for every number below.
+// It was closed once, by hand, for one of them; a band for one number and nothing for the twelve
+// beside it is a coincidence rather than a fix.
+//
+// So it is closed by TABLE. Every module-level numeric constant in web/voice.js is named here with
+// the range it has to stay inside and the reader-visible thing that goes wrong at each edge, and
+// the last test in this section asserts that the table covers every one of them — so a new
+// constant cannot be added without someone saying what value of it would be wrong.
+//
+// The bands are deliberately WIDE. They are not a second opinion about the tuning; they are the
+// boundary between a judgement and a different behaviour wearing the same name.
+const TUNING_BANDS = {
+  STATUS_DISMISS_MS: [2000, 20000,
+    "below a couple of seconds the message goes before it can be read; above twenty it is a " +
+    "fixture covering a line of the conversation, the thing #63 status-line-placement took away"],
+  BANNER_DISMISS_MS: [2000, 30000,
+    "the connection banner sits over the top of the screen: too short to read, or long enough " +
+    "to be furniture"],
+  BOTTOM_SLACK_PX: [1, 120,
+    "slack absorbs rounding and a thumb stopped short; at a screenful it means the page follows " +
+    "the newest line for a reader who has scrolled away from it"],
+  COLLAPSE_OVER_CHARS: [120, 4000,
+    "below about a hundred characters ordinary sentences fold, and above a few thousand nothing " +
+    "ever does — either way the fold control stops meaning anything"],
+  CLEAR_ARMED_MS: [1000, 20000,
+    "the second tap that really clears: under a second the confirmation cannot be reached, over " +
+    "twenty and a stray later tap still destroys the view"],
+  MIN_READING_CH: [20, 60, "the narrowest column the reader may choose"],
+  MAX_READING_CH: [80, 240, "the widest; past a couple of hundred characters a line is unreadable"],
+  DEFAULT_READING_CH: [45, 120,
+    "what an unconfigured reader gets, and it has to be a width that is actually offered"],
+  SUSPENSION_GRACE_MS: [500, 5000,
+    "below about half a second it misses the close iOS delivers on the way back; above a few " +
+    "seconds it excuses genuine failures the reader watched happen"],
+  FAILURE_REPORT_MS: [50, 2000,
+    "it only bridges an onerror and the onclose a browser fires right behind it; a second or " +
+    "more of silence is the swallowed-failure bug returning"],
+  DISCORD_PAGE_LIMIT: [10, 100,
+    "one step of the walk. Discord's own ceiling is 100, and below about ten a step does not " +
+    "fill a screen, so the reader taps once per paragraph"],
+  OLDER_TRIGGER_PX: [8, 300,
+    "how close to the top counts as asking for more. At a viewport's worth EVERY scroll fires a " +
+    "step — including one at the bottom — so a single flick walks the whole channel; at zero the " +
+    "reader has to hit the top exactly"],
+  DISCORD_POLL_MS: [5000, 600000,
+    "the unasked re-read: often enough to be fresh, rare enough that a voice call is not sharing " +
+    "its network with it"],
+};
+test("every number this page is tuned by stays inside a band that says what would be wrong", () => {
+  for (const [name, [low, high, why]] of Object.entries(TUNING_BANDS)) {
+    const value = sourceConstant(name);
+    assert.ok(
+      value >= low && value <= high,
+      `${name} is ${value}, outside ${low}..${high}: ${why}`
+    );
+  }
+  // The two that are a RELATION rather than a range. A default outside the offered range is a
+  // width the reader cannot get back to once they have moved the handle.
+  assert.ok(
+    sourceConstant("MIN_READING_CH") < sourceConstant("MAX_READING_CH"),
+    "the narrowest column the reader may choose is not narrower than the widest"
+  );
+  assert.ok(
+    sourceConstant("DEFAULT_READING_CH") >= sourceConstant("MIN_READING_CH") &&
+      sourceConstant("DEFAULT_READING_CH") <= sourceConstant("MAX_READING_CH"),
+    "the default reading width is not one the reader is allowed to choose"
+  );
+});
+
+test("...and the table covers EVERY constant, so a new one cannot escape by being new", () => {
+  // This is the part that generalises. Pinning the constants that happened to be noticed leaves
+  // the next one unpinned, and the next one is exactly where the same defect comes back.
+  const declared = [...SCRIPT_CODE.matchAll(/^const ([A-Z][A-Z0-9_]*) = (\d+);$/gm)].map(
+    (m) => m[1]
+  );
+  assert.ok(declared.length >= 13, `only ${declared.length} constants found — the scan is broken`);
+  const unpinned = declared.filter((name) => !(name in TUNING_BANDS));
+  assert.deepStrictEqual(
+    unpinned,
+    [],
+    `web/voice.js tunes itself by ${unpinned.join(", ")} and nothing here says what value of ` +
+      "them would be wrong, so widening one of them is a change no test can see"
+  );
+  const gone = Object.keys(TUNING_BANDS).filter((name) => !declared.includes(name));
+  assert.deepStrictEqual(gone, [], `the table pins ${gone.join(", ")}, which no longer exist`);
+});
 
 /** The fold control on a rendered message, or undefined when it has none. */
 const foldButton = (li) => li.descendants().find((node) => node.className === "fold");
