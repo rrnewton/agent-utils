@@ -25,6 +25,7 @@
 
 const TOKEN_KEY = "gent-talk.token"; // shared with the main app on purpose.
 const MIC_SETTINGS_KEY = "gent-talk.voice.mic";
+const WIDTH_KEY = "gent-talk.voice.width";
 
 const el = (id) => document.getElementById(id);
 
@@ -842,6 +843,174 @@ function micSettingsChanged() {
       `(private browsing does this). ${when}`;
 }
 
+// --- the reading column ---------------------------------------------------------------------
+//
+// `#55 voice-desktop-app`. On a wide screen the page holds its two lists to a column instead of
+// letting them fill the window, and the reader chooses how wide that column is. Two controls set
+// the one value — the handle on the edge of the column and the slider in Settings — because the
+// handle needs a mouse and a keyboard needs something it can tab to.
+//
+// WHICH LAYOUT IS IN FORCE IS DECIDED ENTIRELY IN CSS, by `@media (min-width: 900px) and
+// (pointer: fine)` at the foot of web/voice.css. Nothing here asks `matchMedia`, and nothing here
+// looks at a user-agent string: this code only ever sets a number, and the stylesheet decides
+// whether that number means anything. That is what keeps one regime rather than two that can
+// disagree, and it is why the handle can be wired unconditionally.
+//
+// The unit is CHARACTERS, not pixels. What makes a line hard to read is how many characters are on
+// it, so that is what the reader is choosing and what gets stored.
+
+const MIN_READING_CH = 45;
+const MAX_READING_CH = 120;
+const DEFAULT_READING_CH = 72;
+
+/**
+ * A width this page will actually apply.
+ *
+ * Storage is not a trusted input: it is shared with whatever else runs on this origin, it survives
+ * a version of the page that had different limits, and a hand-edited entry is a thing people do.
+ * A stored 4000 must become a column, not a window with no margins, so the value is clamped on the
+ * way IN as well as on the way out — and anything that is not a number at all falls back to the
+ * default rather than to NaN, which CSS would ignore silently.
+ */
+function clampReadingWidth(value) {
+  // A blank entry is ABSENT, not zero. `Number("")` is 0 and `Number(null)` is 0, and taking
+  // either at its word would clamp an empty storage slot to the narrowest column the page allows
+  // — a reader who had never touched the control would find it already moved.
+  const text = typeof value === "string" ? value.trim() : value;
+  if (text === "" || text === null || text === undefined) {
+    return DEFAULT_READING_CH;
+  }
+  const ch = Number(text);
+  if (!Number.isFinite(ch)) {
+    return DEFAULT_READING_CH;
+  }
+  return Math.min(MAX_READING_CH, Math.max(MIN_READING_CH, Math.round(ch)));
+}
+
+/** What was stored, clamped. A missing or corrupt entry is the default, never an error. */
+function storedReadingWidth() {
+  const stored = localStorage.getItem(WIDTH_KEY);
+  return clampReadingWidth(stored === null ? DEFAULT_READING_CH : stored);
+}
+
+// The width currently in force, kept here rather than read back out of the DOM: reading a custom
+// property back gives you the string that was written, and a drag would then be parsing its own
+// output forty times a second.
+let readingWidth = DEFAULT_READING_CH;
+
+/**
+ * Put a width on the page. Returns the width that was actually applied, which is the clamped one.
+ *
+ * The custom property goes on `document.documentElement` because the two things it has to reach —
+ * the panes inside #screen-main and the control pane inside the dock — have no common ancestor
+ * below the root.
+ */
+function applyReadingWidth(value) {
+  readingWidth = clampReadingWidth(value);
+  document.documentElement.style.setProperty("--reading-width", `${readingWidth}ch`);
+  el("reading-width").value = String(readingWidth);
+  el("width-grip").setAttribute("aria-valuenow", String(readingWidth));
+  el("width-grip").setAttribute("aria-valuetext", `${readingWidth} characters`);
+  return readingWidth;
+}
+
+/**
+ * Store it, and READ IT BACK rather than assuming — the same check `persistMicSettings` makes, for
+ * the same reason: private browsing accepts setItem and stores nothing, so "saved" would be a lie
+ * discovered only after a reload.
+ */
+function persistReadingWidth(ch) {
+  const encoded = String(ch);
+  try {
+    localStorage.setItem(WIDTH_KEY, encoded);
+  } catch (_error) {
+    return false;
+  }
+  return localStorage.getItem(WIDTH_KEY) === encoded;
+}
+
+/** Apply a new width and say, in the settings screen, whether it will survive a reload. */
+function readingWidthChanged(value) {
+  const ch = applyReadingWidth(value);
+  el("reading-width-state").textContent = persistReadingWidth(ch)
+    ? `Saved — a column ${ch} characters wide.`
+    : "This browser refused to store the reading width, so it will be forgotten when you " +
+      `reload (private browsing does this). The column is ${ch} characters wide until then.`;
+}
+
+// A drag, in three events. Pointer events rather than mouse events so a trackpad, a pen and a
+// desktop touchscreen all work through one path; the regime that shows the handle at all is the
+// stylesheet's business, not this code's.
+let widthDrag = null;
+
+/**
+ * How many pixels one character is, measured from the column that is actually on screen rather
+ * than assumed. `1ch` is the width of a zero in the current font, which is neither a constant nor
+ * knowable from here — but the pane IS `max-width: var(--reading-width)`, so its rendered width
+ * divided by the width in force is the conversion factor, whatever the font turns out to be.
+ */
+function pixelsPerCh() {
+  const measured = el("pane-voice").getBoundingClientRect().width;
+  if (measured > 0 && readingWidth > 0) {
+    return measured / readingWidth;
+  }
+  return 8; // nothing laid out yet; a plausible figure beats dividing by zero.
+}
+
+function onGripDown(event) {
+  const box = el("screen-main").getBoundingClientRect();
+  // The column is centred, so the handle's distance from the middle is HALF the width. Captured
+  // once at the start of the drag: re-measuring mid-drag would feed the drag its own output.
+  widthDrag = { centre: box.left + box.width / 2, perCh: pixelsPerCh() };
+  const grip = el("width-grip");
+  if (event && event.pointerId !== undefined && grip.setPointerCapture) {
+    // So the drag survives the pointer leaving the nine-pixel handle, which it does immediately.
+    grip.setPointerCapture(event.pointerId);
+  }
+}
+
+function onGripMove(event) {
+  if (!widthDrag || !event) {
+    return;
+  }
+  applyReadingWidth(((event.clientX - widthDrag.centre) * 2) / widthDrag.perCh);
+}
+
+function onGripUp() {
+  if (!widthDrag) {
+    return;
+  }
+  widthDrag = null;
+  // Stored at the END of the drag, not on every frame: forty writes a second to localStorage is a
+  // synchronous disk hit per frame, and only the width the reader stopped at is a decision.
+  readingWidthChanged(readingWidth);
+}
+
+// A separator with `tabindex` is only a control if the arrow keys move it. Shift for a bigger
+// step, Home/End for the ends, which is what a range input does and therefore what a reader who
+// has used one expects.
+const GRIP_KEYS = {
+  ArrowLeft: () => readingWidth - 1,
+  ArrowRight: () => readingWidth + 1,
+  ArrowDown: () => readingWidth - 1,
+  ArrowUp: () => readingWidth + 1,
+  PageDown: () => readingWidth - 10,
+  PageUp: () => readingWidth + 10,
+  Home: () => MIN_READING_CH,
+  End: () => MAX_READING_CH,
+};
+
+function onGripKey(event) {
+  const next = event && GRIP_KEYS[event.key];
+  if (!next) {
+    return;
+  }
+  if (event.preventDefault) {
+    event.preventDefault(); // PageUp and the arrows would otherwise scroll the list behind it.
+  }
+  readingWidthChanged(next());
+}
+
 // --- the call ----------------------------------------------------------------------------------
 
 async function start() {
@@ -1587,6 +1756,17 @@ for (const [id, key] of MIC_TOGGLES) {
   el(id).checked = restoredMicSettings[key];
   el(id).addEventListener("change", micSettingsChanged);
 }
+
+// The column the reader last chose, restored before anything is drawn into it. Applied
+// unconditionally: on a phone the stylesheet never consults the value, so there is nothing to
+// branch on here and no second definition of "is this a desktop" to drift.
+applyReadingWidth(storedReadingWidth());
+el("reading-width").addEventListener("input", () => readingWidthChanged(el("reading-width").value));
+el("width-grip").addEventListener("pointerdown", onGripDown);
+el("width-grip").addEventListener("pointermove", onGripMove);
+el("width-grip").addEventListener("pointerup", onGripUp);
+el("width-grip").addEventListener("pointercancel", onGripUp);
+el("width-grip").addEventListener("keydown", onGripKey);
 
 el("talk").addEventListener("click", onTalk);
 el("hang-up").addEventListener("click", stop);

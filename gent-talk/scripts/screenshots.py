@@ -633,7 +633,25 @@ PROFILES: tuple[Profile, ...] = (
         mobile=False,
         user_agent=DESKTOP_UA,
     ),
+    Profile(
+        # `#55 voice-desktop-app`. One desktop width proves nothing about a reading column: the
+        # column is capped, so at 1440 and at 1280 the transcript is the SAME width and only the
+        # margin beside it changes. That is the property, and it takes two widths to see it.
+        # 1280x800 is also the smallest window most people ever open, and it is just over the
+        # 900px threshold where the desktop regime starts.
+        name="laptop-1280",
+        what="a small laptop window — the narrow end of the desktop regime",
+        width=1280,
+        height=800,
+        scale=1.0,
+        mobile=False,
+        user_agent=DESKTOP_UA,
+    ),
 )
+
+# The profiles where `@media (min-width: 900px) and (pointer: fine)` is in force. A scene about the
+# desktop composition is meaningless on a phone, and worse than meaningless if it PASSES there.
+DESKTOP_PROFILES = ("desktop", "laptop-1280")
 
 
 @dataclass(frozen=True)
@@ -652,6 +670,11 @@ class Scene:
     expect: tuple[tuple[str, str], ...]
     freeze_animations: bool = True
     animation_offset_ms: int | None = None
+    # Which profiles this state means anything on; None is all of them. `#55 voice-desktop-app`
+    # added it because a resized reading column does not exist on a phone -- there is no column and
+    # no pointer to drag its edge -- so running the scene there would either fail confusingly or,
+    # far worse, PASS and be filed as evidence that a phone has a desktop layout.
+    profiles: tuple[str, ...] | None = None
 
 
 class Driver:
@@ -1012,6 +1035,80 @@ def _act_jump_to_newest(driver: Driver) -> None:
     driver.settle(300)
 
 
+# `#55 voice-desktop-app`. The two states below are the reading column at each end of its range.
+#
+# SELF-CONTAINED, unlike everything above them: the scenes before this point are one continuous
+# walk through a session, and these are appended after it, so each starts by loading the page
+# again rather than inheriting whatever state the walk left behind. They also run only on the
+# desktop profiles -- see `Scene.profiles`.
+#
+# The width is set through the SETTINGS SLIDER rather than by dragging the handle, because a
+# synthetic drag is three events whose coordinates would have to be right for the picture to mean
+# anything, and the slider drives exactly the same code with none of that. What the pictures then
+# show, and what nothing in the page suite can show, is the column at a real width in a real
+# browser with real text in it.
+
+SET_READING_WIDTH = (
+    "(() => { const r = document.getElementById('reading-width'); r.value = '%s'; "
+    "r.dispatchEvent(new Event('input', { bubbles: true })); return r.value; })()"
+)
+
+MEASURE_COLUMN = (
+    "(() => document.getElementById('pane-voice').getBoundingClientRect().width)()"
+)
+
+
+def _act_desktop_column(driver: Driver, ch: str, into: str) -> float:
+    """Land on the call screen, set the column to `ch` characters, and record what it measured."""
+    driver.click("open-settings")
+    driver.page.wait_for_function("() => window.__visible('reading-width')", timeout=5_000)
+    driver.js(SET_READING_WIDTH % ch)
+    driver.click("close-settings")
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=5_000)
+    driver.settle(200)
+    width = float(cast(float, driver.js(MEASURE_COLUMN)))
+    driver.js(f"window.{into} = {width}")
+    return width
+
+
+def _act_desktop_seed(driver: Driver) -> None:
+    """Load the page fresh and put a real conversation into it.
+
+    A call has to be OPEN for there to be a transcript at all -- the turn injectors talk to the
+    fake socket, and that only exists once Talk has been pressed -- and a desktop picture with an
+    empty transcript would say nothing at all about line length, which is the whole subject here.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("talk")
+    driver.page.wait_for_function(
+        "() => window.__text('talk-label') === 'Listening'", timeout=10_000
+    )
+    for who, text in LONG_TRANSCRIPT[:8]:
+        driver.js(
+            ("window.__userSays(" if who == "user" else "window.__agentSays(")
+            + json.dumps(text)
+            + ")"
+        )
+    driver.settle(300)
+
+
+def _act_desktop_narrow(driver: Driver) -> None:
+    _act_desktop_seed(driver)
+    _act_desktop_column(driver, "48", "__columnWidth")
+    driver.settle(200)
+
+
+def _act_desktop_wide(driver: Driver) -> None:
+    _act_desktop_seed(driver)
+    # BOTH ends measured inside this one scene. Comparing across scenes is not available -- each
+    # of these reloads the page, which wipes anything the previous one left on `window` -- and a
+    # single width alone cannot show that the control does anything at all.
+    _act_desktop_column(driver, "48", "__narrowColumn")
+    _act_desktop_column(driver, "112", "__wideColumn")
+    driver.settle(200)
+
+
 # Hang up is ABSENT, not disabled, whenever there is no call. Asserted as its own expectation on
 # every no-call state, because "dimmed but present" was the defect the rework removed and a
 # screenshot is the only thing that can tell the two apart.
@@ -1293,6 +1390,67 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="14-desktop-narrow-column",
+        what="the desktop composition with the reading column pulled in narrow",
+        act=_act_desktop_narrow,
+        profiles=DESKTOP_PROFILES,
+        expect=(
+            (
+                "the transcript is held to a column, not stretched across the window",
+                "(() => window.__columnWidth > 0 && window.__columnWidth < "
+                "document.getElementById('scroll-area').getBoundingClientRect().width - 200)()",
+            ),
+            (
+                "the column is centred: the margin either side of it is the same",
+                "(() => { const p = document.getElementById('pane-voice').getBoundingClientRect(); "
+                "const a = document.getElementById('scroll-area').getBoundingClientRect(); "
+                "return Math.abs((p.left - a.left) - (a.right - p.right)) < 4; })()",
+            ),
+            (
+                "the handle is on screen, on the edge of the column",
+                "window.__visible('width-grip') && Math.abs("
+                "document.getElementById('width-grip').getBoundingClientRect().left - "
+                "document.getElementById('pane-voice').getBoundingClientRect().right) < 20",
+            ),
+            (
+                "the controls follow the column rather than spanning the desk",
+                "document.getElementById('control-pane').getBoundingClientRect().width <= "
+                "document.getElementById('dock').getBoundingClientRect().width - 100",
+            ),
+            (
+                "there is a real transcript in it to judge the line length by",
+                "document.querySelectorAll('#transcript li').length >= 6",
+            ),
+        ),
+    ),
+    Scene(
+        name="15-desktop-wide-column",
+        what="the same screen with the column dragged out wide — the control really moves it",
+        act=_act_desktop_wide,
+        profiles=DESKTOP_PROFILES,
+        expect=(
+            (
+                "the wide column is really wider than the narrow one, in pixels",
+                "(() => window.__narrowColumn > 0 && "
+                "window.__wideColumn > window.__narrowColumn + 200)()",
+            ),
+            (
+                "even at its widest it does not fill the window",
+                "(() => window.__wideColumn < "
+                "document.getElementById('scroll-area').getBoundingClientRect().width)()",
+            ),
+            (
+                "the handle moved out with it",
+                "Math.abs(document.getElementById('width-grip').getBoundingClientRect().left - "
+                "document.getElementById('pane-voice').getBoundingClientRect().right) < 20",
+            ),
+            (
+                "there is a real transcript in it to judge the line length by",
+                "document.querySelectorAll('#transcript li').length >= 6",
+            ),
+        ),
+    ),
 )
 
 
@@ -1426,6 +1584,13 @@ def run_captures(
                     driver = Driver(page, url, token, out_dir, profile, theme)
                     print(f"==> {theme} · {profile.name}: {profile.what}")
                     for scene in scenes:
+                        # A state that does not exist on this device is SKIPPED by name rather
+                        # than attempted: the desktop reading column has nothing to photograph on
+                        # a phone, and a scene that quietly succeeded there would be filed as
+                        # evidence of a layout the phone does not have.
+                        if scene.profiles and profile.name not in scene.profiles:
+                            print(f"  skip  {scene.name:<30} not a state this profile has")
+                            continue
                         # A timeout inside the walk is an UNREACHABLE STATE and must read as one.
                         # Left to itself Playwright raises a TimeoutError whose traceback names a
                         # line number in this file and not the state, which is exactly the report
@@ -1571,18 +1736,45 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 13:
+    if len(SCENES) < 15:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
-            "its disclosure open, and settings with its title bar -- and `#47 scrollback-stability` "
-            "added two more that are pure rendering facts: a folded list with one message opened, "
-            "and the chip that appears when a turn arrives off screen."
+            "its disclosure open, and settings with its title bar -- `#47 scrollback-stability` "
+            "added two more that are pure rendering facts (a folded list with one message opened, "
+            "and the chip that appears when a turn arrives off screen), and `#55 "
+            "voice-desktop-app` added the reading column at each end of its range, which is the "
+            "only place the desktop composition can be judged at all."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
         problems.append("two scenes share a name, so one would overwrite the other's capture.")
+    # States that exist ONLY where `@media (min-width: 900px) and (pointer: fine)` is in force.
+    # Named here rather than inferred, because losing the restriction is silent: the scene would
+    # then run on both iPhone profiles and photograph the phone composition -- which has no reading
+    # column and no handle -- under a name that says desktop. That is worse than a failure.
+    desktop_only = {"14-desktop-narrow-column", "15-desktop-wide-column"}
+    for name in desktop_only:
+        scene = next((s for s in SCENES if s.name == name), None)
+        if scene is None:
+            problems.append(f"the '{name}' state is gone from the scene table.")
+        elif scene.profiles != DESKTOP_PROFILES:
+            problems.append(
+                f"scene '{name}' is no longer restricted to {DESKTOP_PROFILES}, so it would be "
+                "captured on a phone, where the state it is named for does not exist."
+            )
+
+    known_profiles = {profile.name for profile in PROFILES}
     for scene in SCENES:
+        # A restriction naming a profile that does not exist restricts the scene to NOTHING, and
+        # a scene that never runs anywhere reports no failure at all -- it just quietly stops
+        # being evidence. Renaming a profile is exactly how that happens.
+        for wanted in scene.profiles or ():
+            if wanted not in known_profiles:
+                problems.append(
+                    f"scene '{scene.name}' is restricted to profile {wanted!r}, which is not in "
+                    "PROFILES, so the state is never captured anywhere."
+                )
         if not scene.expect:
             problems.append(
                 f"scene '{scene.name}' declares NO expectation, so a navigation failure would "
@@ -1619,6 +1811,13 @@ def check_state_controls() -> list[str]:
         # content of state 13.
         "12-collapsed-long-transcript": "data-collapsed",
         "13-jump-to-newest": "jump-newest",
+        # `#55 voice-desktop-app`. Both pinned to a MEASUREMENT rather than to an element being on
+        # screen: the whole content of state 14 is that the column is narrower than the window it
+        # sits in, and the whole content of state 15 is that the control really moved it. A scene
+        # pinned to "#pane-voice exists" would photograph the stretched phone layout this issue
+        # was opened about and file it under the desktop name.
+        "14-desktop-narrow-column": "__columnWidth",
+        "15-desktop-wide-column": "__wideColumn",
     }
     for name, needle in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -1708,8 +1907,33 @@ def check_profile_controls() -> list[str]:
             "only one phone profile is captured. A tall phone alone hides the vertical clipping a "
             "short one shows."
         )
-    if not any(p.width >= 1200 for p in PROFILES):
+    desktops = [p for p in PROFILES if p.width >= 900 and not p.mobile]
+    if not desktops:
         problems.append("no desktop-width profile survives; the wide layout would go unseen.")
+    if len({p.width for p in desktops}) < 2:
+        problems.append(
+            "only one desktop-class width is captured. `#55 voice-desktop-app` caps the transcript "
+            "to a reading column, so at one width there is nothing to compare against: the column "
+            "is the same size at 1280 and at 1440 and only the margin beside it changes, and that "
+            "is the property. One width cannot show it."
+        )
+    if not any(p.width >= 1200 for p in desktops):
+        problems.append("no wide desktop profile survives; the maximised window would go unseen.")
+    # The desktop regime is `(min-width: 900px) and (pointer: fine)`. A profile that claims to be
+    # desktop-class but reports a coarse pointer would be photographing the phone composition under
+    # a desktop name -- `has_touch` is what Chromium turns into `pointer: coarse`.
+    for profile in desktops:
+        if profile.context_options("dark")["has_touch"]:
+            problems.append(
+                f"the {profile.name!r} profile is wide but reports a touch screen, so "
+                "`pointer: fine` does not match and it captures the PHONE layout."
+            )
+    for wanted in DESKTOP_PROFILES:
+        if wanted not in {p.name for p in desktops}:
+            problems.append(
+                f"DESKTOP_PROFILES names {wanted!r}, which is not a desktop-class profile, so "
+                "every desktop-only scene is restricted to a device that cannot show it."
+            )
     if len({p.name for p in PROFILES}) != len(PROFILES):
         problems.append("two profiles share a name, so their captures would collide.")
     return problems
@@ -1865,6 +2089,10 @@ SELF_TEST_CHECKS = (
     "a phone-class profile with a real device scale factor survives",
     "both a tall and a short phone profile survive",
     "a desktop-width profile survives",
+    "more than one desktop-class width survives, so a capped column can be compared",
+    "every desktop-class profile really reports a fine pointer",
+    "a desktop-only scene names profiles that exist",
+    "the desktop-column states are still restricted to the desktop profiles",
     "the missing-package error carries the pip install command",
     "the missing-browser error carries the browser install command",
     "removing viewport-fit=cover from the markup is reported",

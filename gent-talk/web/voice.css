@@ -24,6 +24,13 @@
   --dock: #191c22;
   --ok: #5bd98a;
   --idle: #6b7484;
+  /* THE reading column, in characters. Only the desktop regime at the foot of this file consults
+     it — a phone has no room for a column and no margin to put beside one — but it is declared
+     here, with the other tokens, rather than inside the media query, so that web/voice.js can set
+     it on `document.documentElement` at load without knowing which regime is in force. `ch` and
+     not `rem`: what makes a line hard to read is how many CHARACTERS are on it, and that is the
+     unit that says so. Overwritten per reader; see `applyReadingWidth`. */
+  --reading-width: 72ch;
 }
 
 @media (prefers-color-scheme: light) {
@@ -251,18 +258,35 @@ body {
   margin-top: 0.25rem;
 }
 
+/* The generic `input` rule in web/style.css stretches and pads a text field, which is wrong for a
+   slider in exactly the way it is wrong for a checkbox — the exception below is the same shape as
+   the one that file already makes for `.toggle input[type="checkbox"]`. */
+#reading-width {
+  display: block;
+  width: 100%;
+  padding: 0.35rem 0;
+  background: none;
+  border: none;
+  accent-color: var(--accent);
+}
+
 /* Shown once and then gone; the same text stays reachable from Settings. */
+/* The small type is on the TEXT, not on the box around it. That reads like a nicety and is not
+   one: the desktop regime caps this box in `ch`, and `ch` is resolved against the element's OWN
+   font size — a box set in 0.85rem gets a column fifteen per cent narrower than the transcript
+   beside it, and the two visibly stop lining up. Nothing changes on a phone, because the only text
+   in here is the child this moved to. */
 #connection-banner {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   margin: 0.5rem 0.75rem;
-  font-size: 0.85rem;
 }
 
 #connection-detail {
   flex: 1 1 auto;
   overflow-wrap: anywhere;
+  font-size: 0.85rem;
 }
 
 /* THE one scrolling element on the page. Everything else is fixed by construction.
@@ -384,6 +408,14 @@ body {
   letter-spacing: 0.02em;
   touch-action: manipulation;
   -webkit-tap-highlight-color: transparent;
+}
+
+/* The reading-width handle does not exist outside the desktop regime at the foot of this file:
+   there is no room for a column to resize and no pointer precise enough to grab the edge of one.
+   Stated HERE, before the media query, so the query's `display: block` is the later rule and wins
+   where it applies — the reverse order would silently hide the handle everywhere. */
+#width-grip {
+  display: none;
 }
 
 /* Over the bottom corner of the list, clear of the dock. `pointer-events: none` on the strip and
@@ -544,7 +576,9 @@ body {
     calc(0.85rem + env(safe-area-inset-left));
   min-height: 1.9rem;
   color: var(--muted);
-  font-size: 0.8rem;
+  /* The small type is on #status below, not here. Same reason as #connection-banner: the desktop
+     regime caps this row in `ch`, `ch` follows the element's own font size, and a row set in
+     0.8rem would be a fifth narrower than the control pane directly beneath it. */
 }
 
 /* style.css pins #status to the bottom of the viewport for the OTHER page. Here it is a member of
@@ -559,7 +593,7 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: inherit;
+  font-size: 0.8rem;
 }
 
 .status-dot {
@@ -796,4 +830,114 @@ body {
   color: var(--muted);
   border: 1px solid var(--edge);
   opacity: 0.75;
+}
+
+/* ------------------------------------------------------------------- the desktop regime ---- */
+/*
+ * `#55 voice-desktop-app`.
+ *
+ * Everything above this line was written for a phone held in one hand, and a phone layout
+ * stretched to 1440px is not a desktop application: the transcript ran to ~180 characters a line,
+ * "Start a new call" was a button thirteen hundred pixels wide, and the dock was sized for a thumb
+ * nobody is using. That was photographed, not guessed.
+ *
+ * THE REGIME IS CHOSEN BY CAPABILITY, NEVER BY USER AGENT. `min-width: 900px` says there is room
+ * for a column with margin either side of it; `pointer: fine` says the input device can put a
+ * cursor on a nine-pixel handle. A user-agent string answers neither question — a tablet with a
+ * trackpad and a phone in desktop-mode both lie to it — and the page suite asserts that no such
+ * string appears in this file or in web/voice.js.
+ *
+ * ONE block, deliberately: desktop rules sprinkled through the file are how a phone rule and a
+ * desktop rule end up disagreeing about one selector with nothing on the page saying which wins.
+ * It is LAST in the file so that every override here is the later rule at equal specificity, and
+ * so that the phone declaration is still the first one `cssBlock()` finds.
+ */
+@media (min-width: 900px) and (pointer: fine) {
+  /* THE reading column. Both panes, because the channel is read the same way the transcript is
+     and a 180-character line is no better for being somebody else's words. */
+  #pane-voice,
+  #pane-discord {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  /* The dock follows the column, so the controls sit under the thing they act on instead of
+     spanning a metre of desk. `max-width` and an auto margin, NOT `position` — the pane holds its
+     place by being a grid row, and the suite asserts that it still does. */
+  #control-pane,
+  #status-line {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  /* And so do the two notices. A full-width strip over a narrow column is the same "phone layout
+     stretched sideways" this whole block exists to remove — it was there in the first capture of
+     it, which is what these review rounds are for. */
+  #error,
+  #connection-banner {
+    max-width: var(--reading-width);
+    margin-inline: auto;
+  }
+
+  /* The chips belong to the LIST, not to the window. Anchored to the window's right edge they end
+     up half a screen away from the thing they act on, offering to scroll a column the reader is
+     not looking at the corner of. `left: 50%` puts the origin on the column's centre line; the
+     translate walks back by half the column, the chip's own width and a gutter, landing them just
+     inside the column's right edge. */
+  #scroll-tools {
+    right: auto;
+    left: 50%;
+    transform: translateX(calc(var(--reading-width) / 2 - 100% - 0.6rem));
+  }
+
+  /* A percentage inset is proportionate inside a capped column and absurd across a full-width
+     one. Capping the pane above is what actually fixes the 600px gutter; this only stops a reader
+     who has dragged the column out to 120ch from getting it back. */
+  .messages li.mine {
+    margin-left: min(15%, 6rem);
+  }
+
+  .messages li.theirs {
+    margin-right: min(15%, 6rem);
+  }
+
+  /* The handle, on the right edge of the column and the height of the body. Absolutely positioned
+     against #screen-main, which already carries `position: relative` for #scroll-tools. Out of
+     flow on purpose: a grid row for a drag handle would change the height of the thing being read
+     the moment it appeared. `touch-action: none` so a drag is a drag and not a scroll. */
+  #width-grip {
+    display: block;
+    position: absolute;
+    z-index: 3;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    transform: translateX(calc(var(--reading-width) / 2));
+    width: 0.9rem;
+    padding: 0;
+    background: none;
+    border: none;
+    cursor: ew-resize;
+    touch-action: none;
+  }
+
+  /* Drawn as a hairline rather than as a slab: it is an edge you may grab, not a piece of
+     furniture. It brightens under the pointer and under keyboard focus, which is the only thing
+     that tells a reader it is a control at all. */
+  #width-grip::before {
+    content: "";
+    position: absolute;
+    top: 12%;
+    bottom: 12%;
+    left: 50%;
+    width: 2px;
+    margin-left: -1px;
+    border-radius: 999px;
+    background: var(--edge);
+  }
+
+  #width-grip:hover::before,
+  #width-grip:focus-visible::before {
+    background: var(--accent);
+  }
 }

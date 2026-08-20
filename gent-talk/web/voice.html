@@ -147,6 +147,22 @@
             legible. Out here it is positioned against #screen-main instead, which is why that rule
             gained `position: relative`.
           -->
+          <!--
+            The reading-width handle. `#55 voice-desktop-app`.
+
+            A SIBLING of #scroll-area, never a child of it: the scroll area carries the
+            fade-under-the-header mask and anything inside it is faded with the content. It is
+            absolutely positioned against #screen-main, so it adds no grid row and cannot change
+            the height of the thing being read.
+
+            `display: none` outside the desktop regime — there is no column to resize on a phone —
+            so the settings slider below is the way this is reached without a mouse. Both drive the
+            same value; neither is the master.
+          -->
+          <div id="width-grip" role="separator" aria-orientation="vertical" tabindex="0"
+               aria-label="reading width" aria-valuemin="45" aria-valuemax="120" aria-valuenow="72"
+               title="Drag to set how wide the reading column is. Arrow keys work too."></div>
+
           <div id="scroll-tools">
             <button id="collapse-all" class="chip" type="button" hidden>
               <span id="collapse-all-label">Collapse all</span>
@@ -223,6 +239,24 @@
             shows its author and its message id, so a message the agent describes can be checked
             against a real one — or shown not to exist.
           </p>
+
+          <h2>Reading width</h2>
+          <p class="hint">
+            On a wide screen with a mouse, the transcript and the channel are held to a column
+            rather than filling the window: a line of text stops being readable somewhere past
+            ninety characters, and a maximised browser is twice that. Drag the edge of the column,
+            or use this — they set the same thing. On a phone it does nothing, because there is no
+            room for a column and no margin to put beside it.
+          </p>
+          <input
+            id="reading-width"
+            type="range"
+            min="45"
+            max="120"
+            step="1"
+            aria-label="reading width in characters"
+          />
+          <p id="reading-width-state" class="hint" aria-live="polite"></p>
 
           <h2>Token</h2>
           <button id="forget-token" class="secondary" type="button">Forget token and sign out</button>

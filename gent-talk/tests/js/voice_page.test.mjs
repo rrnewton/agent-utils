@@ -83,9 +83,9 @@ const CONVAI_WRITE =
  * Matching whole rules, not grepping the file, so that a property landing on the WRONG selector
  * cannot satisfy an assertion about this one.
  */
-function cssBlock(selector) {
+function cssRules(text, selector) {
   const blocks = [];
-  for (const rule of CSS.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+  for (const rule of text.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
     const selectors = rule[1]
       .split(",")
       .map((part) => part.split("\n").pop().trim())
@@ -94,9 +94,75 @@ function cssBlock(selector) {
       blocks.push(rule[2]);
     }
   }
+  return blocks;
+}
+
+function cssBlock(selector) {
+  const blocks = cssRules(CSS, selector);
   assert.ok(blocks.length > 0, `web/voice.css has no rule for "${selector}"`);
   return blocks.join("\n");
 }
+
+/** The stylesheet with its comments gone, so a brace or a keyword in prose decides nothing. */
+const CSS_CODE = CSS.replace(/\/\*[\s\S]*?\*\//g, " ");
+
+/**
+ * The body of one `@media` block, brace-matched.
+ *
+ * `cssBlock` above cannot tell which media query a rule sits in — it matches innermost blocks
+ * anywhere in the file — so a desktop rule and a phone rule for the same selector are
+ * indistinguishable to it, and "the desktop composition is declared" would be satisfied by
+ * declaring it for everybody. `#55 voice-desktop-app` introduced this; `#56` reuses it.
+ */
+function mediaBody(query) {
+  const at = CSS_CODE.indexOf(`@media ${query}`);
+  assert.ok(at >= 0, `web/voice.css has no "@media ${query}" block`);
+  const open = CSS_CODE.indexOf("{", at);
+  assert.ok(open > at, `the "@media ${query}" block has no body`);
+  let depth = 0;
+  for (let i = open; i < CSS_CODE.length; i += 1) {
+    if (CSS_CODE[i] === "{") {
+      depth += 1;
+    } else if (CSS_CODE[i] === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return CSS_CODE.slice(open + 1, i);
+      }
+    }
+  }
+  return assert.fail(`the "@media ${query}" block is never closed`);
+}
+
+/** The declaration block one selector gets INSIDE a given media query, and only there. */
+function cssBlockIn(query, selector) {
+  const blocks = cssRules(mediaBody(query), selector);
+  assert.ok(
+    blocks.length > 0,
+    `web/voice.css has no rule for "${selector}" inside "@media ${query}"`
+  );
+  return blocks.join("\n");
+}
+
+/** The stylesheet with one media query's body cut out of it. */
+function cssWithout(query) {
+  const body = mediaBody(query);
+  const at = CSS_CODE.indexOf(body);
+  return CSS_CODE.slice(0, at) + CSS_CODE.slice(at + body.length);
+}
+
+/**
+ * What a selector is given ANYWHERE other than inside `query`.
+ *
+ * The other half of `cssBlockIn`, and the half that carries the property. "The rule is inside the
+ * capability query" is satisfied by a page that ALSO declares it for everybody, which is exactly
+ * the sticky-hover-on-a-phone defect `#56` is about — so being inside is only interesting
+ * alongside not being anywhere else.
+ */
+const cssBlockOutside = (query, selector) => cssRules(cssWithout(query), selector).join("\n");
+const cssRulesElsewhere = (query, selector) => cssRules(cssWithout(query), selector).length;
+
+/** The one capability query the desktop composition lives in. Stated once, used by several tests. */
+const DESKTOP_QUERY = "(min-width: 900px) and (pointer: fine)";
 
 // --- a very small layout model --------------------------------------------------------------
 //
@@ -197,7 +263,24 @@ class FakeElement {
     // "is the reader at the bottom?" without a viewport height. Zero everywhere except the one
     // element that has one; `newPage` gives #scroll-area SCROLL_VIEWPORT_PX.
     this.clientHeight = 0;
+    // Width is not modelled the way height is — nothing in this fixture lays anything out
+    // horizontally — but two things the page does read one: the reading-column handle converts a
+    // pointer position into characters using the pane's measured width, and it centres the drag on
+    // #screen-main. Zero everywhere unless a test sets it, so a test that wants that arithmetic to
+    // mean something has to say what it is measuring against.
+    this.clientWidth = 0;
     this.scrolledIntoView = 0;
+    // `element.style.setProperty` for custom properties, and nothing else. web/voice.js writes
+    // `--reading-width` to the document element and never reads a computed style back, so this is
+    // the whole of the sink; anything richer would be a rendering engine this fixture does not
+    // have and must not pretend to.
+    const properties = new Map();
+    this.style = {
+      properties,
+      setProperty: (name, value) => properties.set(name, String(value)),
+      getPropertyValue: (name) => (properties.has(name) ? properties.get(name) : ""),
+      removeProperty: (name) => properties.delete(name),
+    };
   }
 
   /** Whether this element's class list contains a word — `className` here is a plain string. */
@@ -279,7 +362,8 @@ class FakeElement {
     const box = this.scrollBox();
     const top = box ? this.offsetTop() - box.scrollTop : 0;
     const height = this.height();
-    return { top, bottom: top + height, height, left: 0, right: 0, width: 0 };
+    const width = this.clientWidth;
+    return { top, bottom: top + height, height, left: 0, right: width, width };
   }
 
   addEventListener(type, fn) {
@@ -288,10 +372,18 @@ class FakeElement {
     this.listeners.set(type, existing);
   }
 
-  /** Fire the listeners the page really registered for `type`. No synthetic event object. */
-  async dispatch(type) {
+  /**
+   * Fire the listeners the page really registered for `type`.
+   *
+   * `event` is whatever the test chooses to hand over, and is `undefined` by default: most of this
+   * page's listeners take no argument, and inventing a synthetic event for them would let a
+   * handler start depending on a shape no browser is promising. The pointer and keyboard handlers
+   * on the reading-width handle DO read one, so those tests pass the two or three fields they
+   * really use and nothing else.
+   */
+  async dispatch(type, event) {
     for (const fn of this.listeners.get(type) || []) {
-      await fn();
+      await fn(event);
     }
   }
 
@@ -545,7 +637,13 @@ function newPage(store = new Map(), script = SCRIPT) {
     createdTags: [],
   };
 
+  // The root element, which every browser has and web/voice.html therefore does not declare an id
+  // for. It is here because it is the one sink a custom property can be written to that reaches
+  // BOTH the panes inside #screen-main and the control pane inside the dock — they have no common
+  // ancestor below it — and because the reading-width tests below read the property back off it.
+  page.documentElement = new FakeElement("html", "html");
   const document = {
+    documentElement: page.documentElement,
     getElementById: (id) => elements.get(id) || null,
     createElement: (tag) => {
       page.createdTags.push(String(tag).toLowerCase());
@@ -1326,6 +1424,197 @@ test("the controls SHOW their state, not merely hold it", () => {
   const off = cssBlock(".control[disabled]");
   assert.doesNotMatch(off, /background:\s*var\(--warn\)/, "a dead control kept its warm fill");
   assert.match(off, /background:\s*var\(--panel\)/);
+});
+
+// --- the desktop composition ----------------------------------------------------------------
+//
+// `#55 voice-desktop-app`. The fixture lays nothing out, so it cannot say the desktop composition
+// LOOKS right — that is what the two desktop screenshot profiles are for. What it can say is which
+// query the rules are in, that the phone is not affected by them, and that the width the reader
+// chose is really carried, clamped and stored. Everything below is one of those three.
+
+test("the desktop layout is chosen by CAPABILITY, and no user-agent string decides anything", () => {
+  // The requirement, stated as the two questions a layout actually needs answered: is there room
+  // for a column with margin beside it, and can the input device put a cursor on a nine-pixel
+  // handle. A UA string answers neither — a tablet with a trackpad and a phone in desktop mode
+  // both lie to it — and it is the thing that rots, because the strings keep changing.
+  assert.ok(
+    CSS_CODE.includes(`@media ${DESKTOP_QUERY}`),
+    `web/voice.css declares no "@media ${DESKTOP_QUERY}" regime`
+  );
+  for (const [name, text] of [
+    ["web/voice.js", SCRIPT_CODE],
+    ["web/voice.css", CSS_CODE],
+    ["web/voice.html", HTML_CODE],
+  ]) {
+    assert.doesNotMatch(text, /userAgent|userAgentData/, `${name} sniffs the user agent`);
+    assert.doesNotMatch(
+      text,
+      /\b(iPhone|iPad|Android|Macintosh|Windows NT)\b/,
+      `${name} names a device or an operating system to decide a layout`
+    );
+  }
+  // And the page does not decide the layout in script either: which regime is in force is the
+  // stylesheet's business, so there is nothing here to disagree with it.
+  assert.doesNotMatch(SCRIPT_CODE, /matchMedia/, "web/voice.js grew a second opinion about layout");
+});
+
+test("on a desktop both lists are held to a reading column, and the phone is left alone", () => {
+  // A line stops being readable somewhere past ninety characters; the captured desktop frame was
+  // running to about a hundred and eighty. Both panes, because the channel is read the same way
+  // the transcript is.
+  for (const pane of ["#pane-voice", "#pane-discord"]) {
+    const desktop = cssBlockIn(DESKTOP_QUERY, pane);
+    assert.match(desktop, /max-width:\s*var\(--reading-width\)/, `${pane} is not held to a column`);
+    assert.match(desktop, /margin-inline:\s*auto/, `${pane} is capped but not centred`);
+    assert.equal(
+      cssRulesElsewhere(DESKTOP_QUERY, pane),
+      0,
+      `${pane} is also styled outside the desktop query, so the phone gets the column too`
+    );
+  }
+  // The dock follows the column rather than spanning the desk — but by max-width, never by being
+  // pinned. The frame test above asserts the pane is still a grid row; this is the other half.
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#control-pane"), /max-width:\s*var\(--reading-width\)/);
+  assert.doesNotMatch(cssBlock("#control-pane"), /position:\s*(fixed|absolute)/);
+  // The width is a token with a default, so a browser that never enters the regime still parses.
+  assert.match(cssBlock(":root"), /--reading-width:\s*\d+ch/, "the column has no default width");
+});
+
+test("the reading-width handle is a sibling of the scroll area, not a passenger inside it", () => {
+  // Inside #scroll-area it would be faded by that element's mask and would scroll away with the
+  // content; inside #control-pane it would break the assertion that the pane is a plain grid row.
+  // So it is a sibling, positioned against #screen-main, which already carries `position:
+  // relative` for the chips.
+  assertMarkupContains("screen-main", "width-grip");
+  const grip = markupPlace("width-grip");
+  const area = markupPlace("scroll-area");
+  assert.equal(grip.indent, area.indent, "the handle is nested somewhere it does not belong");
+  const pane = HTML.slice(HTML.indexOf('id="control-pane"'));
+  assert.ok(!pane.includes('id="width-grip"'), "the handle ended up inside the control pane");
+  // Absent entirely outside the desktop regime: there is no column to resize on a phone.
+  assert.match(
+    cssBlockOutside(DESKTOP_QUERY, "#width-grip"),
+    /display:\s*none/,
+    "the handle shows where it cannot be used"
+  );
+  assert.match(cssBlockIn(DESKTOP_QUERY, "#width-grip"), /cursor:\s*ew-resize/);
+});
+
+test("the width the reader chose survives a reload", async () => {
+  const store = new Map();
+  const page = newPage(store);
+  await signIn(page);
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "72ch");
+
+  page.el("reading-width").value = "54";
+  await page.el("reading-width").dispatch("input");
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "54ch");
+  assert.match(page.el("reading-width-state").textContent, /Saved/);
+
+  // A RELOAD: same storage, brand new execution of the same script.
+  const reloaded = newPage(store);
+  assert.equal(
+    reloaded.documentElement.style.getPropertyValue("--reading-width"),
+    "54ch",
+    "the column went back to the default, so the choice was not really kept"
+  );
+  assert.equal(reloaded.el("reading-width").value, "54", "the slider does not show what is in force");
+});
+
+test("a browser that refuses to store the reading width says so instead of claiming saved", async () => {
+  // Private browsing accepts setItem and stores nothing. The same trap the token and the
+  // microphone settings already read back for, and the same answer.
+  const page = newPage();
+  await signIn(page);
+  page.storage.set = () => page.storage;
+
+  page.el("reading-width").value = "90";
+  await page.el("reading-width").dispatch("input");
+
+  const said = page.el("reading-width-state").textContent;
+  assert.match(said, /refused to store/, `it claimed a save it did not get: ${said}`);
+  assert.doesNotMatch(said, /^Saved/);
+  // It still APPLIES, though — refusing to remember it is not a reason to refuse to do it.
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "90ch");
+});
+
+test("a stored width outside the range is clamped, not applied", () => {
+  // Storage is shared with everything else on this origin, survives a version of the page with
+  // different limits, and people edit it by hand. A stored 4000 must become a column, not a window
+  // with no margins at all.
+  const cases = [
+    ["4000", "120ch", "an absurd width was applied verbatim"],
+    ["3", "45ch", "a width narrower than a sentence was applied verbatim"],
+    ["wider please", "72ch", "a value that is not a number became NaN rather than the default"],
+    ["", "72ch", "an empty entry became a zero-width column"],
+    ["63.4", "63ch", "a fractional width was not rounded to whole characters"],
+  ];
+  for (const [stored, expected, complaint] of cases) {
+    const page = newPage(new Map([["gent-talk.voice.width", stored]]));
+    assert.equal(
+      page.documentElement.style.getPropertyValue("--reading-width"),
+      expected,
+      `${complaint} (stored ${JSON.stringify(stored)})`
+    );
+  }
+});
+
+test("the handle works without a mouse: arrow keys move it and it says where it is", async () => {
+  // It is a `separator` with a tabindex, and a separator with a tabindex is only a control if the
+  // keyboard can move it. The aria value is what a screen reader reads out, so it has to follow.
+  const page = newPage();
+  await signIn(page);
+  const grip = page.el("width-grip");
+  assert.equal(grip.getAttribute("aria-valuenow"), "72");
+
+  await grip.dispatch("keydown", { key: "ArrowRight" });
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "73ch");
+  assert.equal(grip.getAttribute("aria-valuenow"), "73");
+
+  await grip.dispatch("keydown", { key: "PageDown" });
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "63ch");
+
+  await grip.dispatch("keydown", { key: "End" });
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "120ch");
+  await grip.dispatch("keydown", { key: "Home" });
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "45ch");
+
+  // A key it does not own is left alone rather than swallowed.
+  await grip.dispatch("keydown", { key: "a" });
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "45ch");
+  assert.equal(page.storage.get("gent-talk.voice.width"), "45", "the keyboard change was not kept");
+});
+
+test("dragging the handle sets the column from where the pointer actually is", async () => {
+  // The fixture has no layout engine, so the geometry has to be STATED: a 1200px body and a
+  // 576px column at the default 72 characters, which makes a character eight pixels wide. What is
+  // being checked is the arithmetic the page does with those numbers — the column is centred, so
+  // the handle's distance from the middle is half the width — not that it looks right, which is
+  // what the desktop screenshot profiles are for.
+  const page = newPage();
+  await signIn(page);
+  page.el("screen-main").clientWidth = 1200;
+  page.el("pane-voice").clientWidth = 576;
+  const grip = page.el("width-grip");
+
+  await grip.dispatch("pointerdown", { pointerId: 1, clientX: 888 });
+  await grip.dispatch("pointermove", { pointerId: 1, clientX: 800 });
+
+  // (800 - 600) * 2 / 8 = 50 characters.
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "50ch");
+  assert.equal(
+    page.storage.has("gent-talk.voice.width"),
+    false,
+    "a drag wrote to storage on every frame instead of once at the end"
+  );
+
+  await grip.dispatch("pointerup", { pointerId: 1 });
+  assert.equal(page.storage.get("gent-talk.voice.width"), "50", "the drag was not kept");
+
+  // A move with no drag in progress must do nothing: the pointer crosses this handle constantly.
+  await grip.dispatch("pointermove", { pointerId: 1, clientX: 1100 });
+  assert.equal(page.documentElement.style.getPropertyValue("--reading-width"), "50ch");
 });
 
 test("content fades under the header rather than being sliced off square", () => {

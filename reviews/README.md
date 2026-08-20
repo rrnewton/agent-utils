@@ -15,6 +15,11 @@ Reviews completed from 2026-08-05 through 2026-08-09:
 - [herdr-agent](herdr-agent.md)
 - [repository-local Rust source launchers](rust-source-launchers.md)
 
+Later, and a different kind of review — a LOOKED-AT one rather than a read-the-code one, because
+the subject is a layout and no test in the repository has an opinion about a layout:
+
+- [gent-talk `/voice` — the desktop composition](gent-talk-desktop-ui.md) (2026-08-19)
+
 ## Where a tool's own related-work document lives
 
 A related-work document belongs to one tool, so it lives **in that tool's own folder, beside that

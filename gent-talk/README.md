@@ -460,6 +460,29 @@ The `/voice` page expects the agent's output audio format to be **PCM** (`pcm_16
 default). It reads the format out of the conversation's initiation metadata and says so plainly if
 it is something it cannot decode, rather than playing noise.
 
+### The page has two compositions, and a capability query picks between them
+
+The phone is the device this page is used on, so the phone layout is the one everything above
+describes. On a wide screen with a pointing device it becomes something else: the transcript and
+the channel are held to a **reading column** instead of filling the window, the dock follows that
+column rather than spanning the desk, and a handle on the column's edge — draggable, and reachable
+from the keyboard — sets how wide it is. The width is stored per browser, in characters, and is
+clamped to 45–120 on the way in and on the way out, because storage is shared with everything else
+on the origin and a hand-edited entry is a thing people do. The settings screen carries a slider
+that drives exactly the same value, so the choice is reachable without a mouse.
+
+**The regime is `@media (min-width: 900px) and (pointer: fine)`, and nothing else decides it.**
+Not a user-agent string — a tablet with a trackpad and a phone in desktop mode both lie to one, and
+the strings keep changing — and not `matchMedia` in the script either, because two places deciding
+what a desktop is, is two places that can disagree. `web/voice.js` only ever sets a number; the
+stylesheet decides whether that number means anything, which is why the same code path runs on a
+phone and does nothing visible there. The page suite asserts both halves: that the rules really are
+inside that query, and that no rule for a capped pane exists outside it.
+
+Judging whether the result reads as a desktop application is not something a fixture with no layout
+engine can do, which is why the screenshot harness gained a second desktop width and two states for
+the column at each end of its range — see "Looking at the page" below.
+
 ## The MCP endpoint
 
 `POST /mcp` is an MCP server speaking **Streamable HTTP**. A hosted voice agent — ElevenLabs, in
@@ -821,7 +844,7 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-315 Rust tests plus a 109-test suite for the `/voice` page: unit tests beside each module,
+315 Rust tests plus a 120-test suite for the `/voice` page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
 `tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
 the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
@@ -857,13 +880,18 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the thirteen states that look different — signed out, idle, live
+Photographs the `/voice` page in the fifteen states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
-mid-scroll, that same list with one folded answer opened among the closed ones, and the moment a
-turn arrives while the reader is up in the history — at three viewports: a tall phone, a short
-phone, and desktop width. It prints the absolute path of every image so an agent can open them
-directly.
+mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
+arrives while the reader is up in the history, and the desktop reading column at each end of its
+range — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+desktop. It prints the absolute path of every image so an agent can open them directly.
+
+The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
+(pointer: fine)` is what puts the reading column on the page at all, so on a phone there is no
+column, no handle, and nothing to photograph. A scene that ran there anyway and passed would be
+filed as evidence of a layout the phone does not have, which is why `Scene.profiles` exists.
 
 **Dark is the default, and that is not a preference.** The owner's phone is dark, and the first run
 of this harness captured nothing but light frames, because light is the browser-automation default
@@ -909,7 +937,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 31 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 35 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.
