@@ -630,6 +630,58 @@ mod tests {
         );
     }
 
+    /// The text of one top-level function in a served asset, up to the next one.
+    ///
+    /// Crude on purpose: it is enough to ask "does THIS function call that one", which is the
+    /// only question the guard below has, and it needs no parser to answer it.
+    fn function_body<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("the asset no longer defines `{signature}`"));
+        let rest = &source[start + signature.len()..];
+        let end = rest.find("\nfunction ").unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn both_message_lists_on_the_voice_page_fold_long_messages_the_same_way() {
+        // `#47 scrollback-stability`. The page renders two message lists — the voice transcript
+        // and the channel view — and the whole point of the folding work is that they behave
+        // IDENTICALLY, because they sit one switch apart and a reader moves between them without
+        // thinking about it. That is not a property of a shared helper existing; it is a property
+        // of both call sites using it. A fix landed on one list and not the other is the exact
+        // defect this file's other guard was written for, and it cost a round trip that time.
+        assert!(
+            VOICE_JS.contains("function foldable("),
+            "the folding idiom must be ONE function, not a behaviour each list implements"
+        );
+        for renderer in ["function line(", "function discordNode("] {
+            assert!(
+                function_body(VOICE_JS, renderer).contains("foldable("),
+                "`{renderer}` in web/voice.js no longer folds long messages, so the two message \
+                 lists on /voice disagree about what a long message looks like"
+            );
+        }
+        // And the anchoring that goes with it: an arrival must be conditional, never the old
+        // unconditional jump.
+        assert!(
+            VOICE_JS.contains("function followIfPinned("),
+            "an arrival must follow the newest line only when the reader was already there"
+        );
+        for renderer in ["function line(", "function seam("] {
+            let body = function_body(VOICE_JS, renderer);
+            assert!(
+                body.contains("followIfPinned("),
+                "`{renderer}` in web/voice.js appends without deciding whether to follow"
+            );
+            assert!(
+                !body.contains("scrollToNewest("),
+                "`{renderer}` in web/voice.js scrolls on every arrival again, which is the \
+                 defect: a reader looking at older messages gets thrown to the bottom"
+            );
+        }
+    }
+
     #[test]
     fn the_phone_app_pluralizes_and_never_prints_the_placeholder_form() {
         // `#62 message-count-accuracy`. `message(s)` is the shape of the defect: it is what a

@@ -98,6 +98,83 @@ function cssBlock(selector) {
   return blocks.join("\n");
 }
 
+// --- a very small layout model --------------------------------------------------------------
+//
+// The fixture cannot lay anything out and does not pretend to. What it CAN do is give every
+// element a height that MOVES when the page changes it, and that is the whole difference between
+// "the reader's position did not change" being a measurable claim and being a hopeful one. Before
+// this existed, `scrollHeight` grew by a flat ten per appended child and no element had a
+// rectangle at all, so an anchoring test could only have asserted that some number stayed the
+// number a test had hand-set.
+//
+// The model is four rules and nothing more:
+//
+//   * one rendered line is LINE_PX tall and holds CHARS_PER_LINE characters;
+//   * an element's height is its own text plus its children's heights, and zero when hidden;
+//   * a `.body` the page has CLAMPED is capped at CLAMP_LINES — that is what clamping is, and it
+//     is the only thing about `-webkit-line-clamp` this fixture can observe;
+//   * an element's top is the sum of the heights before it, minus the scroll position.
+//
+// It is deliberately dumber than a renderer, and being dumber is not the same as being honest. The
+// thing that keeps it honest is that every anchoring assertion below is ALSO run against a copy of
+// web/voice.js with the anchoring deleted, and has to fail there. A model that could not tell the
+// two apart would fail its own negative control.
+const LINE_PX = 20;
+const CHARS_PER_LINE = 40;
+const CLAMP_LINES = 3;
+
+/** The viewport of the one scrolling element, so "the reader is at the bottom" means something. */
+const SCROLL_VIEWPORT_PX = 400;
+
+/**
+ * The nesting the model needs: the one scrolling element really does contain the two lists.
+ *
+ * Stated here rather than parsed — there is no HTML parser in this fixture and there is not going
+ * to be one — and CHECKED against web/voice.html's own indentation by `assertMarkupContains`, so
+ * markup that moved a list out of the scroll area fails here instead of quietly producing a layout
+ * model of a page that no longer exists.
+ */
+const FIXTURE_TREE = {
+  "scroll-area": ["pane-voice", "pane-discord"],
+  "pane-voice": ["empty-state", "transcript"],
+  "pane-discord": ["discord-log"],
+};
+
+/** Where web/voice.html defines an id: which line, and how deeply indented. */
+function markupPlace(id) {
+  const lines = HTML.split("\n");
+  const at = lines.findIndex((line) => line.includes(`id="${id}"`));
+  assert.ok(at >= 0, `web/voice.html defines no #${id}`);
+  return { at, indent: lines[at].length - lines[at].trimStart().length, lines };
+}
+
+/**
+ * Does web/voice.html really nest `child` inside `parent`?
+ *
+ * Answered from the file's own indentation, which is uniform because the file is hand-kept that
+ * way: the parent's element ends at the first later non-blank line indented no further than it.
+ */
+function assertMarkupContains(parent, child) {
+  const outer = markupPlace(parent);
+  const inner = markupPlace(child);
+  let closesAt = outer.lines.length;
+  for (let i = outer.at + 1; i < outer.lines.length; i += 1) {
+    const line = outer.lines[i];
+    if (!line.trim()) {
+      continue;
+    }
+    if (line.length - line.trimStart().length <= outer.indent) {
+      closesAt = i;
+      break;
+    }
+  }
+  assert.ok(
+    inner.at > outer.at && inner.at < closesAt,
+    `web/voice.html no longer nests #${child} inside #${parent}, so the fixture's layout model ` +
+      "describes a page that does not exist"
+  );
+}
+
 class FakeElement {
   constructor(id, tagName = "") {
     this.id = id;
@@ -109,17 +186,100 @@ class FakeElement {
     this.checked = false;
     this.disabled = false;
     this.children = [];
+    // Named as the DOM names it, because the page reads it: a fold entry whose <li> has left the
+    // document is one the page must forget.
+    this.parentNode = null;
     this.attributes = new Map();
     this.listeners = new Map();
-    // The transcript is the one element that scrolls; the page pins it to the newest line.
+    // The scroll area is the one element that scrolls; the page pins it to the newest line.
     this.scrollTop = 0;
-    this.scrollHeight = 0;
     // A real browser clamps scrollTop to scrollHeight - clientHeight, so the page cannot ask
-    // "is the reader at the bottom?" without a viewport height. Zero keeps the fixture's
-    // scrollTop === scrollHeight convention meaning "at the bottom"; a test that cares about
-    // being scrolled UP sets it.
+    // "is the reader at the bottom?" without a viewport height. Zero everywhere except the one
+    // element that has one; `newPage` gives #scroll-area SCROLL_VIEWPORT_PX.
     this.clientHeight = 0;
     this.scrolledIntoView = 0;
+  }
+
+  /** Whether this element's class list contains a word — `className` here is a plain string. */
+  hasClass(name) {
+    return this.className.split(/\s+/).includes(name);
+  }
+
+  /** The height of everything inside, ignoring any clamp on this element itself. */
+  contentHeight() {
+    const own = this.textContent.length
+      ? Math.ceil(this.textContent.length / CHARS_PER_LINE) * LINE_PX
+      : 0;
+    return this.children.reduce((total, kid) => total + kid.height(), own);
+  }
+
+  /** What this element occupies on screen. A hidden element occupies nothing. */
+  height() {
+    if (this.hidden) {
+      return 0;
+    }
+    if (this.hasClass("clamped")) {
+      return Math.min(this.contentHeight(), CLAMP_LINES * LINE_PX);
+    }
+    return this.contentHeight();
+  }
+
+  /**
+   * How tall the scrolling content is. A computed value, not a settable one: a test that hand-set
+   * it would be asserting against a number it chose rather than against the page's own rendering,
+   * which is exactly the theatre this model exists to end.
+   */
+  get scrollHeight() {
+    return this.contentHeight();
+  }
+
+  set scrollHeight(_value) {
+    throw new Error(
+      "scrollHeight is computed from the rendered content now. To make the list overflow, put " +
+        "content in it (see `longMessage`) and set clientHeight on #scroll-area."
+    );
+  }
+
+  /** The scrolling ancestor this element is laid out inside, if any. */
+  scrollBox() {
+    let node = this.parentNode;
+    while (node) {
+      if (node.id === "scroll-area") {
+        return node;
+      }
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  /** Distance from the top of the scrolling content. */
+  offsetTop() {
+    let top = 0;
+    let node = this;
+    while (node.parentNode) {
+      for (const sibling of node.parentNode.children) {
+        if (sibling === node) {
+          break;
+        }
+        top += sibling.height();
+      }
+      if (node.parentNode.id === "scroll-area") {
+        return top;
+      }
+      node = node.parentNode;
+    }
+    return top;
+  }
+
+  /**
+   * Only the parts the page reads: `top` and `bottom`. The scrolling element itself is the origin,
+   * so its own top is zero and everything inside it is measured against that.
+   */
+  getBoundingClientRect() {
+    const box = this.scrollBox();
+    const top = box ? this.offsetTop() - box.scrollTop : 0;
+    const height = this.height();
+    return { top, bottom: top + height, height, left: 0, right: 0, width: 0 };
   }
 
   addEventListener(type, fn) {
@@ -154,14 +314,20 @@ class FakeElement {
   }
 
   append(...kids) {
+    for (const kid of kids) {
+      kid.parentNode = this;
+    }
     this.children.push(...kids);
-    // Growing content is what makes a scroll-to-bottom meaningful.
-    this.scrollHeight += 10;
   }
 
   replaceChildren(...kids) {
+    for (const old of this.children) {
+      old.parentNode = null;
+    }
+    for (const kid of kids) {
+      kid.parentNode = this;
+    }
     this.children = [...kids];
-    this.scrollHeight = kids.length * 10;
   }
 
   scrollIntoView() {
@@ -298,7 +464,7 @@ const MIC_TOGGLE_IDS = ["mic-echo-cancellation", "mic-noise-suppression", "mic-a
  * `store` is the browser's localStorage. Passing an existing one is how a RELOAD is simulated:
  * same storage, brand new script execution.
  */
-function newPage(store = new Map()) {
+function newPage(store = new Map(), script = SCRIPT) {
   const elements = new Map();
   for (const [id, markup] of PAGE_ELEMENTS) {
     const element = new FakeElement(id);
@@ -310,6 +476,15 @@ function newPage(store = new Map()) {
     }
     elements.set(id, element);
   }
+  // The containment the layout model needs, checked against the markup as it is built so it
+  // cannot describe a page web/voice.html no longer serves.
+  for (const [parent, kids] of Object.entries(FIXTURE_TREE)) {
+    for (const kid of kids) {
+      assertMarkupContains(parent, kid);
+      elements.get(parent).append(elements.get(kid));
+    }
+  }
+  elements.get("scroll-area").clientHeight = SCROLL_VIEWPORT_PX;
   const page = {
     elements,
     el: (id) => {
@@ -496,8 +671,27 @@ function newPage(store = new Map()) {
     },
   };
   vm.createContext(context);
-  vm.runInContext(SCRIPT, context, { filename: "voice.js" });
+  vm.runInContext(script, context, { filename: "voice.js" });
   return page;
+}
+
+/**
+ * web/voice.js with one thing broken on purpose.
+ *
+ * Every anchoring test below has a negative control built with this, and the control has to FAIL.
+ * Without them the layout model above would be unfalsifiable: a fixture that never moves the
+ * scroll position satisfies "the scroll position did not move" on any implementation at all,
+ * including one that does nothing. The `includes` check is the other half — a control that no
+ * longer matches the source would silently become a second copy of the positive test.
+ */
+function brokenScript(find, replace) {
+  assert.ok(
+    SCRIPT.includes(find),
+    `the negative control patches ${JSON.stringify(find)}, which web/voice.js no longer contains`
+  );
+  const mutated = SCRIPT.replace(find, replace);
+  assert.notEqual(mutated, SCRIPT, "the negative control changed nothing");
+  return mutated;
 }
 
 /**
@@ -526,6 +720,46 @@ async function startTalking(page) {
   assert.equal(page.processors.length, 1, "capture never started");
   return page.sockets[0];
 }
+
+/** A turn from the assistant, exactly as the vendor's socket delivers one. */
+const assistantSays = (page, text) =>
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "agent_response",
+      agent_response_event: { agent_response: text },
+    }),
+  });
+
+/** A turn from the reader — this page's equivalent of sending a reply. */
+const youSay = (page, text) =>
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "user_transcript",
+      user_transcription_event: { user_transcript: text },
+    }),
+  });
+
+/**
+ * A message long enough that the page folds it, and short enough to read in a failure message.
+ *
+ * Derived from the page's OWN threshold rather than restated: a test that hard-coded 281 would go
+ * green-but-vacuous the day the constant moved.
+ */
+const COLLAPSE_OVER_CHARS = Number(
+  /COLLAPSE_OVER_CHARS = (\d+)/.exec(SCRIPT_CODE)?.[1] ??
+    assert.fail("web/voice.js no longer states a fold threshold")
+);
+const longMessage = (mark = "long") =>
+  `${mark}: ` + "a sentence about the overnight run. ".repeat(
+    Math.ceil((COLLAPSE_OVER_CHARS + 60) / 36)
+  );
+const SHORT_MESSAGE = "it landed at 9c07d3e";
+
+/** The page's own definition of "the reader is at the bottom", restated once for the tests. */
+const atBottomOf = (area) => area.scrollHeight - area.scrollTop - area.clientHeight <= 24;
+
+/** The fold control on a rendered message, or undefined when it has none. */
+const foldButton = (li) => li.descendants().find((node) => node.className === "fold");
 
 /** One buffer of microphone audio arriving from the browser's audio graph. */
 function speakInto(page) {
@@ -1584,23 +1818,303 @@ test("clearing while idle just clears, with no claim about an agent that is not 
   assert.equal(page.el("status").textContent, "Transcript cleared.");
 });
 
-test("the newest line is pinned above the controls", async () => {
+// --- scrollback stability -----------------------------------------------------------------------
+//
+// `#47 scrollback-stability`. The rule this replaces was unconditional: EVERY arrival scrolled to
+// the bottom, including your own transcribed turn. The reader scrolls up to find what the
+// assistant said two minutes ago, a turn lands, and the page throws them back down.
+//
+// The new rule is conditional, and both halves of it are load-bearing. A page that never follows
+// the newest line passes "it did not move me" perfectly and is useless, so every test below that
+// says the view held still has a counterpart saying it still follows, and a NEGATIVE CONTROL: the
+// same scenario against a copy of web/voice.js with the anchoring removed, which must fail.
+
+/** A conversation long enough that the scroll area really overflows its viewport. */
+function fillTranscript(page, turns = 8) {
+  for (let i = 0; i < turns; i += 1) {
+    youSay(page, `question ${i}`);
+    assistantSays(page, longMessage(`answer ${i}`));
+  }
+  const area = page.el("scroll-area");
+  assert.ok(
+    area.scrollHeight > area.clientHeight * 2,
+    `the transcript is ${area.scrollHeight} tall in a ${area.clientHeight} box, so it does not ` +
+      "overflow and a scroll assertion against it would prove nothing"
+  );
+  return area;
+}
+
+test("a turn arriving FOLLOWS the newest line for a reader already at the bottom", async () => {
+  // The positive half. Without it, every "the view held still" test below is satisfied by a page
+  // that never scrolls at all.
   const page = newPage();
   await startTalking(page);
-  const area = page.el("scroll-area");
-  // Stand in for layout the fixture cannot do: a transcript taller than its box, scrolled up.
-  area.scrollHeight = 5000;
-  area.scrollTop = 0;
+  const area = fillTranscript(page);
+  assert.ok(atBottomOf(area), "arrivals should have left the reader at the bottom");
+  const before = area.scrollTop;
 
-  page.sockets[0].onmessage({
-    data: JSON.stringify({
-      type: "user_transcript",
-      user_transcription_event: { user_transcript: "newest" },
-    }),
-  });
+  assistantSays(page, longMessage("newest"));
 
-  assert.ok(area.scrollTop > 0, "the transcript did not follow the newest line");
-  assert.equal(area.scrollTop, area.scrollHeight);
+  assert.ok(area.scrollTop > before, "the transcript did not follow the newest line");
+  assert.ok(atBottomOf(area), "it followed, but not all the way to the newest line");
+  assert.equal(page.el("jump-newest").hidden, true, "nothing is off screen to jump to");
+});
+
+test("YOUR OWN TURN DOES NOT YANK YOU TO THE BOTTOM once you have scrolled up", async () => {
+  // This page has no typed-reply control yet, so `user_transcript` IS "sending a reply" here: it
+  // is the arrival the reader themselves caused. It must not move the view either.
+  const parked = async (script) => {
+    const page = newPage(new Map(), script);
+    await startTalking(page);
+    const area = fillTranscript(page);
+    area.scrollTop = 120; // reading something near the top of the history
+    youSay(page, longMessage("mine"));
+    return { page, area };
+  };
+
+  const { page, area } = await parked();
+  assert.equal(area.scrollTop, 120, "the reader's own turn dragged them to the bottom");
+  assert.equal(
+    page.el("jump-newest").hidden,
+    false,
+    "the view held still and said nothing, so the reader cannot tell a turn arrived"
+  );
+
+  // The control: the OLD rule, an unconditional scroll on every arrival. It has to fail.
+  const control = await parked(
+    brokenScript("function followIfPinned(pinned) {\n  if (pinned) {", "function followIfPinned(pinned) {\n  if (true) {")
+  );
+  assert.notEqual(
+    control.area.scrollTop,
+    120,
+    "the negative control did not reproduce the defect, so this test cannot detect it either"
+  );
+});
+
+test("COLLAPSING A MESSAGE ABOVE THE VIEWPORT LEAVES THE READER LOOKING AT THE SAME LINE", async () => {
+  // The case a browser's own scroll anchoring does not cover: the thing that changed height is
+  // entirely above what the reader can see, so nothing the browser anchors to has moved on screen
+  // and it does not compensate. Everything below it slides up under the eye.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await startTalking(page);
+    const area = fillTranscript(page);
+
+    // Open one of the earliest answers, so collapsing it later is a real change of height.
+    const early = page.el("transcript").children[1];
+    const fold = foldButton(early);
+    assert.ok(fold, "the first long answer arrived with no fold control");
+    await fold.click();
+    assert.equal(early.getAttribute("data-collapsed"), "false", "the fold did not open");
+
+    // Park well down the list, with that message off the top of the screen.
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.7);
+    assert.ok(
+      early.getBoundingClientRect().bottom < 0,
+      "the message being collapsed is still on screen, so this is not the case under test"
+    );
+    const anchor = page.el("transcript").children.find((li) => li.getBoundingClientRect().bottom > 0);
+    assert.ok(anchor, "nothing is on screen to anchor to");
+    const before = anchor.getBoundingClientRect().top;
+
+    await fold.click(); // collapse it again, from above the viewport
+
+    assert.equal(early.getAttribute("data-collapsed"), "true", "the fold did not close");
+    return { page, moved: anchor.getBoundingClientRect().top - before };
+  };
+
+  const { moved } = await run();
+  assert.equal(moved, 0, `the line the reader was looking at moved ${moved}px`);
+
+  // The control: the same page with the restore deleted. The whole test rests on the fixture being
+  // able to SEE the difference, so it has to be shown seeing it.
+  const control = await run(
+    brokenScript(
+      "  area.scrollTop += anchor.getBoundingClientRect().top - before;",
+      "  void before;"
+    )
+  );
+  assert.notEqual(
+    control.moved,
+    0,
+    "with the scroll restore deleted the view still did not move, so this fixture cannot tell " +
+      "an anchored page from an unanchored one"
+  );
+});
+
+test("COLLAPSE ALL puts the list back in one tap, without moving the reader", async () => {
+  const page = newPage();
+  await startTalking(page);
+  const area = fillTranscript(page);
+  const longOnes = page.el("transcript").children.filter((li) => foldButton(li));
+  assert.ok(longOnes.length >= 3, "not enough long messages to be worth collapsing");
+
+  assert.equal(page.el("collapse-all").hidden, true, "nothing is expanded, so there is no offer");
+  for (const li of longOnes) {
+    await foldButton(li).click();
+  }
+  assert.equal(page.el("collapse-all").hidden, false, "the offer never appeared");
+
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.7);
+  const anchor = page.el("transcript").children.find((li) => li.getBoundingClientRect().bottom > 0);
+  const before = anchor.getBoundingClientRect().top;
+
+  await page.el("collapse-all").click();
+
+  assert.ok(
+    longOnes.every((li) => li.getAttribute("data-collapsed") === "true"),
+    "collapse all left something open"
+  );
+  assert.equal(
+    anchor.getBoundingClientRect().top,
+    before,
+    "collapsing everything moved the reader"
+  );
+  assert.equal(page.el("collapse-all").hidden, true, "the offer stayed after it was taken");
+});
+
+test("JUMP TO NEWEST appears only when something arrived off screen, and takes you there", async () => {
+  const page = newPage();
+  await startTalking(page);
+  const area = fillTranscript(page);
+  assert.equal(page.el("jump-newest").hidden, true, "the chip is up while the reader is pinned");
+
+  area.scrollTop = 120;
+  assistantSays(page, longMessage("while you were reading"));
+  assert.equal(page.el("jump-newest").hidden, false, "a turn arrived off screen and said nothing");
+  assert.equal(area.scrollTop, 120, "the chip appeared AND the page moved anyway");
+
+  await page.el("jump-newest").click();
+  assert.ok(atBottomOf(area), "the chip did not take the reader to the newest line");
+  assert.equal(page.el("jump-newest").hidden, true, "the chip stayed after it was taken");
+});
+
+test("reaching the bottom yourself puts the chip away, without a tap", async () => {
+  const page = newPage();
+  await startTalking(page);
+  const area = fillTranscript(page);
+  area.scrollTop = 120;
+  assistantSays(page, longMessage("newest"));
+  assert.equal(page.el("jump-newest").hidden, false);
+
+  // A thumb, not a control: the reader scrolls down to the bottom themselves.
+  area.scrollTop = area.scrollHeight - area.clientHeight;
+  await area.dispatch("scroll");
+
+  assert.equal(page.el("jump-newest").hidden, true, "the chip outstayed the reason for it");
+});
+
+test("ONE COLLAPSING IDIOM: the transcript and the channel fold a long message identically", async () => {
+  // The property the issue asks for, stated as a comparison rather than as two separate checks —
+  // two separate checks are satisfied by two implementations that have drifted apart.
+  const page = newPage();
+  await startTalking(page);
+  assistantSays(page, longMessage("spoken"));
+  const spoken = page.el("transcript").children.at(-1);
+
+  page.messages = [message({ id: "1", content: longMessage("posted") })];
+  await page.el("view-switch").click();
+  await page.settle();
+  const posted = page.el("discord-log").children.at(-1);
+
+  for (const [where, li] of [
+    ["the transcript", spoken],
+    ["the channel", posted],
+  ]) {
+    const fold = foldButton(li);
+    assert.ok(fold, `${where} rendered a long message with no fold control`);
+    assert.equal(fold.tagName, "button", `${where}'s fold control is not a button`);
+    assert.equal(li.getAttribute("data-collapsed"), "true", `${where} did not arrive collapsed`);
+    const body = li.descendants().find((node) => node.hasClass("body"));
+    assert.ok(body.hasClass("clamped"), `${where} collapsed the wrong element`);
+    assert.equal(fold.getAttribute("aria-expanded"), "false", `${where} misreports its state`);
+  }
+
+  assert.equal(
+    foldButton(spoken).className,
+    foldButton(posted).className,
+    "the two lists style their fold controls differently"
+  );
+  assert.equal(
+    foldButton(spoken).textContent,
+    foldButton(posted).textContent,
+    "the two lists word their fold controls differently"
+  );
+
+  // And it is literally one function, called twice — not two implementations that agree today.
+  assert.match(SCRIPT_CODE, /function foldable\(/, "the folding idiom is not a shared function");
+  const calls = (SCRIPT_CODE.match(/foldable\(/g) || []).length - 1;
+  assert.equal(calls, 2, `foldable() is called from ${calls} places; both message lists need it`);
+});
+
+test("a short message gets no fold control at all, in either list", async () => {
+  // A control that would reveal nothing, on every line of the list, is chrome charging rent.
+  const page = newPage();
+  await startTalking(page);
+  assistantSays(page, SHORT_MESSAGE);
+  const spoken = page.el("transcript").children.at(-1);
+
+  page.messages = [message({ id: "1", content: SHORT_MESSAGE })];
+  await page.el("view-switch").click();
+  await page.settle();
+  const posted = page.el("discord-log").children.at(-1);
+
+  for (const [where, li] of [
+    ["the transcript", spoken],
+    ["the channel", posted],
+  ]) {
+    assert.equal(foldButton(li), undefined, `${where} put a fold control on a short message`);
+    assert.equal(li.getAttribute("data-collapsed"), null, `${where} marked a short message`);
+    const body = li.descendants().find((node) => node.hasClass("body"));
+    assert.ok(!body.hasClass("clamped"), `${where} clamped a message with nothing to hide`);
+  }
+});
+
+test("expanding one message leaves its neighbours exactly as they were", async () => {
+  // Otherwise "expand" is a mode, and the list you come back to is not the list you left.
+  const page = newPage();
+  await startTalking(page);
+  fillTranscript(page);
+  const longOnes = page.el("transcript").children.filter((li) => foldButton(li));
+  assert.ok(longOnes.length >= 3, "not enough long messages to have neighbours");
+  assert.ok(
+    longOnes.every((li) => li.getAttribute("data-collapsed") === "true"),
+    "long messages did not ARRIVE collapsed"
+  );
+
+  const fold = foldButton(longOnes[1]);
+  await fold.click();
+
+  assert.equal(longOnes[1].getAttribute("data-collapsed"), "false");
+  assert.equal(fold.getAttribute("aria-expanded"), "true");
+  assert.ok(
+    longOnes.filter((_li, i) => i !== 1).every((li) => li.getAttribute("data-collapsed") === "true"),
+    "expanding one message expanded its neighbours too"
+  );
+
+  await fold.click();
+  assert.equal(longOnes[1].getAttribute("data-collapsed"), "true", "the fold does not close again");
+});
+
+test("the collapsed height is really three LINES, and the chips are outside the faded region", () => {
+  // The fixture cannot prove a line clamp — it has no renderer — so the clamp is asserted as a
+  // declaration on the selector that has to carry it. `overflow: hidden` is checked by name
+  // because without it the box shows every line and the clamp does nothing at all.
+  const clamped = cssBlock(".body.clamped");
+  assert.match(clamped, /-webkit-line-clamp:\s*3\b/, "the clamp is not three lines");
+  assert.match(clamped, /overflow:\s*hidden/, "without this the clamp shows every line anyway");
+  assert.match(clamped, /-webkit-box-orient:\s*vertical/);
+
+  // #scroll-area carries a mask-image gradient that fades its top edge. A chip inside it would be
+  // faded with the content, and would scroll away with it.
+  assert.match(cssBlock("#scroll-area"), /mask-image/, "the fade this reasoning depends on is gone");
+  assertMarkupContains("screen-main", "scroll-tools");
+  assert.throws(
+    () => assertMarkupContains("scroll-area", "scroll-tools"),
+    /no longer nests/,
+    "the chips are inside the scrolling element, where the mask fades them"
+  );
+  assert.match(cssBlock("#screen-main"), /position:\s*relative/, "the chips have nothing to sit on");
 });
 
 // --- the raw Discord view --------------------------------------------------------------------------
@@ -1848,17 +2362,25 @@ test("Refresh re-reads the channel rather than appending to it", async () => {
   assert.match(lines[0].text(), /two/);
 });
 
+/** A channel with enough in it that the scroll area really overflows. */
+const tallChannel = (count = 12) =>
+  Array.from({ length: count }, (_unused, i) =>
+    message({ id: String(i + 1), content: longMessage(`message ${i + 1}`) })
+  );
+
 test("the channel view opens on the NEWEST message, not the top", async () => {
   const page = newPage();
   await signIn(page);
   const area = page.el("scroll-area");
-  // Stand in for layout the fixture cannot do: a channel taller than its box, parked at the top.
-  area.scrollHeight = 5000;
   area.scrollTop = 0;
 
-  await showDiscord(page, [message({ id: "1", content: "oldest" }), message({ id: "2", content: "newest" })]);
+  await showDiscord(page, tallChannel());
 
-  assert.equal(area.scrollTop, area.scrollHeight, "the channel opened at the top of the history");
+  assert.ok(
+    area.scrollHeight > area.clientHeight * 2,
+    "the channel does not overflow, so opening at the bottom would prove nothing"
+  );
+  assert.ok(atBottomOf(area), "the channel opened at the top of the history");
 });
 
 test("EVERY visit to the channel view opens on the newest message, not just the first", async () => {
@@ -1867,21 +2389,24 @@ test("EVERY visit to the channel view opens on the newest message, not just the 
   // switch inherited whatever scrollTop the voice pane had left behind — the top, usually.
   const page = newPage();
   await signIn(page);
-  await showDiscord(page, [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })]);
+  await showDiscord(page, tallChannel());
 
   await page.el("view-switch").click(); // back to the voice transcript
   await page.settle();
   assert.equal(page.tab(), "voice");
 
   const area = page.el("scroll-area");
-  area.scrollHeight = 5000;
   area.scrollTop = 0; // the reader scrolled up in the voice pane
 
   await page.el("view-switch").click(); // and returns to the channel: no reload, the log is populated
   await page.settle();
 
   assert.equal(page.tab(), "discord");
-  assert.equal(area.scrollTop, area.scrollHeight, "the second visit to the channel opened at the top");
+  assert.ok(
+    area.scrollHeight > area.clientHeight * 2,
+    "the channel does not overflow, so opening at the bottom would prove nothing"
+  );
+  assert.ok(atBottomOf(area), "the second visit to the channel opened at the top");
 });
 
 // --- keeping the channel view fresh ------------------------------------------------------------
@@ -1961,41 +2486,57 @@ test("polling stops when the channel is no longer the view you are on", async ()
 test("a background refresh does NOT drag a reader who has scrolled up", async () => {
   const page = newPage();
   await signIn(page);
-  countingChannel(page, [message({ id: "1", content: "one" })]);
+  countingChannel(page, tallChannel());
   await page.el("view-switch").click();
   await page.settle();
 
   const area = page.el("scroll-area");
-  // Reading older messages: a tall channel, parked well above the bottom.
-  area.scrollHeight = 5000;
-  area.clientHeight = 800;
-  area.scrollTop = 1200;
+  // Reading older messages: parked well above the bottom of a channel that really overflows.
+  assert.ok(area.scrollHeight > area.clientHeight * 2, "the channel does not overflow");
+  area.scrollTop = 120;
 
-  page.messages = [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })];
+  page.messages = [...tallChannel(), message({ id: "13", content: longMessage("brand new") })];
   page.expireTimers(45000);
   await page.settle();
 
   assert.equal(page.reads, 2, "the poll did not fire");
-  assert.equal(area.scrollTop, 1200, "a refresh nobody asked for yanked the reader to the bottom");
+  assert.equal(area.scrollTop, 120, "a refresh nobody asked for yanked the reader to the bottom");
 });
 
 test("a background refresh DOES follow the newest line for a reader already at the bottom", async () => {
   const page = newPage();
   await signIn(page);
-  countingChannel(page, [message({ id: "1", content: "one" })]);
+  countingChannel(page, tallChannel());
   await page.el("view-switch").click();
   await page.settle();
 
   const area = page.el("scroll-area");
-  area.scrollHeight = 5000;
-  area.clientHeight = 800;
-  area.scrollTop = 4200; // scrollHeight - clientHeight: pinned to the bottom
+  area.scrollTop = area.scrollHeight - area.clientHeight; // pinned to the bottom
+  const before = area.scrollTop;
 
-  page.messages = [message({ id: "1", content: "one" }), message({ id: "2", content: "two" })];
+  page.messages = [...tallChannel(), message({ id: "13", content: longMessage("brand new") })];
   page.expireTimers(45000);
   await page.settle();
 
-  assert.equal(area.scrollTop, area.scrollHeight, "the reader was at the bottom and did not follow");
+  assert.ok(area.scrollTop > before, "the reader was at the bottom and did not follow");
+  assert.ok(atBottomOf(area), "it followed, but not to the newest message");
+});
+
+test("REFRESH keeps your place too — asking for fresh messages is not asking to be moved", async () => {
+  // The button is a re-read of the channel already in front of you. Being thrown to the bottom of
+  // it is the same defect as a background poll doing so.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallChannel());
+  const area = page.el("scroll-area");
+  area.scrollTop = 120;
+
+  page.messages = [...tallChannel(), message({ id: "13", content: longMessage("brand new") })];
+  await page.el("refresh-discord").click();
+  await page.settle();
+
+  assert.equal(page.el("discord-log").children.length, 13, "Refresh did not re-read the channel");
+  assert.equal(area.scrollTop, 120, "Refresh threw the reader to the bottom");
 });
 
 test("a Discord read that fails reports itself and does NOT hang up on you", async () => {

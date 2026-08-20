@@ -850,14 +850,18 @@ LONG_TRANSCRIPT = [
         "agent",
         "Three things finished and one is still going. The retry-budget branch landed at 9c07d3e, "
         "the cache-key rewrite is open as a draft, and the nightly cache rebuild took twenty-two "
-        "minutes which is inside the usual band.",
+        "minutes which is inside the usual band. Nothing failed outright. The one job still "
+        "outstanding is the arm64 build, which has been queued long enough that it is worth "
+        "looking at on its own rather than waiting for it.",
     ),
     ("user", "what is still going"),
     (
         "agent",
         "The arm64 job. It has been queued for forty-one minutes with nothing executing, which is "
         "a wedged runner rather than a busy one — the run reads green at the run level but its job "
-        "list has a job that never started, so that green is not evidence of anything.",
+        "list has a job that never started, so that green is not evidence of anything. The other "
+        "three architectures finished inside nine minutes each, which is the usual shape, so this "
+        "is the runner and not the change.",
     ),
     ("user", "did anyone re-fire it"),
     (
@@ -878,7 +882,9 @@ LONG_TRANSCRIPT = [
     (
         "agent",
         "One thing. The token the release job uses expires in six days and rotating it needs the "
-        "maintainer account, so nothing automated can do it for you.",
+        "maintainer account, so nothing automated can do it for you. Everything else on the list "
+        "either landed or has an owner who is awake. If it lapses the release job fails at the "
+        "publish step, after the build, which is the most expensive place to find out.",
     ),
     ("user", "and the two issues from the QA sweep"),
     (
@@ -893,13 +899,37 @@ LONG_TRANSCRIPT = [
         "agent",
         "The nightly cache rebuild finished in twenty-two minutes fourteen seconds, three point "
         "one gigabytes written, no evictions. The night before was twenty-four minutes two, so "
-        "that is noise rather than an improvement.",
+        "that is noise rather than an improvement. It also said the eviction policy has not "
+        "triggered once this week, which is the number worth watching if the cache starts missing.",
     ),
     ("user", "how many messages are in the channel now"),
     (
         "agent",
         "Twelve since the run started, from four different authors. The Discord view has all of "
-        "them with their ids if you want to check one against what I just told you.",
+        "them with their ids if you want to check one against what I just told you. Four of them "
+        "are build-bot, which is the noisiest one; the rest are split between claude-integ and "
+        "the two people who were awake for it. None of them is older than the run itself.",
+    ),
+    ("user", "give me the whole picture then, one answer"),
+    (
+        # Deliberately the longest thing in the list, and long enough to run past three lines at
+        # DESKTOP width as well as on a phone. `12-collapsed-long-transcript` opens this one, so
+        # the picture is of a fold that is really hiding something rather than of a fold that
+        # happens to fit. A voice assistant summarising a night's work does answer at this length,
+        # which is the whole reason `#47 scrollback-stability` exists.
+        "agent",
+        "Here is all of it in one go. The retry-budget branch landed at 9c07d3e after the jitter "
+        "ordering was fixed, and the unrelated cache-key rewrite was pulled back out of it into a "
+        "draft of its own. The nightly cache rebuild finished in twenty-two minutes fourteen with "
+        "three point one gigabytes written and no evictions, which is a minute and a half faster "
+        "than the night before and inside the ordinary spread either way. The arm64 job is the "
+        "only thing still outstanding: it has sat queued for forty-one minutes on a runner that "
+        "is wedged rather than busy, it was re-fired twice onto the same runner, and it only "
+        "cleared when the runner was recycled by hand. Of the two QA findings the first is a "
+        "genuine flake that turns on wall-clock ordering between two spawned processes, and the "
+        "second is a real ordering bug that only shows up on a loaded machine. The one thing "
+        "waiting on you is the release token, which expires in six days and needs the maintainer "
+        "account to rotate.",
     ),
 ]
 
@@ -927,6 +957,58 @@ def _act_long_scroll(driver: Driver) -> None:
         "(() => { const a = document.getElementById('scroll-area'); "
         "a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) * 0.45); return a.scrollTop; })()"
     )
+    driver.settle(300)
+
+
+def _act_one_expanded(driver: Driver) -> None:
+    # `#47 scrollback-stability`. Every long answer ARRIVES showing its first three lines, which is
+    # what makes the list above skimmable. The one thing a unit test cannot check is whether three
+    # lines is actually three lines — a line clamp is a rendering fact — so this state exists to be
+    # LOOKED at, with one message opened among the closed ones for the comparison.
+    driver.js("(() => { document.getElementById('scroll-area').scrollTop = 0; })()")
+    driver.settle(150)
+    # Measure ONE message closed, then open THAT ONE. Comparing the first open message against the
+    # first closed one compares two lengths, not two states, and passes or fails on which message
+    # happened to be longest — at desktop width it passed for the wrong reason.
+    driver.js(
+        "(() => { const items = "
+        "[...document.querySelectorAll(\"#transcript li[data-collapsed='true']\")]; "
+        "const li = items.sort((a, b) => b.textContent.length - a.textContent.length)[0]; "
+        "li.id = 'fold-probe'; "
+        "window.__foldedHeight = li.querySelector('.body').getBoundingClientRect().height; "
+        "return window.__foldedHeight; })()"
+    )
+    driver.page.click("#fold-probe .fold")
+    driver.page.wait_for_function(
+        "() => !!document.querySelector(\"#transcript li[data-collapsed='false']\")", timeout=5_000
+    )
+    # Playwright scrolls an element into view before clicking it, which parks the opened message
+    # alone on the screen — a picture of one long message, not of one long message AMONG the
+    # three-line openings, which is the whole comparison this state exists to show. Put the
+    # boundary back on screen.
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); "
+        "const probe = document.getElementById('fold-probe'); "
+        "const offset = probe.getBoundingClientRect().top - a.getBoundingClientRect().top; "
+        "a.scrollTop = Math.max(0, a.scrollTop + offset - a.clientHeight * 0.5); "
+        "return a.scrollTop; })()"
+    )
+    driver.settle(300)
+
+
+def _act_jump_to_newest(driver: Driver) -> None:
+    # A turn arrives while the reader is up in the history. The page must NOT drag them down to it
+    # — and must not leave them unaware it happened either, which is what the chip is for.
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); "
+        "a.scrollTop = Math.round(a.scrollHeight * 0.2); return a.scrollTop; })()"
+    )
+    driver.settle(200)
+    driver.js(
+        "window.__agentSays('One more thing while you were reading: the release token expires in "
+        "six days and rotating it needs the maintainer account.')"
+    )
+    driver.page.wait_for_function("() => window.__visible('jump-newest')", timeout=5_000)
     driver.settle(300)
 
 
@@ -1160,6 +1242,54 @@ SCENES: tuple[Scene, ...] = (
                 "the view is parked in the middle, not pinned to either end",
                 "(() => { const a = document.getElementById('scroll-area'); "
                 "return a.scrollTop > 50 && a.scrollTop < a.scrollHeight - a.clientHeight - 50; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="12-collapsed-long-transcript",
+        what="the same list with one answer opened: three-line openings, and the one full message",
+        act=_act_one_expanded,
+        expect=(
+            (
+                "most of the list is still showing openings only",
+                "document.querySelectorAll(\"#transcript li[data-collapsed='true']\").length >= 4",
+            ),
+            (
+                "exactly one message is open, so the comparison is the point of the picture",
+                "document.querySelectorAll(\"#transcript li[data-collapsed='false']\").length === 1",
+            ),
+            # The assertion no unit test can make: THE SAME message, clamped, is really shorter
+            # than it is unclamped. A line clamp is a rendering fact — the page fixture can only
+            # check that the declaration is on the right selector — so if `-webkit-line-clamp`
+            # stops applying, this is the only thing in the repository that notices.
+            (
+                "the message that was opened is really taller than it was folded",
+                "(() => { const b = document.querySelector('#fold-probe .body'); "
+                "return window.__foldedHeight > 0 && "
+                "b.getBoundingClientRect().height > window.__foldedHeight + 10; })()",
+            ),
+            (
+                "the offer to put the list back is on screen, because something IS open",
+                "window.__visible('collapse-all')",
+            ),
+        ),
+    ),
+    Scene(
+        name="13-jump-to-newest",
+        what="a turn arrived while the reader was up in the history: the view held, the chip appeared",
+        act=_act_jump_to_newest,
+        expect=(
+            ("the chip offering the newest line is on screen", "window.__visible('jump-newest')"),
+            (
+                "the arrival did NOT drag the reader to the bottom",
+                "(() => { const a = document.getElementById('scroll-area'); "
+                "return a.scrollTop < a.scrollHeight - a.clientHeight - 50; })()",
+            ),
+            (
+                "the chip is clear of the dock, not underneath it",
+                "(() => { const r = document.getElementById('jump-newest').getBoundingClientRect(); "
+                "const dock = document.getElementById('dock').getBoundingClientRect(); "
+                "return r.bottom <= dock.top + 1 && r.top >= 0; })()",
             ),
         ),
     ),
@@ -1441,11 +1571,13 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 11:
+    if len(SCENES) < 13:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
-            "its disclosure open, and settings with its title bar."
+            "its disclosure open, and settings with its title bar -- and `#47 scrollback-stability` "
+            "added two more that are pure rendering facts: a folded list with one message opened, "
+            "and the chip that appears when a turn arrives off screen."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -1481,6 +1613,12 @@ def check_state_controls() -> list[str]:
         "09-settings": "topbar-title",
         "10-discord-view": "Discord",
         "11-long-transcript-scrolled": "scrollTop",
+        # Both pinned to the thing the picture is FOR, not to the screen being up. A line clamp is
+        # a rendering fact no behavioural test can reach, so "one is open among the closed ones" is
+        # the whole content of state 12; "a turn arrived and the view did not move" is the whole
+        # content of state 13.
+        "12-collapsed-long-transcript": "data-collapsed",
+        "13-jump-to-newest": "jump-newest",
     }
     for name, needle in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

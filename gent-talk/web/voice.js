@@ -154,6 +154,8 @@ function showView(name) {
   // for. Doing this here rather than in loadDiscord() is deliberate — the load only runs on
   // the FIRST switch, so a fix that lived there would leave every later switch at the top.
   scrollToNewest();
+  // The chips belong to the list you are looking at, and you are now looking at a different one.
+  renderScrollTools();
 }
 
 // --- connection details -------------------------------------------------------------------------
@@ -197,10 +199,98 @@ function dismissBanner() {
 
 // --- transcript -----------------------------------------------------------------------------
 
-/** Keep the newest line directly above the control pane, which is where the eye already is. */
+/**
+ * Go to the newest line — deliberately, because somebody asked.
+ *
+ * This used to run on EVERY arrival, which is the defect `#47 scrollback-stability` is about: the
+ * reader scrolls up to find what the assistant said two minutes ago, a turn lands, and the page
+ * throws them back to the bottom. Every remaining caller is a deliberate act — entering a view,
+ * loading a channel for the first time, tapping "Newest" — or an arrival that happened while the
+ * reader was already parked at the bottom, which is `followIfPinned` below.
+ */
 function scrollToNewest() {
   const area = el("scroll-area");
   area.scrollTop = area.scrollHeight;
+  setJumpNewest(false);
+}
+
+/**
+ * Was the reader already parked on the newest message?
+ *
+ * A browser clamps scrollTop to scrollHeight - clientHeight, so "at the bottom" is never
+ * scrollTop === scrollHeight however hard `scrollToNewest` pushes. The slack absorbs that, plus
+ * sub-pixel layout and a thumb that stopped a few pixels short — at which point the reader still
+ * means "I am at the bottom", and the page should still follow.
+ */
+const BOTTOM_SLACK_PX = 24;
+
+function atBottom(area, slack = BOTTOM_SLACK_PX) {
+  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0) <= slack;
+}
+
+/** The list the reader is actually looking at. Both panes share one scrolling element. */
+function visibleList() {
+  return el(currentView === "discord" ? "discord-log" : "transcript");
+}
+
+/**
+ * The message the reader's eye is on: the first one not already scrolled off the top.
+ *
+ * This is the anchor everything below is measured against. A browser has its own scroll anchoring,
+ * and it is exactly the wrong tool here — it is defeated by a mutation ABOVE the viewport, which
+ * is precisely what collapsing a message the reader has already scrolled past is.
+ */
+function scrollAnchor(area) {
+  const edge = area.getBoundingClientRect().top;
+  const items = visibleList().children;
+  for (const li of items) {
+    if (li.getBoundingClientRect().bottom > edge) {
+      return li;
+    }
+  }
+  return items.length > 0 ? items[items.length - 1] : null;
+}
+
+/**
+ * Run a mutation and leave the reader looking at the same thing afterwards.
+ *
+ * Capture the anchor's offset, mutate, measure it again, and move the scroll position by the
+ * difference. Explicit, because the alternative is trusting browser scroll anchoring, and the
+ * whole point is that it does not hold for a change made above the viewport.
+ *
+ * A reader who was already at the bottom is the one exception: for them "the same thing" IS the
+ * newest line, so the view follows it.
+ */
+function preservingScroll(mutate) {
+  const area = el("scroll-area");
+  const pinned = atBottom(area);
+  const anchor = scrollAnchor(area);
+  const before = anchor ? anchor.getBoundingClientRect().top : 0;
+  mutate();
+  if (pinned) {
+    scrollToNewest();
+    return;
+  }
+  if (!anchor) {
+    return;
+  }
+  area.scrollTop += anchor.getBoundingClientRect().top - before;
+}
+
+/**
+ * A turn arrived. Follow it only if the reader had not scrolled away.
+ *
+ * `pinned` is measured BEFORE the append, because appending is itself what changes the answer.
+ * When it is false the scroll position is left exactly alone and the "Newest" chip appears —
+ * silently leaving the reader in place would be the other half of the same defect, since they
+ * would have no way of knowing something had arrived at all.
+ */
+function followIfPinned(pinned) {
+  if (pinned) {
+    scrollToNewest();
+    return;
+  }
+  setJumpNewest(true);
 }
 
 /** The invitation only makes sense while there is nothing else in the transcript. */
@@ -215,6 +305,120 @@ function stamp() {
   return `${pad(now.getHours())}:${pad(now.getMinutes())}`;
 }
 
+// --- long messages, folded -----------------------------------------------------------------------
+//
+// `#47 scrollback-stability`. Both lists on this page carry long messages — an assistant answers in
+// paragraphs, and so does a coding agent posting into a channel — and ten of those in a row is a
+// list nobody can skim. `foldable` below is called from `line()` AND from `discordNode()`, so this
+// is not two similar behaviours that will drift; it is one behaviour, and the transcript and the
+// channel cannot disagree about it.
+//
+// The open questions on the issue, answered here rather than left to the reader of a diff:
+//
+//   * COLLAPSED SIZE IS MEASURED IN LINES — three, by `-webkit-line-clamp` in web/voice.css. What
+//     the reader is being protected from is a wall of text, and a wall is a number of lines. The
+//     character count below decides only WHETHER to fold.
+//   * A LONG MESSAGE ARRIVES ALREADY FOLDED. Folding it after the reader has seen it is a jump in
+//     the list for no reason they asked for, which is the same class of defect as the scroll one.
+//   * A SHORT MESSAGE GETS NO CONTROL AT ALL. A fold button that would reveal nothing, on every
+//     line of the list, is chrome charging rent.
+//   * THE STATE IS NOT PERSISTED across a reload. The voice transcript does not survive one today
+//     and the channel view re-reads from the server, so there is nothing yet to persist it
+//     against; worth revisiting if the transcript ever starts to survive a reload.
+//   * COLLAPSE ALL IS ONE ACTION, not a preference. It puts the list back the way it arrived.
+//
+// 280 characters is about four lines at phone width — comfortably past the three the fold shows, so
+// a folded message always has something behind it.
+const COLLAPSE_OVER_CHARS = 280;
+
+const FOLD_MORE = "More";
+const FOLD_LESS = "Less";
+
+// Every message that has a fold control, in the order it was rendered. Kept rather than re-queried
+// so that "collapse all" is one pass over what exists; `liveFolds` drops the entries whose <li> has
+// left the document, which is what a cleared transcript and a re-read channel both do.
+const foldables = [];
+
+function liveFolds() {
+  for (let i = foldables.length - 1; i >= 0; i -= 1) {
+    if (!foldables[i].li.parentNode) {
+      foldables.splice(i, 1);
+    }
+  }
+  return foldables;
+}
+
+function setFolded(entry, folded) {
+  entry.li.setAttribute("data-collapsed", folded ? "true" : "false");
+  entry.body.className = folded ? "body clamped" : "body";
+  entry.fold.textContent = folded ? FOLD_MORE : FOLD_LESS;
+  entry.fold.setAttribute("aria-expanded", folded ? "false" : "true");
+}
+
+const isFolded = (entry) => entry.li.getAttribute("data-collapsed") === "true";
+
+/**
+ * Fold this message if it is long enough to be worth folding.
+ *
+ * Called from both message lists with the pieces each of them has already built, so the control,
+ * the class and the attribute are identical in the transcript and in the channel. Returns the
+ * button, or null when the message is short and gets none.
+ */
+function foldable(li, meta, body, text) {
+  if (String(text === null || text === undefined ? "" : text).length <= COLLAPSE_OVER_CHARS) {
+    return null;
+  }
+  const fold = document.createElement("button");
+  fold.className = "fold";
+  fold.setAttribute("type", "button");
+  const entry = { li, body, fold };
+  setFolded(entry, true);
+  // Toggling changes the height of something that may be far above the viewport, which is the one
+  // case the browser's own scroll anchoring does not cover.
+  fold.addEventListener("click", () => {
+    preservingScroll(() => setFolded(entry, !isFolded(entry)));
+    renderScrollTools();
+  });
+  meta.append(fold);
+  foldables.push(entry);
+  return fold;
+}
+
+// --- the two chips over the list ----------------------------------------------------------------
+//
+// Both are ABSENT unless there is something for them to do, for the same reason Hang up is absent
+// when there is no call: a control that is always there and usually inert teaches the eye to skip
+// the corner it lives in.
+
+let jumpNewestWanted = false;
+
+function setJumpNewest(wanted) {
+  jumpNewestWanted = wanted;
+  renderScrollTools();
+}
+
+/** The folds in the list actually on screen. Collapse all acts on what you are looking at. */
+function visibleFolds() {
+  const list = visibleList();
+  return liveFolds().filter((entry) => entry.li.parentNode === list);
+}
+
+function renderScrollTools() {
+  el("jump-newest").hidden = !jumpNewestWanted;
+  // "Collapse all" appears only once something IS expanded. Everything arrives folded, so until
+  // the reader opens one there is nothing for it to collapse.
+  el("collapse-all").hidden = !visibleFolds().some((entry) => !isFolded(entry));
+}
+
+function collapseAll() {
+  preservingScroll(() => {
+    for (const entry of visibleFolds()) {
+      setFolded(entry, true);
+    }
+  });
+  renderScrollTools();
+}
+
 /**
  * One turn.
  *
@@ -223,6 +427,8 @@ function stamp() {
  */
 function line(who, text) {
   const mine = who === "you";
+  // Measured BEFORE the append: appending is what changes the answer.
+  const pinned = atBottom(el("scroll-area"));
   const li = document.createElement("li");
   li.className = mine ? "mine" : "theirs";
   const meta = document.createElement("div");
@@ -239,8 +445,9 @@ function line(who, text) {
   body.textContent = text; // untrusted text: never innerHTML.
   li.append(meta, body);
   el("transcript").append(li);
+  foldable(li, meta, body, text);
   renderEmptyState();
-  scrollToNewest();
+  followIfPinned(pinned);
   return li;
 }
 
@@ -257,6 +464,7 @@ function line(who, text) {
  * named by `title` on a pointer device — and they are not standing on the screen.
  */
 function seam(label, detail) {
+  const pinned = atBottom(el("scroll-area"));
   const li = document.createElement("li");
   li.className = "seam";
   const details = document.createElement("details");
@@ -284,7 +492,7 @@ function seam(label, detail) {
   li.append(details);
   el("transcript").append(li);
   renderEmptyState();
-  scrollToNewest();
+  followIfPinned(pinned);
   return li;
 }
 
@@ -374,6 +582,7 @@ function onClear() {
   disarmClear();
   el("transcript").replaceChildren();
   renderEmptyState();
+  renderScrollTools(); // the folds went with the lines they were attached to.
   if (session.socket) {
     seam(
       "view cleared",
@@ -1117,6 +1326,9 @@ function discordNode(message) {
   body.className = "body";
   renderMarkdownInto(body, message.content);
   li.append(meta, body);
+  // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
+  // up with two idioms for the one behaviour. `#47 scrollback-stability`.
+  foldable(li, meta, body, message.content);
   return li;
 }
 
@@ -1142,20 +1354,11 @@ function channelSummary(count, complete, label) {
 }
 
 /**
- * Was the reader already parked on the newest message?
- *
- * A browser clamps scrollTop to scrollHeight - clientHeight, so "at the bottom" is never
- * scrollTop === scrollHeight however hard `scrollToNewest` pushes. The few pixels of slack
- * absorb sub-pixel layout.
- */
-function atNewest(area) {
-  return area.scrollHeight - area.scrollTop - (area.clientHeight || 0) <= 4;
-}
-
-/**
- * @param {{keepPosition?: boolean}} [options] `keepPosition` marks a refresh the reader did not
- *   ask for. It must not drag them to the bottom while they are reading older messages — it
- *   follows the newest line only if that is where they already were.
+ * @param {{keepPosition?: boolean}} [options] `keepPosition` marks a RE-read of a channel already
+ *   on screen — the background poll, or the Refresh button. It must not drag the reader to the
+ *   bottom while they are reading older messages; it follows the newest line only if that is
+ *   where they already were. The FIRST load of a channel is the other case and does not pass it:
+ *   arriving at the top of a long history means scrolling past everything already read.
  */
 async function loadDiscord(options) {
   const keepPosition = Boolean(options && options.keepPosition);
@@ -1167,7 +1370,7 @@ async function loadDiscord(options) {
   if (discordFetchInFlight) return;
   discordFetchInFlight = true;
   const area = el("scroll-area");
-  const wasAtNewest = atNewest(area);
+  const wasAtNewest = atBottom(area);
   const previousTop = area.scrollTop;
   try {
     if (!keepPosition) {
@@ -1185,6 +1388,7 @@ async function loadDiscord(options) {
     } else {
       scrollToNewest();
     }
+    renderScrollTools();
   } finally {
     discordFetchInFlight = false;
   }
@@ -1384,8 +1588,28 @@ el("view-switch").addEventListener("click", () => {
     }
   })();
 });
-el("refresh-discord").addEventListener("click", guardQuietly(loadDiscord));
-el("discord-channel").addEventListener("change", guardQuietly(loadDiscord));
+// Both wrapped in a lambda rather than passed straight through: a DOM listener is handed the
+// EVENT as its first argument, and `loadDiscord`'s first argument is its options object. Reading
+// `keepPosition` off a MouseEvent happens to answer false, which is the right answer by accident
+// and stops being right the moment another option is added.
+//
+// Refresh keeps your place. It is a re-read of the channel you are already looking at, and being
+// thrown to the bottom of it is the same defect as a background poll doing so — the fact that you
+// asked for fresh messages is not a request to stop reading the one in front of you. A reader who
+// was at the bottom still follows, which is the case where "keep my place" and "show me the
+// newest" are the same instruction.
+el("refresh-discord").addEventListener("click", guardQuietly(() => loadDiscord({ keepPosition: true })));
+// Changing channel is not a re-read; it is a different history, and its bottom is where to start.
+el("discord-channel").addEventListener("change", guardQuietly(() => loadDiscord()));
+el("collapse-all").addEventListener("click", collapseAll);
+el("jump-newest").addEventListener("click", scrollToNewest);
+// The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
+// has nothing left to say, so it takes itself away rather than waiting to be tapped.
+el("scroll-area").addEventListener("scroll", () => {
+  if (jumpNewestWanted && atBottom(el("scroll-area"))) {
+    setJumpNewest(false);
+  }
+});
 
 /**
  * Like `guard`, but for things that are not a call: it reports, and it does NOT tear down a live

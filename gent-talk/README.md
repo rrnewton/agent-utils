@@ -811,7 +811,7 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-270 Rust tests plus a 95-test suite for the `/voice` page: unit tests beside each module,
+315 Rust tests plus a 109-test suite for the `/voice` page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
 `tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
 the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
@@ -847,11 +847,13 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the eleven states that look different — signed out, idle, live
+Photographs the `/voice` page in the thirteen states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
-disclosure open, the clear control armed, settings, the Discord view, and a long transcript parked
-mid-scroll — at three viewports: a tall phone, a short phone, and desktop width. It prints the
-absolute path of every image so an agent can open them directly.
+disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
+mid-scroll, that same list with one folded answer opened among the closed ones, and the moment a
+turn arrives while the reader is up in the history — at three viewports: a tall phone, a short
+phone, and desktop width. It prints the absolute path of every image so an agent can open them
+directly.
 
 **Dark is the default, and that is not a preference.** The owner's phone is dark, and the first run
 of this harness captured nothing but light frames, because light is the browser-automation default
@@ -872,7 +874,7 @@ including on failure — it refuses port 8080 by name, because that is the live 
 
 The two ways a screenshot harness lies are both closed, and both were verified by mutation:
 
-* **Eleven pictures of the same idle screen.** Every state declares what must be true of the live
+* **Thirteen pictures of the same idle screen.** Every state declares what must be true of the live
   page before the shutter opens, and each is pinned to its OWN marker — the post-call shot checks
   for the seam labelled "new conversation", the armed shot for the word the control changes to. A
   state whose expectations do not hold fails BY NAME and is not photographed approximately. A
@@ -888,6 +890,14 @@ Some expectations are load-bearing beyond "did we get here". The opened seam mus
 dock — its first capture caught it unfolding underneath, where it is invisible — so that state
 asserts the explanation's bounding box clears the dock's top edge. That assertion was verified end
 to end by reintroducing the bug in the browser and confirming the run refused.
+
+`12-collapsed-long-transcript` is the other one, and it is here because a LINE CLAMP CANNOT BE
+TESTED ANYWHERE ELSE. The page suite can check that `-webkit-line-clamp: 3` is declared on
+`.body.clamped` and that the page puts that class on the right element; whether three lines is
+really three lines is a rendering fact, and this is the only thing in the repository that measures
+it. It measures the SAME message closed and then open — comparing the first open message against
+the first closed one compares two lengths rather than two states, and passed for the wrong reason
+at desktop width until it was fixed.
 
 `scripts/screenshots.py --self-test` runs 31 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to

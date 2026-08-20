@@ -232,6 +232,10 @@ body {
   display: grid;
   grid-template-rows: auto 1fr;
   min-height: 0;
+  /* The anchor for #scroll-tools, which floats over the bottom corner of the list. It has to be
+     THIS element rather than #scroll-area: a child of the scroll area would be faded by the mask
+     below and would scroll away with the content. */
+  position: relative;
 }
 
 #screen-signin h1 {
@@ -342,6 +346,69 @@ body {
 .at {
   font-variant-numeric: tabular-nums;
   opacity: 0.75;
+}
+
+/* --------------------------------------------------------------- long messages, folded ----- */
+/*
+ * `#47 scrollback-stability`. An agent answers in paragraphs, and ten of those in a row is a list
+ * you cannot skim: finding the reply you remember means scrolling through the ones you do not. So
+ * a long message ARRIVES showing its opening three lines, and opens on a tap.
+ *
+ * Three LINES, not a character budget, because what the reader is protected from is a wall of
+ * text and a wall is measured in lines. `-webkit-line-clamp` is the only way to say that in CSS
+ * that Safari and Chromium both honour today; `line-clamp` is the standard property it is becoming
+ * and is stated beside it so this stops needing the prefix on its own.
+ *
+ * NOTE for anyone trimming this: `overflow: hidden` is not decoration. Without it the box shows
+ * every line and the clamp does nothing at all.
+ */
+.body.clamped {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+
+/* Sized like `.seam-info` and `.chip`: a quiet control on the metadata row, not a second action
+   competing with the dock. */
+.fold {
+  flex: 0 0 auto;
+  padding: 0.05rem 0.5rem;
+  background: none;
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Over the bottom corner of the list, clear of the dock. `pointer-events: none` on the strip and
+   `auto` on the chips so the empty space beside them still scrolls the transcript under it. */
+#scroll-tools {
+  position: absolute;
+  z-index: 2;
+  right: calc(0.75rem + env(safe-area-inset-right));
+  bottom: 0.5rem;
+  display: flex;
+  gap: 0.4rem;
+  pointer-events: none;
+}
+
+#scroll-tools .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  pointer-events: auto;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+}
+
+.chip-icon {
+  width: 0.9rem;
+  height: 0.9rem;
 }
 
 /* ------------------------------------------------------------------- the labelled seam ----- */

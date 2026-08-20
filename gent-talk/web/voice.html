@@ -137,6 +137,28 @@
               <ol id="discord-log" class="messages"></ol>
             </div>
           </div>
+
+          <!--
+            Two chips that float over the bottom corner of the list, and are absent whenever there
+            is nothing for them to do.
+
+            OUTSIDE #scroll-area on purpose. That element carries the fade-under-the-header mask,
+            and anything inside it is faded with the content — including a control that has to stay
+            legible. Out here it is positioned against #screen-main instead, which is why that rule
+            gained `position: relative`.
+          -->
+          <div id="scroll-tools">
+            <button id="collapse-all" class="chip" type="button" hidden>
+              <span id="collapse-all-label">Collapse all</span>
+            </button>
+            <button id="jump-newest" class="chip" type="button" hidden>
+              <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 5v13" />
+                <path d="M6 12.5 12 19l6-6.5" />
+              </svg>
+              <span id="jump-newest-label">Newest</span>
+            </button>
+          </div>
         </section>
 
         <!-- ----------------------------------------------------------------- settings screen -->
