@@ -2796,12 +2796,20 @@ mod tests {
 
     #[test]
     fn ungrantable_cap_refuses_instead_of_sleeping_forever() {
+        // A DECLARED cap that can never grant the demand — deliberately not an undeclared
+        // resource. `undeclared_resource_demands` refuses that case in pre-flight, before any
+        // step runs, so it would preempt this detector and leave no starve to detect. The two
+        // overlap on that one input and the earlier mechanism is the better answer there.
+        //
+        // This detector still owns every starve pre-flight cannot see: a declared-but-insufficient
+        // cap, a dangling dependency, a cycle. MUST stay in step with the Python twin,
+        // `test_ungrantable_cap_refuses_instead_of_sleeping_forever`.
         let cfg = DagConfig {
             steps: vec![
-                step("g", "needs_gpu", "true", &[], 0.0, &[("gpu", 1)]),
+                step("g", "needs_gpu", "true", &[], 0.0, &[("gpu", 4)]),
                 step("g", "plain", "true", &[], 0.0, &[]),
             ],
-            resource_caps: caps(&[("hg", 4)]),
+            resource_caps: caps(&[("gpu", 1)]),
             ..Default::default()
         };
         let res = run_dag(&cfg, 4, false, 0);
@@ -2812,6 +2820,26 @@ mod tests {
             "the satisfiable step still ran; only the starved one is refused"
         );
         assert!(res.outcomes.iter().all(|o| o.ok));
+    }
+
+    #[test]
+    fn an_undeclared_resource_is_refused_before_anything_runs() {
+        // The overlapping case, pinned to the EARLIER mechanism so the two cannot silently swap.
+        // Twin of the Python `test_an_undeclared_resource_is_refused_before_anything_runs`.
+        let cfg = DagConfig {
+            steps: vec![
+                step("g", "needs_gpu", "true", &[], 0.0, &[("gpu", 1)]),
+                step("g", "plain", "true", &[], 0.0, &[]),
+            ],
+            resource_caps: caps(&[("hg", 4)]),
+            ..Default::default()
+        };
+        let res = run_dag(&cfg, 4, false, 0);
+        assert!(!res.ok);
+        assert!(
+            res.outcomes.is_empty(),
+            "pre-flight refused, so NOTHING may have run"
+        );
     }
 
     #[test]
