@@ -1377,77 +1377,100 @@ _MAX_PENDING_LINE_BYTES = 1024 * 1024
 
 
 class _BoundedCapture:
-    """Keeps the last ``limit`` bytes of a stream, and counts what it dropped.
+    """Keeps the last ``limit`` bytes of a stream in a PREALLOCATED RING.
 
-    Deliberately NOT a `deque` of chunks: chunk sizes vary, so a chunk-count
-    bound gives an unbounded byte bound. This bounds BYTES.
+    The buffer is allocated once at ``limit`` bytes and never grows, so appending
+    costs no reallocation and no left-shift regardless of chunk size. The
+    predecessor was a growable bytearray with trim-before-append: correct, and
+    flat in CPU at ~4M single-byte appends/sec independent of length (CPython
+    adjusts an internal offset on a leading delete rather than memmoving), but its
+    PEAK was 2.250050x the limit because `+=` reallocates with amortised headroom.
+    The acceptance bar is 2L + 64 KiB = 2.015625L, which that could not meet.
+
+    Peak here is the ring (exactly L, allocated once) plus one reassembled copy at
+    read time (L), i.e. 2L + O(1) -- inside the bar with room to spare.
+
+    Deliberately NOT a deque of chunks. That was measured at 8.25x peak and 89x on
+    join for one-byte chunks: `os.read(fd, n)` guarantees only a MAXIMUM, so a
+    producer emitting one byte at a time turns a 4 MiB byte bound into 4 million
+    objects and per-object overhead dominates. A byte bound must not be expressible
+    in units the producer controls.
     """
 
     def __init__(self, limit: int) -> None:
         self._limit = limit
-        self._buf = bytearray()
+        self._buf = bytearray(limit)   # allocated ONCE; never grows or shrinks
+        self._pos = 0                  # next write index
+        self._len = 0                  # valid bytes currently held
         self.dropped = 0
 
     def append(self, chunk: bytes) -> None:
-        # A chunk at or over the limit REPLACES the buffer with its own tail,
-        # instead of being concatenated and then trimmed. Without this the peak
-        # tracks the CALLER's chunk size, not the bound: measured, a single
-        # 256 MiB write drove a 4 MiB bound to a 260 MiB peak. The reader happens
-        # to use os.read(fd, 8192) today, but a bound that only holds for small
-        # chunks is a bound that holds until someone changes an unrelated buffer
-        # size.
         size = len(chunk)
-        if size >= self._limit:
-            self.dropped += len(self._buf) + size - self._limit
-            self._buf = bytearray(memoryview(chunk)[-self._limit:])
+        if size == 0:
             return
-        # TRIM BEFORE APPENDING, never after. Appending first and trimming after
-        # lets the buffer reach len(buf) + len(chunk) before it shrinks, so the
-        # PEAK tracks the chunk size on top of the bound, and bytearray's
-        # amortised growth rounds that up again. Measured on the previous
-        # append-then-trim version at a 4 MiB bound:
-        #     chunks of limit-1  ->  17.001 MiB peak  (4.25x)
-        #     chunks of limit/2+1 -> 13.500 MiB peak  (3.38x)
-        #     chunks of 1 MiB     -> 11.250 MiB peak  (2.81x)
-        # The worst case is a chunk one byte under the limit, and it was the one
-        # shape not tested; a review found it. Trimming first means the buffer is
-        # never larger than the limit at any instant.
-        overflow = len(self._buf) + size - self._limit
+        limit = self._limit
+        if size >= limit:
+            # Only the tail can survive; write it directly and reset the cursor.
+            self.dropped += self._len + size - limit
+            self._buf[:] = memoryview(chunk)[size - limit :]
+            self._pos = 0
+            self._len = limit
+            return
+        overflow = self._len + size - limit
         if overflow > 0:
-            del self._buf[:overflow]
             self.dropped += overflow
-        self._buf += chunk
+            self._len = limit - size
+        # Write with wrap. Two slice assignments at most, no allocation.
+        first = min(size, limit - self._pos)
+        self._buf[self._pos : self._pos + first] = memoryview(chunk)[:first]
+        if first < size:
+            self._buf[: size - first] = memoryview(chunk)[first:]
+        self._pos = (self._pos + size) % limit
+        self._len = min(limit, self._len + size)
 
-    # _last_line() takes a Sequence[bytes] and calls reversed() on it, so the
-    # sequence protocol is required, not just __iter__. Getting this wrong would
-    # have raised TypeError only on the summary path, i.e. at the end of a step.
+    def _tail(self) -> bytes:
+        """The retained bytes in arrival order. Allocates ONE copy of <= limit."""
+        if self._len == 0:
+            return b""
+        start = (self._pos - self._len) % self._limit
+        if start + self._len <= self._limit:
+            return bytes(memoryview(self._buf)[start : start + self._len])
+        head = self._limit - start
+        out = bytearray(self._len)
+        out[:head] = memoryview(self._buf)[start:]
+        out[head:] = memoryview(self._buf)[: self._len - head]
+        return bytes(out)
+
+    # _last_line() takes a Sequence[bytes] and calls reversed(), so the sequence
+    # protocol is required, not just __iter__.
     def __len__(self) -> int:
-        return 1 if self._buf else 0
+        return 1 if self._len else 0
 
     def __getitem__(self, index: int) -> bytes:
-        if index not in (0, -1) or not self._buf:
+        if index not in (0, -1) or not self._len:
             raise IndexError(index)
-        return bytes(self._buf)
+        return self._tail()
 
     def __iter__(self):
-        return iter((bytes(self._buf),) if self._buf else ())
+        return iter((self._tail(),) if self._len else ())
 
     def __reversed__(self):
-        return iter((bytes(self._buf),) if self._buf else ())
+        return iter((self._tail(),) if self._len else ())
 
     def __bool__(self) -> bool:
-        return bool(self._buf)
+        return bool(self._len)
 
     def joined(self) -> bytes:
         """The retained tail, prefixed with a notice when the head was dropped."""
+        tail = self._tail()
         if not self.dropped:
-            return bytes(self._buf)
+            return tail
         notice = (
             f"[dag-runner] ... {self.dropped} earlier byte(s) of this step's output "
             f"are NOT shown: only the last {self._limit} bytes are kept in memory. "
             f"The complete stream is in the step log on disk.\n"
         ).encode()
-        return notice + bytes(self._buf)
+        return notice + tail
 
 
 def _last_line(chunks: Sequence[bytes]) -> str:
