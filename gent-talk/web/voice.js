@@ -1668,6 +1668,10 @@ function discordNode(message) {
   // directly: the treatment must not be able to reach `#transcript` rows, and the behavioural
   // suite needs something on a REAL rendered row to assert the stylesheet's hook exists.
   li.className = "discord-message";
+  // `#65 scrollback-paging`. Which message this row IS, readable without parsing the row's text.
+  // The newest page and the older walk both put rows in the same list, and telling one from the
+  // other is a comparison of snowflakes.
+  li.setAttribute("data-id", String(message.id));
   const meta = document.createElement("div");
   meta.className = "meta";
   const author = document.createElement("span");
@@ -1732,6 +1736,136 @@ function channelSummary(count, complete, label) {
   return `${count} message${count === 1 ? "" : "s"} from ${label}`;
 }
 
+// --- walking back through the channel -----------------------------------------------------------
+//
+// `#65 scrollback-paging`. The server half of this landed with `#53 stepped-retrieval` and had no
+// caller at all: `GET /api/v1/channels/{id}/page` takes a `limit` and a `before` cursor, answers
+// with the messages oldest-first, and says whether more exist beyond them and which id to step back
+// from. This page used to read `/messages`, which is a WINDOW — the oldest message on screen was
+// simply the end of what this interface could ever show you, with nothing saying so.
+//
+// So the read moves onto the cursored route, and the reader can walk further back. Two ways in, on
+// purpose: scrolling to the top takes the next step by itself, which is the gesture people already
+// have; and #load-older is the control that SAYS more exists, that a keyboard can reach, and that
+// reports a step in flight. Neither is the master.
+//
+// Older messages arrive ABOVE the viewport, which is exactly the mutation a browser's own scroll
+// anchoring does not cover — the same case as collapsing a message the reader has scrolled past. So
+// it goes through `preservingScroll`, the mechanism `#47 scrollback-stability` already built, and
+// not a second one beside it.
+
+// What one step asks for. The server clamps it by its own `discord.max_fetch_limit`, so this is a
+// ceiling on what the page WANTS rather than a promise about what it gets — which is why the walk
+// is driven by the cursor the server hands back and never by arithmetic on this number.
+const DISCORD_PAGE_LIMIT = 50;
+
+// How close to the top counts as "the reader is looking for something older".
+const OLDER_TRIGGER_PX = 80;
+
+let discordHasOlder = false;
+let discordOlderCursor = null;
+let olderFetchInFlight = false;
+
+/**
+ * Is snowflake `a` older than snowflake `b`?
+ *
+ * Discord ids are timestamps, so ORDER is comparison — but they are decimal strings of differing
+ * length, and `"9" < "10"` is false lexicographically. Length first, then the string.
+ */
+function snowflakeOlder(a, b) {
+  const x = String(a === null || a === undefined ? "" : a);
+  const y = String(b === null || b === undefined ? "" : b);
+  if (!x || !y) {
+    return false;
+  }
+  return x.length === y.length ? x < y : x.length < y.length;
+}
+
+/** `has_more` absent means a server too old to say — which is UNKNOWN, and never "complete". */
+const knownComplete = (hasMore) => (typeof hasMore === "boolean" ? !hasMore : undefined);
+
+function renderOlderControl() {
+  const button = el("load-older");
+  button.hidden = !discordHasOlder;
+  button.disabled = olderFetchInFlight;
+  button.textContent = olderFetchInFlight ? "Loading older messages…" : "Older messages";
+}
+
+/**
+ * Put the newest page on screen, keeping anything the reader has already walked back to.
+ *
+ * The keep rule is `has_more`, and it is the only honest one available: `has_more` says older
+ * messages exist BEYOND this page, so rows older than it may still be real. When it is false this
+ * page IS the whole channel, and anything else on screen is stale — a deleted message, or another
+ * channel's.
+ */
+function applyNewestPage(payload) {
+  const list = el("discord-log");
+  const messages = payload.messages || [];
+  const oldest = messages.length ? messages[0].id : null;
+  const kept =
+    payload.has_more === true && oldest
+      ? [...list.children].filter((li) => snowflakeOlder(li.getAttribute("data-id"), oldest))
+      : [];
+  list.replaceChildren(...kept, ...messages.map(discordNode));
+  // Only when nothing was kept. If older rows survived, the cursor that belongs to them is the one
+  // the older walk left behind, and overwriting it with this page's would rewind the walk.
+  if (kept.length === 0) {
+    discordHasOlder = payload.has_more === true;
+    discordOlderCursor = payload.next_before || null;
+  }
+  renderOlderControl();
+  return list.children.length;
+}
+
+/**
+ * One step further back.
+ *
+ * Guarded against re-entry rather than debounced: the automatic trigger fires on every scroll
+ * event, and a phone produces a lot of those.
+ */
+async function loadOlder() {
+  if (!discordHasOlder || !discordOlderCursor || olderFetchInFlight) {
+    return;
+  }
+  const channel = el("discord-channel").value;
+  if (!channel) {
+    return;
+  }
+  olderFetchInFlight = true;
+  renderOlderControl();
+  try {
+    const payload = await api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/page` +
+        `?limit=${DISCORD_PAGE_LIMIT}&before=${encodeURIComponent(discordOlderCursor)}`
+    );
+    const list = el("discord-log");
+    const arriving = (payload.messages || []).map(discordNode);
+    // Prepending is a mutation ABOVE the viewport, which is the one case browser scroll anchoring
+    // does not handle. Same helper as the fold control, deliberately.
+    preservingScroll(() => list.replaceChildren(...arriving, ...list.children));
+    discordHasOlder = payload.has_more === true;
+    discordOlderCursor = payload.next_before || null;
+    setStatus(
+      channelSummary(list.children.length, knownComplete(payload.has_more), payload.channel.label)
+    );
+    renderScrollTools();
+  } finally {
+    olderFetchInFlight = false;
+    renderOlderControl();
+  }
+}
+
+/** The reader has arrived at the top of what is loaded. Take the next step for them. */
+function maybeLoadOlder() {
+  if (currentView !== "discord" || !discordHasOlder || olderFetchInFlight) {
+    return;
+  }
+  if (el("scroll-area").scrollTop <= OLDER_TRIGGER_PX) {
+    guardQuietly(loadOlder)();
+  }
+}
+
 /**
  * @param {{keepPosition?: boolean}} [options] `keepPosition` marks a RE-read of a channel already
  *   on screen — the background poll, or the Refresh button. It must not drag the reader to the
@@ -1758,16 +1892,15 @@ async function loadDiscord(options) {
     if (!keepPosition) {
       setStatus("fetching the channel…");
     }
-    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/messages`);
-    const list = el("discord-log");
-    list.replaceChildren();
-    for (const message of payload.messages) {
-      list.append(discordNode(message));
-    }
-    setStatus(channelSummary(payload.messages.length, payload.complete, payload.channel.label));
-    const newest = payload.messages.length
-      ? payload.messages[payload.messages.length - 1].id
-      : null;
+    const payload = await api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}`
+    );
+    const loaded = applyNewestPage(payload);
+    setStatus(
+      channelSummary(loaded, knownComplete(payload.has_more), payload.channel.label)
+    );
+    const messages = payload.messages || [];
+    const newest = messages.length ? messages[messages.length - 1].id : null;
     // Something ARRIVED only if the newest id moved. A refresh that returns the same messages must
     // not raise the chip, or a background poll every 45 seconds would offer to jump the reader to
     // a bottom that has not changed since the last time they declined.
@@ -2161,7 +2294,20 @@ el("view-switch").addEventListener("click", () => {
 // newest" are the same instruction.
 el("refresh-discord").addEventListener("click", guardQuietly(() => loadDiscord({ keepPosition: true })));
 // Changing channel is not a re-read; it is a different history, and its bottom is where to start.
-el("discord-channel").addEventListener("change", guardQuietly(() => loadDiscord()));
+// The walk back resets with it: a cursor from one channel means nothing in another, and carrying
+// one across would ask the server to step back from a message that is not there.
+el("discord-channel").addEventListener(
+  "change",
+  guardQuietly(() => {
+    discordHasOlder = false;
+    discordOlderCursor = null;
+    discordNewestId = null;
+    el("discord-log").replaceChildren();
+    renderOlderControl();
+    return loadDiscord();
+  })
+);
+el("load-older").addEventListener("click", guardQuietly(loadOlder));
 el("collapse-all").addEventListener("click", collapseAll);
 el("jump-newest").addEventListener("click", scrollToNewest);
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
@@ -2170,6 +2316,8 @@ el("scroll-area").addEventListener("scroll", () => {
   if (jumpNewestWanted[currentView] && atBottom(el("scroll-area"))) {
     setJumpNewest(false);
   }
+  // ...and the other end of the same list: arriving at the top is a request for what is above it.
+  maybeLoadOlder();
 });
 
 /**

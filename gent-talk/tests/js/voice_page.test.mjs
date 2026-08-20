@@ -253,7 +253,10 @@ const SCROLL_VIEWPORT_PX = 400;
 const FIXTURE_TREE = {
   "scroll-area": ["pane-voice", "pane-discord"],
   "pane-voice": ["empty-state", "transcript"],
-  "pane-discord": ["discord-log"],
+  // In markup order: the walk-back control sits ABOVE the log and inside the scrolling element, so
+  // it scrolls away with the top of the history rather than standing on the screen. Its height is
+  // part of what the anchoring model measures against. `#65 scrollback-paging`.
+  "pane-discord": ["load-older", "discord-log"],
 };
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
@@ -683,7 +686,14 @@ function newPage(store = new Map(), script = SCRIPT) {
     clientConfig: async () =>
       json(200, { version: "test", channels: [CHANNEL], elevenlabs_agent_id: "agent_test" }),
     messages: [],
-    channelMessages: async () => json(200, { channel: CHANNEL, messages: page.messages }),
+    /**
+     * One step of a walk, shaped exactly as `PageResponse` serializes one.
+     *
+     * No `has_more` by default, and that is the ordinary case rather than an omission: a server
+     * that does not say is UNKNOWN, and the page must not read silence as "you have the lot".
+     * A paging test replaces this with something that answers a `before` cursor.
+     */
+    channelPage: async () => json(200, { channel: CHANNEL, messages: page.messages }),
     setFetch(fn) {
       page.mint = fn;
     },
@@ -858,8 +868,11 @@ function newPage(store = new Map(), script = SCRIPT) {
       if (String(path).startsWith("/api/v1/client-config")) {
         return page.clientConfig(path, options);
       }
-      if (/\/messages$/.test(String(path))) {
-        return page.channelMessages(path, options);
+      // `#65 scrollback-paging` moved the channel read onto the CURSORED route. `/messages` is
+      // deliberately not served any more: it is a window with no way past its own oldest message,
+      // and a page that went back to it should fail here loudly rather than quietly lose the walk.
+      if (/\/page(\?|$)/.test(String(path))) {
+        return page.channelPage(path, options);
       }
       // `#51 reply-view`. Recorded rather than merely answered: the assertion that matters is what
       // the page really SENT — the channel it named and the message it referenced — and asserting
@@ -2856,8 +2869,11 @@ test("the channel view counts only when the count is the CHANNEL'S, and pluraliz
   const page = newPage();
   await signIn(page);
   page.messages = [message({ id: "1" }), message({ id: "2" })];
-  page.channelMessages = async () =>
-    json(200, { channel: CHANNEL, messages: page.messages, complete: true });
+  // `has_more: false` is how the cursored route says "there is nothing older" — `#65
+  // scrollback-paging` moved the read onto it, and this is the same claim `complete: true` used to
+  // make on the window route. The count is only the channel's own when the server says that.
+  page.channelPage = async () =>
+    json(200, { channel: CHANNEL, messages: page.messages, has_more: false });
 
   await page.el("view-switch").click();
   await page.settle();
@@ -3097,7 +3113,7 @@ test("EVERY visit to the channel view opens on the newest message, not just the 
 function countingChannel(page, messages) {
   page.messages = messages;
   page.reads = 0;
-  page.channelMessages = async () => {
+  page.channelPage = async () => {
     page.reads += 1;
     return json(200, { channel: CHANNEL, messages: page.messages });
   };
@@ -3220,7 +3236,7 @@ test("REFRESH keeps your place too — asking for fresh messages is not asking t
 test("a Discord read that fails reports itself and does NOT hang up on you", async () => {
   const page = newPage();
   await startTalking(page);
-  page.channelMessages = async () => json(502, { error: "discord_error", detail: "rate limited" });
+  page.channelPage = async () => json(502, { error: "discord_error", detail: "rate limited" });
 
   await page.el("view-switch").click();
   await page.settle();
@@ -3237,6 +3253,281 @@ test("a Discord read that fails reports itself and does NOT hang up on you", asy
 // enforces that, and it is written as an exact-object comparison on purpose — a `match` or a
 // property-by-property check would let an extra constraint through, and "we started sending one
 // more thing to getUserMedia" is precisely the regression that would be invisible from the page.
+
+// --- walking back through the channel ---------------------------------------------------------
+//
+// `#65 scrollback-paging`. The server half landed with `#53 stepped-retrieval` and had NO web
+// caller: the page read `/messages`, which is a window, and the oldest message on screen was
+// simply the end of what this interface could show — with nothing saying so. These check that the
+// walk really uses the server's cursor, that older messages arrive above without moving the
+// reader, and that a re-read does not throw away what they walked back to.
+
+/**
+ * A channel that really pages: `size` messages a step, `steps` steps, newest step first.
+ *
+ * The ids ascend with time the way snowflakes do, and the handler answers a `before` cursor the
+ * way the route does — so a test can only get older messages by sending back the cursor it was
+ * given, which is the property under test.
+ */
+function pagedChannel(page, { steps = 3, size = 4 } = {}) {
+  // Deliberately spanning 999 -> 1000, so the ids change LENGTH partway through. Discord
+  // snowflakes are decimal strings and `"999" < "1000"` is false lexicographically, which is
+  // exactly the comparison a page merging two reads has to get right.
+  const all = [];
+  for (let i = 0; i < steps * size; i += 1) {
+    all.push(message({ id: String(995 + i), content: `message ${i}` }));
+  }
+  page.pagesServed = [];
+  page.channelPage = async (path) => {
+    page.pagesServed.push(String(path));
+    const before = /[?&]before=([^&]+)/.exec(String(path));
+    const end = before
+      ? all.findIndex((m) => m.id === decodeURIComponent(before[1]))
+      : all.length;
+    const start = Math.max(0, end - size);
+    return json(200, {
+      channel: CHANNEL,
+      messages: all.slice(start, end),
+      returned: end - start,
+      limit: size,
+      has_more: start > 0,
+      next_before: start > 0 ? all[start].id : null,
+    });
+  };
+  return all;
+}
+
+test("THE CHANNEL WALKS BACK USING THE CURSOR THE SERVER HANDED BACK", async () => {
+  // Not arithmetic on an offset, and not a second read of the same window: the id the previous
+  // step named is the id that goes out, which is the whole contract of the cursored route.
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: 3, size: 4 });
+  await showDiscord(page, []);
+
+  const log = page.el("discord-log");
+  assert.equal(log.children.length, 4, "the first read is one page, not the whole channel");
+  assert.equal(page.el("load-older").hidden, false, "nothing says there is more above");
+
+  await page.el("load-older").click();
+  await page.settle();
+
+  assert.equal(log.children.length, 8, "the older step did not arrive");
+  // Oldest first, and the older step is ABOVE the newer one — a channel read upside down would
+  // otherwise satisfy a count.
+  assert.deepStrictEqual(
+    log.children.map((li) => li.getAttribute("data-id")),
+    all.slice(4, 12).map((m) => m.id)
+  );
+  // The cursor really was the one handed back: the oldest id of the first page.
+  assert.match(
+    page.pagesServed[1],
+    new RegExp(`[?&]before=${all[8].id}(&|$)`),
+    `it asked for ${page.pagesServed[1]}, not for the oldest id of the page it was handed`
+  );
+  assert.doesNotMatch(page.pagesServed[0], /before=/, "the first read must not carry a cursor");
+});
+
+test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async () => {
+  // Prepending is a mutation ABOVE the viewport, which is the one case a browser's own scroll
+  // anchoring does not cover — the same case as collapsing something the reader scrolled past, and
+  // handled by the same helper rather than by a second mechanism.
+  const run = async (script) => {
+    const page = newPage(new Map(), script);
+    await signIn(page);
+    page.channelPage = async (path) => {
+      const before = /[?&]before=/.test(String(path));
+      const body = Array.from({ length: 8 }, (_u, i) =>
+        message({ id: String((before ? 2000 : 3000) + i), content: longMessage(`m${i}`) })
+      );
+      return json(200, { channel: CHANNEL, messages: body, has_more: true, next_before: "1999" });
+    };
+    await showDiscord(page, []);
+    const area = page.el("scroll-area");
+    assert.ok(area.scrollHeight > area.clientHeight * 2, "the channel does not overflow");
+    area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+    const anchor = page.el("discord-log").children.find(
+      (li) => li.getBoundingClientRect().bottom > 0
+    );
+    const before = anchor.getBoundingClientRect().top;
+
+    await page.el("load-older").click();
+    await page.settle();
+
+    return { page, moved: anchor.getBoundingClientRect().top - before };
+  };
+
+  const { page, moved } = await run();
+  assert.equal(page.el("discord-log").children.length, 16, "the older step did not arrive");
+  assert.equal(moved, 0, `the line the reader was looking at moved ${moved}px`);
+
+  // THE CONTROL. Without it the fixture could be one that never moves scrollTop at all.
+  const control = await run(
+    brokenScript(
+      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
+      "  void mark;"
+    )
+  );
+  assert.notEqual(
+    control.moved,
+    0,
+    "with the restore deleted the view still did not move, so this test cannot tell an anchored " +
+      "page from an unanchored one"
+  );
+});
+
+test("reaching the top loads the next step without a tap, and only one at a time", async () => {
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 4, size: 4 });
+  await showDiscord(page, []);
+  const area = page.el("scroll-area");
+
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  // A phone fires a great many scroll events; a second step must not be started on top of the
+  // first, or the same page arrives twice and the cursor jumps a step.
+  await area.dispatch("scroll");
+  await area.dispatch("scroll");
+  await page.settle();
+
+  assert.equal(page.el("discord-log").children.length, 8, "the automatic step ran more than once");
+  assert.equal(page.pagesServed.length, 2, `${page.pagesServed.length} reads went out, not 2`);
+
+  // ...and the same guard on the CONTROL, which the automatic path does not exercise: two taps
+  // before the first has answered must still be one step, or the same page arrives twice and the
+  // cursor skips one.
+  const first = page.el("load-older").click();
+  const second = page.el("load-older").click();
+  await first;
+  await second;
+  await page.settle();
+  assert.equal(page.pagesServed.length, 3, "a second tap started a second step on top of the first");
+  assert.equal(page.el("discord-log").children.length, 12);
+});
+
+test("reaching the beginning of the channel stops offering more, and says the count", async () => {
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 2, size: 3 });
+  await showDiscord(page, []);
+  assert.match(
+    page.el("status").textContent,
+    /older ones are not loaded/,
+    "it claimed a total before the walk had reached the beginning"
+  );
+
+  await page.el("load-older").click();
+  await page.settle();
+
+  assert.equal(page.el("load-older").hidden, true, "it still offers a step past the beginning");
+  // ...and NOW the number is the channel's own, because there is nothing above it. That is the
+  // `#62 message-count-accuracy` rule, and this is the first time this page can satisfy it.
+  assert.match(page.el("status").textContent, /^6 messages from lead team$/);
+});
+
+test("a step that FAILS keeps what is already on screen, and does not hang up", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  pagedChannel(page, { steps: 3, size: 4 });
+  await showDiscord(page, []);
+  page.channelPage = errorResponse(502, "discord_error", "discord returned HTTP 500");
+
+  await page.el("load-older").click();
+  await page.settle();
+
+  assert.equal(page.el("discord-log").children.length, 4, "a failed step emptied the channel");
+  assert.match(page.el("error").textContent, /502/, "the failure was swallowed");
+  assert.equal(page.el("load-older").disabled, false, "the control is stuck reporting a step");
+  assert.equal(page.tracks[0].stops, 0, "a failed step released the microphone");
+  assert.notEqual(socket.readyState, 3, "a failed step hung up the call");
+});
+
+test("A REFRESH DOES NOT THROW AWAY WHAT THE READER WALKED BACK TO", async () => {
+  // The interaction that makes paging and polling hard to have at once: a re-read of the NEWEST
+  // page must not silently discard the older ones, or a background poll would delete the history
+  // out from under somebody reading it every forty-five seconds.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 3, size: 4 });
+  await showDiscord(page, []);
+  await page.el("load-older").click();
+  await page.settle();
+  assert.equal(page.el("discord-log").children.length, 8);
+
+  await page.el("refresh-discord").click();
+  await page.settle();
+
+  assert.equal(
+    page.el("discord-log").children.length,
+    8,
+    "the refresh replaced eight loaded messages with the newest four"
+  );
+  assert.equal(
+    page.el("discord-log").children[0].getAttribute("data-id"),
+    "999",
+    "the oldest row the reader had walked back to is not at the top any more"
+  );
+  // The ids span a LENGTH change, so this also fails on a page that compares snowflakes as plain
+  // strings: `"999" < "1003"` is false lexicographically and true numerically.
+  assert.deepStrictEqual(
+    page.el("discord-log").children.map((li) => li.getAttribute("data-id")),
+    ["999", "1000", "1001", "1002", "1003", "1004", "1005", "1006"]
+  );
+});
+
+test("a channel that is WHOLE replaces on a refresh rather than accumulating", async () => {
+  // The other side of the keep rule. `has_more: false` means this page IS the channel, so anything
+  // else on screen is stale — a deleted message, or the previous channel's. Keeping it would be
+  // the "Refresh appended instead of replacing" defect wearing a paging costume.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1", content: "one" })]);
+  page.channelPage = async () =>
+    json(200, { channel: CHANNEL, messages: [message({ id: "2", content: "two" })], has_more: false });
+
+  await page.el("refresh-discord").click();
+  await page.settle();
+
+  const lines = page.el("discord-log").children;
+  assert.equal(lines.length, 1, "a whole-channel read kept a message that no longer exists");
+  assert.match(lines[0].text(), /two/);
+});
+
+test("switching channel starts the walk again rather than stepping back from a stranger", async () => {
+  // A cursor is a message id in ONE channel. Carrying it across would ask the server to step back
+  // from a message that is not there, which the route answers with an error the reader cannot act
+  // on — and would be a confusing one, because they only changed channel.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 3, size: 4 });
+  await showDiscord(page, []);
+  await page.el("load-older").click();
+  await page.settle();
+  assert.equal(page.el("discord-log").children.length, 8);
+
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+
+  assert.equal(page.el("discord-log").children.length, 4, "the other channel's rows stayed");
+  assert.doesNotMatch(
+    page.pagesServed[page.pagesServed.length - 1],
+    /before=/,
+    "the new channel was read from a cursor belonging to the old one"
+  );
+
+  // ...and the reset holds even when the new channel's read FAILS. Leaving the old channel's
+  // cursor armed is the dangerous case: a scroll to the top would then ask this server to step
+  // back from a message that is not in this channel, and the reader only changed channel.
+  page.channelPage = errorResponse(502, "discord_error", "nope");
+  await page.el("discord-channel").dispatch("change");
+  await page.settle();
+  assert.equal(
+    page.el("load-older").hidden,
+    true,
+    "after a failed channel change the page still offers to step back from the old channel"
+  );
+});
 
 // --- one channel row at a time --------------------------------------------------------------
 //
@@ -3291,6 +3582,20 @@ test("A TAPPED ROW CANNOT STAY LIT: the hover tint is behind a pointer query", a
     /#transcript/,
     "the row treatment reached the voice transcript, which has two speakers and no rows to pick out"
   );
+});
+
+test("the channel row's metadata line can WRAP, because five things do not fit on a phone", () => {
+  // Found by looking at a photograph, not by anything in this file: `.meta` is a flex row in
+  // web/style.css with no wrap, the fold and the reply controls are both `flex: 0 0 auto`, and the
+  // row therefore became WIDER THAN A 393-PIXEL SCREEN the moment `#51 reply-view` added the
+  // second of them — message bodies ran off the right edge and the reply control was entirely off
+  // it. A fixture with no layout engine cannot see that, so what is asserted here is the
+  // declaration; `10-discord-view` asserts the pixels.
+  const meta = cssBlock("#discord-log .meta");
+  assert.match(meta, /flex-wrap:\s*wrap/, "the channel's metadata line cannot wrap again");
+  // NOT on the shared `.meta`: web/style.css belongs to the phone app at `/` as well, and the
+  // transcript's own metadata line has three things on it and fits.
+  assert.doesNotMatch(SHARED_CSS, /flex-wrap/, "the shared sheet was changed to fix this page");
 });
 
 test("the hovered surface is really a DIFFERENT surface, in both schemes", async () => {

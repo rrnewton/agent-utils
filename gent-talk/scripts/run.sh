@@ -62,7 +62,7 @@
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
-#   --screenshots  Photograph the /voice page in all twenty states that look different, so an
+#   --screenshots  Photograph the /voice page in all twenty-one states that look different, so an
 #                  agent can LOOK at the interface before the owner does. FREE and offline: no vendor
 #                  conversation, no microphone, no money. The conversation WebSocket is replaced by
 #                  a fake and the microphone is Chromium's built-in fake capture device, so the
@@ -369,6 +369,13 @@ bind = "127.0.0.1:$SHOTS_PORT"
 
 [discord]
 bot_token = "screenshot-run-bot-token-never-sent-anywhere"
+# Deliberately SMALL, and this is the only reason it is here: --fake-discord seeds about a dozen
+# messages, so at the default ceiling the channel arrives in one read and the walk `#65
+# scrollback-paging` added is never exercised at all. At eight, the seeded channel really pages,
+# the "Older messages" control really appears, and 21-channel-older-loaded is a picture of a
+# server-cursored step rather than of a control that happens to be rendered.
+default_fetch_limit = 8
+max_fetch_limit = 8
 
 [auth]
 read_token = "$SHOTS_READ_TOKEN"

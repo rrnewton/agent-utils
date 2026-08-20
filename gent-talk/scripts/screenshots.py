@@ -1213,8 +1213,84 @@ def _act_open_channel(driver: Driver) -> None:
     driver.settle(300)
 
 
-def _act_reply_view(driver: Driver) -> None:
+def _act_whole_channel(driver: Driver) -> None:
+    """Open the channel and walk all the way back to its beginning.
+
+    The throwaway server this harness starts is configured with a small fetch ceiling on purpose --
+    otherwise `#65 scrollback-paging` is never exercised at all -- so a channel arrives a few
+    messages at a time. States that need the WHOLE channel on screen (because they need it to
+    overflow, or need its longest message) say so by calling this rather than by assuming the first
+    read was everything.
+    """
     _act_open_channel(driver)
+    # Driven by SCROLLING to the top rather than by clicking the control, and that is not a
+    # preference: Playwright scrolls an element into view before clicking it, and #load-older lives
+    # at the top of the list, so a click would itself trigger the automatic step it is trying to
+    # take and then race the DOM it is standing on.
+    for _ in range(20):
+        if not bool(driver.js("window.__visible('load-older')")):
+            break
+        driver.js(
+            "(() => { window.__walkFrom = "
+            "document.querySelectorAll('#discord-log li').length; "
+            "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()"
+        )
+        driver.page.wait_for_function(
+            "() => document.querySelectorAll('#discord-log li').length > window.__walkFrom",
+            timeout=10_000,
+        )
+        driver.settle(120)
+    else:
+        raise Unreachable(
+            "the channel walk", "the walk back reaches the beginning of the channel", "20 steps"
+        )
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); a.scrollTop = a.scrollHeight; })()"
+    )
+    driver.settle(250)
+
+
+def _act_channel_older(driver: Driver) -> None:
+    _act_open_channel(driver)
+    # Park in the MIDDLE. At the bottom of a list the page counts the reader as pinned to the
+    # newest line, and following it is then the correct behaviour -- so a scene that measured the
+    # anchor from there would be asserting the opposite of what it says.
+    driver.js(
+        "(() => { const a = document.getElementById('scroll-area'); "
+        "a.scrollTop = Math.round((a.scrollHeight - a.clientHeight) * 0.5); "
+        "window.__parkedMid = a.scrollTop; return a.scrollTop; })()"
+    )
+    driver.settle(200)
+    # Measured BEFORE the step: how much is loaded, and where on screen the row the reader is
+    # looking at sits. Both are compared after, which is what makes this a picture of an anchored
+    # prepend rather than of a longer list.
+    driver.js(
+        "(() => { const rows = [...document.querySelectorAll('#discord-log li')]; "
+        "const a = document.getElementById('scroll-area').getBoundingClientRect(); "
+        "const seen = rows.find((n) => n.getBoundingClientRect().bottom > a.top); "
+        "seen.id = 'anchor-probe'; "
+        "window.__loadedBefore = rows.length; "
+        "window.__anchorBefore = seen.getBoundingClientRect().top; "
+        "return window.__loadedBefore; })()"
+    )
+    # Through the DOM, for the same reason the walk above scrolls instead of clicking: a real
+    # click would scroll the control into view, and scrolling is what this scene is measuring.
+    driver.js("(() => { document.getElementById('load-older').click(); })()")
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log li').length > window.__loadedBefore",
+        timeout=10_000,
+    )
+    driver.settle(250)
+    driver.js(
+        "(() => { window.__anchorAfter = "
+        "document.getElementById('anchor-probe').getBoundingClientRect().top; "
+        "window.__loadedAfter = document.querySelectorAll('#discord-log li').length; "
+        "return window.__anchorAfter; })()"
+    )
+
+
+def _act_reply_view(driver: Driver) -> None:
+    _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
     # claim about the reader's position rather than a hope -- and it is one no unit test can make,
     # because the reset a browser performs on a hidden element's scrollTop is a browser fact.
@@ -1281,6 +1357,8 @@ LONG_CHANNEL_POST = " ".join(
 
 
 def _act_reply_long_target(driver: Driver) -> None:
+    # NOT the whole channel: this state needs one very long message, which it posts itself, and
+    # walking back first only adds rows for Playwright to scroll past on the way to Refresh.
     _act_open_channel(driver)
     posted = driver.page.evaluate(
         "async (text) => {"
@@ -1308,7 +1386,10 @@ def _act_reply_long_target(driver: Driver) -> None:
         # rendered means the marker check below is satisfied by the render that is being replaced,
         # and the element this scene then marks is detached from the document a moment later --
         # which is exactly what happened on the second profile of the first run.
-        driver.click("refresh-discord")
+        # Clicked through the DOM rather than through the pointer. #refresh-discord sits above the
+        # list, so a real click would scroll the view to the top to reach it -- which is itself the
+        # gesture that loads older messages, and this state is not about that.
+        driver.js("(() => { document.getElementById('refresh-discord').click(); })()")
         driver.page.wait_for_function(
             "() => [...document.querySelectorAll('#discord-log li')]"
             ".some((n) => n.textContent.includes('in full, because you asked'))",
@@ -1339,7 +1420,12 @@ def _act_reply_long_target(driver: Driver) -> None:
         "return a.scrollTop; })()"
     )
     driver.settle(150)
-    driver.page.click("#reply-probe .reply-button")
+    # Through the DOM. The longest message is the NEWEST one, so it is the last row, and the last
+    # row cannot be brought up the screen -- there is nothing below it to scroll. Its controls
+    # therefore sit on the scroll area's bottom edge, where Playwright's own hit test lands on the
+    # list rather than on the button. State 18 is where a real pointer clicks a reply control; this
+    # state is about what the reply SCREEN does with a message longer than the frame.
+    driver.js("(() => { document.querySelector('#reply-probe .reply-button').click(); })()")
     driver.page.wait_for_function("() => window.__visible('screen-reply')", timeout=5_000)
     driver.settle(250)
 
@@ -1577,6 +1663,16 @@ SCENES: tuple[Scene, ...] = (
             (
                 "every message shows its id, so it can be checked against a real one",
                 "[...document.querySelectorAll('#discord-log li .msg-id')].length >= 5",
+            ),
+            # `#51 reply-view` put a fifth thing on a metadata line that is a flex row with no
+            # wrap, and the row became wider than a phone: every message body ran off the right
+            # edge and the reply control was entirely off it. Nothing in the page suite can see
+            # that, and nothing here did either until somebody looked at the picture. Now it is
+            # checked, in pixels, on every profile.
+            (
+                "the channel does not overflow the screen sideways",
+                "(() => { const a = document.getElementById('scroll-area'); "
+                "return a.scrollWidth <= a.clientWidth + 1; })()",
             ),
         ),
     ),
@@ -1848,6 +1944,42 @@ SCENES: tuple[Scene, ...] = (
                 "const cold = rows.find((r) => r !== hot); "
                 "return getComputedStyle(hot).borderTopColor !== "
                 "getComputedStyle(cold).borderTopColor; })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="21-channel-older-loaded",
+        what="one step further back through the channel, with the reader left where they were",
+        act=_act_channel_older,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the reader was parked mid-list, not pinned to the newest line",
+                "window.__parkedMid > 0",
+            ),
+            (
+                "older messages really arrived",
+                "window.__loadedAfter > window.__loadedBefore",
+            ),
+            # THE claim, and one only a real browser can settle: the step prepends ABOVE the
+            # viewport, which is the mutation browser scroll anchoring does not cover, and the row
+            # the reader was looking at must not have moved a pixel.
+            (
+                "the row the reader was looking at did not move",
+                "Math.abs(window.__anchorAfter - window.__anchorBefore) <= 1",
+            ),
+            (
+                # Compared as STRINGS, length first. A Discord snowflake is nineteen digits and
+                # `Number()` rounds it: two adjacent ids come out as the same float, and an
+                # ordering check written with `<` on numbers quietly answers false for a list that
+                # is perfectly ordered. web/voice.js compares them the same way, for the same
+                # reason.
+                "they are ABOVE what was already there, oldest first",
+                "(() => { const ids = [...document.querySelectorAll('#discord-log li')]"
+                ".map((n) => n.getAttribute('data-id') || ''); "
+                "const older = (a, b) => (a.length === b.length ? a < b : a.length < b.length); "
+                "return ids.length > 1 && ids.every((id, i) => i === 0 || older(ids[i - 1], id)); "
+                "})()",
             ),
         ),
     ),
@@ -2136,7 +2268,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 20:
+    if len(SCENES) < 21:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2150,7 +2282,8 @@ def check_state_controls() -> list[str]:
             "state above shows the error panel at all. `#51 reply-view` added the reply "
             "screen and the same screen with a target longer than the frame, and `#56 "
             "message-hover-highlight` added the row picked out under a pointer -- the only place "
-            "that treatment can be looked at at all."
+            "that treatment can be looked at at all -- and `#65 scrollback-paging` added a step "
+            "further back through the channel, which is where the anchored prepend is judged."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2220,7 +2353,7 @@ def check_state_controls() -> list[str]:
         "07-seam-disclosure-open": "dock.top",
         "08-clear-armed": "Sure?",
         "09-settings": "topbar-title",
-        "10-discord-view": "Discord",
+        "10-discord-view": "scrollWidth",
         "11-long-transcript-scrolled": "scrollTop",
         # Both pinned to the thing the picture is FOR, not to the screen being up. A line clamp is
         # a rendering fact no behavioural test can reach, so "one is open among the closed ones" is
@@ -2250,6 +2383,10 @@ def check_state_controls() -> list[str]:
         # row being hovered would be satisfied with the rule deleted, which is the whole failure
         # this state exists to catch -- there is nothing else in the repository that can see it.
         "20-discord-hover": "backgroundColor",
+        # `#65 scrollback-paging`. Pinned to the anchor, not to the list being longer: a page that
+        # loaded older messages and threw the reader to the top would satisfy "more arrived", and
+        # that is the defect, not the feature.
+        "21-channel-older-loaded": "__anchorAfter",
     }
     for name, needle in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2515,6 +2652,7 @@ SELF_TEST_CHECKS = (
     "the reply state is pinned to the scroll round trip, not to the form being on screen",
     "the long-target state is pinned to the target really overflowing its own box",
     "the hover state is pinned to the rendered colour, not to the row being hovered",
+    "the older-step state is pinned to the anchor holding, not to the list being longer",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",

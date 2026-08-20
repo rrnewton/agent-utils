@@ -316,6 +316,10 @@ body {
    competing with the dock. */
 .reply-button {
   flex: 0 0 auto;
+  /* Hard right, on whichever line it lands on. On a wide screen that is the end of the metadata
+     row, which is where Discord puts a row's actions; on a phone the row wraps and this keeps the
+     control in the same corner rather than stranding it under the author's name. */
+  margin-left: auto;
   padding: 0.05rem 0.5rem;
   background: none;
   border: 1px solid var(--edge);
@@ -629,6 +633,19 @@ body {
   color: var(--accent);
 }
 
+/* `#65 scrollback-paging`. Centred above the oldest message loaded, and absent when there is
+   nothing older — the same rule Hang up follows. A control that is always there and usually inert
+   teaches the eye to skip the place it lives in, and the place this lives in is the one the reader
+   arrives at when they are looking for something old. */
+#load-older {
+  display: block;
+  margin: 0.6rem auto 0.2rem;
+}
+
+#load-older[disabled] {
+  opacity: 0.7;
+}
+
 /* ------------------------------------------------------- one channel row at a time --------- */
 /*
  * `#56 message-hover-highlight`. A long channel is a wall of blocks; Discord delineates the row
@@ -677,6 +694,27 @@ body {
 #discord-log li.discord-message:focus-within .reply-button {
   color: var(--ink);
   border-color: var(--accent);
+}
+
+/* THE CHANNEL ROW'S METADATA LINE MUST WRAP, and this is not tidying.
+ *
+ * It carries five things — author, time, message id, the fold control and the reply control — and
+ * a phone is 393 CSS pixels wide. `.meta` is a flex row (web/style.css) with no wrap, and the last
+ * two are `flex: 0 0 auto`, so they cannot shrink: the row simply became WIDER THAN THE SCREEN the
+ * moment `#51 reply-view` added the second of them. Every message body then ran off the right edge
+ * and the reply control was entirely off it.
+ *
+ * Nothing in the page suite could see that — it has no layout engine — and it was found by looking
+ * at `dark--iphone15--10-discord-view.png`, which is the whole reason those pictures are taken.
+ * The scene now also asserts that the channel does not overflow horizontally, because a rule this
+ * easy to lose deserves a check that runs.
+ *
+ * Scoped to `#discord-log` rather than put on `.meta` in web/style.css: that file is shared with
+ * the phone app at `/`, and the transcript's own metadata line has three things on it and fits.
+ */
+#discord-log .meta {
+  flex-wrap: wrap;
+  row-gap: 0.15rem;
 }
 
 /* The message id is the point of this view: it is what lets the operator say "that message does

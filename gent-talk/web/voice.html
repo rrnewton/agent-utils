@@ -141,6 +141,19 @@
                 <select id="discord-channel" aria-label="channel"></select>
                 <button id="refresh-discord" type="button">Refresh</button>
               </div>
+              <!--
+                `#65 scrollback-paging`. A channel read is a WINDOW, never the whole channel, and
+                until now the window was all there was: the oldest message on screen was the end of
+                what this page could ever show you. This walks further back, one server-cursored
+                step at a time.
+
+                It sits above the log and inside the scrolling element, so it scrolls away as the
+                reader moves down — it is the top of the history, not a fixture of the screen. It
+                is a real control as well as an automatic one: scrolling to the top loads the next
+                step, and this is what says so, what a keyboard can reach, and what reports that a
+                step is in flight.
+              -->
+              <button id="load-older" class="chip" type="button" hidden>Older messages</button>
               <ol id="discord-log" class="messages"></ol>
             </div>
           </div>
