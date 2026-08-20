@@ -832,6 +832,14 @@ def _act_idle(driver: Driver) -> None:
     # real server. Waiting on the element rather than a timeout keeps a slow box from reading as a
     # broken page.
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    # Settle past the transient message's own life. `#63 status-line-placement` is about a strip
+    # that used to hold a row of a phone screen on every frame; THIS is the picture that shows it
+    # gone, and a capture taken while "Ready." was still up would show the thing the issue is
+    # about. Waiting on the element rather than on a timeout keeps the delay honest if the timer
+    # ever changes.
+    driver.page.wait_for_function(
+        "() => !window.__visible('status-line')", timeout=15_000
+    )
     driver.settle()
 
 
@@ -1482,6 +1490,12 @@ SCENES: tuple[Scene, ...] = (
             ("the control pane is on screen", "window.__visible('control-pane')"),
             ("the talk control reads 'Talk'", "window.__text('talk-label') === 'Talk'"),
             ("the empty state is showing", "window.__visible('empty-state')"),
+            # `#63 status-line-placement`, and this frame is the whole issue: at rest, nothing is
+            # holding a strip of the screen for a line that has nothing to say.
+            (
+                "no status line is holding real estate at rest",
+                "!window.__visible('status-line')",
+            ),
             NO_HANGUP,
             ("the sign-in screen is gone", "!window.__visible('screen-signin')"),
         ),
@@ -1622,6 +1636,10 @@ SCENES: tuple[Scene, ...] = (
                 "nothing has been cleared yet — arming must not erase",
                 "document.querySelectorAll('#transcript li').length >= 3",
             ),
+            # The POSITIVE control for 02-idle. A page that had simply deleted the status line
+            # would satisfy "nothing is holding real estate"; this is the frame where it has
+            # something to say and says it.
+            ("the transient message is up", "window.__visible('status-line')"),
         ),
     ),
     Scene(
@@ -1663,6 +1681,13 @@ SCENES: tuple[Scene, ...] = (
             (
                 "every message shows its id, so it can be checked against a real one",
                 "[...document.querySelectorAll('#discord-log li .msg-id')].length >= 5",
+            ),
+            # `#63 status-line-placement`. The channel's summary is an entry at the head of the
+            # list now, where it scrolls away, rather than a line on a strip that takes itself
+            # away after six seconds.
+            (
+                "the channel says what it is showing, inline at the head of the list",
+                "!!document.querySelector('#channel-summary li.seam .seam-label')",
             ),
             # `#51 reply-view` put a fifth thing on a metadata line that is a flex row with no
             # wrap, and the row became wider than a phone: every message body ran off the right
@@ -2339,9 +2364,9 @@ def check_state_controls() -> list[str]:
     # all generic is satisfied by whatever screen happens to be up, which is the exact failure this
     # whole mechanism exists to prevent. (Found by mutation: deleting the settings screen's own
     # check left every control green.)
-    required = {
+    required: dict[str, str | tuple[str, ...]] = {
         "01-signed-out": "save-token",
-        "02-idle": "empty-state",
+        "02-idle": ("empty-state", "!window.__visible('status-line')"),
         "03-live-call": "Listening",
         "04-muted": "Muted",
         "05-speaker-silenced": "Silent",
@@ -2351,9 +2376,9 @@ def check_state_controls() -> list[str]:
         # exists for -- that the explanation does not open underneath the dock, which is the bug
         # its first capture caught -- could be deleted with every control still green.
         "07-seam-disclosure-open": "dock.top",
-        "08-clear-armed": "Sure?",
+        "08-clear-armed": ("Sure?", "window.__visible('status-line')"),
         "09-settings": "topbar-title",
-        "10-discord-view": "scrollWidth",
+        "10-discord-view": ("scrollWidth", "channel-summary"),
         "11-long-transcript-scrolled": "scrollTop",
         # Both pinned to the thing the picture is FOR, not to the screen being up. A line clamp is
         # a rendering fact no behavioural test can reach, so "one is open among the closed ones" is
@@ -2388,16 +2413,20 @@ def check_state_controls() -> list[str]:
         # that is the defect, not the feature.
         "21-channel-older-loaded": "__anchorAfter",
     }
-    for name, needle in required.items():
+    for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
         if required_scene is None:
             problems.append(f"the '{name}' state is gone from the scene table.")
             continue
-        if not any(needle in expression for _description, expression in required_scene.expect):
-            problems.append(
-                f"scene '{name}' no longer checks for {needle!r} before capturing, so a run that "
-                "never reached that state would still write a picture under its name."
-            )
+        # A tuple where one marker is not enough: `02-idle` has to be pinned BOTH to the empty
+        # state it is a picture of and to the absence of the status strip, which is the whole
+        # content of `#63 status-line-placement`.
+        for needle in (needles,) if isinstance(needles, str) else needles:
+            if not any(needle in expression for _description, expression in required_scene.expect):
+                problems.append(
+                    f"scene '{name}' no longer checks for {needle!r} before capturing, so a run "
+                    "that never reached that state would still write a picture under its name."
+                )
 
     # The interface rework renamed all of these. A scene still driving one would not fail loudly --
     # `getElementById` returns null, `__visible` answers false, and the run reports an unreachable
@@ -2645,6 +2674,7 @@ SELF_TEST_CHECKS = (
     "an 8x8 frame is rejected as too small to be a page",
     "a 60x60 frame is rejected on its DIMENSIONS, not on its byte count",
     "every state is pinned to its own distinguishing marker",
+    "the idle frame is pinned to the status strip being GONE, and 08 to it being up",
     "no state still drives a selector the interface rework retired",
     "the seam state is pinned to the dock geometry, not just to the element",
     "the suspended state is pinned to the ABSENCE of the failure banner",

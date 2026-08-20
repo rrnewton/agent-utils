@@ -82,6 +82,31 @@
            on a phone means it may as well not exist. -->
       <div id="error" class="panel error" role="alert" hidden></div>
 
+      <!--
+        `#63 status-line-placement`. This used to be a permanent grid row at the top of the dock,
+        costing a strip of a phone screen on every frame for a line that is blank most of the time.
+        It is now a TRANSIENT message: it ships hidden, appears when there is something to say, and
+        takes itself away a few seconds later.
+
+        An overlay rather than a collapsing row, and the ids are unchanged on purpose:
+
+          * OVERLAY, because a row that appears and disappears resizes #scroll-area and jitters the
+            transcript under the reader's thumb. Nothing else on this page is positioned, and the
+            rule in web/voice.css says why this one is.
+          * `status-line`, `status` and `data-state` are exactly as they were, so `setState`, the
+            dot colours, the page suite's own state helper and scripts/screenshots.py all keep
+            working — this is a move, not a rename.
+
+        Nothing that must survive is kept here. Errors live in #error above, close codes in the
+        settings connection detail, and conversation boundaries are seams in the transcript. What
+        is left is a thing that was true a moment ago, and that is allowed to go away.
+      -->
+      <div id="status-line" data-state="idle" hidden>
+        <span class="status-dot" aria-hidden="true"></span>
+        <span id="status" role="status" aria-live="polite"></span>
+        <button id="dismiss-status" class="chip" type="button" aria-label="Dismiss">×</button>
+      </div>
+
       <div id="screens">
         <!-- ------------------------------------------------------------------ sign-in screen -->
         <section id="screen-signin" class="screen">
@@ -141,6 +166,19 @@
                 <select id="discord-channel" aria-label="channel"></select>
                 <button id="refresh-discord" type="button">Refresh</button>
               </div>
+              <!--
+                `#63 status-line-placement`. The channel's own summary — how much is loaded, and
+                whether that is the whole channel — used to be a line on the status strip, and that
+                strip is transient now. A standing fact about what you are looking at does not
+                belong in a message that takes itself away after six seconds, so it is an entry at
+                the head of the view, in the same idiom the transcript uses for a conversation
+                boundary, and it scrolls off as the reader moves down.
+
+                Its own list rather than the first row of #discord-log: that log's children are the
+                channel's MESSAGES, and the page and its suite both count on that.
+              -->
+              <ol id="channel-summary" class="messages"></ol>
+
               <!--
                 `#65 scrollback-paging`. A channel read is a WINDOW, never the whole channel, and
                 until now the window was all there was: the oldest message on screen was the end of
@@ -322,11 +360,6 @@
       voice.css keep it clear of the curve on both sides.
     -->
     <footer id="dock">
-      <div id="status-line" data-state="idle">
-        <span class="status-dot" aria-hidden="true"></span>
-        <span id="status" role="status" aria-live="polite"></span>
-      </div>
-
       <!--
         A dense tile: two small controls stacked in the left column to exactly the height of the
         large ones, which each span both rows. Nothing is a fixed pixel width, so the pane fills

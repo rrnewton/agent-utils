@@ -217,6 +217,9 @@ body {
 /* ------------------------------------------------------------------------------ the body --- */
 
 #frame-body {
+  /* The anchor for #status-line, which floats over the bottom of the body area, above the dock.
+     `#63 status-line-placement`. */
+  position: relative;
   /* `min-height: 0` is the load-bearing one: without it a grid item refuses to shrink below its
      content, the body row grows past the viewport, and the document scrolls again — which is the
      exact behaviour this whole file removes. */
@@ -736,21 +739,53 @@ body {
    at the foot of the screen, in two vocabularies, by two mechanisms that did not know about each
    other. There is one now, and the dot carries the state the second line used to spell out.
  *
- * It sits ABOVE the control pane. On a phone with rounded corners the bottom edge is exactly
- * where a line of text gets eaten by the curve — the owner photographed the first word of this
- * line missing on an iPhone 16. The horizontal safe-area insets below are the other half of that
- * fix; only the bottom inset was ever applied. */
+ * `#63 status-line-placement` made it TRANSIENT. It used to be a permanent grid row at the top of
+ * the dock, holding a strip of a phone screen on every frame for a line that is blank most of the
+ * time — and the governing rule of this file is that the majority of the space belongs to content.
+ *
+ * AN OVERLAY, AND THIS IS THE ONE EXCEPTION TO "NOTHING HERE IS POSITIONED". A row that appears
+ * and disappears resizes #scroll-area, and resizing the scrolling element moves the transcript
+ * under the reader's thumb — the very defect `#47 scrollback-stability` exists to remove. Floating
+ * it costs no reflow at all. Do not "clean this up" into a grid row.
+ *
+ * The HISTORY that must survive the move: it sits above the dock, not on the bottom edge. On a
+ * phone with rounded corners the bottom edge is exactly where a line of text is eaten by the
+ * curve, and the owner photographed the first word of this line missing on an iPhone 16. The
+ * horizontal safe-area insets in the padding are the other half of that fix; only the bottom inset
+ * was ever applied before it. Both halves are still here, and both are still asserted. */
 #status-line {
+  position: absolute;
+  z-index: 5;
+  inset-inline: 0;
+  bottom: 0.5rem;
+  width: max-content;
+  max-width: calc(100% - 1.5rem);
+  margin-inline: auto;
   display: flex;
   align-items: center;
   gap: 0.5rem;
-  padding: 0.45rem calc(0.85rem + env(safe-area-inset-right)) 0.45rem
+  padding: 0.3rem calc(0.5rem + env(safe-area-inset-right)) 0.3rem
     calc(0.85rem + env(safe-area-inset-left));
   min-height: 1.9rem;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  box-shadow: 0 1px 8px rgb(0 0 0 / 35%);
   color: var(--muted);
   /* The small type is on #status below, not here. Same reason as #connection-banner: the desktop
-     regime caps this row in `ch`, `ch` follows the element's own font size, and a row set in
-     0.8rem would be a fifth narrower than the control pane directly beneath it. */
+     regime caps this pill in `ch`, `ch` follows the element's own font size, and a pill set in
+     0.8rem would be a fifth narrower than the control pane beneath it. */
+}
+
+/* Quiet, and the same size as the dot beside it. It is the way out for somebody who has read the
+   message and does not want to wait six seconds; it is not a thing to notice. */
+#dismiss-status {
+  padding: 0 0.4rem;
+  min-height: 0;
+  line-height: 1.1;
+  font-size: 0.95rem;
+  background: none;
+  border: none;
 }
 
 /* style.css pins #status to the bottom of the viewport for the OTHER page. Here it is a member of
@@ -814,7 +849,9 @@ body {
   grid-template-columns: 3.5rem 1fr 1fr;
   grid-template-rows: 1fr 1fr;
   gap: 0.4rem;
-  padding: 0 calc(0.6rem + env(safe-area-inset-right)) 0.6rem
+  /* The top padding used to come from the status row sitting on top of this one. That row is an
+     overlay now, so the separation from the dock's own border has to be stated. */
+  padding: 0.6rem calc(0.6rem + env(safe-area-inset-right)) 0.6rem
     calc(0.6rem + env(safe-area-inset-left));
   /* Clear of the home indicator on a phone that has one, and zero on one that does not. */
   padding-bottom: calc(0.6rem + env(safe-area-inset-bottom));

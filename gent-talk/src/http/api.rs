@@ -668,7 +668,13 @@ mod tests {
             VOICE_JS.contains("function followIfPinned("),
             "an arrival must follow the newest line only when the reader was already there"
         );
-        for renderer in ["function line(", "function seam("] {
+        // `function seam(` used to be in this list. `#63 status-line-placement` split BUILDING a
+        // seam from PLACING one — the channel's summary is a seam at the head of its own list, and
+        // placing it at the end of the transcript would be wrong — so the thing that appends to
+        // the transcript, and therefore the thing that has to decide whether to follow, is
+        // `transcriptSeam`. The property asserted is unchanged; the name of the function that has
+        // to satisfy it moved.
+        for renderer in ["function line(", "function transcriptSeam("] {
             let body = function_body(VOICE_JS, renderer);
             assert!(
                 body.contains("followIfPinned("),

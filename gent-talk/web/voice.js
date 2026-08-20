@@ -29,12 +29,47 @@ const WIDTH_KEY = "gent-talk.voice.width";
 
 const el = (id) => document.getElementById(id);
 
-// ONE status line, above the control pane. It used to be two — a word under the header and a
-// sentence at the foot — which is how the closed state managed to announce itself three times in
-// three vocabularies. The sentence is the line; the state is the dot beside it.
+// ONE status line. It used to be two — a word under the header and a sentence at the foot — which
+// is how the closed state managed to announce itself three times in three vocabularies. The
+// sentence is the line; the state is the dot beside it.
+//
+// `#63 status-line-placement` made it TRANSIENT. It was a permanent row in the dock, holding a
+// strip of a phone screen on every frame for a line that is blank most of the time. It now appears
+// when there is something to say and takes itself away.
+//
+// A message that goes away can hide something the owner never saw, so nothing that MUST survive is
+// carried here and nowhere else: a failure is in `#error` until it is fixed, a close code is in
+// the connection detail on the settings screen, a conversation boundary is a seam in the
+// transcript, and the live/muted/idle state is on the controls themselves. What is left is a thing
+// that was true a moment ago.
+const STATUS_DISMISS_MS = 6000;
+let statusTimer = null;
+
 const setStatus = (text) => {
+  if (statusTimer !== null) {
+    clearTimeout(statusTimer);
+  }
+  // UN-HIDE FIRST, then write. An `aria-live` region whose element is `display: none` when its
+  // text changes announces nothing at all; the order here is what makes it speak.
+  el("status-line").hidden = false;
   el("status").textContent = redact(text);
+  statusTimer = setTimeout(dismissStatus, STATUS_DISMISS_MS);
 };
+
+/**
+ * Take it away.
+ *
+ * A HIDE, NOT AN ERASE, and that is deliberate twice over: the text is still there for anything
+ * that wants to know what was last said, and a dozen assertions in the page suite read
+ * `#status`'s textContent after the moment it was set.
+ */
+function dismissStatus() {
+  if (statusTimer !== null) {
+    clearTimeout(statusTimer);
+    statusTimer = null;
+  }
+  el("status-line").hidden = true;
+}
 
 /**
  * One of: idle, working, live, ended, suspended, error. web/voice.css colours the dot from this.
@@ -142,8 +177,12 @@ function showScreen(name) {
     el("topbar-title").textContent = SCREEN_TITLES[name];
   }
   // The control pane is a grid ROW inside the dock. Hiding it collapses the row, so the body grows
-  // to fill the frame rather than leaving a band of empty pane under a sign-in form. The status
-  // line above it is NOT hidden: a sign-in failure has to be able to say so.
+  // to fill the frame rather than leaving a band of empty pane under a sign-in form.
+  //
+  // The status line is not touched here any more. It used to be kept visible on every screen so a
+  // sign-in failure could say so — but a sign-in failure is shown by the `#error` panel, which is
+  // permanent and is on whichever screen is up, and the sign-in screen states what to paste in its
+  // own body. `#63 status-line-placement`.
   el("control-pane").hidden = !main;
   if (!main) {
     disarmClear();
@@ -520,7 +559,6 @@ function line(who, text) {
  * named by `title` on a pointer device — and they are not standing on the screen.
  */
 function seam(label, detail) {
-  const pinned = atBottom(el("scroll-area"));
   const li = document.createElement("li");
   li.className = "seam";
   const details = document.createElement("details");
@@ -546,6 +584,19 @@ function seam(label, detail) {
   });
   details.append(summary, body);
   li.append(details);
+  return li;
+}
+
+/**
+ * A seam at the end of the transcript.
+ *
+ * `seam()` above only BUILDS one, because `#63 status-line-placement` gave the channel list a seam
+ * of its own and that one belongs at the TOP of its list rather than at the end. Placement is
+ * therefore the caller's, and the two transcript callers share this.
+ */
+function transcriptSeam(label, detail) {
+  const pinned = atBottom(el("scroll-area"));
+  const li = seam(label, detail);
   el("transcript").append(li);
   renderEmptyState();
   followIfPinned(pinned);
@@ -608,7 +659,7 @@ function noteConversationEnded(cause = "ended") {
   // Drawn at the moment of the DROP, not when Resume is tapped: the boundary is where the
   // conversation actually broke, and marking it later would put the reader's own next turn on the
   // wrong side of it.
-  seam("new conversation", seamDetailFor(cause));
+  transcriptSeam("new conversation", seamDetailFor(cause));
 }
 
 // --- clearing the transcript ---------------------------------------------------------------
@@ -664,7 +715,7 @@ function onClear() {
   renderEmptyState();
   renderScrollTools(); // the folds went with the lines they were attached to.
   if (session.socket) {
-    seam(
+    transcriptSeam(
       "view cleared",
       "The screen was emptied; nothing else was. The agent still has everything said before " +
         "this point. Hang up is what ends the call."
@@ -1784,6 +1835,38 @@ function snowflakeOlder(a, b) {
 /** `has_more` absent means a server too old to say — which is UNKNOWN, and never "complete". */
 const knownComplete = (hasMore) => (typeof hasMore === "boolean" ? !hasMore : undefined);
 
+// `#63 status-line-placement`. The channel's own summary — how much is loaded, and whether that is
+// the whole channel — used to be a line on the status strip, and the strip is transient now: a
+// message that is true for six seconds is the wrong home for a standing fact about what you are
+// looking at. So it is an entry at the HEAD OF THE LOG, in the same idiom the transcript uses for
+// a conversation boundary, and it scrolls away as the reader moves down instead of holding a strip
+// of the screen.
+//
+// The disclosure inside it answers the question the label raises and cannot answer on its own:
+// why there might be more than this. Kept to a couple of clauses, and measured by the suite
+// alongside the other two seams.
+const CHANNEL_SEAM_DETAIL =
+  "The channel is read a page at a time. Discord gives a bot no message count, so a total " +
+  "appears only once the walk reaches the beginning.";
+
+/**
+ * Put the channel's summary at the head of the channel view, replacing any that is already there.
+ *
+ * In a list of its OWN, immediately above the log, rather than as the log's first child. That is a
+ * deliberate departure from the issue's wording: `#discord-log`'s children are the channel's
+ * messages, everywhere in this page and in its suite — `applyNewestPage` filters them by snowflake,
+ * `scrollAnchor` walks them, and a couple of dozen assertions count them — and putting something
+ * that is not a message among them redefines all of that for a placement. It is inside the
+ * scrolling element either way, which is what the issue actually asks for: it scrolls off as the
+ * reader moves down, exactly like the boundary in the transcript.
+ *
+ * REPLACING, not appending: `loadDiscord` and `loadOlder` both call this, and a summary that
+ * stacked would grow one line per refresh — a background poll runs every forty-five seconds.
+ */
+function renderChannelSeam(label) {
+  el("channel-summary").replaceChildren(seam(label, CHANNEL_SEAM_DETAIL));
+}
+
 function renderOlderControl() {
   const button = el("load-older");
   button.hidden = !discordHasOlder;
@@ -1843,12 +1926,21 @@ async function loadOlder() {
     const arriving = (payload.messages || []).map(discordNode);
     // Prepending is a mutation ABOVE the viewport, which is the one case browser scroll anchoring
     // does not handle. Same helper as the fold control, deliberately.
-    preservingScroll(() => list.replaceChildren(...arriving, ...list.children));
+    preservingScroll(() => {
+      list.replaceChildren(...arriving, ...list.children);
+      // Re-stated inside the SAME anchored mutation. It sits above everything that just arrived,
+      // so rewriting it afterwards would be a second change of height above the viewport and the
+      // reader would move by whatever the difference happened to be.
+      renderChannelSeam(
+        channelSummary(
+          list.children.length,
+          knownComplete(payload.has_more),
+          payload.channel.label
+        )
+      );
+    });
     discordHasOlder = payload.has_more === true;
     discordOlderCursor = payload.next_before || null;
-    setStatus(
-      channelSummary(list.children.length, knownComplete(payload.has_more), payload.channel.label)
-    );
     renderScrollTools();
   } finally {
     olderFetchInFlight = false;
@@ -1896,9 +1988,10 @@ async function loadDiscord(options) {
       `/api/v1/channels/${encodeURIComponent(channel)}/page?limit=${DISCORD_PAGE_LIMIT}`
     );
     const loaded = applyNewestPage(payload);
-    setStatus(
-      channelSummary(loaded, knownComplete(payload.has_more), payload.channel.label)
-    );
+    // Inline, at the head of the list, rather than on the transient strip. `#63
+    // status-line-placement`: this is a standing fact about what you are looking at, and the strip
+    // takes itself away after a few seconds.
+    renderChannelSeam(channelSummary(loaded, knownComplete(payload.has_more), payload.channel.label));
     const messages = payload.messages || [];
     const newest = messages.length ? messages[messages.length - 1].id : null;
     // Something ARRIVED only if the newest id moved. A refresh that returns the same messages must
@@ -2109,6 +2202,12 @@ function setTokenState(text) {
   el("token-state").textContent = text;
 }
 
+// What the sign-in screen says when there is nothing stored. It carries the INSTRUCTION, not just
+// the fact, because this is now the only place a first-time visitor is told what to do — the
+// load-time status toast that used to say it was a message over the screen that was already
+// asking. `#63 status-line-placement`.
+const NO_TOKEN_YET = "no token saved in this browser — paste your write-scope token above.";
+
 function applyClientConfig(config) {
   const select = el("discord-channel");
   select.replaceChildren();
@@ -2183,7 +2282,7 @@ async function saveToken() {
   markSave("Saving…", "", true);
   if (!value) {
     markSave(SAVE_LABEL, "", false);
-    setTokenState("no token saved in this browser");
+    setTokenState(NO_TOKEN_YET);
     showError("There is nothing to save — paste your write-scope API token first.");
     setStatus("nothing to save");
     return;
@@ -2193,7 +2292,7 @@ async function saveToken() {
   // or silently do nothing, and "saved" would then be a lie the owner only discovers later.
   if (localStorage.getItem(TOKEN_KEY) !== value) {
     markSave(SAVE_LABEL, "", false);
-    setTokenState("no token saved in this browser");
+    setTokenState(NO_TOKEN_YET);
     showError(
       "This browser refused to store the token. Private browsing and a full storage quota both " +
         "do this; the token was NOT saved."
@@ -2214,7 +2313,7 @@ function forgetToken() {
   localStorage.removeItem(TOKEN_KEY);
   el("api-token").value = "";
   markSave(SAVE_LABEL, "", false);
-  setTokenState("no token saved in this browser");
+  setTokenState(NO_TOKEN_YET);
   setStatus("token forgotten");
   showScreen("signin");
 }
@@ -2253,6 +2352,7 @@ el("hang-up").addEventListener("click", stop);
 el("clear-view").addEventListener("click", onClear);
 el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff));
 el("dismiss-banner").addEventListener("click", dismissBanner);
+el("dismiss-status").addEventListener("click", dismissStatus);
 el("open-settings").addEventListener("click", () => showScreen("settings"));
 el("close-settings").addEventListener("click", () => showScreen(screenBeforeSettings));
 // `#51 reply-view`. Both ways out of the reply screen go through `closeReply`, so neither can be
@@ -2331,8 +2431,13 @@ function guardQuietly(fn) {
     });
 }
 
-setTokenState(token() ? "token saved in this browser" : "no token saved in this browser");
-setStatus(token() ? "Checking your token…" : "Paste your write-scope API token first.");
+setTokenState(token() ? "token saved in this browser" : NO_TOKEN_YET);
+// With no token there is nothing to report YET, and firing a toast at page load to say so would
+// put a message over a screen whose entire subject is the thing it is asking for. The sign-in
+// screen says it in its own body; see `setTokenState`. `#63 status-line-placement`.
+if (token()) {
+  setStatus("Checking your token…");
+}
 showView("voice");
 renderEmptyState();
 renderControls();

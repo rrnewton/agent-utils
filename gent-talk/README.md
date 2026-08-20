@@ -460,6 +460,41 @@ The `/voice` page expects the agent's output audio format to be **PCM** (`pcm_16
 default). It reads the format out of the conversation's initiation metadata and says so plainly if
 it is something it cannot decode, rather than playing noise.
 
+### The status line is a message, not a fixture
+
+It used to be a permanent grid row at the top of the dock: a strip of a phone screen held on every
+frame, for a line that is blank most of the time. The governing rule of the layout is that the
+majority of the space belongs to content, and a row reserved for something that is usually not
+there is the clearest possible violation of it.
+
+It now ships hidden, appears when there is something to say, and takes itself away after six
+seconds — or immediately, if you tap its dismiss control. **Dismissal is a hide, not an erase**:
+what was last said stays readable to anything that asks.
+
+**It is an overlay, and that is the one exception to this page's "nothing is positioned" rule.** A
+row that appears and disappears resizes `#scroll-area`, and resizing the scrolling element moves
+the transcript under the reader's thumb — the exact defect `#47 scrollback-stability` exists to
+remove. Floating it costs no reflow. The CSS says so, at length, so it does not get "cleaned up".
+
+**A message that goes away can hide something nobody saw**, so nothing that must survive is kept
+only here: a failure is in the `#error` panel until it is fixed, a close code is in the connection
+detail on the settings screen, a conversation boundary is a seam in the transcript, and live /
+muted / idle is carried by the controls themselves. What is left on the strip is a thing that was
+true a moment ago.
+
+Two things moved out of it rather than away:
+
+- **The channel's own summary** — how much is loaded, and whether that is all of it — is now an
+  entry at the head of the channel view, in the same seam idiom the transcript uses for a
+  conversation boundary. It is a standing fact about what you are looking at, and it scrolls off as
+  you read rather than expiring after six seconds.
+- **The "paste your token" instruction** is in the sign-in screen's own body. Firing a toast at
+  page load to say it was a message over the screen that was already asking.
+
+`02-idle` is the screenshot that proves the issue is fixed: the idle phone, at rest, with nothing
+holding a strip. `08-clear-armed` is its positive control — the same page with something to say,
+saying it — because a page that had simply deleted the line would satisfy the first alone.
+
 ### The channel view walks back, one server-cursored step at a time
 
 `GET /api/v1/channels/{id}/page` landed with **#53 stepped-retrieval** and had **no web caller at
@@ -964,7 +999,7 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-315 Rust tests plus a 148-test suite for the `/voice` page: unit tests beside each module,
+315 Rust tests plus a 152-test suite for the `/voice` page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
 `tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
 the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
@@ -1060,7 +1095,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 41 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 42 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.

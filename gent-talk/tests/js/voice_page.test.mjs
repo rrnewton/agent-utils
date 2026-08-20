@@ -256,7 +256,7 @@ const FIXTURE_TREE = {
   // In markup order: the walk-back control sits ABOVE the log and inside the scrolling element, so
   // it scrolls away with the top of the history rather than standing on the screen. Its height is
   // part of what the anchoring model measures against. `#65 scrollback-paging`.
-  "pane-discord": ["load-older", "discord-log"],
+  "pane-discord": ["channel-summary", "load-older", "discord-log"],
 };
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
@@ -1028,6 +1028,19 @@ const SEAM_DETAIL_MAX_WORDS = 28;
 /** The one status line's machine-readable state, which is what colours its dot. */
 const state = (page) => page.el("status-line").getAttribute("data-state");
 
+/**
+ * What the channel view says about itself, at the head of the list.
+ *
+ * `#63 status-line-placement` moved this off the status strip: it is a standing fact about what
+ * you are looking at, and the strip is a message that takes itself away after a few seconds.
+ */
+const channelSummaryText = (page) => {
+  const [line] = page.el("channel-summary").children;
+  assert.ok(line, "the channel view states no summary at all");
+  assert.equal(line.className, "seam", "the summary is not drawn in the seam idiom");
+  return seamLabel(line);
+};
+
 /** Just the audio frames, not the initiation message or a pong. */
 const audioFrames = (socket) => socket.sent.filter((s) => s.includes("user_audio_chunk"));
 
@@ -1199,8 +1212,17 @@ test("with no token the page IS the sign-in screen, not the interface behind a n
   // The controls act on a call this visitor cannot place, so they are not on the screen.
   assert.equal(page.el("control-pane").hidden, true, "the control pane showed before sign-in");
   assert.equal(page.el("view-switch").hidden, true, "there is nothing to switch between yet");
-  // The status line, on the other hand, stays: a refused token has to be able to say so.
-  assert.equal(page.el("status-line").hidden, false);
+  // The status line used to be kept visible here so a refused token could say so. It is a
+  // transient message now (`#63 status-line-placement`) and nothing has happened yet, so firing
+  // one at page load would put a toast over a screen whose whole subject is the thing it is
+  // asking for. The instruction lives in the sign-in screen's own body instead — and a refusal,
+  // when there is one, is the permanent `#error` panel, which shows on whichever screen is up.
+  assert.equal(page.el("status-line").hidden, true, "an empty toast greeted a first-time visitor");
+  assert.match(
+    page.el("token-state").textContent,
+    /paste your write-scope token/i,
+    "nothing on the sign-in screen tells a first visitor what to do"
+  );
 });
 
 test("the explanatory text lives on the sign-in screen, not over the transcript", () => {
@@ -1507,27 +1529,154 @@ test("the header shows two things at a time, and which two depends on the screen
 
 // --- the one status line -------------------------------------------------------------------------
 
-test("state is reported in ONE place, above the controls", () => {
-  // It used to be two: a small grey word under the header and a sentence at the foot. That split
-  // is how the closed state managed to announce itself three times, in three vocabularies.
+test("THE DOCK HOLDS NOTHING BUT THE CONTROL PANE", () => {
+  // It used to hold a permanent status row as well, which cost a strip of a phone screen on every
+  // frame for a line that is blank most of the time. `#63 status-line-placement` moved it into the
+  // body as a transient overlay.
+  //
+  // Two facts from before the move that MUST survive it, because each was a fix for something the
+  // owner photographed:
+  //
+  //   * state is reported in ONE place. It used to be two — a word under the header and a sentence
+  //     at the foot — which is how the closed state announced itself three times in three
+  //     vocabularies.
+  //   * it is not on the bottom EDGE. On a phone with rounded corners that is exactly where a line
+  //     of text is eaten by the curve; the first word of this line went missing on an iPhone 16.
+  //     Above the dock is where it was moved to, and above the dock is where it still floats.
   assert.equal(
     PAGE_IDS.has("conversation-state"),
     false,
     "the second status element is still in the page"
   );
   const dock = HTML.slice(HTML.indexOf('id="dock"'));
-  assert.ok(
-    dock.indexOf('id="status-line"') < dock.indexOf('id="control-pane"'),
-    "the status line must sit ABOVE the control pane, out of the corner curvature"
-  );
+  assert.doesNotMatch(dock, /id="status-line"/, "the status row is back in the dock");
+  assert.ok(dock.includes('id="control-pane"'), "the dock lost the controls too");
+  assertMarkupContains("frame-body", "status-line");
   const header = HTML.slice(HTML.indexOf('id="topbar"'), HTML.indexOf("</header>"));
   assert.doesNotMatch(header, /id="status/, "the header must not report status too");
 });
 
-test("the status line is not pinned to the bottom edge of the screen", () => {
+test("the status line floats ABOVE the dock rather than reflowing the transcript", () => {
+  // An overlay is the one exception to this file's standing "nothing here is positioned" rule, and
+  // the exception is the point: a row that appears and disappears resizes #scroll-area, and
+  // resizing the scrolling element moves the transcript under the reader's thumb — the very defect
+  // `#47 scrollback-stability` exists to remove.
+  const line = cssBlock("#status-line");
+  assert.match(line, /position:\s*absolute/, "it is a reflowing row again");
+  assert.match(line, /bottom:\s*/, "it is not anchored to the foot of the body area");
+  assert.match(cssBlock("#frame-body"), /position:\s*relative/, "it has nothing to float against");
+  // ...and it is NOT on the bottom edge of the SCREEN: the dock is still a grid row below it.
+  const body = cssBlock("body");
+  assert.match(body, /grid-template-rows:\s*auto 1fr auto/);
+  assert.doesNotMatch(cssBlock("#dock"), /position:\s*(fixed|absolute)/);
   // style.css pins #status to the viewport bottom for the OTHER page. Inherited here, that is what
   // put the line inside the corner curvature of the owner's phone, which ate its first word.
   assert.match(cssBlock("#status"), /position:\s*static/, "the shared fixed positioning is back");
+  // The control pane relied on the status row for separation from the dock's border; with the row
+  // gone it has to say so itself.
+  assert.match(cssBlock("#control-pane"), /padding:\s*[\d.]+rem/, "the controls sit on the border");
+});
+
+test("THE STATUS LINE IS A MESSAGE, NOT A FIXTURE", async () => {
+  // The issue, in one test. It ships hidden, it appears when there is something to say, and it
+  // takes itself away — and taking itself away is a HIDE, not an erase.
+  assert.equal(
+    PAGE_ELEMENTS.get("status-line").hidden,
+    true,
+    "the markup ships it visible, so it holds space before anything has happened"
+  );
+
+  const page = newPage();
+  await signIn(page);
+  page.el("status-line").hidden = true; // signing in says "Ready."; start from nothing showing.
+
+  // WHICH ORDER the page does it in, which is not decoration: an `aria-live` region whose element
+  // is `display: none` at the moment its text changes announces nothing at all, so the un-hide has
+  // to come first. Recorded here rather than asserted after the fact, because after the fact both
+  // orders look identical.
+  const status = page.el("status");
+  let hiddenWhenWritten = null;
+  let written = "";
+  Object.defineProperty(status, "textContent", {
+    configurable: true,
+    get: () => written,
+    set: (value) => {
+      hiddenWhenWritten = page.el("status-line").hidden;
+      written = value;
+    },
+  });
+
+  await page.el("clear-view").click();
+  assert.equal(page.el("status-line").hidden, false, "arming Clear said nothing");
+  assert.equal(
+    hiddenWhenWritten,
+    false,
+    "the text was written while the element was still hidden, so a screen reader hears nothing"
+  );
+  assert.match(page.el("status").textContent, /again/);
+
+  assert.equal(page.expireTimers(6000), 1, "no timer was armed to take the message away");
+  assert.equal(page.el("status-line").hidden, true, "the message outstayed its welcome");
+  assert.match(
+    page.el("status").textContent,
+    /again/,
+    "the dismissal ERASED the text; it is a hide, so what was last said stays readable"
+  );
+});
+
+test("the transient message can be dismissed by hand, without waiting", async () => {
+  const page = newPage();
+  await signIn(page);
+  await page.el("clear-view").click();
+  assert.equal(page.el("status-line").hidden, false);
+
+  await page.el("dismiss-status").click();
+
+  assert.equal(page.el("status-line").hidden, true, "Dismiss did not dismiss");
+  assert.equal(page.expireTimers(6000), 0, "the timer was left running after a manual dismissal");
+});
+
+test("A LIVE CALL IS STILL LEGIBLE ONCE THE MESSAGE HAS GONE", async () => {
+  // This is what justifies retiring the permanent row. Everything the strip used to hold
+  // permanently is carried somewhere durable: the live state by the controls, an error by the
+  // panel, the close code by the connection detail, a conversation boundary by a seam.
+  const page = newPage();
+  await startTalking(page);
+  assert.equal(page.el("status-line").hidden, false, "a connected call said nothing at all");
+
+  page.expireTimers(6000);
+
+  assert.equal(page.el("status-line").hidden, true);
+  assert.equal(page.el("talk-label").textContent, "Listening", "nothing says the call is live");
+  assert.match(page.el("talk").className, /\blive\b/);
+  assert.equal(page.el("hang-up").hidden, false, "nothing says there is a call to hang up");
+  // ...and a failure is NOT transient: it stays until it is fixed.
+  page.sockets[0].onerror({});
+  page.sockets[0].onclose({ code: 1006, reason: "" });
+  page.expireTimers(6000);
+  assert.equal(page.el("error").hidden, false, "the failure panel went away with the toast");
+});
+
+test("the channel says what it is showing INLINE, where it scrolls away", async () => {
+  // `#63 status-line-placement` names this line specifically: it is a standing fact about what you
+  // are looking at, and it was living on a strip that is now a message with a six-second life.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, [message({ id: "1" }), message({ id: "2" })]);
+
+  const summary = page.el("channel-summary");
+  assert.equal(summary.children.length, 1, "the channel states no summary at all");
+  assert.equal(summary.children[0].className, "seam", "it is not drawn as a seam");
+  assert.match(channelSummaryText(page), /lead team/, "it does not name the channel");
+  // Inside the scrolling element, so it scrolls off — that is the whole point of moving it.
+  assertMarkupContains("scroll-area", "channel-summary");
+  // And the explanation is one tap inside it, measured exactly like the transcript's two seams.
+  const spent = words(seamDetail(summary.children[0]));
+  assert.ok(spent >= SEAM_DETAIL_MIN_WORDS, `the channel seam explains nothing: ${spent} words`);
+  assert.ok(spent <= SEAM_DETAIL_MAX_WORDS, `${spent} words behind a tap is an essay`);
+  // It is not ALSO on the strip: two mechanisms saying the same thing is what this page keeps
+  // removing.
+  assert.doesNotMatch(page.el("status").textContent, /lead team/);
 });
 
 test("the horizontal safe-area insets are applied, not only the bottom one", () => {
@@ -2026,14 +2175,29 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
     assert.equal(summary.getAttribute("title"), detail);
   }
 
-  // And there are exactly these two doors. A third `seam(...)` call would be an unmeasured one,
-  // which is how the first essay got in. (`seam(` also appears once as its own definition.)
-  const mentions = (SCRIPT_CODE.match(/\bseam\(/g) || []).length;
+  // And there are exactly these doors. An unmeasured seam is how the first essay got in, so the
+  // count has to keep up with the code — and `#63 status-line-placement` split building a seam
+  // from placing one, because the channel's summary belongs at the head of its list rather than at
+  // the end of the transcript.
+  //
+  // The invariant that survives that split: `seam()` is called by the two PLACERS and by nothing
+  // else, `transcriptSeam()` is called exactly as many times as this test measures, and the
+  // channel's placer is measured by "the channel says what it is showing INLINE" with the same
+  // word band. (Each name also appears once as its own definition.)
+  const drawn = (name) =>
+    (SCRIPT_CODE.match(new RegExp(`\\b${name}\\(`, "g")) || []).length - 1;
   assert.equal(
-    mentions - 1,
-    sites.length,
-    `web/voice.js draws ${mentions - 1} seams and this test measures ${sites.length}`
+    drawn("seam"),
+    2,
+    `seam() is built from ${drawn("seam")} places, and only the two placers may build one`
   );
+  assert.equal(
+    drawn("transcriptSeam"),
+    sites.length,
+    `web/voice.js draws ${drawn("transcriptSeam")} transcript seams and this test measures ` +
+      `${sites.length}`
+  );
+  assert.ok(drawn("renderChannelSeam") > 0, "nothing places the channel's own summary any more");
 });
 
 test("the voice on this page is the ASSISTANT, not one more 'agent'", async () => {
@@ -2861,8 +3025,8 @@ test("every raw message shows its author and its message id", async () => {
   assert.match(text, /2026-08-19 04:31/);
   // `#62 message-count-accuracy`, carried across from web/app.js. The fixture sends no `complete`,
   // which is exactly the ordinary case: the fetch window is not a channel total, so no digit.
-  assert.match(page.el("status").textContent, /lead team — the most recent messages/);
-  assert.doesNotMatch(page.el("status").textContent, /\(s\)/, "the placeholder plural came back");
+  assert.match(channelSummaryText(page), /lead team — the most recent messages/);
+  assert.doesNotMatch(channelSummaryText(page), /\(s\)/, "the placeholder plural came back");
 });
 
 test("the channel view counts only when the count is the CHANNEL'S, and pluralizes", async () => {
@@ -2877,12 +3041,15 @@ test("the channel view counts only when the count is the CHANNEL'S, and pluraliz
 
   await page.el("view-switch").click();
   await page.settle();
-  assert.match(page.el("status").textContent, /^2 messages from lead team$/);
+  assert.match(channelSummaryText(page), /^2 messages from lead team$/);
 
   page.messages = [message({ id: "1" })];
   await page.el("refresh-discord").click();
   await page.settle();
-  assert.match(page.el("status").textContent, /^1 message from lead team$/, "singular, not '1 messages'");
+  assert.match(channelSummaryText(page), /^1 message from lead team$/, "singular, not '1 messages'");
+  // Replaced, never stacked: a background poll runs every forty-five seconds, and a summary that
+  // accumulated would grow a line each time. `#63 status-line-placement`.
+  assert.equal(page.el("channel-summary").children.length, 1);
 });
 
 test("the channel view speaks the operator's clock, not UTC", async () => {
@@ -3412,7 +3579,7 @@ test("reaching the beginning of the channel stops offering more, and says the co
   pagedChannel(page, { steps: 2, size: 3 });
   await showDiscord(page, []);
   assert.match(
-    page.el("status").textContent,
+    channelSummaryText(page),
     /older ones are not loaded/,
     "it claimed a total before the walk had reached the beginning"
   );
@@ -3423,7 +3590,7 @@ test("reaching the beginning of the channel stops offering more, and says the co
   assert.equal(page.el("load-older").hidden, true, "it still offers a step past the beginning");
   // ...and NOW the number is the channel's own, because there is nothing above it. That is the
   // `#62 message-count-accuracy` rule, and this is the first time this page can satisfy it.
-  assert.match(page.el("status").textContent, /^6 messages from lead team$/);
+  assert.match(channelSummaryText(page), /^6 messages from lead team$/);
 });
 
 test("a step that FAILS keeps what is already on screen, and does not hang up", async () => {
