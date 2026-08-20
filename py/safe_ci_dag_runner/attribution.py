@@ -26,6 +26,12 @@ _MAX_COMPONENT_BYTES = 255
 #: threatens both independently.
 STEP_LOG_CAP_BYTES = 1024 * 1024 * 1024
 
+#: Bytes held back from the cap so the truncation notice fits INSIDE it. Without
+#: this the notice is written past the limit and the file exceeds the number it
+#: advertises -- measured, a 1,024-byte cap produced a 1,167-byte file. A cap that
+#: overshoots to announce itself is not a cap.
+_LOG_MARKER_RESERVE = 512
+
 
 def sanitize(tag: str) -> str:
     """Injectively encode a UTF-8 tag as an ASCII filename component."""
@@ -467,7 +473,7 @@ class StepStream:
                 # could stop the drain, the producer would block on a full pipe,
                 # and a hung run is worse than a full disk. A full disk crashes;
                 # a hang burns CPU for 28 hours looking like a product bug.
-                room = self._log_cap - self._log_written
+                room = self._log_cap - _LOG_MARKER_RESERVE - self._log_written
                 if room > 0:
                     take = data[:room]
                     try:
@@ -508,7 +514,7 @@ class StepStream:
             f"\n[dag-runner] *** STEP LOG CAPPED *** {self.tag}: this log stops at "
             f"{self._log_cap} bytes. The step CONTINUED past this point and its "
             f"later output is NOT below.\n"
-        ).encode()
+        ).encode()[:_LOG_MARKER_RESERVE]
         try:
             self._log.write(notice)
             self._log.flush()
