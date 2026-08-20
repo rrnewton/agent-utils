@@ -163,6 +163,12 @@ def test_reap_subcommand_reports_both_sides_and_closes_nothing(
     assert [entry["pane_id"] for entry in document["reapable"]] == ["w1:p1"]
     assert [entry["pane_id"] for entry in document["declined"]] == ["w1:p2"]
     assert all(entry["reason"] for entry in document["declined"])
+    # The report also has to state the bound on what it could POSSIBLY have considered. Candidates
+    # are the panes named by surviving run records, and herdr-run's own retention deletes those
+    # records -- so the oldest leaked tabs, the ones the pane cap exists to bound, are exactly the
+    # ones missing from this count. Printing the window keeps "considered: 2" from implying more.
+    assert document["candidate_source"]["retention_days"] == 4
+    assert "retention_days" in document["candidate_source"]["note"]
 
 
 class _CapturedText(io.StringIO):

@@ -79,7 +79,7 @@ Wrapped-command statuses are passed through unchanged. Wrapper failures use thes
 | --- | --- |
 | `77` | **REFUSED** by the allowlist. Nothing was executed. |
 | `75` | **PANE BUSY** — the pane was not observably idle. Nothing was executed; retrying is meaningful. |
-| `69` | Herdr server / workspace / tab / pane could not be established. |
+| `69` | Herdr server / workspace / tab / pane could not be established. **Not a retry signal**: it covers both a transient bring-up failure and the `max_panes` refusal, and the second only clears when somebody closes tabs. `75` is the only code that promises retrying is meaningful. |
 | `76` | The command was launched but did not finish before the timeout. It is **still running**. |
 | `78` | The project config is malformed. |
 
@@ -275,16 +275,33 @@ message naming the remedy. The check is deliberately only on the create path: an
 already exists is never locked out of it, because a cap that can break work in progress is a cap
 that gets switched off. Set `max_panes: 0` to disable it.
 
+The cap is **per workspace**, while the measurement behind the number is **per server**. Five
+projects each with their own `workspace:` and each sitting at 63 panes reproduce the measured
+condition without any of them breaching its cap. `max_panes` bounds one project's contribution to
+the leak, not a host's total.
+
 `herdr-run reap` says which tabs can go. It considers only panes **this tool has run a command in**
 (read from the run spool, not from `herdr pane list`, so a human's tab in the same workspace is not
 a candidate), and it re-derives scope from the current configuration: the recorded workspace label
 must equal `workspace`, and the recorded tab label must equal what `tab_name` renders today for the
 recorded agent. Retarget either and the old tabs immediately fall out of scope.
 
+**The candidate set is bounded by retention, and this matters.** Run records are the candidates,
+and herdr-run deletes a run record `retention_days` (four by default) after the run finished. A tab
+whose owning agent last ran a week ago therefore has no surviving record, is not a candidate, and
+will never appear in this report — while still holding a pane and still counting against
+`max_panes`. The oldest leaks are the ones `reap` cannot see, and they have to be closed by hand.
+The report prints `candidate_source.retention_days` for exactly this reason: `"considered": 3` means
+three panes were *eligible to look at*, not that the workspace holds three tabs.
+
 A tab is reported STALE only when all three hold, each of them positive evidence:
 
 1. **No in-flight work** — every run naming the pane recorded an `exit_code`. A run without one is
-   the agent-is-thinking case, and it wins over every other signal.
+   the agent-is-thinking case, and it wins over every other signal. That state is written when a
+   command outlives its timeout: it is still running in a pane nobody owns, so the run is recorded
+   with a null exit code rather than not recorded at all. If the command later finishes, its
+   `exit_code` file is re-read on the next sweep, so one timeout cannot make a pane permanently
+   unreapable.
 2. **The pane's shell is gone** — herdr still lists the pane, but `/proc` says the shell pid it
    reports does not exist. Note this is the PANE shell, not the trailing PID in the run directory
    name: that one is the short-lived `herdr-run` CLI and is dead for every completed run, so a
@@ -293,8 +310,10 @@ A tab is reported STALE only when all three hold, each of them positive evidence
    field 22 of `/proc/<pid>/stat`, recorded in `meta.json` at run time and compared against the live
    process. A recycled pid, a new pane incarnation, or a record from a previous boot is UNKNOWN.
 
-Everything else — unreadable `/proc`, a pane herdr no longer lists, a control call that fails — is
-UNKNOWN, and UNKNOWN is never reaped. **`reap` closes nothing**; it prints the plan, with a reason
+Everything else — an unreadable or unparseable `/proc` entry, a pane herdr no longer lists, a
+workspace label herdr cannot resolve, a control call that fails — is UNKNOWN, and UNKNOWN is never
+reaped. Only a `/proc` entry that is *positively absent* may contribute to STALE; "could not tell"
+never does. **`reap` closes nothing**; it prints the plan, with a reason
 for every pane it declined and a count for every verdict including the zeros, because "reaped 0
 because nothing was stale" and "reaped 0 because the detector is inert" are otherwise the same
 output.

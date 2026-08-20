@@ -8,6 +8,9 @@ pub const EXIT_CONFIG: i32 = 78;
 /// The command was rejected by policy (`EX_NOPERM`).
 pub const EXIT_REFUSED: i32 = 77;
 /// Herdr or the requested session target is unavailable (`EX_UNAVAILABLE`).
+///
+/// NOT a retry signal: it also carries the `max_panes` refusal, which only clears when somebody
+/// closes tabs. [`EXIT_BUSY`] is the only code that promises retrying is meaningful.
 pub const EXIT_UNAVAILABLE: i32 = 69;
 /// The pane was not safe to use (`EX_TEMPFAIL`).
 pub const EXIT_BUSY: i32 = 75;

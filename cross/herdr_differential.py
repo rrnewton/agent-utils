@@ -686,6 +686,111 @@ spool_dir: .audit-spool
     report.exact("dry-run/audit-jsonl", python_audit, rust_audit, expected_rc=0)
 
 
+#: Workspace label used by the reap fixtures. Deliberately not a name any real session would carry,
+#: so a host that happens to be running a live Herdr server cannot resolve it and the verdicts stay
+#: the same everywhere. Without that, this section would pass or fail depending on the machine.
+_REAP_WORKSPACE = "cross-differential-fixture"
+
+_REAP_CONFIG = f"""\
+workspace: {_REAP_WORKSPACE}
+allow: [printf]
+prefixes: []
+spool_dir: .herdr-run
+retention_days: 7
+"""
+
+
+def _reap_record(pane_id: str, workspace: str, exit_code: str = "0") -> str:
+    """One planted ``meta.json``, shaped exactly as the runner writes it."""
+    return json.dumps(
+        {
+            "agent": "kvm",
+            "exit_code": None if exit_code == "null" else int(exit_code),
+            "pane_id": pane_id,
+            "readiness": {
+                "boot_id": "3f2b1c8e-0000-4000-8000-000000000001",
+                "shell_pid": 4242,
+                "shell_start_ticks": 900,
+            },
+            "run_id": "20260819T000000-kvm-1",
+            "tab": {"id": "w1:t1", "label": "kvm"},
+            "workspace": {"id": "w1", "label": workspace},
+        },
+        indent=2,
+        sort_keys=True,
+    )
+
+
+def _reap(harness: Harness, report: Report) -> None:
+    """Compare the REAPING VERDICTS, not just that both editions list the subcommand.
+
+    ``reap`` is the one subcommand whose output can authorise destroying someone's running work, so
+    "both help texts contain the word reap" is not a cross-edition guarantee of anything. These
+    cases plant a run spool and compare the whole document byte for byte: counts, per-pane verdicts,
+    reason wording, key ordering, and the retention window the candidate set is bounded by.
+
+    Only the host-independent verdicts can be paired here. STALE and SHELL_ALIVE need a pane a live
+    Herdr server still lists, and this harness deliberately cannot stand one up; those two are
+    covered by the planted-population unit tests in both editions instead.
+    """
+    empty = harness.case("reap-empty", {".herdr-run.yaml": _REAP_CONFIG})
+    python, rust = harness.invoke(empty, ("reap",))
+    report.exact("reap/empty-spool", python, rust, expected_rc=0)
+    report.require(
+        "reap/empty-spool-shape",
+        python.stderr == ""
+        and '"considered": 0' in python.stdout
+        and all(
+            f'"{verdict}": 0' in python.stdout
+            for verdict in ("STALE", "IN_FLIGHT", "SHELL_ALIVE", "UNKNOWN", "OUT_OF_SCOPE")
+        )
+        and '"retention_days": 7' in python.stdout
+        and f'"workspace": "{_REAP_WORKSPACE}"' in python.stdout,
+        "an inert sweep must still print its own shape, and the window bounding it: "
+        f"{_describe(python)}",
+    )
+
+    scoped = harness.case(
+        "reap-in-scope",
+        {
+            ".herdr-run.yaml": _REAP_CONFIG,
+            ".herdr-run/runs/20260819T000000-kvm-1/meta.json": _reap_record(
+                "w1:p1", _REAP_WORKSPACE
+            ),
+        },
+    )
+    python, rust = harness.invoke(scoped, ("reap",))
+    report.exact("reap/unresolvable-workspace", python, rust, expected_rc=0)
+    report.require(
+        "reap/unresolvable-workspace-shape",
+        '"STALE": 0' in python.stdout
+        and '"UNKNOWN": 1' in python.stdout
+        and '"reapable": []' in python.stdout
+        and "no workspace labelled" in python.stdout,
+        "a workspace herdr cannot resolve must reap nothing and say why: "
+        f"{_describe(python)}",
+    )
+
+    foreign = harness.case(
+        "reap-out-of-scope",
+        {
+            ".herdr-run.yaml": _REAP_CONFIG,
+            ".herdr-run/runs/20260819T000000-kvm-1/meta.json": _reap_record(
+                "w1:p1", "someone-elses"
+            ),
+        },
+    )
+    python, rust = harness.invoke(foreign, ("reap",))
+    report.exact("reap/out-of-scope", python, rust, expected_rc=0)
+    report.require(
+        "reap/out-of-scope-shape",
+        '"OUT_OF_SCOPE": 1' in python.stdout
+        and '"STALE": 0' in python.stdout
+        and '"reapable": []' in python.stdout,
+        f"a pane recorded in another workspace must never be a candidate: {_describe(python)}",
+    )
+
+
 def build_report(
     python_command: Sequence[str],
     rust_command: Sequence[str],
@@ -700,9 +805,15 @@ def build_report(
         _config_success(harness, report)
         _config_malformed(harness, report)
         _dry_run(harness, report)
+        _reap(harness, report)
     report.notes.append(
         "external fake-Herdr lifecycle/protocol checks were not run: production resolution "
         "intentionally ignores caller PATH and exposes no safe executable override"
+    )
+    report.notes.append(
+        "reap is paired on the host-independent verdicts (empty spool, unresolvable workspace, "
+        "out of scope); STALE and SHELL_ALIVE need a pane a live Herdr server still lists, and are "
+        "covered by planted-population unit tests in each edition instead"
     )
     report.notes.append(
         "NUL cannot be represented in a POSIX argv entry; all other terminal-control classes are covered"

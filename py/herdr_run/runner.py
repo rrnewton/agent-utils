@@ -398,6 +398,22 @@ def execute(
                 break
             sleep(poll_interval)
 
+        # Record the run BEFORE reporting the timeout, with a null exit code. This is the only
+        # writer that can produce the state :mod:`herdr_run.reap` calls IN FLIGHT, and it is the
+        # literal truth: the command is still running in a pane this process does not own. Without
+        # it the reaper's "the agent is thinking" rule has no way of ever being true, and the one
+        # pane that provably still has work in it would be the one pane leaving no evidence.
+        _write_unfinished_meta(
+            run_id=run_id,
+            spool=spool,
+            agent=agent,
+            admission=admission,
+            config=config,
+            target=target,
+            readiness=readiness,
+            duration_seconds=monotonic() - started,
+        )
+
         # Carry partial output with the typed failure. A bare message would make a timed-out run
         # look falsely empty to a caller that does not inspect the spool directory.
         timed_out = RunTimeout(
@@ -420,32 +436,58 @@ def write_meta(result: RunResult, admission: Admission, config: Config, agent: s
     matter how many runs it had to look at. Either field may be ``null`` when ``/proc`` could not be
     read, which the policy reads as UNKNOWN — the safe direction.
     """
-    path = os.path.join(result.spool.directory, "meta.json")
+    return _write_meta(
+        run_id=result.run_id,
+        spool=result.spool,
+        agent=agent,
+        admission=admission,
+        config=config,
+        target=result.target,
+        readiness=result.readiness,
+        exit_code=result.exit_code,
+        duration_seconds=result.duration_seconds,
+    )
+
+
+def _write_meta(
+    *,
+    run_id: str,
+    spool: SpoolPaths,
+    agent: str,
+    admission: Admission,
+    config: Config,
+    target: Target,
+    readiness: Readiness,
+    exit_code: int | None,
+    duration_seconds: float,
+) -> str:
+    """Write one run record. ``exit_code`` is ``None`` only for a run still running in the pane."""
+    path = os.path.join(spool.directory, "meta.json")
     document = {
-        "run_id": result.run_id,
+        "run_id": run_id,
         "agent": agent,
         "argv": list(admission.argv),
         "program": admission.program,
         "prefix": list(admission.prefix),
         "subcommand": admission.subcommand,
         "rendered": admission.rendered,
-        "exit_code": result.exit_code,
-        "duration_seconds": round(result.duration_seconds, 3),
-        "workspace": {"label": result.target.workspace_label, "id": result.target.workspace_id},
-        "tab": {"label": result.target.tab_label, "id": result.target.tab_id},
-        "pane_id": result.target.pane_id,
-        "created": list(result.target.created),
-        "from_cache": result.target.from_cache,
+        "exit_code": exit_code,
+        "duration_seconds": round(duration_seconds, 3),
+        "workspace": {"label": target.workspace_label, "id": target.workspace_id},
+        "tab": {"label": target.tab_label, "id": target.tab_id},
+        "pane_id": target.pane_id,
+        "created": list(target.created),
+        "from_cache": target.from_cache,
         "readiness": {
-            "process_idle": result.readiness.process.idle,
-            "process_reason": result.readiness.process.reason,
-            "shell_pid": result.readiness.process.shell_pid,
+            "process_idle": readiness.process.idle,
+            "process_reason": readiness.process.reason,
+            "shell_pid": readiness.process.shell_pid,
             "boot_id": current_boot_id(),
-            "shell_start_ticks": process_start_ticks(result.readiness.process.shell_pid),
-            "foreground_pgid": result.readiness.process.foreground_pgid,
-            "prompt_verdict": result.readiness.prompt.verdict,
-            "prompt_reason": result.readiness.prompt.reason,
-            "prompt_tail": result.readiness.prompt.tail,
+            "shell_start_ticks": process_start_ticks(readiness.process.shell_pid),
+            "foreground_pgid": readiness.process.foreground_pgid,
+            "prompt_verdict": readiness.prompt.verdict,
+            "prompt_reason": readiness.prompt.reason,
+            "prompt_tail": readiness.prompt.tail,
         },
         "config_source": config.source_path,
     }
@@ -454,3 +496,37 @@ def write_meta(result: RunResult, admission: Admission, config: Config, agent: s
     )
     _create_private_file(path, encoded)
     return path
+
+
+def _write_unfinished_meta(
+    *,
+    run_id: str,
+    spool: SpoolPaths,
+    agent: str,
+    admission: Admission,
+    config: Config,
+    target: Target,
+    readiness: Readiness,
+    duration_seconds: float,
+) -> None:
+    """Record a run that timed out and is STILL RUNNING, with ``exit_code`` null.
+
+    Best effort by construction: a failure to record the run must not replace the timeout the
+    caller actually needs to hear about. The reaper reads the null as IN FLIGHT and spares the
+    pane; :func:`herdr_run.sweep.load_run_records` later re-reads the spool's ``exit_code`` file,
+    so a command that finishes after we stopped waiting stops looking in-flight forever.
+    """
+    try:
+        _write_meta(
+            run_id=run_id,
+            spool=spool,
+            agent=agent,
+            admission=admission,
+            config=config,
+            target=target,
+            readiness=readiness,
+            exit_code=None,
+            duration_seconds=duration_seconds,
+        )
+    except OSError:
+        return

@@ -250,11 +250,27 @@ def _cmd_reap(config: Config, environ: dict[str, str]) -> int:
     lets it act. Every declined pane carries its reason, and every verdict is counted including the
     zeros, because "reaped 0 because nothing was stale" and "reaped 0 because the detector is inert"
     are otherwise the same output.
+
+    ``candidate_source`` states the bound on what could POSSIBLY have been considered. The candidate
+    set is the panes named by surviving run records, and herdr-run prunes a run record
+    ``retention_days`` after the run finished -- so the oldest leaked tabs, which are exactly the
+    ones the pane cap exists to bound, drop out of this report while still counting against
+    ``max_panes``. Printing the window is the difference between a report an operator can reason
+    about and a count that quietly means something narrower than it says.
     """
     client = _client(config, environ)
     plan = sweep(client, config)
     document = {
         "workspace": config.workspace,
+        "candidate_source": {
+            "spool_dir": config.spool_dir,
+            "retention_days": config.retention_days,
+            "note": (
+                "candidates are the panes named by surviving run records; run records are pruned "
+                "retention_days after the run finished, so a tab whose agent last ran longer ago "
+                "than that is not considered here and must be closed by hand"
+            ),
+        },
         "counts": plan.counts(),
         "reapable": [
             {

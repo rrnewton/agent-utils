@@ -13,6 +13,17 @@ ran for. That is a record we authored, so a pane appearing in it is a pane *this
 which is exactly the population the tab leak is made of. Enumerating live panes instead would sweep
 up tabs a human opened in the same workspace and make scope a matter of pattern-matching a label.
 
+**AND THE CANDIDATE SET IS BOUNDED BY OUR OWN RETENTION.** :func:`herdr_run.retention.prune_runs`
+deletes a run directory, ``meta.json`` included, ``retention_days`` (default 4) after the run
+finished. A tab whose owning agent last ran a week ago therefore has no surviving record and is not
+a candidate at all — while still holding a pane and still counting against ``max_panes``. The
+oldest leaks, which are the ones the cap exists to bound, are precisely the ones this sweep cannot
+see. That is a real gap, not a rounding error, and it is why ``herdr-run reap`` prints the window
+alongside the counts instead of letting "considered: 3" imply it looked at everything. Closing it
+properly needs a pane ledger that outlives output retention, which is a separate change; widening
+the candidate set to ``herdr pane list`` is NOT the answer, because scope would then be a matter of
+pattern-matching a label on tabs we may not have opened.
+
 SCOPE IS RE-DERIVED, NOT READ BACK
 ----------------------------------
 A recorded tab label is not taken as proof that the tab is ours. The label is recomputed from the
@@ -73,10 +84,34 @@ def load_run_records(config: Config) -> tuple[dict[str, object], ...]:
             if len(payload) > _MAX_META_BYTES:
                 continue
             document: object = json.loads(payload.decode("utf-8"))
-            records.append(as_mapping(document, path))
+            record = as_mapping(document, path)
         except (OSError, UnicodeError, TypeError, json.JSONDecodeError):
             continue
+        _resolve_late_completion(record, os.path.join(root, name))
+        records.append(record)
     return tuple(records)
+
+
+def _resolve_late_completion(record: dict[str, object], directory: str) -> None:
+    """Fill in an ``exit_code`` the run's own timeout could not wait for.
+
+    A run that timed out is recorded with a null exit code, which the policy reads as IN FLIGHT.
+    That is correct at the moment it is written and wrong forever afterwards: the command keeps
+    running in the pane and eventually writes ``exit_code``, which is the completion signal the
+    runner was waiting for. Reading it here is what stops one timeout from making a pane
+    permanently unreapable -- the safe direction, but still a leak.
+    """
+    if record.get("exit_code") is not None:
+        return
+    try:
+        with open(os.path.join(directory, "exit_code"), encoding="utf-8") as handle:
+            text = handle.read(64).strip()
+    except OSError:
+        return
+    try:
+        record["exit_code"] = int(text)
+    except ValueError:
+        return
 
 
 def pane_ids_in(records: Iterable[dict[str, object]]) -> tuple[str, ...]:
@@ -136,7 +171,12 @@ def build_evidence(
     listing_error: str | None = None
     try:
         workspace_id = client.workspace_id_for_label(config.workspace)
-        if workspace_id is not None:
+        if workspace_id is None:
+            # No workspace by that label means we never got a listing at all. Saying nothing here
+            # would leave every pane reporting "herdr does not list this pane", which tells an
+            # operator the tabs are already gone -- the opposite of what happened.
+            listing_error = f"herdr has no workspace labelled {config.workspace!r}"
+        else:
             live_pane_ids = frozenset(pane.pane_id for pane in client.panes(workspace_id))
     except HerdrRunError as exc:
         # Not fatal, and NOT an empty listing: "herdr did not answer" must not be read as "every

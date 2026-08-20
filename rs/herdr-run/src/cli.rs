@@ -524,6 +524,23 @@ fn write_meta_best_effort(
 /// lets it act. Every declined pane carries its reason, and every verdict is counted including the
 /// zeros, because "reaped 0 because nothing was stale" and "reaped 0 because the detector is inert"
 /// are otherwise the same output.
+///
+/// `candidate_source` states the bound on what could POSSIBLY have been considered. The candidate
+/// set is the panes named by surviving run records, and herdr-run prunes a run record
+/// `retention_days` after the run finished — so the oldest leaked tabs, which are exactly the ones
+/// the pane cap exists to bound, drop out of this report while still counting against `max_panes`.
+/// Printing the window is the difference between a report an operator can reason about and a count
+/// that quietly means something narrower than it says.
+/// The bound on `reap`'s candidate set, printed with every report.
+///
+/// A constant rather than an inline literal because the wording is part of the command's stable
+/// output and is compared verbatim by the differential harness.
+const CANDIDATE_SOURCE_NOTE: &str = concat!(
+    "candidates are the panes named by surviving run records; run records are pruned ",
+    "retention_days after the run finished, so a tab whose agent last ran longer ago than that ",
+    "is not considered here and must be closed by hand"
+);
+
 fn command_reap(config: &Config) -> Result<i32> {
     let client = HerdrClient::new(&config.broker)?;
     let plan = sweep(&client, config, Path::new("/proc"));
@@ -539,6 +556,11 @@ fn command_reap(config: &Config) -> Result<i32> {
         Value::Object(object)
     };
     let document = json!({
+        "candidate_source": {
+            "note": CANDIDATE_SOURCE_NOTE,
+            "retention_days": config.retention_days,
+            "spool_dir": config.spool_dir,
+        },
         "counts": plan.counts(),
         "declined": plan.declined().into_iter().map(|d| entry(d, true)).collect::<Vec<_>>(),
         "reapable": plan.reapable().into_iter().map(|d| entry(d, false)).collect::<Vec<_>>(),

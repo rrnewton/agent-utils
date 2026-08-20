@@ -58,6 +58,10 @@ class FakeHerdrClient:
         #: When true, ``panes`` fails the way an unreachable server does. Distinguishing that from
         #: an empty listing is the difference between "reap nothing" and "reap everything".
         self.fail_pane_list = False
+        #: When true, ``process_info`` fails the way a busy or restarting server does. A control
+        #: call that did not answer says nothing about whether the pane's shell is alive, so the
+        #: sweep must reach UNKNOWN and not "the shell is gone".
+        self.fail_process_info = False
         #: Every call made, in order — lets a test assert on idempotency rather than infer it.
         self.calls: list[str] = []
         self.commands: list[tuple[str, str]] = []
@@ -146,6 +150,8 @@ class FakeHerdrClient:
 
     def process_info(self, pane_id: str) -> ProcessInfo:
         """Report the pane as idle, or as running a job when listed in ``busy_panes``."""
+        if self.fail_process_info:
+            raise HerdrUnavailable("pane process-info: herdr is not answering")
         shell_pid = self.shell_pids.get(pane_id, 100)
         if pane_id in self.busy_panes:
             return ProcessInfo(pane_id=pane_id, shell_pid=shell_pid, foreground_pgid=shell_pid + 100, foreground=((shell_pid + 100, "git", "git push"),))

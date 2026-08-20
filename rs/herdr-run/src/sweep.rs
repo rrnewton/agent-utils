@@ -14,6 +14,17 @@
 //! would sweep up tabs a human opened in the same workspace and make scope a matter of
 //! pattern-matching a label.
 //!
+//! **And the candidate set is bounded by our own retention.** [`crate::retention`] deletes a run
+//! directory, `meta.json` included, `retention_days` (default 4) after the run finished. A tab whose
+//! owning agent last ran a week ago therefore has no surviving record and is not a candidate at all
+//! — while still holding a pane and still counting against `max_panes`. The oldest leaks, which are
+//! the ones the cap exists to bound, are precisely the ones this sweep cannot see. That is a real
+//! gap, not a rounding error, and it is why `herdr-run reap` prints the window alongside the counts
+//! instead of letting "considered: 3" imply it looked at everything. Closing it properly needs a
+//! pane ledger that outlives output retention, which is a separate change; widening the candidate
+//! set to `herdr pane list` is NOT the answer, because scope would then be a matter of
+//! pattern-matching a label on tabs we may not have opened.
+//!
 //! # Scope is re-derived, not read back
 //!
 //! A recorded tab label is not taken as proof that the tab is ours. The label is recomputed from
@@ -78,11 +89,36 @@ pub fn load_run_records(config: &Config) -> Vec<Value> {
             continue;
         };
         match serde_json::from_str::<Value>(&text) {
-            Ok(value) if value.is_object() => records.push(value),
+            Ok(mut value) if value.is_object() => {
+                resolve_late_completion(&mut value, &directory);
+                records.push(value);
+            }
             _ => continue,
         }
     }
     records
+}
+
+/// Fill in an `exit_code` the run's own timeout could not wait for.
+///
+/// A run that timed out is recorded with a null exit code, which the policy reads as IN FLIGHT.
+/// That is correct at the moment it is written and wrong forever afterwards: the command keeps
+/// running in the pane and eventually writes `exit_code`, which is the completion signal the runner
+/// was waiting for. Reading it here is what stops one timeout from making a pane permanently
+/// unreapable — the safe direction, but still a leak.
+fn resolve_late_completion(record: &mut Value, directory: &Path) {
+    if !matches!(record.get("exit_code"), None | Some(Value::Null)) {
+        return;
+    }
+    let Ok(text) = fs::read_to_string(directory.join("exit_code")) else {
+        return;
+    };
+    let Ok(code) = text.trim().parse::<i64>() else {
+        return;
+    };
+    if let Some(object) = record.as_object_mut() {
+        object.insert("exit_code".to_owned(), Value::from(code));
+    }
 }
 
 /// Every distinct pane id named by these records, in first-seen order.
@@ -196,7 +232,15 @@ pub fn build_evidence<A: HerdrApi + ?Sized>(
             // "every pane is gone", which is the one mistake that would close the whole workspace.
             Err(error) => listing_error = Some(error.to_string()),
         },
-        Ok(None) => {}
+        // No workspace by that label means we never got a listing at all. Saying nothing here would
+        // leave every pane reporting "herdr does not list this pane", which tells an operator the
+        // tabs are already gone — the opposite of what happened.
+        Ok(None) => {
+            listing_error = Some(format!(
+                "herdr has no workspace labelled '{}'",
+                config.workspace
+            ));
+        }
         Err(error) => listing_error = Some(error.to_string()),
     }
 
@@ -292,6 +336,13 @@ mod tests {
         panes: Vec<Pane>,
         shell_pids: BTreeMap<String, i64>,
         fail_pane_list: bool,
+        /// When true, `process_info` fails the way a busy or restarting server does. A control call
+        /// that did not answer says nothing about whether the pane's shell is alive, so the sweep
+        /// must reach UNKNOWN and not "the shell is gone".
+        fail_process_info: bool,
+        /// When false, `workspace_id_for_label` resolves nothing — the workspace was renamed or
+        /// deleted out from under us.
+        workspace_exists: bool,
     }
 
     impl SweepFake {
@@ -304,6 +355,8 @@ mod tests {
                 }],
                 shell_pids: BTreeMap::from([(pane_id.to_owned(), shell_pid)]),
                 fail_pane_list: false,
+                fail_process_info: false,
+                workspace_exists: true,
             }
         }
     }
@@ -314,7 +367,7 @@ mod tests {
         }
 
         fn workspace_id_for_label(&self, _label: &str) -> Result<Option<String>> {
-            Ok(Some("w1".to_owned()))
+            Ok(self.workspace_exists.then(|| "w1".to_owned()))
         }
 
         fn workspace_label_for_id(&self, _workspace_id: &str) -> Result<Option<String>> {
@@ -351,6 +404,11 @@ mod tests {
         }
 
         fn process_info(&self, pane_id: &str) -> Result<ProcessInfo> {
+            if self.fail_process_info {
+                return Err(HerdrRunError::unavailable(
+                    "pane process-info: herdr is not answering",
+                ));
+            }
             let shell_pid = *self.shell_pids.get(pane_id).unwrap_or(&100);
             Ok(ProcessInfo {
                 pane_id: pane_id.to_owned(),
@@ -511,6 +569,222 @@ mod tests {
     }
 
     #[test]
+    fn a_proc_entry_that_cannot_be_opened_is_unknown_not_stale() {
+        // Same verdict as the unparseable case, reached through the READ-error arm instead. There
+        // is no /proc/4242 sibling, so the only thing standing between this pane and a STALE
+        // verdict is the refusal to read an open failure as a death.
+        let root = temporary_root("unopenable");
+        write_spool(&root, &[record("w1:p1", json!(0), "agent-cmds", "kvm")]);
+        let proc = proc_with(&root, None, 0);
+        fs::create_dir_all(proc.join("4242").join("stat")).expect("stat directory");
+        let plan = sweep(&SweepFake::with_pane("w1:p1", 4242), &config(&root), &proc);
+        assert_eq!(plan.counts()["UNKNOWN"], 1);
+        assert_eq!(plan.counts()["STALE"], 0);
+        assert!(
+            plan.declined()[0].reason.contains("cannot read"),
+            "{}",
+            plan.declined()[0].reason
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_oversized_proc_entry_is_unknown_not_stale() {
+        let root = temporary_root("oversized");
+        write_spool(&root, &[record("w1:p1", json!(0), "agent-cmds", "kvm")]);
+        let proc = proc_with(&root, None, 0);
+        fs::create_dir_all(proc.join("4242")).expect("pid directory");
+        let padding = "0 ".repeat(40_000);
+        fs::write(
+            proc.join("4242").join("stat"),
+            format!("4242 (bash) S {padding}\n"),
+        )
+        .expect("stat");
+        let plan = sweep(&SweepFake::with_pane("w1:p1", 4242), &config(&root), &proc);
+        assert_eq!(plan.counts()["UNKNOWN"], 1);
+        assert_eq!(plan.counts()["STALE"], 0);
+        assert!(
+            plan.declined()[0].reason.contains("implausibly long"),
+            "{}",
+            plan.declined()[0].reason
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failing_process_info_call_is_unknown_not_stale() {
+        // A control call that did not answer is not a report that the shell died. The pane is
+        // listed and /proc holds no such pid, so every other signal points at STALE; only the
+        // refusal to treat a failed `pane process-info` as evidence keeps the tab open.
+        let root = temporary_root("process-info-failure");
+        write_spool(&root, &[record("w1:p1", json!(0), "agent-cmds", "kvm")]);
+        let proc = proc_with(&root, None, 0);
+        let mut fake = SweepFake::with_pane("w1:p1", 4242);
+        fake.fail_process_info = true;
+        let plan = sweep(&fake, &config(&root), &proc);
+        assert_eq!(plan.counts()["STALE"], 0);
+        assert_eq!(plan.counts()["UNKNOWN"], 1);
+        assert!(
+            plan.declined()[0]
+                .reason
+                .contains("cannot read process info for w1:p1"),
+            "{}",
+            plan.declined()[0].reason
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_workspace_herdr_does_not_know_is_reported_as_a_missing_listing() {
+        // No workspace by that label means no listing was obtained, not that the tabs are gone.
+        let root = temporary_root("workspace-renamed");
+        write_spool(&root, &[record("w1:p1", json!(0), "agent-cmds", "kvm")]);
+        let proc = proc_with(&root, None, 0);
+        let mut fake = SweepFake::with_pane("w1:p1", 4242);
+        fake.workspace_exists = false;
+        let plan = sweep(&fake, &config(&root), &proc);
+        assert_eq!(plan.counts()["STALE"], 0);
+        assert_eq!(plan.counts()["UNKNOWN"], 1);
+        let reason = &plan.declined()[0].reason;
+        assert!(reason.contains("no workspace labelled"), "{reason}");
+        assert!(!reason.contains("does not list this pane"), "{reason}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_run_that_finished_after_the_timeout_stops_looking_in_flight() {
+        // The completion signal outlives the process that was waiting for it. A timed-out run is
+        // recorded with a null exit code, which is true when it is written; the command then keeps
+        // running and writes `exit_code` into the same directory. Reading that back is what stops
+        // one timeout from making the pane permanently unreapable.
+        let root = temporary_root("late-completion");
+        write_spool(&root, &[record("w1:p1", Value::Null, "agent-cmds", "kvm")]);
+        fs::write(
+            root.join("spool/runs/20260819T000000-agent-0/exit_code"),
+            "0\n",
+        )
+        .expect("plant completion signal");
+        let proc = proc_with(&root, None, 0);
+        let plan = sweep(&SweepFake::with_pane("w1:p1", 4242), &config(&root), &proc);
+        assert_eq!(plan.counts()["IN_FLIGHT"], 0);
+        assert_eq!(plan.counts()["STALE"], 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_run_still_waiting_on_its_exit_code_stays_in_flight() {
+        // Negative control for the case above: created but empty, as during a torn write.
+        let root = temporary_root("torn-completion");
+        write_spool(&root, &[record("w1:p1", Value::Null, "agent-cmds", "kvm")]);
+        fs::write(
+            root.join("spool/runs/20260819T000000-agent-0/exit_code"),
+            "",
+        )
+        .expect("plant torn signal");
+        let proc = proc_with(&root, None, 0);
+        let plan = sweep(&SweepFake::with_pane("w1:p1", 4242), &config(&root), &proc);
+        assert_eq!(plan.counts()["IN_FLIGHT"], 1);
+        assert_eq!(plan.counts()["STALE"], 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_run_records_skips_an_absurdly_large_entry() {
+        let root = temporary_root("huge-meta");
+        write_spool(
+            &root,
+            &[
+                record("w1:p1", json!(0), "agent-cmds", "kvm"),
+                record("w1:p2", json!(0), "agent-cmds", "kvm"),
+            ],
+        );
+        let huge = root.join("spool/runs/20260819T000000a-huge");
+        fs::create_dir_all(&huge).expect("huge directory");
+        let padding = "x".repeat(1 << 21);
+        fs::write(
+            huge.join("meta.json"),
+            serde_json::to_vec(&json!({"pane_id": "w1:pHUGE", "padding": padding}))
+                .expect("encode"),
+        )
+        .expect("write huge");
+        let records = load_run_records(&config(&root));
+        assert_eq!(
+            pane_ids_in(&records),
+            ["w1:p1", "w1:p2"],
+            "an unbounded read must not be attempted"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn records_arrive_in_run_order_whatever_the_directory_listing_says() {
+        // `names.sort()` is what makes "the LAST record wins" mean "the most recent run". The run
+        // directories are created newest-first here, so a listing taken in creation order would
+        // hand the sweep the records backwards and make the oldest labels authoritative.
+        let root = temporary_root("ordering");
+        let runs = root.join("spool").join("runs");
+        for (stamp, pane) in [("20260819T000003", "w1:p3"), ("20260819T000001", "w1:p1")] {
+            let directory = runs.join(format!("{stamp}-agent"));
+            fs::create_dir_all(&directory).expect("run directory");
+            fs::write(
+                directory.join("meta.json"),
+                serde_json::to_vec(&record(pane, json!(0), "agent-cmds", "kvm")).expect("encode"),
+            )
+            .expect("write meta");
+        }
+        assert_eq!(
+            pane_ids_in(&load_run_records(&config(&root))),
+            ["w1:p1", "w1:p3"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scope_comes_from_the_latest_record_not_the_first() {
+        // A pane retargeted into another workspace must lose the authority its first run had.
+        // Keeping the FIRST record is the unsafe direction: the tab would stay in scope on labels
+        // that no longer describe it, and this planted population would then be reaped.
+        let root = temporary_root("latest-scope");
+        write_spool(
+            &root,
+            &[
+                record("w1:p1", json!(0), "agent-cmds", "kvm"),
+                record("w1:p1", json!(0), "someone-elses", "kvm"),
+            ],
+        );
+        let proc = proc_with(&root, None, 0); // the shell is gone; only scope can spare this pane
+        let plan = sweep(&SweepFake::with_pane("w1:p1", 4242), &config(&root), &proc);
+        assert_eq!(plan.counts()["OUT_OF_SCOPE"], 1);
+        assert_eq!(plan.counts()["STALE"], 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retention_takes_the_oldest_leaked_tabs_out_of_the_candidate_set() {
+        // Pins the known gap so it cannot become news later. The reaper's candidates are the panes
+        // named by SURVIVING run records, and herdr-run's own retention deletes those records. A
+        // tab whose agent last ran longer ago than the window is invisible here while still
+        // counting against `max_panes`; `herdr-run reap` prints the window for exactly this reason.
+        let root = temporary_root("retention-window");
+        write_spool(&root, &[record("w1:pLEAK", json!(0), "agent-cmds", "kvm")]);
+        let runs = root.join("spool").join("runs");
+        let exit_code = runs.join("20260819T000000-agent-0").join("exit_code");
+        fs::write(&exit_code, "0\n").expect("plant completion signal");
+        let ancient =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 24 * 60 * 60);
+        fs::File::open(&exit_code)
+            .expect("open completion marker")
+            .set_times(fs::FileTimes::new().set_modified(ancient))
+            .expect("backdate completion marker");
+
+        assert_eq!(pane_ids_in(&load_run_records(&config(&root))), ["w1:pLEAK"]);
+        let result = crate::retention::prune_runs(&runs, 4);
+        assert_eq!(result.removed.len(), 1);
+        assert!(pane_ids_in(&load_run_records(&config(&root))).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn a_tab_retargeted_out_of_the_schema_is_out_of_scope() {
         // Scope is recomputed from the CURRENT config, not read back from the record.
         let root = temporary_root("retargeted");
@@ -569,12 +843,13 @@ mod tests {
         assert_eq!(plan.counts()["UNKNOWN"], 1);
         // And it must say the SERVER did not answer, not that herdr no longer lists the pane. The
         // verdict is the same either way, but the second sentence tells an operator the tabs are
-        // already gone -- which is the opposite of what happened.
-        assert!(
-            plan.declined()[0].reason.contains("not answering"),
-            "{}",
-            plan.declined()[0].reason
-        );
+        // already gone -- which is the opposite of what happened. Anchored on the two strings
+        // PRODUCTION owns: the sweep's "evidence unavailable" wrapper and the control call's own
+        // purpose prefix, which the client puts in front of every failure it raises.
+        let reason = &plan.declined()[0].reason;
+        assert!(reason.starts_with("evidence unavailable: "), "{reason}");
+        assert!(reason.contains("pane list"), "{reason}");
+        assert!(!reason.contains("does not list this pane"), "{reason}");
         fs::remove_dir_all(root).unwrap();
     }
 

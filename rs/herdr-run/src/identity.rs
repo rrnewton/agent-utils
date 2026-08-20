@@ -196,4 +196,60 @@ mod tests {
         assert!(!probe.gone);
         assert!(probe.error.is_some());
     }
+
+    #[test]
+    fn a_pid_of_zero_is_an_error_rather_than_a_death_certificate() {
+        let probe = probe_process(0, Path::new("/proc"));
+        assert!(!probe.gone);
+        assert!(probe
+            .error
+            .is_some_and(|error| error.contains("not a process id")));
+    }
+
+    #[test]
+    fn a_stat_entry_that_cannot_be_opened_is_unknown_not_gone() {
+        // The READ-error arm, which is a different branch from the parse-error arm above. A
+        // directory where the kernel puts a file fails the read with something that is emphatically
+        // NOT NotFound; reporting that as `gone` would hand the policy a death certificate written
+        // by an EACCES.
+        let root =
+            std::env::temp_dir().join(format!("herdr-identity-unopenable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("88").join("stat")).expect("create stat directory");
+        let probe = probe_process(88, &root);
+        assert!(
+            !probe.gone,
+            "an unopenable /proc entry must not authorise reaping"
+        );
+        assert!(probe
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("cannot read")));
+        assert!(probe.start_ticks.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_implausibly_long_stat_entry_is_unknown_not_gone() {
+        let root = std::env::temp_dir().join(format!("herdr-identity-huge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("99")).expect("create pid directory");
+        let padding = "0 ".repeat(40_000);
+        fs::write(
+            root.join("99").join("stat"),
+            format!("99 (bash) S {padding}\n"),
+        )
+        .expect("write stat");
+        let probe = probe_process(99, &root);
+        assert!(
+            !probe.gone,
+            "an oversized /proc entry must not authorise reaping"
+        );
+        assert!(probe
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("implausibly long")));
+        assert!(probe.start_ticks.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
 }

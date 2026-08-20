@@ -410,6 +410,24 @@ pub fn execute<A: HerdrApi + ?Sized>(
         thread::sleep(Duration::from_millis(250));
     }
     FileExt::unlock(&lock).ok();
+    // Record the run BEFORE reporting the timeout, with a null exit code. This is the only writer
+    // that can produce the state [`crate::reap`] calls IN FLIGHT, and it is the literal truth: the
+    // command is still running in a pane this process does not own. Without it the reaper's "the
+    // agent is thinking" rule has no way of ever being true, and the one pane that provably still
+    // has work in it would be the one pane leaving no evidence. Best effort: a failure to record
+    // must not replace the timeout the caller actually needs to hear about.
+    write_meta_document(
+        &run_id,
+        &spool,
+        agent,
+        admission,
+        config,
+        target,
+        &readiness,
+        Value::Null,
+        started.elapsed().as_secs_f64(),
+    )
+    .ok();
     let message = format!(
         "command did not finish within {}s. It is STILL RUNNING in pane {} ({}) and was not killed. Partial output is in {}; the exit code will appear in {} when it finishes.",
         number_text(timeout),
@@ -468,37 +486,63 @@ pub fn write_meta(
     config: &Config,
     agent: &str,
 ) -> Result<PathBuf> {
-    let path = result.spool.directory.join("meta.json");
+    write_meta_document(
+        &result.run_id,
+        &result.spool,
+        agent,
+        admission,
+        config,
+        &result.target,
+        &result.readiness,
+        Value::from(result.exit_code),
+        result.duration_seconds,
+    )
+}
+
+/// Write one run record. `exit_code` is `Value::Null` only for a run still running in the pane.
+#[allow(clippy::too_many_arguments)]
+fn write_meta_document(
+    run_id: &str,
+    spool: &SpoolPaths,
+    agent: &str,
+    admission: &Admission,
+    config: &Config,
+    target: &Target,
+    readiness: &Readiness,
+    exit_code: Value,
+    duration_seconds: f64,
+) -> Result<PathBuf> {
+    let path = spool.directory.join("meta.json");
     let document = json!({
         "agent": agent,
         "argv": admission.argv,
         "config_source": config.source_path,
-        "created": result.target.created,
-        "duration_seconds": round_three(result.duration_seconds),
-        "exit_code": result.exit_code,
-        "from_cache": result.target.from_cache,
-        "pane_id": result.target.pane_id,
+        "created": target.created,
+        "duration_seconds": round_three(duration_seconds),
+        "exit_code": exit_code,
+        "from_cache": target.from_cache,
+        "pane_id": target.pane_id,
         "prefix": admission.prefix,
         "program": admission.program,
         "readiness": {
             "boot_id": crate::identity::current_boot_id(std::path::Path::new("/proc")),
-            "foreground_pgid": result.readiness.process.foreground_pgid,
-            "process_idle": result.readiness.process.idle,
-            "process_reason": result.readiness.process.reason,
-            "prompt_reason": result.readiness.prompt.reason,
-            "prompt_tail": result.readiness.prompt.tail,
-            "prompt_verdict": result.readiness.prompt.verdict,
-            "shell_pid": result.readiness.process.shell_pid,
+            "foreground_pgid": readiness.process.foreground_pgid,
+            "process_idle": readiness.process.idle,
+            "process_reason": readiness.process.reason,
+            "prompt_reason": readiness.prompt.reason,
+            "prompt_tail": readiness.prompt.tail,
+            "prompt_verdict": readiness.prompt.verdict,
+            "shell_pid": readiness.process.shell_pid,
             "shell_start_ticks": crate::identity::process_start_ticks(
-                result.readiness.process.shell_pid,
+                readiness.process.shell_pid,
                 std::path::Path::new("/proc"),
             ),
         },
         "rendered": admission.rendered(),
-        "run_id": result.run_id,
+        "run_id": run_id,
         "subcommand": admission.subcommand,
-        "tab": {"id": result.target.tab_id, "label": result.target.tab_label},
-        "workspace": {"id": result.target.workspace_id, "label": result.target.workspace_label},
+        "tab": {"id": target.tab_id, "label": target.tab_label},
+        "workspace": {"id": target.workspace_id, "label": target.workspace_label},
     });
     let mut encoded = serde_json::to_vec_pretty(&document).map_err(|error| {
         HerdrRunError::unavailable(format!("cannot encode run metadata: {error}"))
@@ -797,6 +841,111 @@ mod tests {
         let (flags, identity) = crate::sweep::evidence_from_runs("p-meta-identity", &[document]);
         assert_eq!(flags, [true]);
         assert!(identity.is_some_and(|identity| identity.is_bound()));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Like [`SelfShellApi`], except the pane never actually runs the line, so no exit code ever
+    /// appears and collection must time out.
+    struct NeverRunsApi;
+
+    impl HerdrApi for NeverRunsApi {
+        fn ensure_server(&self) -> Result<bool> {
+            SelfShellApi.ensure_server()
+        }
+        fn workspace_id_for_label(&self, label: &str) -> Result<Option<String>> {
+            SelfShellApi.workspace_id_for_label(label)
+        }
+        fn workspace_label_for_id(&self, workspace: &str) -> Result<Option<String>> {
+            SelfShellApi.workspace_label_for_id(workspace)
+        }
+        fn create_workspace(&self, label: &str, cwd: &str) -> Result<(String, String, String)> {
+            SelfShellApi.create_workspace(label, cwd)
+        }
+        fn tab_id_for_label(&self, workspace: &str, label: &str) -> Result<Option<String>> {
+            SelfShellApi.tab_id_for_label(workspace, label)
+        }
+        fn create_tab(&self, workspace: &str, label: &str, cwd: &str) -> Result<String> {
+            SelfShellApi.create_tab(workspace, label, cwd)
+        }
+        fn rename_tab(&self, tab: &str, label: &str) -> Result<()> {
+            SelfShellApi.rename_tab(tab, label)
+        }
+        fn panes(&self, workspace: Option<&str>) -> Result<Vec<Pane>> {
+            SelfShellApi.panes(workspace)
+        }
+        fn pane_exists(&self, pane: &str) -> bool {
+            SelfShellApi.pane_exists(pane)
+        }
+        fn process_info(&self, pane: &str) -> Result<ProcessInfo> {
+            SelfShellApi.process_info(pane)
+        }
+        fn read(&self, pane: &str, source: &str, lines: Option<usize>) -> Result<String> {
+            SelfShellApi.read(pane, source, lines)
+        }
+        fn run(&self, _pane: &str, _command: &str) -> Result<()> {
+            Ok(())
+        }
+        fn send_keys(&self, pane: &str, keys: &str) -> Result<()> {
+            SelfShellApi.send_keys(pane, keys)
+        }
+    }
+
+    /// The ONLY writer of the state the reaper calls IN FLIGHT.
+    ///
+    /// A command that outlived its deadline is still running in a pane nobody owns. If the timeout
+    /// left no record, the one pane that provably still has work in it would be the one pane the
+    /// reaper had no evidence about, and `exit_code: null` would be a state no writer could produce.
+    #[test]
+    fn a_timed_out_run_is_recorded_as_unfinished() {
+        let root =
+            std::env::temp_dir().join(format!("herdr-meta-unfinished-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let config = Config {
+            project_root: root.to_string_lossy().into_owned(),
+            spool_dir: "spool".to_owned(),
+            allow: vec!["printf".to_owned()],
+            ..Config::default()
+        };
+        let admission = admit("printf ok", &config).expect("admitted");
+        let mut isolated_target = target();
+        isolated_target.pane_id = "p-meta-unfinished".to_owned();
+        let error = execute(
+            &NeverRunsApi,
+            &config,
+            &isolated_target,
+            &admission,
+            "agent",
+            &root,
+            0.0,
+            0.05,
+        )
+        .expect_err("collection must time out");
+        assert_eq!(error.kind(), crate::error::ErrorKind::Timeout);
+
+        let runs = root.join("spool").join("runs");
+        let entry = fs::read_dir(&runs)
+            .expect("runs root")
+            .next()
+            .expect("one run directory")
+            .expect("readable entry");
+        let document: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(entry.path().join("meta.json")).expect("read meta"),
+        )
+        .expect("parse");
+        assert_eq!(
+            document["exit_code"],
+            Value::Null,
+            "a run still running must not record a status"
+        );
+        assert_eq!(document["pane_id"], json!("p-meta-unfinished"));
+
+        let (flags, identity) = crate::sweep::evidence_from_runs("p-meta-unfinished", &[document]);
+        assert_eq!(
+            flags,
+            [false],
+            "the reaper must read this as work in flight"
+        );
+        assert!(identity.is_some());
         let _ = fs::remove_dir_all(root);
     }
 
