@@ -1584,6 +1584,36 @@ def _act_pull_armed(driver: Driver) -> None:
     driver.settle(250)
 
 
+def _act_summary_mode(driver: Driver) -> None:
+    """`#49 cached-summaries`: the channel with the collapsed rows summarised instead of clipped."""
+    _act_open_channel(driver)
+    # The row this picture is ABOUT, measured before anything changes. The seeded backlog has
+    # exactly one message over the server's summarisation threshold and it is the newest, so it is
+    # on screen from the first read; its height here is what the three-line clamp gives it.
+    driver.js(
+        "(() => { const rows = [...document.querySelectorAll('#discord-log li')].reverse(); "
+        "const row = rows.find((n) => n.getAttribute('data-collapsed') === 'true'); "
+        "row.id = 'summary-probe'; "
+        "window.__foldedHeight = row.getBoundingClientRect().height; "
+        "return window.__foldedHeight; })()"
+    )
+    # Through the DOM rather than by clicking: the chip floats over the bottom corner of the list
+    # and a real click would scroll it into view, which moves the thing being photographed.
+    driver.js("(() => { document.getElementById('summarise').click(); })()")
+    # For a REAL summary, not for the placeholder the row shows while the request is in flight.
+    driver.page.wait_for_function(
+        "() => [...document.querySelectorAll('#discord-log .summary-text')]"
+        ".some((n) => (n.textContent || '').length > 0 && !/^summarising/.test(n.textContent))",
+        timeout=20_000,
+    )
+    driver.settle(300)
+    driver.js(
+        "(() => { window.__summarisedHeight = "
+        "document.getElementById('summary-probe').getBoundingClientRect().height; "
+        "return window.__summarisedHeight; })()"
+    )
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -2810,6 +2840,44 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="32-channel-summarised",
+        what="the channel in summary mode: a long message shown as one line about it, not its first three",
+        act=_act_summary_mode,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the control says the mode is on",
+                "document.getElementById('summarise').getAttribute('aria-pressed') === 'true'",
+            ),
+            # THE claim, and the only place in the repository it can be made at all: a summarised
+            # row is SHORTER than the same row clamped to three lines. The behavioural suite has no
+            # renderer and cannot compare two heights; a scene pinned to "a summary line exists"
+            # would be satisfied by one sitting on top of the clamped message, which is the
+            # obvious wrong implementation and is not a shorter row.
+            (
+                "the summarised row really is shorter than the clamped one it replaced",
+                "window.__summarisedHeight > 0 && window.__summarisedHeight < window.__foldedHeight",
+            ),
+            (
+                "a real summary is on screen, not the placeholder shown while it is fetched",
+                "[...document.querySelectorAll('#discord-log .summary-text')]"
+                ".some((n) => (n.textContent || '').length > 0 && !/^summarising/.test(n.textContent))",
+            ),
+            (
+                "the message it summarises is not also on screen underneath it",
+                "(() => { const row = document.getElementById('summary-probe'); "
+                "return row.querySelector('.body').offsetParent === null; })()",
+            ),
+            (
+                # Quoted from the server's own answer. The shipped summariser truncates, and a
+                # screen that showed short lines without naming their author would be implying a
+                # reading nobody paid for.
+                "the view says which summariser produced them",
+                "/Summaries by .+/.test(window.__text('summary-note') || '')",
+            ),
+        ),
+    ),
 )
 
 
@@ -3126,7 +3194,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 31:
+    if len(SCENES) < 32:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -3154,14 +3222,17 @@ def check_state_controls() -> list[str]:
             "is the same kind of question, and no fixture can answer it. `#44 live-push` added "
             "the one where a row appears because the SERVER said so rather than because the page "
             "asked, and `#46 conversation-replay` the one where a resumed call admits its "
-            "reconstruction was only partial. `#83 channel-selector-in-bar` added the last one: "
-            "the channel picker on the bar with the history walked back several pages, because "
-            "'this control cannot be reached' is a measurement on a real 375px screen -- whether "
-            "the picker is inside the viewport, whole, at a scroll position the reader can be in "
-            "-- and nothing without a layout engine can answer it. `#68 pull-to-refresh` added "
-            "the armed pull, which is the one state in this whole table built from real Touch and "
-            "TouchEvent objects: the page fixture hands the page whatever a test invents, so only "
-            "a browser can say the handlers read what a browser really sends."
+            "reconstruction was only partial. `#83 channel-selector-in-bar` added the channel "
+            "picker on the bar with the history walked back several pages, because 'this control "
+            "cannot be reached' is a measurement on a real 375px screen -- whether the picker is "
+            "inside the viewport, whole, at a scroll position the reader can be in -- and nothing "
+            "without a layout engine can answer it. `#68 pull-to-refresh` added the armed pull, "
+            "which is the one state in this whole table built from real Touch and TouchEvent "
+            "objects: the page fixture hands the page whatever a test invents, so only a browser "
+            "can say the handlers read what a browser really sends. `#49 cached-summaries` added "
+            "the channel with its collapsed rows summarised, which is the only place the claim "
+            "that a summarised row is SHORTER than a clamped one can be settled -- nothing "
+            "without a layout engine can compare two heights."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -3310,6 +3381,11 @@ def check_state_controls() -> list[str]:
         # under the finger rather than the channel having been walked to its beginning first, which
         # is how this scene was reachable at all while the gesture was unreachable in life.
         "31-pull-to-refresh-armed": ("'armed'", "Release", "dock.top", "__pullRowsAfter"),
+        # `#49 cached-summaries`. Pinned to the MEASUREMENT and to the attribution, not to a
+        # summary line existing: a line stacked above the clamped message satisfies "a summary is
+        # on screen" and is the exact wrong implementation, and a page that named a summariser
+        # from a constant of its own would satisfy any check that only looked for words.
+        "32-channel-summarised": ("__summarisedHeight", "Summaries by"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

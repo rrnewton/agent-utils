@@ -901,6 +901,46 @@ Two things moved out of it rather than away:
 holding a strip. `08-clear-armed` is its positive control — the same page with something to say,
 saying it — because a page that had simply deleted the line would satisfy the first alone.
 
+### A long message can be read as a summary of itself
+
+`#49 cached-summaries` landed as a **server half with no caller**: the endpoint answered, the store
+cached, the policy-versioned key invalidated correctly, a startup sweep collected what a changed
+policy orphaned — and nothing on any screen ever asked for a summary. A cache nobody spends is a
+cost with no benefit.
+
+**Summaries** is a chip over the channel list, beside "Collapse all", and it is a **mode** rather
+than a per-row control. Collapsing to a prefix stays the default and costs nothing; a reader who
+turns the mode on sees each folded row's opening three lines replaced by one line about the
+message, with the message itself still one tap away behind **More**.
+
+Four properties, all of them about cost rather than about appearance, and all of them tested:
+
+- **"Long enough to summarise" is `COLLAPSE_OVER_CHARS`** — the same sentence `#47
+  scrollback-stability` folds by, in the same function. A short message has no fold control and is
+  never sent anywhere. A second threshold here would be a second definition of short, and the two
+  would drift.
+- **One request per message, ever.** The record is consulted before the fetch, not written after
+  it, so a hundred scroll events over one row cost one request — and the forty-five-second
+  background poll, which replaces every row on screen, buys nothing a second time.
+- **Only what you are looking at.** Rows are asked about as they come near the viewport, so
+  nothing is spent on messages nobody scrolls to.
+- **The page names the summariser it actually got**, quoting the server's own answer at the head
+  of the view. The shipped backend truncates — no model, no comprehension — and showing its output
+  without saying so would be claiming a reading nobody paid for. `web/voice.js` contains no
+  backend name of its own, which is asserted, because a constant here would outlive the deployment
+  it described.
+
+Two answers are deliberately different. `below_threshold` is the **server's** own, stricter
+threshold saying the message is short enough to read as it is: settled, never asked again, and the
+row keeps its opening lines. Anything else without usable text is a **failure**: the row falls back
+the same way, the strip says so once, the error panel is not raised for one row out of fifty — and
+leaving the mode and re-entering it retries it, because a failure is not a verdict.
+
+Entering the mode changes the height of every row on screen at once and adds a sentence above the
+list, which is the mutation browser scroll anchoring does not cover. It goes through the anchor
+helper `#47` built, and the page suite proves it with a negative control built from a copy of
+`web/voice.js` with that call removed.
+
 ### The channel view walks back, one server-cursored step at a time
 
 `GET /api/v1/channels/{id}/page` landed with **#53 stepped-retrieval** and had **no web caller at
@@ -1696,7 +1736,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the thirty-one states that look different — signed out, idle, live
+Photographs the `/voice` page in the thirty-two states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1709,9 +1749,10 @@ rather than spoken, the control bar in each of its two homes, that same bar conv
 text field, the bar packed with every button it has, a channel message that arrived because the
 SERVER pushed it rather than because the page asked, a resumed call whose reconstruction was
 only partial and says so, the channel picker on the bar with the history walked back several
-pages, and the channel pulled down past the point where letting go refreshes it — at four
-viewports: a tall phone, a short phone, a small laptop window and a maximised desktop. It prints
-the absolute path of every image so an agent can open them directly.
+pages, the channel pulled down past the point where letting go refreshes it, and the channel with
+its collapsed rows summarised instead of clipped — at four viewports: a tall phone, a short
+phone, a small laptop window and a maximised desktop. It prints the absolute path of every image
+so an agent can open them directly.
 
 **Some states exist on one class of device and are captured only there**, and the run says so by
 name. The reading column at each end of its range is DESKTOP ONLY, because `@media (min-width:
@@ -1776,7 +1817,7 @@ transcript on screen" was a requirement nothing stated. The three transcript sta
 list they photograph, through one shared act, and `--self-test` checks that they still do.
 `#74 scroll-test-strength`.
 
-`scripts/screenshots.py --self-test` runs 47 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 48 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.

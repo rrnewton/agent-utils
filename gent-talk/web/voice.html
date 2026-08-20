@@ -175,6 +175,16 @@
               <ol id="channel-summary" class="messages"></ol>
 
               <!--
+                `#49 cached-summaries`. Present only while summary mode is on, and it says the one
+                thing the collapsed rows cannot say for themselves: WHO wrote the short line you
+                are reading. The shipped summariser truncates — no model, no network — and a page
+                that showed its output without naming it would be implying a comprehension nobody
+                paid for. The backend is quoted from the server's own answer rather than guessed
+                here, so it cannot describe a summariser this deployment does not run.
+              -->
+              <p id="summary-note" class="hint" hidden></p>
+
+              <!--
                 `#65 scrollback-paging`. A channel read is a WINDOW, never the whole channel, and
                 until now the window was all there was: the oldest message on screen was the end of
                 what this page could ever show you. This walks further back, one server-cursored
@@ -233,6 +243,15 @@
                title="Drag to set how wide the reading column is. Arrow keys work too."></div>
 
           <div id="scroll-tools">
+            <!--
+              `#49 cached-summaries`. Summary mode is OPT-IN and it is a mode, not a per-row
+              control: collapsing to a prefix stays the default and costs nothing, and a button on
+              every long row would spend a model call every time a thumb slipped. It lives beside
+              "Collapse all" because the two act on the same thing — what a folded message shows.
+            -->
+            <button id="summarise" class="chip" type="button" aria-pressed="false" hidden>
+              <span id="summarise-label">Summaries</span>
+            </button>
             <button id="collapse-all" class="chip" type="button" hidden>
               <span id="collapse-all-label">Collapse all</span>
             </button>

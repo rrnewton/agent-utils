@@ -462,7 +462,15 @@ function liveFolds() {
 
 function setFolded(entry, folded) {
   entry.li.setAttribute("data-collapsed", folded ? "true" : "false");
+  // `#49 cached-summaries`. A summary REPLACES the clamped opening lines; it never sits above
+  // them. Two condensations of the same message stacked on one row is not a shorter row, and it
+  // would make the fold control ambiguous about which of the two "More" opens.
+  const summarised = folded && summaryMode && entry.note !== null && entry.summaryState !== "none";
+  entry.body.hidden = summarised;
   entry.body.className = folded ? "body clamped" : "body";
+  if (entry.note) {
+    entry.note.hidden = !summarised;
+  }
   entry.fold.textContent = folded ? FOLD_MORE : FOLD_LESS;
   entry.fold.setAttribute("aria-expanded", folded ? "false" : "true");
 }
@@ -475,15 +483,39 @@ const isFolded = (entry) => entry.li.getAttribute("data-collapsed") === "true";
  * Called from both message lists with the pieces each of them has already built, so the control,
  * the class and the attribute are identical in the transcript and in the channel. Returns the
  * button, or null when the message is short and gets none.
+ *
+ * `messageId` is the channel's, and it is what makes a row summarisable: a voice turn has no
+ * server-side identity and nothing to key a cached summary under, so the transcript passes
+ * nothing and gets no summary line. `#49 cached-summaries` deliberately hangs off THIS function
+ * rather than beside it — "long enough to be worth folding" and "long enough to be worth
+ * summarising" have to be the same sentence, or the page would grow a second definition of short.
  */
-function foldable(li, meta, body, text) {
+function foldable(li, meta, body, text, messageId) {
   if (String(text === null || text === undefined ? "" : text).length <= COLLAPSE_OVER_CHARS) {
     return null;
   }
   const fold = document.createElement("button");
   fold.className = "fold";
   fold.setAttribute("type", "button");
-  const entry = { li, body, fold };
+  const entry = { li, body, fold, id: messageId || null, note: null, said: null };
+  if (entry.id) {
+    entry.note = document.createElement("div");
+    entry.note.className = "summary";
+    const mark = document.createElement("span");
+    mark.className = "summary-mark";
+    // On every summarised row, not once at the top: the reader scrolls, the note at the head of
+    // the view scrolls away with it, and a short line with nothing marking it reads as the
+    // message itself rather than as something written about the message.
+    mark.textContent = SUMMARY_MARK;
+    entry.said = document.createElement("span");
+    entry.said.className = "summary-text";
+    // A summary is a model's reading of third-party text and is third-party text itself.
+    // `textContent`, never the markdown renderer the body gets.
+    entry.said.textContent = "";
+    entry.note.append(mark, entry.said);
+    li.append(entry.note);
+    applySummaryState(entry);
+  }
   setFolded(entry, true);
   // Toggling changes the height of something that may be far above the viewport, which is the one
   // case the browser's own scroll anchoring does not cover.
@@ -496,11 +528,222 @@ function foldable(li, meta, body, text) {
   return fold;
 }
 
-// --- the two chips over the list ----------------------------------------------------------------
+// --- summaries, asked for as you scroll -----------------------------------------------------------
 //
-// Both are ABSENT unless there is something for them to do, for the same reason Hang up is absent
-// when there is no call: a control that is always there and usually inert teaches the eye to skip
-// the corner it lives in.
+// `#49 cached-summaries`. The server half of this landed on its own and had NOTHING reading it:
+// `GET /api/v1/channels/{id}/messages/{id}/summary` answers with a summary, the store caches it
+// under a policy-versioned key, a startup sweep collects the entries a changed policy orphaned —
+// and no view showed one, no control asked for one, and this file did not mention it. A cache
+// nobody spends is a cost with no benefit.
+//
+// The half a person can see is deliberately small, and every decision in it is the issue's:
+//
+//   * COLLAPSING TO A PREFIX STAYS THE DEFAULT. Summaries are a MODE the reader turns on, so the
+//     ordinary case still costs nothing at all.
+//   * SHORT IS DEFINED ONCE. A row is summarisable exactly when it is foldable, which is
+//     `COLLAPSE_OVER_CHARS` in `foldable` above and nowhere else. The server has its own,
+//     stricter, threshold and answers `below_threshold` when a message clears ours and not its —
+//     which is not a failure and not a summary, so the row simply keeps its opening lines.
+//   * ONE REQUEST PER MESSAGE, EVER. `summariesAsked` is the record, and it is consulted before
+//     the fetch rather than after it, so a hundred scroll events over one row are one request.
+//   * ONLY WHAT YOU ARE LOOKING AT. Nothing is spent on rows the reader never reaches.
+//   * THE MODE IS NOT PERSISTED across a reload, for the same reason the fold state is not: it is
+//     an act, not a preference, and one that spends money should not come back on by itself.
+//
+// What is NOT here, and is the server's job rather than this file's: deciding whether an answer
+// came from the cache. The page asks the same way either way and is told which happened; acting
+// on the difference would be the page second-guessing a cache it cannot see.
+
+// How far beyond the viewport a row is still worth summarising. The point is that the line is
+// there when the reader arrives at it rather than appearing under their eye.
+const SUMMARY_LOOKAHEAD_PX = 600;
+
+/** What a summarised row shows before its answer arrives, and what marks it as not the message. */
+const SUMMARY_MARK = "summary";
+const SUMMARY_WAITING = "summarising…";
+
+/** Is the reader in summary mode? Session-only, on purpose — see above. */
+let summaryMode = false;
+
+/**
+ * What the server has said about each message, by id.
+ *
+ * `{ text }` with a string is a summary. `{ text: null }` is a settled "there is no summary for
+ * this" — the server's own threshold, which is allowed to be stricter than the page's. `failed`
+ * marks the third case, which is NOT settled: see `setSummaryMode`.
+ */
+const summaries = new Map();
+
+/** Every message id a request has gone out for. Consulted before asking, so one row is one ask. */
+const summariesAsked = new Set();
+
+/**
+ * What the server says produced the summaries, quoted from its own answer.
+ *
+ * Empty until something has answered, and the note says less while it is. The shipped summariser
+ * truncates rather than comprehends, so a page that showed short lines without naming their author
+ * would be claiming a reading nobody did.
+ */
+let summaryBackend = "";
+
+/** Put one row into the state the map says it is in. */
+function applySummaryState(entry) {
+  if (!entry.note) {
+    return;
+  }
+  const held = summaries.get(entry.id);
+  if (held === undefined) {
+    entry.summaryState = "waiting";
+    entry.said.textContent = SUMMARY_WAITING;
+  } else if (held.text === null) {
+    // Nothing to show, so show the message. This is the below-threshold answer and the failed
+    // one alike: in both cases the honest row is the one the reader would have had with the mode
+    // off, rather than a row apologising where its content should be.
+    entry.summaryState = "none";
+    entry.said.textContent = "";
+  } else {
+    entry.summaryState = "ready";
+    entry.said.textContent = held.text;
+  }
+}
+
+/** The standing sentence at the head of the channel view while the mode is on. */
+function summaryNoteText() {
+  const base = "Collapsed messages show a summary instead of their opening lines. Tap More for " +
+    "the message itself.";
+  return summaryBackend ? `${base} Summaries by ${summaryBackend}.` : base;
+}
+
+/** Every row's summary line brought back into agreement with what the server has said. */
+function renderSummaries() {
+  preservingScroll(() => {
+    for (const entry of liveFolds()) {
+      applySummaryState(entry);
+      setFolded(entry, isFolded(entry));
+    }
+    const note = el("summary-note");
+    note.hidden = !summaryMode;
+    note.textContent = summaryMode ? summaryNoteText() : "";
+  });
+  renderScrollTools();
+}
+
+/**
+ * The rows worth asking about right now: foldable, in the channel list, and near the viewport.
+ *
+ * `#scroll-area`'s own rectangle is the frame — `scrollAnchor` measures against the same edge —
+ * and `clientHeight` is its bottom, because the element's box is the viewport while its
+ * `scrollHeight` is the whole history behind it.
+ */
+function summaryTargets() {
+  if (!summaryMode || currentView !== "discord") {
+    return [];
+  }
+  const area = el("scroll-area");
+  const top = area.getBoundingClientRect().top - SUMMARY_LOOKAHEAD_PX;
+  const bottom = top + (area.clientHeight || 0) + 2 * SUMMARY_LOOKAHEAD_PX;
+  const list = el("discord-log");
+  return liveFolds().filter((entry) => {
+    if (!entry.id || entry.li.parentNode !== list) {
+      return false;
+    }
+    const box = entry.li.getBoundingClientRect();
+    return box.bottom > top && box.top < bottom;
+  });
+}
+
+function requestVisibleSummaries() {
+  for (const entry of summaryTargets()) {
+    if (summariesAsked.has(entry.id)) {
+      continue;
+    }
+    // Marked BEFORE the await, not in the handler: the scroll listener fires again long before a
+    // response lands, and a record written on completion would let one row issue a request per
+    // scroll event — the exact thing the issue names.
+    summariesAsked.add(entry.id);
+    fetchSummary(entry.id);
+  }
+}
+
+async function fetchSummary(id) {
+  const channel = el("discord-channel").value;
+  if (!channel) {
+    return;
+  }
+  let payload = null;
+  try {
+    payload = await api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/messages/${encodeURIComponent(id)}/summary`
+    );
+  } catch (error) {
+    summaryFailed(id, error.message);
+    return;
+  }
+  if (payload && payload.backend) {
+    summaryBackend = payload.backend;
+  }
+  // `below_threshold` is an ANSWER, not an omission: the server considers the message short
+  // enough to read as it is, and a shortened copy of something already short would be a claim
+  // that work was done. It is SETTLED — the row keeps its own opening lines and is never asked
+  // about again — which is the whole reason the STATE decides rather than the presence of text.
+  if (payload && payload.state === "below_threshold") {
+    summaries.set(id, { text: null });
+    renderSummaries();
+    return;
+  }
+  // Anything else without usable text is a server this page cannot understand. That is a
+  // FAILURE, not a verdict that the message is short: it is worth retrying, and reading it as
+  // "below threshold" would quietly file every malformed answer as a decision nobody made.
+  const said = payload ? payload.summary : null;
+  if (typeof said !== "string" || !said) {
+    summaryFailed(id, "the server answered without a summary");
+    return;
+  }
+  summaries.set(id, { text: said });
+  renderSummaries();
+}
+
+/**
+ * One message could not be summarised.
+ *
+ * Deliberately NOT `guardQuietly`, and deliberately not the error panel: taking the channel away
+ * because one row out of fifty could not be condensed is a worse answer than the row the reader
+ * would have had with the mode off, which is exactly what it falls back to. `failed` marks it as
+ * retryable — see `setSummaryMode`.
+ */
+function summaryFailed(id, why) {
+  summaries.set(id, { text: null, failed: true });
+  renderSummaries();
+  setStatus(`one message could not be summarised: ${why}`);
+}
+
+function setSummaryMode(on) {
+  summaryMode = on;
+  el("summarise").setAttribute("aria-pressed", on ? "true" : "false");
+  el("summarise-label").textContent = on ? SUMMARY_MODE_ON : SUMMARY_MODE_OFF;
+  if (on) {
+    // A failure is not a verdict. Re-entering the mode is the reader asking again, and without
+    // this one flaky response would leave that row plain until the page is reloaded — while a
+    // below-threshold answer, which is settled, stays settled and is never re-asked.
+    for (const [id, held] of [...summaries]) {
+      if (held.failed) {
+        summaries.delete(id);
+        summariesAsked.delete(id);
+      }
+    }
+  }
+  renderSummaries();
+  requestVisibleSummaries();
+}
+
+const SUMMARY_MODE_OFF = "Summaries";
+const SUMMARY_MODE_ON = "Summaries on";
+
+// --- the chips over the list ----------------------------------------------------------------
+//
+// All of them are ABSENT unless there is something for them to do, for the same reason Hang up is
+// absent when there is no call: a control that is always there and usually inert teaches the eye
+// to skip the corner it lives in.
 
 // PER LIST, not per page. Both lists live in one #scroll-area, so a single flag would raise the
 // chip for a voice turn while the reader is looking at the channel — offering to jump them to the
@@ -524,6 +767,11 @@ function renderScrollTools() {
   // "Collapse all" appears only once something IS expanded. Everything arrives folded, so until
   // the reader opens one there is nothing for it to collapse.
   el("collapse-all").hidden = !visibleFolds().some((entry) => !isFolded(entry));
+  // ...and summary mode only where a summary can exist at all: the channel, with something long
+  // enough in it to be worth condensing. Offering it over the voice transcript would be offering
+  // a mode that changes nothing, since a voice turn has no message id to key a summary under.
+  el("summarise").hidden =
+    currentView !== "discord" || !visibleFolds().some((entry) => entry.id !== null);
 }
 
 function collapseAll() {
@@ -2443,8 +2691,11 @@ function discordNode(message) {
   renderMarkdownInto(body, message.content);
   li.append(meta, body);
   // The SAME call the voice transcript makes, on the same arguments, so the two lists cannot end
-  // up with two idioms for the one behaviour. `#47 scrollback-stability`.
-  foldable(li, meta, body, message.content);
+  // up with two idioms for the one behaviour. `#47 scrollback-stability`. The one extra argument
+  // is the message id, which is what `#49 cached-summaries` keys a summary under — the transcript
+  // has none to give, so it gets no summary line and the two lists still share one definition of
+  // "long enough to fold".
+  foldable(li, meta, body, message.content, String(message.id));
   // `#51 reply-view`. Every raw message can be answered, and the affordance is on the row rather
   // than in a menu — Discord's own idiom, and the thing that makes a reply a REPLY rather than a
   // loose message.
@@ -2663,6 +2914,9 @@ async function loadOlder() {
       renderOlderControl();
     });
     renderScrollTools();
+    // The rows that just arrived above the viewport are candidates too, and the reader is right
+    // at the top of them. `#49 cached-summaries`.
+    requestVisibleSummaries();
   } finally {
     // The success path has already done both, and doing them again is a no-op. This is here for
     // the FAILURE path, where the step must stop reporting itself in flight.
@@ -2956,6 +3210,10 @@ async function loadDiscord(options) {
       setJumpNewest(false, "discord");
     }
     renderScrollTools();
+    // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
+    // be asked about again. `summariesAsked` is what stops that being a second request for a
+    // message already answered, which matters most here: this runs every DISCORD_POLL_MS.
+    requestVisibleSummaries();
   } finally {
     discordFetchInFlight = false;
   }
@@ -3636,6 +3894,9 @@ function receiveLiveMessage(message, selfPosted, replayed) {
     setJumpNewest(true, "discord");
   }
   renderScrollTools();
+  // A row that arrived because the SERVER said so is a row like any other: if it is long and the
+  // reader is looking at it, it gets a summary. `#49 cached-summaries`.
+  requestVisibleSummaries();
   relayToAgent(message, selfPosted, replayed);
 }
 
@@ -4015,6 +4276,7 @@ el("discord-channel").addEventListener(
 );
 el("load-older").addEventListener("click", guardQuietly(loadOlder));
 el("collapse-all").addEventListener("click", collapseAll);
+el("summarise").addEventListener("click", () => setSummaryMode(!summaryMode));
 el("jump-newest").addEventListener("click", scrollToNewest);
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it
 // has nothing left to say, so it takes itself away rather than waiting to be tapped.
@@ -4024,6 +4286,10 @@ el("scroll-area").addEventListener("scroll", () => {
   }
   // ...and the other end of the same list: arriving at the top is a request for what is above it.
   maybeLoadOlder();
+  // `#49 cached-summaries`. Summaries are produced as the reader scrolls, so this is where they
+  // are asked for. It is cheap on the ordinary event: `summariesAsked` answers for every row that
+  // has already been asked about, and a scroll that reveals nothing new issues nothing.
+  requestVisibleSummaries();
 });
 // `#68 pull-to-refresh`. On #scroll-area rather than on the document, because the gesture is about
 // THIS list and because the page's other three scroll gestures already live here. Nothing calls

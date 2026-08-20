@@ -115,6 +115,30 @@ const SEEDED_BACKLOG: &[(&str, &str)] = &[
          flake, it is a real ordering bug that only shows up when the machine is loaded, and I \
          would rather we not label it flaky because that is how it gets ignored.",
     ),
+    // OVER `summaries.threshold_chars`, which is 400 by default, and it is the only entry here
+    // that is. Everything above is between 140 and 340 characters, so against this backlog every
+    // summary the page asked for came back `below_threshold` and `#49 cached-summaries` could not
+    // be exercised locally AT ALL — the seam existed, the endpoint answered, and nothing a
+    // developer could see ever produced a summary. It is also the honest case: the message this
+    // whole project exists for is the one you cannot skim at the roadside.
+    (
+        "codex-eng",
+        "seeded: long one, sorry. The cache-key rewrite is done and I want to write down what \
+         changed before I forget it. The key used to be the source path plus the compiler \
+         version, which looked complete and was not: two builds of the same file with different \
+         feature flags hashed identically, so the second one silently reused the first one's \
+         object and the flags did nothing. That is the bug behind the three 'it works on my \
+         machine' reports from last month, and it explains why clearing the cache always fixed \
+         them. The new key folds in the feature set, the target triple and the optimisation \
+         level, and it is versioned, so the moment any of that changes every old entry becomes \
+         unreachable at once rather than being served under rules that no longer exist. I did \
+         NOT make it a cryptographic hash - it is a change detector, not a defence, and calling \
+         it a defence would invite somebody to rely on it as one. The migration is a no-op: old \
+         entries are simply never hit again and the retention sweep collects them within the \
+         week. One thing I want a second opinion on before this lands: the optimisation level is \
+         in the key, which means a debug build and a release build no longer share anything, and \
+         on this repository that roughly doubles the cache on disk.",
+    ),
 ];
 
 struct Args {

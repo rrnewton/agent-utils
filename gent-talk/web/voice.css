@@ -499,6 +499,41 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
+/* ------------------------------------------------------------ summaries, in place of it ----- */
+/*
+ * `#49 cached-summaries`. The other collapsed form: instead of the first three lines of a wall of
+ * text, one short line about it. It occupies the same place on the row that `.body.clamped` does
+ * and never sits beside it — web/voice.js hides one to show the other — so the row keeps the
+ * uniform height that makes a long list scannable at all.
+ *
+ * `.summary-mark` is not decoration. A short line where a message should be, with nothing saying
+ * who wrote it, reads as the message; the mark is what stops the reader taking a machine's
+ * paraphrase for what somebody actually said.
+ */
+.summary {
+  display: flex;
+  gap: 0.4rem;
+  align-items: baseline;
+}
+
+.summary-mark {
+  flex: 0 0 auto;
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.summary-text {
+  font-style: italic;
+}
+
+/* The standing sentence naming the summariser, at the head of the channel view while the mode is
+   on. Quiet, because it is a fact about the view rather than a message. */
+#summary-note {
+  margin: 0 0 0.4rem;
+}
+
 /* The reading-width handle does not exist outside the desktop regime at the foot of this file:
    there is no room for a column to resize and no pointer precise enough to grab the edge of one.
    Stated HERE, before the media query, so the query's `display: block` is the later rule and wins
