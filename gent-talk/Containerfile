@@ -45,6 +45,20 @@ RUN apt-get update \
 
 # Never run the bridge as root: it holds a Discord bot token and is meant to face the internet.
 RUN useradd --system --create-home --uid 10001 gent
+
+# Durable state. THE IMAGE IS NOT STORAGE: a directory created here lives in the container's
+# writable layer and is destroyed by `podman rm`, by a rebuild, and by a re-pull. So this
+# directory exists only to be a MOUNT POINT — declare a volume over it, or the transcripts and
+# read marks written into it are lost the first time the container is replaced, silently, with no
+# error anywhere. `scripts/run.sh` bind-mounts a host directory here; the VOLUME below is the
+# backstop for a hand-run container, and it yields an anonymous volume that is easy to orphan, so
+# prefer an explicit `-v`.
+#
+# 0700 and owned by the server's user because what lands in there is the owner's speech and
+# third-party channel text. See the README's "Durable state" section.
+RUN install -d -m 0700 -o 10001 -g 10001 /var/lib/gent-talk
+VOLUME ["/var/lib/gent-talk"]
+
 USER gent
 WORKDIR /home/gent
 
@@ -52,6 +66,7 @@ COPY --from=build /src/target/release/gent-talk /usr/local/bin/gent-talk
 
 ENV GENT_TALK_BIND=0.0.0.0:8080 \
     GENT_TALK_CONFIG=/etc/gent-talk/gent-talk.toml \
+    GENT_TALK_STORAGE_PATH=/var/lib/gent-talk/gent-talk.sqlite3 \
     RUST_LOG=info
 EXPOSE 8080
 

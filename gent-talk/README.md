@@ -162,6 +162,26 @@ podman run --rm --name gent-talk -p 127.0.0.1:8080:8080 \
 The image runs as a non-root user and contains no configuration; a container started with no
 credentials fails immediately rather than coming up with defaults.
 
+**None of the commands above keep anything.** The image declares a volume at `/var/lib/gent-talk`
+and points `GENT_TALK_STORAGE_PATH` into it, but a container run without a mount writes into its
+own writable layer, which `podman rm` — and therefore every rebuild and every redeploy — destroys
+without a word. Mount a host directory over it:
+
+```sh
+mkdir -p -m 700 ~/.local/share/gent-talk
+podman run --name gent-talk -p 127.0.0.1:8080:8080 \
+  -v ~/.local/share/gent-talk:/var/lib/gent-talk:Z \
+  -e GENT_TALK_DISCORD_BOT_TOKEN='your-bot-token' \
+  -e GENT_TALK_READ_TOKEN='your-read-token' \
+  -e GENT_TALK_WRITE_TOKEN='your-write-token' \
+  -e GENT_TALK_CHANNELS='123456789012345678:lead team:rw' \
+  gent-talk:v0
+```
+
+`scripts/run.sh` does this for you: it creates `$GENT_TALK_DATA_DIR` (default
+`${XDG_DATA_HOME:-$HOME/.local/share}/gent-talk`) mode `0700`, mounts it, and reports it under
+`--status`. See **Durable state** below for what ends up in there.
+
 ## The startup channel probe
 
 At startup, after the configuration is loaded and before the listener is bound, the server reads
@@ -287,11 +307,88 @@ curl -s -X POST localhost:8080/mcp \
 | ElevenLabs agent id | `elevenlabs.agent_id` | `GENT_TALK_ELEVENLABS_AGENT_ID` | public |
 | ElevenLabs API key | `elevenlabs.api_key` | `GENT_TALK_ELEVENLABS_API_KEY` | **secret**, needed to mint signed URLs |
 | ElevenLabs API base | `elevenlabs.api_base` | `GENT_TALK_ELEVENLABS_API_BASE` | `https://api.elevenlabs.io/v1` |
+| Storage path | `storage.path` | `GENT_TALK_STORAGE_PATH` | absolute; unset means **no durable state** |
+| Conversations kept | `storage.max_conversations` | — | default `50`, oldest dropped first |
+| Turns per conversation | `storage.max_turns_per_conversation` | — | default `1000`, then `413` |
+| Retention age | `storage.retain_days` | — | default `30`; `0` means no age limit |
 | Config file path | — | `GENT_TALK_CONFIG` | or `--config` |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
 renders unset variables as `""` cannot blank out a configured value. An unknown key in the file is
 an error, not a shrug — a typo'd section name should not silently disable a setting.
+
+## Durable state
+
+Almost nothing in this server is remembered. Channel content is never cached: every question is a
+fresh Discord fetch, and it stays that way. There is exactly one store, `src/store/`, and it holds
+only what **this server itself authored**:
+
+* the `/voice` **conversation transcript** — what the owner said and what the agent said back; and
+* **read marks** — how far the owner has been shown each channel.
+
+### Read state is ours, and is never synchronised with Discord
+
+Discord does not share read state with bots. There is no ack route a bot may call, no read-state
+field on the channel object a bot can see, and no `read_state` in the gateway `READY` payload for
+a bot user (this is what issue #61 `unread-status` established). So the read marks here are
+gent-talk's own record, and the rule is stated once rather than left to be inferred:
+
+* **No sync-in.** Marking a channel read in the Discord app changes nothing here.
+* **No sync-back.** Marking a channel read here acks nothing and posts nothing; the Discord app's
+  unread badge does not move.
+
+Anything that shows a read mark to a person has to say that, because "read" already means
+something else to a Discord user.
+
+### Where it lives
+
+One SQLite file at `storage.path`, which **must be absolute**. A relative path resolves against
+the working directory, which in a container is a directory in the *image* — a store like that
+works perfectly until the next rebuild and is then gone, with no error anywhere. The server
+refuses a relative path at startup rather than discovering this later.
+
+Unset means **off**, and off is loud: the store is a `DisabledStore` that refuses every call and
+names the setting to add, and the routes that need it answer `503 storage_not_configured`. It is
+deliberately not a silent in-memory substitute, because state that quietly evaporates on restart
+is worse than state that was never promised.
+
+### What is kept, for how long
+
+Retention is enforced **on every append**, not by a sweeper that might never run: at most
+`max_conversations` conversations (least recently active dropped first), at most
+`max_turns_per_conversation` turns in one of them (further turns are refused, not silently
+dropped), and nothing older than `retain_days` days since its last turn. The defaults are 50, 1000
+and 30.
+
+### How an operator purges it
+
+Three ways, all of which are complete:
+
+1. delete the file (`rm ~/.local/share/gent-talk/gent-talk.sqlite3`) — with the server stopped;
+2. delete the mounted directory, which is also what `scripts/run.sh --status` prints; or
+3. `storage.path` unset, which turns the whole feature off.
+
+### Security posture — this is new, and it is a change
+
+This is the first thing gent-talk retains at rest, and what it retains is the owner's own speech
+plus Discord text written by third parties.
+
+* The database file is created `0600` and its directory `0700`.
+* It is **not encrypted**. Anyone with filesystem access to the host — another process running as
+  the same user, a backup, a stolen disk — can read every transcript. There is no key management
+  here and pretending otherwise would be worse than saying so.
+* The bind mount means state now **outlives the container, the image, and a token rotation**. A
+  rebuild no longer clears it. That is the point, and it is also the risk.
+* Message content still never reaches the access log at INFO; see below.
+* Conversation ids are validated against `[A-Za-z0-9_-]{1,64}` before they are used as a key,
+  because they arrive from the vendor and from the browser.
+
+### Migrations
+
+`src/store/sqlite.rs` holds an append-only `MIGRATIONS` list and records progress in SQLite's
+`user_version`. Opening an older file applies the missing steps. Opening a file written by a
+*newer* gent-talk is **refused**, naming the reason — a downgrade that wrote through the old
+statements would corrupt data quietly.
 
 ## The access log
 
@@ -939,6 +1036,8 @@ voice agent, the real security boundary of the whole design.
 * Secrets are wrapped in a `Secret` type whose `Debug` prints `<redacted>`; a test asserts that
   neither it nor the whole `Config` leaks a token when formatted.
 * The image runs as a non-root user and contains no configuration.
+* Durable state is `0600` in a `0700` directory, is bounded by retention, and is off unless an
+  absolute path is configured. See **Durable state** above.
 * The web app never uses `innerHTML` and never renders markdown, so channel text cannot become
   markup or a tappable link.
 
@@ -969,6 +1068,10 @@ voice agent, the real security boundary of the whole design.
 * **Channel text transits the agent platform.** Anything `digest_channel`, `find_message` or
   `read_message` returns is sent to ElevenLabs and to whatever model is behind it. The fencing
   constrains how it is *framed*, not where it goes.
+* **Stored transcripts are not encrypted at rest.** Once `storage.path` is set, the owner's
+  speech and the channel text the agent read aloud sit in the clear in a SQLite file that
+  outlives the container. Anyone with host filesystem access can read it. Retention bounds how
+  much accumulates; it does not protect what is there.
 * **The bot's own permissions are the real ceiling.** Give the bot the narrowest Discord
   permissions that work, in the fewest channels. Server-side allowlisting is a second fence, not
   the first one.
@@ -1123,6 +1226,7 @@ src/bin/mock_elevenlabs.rs     that mock as a process, for a browser or the smok
 src/mcp/mod.rs        the tool manifest and per-tool approval policy
 src/mcp/protocol.rs   JSON-RPC 2.0 and the MCP method set
 src/mcp/transport.rs  the Streamable HTTP endpoint at /mcp
+src/store/            the StateStore trait, the SQLite backend, the fake, the refusing one
 src/agent_backend.rs  the slow-path seam
 src/http/             router, handlers, and the access-log middleware
 web/                  the phone app and the /voice page (plain HTML/CSS/JS, no framework, no build step)

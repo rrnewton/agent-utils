@@ -289,6 +289,22 @@ grep -q -- '--restart on-failure:5' <<< "$runline" || fail "run command does not
 grep -q -- '--rm' <<< "$runline" && fail "run command still uses --rm, so the logs would not survive a stop: $runline"
 ok "the launch is detached, named, restart-policied, and does not use --rm"
 
+# --- 8c. durable state is bind-mounted from the host -----------------------------------------
+# Without this mount the store lives in the container's writable layer, which run.sh itself
+# destroys on the very next launch. That failure is silent: the server starts, writes happily,
+# and the transcripts are simply gone after the next deploy. So assert the mount, not the
+# VOLUME declaration in the Containerfile, which yields an anonymous volume nobody can find.
+grep -q -- '-v .*:/var/lib/gent-talk:Z' <<< "$runline" \
+    || fail "run command does not bind-mount durable state, so a rebuild would discard it: $runline"
+ok "durable state is bind-mounted from the host, so a rebuild does not discard it"
+
+# --status must say where that directory is, or an operator cannot find it to back it up or
+# purge it.
+statusout="$(run_sh --config "$GOOD_CONFIG" --status --no-tunnel)"
+grep -q 'durable state:' <<< "$statusout" || fail "--status does not report the state directory: $statusout"
+grep -q '/var/lib/gent-talk' <<< "$statusout" || fail "--status does not say where state is mounted: $statusout"
+ok "--status reports where durable state lives on the host"
+
 # --restart-policy is honoured, and a bad one is refused BEFORE anything is built or stopped.
 out="$(run_sh --config "$GOOD_CONFIG" --dry-run --no-tunnel --restart-policy always)"
 grep -q -- '--restart always' <<< "$out" || fail "--restart-policy always was not applied"

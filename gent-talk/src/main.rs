@@ -14,6 +14,9 @@ use gent_talk::elevenlabs::SignedUrlProvider;
 use gent_talk::probe::{self, ENV_SKIP_STARTUP_PROBE};
 use gent_talk::retrieval::LexicalRanker;
 use gent_talk::state::AppState;
+use gent_talk::store::disabled::DisabledStore;
+use gent_talk::store::sqlite::SqliteStore;
+use gent_talk::store::StateStore;
 
 const USAGE: &str = "\
 gent-talk — a Discord bridge for a voice agent
@@ -205,6 +208,42 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(HttpDiscordClient::new(&config.discord).context("building the Discord client")?)
     };
 
+    // Open the store BEFORE the probe and before the listener: a storage path that cannot be
+    // created is a configuration error, and a server that came up and only discovered it on the
+    // first attempt to record a turn would lose that turn and say nothing useful about why.
+    let store: Arc<dyn StateStore> = match &config.storage.path {
+        Some(path) => {
+            let opened = SqliteStore::open(path, config.storage.retention).with_context(|| {
+                format!(
+                    "opening the durable state store at {}. It must be an absolute path this \
+                     process can write to — in a container, a mounted VOLUME rather than a \
+                     directory in the image.",
+                    path.display()
+                )
+            })?;
+            let retention = config.storage.retention;
+            tracing::info!(
+                path = %path.display(),
+                max_conversations = retention.max_conversations,
+                max_turns_per_conversation = retention.max_turns_per_conversation,
+                retain_days = retention.retain_days,
+                "durable state is ON. Conversation transcripts and read marks are written to \
+                 this file at 0600 and survive a restart. Read marks are THIS SERVER'S OWN: \
+                 nothing is read from or written back to Discord."
+            );
+            Arc::new(opened)
+        }
+        None => {
+            tracing::warn!(
+                setting = gent_talk::store::disabled::SETTING,
+                "durable state is OFF. This server keeps NOTHING between restarts, and the \
+                 routes that need it refuse with 503 storage_not_configured rather than \
+                 pretending. Set an absolute path on a mounted volume to turn it on."
+            );
+            Arc::new(DisabledStore)
+        }
+    };
+
     run_startup_probe(discord.as_ref(), &config, args.skip_startup_probe).await?;
 
     for channel in &config.channels {
@@ -271,6 +310,7 @@ async fn main() -> anyhow::Result<()> {
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs,
+        store,
     };
     let app = gent_talk::http::router(state);
 

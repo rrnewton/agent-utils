@@ -13,6 +13,7 @@ use crate::discord::fake::FakeDiscord;
 use crate::elevenlabs::fake::{FakeElevenLabs, KNOWN_AGENT_ID, VALID_API_KEY};
 use crate::retrieval::LexicalRanker;
 use crate::state::AppState;
+use crate::store::fake::FakeStore;
 
 /// Read-scope token used by tests.
 pub const READ_TOKEN: &str = "test-read-token-000000000000";
@@ -105,6 +106,38 @@ pub fn state_parts() -> (AppState, Arc<FakeDiscord>, Arc<FakeElevenLabs>) {
 /// Panics if `text` is not a valid configuration, which is a failure of the test that wrote it.
 #[must_use]
 pub fn state_from_toml(text: &str) -> (AppState, Arc<FakeDiscord>, Arc<FakeElevenLabs>) {
+    let (state, discord, elevenlabs, _store) = state_pieces(text, Arc::new(FakeStore::new()));
+    (state, discord, elevenlabs)
+}
+
+/// The same server, plus a handle to its in-memory store.
+///
+/// A separate accessor rather than a fourth element on [`state_from_toml`] so the six existing
+/// call sites keep working; a test that cares about durable state asks for it.
+#[must_use]
+pub fn state_with_store() -> (AppState, Arc<FakeDiscord>, Arc<FakeStore>) {
+    let store = Arc::new(FakeStore::new());
+    let (state, discord, _elevenlabs, _erased) = state_pieces(&config_toml(), store.clone());
+    (state, discord, store)
+}
+
+/// A server whose store is one the caller built — a [`FakeStore`] primed to fail, a
+/// [`crate::store::disabled::DisabledStore`], or a real SQLite file.
+#[must_use]
+pub fn state_with(store: Arc<dyn crate::store::StateStore>) -> (AppState, Arc<FakeDiscord>) {
+    let (state, discord, _elevenlabs, _store) = state_pieces(&config_toml(), store);
+    (state, discord)
+}
+
+fn state_pieces(
+    text: &str,
+    store: Arc<dyn crate::store::StateStore>,
+) -> (
+    AppState,
+    Arc<FakeDiscord>,
+    Arc<FakeElevenLabs>,
+    Arc<dyn crate::store::StateStore>,
+) {
     let fake = Arc::new(FakeDiscord::new());
     fake.register_channel(&crate::model::ChannelId(READ_CHANNEL.to_owned()));
     fake.register_channel(&crate::model::ChannelId(WRITE_CHANNEL.to_owned()));
@@ -116,8 +149,48 @@ pub fn state_from_toml(text: &str) -> (AppState, Arc<FakeDiscord>, Arc<FakeEleve
         ranker: Arc::new(LexicalRanker),
         agent: Arc::new(NoAgentBackend),
         elevenlabs: elevenlabs.clone(),
+        store: Arc::clone(&store),
     };
-    (state, fake, elevenlabs)
+    (state, fake, elevenlabs, store)
+}
+
+/// A directory that deletes itself, so a test can drive the real SQLite store.
+///
+/// Hand-rolled rather than a `tempfile` dependency: it is twenty lines, and this crate's
+/// dependency list is short on purpose. It is not hardened against a hostile `TMPDIR` — it is
+/// test scaffolding, and the process that creates it is the process that removes it.
+#[derive(Debug)]
+pub struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    /// Create a fresh directory under the system temporary directory.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the directory cannot be created, which is a broken test environment rather than
+    /// a test failure.
+    #[must_use]
+    pub fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("gent-talk-{tag}-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("a temporary directory can be created");
+        Self(path)
+    }
+
+    /// The directory itself.
+    #[must_use]
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// A `tracing` writer that keeps everything in memory.

@@ -8,6 +8,7 @@ use crate::discord::DiscordClient;
 use crate::elevenlabs::SignedUrlProvider;
 use crate::model::{ChannelId, ChannelInfo};
 use crate::retrieval::Ranker;
+use crate::store::StateStore;
 
 /// Everything a request handler needs.
 #[derive(Clone)]
@@ -22,6 +23,13 @@ pub struct AppState {
     pub elevenlabs: Arc<dyn SignedUrlProvider>,
     /// Slow-path backend (absent in v0).
     pub agent: Arc<dyn AgentBackend>,
+    /// The one place this server keeps anything between restarts.
+    ///
+    /// Reached only through the trait, never as a concrete database, so the backend can be
+    /// replaced without touching a handler. When nothing is configured this is
+    /// [`crate::store::disabled::DisabledStore`], which refuses every call and names the setting
+    /// to add — it is deliberately not a silent in-memory substitute. See [`crate::store`].
+    pub store: Arc<dyn StateStore>,
 }
 
 impl AppState {

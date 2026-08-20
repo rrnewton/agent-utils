@@ -6,11 +6,12 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
 use crate::model::{ChannelId, ChannelInfo};
+use crate::store::Retention;
 
 /// Environment variable naming the configuration file.
 pub const ENV_CONFIG_PATH: &str = "GENT_TALK_CONFIG";
@@ -35,6 +36,11 @@ pub const ENV_CHANNELS: &str = "GENT_TALK_CHANNELS";
 pub const ENV_PUBLIC_BASE_URL: &str = "GENT_TALK_PUBLIC_BASE_URL";
 /// Environment variable overriding the operator's time zone, as an IANA name.
 pub const ENV_TIMEZONE: &str = "GENT_TALK_TIMEZONE";
+/// Environment variable naming the SQLite file that holds durable state.
+///
+/// Unset means this server keeps nothing between restarts, and says so rather than pretending.
+/// See [`crate::store`].
+pub const ENV_STORAGE_PATH: &str = "GENT_TALK_STORAGE_PATH";
 
 /// Shortest API token this server will accept.
 ///
@@ -104,6 +110,20 @@ pub struct Config {
     pub channels: Vec<ChannelInfo>,
     /// ElevenLabs wiring, when configured.
     pub elevenlabs: ElevenLabsConfig,
+    /// Durable state: where it lives, and how much of it is kept.
+    pub storage: StorageConfig,
+}
+
+/// Where durable state lives, and how much of it is kept.
+///
+/// See [`crate::store`] for what is stored and why the absent case is a refusal rather than an
+/// in-memory fallback.
+#[derive(Debug, Default)]
+pub struct StorageConfig {
+    /// Absolute path to the SQLite file. `None` means this server keeps nothing.
+    pub path: Option<PathBuf>,
+    /// Bounds on what is kept.
+    pub retention: Retention,
 }
 
 /// Discord access parameters.
@@ -202,6 +222,8 @@ struct FileConfig {
     channels: Vec<FileChannel>,
     #[serde(default)]
     elevenlabs: FileElevenLabs,
+    #[serde(default)]
+    storage: FileStorage,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -244,6 +266,15 @@ struct FileElevenLabs {
     agent_id: Option<String>,
     api_key: Option<Secret>,
     api_base: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileStorage {
+    path: Option<String>,
+    max_conversations: Option<u16>,
+    max_turns_per_conversation: Option<u16>,
+    retain_days: Option<u16>,
 }
 
 /// Default bind address: every interface inside a container, port 8080.
@@ -391,6 +422,8 @@ impl Config {
             });
         }
 
+        let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
+
         Ok(Self {
             bind,
             public_base_url: get(ENV_PUBLIC_BASE_URL)
@@ -424,8 +457,63 @@ impl Config {
                     .or(file.elevenlabs.api_base)
                     .unwrap_or_else(|| DEFAULT_ELEVENLABS_API_BASE.to_owned()),
             },
+            storage,
         })
     }
+}
+
+/// Resolve the `[storage]` section.
+///
+/// The one rule worth spelling out is that the path must be **absolute**. A relative path is
+/// resolved against the process's working directory, which inside a container is a directory in
+/// the image — so a store configured that way works perfectly until the image is rebuilt and then
+/// silently loses everything. That is the exact failure this setting exists to prevent, so it is
+/// refused at load rather than warned about at runtime.
+fn storage_config(from_env: Option<&str>, file: FileStorage) -> Result<StorageConfig, ConfigError> {
+    let path = from_env
+        .map(str::to_owned)
+        .or(file.path)
+        .map(|p| p.trim().to_owned())
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    if let Some(path) = &path {
+        if !path.is_absolute() {
+            return Err(ConfigError::Invalid {
+                field: "storage.path".to_owned(),
+                detail: format!(
+                    "{} is relative; give an absolute path on a mounted volume, or a rebuild of \
+                     the image silently discards everything stored so far",
+                    path.display()
+                ),
+            });
+        }
+    }
+
+    let retention = Retention {
+        max_conversations: file
+            .max_conversations
+            .unwrap_or(crate::store::DEFAULT_MAX_CONVERSATIONS),
+        max_turns_per_conversation: file
+            .max_turns_per_conversation
+            .unwrap_or(crate::store::DEFAULT_MAX_TURNS_PER_CONVERSATION),
+        retain_days: file
+            .retain_days
+            .unwrap_or(crate::store::DEFAULT_RETAIN_DAYS),
+    };
+    if retention.max_conversations == 0 {
+        return Err(ConfigError::Invalid {
+            field: "storage.max_conversations".to_owned(),
+            detail: "must be at least 1; zero would delete every conversation as it was written"
+                .to_owned(),
+        });
+    }
+    if retention.max_turns_per_conversation == 0 {
+        return Err(ConfigError::Invalid {
+            field: "storage.max_turns_per_conversation".to_owned(),
+            detail: "must be at least 1, or no turn can ever be recorded".to_owned(),
+        });
+    }
+    Ok(StorageConfig { path, retention })
 }
 
 fn check_token_strength(field: &str, token: &Secret) -> Result<(), ConfigError> {
@@ -756,6 +844,97 @@ writable = true
         let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
         assert!(cfg.elevenlabs.agent_id.is_none());
         assert!(cfg.elevenlabs.api_key.is_none());
+    }
+
+    #[test]
+    fn storage_is_off_unless_a_path_is_given() {
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(
+            cfg.storage.path.is_none(),
+            "a server with no storage configured must not invent a path for the owner's speech"
+        );
+        assert_eq!(
+            cfg.storage.retention,
+            crate::store::Retention::default(),
+            "the bounds still have to be defined, so the absent case is one decision not two"
+        );
+    }
+
+    #[test]
+    fn the_storage_path_comes_from_file_or_environment() {
+        let text = format!("{FULL}\n[storage]\npath = \"/var/lib/gent-talk/from-file.sqlite3\"\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(
+            cfg.storage.path.as_deref(),
+            Some(Path::new("/var/lib/gent-talk/from-file.sqlite3"))
+        );
+
+        let cfg =
+            Config::from_toml_and_env(&text, &env(&[(ENV_STORAGE_PATH, "/data/from-env.sqlite3")]))
+                .expect("valid config");
+        assert_eq!(
+            cfg.storage.path.as_deref(),
+            Some(Path::new("/data/from-env.sqlite3")),
+            "the environment must win, so a container can be told where its volume is"
+        );
+    }
+
+    #[test]
+    fn a_relative_storage_path_is_refused() {
+        // A relative path inside a container points into the IMAGE, so the store works until the
+        // next rebuild and then is gone. Refusing is the whole point of the setting.
+        let text = format!("{FULL}\n[storage]\npath = \"state/gent-talk.sqlite3\"\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "storage.path"),
+            "unexpected error: {err}"
+        );
+
+        let err = Config::from_toml_and_env(FULL, &env(&[(ENV_STORAGE_PATH, "./state.sqlite3")]))
+            .expect_err("must refuse the environment form too");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "storage.path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn retention_bounds_are_configurable_and_must_be_usable() {
+        let text = format!(
+            "{FULL}\n[storage]\npath = \"/data/s.sqlite3\"\nmax_conversations = 3\n\
+             max_turns_per_conversation = 7\nretain_days = 0\n"
+        );
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert_eq!(cfg.storage.retention.max_conversations, 3);
+        assert_eq!(cfg.storage.retention.max_turns_per_conversation, 7);
+        assert_eq!(
+            cfg.storage.retention.retain_days, 0,
+            "zero days must mean no age limit, not immediate deletion"
+        );
+
+        let text = format!("{FULL}\n[storage]\nmax_conversations = 0\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "storage.max_conversations"),
+            "unexpected error: {err}"
+        );
+
+        let text = format!("{FULL}\n[storage]\nmax_turns_per_conversation = 0\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "storage.max_turns_per_conversation"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn a_typo_in_the_storage_section_is_refused_rather_than_ignored() {
+        let text = format!("{FULL}\n[storage]\npth = \"/data/s.sqlite3\"\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "a misspelled key must not silently leave storage off: {err}"
+        );
     }
 
     #[test]

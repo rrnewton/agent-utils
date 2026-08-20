@@ -7,7 +7,14 @@
 #   2. Loads configuration and verifies every REQUIRED variable is actually set, by name.
 #   3. Optionally (off by default) makes sure the cloudflared tunnel unit is running.
 #   4. Rebuilds the image.
-#   5. Removes a leftover STOPPED container, then runs the new one detached.
+#   5. Removes a leftover STOPPED container, then runs the new one detached, with a host
+#      directory bind-mounted for durable state.
+#
+# DURABLE STATE. The server keeps the /voice transcript and its own read marks in a SQLite file.
+# That file must live OUTSIDE the container: this script replaces the container on every launch,
+# so anything written into the image's writable layer is destroyed by the next deploy, silently.
+# GENT_TALK_DATA_DIR (default: ${XDG_DATA_HOME:-$HOME/.local/share}/gent-talk) is created 0700
+# and mounted at /var/lib/gent-talk. --status reports it. Deleting that directory is the purge.
 #
 # Usage:
 #   scripts/run.sh [--shutdown] [--restart] [--logs] [--follow] [--status] [--tunnel-status]
@@ -27,7 +34,8 @@
 #                  though you had started the container in the foreground yourself. Nothing is
 #                  stopped when you interrupt it; you are only reading.
 #   --status       Report what is running, plus config, container name, restart policy, whether
-#                  logs are being retained, and tunnel state; then exit.
+#                  logs are being retained, where durable state is mounted from, and tunnel state;
+#                  then exit.
 #   --tunnel-status  Report the cloudflared tunnel user unit: whether it is active, since when,
 #                  whether it is enabled at boot, and the hostname it serves. STRICTLY READ-ONLY
 #                  — it never starts, stops, or enables anything. Exits 0 when the unit is
@@ -178,6 +186,7 @@ OPTIONAL_VARS=(
     GENT_TALK_PUBLIC_BASE_URL
     GENT_TALK_TIMEZONE
     GENT_TALK_SKIP_STARTUP_PROBE
+    GENT_TALK_STORAGE_PATH
     RUST_LOG
 )
 # Settings for this launcher itself (not for the server). They may be set in the same config file.
@@ -192,6 +201,7 @@ LAUNCHER_VARS=(
     GENT_TALK_TUNNEL_UNIT
     GENT_TALK_TUNNEL_CONFIG
     GENT_TALK_ENGINE
+    GENT_TALK_DATA_DIR
 )
 
 CONFIG_FILE=""
@@ -520,6 +530,13 @@ HOST_ADDR="${GENT_TALK_HOST_ADDR:-127.0.0.1}"
 TUNNEL_UNIT="${GENT_TALK_TUNNEL_UNIT:-cloudflared-gent-talk.service}"
 TUNNEL_CONFIG="${GENT_TALK_TUNNEL_CONFIG:-$HOME/.cloudflared/config.yml}"
 ENGINE="${GENT_TALK_ENGINE:-podman}"
+# The HOST directory bind-mounted at /var/lib/gent-talk. This mount, not the image's VOLUME
+# declaration, is what makes durable state actually durable: without it the store lives in the
+# container's writable layer and is destroyed the next time this script replaces the container —
+# which it does on every launch. An anonymous podman volume would survive but is trivially
+# orphaned and impossible to find later, so the explicit path is the mechanism.
+DATA_DIR="${GENT_TALK_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/gent-talk}"
+CONTAINER_DATA_DIR=/var/lib/gent-talk
 IMAGE_REF="${IMAGE_NAME}:${IMAGE_TAG}"
 # Defaults to the image name, so the self-test's throwaway image gets a throwaway container name
 # and can never collide with the real 'gent-talk'.
@@ -729,6 +746,11 @@ if [ "$STATUS_ONLY" = 1 ]; then
     note "                read them with: $SCRIPT_DIR/run.sh --logs   (or --follow to stream)"
     note "                they are discarded at the next launch, when the old container is removed."
     note "config file:    ${SOURCED_FILES[*]}"
+    if [ -d "$DATA_DIR" ]; then
+        note "durable state:  $DATA_DIR -> $CONTAINER_DATA_DIR  (exists; transcripts and read marks survive a rebuild)"
+    else
+        note "durable state:  $DATA_DIR -> $CONTAINER_DATA_DIR  (NOT created yet; the next launch creates it 0700)"
+    fi
     note "tunnel check:   $([ "$TUNNEL_ENABLED" = 1 ] && echo "enabled (unit $TUNNEL_UNIT)" || echo "disabled")   — see --tunnel-status for the unit itself"
     if [ -n "$FOUND" ]; then
         note "running:"
@@ -1053,7 +1075,21 @@ fi
 
 # -d and no --rm: see the header. The container outlives this shell, and keeps its logs when it
 # stops.
+# Create the state directory before the mount, and privately: podman would otherwise create it
+# root-owned or with the umask's permissions, and what lands in it is the owner's speech and
+# third-party channel text.
+if [ "$DRY_RUN" = 1 ]; then
+    note "(dry run) would ensure $DATA_DIR exists, mode 0700"
+else
+    mkdir -p -- "$DATA_DIR" || die "cannot create the state directory: $DATA_DIR
+Set GENT_TALK_DATA_DIR to somewhere this user can write."
+    chmod 700 -- "$DATA_DIR" || die "cannot restrict the state directory: $DATA_DIR"
+fi
+
 run_args=(run -d --name "$CONTAINER_NAME" --restart "$RESTART_POLICY" -p "${HOST_ADDR}:${HOST_PORT}:8080")
+# :Z relabels for SELinux, which is what makes the mount readable to a rootless container on a
+# host that enforces it. Without it the server starts and every storage call fails with EACCES.
+run_args+=(-v "${DATA_DIR}:${CONTAINER_DATA_DIR}:Z")
 for var in "${REQUIRED_VARS[@]}" "${OPTIONAL_VARS[@]}"; do
     [ -n "${!var:-}" ] || continue
     export "${var?}"
@@ -1077,3 +1113,4 @@ note "follow the output:  $SCRIPT_DIR/run.sh --follow"
 note "one-shot log dump:  $SCRIPT_DIR/run.sh --logs"
 note "stop it:            $SCRIPT_DIR/run.sh --shutdown   (logs survive; they go at the next launch)"
 note "state, any time:    $SCRIPT_DIR/run.sh --status"
+note "durable state:      $DATA_DIR (mounted at $CONTAINER_DATA_DIR; survives rebuilds, delete it to purge)"

@@ -88,3 +88,25 @@ writable = false
 # Where to mint signed URLs from. Only change this to point at a regional endpoint or a proxy.
 # Environment: GENT_TALK_ELEVENLABS_API_BASE
 # api_base = "https://api.elevenlabs.io/v1"
+
+[storage]
+# Durable state: the /voice conversation transcript, and how far the owner has read in each
+# channel. Everything else this server does is stateless — channel content is never cached.
+#
+# UNSET MEANS OFF, and off is honest: the routes that need a store answer 503
+# storage_not_configured rather than keeping state in memory that evaporates on restart.
+#
+# The path must be ABSOLUTE. A relative path is resolved against the working directory, which in
+# a container is a directory INSIDE THE IMAGE — that store works perfectly until the next rebuild
+# and then is gone, with no error. In a container this must be a mounted volume; the image
+# defaults it to /var/lib/gent-talk/gent-talk.sqlite3 and declares a VOLUME there.
+#
+# The file is created 0600 and its directory 0700. Anyone with filesystem access to the host can
+# still read it: it holds the owner's speech and third-party channel text in the clear.
+# Environment: GENT_TALK_STORAGE_PATH
+# path = "/var/lib/gent-talk/gent-talk.sqlite3"
+
+# Retention. Enforced on every append, not by a sweeper that might not run.
+# max_conversations = 50            # oldest dropped first; at least 1
+# max_turns_per_conversation = 1000 # further turns are refused with 413; at least 1
+# retain_days = 30                  # 0 means no age limit
