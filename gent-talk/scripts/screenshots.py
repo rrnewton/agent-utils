@@ -99,6 +99,7 @@ EXIT CODES -- a failure says WHICH failure
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import pathlib
@@ -1129,10 +1130,20 @@ LONG_TRANSCRIPT = [
 
 
 def _act_long_scroll(driver: Driver) -> None:
-    driver.click("view-switch")  # back to the call
-    driver.page.wait_for_function(
-        "() => window.__text('view-switch-label') === 'Voice'", timeout=5_000
-    )
+    """A long call, parked mid-scroll — and the state the two below are built on.
+
+    SELF-CONTAINED, by `#74 scroll-test-strength` finding 3. It used to begin by switching back to
+    the call, which only worked because `10-discord-view` had left the Discord pane up, and the two
+    states after it inherited whatever this one left on the screen. That made the chain invisible:
+    `13-jump-to-newest` photographed a "Collapse all" chip that belonged to `12`, and neither could
+    be run with `--only` at all — which is exactly when somebody reaches for one scene.
+
+    So it loads the page itself, and `_act_one_expanded` and `_act_jump_to_newest` CALL this rather
+    than assuming it ran. The dependency is still real; it is now written down in code that
+    executes, which is the only kind that cannot go stale.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
@@ -1159,6 +1170,11 @@ def _act_one_expanded(driver: Driver) -> None:
     # what makes the list above skimmable. The one thing a unit test cannot check is whether three
     # lines is actually three lines — a line clamp is a rendering fact — so this state exists to be
     # LOOKED at, with one message opened among the closed ones for the comparison.
+    #
+    # It builds its own folded transcript rather than assuming the state before it left one. `#74
+    # scroll-test-strength` finding 3: this scene could not be run with `--only` at all, because
+    # "there is already a long folded list on the screen" was a dependency nothing declared.
+    _act_long_scroll(driver)
     driver.js("(() => { document.getElementById('scroll-area').scrollTop = 0; })()")
     driver.settle(150)
     # Measure ONE message closed, then open THAT ONE. Comparing the first open message against the
@@ -1191,8 +1207,19 @@ def _act_one_expanded(driver: Driver) -> None:
 
 
 def _act_jump_to_newest(driver: Driver) -> None:
-    # A turn arrives while the reader is up in the history. The page must NOT drag them down to it
-    # — and must not leave them unaware it happened either, which is what the chip is for.
+    """A turn arrives while the reader is up in the history: the view holds, and the chip appears.
+
+    The page must NOT drag them down to it — and must not leave them unaware it happened either,
+    which is what the chip is for.
+
+    ITS OWN TRANSCRIPT, and that is the fix rather than tidying. `#74 scroll-test-strength` finding
+    3: this scene used to inherit whatever `12-collapsed-long-transcript` left behind, so the frame
+    showed a "Collapse all" chip belonging to a message THAT scene had opened, while this one's own
+    description says "the chip appeared", singular. A picture with two chips in it, filed under a
+    name that mentions one, is worse than no picture: it is evidence for a state the walk was never
+    in. Building the list here makes the frame the one the name promises, and makes `--only` work.
+    """
+    _act_long_scroll(driver)
     driver.js(
         "(() => { const a = document.getElementById('scroll-area'); "
         "a.scrollTop = Math.round(a.scrollHeight * 0.2); return a.scrollTop; })()"
@@ -2172,6 +2199,14 @@ SCENES: tuple[Scene, ...] = (
         act=_act_jump_to_newest,
         expect=(
             ("the chip offering the newest line is on screen", "window.__visible('jump-newest')"),
+            (
+                # `#74 scroll-test-strength`, finding 3. THE chip, singular, which is what this
+                # state's own description promises: the frame used to carry "Collapse all" as well,
+                # left open by the scene before it, and a picture of two chips filed under a name
+                # that mentions one is evidence for a state the walk was never in.
+                "nothing is open, so this is a picture of the ONE chip it says it is",
+                "!window.__visible('collapse-all')",
+            ),
             (
                 "the arrival did NOT drag the reader to the bottom",
                 "(() => { const a = document.getElementById('scroll-area'); "
@@ -3164,7 +3199,7 @@ def check_state_controls() -> list[str]:
         # the whole content of state 12; "a turn arrived and the view did not move" is the whole
         # content of state 13.
         "12-collapsed-long-transcript": "data-collapsed",
-        "13-jump-to-newest": "jump-newest",
+        "13-jump-to-newest": ("jump-newest", "!window.__visible('collapse-all')"),
         # `#55 voice-desktop-app`. Both pinned to a MEASUREMENT rather than to an element being on
         # screen: the whole content of state 14 is that the column is narrower than the window it
         # sits in, and the whole content of state 15 is that the control really moved it. A scene
@@ -3275,6 +3310,43 @@ def check_state_controls() -> list[str]:
     if "seam that marks" not in text:
         problems.append("an unreachable state's error does not say WHICH expectation failed.")
 
+    return problems
+
+
+def check_standalone_scene_controls() -> list[str]:
+    """`#74 scroll-test-strength`, finding 3: a scene's dependencies are in code, not in the order.
+
+    The walk through a session is deliberately a chain -- `04-muted` is a picture of the call
+    `03-live-call` started, and rebuilding it would be a fiction. What is NOT allowed is a scene
+    that inherits state it does not photograph: `13-jump-to-newest` used to show a "Collapse all"
+    chip opened by the scene before it, and neither that scene nor `12-collapsed-long-transcript`
+    could be run with `--only`, because "there is already a folded transcript on screen" was a
+    requirement nothing stated.
+
+    The fix was to make the three transcript states build the list they photograph, through one
+    shared act. This is what stops that quietly coming undone: the builder has to load the page,
+    and the two states after it have to call the builder.
+    """
+    problems: list[str] = []
+    builder = inspect.getsource(_act_long_scroll)
+    if "driver.load(" not in builder:
+        problems.append(
+            "_act_long_scroll no longer loads the page itself, so the three transcript states "
+            "depend on whichever scene happened to run before them -- and none of them can be run "
+            "with --only."
+        )
+    for name in ("12-collapsed-long-transcript", "13-jump-to-newest"):
+        scene = next((s for s in SCENES if s.name == name), None)
+        if scene is None:
+            problems.append(f"the '{name}' state is gone from the scene table.")
+            continue
+        if "_act_long_scroll(" not in inspect.getsource(scene.act):
+            problems.append(
+                f"scene '{name}' no longer builds the transcript it photographs. It would then "
+                "inherit whatever the scene before it left open -- which is the defect `#74 "
+                "scroll-test-strength` recorded, and it reads as a page bug rather than as a "
+                "harness one."
+            )
     return problems
 
 
@@ -3511,6 +3583,7 @@ SELF_TEST_CHECKS = (
     "a rejected capture is still left on disk to look at",
     "record_capture accepts and writes a rendered frame",
     "every state declares at least one expectation before its shutter opens",
+    "the three transcript states build the list they photograph, so --only reaches any of them",
     "an unreachable state's error names the state AND the expectation",
     "a phone-class profile with a real device scale factor survives",
     "both a tall and a short phone profile survive",
@@ -3536,6 +3609,7 @@ def run_self_test(tmp: Path) -> int:
         + check_image_judgement_controls()
         + check_blank_gate_controls(tmp)
         + check_state_controls()
+        + check_standalone_scene_controls()
         + check_profile_controls()
         + check_theme_controls()
         + check_dependency_message_controls()

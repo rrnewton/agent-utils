@@ -337,7 +337,8 @@ class FakeElement {
     this.attributes = new Map();
     this.listeners = new Map();
     // The scroll area is the one element that scrolls; the page pins it to the newest line.
-    this.scrollTop = 0;
+    // CLAMPED on the way in — see the accessor below.
+    this.scrollPosition = 0;
     // A real browser clamps scrollTop to scrollHeight - clientHeight, so the page cannot ask
     // "is the reader at the bottom?" without a viewport height. Zero everywhere except the one
     // element that has one; `newPage` gives #scroll-area SCROLL_VIEWPORT_PX.
@@ -360,6 +361,30 @@ class FakeElement {
       getPropertyValue: (name) => (properties.has(name) ? properties.get(name) : ""),
       removeProperty: (name) => properties.delete(name),
     };
+  }
+
+  /**
+   * How far this element is scrolled — CLAMPED, exactly as a browser clamps it.
+   *
+   * `#74 scroll-test-strength`, finding 1. Without the clamp, "the reader is looking at the same
+   * line" was algebraically forced: `getBoundingClientRect().top` here is `offsetTop() - scrollTop`
+   * and the page's restore is `scrollTop += top - before`, so substituting one into the other makes
+   * the post-mutation top identically `before` FOR ANY HEIGHT CHANGE — including a restore that
+   * scrolls past the end of the content, which no browser will do. A fixture that accepts an
+   * unreachable position cannot tell a correct restore from one that overshoots by a screenful.
+   *
+   * So the position a test can observe is the position a browser would really have: never past
+   * `scrollHeight - clientHeight`, never below zero. An element with nothing to scroll — every
+   * element here except #scroll-area — therefore sits at zero and stays there, which is also true
+   * of the real thing.
+   */
+  get scrollTop() {
+    return this.scrollPosition;
+  }
+
+  set scrollTop(value) {
+    const furthest = Math.max(0, this.scrollHeight - this.clientHeight);
+    this.scrollPosition = Math.max(0, Math.min(Number(value) || 0, furthest));
   }
 
   /** Whether this element's class list contains a word — `className` here is a plain string. */
@@ -1408,7 +1433,13 @@ const words = (text) => text.trim().split(/\s+/).filter(Boolean).length;
  * A FLOOR, because the assertion this replaces was `length > 120` and that floor was the whole
  * reason it existed: without one, deleting the explanation outright passes.
  */
-const SEAM_DETAIL_MIN_WORDS = 10;
+// RAISED from 10 by `#74 scroll-test-strength`, finding 2, and deliberately: the shortest
+// disclosure the page actually ships is eighteen words, so a floor of ten let every one of them be
+// cut to half its length with this and both seam tests still green. Fifteen is under the shortest
+// live one with a little room to edit, and over the point where a disclosure stops being able to
+// say both of the things these seams have to say — what happened, and what it means for the
+// agent's memory.
+const SEAM_DETAIL_MIN_WORDS = 15;
 const SEAM_DETAIL_MAX_WORDS = 28;
 
 /** The one status line's machine-readable state, which is what colours its dot. */
@@ -3378,6 +3409,48 @@ test("clearing during a call empties the screen and says the agent has not forgo
   assert.notEqual(page.sockets[0].readyState, 3);
 });
 
+test("THE VIEW-CLEARED SEAM SAYS ALL THREE OF THE THINGS IT IS THERE TO SAY", async () => {
+  // `#74 scroll-test-strength`, finding 2. One clause of this disclosure was pinned and the other
+  // two were not, so the sentences that distinguish "the screen was emptied" from "the call ended"
+  // — the two the ambiguous middle turns on — could be deleted with every test still green.
+  //
+  // Three claims, and each is a separate thing the reader has to be told:
+  //
+  //   1. WHAT was emptied, and that nothing else was;
+  //   2. that the AGENT still has everything said before this point;
+  //   3. WHICH control would have ended the call, since this one did not.
+  //
+  // Pinned as three assertions rather than one string comparison: the wording is allowed to be
+  // edited, and what may not go is any of the three.
+  const page = newPage();
+  await startTalking(page);
+  page.sockets[0].onmessage({
+    data: JSON.stringify({
+      type: "agent_response",
+      agent_response_event: { agent_response: "the secret is 12345" },
+    }),
+  });
+
+  await page.el("clear-view").click();
+  await page.el("clear-view").click();
+
+  const line = page.el("transcript").children.find((li) => li.className === "seam");
+  assert.ok(line, "clearing during a call drew no seam at all");
+  const detail = seamDetail(line);
+  assert.match(detail, /nothing else was/, "it no longer says what was NOT emptied");
+  assert.match(detail, /still has everything said before this point/, "the agent's memory claim");
+  assert.match(detail, /Hang up is what ends the call/, "it no longer says what WOULD end the call");
+  // ...and the negative that keeps it from drifting into the OTHER seam's wording. These two are
+  // the same idiom in the same list, and the end-of-call one says the opposite about memory: an
+  // edit that copied it here would be the interface telling the reader the agent has forgotten
+  // everything they just cleared.
+  assert.doesNotMatch(
+    detail,
+    /has never seen anything above it/,
+    "the view-cleared seam is claiming the agent's memory was emptied too"
+  );
+});
+
 test("clearing while idle just clears, with no claim about an agent that is not there", async () => {
   const page = newPage();
   await signIn(page);
@@ -4007,6 +4080,37 @@ test("the channel view opens on the NEWEST message, not the top", async () => {
   assert.ok(atBottomOf(area), "the channel opened at the top of the history");
 });
 
+test("AND THE NEWEST MESSAGE IS REALLY ON THE SCREEN WHEN IT GETS THERE", async () => {
+  // `#74 scroll-test-strength`, finding 1, at its root. The page pins itself to the newest line
+  // with `scrollTop = scrollHeight`, which is a value NO BROWSER ACCEPTS: it clamps to
+  // `scrollHeight - clientHeight`. A fixture that took that assignment at its word modelled "at
+  // the newest line" as a whole viewport PAST the last row — so the row the reader is supposedly
+  // looking at was off the top of the screen, and every question this suite asks about following
+  // the newest line was being answered about a position that cannot exist.
+  //
+  // The clamp on `scrollTop` is what fixes that, and this is what can see it: the assertion is
+  // about pixels the reader can look at, not about a number the page set.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallChannel());
+  const area = page.el("scroll-area");
+  assert.ok(area.scrollHeight > area.clientHeight * 2, "the channel does not overflow");
+
+  const furthest = area.scrollHeight - area.clientHeight;
+  assert.ok(
+    area.scrollTop <= furthest,
+    `the page is scrolled to ${area.scrollTop}, past the ${furthest} a browser would allow`
+  );
+  const rows = page.el("discord-log").children;
+  const newest = rows[rows.length - 1];
+  const rect = newest.getBoundingClientRect();
+  assert.ok(
+    rect.bottom > 0 && rect.top < area.clientHeight,
+    `the newest row occupies ${rect.top}..${rect.bottom} of a 0..${area.clientHeight} viewport, ` +
+      "so the reader was taken somewhere it cannot be seen"
+  );
+});
+
 test("EVERY visit to the channel view opens on the newest message, not just the first", async () => {
   // The regression this guards: the only scroll-to-bottom used to live in loadDiscord(), which
   // runs solely on the FIRST switch. Both panes share one scroll container, so every later
@@ -4288,12 +4392,30 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
     await page.el("load-older").click();
     await page.settle();
 
-    return { page, moved: anchor.getBoundingClientRect().top - before };
+    return { page, area, moved: anchor.getBoundingClientRect().top - before };
   };
 
-  const { page, moved } = await run();
+  const { page, area, moved } = await run();
   assert.equal(page.el("discord-log").children.length, 16, "the older step did not arrive");
   assert.equal(moved, 0, `the line the reader was looking at moved ${moved}px`);
+
+  // WHAT THIS ASSERTION IS, EXACTLY. `#74 scroll-test-strength`, finding 1, recorded here rather
+  // than left for the next reader to rediscover: `getBoundingClientRect().top` in this fixture is
+  // `offsetTop() - scrollTop` and the page's restore is `scrollTop += top - before`, so the two
+  // substituted into each other make the post-mutation top identically `before`. Read on its own,
+  // `moved === 0` therefore says "the restore formula was applied, against the same anchor" — a
+  // real claim, and a smaller one than the sentence in the test's name.
+  //
+  // Two things make the rest of the claim real, and both are below. The fixture CLAMPS scrollTop
+  // the way a browser does, so a restore that scrolls past the end of the content is refused and
+  // the anchor moves; and the position is asserted to be strictly INSIDE the range, so `moved ===
+  // 0` cannot have been reached by being pinned against either end of it.
+  const furthest = area.scrollHeight - area.clientHeight;
+  assert.ok(
+    area.scrollTop > 0 && area.scrollTop < furthest,
+    `the restore landed at ${area.scrollTop} of 0..${furthest} — against an end of the range, ` +
+      "which is a position the clamp could have produced from any overshoot at all"
+  );
 
   // THE CONTROL. Without it the fixture could be one that never moves scrollTop at all.
   const control = await run(
@@ -4307,6 +4429,24 @@ test("LOADING OLDER MESSAGES LEAVES THE READER LOOKING AT THE SAME LINE", async 
     0,
     "with the restore deleted the view still did not move, so this test cannot tell an anchored " +
       "page from an unanchored one"
+  );
+
+  // THE SECOND CONTROL, and the one that answers the reading above: "against the same anchor" is
+  // the load-bearing half of what `moved === 0` proves, so a page that applies the very same
+  // formula against a DIFFERENT element has to fail here. It is not a hypothetical mistake — the
+  // first child of the log is a perfectly natural thing to measure, and after a prepend it is not
+  // the same row it was.
+  const wrongAnchor = await run(
+    brokenScript(
+      "  area.scrollTop += mark.anchor.getBoundingClientRect().top - mark.top;",
+      '  area.scrollTop += el("discord-log").children[0].getBoundingClientRect().top - mark.top;'
+    )
+  );
+  assert.notEqual(
+    wrongAnchor.moved,
+    0,
+    "the restore measured against a different element and the reader still did not move, so this " +
+      "test cannot see WHICH anchor the formula was applied to"
   );
 });
 

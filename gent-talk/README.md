@@ -1632,6 +1632,18 @@ posted to the wrong channel, or ignored the scope split fails those tests. The p
 Discord client that cannot be exercised without a token — the URL, the `Bot ` authorization prefix,
 the request body, and the payload-to-message mapping — are pure functions with their own tests.
 
+**The page suite's scroll position is clamped, exactly as a browser clamps it**, and that is not
+tidiness. `scrollTop` in a browser can never exceed `scrollHeight - clientHeight`; a fixture that
+took `scrollTop = scrollHeight` at its word — which is how the page pins itself to the newest line
+— modelled "at the newest message" as a whole viewport PAST the last row, so every question the
+suite asks about following the newest line was being answered about a position that cannot exist.
+It also left the anchoring assertion weaker than it reads: `getBoundingClientRect().top` is
+`offsetTop - scrollTop` here and the restore is `scrollTop += top - before`, so "the reader did not
+move" is algebraically forced for any height change at all — including a restore that scrolls past
+the end of the content. The clamp refuses that, the anchoring test additionally requires the
+resulting position to be strictly inside the range, and it carries a second negative control: the
+same formula applied against a DIFFERENT element has to fail. `#74 scroll-test-strength`.
+
 The safety tests were checked against deliberate breakage rather than assumed to have teeth. Four
 mutations were applied one at a time and the suite was required to go red for each: removing the
 bearer check in the MCP transport (3 failures), removing the channel allowlist in `src/ops.rs`
@@ -1720,7 +1732,17 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 46 controls for those checks offline, with no browser and
+**The walk is a chain, and where that is a lie it has been made false.** Most of these states are
+one continuous session on purpose — `04-muted` is a picture of the call `03-live-call` started, and
+rebuilding it would be a fiction. What is not allowed is a state that inherits something it does
+not photograph: `13-jump-to-newest` used to show a "Collapse all" chip opened by the scene before
+it, while its own description says "the chip appeared", singular — and neither it nor
+`12-collapsed-long-transcript` could be run with `--only`, because "there is already a folded
+transcript on screen" was a requirement nothing stated. The three transcript states now build the
+list they photograph, through one shared act, and `--self-test` checks that they still do.
+`#74 scroll-test-strength`.
+
+`scripts/screenshots.py --self-test` runs 47 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.
