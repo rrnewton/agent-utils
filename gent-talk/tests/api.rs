@@ -1834,6 +1834,54 @@ async fn bankruptcy_over_http_clears_through_the_boundary_and_hands_back_its_own
 }
 
 #[tokio::test]
+async fn a_bankruptcy_carries_the_window_it_was_read_with_over_the_wire() {
+    // The paging client, end to end: it read `/todo?limit=1`, so it displayed one row, so giving up
+    // on that row must clear one row. `ops` enforces it; what is tested HERE is that the number
+    // survives the request body at all — a `limit` the deserializer dropped would leave the whole
+    // guard unreachable from the only place callers can reach it.
+    let (harness, _store, ids) = todo_harness();
+    let (status, page) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo?limit=1"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["messages"].as_array().expect("messages").len(), 1);
+
+    let (status, cleared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "through": ids[2], "limit": 1 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(
+        cleared["messages"],
+        serde_json::json!([ids[2]]),
+        "the request said it had displayed one message and cleared more: {cleared}"
+    );
+
+    let (_status, left) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        left["messages"].as_array().expect("messages").len(),
+        2,
+        "messages the caller never displayed were cleared: {left}"
+    );
+}
+
+#[tokio::test]
 async fn a_dismissal_that_names_both_ways_of_choosing_is_refused_rather_than_guessed() {
     // Guessing would be wrong half the time, and the wrong half CLEARS A BACKLOG. An empty
     // request is refused for the neighbouring reason: reporting success for having done nothing

@@ -141,7 +141,7 @@ async fn bankruptcy_clears_everything_through_the_boundary_and_nothing_after_it(
     // row the reader pressed is part of what they are giving up on, and a version that excluded it
     // would leave one message behind on every single use, which reads as the feature not working.
     let server = Server::with(5);
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(2))
+    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(2), None)
         .await
         .expect("declares");
 
@@ -161,7 +161,7 @@ async fn bankruptcy_clears_everything_through_the_boundary_and_nothing_after_it(
 async fn bankruptcy_at_the_newest_message_clears_the_whole_backlog_and_undo_brings_it_all_back() {
     // The other edge, and the ordinary use: the reader gives up on everything they can see.
     let server = Server::with(5);
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(4))
+    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(4), None)
         .await
         .expect("declares");
     assert_eq!(change.messages.len(), 5);
@@ -175,6 +175,55 @@ async fn bankruptcy_at_the_newest_message_clears_the_whole_backlog_and_undo_brin
 }
 
 #[tokio::test]
+async fn bankruptcy_clears_only_the_window_the_reader_actually_read() {
+    // THE worst failure this view has: clearing work the owner never saw. A paging client reads
+    // `/todo?limit=3`, the reader gives up on the three rows in front of them, and the boundary
+    // they name is the newest of those three. Resolved against the DEFAULT window, that same
+    // boundary means "everything through the newest message in the channel" — ten here, fifty in
+    // the shipped configuration — and the rows above it are marked dealt with without ever having
+    // been on screen. The undo would recover them, but only for a reader who noticed.
+    let server = Server::with(10);
+    let read = ops::todo(&server.state, READ_CHANNEL, Some(3))
+        .await
+        .expect("reads");
+    assert_eq!(read.messages.len(), 3, "the narrowed read is the premise");
+
+    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(9), Some(3))
+        .await
+        .expect("declares");
+    assert_eq!(
+        change.messages,
+        vec![server.id(7), server.id(8), server.id(9)],
+        "bankruptcy cleared outside the window it was read with: {:?}",
+        change.messages
+    );
+    assert_eq!(
+        server.left().await.len(),
+        7,
+        "the seven messages above the reader's page were cleared unseen"
+    );
+
+    // ...and a boundary the caller could not have displayed is a refusal rather than a silent
+    // widening: naming the oldest message of the channel from a three-message page is either a bug
+    // in the caller or an attempt to clear what it never showed.
+    assert_eq!(
+        ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(0), Some(3))
+            .await
+            .expect_err("must refuse")
+            .code(),
+        "unknown_message"
+    );
+
+    // THE CONTROL: the same boundary with the same window the default read uses clears the lot, so
+    // the assertion above is about the LIMIT and not about a bankruptcy that stopped working.
+    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(6), None)
+        .await
+        .expect("declares");
+    assert_eq!(change.messages.len(), 7);
+    assert!(server.left().await.is_empty());
+}
+
+#[tokio::test]
 async fn bankruptcy_reports_only_what_it_really_cleared_so_the_undo_cannot_resurrect_older_work() {
     // THE trap in a bulk undo. The reader dealt with one message an hour ago and then declared
     // bankruptcy through a later one. If the bankruptcy claimed the earlier message too, undoing
@@ -185,7 +234,7 @@ async fn bankruptcy_reports_only_what_it_really_cleared_so_the_undo_cannot_resur
         .await
         .expect("dismisses");
 
-    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(3))
+    let change = ops::declare_bankruptcy(&server.state, READ_CHANNEL, &server.id(3), None)
         .await
         .expect("declares");
     assert_eq!(
@@ -259,7 +308,8 @@ async fn a_message_outside_the_window_or_the_allowlist_cannot_grow_the_store() {
         ops::declare_bankruptcy(
             &server.state,
             READ_CHANNEL,
-            &MessageId("1000000000000009999".to_owned())
+            &MessageId("1000000000000009999".to_owned()),
+            None
         )
         .await
         .expect_err("must refuse")

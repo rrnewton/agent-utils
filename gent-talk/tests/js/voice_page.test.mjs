@@ -948,6 +948,14 @@ function newPage(store = new Map(), script = SCRIPT) {
     dealtWith: new Set(),
     /** How many times the page has read the to-do list. */
     todoReads: 0,
+    /**
+     * Every to-do read, as the URL it went out on.
+     *
+     * The PATH rather than a count, because the window the page read with is half of a fact whose
+     * other half is on the dismissal: a bulk clear has to name the same window it displayed, and a
+     * fixture that recorded only "a read happened" could not say whether the two agree.
+     */
+    todoReadPaths: [],
     /** Every dismissal and every restoration the page sent, exactly as it went out. */
     dismissCalls: [],
     restoreCalls: [],
@@ -1164,6 +1172,7 @@ function newPage(store = new Map(), script = SCRIPT) {
       // can read its own record back" are the same fact here as they are on the server.
       if (/\/todo(\?|$)/.test(String(path))) {
         page.todoReads += 1;
+        page.todoReadPaths.push(String(path));
         const left = page.messages.filter((m) => !page.dealtWith.has(String(m.id)));
         return json(200, {
           channel: CHANNEL,
@@ -4803,6 +4812,56 @@ test("scrolling past a message asks for its summary ONCE, not once per scroll ev
   }
 });
 
+test("the one-ask record is written BEFORE the request, not when the answer comes back", async () => {
+  // `#49 cached-summaries`' headline property, and the ONE the test above cannot see: its fixture
+  // answers immediately, so every response lands between two scroll events and a record written in
+  // the response handler looks exactly like a record written before the await. Here the answers are
+  // HELD, which is what a phone on a slow connection does — twenty scroll events all fire while the
+  // first request is still in flight.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallChannel());
+
+  let release = null;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const answer = page.summaryResponse;
+  page.summaryResponse = async (id) => {
+    await held;
+    return answer(id);
+  };
+
+  await turnSummariesOn(page);
+  const inFlight = page.summaryAsks.length;
+  assert.ok(inFlight > 0, "nothing was asked about at all, so 'exactly once' is vacuous");
+
+  const area = page.el("scroll-area");
+  for (let i = 0; i < 20; i += 1) {
+    area.scrollTop = area.scrollHeight - i;
+    await area.dispatch("scroll");
+  }
+  await page.settle();
+  assert.equal(
+    page.summaryAsks.length,
+    inFlight,
+    "twenty scroll events over rows whose answers had not come back yet issued fresh requests: " +
+      "the one-ask record is being written in the response handler, so it is not written at all " +
+      "until the response lands"
+  );
+
+  // ...and the answers landing does not open a second window in which the same rows can be asked
+  // about again.
+  release();
+  await page.settle();
+  area.scrollTop = area.scrollHeight;
+  await area.dispatch("scroll");
+  await page.settle();
+  for (const id of new Set(page.summaryAsks.map((ask) => ask.message))) {
+    assert.equal(asksFor(page, id), 1, `message ${id} was asked about more than once`);
+  }
+});
+
 test("only the rows near the viewport are summarised, and reaching the others summarises those", async () => {
   // "Produced on demand as the reader scrolls" is the whole cost argument: nothing is spent on
   // messages nobody looks at. A page that summarised the loaded window on entering the mode would
@@ -5248,10 +5307,47 @@ test("declaring bankruptcy says how many it will clear, and takes two taps to do
   await page.settle();
   assert.deepStrictEqual(
     page.dismissCalls,
-    [{ through: "8000000000000000004" }],
-    "bankruptcy did not go through the newest message as a boundary"
+    [{ through: "8000000000000000004", limit: readWindow(page) }],
+    "bankruptcy did not go through the newest message as a boundary, in the window it displayed"
   );
   assert.deepStrictEqual(shownIds(page), [], "the backlog survived being declared bankrupt");
+});
+
+/** The `limit` the page last read the to-do list with, as a number. */
+function readWindow(page) {
+  const last = page.todoReadPaths[page.todoReadPaths.length - 1];
+  assert.ok(last, "the page never read the to-do list");
+  const asked = new URL(last, "https://example.invalid").searchParams.get("limit");
+  assert.ok(asked, `the to-do read named no window at all: ${last}`);
+  return Number(asked);
+}
+
+test("a bulk clear names the window it READ with, so it cannot clear what it never showed", async () => {
+  // The worst failure this view has, and it is a two-sided fact: the server resolves `{through}`
+  // against a window of its own, so a boundary sent without the window the client displayed is
+  // resolved against the server's DEFAULT — and every message above the reader's page is marked
+  // dealt with having never been on screen. Recoverable by the undo, but only for a reader who
+  // noticed, and the whole point of this control is that it is used when they have stopped reading.
+  //
+  // The server half is in tests/todo.rs and tests/api.rs. What is asserted HERE is that the two
+  // numbers this page sends are the SAME number: a page that read fifty and declared three, or
+  // read three and declared nothing, is the defect whichever way round it is.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(3));
+  await turnTodoOn(page);
+  await page.el("clear-backlog").click();
+  await page.el("clear-backlog").click();
+  await page.settle();
+
+  assert.equal(page.dismissCalls.length, 1);
+  assert.equal(
+    page.dismissCalls[0].limit,
+    readWindow(page),
+    `the clear declared a window of ${page.dismissCalls[0].limit} over a list read with ` +
+      `${readWindow(page)}: the server would resolve the boundary against messages this page ` +
+      "never displayed"
+  );
 });
 
 test("bankruptcy is undoable, and the undo restores every message it cleared", async () => {
@@ -5375,6 +5471,168 @@ test("the head of the to-do list says how much is left OF how much, not how big 
 
   const head = page.el("channel-summary").text();
   assert.match(head, /3 of 4/, `the head of the list does not say 3 of 4: ${head}`);
+});
+
+// --- the to-do list while things are still arriving ----------------------------------------------
+//
+// The view is a filtered list of what has not been dealt with, and it is READ once per act. But the
+// channel does not stop while the reader works through it: a message can arrive on the live stream,
+// and a background poll can bring one in off screen. Both change what the list IS, and everything
+// that DESCRIBES the list has to move with it — the count on the bulk control, the head of the
+// list, and the chip that says something turned up. A view that draws a new row while its own head
+// still says "nothing left to deal with" is worse than one that missed the row: it is a false
+// statement with the counter-example visible directly beneath it.
+
+/** A to-do backlog of rows tall enough to scroll, so "off screen" means something. */
+const tallBacklog = (count) =>
+  Array.from({ length: count }, (_unused, i) =>
+    message({ id: `90000000000000${String(i).padStart(4, "0")}`, content: longMessage(`todo ${i}`) })
+  );
+
+test("a message arriving live while the filter is on is COUNTED, not just drawn", async () => {
+  // The contradiction in its purest form: an empty to-do list, one message arrives, and the head of
+  // the list goes on saying there is nothing to deal with — over a message.
+  const page = newPage();
+  const stream = await withLiveChannel(page, backlog(1));
+  await turnTodoOn(page);
+  await doneButton(page.el("discord-log").children[0]).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), [], "the premise is an emptied to-do list");
+  assert.match(page.el("channel-summary").text(), /nothing left to deal with/);
+  assert.equal(page.el("clear-backlog").hidden, true, "an empty list offered a bulk clear");
+
+  const arriving = message({ id: "9100000000000000001", content: "the runner came back" });
+  page.messages = [...page.messages, arriving]; // the server holds it too, as it really would
+  await deliver(page, stream, sseMessage(arriving));
+
+  assert.deepStrictEqual(
+    shownIds(page),
+    ["9100000000000000001"],
+    "the arriving message never reached the filtered list"
+  );
+  const head = page.el("channel-summary").text();
+  assert.doesNotMatch(
+    head,
+    /nothing left to deal with/,
+    `the head of the list denies the message drawn beneath it: ${head}`
+  );
+  assert.match(head, /^1 of/, `the head does not count the arrival: ${head}`);
+  assert.equal(
+    page.el("clear-backlog").hidden,
+    false,
+    "a list with something in it offered no way to bulk-clear it"
+  );
+});
+
+test("the bulk control counts a message that arrived live, and really clears it", async () => {
+  // The dangerous half. The label is drawn from the page's own count and the act is drawn from the
+  // rows, so a count that stops at the last read means a control that says "clear 2" over three
+  // rows and takes all three — a bulk destructive action understating itself.
+  const page = newPage();
+  const stream = await withLiveChannel(page, backlog(2));
+  await turnTodoOn(page);
+  assert.match(page.el("clear-backlog").textContent, /\(2\)/);
+
+  const arriving = message({ id: "9100000000000000002", content: "and another one" });
+  page.messages = [...page.messages, arriving];
+  await deliver(page, stream, sseMessage(arriving));
+
+  assert.equal(shownIds(page).length, 3);
+  assert.match(
+    page.el("clear-backlog").textContent,
+    /\(3\)/,
+    `the control says ${page.el("clear-backlog").textContent} over three rows it would clear`
+  );
+
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.match(page.el("status").textContent, /clear 3/, "the confirmation undercounts what it asks about");
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.equal(page.dismissCalls[0].through, "9100000000000000002", "the clear stopped at the last read");
+  assert.deepStrictEqual(shownIds(page), []);
+});
+
+test("a reply posted from the to-do list is counted by the list it lands in", async () => {
+  // The SECOND door into the same defect. A posted reply is appended to the log without any read,
+  // exactly as a live arrival is, and it is in the window from now on — so the next `/todo` answer
+  // will count it. A page that counted it only from that next read would spend the time in between
+  // saying one number over a list of another, and the bulk control would clear the row it never
+  // offered to.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(2));
+  await turnTodoOn(page);
+  assert.match(page.el("clear-backlog").textContent, /\(2\)/, "the premise is a count of two");
+
+  await replyButton(page.el("discord-log").children[0]).click();
+  page.el("reply-text").value = "on it";
+  await page.el("reply-text").dispatch("input");
+  await page.el("reply-send").click();
+  await page.settle();
+
+  assert.equal(shownIds(page).length, 3, "the posted reply never landed in the list");
+  assert.match(
+    page.el("clear-backlog").textContent,
+    /\(3\)/,
+    `the control says ${page.el("clear-backlog").textContent} over three rows it would clear`
+  );
+  assert.match(page.el("channel-summary").text(), /^3 of/, "the head of the list undercounts");
+});
+
+test("a message arriving during a to-do POLL raises the chip, as it does in the channel", async () => {
+  // The one view whose entire purpose is surfacing new work was the one that said nothing when new
+  // work turned up off screen. The unfiltered channel beside it has raised this chip since `#44`.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallBacklog(12));
+  await turnTodoOn(page);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0; // working through the older ones, not pinned to the bottom
+
+  page.messages = tallBacklog(13);
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+
+  assert.equal(page.todoReads, 2, "the poll did not read the to-do list");
+  assert.equal(shownIds(page).length, 13, "the poll did not bring the message in");
+  assert.equal(area.scrollTop, 0, "a background poll moved the reader");
+  assert.equal(
+    page.el("jump-newest").hidden,
+    false,
+    "the to-do list gained a message off screen and said nothing — the reader cannot tell"
+  );
+});
+
+test("a to-do poll that returns the same list, and the reader's own act, raise nothing", async () => {
+  // THE CONTROL for the test above, in both directions. A chip raised by an unchanged poll would
+  // nag every forty-five seconds about nothing; a chip raised by the reader's own Done would answer
+  // their tap with an offer to jump to a bottom nothing arrived at.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallBacklog(12));
+  await turnTodoOn(page);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+
+  page.expireTimers(DISCORD_POLL_MS); // same page.messages: nothing new
+  await page.settle();
+  assert.equal(page.todoReads, 2, "the poll did not fire");
+  assert.equal(
+    page.el("jump-newest").hidden,
+    true,
+    "an unchanged to-do list raised a chip; every 45 seconds it would nag about nothing"
+  );
+
+  const rows = page.el("discord-log").children;
+  await doneButton(rows[rows.length - 1]).click(); // deal with the NEWEST, so the newest id moves
+  await page.settle();
+  assert.equal(shownIds(page).length, 11, "the dismissal did not take");
+  assert.equal(
+    page.el("jump-newest").hidden,
+    true,
+    "dealing with the newest row was reported back to the reader as an arrival"
+  );
 });
 
 // --- keeping the channel view fresh ------------------------------------------------------------

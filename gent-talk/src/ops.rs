@@ -789,6 +789,17 @@ pub async fn dismiss(
 /// press on a row and give up on the backlog, and the row they pressed is part of what they are
 /// giving up on. That is a decision, not an accident, and it is tested at the boundary.
 ///
+/// **`limit` is the window the caller READ with, and it bounds what this can clear.** The same
+/// number that was passed to [`todo`], because "everything before this one" means everything the
+/// reader was looking at — and a caller that read a three-message page must not be able to clear a
+/// fifty-message backlog by naming the oldest row of the three. Passing `None` means the default
+/// window, which is what a caller that read `/todo` without a limit was shown. A `through` outside
+/// the narrowed window is [`OpError::UnknownMessage`], which is the right refusal: the caller is
+/// naming a boundary it did not display.
+///
+/// Contrast [`dismiss`], which takes no window: there the window is only a check that the named
+/// ids exist, so narrowing it could only refuse an id the caller really did see.
+///
 /// Answers the exact set it cleared, so the undo is exact — which is what makes a bulk,
 /// destructive action safe enough to offer at all. Messages already dealt with are not in it: they
 /// did not change, and restoring them would resurrect something the reader cleared earlier and
@@ -796,13 +807,14 @@ pub async fn dismiss(
 ///
 /// # Errors
 ///
-/// As [`dismiss`]. `through` must itself be in the window.
+/// As [`dismiss`]. `through` must itself be in the window `limit` describes.
 pub async fn declare_bankruptcy(
     state: &AppState,
     channel_id: &str,
     through: &MessageId,
+    limit: Option<u16>,
 ) -> Result<InboxChange, OpError> {
-    let window = messages(state, channel_id, None).await?;
+    let window = messages(state, channel_id, limit).await?;
     let boundary = window
         .messages
         .iter()

@@ -1220,6 +1220,15 @@ pub struct DismissRequest {
     /// Or: everything in the window at or before this one. The boundary is INCLUDED.
     #[serde(default)]
     pub through: Option<String>,
+    /// The window the caller READ the list with, so `through` cannot clear more than was shown.
+    ///
+    /// The same number sent to `GET /todo?limit=`. Without it a client that paged three messages
+    /// and gave up on them would clear the default fifty, because the boundary would be resolved
+    /// against a window it never displayed — clearing work the owner never saw, which is the worst
+    /// failure this view has. Ignored when `messages` names the ids one by one: there the window is
+    /// only an existence check, so narrowing it could only refuse an id the caller really did see.
+    #[serde(default)]
+    pub limit: Option<u16>,
 }
 
 /// What a dismissal or a restoration actually did.
@@ -1245,6 +1254,16 @@ fn answered(change: ops::InboxChange) -> Response {
     }))
 }
 
+/// Why a dismissal that names both ways of choosing, or neither, is refused.
+///
+/// Held as constants so the match below stays one line per case and reads as the table of four it
+/// is. Guessing between the two would be wrong half the time, and the wrong half CLEARS A BACKLOG.
+const NAMES_BOTH_WAYS: &str = "send either `messages` or `through`, not both: they are different \
+                               acts and guessing which one you meant would clear a backlog by \
+                               accident";
+const NAMES_NEITHER: &str = "send `messages` or `through`; an empty request would report success \
+                             for having done nothing";
+
 /// `POST /api/v1/channels/{channel_id}/dismiss`
 pub async fn dismiss(
     State(state): State<AppState>,
@@ -1254,14 +1273,11 @@ pub async fn dismiss(
 ) -> Result<Response, ApiError> {
     require(&headers, &state, Scope::Write)?;
     let change = match (request.through, request.messages.is_empty()) {
-        (Some(_), false) => {
-            return Err(ApiError::bad_request(
-                "send either `messages` or `through`, not both: they are different acts and \
-                 guessing which one you meant would clear a backlog by accident",
-            ))
-        }
+        (Some(_), false) => return Err(ApiError::bad_request(NAMES_BOTH_WAYS)),
         (Some(through), true) => {
-            ops::declare_bankruptcy(&state, &channel_id, &crate::model::MessageId(through)).await?
+            // WITH the window the caller read the list with. See `DismissRequest::limit`.
+            let boundary = crate::model::MessageId(through);
+            ops::declare_bankruptcy(&state, &channel_id, &boundary, request.limit).await?
         }
         (None, false) => {
             let wanted: Vec<crate::model::MessageId> = request
@@ -1271,12 +1287,7 @@ pub async fn dismiss(
                 .collect();
             ops::dismiss(&state, &channel_id, &wanted).await?
         }
-        (None, true) => {
-            return Err(ApiError::bad_request(
-                "send `messages` or `through`; an empty request would report success for having \
-                 done nothing",
-            ))
-        }
+        (None, true) => return Err(ApiError::bad_request(NAMES_NEITHER)),
     };
     Ok(answered(change))
 }

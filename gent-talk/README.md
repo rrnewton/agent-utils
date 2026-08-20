@@ -528,7 +528,7 @@ not, and neither reveals anything about the configuration.
 | GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
 | GET | `/api/v1/channels/{id}/todo?limit=` | read | the recent window MINUS what has been dealt with |
-| POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` or `{through:id}` — mark as dealt with; answers the exact set it changed |
+| POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}`, or `{through:id, limit:n}` — mark as dealt with; answers the exact set it changed. Send back the `limit` you read `/todo` with, or `through` is resolved against the default window and clears more than you displayed |
 | POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
@@ -939,12 +939,25 @@ Three acts, each reachable from a control:
 - **Done**, on the row. One message, and the answer names it, which is what makes the undo exact.
 - **Clear the backlog**, above the list. Bulk and destructive, so it says how many it is about to
   take, takes two taps — the same armed idiom the dock's Clear control uses — and lapses back to
-  safe after a few seconds. It sends `{through: <newest id>}` and the **boundary is included**:
-  the row you gave up on is part of what you gave up on, and that is tested at the boundary.
+  safe after a few seconds. It sends `{through: <newest id>, limit: <the window it read with>}`
+  and the **boundary is included**: the row you gave up on is part of what you gave up on, and
+  that is tested at the boundary. The `limit` is not decoration: the server resolves `through`
+  against a window of its own, so a boundary sent without one is resolved against the server's
+  default and clears messages that were never displayed. Clearing work the owner never saw is the
+  worst failure this view has, so the window the list was READ with rides along with the act.
 - **Undo**, as a chip, carrying the exact set the server said it cleared. Not "the last N", which
   is a different set by the time it is pressed. A bulk clear that also claimed messages you had
   dealt with *earlier* would resurrect them on undo, so the server reports only what it really
   changed.
+
+**The channel does not stop while you work through it.** A message can arrive on the live stream
+or come in on the 45-second poll while the filter is on, and it is by definition not dealt with —
+so it is one more thing to do, and everything that *describes* the list moves with it in the same
+moment the row appears: the head of the list, the count on **Clear the backlog**, and the Newest
+chip when the row landed off screen. A view that drew the row while its own head still said
+"nothing left to deal with" would be worse than one that missed it — a false statement with the
+counter-example visible directly beneath it — and a bulk control that undercounted would clear
+more than it offered to.
 
 Two consequences worth stating. The walk back is **not** offered over a filtered list: the cursor
 belongs to the unfiltered channel, and stepping back with it would prepend messages you have
@@ -982,9 +995,13 @@ Four properties, all of them about cost rather than about appearance, and all of
   scrollback-stability` folds by, in the same function. A short message has no fold control and is
   never sent anywhere. A second threshold here would be a second definition of short, and the two
   would drift.
-- **One request per message, ever.** The record is consulted before the fetch, not written after
-  it, so a hundred scroll events over one row cost one request — and the forty-five-second
-  background poll, which replaces every row on screen, buys nothing a second time.
+- **One request per message, ever.** The record is written BEFORE the await, not in the response
+  handler, so a hundred scroll events over one row cost one request even while the first answer is
+  still in flight — which is the case that matters, because a phone on a slow connection is where
+  the events pile up. That is tested against a fixture whose answers are HELD, not merely against
+  one that replies instantly: with an immediate reply, a record written on completion looks
+  exactly like a record written before the request. The forty-five-second background poll, which
+  replaces every row on screen, also buys nothing a second time.
 - **Only what you are looking at.** Rows are asked about as they come near the viewport, so
   nothing is spent on messages nobody scrolls to.
 - **The page names the summariser it actually got**, quoting the server's own answer at the head

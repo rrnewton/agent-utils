@@ -3177,6 +3177,46 @@ async function pullEnd() {
   );
 }
 
+/** The id of the newest message the channel list is currently showing, or null. */
+let discordNewestId = null;
+
+/**
+ * Settle the reader's position and the jump-newest chip after a read that replaced the list.
+ *
+ * ONE function for both reads, and that is the point: `loadTodo` had no version of this at all, so
+ * in the one view whose entire purpose is surfacing new work a background poll could add a row off
+ * screen and say nothing, while the unfiltered channel beside it raised the chip correctly. A
+ * second mechanism for the filtered list would be a second set of rules about when the chip is
+ * earned, and they would disagree.
+ *
+ * Something ARRIVED only if the newest id MOVED. A refresh that returns the same messages must not
+ * raise the chip, or a background poll every 45 seconds would offer to jump the reader to a bottom
+ * that has not changed since the last time they declined.
+ *
+ * `ownAct` is for the read that FOLLOWS something the reader just did — a dismissal, an undo. Those
+ * change which row is newest without anything arriving, and a chip saying "something arrived" in
+ * answer to the reader's own tap is a lie about where the row came from.
+ *
+ * @param {Array<{id: string}>} messages the list as it was just read, oldest first
+ * @param {{keepPosition: boolean, wasAtNewest: boolean, area: object, previousTop: number,
+ *          ownAct?: boolean}} how
+ */
+function settleAfterRead(messages, how) {
+  const newest = messages.length ? String(messages[messages.length - 1].id) : null;
+  const moved = newest !== null && discordNewestId !== null && newest !== discordNewestId;
+  const arrived = moved && how.ownAct !== true;
+  discordNewestId = newest;
+  if (how.keepPosition && !how.wasAtNewest) {
+    how.area.scrollTop = how.previousTop;
+    if (arrived) {
+      setJumpNewest(true, "discord");
+    }
+  } else {
+    scrollToNewest();
+    setJumpNewest(false, "discord");
+  }
+}
+
 /**
  * @param {{keepPosition?: boolean}} [options] `keepPosition` marks a RE-read of a channel already
  *   on screen — the background poll, or the Refresh button. It must not drag the reader to the
@@ -3184,9 +3224,6 @@ async function pullEnd() {
  *   where they already were. The FIRST load of a channel is the other case and does not pass it:
  *   arriving at the top of a long history means scrolling past everything already read.
  */
-/** The id of the newest message the channel list is currently showing, or null. */
-let discordNewestId = null;
-
 async function loadDiscord(options) {
   // `#50 todo-view`. Every path that re-reads the channel comes through here — the background
   // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
@@ -3219,21 +3256,7 @@ async function loadDiscord(options) {
     // takes itself away after a few seconds.
     renderChannelSeam(channelSummary(loaded, loadedIsWhole(), payload.channel.label));
     const messages = payload.messages || [];
-    const newest = messages.length ? messages[messages.length - 1].id : null;
-    // Something ARRIVED only if the newest id moved. A refresh that returns the same messages must
-    // not raise the chip, or a background poll every 45 seconds would offer to jump the reader to
-    // a bottom that has not changed since the last time they declined.
-    const arrived = newest !== null && discordNewestId !== null && newest !== discordNewestId;
-    discordNewestId = newest;
-    if (keepPosition && !wasAtNewest) {
-      area.scrollTop = previousTop;
-      if (arrived) {
-        setJumpNewest(true, "discord");
-      }
-    } else {
-      scrollToNewest();
-      setJumpNewest(false, "discord");
-    }
+    settleAfterRead(messages, { keepPosition, wasAtNewest, area, previousTop });
     renderScrollTools();
     // Every row here is new — `applyNewestPage` replaced the list — so the ones on screen have to
     // be asked about again. `summariesAsked` is what stops that being a second request for a
@@ -3342,7 +3365,13 @@ async function loadTodo(options) {
   const wasAtNewest = atBottom(area);
   const previousTop = area.scrollTop;
   try {
-    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/todo`);
+    // The SAME window the unfiltered read uses, and it is sent rather than left to the server's
+    // default because the bulk clear has to send it back: `{through}` is resolved against a window
+    // on the server, and a boundary resolved against a WIDER window than the one this page
+    // displayed would clear messages the reader never saw. See `clearBacklog`.
+    const payload = await api(
+      `/api/v1/channels/${encodeURIComponent(channel)}/todo?limit=${DISCORD_PAGE_LIMIT}`
+    );
     const messages = payload.messages || [];
     const list = el("discord-log");
     list.replaceChildren(...messages.map(discordNode));
@@ -3354,19 +3383,42 @@ async function loadTodo(options) {
     backlogSize = messages.length;
     // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
     el("inbox-note").textContent = payload.read_state_notice || "";
-    renderChannelSeam(todoSummary(payload));
+    noteTodoRead(payload);
+    renderChannelSeam(todoSummary());
     renderTodoControls();
-    if (keepPosition && !wasAtNewest) {
-      area.scrollTop = previousTop;
-    } else {
-      scrollToNewest();
-      setJumpNewest(false, "discord");
-    }
+    settleAfterRead(messages, {
+      keepPosition,
+      wasAtNewest,
+      area,
+      previousTop,
+      ownAct: Boolean(options && options.ownAct),
+    });
     renderScrollTools();
     requestVisibleSummaries();
   } finally {
     discordFetchInFlight = false;
   }
+}
+
+/**
+ * What the last `/todo` read said, held so that anything which changes the list can RESTATE it.
+ *
+ * Kept rather than recomputed from the payload at the call site, because the payload is not the
+ * only thing that changes the list: a message arriving on the live stream adds a row without any
+ * read at all, and the head of the list, the backlog count and the bulk control all have to move
+ * with it or the view contradicts itself.
+ */
+let todoView = { left: 0, window: 0, complete: false, label: "this channel" };
+
+/** Take down what a `/todo` answer said about itself. */
+function noteTodoRead(payload) {
+  const left = (payload.messages || []).length;
+  todoView = {
+    left,
+    window: typeof payload.window === "number" ? payload.window : left,
+    complete: payload.complete === true,
+    label: payload.channel ? payload.channel.label : "this channel",
+  };
 }
 
 /**
@@ -3376,15 +3428,45 @@ async function loadTodo(options) {
  * point of this view is that it is a SUBSET. `complete` is `#62 message-count-accuracy` again —
  * the window is the channel's own only when the server says the set is whole.
  */
-function todoSummary(payload) {
-  const left = (payload.messages || []).length;
-  const window = typeof payload.window === "number" ? payload.window : left;
-  const label = payload.channel ? payload.channel.label : "this channel";
+function todoSummary() {
+  const { left, window, complete, label } = todoView;
   if (left === 0) {
     return `nothing left to deal with in ${label}`;
   }
-  const of = payload.complete === true ? `of ${window}` : `of the ${window} most recent`;
+  const of = complete ? `of ${window}` : `of the ${window} most recent`;
   return `${left} ${of} in ${label} still want attention`;
+}
+
+/**
+ * Put one row at the end of the channel list, and keep everything that DESCRIBES the list in step.
+ *
+ * TWO paths add a row without a read: a message arriving on the live stream, and a reply this page
+ * has just posted. Both are the same fact — the list on screen is now longer than the last `/todo`
+ * answer said — and both are wrong in the same way if only the row moves. In to-do mode a message
+ * that has just arrived has by definition not been dealt with, so it is one more thing to do, and
+ * the head of the list, the backlog count and the bulk control have to say so in the same moment
+ * the row appears. Otherwise the view contradicts itself: "nothing left to deal with" written
+ * directly above a message, a bulk control hidden while there is something to clear, or a count
+ * that says two over a list of three — which `clearBacklog` would then clear all three of.
+ *
+ * Outside the mode this is an ordinary append, because nothing on screen is claiming a count.
+ */
+function appendChannelRow(message) {
+  el("discord-log").append(discordNode(message));
+  if (!todoMode) {
+    return;
+  }
+  todoView = {
+    ...todoView,
+    left: todoView.left + 1,
+    // The channel gained a message too, so the SUBSET and the window it is a subset of both grow.
+    // Leaving the window alone would read as the backlog catching up with a channel that stood
+    // still.
+    window: todoView.window + 1,
+  };
+  backlogSize += 1;
+  renderChannelSeam(todoSummary());
+  renderTodoControls();
 }
 
 /** Mark messages as dealt with, remember the exact set, and re-read. */
@@ -3395,7 +3477,9 @@ async function dismissMessages(body) {
     body,
   });
   lastDismissal = { channel, messages: payload.messages || [] };
-  await loadTodo({ keepPosition: true });
+  // `ownAct`: rows LEAVING because the reader said so is not something arriving, and the re-read
+  // must not answer their own tap with an offer to jump to a bottom nothing turned up at.
+  await loadTodo({ keepPosition: true, ownAct: true });
   const count = lastDismissal.messages.length;
   setStatus(
     `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in Discord.`
@@ -3417,7 +3501,7 @@ async function undoDismissal() {
     method: "POST",
     body: { messages: undoing.messages },
   });
-  await loadTodo({ keepPosition: true });
+  await loadTodo({ keepPosition: true, ownAct: true });
   setStatus(`${undoing.messages.length} back in the list.`);
 }
 
@@ -3435,7 +3519,16 @@ async function clearBacklog() {
   disarmBacklog();
   // THROUGH the newest row on screen, so the server decides the boundary from its own ordering
   // rather than from a list of ids this page assembled. The boundary is included.
-  await dismissMessages({ through: rows[rows.length - 1].getAttribute("data-id") });
+  //
+  // ...and WITH the window this page read the list with. The server resolves `through` against a
+  // window of its own, so a boundary sent without one is resolved against the server's default —
+  // which, for a client reading a smaller page than the server's default, means clearing messages
+  // that were never on screen. The limit is what makes "everything above this row" mean the rows
+  // the reader was actually looking at.
+  await dismissMessages({
+    through: rows[rows.length - 1].getAttribute("data-id"),
+    limit: DISCORD_PAGE_LIMIT,
+  });
 }
 
 function setTodoMode(on) {
@@ -3588,7 +3681,10 @@ async function sendReply() {
       body: { text, reply_to: target.id },
     });
     if (payload && payload.posted) {
-      el("discord-log").append(discordNode(payload.posted));
+      // Through the same appender as a live arrival: the reply is in the window from now on, so
+      // the next `/todo` read will count it, and a list that counted it one read later would
+      // disagree with itself in between.
+      appendChannelRow(payload.posted);
     }
     drafts.delete(target.id);
     persistDrafts();
@@ -4117,7 +4213,7 @@ function receiveLiveMessage(message, selfPosted, replayed) {
   // identical on both paths. A live feed is not a reason to relax element construction.
   const area = el("scroll-area");
   const wasAtNewest = currentView === "discord" && atBottom(area);
-  list.append(discordNode(message));
+  appendChannelRow(message);
   discordNewestId = id;
   if (wasAtNewest) {
     scrollToNewest();
