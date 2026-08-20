@@ -931,39 +931,28 @@ body {
   -webkit-user-select: none;
 }
 
-/* ------------------------------------------------------------------------- the composer ---- */
+/* ------------------------------------------------------------ text entry, in the bar ------- */
 /*
- * `#43 typed-input`. One small button at rest; a text field only once it has been asked for.
+ * `#59 text-entry-button`. Pressing Type CONVERTS the control bar into a text field: the toggle
+ * stays, everything else on the bar goes, the field takes the width and a Send appears on the
+ * right. Pressing it again converts the bar back.
  *
- * The horizontal padding follows the same safe-area pattern as every other full-width band on this
- * page: on a phone with rounded corners an un-inset row loses its first character to the curve,
- * which the owner photographed once already on the status line.
+ * `#43 typed-input` shipped this as a row of its own in the dock, which was the honest way to
+ * build and test the send path but cost a band of a 375x667 phone. That row is gone; this is the
+ * same composer in the space the bar already occupies, so text entry now costs nothing at rest.
+ *
+ * WHAT ACTUALLY MOVES THE TOGGLE LEFT is the gear being hidden, not an animation and not an
+ * `order` — the two things to its left simply stop being there, and flex closes the gap. Recorded
+ * because the issue describes it as a slide: this is a reflow, the only transition is the colour,
+ * and `prefers-reduced-motion` already has a block at the foot of this file.
  */
-#composer {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  padding: 0.4rem calc(0.6rem + env(safe-area-inset-right)) 0
-    calc(0.6rem + env(safe-area-inset-left));
-}
-
-/* The field and its Send, as one group, so `flex: 1 1 auto` gives the whole composer the width
-   left over beside the toggle rather than giving it to the input alone. */
-#composer-row {
-  flex: 1 1 auto;
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-  min-width: 0;
-}
-
-#composer-input {
+#compose-text {
   flex: 1 1 auto;
   min-width: 0;
   /* SIXTEEN PIXELS, and not a rem. iOS Safari zooms the whole frame when a text input smaller than
      16px takes focus, and this page is a fixed 100dvh grid — zooming it does not scroll a page, it
-     pushes the dock off the bottom of a viewport that cannot scroll to reach it again. This is the
-     one place in the file where an absolute font size is the correct answer. */
+     pushes the dock off a viewport that cannot scroll to reach it again. This is the one place in
+     the file where an absolute font size is the correct answer. */
   font-size: 16px;
   min-height: 2.4rem;
   padding: 0.3rem 0.6rem;
@@ -973,28 +962,24 @@ body {
   border-radius: 0.6rem;
 }
 
-/* Sized like the small controls in the pane below, and deliberately NOT `.control-mini`: that
-   class carries `grid-column: 1`, which belongs to #control-pane's 3x2 grid and would mean
-   something quite different here. */
-.composer-button {
-  flex: 0 0 auto;
-  min-height: 2.4rem;
-  min-width: 2.75rem;
-  background: var(--panel);
-  color: var(--ink);
-  border: 1px solid var(--edge);
-  gap: 0.05rem;
-}
-
-/* Open is a state of the TOGGLE, drawn the way every other on-state on this page is drawn: the
-   accent on the border and the glyph. Same idiom as `.control-mini.on`. */
-#composer[data-open="true"] #composer-toggle {
+/* Pressed: the accent on the border and the glyph, the same idiom `.control-mini.on` uses, so the
+   toggle's own state is what tells you which mode the bar is in. */
+#text-entry[aria-pressed="true"] {
   border-color: var(--accent);
   color: var(--accent);
+  transition: color 140ms ease, border-color 140ms ease;
 }
 
-#composer[data-open="true"] #composer-toggle .mini-label {
+#text-entry[aria-pressed="true"] .mini-label {
   color: var(--accent);
+}
+
+/* In text mode the pack holds one button and must stop claiming the leftover width — the FIELD
+   takes it. Without this the input is squeezed to nothing beside a 2.75rem toggle that has grown
+   to fill the bar. */
+#control-bar[data-mode="text"] #bar-pack {
+  flex: 0 0 auto;
+  overflow-x: visible;
 }
 
 /* --------------------------------------------------------------------- the control pane ---- */

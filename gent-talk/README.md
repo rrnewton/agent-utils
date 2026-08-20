@@ -842,11 +842,22 @@ the conversation socket that is already open, documented by the vendor as proces
 speech. A typed turn and a spoken turn are therefore the same thing to the conversation, they land
 in the same transcript, and the agent answers either one out loud.
 
-**It is collapsed by default**, which is what makes it affordable. A permanent text field is a
-fourth band of dock on a 375x667 phone, competing with the transcript on every frame — the rent
-"The status line is a message, not a fixture" above just stopped paying. What stands on the screen
-is one small button; the field appears when it is asked for, and a half-typed message survives
-closing it again.
+**It costs one small button, and only while it is in use.** Type is a toggle in the control bar:
+pressing it CONVERTS the bar into a text field — the toggle stays, the gear and the switch get out
+of the way, the field takes the width and a Send appears on the right — and pressing it again
+converts the bar back. One control both enters and leaves the mode, and its own pressed state is
+what says which mode you are in. A permanent text field would be a whole extra band of dock on a
+375x667 phone, competing with the transcript on every frame — the rent "The status line is a
+message, not a fixture" above just stopped paying. A half-typed message survives leaving the mode.
+
+The toggle appearing to *slide left* is the gear ceasing to exist beside it, not an animation:
+flex simply closes the gap. There is no second mechanism to keep in step, and the only transition
+is the colour.
+
+`#43 typed-input` first shipped this composer as a row of its own in the dock, which was the
+honest way to build and test the send path before there was a bar to put it in. That row is
+**deleted**, not left standing beside the new one — two text fields racing to be the one somebody
+types in is worse than either.
 
 **Composing pings the agent.** `{"type": "user_activity"}` is documented as resetting the turn
 timeout without touching conversation content, and it is sent at most once every thirty seconds
@@ -1303,7 +1314,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-five states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty-six states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1311,10 +1322,10 @@ arrives while the reader is up in the history, the desktop reading column at eac
 range, and the two connection outcomes that used to look identical — a call suspended by the
 phone, and one that really failed — the reply screen with a short target and with one longer
 than the frame, one channel row picked out under the pointer, a step further back through the
-channel, the earlier conversation restored from the server after a reload, and the text composer
-open during a live call with a turn that was typed rather than spoken, and the control bar in
-each of its two homes — at four viewports: a tall phone, a short phone, a small laptop window and
-a maximised desktop. It prints the absolute path of every image so an agent can open them directly.
+channel, the earlier conversation restored from the server after a reload, a turn that was typed
+rather than spoken, the control bar in each of its two homes, and that same bar converted into a
+text field — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
 (pointer: fine)` is what puts the reading column on the page at all, so on a phone there is no
@@ -1365,7 +1376,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 44 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 45 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.

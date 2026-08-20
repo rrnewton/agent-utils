@@ -193,14 +193,12 @@ function showScreen(name) {
   // permanent and is on whichever screen is up, and the sign-in screen states what to paste in its
   // own body. `#63 status-line-placement`.
   el("control-pane").hidden = !main;
-  // The composer acts on the conversation, so it belongs to the screen the conversation is on.
-  // `#43 typed-input`.
-  el("composer").hidden = !main;
   if (!main) {
     disarmClear();
-    // Collapsed, not merely hidden: coming back to the call screen should show the dock as it
-    // rests, not with a text field standing open from a visit to Settings.
-    setComposerOpen(false);
+    // The composer lives in the control bar now, and leaving the call screen leaves text entry:
+    // coming back should show the bar as it rests, not with a field standing open from a visit to
+    // Settings. `#59 text-entry-button`. `renderControlBar` below is what actually redraws it.
+    textMode = false;
   }
   if (name !== "settings") {
     screenBeforeSettings = name;
@@ -830,8 +828,8 @@ function sendUserMessage(text) {
   line("you", said);
   recordTurn("you", said);
   lastTyped = { text: said, at: Date.now() };
-  el("composer-input").value = "";
-  el("composer-input").focus();
+  el("compose-text").value = "";
+  el("compose-text").focus();
   setStatus("Sent.");
   return true;
 }
@@ -862,22 +860,35 @@ function noteComposing() {
   return true;
 }
 
-let composerOpen = false;
+// `#59 text-entry-button`. The composer is not a row of its own any more: pressing Type CONVERTS
+// the control bar into a text field, and pressing it again converts it back. One button both
+// enters and leaves the mode, and its own pressed state is what says which mode you are in.
+let textMode = false;
 
 /**
- * Show or hide the text field.
+ * Enter or leave text entry.
  *
- * KEEPS WHAT WAS TYPED. Closing the composer is not the same act as discarding a half-written
+ * Everything about WHAT IS ON THE BAR is decided by `renderControlBar`, which is the one place
+ * that knows — this only sets the flag and says what happened. `#43 typed-input` shipped a second
+ * composer in the dock; that row is deleted rather than joined, because two text fields racing to
+ * be the one somebody types in is worse than either of them.
+ *
+ * KEEPS WHAT WAS TYPED. Leaving text entry is not the same act as discarding a half-written
  * message, and a control that quietly does both is the kind of thing this page keeps removing.
  */
-function setComposerOpen(open) {
-  composerOpen = Boolean(open);
-  el("composer").setAttribute("data-open", composerOpen ? "true" : "false");
-  el("composer-row").hidden = !composerOpen;
-  el("composer-toggle").setAttribute("aria-expanded", composerOpen ? "true" : "false");
-  if (composerOpen) {
-    el("composer-input").focus();
+function setTextMode(on) {
+  const entering = Boolean(on) && !textMode;
+  textMode = Boolean(on);
+  renderControlBar();
+  if (entering) {
+    el("compose-text").focus();
+    setStatus("Type a message. It reaches the same conversation you are speaking in.");
   }
+}
+
+/** The Send button and the Enter key, which must not be two different opinions about sending. */
+function sendTyped() {
+  return sendUserMessage(el("compose-text").value);
 }
 
 // --- the server ------------------------------------------------------------------------------
@@ -1363,11 +1374,32 @@ function placementChanged() {
  * up with a different opinion about whether the gear is reachable.
  */
 function renderControlBar() {
+  const main = currentScreen === "main";
+  // `#59 text-entry-button`. Text entry is a MODE OF THE BAR, and it is only ever on where there
+  // is a conversation to type into, so leaving the main screen leaves the mode with it.
+  const typing = textMode && main;
+  el("control-bar").setAttribute("data-mode", typing ? "text" : "buttons");
   // PER MEMBER, not the bar as a whole. The gear is reachable from the sign-in screen today and
   // must stay so — hiding the bar wholesale off the main screen would take it away.
-  el("view-switch").hidden = currentScreen !== "main";
-  el("open-settings").hidden = Object.prototype.hasOwnProperty.call(SCREEN_TITLES, currentScreen);
-  const members = [el("open-settings"), el("view-switch"), ...el("bar-pack").children];
+  el("view-switch").hidden = !main || typing;
+  el("open-settings").hidden =
+    Object.prototype.hasOwnProperty.call(SCREEN_TITLES, currentScreen) || typing;
+  // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
+  // members here, and every one of them belongs to the call and gets out of the way of the field.
+  // The toggle is the exception, because it is the way back out of the mode.
+  for (const member of el("bar-pack").children) {
+    member.hidden = !main || (typing && member.id !== "text-entry");
+  }
+  el("text-entry").setAttribute("aria-pressed", typing ? "true" : "false");
+  el("compose-text").hidden = !typing;
+  el("send-text").hidden = !typing;
+  const members = [
+    el("open-settings"),
+    el("view-switch"),
+    el("compose-text"),
+    el("send-text"),
+    ...el("bar-pack").children,
+  ];
   el("control-bar").hidden = members.every((member) => member.hidden);
   // The header collapses when it holds nothing. With the bar at the bottom that is the ordinary
   // case on the main screen, and an empty 2.4rem strip across the top of a phone is exactly the
@@ -1923,10 +1955,10 @@ function renderControls() {
 
   el("hang-up").hidden = !live;
   el("control-pane").className = live ? "" : "solo";
-  // Send is dead without a conversation to send into. Drawn as disabled rather than hidden: the
-  // composer is a stable shape, and a button that comes and goes under a thumb is worse than one
-  // that is visibly inert. `.control[disabled]` drops its fill, so it does not look live.
-  el("composer-send").disabled = !canSendText();
+  // Send is dead without a conversation to send into. Disabled rather than absent: the bar in
+  // text mode is a stable shape, and a control that comes and goes under a thumb is worse than one
+  // that is visibly inert.
+  el("send-text").disabled = !canSendText();
 
   note.hidden = true;
   note.textContent = "";
@@ -2850,24 +2882,22 @@ el("clear-view").addEventListener("click", onClear);
 // `guardQuietly`, not `guard`: erasing a stored record must never be able to hang up a live call.
 el("forget-conversations").addEventListener("click", guardQuietly(forgetConversations));
 el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff));
-// `#43 typed-input`. The composer, in four listeners and no logic: everything they call is a named
-// function above, so `#59 text-entry-button` can move the control without moving the send path.
-el("composer-toggle").addEventListener("click", () => setComposerOpen(!composerOpen));
+// `#43 typed-input`, rehoused by `#59 text-entry-button`: the composer, in four listeners and no
+// logic. Everything they call is a named function above, which is exactly why moving the control
+// out of the dock and into the bar did not move the send path with it.
+el("text-entry").addEventListener("click", () => setTextMode(!textMode));
 // `guardQuietly`, NOT `guard`. `guard()` calls `teardown()`, so a send that failed would hang up on
 // the owner — which is the one thing a failed message must never do.
-el("composer-send").addEventListener(
-  "click",
-  guardQuietly(() => sendUserMessage(el("composer-input").value))
-);
-el("composer-input").addEventListener("input", noteComposing);
-el("composer-input").addEventListener("keydown", (event) => {
+el("send-text").addEventListener("click", guardQuietly(sendTyped));
+el("compose-text").addEventListener("input", noteComposing);
+el("compose-text").addEventListener("keydown", (event) => {
   if (!event || event.key !== "Enter") {
     return;
   }
   if (event.preventDefault) {
     event.preventDefault(); // a bare Enter in a lone text input would submit and reload the page.
   }
-  sendUserMessage(el("composer-input").value);
+  sendTyped();
 });
 el("dismiss-banner").addEventListener("click", dismissBanner);
 el("dismiss-status").addEventListener("click", dismissStatus);

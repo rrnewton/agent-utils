@@ -257,6 +257,16 @@ const FIXTURE_TREE = {
   // it scrolls away with the top of the history rather than standing on the screen. Its height is
   // part of what the anchoring model measures against. `#65 scrollback-paging`.
   "pane-discord": ["channel-summary", "load-older", "discord-log"],
+  // `#59 text-entry-button` and `#60 canned-prompt-buttons` put their buttons in the pack, and
+  // web/voice.js hides and shows them by ITERATING it rather than by name — which is what makes a
+  // third button one list entry rather than a new code path. So the fixture has to really nest
+  // them, or that loop runs over nothing and every test of it certifies an empty set.
+  "bar-pack": ["text-entry"],
+  // ...and the bar itself, in markup order, because "the toggle is the leftmost thing on the bar
+  // once the gear has gone" is an ordering claim and a fixture that held the members in a flat
+  // list could not check it. It is also what `setPlacement` re-parents, so the move has something
+  // real to move.
+  "control-bar": ["open-settings", "bar-pack", "compose-text", "send-text", "view-switch"],
 };
 
 /** Where web/voice.html defines an id: which line, and how deeply indented. */
@@ -4970,12 +4980,12 @@ const session_lines = (page) =>
 
 // --- typing to the agent (#43 typed-input) --------------------------------------------------------
 
-/** Open the composer and put text in the field, the way a finger does. */
+/** Enter text entry if it is not already on, and put text in the field, the way a finger does. */
 async function compose(page, text) {
-  if (page.el("composer-row").hidden) {
-    await page.el("composer-toggle").click();
+  if (page.el("compose-text").hidden) {
+    await page.el("text-entry").click();
   }
-  await page.el("composer-input").setValue(text);
+  await page.el("compose-text").setValue(text);
 }
 
 /** Just the typed client events, so a `user_audio_chunk` cannot be mistaken for one. */
@@ -4989,7 +4999,7 @@ test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {
   const heard = audioFrames(socket).length;
 
   await compose(page, "did the retry-budget branch land");
-  await page.el("composer-send").click();
+  await page.el("send-text").click();
 
   const sent = typedFrames(socket);
   assert.equal(sent.length, 1, `exactly one typed frame, not ${sent.length}`);
@@ -5004,7 +5014,7 @@ test("TYPING A MESSAGE SENDS user_message, AND NOTHING ELSE", async () => {
   assert.equal(audioFrames(socket).length, heard, "typing changed what the microphone was sending");
   assert.equal(page.el("talk-label").textContent, "Listening", "typing changed the call's state");
   // ...and the field is empty again, so a second message does not start with the first one in it.
-  assert.equal(page.el("composer-input").value, "", "the sent text was left in the box");
+  assert.equal(page.el("compose-text").value, "", "the sent text was left in the box");
 });
 
 test("a typed turn and a spoken turn land in the SAME transcript", async () => {
@@ -5015,7 +5025,7 @@ test("a typed turn and a spoken turn land in the SAME transcript", async () => {
 
   youSay(page, "morning");
   await compose(page, "and what about the nightly");
-  await page.el("composer-send").click();
+  await page.el("send-text").click();
   assistantSays(page, "it passed at 04:12");
   await page.settle();
 
@@ -5043,7 +5053,7 @@ test("THE VENDOR ECHOING A TYPED MESSAGE BACK DOES NOT RENDER IT TWICE", async (
   const page = newPage();
   await startTalking(page);
   await compose(page, "did the retry-budget branch land");
-  await page.el("composer-send").click();
+  await page.el("send-text").click();
   assert.equal(session_lines(page).length, 1);
 
   youSay(page, "did the retry-budget branch land");
@@ -5063,7 +5073,7 @@ test("sending with no call SAYS SO instead of silently doing nothing", async () 
   page.el("status-line").hidden = true;
 
   await compose(page, "are you there");
-  await page.el("composer-send").click();
+  await page.el("send-text").click();
 
   assert.equal(page.sockets.length, 0, "a typed message opened a conversation by itself");
   assert.equal(page.el("status-line").hidden, false, "the refusal was silent");
@@ -5074,9 +5084,9 @@ test("sending with no call SAYS SO instead of silently doing nothing", async () 
   );
   // AND IT KEEPS THE TEXT. Losing what somebody typed because there was nowhere to send it is a
   // second failure on top of the first.
-  assert.equal(page.el("composer-input").value, "are you there", "the refusal ate the message");
+  assert.equal(page.el("compose-text").value, "are you there", "the refusal ate the message");
   // The control also SHOWS that it cannot act, rather than looking live and doing nothing.
-  assert.equal(page.el("composer-send").disabled, true, "a dead Send looks exactly like a live one");
+  assert.equal(page.el("send-text").disabled, true, "a dead Send looks exactly like a live one");
 });
 
 test("COMPOSING TELLS THE AGENT SOMEONE IS THERE, AT MOST ONCE EVERY THIRTY SECONDS", async () => {
@@ -5088,16 +5098,16 @@ test("COMPOSING TELLS THE AGENT SOMEONE IS THERE, AT MOST ONCE EVERY THIRTY SECO
   const throttle = sourceConstant("ACTIVITY_INTERVAL_MS");
 
   await compose(page, "d");
-  await page.el("composer-input").setValue("di");
-  await page.el("composer-input").setValue("did");
+  await page.el("compose-text").setValue("di");
+  await page.el("compose-text").setValue("did");
   assert.equal(activityFrames(socket).length, 1, "every keystroke pinged the agent");
 
   page.setClock(page.clock() + throttle - 1);
-  await page.el("composer-input").setValue("did ");
+  await page.el("compose-text").setValue("did ");
   assert.equal(activityFrames(socket).length, 1, "the throttle window is not honoured");
 
   page.setClock(page.clock() + 2);
-  await page.el("composer-input").setValue("did t");
+  await page.el("compose-text").setValue("did t");
   assert.equal(activityFrames(socket).length, 2, "composing stopped pinging after the first burst");
 });
 
@@ -5126,57 +5136,102 @@ test("a fresh call pings on its FIRST keystroke, not thirty seconds in", async (
   await page.el("hang-up").click();
   await page.el("talk").click();
   page.sockets[1].onopen();
-  await page.el("composer-input").setValue("hello again");
+  await page.el("compose-text").setValue("hello again");
 
   assert.equal(activityFrames(page.sockets[1]).length, 1, "the new call inherited the old throttle");
 });
 
-test("THE COMPOSER IS COLLAPSED UNTIL IT IS ASKED FOR", async () => {
-  // A permanent text field would be a fourth band of dock on a 375x667 phone, competing with the
-  // transcript on every frame — the rent `#63 status-line-placement` just stopped paying.
-  assert.equal(
-    PAGE_ELEMENTS.get("composer-row").hidden,
-    true,
-    "the markup ships the field open, so it holds space before anyone asks for it"
-  );
+test("PRESSING TYPE CONVERTS THE BAR, AND PRESSING IT AGAIN RESTORES IT", async () => {
+  // `#59 text-entry-button`, and the owner's whole interaction model: one button both enters and
+  // leaves text entry, and its own state is what tells you which mode you are in. A permanent text
+  // field is what this refuses to be — at rest, typing costs one small button's worth of a bar
+  // that was already there.
+  //
+  // Both ends ship hidden in the MARKUP, so their appearance really is the signal.
+  assert.equal(PAGE_ELEMENTS.get("compose-text").hidden, true, "the field ships open");
+  assert.equal(PAGE_ELEMENTS.get("send-text").hidden, true, "Send ships open");
+
   const page = newPage();
   await signIn(page);
-  assert.equal(page.el("composer-row").hidden, true);
-  assert.equal(page.el("composer-toggle").getAttribute("aria-expanded"), "false");
+  const showing = () =>
+    ["text-entry", "compose-text", "send-text", "view-switch", "open-settings"].filter(
+      (id) => !page.el(id).hidden
+    );
+  assert.deepStrictEqual(showing(), ["text-entry", "view-switch", "open-settings"]);
+  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "false");
+  assert.equal(page.el("control-bar").getAttribute("data-mode"), "buttons");
 
-  await page.el("composer-toggle").click();
-  assert.equal(page.el("composer-row").hidden, false, "the toggle did not open the field");
-  assert.equal(page.el("composer-toggle").getAttribute("aria-expanded"), "true");
-  assert.equal(page.el("composer").getAttribute("data-open"), "true");
+  await page.el("text-entry").click();
 
-  // Half-typed text SURVIVES closing it. Closing the composer is not the same act as discarding a
-  // message, and a control that quietly does both is what this page keeps removing.
-  page.el("composer-input").value = "half a thought";
-  await page.el("composer-toggle").click();
-  assert.equal(page.el("composer-row").hidden, true, "the toggle did not close the field");
-  assert.equal(page.el("composer-toggle").getAttribute("aria-expanded"), "false");
-  assert.equal(page.el("composer-input").value, "half a thought", "closing it ate the draft");
+  // THE BAR IS NOW THE FIELD: the toggle stays, the field and its Send are up, and everything
+  // else on the bar has got out of the way.
+  assert.deepStrictEqual(showing(), ["text-entry", "compose-text", "send-text"]);
+  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "true", "the toggle is not ON");
+  assert.equal(page.el("control-bar").getAttribute("data-mode"), "text");
+  // And the toggle is now the LEFTMOST thing on the bar, which is the "slides to the left" in the
+  // issue: the gear that was to its left is gone, so flex closes the gap. There is no second
+  // mechanism, no animation and nothing to keep in step.
+  const order = page.el("control-bar").children.flatMap((member) =>
+    member.id === "bar-pack" ? member.children : [member]
+  );
+  const visible = order.filter((member) => !member.hidden);
+  assert.equal(visible[0].id, "text-entry", "something is still to the left of the toggle");
+  assert.equal(visible[visible.length - 1].id, "send-text", "Send is not on the right");
+
+  // Pressing it again restores EXACTLY the bar that was there before.
+  page.el("compose-text").value = "half a thought";
+  await page.el("text-entry").click();
+  assert.deepStrictEqual(showing(), ["text-entry", "view-switch", "open-settings"]);
+  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "false");
+  // ...and keeps what was typed. Leaving the mode is not the same act as discarding a message.
+  assert.equal(page.el("compose-text").value, "half a thought", "leaving text entry ate the draft");
 });
 
-test("the composer is not on the sign-in or settings screens", async () => {
+test("THERE IS EXACTLY ONE COMPOSER, AND IT IS IN THE BAR", () => {
+  // `#43 typed-input` shipped a composer as a row of its own in the dock so the send path could be
+  // built and tested; `#59 text-entry-button` MOVES it. Adding the bar version beside the dock
+  // version would be two text fields racing to be the one somebody types in, so the old row's ids
+  // are asserted GONE rather than merely unused.
+  for (const dead of ["composer", "composer-row", "composer-toggle", "composer-input", "composer-send"]) {
+    assert.equal(PAGE_IDS.has(dead), false, `the dock composer's #${dead} is still in the page`);
+  }
+  const dock = HTML.slice(HTML.indexOf('id="dock"'));
+  assert.equal(
+    (dock.match(/<input/g) || []).length,
+    1,
+    "the dock holds more than one text input, so there are two composers"
+  );
+  // The one that is left is inside the bar, between the pack and the switch.
+  const bar = barSlice();
+  assert.ok(bar.indexOf('id="bar-pack"') < bar.indexOf('id="compose-text"'));
+  assert.ok(bar.indexOf('id="compose-text"') < bar.indexOf('id="send-text"'));
+  assert.ok(bar.indexOf('id="send-text"') < bar.indexOf('id="view-switch"'));
+  // And the toggle is a member of the PACK, which is what makes it sit beside the buttons `#60`
+  // adds rather than in a place of its own.
+  assertMarkupContains("bar-pack", "text-entry");
+});
+
+test("text entry is not offered on the sign-in or settings screens", async () => {
   const page = newPage();
-  assert.equal(page.el("composer").hidden, true, "the composer is up before anyone has signed in");
+  assert.equal(page.el("text-entry").hidden, true, "typing is offered before anyone has signed in");
 
   await signIn(page);
-  assert.equal(page.el("composer").hidden, false);
-  await page.el("composer-toggle").click();
-  assert.equal(page.el("composer-row").hidden, false);
+  assert.equal(page.el("text-entry").hidden, false);
+  await page.el("text-entry").click();
+  assert.equal(page.el("compose-text").hidden, false);
 
   await page.el("open-settings").click();
-  assert.equal(page.el("composer").hidden, true, "the composer followed you into Settings");
+  assert.equal(page.el("compose-text").hidden, true, "the field followed you into Settings");
+  assert.equal(page.el("text-entry").hidden, true);
 
   await page.el("close-settings").click();
-  assert.equal(page.el("composer").hidden, false);
+  assert.equal(page.el("text-entry").hidden, false);
   assert.equal(
-    page.el("composer-row").hidden,
+    page.el("compose-text").hidden,
     true,
-    "coming back from Settings left the field standing open"
+    "coming back from Settings left the bar in text mode"
   );
+  assert.equal(page.el("text-entry").getAttribute("aria-pressed"), "false");
 });
 
 test("whitespace-only text sends nothing at all", async () => {
@@ -5184,7 +5239,7 @@ test("whitespace-only text sends nothing at all", async () => {
   const socket = await startTalking(page);
 
   await compose(page, "   ");
-  await page.el("composer-send").click();
+  await page.el("send-text").click();
 
   assert.equal(typedFrames(socket).length, 0, "a blank message went to the agent");
   assert.equal(session_lines(page).length, 0, "a blank message landed in the transcript");
@@ -5196,7 +5251,7 @@ test("Enter sends, and does not reload the page out from under the call", async 
   await compose(page, "anything red anywhere else");
 
   let defaulted = true;
-  await page.el("composer-input").dispatch("keydown", {
+  await page.el("compose-text").dispatch("keydown", {
     key: "Enter",
     preventDefault: () => {
       defaulted = false;
@@ -5209,34 +5264,34 @@ test("Enter sends, and does not reload the page out from under the call", async 
   // ...and an ordinary key does not. Written against a field with text in it, because after the
   // send above the field is empty and an empty send is refused for a different reason entirely —
   // which would make this pass with the key check deleted.
-  await page.el("composer-input").setValue("half a th");
-  await page.el("composer-input").dispatch("keydown", { key: "a", preventDefault: () => {} });
+  await page.el("compose-text").setValue("half a th");
+  await page.el("compose-text").dispatch("keydown", { key: "a", preventDefault: () => {} });
   assert.equal(typedFrames(socket).length, 1, "every keystroke sends the message");
-  assert.equal(page.el("composer-input").value, "half a th", "an ordinary key cleared the field");
+  assert.equal(page.el("compose-text").value, "half a th", "an ordinary key cleared the field");
 });
 
-test("the composer states its own layout rules: safe area, and the size iOS will not zoom", () => {
-  // NEITHER IS VERIFIABLE BY SCREENSHOT. Chromium under automation reports zero safe-area insets
-  // and has no iOS text-zoom behaviour at all, so the declaration is the only part checkable here.
-  const composer = cssBlock("#composer");
-  assert.match(composer, /env\(safe-area-inset-left\)/, "#composer ignores the left inset");
-  assert.match(composer, /env\(safe-area-inset-right\)/, "#composer ignores the right inset");
+test("the field states its own layout rule: the size iOS will not zoom", () => {
+  // NOT VERIFIABLE BY SCREENSHOT. Chromium under automation has no iOS text-zoom behaviour at all,
+  // so the declaration is the only part checkable here.
+  //
   // 16px, not a rem: iOS Safari zooms the whole frame when a smaller input takes focus, and this
   // page is a fixed 100dvh grid — the zoom pushes the dock off a viewport that cannot scroll back.
   assert.match(
-    cssBlock("#composer-input"),
+    cssBlock("#compose-text"),
     /font-size:\s*16px/,
     "the field is small enough that iOS Safari will zoom the frame when it takes focus"
   );
-  // Sized like the pane's own small controls, and deliberately not BY being one: `.control-mini`
-  // carries `grid-column: 1`, which belongs to #control-pane's grid.
-  const composerButton = cssBlock(".composer-button");
-  assert.doesNotMatch(composerButton, /grid-column/, "the composer buttons joined the pane's grid");
-  assert.equal(
-    /min-height:\s*([\d.]+)rem/.exec(composerButton)[1],
-    /min-height:\s*([\d.]+)rem/.exec(cssBlock(".control-mini"))[1],
-    "the composer buttons are not the same size as Sound and Clear"
-  );
+  // It takes the width the bar has left, and it can shrink: a flex item without `min-width: 0`
+  // refuses to go below its content and pushes Send off the end of a 375px phone.
+  assert.match(cssBlock("#compose-text"), /flex:\s*1 1 auto/);
+  assert.match(cssBlock("#compose-text"), /min-width:\s*0/);
+  // ...and in text mode the PACK gives that width up. Without this the field is squeezed to
+  // nothing beside a toggle that has grown to fill the bar.
+  assert.match(cssBlock('#control-bar[data-mode="text"] #bar-pack'), /flex:\s*0 0 auto/);
+  // The toggle's ON state is drawn, not merely recorded — the same accent idiom `.control-mini.on`
+  // uses. A toggle that looks identical in both modes is not a mode indicator.
+  const pressed = cssBlock('#text-entry[aria-pressed="true"]');
+  assert.match(pressed, /var\(--accent\)/, "the pressed toggle looks exactly like the unpressed one");
 });
 
 // --- reading the transcript -----------------------------------------------------------------------

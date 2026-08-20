@@ -1495,28 +1495,28 @@ def _act_restored_conversation(driver: Driver) -> None:
 
 
 def _act_typed_turn(driver: Driver) -> None:
-    """`#43 typed-input`: the composer open, with a turn that was TYPED rather than spoken.
+    """`#43 typed-input`, through `#59 text-entry-button`'s bar: a turn that was TYPED, not spoken.
 
     Entered from a real live call, because a typed message is a client event on the conversation
     socket and a composer with no call behind it is a picture of the refusal, not of the feature.
 
-    The two things only a browser can settle are pinned below: whether a fourth dock band fits at
-    all on the 375x667 profile, and whether it lands ABOVE the big controls rather than over them.
-    A fixture with no layout engine has no opinion about either.
+    This scene is about the TRANSCRIPT — that a typed turn lands in it beside the spoken ones, and
+    that the bar carrying the field still sits above the big controls rather than over them. What
+    the converted bar itself looks like is `26-text-entry-open`.
     """
     driver.click("talk")
     driver.page.wait_for_function(
         "() => window.__text('talk-label') === 'Listening'", timeout=10_000
     )
-    driver.click("composer-toggle")
-    driver.page.wait_for_function("() => window.__visible('composer-input')", timeout=5_000)
-    driver.page.fill("#composer-input", "and 9c07d3e — did that land on integration")
-    driver.click("composer-send")
+    driver.click("text-entry")
+    driver.page.wait_for_function("() => window.__visible('compose-text')", timeout=5_000)
+    driver.page.fill("#compose-text", "and 9c07d3e — did that land on integration")
+    driver.click("send-text")
     driver.page.wait_for_function(
         "() => document.querySelectorAll('#transcript li.mine').length > 0", timeout=5_000
     )
     # Typing again, so the field in the photograph is not the empty one a send leaves behind.
-    driver.page.fill("#composer-input", "and the nightly")
+    driver.page.fill("#compose-text", "and the nightly")
     driver.settle(300)
 
 
@@ -1544,6 +1544,25 @@ def _act_control_bar_bottom(driver: Driver) -> None:
     driver.page.select_option("#bar-placement", "bottom")
     driver.click("close-settings")
     driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=5_000)
+    driver.settle(300)
+
+
+def _act_text_entry_open(driver: Driver) -> None:
+    """`#59 text-entry-button`: the bar CONVERTED into a text field.
+
+    The subject here is the bar itself, not the transcript — whether one strip really holds a
+    usable field, a Send, and the toggle that got you here, on a 375px phone. The call underneath
+    is incidental and is started only because the field refuses to send without one.
+    """
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("talk")
+    driver.page.wait_for_function(
+        "() => window.__text('talk-label') === 'Listening'", timeout=10_000
+    )
+    driver.click("text-entry")
+    driver.page.wait_for_function("() => window.__visible('compose-text')", timeout=5_000)
+    driver.page.fill("#compose-text", "summarize the last hour")
     driver.settle(300)
 
 
@@ -2115,12 +2134,12 @@ SCENES: tuple[Scene, ...] = (
     ),
     Scene(
         name="23-typed-turn",
-        what="the composer open during a live call, with a turn that was typed rather than spoken",
+        what="a turn typed into the control bar during a live call, beside the spoken ones",
         act=_act_typed_turn,
         expect=(
             (
-                "the composer's field and its Send are really on screen",
-                "window.__visible('composer-input') && window.__visible('composer-send')",
+                "the field and its Send are really on screen",
+                "window.__visible('compose-text') && window.__visible('send-text')",
             ),
             (
                 "the typed turn is in the transcript, attributed to you",
@@ -2129,10 +2148,10 @@ SCENES: tuple[Scene, ...] = (
             ),
             # THE claim no fixture can make. A fourth band in the dock competes with the transcript
             # on a 375x667 phone, and the failure mode is not "it looks cramped" -- it is the
-            # composer overlapping the controls the reader is trying to hit. Measured, not eyeballed.
+            # bar overlapping the controls the reader is trying to hit. Measured, not eyeballed.
             (
-                "the composer sits ABOVE the big controls, not over them",
-                "(() => { const c = document.getElementById('composer').getBoundingClientRect(); "
+                "the bar carrying the field sits ABOVE the big controls, not over them",
+                "(() => { const c = document.getElementById('control-bar').getBoundingClientRect(); "
                 "const p = document.getElementById('control-pane').getBoundingClientRect(); "
                 "return c.height > 0 && c.bottom <= p.top + 1; })()",
             ),
@@ -2191,6 +2210,43 @@ SCENES: tuple[Scene, ...] = (
             (
                 "the switch is still reachable down there",
                 "window.__visible('view-switch') && window.__visible('open-settings')",
+            ),
+        ),
+    ),
+    Scene(
+        name="26-text-entry-open",
+        what="the control bar converted into a text field, with the Type toggle ON",
+        act=_act_text_entry_open,
+        expect=(
+            (
+                "the bar became a field with a Send beside it",
+                "window.__visible('compose-text') && window.__visible('send-text')",
+            ),
+            # The conversion, stated as the disappearance it is: the switch and the gear are not
+            # squeezed or scrolled out of sight, they are gone for as long as the mode is on.
+            (
+                "the rest of the bar got out of the way",
+                "!window.__visible('view-switch') && !window.__visible('open-settings')",
+            ),
+            (
+                "the toggle is ON and is the way back out",
+                "window.__visible('text-entry') && "
+                "document.getElementById('text-entry').getAttribute('aria-pressed') === 'true'",
+            ),
+            # THE geometry claim, and the reason this is a photograph rather than a fixture test:
+            # the whole composer has to fit INSIDE the one strip the bar already occupied, on a
+            # 375px phone. A field that overflows it is a second band by another name.
+            (
+                "the whole composer fits inside the bar it converted",
+                "(() => { const b = document.getElementById('control-bar').getBoundingClientRect(); "
+                "const f = document.getElementById('compose-text').getBoundingClientRect(); "
+                "const s = document.getElementById('send-text').getBoundingClientRect(); "
+                "return f.width > 60 && f.left >= b.left - 1 && s.right <= b.right + 1 && "
+                "f.top >= b.top - 1 && s.bottom <= b.bottom + 1; })()",
+            ),
+            (
+                "the call is untouched by the mode change",
+                "window.__text('talk-label') === 'Listening'",
             ),
         ),
     ),
@@ -2510,7 +2566,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 25:
+    if len(SCENES) < 26:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2531,7 +2587,9 @@ def check_state_controls() -> list[str]:
             "question 'does a fourth dock band fit on a 375x667 phone without eating the "
             "transcript or overlapping the controls' can be answered at all. `#58 control-bar` "
             "added the bar in BOTH of its homes, because 'directly above the big buttons' is a "
-            "measurement and nothing without a layout engine has an opinion about it."
+            "measurement and nothing without a layout engine has an opinion about it, and `#59 "
+            "text-entry-button` added the bar converted into a text field -- whether a whole "
+            "composer fits inside one strip on a 375px phone is the same kind of question."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -2649,6 +2707,9 @@ def check_state_controls() -> list[str]:
         # of, and `topbar` is the row that is supposed to disappear underneath it.
         "24-control-bar-top": ("scroll-area", "topbar"),
         "25-control-bar-bottom": ("control-pane", "topbar"),
+        # `#59 text-entry-button`. `view-switch` is the conversion -- the rest of the bar getting
+        # out of the way -- and `send-text` is the geometry: the composer inside the bar's own box.
+        "26-text-entry-open": ("view-switch", "send-text"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2920,8 +2981,9 @@ SELF_TEST_CHECKS = (
     "the long-target state is pinned to the target really overflowing its own box",
     "the hover state is pinned to the rendered colour, not to the row being hovered",
     "the older-step state is pinned to the anchor holding, not to the list being longer",
-    "the typed-turn state is pinned to the dock geometry, not just to the composer being up",
+    "the typed-turn state is pinned to the dock geometry, not just to the field being up",
     "both control-bar states are pinned to where the bar IS, not to the bar existing",
+    "the text-entry state is pinned to the composer fitting inside the bar it converted",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",
