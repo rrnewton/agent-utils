@@ -53,6 +53,11 @@ Direct-to-main does not mean unvalidated-to-main. Before every push:
 make validate
 ```
 
+**Do not pipe it.** `make validate | tail` reports *tail's* exit status, not the
+validator's, so a red run reads as green. That has happened twice, and the
+second time it put an unformatted commit on `main`. Run it bare, or redirect to
+a file and check `$?` — never through a pipe.
+
 That runs **only the checks your change can actually affect**, and prints the
 rest as skipped, by name, with the reason. A change confined to `gent-talk/`
 runs the gent-talk suite and nothing else, because gent-talk is outside the
