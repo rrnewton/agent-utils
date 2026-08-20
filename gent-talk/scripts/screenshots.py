@@ -518,6 +518,37 @@ STUB_JS = r"""
       user_transcription_event: { user_transcript: text },
     });
 
+  // `#54 resume-recovery`. There is no way to really background a Playwright page -- the browser
+  // stays visible and `visibilitychange` never fires -- so the two facts the page reads are
+  // redefined on the document and the event is dispatched by hand. Everything downstream of that
+  // is the page's own code: it classifies the close itself, and nothing here touches the panel or
+  // the controls.
+  const __setVisibility = (value) => {
+    Object.defineProperty(document, "visibilityState", {
+      configurable: true,
+      get: () => value,
+    });
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => value === "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+  window.__suspend = () => {
+    __setVisibility("hidden");
+    // Exactly what iOS does to a socket belonging to a page it has suspended: an error, then an
+    // abnormal close with no reason at all.
+    if (window.__socket) {
+      if (window.__socket.onerror) window.__socket.onerror({});
+      window.__socket.close(1006, "");
+    }
+  };
+  window.__resume = () => __setVisibility("visible");
+  // A failure with the page in the FOREGROUND, which is the one case that is still a failure.
+  window.__fail = () => {
+    if (window.__socket && window.__socket.onerror) window.__socket.onerror({});
+  };
+
   // Visibility as the eye sees it, not as `offsetParent` reports it: `offsetParent` is null for a
   // fixed-position element, which would make a perfectly visible control read as absent.
   window.__visible = (id) => {
@@ -1109,6 +1140,46 @@ def _act_desktop_wide(driver: Driver) -> None:
     driver.settle(200)
 
 
+# `#54 resume-recovery`. The two connection outcomes that were previously indistinguishable, and
+# which nothing in this table has ever photographed: NONE of the states above shows the error panel
+# at all, which is a large part of why the page spent months telling people a suspended call had
+# failed. Self-contained, and on every profile -- the phone is the device this actually happens on.
+
+
+def _act_call_for_drop(driver: Driver) -> None:
+    driver.load(with_token=True)
+    driver.page.wait_for_function("() => window.__visible('control-pane')", timeout=10_000)
+    driver.click("talk")
+    driver.page.wait_for_function(
+        "() => window.__text('talk-label') === 'Listening'", timeout=10_000
+    )
+    driver.js("window.__userSays('did the overnight run finish')")
+    driver.js(
+        "window.__agentSays('It did. The retry-budget branch landed at 9c07d3e and the tip is "
+        "green.')"
+    )
+    driver.settle(200)
+
+
+def _act_suspended(driver: Driver) -> None:
+    _act_call_for_drop(driver)
+    driver.js("window.__suspend()")
+    driver.settle(150)
+    driver.js("window.__resume()")
+    driver.page.wait_for_function("() => window.__text('talk-label') === 'Resume'", timeout=5_000)
+    driver.settle(200)
+
+
+def _act_connection_failed(driver: Driver) -> None:
+    _act_call_for_drop(driver)
+    # Foreground, so this really is the failure case: an error, and then the close that confirms
+    # the page was never hidden.
+    driver.js("window.__fail()")
+    driver.js("window.__socket.close(1006, '')")
+    driver.page.wait_for_function("() => window.__visible('error')", timeout=5_000)
+    driver.settle(200)
+
+
 # Hang up is ABSENT, not disabled, whenever there is no call. Asserted as its own expectation on
 # every no-call state, because "dimmed but present" was the defect the rework removed and a
 # screenshot is the only thing that can tell the two apart.
@@ -1451,6 +1522,59 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="16-suspended-recoverable",
+        what="the call dropped while the page was backgrounded — a pause, offering to Resume",
+        act=_act_suspended,
+        expect=(
+            (
+                "the large control offers to Resume, not to start something new",
+                "window.__text('talk-label') === 'Resume'",
+            ),
+            # THE point of this picture, and half of the pair. The state it has to be told apart
+            # from is state 17, which is the same close code with the page in the foreground.
+            (
+                "NO failure banner: nothing failed, the reader switched apps",
+                "!window.__visible('error')",
+            ),
+            (
+                "the dot says suspended, which is neither ended nor error",
+                "document.getElementById('status-line').dataset.state === 'suspended'",
+            ),
+            (
+                "the boundary is marked in the transcript, so nothing implies continuity",
+                "[...document.querySelectorAll('#transcript li.seam .seam-label')]"
+                ".some((n) => n.textContent.trim() === 'new conversation')",
+            ),
+            NO_HANGUP,
+        ),
+    ),
+    Scene(
+        name="17-connection-failed",
+        what="the same close code with the page in the FOREGROUND — a real failure, said plainly",
+        act=_act_connection_failed,
+        expect=(
+            # The other half of the pair. Together these two frames are the evidence that the fix
+            # distinguished two states rather than silencing one of them.
+            (
+                "the failure banner IS on screen, because this one really is a failure",
+                "window.__visible('error')",
+            ),
+            (
+                "it says where the failure is, not 'see the console'",
+                "/between this browser and ElevenLabs/.test("
+                "document.getElementById('error').textContent)",
+            ),
+            (
+                "the dot says error, not suspended",
+                "document.getElementById('status-line').dataset.state === 'error'",
+            ),
+            (
+                "the large control does NOT offer to Resume — there is nothing to resume",
+                "window.__text('talk-label') !== 'Resume'",
+            ),
+        ),
+    ),
 )
 
 
@@ -1736,7 +1860,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 15:
+    if len(SCENES) < 17:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -1744,7 +1868,10 @@ def check_state_controls() -> list[str]:
             "added two more that are pure rendering facts (a folded list with one message opened, "
             "and the chip that appears when a turn arrives off screen), and `#55 "
             "voice-desktop-app` added the reading column at each end of its range, which is the "
-            "only place the desktop composition can be judged at all."
+            "only place the desktop composition can be judged at all. `#54 resume-recovery` added "
+            "the last two: a suspended call and a failed one, which are the same close code and "
+            "must not look the same -- and which nothing here photographed before, because no "
+            "state above shows the error panel at all."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -1818,6 +1945,11 @@ def check_state_controls() -> list[str]:
         # was opened about and file it under the desktop name.
         "14-desktop-narrow-column": "__columnWidth",
         "15-desktop-wide-column": "__wideColumn",
+        # `#54 resume-recovery`. The pair. 16 is pinned to the ABSENCE of the banner, because a
+        # picture of a Resume button beside a red panel would be the defect itself; 17 is pinned to
+        # its presence, because a fix that simply stopped reporting failures would satisfy 16.
+        "16-suspended-recoverable": "!window.__visible('error')",
+        "17-connection-failed": "window.__visible('error')",
     }
     for name, needle in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -2078,6 +2210,8 @@ SELF_TEST_CHECKS = (
     "every state is pinned to its own distinguishing marker",
     "no state still drives a selector the interface rework retired",
     "the seam state is pinned to the dock geometry, not just to the element",
+    "the suspended state is pinned to the ABSENCE of the failure banner",
+    "the failed state is pinned to its presence, so silencing errors cannot pass",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",

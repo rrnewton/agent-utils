@@ -537,13 +537,23 @@ function errorResponse(status, error, detail) {
   return async () => json(status, { error, detail });
 }
 
-/** A successful mint, exactly as `/api/v1/signed-url` serializes one. */
-const MINTED = async () =>
-  json(200, {
-    signed_url: "wss://example.invalid/convai?sig=test",
+/**
+ * A successful mint, exactly as `/api/v1/signed-url` serializes one.
+ *
+ * The signature is DIFFERENT every time, because a signed URL is a single-use short-lived
+ * credential and the real endpoint mints a fresh one per request. A constant here would make
+ * "resuming really re-minted rather than reusing the dead URL" — the assertion `#54
+ * resume-recovery` turns on — impossible to state at all.
+ */
+let mints = 0;
+const MINTED = async () => {
+  mints += 1;
+  return json(200, {
+    signed_url: `wss://example.invalid/convai?sig=test-${mints}`,
     agent_id: "agent_test",
     valid_for_seconds: 900,
   });
+};
 
 const CHANNEL = { id: "1110000000000000001", label: "lead team", writable: true };
 
@@ -642,13 +652,32 @@ function newPage(store = new Map(), script = SCRIPT) {
   // BOTH the panes inside #screen-main and the control pane inside the dock — they have no common
   // ancestor below it — and because the reading-width tests below read the property back off it.
   page.documentElement = new FakeElement("html", "html");
+  // The document's own listeners — today only `visibilitychange`, which is the one signal a
+  // browser gives for "this page went away". `#54 resume-recovery` turns entirely on it, and
+  // before this the fake document had no way to be hidden at all.
+  const documentListeners = new Map();
   const document = {
     documentElement: page.documentElement,
+    visibilityState: "visible",
+    hidden: false,
+    addEventListener: (type, fn) => {
+      const existing = documentListeners.get(type) || [];
+      existing.push(fn);
+      documentListeners.set(type, existing);
+    },
     getElementById: (id) => elements.get(id) || null,
     createElement: (tag) => {
       page.createdTags.push(String(tag).toLowerCase());
       return new FakeElement("", String(tag).toLowerCase());
     },
+  };
+  /** Background the page, or bring it back — the property AND the event, as a browser does. */
+  page.setVisibility = async (visibility) => {
+    document.visibilityState = visibility;
+    document.hidden = visibility === "hidden";
+    for (const fn of documentListeners.get("visibilitychange") || []) {
+      await fn();
+    }
   };
   const localStorage = {
     getItem: (k) => (store.has(k) ? store.get(k) : null),
@@ -1413,8 +1442,24 @@ test("the controls SHOW their state, not merely hold it", () => {
   // The status dot must actually differ between states, or the one status line is just a sentence.
   const dot = (state) => cssBlock(`#status-line[data-state="${state}"] .status-dot`);
   const colour = (block) => /background:\s*([^;]+);/.exec(block)[1].trim();
-  const shades = new Set([colour(cssBlock(".status-dot")), colour(dot("live")), colour(dot("error"))]);
-  assert.equal(shades.size, 3, `idle, live and error must look different: ${[...shades]}`);
+  // `#54 resume-recovery` made this four rather than three. A suspension that shares a colour with
+  // either an ended call or an error is a state the eye cannot tell from the thing it is NOT.
+  const shades = new Set([
+    colour(cssBlock(".status-dot")),
+    colour(dot("live")),
+    colour(dot("error")),
+    colour(dot("suspended")),
+  ]);
+  assert.equal(
+    shades.size,
+    4,
+    `idle, live, error and suspended must look different: ${[...shades]}`
+  );
+  // And the token really has a value in BOTH schemes: a dot that is only defined for dark mode
+  // renders as nothing at all in light mode, which is worse than the wrong colour.
+  for (const block of [cssBlock(":root"), cssBlockIn("(prefers-color-scheme: light)", ":root")]) {
+    assert.match(block, /--paused:\s*#[0-9a-f]{6}/i, "the suspended colour is missing a scheme");
+  }
 
   // An armed Clear that looks like an unarmed one is not a confirmation.
   const armed = cssBlock("#clear-view.armed");
@@ -1996,6 +2041,230 @@ test("a call that never connected does not claim a conversation ended", async ()
     0,
     "a failed mint produced an end-of-call marker for a call that never happened"
   );
+});
+
+// --- a call that was suspended, not lost -------------------------------------------------------
+//
+// `#54 resume-recovery`. Put the phone in your pocket mid-call, come back, and the page used to
+// greet you with a red panel saying the connection to the voice agent had FAILED. Nothing had
+// failed; you switched apps. These are the first tests this page has ever had for `socket.onerror`
+// — that path had zero coverage before, which is part of why it was wrong.
+
+/**
+ * Background the page, let the socket die the way iOS kills one, and come back.
+ *
+ * `onerror` THEN `onclose`, in that order and with code 1006, because that is what a browser
+ * really does with an abnormal close — and because the error event is what used to put the red
+ * panel on the screen. A scenario that skipped it would not reproduce the reported defect at all,
+ * and the negative control below would then have nothing to fail on.
+ */
+async function suspendAndReturn(page, { code = 1006 } = {}) {
+  await page.setVisibility("hidden");
+  page.sockets[0].onerror({});
+  page.sockets[0].onclose({ code, reason: "" });
+  await page.setVisibility("visible");
+}
+
+test("A CALL DROPPED IN THE BACKGROUND IS PAUSED, NOT FAILED", async () => {
+  // The whole issue, in one scenario.
+  const page = newPage();
+  await startTalking(page);
+  assistantSays(page, "it landed at 9c07d3e");
+
+  await suspendAndReturn(page);
+
+  assert.equal(page.el("error").hidden, true, "switching apps raised a failure banner");
+  assert.equal(state(page), "suspended", `the dot says ${state(page)}, not suspended`);
+  assert.match(page.el("status").textContent, /background|paused/i);
+  assert.equal(page.el("talk-label").textContent, "Resume");
+
+  // THE CONTROL. Without it this test is satisfied by a page that has simply stopped reporting
+  // errors at all, which is a strictly worse page than the one being fixed.
+  const control = newPage(
+    new Map(),
+    brokenScript("    hiddenDuringCall &&", "    false &&")
+  );
+  await startTalking(control);
+  await suspendAndReturn(control);
+  assert.equal(
+    control.el("error").hidden,
+    false,
+    "with the suspension check removed the page STILL said nothing, so this test cannot tell a " +
+      "fixed page from a silent one"
+  );
+});
+
+test("the same drop while the page is VISIBLE is still a failure, and still says so", async () => {
+  // The other half of the control: a fix that hid every error would pass the test above.
+  const page = newPage();
+  await startTalking(page);
+
+  page.sockets[0].onerror({});
+  page.sockets[0].onclose({ code: 1006, reason: "" });
+
+  assert.equal(page.el("error").hidden, false, "a real failure was swallowed");
+  assert.match(page.el("error").textContent, /connection to the voice agent failed/i);
+  assert.equal(state(page), "error");
+  assert.doesNotMatch(
+    page.el("status").textContent,
+    /background|paused/i,
+    "a genuine failure was dressed up as a suspension"
+  );
+  assert.equal(page.el("talk-label").textContent, "Start a new call", "a failure is not a pause");
+});
+
+test("a close that arrives on the way BACK is still the suspension; one long after is not", async () => {
+  // The grace window is the whole heuristic, and it exists because iOS commonly delivers the close
+  // when the page returns rather than while it is hidden. Both edges are asserted, because a
+  // window wide enough to catch the first case must not be wide enough to excuse the second.
+  const grace = Number(/SUSPENSION_GRACE_MS = (\d+)/.exec(SCRIPT_CODE)[1]);
+  // The two checks below are written against whatever the page says the window is, which makes
+  // them silent about the window itself: widening it to ten minutes moves both boundaries with it
+  // and they stay green. So the VALUE is pinned too. A band, not a number — the exact figure is a
+  // judgement — but a window long enough to excuse a failure the reader watched happen is not a
+  // grace period, it is a way of never reporting a failure again.
+  assert.ok(
+    grace >= 500 && grace <= 5000,
+    `a ${grace}ms grace window is not a grace window: below about half a second it misses the ` +
+      "close iOS delivers on the way back, and above a few seconds it starts excusing genuine " +
+      "failures the reader was looking at when they happened"
+  );
+
+  const soon = newPage();
+  await startTalking(soon);
+  await soon.setVisibility("hidden");
+  await soon.setVisibility("visible");
+  soon.setClock(soon.clock() + grace - 1);
+  soon.sockets[0].onclose({ code: 1006, reason: "" });
+  assert.equal(state(soon), "suspended", "the close iOS delivers on the way back was not excused");
+  assert.equal(soon.el("error").hidden, true);
+
+  const late = newPage();
+  await startTalking(late);
+  await late.setVisibility("hidden");
+  await late.setVisibility("visible");
+  late.setClock(late.clock() + grace + 1);
+  late.sockets[0].onerror({});
+  late.sockets[0].onclose({ code: 1006, reason: "" });
+  assert.equal(
+    state(late),
+    "error",
+    "a genuine failure a moment after a tab switch was excused as a suspension"
+  );
+  assert.equal(late.el("error").hidden, false);
+});
+
+test("coming back does NOT silently reconnect — nothing reopens the microphone unasked", async () => {
+  // Explicitly ruled out by the issue, and it is the reason this is a classification rather than a
+  // reconnection: returning to a phone that has quietly reopened the microphone and started a
+  // conversation is a worse outcome than the banner being replaced.
+  const page = newPage();
+  await startTalking(page);
+
+  await suspendAndReturn(page);
+
+  assert.equal(page.sockets.length, 1, "the page reconnected on its own");
+  assert.equal(page.micRequests.length, 1, "the page reopened the microphone on its own");
+  assert.equal(page.tracks[0].stops, 1, "the suspended call did not release the microphone");
+});
+
+test("RESUMING MINTS A FRESH SIGNED URL, and the reader never sees an error doing it", async () => {
+  // The "expired credential" case the issue worries about, closed by construction rather than by
+  // handling: `start()` mints on every call, so there is no path on which a stale URL is reused.
+  const page = newPage();
+  await startTalking(page);
+  await suspendAndReturn(page);
+
+  await page.el("talk").click();
+  page.sockets[1].onopen();
+
+  assert.equal(page.sockets.length, 2, "Resume did not open a second conversation");
+  assert.notEqual(
+    page.sockets[1].url,
+    page.sockets[0].url,
+    "Resume reused the signed URL of the conversation that died"
+  );
+  assert.equal(page.micRequests.length, 2, "Resume did not reopen the microphone");
+  assert.equal(page.el("error").hidden, true, "the whole round trip must show no error at all");
+  assert.equal(state(page), "live");
+  assert.equal(page.el("talk-label").textContent, "Listening");
+});
+
+test("the boundary is marked ONCE, where the conversation actually broke", async () => {
+  // At the moment of the drop, not when Resume is tapped: marking it later would put the reader's
+  // own next turn on the wrong side of it. Same LABEL as a hang-up, because it is the same
+  // boundary — the agent below it has never seen anything above it.
+  const page = newPage();
+  await startTalking(page);
+  assistantSays(page, "before the drop");
+  await suspendAndReturn(page);
+
+  await page.el("talk").click();
+  page.sockets[1].onopen();
+  assistantSays(page, "after the resume");
+
+  const lines = page.el("transcript").children;
+  const seams = lines.filter((li) => li.className === "seam");
+  assert.equal(seams.length, 1, `the boundary was drawn ${seams.length} times`);
+  assert.equal(seamLabel(seams[0]), "new conversation");
+  assert.ok(
+    lines.indexOf(seams[0]) < lines.length - 1,
+    "the boundary is the last thing in the list, so the resumed turn landed above it"
+  );
+  // Its explanation is measured exactly like the other two, so the essay cannot regrow here.
+  const spent = words(seamDetail(seams[0]));
+  assert.ok(spent >= SEAM_DETAIL_MIN_WORDS, `the suspension seam explains nothing: ${spent} words`);
+  assert.ok(spent <= SEAM_DETAIL_MAX_WORDS, `${spent} words behind a tap is an essay`);
+  assert.match(seamDetail(seams[0]), /background/, "it does not say WHY the conversation broke");
+});
+
+test("a resumed call is judged on ITS OWN events, not on the dead one's", async () => {
+  // Both halves of the state a new call has to start from, and both are one missing line away from
+  // a page that is confidently wrong about the SECOND call because of what happened to the first.
+
+  // 1. A drop, then Resume tapped immediately — inside the grace window, which is exactly when
+  //    this goes wrong — and then a genuine failure. It must be a failure, not a second pause.
+  const page = newPage();
+  await startTalking(page);
+  await suspendAndReturn(page);
+  await page.el("talk").click(); // same instant: the fixture clock has not moved
+  page.sockets[1].onopen();
+  page.sockets[1].onerror({});
+  page.sockets[1].onclose({ code: 1006, reason: "" });
+  assert.equal(
+    state(page),
+    "error",
+    "the second call inherited the first one's suspension and hid a real failure"
+  );
+  assert.equal(page.el("error").hidden, false);
+
+  // 2. The mirror image: a failure, then a new call that ends cleanly. It must be an ordinary
+  //    ending, not the previous failure reported twice.
+  const after = newPage();
+  await startTalking(after);
+  after.sockets[0].onerror({});
+  after.sockets[0].onclose({ code: 1006, reason: "" });
+  await after.el("talk").click();
+  after.sockets[1].onopen();
+  assert.equal(after.el("error").hidden, true, "starting a new call left the old failure showing");
+  await after.el("hang-up").click();
+  assert.equal(after.el("error").hidden, true, "a clean hang-up re-reported the previous failure");
+  assert.equal(state(after), "ended");
+});
+
+test("an error with NO close following still reaches the screen", async () => {
+  // `onerror` no longer reports directly — it arms a short timer the close cancels — so the case
+  // that has to be checked is the one where no close ever comes. Silence there would be the
+  // original bug (a failure only the dev console knows about) in a new coat.
+  const page = newPage();
+  await startTalking(page);
+
+  page.sockets[0].onerror({});
+  assert.equal(page.el("error").hidden, true, "it reported before the close had a chance to speak");
+
+  assert.equal(page.expireTimers(250), 1, "no timer was armed to report the unaccompanied error");
+  assert.equal(page.el("error").hidden, false, "an error with no close was never reported at all");
+  assert.match(page.el("error").textContent, /between this browser and ElevenLabs/);
 });
 
 // --- clearing the view ----------------------------------------------------------------------------

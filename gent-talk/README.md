@@ -460,6 +460,40 @@ The `/voice` page expects the agent's output audio format to be **PCM** (`pcm_16
 default). It reads the format out of the conversation's initiation metadata and says so plainly if
 it is something it cannot decode, rather than playing noise.
 
+### A conversation can end three ways, and they are three different sentences
+
+A WebSocket close is one event, and the page used to have two things to say about it. That is one
+too few, and the missing one is the common case on a phone: **put the handset in your pocket
+mid-call and iOS suspends the page**, the socket dies, and the page greeted the owner on his return
+with a red panel saying the connection to the voice agent had FAILED. Nothing had failed. He
+switched apps.
+
+`socket.onclose` is now the only classifier, and it distinguishes:
+
+| What happened | What the page says | Dot |
+|---|---|---|
+| The page was in the background when the socket died | "Paused — the app was in the background." The large control offers **Resume**. | `suspended` |
+| Something really broke between this browser and ElevenLabs | The failure panel, unchanged, naming where the fault is | `error` |
+| The call ended | What it already said, in words rather than a close code | `ended` |
+
+`socket.onerror` no longer reports anything by itself: it fires *before* the close, and only the
+close knows whether the page was hidden. It records the fact and arms a 250 ms timer that the close
+cancels — so an error with no close following still reaches the screen, which is what that timer is
+for.
+
+**Nothing auto-reconnects.** Returning to a phone that has quietly reopened the microphone and
+started a conversation nobody asked for is a worse outcome than the banner this replaces. Resume is
+a tap, and it runs the ordinary start path — which mints a **fresh** signed URL every time, so the
+"expired credential" case is closed by construction rather than by handling: this page has never
+reused one. The clause under the button says so, because "Resume" is the honest word for what the
+reader wants and a dishonest word for what the agent gets.
+
+The suspension test is a **heuristic** and is documented as one: a close within 2.5 s of the page
+coming back still counts as part of the suspension, because iOS commonly delivers it on the way
+*back* rather than while hidden. Too wide a window would excuse a genuine drop moments after a tab
+switch, which is why the page suite carries the negative control both ways — a visible failure must
+still raise the banner, and a page with the suspension check removed must fail the suspension test.
+
 ### The page has two compositions, and a capability query picks between them
 
 The phone is the device this page is used on, so the phone layout is the one everything above
@@ -844,7 +878,7 @@ cargo run -- --config gent-talk.toml --fake-discord &
 scripts/verify-deployment.sh --url http://127.0.0.1:8080 --channel <a-configured-snowflake>
 ```
 
-315 Rust tests plus a 120-test suite for the `/voice` page: unit tests beside each module,
+315 Rust tests plus a 128-test suite for the `/voice` page: unit tests beside each module,
 end-to-end tests in `tests/api.rs` that drive the real router against the in-memory Discord, and
 `tests/mcp.rs` doing the same for the MCP endpoint. `tests/elevenlabs_mock.rs` is the one place
 the WHOLE chain runs — the real `HttpElevenLabsClient` mints against a loopback ElevenLabs
@@ -880,12 +914,13 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the fifteen states that look different — signed out, idle, live
+Photographs the `/voice` page in the seventeen states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
-arrives while the reader is up in the history, and the desktop reading column at each end of its
-range — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+arrives while the reader is up in the history, the desktop reading column at each end of its
+range, and the two connection outcomes that used to look identical — a call suspended by the
+phone, and one that really failed — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
 desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
@@ -937,7 +972,7 @@ it. It measures the SAME message closed and then open — comparing the first op
 the first closed one compares two lengths rather than two states, and passed for the wrong reason
 at desktop width until it was fixed.
 
-`scripts/screenshots.py --self-test` runs 35 controls for those checks offline, with no browser and
+`scripts/screenshots.py --self-test` runs 37 controls for those checks offline, with no browser and
 no server; `scripts/test-run-sh.sh` runs them as part of its own suite. Screenshots are written to
 the gitignored `debug/screenshots/` and are never committed. Playwright and its Chromium are the
 only requirement, and a missing one fails by name with the install command.

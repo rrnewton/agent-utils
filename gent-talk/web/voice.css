@@ -24,6 +24,11 @@
   --dock: #191c22;
   --ok: #5bd98a;
   --idle: #6b7484;
+  /* `#54 resume-recovery`. A call that was dropped while the page was in the background is not a
+     failure and is not an ordinary hang-up, so its dot is neither `--warn` nor `--muted`. Violet,
+     because nothing else on this page is: the three states it has to be told apart from at a
+     glance are green, orange and grey. */
+  --paused: #9b8cf0;
   /* THE reading column, in characters. Only the desktop regime at the foot of this file consults
      it — a phone has no room for a column and no margin to put beside one — but it is declared
      here, with the other tokens, rather than inside the media query, so that web/voice.js can set
@@ -41,6 +46,7 @@
     --dock: #eef1f5;
     --ok: #1f8f4c;
     --idle: #98a1b0;
+    --paused: #5b48c4;
   }
 }
 
@@ -618,6 +624,14 @@ body {
 
 #status-line[data-state="error"] .status-dot {
   background: var(--warn);
+}
+
+/* `#54 resume-recovery`. The call dropped while the page was in the background — recoverable, and
+   NOT the same thing as either of the two above it. Reading it as `ended` would say the reader
+   chose to hang up; reading it as `error` would say something is broken, which is what the page
+   used to do and what the issue is about. */
+#status-line[data-state="suspended"] .status-dot {
+  background: var(--paused);
 }
 
 /* --------------------------------------------------------------------- the control pane ---- */

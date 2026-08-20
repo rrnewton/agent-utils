@@ -36,7 +36,13 @@ const setStatus = (text) => {
   el("status").textContent = redact(text);
 };
 
-/** One of: idle, working, live, ended, error. web/voice.css colours the dot from this. */
+/**
+ * One of: idle, working, live, ended, suspended, error. web/voice.css colours the dot from this.
+ *
+ * `suspended` is `#54 resume-recovery`: the socket died while the page was in the background. It
+ * is deliberately neither `ended` (which says the reader chose to hang up) nor `error` (which says
+ * something is broken), because it is neither, and calling it either one is the defect.
+ */
 const setState = (name) => {
   el("status-line").setAttribute("data-state", name);
 };
@@ -81,6 +87,10 @@ function clearError() {
 const session = {
   socket: null,
   connected: false, // true only between `onopen` and teardown.
+  // `#54 resume-recovery`. Set by `onerror`, read by `onclose`. The socket reports a failure and a
+  // close as two separate events, in that order, and only the CLOSE knows whether the page was in
+  // the background — so the error cannot be the thing that decides what to tell the reader.
+  failed: false,
   muted: false,
   // The agent's VOICE is silenced; the agent is not. Its replies keep arriving and keep being
   // written into the transcript — see `handle`, where only the audio frames are dropped.
@@ -521,24 +531,48 @@ let conversationOpen = false;
  * is to mark the break rather than to promise a resume, and mute — which never closes the socket —
  * is the control that actually preserves context.
  */
-function noteConversationEnded() {
+// What the seam says INSIDE its disclosure, per cause. The LABEL is the same three words in every
+// case, deliberately: the boundary is the same boundary — the agent below it has never seen
+// anything above it — however the socket happened to close. Only the explanation differs, because
+// only the cause differs, and each of these is a couple of clauses because the suite measures
+// them. `#54 resume-recovery`.
+const SEAM_DETAILS = {
+  ended:
+    "Anything below this line goes to an agent that has never seen anything above it. " +
+    "Mute, not Hang up, keeps its memory.",
+  suspended:
+    "The call dropped while this page was in the background. Resuming starts a NEW " +
+    "conversation: the agent below this line remembers nothing above it.",
+  failed:
+    "The connection dropped. Anything below this line goes to an agent that has never seen " +
+    "anything above it.",
+};
+
+function seamDetailFor(cause) {
+  return SEAM_DETAILS[cause] || SEAM_DETAILS.ended;
+}
+
+function noteConversationEnded(cause = "ended") {
   if (!conversationOpen) {
     return;
   }
   conversationOpen = false;
   // From here the large control is a different offer — a NEW call, from nothing — and it says so.
   hasEnded = true;
+  // ...and if the drop was a suspension, the offer has a different WORD on it, because "Start a
+  // new call" reads as an invitation to begin something and this is an invitation to carry on.
+  hasSuspended = cause === "suspended";
   renderControls();
   // Two facts, and only two: what the line means, and which control would have avoided it. The
   // version before this one was fifty-seven words of vendor archaeology one tap inside a
   // disclosure, which is not shorter than a paragraph — it is a paragraph nobody opens. The rest
   // of it (why a hang-up loses the context, and that the lines above are still your own record)
   // lives in Settings under "What the controls do", which is where the long form belongs.
-  seam(
-    "new conversation",
-    "Anything below this line goes to an agent that has never seen anything above it. " +
-      "Mute, not Hang up, keeps its memory."
-  );
+  //
+  // Drawn at the moment of the DROP, not when Resume is tapped: the boundary is where the
+  // conversation actually broke, and marking it later would put the reader's own next turn on the
+  // wrong side of it.
+  seam("new conversation", seamDetailFor(cause));
 }
 
 // --- clearing the transcript ---------------------------------------------------------------
@@ -1011,6 +1045,70 @@ function onGripKey(event) {
   readingWidthChanged(next());
 }
 
+// --- a call that was suspended, not lost ------------------------------------------------------
+//
+// `#54 resume-recovery`. Put the phone in your pocket mid-call and iOS suspends the page; the
+// WebSocket dies, and this page used to greet you on your return with a red panel saying the
+// connection to the voice agent had FAILED. Nothing had failed. You switched apps.
+//
+// The fix is a classification, not a reconnection. Three things can end a socket and they are
+// three different sentences:
+//
+//   * the page was backgrounded         -> Paused, and the large control offers to Resume
+//   * something really broke            -> the error panel, unchanged, because it is real
+//   * the call ended                    -> what the page already said
+//
+// NOTHING AUTO-RECONNECTS. Coming back to a phone that has quietly reopened the microphone and
+// started a conversation nobody asked for is a worse outcome than the banner this replaces, and
+// the issue rules it out. Resume is a tap, and it runs the ordinary `start()` — which mints a
+// FRESH signed URL every time, so the "expired credential" case the issue worries about cannot
+// arise: the page has never reused one.
+
+// How long after the page comes back a close still counts as part of the suspension. iOS commonly
+// delivers the close on the way BACK rather than while hidden, so a window with no grace at all
+// would miss the exact case this exists for. Too wide and a genuine drop moments after a tab
+// switch gets excused, which is why the suite carries a negative control for a VISIBLE failure.
+const SUSPENSION_GRACE_MS = 2500;
+
+// `onerror` arms this; `onclose` cancels it. Short, because it is only bridging the gap between
+// two events the browser fires back to back.
+const FAILURE_REPORT_MS = 250;
+let failureTimer = null;
+
+let hiddenDuringCall = false;
+let visibleAt = 0;
+
+// Short on purpose: `#status` is one line with `white-space: nowrap` and an ellipsis, so anything
+// longer than about forty characters is simply not readable on a phone.
+const SUSPENDED_STATUS = "Paused — the app was in the background.";
+
+function onVisibility() {
+  if (document.visibilityState === "hidden") {
+    // Only a call can be suspended. Hiding an idle page is not an event.
+    if (session.socket) {
+      hiddenDuringCall = true;
+    }
+    return;
+  }
+  visibleAt = Date.now();
+}
+
+function wasSuspended() {
+  return (
+    hiddenDuringCall &&
+    (document.visibilityState === "hidden" || Date.now() - visibleAt < SUSPENSION_GRACE_MS)
+  );
+}
+
+function reportFailure() {
+  failureTimer = null;
+  showError(
+    "The connection to the voice agent failed. The signed URL was minted, so gent-talk and " +
+      "your token are fine; the failure is between this browser and ElevenLabs."
+  );
+  setStatus("The connection to the voice agent failed.");
+}
+
 // --- the call ----------------------------------------------------------------------------------
 
 async function start() {
@@ -1019,6 +1117,11 @@ async function start() {
     return;
   }
   clearError();
+  // A new call is a clean slate for all three of these. `hasSuspended` in particular: leaving it
+  // set would keep the large control reading "Resume" during and after the call it started.
+  session.failed = false;
+  hiddenDuringCall = false;
+  hasSuspended = false;
   setState("working");
   setStatus("Asking gent-talk for a signed URL…");
   const minted = await mintSignedUrl();
@@ -1072,27 +1175,47 @@ async function start() {
   };
 
   socket.onerror = () => {
-    // Not "see the console": the console is exactly where this used to die.
-    showError(
-      "The connection to the voice agent failed. The signed URL was minted, so gent-talk and " +
-        "your token are fine; the failure is between this browser and ElevenLabs."
-    );
-    setStatus("The connection to the voice agent failed.");
+    // NOT `showError` any more. `onerror` fires BEFORE the close, and only the close knows whether
+    // this browser had backgrounded the page — which is the difference between "something is
+    // broken" and "you switched apps". So this records the fact and arms a short timer; the close
+    // cancels it and classifies. An error with no close following still reaches the screen, which
+    // is what the timer is for: silence would be the old bug in a new coat.
+    session.failed = true;
+    if (failureTimer !== null) {
+      clearTimeout(failureTimer);
+    }
+    failureTimer = setTimeout(reportFailure, FAILURE_REPORT_MS);
   };
 
   socket.onclose = (event) => {
-    // A signed-URL failure shows up HERE, as an immediate close, so the page has to say something
-    // — but "code 1005" is not something. It says what happened in words; the number goes where
-    // numbers belong, in the connection details on the settings screen.
-    setState("ended");
-    setStatus(closeReason(event.code));
+    // THE one classifier. Three outcomes, and they are three different things to say:
+    //
+    //   suspended  the page was in the background — recoverable, and no failure happened
+    //   failed     something really went wrong between this browser and ElevenLabs
+    //   ended      the call is over, either because it was hung up or because it ran out
+    //
+    // The old code had two of these and reported the first as the second.
+    if (failureTimer !== null) {
+      clearTimeout(failureTimer);
+      failureTimer = null;
+    }
+    const cause = wasSuspended() ? "suspended" : session.failed ? "failed" : "ended";
+    if (cause === "failed") {
+      reportFailure();
+    } else {
+      setState(cause);
+      // A signed-URL failure also shows up here, as an immediate close, so the page has to say
+      // something — but "code 1005" is not something. It says what happened in words; the number
+      // goes where numbers belong, in the connection details on the settings screen.
+      setStatus(cause === "suspended" ? SUSPENDED_STATUS : closeReason(event.code));
+    }
     // The banner is about a conversation that no longer exists, and the code is the one thing on
     // this page that must not be read as user-facing. Put the banner away FIRST, then record the
     // number where numbers belong: the connection details on the settings screen.
     dismissBanner();
     addDetail(`closed with code ${event.code}${event.reason ? `: ${event.reason}` : ""}`);
     teardown();
-    noteConversationEnded();
+    noteConversationEnded(cause);
   };
 }
 
@@ -1264,6 +1387,12 @@ function stop() {
 // "Start a new call" afterwards. They are different offers: the second one starts from nothing.
 let hasEnded = false;
 
+// ...and true when the reason it ended was a SUSPENSION rather than anything the reader did or
+// anything that broke. Same offer, different word: "Resume" reads as carrying on, which is what
+// the reader is trying to do. The clause under it refuses to imply the continuity they might
+// otherwise assume from that word. `#54 resume-recovery`.
+let hasSuspended = false;
+
 function renderControls() {
   const talk = el("talk");
   const label = el("talk-label");
@@ -1278,9 +1407,15 @@ function renderControls() {
 
   if (!live) {
     talk.className = "control control-talk";
-    label.textContent = hasEnded ? "Start a new call" : "Talk";
+    if (hasSuspended) {
+      label.textContent = "Resume";
+    } else {
+      label.textContent = hasEnded ? "Start a new call" : "Talk";
+    }
     if (hasEnded) {
-      note.textContent = "the agent starts fresh";
+      // "Resume" is the honest word for what the reader wants and a dishonest word for what the
+      // agent gets, so the clause under it says which of the two this is.
+      note.textContent = hasSuspended ? "a new call — the agent starts fresh" : "the agent starts fresh";
       note.hidden = false;
     }
     return;
@@ -1767,6 +1902,11 @@ el("width-grip").addEventListener("pointermove", onGripMove);
 el("width-grip").addEventListener("pointerup", onGripUp);
 el("width-grip").addEventListener("pointercancel", onGripUp);
 el("width-grip").addEventListener("keydown", onGripKey);
+
+// `#54 resume-recovery`. The one signal a browser gives for "this page went away": it is what
+// distinguishes a socket that died because the reader switched apps from one that died because
+// something is broken.
+document.addEventListener("visibilitychange", onVisibility);
 
 el("talk").addEventListener("click", onTalk);
 el("hang-up").addEventListener("click", stop);
