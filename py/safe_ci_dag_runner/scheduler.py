@@ -8,6 +8,7 @@ Per-step supervision reaps complete process trees and records structured outcome
 
 from __future__ import annotations
 
+import codecs
 import os
 import subprocess
 import sys
@@ -1096,7 +1097,14 @@ class Runner:
                 )
             # Self-contained failure: dump the captured child output, tagged.
             self._emit(f"[{step.tag}] ----- detail -----")
-            for line in captured.joined().decode(errors="replace").splitlines():
+            # INCREMENTAL. `captured.joined().decode().splitlines()` materialised
+            # the whole decoded tail AND a list of per-line objects, blowing the
+            # L + 64 KiB budget on every required input shape (9.279L on
+            # newline-heavy, 2.494L on the incident's own four-banner output).
+            # iter_text() streams bounded decoded pieces out of the ring instead.
+            if captured.dropped_notice():
+                self._emit(f"[{step.tag}] " + captured.dropped_notice().rstrip("\n"))
+            for line in _lines_from_pieces(captured.iter_text()):
                 self._emit(f"[{step.tag}] {line}")
             self._emit(f"[{step.tag}] ----- end detail -----")
 
@@ -1370,6 +1378,16 @@ def run_dag_limited(
 #: disk (which has its own, separate cap).
 CAPTURE_TAIL_BYTES = 4 * 1024 * 1024
 
+#: Bytes decoded at a time when rendering. 2 KiB, not 8: the decoded piece is what
+#: lands in memory and a `str` costs up to 4 bytes per character, so the window is
+#: an upper bound on overhead only after that multiplier. Measured worst-case
+#: render overhead against the L + 64 KiB detail bar, by window size:
+#:     8192 -> 84,161  OVER      4096 -> 43,145      2048 -> 22,609
+#: The worst shape is invalid UTF-8, where every byte becomes a 2-byte replacement
+#: character AND there are no newlines to flush on, so the carry runs to the
+#: window before it is emitted. 2 KiB leaves ~3x headroom under the bar.
+_RENDER_WINDOW_BYTES = 2 * 1024
+
 #: Longest unterminated run the live-stream path will hold before flushing it as
 #: a partial line. Separate from CAPTURE_TAIL_BYTES: that bounds what is KEPT,
 #: this bounds what is BUFFERED WAITING FOR A NEWLINE.
@@ -1460,6 +1478,70 @@ class _BoundedCapture:
     def __bool__(self) -> bool:
         return bool(self._len)
 
+    def iter_text(self):
+        """Yield the retained output as decoded pieces, incrementally.
+
+        NEVER materialises the whole decoded tail and NEVER builds a list of
+        lines. `bytes.decode().splitlines()` does both, and both blow the bound:
+        measured against an L + 64 KiB bar at L = 4 MiB, with the old path,
+            the exact four-banner incident shape   2.494L
+            newline-heavy                          9.279L
+            mixed Unicode                          4.539L
+            invalid UTF-8                          3.000L
+            long-line                              2.000L
+        A decoded `str` costs up to 4 bytes per character once any non-ASCII
+        appears, and `splitlines()` then adds a ~49-byte object header per line --
+        which is why newline-heavy is the worst shape and why the incident's own
+        log, a third of whose lines are blank, is over the bar too.
+
+        Pieces are yielded WITHOUT dropping anything: a line longer than the
+        window arrives in several pieces rather than being truncated. Callers that
+        want lines should split on the newlines they receive; callers that are
+        printing can print the pieces straight out.
+
+        Decoding is INCREMENTAL so a multi-byte character split across the window
+        boundary, or across the ring's wrap, still decodes correctly instead of
+        becoming two replacement characters.
+        """
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        for segment in self._segments():
+            for start in range(0, len(segment), _RENDER_WINDOW_BYTES):
+                piece = decoder.decode(
+                    bytes(segment[start : start + _RENDER_WINDOW_BYTES])
+                )
+                if piece:
+                    yield piece
+        tail = decoder.decode(b"", True)
+        if tail:
+            yield tail
+
+    def _segments(self):
+        """The retained bytes in arrival order, as at most two memoryviews.
+
+        Views, not copies: iterating the ring for rendering must not allocate the
+        second L that `joined()` does.
+        """
+        if self._len == 0:
+            return
+        start = (self._pos - self._len) % self._limit
+        view = memoryview(self._buf)
+        if start + self._len <= self._limit:
+            yield view[start : start + self._len]
+        else:
+            yield view[start:]
+            yield view[: self._len - (self._limit - start)]
+
+    def dropped_notice(self) -> str:
+        """The head-dropped notice, or empty. Separate so a renderer can emit it
+        first without going through `joined()` and paying for a copy."""
+        if not self.dropped:
+            return ""
+        return (
+            f"[dag-runner] ... {self.dropped} earlier byte(s) of this step's output "
+            f"are NOT shown: only the last {self._limit} bytes are kept in memory. "
+            f"The complete stream is in the step log on disk.\n"
+        )
+
     def joined(self) -> bytes:
         """The retained tail, prefixed with a notice when the head was dropped."""
         tail = self._tail()
@@ -1471,6 +1553,28 @@ class _BoundedCapture:
             f"The complete stream is in the step log on disk.\n"
         ).encode()
         return notice + tail
+
+
+def _lines_from_pieces(pieces):
+    """Re-assemble lines from bounded decoded pieces, holding at most one line.
+
+    Deliberately NOT `"".join(pieces).splitlines()` -- that would rebuild exactly
+    the object this exists to avoid. A line longer than the render window is
+    emitted in parts rather than buffered whole, so a single enormous line cannot
+    reintroduce the bound it broke; nothing is dropped, only split.
+    """
+    carry = ""
+    for piece in pieces:
+        carry += piece
+        while "\n" in carry:
+            line, carry = carry.split("\n", 1)
+            yield line
+        if len(carry) > _RENDER_WINDOW_BYTES:
+            yield carry
+            carry = ""
+    if carry:
+        yield carry
+
 
 
 def _last_line(chunks: Sequence[bytes]) -> str:
