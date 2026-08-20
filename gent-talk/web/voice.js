@@ -311,12 +311,15 @@ function noteConversationEnded() {
   // From here the large control is a different offer — a NEW call, from nothing — and it says so.
   hasEnded = true;
   renderControls();
+  // Two facts, and only two: what the line means, and which control would have avoided it. The
+  // version before this one was fifty-seven words of vendor archaeology one tap inside a
+  // disclosure, which is not shorter than a paragraph — it is a paragraph nobody opens. The rest
+  // of it (why a hang-up loses the context, and that the lines above are still your own record)
+  // lives in Settings under "What the controls do", which is where the long form belongs.
   seam(
     "new conversation",
-    "The call ended, and the agent does not carry the earlier conversation into the next one: " +
-      "anything below this line is spoken to an agent that has never seen anything above it. " +
-      "The lines stay on screen because they are still your record of what was said. To pause " +
-      "without losing the agent's memory, use Mute rather than Hang up."
+    "Anything below this line goes to an agent that has never seen anything above it. " +
+      "Mute, not Hang up, keeps its memory."
   );
 }
 
@@ -374,9 +377,8 @@ function onClear() {
   if (session.socket) {
     seam(
       "view cleared",
-      "The screen was emptied; nothing else was. The call is still open and the agent still has " +
-        "everything said before this point in its context. Hanging up is what ends the " +
-        "conversation."
+      "The screen was emptied; nothing else was. The agent still has everything said before " +
+        "this point. Hang up is what ends the call."
     );
     setStatus("Transcript cleared. The agent has not forgotten anything.");
   } else {

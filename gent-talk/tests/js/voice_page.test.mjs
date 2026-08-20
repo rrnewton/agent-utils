@@ -540,6 +540,26 @@ function speakInto(page) {
 const seamLabel = (li) =>
   li.descendants().find((node) => node.className === "seam-label").textContent;
 
+/** The sentences a seam keeps INSIDE its disclosure. */
+const seamDetail = (li) =>
+  li.descendants().find((node) => node.className === "seam-detail").textContent;
+
+/** How many words a piece of interface text spends. */
+const words = (text) => text.trim().split(/\s+/).filter(Boolean).length;
+
+/**
+ * The band a seam's disclosure has to stay inside.
+ *
+ * A CEILING, because the first version of the seam printed four sentences onto the transcript and
+ * the fix that moved them into a disclosure did not shorten them — sixty words one tap away is
+ * still sixty words, and nobody opens them.
+ *
+ * A FLOOR, because the assertion this replaces was `length > 120` and that floor was the whole
+ * reason it existed: without one, deleting the explanation outright passes.
+ */
+const SEAM_DETAIL_MIN_WORDS = 10;
+const SEAM_DETAIL_MAX_WORDS = 28;
+
 /** The one status line's machine-readable state, which is what colours its dot. */
 const state = (page) => page.el("status-line").getAttribute("data-state");
 
@@ -1257,16 +1277,79 @@ test("THE SEAM IS A LABEL, NOT A PARAGRAPH — the explanation is one tap inside
   assert.ok(label.length <= 24, `the surface text must be a label: "${label}"`);
   assert.ok(label.split(/\s+/).length <= 3, `at most three words on the rule: "${label}"`);
 
-  // The detail exists, is long, and is inside a disclosure — not beside the label.
+  // The detail exists, is inside a disclosure — not beside the label — and is a couple of clauses
+  // rather than an essay. A ceiling AND a floor: the essay must not come back, and it must not be
+  // satisfied by deleting the explanation instead of shortening it.
   const details = seamLine.descendants().filter((node) => node.tagName === "details");
   assert.equal(details.length, 1, "the explanation must live in a disclosure");
   const detail = seamLine.descendants().find((node) => node.className === "seam-detail");
-  assert.ok(detail.textContent.length > 120, "the explanation was deleted rather than disclosed");
+  const spent = words(detail.textContent);
+  assert.ok(
+    spent >= SEAM_DETAIL_MIN_WORDS,
+    `the explanation was deleted rather than shortened: "${detail.textContent}"`
+  );
+  assert.ok(
+    spent <= SEAM_DETAIL_MAX_WORDS,
+    `${spent} words is an essay behind a tap, not a disclosure: "${detail.textContent}"`
+  );
   assert.match(detail.textContent, /has never seen anything above it/);
-  assert.match(detail.textContent, /Mute rather than Hang up/, "name the control that does work");
+  assert.match(detail.textContent, /Mute, not Hang up/, "name the control that does work");
   // A pointer device gets it on hover, without opening anything.
   const summary = seamLine.descendants().find((node) => node.className === "seam-summary");
   assert.equal(summary.getAttribute("title"), detail.textContent);
+});
+
+test("EVERY seam is the same size, so the essay cannot come back through the other door", async () => {
+  // The page draws a seam from two places, and the test above only looks at one of them. The
+  // second one is where the paragraph would quietly regrow: nothing about the end-of-call
+  // wording constrains the view-cleared wording, and they are the same idiom on the same rule in
+  // the same list.
+  const sites = [
+    [
+      "new conversation",
+      async (page) => {
+        await page.el("hang-up").click();
+      },
+    ],
+    [
+      "view cleared",
+      async (page) => {
+        await page.el("clear-view").click(); // arms it
+        await page.el("clear-view").click(); // and clears
+      },
+    ],
+  ];
+
+  for (const [label, act] of sites) {
+    const page = newPage();
+    await startTalking(page);
+    await act(page);
+
+    const seamLine = page.el("transcript").children.find((li) => li.className === "seam");
+    assert.ok(seamLine, `no seam was drawn for "${label}"`);
+    assert.equal(seamLabel(seamLine), label);
+
+    const detail = seamDetail(seamLine);
+    const spent = words(detail);
+    assert.ok(spent >= SEAM_DETAIL_MIN_WORDS, `"${label}" explains nothing: "${detail}"`);
+    assert.ok(
+      spent <= SEAM_DETAIL_MAX_WORDS,
+      `"${label}" spends ${spent} words behind a tap: "${detail}"`
+    );
+    // Whatever it says, the hover text and the disclosure say the SAME thing — one wording, two
+    // ways in, so shortening one cannot leave the other long.
+    const summary = seamLine.descendants().find((node) => node.className === "seam-summary");
+    assert.equal(summary.getAttribute("title"), detail);
+  }
+
+  // And there are exactly these two doors. A third `seam(...)` call would be an unmeasured one,
+  // which is how the first essay got in. (`seam(` also appears once as its own definition.)
+  const mentions = (SCRIPT_CODE.match(/\bseam\(/g) || []).length;
+  assert.equal(
+    mentions - 1,
+    sites.length,
+    `web/voice.js draws ${mentions - 1} seams and this test measures ${sites.length}`
+  );
 });
 
 test("opening the disclosure brings it into view instead of unfolding it under the dock", async () => {
@@ -2077,6 +2160,14 @@ test("the settings screen explains what each control does to the agent's memory"
   assert.match(note, /does not keep its context/);
   assert.match(note, /never makes the agent forget/);
   assert.match(note, /Sound<\/strong> silences the agent's voice without silencing the agent/);
+  // Shortening the end-of-call seam DROPPED a clause rather than only compressing one, and a
+  // dropped clause has to land somewhere reachable or it has simply been deleted. This block is
+  // the long-form home the earlier rework designated, so it is where it landed.
+  assert.match(
+    note,
+    /still your own record of what was said/,
+    "the clause the seam no longer says has to be readable somewhere"
+  );
 });
 
 test("A FORMAT THIS PAGE CANNOT PLAY IS AN ERROR PANEL, NOT AN UNCAUGHT THROW", async () => {
