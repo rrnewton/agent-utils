@@ -44,13 +44,26 @@ use crate::attribution::{
 use crate::cgroup::CgroupManager;
 use crate::model::{
     canonical_cpu_timeout, command_with_inner_jobs, effective_cpu_count, effective_jobs_flag,
-    preferred_inner_jobs, scale_cpu_timeout, step_classification, write_domain_violations,
-    DagConfig, RunResult, Step, StepOutcome,
+    preferred_inner_jobs, scale_cpu_timeout, step_classification, undeclared_resource_demands,
+    write_domain_violations, DagConfig, RunResult, Step, StepOutcome,
 };
 use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_columns};
 
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
 type ProfileRow = BTreeMap<String, String>;
+
+/// Consumed user+system CPU-seconds from a step's cgroup `cpu.stat`, or `None` when the counter
+/// is ABSENT.
+///
+/// ABSENT IS NOT ZERO. A missing `usage_usec` means the step's CPU cannot be MEASURED, not that
+/// it has consumed none. Reading it as 0 made the budget comparison permanently unsatisfiable, so
+/// a declared CPU-time budget silently enforced nothing — an enforcement guard switched off by a
+/// missing field, with no warning anywhere. `None` forces the caller to say so instead.
+fn cpu_seconds_from_stats(stats: &BTreeMap<String, i64>) -> Option<f64> {
+    stats
+        .get("usage_usec")
+        .map(|usec| *usec as f64 / 1_000_000.0)
+}
 
 /// Optional per-step cgroup manager shared (behind an `Arc`) across the run's supervisor threads.
 pub type BoxedCgroups = Option<Arc<dyn CgroupManager>>;
@@ -1620,6 +1633,8 @@ fn run_step(ctx: StepCtx) {
         let mstart = start;
         Some(thread::spawn(move || {
             let mut since = Duration::ZERO;
+            // One-shot, so an unmeasurable budget is stated once per step, not once per tick.
+            let mut unmeasurable_warned = false;
             let tick = Duration::from_millis(50);
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(tick);
@@ -1638,8 +1653,21 @@ fn run_step(ctx: StepCtx) {
                     // the whole tree once when over budget, then exit the monitor.
                     if cpu_timeout > 0 && !cpu_flag.load(Ordering::Relaxed) {
                         if let Some(cs) = c.cpu_stats(&t) {
-                            let cpu_used_s =
-                                cs.get("usage_usec").copied().unwrap_or(0) as f64 / 1_000_000.0;
+                            // ABSENT IS NOT ZERO: see `cpu_seconds_from_stats`. Say so once and
+                            // leave the budget explicitly unenforced rather than reading a
+                            // missing counter as "has consumed none".
+                            let Some(cpu_used_s) = cpu_seconds_from_stats(&cs) else {
+                                if !unmeasurable_warned {
+                                    unmeasurable_warned = true;
+                                    eprintln!(
+                                        "[scheduler] \u{26a0} step {t:?}: cgroup cpu.stat has no \
+                                         'usage_usec', so the {cpu_timeout}s CPU-time budget \
+                                         CANNOT be enforced for this step; only the wall timeout \
+                                         still applies."
+                                    );
+                                }
+                                continue;
+                            };
                             if cpu_used_s >= cpu_timeout as f64 {
                                 cpu_flag.store(true, Ordering::Relaxed);
                                 let culprit = capture_termination_evidence(
@@ -2201,6 +2229,30 @@ pub fn run_dag_boxed_deadline_limited(
             "[scheduler] ERROR: REFUSING to run before any node starts: write-domain policy \
              violation(s): {}",
             domain_errors.join("; ")
+        );
+        return RunResult {
+            ok: false,
+            wall_s: 0.0,
+            outcomes: Vec::new(),
+            skipped: Vec::new(),
+            intentional_skips: Vec::new(),
+            step_profile_rows: Vec::new(),
+            run_timed_out: false,
+            max_concurrent_steps: 0,
+        };
+    }
+    // ABSENT IS NOT ZERO. Left to the ready-set loop this is an infinite 50 ms sleep at 0% CPU
+    // with nothing printed — indistinguishable from a deliberate cap of 0, and from a hang. Name
+    // it here, before anything can wait on it.
+    let undeclared = undeclared_resource_demands(cfg);
+    if !undeclared.is_empty() {
+        eprintln!(
+            "[scheduler] ERROR: REFUSING to run before any node starts: {} step/resource pair(s) \
+             demand a named resource with NO declared cap in resource_caps, so they can never \
+             become ready: {}. Declare the capacity, or set the cap to 0 explicitly to block them \
+             on purpose.",
+            undeclared.len(),
+            undeclared.join("; ")
         );
         return RunResult {
             ok: false,
@@ -3147,5 +3199,120 @@ mod tests {
                 "the unlabelled elapsed_s must not come back:\n{record}"
             );
         }
+    }
+
+    /// An ABSENT CPU counter is not a measured ZERO.
+    ///
+    /// The guard read `cpu.stat`'s `usage_usec` with a default of 0, so a cgroup that does not
+    /// publish that counter reported "this step has burned no CPU" forever. That made `>= budget`
+    /// permanently unsatisfiable: a declared `cpu_timeout` enforced nothing, quietly. The
+    /// measured cases are asserted just as hard, so "always return None" cannot pass.
+    #[test]
+    fn an_absent_cpu_counter_is_unmeasurable_not_zero() {
+        let measured = BTreeMap::from([("usage_usec".to_string(), 2_500_000i64)]);
+        assert_eq!(cpu_seconds_from_stats(&measured), Some(2.5));
+
+        // A genuine measured zero is still a measurement, and must survive as one.
+        let idle = BTreeMap::from([("usage_usec".to_string(), 0i64)]);
+        assert_eq!(cpu_seconds_from_stats(&idle), Some(0.0));
+
+        // Absent means CANNOT MEASURE, and the caller must be forced to say so.
+        let without = BTreeMap::from([("nr_periods".to_string(), 3i64)]);
+        assert_eq!(cpu_seconds_from_stats(&without), None);
+    }
+
+    /// An UNDECLARED resource cap is not a cap of ZERO.
+    ///
+    /// The readiness gate reads `resource_avail.get(name).unwrap_or(0)`, which collapses two
+    /// conditions whose remedies are opposites: "you forgot to declare capacity" and "this is
+    /// deliberately blocked". Both produced byte-identical behaviour -- an infinite 50 ms sleep
+    /// at 0% CPU with nothing printed -- so the one thing a reader needed was the one thing not
+    /// reported.
+    ///
+    /// Bracketed BOTH ways. A one-sided test would pass if the predicate simply flagged every
+    /// resource demand, so the declared-zero case is asserted just as hard as the undeclared one.
+    #[test]
+    fn an_undeclared_resource_demand_is_named_and_a_declared_zero_is_not() {
+        let demanding = step("g", "needs", "true", &[], 0.0, &[("browser", 1)]);
+
+        let absent = DagConfig {
+            steps: vec![demanding.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            undeclared_resource_demands(&absent),
+            vec!["g.needs: browser".to_string()]
+        );
+
+        // A cap DECLARED as 0 is a real value: deliberately blocking, and still gating normally.
+        let blocked = DagConfig {
+            steps: vec![demanding.clone()],
+            resource_caps: BTreeMap::from([("browser".to_string(), 0i64)]),
+            ..Default::default()
+        };
+        assert!(undeclared_resource_demands(&blocked).is_empty());
+
+        // An ordinary cap is likewise not flagged.
+        let ample = DagConfig {
+            steps: vec![demanding],
+            resource_caps: BTreeMap::from([("browser".to_string(), 4i64)]),
+            ..Default::default()
+        };
+        assert!(undeclared_resource_demands(&ample).is_empty());
+
+        // A demand of 0 is satisfied by the absent-cap default of 0, so it cannot starve.
+        let zero_demand = DagConfig {
+            steps: vec![step("g", "idle", "true", &[], 0.0, &[("browser", 0)])],
+            ..Default::default()
+        };
+        assert!(undeclared_resource_demands(&zero_demand).is_empty());
+
+        // An intentionally-skipped step never launches, so its dormant demand cannot hang a run
+        // and must not fail one either.
+        let mut skipped = step("g", "skipped", "true", &[], 0.0, &[("browser", 1)]);
+        skipped.skip_reason = Some(IntentionalSkipReason::EmptyManifestBucket);
+        let skipped_cfg = DagConfig {
+            steps: vec![skipped],
+            ..Default::default()
+        };
+        assert!(undeclared_resource_demands(&skipped_cfg).is_empty());
+    }
+
+    /// The refusal is what turns a hang into a bug report, so assert the RUN, not just the
+    /// predicate. The outer run budget is here so this test cannot hang when the refusal is
+    /// removed: without the refusal the ready-set loop sleeps until that budget expires and the
+    /// failure is blamed on the run instead of on the node, which is exactly the worse report.
+    #[test]
+    fn a_run_with_an_undeclared_demand_is_refused_rather_than_waited_out() {
+        let mut demanding = step("g", "needs", "true", &[], 0.0, &[("browser", 1)]);
+        demanding.timeout = 1;
+        let cfg = DagConfig {
+            steps: vec![demanding],
+            ..Default::default()
+        };
+
+        let started = Instant::now();
+        let res = run_dag_boxed_deadline(&cfg, 1, false, 0, None, None, Some(1), Some(3));
+        let elapsed = started.elapsed().as_secs_f64();
+
+        assert!(!res.ok);
+        assert!(
+            !res.run_timed_out,
+            "the demand can never be satisfied, so this must be refused up front and named -- not \
+             waited out until the run budget expires and blamed on the run"
+        );
+        assert!(
+            elapsed < 3.0,
+            "the run should refuse before any node starts, not wait on the gate ({elapsed}s)"
+        );
+        assert!(res.outcomes.is_empty());
+
+        // The refusal must not become a blanket ban on resource demands.
+        let declared = DagConfig {
+            steps: vec![step("g", "needs", "true", &[], 0.0, &[("browser", 1)])],
+            resource_caps: BTreeMap::from([("browser".to_string(), 1i64)]),
+            ..Default::default()
+        };
+        assert!(run_dag(&declared, 1, false, 0).ok);
     }
 }

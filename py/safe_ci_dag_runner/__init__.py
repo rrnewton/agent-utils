@@ -68,6 +68,7 @@ from safe_ci_dag_runner.model import (
     render_jobs_flag,
     step_classification,
     step_failure_reason,
+    undeclared_resource_demands,
     write_domain_violations,
 )
 from safe_ci_dag_runner.perflog import CsvMetricsSink, PerfWindow
@@ -145,6 +146,7 @@ __all__ = [
     "step_classification",
     "preferred_inner_jobs",
     "step_failure_reason",
+    "undeclared_resource_demands",
     "write_domain_violations",
     "render_jobs_flag",
     "effective_jobs_flag",

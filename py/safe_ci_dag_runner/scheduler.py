@@ -44,6 +44,7 @@ from safe_ci_dag_runner.model import (
     scale_cpu_timeout,
     preferred_inner_jobs,
     step_classification,
+    undeclared_resource_demands,
     write_domain_violations,
 )
 from safe_ci_dag_runner.profile_enrich import (
@@ -109,6 +110,19 @@ class BudgetUnit(Enum):
 def _warn(message: str) -> None:
     """Emit a visible degraded-behavior warning (No Silent Failure)."""
     print(f"[scheduler] ⚠ {message}", file=sys.stderr)
+
+
+def _cpu_seconds_from_stats(stats: Mapping[str, int]) -> float | None:
+    """Consumed user+system CPU-seconds from a step's cgroup ``cpu.stat``, else ``None``.
+
+    ABSENT IS NOT ZERO.  A missing ``usage_usec`` means the step's CPU cannot be MEASURED, not
+    that it has consumed none.  Reading it as 0 made the budget comparison permanently
+    unsatisfiable, so a declared CPU-time budget silently enforced nothing — an enforcement guard
+    switched off by a missing field, with no warning anywhere.  ``None`` forces the caller to say
+    so instead.
+    """
+    usage_usec = stats.get("usage_usec")
+    return None if usage_usec is None else usage_usec / 1_000_000
 
 
 def _psi_reading(pressure: Mapping[str, float] | None) -> PsiReading | None:
@@ -862,6 +876,8 @@ class Runner:
             # while burning no CPU. Enforcement is best-effort at the poll granularity
             # (_MONITOR_INTERVAL_S), and inert when cgroup boxing is off (cpu_stats is None).
             nonlocal thread_peak, cpu_timed_out, termination_culprit
+            # One-shot, so an unmeasurable budget is stated once per step, not once per tick.
+            unmeasurable_warned = False
             while not monitor_stop.wait(_MONITOR_INTERVAL_S):
                 count = self.cgroups.thread_count(step.tag)
                 if count is not None:
@@ -869,7 +885,20 @@ class Runner:
                 if cpu_budget > 0 and not cpu_timed_out:
                     cs = self.cgroups.cpu_stats(step.tag)
                     if cs is not None:
-                        cpu_used_s = cs.get("usage_usec", 0) / 1_000_000
+                        # ABSENT IS NOT ZERO: see :func:`_cpu_seconds_from_stats`. Say so once
+                        # and leave the budget explicitly unenforced rather than reading a
+                        # missing counter as "has consumed none".
+                        measured = _cpu_seconds_from_stats(cs)
+                        if measured is None:
+                            if not unmeasurable_warned:
+                                unmeasurable_warned = True
+                                _warn(
+                                    f"step {step.tag!r}: cgroup cpu.stat has no 'usage_usec', so "
+                                    f"the {cpu_budget}s CPU-time budget CANNOT be enforced for "
+                                    "this step; only the wall timeout still applies."
+                                )
+                            continue
+                        cpu_used_s = measured
                         if cpu_used_s >= cpu_budget:
                             # Over CPU budget: reap the whole group now. The main thread's
                             # proc.wait() then returns normally (no wall TimeoutExpired).
@@ -1306,6 +1335,19 @@ def run_dag_limited(
         print(
             "[scheduler] ERROR: REFUSING to run before any node starts: "
             "write-domain policy violation(s): " + "; ".join(domain_errors),
+            file=sys.stderr,
+        )
+        return RunResult(ok=False, wall_s=0.0)
+    undeclared = undeclared_resource_demands(cfg)
+    if undeclared:
+        # ABSENT IS NOT ZERO. Left to the ready-set loop this is an infinite 50 ms sleep at 0%
+        # CPU with nothing printed — indistinguishable from a deliberate cap of 0, and from a
+        # hang. Name it here, before anything can wait on it.
+        print(
+            f"[scheduler] ERROR: REFUSING to run before any node starts: {len(undeclared)} "
+            "step/resource pair(s) demand a named resource with NO declared cap in "
+            "resource_caps, so they can never become ready: " + "; ".join(undeclared) + ". "
+            "Declare the capacity, or set the cap to 0 explicitly to block them on purpose.",
             file=sys.stderr,
         )
         return RunResult(ok=False, wall_s=0.0)

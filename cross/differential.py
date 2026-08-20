@@ -631,7 +631,9 @@ def _random_dag(rng: random.Random) -> tuple[dict[str, object], bool]:
         if rng.random() < 0.5:
             hint["classification"] = rng.choice(classes)
         if rng.random() < 0.4:
-            # Only demand resources that exist in caps (an unmet demand would hang the run).
+            # Only demand resources that exist in caps. An undeclared demand is refused before
+            # any node starts (both engines), which is a correct outcome but not the one this
+            # generator is here to compare.
             res_name = rng.choice(list(caps))
             hint["resources"] = {res_name: 1}
         if rng.random() < 0.3:

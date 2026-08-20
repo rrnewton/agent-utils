@@ -63,9 +63,9 @@ pub use io::{
 };
 pub use model::{
     command_with_inner_jobs, effective_jobs_flag, preferred_inner_jobs, render_jobs_flag,
-    step_classification, step_failure_reason, write_domain_violations, DagConfig, ResourceHint,
-    RunResult, Step, StepClass, StepOutcome, WriteDomainGuarantee, WriteDomainPolicy,
-    DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    step_classification, step_failure_reason, undeclared_resource_demands, write_domain_violations,
+    DagConfig, ResourceHint, RunResult, Step, StepClass, StepOutcome, WriteDomainGuarantee,
+    WriteDomainPolicy, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
 };
 pub use perflog::{append_step_profiles, PerfWindow};
 pub use profile_enrich::{

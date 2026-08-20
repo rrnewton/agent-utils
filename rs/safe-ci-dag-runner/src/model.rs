@@ -566,6 +566,40 @@ impl DagConfig {
     }
 }
 
+/// Steps demanding a named resource that `resource_caps` never declares.
+///
+/// ABSENT IS NOT ZERO, and this is the one place the difference can still be seen. The
+/// scheduler's gate reads `resource_avail.get(name).unwrap_or(0)`, so an undeclared resource and
+/// a resource deliberately capped at 0 collapse into the same integer and produce byte-identical
+/// behaviour: the step is never ready, the ready-set loop keeps sleeping, and the run sits at 0%
+/// CPU emitting nothing until some outer deadline kills it. Their remedies are opposites —
+/// "declare the capacity you forgot" versus "this is blocked on purpose" — so a report that
+/// cannot tell them apart is worse than no report.
+///
+/// Only a demand GREATER THAN ZERO can starve, and an intentionally-skipped step never launches,
+/// so neither is named here. A cap DECLARED as 0 is a real value and is likewise not named: it
+/// still gates the step, exactly as its author asked.
+///
+/// Returns sorted `"<tag>: <resource>"` entries, empty when every demand has a declared cap.
+pub fn undeclared_resource_demands(cfg: &DagConfig) -> Vec<String> {
+    let mut out: Vec<String> = cfg
+        .steps
+        .iter()
+        .filter(|s| s.skip_reason.is_none())
+        .flat_map(|s| {
+            let tag = s.tag();
+            s.hint
+                .resources
+                .iter()
+                .filter(|(name, count)| **count > 0 && !cfg.resource_caps.contains_key(*name))
+                .map(move |(name, _)| format!("{tag}: {name}"))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Return deterministic fail-closed write-domain declaration errors.
 ///
 /// Parsers call this while loading, and scheduler entry points call it again so an

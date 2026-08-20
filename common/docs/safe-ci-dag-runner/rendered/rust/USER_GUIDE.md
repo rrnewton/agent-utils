@@ -55,6 +55,13 @@ Each step is identified by a `group.job` tag. `deps` names predecessor tags.
 The optional `hint` object supplies estimates and limits; top-level
 `resource_caps` limits caller-defined scarce resources.
 
+Every resource a step demands must have a cap declared. An UNDECLARED
+resource is refused before any node starts, because it is not the same thing
+as a cap of `0`: undeclared means capacity you forgot to grant, while `0`
+means the step is blocked on purpose. Both would otherwise leave the step
+permanently unready with nothing said, so declare the capacity — or write the
+cap as `0` to say the block is deliberate.
+
 ```yaml
 resource_caps:
   browser: 1
