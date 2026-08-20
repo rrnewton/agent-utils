@@ -15,6 +15,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from enum import Enum
 from typing import overload
 
 from safe_ci_dag_runner.ambient import (
@@ -85,6 +86,24 @@ _POST_TIMEOUT_WAIT_S = 10.0
 
 #: Brief join timeout for the daemon reader/monitor threads at step end (seconds).
 _THREAD_JOIN_S = 2.0
+
+
+class BudgetUnit(Enum):
+    """The quantity a per-step budget bounds, and the ONLY unit a breach may be reported in.
+
+    A wall ceiling and a CPU ceiling are different physical quantities, and for the same step
+    they are different numbers: wall keeps rising while the step is descheduled, CPU does not.
+    Naming the unit is not decoration.  A termination record that printed an unlabelled
+    ``elapsed_s`` (wall) beside a ``limit_s`` that was CPU-seconds invited the natural reading
+    that the two were comparable, which is how a CPU breach came to be quoted as consuming more
+    seconds than its own run's CPU rollup contained.
+
+    The values are part of the durable journal's public shape, so every paired implementation
+    of this runner spells them identically.
+    """
+
+    CPU_SECONDS = "cpu_seconds"
+    WALL_SECONDS = "wall_seconds"
 
 
 def _warn(message: str) -> None:
@@ -477,10 +496,18 @@ class Runner:
         proc: subprocess.Popen[bytes],
         nonce: str,
         event: str,
+        unit: BudgetUnit,
         limit_s: int,
-        elapsed_s: float,
+        measured_s: float,
+        wall_elapsed_s: float,
     ) -> Culprit:
-        """Persist test/process state before SIGTERM starts the graceful-kill window."""
+        """Persist test/process state before SIGTERM starts the graceful-kill window.
+
+        ``measured_s`` is the quantity the guard actually compared against ``limit_s``, and one
+        ``unit`` covers both: recording a wall figure against a CPU bound is unrepresentable
+        rather than merely discouraged.  ``wall_elapsed_s`` rides along as context and is only
+        the compared quantity when the limit is itself a wall limit.
+        """
         observations = process_snapshot(proc.pid, nonce)
         for row in observations:
             self._emit(
@@ -511,8 +538,11 @@ class Runner:
                 event,
                 [
                     ("step", step.tag),
-                    ("elapsed_s", f"{elapsed_s:.3f}"),
+                    ("measured_s", f"{measured_s:.3f}"),
                     ("limit_s", str(limit_s)),
+                    # Applies to BOTH numbers above, which is the point: they are one comparison.
+                    ("unit", unit.value),
+                    ("wall_elapsed_s", f"{wall_elapsed_s:.3f}"),
                     ("culprit_test", culprit.test or ""),
                     ("culprit_basis", culprit.how),
                     ("tests_completed", str(culprit.completed)),
@@ -850,8 +880,11 @@ class Runner:
                                 proc=proc,
                                 nonce=nonce,
                                 event="cpu_timeout",
+                                unit=BudgetUnit.CPU_SECONDS,
                                 limit_s=cpu_budget,
-                                elapsed_s=time.time() - start,
+                                # The very reading the comparison above was made on.
+                                measured_s=cpu_used_s,
+                                wall_elapsed_s=time.time() - start,
                             )
                             reap(proc, self.cgroups, step.tag, nonce=nonce)
                             return
@@ -872,8 +905,10 @@ class Runner:
                 proc=proc,
                 nonce=nonce,
                 event="step_timeout",
+                unit=BudgetUnit.WALL_SECONDS,
                 limit_s=step.timeout,
-                elapsed_s=time.time() - start,
+                measured_s=time.time() - start,
+                wall_elapsed_s=time.time() - start,
             )
             reap(proc, self.cgroups, step.tag, nonce=nonce)
             try:

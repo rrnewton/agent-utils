@@ -1224,10 +1224,43 @@ fn fmt_bytes(n: Option<i64>) -> String {
 /// Controlled runners bind tests through explicit boundaries in `StepStream`. Third-party
 /// runners additionally get an owned `/proc` snapshot: nextest-style `--exact TEST` children can
 /// be bound directly, while cargo-test's shared test binary remains explicitly unattributed.
+/// The quantity a per-step budget bounds — and therefore the ONLY quantity a breach of it may be
+/// reported in.
+///
+/// A wall ceiling and a CPU ceiling are different physical quantities, and for the same step they
+/// are different numbers: wall keeps rising while the step is descheduled, CPU does not. Naming
+/// the unit is not decoration; without it a reader compares whichever number is printed against
+/// whichever limit is printed, which is how a CPU breach came to be reported as having consumed
+/// more seconds than its own run's CPU rollup contained.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BudgetUnit {
+    /// user+system CPU seconds, as the CPU guard measures them.
+    CpuSeconds,
+    /// wall-clock seconds since the step started.
+    WallSeconds,
+}
+
+impl BudgetUnit {
+    fn as_str(self) -> &'static str {
+        match self {
+            BudgetUnit::CpuSeconds => "cpu_seconds",
+            BudgetUnit::WallSeconds => "wall_seconds",
+        }
+    }
+}
+
+/// The bound a step crossed, recorded in the unit it was actually measured in.
+///
+/// `measured_s` is the quantity the guard compared against `limit_s`, and ONE `unit` covers both:
+/// recording a wall figure against a CPU bound is not merely discouraged, it is unrepresentable.
+/// `wall_elapsed_s` is always carried alongside as context and is never the compared quantity
+/// unless the limit is itself a wall limit.
 struct TerminationBoundary<'a> {
     event: &'a str,
+    unit: BudgetUnit,
     limit_s: i64,
-    elapsed_s: f64,
+    measured_s: f64,
+    wall_elapsed_s: f64,
 }
 
 fn capture_termination_evidence(
@@ -1276,8 +1309,11 @@ fn capture_termination_evidence(
             boundary.event,
             &[
                 ("step", tag.to_string()),
-                ("elapsed_s", format!("{:.3}", boundary.elapsed_s)),
+                ("measured_s", format!("{:.3}", boundary.measured_s)),
                 ("limit_s", boundary.limit_s.to_string()),
+                // Applies to BOTH numbers above, which is the point: they are one comparison.
+                ("unit", boundary.unit.as_str().to_string()),
+                ("wall_elapsed_s", format!("{:.3}", boundary.wall_elapsed_s)),
                 ("culprit_test", culprit.test.clone().unwrap_or_default()),
                 ("culprit_basis", culprit.how.to_string()),
                 ("tests_completed", culprit.completed.to_string()),
@@ -1614,8 +1650,11 @@ fn run_step(ctx: StepCtx) {
                                     &mnonce,
                                     TerminationBoundary {
                                         event: "cpu_timeout",
+                                        unit: BudgetUnit::CpuSeconds,
                                         limit_s: cpu_timeout,
-                                        elapsed_s: mstart.elapsed().as_secs_f64(),
+                                        // The very reading the comparison above was made on.
+                                        measured_s: cpu_used_s,
+                                        wall_elapsed_s: mstart.elapsed().as_secs_f64(),
                                     },
                                 );
                                 if let Ok(mut slot) = mculprit.lock() {
@@ -1651,8 +1690,10 @@ fn run_step(ctx: StepCtx) {
                         &nonce,
                         TerminationBoundary {
                             event: "step_timeout",
+                            unit: BudgetUnit::WallSeconds,
                             limit_s: step.timeout,
-                            elapsed_s: start.elapsed().as_secs_f64(),
+                            measured_s: start.elapsed().as_secs_f64(),
+                            wall_elapsed_s: start.elapsed().as_secs_f64(),
                         },
                     );
                     if let Ok(mut slot) = termination_culprit.lock() {
@@ -3005,5 +3046,106 @@ mod tests {
         );
         assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A termination record must say WHICH quantity crossed WHICH limit.
+    ///
+    /// The CPU guard compares cgroup `cpu.stat` CPU-seconds against a CPU-second budget,
+    /// correctly. The RECORD of that decision used to print an unlabelled `elapsed_s` -- which
+    /// was WALL -- beside a `limit_s` that was CPU-seconds. Side by side and unlabelled, the
+    /// natural reading is that the two are comparable, and they are not: wall keeps rising while
+    /// the step is descheduled and CPU does not, so a CPU breach could be quoted as having
+    /// consumed more seconds than its own run's whole CPU rollup contained.
+    #[test]
+    fn a_termination_record_names_the_quantity_it_compared() {
+        let dir = std::env::temp_dir().join(format!(
+            "scdr_units_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let evidence = RunEvidence::open(Some(dir.clone())).map(Arc::new);
+        assert!(evidence.is_some(), "test needs a writable evidence dir");
+        let sink = StepStream::new("g.step", evidence.clone());
+
+        // A CPU breach: the compared quantity is the CPU reading, deliberately far from the wall
+        // figure recorded alongside it, so a record that substituted one for the other is
+        // visibly wrong rather than coincidentally right.
+        capture_termination_evidence(
+            &evidence,
+            &sink,
+            "g.step",
+            std::process::id(),
+            "nonce",
+            TerminationBoundary {
+                event: "cpu_timeout",
+                unit: BudgetUnit::CpuSeconds,
+                limit_s: 300,
+                measured_s: 308.25,
+                wall_elapsed_s: 354.587,
+            },
+        );
+        // A wall breach was never wrong. Assert it just as hard, so "label everything
+        // cpu_seconds" cannot pass.
+        capture_termination_evidence(
+            &evidence,
+            &sink,
+            "g.step",
+            std::process::id(),
+            "nonce",
+            TerminationBoundary {
+                event: "step_timeout",
+                unit: BudgetUnit::WallSeconds,
+                limit_s: 900,
+                measured_s: 900.13,
+                wall_elapsed_s: 900.13,
+            },
+        );
+        drop(evidence);
+
+        let journal = std::fs::read_to_string(dir.join("journal.jsonl")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let cpu = journal
+            .lines()
+            .find(|l| l.contains(r#""event":"cpu_timeout""#))
+            .expect("no cpu_timeout record");
+        let wall = journal
+            .lines()
+            .find(|l| l.contains(r#""event":"step_timeout""#))
+            .expect("no step_timeout record");
+
+        for (record, expected) in [
+            (
+                cpu,
+                [
+                    r#""measured_s":"308.250""#,
+                    r#""limit_s":"300""#,
+                    r#""unit":"cpu_seconds""#,
+                    r#""wall_elapsed_s":"354.587""#,
+                ],
+            ),
+            (
+                wall,
+                [
+                    r#""measured_s":"900.130""#,
+                    r#""limit_s":"900""#,
+                    r#""unit":"wall_seconds""#,
+                    r#""wall_elapsed_s":"900.130""#,
+                ],
+            ),
+        ] {
+            for field in expected {
+                assert!(
+                    record.contains(field),
+                    "termination record is missing {field}:\n{record}"
+                );
+            }
+            // The ambiguous field is GONE. Retaining it would preserve the exact misreading this
+            // fixes: an unlabelled seconds figure sitting next to a limit in a different unit.
+            assert!(
+                !record.contains(r#""elapsed_s""#),
+                "the unlabelled elapsed_s must not come back:\n{record}"
+            );
+        }
     }
 }
