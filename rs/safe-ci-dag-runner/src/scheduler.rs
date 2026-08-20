@@ -957,9 +957,7 @@ impl Runner {
                         let mut stuck: Vec<String> = self
                             .order
                             .iter()
-                            .filter(|t| {
-                                !sh.done.contains_key(*t) && !skipped.contains(*t)
-                            })
+                            .filter(|t| !sh.done.contains_key(*t) && !skipped.contains(*t))
                             .cloned()
                             .collect();
                         stuck.sort();
@@ -2659,7 +2657,10 @@ mod tests {
         };
         assert_eq!(ungrantable_resources(&cfg).len(), 0, "positive: 0 refusals");
         let res = run_dag(&cfg, 4, false, 0);
-        assert!(res.ok, "positive: a satisfiable DAG must still run to completion");
+        assert!(
+            res.ok,
+            "positive: a satisfiable DAG must still run to completion"
+        );
         assert_eq!(res.outcomes.len(), 2, "positive: 2 steps executed");
         assert_eq!(res.skipped.len(), 0);
     }
@@ -2678,13 +2679,26 @@ mod tests {
         assert_eq!(refusals.len(), 1, "negative(absent): exactly 1 refusal");
         assert_eq!(refusals[0].observed, Observed::Absent);
         let rendered = refusals[0].to_string();
-        assert!(rendered.contains("<absent>"), "must render Absent distinctly: {rendered}");
-        assert!(rendered.contains("gpu=1"), "must name the demand: {rendered}");
-        assert!(rendered.contains("hg=4"), "must show what WAS declared: {rendered}");
+        assert!(
+            rendered.contains("<absent>"),
+            "must render Absent distinctly: {rendered}"
+        );
+        assert!(
+            rendered.contains("gpu=1"),
+            "must name the demand: {rendered}"
+        );
+        assert!(
+            rendered.contains("hg=4"),
+            "must show what WAS declared: {rendered}"
+        );
 
         let res = run_dag(&cfg, 4, false, 0);
         assert!(!res.ok, "negative(absent): must refuse");
-        assert_eq!(res.outcomes.len(), 0, "a refusal RAN NOTHING -- no outcomes to miscount as reds");
+        assert_eq!(
+            res.outcomes.len(),
+            0,
+            "a refusal RAN NOTHING -- no outcomes to miscount as reds"
+        );
         assert_eq!(res.skipped.len(), 2, "both tags skipped");
         assert_eq!(res.wall_s, 0.0);
     }
@@ -2702,8 +2716,14 @@ mod tests {
         assert_eq!(refusals.len(), 1, "negative(zero): exactly 1 refusal");
         assert_eq!(refusals[0].observed, Observed::Present("gpu=0".into()));
         let rendered = refusals[0].to_string();
-        assert!(rendered.contains("gpu=0"), "declared zero must show its value: {rendered}");
-        assert!(!rendered.contains("<absent>"), "a declared 0 must NOT read as absent: {rendered}");
+        assert!(
+            rendered.contains("gpu=0"),
+            "declared zero must show its value: {rendered}"
+        );
+        assert!(
+            !rendered.contains("<absent>"),
+            "a declared 0 must NOT read as absent: {rendered}"
+        );
     }
 
     #[test]
