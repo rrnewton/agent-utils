@@ -2252,13 +2252,14 @@ def main(argv: list[str]) -> int:  # noqa: PLR0911, PLR0912, PLR0915 - one linea
                 "and the control could not."
             )
             out.emit(f"   wall clock: {time.time() - wall_started:.1f}s")
-            leaks = out.scan(
+            leaks = secrets_found(
+                out.text(),
                 [
                     ("GENT_TALK_READ_TOKEN", read_token),
                     ("GENT_TALK_WRITE_TOKEN", write_token),
                     ("GENT_TALK_ELEVENLABS_API_KEY", elevenlabs_key),
                 ]
-                + [("signed URL", url) for url in runner.signed_urls]
+                + [("signed URL", url) for url in runner.signed_urls],
             )
             if leaks:
                 for leak in leaks:

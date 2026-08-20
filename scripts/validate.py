@@ -91,6 +91,12 @@ WHY: dict[str, str] = {
 
 #: Longest prefix wins, so `scripts/embed_userguides.py` beats the bare `scripts/` catch-all.
 PREFIX_RULES: tuple[tuple[str, frozenset[str]], ...] = (
+    # gent-talk is outside the Rust workspace, but its PYTHON is not outside the repository's
+    # type check: `make check` runs mypy over `.`, which walks `gent-talk/scripts/`. Selecting
+    # only the gent-talk group for those files let a real type error reach main — the scan for
+    # leaked credentials in smoke-agent.py called a method that does not exist, and nothing that
+    # ran locally could see it. Longest-prefix wins, so this beats the bare `gent-talk/` rule.
+    ("gent-talk/scripts/", frozenset({GENT_TALK, WORKSPACE})),
     ("gent-talk/", frozenset({GENT_TALK})),
     ("rs/", frozenset({WORKSPACE, CROSS, PACKAGES})),
     ("py/", frozenset({WORKSPACE, CROSS, PACKAGES})),
@@ -193,6 +199,11 @@ def self_test() -> int:
 
     expect(["gent-talk/src/ops.rs"], {GENT_TALK}, "a gent-talk change must not drag in the workspace contract")
     expect(["gent-talk/web/voice.js", "gent-talk/README.md"], {GENT_TALK}, "gent-talk docs are still gent-talk")
+    expect(
+        ["gent-talk/scripts/smoke-agent.py"],
+        {GENT_TALK, WORKSPACE},
+        "gent-talk PYTHON is inside the repository mypy run, so it must select the workspace too",
+    )
     expect(["rs/tick-hub/src/lib.rs"], {WORKSPACE, CROSS, PACKAGES}, "a workspace crate needs the full chain")
     expect(["py/safe_ci_dag_runner/sizing.py"], {WORKSPACE, CROSS, PACKAGES}, "python source needs the full chain")
     expect(["cross/differential.py"], {CROSS}, "the differential harness needs only itself")
@@ -223,7 +234,7 @@ def self_test() -> int:
     if failures:
         print(f"\n{len(failures)} self-test failure(s)", file=sys.stderr)
         return 1
-    print("validate --self-test: PASSED (14 mapping controls)")
+    print("validate --self-test: PASSED (15 mapping controls)")
     return 0
 
 
