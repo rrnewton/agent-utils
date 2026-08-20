@@ -142,6 +142,18 @@ const session = {
   // record of the same call; invented locally otherwise, because a call that the vendor never
   // named still happened and still deserves to survive a reload.
   conversationId: null,
+  // THIS CONVERSATION IS TYPED, and the microphone was never opened for it.
+  //
+  // Not a mode the reader can flip: it is decided when the socket opens and it is true for the
+  // life of that conversation, because that is the only honest shape for it. Everything the flag
+  // gates — no getUserMedia, no AudioContext, no capture graph, no playback — is a decision taken
+  // before the socket exists. See `start()`.
+  chat: false,
+  // Whether the vendor sent audio anyway on a conversation we asked to be text-only. Recorded
+  // rather than assumed: the text-only request is an OVERRIDE, and an agent whose dashboard
+  // forbids overrides ignores it silently. The page must not claim a text-only conversation it did
+  // not get, so this is what turns that claim into a reported fact. See `handle`.
+  vendorSentAudioInChat: false,
 };
 
 // Recording is FIRE-AND-FORGET and gives up after the first failure.
@@ -1208,8 +1220,42 @@ function setTextMode(on) {
   renderControlBar();
   if (entering) {
     el("compose-text").focus();
-    setStatus("Type a message. It reaches the same conversation you are speaking in.");
+    setStatus(
+      session.socket && !session.chat
+        ? "Type a message. It reaches the same conversation you are speaking in."
+        : "Type a message."
+    );
   }
+}
+
+/**
+ * The Type button.
+ *
+ * It is still exactly a toggle — that is the whole interaction model and it is unchanged. What is
+ * new is what happens when it is pressed with NOTHING OPEN: it starts a typed conversation, so
+ * reaching a text interface is one press rather than three.
+ *
+ * THE COMPLAINT THIS ANSWERS, because the shape of the fix is decided by it: getting to a text
+ * interface used to mean starting a voice call, muting it, and silencing it. Two of those three are
+ * controls that exist to manage a microphone, and the reader did not want a microphone. Worse, the
+ * microphone genuinely stayed open the whole time — mute withholds frames from a live capture graph
+ * on purpose, so that unmuting keeps the agent's context — which means the phone kept showing the
+ * mic as in use for a conversation that was being typed.
+ *
+ * A typed conversation is therefore a DIFFERENT KIND of conversation, chosen when the socket opens,
+ * not a voice call with two switches thrown. See `start()`.
+ *
+ * Only on the way IN, and only when there is no conversation already. Pressing Type during a voice
+ * call still just opens the field, because that call is the one the text should reach; and pressing
+ * it again to leave text mode never starts anything.
+ */
+function onTextEntry() {
+  const entering = !textMode;
+  setTextMode(entering);
+  if (entering && !session.socket) {
+    return guard(start)({ chat: true });
+  }
+  return Promise.resolve();
 }
 
 /** The Send button and the Enter key, which must not be two different opinions about sending. */
@@ -2149,15 +2195,25 @@ function reportFailure() {
 
 // --- the call ----------------------------------------------------------------------------------
 
-async function start() {
+/**
+ * Open a conversation.
+ *
+ * @param {{chat?: boolean}} [options] `chat: true` opens a TEXT-ONLY conversation: the microphone
+ *   is never requested, no AudioContext is created, no capture graph is built, and nothing is
+ *   played back. See `CHAT MODE` below.
+ */
+async function start(options) {
   if (session.socket) {
     setStatus("already connected");
     return;
   }
+  const chat = Boolean(options && options.chat);
   clearError();
   // A new call is a clean slate for all three of these. `hasSuspended` in particular: leaving it
   // set would keep the large control reading "Resume" during and after the call it started.
   session.failed = false;
+  session.chat = chat;
+  session.vendorSentAudioInChat = false;
   hiddenDuringCall = false;
   hasSuspended = false;
   setState("working");
@@ -2173,12 +2229,26 @@ async function start() {
     )} minutes`
   );
 
-  setStatus("Asking for the microphone…");
-  // Read HERE, at the moment the stream opens — which is why a toggle flipped mid-call cannot
-  // reach this one, and why `micSettingsChanged` says so out loud.
-  session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(micSettings()));
-  session.audio = new (window.AudioContext || window.webkitAudioContext)();
-  await session.audio.resume(); // iOS starts it suspended until a gesture.
+  // CHAT MODE: THE MICROPHONE IS NOT OPENED, AND THAT IS THE WHOLE FEATURE.
+  //
+  // The owner's complaint was precise: reaching a text interface required starting a voice call and
+  // then muting it and silencing it — three acts to arrive at "typing", and the phone showing the
+  // microphone as in use throughout, because it really was. Mute withholds frames from a live
+  // capture graph; it does not close the microphone, and it is documented here at length as
+  // deliberately not doing so. So mute could never be the answer to this: the answer is not
+  // acquiring the microphone in the first place.
+  //
+  // Everything below is skipped, not disabled: no `getUserMedia`, so no permission prompt and no
+  // in-use indicator; no AudioContext; no capture graph in `socket.onopen`; and no playback in
+  // `handle`. There is nothing to mute because there is nothing running.
+  if (!chat) {
+    setStatus("Asking for the microphone…");
+    // Read HERE, at the moment the stream opens — which is why a toggle flipped mid-call cannot
+    // reach this one, and why `micSettingsChanged` says so out loud.
+    session.stream = await navigator.mediaDevices.getUserMedia(audioConstraints(micSettings()));
+    session.audio = new (window.AudioContext || window.webkitAudioContext)();
+    await session.audio.resume(); // iOS starts it suspended until a gesture.
+  }
 
   setState("working");
   const socket = new WebSocket(minted.signed_url);
@@ -2197,6 +2267,20 @@ async function start() {
     const carriedOnInitiation = resume && resume.transport === "client_data";
     if (carriedOnInitiation) {
       initiation.dynamic_variables = { gent_talk_resume: resume.text };
+    }
+    // ASKED FOR, NOT RELIED ON. A text-only response mode is settled once, here, at initiation —
+    // which is exactly why Sound does not renegotiate one mid-call, and why this is the only place
+    // it can be requested at all. It is an OVERRIDE, so an agent whose dashboard forbids overrides
+    // ignores it and keeps sending audio.
+    //
+    // That failure is survivable HERE in a way it is not elsewhere in this file, and the reason is
+    // worth stating: chat mode's guarantee is "this page never opened your microphone", and that
+    // guarantee is made entirely on this side of the socket. The override only decides whether the
+    // vendor also stops sending audio down. If it is ignored, the conversation is still typed,
+    // still silent, and still mic-free — it merely wastes downstream bandwidth. `handle` notices
+    // and records it rather than letting the page imply a negotiation that did not happen.
+    if (chat) {
+      initiation.conversation_config_override = { conversation: { text_only: true } };
     }
     socket.send(JSON.stringify(initiation));
     if (resume && !carriedOnInitiation) {
@@ -2219,9 +2303,11 @@ async function start() {
       announceMute(true);
     }
     setState("live");
-    setStatus("Connected — say something.");
+    setStatus(chat ? "Connected — type a message." : "Connected — say something.");
     renderControls();
-    startCapture(socket);
+    if (!chat) {
+      startCapture(socket);
+    }
   };
 
   socket.onmessage = (event) => {
@@ -2321,6 +2407,22 @@ function handle(socket, message) {
       break;
     }
     case "audio":
+      // In chat mode there is NOTHING to play it with — no AudioContext was ever created — so this
+      // is a hard drop rather than a preference. It is also evidence: audio arriving on a
+      // conversation this page asked to be text-only means the override was not honoured. Said
+      // ONCE, into the connection details, because a per-frame report would be thousands of lines
+      // and because the reader's conversation is unaffected either way.
+      if (session.chat) {
+        if (!session.vendorSentAudioInChat) {
+          session.vendorSentAudioInChat = true;
+          addDetail(
+            "asked for a text-only conversation and the agent sent audio anyway — the override " +
+              "is refused by its settings. Nothing is played and the microphone was never opened; " +
+              "this only costs downstream bandwidth."
+          );
+        }
+        break;
+      }
       // Sound off silences the agent's VOICE, not the agent: the frame is dropped here, and the
       // `agent_response` case below still writes what it said into the transcript.
       if (!session.speakerOff) {
@@ -2439,6 +2541,11 @@ function teardown() {
   session.socket = null;
   session.connected = false;
   session.muted = false;
+  // Chat is a property of ONE conversation, decided when its socket opened. Carrying it into the
+  // next one would mean the big control silently started a typed conversation because the previous
+  // one was typed, which is the sort of stickiness the placement rules of this page keep removing.
+  session.chat = false;
+  session.vendorSentAudioInChat = false;
   // A fresh call pings on its first keystroke rather than inheriting the last call's throttle
   // window, which would leave the agent up to thirty seconds of unexplained silence. And a typed
   // turn from the dead conversation cannot suppress a transcript in the new one.
@@ -2488,8 +2595,17 @@ function renderControls() {
   const note = el("talk-note");
   const live = Boolean(session.socket);
 
+  // A TYPED conversation has no microphone to mute and no voice to silence, so the two controls
+  // that act on those are ABSENT rather than sitting there inert. That is the same rule Hang up
+  // already follows when there is no call, and it is the rule the owner's complaint was really
+  // about: the old way to reach typing left both of them on screen, in states you had to set by
+  // hand, acting on a microphone you never wanted open.
+  const chat = live && session.chat;
+  el("speaker").hidden = chat;
+  el("talk").hidden = chat;
   el("hang-up").hidden = !live;
-  el("control-pane").className = live ? "" : "solo";
+  el("hangup-label").textContent = chat ? "End chat" : "Hang up";
+  el("control-pane").className = chat ? "chat" : live ? "" : "solo";
   // Send is dead without a conversation to send into. Disabled rather than absent: the bar in
   // text mode is a stable shape, and a control that comes and goes under a thumb is worse than one
   // that is visibly inert.
@@ -2501,6 +2617,12 @@ function renderControls() {
 
   note.hidden = true;
   note.textContent = "";
+
+  // AFTER the composer and the canned buttons, which are the controls a typed conversation is
+  // actually driven by, and before the microphone branches, which are the ones it has none of.
+  if (chat) {
+    return;
+  }
 
   if (!live) {
     talk.className = "control control-talk";
@@ -4806,7 +4928,7 @@ el("speaker").addEventListener("click", () => setSpeakerOff(!session.speakerOff)
 // `#43 typed-input`, rehoused by `#59 text-entry-button`: the composer, in four listeners and no
 // logic. Everything they call is a named function above, which is exactly why moving the control
 // out of the dock and into the bar did not move the send path with it.
-el("text-entry").addEventListener("click", () => setTextMode(!textMode));
+el("text-entry").addEventListener("click", guardQuietly(onTextEntry));
 // `guardQuietly`, NOT `guard`. `guard()` calls `teardown()`, so a send that failed would hang up on
 // the owner — which is the one thing a failed message must never do.
 el("send-text").addEventListener("click", guardQuietly(sendTyped));

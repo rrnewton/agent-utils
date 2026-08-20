@@ -1497,6 +1497,30 @@ down; nothing here wires the two together.
 
 **None of this makes a mute cheaper.** Billing continues while muted; the vendor discounts silent
 periods but does not stop the meter. This makes a long mute quieter, not free.
+### A typed conversation is a different conversation, not a call with the switches thrown
+
+Because a text-only mode is settled *at initiation*, it can be **chosen** there — and that is what
+**Type** does when it is pressed with nothing open. The owner's report is what this answers:
+reaching a text interface used to mean starting a voice call, muting it, and silencing it. Two of
+those three controls exist to manage a microphone he did not want open, and mute deliberately does
+not close one — it withholds frames from a live capture graph so that unmuting keeps the agent's
+context — so the phone showed the microphone as in use for a conversation that was being typed.
+
+`start({chat: true})` therefore **skips the microphone entirely**: no `getUserMedia`, so no
+permission prompt and no in-use indicator; no `AudioContext`; no capture graph; no playback. Talk
+and Sound are *absent* rather than inert, because there is nothing for either to act on, and Hang
+up becomes "End chat" and takes the space Talk would have had. The suite asserts the guarantee in
+the only form that is actually a guarantee — `micRequests`, `tracks` and `processors` are all
+empty — rather than asserting that something was muted afterwards.
+
+The page **also** asks the vendor for a text-only response, as
+`conversation_config_override.conversation.text_only`, and **does not rely on getting it**. That is
+an override, and an agent whose dashboard forbids overrides ignores it silently. If audio arrives
+anyway it is dropped — there is no `AudioContext` to play it with — and the fact is recorded once
+in the connection details, in as many words: the override was refused, nothing is played, and the
+microphone was never opened. The guarantee the page makes is the one it can keep on its own side of
+the socket; the override is an optimisation on top of it, and the difference is stated rather than
+blurred.
 
 ### The page has two compositions, and a capability query picks between them
 

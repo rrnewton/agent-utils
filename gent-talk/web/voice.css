@@ -1351,6 +1351,24 @@ textarea {
   grid-column: 2 / -1;
 }
 
+/* CHAT MODE: a typed conversation, with no microphone open and nothing to play.
+ *
+ * Two of the four controls have nothing to act on and web/voice.js hides them — Talk, because
+ * there is no capture graph to mute, and Sound, because there is no playback to silence. What is
+ * left is arranged rather than left with holes in it: Hang up takes the whole large area the way
+ * Talk does when idle, and Clear grows to the full height of the small column instead of sitting
+ * in the bottom half of an otherwise empty tile.
+ *
+ * The pane keeps its shape and its metrics. This is the same 3x2 grid with two members absent, not
+ * a second layout that has to be maintained alongside the first. */
+#control-pane.chat .control-hangup {
+  grid-column: 2 / -1;
+}
+
+#control-pane.chat #clear-view {
+  grid-row: 1 / span 2;
+}
+
 /* The caveat that used to be a paragraph in the transcript: one clause, attached to the action it
    is about, and only on the screen where it applies. */
 .control-note {

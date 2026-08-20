@@ -141,7 +141,10 @@
                   <path d="M5 11a7 7 0 0 0 14 0" />
                   <path d="M12 18v3.5" />
                 </svg>
-                <p id="empty-line">Tap Talk to start a conversation.</p>
+                <!-- BOTH ways in, because there are two and they are different kinds of
+                     conversation: Talk opens the microphone, Type never does. Naming only Talk
+                     here is what made the typed path look like a mode of the spoken one. -->
+                <p id="empty-line">Tap Talk to speak, or Type to write.</p>
               </div>
               <ol id="transcript" class="messages"></ol>
             </div>
@@ -432,11 +435,19 @@
             format is settled once when the conversation opens — switching it would mean closing
             and reopening the socket, and a reopened socket is a new conversation that remembers
             nothing. Silencing the agent must not cost you its memory.
-            <strong>Type</strong> turns the control bar into a text box that sends what you write
-            into the same conversation you are speaking in, so a typed turn and a spoken one land
-            in the same transcript and the agent answers either one out loud. It is a toggle: the
-            same button leaves text entry again, and whatever you had half-written is still there
-            when you come back to it.
+            <strong>Type</strong> turns the control bar into a text box. During a call it sends
+            what you write into the same conversation you are speaking in, so a typed turn and a
+            spoken one land in the same transcript and the agent answers either one out loud.
+            Pressed with <strong>nothing open</strong> it starts a <strong>typed
+            conversation</strong> instead: the microphone is never requested, so there is no
+            permission prompt and no in-use indicator, and there is no Talk or Sound button because
+            there is no microphone to mute and no voice to silence. That is a different kind of
+            conversation, chosen when it opens — not a call with two switches thrown, which is what
+            it used to take. This page also asks the agent for a text-only response, but that is an
+            override an agent's own settings can refuse; if it is refused the agent's audio is
+            received and thrown away, the connection details say so, and nothing about the
+            microphone changes. It is a toggle either way: the same button leaves text entry again,
+            and whatever you had half-written is still there when you come back to it.
             <strong>Clear</strong> empties this screen only and never makes the agent forget
             anything. It asks twice, because it sits under your thumb and it cannot be undone.
             It also leaves the stored record on the server untouched, so the conversation comes
@@ -690,7 +701,7 @@
               type="button"
               aria-pressed="false"
               aria-controls="compose-text"
-              title="Type a message to the agent instead of speaking it. It reaches the same conversation."
+              title="Write to the agent instead of speaking. With no call open this starts a TYPED conversation — the microphone is never opened."
             >
               <svg class="mini-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M4 5.5h16v10.5H9.5L5.5 19.5V16H4z" />

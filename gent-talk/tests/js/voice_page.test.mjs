@@ -7891,6 +7891,179 @@ test("PRESSING TYPE CONVERTS THE BAR, AND PRESSING IT AGAIN RESTORES IT", async 
   assert.equal(page.el("compose-text").value, "half a thought", "leaving text entry ate the draft");
 });
 
+// --- chat mode: a TYPED conversation, with no microphone ---------------------------------------
+//
+// The owner's report: reaching a text interface meant starting a voice call, then muting it, then
+// silencing it. Two of those three controls exist to manage a microphone, and he did not want one
+// open — and mute deliberately does NOT close it, so the phone showed the mic as in use throughout.
+//
+// The fix is not a fourth switch. A typed conversation is a different kind of conversation, decided
+// when the socket opens: `start({chat: true})`. What these assert is the part that is entirely on
+// this side of the socket and therefore actually guaranteeable — THE MICROPHONE IS NEVER OPENED.
+
+/** Press Type with nothing open, which is what starts a typed conversation. */
+async function startChatting(page) {
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  page.setFetch(MINTED);
+
+  await page.el("text-entry").click();
+  await page.settle();
+
+  assert.equal(
+    page.el("error").hidden,
+    true,
+    `the chat never opened: ${page.el("error").textContent}`
+  );
+  assert.equal(page.sockets.length, 1, "no conversation was opened at all");
+  page.sockets[0].onopen();
+  await page.settle();
+  return page.sockets[0];
+}
+
+test("PRESSING TYPE WITH NOTHING OPEN NEVER ASKS FOR THE MICROPHONE", async () => {
+  const page = newPage();
+  await startChatting(page);
+
+  // THE ASSERTION THE WHOLE FEATURE EXISTS FOR. Not "the mic was muted", not "the track was
+  // stopped" — never acquired. There is no permission prompt and no in-use indicator because
+  // there is nothing to indicate.
+  assert.deepStrictEqual(page.micRequests, [], "chat mode opened the microphone");
+  assert.deepStrictEqual(page.tracks, [], "chat mode took a microphone track");
+  assert.deepStrictEqual(page.processors, [], "chat mode built a capture graph");
+  assert.equal(state(page), "live", "the conversation is not live");
+});
+
+test("the typed conversation ASKS the vendor for text-only, on the initiation frame", async () => {
+  // It has to be here or nowhere: a text-only response mode is settled once, at initiation. That
+  // is the same fact that stops Sound renegotiating one mid-call.
+  const page = newPage();
+  const socket = await startChatting(page);
+
+  const frames = socket.sent.map((raw) => JSON.parse(raw));
+  const initiation = frames.filter((f) => f.type === "conversation_initiation_client_data");
+  assert.equal(initiation.length, 1, "not exactly one initiation frame");
+  assert.deepStrictEqual(initiation[0].conversation_config_override, {
+    conversation: { text_only: true },
+  });
+  // And nothing that would only make sense with a microphone behind it.
+  assert.equal(
+    frames.some((f) => Object.prototype.hasOwnProperty.call(f, "user_audio_chunk")),
+    false,
+    "audio was sent on a conversation with no microphone"
+  );
+});
+
+test("a voice call is UNCHANGED — it asks for no override and still opens the microphone", async () => {
+  // The control for the test above. If the override leaked onto every conversation it would change
+  // what a spoken call negotiates, which is a silent behaviour change to the page's main path.
+  const page = newPage();
+  const socket = await startTalking(page);
+
+  const initiation = socket.sent
+    .map((raw) => JSON.parse(raw))
+    .find((f) => f.type === "conversation_initiation_client_data");
+  assert.ok(initiation, "a voice call sent no initiation frame");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(initiation, "conversation_config_override"),
+    false,
+    "a spoken call is now asking for text-only"
+  );
+  assert.equal(page.micRequests.length, 1, "a voice call stopped opening the microphone");
+});
+
+test("in a typed conversation the microphone controls are ABSENT, not merely inert", async () => {
+  const page = newPage();
+  await startChatting(page);
+
+  // There is no capture graph to mute and no playback to silence, so a Talk button and a Sound
+  // button would be two controls acting on nothing.
+  assert.equal(page.el("talk").hidden, true, "the microphone control is still on screen");
+  assert.equal(page.el("speaker").hidden, true, "the speaker control is still on screen");
+  assert.equal(page.el("control-pane").className, "chat");
+  assert.equal(page.el("hangup-label").textContent, "End chat");
+  // ...and the controls a typed conversation IS driven by are live.
+  assert.equal(page.el("compose-text").hidden, false, "the composer is not up");
+  assert.equal(page.el("send-text").disabled, false, "Send is dead in a live chat");
+  assert.equal(page.el("canned-summary").getAttribute("aria-disabled"), "false");
+});
+
+test("AUDIO ARRIVING ON A TEXT-ONLY CONVERSATION IS DROPPED AND REPORTED, NOT PLAYED", async () => {
+  // The override is an OVERRIDE: an agent whose dashboard forbids them ignores it silently. The
+  // page must not claim a negotiation it did not get — and must not fall over either, because
+  // there is no AudioContext to play the frame with.
+  const page = newPage();
+  const socket = await startChatting(page);
+
+  const audio = () =>
+    socket.onmessage({
+      data: JSON.stringify({ type: "audio", audio_event: { audio_base_64: "AAAA" } }),
+    });
+  audio();
+  audio();
+  audio();
+  await page.settle();
+
+  assert.equal(page.el("error").hidden, true, "an audio frame broke the typed conversation");
+  const detail = page.el("settings-detail").textContent;
+  assert.match(detail, /sent audio anyway/, "the ignored override was not reported");
+  assert.match(detail, /microphone was never opened/, "the report does not say what still holds");
+  // ONCE, not once per frame: a real agent sends thousands and the reader's conversation is
+  // unaffected either way.
+  assert.equal(detail.match(/sent audio anyway/g).length, 1, "reported per frame");
+
+  // The agent's WORDS still arrive, which is the whole point of a typed conversation.
+  socket.onmessage({
+    data: JSON.stringify({
+      type: "agent_response",
+      agent_response_event: { agent_response: "typed reply" },
+    }),
+  });
+  await page.settle();
+  const said = session_lines(page);
+  assert.match(said[said.length - 1].text(), /typed reply/, "the agent's words did not arrive");
+});
+
+test("chat does not STICK: after a typed conversation, Talk still opens a spoken one", async () => {
+  const page = newPage();
+  const socket = await startChatting(page);
+  socket.onclose({ code: 1000 });
+  await page.settle();
+
+  assert.equal(page.el("talk").hidden, false, "the microphone control never came back");
+  assert.equal(page.el("speaker").hidden, false, "the speaker control never came back");
+
+  page.setFetch(MINTED);
+  await page.el("talk").click();
+  await page.settle();
+  page.sockets[1].onopen();
+  await page.settle();
+
+  assert.equal(page.micRequests.length, 1, "the second call did not open the microphone");
+  const second = JSON.parse(page.sockets[1].sent[0]);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(second, "conversation_config_override"),
+    false,
+    "the text-only override leaked into the next conversation"
+  );
+});
+
+test("pressing Type DURING a voice call still just opens the field", async () => {
+  // The auto-start is only for "there is nothing open". A second conversation started underneath a
+  // live one would be the worst possible reading of this button.
+  const page = newPage();
+  await startTalking(page);
+  assert.equal(page.sockets.length, 1);
+
+  await page.el("text-entry").click();
+  await page.settle();
+
+  assert.equal(page.sockets.length, 1, "typing during a call opened a second conversation");
+  assert.equal(page.el("compose-text").hidden, false, "the field did not open");
+  assert.equal(page.el("talk").hidden, false, "a live voice call lost its microphone control");
+});
+
 test("THERE IS EXACTLY ONE COMPOSER, AND IT IS IN THE BAR", () => {
   // `#43 typed-input` shipped a composer as a row of its own in the dock so the send path could be
   // built and tested; `#59 text-entry-button` MOVES it. Adding the bar version beside the dock
