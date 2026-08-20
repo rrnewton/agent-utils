@@ -957,17 +957,35 @@ It is the **first** member of the pack, and that is the reachability argument ra
 one — the pack scrolls sideways when it is full, so the member at its left edge is the one on
 screen without scrolling anything. It may shrink but never grow (`flex: 0 1 auto` against the
 `flex: 1` every `select` inherits from `style.css`), because a member that grew would take the
-width the pack holds for the buttons beside it. And it is offered **only on the channel view**: on
-the call view it names a channel you are not looking at, and it is the widest thing in the bar.
+width the pack holds for the buttons beside it.
+
+**Every member of the pack says which views it belongs on**, in one table (`PACK_VIEWS` in
+web/voice.js) rather than in a branch. The rule is where the member's effect lands: the picker
+names what the channel view is reading, and Type, Sumry and Blockers all go out through
+`sendUserMessage`, which draws the line into the **transcript** and needs a live call — so on the
+channel view they are three controls whose whole result appears on a screen you are not looking
+at. A member with no line in the table is hidden everywhere and the page suite names it; there is
+no default, because a default is how a control ends up on a view nobody chose for it.
+
+That is a layout decision as much as a semantic one, and it is **measured**: the bar is one strip
+on a 375px phone, six controls do not fit on it, and the pack scrolls — so a control pushed past
+the pack's right edge is exactly as unreachable as the picker used to be. "The bar fits on the
+owner's 375px phone" costs whatever `renderControlBar` really leaves visible against widths read
+out of web/voice.css, on each view and in text mode, and the same test proves it is not vacuous by
+showing that all six together overflow by about 55px.
 
 **Refresh stays where it is.** It is a re-read of what is already on screen rather than a choice
 about what to read, it keeps your place, and a keyboard reaches it wherever the list is scrolled
 to.
 
-The screenshot state `30-channel-picker-in-bar` is what settles the acceptance criterion, because
-"unreachable" is a measurement: it walks the channel back several pages, parks mid-history, and
-asserts the picker is inside a 375px viewport on all four sides and did not move by so much as a
-pixel across the whole walk. Nothing without a layout engine has an opinion about that.
+The screenshot state `30-channel-picker-in-bar` is the check written for the acceptance criterion,
+because "unreachable" is ultimately a measurement a layout engine makes: it walks the channel back
+several pages, parks mid-history, and asserts the picker is inside a 375px viewport on all four
+sides and did not move by so much as a pixel across the whole walk. **It has not been captured.**
+No host this has run on has had Playwright or Chromium, so what is checked today is the offline
+arithmetic above and `--self-test`, which confirms the scene is *pinned* to those claims without
+rendering a frame. The same is true of `31-pull-to-refresh-armed`. Both are written and neither is
+evidence yet; the first run with a browser is what turns them into any.
 
 ### Pulling the channel down, and the other end of the same container
 
@@ -977,26 +995,42 @@ entry and polls every forty-five seconds while it is up — and that covers bein
 waiting*. It gives no way to say **refresh, now**. `#68 pull-to-refresh`.
 
 **The contention is the whole design question**, because pull-down-at-the-top and
-load-older-on-scroll-up are the two ends of one scrolling element. They are told apart by **where
-the drag starts**:
+load-older-on-scroll-up are the two ends of one scrolling element. The rule is two sentences, and
+it has to be two, because the obvious one-sentence version leaves the gesture unreachable on
+exactly the channels that need it:
 
-- with content still above the viewport there is somewhere to scroll to, so the drag is a
-  **scroll** — it reaches the top, and the automatic step back fires exactly as `#65
-  scrollback-paging` intends;
-- with the list already at its top there is nothing left to scroll into, so the drag is an
-  **overscroll** — and that is the pull. `overscroll-behavior: contain` is what leaves that
-  overscroll to this page instead of letting the browser reload the whole application under it.
+1. **A finger on the glass suspends the automatic step back.** Deferred, never dropped — it is
+   taken the moment the finger lifts, so `#65 scrollback-paging` stays automatic rather than
+   becoming a button.
+2. **The pull is measured from where the list ran out**, not from where the finger landed. An
+   overscroll begins at the edge, so the pixels spent reaching the top are scrolling and only the
+   ones after it are a pull.
 
-Neither is a mode and neither has to be armed: the reader does what they already do, and where
-the finger landed says which of the two they meant. The reading is taken at `touchstart` rather
-than from where the finger is *now*, and that is load-bearing — a flick started a little below the
-top runs the list out within a frame, so judging it live would turn ordinary scrolling into a
-refresh.
+So the reader has one continuous motion for each meaning: drag up through the history and the list
+scrolls (lift within `OLDER_TRIGGER_PX` of the top and the deferred step fires, and the walk back
+continues); drag down until the list runs out and keep going, and the extra travel past the edge
+is the pull. `overscroll-behavior: contain` is what leaves that overscroll to this page instead of
+letting the browser reload the whole application under it.
 
-Two rules keep them out of each other's way while both are live: an automatic step back **stands
-aside** while a finger is pulling (it will fire again the moment the finger lifts, whereas the
-pull is something somebody deliberately did), and a step already **in flight** refuses to arm a
-pull, because its answer is about to prepend content above the viewport.
+**The one-sentence version was wrong, and it shipped.** Judging the gesture by the scroll position
+at `touchstart` reads well — "the list is already at its top, so this drag is an overscroll" — and
+it describes a state a reader on a paged channel can never be in: arriving at the top fires the
+step back, the anchored prepend puts them at a positive offset again, and so `scrollTop === 0`
+never holds until the whole history has been walked. The feature existed only on channels short
+enough not to need it. Rule 2 is what replaces that reading while keeping what it got right: a
+flick started a little below the top runs the list out within a frame, so the first `touchmove`
+already reports zero — anchoring at the edge means that flick has travelled nothing yet, where
+judging it from where the finger *is* would turn ordinary scrolling into a refresh.
+
+Two more rules keep the features out of each other's way: a step already **in flight** refuses to
+arm a pull (its answer is about to prepend content above the viewport), and an **armed** pull drops
+the deferred step rather than taking it on release — the reader asked for the newest end, and
+answering with more history is answering the opposite question.
+
+A pull is also **one finger going down**. A drag whose sideways travel exceeds its vertical travel
+is refused for the rest of the touch (the platform's own edge-swipe carries tens of pixels of
+downward drift), and a second finger landing mid-gesture refuses it too rather than re-reading
+`touches[0]` and silently restarting the measurement from wherever finger one has reached.
 
 **It says what it is doing, and then what it found.** *Pull to refresh* while dragging, *Release to
 refresh* once past the threshold — before the finger lifts, so the gesture can still be abandoned —

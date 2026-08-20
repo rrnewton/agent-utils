@@ -554,9 +554,14 @@
               FIRST in the pack, immediately right of the gear, and that is the reachability
               argument rather than a taste one: the pack scrolls sideways when it is full, so the
               member at its left edge is the one that is on screen without scrolling anything —
-              and "this control cannot be reached" is the entire defect being fixed. It also
-              displaces nothing: flex lays the pack out from the left, so the buttons that were
-              already here keep their distance from the switch.
+              and "this control cannot be reached" is the entire defect being fixed.
+
+              Being first is a DOM-ORDER fact and settles nothing about width: a sixth control on a
+              375px strip pushes the last member of the pack out of its visible window whatever the
+              order is. What settles that is `PACK_VIEWS` in web/voice.js, which puts this member on
+              the channel view and the three that talk to the agent on the call view, and the page
+              suite's "THE BAR FITS ON THE OWNER'S 375px PHONE" — which prices whatever the bar
+              really shows against the widths declared in web/voice.css.
 
               A `select`, not a button that opens something: the platform's own picker is the one
               a thumb already knows, and it needs no menu of this page's invention.

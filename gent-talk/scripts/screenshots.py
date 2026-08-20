@@ -1509,6 +1509,13 @@ def _act_channel_picker_reachable(driver: Driver) -> None:
 # The finger is deliberately NEVER LIFTED. The state worth a picture is the armed one, because it is
 # the state that exists so the reader can still change their mind, and it is the only frame in which
 # the page is asking for a decision.
+#
+# IT IS PERFORMED ON A CHANNEL THAT STILL HAS HISTORY, which is the case the first version of this
+# feature could not reach at all: the reader drags, the list runs out under the finger, and the page
+# hears the browser's own `scroll` while the finger is still down. Synthetic touches move nothing by
+# themselves, so the scroll a real drag would produce is supplied here -- but the EVENT is real, it
+# is the one `#65 scrollback-paging` listens on, and whether the page takes a step back on hearing it
+# is exactly what this scene is here to see.
 PULL_GESTURE = """
 (() => {
   const area = document.getElementById('scroll-area');
@@ -1525,9 +1532,14 @@ PULL_GESTURE = """
       bubbles: true, cancelable: true,
     });
   };
+  window.__pullRowsBefore = document.querySelectorAll('#discord-log li').length;
+  window.__pullMoreAbove = window.__visible('load-older');
   area.dispatchEvent(at('touchstart', start));
+  area.scrollTop = 0;
+  area.dispatchEvent(new Event('scroll'));
   area.dispatchEvent(at('touchmove', start + 30));
-  area.dispatchEvent(at('touchmove', start + 140));
+  area.dispatchEvent(at('touchmove', start + 30 + 140));
+  window.__pullRowsAfter = document.querySelectorAll('#discord-log li').length;
   return document.getElementById('pull-refresh').getAttribute('data-state');
 })()
 """
@@ -1536,15 +1548,32 @@ PULL_GESTURE = """
 def _act_pull_armed(driver: Driver) -> None:
     """`#68 pull-to-refresh`: the finger is down, past the threshold, and the page says so.
 
-    Walked all the way back FIRST, and that is not decoration. A pull begins only where the list has
-    nothing left to scroll into, and arriving at the top of a channel that still has history above
-    it starts an automatic step back -- which the page refuses to arm a pull on top of, deliberately
-    (`#65 scrollback-paging` and this gesture are the two ends of one container). Reaching the
-    beginning first removes the race rather than sleeping through it.
+    Deliberately NOT walked to the beginning of the channel. This scene used to do that, and the
+    reason it had to was the defect: arriving at the top of a channel with history fired the
+    automatic step back, the anchored prepend put the reader at a positive offset again, and so the
+    old `scrollTop === 0 at touchstart` precondition could never be met while anything remained
+    above. Walking the whole channel first removed the race by removing the case -- and the case is
+    every channel this issue is about.
+
+    So it takes ONE step back, leaving history above the reader, and pulls from there. What the
+    picture is worth is then a claim about the paged channel and not about the exhausted one.
     """
-    _act_whole_channel(driver)
-    driver.js("(() => { document.getElementById('scroll-area').scrollTop = 0; })()")
-    driver.settle(300)
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { window.__walkFrom = document.querySelectorAll('#discord-log li').length; "
+        "document.getElementById('scroll-area').scrollTop = 0; return window.__walkFrom; })()"
+    )
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log li').length > window.__walkFrom",
+        timeout=10_000,
+    )
+    driver.settle(250)
+    if not bool(driver.js("window.__visible('load-older')")):
+        raise Unreachable(
+            "31-pull-to-refresh-armed",
+            "the channel still has history above the reader, which is the case the pull is for",
+            "the walk reached the beginning of the channel in one step",
+        )
     state = driver.js(PULL_GESTURE)
     if state != "armed":
         raise Unreachable(
@@ -2745,6 +2774,20 @@ SCENES: tuple[Scene, ...] = (
                 "document.getElementById('scroll-area').scrollTop === 0",
             ),
             (
+                # THE case, and the one the old scene could not photograph: there is still history
+                # above the reader. A pull that only works once the channel has been walked to its
+                # beginning is a pull that does not exist on the channels this issue is about.
+                "the channel still has history above the reader",
+                "window.__pullMoreAbove === true && window.__visible('load-older')",
+            ),
+            (
+                # ...and the automatic step back really did stand aside under the finger. Without
+                # this the frame above is satisfiable by a page that prepended a page of history
+                # mid-gesture and armed anyway.
+                "no step back fired while the finger was down",
+                "window.__pullRowsAfter === window.__pullRowsBefore",
+            ),
+            (
                 # THE claim. Not "an element is visible": the state is what the reader is being
                 # asked to decide, and a page that showed the same strip whatever the finger had
                 # done would satisfy any weaker check.
@@ -3263,7 +3306,10 @@ def check_state_controls() -> list[str]:
         # being on screen: a page that showed the same affordance whatever the finger had done
         # would satisfy "it is visible", and what the reader has to be told is what letting go
         # will do.
-        "31-pull-to-refresh-armed": ("'armed'", "Release", "dock.top"),
+        # ...and to the CASE: `__pullRowsAfter` is what says the automatic step back stood aside
+        # under the finger rather than the channel having been walked to its beginning first, which
+        # is how this scene was reachable at all while the gesture was unreachable in life.
+        "31-pull-to-refresh-armed": ("'armed'", "Release", "dock.top", "__pullRowsAfter"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
@@ -3576,6 +3622,7 @@ SELF_TEST_CHECKS = (
     "both control-bar states are pinned to where the bar IS, not to the bar existing",
     "the text-entry state is pinned to the composer fitting inside the bar it converted",
     "the packed-bar state is pinned to nothing being clipped, not to the buttons existing",
+    "the armed-pull state is pinned to the channel still having history above the reader",
     "dark is the default theme, and both schemes stay capturable",
     "each theme really sets color_scheme on the browser context",
     "a non-PNG file is rejected",

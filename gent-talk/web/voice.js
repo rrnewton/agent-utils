@@ -665,12 +665,11 @@ const SEAM_DETAILS = {
 // lying in the one place the reader looks to find out what just happened.
 const RESUME_SEAM_DETAILS = {
   ended:
-    "This is where the conversation broke. The next call is a NEW one, but this server will " +
-    "read the lines above back to it, so it can carry on. That is a reconstruction, not the same " +
-    "conversation.",
+    "This is where the conversation broke. The next call is NEW, but this server will read the " +
+    "lines above back to it: a reconstruction, not the same conversation.",
   suspended:
     "The call dropped while this page was in the background. Resuming opens a NEW conversation " +
-    "and reads the lines above back to it, so it can carry on from them.",
+    "and reads the lines above back to it, so it can carry on.",
   failed:
     "The connection dropped. The next call is a NEW one, and this server will read the lines " +
     "above back to it so it can carry on.",
@@ -1520,6 +1519,35 @@ function placementChanged() {
 }
 
 /**
+ * WHICH VIEW each member of #bar-pack belongs on. A table, and every member needs a line in it.
+ *
+ * The bar is one strip on a 375px phone and the pack is the part of it that scrolls, so a member
+ * that is on screen where it cannot act is not free — it costs the reachability of the members
+ * beside it, which is the whole of `#83 channel-selector-in-bar`. The rule is therefore per member
+ * and it follows WHERE THE MEMBER'S EFFECT LANDS:
+ *
+ *   * the channel picker names what the channel view is reading, and on the call view it names a
+ *     channel you are not looking at;
+ *   * Type, Sumry and Blockers all go out through `sendUserMessage`, which draws the line into the
+ *     TRANSCRIPT and needs a live call. Offering them over the channel means tapping a button
+ *     whose whole result appears on a screen you are not on. Writing INTO the channel is a
+ *     different act with its own control — the reply on the row, `#51 reply-view`.
+ *
+ * There is no default. A member missing from this table is hidden everywhere and the page suite
+ * says which one, because a silent default is how a member ends up on a view nobody chose for it —
+ * and because the fit check below is only as good as this table is complete.
+ */
+const PACK_VIEWS = {
+  "discord-channel": ["discord"],
+  "text-entry": ["voice"],
+  // Derived from the canned list rather than restated, and for the reason `#60
+  // canned-prompt-buttons` made that list in the first place: a third canned button is one entry
+  // there and must not need a second one here. They are all the same answer anyway — every one of
+  // them goes out through `sendUserMessage`.
+  ...Object.fromEntries(CANNED_PROMPTS.map((entry) => [entry.button, ["voice"]])),
+};
+
+/**
  * What is ON the bar right now, and whether the header is worth a row.
  *
  * ONE function owns both, because they are the same question asked twice: `#59` and `#60` extend
@@ -1529,8 +1557,11 @@ function placementChanged() {
 function renderControlBar() {
   const main = currentScreen === "main";
   // `#59 text-entry-button`. Text entry is a MODE OF THE BAR, and it is only ever on where there
-  // is a conversation to type into, so leaving the main screen leaves the mode with it.
-  const typing = textMode && main;
+  // is a conversation to type into, so leaving the main screen — or the view whose transcript the
+  // typing lands in — leaves the mode with it. Without the second half the reader could enter the
+  // mode on the call view, switch to the channel, and be left in a text field whose own toggle is
+  // no longer on the bar to press again.
+  const typing = textMode && main && PACK_VIEWS["text-entry"].includes(currentView);
   el("control-bar").setAttribute("data-mode", typing ? "text" : "buttons");
   // PER MEMBER, not the bar as a whole. The gear is reachable from the sign-in screen today and
   // must stay so — hiding the bar wholesale off the main screen would take it away.
@@ -1538,17 +1569,16 @@ function renderControlBar() {
   el("open-settings").hidden =
     Object.prototype.hasOwnProperty.call(SCREEN_TITLES, currentScreen) || typing;
   // The pack, by the same rule and as a LOOP rather than by name: `#60 canned-prompt-buttons` adds
-  // members here, and every one of them belongs to the call and gets out of the way of the field.
-  // The toggle is the exception, because it is the way back out of the mode.
+  // members here, and every one of them gets out of the way of the field. The toggle is the
+  // exception, because it is the way back out of the mode.
   //
-  // `#83 channel-selector-in-bar` adds the one member that belongs to a VIEW rather than to the
-  // screen: a channel picker on the call view names a channel you are not looking at, and it is
-  // the widest thing in the pack. So it is offered where it acts, and the rule is stated as a
-  // question about the member rather than as a branch, so a second view-scoped member is one
-  // entry rather than a second code path.
-  const forThisView = (member) => member.id !== "discord-channel" || currentView === "discord";
+  // WHICH VIEW each member belongs on is read out of `PACK_VIEWS` — a table, so that adding a
+  // member is an entry rather than a branch, and so that "does the bar fit on a 375px phone"
+  // is a question something can be asked. A member with no entry is a mistake rather than a
+  // default: see the loop below.
   for (const member of el("bar-pack").children) {
-    member.hidden = !main || !forThisView(member) || (typing && member.id !== "text-entry");
+    const views = PACK_VIEWS[member.id] || [];
+    member.hidden = !main || !views.includes(currentView) || (typing && member.id !== "text-entry");
   }
   el("text-entry").setAttribute("aria-pressed", typing ? "true" : "false");
   el("compose-text").hidden = !typing;
@@ -2646,18 +2676,36 @@ function maybeLoadOlder() {
   if (currentView !== "discord" || discordMoreAbove !== true || olderFetchInFlight) {
     return;
   }
-  // `#68 pull-to-refresh`. A pull is a request for the NEWEST, and it happens at the top of the
-  // list — the same place this fires. Taking a step back under a finger that is asking for the
-  // opposite would grow the history the reader is trying to leave, and would do it while the
-  // gesture is mid-flight. The two are the same container's two ends, so one of them has to yield,
-  // and it is this one: the older step is automatic and will fire again the moment the finger
-  // lifts, whereas the pull is something somebody deliberately did.
-  if (pulling()) {
+  if (el("scroll-area").scrollTop > OLDER_TRIGGER_PX) {
     return;
   }
-  if (el("scroll-area").scrollTop <= OLDER_TRIGGER_PX) {
-    guardQuietly(loadOlder)();
+  // `#68 pull-to-refresh`. A FINGER ON THE GLASS SUSPENDS THIS STEP — not just a finger that has
+  // already been recognised as a pull. Two reasons, and the second is the one that makes both
+  // features reachable at once:
+  //
+  //   * prepending history under a finger that is mid-drag moves the ground the reader is
+  //     steering by, which is the fight this design exists to avoid; and
+  //   * the pull can only begin where the list has run out, so a step back that fires the instant
+  //     the top comes into range — `preservingScroll` then putting the reader back at a positive
+  //     offset — is a step that makes the top UNREACHABLE while any history remains. That is
+  //     every channel this issue is about.
+  //
+  // Suspended, never dropped: the step is remembered and taken the moment the finger lifts, which
+  // is what keeps `#65 scrollback-paging` automatic rather than turning it into a button.
+  if (pull !== null) {
+    olderDeferred = true;
+    return;
   }
+  guardQuietly(loadOlder)();
+}
+
+/** The finger has left the glass. Take the step that was refused while it was down. */
+function takeDeferredOlder() {
+  if (!olderDeferred) {
+    return;
+  }
+  olderDeferred = false;
+  maybeLoadOlder();
 }
 
 // --- pulling the channel down to refresh it -----------------------------------------------------
@@ -2667,18 +2715,35 @@ function maybeLoadOlder() {
 // stale." `4e3d850` fixed the staleness itself — the view re-reads on entry and polls while it is
 // up — and that covers being stale AND WAITING. It gives no way to say "refresh, NOW".
 //
-// THE TWO GESTURES AT THIS END OF THE LIST ARE TOLD APART BY WHERE THE DRAG STARTS, which is the
-// design decision the issue asks for and the only one that does not make either feature worse:
+// THE TWO GESTURES AT THIS END OF THE LIST ARE TOLD APART BY WHERE THE LIST RAN OUT, and the rule
+// is two sentences long because it has to leave BOTH of them reachable on a channel that still has
+// history above the reader — which is every channel this issue is about:
 //
-//   * a drag that begins with content still above the viewport is a SCROLL. It scrolls, it reaches
-//     the top, and `maybeLoadOlder` takes the next step back — `#65 scrollback-paging`, unchanged.
-//   * a drag that begins with the list ALREADY at its top is an OVERSCROLL, because there is
-//     nothing left to scroll into. That is the pull, and `overscroll-behavior: contain` on
-//     #scroll-area is what leaves it to this page rather than letting the browser's own
-//     pull-to-refresh reload the whole application.
+//   1. A FINGER ON THE GLASS SUSPENDS THE AUTOMATIC STEP BACK (`maybeLoadOlder` above). Deferred,
+//      not dropped: it is taken the moment the finger lifts.
+//   2. THE PULL'S TRAVEL IS MEASURED FROM WHERE THE LIST RAN OUT, never from where the finger
+//      landed. An overscroll begins at the edge, so the pixels the finger spent getting to the top
+//      are scrolling and only the pixels after it are a pull.
 //
-// Neither is a mode and neither has to be armed: the reader does the same thing they already do,
-// and the position the finger starts from is what says which of the two they meant.
+// Together those give the reader one continuous motion for each meaning, and neither is a mode:
+//
+//   * drag up through the history — the list scrolls; if the finger lifts within OLDER_TRIGGER_PX
+//     of the top the deferred step fires and the walk back continues, `#65 scrollback-paging`;
+//   * drag DOWN until the list runs out and keep going — the extra PULL_ARM_PX past the edge is
+//     the overscroll, and that is the pull. `overscroll-behavior: contain` on #scroll-area is what
+//     leaves that overscroll to this page rather than letting the browser's own pull-to-refresh
+//     reload the whole application.
+//
+// The earlier reading of this — "judged by the scroll position at touchstart" — is what rule 2
+// replaces, and it was wrong in a way no test then reached: arriving at the top of a paged channel
+// fires the step back, `preservingScroll` restores the reader to a positive offset, and so
+// `scrollTop === 0` at touchstart was a state a reader on a channel with history could never be
+// in. The gesture existed only once the whole channel had been walked back.
+//
+// Rule 2 keeps what that reading got right, and for the reason it was chosen: a flick started a
+// little below the top runs the list out within a single frame, so the first touchmove the page
+// sees already reports zero. Anchoring at the edge means that flick has travelled nothing yet —
+// judging it from where the finger IS would turn ordinary scrolling into a refresh.
 //
 // `keepPosition: false`, unlike Refresh and unlike the poll. This is a gesture made AT THE TOP of
 // the history asking for what is new, and "keep my place" there means "stay at the oldest thing
@@ -2696,11 +2761,18 @@ const PULL_LABELS = {
   busy: "Refreshing…",
 };
 
-/** The gesture on the finger right now, or null. */
+/**
+ * The TOUCH on the glass right now, or null.
+ *
+ * Built on every touchstart in the channel view, wherever the list happens to be scrolled to —
+ * because rule 1 above is about a finger being down and not about what that finger turns out to
+ * mean. `anchorY` is null until the list runs out under it, and that is what says whether any of
+ * this drag counts as a pull yet.
+ */
 let pull = null;
 
-/** Is a pull-to-refresh gesture in progress? Read by `maybeLoadOlder`, which must stand aside. */
-const pulling = () => pull !== null;
+/** A step back that `maybeLoadOlder` refused because a finger was down, and owes the reader. */
+let olderDeferred = false;
 
 /** Show the gesture, or take the affordance away. `null` is "no gesture". */
 function renderPull(state) {
@@ -2713,52 +2785,109 @@ function renderPull(state) {
 function pullCancel() {
   pull = null;
   renderPull(null);
+  // The finger is off the glass however it left, so the suspension is over. A step the reader is
+  // owed must not be lost because the browser took the gesture away.
+  takeDeferredOlder();
 }
 
-/** A finger landed. Decide whether this drag could be a pull at all. */
+/** A finger landed. Start following this touch — whether or not it turns out to be a pull. */
 function pullStart(event) {
-  const point = event && event.touches && event.touches[0];
+  const touches = (event && event.touches) || [];
+  // MORE THAN ONE FINGER IS NEVER A PULL. `touches` carries every finger currently on the glass,
+  // so this is a second one landing part-way through a drag — a pinch, or a two-thumb scroll.
+  // Rebuilding the gesture from `touches[0]` here is what the page used to do, and it silently
+  // re-anchored the travel to wherever finger one had got to: a drag stopped just short of the
+  // threshold could arm from halfway. Refused for the rest of the touch, suspension still in force.
+  if (touches.length > 1) {
+    if (pull !== null) {
+      pull.refused = true;
+      pull.armed = false;
+      renderPull(null);
+    }
+    return;
+  }
+  // A LONE finger landing means no other is down, so any gesture still held here belongs to a
+  // touch whose end this page never saw — a stale one, and the new touch replaces it. Keeping it
+  // would suspend the automatic step back for as long as the page stayed open.
+  const point = touches[0];
   pull = null;
   if (!point || currentView !== "discord" || olderFetchInFlight || discordFetchInFlight) {
     return;
   }
-  // The whole test, and the reason the two gestures do not fight: there is nothing above to
-  // scroll into, so whatever this drag does next is an overscroll.
-  if (el("scroll-area").scrollTop > 0) {
-    return;
-  }
-  pull = { startY: point.clientY, armed: false };
+  pull = {
+    startX: Number(point.clientX) || 0,
+    startY: Number(point.clientY) || 0,
+    // Null means "the list has not run out yet". Set to where the finger was at the moment it
+    // did, which is where an overscroll actually begins — see rule 2 above. Landing with the list
+    // already at its top is that same moment, arriving early.
+    anchorY: el("scroll-area").scrollTop > 0 ? null : Number(point.clientY) || 0,
+    armed: false,
+    refused: false,
+  };
 }
 
-/** The finger moved. Arm the pull, or decide this was a scroll after all. */
+/** The finger moved. Arm the pull, or decide this drag is something else. */
 function pullMove(event) {
   const point = pull && event && event.touches && event.touches[0];
-  if (!point) {
+  if (!point || pull.refused) {
     return;
   }
-  const travelled = point.clientY - pull.startY;
-  // Upward travel is a scroll INTO the list, and a scroll position that has left the top means
-  // the browser found something to scroll. Either way this was not a pull; abandoning it here is
-  // what lets the reader change their mind without lifting a finger.
-  if (travelled <= 0 || el("scroll-area").scrollTop > 0) {
-    pullCancel();
+  const y = Number(point.clientY) || 0;
+  // MOSTLY SIDEWAYS IS NOT A PULL. Without an axis test a drag across the list — a swipe the
+  // owner's thumb makes at the edge of the screen for the platform's own back gesture — arms a
+  // refresh on whatever downward drift it happens to carry. Refused for the rest of the touch
+  // rather than re-tested each move, because a gesture that changes its mind about its own axis
+  // is how a horizontal drag arms at the far end of the arc.
+  if (Math.abs((Number(point.clientX) || 0) - pull.startX) > Math.abs(y - pull.startY)) {
+    pull.refused = true;
+    pull.armed = false;
+    renderPull(null);
+    return;
+  }
+  if (el("scroll-area").scrollTop > 0) {
+    // Still content above: the browser has somewhere to scroll, so these pixels are a scroll. Any
+    // anchor from earlier in this drag is void — the reader went back INTO the history, and the
+    // overscroll would have to begin again if they come back out of it.
+    pull.anchorY = null;
+    pull.armed = false;
+    renderPull(null);
+    return;
+  }
+  if (pull.anchorY === null) {
+    // The list has just run out under the finger. THIS is the edge, and the pull is measured from
+    // here — the travel spent reaching it belonged to the scroll.
+    pull.anchorY = y;
+  }
+  const travelled = y - pull.anchorY;
+  if (travelled <= 0) {
+    // Moving back up while still at the top. Re-anchor rather than refuse: the finger has not
+    // left, the list is still at its edge, and the next downward millimetre is the start of a
+    // pull. This is what lets the reader change their mind without lifting.
+    pull.anchorY = y;
+    pull.armed = false;
+    renderPull(null);
     return;
   }
   pull.armed = travelled >= PULL_ARM_PX;
   renderPull(pull.armed ? "armed" : "pull");
 }
 
-/** The finger lifted. Only an ARMED pull does anything. */
+/** The finger lifted. Only an ARMED pull does anything — but the suspension ends either way. */
 async function pullEnd() {
-  if (!pull) {
-    return;
-  }
-  const armed = pull.armed;
+  const armed = pull !== null && pull.armed;
   pull = null;
   if (!armed) {
     renderPull(null);
+    // Whatever this touch was, it was not a pull, so the step back it stood in the way of is the
+    // reader's again. THIS is what keeps the walk automatic: a reader who drags up to the top and
+    // lifts has asked for what is above, and gets it here rather than having to scroll a second
+    // time to re-announce it.
+    takeDeferredOlder();
     return;
   }
+  // An ARMED pull drops it instead: the reader has asked for the newest end of the channel, and
+  // answering that by prepending more history is answering the opposite question.
+  olderDeferred = false;
   renderPull("busy");
   const before = discordNewestId;
   try {

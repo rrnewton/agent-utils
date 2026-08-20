@@ -71,6 +71,9 @@ const PAGE_ELEMENTS = new Map(
       // The initial state the MARKUP gives the status line, so a test can read it before the page
       // has had any reason to change it.
       state: (/\bdata-state="([^"]+)"/.exec(m[2]) || [])[1],
+      // The class the MARKUP gives it, which is how the bar's width budget prices a control: a
+      // member added wearing a class nothing has costed fails there rather than being free.
+      className: (/\bclass="([^"]+)"/.exec(m[2]) || [])[1] || "",
       text: m[4].trim(),
     },
   ])
@@ -374,16 +377,27 @@ class FakeElement {
    * unreachable position cannot tell a correct restore from one that overshoots by a screenful.
    *
    * So the position a test can observe is the position a browser would really have: never past
-   * `scrollHeight - clientHeight`, never below zero. An element with nothing to scroll — every
-   * element here except #scroll-area — therefore sits at zero and stays there, which is also true
-   * of the real thing.
+   * `scrollHeight - clientHeight`, never below zero.
+   *
+   * AND ONLY ONE ELEMENT HAS A POSITION AT ALL. Everything else is pinned to zero, which is what a
+   * browser reports for a box that does not scroll — and it is a deliberate correction to what
+   * this comment used to claim. The clamp alone does NOT put those elements at zero: the ceiling
+   * is `scrollHeight - clientHeight`, every element but #scroll-area is given a `clientHeight` of
+   * zero, and so the ceiling for all of them was their whole content height. `#discord-log` would
+   * happily hold a scroll position of 500.
+   *
+   * That the model has exactly one scrolling box is a fact about the page and is checked as one:
+   * web/voice.css gives three other elements their own overflow, and none of them is inside the
+   * layout tree above — see "the fixture carries a scroll position for the ONE element the page
+   * ever scrolls".
    */
   get scrollTop() {
     return this.scrollPosition;
   }
 
   set scrollTop(value) {
-    const furthest = Math.max(0, this.scrollHeight - this.clientHeight);
+    const furthest =
+      this.id === "scroll-area" ? Math.max(0, this.scrollHeight - this.clientHeight) : 0;
     this.scrollPosition = Math.max(0, Math.min(Number(value) || 0, furthest));
   }
 
@@ -1433,14 +1447,43 @@ const words = (text) => text.trim().split(/\s+/).filter(Boolean).length;
  * A FLOOR, because the assertion this replaces was `length > 120` and that floor was the whole
  * reason it existed: without one, deleting the explanation outright passes.
  */
-// RAISED from 10 by `#74 scroll-test-strength`, finding 2, and deliberately: the shortest
-// disclosure the page actually ships is eighteen words, so a floor of ten let every one of them be
-// cut to half its length with this and both seam tests still green. Fifteen is under the shortest
-// live one with a little room to edit, and over the point where a disclosure stops being able to
-// say both of the things these seams have to say — what happened, and what it means for the
-// agent's memory.
+// RAISED from 10 by `#74 scroll-test-strength`, finding 2: the shortest disclosure the page ships
+// is eighteen words, so a floor of ten let every one of them be cut to half its length with both
+// seam tests still green. Fifteen is under that shortest one with a little room to edit, and over
+// the point where a disclosure stops being able to say both of the things these seams have to say
+// — what happened, and what it means for the agent's memory.
+//
+// "The shortest the page ships" was a claim about `SEAM_DETAILS.failed`, which NO TEST MEASURED
+// when the floor was raised on the strength of it — the three sites driven below reach three other
+// strings. "EVERY WORDING A SEAM CAN SHOW" is what makes it a measured fact: it walks both tables
+// and pins the distance between this floor and the real shortest, so the justification cannot
+// quietly stop being true of the page.
 const SEAM_DETAIL_MIN_WORDS = 15;
 const SEAM_DETAIL_MAX_WORDS = 28;
+
+/**
+ * One of web/voice.js's tables of interface sentences, read out of the source.
+ *
+ * The page composes them with `+` across several lines, so this joins the string literals inside
+ * each entry. Deliberately strict about the shape: a table it cannot parse is an assertion
+ * failure, never an empty result that measures nothing.
+ */
+function sourceStringTable(name) {
+  const found = new RegExp(`const ${name} = \\{([\\s\\S]*?)\\n\\};`).exec(SCRIPT_CODE);
+  assert.ok(found, `web/voice.js no longer states a ${name}`);
+  const table = {};
+  for (const part of found[1].split(/\n {2}(?=[\w"]+:)/)) {
+    const key = /^\s*"?([\w-]+)"?:/.exec(part);
+    if (!key) {
+      continue;
+    }
+    const pieces = [...part.matchAll(/"((?:[^"\\]|\\.)*)"/g)].map((m) => m[1]);
+    assert.ok(pieces.length, `${name}.${key[1]} is not a string this test can read`);
+    table[key[1]] = pieces.join("");
+  }
+  assert.ok(Object.keys(table).length, `${name} parsed as an empty table, so it measures nothing`);
+  return table;
+}
 
 /** The one status line's machine-readable state, which is what colours its dot. */
 const state = (page) => page.el("status-line").getAttribute("data-state");
@@ -2166,6 +2209,256 @@ test("the picker cannot take the width the pack holds for everything else", () =
   assert.match(rule, /font-size:\s*16px/, "focusing the picker will zoom the frame on iOS");
 });
 
+// --- and does the whole bar FIT? ----------------------------------------------------------------
+//
+// `#83 channel-selector-in-bar` put a SIXTH control on a strip that already carried five, and the
+// pack scrolls sideways — so "it is on the bar" and "it can be reached" stopped being the same
+// sentence the moment the sixth arrived. An overfull pack reintroduces the exact defect this issue
+// is about at the other end of the strip: the member past the right edge of the pack's visible
+// window is as unreachable as the picker used to be, and it goes unnoticed because nothing in this
+// fixture lays anything out horizontally.
+//
+// So the budget is read OUT OF THE STYLESHEET and spent by whatever `renderControlBar` really
+// leaves visible. Neither half is restated: change a min-width and the budget moves with it, show
+// one more member on a view and the bill goes up. A layout engine would say it better — that is
+// scene 27 and scene 30 — but a browser is exactly what this repository does not have on every
+// run, and "six controls fit in 375px" is arithmetic before it is rendering.
+
+/** Nothing in either stylesheet sets a root font size, so a rem is the browser's default. */
+const REM_PX = 16;
+
+/** The owner's screen, and the width every other 375 in this file means. */
+const PHONE_PX = 375;
+
+/**
+ * One CSS length, in pixels.
+ *
+ * `calc(0.6rem + env(safe-area-inset-left))` counts as the rem alone: the inset is zero on a phone
+ * without a cutout and POSITIVE on one with, so ignoring it can only make this budget optimistic —
+ * never wrong in the direction that would let an overfull bar pass.
+ */
+function lengthPx(token) {
+  const rem = /(-?[\d.]+)rem/.exec(token);
+  if (rem) {
+    return Number(rem[1]) * REM_PX;
+  }
+  const px = /(-?[\d.]+)px/.exec(token);
+  assert.ok(px || /^\s*0\s*$/.test(token), `no length this test can read in ${JSON.stringify(token)}`);
+  return px ? Number(px[1]) : 0;
+}
+
+/** What a declaration block gives one property, or undefined. Matched as a property, not grepped. */
+function cssValue(block, property) {
+  const found = new RegExp(`(?:^|[;{\\s])${property}:\\s*([^;}]+)`).exec(block);
+  return found ? found[1].trim() : undefined;
+}
+
+/**
+ * The left and right padding a rule declares, in pixels, shorthand included.
+ *
+ * Split at the TOP LEVEL, counting parentheses: this file's insets are
+ * `calc(0.6rem + env(safe-area-inset-left))`, and a naive split on the first `)` reads the second
+ * value as the fourth and quietly prices the wrong edge.
+ */
+function paddingXPx(block) {
+  const declared = cssValue(block, "padding");
+  if (declared === undefined) {
+    return 0;
+  }
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  for (const character of declared) {
+    if (character === "(") depth += 1;
+    if (character === ")") depth -= 1;
+    if (/\s/.test(character) && depth === 0) {
+      if (current) parts.push(current);
+      current = "";
+      continue;
+    }
+    current += character;
+  }
+  if (current) parts.push(current);
+  assert.ok(
+    parts.length >= 1 && parts.length <= 4,
+    `padding shorthand with ${parts.length} values in ${JSON.stringify(declared)}`
+  );
+  const right = parts.length >= 2 ? parts[1] : parts[0];
+  const left = parts.length >= 4 ? parts[3] : right;
+  return lengthPx(right) + lengthPx(left);
+}
+
+/**
+ * The narrowest box a rule can be drawn in, in pixels.
+ *
+ * `style.css` sets `* { box-sizing: border-box }`, so a declared min-width already contains the
+ * padding and the border. A rule with NO floor at all is a failure rather than a zero: the whole
+ * point of this arithmetic is that every member of the strip has a width nothing can take away.
+ */
+function minBoxPx(selector) {
+  const block = cssBlock(selector);
+  const floor = cssValue(block, "min-width") || cssValue(block, "width");
+  assert.ok(
+    floor !== undefined,
+    `${selector} declares neither a min-width nor a width, so nothing can say whether the bar fits`
+  );
+  return lengthPx(floor);
+}
+
+/** The view switch, which has no width of its own: it is as wide as the parts inside it. */
+function switchPx() {
+  const outer = cssBlock(".switch");
+  const border = lengthPx((cssValue(outer, "border") || "0").split(/\s+/)[0]) * 2;
+  return (
+    minBoxPx(".switch-track") +
+    minBoxPx(".switch-word") +
+    lengthPx(cssValue(outer, "gap")) +
+    paddingXPx(outer) +
+    border
+  );
+}
+
+/**
+ * What one member of the strip costs, priced by the CLASS THE MARKUP GIVES IT.
+ *
+ * The widest priced class wins, because a member wearing two — `.bar-button.heavy` — is drawn by
+ * both. A member wearing a class nothing here has priced is a failure and not a free control.
+ */
+function memberPx(id) {
+  const className = PAGE_ELEMENTS.get(id).className;
+  const byClass = {
+    "bar-button": () => minBoxPx(".bar-button"),
+    "bar-select": () => minBoxPx(".bar-select"),
+    switch: switchPx,
+  };
+  const priced = className
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter((name) => byClass[name])
+    .map((name) => byClass[name]());
+  if (priced.length) {
+    return Math.max(...priced);
+  }
+  assert.equal(
+    className,
+    "",
+    `#${id} is on the bar wearing class ${JSON.stringify(className)}, which this budget cannot ` +
+      "price — add it to the table above rather than letting an unpriced control onto the strip"
+  );
+  return minBoxPx(`#${id}`);
+}
+
+/** What the bar costs as it is CURRENTLY drawn: the visible members, plus the gaps between them. */
+function barCostPx(page) {
+  const gap = lengthPx(cssValue(cssBlock("#control-bar"), "gap"));
+  const packGap = lengthPx(cssValue(cssBlock("#bar-pack"), "gap"));
+  const shown = [];
+  let cost = 0;
+  for (const member of page.el("control-bar").children) {
+    if (member.id === "bar-pack") {
+      const inside = member.children.filter((kid) => !kid.hidden);
+      if (!inside.length) {
+        continue;
+      }
+      shown.push(...inside.map((kid) => kid.id));
+      cost += inside.reduce((total, kid) => total + memberPx(kid.id), 0);
+      cost += packGap * (inside.length - 1);
+      continue;
+    }
+    if (member.hidden) {
+      continue;
+    }
+    shown.push(member.id);
+    cost += memberPx(member.id);
+  }
+  const boxes = page.el("control-bar").children.filter(
+    (member) => !member.hidden && (member.id !== "bar-pack" || member.children.some((k) => !k.hidden))
+  ).length;
+  return { cost: cost + gap * Math.max(0, boxes - 1), shown };
+}
+
+/** The width the bar really has on a 375px phone: the tighter of its two homes. */
+function barBudgetPx() {
+  const dock = paddingXPx(cssBlock('#control-bar[data-placement="bottom"]'));
+  const header = paddingXPx(cssBlock("#topbar"));
+  return PHONE_PX - Math.max(dock, header);
+}
+
+test("EVERY MEMBER OF THE BAR SAYS WHICH VIEWS IT BELONGS ON, AND NONE IS LEFT TO A DEFAULT", () => {
+  // The rule is a TABLE and this is what makes that claim true rather than a description of one
+  // hardcoded comparison: a member added to the pack with no line in `PACK_VIEWS` is hidden
+  // everywhere, and it fails here by name rather than quietly appearing on a view nobody chose.
+  const table = /const PACK_VIEWS = \{([\s\S]*?)\n\};/.exec(SCRIPT_CODE);
+  assert.ok(table, "web/voice.js no longer states which views the bar's members belong on");
+  const listed = new Set([...table[1].matchAll(/"([\w-]+)":/g)].map((m) => m[1]));
+  // The canned buttons are DERIVED from `CANNED_PROMPTS` rather than named here — that is the
+  // whole of `#60`'s "a third one is an entry, not a code path" — so the table is read through a
+  // real page instead of by eye: what matters is that every member is decided by it.
+  const page = newPage();
+  for (const member of page.el("bar-pack").children) {
+    const decided =
+      listed.has(member.id) ||
+      CANNED.some((entry) => entry.button === member.id);
+    assert.ok(
+      decided,
+      `#${member.id} is in the pack but in no line of PACK_VIEWS, so nothing decided which view ` +
+        "it belongs on"
+    );
+  }
+});
+
+test("THE BAR FITS ON THE OWNER'S 375px PHONE, ON EVERY VIEW AND IN BOTH MODES", async () => {
+  // The measurement `#83` skipped. Six controls went onto one strip and the only thing that had an
+  // opinion about whether they fit was a screenshot scene that runs on the CALL view — where the
+  // picker is hidden, so it could not see the case that matters.
+  const budget = barBudgetPx();
+  assert.ok(budget > 300 && budget < PHONE_PX, `the budget arithmetic is broken: ${budget}px`);
+  const page = newPage();
+  await signIn(page);
+
+  const report = (where, { cost, shown }) =>
+    `${where}: ${shown.join(" + ")} need ${cost.toFixed(1)}px of the ${budget.toFixed(1)}px a ` +
+    `${PHONE_PX}px phone leaves, so ${Math.ceil(cost - budget)}px of the bar is off the edge — ` +
+    "#bar-pack scrolls, so what is off the edge is a control the owner cannot reach";
+
+  // The call view: the gear, the three controls that speak to the agent, and the switch.
+  const call = barCostPx(page);
+  assert.ok(call.shown.includes("canned-blockers"), "this is not the call view's full bar");
+  assert.ok(call.cost <= budget, report("the call view", call));
+
+  // The channel view: the same strip with the picker instead, which is the widest single member of
+  // the pack. THIS is the composition `#83` added and nothing measured.
+  await showDiscord(page, [message({ content: "hi" })]);
+  const channel = barCostPx(page);
+  assert.ok(channel.shown.includes("discord-channel"), "this is not the channel view's bar");
+  assert.ok(channel.cost <= budget, report("the channel view", channel));
+
+  // Text entry, where the bar converts into a field. The field itself is deliberately allowed to
+  // shrink to nothing (`min-width: 0`, so a long message never pushes Send away), so what this
+  // costs is the toggle and the Send beside it — the two that must survive on any screen.
+  await page.el("view-switch").click();
+  await page.el("text-entry").click();
+  const typing = barCostPx(page);
+  assert.ok(typing.shown.includes("send-text"), "text entry is not open");
+  assert.ok(typing.cost <= budget, report("text entry", typing));
+
+  // ...and the arithmetic is not vacuous: putting the whole pack on one view — which is what the
+  // page did before `PACK_VIEWS` decided per member — really does overflow.
+  const everything =
+    memberPx("open-settings") +
+    memberPx("discord-channel") +
+    memberPx("text-entry") +
+    CANNED.reduce((total, entry) => total + memberPx(entry.button), 0) +
+    memberPx("view-switch") +
+    lengthPx(cssValue(cssBlock("#bar-pack"), "gap")) * 3 +
+    lengthPx(cssValue(cssBlock("#control-bar"), "gap")) * 2;
+  assert.ok(
+    everything > budget,
+    `all six members together need only ${everything}px of ${budget}px, so this test would pass ` +
+      "with every control on every view and is measuring nothing"
+  );
+});
+
 test("WALKING BACK THROUGH THE CHANNEL CANNOT MOVE THE PICKER", async () => {
   // The regression half of `#83`, stated as the thing the reader experiences: take several steps
   // back through the history — each one prepending above the viewport, exactly as `#65
@@ -2211,8 +2504,7 @@ test("WALKING BACK THROUGH THE CHANNEL CANNOT MOVE THE PICKER", async () => {
 
 test("the picker is offered where there is a channel to pick, and nowhere else", async () => {
   // It is the widest member of the pack and it names a channel the call view is not showing, so
-  // it belongs to the VIEW rather than to the screen. Everything else on the bar is the other
-  // rule, which is why this one is written as a question about the member.
+  // it belongs to the VIEW rather than to the screen — one line of `PACK_VIEWS`, not a branch.
   const page = newPage();
   await signIn(page);
   assert.equal(page.tab(), "voice");
@@ -2222,10 +2514,30 @@ test("the picker is offered where there is a channel to pick, and nowhere else",
   assert.equal(page.el("discord-channel").hidden, false, "the picker is missing from its own view");
 
   // The bar's other rule still applies to it: text entry takes the bar, and every member that is
-  // not the way back out of the mode gets out of the way.
+  // not the way back out of the mode gets out of the way. Entered from the view text entry lives
+  // on, because that is now the only place it can be entered from — the picker and the field can
+  // never be on the strip together, which is the claim, and it is checked on BOTH views rather
+  // than on the one where the mode happens to be reachable.
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "voice");
   await page.el("text-entry").click();
+  assert.equal(page.el("compose-text").hidden, false, "text entry did not open where it lives");
   assert.equal(page.el("discord-channel").hidden, true, "the picker crowded the text field");
+
+  // The reader cannot ordinarily leave the view while typing — the switch is one of the members
+  // that gets out of the way of the field — so the next click is the DEFENSIVE path: whatever
+  // moves the view, the field must not arrive on a view whose bar has no way back out of the mode.
+  assert.equal(page.el("view-switch").hidden, true, "the switch is on the bar during text entry");
+  await page.el("view-switch").click();
+  assert.equal(page.tab(), "discord");
+  assert.equal(page.el("compose-text").hidden, true, "the composer followed the reader off its view");
+  assert.equal(page.el("discord-channel").hidden, false, "the picker is missing from its own view");
+
+  // ...and leaving the mode where it lives puts the call view back the way it was.
+  await page.el("view-switch").click();
   await page.el("text-entry").click();
+  assert.equal(page.el("compose-text").hidden, true, "the toggle stopped closing the field");
+  await page.el("view-switch").click();
   assert.equal(page.el("discord-channel").hidden, false);
 
   // ...and so does the screen rule.
@@ -2963,6 +3275,52 @@ test("EVERY seam is the same size, so the essay cannot come back through the oth
       `${sites.length}`
   );
   assert.ok(drawn("renderChannelSeam") > 0, "nothing places the channel's own summary any more");
+});
+
+test("EVERY WORDING A SEAM CAN SHOW IS INSIDE THE BAND, INCLUDING THE ONES NO SITE DRIVES", () => {
+  // The test above drives three seams and measures the three strings they happen to reach. The
+  // page can show SIX: `seamDetailFor` picks a cause out of one of two tables, and whether
+  // resuming is armed decides which table. `RESUME_SEAM_DETAILS.ended` was thirty-seven words —
+  // nine past a ceiling that exists because "sixty words one tap away is still sixty words" — and
+  // nothing in the suite had ever looked at it.
+  const tables = {
+    SEAM_DETAILS: sourceStringTable("SEAM_DETAILS"),
+    RESUME_SEAM_DETAILS: sourceStringTable("RESUME_SEAM_DETAILS"),
+  };
+  // The two tables answer the same question, so they must answer it for the same causes: a cause
+  // present in one and missing from the other falls back to `ended` and says the wrong thing.
+  assert.deepStrictEqual(
+    Object.keys(tables.SEAM_DETAILS).sort(),
+    Object.keys(tables.RESUME_SEAM_DETAILS).sort(),
+    "the two seam tables disagree about which causes exist"
+  );
+  assert.ok(Object.keys(tables.SEAM_DETAILS).length >= 3, "the seam causes are not being read");
+
+  let shortest = Infinity;
+  for (const [name, table] of Object.entries(tables)) {
+    for (const [cause, text] of Object.entries(table)) {
+      const spent = words(text);
+      shortest = Math.min(shortest, spent);
+      assert.ok(
+        spent >= SEAM_DETAIL_MIN_WORDS,
+        `${name}.${cause} explains nothing in ${spent} words: "${text}"`
+      );
+      assert.ok(
+        spent <= SEAM_DETAIL_MAX_WORDS,
+        `${name}.${cause} spends ${spent} words behind a tap: "${text}"`
+      );
+    }
+  }
+
+  // ...and the floor is pinned TO that shortest one, which is the claim the raise was justified
+  // by. Too far under it and the floor is decorative — every disclosure could lose a third of
+  // itself and stay green, which is the state `#74 scroll-test-strength` found it in.
+  assert.ok(
+    shortest - SEAM_DETAIL_MIN_WORDS <= 5,
+    `the shortest wording the page ships is ${shortest} words and the floor is ` +
+      `${SEAM_DETAIL_MIN_WORDS}, so ${shortest - SEAM_DETAIL_MIN_WORDS} words could be cut out of ` +
+      "every one of them with this band still green — raise the floor or shorten nothing"
+  );
 });
 
 test("the voice on this page is the ASSISTANT, not one more 'agent'", async () => {
@@ -4111,6 +4469,52 @@ test("AND THE NEWEST MESSAGE IS REALLY ON THE SCREEN WHEN IT GETS THERE", async 
   );
 });
 
+test("the fixture carries a scroll position for the ONE element the page ever scrolls", async () => {
+  // The docstring on `FakeElement.scrollTop` used to say that the clamp put every other element at
+  // zero "the way the real thing does". It did not: the ceiling is `scrollHeight - clientHeight`,
+  // and every element but #scroll-area has a clientHeight of zero and a content height that is
+  // not — so the ceiling was the whole content and `#discord-log` could hold a position of 500.
+  // Another track resolving a conflict here would have been relying on a claim the code did not
+  // make, which is why this is a checked property now and not a sentence.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, tallChannel());
+  const log = page.el("discord-log");
+  assert.ok(log.scrollHeight > 500, "the log is too short for this to be asking anything");
+  log.scrollTop = 500;
+  assert.equal(log.scrollTop, 0, "an element the page never scrolls is holding a scroll position");
+  // ...and the one that does scroll still clamps to the range a browser would allow, rather than
+  // to zero. Both halves, because either alone is satisfiable by breaking the other.
+  const area = page.el("scroll-area");
+  area.scrollTop = area.scrollHeight * 2;
+  assert.equal(area.scrollTop, area.scrollHeight - area.clientHeight);
+
+  // WHY the model is allowed only one: the stylesheet's other scrolling elements are outside the
+  // layout tree this fixture models, so nothing here has to have an opinion about them. Computed
+  // from web/voice.css rather than listed, so giving #discord-log its own overflow fails here.
+  const scrollers = new Set();
+  for (const rule of CSS_CODE.matchAll(/([^{}]+)\{([^{}]*)\}/g)) {
+    if (!/overflow(-y)?:\s*(auto|scroll)/.test(rule[2])) {
+      continue;
+    }
+    for (const selector of rule[1].split(",").map((part) => part.split("\n").pop().trim())) {
+      if (selector) scrollers.add(selector);
+    }
+  }
+  assert.ok(scrollers.has("#scroll-area"), "the one element this model scrolls no longer scrolls");
+  const modelled = new Set(
+    Object.keys(FIXTURE_TREE).concat(...Object.values(FIXTURE_TREE))
+  );
+  for (const selector of scrollers) {
+    const id = selector.replace(/^#/, "");
+    assert.ok(
+      id === "scroll-area" || !modelled.has(id),
+      `${selector} scrolls in web/voice.css AND is inside the fixture's layout tree, so the ` +
+        "model's one-scrolling-box assumption has stopped being true of the page"
+    );
+  }
+});
+
 test("EVERY visit to the channel view opens on the newest message, not just the first", async () => {
   // The regression this guards: the only scroll-to-bottom used to live in loadDiscord(), which
   // runs solely on the FIRST switch. Both panes share one scroll container, so every later
@@ -4764,17 +5168,31 @@ test("switching channel starts the walk again rather than stepping back from a s
 // while it is up — and that covers being stale AND WAITING; this is the way to say "refresh, now".
 //
 // The whole design question is the CONTENTION, because pull-down-at-the-top and
-// load-older-on-scroll-up are the two ends of one container. The page tells them apart by where
-// the drag STARTS: with content still above the viewport it is a scroll (and reaching the top
-// takes a step back, `#65 scrollback-paging`, untouched); with the list already at its top there
-// is nothing left to scroll into, so the drag is an overscroll and that is the pull. The tests
-// below check both readings and the two ways they could be made to fight.
+// load-older-on-scroll-up are the two ends of one container, and the rule is two sentences:
+//
+//   1. A FINGER ON THE GLASS SUSPENDS the automatic step back — deferred, not dropped, and taken
+//      the moment the finger lifts. Without this the reader can never be at the top of a paged
+//      channel at all: arriving there fires the step, `preservingScroll` puts them back at a
+//      positive offset, and the pull is unreachable until the whole history has been walked.
+//   2. THE PULL IS MEASURED FROM WHERE THE LIST RAN OUT, not from where the finger landed, so the
+//      pixels spent reaching the top are scrolling and only the ones after it are a pull.
+//
+// The tests below check both, both ways they could be made to fight, and — the case the first
+// version of this feature could not reach at all — a pull on a channel that still has history.
 
 /** How far a finger has to travel before a release refreshes. Derived, never restated. */
 const PULL_ARM_PX = sourceConstant("PULL_ARM_PX");
 
 /** A touch event carrying only what the page reads off one. */
-const touchAt = (y) => ({ touches: [{ clientY: y }] });
+const touchAt = (y, x = 0) => ({ touches: [{ clientY: y, clientX: x }] });
+
+/** Two fingers on the glass, which is a pinch or a two-thumb scroll and never a pull. */
+const twoFingers = (first, second) => ({
+  touches: [
+    { clientY: first, clientX: 0 },
+    { clientY: second, clientX: 0 },
+  ],
+});
 
 /**
  * One pull gesture on the channel list: land at `from`, drag `travel` pixels DOWN, and lift.
@@ -5014,6 +5432,167 @@ test("THE PULL AND THE STEP BACK ARE THE SAME CONTAINER'S TWO ENDS, AND DO NOT F
   answer(json(200, { channel: CHANNEL, messages: [], has_more: false, next_before: null }));
   await lifted;
   await page.settle();
+});
+
+/**
+ * A channel with MORE HISTORY ABOVE, arrived at the way a browser really arrives.
+ *
+ * Every earlier test in this section reaches the pullable state by ASSIGNING `scrollTop = 0` and
+ * never dispatching the `scroll` event that a browser guarantees — so the suite was green about a
+ * state a reader on a paged channel could not be in. This drags the list to its top with a finger
+ * down and lets the page hear the scroll, which is the case `#68` is actually for: the channel is
+ * hours out of date AND it has a history.
+ */
+async function draggedToTopOf(page, y) {
+  const area = page.el("scroll-area");
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.4);
+  assert.ok(
+    area.scrollTop > sourceConstant("OLDER_TRIGGER_PX"),
+    "the fixture's channel is too short to drag through"
+  );
+  await area.dispatch("touchstart", touchAt(y));
+  // The browser scrolls the content under the finger and reports it. THIS is the event `#65
+  // scrollback-paging` listens on, and it arrives while the finger is still on the glass.
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await page.settle();
+  return area;
+}
+
+test("A CHANNEL THAT STILL HAS HISTORY CAN BE PULLED — THE CASE THE ISSUE IS ABOUT", async () => {
+  // The defect this replaces: arriving at the top of a paged channel fired the automatic step
+  // back, `preservingScroll` restored the reader to a positive offset, and so `scrollTop === 0`
+  // at touchstart — the old precondition for a pull — was a state that could not occur until the
+  // whole channel had been walked back. The gesture existed only on channels that did not need it.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 4, size: 4, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(page, []);
+  const log = page.el("discord-log");
+  assert.equal(log.children.length, 4, "the channel did not load its newest page");
+  assert.equal(page.el("load-older").hidden, false, "this channel has no history, so it is not the case");
+
+  const area = await draggedToTopOf(page, 300);
+
+  // The step back stood aside while the finger was down — which is what leaves the reader AT the
+  // top, where an overscroll is possible at all.
+  assert.equal(log.children.length, 4, "the step back fired under the finger and moved the ground");
+  assert.equal(area.scrollTop, 0, "the reader was pushed off the top mid-drag");
+  const readsBefore = page.pagesServed.length;
+
+  // The list has run out under the finger, so from here on the drag is an overscroll: the first
+  // move anchors the edge, and the travel after it is the pull.
+  await area.dispatch("touchmove", touchAt(320));
+  await area.dispatch("touchmove", touchAt(320 + PULL_ARM_PX));
+  assert.equal(
+    page.el("pull-refresh").getAttribute("data-state"),
+    "armed",
+    "a pull on a channel with history above it cannot be armed at all"
+  );
+
+  await area.dispatch("touchend");
+  await page.settle();
+
+  assert.equal(page.pagesServed.length, readsBefore + 1, "the pull fetched nothing");
+  assert.doesNotMatch(
+    page.pagesServed[page.pagesServed.length - 1],
+    /before=/,
+    "the pull was answered with OLDER messages instead of with what is new"
+  );
+  assert.match(page.el("status").textContent, /refreshed/, "the refresh said nothing at all");
+  assert.ok(atBottomOf(area), "the pull left the reader at the top instead of at the newest line");
+  // ...and the channel still has a history, so this really was the paged case and not the
+  // walked-to-the-end one the old gesture needed.
+  assert.equal(page.el("load-older").hidden, false, "the channel ran out of history on the way");
+});
+
+test("THE STEP BACK IS SUSPENDED UNDER A FINGER, NOT SWITCHED OFF", async () => {
+  // The other half of the same rule, and the one that keeps `#65 scrollback-paging` automatic. A
+  // suspension that forgot the step would make the walk back need a second gesture to re-announce
+  // itself — the reader is already at the top and cannot scroll further to produce one.
+  const page = newPage();
+  await signIn(page);
+  pagedChannel(page, { steps: 4, size: 4, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(page, []);
+  const log = page.el("discord-log");
+
+  const area = await draggedToTopOf(page, 300);
+  assert.equal(log.children.length, 4, "the step back fired under the finger");
+
+  // The finger lifts without pulling: no overscroll, so this was a scroll to the top, and the
+  // step the reader asked for by getting there is taken now.
+  await area.dispatch("touchend");
+  await page.settle();
+
+  assert.equal(log.children.length, 8, "lifting the finger lost the step back entirely");
+  assert.match(page.pagesServed[page.pagesServed.length - 1], /before=/, "that was not a step back");
+  assert.equal(page.el("pull-refresh").hidden, true, "a scroll to the top offered to refresh");
+  // ...and the anchored prepend put the reader back on the line they were reading, which is why
+  // the top is not where they are afterwards. `#47 scrollback-stability`.
+  assert.ok(area.scrollTop > 0, "the reader was left at the top with four new pages above them");
+
+  // A browser cancelling the gesture is the same lift as far as the owed step is concerned.
+  const again = newPage();
+  await signIn(again);
+  pagedChannel(again, { steps: 4, size: 4, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(again, []);
+  const cancelled = await draggedToTopOf(again, 300);
+  assert.equal(again.el("discord-log").children.length, 4);
+  await cancelled.dispatch("touchcancel");
+  await again.settle();
+  assert.equal(
+    again.el("discord-log").children.length,
+    8,
+    "a cancelled touch swallowed the step back the reader had already asked for"
+  );
+});
+
+test("A DRAG ACROSS THE LIST IS NOT A PULL, HOWEVER FAR IT DRIFTS DOWN", async () => {
+  // A thumb swiping sideways at the edge of the screen — the platform's own back gesture — carries
+  // tens of pixels of downward drift, and a gesture that read only clientY armed a refresh on it.
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  area.scrollTop = 0;
+  const readsBefore = page.pagesServed.length;
+
+  await area.dispatch("touchstart", touchAt(300, 20));
+  await area.dispatch("touchmove", touchAt(300 + PULL_ARM_PX * 2, 20 + PULL_ARM_PX * 4));
+
+  assert.equal(page.el("pull-refresh").hidden, true, "a sideways swipe offered to refresh");
+  // ...and it stays refused for the rest of the touch. A drag that arcs back to vertical at the
+  // far end of its travel must not arm on the way: the reader is swiping across, not down.
+  await area.dispatch("touchmove", touchAt(300 + PULL_ARM_PX * 3, 20 + PULL_ARM_PX * 4));
+  assert.equal(page.el("pull-refresh").hidden, true, "a sideways swipe armed by curving downward");
+
+  await area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.pagesServed.length, readsBefore, "a sideways swipe refreshed the channel");
+});
+
+test("A SECOND FINGER DOES NOT RE-ANCHOR THE TRAVEL", async () => {
+  // `touches[0]` changes meaning when a second finger lands, and rebuilding the gesture from it
+  // restarts the measurement from wherever finger one has got to — so a drag that had travelled
+  // almost far enough could arm on a pinch, from halfway.
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  area.scrollTop = 0;
+  const readsBefore = page.pagesServed.length;
+
+  await area.dispatch("touchstart", touchAt(300));
+  await area.dispatch("touchmove", touchAt(300 + PULL_ARM_PX - 1));
+  assert.equal(page.el("pull-refresh").getAttribute("data-state"), "pull", "the drag is not recognised");
+
+  await area.dispatch("touchstart", twoFingers(300 + PULL_ARM_PX - 1, 520));
+  assert.equal(page.el("pull-refresh").hidden, true, "a second finger left the offer standing");
+
+  await area.dispatch("touchmove", twoFingers(300 + PULL_ARM_PX * 2, 520));
+  assert.equal(page.el("pull-refresh").hidden, true, "a two-finger gesture armed a refresh");
+
+  await area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.pagesServed.length, readsBefore, "a pinch refreshed the channel");
 });
 
 test("the gesture does not take the button away, because a desktop has no gesture", async () => {
