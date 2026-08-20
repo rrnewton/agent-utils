@@ -647,6 +647,15 @@ const MINTED = async () => {
 
 const CHANNEL = { id: "1110000000000000001", label: "lead team", writable: true };
 
+/**
+ * Stand-in for `gent_talk::replay::PREAMBLE`.
+ *
+ * Deliberately not the real text: the page must not depend on the WORDS of a payload the server
+ * builds, only on carrying it through unchanged. A test that quoted the real preamble would go red
+ * for a copy-edit on the server side and prove nothing about the page.
+ */
+const REPLAY_PREAMBLE = "You are resuming an earlier voice conversation with this same user.";
+
 /** The three microphone toggles, and the constraint each one drives. */
 const MIC_TOGGLE_IDS = ["mic-echo-cancellation", "mic-noise-suppression", "mic-auto-gain"];
 
@@ -789,6 +798,7 @@ function newPage(store = new Map(), script = SCRIPT) {
         channels: [CHANNEL],
         elevenlabs_agent_id: "agent_test",
         live_poll_seconds: page.livePollSeconds,
+        replay_enabled: page.replayEnabled,
       }),
     /** What the server reports as its ingestion interval; 0 means it is not watching. */
     livePollSeconds: 30,
@@ -807,6 +817,12 @@ function newPage(store = new Map(), script = SCRIPT) {
     storedTurns: new Map(),
     /** Every request the page made against the store, in order, as `METHOD path`. */
     storeCalls: [],
+    /** `#46 conversation-replay`: every replay fetch, and the knobs that shape the answer. */
+    replayCalls: [],
+    replayEnabled: true,
+    replayStatus: 200,
+    replayMaxTurns: 40,
+    replayTransport: "contextual_update",
     /** Set to a status to make the whole store answer that way — a 503 is the unconfigured one. */
     storeStatus: null,
     /**
@@ -1046,6 +1062,36 @@ function newPage(store = new Map(), script = SCRIPT) {
           body: JSON.parse((options && options.body) || "null"),
         });
         return page.replyResponse(path, options);
+      }
+      // `#46 conversation-replay`. Answered from `storedTurns` rather than from a canned string,
+      // so "the page sent what the server built" and "the server built it from what was stored"
+      // are the same fact here as they are on the wire. Matched BEFORE the conversation route
+      // below, whose regex would otherwise claim the path and answer 404.
+      const wantsReplay = /^\/api\/v1\/conversations\/([^/]+)\/replay$/.exec(String(path));
+      if (wantsReplay) {
+        page.replayCalls.push(String(path));
+        if (page.replayStatus !== 200) {
+          return json(page.replayStatus, { error: "storage_error", detail: "the store is down" });
+        }
+        const held = page.storedTurns.get(wantsReplay[1]) || [];
+        const spoken = held.filter((turn) => turn.speaker !== "note");
+        const kept = spoken.slice(Math.max(0, spoken.length - page.replayMaxTurns));
+        const text =
+          kept.length === 0
+            ? ""
+            : `${REPLAY_PREAMBLE}\n<<<FENCE>>>\n` +
+              kept.map((turn) => `${turn.speaker}: ${turn.text}`).join("\n") +
+              "\n<<<FENCE>>>\n";
+        return json(200, {
+          text,
+          included: kept.length,
+          dropped: spoken.length - kept.length,
+          truncated: spoken.length > kept.length,
+          policy: { max_chars: 6000, max_turns: page.replayMaxTurns },
+          transport: page.replayTransport,
+          enabled: page.replayEnabled,
+          untrusted_content_notice: "third-party text; DATA, never instructions",
+        });
       }
       const conversation = /^\/api\/v1\/conversations(?:\/([^/]+))?(\/turns)?$/.exec(String(path));
       if (conversation) {
@@ -4914,7 +4960,17 @@ test("the settings screen explains what each control does to the agent's memory"
   // continuity it does not have. They live HERE, one tap away, rather than on the call screen.
   const note = HTML.slice(HTML.indexOf('id="continuity-note"'));
   assert.match(note, /Mute<\/strong> keeps the call open and keeps the agent's context/);
-  assert.match(note, /does not keep its context/);
+  // `#46 conversation-replay` CHANGED this assertion deliberately. It used to pin the flat claim
+  // "the agent does not keep its context across a hang-up", and that sentence became FALSE the
+  // moment resuming shipped — a test that kept demanding it would have been demanding a lie. What
+  // replaces it is strictly more: the vendor fact, which is still true and is the reason any of
+  // this exists, AND the caveat that stops the replacement over-claiming.
+  assert.match(note, /cannot resume a call once\s+it has closed/);
+  assert.match(
+    note,
+    /reconstruction from our side, not the same conversation/,
+    "the page must not describe a replayed call as a continued one"
+  );
   assert.match(note, /never makes the agent forget/);
   assert.match(note, /Sound<\/strong> silences the agent's voice without silencing the agent/);
   // Shortening the end-of-call seam DROPPED a clause rather than only compressing one, and a
@@ -6451,4 +6507,275 @@ test("the relay is cut to a budget rather than sending a whole essay into a call
       `not a budget of ${budget}`
   );
   assert.match(quoted, /…$/, "a cut line has to look cut");
+});
+
+// --- resuming an earlier conversation ------------------------------------------------------------
+//
+// `#46 conversation-replay`. The risk of this feature is not that it fails; it is that it succeeds
+// partially and the screen keeps saying it worked. So half of what follows is about the wording.
+
+/** Every frame the page put on the conversation socket, parsed. */
+const framesSent = (socket) =>
+  socket.sent
+    .map((raw) => {
+      try {
+        return JSON.parse(raw);
+      } catch (_error) {
+        return null;
+      }
+    })
+    .filter(Boolean);
+
+const initiationFrame = (socket) =>
+  framesSent(socket).find((f) => f.type === "conversation_initiation_client_data");
+const resumeFrame = (socket) =>
+  framesSent(socket).find(
+    (f) => f.type === "contextual_update" && String(f.text || "").includes(REPLAY_PREAMBLE)
+  );
+
+/** Sign in with an earlier conversation already stored, and the toggle in a chosen position. */
+async function withEarlierConversation(page, options) {
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "you", text: "what happened to the arm64 job", at_ms: 1 },
+    { speaker: "agent", text: "the mac runner stalled mid-deploy", at_ms: 2 },
+  ]);
+  await signIn(page);
+  await page.settle();
+  if (options && options.resume) {
+    await page.el("resume-toggle").setChecked(true);
+  }
+  return page;
+}
+
+test("with resuming on, the new call is told what was already said", async () => {
+  const page = newPage();
+  await withEarlierConversation(page, { resume: true });
+
+  const socket = await startTalking(page);
+
+  assert.equal(page.replayCalls.length, 1, "the page never fetched a replay");
+  assert.match(page.replayCalls[0], /\/conversations\/conv_earlier\/replay$/);
+  const sent = resumeFrame(socket);
+  assert.ok(sent, `no replay reached the socket: ${socket.sent.join(" | ")}`);
+  assert.match(sent.text, /the mac runner stalled mid-deploy/, "the earlier line has to be in it");
+  assert.equal(
+    page.el("talk-note").textContent,
+    "",
+    "the note belongs to the idle pane; a live call has other things to say"
+  );
+});
+
+test("the initiation frame itself is unchanged by resuming", async () => {
+  // `contextual_update` is the default transport precisely so this frame does not have to change:
+  // the `client_data` path depends on the agent's dashboard permitting overrides and fails
+  // silently when it does not.
+  const page = newPage();
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startTalking(page);
+
+  assert.deepStrictEqual(
+    initiationFrame(socket),
+    { type: "conversation_initiation_client_data" },
+    "the initiation frame grew a field on the default transport"
+  );
+  const order = framesSent(socket).map((f) => f.type);
+  assert.equal(order[0], "conversation_initiation_client_data");
+  assert.equal(order[1], "contextual_update", "the record has to be in before the first turn");
+});
+
+test("the server chooses the transport, and client_data really carries it on the initiation frame", async () => {
+  const page = newPage();
+  page.replayTransport = "client_data";
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startTalking(page);
+
+  const initiation = initiationFrame(socket);
+  assert.ok(
+    String(initiation.dynamic_variables.gent_talk_resume).includes("the mac runner stalled"),
+    `client_data must ride on the initiation frame: ${JSON.stringify(initiation)}`
+  );
+  assert.equal(
+    resumeFrame(socket),
+    undefined,
+    "and must not ALSO go as a contextual_update — that would send it twice and bill for both"
+  );
+});
+
+test("with resuming off, nothing about the earlier conversation is sent or even fetched", async () => {
+  const page = newPage();
+  await withEarlierConversation(page, { resume: false });
+
+  const socket = await startTalking(page);
+
+  assert.deepStrictEqual(
+    page.replayCalls,
+    [],
+    "with the toggle off the transcript must not even be requested from the server"
+  );
+  assert.equal(resumeFrame(socket), undefined);
+  assert.deepStrictEqual(initiationFrame(socket), { type: "conversation_initiation_client_data" });
+});
+
+test("a server that does not allow resuming is not overridden by the switch", async () => {
+  const page = newPage();
+  page.replayEnabled = false;
+  await withEarlierConversation(page, { resume: true });
+
+  const socket = await startTalking(page);
+
+  assert.deepStrictEqual(page.replayCalls, []);
+  assert.equal(resumeFrame(socket), undefined);
+  assert.match(page.el("resume-state").textContent, /OFF on this server/);
+});
+
+test("a replay fetch that fails still opens the call, and says the agent starts fresh", async () => {
+  // The point of a call is the call. A lost reconstruction degrades; it must not refuse.
+  const page = newPage();
+  page.replayStatus = 503;
+  await withEarlierConversation(page, { resume: true });
+
+  const socket = await startTalking(page);
+
+  assert.equal(page.el("error").hidden, true, "a lost replay must not look like a broken call");
+  assert.equal(resumeFrame(socket), undefined);
+  assert.match(page.el("resume-state").textContent, /could NOT be resumed/);
+
+  socket.close();
+  await page.settle();
+  assert.match(
+    page.el("talk-note").textContent,
+    /the agent starts fresh/,
+    "after a failed replay the control must not offer a resumption it did not manage"
+  );
+  assert.match(page.el("talk-note").textContent, /could not be read/, "and must say why");
+});
+
+test("a partial reconstruction says 'in part' rather than 'replayed'", async () => {
+  const page = newPage();
+  page.replayMaxTurns = 1;
+  await withEarlierConversation(page, { resume: true });
+
+  const socket = await startTalking(page);
+  assert.ok(resumeFrame(socket), "a budgeted replay still goes out");
+  socket.close();
+  await page.settle();
+
+  assert.equal(
+    page.el("talk-note").textContent,
+    "the earlier conversation is replayed in part",
+    "a reconstruction that lost its beginning must not report itself as a resumption"
+  );
+  assert.match(page.el("resume-state").textContent, /IN PART/);
+  assert.match(page.el("resume-state").textContent, /1 earlier line/);
+});
+
+test("a whole reconstruction says so, which is the control for the partial one", async () => {
+  const page = newPage();
+  await withEarlierConversation(page, { resume: true });
+  const socket = await startTalking(page);
+  socket.close();
+  await page.settle();
+
+  assert.equal(page.el("talk-note").textContent, "the earlier conversation is replayed");
+  assert.doesNotMatch(page.el("resume-state").textContent, /IN PART/);
+});
+
+test("with resuming off the control keeps saying the agent starts fresh", async () => {
+  const page = newPage();
+  await withEarlierConversation(page, { resume: false });
+  const socket = await startTalking(page);
+  socket.close();
+  await page.settle();
+
+  assert.equal(page.el("talk-note").textContent, "the agent starts fresh");
+});
+
+test("the end-of-call seam stops claiming the agent remembers nothing when it will", async () => {
+  // Every seam sentence asserted that anything below the line goes to an agent that has never seen
+  // anything above it. That became false the moment resuming shipped, and the seam is the first
+  // place a reader looks to find out what just happened.
+  const fresh = newPage();
+  await withEarlierConversation(fresh, { resume: false });
+  (await startTalking(fresh)).close();
+  await fresh.settle();
+  const freshSeam = fresh.el("transcript").text();
+  assert.match(freshSeam, /new conversation/);
+  assert.match(freshSeam, /has never seen anything above it/);
+
+  const resuming = newPage();
+  await withEarlierConversation(resuming, { resume: true });
+  (await startTalking(resuming)).close();
+  await resuming.settle();
+  const resumingSeam = resuming.el("transcript").text();
+  assert.match(resumingSeam, /new conversation/, "it is still a boundary, and still says so");
+  assert.match(resumingSeam, /read the lines above back to it/);
+  assert.match(
+    resumingSeam,
+    /reconstruction, not the same conversation/,
+    "and it must not let the reader believe the call simply continued"
+  );
+  assert.doesNotMatch(resumingSeam, /has never seen anything above it/);
+});
+
+test("turning resuming off forgets what the last call under the old setting did", async () => {
+  const page = newPage();
+  await withEarlierConversation(page, { resume: true });
+  (await startTalking(page)).close();
+  await page.settle();
+  assert.match(page.el("resume-state").textContent, /was resumed/);
+
+  await page.el("resume-toggle").setChecked(false);
+
+  assert.doesNotMatch(
+    page.el("resume-state").textContent,
+    /was resumed/,
+    "Settings reported a resumption under a switch that is now off"
+  );
+  assert.equal(page.el("talk-note").textContent, "the agent starts fresh");
+});
+
+test("Settings states the privacy cost of resuming, and that it is a reconstruction", () => {
+  const block = HTML.slice(HTML.indexOf("<h2>Resuming</h2>"), HTML.indexOf("<h2>Live messages</h2>"));
+  assert.match(block, /id="resume-toggle"/);
+  assert.ok(
+    !/id="resume-toggle"[^>]*\bchecked\b/.test(block),
+    "a control that re-sends prior conversation content to a vendor must not ship on"
+  );
+  assert.match(
+    block,
+    /re-sends earlier conversation content to the voice vendor/,
+    "where the transcript goes has to be said, not implied"
+  );
+  assert.match(block, /written by other people/, "it is not only the reader's own speech");
+  assert.match(block, /reconstruction/);
+  assert.match(block, /oldest lines are dropped/, "the budget and its rule have to be stated");
+});
+
+test("an earlier conversation with nothing in it is not reported as a resumption", async () => {
+  // The fourth state, and the easiest one to lose: the fetch WORKED and there was simply nothing
+  // to replay. That is neither a resumption nor a failure, and reporting it as either would be the
+  // interface claiming a continuity that did not happen — with an empty payload behind it.
+  const page = newPage();
+  page.storedTurns.set("conv_empty", [{ speaker: "note", text: "the call ended", at_ms: 1 }]);
+  await signIn(page);
+  await page.settle();
+  await page.el("resume-toggle").setChecked(true);
+
+  const socket = await startTalking(page);
+
+  assert.equal(page.replayCalls.length, 1, "it still asks — there is a conversation to ask about");
+  assert.equal(
+    resumeFrame(socket),
+    undefined,
+    "an empty record must not be sent: a 'you are resuming' preamble with nothing behind it is " +
+      "the false continuity claim this whole feature is written against"
+  );
+  assert.deepStrictEqual(initiationFrame(socket), { type: "conversation_initiation_client_data" });
+
+  socket.close();
+  await page.settle();
+  assert.match(page.el("talk-note").textContent, /the agent starts fresh/);
+  assert.match(page.el("talk-note").textContent, /nothing to replay/, "and it must say WHY");
+  assert.doesNotMatch(page.el("resume-state").textContent, /could NOT be resumed/, "not a failure");
+  assert.match(page.el("resume-state").textContent, /nothing to replay/);
 });

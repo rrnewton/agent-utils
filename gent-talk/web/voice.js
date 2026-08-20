@@ -654,8 +654,26 @@ const SEAM_DETAILS = {
     "anything above it.",
 };
 
+// ...and what it says when resuming is armed, because every sentence above asserts that the agent
+// below the line remembers nothing above it — which stops being true the moment `#46
+// conversation-replay` is switched on. A seam that kept the old wording would be the feature
+// lying in the one place the reader looks to find out what just happened.
+const RESUME_SEAM_DETAILS = {
+  ended:
+    "This is where the conversation broke. The next call is a NEW one, but this server will " +
+    "read the lines above back to it, so it can carry on. That is a reconstruction, not the same " +
+    "conversation.",
+  suspended:
+    "The call dropped while this page was in the background. Resuming opens a NEW conversation " +
+    "and reads the lines above back to it, so it can carry on from them.",
+  failed:
+    "The connection dropped. The next call is a NEW one, and this server will read the lines " +
+    "above back to it so it can carry on.",
+};
+
 function seamDetailFor(cause) {
-  return SEAM_DETAILS[cause] || SEAM_DETAILS.ended;
+  const table = resumeArmed() ? RESUME_SEAM_DETAILS : SEAM_DETAILS;
+  return table[cause] || table.ended;
 }
 
 function noteConversationEnded(cause = "ended") {
@@ -663,6 +681,12 @@ function noteConversationEnded(cause = "ended") {
     return;
   }
   conversationOpen = false;
+  // The call that just ended is what the NEXT one resumes from. Read here rather than in
+  // `teardown`, which clears the session — and only when a conversation was really open, so a
+  // failed mint cannot point the next call at a conversation that has no turns.
+  if (session.conversationId) {
+    resumeConversationId = session.conversationId;
+  }
   // From here the large control is a different offer — a NEW call, from nothing — and it says so.
   hasEnded = true;
   // ...and if the drop was a suspension, the offer has a different WORD on it, because "Start a
@@ -1186,6 +1210,11 @@ async function loadStoredConversation() {
       turn.speaker === "you" ? "you" : turn.speaker === "note" ? "note" : "assistant";
     line(who, turn.text, turn.at_ms);
   }
+  // `#46 conversation-replay`. The conversation a new call would resume from is the one just
+  // restored: the most recent the server holds. Set even when resuming is off, because the toggle
+  // can be turned on without a reload and the answer must not then be "nothing to resume from".
+  resumeConversationId = conversations[0].id;
+  renderResumeState();
   if (((restored && restored.turns) || []).length > 0) {
     transcriptSeam(
       "earlier conversation",
@@ -1779,6 +1808,10 @@ async function start() {
   setState("working");
   setStatus("Asking gent-talk for a signed URL…");
   const minted = await mintSignedUrl();
+  // Fetched HERE, before the socket exists, so a slow or failing store delays the call rather than
+  // racing `onopen` — a payload that arrived after the agent had already spoken would be a
+  // "here is what we said" delivered into the middle of a sentence.
+  const resume = await fetchResume();
   showDetail(
     `agent ${minted.agent_id}; signed URL valid for about ${Math.round(
       (minted.valid_for_seconds || 900) / 60
@@ -1799,7 +1832,23 @@ async function start() {
   renderControls();
 
   socket.onopen = () => {
-    socket.send(JSON.stringify({ type: "conversation_initiation_client_data" }));
+    // The initiation frame is UNCHANGED on the default path. `contextual_update` is the default
+    // transport because the alternative — carrying the text on this frame under
+    // `dynamic_variables` — depends on the agent's dashboard security settings permitting
+    // overrides and fails SILENTLY when they do not, which is the worst possible failure shape for
+    // a feature whose entire risk is claiming a continuity it does not have. The server chooses;
+    // the page does not guess.
+    const initiation = { type: "conversation_initiation_client_data" };
+    const carriedOnInitiation = resume && resume.transport === "client_data";
+    if (carriedOnInitiation) {
+      initiation.dynamic_variables = { gent_talk_resume: resume.text };
+    }
+    socket.send(JSON.stringify(initiation));
+    if (resume && !carriedOnInitiation) {
+      // Immediately after, and before any audio: the vendor documents this as non-interrupting
+      // background information, and the first agent turn is the one that has to know.
+      socket.send(JSON.stringify({ type: "contextual_update", text: resume.text }));
+    }
     session.connected = true;
     conversationOpen = true;
     setState("live");
@@ -2092,7 +2141,10 @@ function renderControls() {
     if (hasEnded) {
       // "Resume" is the honest word for what the reader wants and a dishonest word for what the
       // agent gets, so the clause under it says which of the two this is.
-      note.textContent = hasSuspended ? "a new call — the agent starts fresh" : "the agent starts fresh";
+      // `#46 conversation-replay`. This sentence used to be a constant, and the moment resuming
+      // shipped it became the place the feature would lie from. It is derived now.
+      const offer = resumeNote();
+      note.textContent = hasSuspended ? `a new call — ${offer}` : offer;
       note.hidden = false;
     }
     return;
@@ -2836,6 +2888,153 @@ function scheduleDiscordPoll() {
   }, DISCORD_POLL_MS);
 }
 
+// --- resuming an earlier conversation ------------------------------------------------------------
+//
+// `#46 conversation-replay`. The vendor documents no way to resume a conversation once the socket
+// closes — the initiation message and the signed-URL endpoint both take an `agent_id` and neither
+// accepts a `conversation_id`. But the EFFECT can be rebuilt from this end: the server holds the
+// transcript, so a new call can be handed the earlier exchange as text.
+//
+// THIS IS A RECONSTRUCTION AND THE SCREEN MUST NEVER SAY OTHERWISE. That is the whole risk of the
+// feature, and it is why there are four states here rather than an on/off light: resuming can be
+// off, armed, PARTIAL, or FAILED, and each of those is a different sentence.
+//
+// A failed replay never aborts the call. It degrades to a fresh one and says so — the point of a
+// call is the call, and a lost reconstruction is not a reason to refuse to connect.
+
+const RESUME_KEY = "gent-talk.voice.resume";
+
+/** Whether the SERVER permits it at all, from `/api/v1/client-config`. */
+let resumeAllowed = false;
+/** The conversation a new call would resume from, or null. */
+let resumeConversationId = null;
+/**
+ * What the last attempt actually did — not what it was asked to do.
+ *
+ * `armed` means a payload really went out on the socket. `dropped` is how many older turns the
+ * server's budget left behind, which is the difference between "replayed" and "replayed in part".
+ * `failed` means the fetch did not answer. And `attempted` without `armed` is the fourth case that
+ * is easy to miss: the fetch WORKED and came back with nothing to replay — an earlier conversation
+ * in which nothing was actually said. That must not be reported as a resumption, and it must not
+ * be reported as a failure either.
+ */
+let resumeLast = { attempted: false, armed: false, dropped: 0, failed: false };
+
+const resumeWanted = () => localStorage.getItem(RESUME_KEY) === "on";
+
+function persistResume(on) {
+  try {
+    localStorage.setItem(RESUME_KEY, on ? "on" : "off");
+  } catch (_error) {
+    // Same as the relay toggle: honoured for this session, not remembered. Better than failing.
+  }
+}
+
+/** Will the NEXT call carry a replay? Everything the screen says is derived from this. */
+const resumeArmed = () =>
+  Boolean(resumeAllowed && resumeWanted() && resumeConversationId && !resumeLast.failed);
+
+/**
+ * The clause under the large control, and the one place this feature could lie.
+ *
+ * Four answers, and the failed one is deliberately the same PROMISE as the off one with the reason
+ * attached: both mean the agent starts fresh, and only one of them is what the reader asked for.
+ */
+function resumeNote() {
+  if (!resumeAllowed || !resumeWanted() || !resumeConversationId) {
+    return "the agent starts fresh";
+  }
+  if (resumeLast.failed) {
+    return "the agent starts fresh — the earlier conversation could not be read";
+  }
+  if (resumeLast.attempted && !resumeLast.armed) {
+    return "the agent starts fresh — there was nothing to replay";
+  }
+  if (resumeLast.armed && resumeLast.dropped > 0) {
+    return "the earlier conversation is replayed in part";
+  }
+  return "the earlier conversation is replayed";
+}
+
+/** What Settings says, in longer form. */
+function renderResumeState() {
+  const state = el("resume-state");
+  if (!state) {
+    return;
+  }
+  if (!resumeAllowed) {
+    state.textContent =
+      "Resuming is OFF on this server. Every new call starts the agent from nothing, whatever " +
+      "this switch says.";
+  } else if (!resumeWanted()) {
+    state.textContent = "Resuming is off. A new call starts the agent from nothing.";
+  } else if (resumeLast.failed) {
+    state.textContent =
+      "The last call could NOT be resumed — the earlier conversation would not load — so it " +
+      "started fresh.";
+  } else if (resumeLast.armed && resumeLast.dropped > 0) {
+    state.textContent =
+      `The last call was resumed IN PART: ${resumeLast.dropped} earlier line` +
+      `${resumeLast.dropped === 1 ? "" : "s"} did not fit the server's budget and the agent was ` +
+      "told so.";
+  } else if (resumeLast.armed) {
+    state.textContent = "The last call was resumed from the earlier conversation.";
+  } else if (resumeLast.attempted) {
+    state.textContent =
+      "The last call started fresh: the earlier conversation held nothing to replay.";
+  } else if (!resumeConversationId) {
+    state.textContent =
+      "Resuming is on. There is no earlier conversation to resume from yet, so the next call " +
+      "starts fresh.";
+  } else {
+    state.textContent = "Resuming is on. The next call will be told what was already said.";
+  }
+  renderControls();
+}
+
+/**
+ * Fetch the payload for a new call. NEVER throws, and never leaves the state stale.
+ *
+ * Answers the payload, or null when there is nothing to send — which includes every failure. The
+ * caller does not branch on why; the SCREEN does, off `resumeLast`.
+ */
+async function fetchResume() {
+  resumeLast = { attempted: false, armed: false, dropped: 0, failed: false };
+  if (!resumeAllowed || !resumeWanted() || !resumeConversationId) {
+    renderResumeState();
+    return null;
+  }
+  resumeLast.attempted = true;
+  let payload = null;
+  try {
+    payload = await api(
+      `/api/v1/conversations/${encodeURIComponent(resumeConversationId)}/replay`
+    );
+  } catch (error) {
+    resumeLast = { attempted: true, armed: false, dropped: 0, failed: true };
+    // The connection details, not the error panel: a lost reconstruction must not look like a
+    // broken call, and the call is about to open perfectly well.
+    addDetail(`the earlier conversation could not be replayed: ${error.message}`);
+    renderResumeState();
+    return null;
+  }
+  // `included > 0` is the gate, not `text`: an empty transcript answers 200 with an empty payload
+  // on purpose, and sending a "you are resuming" preamble with no record behind it is the false
+  // continuity claim this whole feature is written against.
+  if (!payload || payload.enabled !== true || !(payload.included > 0) || !payload.text) {
+    renderResumeState();
+    return null;
+  }
+  resumeLast = {
+    attempted: true,
+    armed: true,
+    dropped: Number(payload.dropped) || 0,
+    failed: false,
+  };
+  renderResumeState();
+  return payload;
+}
+
 // --- the live channel stream -------------------------------------------------------------------
 //
 // `#44 live-push`. Until now this view only ever learned about a message by asking: a timer above
@@ -3224,6 +3423,10 @@ function applyClientConfig(config) {
   // which is exactly what a quiet channel looks like, so the indicator would be a guess.
   livePollSeconds = Number(config.live_poll_seconds) || 0;
   renderLiveState();
+  // `#46 conversation-replay`. What the SERVER permits, which is not the same as what the reader
+  // has asked for — and the screen has to be able to say which of the two is stopping it.
+  resumeAllowed = config.replay_enabled === true;
+  renderResumeState();
   // Started here rather than when the Discord view opens: PUSH TWO is the point of it, and an
   // arriving message has to be able to reach a call that is happening on the OTHER tab. Following
   // only the visible view would mean the relay was off precisely while the reader was talking.
@@ -3364,6 +3567,24 @@ el("relay-to-agent").addEventListener("change", () => {
   );
 });
 renderLiveState();
+
+// `#46 conversation-replay`. Off unless asked for, and restored the same way: a control that
+// re-sends earlier conversation content to a paid vendor on every call must not come back on by
+// itself.
+el("resume-toggle").checked = resumeWanted();
+el("resume-toggle").addEventListener("change", () => {
+  const on = el("resume-toggle").checked;
+  persistResume(on);
+  // Deliberately NOT clearing `resumeLast`: everything the screen says about resuming is already
+  // gated on the switch, so an outcome from before it was flipped cannot be read out under it.
+  // Clearing here as well would be a second place that decides the same thing.
+  renderResumeState();
+  setStatus(
+    on
+      ? "The next call will be told what was already said."
+      : "The next call will start the agent from nothing."
+  );
+});
 
 // The column the reader last chose, restored before anything is drawn into it. Applied
 // unconditionally: on a phone the stylesheet never consults the value, so there is nothing to

@@ -83,6 +83,12 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/conversations/{conversation_id}/turns",
             post(api::append_turn),
         )
+        // `#46 conversation-replay`. A READ of a transcript, rendered — so it takes the write
+        // scope like every other conversation route, for the reason stated above them.
+        .route(
+            "/api/v1/conversations/{conversation_id}/replay",
+            get(api::replay),
+        )
         // The operator's erase, and the only COMPLETE one over HTTP: the conversation routes
         // clear transcripts and say so, this one clears everything the store holds.
         .route("/api/v1/storage", axum::routing::delete(api::purge_storage))

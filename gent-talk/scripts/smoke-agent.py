@@ -174,6 +174,13 @@ EXIT_RELAY_TOO_STRICT = 18
 #: Neither a pass nor a fail. The channel cannot decide the question, so the run does not pretend
 #: to have answered it.
 EXIT_CHANNEL_UNUSABLE = 20
+#: `--replay-check`: the vendor did not act on the replayed transcript. A DISTINCT result, not a
+#: generic failure -- "the payload is not honoured" is the single most useful thing this check can
+#: report, and folding it into "smoke failed" would lose it.
+EXIT_REPLAY_NOT_HONOURED = 21
+#: `--replay-check`: the CONTROL conversation answered too, so the check proved fluency rather than
+#: memory. That invalidates the positive result rather than joining it.
+EXIT_REPLAY_CONTROL_LEAKED = 22
 
 #: The read tools whose appearance in the access log proves the agent really reached this server.
 #: post_reply is deliberately NOT here: this test never asks for a post, so a post_reply line would
@@ -1208,13 +1215,23 @@ class Conversation:
         return "\n".join(self.responses_after_ask)
 
 
-async def converse(signed_url: str, ask: str, max_seconds: float, quiet_seconds: float) -> Conversation:
+async def converse(
+    signed_url: str,
+    ask: str,
+    max_seconds: float,
+    quiet_seconds: float,
+    resume: str | None = None,
+) -> Conversation:
     """Hold one text-driven conversation and come straight back out of it.
 
     The wire protocol here is deliberately the same one web/voice.js speaks, minus the microphone:
     bare `conversation_initiation_client_data`, `pong` for every `ping`, audio ignored. The one
     addition is `user_message`, which the vendor documents as triggering the same response flow as
     speech.
+
+    `resume` is `#46 conversation-replay`'s payload, sent as a `contextual_update` IMMEDIATELY
+    after the initiation frame and before anything is asked -- exactly what web/voice.js does, and
+    exactly the ordering whose effect on the FIRST agent turn nothing but a billed run can settle.
     """
     try:
         import websockets
@@ -1251,6 +1268,8 @@ async def converse(signed_url: str, ask: str, max_seconds: float, quiet_seconds:
     last_response_at: float | None = None
     try:
         await socket.send(json.dumps({"type": "conversation_initiation_client_data"}))
+        if resume:
+            await socket.send(json.dumps({"type": "contextual_update", "text": resume}))
 
         while True:
             remaining = deadline - time.monotonic()
@@ -1552,6 +1571,168 @@ class Runner:
                 "stale cached manifest."
             )
 
+    # -- `--replay-check`: three conversations, three separate answers ---------------------------
+
+    def run_replay_check(self) -> ReplayVerdict:
+        """Prove -- or disprove -- that the vendor acts on a replayed transcript.
+
+        Three conversations, in this order:
+
+          A  states a nonce fact, and its turns are RECORDED through this server's own transcript
+             API, exactly as web/voice.js records them. Nothing here shortcuts the store: the
+             payload B receives is the one the real page would get.
+          B  opens WITH the replay payload and is asked to recall the nonce. It must.
+          C  the CONTROL: same question, no payload, and it must NOT be able to answer. Without
+             this the run proves the agent is fluent rather than that it remembers.
+        """
+        nonce = make_nonce()
+        fact = REPLAY_FACT.format(nonce=nonce)
+
+        # -- refuse before billing anything, when the substrate is not there ----------------------
+        status, body = http_json(f"{self.base}/api/v1/conversations", self.write_token)
+        if status == 503:
+            raise SmokeFailure(
+                EXIT_CHANNEL_UNUSABLE,
+                "storage_not_configured",
+                "this server has no durable store, so there is no transcript to replay and this "
+                "check has nothing to prove. Set storage.path and restart. Nothing was billed.",
+            )
+        if status != 200:
+            raise SmokeFailure(
+                EXIT_BASELINE_FAILED,
+                "storage_unreadable",
+                f"GET /api/v1/conversations returned {status}: {body}. Refusing to open a "
+                "conversation whose result could not then be checked. Nothing was billed.",
+            )
+
+        out = self.out
+        out.emit("")
+        out.emit("-- conversation A: establishing something only this conversation could know")
+        first = asyncio.run(
+            converse(self.mint(), fact, self.args.max_seconds, self.args.quiet_seconds)
+        )
+        conversation_id = first.conversation_id or f"replaycheck-{nonce}"
+        out.emit(f"  ok    conversation {conversation_id} ran {first.seconds:.1f}s")
+
+        # Recorded through the SAME route the page uses. If this cannot be written there is no
+        # transcript to replay and the check refuses rather than reporting a vendor failure that
+        # is really a storage failure.
+        for speaker, text in (("you", fact), ("agent", first.reply or "(the agent said nothing)")):
+            wrote, wrote_body = http_json(
+                f"{self.base}/api/v1/conversations/{urllib.parse.quote(conversation_id)}/turns",
+                self.write_token,
+                method="POST",
+                payload={"speaker": speaker, "text": text},
+            )
+            if wrote != 200:
+                raise SmokeFailure(
+                    EXIT_BASELINE_FAILED,
+                    "transcript_not_recorded",
+                    f"recording the {speaker} turn returned {wrote}: {wrote_body}. One "
+                    "conversation has been billed; the remaining two are not worth opening.",
+                )
+        out.emit("  ok    both turns recorded through /api/v1/conversations/{id}/turns")
+
+        status, payload = http_json(
+            f"{self.base}/api/v1/conversations/{urllib.parse.quote(conversation_id)}/replay",
+            self.write_token,
+        )
+        if status != 200 or not isinstance(payload, dict):
+            raise SmokeFailure(
+                EXIT_BASELINE_FAILED,
+                "replay_unavailable",
+                f"GET .../replay returned {status}: {payload}. One conversation was billed.",
+            )
+        if payload.get("enabled") is not True:
+            raise SmokeFailure(
+                EXIT_CHANNEL_UNUSABLE,
+                "replay_disabled",
+                "this server has replay.enabled = false, so there is nothing to check. Turn it on "
+                "and restart. One conversation was billed before this could be known -- the "
+                "transcript had to exist before it could be asked for.",
+            )
+        text = str(payload.get("text") or "")
+        if not text or not payload.get("included"):
+            raise SmokeFailure(
+                EXIT_CHANNEL_UNUSABLE,
+                "replay_empty",
+                "the replay came back EMPTY, so conversation B would be given nothing and the "
+                "check could not fail. Refusing to spend two more conversations on a question "
+                "that cannot be answered.",
+            )
+        out.emit(
+            f"  ok    the replay carries {payload.get('included')} turn(s), "
+            f"{payload.get('dropped')} dropped, transport {payload.get('transport')}"
+        )
+        if nonce not in text:
+            raise SmokeFailure(
+                EXIT_BASELINE_FAILED,
+                "replay_lost_the_nonce",
+                "the payload this server built does NOT contain the nonce, so conversation B "
+                "could not answer even if the vendor honoured it perfectly. That is a fault here, "
+                "not at the vendor, and the remaining conversations would prove nothing.",
+            )
+
+        out.emit("")
+        out.emit("-- conversation B: a NEW call, opened with the record of A")
+        resumed = asyncio.run(
+            converse(
+                self.mint(),
+                REPLAY_QUESTION,
+                self.args.max_seconds,
+                self.args.quiet_seconds,
+                resume=text,
+            )
+        )
+        out.emit(f"  ok    conversation {resumed.conversation_id or '?'} ran {resumed.seconds:.1f}s")
+
+        out.emit("")
+        out.emit("-- conversation C: the CONTROL, same question and NO record")
+        control = asyncio.run(
+            converse(
+                self.mint(),
+                REPLAY_QUESTION,
+                self.args.max_seconds,
+                self.args.quiet_seconds,
+            )
+        )
+        out.emit(f"  ok    conversation {control.conversation_id or '?'} ran {control.seconds:.1f}s")
+
+        verdict = replay_verdict(nonce, resumed.reply, control.reply)
+        out.emit("")
+        out.emit("-- what the three conversations showed")
+        out.emit(
+            f"  {'ok   ' if verdict.honoured else 'FAIL '} B, given the record, "
+            f"{'returned' if verdict.honoured else 'did NOT return'} the nonce"
+        )
+        out.emit(
+            f"  {'FAIL ' if verdict.control_leaked else 'ok   '} C, the control, "
+            f"{'ALSO returned it' if verdict.control_leaked else 'could not answer'}"
+        )
+        out.emit(f"        B said: {resumed.reply[:400] or '(nothing)'}")
+        out.emit(f"        C said: {control.reply[:400] or '(nothing)'}")
+        if verdict.control_leaked:
+            raise SmokeFailure(
+                EXIT_REPLAY_CONTROL_LEAKED,
+                "replay_control_leaked",
+                "the CONTROL conversation produced the nonce without ever being given it. That "
+                "invalidates B rather than joining it: whatever it proves, it is not that the "
+                "replay was honoured. Check that the agent has no memory feature enabled and that "
+                "the nonce is not guessable.",
+            )
+        if not verdict.honoured:
+            raise SmokeFailure(
+                EXIT_REPLAY_NOT_HONOURED,
+                "replay_not_honoured",
+                "the vendor did NOT act on the replayed transcript for the first agent turn. This "
+                "is a real, useful answer and not a broken run: it means `#46 "
+                "conversation-replay` does nothing on this deployment with transport "
+                f"{payload.get('transport')!r}. Try the other transport "
+                "(replay.transport = \"client_data\"), and until one of them works the "
+                "interface must not claim a call was resumed.",
+            )
+        return verdict
+
     def mint(self) -> str:
         status, body = http_json(f"{self.base}/api/v1/signed-url", self.write_token)
         if status != 200 or not isinstance(body, dict) or not body.get("signed_url"):
@@ -1794,6 +1975,77 @@ def check_exit_status_controls() -> list[str]:
     return problems
 
 
+# --- `--replay-check`: does the vendor act on a replayed transcript? -----------------------------
+#
+# `#46 conversation-replay` rebuilds continuity by handing a NEW conversation a written record of
+# the old one. Whether the vendor puts that record in context for the FIRST agent turn is a
+# question no test in this repository can answer: it is a property of the platform, reachable only
+# by paying for three conversations.
+#
+# THREE, not two, and the third is the point. A run that only proved conversation B could answer
+# would be proving the agent is fluent. The control -- same question, no payload -- has to FAIL to
+# answer, or the positive result means nothing. All three outcomes are reported separately, and
+# "not honoured" has an exit code of its own, because it is the most useful thing this can say.
+
+#: What conversation A is told, and what B is asked to recall. A nonce, so nothing but the replay
+#: could put it in the answer.
+REPLAY_FACT = "Please remember this exactly: my build nonce for today is {nonce}."
+REPLAY_QUESTION = "Earlier in our conversation I gave you my build nonce for today. What was it?"
+
+
+@dataclass
+class ReplayVerdict:
+    """What the three conversations showed, as three separate answers."""
+
+    #: Did B, opened WITH the payload, return the nonce?
+    honoured: bool = False
+    #: Did C, opened WITHOUT it, also return the nonce? If so, B proves nothing.
+    control_leaked: bool = False
+    #: What B actually said, for the report.
+    resumed_reply: str = ""
+    #: ...and what C said.
+    control_reply: str = ""
+
+    @property
+    def proves_memory(self) -> bool:
+        return self.honoured and not self.control_leaked
+
+
+def replay_verdict(nonce: str, resumed_reply: str, control_reply: str) -> ReplayVerdict:
+    """Read the two replies. Reuses the nonce matcher the relay check already trusts."""
+    return ReplayVerdict(
+        honoured=bool(check_relay(resumed_reply, "", "", nonce).nonce_hit),
+        control_leaked=bool(check_relay(control_reply, "", "", nonce).nonce_hit),
+        resumed_reply=resumed_reply,
+        control_reply=control_reply,
+    )
+
+
+def check_replay_controls() -> list[str]:
+    """The replay verdict's own controls, run before anything is billed."""
+    problems: list[str] = []
+    nonce = "GT-7Q2X"
+    honoured = replay_verdict(nonce, f"Your build nonce was {nonce}.", "I have no record of that.")
+    if not honoured.proves_memory:
+        problems.append(
+            "the replay verdict does not recognise a resumed conversation that returned the nonce "
+            "while the control did not -- which is the only shape that means the feature works."
+        )
+    missed = replay_verdict(nonce, "I do not have that from earlier.", "I have no record of that.")
+    if missed.honoured or missed.proves_memory:
+        problems.append(
+            "the replay verdict reports a reply with no nonce in it as honoured, so a vendor that "
+            "ignores the payload would be reported as one that acts on it."
+        )
+    leaked = replay_verdict(nonce, f"It was {nonce}.", f"I believe it was {nonce}.")
+    if not leaked.control_leaked or leaked.proves_memory:
+        problems.append(
+            "the replay verdict does not notice that the CONTROL answered too, so a run proving "
+            "only fluency would be reported as proving memory."
+        )
+    return problems
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="smoke-agent.py",
@@ -1831,6 +2083,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="hang up this long after the agent stops talking",
     )
     parser.add_argument(
+        "--replay-check",
+        action="store_true",
+        help="instead of the relay check, prove whether the vendor acts on a replayed transcript "
+        "(#46 conversation-replay). Holds THREE conversations, so it costs three times as much, "
+        "and refuses to run at all when storage is not configured.",
+    )
+    parser.add_argument(
         "--self-test",
         action="store_true",
         help="run every control offline. No network, no vendor minutes, no conversation.",
@@ -1846,6 +2105,7 @@ def run_self_test(out: Transcript) -> int:
         + check_relay_controls()
         + check_credential_scanner_controls()
         + check_diagnostics_controls()
+        + check_replay_controls()
         # Only here, never in main()'s pre-flight: this one CALLS main(), and running it from
         # inside main()'s own control block would recurse.
         + check_exit_status_controls()
@@ -1883,6 +2143,9 @@ def run_self_test(out: Transcript) -> int:
         "a blank secret does not match everything",
         "the MCP-status reader understands a real captured payload",
         "the MCP-status reader invents nothing from unrelated events",
+        "the replay verdict accepts memory: B answered and the control did not",
+        "the replay verdict REJECTS a resumed reply that carries no nonce",
+        "the replay verdict notices when the CONTROL answered too, so fluency is not memory",
         "a FAILED run returns the documented exit code, not 0",
     ]
     if problems:
@@ -1965,6 +2228,43 @@ def main(argv: list[str]) -> int:  # noqa: PLR0911, PLR0912, PLR0915 - one linea
                 EXIT_BASELINE_FAILED, "unreachable", f"GET /healthz returned {status}, expected 200."
             )
         out.emit("  ok    the server is up")
+
+        # -- `--replay-check` is its own run, not an extra assertion on this one ------------------
+        #
+        # It asks a different question (does the VENDOR act on a replayed transcript?), spends
+        # three conversations rather than one, and reports three outcomes. Bolting it onto the
+        # relay check would make a single "smoke failed" out of two unrelated findings.
+        if args.replay_check:
+            for problem in check_replay_controls():
+                out.emit(f"   {problem}")
+                result = EXIT_CONTROL_FAILED
+            if result == EXIT_CONTROL_FAILED:
+                raise SmokeFailure(
+                    EXIT_CONTROL_FAILED,
+                    "control_failed",
+                    "the replay verdict's own controls failed; nothing below would mean anything.",
+                )
+            out.emit("  ok    the replay verdict tells memory from fluency, and notices a leak")
+            runner.run_replay_check()
+            out.emit("")
+            out.emit(
+                "PASSED — the vendor acted on the replayed transcript for the first agent turn, "
+                "and the control could not."
+            )
+            out.emit(f"   wall clock: {time.time() - wall_started:.1f}s")
+            leaks = out.scan(
+                [
+                    ("GENT_TALK_READ_TOKEN", read_token),
+                    ("GENT_TALK_WRITE_TOKEN", write_token),
+                    ("GENT_TALK_ELEVENLABS_API_KEY", elevenlabs_key),
+                ]
+                + [("signed URL", url) for url in runner.signed_urls]
+            )
+            if leaks:
+                for leak in leaks:
+                    out.emit(f"   {leak}")
+                return EXIT_CREDENTIAL_LEAK
+            return EXIT_OK
 
         # -- 1. the cheap round: read the channel ourselves, then ask -----------------------------
         #

@@ -150,3 +150,31 @@ writable = false
 # carries the backend name, so a page can never imply a model summary it did not get.
 # Environment: GENT_TALK_SUMMARY_MODEL
 # model = "..."
+
+[replay]
+# RESUMING A CONVERSATION ACROSS A HANG-UP. The vendor cannot resume a closed conversation, so
+# what this does instead is hand the NEW call a written record of the earlier one: a
+# reconstruction, not a continuation, and the /voice page says which of the two you got.
+#
+# OFF by default, and the reason is privacy rather than caution: every new call re-sends earlier
+# conversation content — the owner's own speech AND any Discord text the agent read out to him,
+# written by other people — to the voice vendor. Turn it on deliberately.
+# Environment: GENT_TALK_REPLAY_ENABLED
+enabled = false
+
+# The budget. The most recent turns are kept until either ceiling is reached and the OLDEST are
+# dropped; when anything is dropped, the payload says so and the page says "in part". Both are
+# guesses until measured — the payload is billed per call and the model's window is finite — and
+# `scripts/run.sh --smoke-agent --replay-check` is the only thing that can measure them.
+# Environment: GENT_TALK_REPLAY_MAX_CHARS / GENT_TALK_REPLAY_MAX_TURNS
+# max_chars = 6000
+# max_turns = 40
+
+# How the record reaches the vendor. "contextual_update" (the default) is a client event sent
+# immediately after the initiation message, documented as non-interrupting background information.
+# "client_data" carries the text on the initiation message itself, under dynamic_variables; it
+# depends on the agent's dashboard security settings permitting overrides and fails SILENTLY when
+# they do not. Which one a deployment actually honours for the FIRST agent turn is a question only
+# the billed check can answer, which is why both exist.
+# Environment: GENT_TALK_REPLAY_TRANSPORT
+# transport = "contextual_update"

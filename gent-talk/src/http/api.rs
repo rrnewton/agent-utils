@@ -206,6 +206,12 @@ pub struct ClientConfigResponse {
     pub elevenlabs_agent_id: Option<String>,
     /// Server version, so a stale cached page is visible.
     pub version: &'static str,
+    /// Whether the operator has allowed an earlier transcript to be replayed into a new call.
+    ///
+    /// The page needs it BEFORE it has anything to replay: the Settings screen has to describe
+    /// what resuming will do, and the control's own note has to say what the next call will be —
+    /// both of which are questions asked while there is no conversation to fetch.
+    pub replay_enabled: bool,
     /// Seconds between live ingestion ticks, or `0` when live ingestion is OFF.
     ///
     /// The page needs this to tell the truth about its own channel view. With ingestion off the
@@ -227,6 +233,7 @@ pub async fn client_config(
         elevenlabs_agent_id: state.config.elevenlabs.agent_id.clone(),
         version: env!("CARGO_PKG_VERSION"),
         live_poll_seconds: state.config.discord.live_poll_seconds,
+        replay_enabled: state.config.replay.enabled,
     }))
 }
 
@@ -925,6 +932,73 @@ pub async fn conversation(
     Ok(no_store(Json(ConversationResponse {
         id,
         turns,
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
+/// A reconstruction of an earlier conversation, and everything needed to describe it honestly.
+#[derive(Debug, Serialize)]
+pub struct ReplayResponse {
+    /// The payload to send on the new socket. EMPTY when there is nothing to resume from.
+    pub text: String,
+    /// How many turns are in it.
+    pub included: usize,
+    /// How many older turns were left out. Non-zero means the interface must say "in part".
+    pub dropped: usize,
+    /// Whether the budget, rather than the transcript running out, is what stopped it.
+    pub truncated: bool,
+    /// The budget that produced it.
+    pub policy: crate::replay::ReplayPolicy,
+    /// How the page should hand `text` to the vendor.
+    pub transport: crate::replay::Transport,
+    /// Whether the operator has turned resuming on at all.
+    ///
+    /// Reported rather than answered with a 404, because "off" and "nothing to resume from" are
+    /// different things the page has to say differently. A route that refused would collapse them.
+    pub enabled: bool,
+    /// Standing reminder that a transcript quotes third-party channel text.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/conversations/{conversation_id}/replay`
+///
+/// **Write scope, like every other conversation route**, and for the same reason: what comes back
+/// is the transcript itself, rendered. If a read token could fetch this it could fetch the
+/// transcript, and the block comment above says why it may not.
+///
+/// Server-side rather than in the page, for two reasons. The budget policy is then testable in
+/// Rust and shared with the billed harness that is the only thing able to say whether the vendor
+/// honours the payload at all; and the transcript already lives here, so building it in the
+/// browser would mean shipping the whole record to the page in order to throw most of it away.
+///
+/// **Disabled is a 200, not a refusal.** `enabled: false` with an empty `text` is a state the page
+/// renders ("the agent starts fresh"); a 404 would be indistinguishable from a conversation that
+/// was never stored, and the page would say the wrong one of those two things.
+pub async fn replay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let id = ConversationId::parse(&conversation_id)?;
+    let settings = &state.config.replay;
+    // Not fetched at all when resuming is off. The point of the setting is that prior conversation
+    // content is not re-sent to a vendor, and a server that assembled the payload anyway and let
+    // the page decide would have already read the whole transcript to do it.
+    let built = if settings.enabled {
+        let turns = state.store.turns(&id).await?;
+        crate::replay::build(&turns, &settings.policy)
+    } else {
+        crate::replay::build(&[], &settings.policy)
+    };
+    Ok(no_store(Json(ReplayResponse {
+        text: built.text,
+        included: built.included,
+        dropped: built.dropped,
+        truncated: built.truncated,
+        policy: built.policy,
+        transport: settings.transport,
+        enabled: settings.enabled,
         untrusted_content_notice: untrusted::NOTICE,
     })))
 }

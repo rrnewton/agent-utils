@@ -333,10 +333,13 @@
             sending it your audio. Your phone will still show the microphone as in use, because the
             microphone really is still open — which is what lets unmuting drop you back into the
             same conversation rather than a new one.
-            <strong>Hang up</strong> ends the conversation. The agent does not keep its context
-            across a hang-up, so the next call starts from nothing; the lines already on screen stay
+            <strong>Hang up</strong> ends the conversation. The vendor cannot resume a call once
+            it has closed, so the next call is always a new one; the lines already on screen stay
             there because they are still your own record of what was said, and the transcript marks
-            where one conversation ended and the next began.
+            where one conversation ended and the next began. With <strong>Resuming</strong> below
+            turned on, this server reads the earlier lines back to the new call so it can carry on
+            from them — that is a reconstruction from our side, not the same conversation, and the
+            transcript seam says which of the two you got.
             <strong>Sound</strong> silences the agent's voice without silencing the agent: its
             replies keep arriving as text in the transcript. It keeps receiving that audio and
             throws it away rather than asking for a text-only conversation, because the response
@@ -381,6 +384,33 @@
             aria-label="reading width in characters"
           />
           <p id="reading-width-state" class="hint" aria-live="polite"></p>
+
+          <h2>Resuming</h2>
+          <!--
+            `#46 conversation-replay`. FOUR states, and the screen must be able to say each of
+            them: off on the server, off here, resumed, and resumed IN PART. A single "resuming"
+            light would be the feature claiming a continuity it does not have, which is the one
+            failure this whole thing is arranged around.
+          -->
+          <p id="resume-state" class="hint" aria-live="polite"></p>
+
+          <label class="toggle">
+            <input id="resume-toggle" type="checkbox" />
+            Tell a new call what was already said
+          </label>
+          <p class="hint">
+            The vendor cannot resume a conversation once the connection closes. What this does
+            instead is hand the new call a written record of the earlier one, so it can carry on
+            from it. It is a <strong>reconstruction</strong>: a new conversation that has been told
+            what happened, not the old one continued.
+          </p>
+          <p class="hint">
+            It <strong>re-sends earlier conversation content to the voice vendor on every new
+            call</strong> — your own speech, and any Discord text the agent read out to you, which
+            was written by other people. That is why it is off by default. The record is capped by
+            the server; when it does not all fit, the oldest lines are dropped and both you and the
+            agent are told the reconstruction is partial.
+          </p>
 
           <h2>Live messages</h2>
           <!--

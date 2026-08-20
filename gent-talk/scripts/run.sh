@@ -26,7 +26,8 @@
 #
 # Usage:
 #   scripts/run.sh [--shutdown] [--restart] [--logs] [--follow] [--status] [--tunnel-status]
-#                  [--smoke-agent [--nonce]] [--screenshots [--out DIR] [--theme THEME]]
+#                  [--smoke-agent [--nonce] [--replay-check]]
+#                  [--screenshots [--out DIR] [--theme THEME]]
 #                  [--config FILE] [--tunnel|--no-tunnel] [--tag TAG] [--port PORT]
 #                  [--restart-policy POLICY] [--dry-run] [--help]
 #
@@ -73,12 +74,26 @@
 #                  Some runs are REFUSED rather than decided: an empty channel, or a newest message
 #                  with nothing distinctive in it, cannot decide the question either way, so the
 #                  run stops before opening any conversation and bills nothing.
+#   --replay-check Only with --smoke-agent. *** COSTS THREE CONVERSATIONS. *** Asks a DIFFERENT
+#                  question from the ordinary run: does the vendor actually act on a replayed
+#                  transcript (#46 conversation-replay)? Conversation A states a nonce and its
+#                  turns are recorded through this server's own transcript API, exactly as the
+#                  /voice page records them; conversation B opens WITH that record and must return
+#                  the nonce; conversation C is the CONTROL — same question, no record — and must
+#                  NOT be able to answer. Without C the run would prove the agent is fluent rather
+#                  than that it remembers, so all three are reported separately.
+#                  Refused, billing nothing, when this server has no durable store; refused after
+#                  ONE conversation when replay.enabled is false or the transcript came back
+#                  empty, because the transcript has to exist before it can be asked for.
+#                  "The vendor did not honour it" is a distinct exit code (21), not a generic
+#                  failure: it is the single most useful thing this check can tell you, and until
+#                  it comes back green the interface must not claim a call was resumed.
 #   --nonce        Only with --smoke-agent. Go straight to the token round instead of waiting for
 #                  the cheap check to fail — for when you want that evidence on a run that would
 #                  otherwise pass cheaply, or when the channel's latest message is too plain to
 #                  match on. It always writes one line to the channel. You do not need this to get
 #                  the escalation: that happens by itself when the cheap check fails.
-#   --screenshots  Photograph the /voice page in all twenty-eight states that look different, so an
+#   --screenshots  Photograph the /voice page in all twenty-nine states that look different, so an
 #                  agent can LOOK at the interface before the owner does. FREE and offline: no vendor
 #                  conversation, no microphone, no money. The conversation WebSocket is replaced by
 #                  a fake and the microphone is Chromium's built-in fake capture device, so the
@@ -222,6 +237,7 @@ FOLLOW=0
 TUNNEL_STATUS_ONLY=0
 SMOKE_AGENT=0
 SMOKE_NONCE=0
+SMOKE_REPLAY=0
 SCREENSHOTS=0
 SHOTS_OUT=""
 SHOTS_THEME=""
@@ -255,6 +271,7 @@ while [ $# -gt 0 ]; do
         --tunnel-status) TUNNEL_STATUS_ONLY=1; shift ;;
         --smoke-agent) SMOKE_AGENT=1; shift ;;
         --nonce) SMOKE_NONCE=1; shift ;;
+        --replay-check) SMOKE_REPLAY=1; shift ;;
         --screenshots) SCREENSHOTS=1; shift ;;
         --out) SHOTS_OUT="${2:?--out needs a directory}"; shift 2 ;;
         --theme) SHOTS_THEME="${2:?--theme needs dark, light or both}"; shift 2 ;;
@@ -285,6 +302,19 @@ if [ "${#ACTIONS_GIVEN[@]}" -gt 1 ]; then
 Each one ends the run somewhere different. Pick exactly one and re-run.
   --logs dumps output and exits;  --follow streams it;  --status and --tunnel-status report;
   --shutdown stops and exits;     --restart stops and relaunches."
+fi
+
+if [ "$SMOKE_REPLAY" = 1 ] && [ "$SMOKE_AGENT" != 1 ]; then
+    die "--replay-check only means something together with --smoke-agent.
+It is a different question asked through the same harness: whether the VENDOR acts on a replayed
+transcript. On its own there is no conversation for it to hold, and accepting it silently would
+leave you believing you had checked resuming when you had not."
+fi
+
+if [ "$SMOKE_NONCE" = 1 ] && [ "$SMOKE_REPLAY" = 1 ]; then
+    die "--nonce and --replay-check ask different questions of different rounds.
+--nonce strengthens the relay check by posting a token to the CHANNEL; --replay-check does not
+run the relay check at all. Pick one and re-run."
 fi
 
 if [ "$SMOKE_NONCE" = 1 ] && [ "$SMOKE_AGENT" != 1 ]; then
@@ -850,11 +880,17 @@ Start it with: $SCRIPT_DIR/run.sh"
         --engine "$ENGINE"
     )
     if [ "$SMOKE_NONCE" = 1 ]; then SMOKE_ARGS+=(--nonce); fi
+    if [ "$SMOKE_REPLAY" = 1 ]; then SMOKE_ARGS+=(--replay-check); fi
 
     step "Agent smoke test — a REAL conversation with the deployed agent. THIS COSTS VENDOR MINUTES."
     note "target:    http://${HOST_ADDR}:${HOST_PORT}"
     note "channel:   $SMOKE_CHANNEL"
     note "log from:  $SMOKE_CONTAINER  ($_smoke_status)"
+    if [ "$SMOKE_REPLAY" = 1 ]; then
+        note "mode:      --replay-check — THREE conversations: one to establish a fact, one opened"
+        note "           with the record of it, and a CONTROL opened without. Nothing is posted to"
+        note "           the channel; the transcript is written through this server's own API."
+    fi
     if [ "$SMOKE_NONCE" = 1 ]; then
         note "mode:      --nonce — posts ONE unique token to the channel through this server's own"
         note "           write API (never through the agent) and requires it back verbatim."

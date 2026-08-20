@@ -121,6 +121,18 @@ pub fn state_with_store() -> (AppState, Arc<FakeDiscord>, Arc<FakeStore>) {
     (state, discord, store)
 }
 
+/// A server built from arbitrary configuration text, plus a handle to its in-memory store.
+///
+/// The pair [`state_with_store`] and [`state_from_toml`] each give up one of the two things a
+/// test of a CONFIGURED durable feature needs — `#46 conversation-replay` is the first, since
+/// `[replay]` is off by default and a test of the on case has to set it and then write turns.
+#[must_use]
+pub fn state_with_store_from_toml(text: &str) -> (AppState, Arc<FakeDiscord>, Arc<FakeStore>) {
+    let store = Arc::new(FakeStore::new());
+    let (state, discord, _elevenlabs, _erased) = state_pieces(text, store.clone());
+    (state, discord, store)
+}
+
 /// A server whose store is one the caller built — a [`FakeStore`] primed to fail, a
 /// [`crate::store::disabled::DisabledStore`], or a real SQLite file.
 #[must_use]

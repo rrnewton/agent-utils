@@ -147,6 +147,9 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             "/api/v1/conversations/abc/turns".to_owned(),
             Some(serde_json::json!({"speaker": "you", "text": "hello"})),
         ),
+        // `#46 conversation-replay`. It renders the transcript, so it is exactly as reachable as
+        // the transcript and belongs in this table for the same reason.
+        ("GET", "/api/v1/conversations/abc/replay".to_owned(), None),
         ("DELETE", "/api/v1/storage".to_owned(), None),
         ("GET", "/api/v1/inbox".to_owned(), None),
         (
@@ -1452,4 +1455,184 @@ async fn a_transcript_is_never_cached() {
         Some("no-store"),
         "the owner's own speech must not sit in a proxy or a back-forward cache"
     );
+}
+
+// --- replaying an earlier conversation into a new call -------------------------------------------
+
+/// The same server, with `[replay]` turned on and a budget the test names.
+fn replay_harness(extra: &str) -> (Harness, std::sync::Arc<gent_talk::store::fake::FakeStore>) {
+    let toml = format!(
+        "{}\n[replay]\nenabled = true\n{extra}",
+        gent_talk::testing::config_toml()
+    );
+    let (state, discord, store) = gent_talk::testing::state_with_store_from_toml(&toml);
+    (
+        Harness {
+            router: router(state),
+            discord,
+        },
+        store,
+    )
+}
+
+async fn record(harness: &Harness, id: &str, speaker: &str, text: &str) {
+    let (status, payload) = call(
+        harness,
+        "POST",
+        &format!("/api/v1/conversations/{id}/turns"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"speaker": speaker, "text": text})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+}
+
+#[tokio::test]
+async fn a_replay_is_refused_to_a_read_token_because_it_is_the_transcript() {
+    // The whole route is the transcript, rendered. If a read token could fetch this it could
+    // fetch the transcript, and the block comment above the conversation handlers says why not.
+    let (harness, _store) = replay_harness("");
+    record(&harness, "conv_read", "you", "something private").await;
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_read/replay",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(payload["error"], "forbidden");
+    assert!(
+        !payload.to_string().contains("something private"),
+        "the refusal leaked the thing it refused: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn replaying_is_off_until_an_operator_turns_it_on_and_says_so_rather_than_refusing() {
+    // Two facts at once. Off is the DEFAULT — every new call re-sends earlier conversation content
+    // to a vendor, so it is a decision rather than an upgrade. And off answers 200 with
+    // `enabled: false`, not 404: the page has to be able to tell "resuming is off" from "there is
+    // no such conversation", and those are different sentences on screen.
+    let (harness, _store) = store_harness();
+    record(&harness, "conv_off", "you", "the runner stalled again").await;
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_off/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["enabled"], false);
+    assert_eq!(payload["included"], 0);
+    assert_eq!(payload["text"], "");
+    assert!(
+        !payload.to_string().contains("the runner stalled again"),
+        "with resuming off the transcript must not even be read: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn a_replay_carries_the_earlier_exchange_framed_as_a_record() {
+    let (harness, _store) = replay_harness("");
+    record(&harness, "conv_on", "you", "what happened overnight").await;
+    record(&harness, "conv_on", "agent", "the mac runner stalled").await;
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_on/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["enabled"], true);
+    assert_eq!(payload["included"], 2);
+    assert_eq!(payload["dropped"], 0);
+    assert_eq!(payload["transport"], "contextual_update");
+    let text = payload["text"].as_str().expect("text");
+    assert!(text.starts_with(gent_talk::replay::PREAMBLE), "{text}");
+    assert!(text.contains("you: what happened overnight"), "{text}");
+    assert!(text.contains("agent: the mac runner stalled"), "{text}");
+    assert!(
+        text.contains(gent_talk::untrusted::FENCE),
+        "the transcript quotes third-party channel text and has to arrive fenced: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_transcript_over_budget_reports_what_it_dropped_and_drops_the_oldest() {
+    let (harness, _store) = replay_harness("max_turns = 2\n");
+    for line in ["the first thing", "the second thing", "the third thing"] {
+        record(&harness, "conv_big", "you", line).await;
+    }
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_big/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["included"], 2);
+    assert_eq!(payload["dropped"], 1);
+    assert_eq!(payload["truncated"], true);
+    assert_eq!(payload["policy"]["max_turns"], 2);
+    let text = payload["text"].as_str().expect("text");
+    assert!(
+        !text.contains("the first thing"),
+        "the OLDEST line is the one dropped: {text}"
+    );
+    assert!(text.contains("the third thing"), "{text}");
+    assert!(
+        text.contains("INCOMPLETE"),
+        "the agent has to be told the record is partial, or it will contradict the user: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_replay_of_a_conversation_that_was_never_stored_is_a_404_rather_than_an_empty_success() {
+    // Deliberately NOT flattened into `included: 0`. That would be this server answering
+    // confidently about a record it has never seen, and the two cases have different causes: a
+    // call where nobody spoke leaves no conversation, and so does a store that lost it. The page
+    // treats every failure of this route the same way — degrade to a fresh call and SAY so — so
+    // nothing is lost by telling the truth here, and the ambiguity would be permanent.
+    let (harness, _store) = replay_harness("");
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_missing/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{payload}");
+    assert_eq!(payload["error"], "not_found");
+}
+
+#[tokio::test]
+async fn a_stored_conversation_with_nothing_spoken_in_it_replays_nothing() {
+    // The other half of the pair above, and the one that has to be a 200: the conversation EXISTS
+    // and holds only the page's own notes, so there is nothing to resume from and no failure
+    // either. A preamble on its own would claim a continuity that did not happen.
+    let (harness, _store) = replay_harness("");
+    record(&harness, "conv_quiet", "note", "the call ended").await;
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations/conv_quiet/replay",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["enabled"], true);
+    assert_eq!(payload["included"], 0);
+    assert_eq!(payload["text"], "");
 }

@@ -46,6 +46,15 @@ pub const ENV_TIMEZONE: &str = "GENT_TALK_TIMEZONE";
 /// See [`crate::store`].
 pub const ENV_STORAGE_PATH: &str = "GENT_TALK_STORAGE_PATH";
 
+/// Environment variable turning conversation replay on or off (`1`/`true`/`yes`/`on`).
+pub const ENV_REPLAY_ENABLED: &str = "GENT_TALK_REPLAY_ENABLED";
+/// Environment variable capping the replayed transcript, in characters.
+pub const ENV_REPLAY_MAX_CHARS: &str = "GENT_TALK_REPLAY_MAX_CHARS";
+/// Environment variable capping the replayed transcript, in turns.
+pub const ENV_REPLAY_MAX_TURNS: &str = "GENT_TALK_REPLAY_MAX_TURNS";
+/// Environment variable choosing how the replay reaches the vendor.
+pub const ENV_REPLAY_TRANSPORT: &str = "GENT_TALK_REPLAY_TRANSPORT";
+
 /// Environment variable overriding the model a summariser is asked for.
 pub const ENV_SUMMARY_MODEL: &str = "GENT_TALK_SUMMARY_MODEL";
 
@@ -111,6 +120,8 @@ pub struct Config {
     pub timezone: crate::clock::Zone,
     /// Discord access.
     pub discord: DiscordConfig,
+    /// Whether and how an earlier transcript is replayed into a new call.
+    pub replay: ReplayConfig,
     /// API credentials for callers (the voice agent, and the web app).
     pub auth: AuthConfig,
     /// Channels this server will read.
@@ -173,6 +184,42 @@ pub struct StorageConfig {
     pub path: Option<PathBuf>,
     /// Bounds on what is kept.
     pub retention: Retention,
+}
+
+/// Default ceiling on a replayed transcript, in characters.
+///
+/// A guess, and labelled as one. It is billed per call and the model's window is finite; nothing
+/// in this crate can measure whether it is right. `scripts/smoke-agent.py --replay-check` can.
+pub const DEFAULT_REPLAY_MAX_CHARS: usize = 6000;
+/// Default ceiling on a replayed transcript, in turns.
+pub const DEFAULT_REPLAY_MAX_TURNS: usize = 40;
+
+/// Reconstructing continuity across a hang-up. See [`crate::replay`].
+#[derive(Debug)]
+pub struct ReplayConfig {
+    /// Whether the page may ask for a replay at all.
+    ///
+    /// **Off by default, and the reason is privacy rather than caution.** Every new call re-sends
+    /// earlier conversation content — including Discord text written by other people — to the
+    /// voice vendor. That is a decision an operator makes deliberately.
+    pub enabled: bool,
+    /// The budget.
+    pub policy: crate::replay::ReplayPolicy,
+    /// How the payload reaches the vendor.
+    pub transport: crate::replay::Transport,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            policy: crate::replay::ReplayPolicy {
+                max_chars: DEFAULT_REPLAY_MAX_CHARS,
+                max_turns: DEFAULT_REPLAY_MAX_TURNS,
+            },
+            transport: crate::replay::Transport::ContextualUpdate,
+        }
+    }
 }
 
 /// Discord access parameters.
@@ -282,6 +329,17 @@ struct FileConfig {
     storage: FileStorage,
     #[serde(default)]
     summaries: FileSummaries,
+    #[serde(default)]
+    replay: FileReplay,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileReplay {
+    enabled: Option<bool>,
+    max_chars: Option<usize>,
+    max_turns: Option<usize>,
+    transport: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -514,6 +572,15 @@ impl Config {
 
         let storage = storage_config(get(ENV_STORAGE_PATH), file.storage)?;
         let summaries = summaries_config(get(ENV_SUMMARY_MODEL), file.summaries)?;
+        let replay = replay_config(
+            [
+                get(ENV_REPLAY_ENABLED),
+                get(ENV_REPLAY_MAX_CHARS),
+                get(ENV_REPLAY_MAX_TURNS),
+                get(ENV_REPLAY_TRANSPORT),
+            ],
+            file.replay,
+        )?;
 
         Ok(Self {
             bind,
@@ -551,8 +618,81 @@ impl Config {
             },
             storage,
             summaries,
+            replay,
         })
     }
+}
+
+/// Resolve the `[replay]` section.
+fn replay_config(
+    from_env: [Option<&str>; 4],
+    file: FileReplay,
+) -> Result<ReplayConfig, ConfigError> {
+    let [enabled_env, chars_env, turns_env, transport_env] = from_env;
+    let defaults = ReplayConfig::default();
+    let number =
+        |raw: Option<&str>, field: &'static str, from_file: Option<usize>, fallback| match raw {
+            Some(text) => text
+                .trim()
+                .parse::<usize>()
+                .map_err(|e| ConfigError::Invalid {
+                    field: field.to_owned(),
+                    detail: format!("{text:?} is not a whole number ({e})"),
+                }),
+            None => Ok(from_file.unwrap_or(fallback)),
+        };
+    let enabled = match enabled_env {
+        Some(raw) => matches!(raw.trim(), "1" | "true" | "yes" | "on"),
+        None => file.enabled.unwrap_or(defaults.enabled),
+    };
+    let max_chars = number(
+        chars_env,
+        "replay.max_chars",
+        file.max_chars,
+        defaults.policy.max_chars,
+    )?;
+    let max_turns = number(
+        turns_env,
+        "replay.max_turns",
+        file.max_turns,
+        defaults.policy.max_turns,
+    )?;
+    if max_chars == 0 || max_turns == 0 {
+        // Zero is not "unlimited" and must not be readable as it. A budget of nothing produces an
+        // empty replay on every call, which the page then correctly reports as "the agent starts
+        // fresh" — a feature that is silently off while the setting says it is on.
+        return Err(ConfigError::Invalid {
+            field: if max_chars == 0 {
+                "replay.max_chars".to_owned()
+            } else {
+                "replay.max_turns".to_owned()
+            },
+            detail: "must be at least 1. Zero is not 'no limit'; it is a replay that is always \
+                     empty while the interface says resuming is on. Use replay.enabled = false."
+                .to_owned(),
+        });
+    }
+    let transport_text = transport_env.map(str::to_owned).or(file.transport);
+    let transport = match transport_text {
+        Some(text) => {
+            crate::replay::Transport::parse(&text).ok_or_else(|| ConfigError::Invalid {
+                field: "replay.transport".to_owned(),
+                detail: format!(
+                    "{text:?} is not a transport. Use \"contextual_update\" (the default) or \
+                     \"client_data\"."
+                ),
+            })?
+        }
+        None => defaults.transport,
+    };
+    Ok(ReplayConfig {
+        enabled,
+        policy: crate::replay::ReplayPolicy {
+            max_chars,
+            max_turns,
+        },
+        transport,
+    })
 }
 
 /// Resolve the `[summaries]` section.
@@ -976,6 +1116,71 @@ writable = true
                 if field == "discord.live_poll_seconds"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resuming_is_off_by_default_and_its_budget_cannot_be_configured_into_a_lie() {
+        // OFF by default is the safety property, and it is about privacy: every new call re-sends
+        // prior conversation content to a vendor, so an upgrade must not start doing that.
+        let cfg = Config::from_toml_and_env(FULL, &env(&[])).expect("valid config");
+        assert!(!cfg.replay.enabled);
+        assert_eq!(cfg.replay.policy.max_chars, DEFAULT_REPLAY_MAX_CHARS);
+        assert_eq!(cfg.replay.policy.max_turns, DEFAULT_REPLAY_MAX_TURNS);
+        assert_eq!(
+            cfg.replay.transport,
+            crate::replay::Transport::ContextualUpdate,
+            "the transport that does not depend on a dashboard setting is the default"
+        );
+
+        let text = format!("{FULL}\n[replay]\nenabled = true\nmax_turns = 5\n");
+        let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
+        assert!(cfg.replay.enabled);
+        assert_eq!(cfg.replay.policy.max_turns, 5);
+
+        let cfg = Config::from_toml_and_env(&text, &env(&[(ENV_REPLAY_ENABLED, "0")]))
+            .expect("valid config");
+        assert!(
+            !cfg.replay.enabled,
+            "the environment has to be able to turn it back OFF, which is the direction an \
+             operator reaches for in a hurry"
+        );
+
+        // Zero is not "no limit". It is a replay that is always empty while the interface says
+        // resuming is on, which is the silent-nothing this feature must not be able to become.
+        let text = format!("{FULL}\n[replay]\nenabled = true\nmax_chars = 0\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, detail }
+                if field == "replay.max_chars" && detail.contains("not 'no limit'")),
+            "unexpected error: {err}"
+        );
+
+        // An unknown transport is refused rather than silently defaulted: a typo'd
+        // "prompt_override" that quietly became contextual_update would be a deployment behaving
+        // differently from its own configuration file.
+        let text = format!("{FULL}\n[replay]\ntransport = \"prompt_override\"\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "replay.transport"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn the_shipped_example_configuration_is_one_this_server_would_actually_accept() {
+        // Both example files are the first thing an operator copies, and `deny_unknown_fields`
+        // means a section documented but never wired up is a server that refuses to start. Nothing
+        // checked either of them until `#46 conversation-replay` added a section to both.
+        let example = include_str!("../gent-talk.example.toml")
+            .replace(
+                "REPLACE-ME-at-least-24-characters",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .replace(
+                "REPLACE-ME-different-and-at-least-24-characters",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            );
+        Config::from_toml_and_env(&example, &env(&[])).expect("the shipped example must parse");
     }
 
     #[test]

@@ -317,6 +317,9 @@ curl -s -X POST localhost:8080/mcp \
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
 | Summary model | `summaries.model` | `GENT_TALK_SUMMARY_MODEL` | unset means the extractive backend |
+| Resuming | `replay.enabled` | `GENT_TALK_REPLAY_ENABLED` | **off by default**; on, every new call re-sends earlier conversation content to the vendor |
+| Replay budget | `replay.max_chars` / `replay.max_turns` | `GENT_TALK_REPLAY_MAX_CHARS` / `_TURNS` | default `6000` / `40`; oldest dropped first; `0` is refused, not "unlimited" |
+| Replay transport | `replay.transport` | `GENT_TALK_REPLAY_TRANSPORT` | `contextual_update` (default) or `client_data` |
 | Config file path | — | `GENT_TALK_CONFIG` | or `--config` |
 
 Environment wins over file. An empty environment variable is treated as unset, so a runtime that
@@ -511,6 +514,7 @@ not, and neither reveals anything about the configuration.
 | GET | `/api/v1/conversations/{id}` | **write** | one stored transcript, oldest turn first |
 | DELETE | `/api/v1/conversations/{id}` | **write** | erase one stored transcript |
 | POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn |
+| GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
@@ -585,6 +589,84 @@ unreachable, and an empty `allowed_mentions` — which is what this used to send
 (the full message, or `null`), `alternatives`, and `ambiguous`. **A query that matches nothing
 returns `best: null`** rather than the newest message wearing a confident label; a voice interface
 that guesses is worse than one that says it did not find anything.
+
+## Resuming a conversation across a hang-up
+
+The vendor cannot resume a conversation once the socket closes — the initiation message and the
+signed-URL endpoint both take an `agent_id` and neither accepts a `conversation_id`. So this
+server does not resume anything. What it does instead is hand a NEW call a written record of the
+old one, so the agent can carry on from it.
+
+**That is a reconstruction, and every part of this is arranged so it cannot read as more than
+one.** `replay.enabled` is off by default; when it is on, `GET /api/v1/conversations/{id}/replay`
+renders the stored transcript and the page sends it on the new socket.
+
+### The four states, which are four different sentences
+
+The failure to avoid is not that this breaks; it is that it half-works and the screen keeps saying
+it worked. So the clause under the large control is derived rather than written:
+
+| State | What the screen says |
+|---|---|
+| off, here or on the server | "the agent starts fresh" |
+| armed, whole record sent | "the earlier conversation is replayed" |
+| armed, budget dropped some | "the earlier conversation is replayed **in part**" |
+| the fetch failed | "the agent starts fresh — the earlier conversation could not be read" |
+
+The end-of-call seam changes with it. Every version of it asserted that the agent below the line
+has never seen anything above it, and that stops being true the moment resuming is armed; with it
+on, the seam says the new call will be read the lines above and that this is a reconstruction, not
+the same conversation. A failed replay never aborts the call — it degrades to a fresh one and says
+which it was.
+
+### The budget, and why it is stated rather than discovered
+
+A transcript grows without bound, the payload is billed per call, and the model's window is
+finite. The rule: keep the most recent turns until either `replay.max_chars` or `replay.max_turns`
+is reached, drop **oldest first**, and report how many were dropped. When anything was dropped the
+agent is told so inside the payload as well — otherwise it insists the user never mentioned
+something the user definitely did.
+
+`0` is refused rather than read as "no limit": a budget of nothing is a replay that is always empty
+while the interface says resuming is on, which is a feature that is silently doing nothing.
+
+### The transcript is untrusted text
+
+A stored turn is the owner's own speech AND whatever channel text the agent read aloud to him,
+which is third-party Discord text. Every turn is neutralized and the whole record is fenced by
+`src/untrusted.rs`; the preamble sits OUTSIDE the fence, because it is this server speaking and
+the point of the fence is that nothing inside it is. A turn that forges the fence is defused and
+the tampering stays visible.
+
+### Privacy
+
+**Every new call re-sends earlier conversation content to ElevenLabs**, including Discord text
+written by other people that the agent read out. That is why it is off by default, why the
+Settings screen says it in those words, and why it deserves an explicit decision if any of that
+content is sensitive.
+
+### The one check that can answer the real question
+
+Whether the vendor puts a `contextual_update` sent immediately after the initiation message in
+context for the **first agent turn** is a property of the platform. Nothing in this repository can
+settle it:
+
+```sh
+scripts/run.sh --smoke-agent --replay-check
+```
+
+Three conversations, so three times the cost. A states a nonce and its turns are recorded through
+this server's own transcript API, exactly as `/voice` records them; B opens WITH that record and
+must return the nonce; **C is the control** — same question, no record — and must NOT be able to
+answer, or the run proved the agent is fluent rather than that it remembers. All three outcomes
+are reported separately, and "the vendor did not honour it" has an exit code of its own (21)
+rather than being folded into a generic failure. It refuses, billing nothing, when this server has
+no durable store.
+
+**Until that check comes back green on a deployment, the interface must not claim a call was
+resumed there.** `replay.transport = "client_data"` exists so the other path can be measured too:
+it carries the text on the initiation message under `dynamic_variables`, which depends on the
+agent's dashboard security settings permitting overrides and fails SILENTLY when they do not.
 
 ## Live push
 
@@ -1458,7 +1540,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the twenty-eight states that look different — signed out, idle, live
+Photographs the `/voice` page in the twenty-nine states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1468,7 +1550,9 @@ phone, and one that really failed — the reply screen with a short target and w
 than the frame, one channel row picked out under the pointer, a step further back through the
 channel, the earlier conversation restored from the server after a reload, a turn that was typed
 rather than spoken, the control bar in each of its two homes, that same bar converted into a
-text field, and the bar packed with every button it has — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
+text field, the bar packed with every button it has, a channel message that arrived because the
+SERVER pushed it rather than because the page asked, and a resumed call whose reconstruction was
+only partial and says so — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
 desktop. It prints the absolute path of every image so an agent can open them directly.
 
 The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
@@ -1542,6 +1626,7 @@ src/retrieval.rs      semantic random access, behind the Ranker trait
 src/untrusted.rs      the data-not-instructions boundary
 src/ops.rs            the operations both front doors share: allowlist, fetch, transform
 src/live.rs           inbound ingestion (bounded polling), the per-channel fan-out, and the SSE body
+src/replay.rs         rebuilding continuity across a hang-up: the preamble, the budget, the fence
 src/probe.rs          the startup channel reachability probe and its failure taxonomy
 src/elevenlabs/       the SignedUrlProvider trait, the live client, the in-memory fake
 src/elevenlabs/mock/  the loopback vendor: a real mint endpoint, a real WebSocket, a real MCP client
@@ -1589,6 +1674,13 @@ Beyond the security list above:
   rule, the cursor, the failure path and the SSE framing are all tested against the in-memory
   fake; the first real deployment with an interval set will be the first time the poll loop meets
   Discord's rate limiter.
+* **Whether the vendor honours a replayed transcript is UNVERIFIED.** `#46 conversation-replay`
+  is complete on this side — the budget, the fencing, the four honesty states and the transport
+  switch are all tested — but no billed run has yet confirmed that ElevenLabs puts the payload in
+  context for the first agent turn. `scripts/run.sh --smoke-agent --replay-check` is the check;
+  it has never been run against a live agent. That is why `replay.enabled` defaults to false.
+* **The replay budget is a guess.** 6000 characters and 40 turns were chosen, not measured. The
+  payload is billed per call.
 * **A contextual update reaches the agent only while `/voice` is open.** The conversation socket
   belongs to the browser, not to this server (see "Live push"), so closing the tab ends the relay
   even though the server keeps ingesting.
