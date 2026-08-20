@@ -160,6 +160,13 @@
               -->
               <div class="row">
                 <button id="refresh-discord" type="button">Refresh</button>
+                <!--
+                  `#50 todo-view`. A SUB-TOGGLE of this view, not a third tab: it is the same list
+                  filtered, and a tab would imply a second place messages live. It sits in the
+                  view's own header rather than among the floating chips because it changes what
+                  the list IS, where those change how it is displayed.
+                -->
+                <button id="todo-filter" type="button" aria-pressed="false">To do</button>
               </div>
               <!--
                 `#63 status-line-placement`. The channel's own summary — how much is loaded, and
@@ -183,6 +190,21 @@
                 here, so it cannot describe a summariser this deployment does not run.
               -->
               <p id="summary-note" class="hint" hidden></p>
+
+              <!--
+                `#61 unread-status`, said in the interface rather than left to be discovered from a
+                divergence. This text is QUOTED from the server's answer and is not written here:
+                one statement, in one place, and a page that drifted from the server's own posture
+                could not do so silently.
+              -->
+              <p id="inbox-note" class="hint" hidden></p>
+
+              <!--
+                Declaring bankruptcy. Bulk and destructive, so it says how many it is about to
+                clear before it does it, takes two taps, and is undoable afterwards — the same
+                armed idiom the Clear control on the dock uses, for the same reason.
+              -->
+              <button id="clear-backlog" class="chip" type="button" hidden>Clear the backlog</button>
 
               <!--
                 `#65 scrollback-paging`. A channel read is a WINDOW, never the whole channel, and
@@ -251,6 +273,14 @@
             -->
             <button id="summarise" class="chip" type="button" aria-pressed="false" hidden>
               <span id="summarise-label">Summaries</span>
+            </button>
+            <!--
+              `#50 todo-view`. The way back from a dismissal, including a bulk one. It carries the
+              exact set the server said it cleared, so it restores that and nothing else — and it
+              is absent until there is something to undo.
+            -->
+            <button id="undo-dismiss" class="chip" type="button" hidden>
+              <span id="undo-dismiss-label">Undo</span>
             </button>
             <button id="collapse-all" class="chip" type="button" hidden>
               <span id="collapse-all-label">Collapse all</span>

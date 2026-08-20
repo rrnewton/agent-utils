@@ -93,6 +93,13 @@ pub fn router(state: AppState) -> Router {
         // clear transcripts and say so, this one clears everything the store holds.
         .route("/api/v1/storage", axum::routing::delete(api::purge_storage))
         .route("/api/v1/inbox", get(api::inbox))
+        // `#50 todo-view`. The channel filtered down to what has not been dealt with, and the two
+        // acts that change that. READ scope to look, WRITE scope to change — the same split every
+        // durable write on this server takes, and the reason it is not "read scope because it is
+        // only a flag" is that the flag outlives the process and another device reads it back.
+        .route("/api/v1/channels/{channel_id}/todo", get(api::todo))
+        .route("/api/v1/channels/{channel_id}/dismiss", post(api::dismiss))
+        .route("/api/v1/channels/{channel_id}/restore", post(api::restore))
         .route(
             "/api/v1/channels/{channel_id}/read",
             post(api::mark_read).delete(api::forget_read_mark),

@@ -124,11 +124,19 @@ writable = false
 # max_conversations = 50            # oldest dropped first; at least 1
 # max_turns_per_conversation = 1000 # further turns are refused with 413; at least 1
 # max_summaries = 2000              # least recently written dropped first; at least 1
+# max_dismissals = 10000            # "dealt with" marks, oldest dropped first; at least 1
 # retain_days = 30                  # 0 means no age limit. Applies to conversations (since the
 #                                   # last turn) AND to cached summaries (since they were made) —
 #                                   # for a summary it is the only thing that collects an entry
 #                                   # whose message was edited or deleted upstream, because such
 #                                   # an entry is unreachable by key and nothing announces it.
+#                                   #
+#                                   # It does NOT apply to max_dismissals, and that is deliberate:
+#                                   # expiring a "dealt with" mark would put a message the owner
+#                                   # cleared last month back into his to-do list because time
+#                                   # passed, with nothing on the row saying why. The count bound
+#                                   # is enough there — it is the one table holding no message
+#                                   # text, only two snowflakes and an instant.
 
 [summaries]
 # How a long channel message is turned into one short line. EVERY setting here is folded into the

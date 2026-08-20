@@ -47,6 +47,15 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    /// A request this server understood and will not carry out as written.
+    ///
+    /// One code, `bad_request`, because a client branches on the code and there is nothing useful
+    /// to branch on here: the detail says what to send instead, and every use of this is a shape
+    /// the caller can fix by reading it.
+    fn bad_request(detail: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "bad_request", detail)
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -1071,8 +1080,8 @@ pub async fn forget_conversations(
 /// `DELETE /api/v1/conversations` clears transcripts and deliberately leaves the read marks
 /// alone, because the two are different records and a control that quietly does more than it
 /// says is the failure this project is written against. This route says it does all of it: the
-/// transcripts, this server's read marks, and the cached summaries — which are the one thing on
-/// disk written by third parties.
+/// transcripts, this server's read marks, the cached summaries — which are the one thing on
+/// disk written by third parties — and the per-message inbox overlay `#50 todo-view` adds.
 ///
 /// Write scope, obviously. It exists because [`crate::store::StateStore::purge_everything`] was
 /// otherwise trait surface with three implementations and no caller: an erase nobody can invoke
@@ -1084,7 +1093,7 @@ pub async fn purge_storage(
     require(&headers, &state, Scope::Write)?;
     state.store.purge_everything().await?;
     Ok(no_store(Json(serde_json::json!({
-        "purged": ["conversations", "read_marks", "summaries"],
+        "purged": ["conversations", "read_marks", "summaries", "dismissals"],
         "detail": "every durable record this server holds has been erased; the store is still \
                    open and usable",
     }))))
@@ -1166,6 +1175,131 @@ pub async fn forget_read_mark(
         "channel": channel,
         "read_state_notice": crate::store::INBOX_NOTICE,
     }))))
+}
+
+/// The messages in one channel that have not been dealt with here.
+#[derive(Debug, Serialize)]
+pub struct TodoResponse {
+    /// The to-do list itself: the channel, what is left, and how big the window was.
+    #[serde(flatten)]
+    pub todo: ops::TodoView,
+    /// See [`crate::store::INBOX_NOTICE`]. On the LISTING as well as on the mutations, because
+    /// this is the screen where "unread" means something to a Discord user and this is not that
+    /// thing.
+    pub read_state_notice: &'static str,
+    /// The messages are somebody else's words, exactly as on every other read.
+    pub untrusted_content_notice: &'static str,
+}
+
+/// `GET /api/v1/channels/{channel_id}/todo`
+pub async fn todo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Query(query): Query<LimitQuery>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Read)?;
+    let todo = ops::todo(&state, &channel_id, query.limit).await?;
+    Ok(no_store(Json(TodoResponse {
+        todo,
+        read_state_notice: crate::store::INBOX_NOTICE,
+        untrusted_content_notice: untrusted::NOTICE,
+    })))
+}
+
+/// Which messages to mark as dealt with, or put back.
+///
+/// Exactly one of the two, and supplying both is a refusal rather than a precedence rule: a
+/// caller that sent both meant one of them, and guessing which would be wrong half the time in a
+/// way that quietly clears a backlog.
+#[derive(Debug, Default, Deserialize)]
+pub struct DismissRequest {
+    /// The messages named one by one.
+    #[serde(default)]
+    pub messages: Vec<String>,
+    /// Or: everything in the window at or before this one. The boundary is INCLUDED.
+    #[serde(default)]
+    pub through: Option<String>,
+}
+
+/// What a dismissal or a restoration actually did.
+#[derive(Debug, Serialize)]
+pub struct InboxChangeResponse {
+    /// The channel and the exact set that changed.
+    #[serde(flatten)]
+    pub change: ops::InboxChange,
+    /// How many messages changed state. The list beside it is what an undo needs; this is what a
+    /// confirmation says out loud.
+    pub count: usize,
+    /// See [`crate::store::INBOX_NOTICE`]. Repeated on the mutating routes, because this is
+    /// exactly where someone expects the Discord badge to move.
+    pub read_state_notice: &'static str,
+}
+
+fn answered(change: ops::InboxChange) -> Response {
+    let count = change.messages.len();
+    no_store(Json(InboxChangeResponse {
+        change,
+        count,
+        read_state_notice: crate::store::INBOX_NOTICE,
+    }))
+}
+
+/// `POST /api/v1/channels/{channel_id}/dismiss`
+pub async fn dismiss(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(request): Json<DismissRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    let change = match (request.through, request.messages.is_empty()) {
+        (Some(_), false) => {
+            return Err(ApiError::bad_request(
+                "send either `messages` or `through`, not both: they are different acts and \
+                 guessing which one you meant would clear a backlog by accident",
+            ))
+        }
+        (Some(through), true) => {
+            ops::declare_bankruptcy(&state, &channel_id, &crate::model::MessageId(through)).await?
+        }
+        (None, false) => {
+            let wanted: Vec<crate::model::MessageId> = request
+                .messages
+                .into_iter()
+                .map(crate::model::MessageId)
+                .collect();
+            ops::dismiss(&state, &channel_id, &wanted).await?
+        }
+        (None, true) => {
+            return Err(ApiError::bad_request(
+                "send `messages` or `through`; an empty request would report success for having \
+                 done nothing",
+            ))
+        }
+    };
+    Ok(answered(change))
+}
+
+/// `POST /api/v1/channels/{channel_id}/restore`
+pub async fn restore(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+    Json(request): Json<DismissRequest>,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    if request.messages.is_empty() {
+        return Err(ApiError::bad_request(
+            "send the `messages` an earlier dismissal reported; restoring nothing is not an undo",
+        ));
+    }
+    let wanted: Vec<crate::model::MessageId> = request
+        .messages
+        .into_iter()
+        .map(crate::model::MessageId)
+        .collect();
+    Ok(answered(ops::restore(&state, &channel_id, &wanted).await?))
 }
 
 /// One message, summarised.

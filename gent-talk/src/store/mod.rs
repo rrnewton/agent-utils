@@ -6,7 +6,8 @@
 //!
 //! * the **conversation transcript** the `/voice` page builds while the owner is talking, which
 //!   today evaporates on a reload; and
-//! * the **inbox state** — how far the owner has read in each channel.
+//! * the **inbox state** — how far the owner has read in each channel, and which individual
+//!   messages he has dealt with.
 //!
 //! # Read state is OURS, and it is never synchronised with Discord
 //!
@@ -20,6 +21,14 @@
 //!   Discord app has no effect on gent-talk.
 //! * **No sync-back.** Marking a channel read here posts nothing, acks nothing, and changes
 //!   nothing in Discord. The unread badge in the Discord app will not move.
+//!
+//! That holds for the per-message overlay `#50 todo-view` adds on top of it just as it holds for
+//! the channel read marks: dismissing a message here is this server's record and nobody else's.
+//!
+//! **The store is single-tenant.** Every read mark and every dismissal is "the owner's", with no
+//! column saying WHOSE — one file, one person. Sharing a deployment between two operators would
+//! silently merge their inboxes, and that is not a configuration this decision survives; it would
+//! have to be revisited, not worked around.
 //!
 //! Anything that shows a read mark to a human has to say that, because "read" is a word that
 //! already means something to a Discord user and this is not that thing.
@@ -45,8 +54,8 @@
 //!
 //! * the database file is `0600` and its directory `0700`;
 //! * retention is bounded by [`Retention`] — a conversation count, a per-conversation turn count,
-//!   a cached-summary count, and an age in days that applies to both — enforced on every write,
-//!   not by a sweeper that might not run;
+//!   a cached-summary count, a dismissal count, and an age in days that applies to the first
+//!   three — enforced on every write, not by a sweeper that might not run;
 //! * [`StateStore::purge_everything`] erases all of it, and an operator who does not trust that
 //!   can delete the single file the store lives in.
 
@@ -284,6 +293,16 @@ pub struct Retention {
     /// How many cached summaries to keep. The least recently written are dropped first. At
     /// least 1.
     pub max_summaries: u32,
+    /// How many "dealt with" marks to keep, across all channels. The oldest are dropped first.
+    ///
+    /// **Deliberately NOT covered by `retain_days`, and that is the one asymmetry in this
+    /// struct.** An age limit on this table would put a message the owner cleared a month ago
+    /// back into his to-do list purely because time passed — a lie he cannot diagnose, since
+    /// nothing on the row would say why it came back. The count bound is what stops the table
+    /// growing, and it is enough here for a reason it is not enough for a summary: a dismissal
+    /// holds two snowflakes and a timestamp and NO message text, so unlike a cached summary it is
+    /// not a second at-rest copy of anybody's words.
+    pub max_dismissals: u32,
     /// How many days a record survives: a conversation after its last turn, a cached summary
     /// after it was made. `0` means no age limit.
     ///
@@ -299,6 +318,7 @@ impl Default for Retention {
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
             max_turns_per_conversation: DEFAULT_MAX_TURNS_PER_CONVERSATION,
             max_summaries: DEFAULT_MAX_SUMMARIES,
+            max_dismissals: DEFAULT_MAX_DISMISSALS,
             retain_days: DEFAULT_RETAIN_DAYS,
         }
     }
@@ -314,6 +334,13 @@ pub const DEFAULT_MAX_TURNS_PER_CONVERSATION: u16 = 1_000;
 /// is small enough not to matter and large enough that a real day's reading never evicts anything
 /// it would have reused.
 pub const DEFAULT_MAX_SUMMARIES: u32 = 2_000;
+/// Default number of "dealt with" marks kept.
+///
+/// Ten thousand rows of two snowflakes and a timestamp is a few hundred kilobytes. It is set well
+/// above `max_summaries` on purpose: a dismissal is the cheapest row this store has and the one
+/// whose loss is most visible to the reader, because losing it puts a message he already dealt
+/// with back in front of him.
+pub const DEFAULT_MAX_DISMISSALS: u32 = 10_000;
 /// Default age limit, in days.
 pub const DEFAULT_RETAIN_DAYS: u16 = 30;
 
@@ -449,6 +476,49 @@ pub trait StateStore: Send + Sync {
     ///
     /// [`StoreError::NotFound`] when there was no mark, plus the errors above.
     async fn forget_read_mark(&self, channel: &ChannelId) -> Result<(), StoreError>;
+
+    /// Every message in this channel the owner has marked as dealt with here, newest first.
+    ///
+    /// The ids alone. What a caller does with them is filter a window of messages it already
+    /// holds, and returning anything more would be a second copy of text this server is at pains
+    /// not to keep twice.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a read
+    /// failure.
+    async fn dismissals(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError>;
+
+    /// Mark messages as dealt with, returning how many were not already.
+    ///
+    /// Idempotent by construction: dismissing something twice is not an error and does not move
+    /// it, because the second tap of a control the reader cannot see the result of must not
+    /// change the answer. That is also what makes the count meaningful — it is how many the
+    /// reader actually cleared, which is what an undo has to restore and what a bulk action has
+    /// to report.
+    ///
+    /// Bounded by [`Retention::max_dismissals`] on the way in, exactly as every other write here
+    /// is.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::BadId`] when an id cannot be ordered as a snowflake;
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn dismiss(&self, channel: &ChannelId, messages: &[MessageId])
+        -> Result<u64, StoreError>;
+
+    /// Put messages back into the to-do list, returning how many really came back.
+    ///
+    /// The undo, and the reason `dismiss` reports a count: restoring exactly what one action
+    /// cleared is only possible if that action said what it cleared.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
+    /// write failure.
+    async fn restore(&self, channel: &ChannelId, messages: &[MessageId])
+        -> Result<u64, StoreError>;
 
     /// The summary already produced for this exact key, if there is one.
     ///

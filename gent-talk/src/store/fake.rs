@@ -12,7 +12,8 @@
 //! * the same [`Retention`] bounds apply, including the per-conversation turn ceiling, the
 //!   [`super::MAX_TURN_CHARS`] limit on one turn, and the count and age bounds on the cached
 //!   summaries;
-//! * a read mark refuses an id it cannot order, and never moves backwards;
+//! * a read mark refuses an id it cannot order, and never moves backwards, and so does a
+//!   dismissal, whole batch and all;
 //! * [`FakeStore::fail_next`] makes the very next operation fail, so a caller's error path can be
 //!   exercised instead of assumed.
 //!
@@ -50,6 +51,9 @@ struct State {
     conversations: BTreeMap<String, Vec<Turn>>,
     marks: BTreeMap<String, (MessageId, u64, i64)>,
     summaries: BTreeMap<(String, String, String, String), FakeSummary>,
+    /// `(channel, message)` to `(snowflake, when it was dismissed)`. The same shape the real
+    /// table has, so the count bound and the ordering can be reproduced rather than assumed.
+    dismissals: BTreeMap<(String, String), (u64, i64)>,
     next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
@@ -311,6 +315,86 @@ impl StateStore for FakeStore {
             .ok_or(StoreError::NotFound)
     }
 
+    async fn dismissals(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let mut held: Vec<(u64, MessageId)> = state
+            .dismissals
+            .iter()
+            .filter(|((held, _), _)| held == channel.as_str())
+            .map(|((_, message), (numeric, _))| (*numeric, MessageId(message.clone())))
+            .collect();
+        held.sort_by_key(|(numeric, _)| std::cmp::Reverse(*numeric));
+        Ok(held.into_iter().map(|(_, message)| message).collect())
+    }
+
+    async fn dismiss(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<u64, StoreError> {
+        // Refused BEFORE the lock and before anything is written, exactly as the real store does:
+        // a batch with one unorderable id changes nothing at all.
+        let ordered = messages
+            .iter()
+            .map(|message| {
+                message
+                    .numeric()
+                    .map(|n| (message.clone(), n))
+                    .ok_or_else(|| {
+                        StoreError::BadId(format!(
+                        "{message:?} is not a message snowflake, so this server cannot order it"
+                    ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let at = now_ms();
+        let mut added = 0;
+        for (message, numeric) in ordered {
+            let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
+            if state.dismissals.contains_key(&slot) {
+                // Already dealt with. Not an error, and NOT a refresh of its position: the same
+                // rule the real store's `DO NOTHING` enforces.
+                continue;
+            }
+            state.dismissals.insert(slot, (numeric, at));
+            added += 1;
+        }
+        while state.dismissals.len() > self.retention.max_dismissals as usize {
+            let oldest = state
+                .dismissals
+                .iter()
+                .min_by_key(|(slot, (_, at))| (*at, (*slot).clone()))
+                .map(|(slot, _)| slot.clone());
+            match oldest {
+                Some(slot) => {
+                    state.dismissals.remove(&slot);
+                }
+                None => break,
+            }
+        }
+        Ok(added)
+    }
+
+    async fn restore(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<u64, StoreError> {
+        let mut state = self.lock();
+        armed(&mut state)?;
+        let mut removed = 0;
+        for message in messages {
+            let slot = (channel.as_str().to_owned(), message.as_str().to_owned());
+            if state.dismissals.remove(&slot).is_some() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
@@ -379,6 +463,7 @@ impl StateStore for FakeStore {
         state.conversations.clear();
         state.marks.clear();
         state.summaries.clear();
+        state.dismissals.clear();
         state.purges += 1;
         Ok(())
     }

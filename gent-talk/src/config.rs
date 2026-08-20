@@ -401,6 +401,7 @@ struct FileStorage {
     max_conversations: Option<u16>,
     max_turns_per_conversation: Option<u16>,
     max_summaries: Option<u32>,
+    max_dismissals: Option<u32>,
     retain_days: Option<u16>,
 }
 
@@ -770,6 +771,9 @@ fn storage_config(from_env: Option<&str>, file: FileStorage) -> Result<StorageCo
         max_summaries: file
             .max_summaries
             .unwrap_or(crate::store::DEFAULT_MAX_SUMMARIES),
+        max_dismissals: file
+            .max_dismissals
+            .unwrap_or(crate::store::DEFAULT_MAX_DISMISSALS),
         retain_days: file
             .retain_days
             .unwrap_or(crate::store::DEFAULT_RETAIN_DAYS),
@@ -791,6 +795,14 @@ fn storage_config(from_env: Option<&str>, file: FileStorage) -> Result<StorageCo
         return Err(ConfigError::Invalid {
             field: "storage.max_summaries".to_owned(),
             detail: "must be at least 1; zero would delete every cached summary as it was written"
+                .to_owned(),
+        });
+    }
+    if retention.max_dismissals == 0 {
+        return Err(ConfigError::Invalid {
+            field: "storage.max_dismissals".to_owned(),
+            detail: "must be at least 1; zero would put every message the owner dealt with back \
+                     in front of him the moment he cleared it"
                 .to_owned(),
         });
     }

@@ -2713,6 +2713,24 @@ function discordNode(message) {
   // against a list that the next poll may have replaced.
   reply.addEventListener("click", () => openReply(message));
   meta.append(reply);
+  // `#50 todo-view`. The non-gestural way to say "dealt with", and the one a keyboard can reach.
+  // On EVERY channel row rather than only on rows built while the mode is on: the mode is a
+  // filter over the same list, and a control that exists in one rendering and not another is a
+  // second code path waiting to disagree with the first. It is HIDDEN outside the mode.
+  const done = document.createElement("button");
+  done.className = "done-button";
+  done.setAttribute("type", "button");
+  done.setAttribute("title", "Mark as dealt with here. This does not change anything in Discord.");
+  done.textContent = "Done";
+  // Hidden OUTSIDE the mode rather than absent, and decided once, here, at construction. Every
+  // path that changes the mode re-reads the channel, so every row is built with the answer already
+  // known — a second pass over the existing rows to correct them would be a branch nothing ever
+  // takes, which is worse than no branch at all.
+  done.hidden = !todoMode;
+  done.addEventListener("click", () =>
+    guardQuietly(() => dismissMessages({ messages: [String(message.id)] }))()
+  );
+  meta.append(done);
   return li;
 }
 
@@ -3170,6 +3188,13 @@ async function pullEnd() {
 let discordNewestId = null;
 
 async function loadDiscord(options) {
+  // `#50 todo-view`. Every path that re-reads the channel comes through here — the background
+  // poll, Refresh, entering the view, changing channel — so the mode is honoured HERE rather than
+  // at four call sites, one of which would eventually be forgotten and overwrite the filtered
+  // list with the unfiltered one.
+  if (todoMode) {
+    return loadTodo(options);
+  }
   const keepPosition = Boolean(options && options.keepPosition);
   const channel = el("discord-channel").value;
   if (!channel) {
@@ -3217,6 +3242,213 @@ async function loadDiscord(options) {
   } finally {
     discordFetchInFlight = false;
   }
+}
+
+// --- the to-do view: what you have not dealt with yet ---------------------------------------------
+//
+// `#50 todo-view`. A long backlog of assistant messages is a to-do list in practice, and until now
+// nothing on this page could tell the ones that still want attention from the ones already handled.
+//
+// A SUB-TOGGLE of the channel view rather than a third tab, because it is the same list filtered.
+// Turning it on reads a DIFFERENT route — `/todo`, which is the recent window minus what has been
+// dealt with — rather than filtering the rows already on screen. That is deliberate: the walk-back
+// cursor belongs to the unfiltered channel, and a filtered list paged by an unfiltered cursor would
+// step over messages without saying so. So `#load-older` is absent in this mode, and the view is
+// honestly the recent window.
+//
+// THE ONE THING THIS MODE HAS TO SAY OUT LOUD, from `#61 unread-status`: this read state is OURS.
+// Discord shares none with a bot, so nothing here is read from the Discord app and nothing here is
+// written back to it. `#inbox-note` carries the server's own sentence, quoted rather than rewritten
+// here, so the page and the server cannot come to describe the posture differently.
+//
+// WHAT IS NOT HERE, and why. The issue asks for a SWIPE to dismiss and a PRESS-AND-HOLD to declare
+// bankruptcy. Those are a gesture layer — horizontal intent disambiguated from vertical, on the one
+// list this page scrolls — and they are a change of their own; this lands the acts themselves, each
+// reachable by a control a keyboard can also get to, so the gestures become a second way in rather
+// than the only way. It also asks for a message to leave the list when it is REPLIED to; that is
+// derived state and needs a reply reference on the server's Message, which is a wire-format change.
+// Both are follow-ups, and until the second one lands "dealt with" here is always DECLARED — which
+// is why nothing in this file has to decide what happens when derived and declared disagree.
+
+/** Is the reader looking at the to-do list rather than the whole channel? Session-only. */
+let todoMode = false;
+
+/**
+ * The exact set the last dismissal cleared, so the undo restores that and nothing else.
+ *
+ * Not a count and not "the last N": by the time the reader presses undo, N may name a different
+ * set. Held as the server reported it, which is also what makes undoing a BULK clear exact.
+ */
+let lastDismissal = null;
+
+/** How many the backlog control is about to clear, so it can say so before it does it. */
+let backlogSize = 0;
+
+function renderTodoControls() {
+  // `aria-pressed` and nothing else: the WORD does not change, because "To do" names where the
+  // control takes you in both directions and a toggle that renames itself to its own opposite is
+  // the ambiguity every mute button in history has had. web/voice.css draws the pressed state off
+  // this same attribute, so the state is said twice — to a screen reader and to an eye — from one
+  // source.
+  el("todo-filter").setAttribute("aria-pressed", todoMode ? "true" : "false");
+  el("inbox-note").hidden = !todoMode;
+  const clear = el("clear-backlog");
+  clear.hidden = !todoMode || backlogSize === 0;
+  clear.textContent = backlogIsArmed()
+    ? `Clear ${backlogSize}?`
+    : `Clear the backlog (${backlogSize})`;
+  clear.className = backlogIsArmed() ? "chip armed" : "chip";
+  el("undo-dismiss").hidden = lastDismissal === null;
+}
+
+// Bulk and destructive, so it asks twice — the same armed idiom the Clear control on the dock
+// uses, and the same window, because a reader who has learnt one has learnt the other.
+let backlogArmedTimer = null;
+const backlogIsArmed = () => backlogArmedTimer !== null;
+
+function disarmBacklog() {
+  if (backlogArmedTimer !== null) {
+    clearTimeout(backlogArmedTimer);
+    backlogArmedTimer = null;
+  }
+  renderTodoControls();
+}
+
+function armBacklog() {
+  if (backlogArmedTimer !== null) {
+    clearTimeout(backlogArmedTimer);
+  }
+  backlogArmedTimer = setTimeout(disarmBacklog, CLEAR_ARMED_MS);
+  renderTodoControls();
+}
+
+/**
+ * Read the to-do list and put it on screen.
+ *
+ * Shares `discordFetchInFlight` with `loadDiscord` rather than having a flag of its own: they
+ * write to the same list, and two reads racing to `replaceChildren` is how a view ends up showing
+ * a mixture of two answers.
+ */
+async function loadTodo(options) {
+  const keepPosition = Boolean(options && options.keepPosition);
+  const channel = el("discord-channel").value;
+  if (!channel) {
+    setStatus("no channel to read — this server has none configured.");
+    return;
+  }
+  if (discordFetchInFlight) return;
+  discordFetchInFlight = true;
+  const area = el("scroll-area");
+  const wasAtNewest = atBottom(area);
+  const previousTop = area.scrollTop;
+  try {
+    const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/todo`);
+    const messages = payload.messages || [];
+    const list = el("discord-log");
+    list.replaceChildren(...messages.map(discordNode));
+    // The walk back belongs to the UNFILTERED channel. Leaving a cursor armed here would let a
+    // scroll to the top prepend unfiltered rows into a filtered list.
+    discordMoreAbove = false;
+    discordOlderCursor = null;
+    renderOlderControl();
+    backlogSize = messages.length;
+    // Quoted, never rewritten: `#61 unread-status` is one posture and it is stated on the server.
+    el("inbox-note").textContent = payload.read_state_notice || "";
+    renderChannelSeam(todoSummary(payload));
+    renderTodoControls();
+    if (keepPosition && !wasAtNewest) {
+      area.scrollTop = previousTop;
+    } else {
+      scrollToNewest();
+      setJumpNewest(false, "discord");
+    }
+    renderScrollTools();
+    requestVisibleSummaries();
+  } finally {
+    discordFetchInFlight = false;
+  }
+}
+
+/**
+ * What the head of the to-do list says about itself.
+ *
+ * "9 of 30" rather than "9 messages": the second reads as the size of the channel, and the whole
+ * point of this view is that it is a SUBSET. `complete` is `#62 message-count-accuracy` again —
+ * the window is the channel's own only when the server says the set is whole.
+ */
+function todoSummary(payload) {
+  const left = (payload.messages || []).length;
+  const window = typeof payload.window === "number" ? payload.window : left;
+  const label = payload.channel ? payload.channel.label : "this channel";
+  if (left === 0) {
+    return `nothing left to deal with in ${label}`;
+  }
+  const of = payload.complete === true ? `of ${window}` : `of the ${window} most recent`;
+  return `${left} ${of} in ${label} still want attention`;
+}
+
+/** Mark messages as dealt with, remember the exact set, and re-read. */
+async function dismissMessages(body) {
+  const channel = el("discord-channel").value;
+  const payload = await api(`/api/v1/channels/${encodeURIComponent(channel)}/dismiss`, {
+    method: "POST",
+    body,
+  });
+  lastDismissal = { channel, messages: payload.messages || [] };
+  await loadTodo({ keepPosition: true });
+  const count = lastDismissal.messages.length;
+  setStatus(
+    `${count} message${count === 1 ? "" : "s"} marked as dealt with here — not in Discord.`
+  );
+  renderTodoControls();
+}
+
+/** Put back exactly what the last dismissal cleared. */
+async function undoDismissal() {
+  if (lastDismissal === null) {
+    return;
+  }
+  const undoing = lastDismissal;
+  // Cleared BEFORE the request, so a second tap on a slow connection cannot restore twice — and
+  // so a failure below cannot leave the chip offering an undo that has already happened.
+  lastDismissal = null;
+  renderTodoControls();
+  await api(`/api/v1/channels/${encodeURIComponent(undoing.channel)}/restore`, {
+    method: "POST",
+    body: { messages: undoing.messages },
+  });
+  await loadTodo({ keepPosition: true });
+  setStatus(`${undoing.messages.length} back in the list.`);
+}
+
+/** Declare bankruptcy on everything currently in the list. Two taps, and it says the count. */
+async function clearBacklog() {
+  const rows = [...el("discord-log").children];
+  if (rows.length === 0) {
+    return;
+  }
+  if (!backlogIsArmed()) {
+    armBacklog();
+    setStatus(`Tap again to clear ${rows.length} — undo will be offered afterwards.`);
+    return;
+  }
+  disarmBacklog();
+  // THROUGH the newest row on screen, so the server decides the boundary from its own ordering
+  // rather than from a list of ids this page assembled. The boundary is included.
+  await dismissMessages({ through: rows[rows.length - 1].getAttribute("data-id") });
+}
+
+function setTodoMode(on) {
+  todoMode = on;
+  disarmBacklog();
+  // An undo belongs to the act it undoes, and leaving the view is the reader moving on. Keeping
+  // it would offer to restore messages into a list they are no longer looking at.
+  lastDismissal = null;
+  if (!on) {
+    backlogSize = 0;
+  }
+  renderTodoControls();
+  guardQuietly(() => (on ? loadTodo() : loadDiscord()))();
 }
 
 // --- replying to a channel message -------------------------------------------------------------
@@ -4276,6 +4508,9 @@ el("discord-channel").addEventListener(
 );
 el("load-older").addEventListener("click", guardQuietly(loadOlder));
 el("collapse-all").addEventListener("click", collapseAll);
+el("todo-filter").addEventListener("click", () => setTodoMode(!todoMode));
+el("clear-backlog").addEventListener("click", guardQuietly(clearBacklog));
+el("undo-dismiss").addEventListener("click", guardQuietly(undoDismissal));
 el("summarise").addEventListener("click", () => setSummaryMode(!summaryMode));
 el("jump-newest").addEventListener("click", scrollToNewest);
 // The chip is an offer to go somewhere the reader may simply go themselves. Once they are there it

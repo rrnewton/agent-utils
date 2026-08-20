@@ -162,6 +162,24 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
             None,
         ),
+        // `#50 todo-view`. The to-do list is the owner's own inbox state, and the two acts that
+        // change it are durable writes. All three belong in this table for the same reason
+        // everything above does.
+        (
+            "GET",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+            Some(serde_json::json!({"messages": ["1000000000000000200"]})),
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/restore"),
+            Some(serde_json::json!({"messages": ["1000000000000000200"]})),
+        ),
     ];
     for (method, uri, body) in routes {
         let (status, payload) = call(&harness, method, uri, None, body.clone()).await;
@@ -1087,6 +1105,20 @@ async fn the_read_token_cannot_reach_a_transcript_or_move_a_mark() {
             format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
             None,
         ),
+        // `#50 todo-view`. Marking something dealt with is a durable write another device reads
+        // back, which is a strictly larger capability than any read on this server — so the read
+        // token, the one pasted into a hosted agent, may not do it. It MAY look; see the control
+        // in `a_read_token_may_look_at_the_to_do_list_and_may_not_change_it`.
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+            Some(serde_json::json!({"messages": ["1000000000000000200"]})),
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/restore"),
+            Some(serde_json::json!({"messages": ["1000000000000000200"]})),
+        ),
     ];
     for (method, uri, body) in forbidden {
         let (status, payload) = call(&harness, method, uri, Some(READ_TOKEN), body.clone()).await;
@@ -1230,7 +1262,7 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
     assert_eq!(status, StatusCode::OK, "{payload}");
     assert_eq!(
         payload["purged"],
-        serde_json::json!(["conversations", "read_marks", "summaries"]),
+        serde_json::json!(["conversations", "read_marks", "summaries", "dismissals"]),
         "the answer has to name what it erased: {payload}"
     );
 
@@ -1259,6 +1291,17 @@ async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() 
         store.cached_summaries(),
         0,
         "the cached summaries survived the purge, and those are third parties' text"
+    );
+    // `#50 todo-view`. The fourth table, checked separately for the same reason the other three
+    // are: an erase that took everything except the record of what the owner had dealt with would
+    // pass every assertion above.
+    assert!(
+        store
+            .dismissals(&ChannelId(READ_CHANNEL.to_owned()))
+            .await
+            .expect("dismissals")
+            .is_empty(),
+        "the inbox overlay survived the purge"
     );
 
     // And the store is still open: a purge that broke the server would be a restart, not an
@@ -1635,4 +1678,210 @@ async fn a_stored_conversation_with_nothing_spoken_in_it_replays_nothing() {
     assert_eq!(payload["enabled"], true);
     assert_eq!(payload["included"], 0);
     assert_eq!(payload["text"], "");
+}
+
+// --- the to-do view over HTTP -------------------------------------------------------------------
+//
+// `#50 todo-view`. The behaviour lives in `tests/todo.rs`, against `ops`. What is tested HERE is
+// what only the HTTP layer decides: which credential may look and which may change, whether the
+// standing "this is not Discord's read state" notice really rides along on every answer, and what
+// a malformed request is told.
+
+/// A harness with a real store and a channel with three messages in it, newest last.
+fn todo_harness() -> (
+    Harness,
+    std::sync::Arc<gent_talk::store::fake::FakeStore>,
+    Vec<String>,
+) {
+    let (harness, store) = store_harness();
+    let channel = ChannelId(WRITE_CHANNEL.to_owned());
+    let ids = (0..3)
+        .map(|n| {
+            harness
+                .discord
+                .seed(&channel, "codex-eng", &format!("message {n}"))
+                .0
+        })
+        .collect();
+    (harness, store, ids)
+}
+
+#[tokio::test]
+async fn a_read_token_may_look_at_the_to_do_list_and_may_not_change_it() {
+    // The read token is the one pasted into a hosted voice agent. It may SEE the backlog — that is
+    // the same text `/messages` already serves it — and it may not clear one, because a durable
+    // write reachable from the least-trusted credential is what the two-token split exists to
+    // prevent. This is the LOOKING half; the refusals are in the table above.
+    let (harness, _store, ids) = todo_harness();
+
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["messages"].as_array().expect("messages").len(), 3);
+
+    // THE CONTROL for the refusals: the same body with the WRITE token goes through, so those
+    // are about the scope rather than about a route that never works.
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "messages": [ids[0]] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["count"], 1);
+    assert_eq!(payload["messages"], serde_json::json!([ids[0]]));
+}
+
+#[tokio::test]
+async fn every_to_do_answer_says_that_this_read_state_is_not_discords() {
+    // Said once, plainly, on every answer — including the LISTING, not only the mutations. The
+    // alternative is that the owner discovers it from a divergence: a badge in the Discord app
+    // that will not clear, or a message gent-talk still calls undealt-with that he answered on
+    // his laptop an hour ago. Neither is broken. They are different records.
+    let (harness, _store, ids) = todo_harness();
+    let calls: Vec<(&str, String, Option<Value>)> = vec![
+        (
+            "GET",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+            None,
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+            Some(serde_json::json!({ "messages": [ids[0]] })),
+        ),
+        (
+            "POST",
+            format!("/api/v1/channels/{WRITE_CHANNEL}/restore"),
+            Some(serde_json::json!({ "messages": [ids[0]] })),
+        ),
+    ];
+    for (method, uri, body) in calls {
+        let (status, payload) = call(&harness, method, &uri, Some(WRITE_TOKEN), body).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {payload}");
+        let notice = payload["read_state_notice"].as_str().unwrap_or_default();
+        assert_eq!(
+            notice,
+            gent_talk::store::INBOX_NOTICE,
+            "{uri} does not carry the standing statement about whose read state this is"
+        );
+        // Both directions, by name, because a notice stating only one of them would leave the
+        // other to be discovered the hard way.
+        assert!(
+            notice.contains("nothing here is read from Discord")
+                && notice.contains("nothing here is written"),
+            "the notice states only one direction: {notice}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bankruptcy_over_http_clears_through_the_boundary_and_hands_back_its_own_undo() {
+    let (harness, _store, ids) = todo_harness();
+    let (status, cleared) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "through": ids[1] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert_eq!(cleared["count"], 2, "the boundary must be included");
+    assert_eq!(cleared["messages"], serde_json::json!([ids[0], ids[1]]));
+
+    let (_status, left) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(left["messages"].as_array().expect("messages").len(), 1);
+    assert_eq!(
+        left["window"], 3,
+        "the window size is what makes 1 readable"
+    );
+
+    // The undo is built from the ANSWER, not from a count, so it restores exactly that set.
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/restore"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({ "messages": cleared["messages"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let (_status, left) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(left["messages"].as_array().expect("messages").len(), 3);
+}
+
+#[tokio::test]
+async fn a_dismissal_that_names_both_ways_of_choosing_is_refused_rather_than_guessed() {
+    // Guessing would be wrong half the time, and the wrong half CLEARS A BACKLOG. An empty
+    // request is refused for the neighbouring reason: reporting success for having done nothing
+    // is how a client comes to believe its undo has something to restore when it has not.
+    let (harness, _store, ids) = todo_harness();
+    for body in [
+        serde_json::json!({ "messages": [ids[0]], "through": ids[2] }),
+        serde_json::json!({}),
+        serde_json::json!({ "messages": [] }),
+    ] {
+        let (status, payload) = call(
+            &harness,
+            "POST",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/dismiss"),
+            Some(WRITE_TOKEN),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {payload}");
+        assert_eq!(payload["error"], "bad_request", "{body}: {payload}");
+    }
+    let (_status, left) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/todo"),
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(
+        left["messages"].as_array().expect("messages").len(),
+        3,
+        "a refused request cleared something anyway"
+    );
+
+    // ...and the same on the way back. An empty restore answering 200 is how a client comes to
+    // believe an undo happened: it clears its own "you can undo this" affordance on the success,
+    // and the messages stay gone with nothing left offering to bring them back.
+    for body in [serde_json::json!({}), serde_json::json!({ "messages": [] })] {
+        let (status, payload) = call(
+            &harness,
+            "POST",
+            &format!("/api/v1/channels/{WRITE_CHANNEL}/restore"),
+            Some(WRITE_TOKEN),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {payload}");
+        assert_eq!(payload["error"], "bad_request", "{body}: {payload}");
+    }
 }

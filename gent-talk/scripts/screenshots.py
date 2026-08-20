@@ -1614,6 +1614,59 @@ def _act_summary_mode(driver: Driver) -> None:
     )
 
 
+def _act_todo_view(driver: Driver) -> None:
+    """`#50 todo-view`: the channel filtered down to what has not been dealt with."""
+    _act_open_channel(driver)
+    driver.js(
+        "(() => { window.__beforeTodo = "
+        "document.querySelectorAll('#discord-log li').length; return window.__beforeTodo; })()"
+    )
+    driver.click("todo-filter")
+    driver.page.wait_for_function(
+        "() => document.getElementById('todo-filter').getAttribute('aria-pressed') === 'true' "
+        "&& (window.__text('inbox-note') || '').length > 0",
+        timeout=15_000,
+    )
+    # Deal with the oldest one, so the picture is of a list somebody has WORKED rather than of a
+    # filter that has been switched on and has done nothing yet. Through the DOM, because a real
+    # click would scroll the row into view and this frame is about the list at rest.
+    driver.js(
+        "(() => { const row = document.querySelector('#discord-log li'); "
+        "window.__dealtWith = row.getAttribute('data-id'); "
+        "row.querySelector('.done-button').click(); return window.__dealtWith; })()"
+    )
+    driver.page.wait_for_function(
+        "() => document.querySelectorAll('#discord-log li').length < window.__beforeTodo "
+        "&& !document.getElementById('undo-dismiss').hidden",
+        timeout=15_000,
+    )
+    driver.settle(300)
+    driver.js(
+        "(() => { window.__afterTodo = "
+        "document.querySelectorAll('#discord-log li').length; return window.__afterTodo; })()"
+    )
+
+
+def _act_bankruptcy_armed(driver: Driver) -> None:
+    """The bulk clear with one tap on it: saying how many, before it has done anything."""
+    _act_open_channel(driver)
+    driver.click("todo-filter")
+    driver.page.wait_for_function(
+        "() => !document.getElementById('clear-backlog').hidden", timeout=15_000
+    )
+    driver.js(
+        "(() => { window.__backlog = "
+        "document.querySelectorAll('#discord-log li').length; return window.__backlog; })()"
+    )
+    driver.js("(() => { document.getElementById('clear-backlog').click(); })()")
+    driver.page.wait_for_function(
+        "() => (window.__text('clear-backlog') || '').trim().endsWith('?')", timeout=5_000
+    )
+    # Promptly: the arming lapses after a few seconds, and a picture taken after that would be of
+    # a control at rest filed under a name that says armed.
+    driver.settle(150)
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -2878,6 +2931,65 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="33-todo-view",
+        what="the channel filtered to what you have not dealt with, one message already cleared",
+        act=_act_todo_view,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the filter says it is on",
+                "document.getElementById('todo-filter').getAttribute('aria-pressed') === 'true'",
+            ),
+            (
+                "a message the reader dealt with really left the list",
+                "window.__afterTodo > 0 && window.__afterTodo < window.__beforeTodo && "
+                "![...document.querySelectorAll('#discord-log li')]"
+                ".some((n) => n.getAttribute('data-id') === window.__dealtWith)",
+            ),
+            (
+                # THE thing this frame exists to settle, and the reason it is a picture rather
+                # than an assertion: `#61 unread-status` says this has to be said in the
+                # interface, and whether a sentence is legible on a 375px phone above a list is
+                # not a question any fixture can answer.
+                "the page says on screen that this read state is not Discord's",
+                "/Discord/.test(window.__text('inbox-note') || '') && "
+                "window.__visible('inbox-note')",
+            ),
+            ("there is a way back from the dismissal", "window.__visible('undo-dismiss')"),
+            (
+                "every remaining row offers the act, and none of them is clipped past the edge",
+                "(() => { const rows = [...document.querySelectorAll('#discord-log li')]; "
+                "const pane = document.getElementById('pane-discord').getBoundingClientRect(); "
+                "return rows.length > 0 && rows.every((n) => { "
+                "const b = n.querySelector('.done-button'); "
+                "return b && b.getBoundingClientRect().right <= pane.right + 1; }); })()",
+            ),
+        ),
+    ),
+    Scene(
+        name="34-bankruptcy-armed",
+        what="the bulk clear with one tap on it: saying how many it is about to take, before it does",
+        act=_act_bankruptcy_armed,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                # The whole content of this frame. A bulk destructive control that did not say
+                # how much it was about to take is the defect; one that says it only AFTER acting
+                # is the same defect with a receipt.
+                "the armed control names the number it is about to clear",
+                "(window.__text('clear-backlog') || '').includes(window.__backlog + '?')",
+            ),
+            (
+                "nothing has been cleared yet: the backlog is all still there",
+                "document.querySelectorAll('#discord-log li').length === window.__backlog",
+            ),
+            (
+                "and it is drawn as armed rather than merely relabelled",
+                "document.getElementById('clear-backlog').className.includes('armed')",
+            ),
+        ),
+    ),
 )
 
 
@@ -3194,7 +3306,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 32:
+    if len(SCENES) < 34:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -3232,7 +3344,11 @@ def check_state_controls() -> list[str]:
             "can say the handlers read what a browser really sends. `#49 cached-summaries` added "
             "the channel with its collapsed rows summarised, which is the only place the claim "
             "that a summarised row is SHORTER than a clamped one can be settled -- nothing "
-            "without a layout engine can compare two heights."
+            "without a layout engine can compare two heights. `#50 todo-view` added the last "
+            "two: the channel filtered to what has not been dealt with -- where the only "
+            "question that matters is whether the statement about whose read state this is fits "
+            "on a phone above the list -- and the bulk clear with one tap on it, which is the "
+            "frame that shows it saying how many it is about to take BEFORE it takes them."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -3386,6 +3502,13 @@ def check_state_controls() -> list[str]:
         # on screen" and is the exact wrong implementation, and a page that named a summariser
         # from a constant of its own would satisfy any check that only looked for words.
         "32-channel-summarised": ("__summarisedHeight", "Summaries by"),
+        # `#50 todo-view`. 33 is pinned BOTH to a message really leaving the list and to the
+        # read-state statement being on screen: the second is the whole of `#61 unread-status`,
+        # and a scene pinned only to the filter being on would be satisfied with it deleted. 34 is
+        # pinned to the NUMBER, because "the control is armed" is satisfied by a control that
+        # relabels itself and still does not say how much it is about to take.
+        "33-todo-view": ("__dealtWith", "inbox-note"),
+        "34-bankruptcy-armed": ("__backlog", "armed"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)

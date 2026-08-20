@@ -71,6 +71,18 @@ impl StateStore for DisabledStore {
         refuse()
     }
 
+    async fn dismissals(&self, _: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
+        refuse()
+    }
+
+    async fn dismiss(&self, _: &ChannelId, _: &[MessageId]) -> Result<u64, StoreError> {
+        refuse()
+    }
+
+    async fn restore(&self, _: &ChannelId, _: &[MessageId]) -> Result<u64, StoreError> {
+        refuse()
+    }
+
     async fn cached_summary(&self, _: &SummaryKey) -> Result<Option<String>, StoreError> {
         refuse()
     }
@@ -119,6 +131,15 @@ mod tests {
                 .await
                 .expect_err("mark read"),
             store.forget_read_mark(&channel).await.expect_err("unmark"),
+            store.dismissals(&channel).await.expect_err("dismissals"),
+            store
+                .dismiss(&channel, std::slice::from_ref(&message))
+                .await
+                .expect_err("dismiss"),
+            store
+                .restore(&channel, std::slice::from_ref(&message))
+                .await
+                .expect_err("restore"),
             store.purge_everything().await.expect_err("purge"),
         ];
         for error in errors {

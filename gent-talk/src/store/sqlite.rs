@@ -84,6 +84,28 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (version, channel_id, message_id, content_hash)
     ) STRICT;
     ",
+    // v3 — the per-message inbox overlay. `#50 todo-view`.
+    //
+    // This is the table `#61 unread-status` decided is OURS: Discord shares no read state with a
+    // bot, so "I have dealt with this one" exists nowhere else and is authored here. It holds NO
+    // message text — two snowflakes and an instant — which is why it is the one table in this
+    // file that the age bound does not reach: an age limit would put a message the owner cleared
+    // last month back in front of him for no reason he could see.
+    //
+    // `numeric` is the snowflake as an integer, so "everything through this message" is one
+    // indexed range rather than a comparison this code would have to do in Rust over every row.
+    // A snowflake that will not parse is refused at the door and never reaches this table.
+    "
+    CREATE TABLE dismissals (
+        channel_id   TEXT    NOT NULL,
+        message_id   TEXT    NOT NULL,
+        numeric      INTEGER NOT NULL,
+        at_ms        INTEGER NOT NULL,
+        PRIMARY KEY (channel_id, message_id)
+    ) STRICT;
+
+    CREATE INDEX dismissals_by_position ON dismissals (channel_id, numeric);
+    ",
 ];
 
 /// A [`StateStore`] backed by one SQLite file.
@@ -251,6 +273,48 @@ fn prune_summaries(
         )
         .map_err(backend)?;
     Ok(())
+}
+
+/// Keep the dismissal table under its ceiling, inside the caller's transaction.
+///
+/// ONE bound, not two, and the missing one is deliberate: see [`Retention::max_dismissals`]. The
+/// oldest marks go first, which is the right end — the reader is never shown a message old enough
+/// for its mark to have been evicted, because the window this filters is the recent one.
+fn prune_dismissals(
+    transaction: &rusqlite::Transaction<'_>,
+    retention: Retention,
+) -> Result<(), StoreError> {
+    transaction
+        .execute(
+            "DELETE FROM dismissals WHERE rowid NOT IN (
+                 SELECT rowid FROM dismissals ORDER BY at_ms DESC, rowid DESC LIMIT ?1
+             )",
+            [i64::from(retention.max_dismissals)],
+        )
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// Pair every id with its numeric snowflake, refusing the batch if any of them will not order.
+///
+/// All-or-nothing on purpose. A bulk dismissal that silently dropped the one id it could not read
+/// would report a count that does not match what the reader saw, and the undo built from that
+/// count would put back the wrong set.
+fn orderable(messages: &[MessageId]) -> Result<Vec<(MessageId, i64)>, StoreError> {
+    messages
+        .iter()
+        .map(|message| {
+            let numeric = message
+                .numeric()
+                .and_then(|raw| i64::try_from(raw).ok())
+                .ok_or_else(|| {
+                    StoreError::BadId(format!(
+                        "{message:?} is not a message snowflake, so this server cannot order it"
+                    ))
+                })?;
+            Ok((message.clone(), numeric))
+        })
+        .collect()
 }
 
 /// Delete whatever retention no longer allows, inside the caller's transaction.
@@ -544,6 +608,83 @@ impl StateStore for SqliteStore {
         .await
     }
 
+    async fn dismissals(&self, channel: &ChannelId) -> Result<Vec<MessageId>, StoreError> {
+        let channel = channel.clone();
+        self.with_connection(move |connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT message_id FROM dismissals WHERE channel_id = ?1
+                     ORDER BY numeric DESC",
+                )
+                .map_err(backend)?;
+            let rows = statement
+                .query_map([channel.as_str()], |row| row.get::<_, String>(0))
+                .map_err(backend)?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(MessageId(row.map_err(backend)?));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn dismiss(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<u64, StoreError> {
+        let channel = channel.clone();
+        let ordered = orderable(messages)?;
+        let retention = self.retention;
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let at = now_ms();
+            let mut added = 0_u64;
+            for (message, numeric) in &ordered {
+                // DO NOTHING, not DO UPDATE. Dismissing something twice must not move it, or the
+                // count below stops meaning "how many the reader actually cleared" and the
+                // retention queue would reorder itself under a repeated tap.
+                added += transaction
+                    .execute(
+                        "INSERT INTO dismissals (channel_id, message_id, numeric, at_ms)
+                         VALUES (?1, ?2, ?3, ?4)
+                         ON CONFLICT(channel_id, message_id) DO NOTHING",
+                        rusqlite::params![channel.as_str(), message.as_str(), numeric, at],
+                    )
+                    .map_err(backend)? as u64;
+            }
+            prune_dismissals(&transaction, retention)?;
+            transaction.commit().map_err(backend)?;
+            Ok(added)
+        })
+        .await
+    }
+
+    async fn restore(
+        &self,
+        channel: &ChannelId,
+        messages: &[MessageId],
+    ) -> Result<u64, StoreError> {
+        let channel = channel.clone();
+        let messages: Vec<MessageId> = messages.to_vec();
+        self.with_connection(move |connection| {
+            let transaction = connection.transaction().map_err(backend)?;
+            let mut removed = 0_u64;
+            for message in &messages {
+                removed += transaction
+                    .execute(
+                        "DELETE FROM dismissals WHERE channel_id = ?1 AND message_id = ?2",
+                        rusqlite::params![channel.as_str(), message.as_str()],
+                    )
+                    .map_err(backend)? as u64;
+            }
+            transaction.commit().map_err(backend)?;
+            Ok(removed)
+        })
+        .await
+    }
+
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let key = key.clone();
         self.with_connection(move |connection| {
@@ -619,6 +760,9 @@ impl StateStore for SqliteStore {
                 .map_err(backend)?;
             transaction
                 .execute("DELETE FROM summaries", [])
+                .map_err(backend)?;
+            transaction
+                .execute("DELETE FROM dismissals", [])
                 .map_err(backend)?;
             transaction.commit().map_err(backend)
         })
@@ -917,6 +1061,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_inbox_overlay_survives_the_store_being_closed_and_reopened() {
+        // THE property that distinguishes an overlay from a cache, and the reason `#50 todo-view`
+        // depends on `#48 transcript-storage`: a database inside a container image is storage
+        // until the first rebuild. Nothing in `store::fake` can make this claim.
+        let dir = TempDir::new("sqlite-dismissals");
+        let channel = ChannelId("1111111111".to_owned());
+        let dealt = MessageId("1000000000000000200".to_owned());
+        let left = MessageId("1000000000000000300".to_owned());
+        {
+            let store = store(&dir, Retention::default());
+            assert_eq!(
+                store
+                    .dismiss(&channel, std::slice::from_ref(&dealt))
+                    .await
+                    .expect("dismiss"),
+                1
+            );
+            // The second one is the control: without it, "the file remembers" is satisfied by a
+            // reopen that answers everything.
+            assert_eq!(
+                store
+                    .dismiss(&channel, std::slice::from_ref(&dealt))
+                    .await
+                    .expect("dismiss again"),
+                0,
+                "dismissing something twice reported a second change"
+            );
+        }
+
+        let reopened = store(&dir, Retention::default());
+        assert_eq!(
+            reopened.dismissals(&channel).await.expect("read"),
+            vec![dealt.clone()],
+            "the inbox overlay did not survive a restart, which makes it a cache"
+        );
+        assert!(
+            !reopened
+                .dismissals(&channel)
+                .await
+                .expect("read")
+                .contains(&left),
+            "a message nobody dismissed came back marked as dealt with"
+        );
+
+        // ...and the undo is durable too, which is the half a write-only overlay would fail.
+        assert_eq!(
+            reopened
+                .restore(&channel, std::slice::from_ref(&dealt))
+                .await
+                .expect("restore"),
+            1
+        );
+        drop(reopened);
+        assert!(
+            store(&dir, Retention::default())
+                .dismissals(&channel)
+                .await
+                .expect("read")
+                .is_empty(),
+            "an undo did not survive the restart the dismissal did"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dismissal_table_is_bounded_by_count_and_the_oldest_mark_goes_first() {
+        let dir = TempDir::new("sqlite-dismissal-bound");
+        let store = store(
+            &dir,
+            Retention {
+                max_dismissals: 2,
+                ..Retention::default()
+            },
+        );
+        let channel = ChannelId("1111111111".to_owned());
+        for n in 0..2_u64 {
+            store
+                .dismiss(
+                    &channel,
+                    &[MessageId(format!("100000000000000{:04}", 100 + n))],
+                )
+                .await
+                .expect("dismiss");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        store
+            .dismiss(&channel, &[MessageId("1000000000000000999".to_owned())])
+            .await
+            .expect("dismiss");
+        let held = store.dismissals(&channel).await.expect("read");
+        assert_eq!(held.len(), 2, "the ceiling did not hold");
+        assert!(
+            held.iter().any(|id| id.as_str() == "1000000000000000999"),
+            "the ceiling evicted the mark that was just made: {held:?}"
+        );
+        assert!(
+            !held.iter().any(|id| id.as_str() == "1000000000000000100"),
+            "the ceiling evicted the newest mark instead of the oldest: {held:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_dismissal_is_never_collected_by_age_the_way_an_old_summary_is() {
+        // The deliberate asymmetry in `Retention`, and the ONE test that can see it. A dismissal
+        // written now is inside any age limit expressible in whole days, so this backdates the row
+        // by a hundred days in the file itself and then triggers a prune — which is what a real
+        // deployment does after three months of use. An age bound here would put a message the
+        // owner cleared in the spring back in front of him in the summer, and nothing on the row
+        // would say why.
+        let dir = TempDir::new("sqlite-dismissal-age");
+        let store = store(
+            &dir,
+            Retention {
+                retain_days: 30,
+                ..Retention::default()
+            },
+        );
+        let channel = ChannelId("1111111111".to_owned());
+        let ancient = MessageId("1000000000000000100".to_owned());
+        store
+            .dismiss(&channel, std::slice::from_ref(&ancient))
+            .await
+            .expect("dismiss");
+        {
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard
+                .execute(
+                    "UPDATE dismissals SET at_ms = ?1",
+                    [now_ms() - 100 * 86_400_000],
+                )
+                .expect("backdate");
+        }
+
+        // THE CONTROL, in the same file under the same retention: a summary of the same age IS
+        // collected. Without it this test would pass on a store that prunes nothing at all.
+        let key = SummaryKey {
+            channel: channel.clone(),
+            message: ancient.clone(),
+            content_hash: 7,
+            version: "current".to_owned(),
+        };
+        store.cache_summary(&key, "old text").await.expect("cache");
+        {
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard
+                .execute(
+                    "UPDATE summaries SET made_at_ms = ?1",
+                    [now_ms() - 100 * 86_400_000],
+                )
+                .expect("backdate");
+        }
+
+        // One more write of each, which is when every bound in this store is applied.
+        store
+            .dismiss(&channel, &[MessageId("1000000000000000200".to_owned())])
+            .await
+            .expect("dismiss");
+        let fresh = SummaryKey {
+            message: MessageId("1000000000000000200".to_owned()),
+            ..key.clone()
+        };
+        store
+            .cache_summary(&fresh, "new text")
+            .await
+            .expect("cache");
+
+        assert!(
+            store
+                .dismissals(&channel)
+                .await
+                .expect("read")
+                .contains(&ancient),
+            "an age bound reached the inbox overlay and resurrected a message the owner cleared"
+        );
+        assert_eq!(
+            store.cached_summary(&key).await.expect("read"),
+            None,
+            "the control failed: the age bound is not collecting anything at all, so the \
+             assertion above says nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn a_read_mark_refuses_an_id_it_cannot_order() {
         let dir = TempDir::new("sqlite-badmark");
         let store = store(&dir, Retention::default());
@@ -943,10 +1276,18 @@ mod tests {
             .mark_read(&channel, &MessageId("1000000000000000200".to_owned()))
             .await
             .expect("mark");
+        store
+            .dismiss(&channel, &[MessageId("1000000000000000300".to_owned())])
+            .await
+            .expect("dismiss");
 
         store.purge_everything().await.expect("purge");
         assert!(store.conversations().await.expect("list").is_empty());
         assert!(store.read_marks().await.expect("marks").is_empty());
+        assert!(
+            store.dismissals(&channel).await.expect("read").is_empty(),
+            "the operator's erase left the record of what he had dealt with behind"
+        );
 
         store
             .append_turn(&id("conv"), &Turn::now(Speaker::You, "still working"))
@@ -1250,6 +1591,15 @@ mod tests {
             store.cached_summary(&key).await.expect("hit").as_deref(),
             Some("it works")
         );
+        // ...and so does the one after it, which is the whole point of a LADDER: a file at v1
+        // has to arrive at the newest shape, not at the shape of the migration that came next.
+        store
+            .dismiss(
+                &ChannelId("1111111111".to_owned()),
+                &[MessageId("1000000000000000200".to_owned())],
+            )
+            .await
+            .expect("the v3 table has to exist after the upgrade too");
         // And the older table's data is still reachable, which is the half a DROP-and-recreate
         // migration would silently lose.
         store

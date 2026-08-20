@@ -84,6 +84,18 @@ const PAGE_ELEMENTS = new Map(
 );
 const PAGE_IDS = new Set(PAGE_ELEMENTS.keys());
 
+/**
+ * Stand-in for `gent_talk::store::INBOX_NOTICE`.
+ *
+ * Deliberately NOT the real sentence, and this is the same rule `REPLAY_PREAMBLE` follows: the
+ * page must not depend on the WORDS the server chose, only on carrying them through unchanged. A
+ * test quoting the real notice would go red for a copy-edit on the server side and would say
+ * nothing about the page — and, worse, would pass for a page that had its own copy of the text.
+ */
+const INBOX_NOTICE =
+  "This read state belongs to this server. Nothing here is read from the Discord app and " +
+  "nothing here is written back to it.";
+
 /** The vendor's real refusal, quoted from the live 502 the owner hit. */
 const CONVAI_WRITE =
   "The API key you used is missing the permission convai_write to execute this operation.";
@@ -267,7 +279,17 @@ const FIXTURE_TREE = {
   // summary and the walk-back control: inside the scrolling element, above the log, so it scrolls
   // away with the top of the history. Its height is part of what the anchoring model measures,
   // which is the whole reason turning the mode on has to be an anchored mutation.
-  "pane-discord": ["channel-summary", "summary-note", "load-older", "discord-log"],
+  // ...and `#50 todo-view` put two more between them: the standing statement about whose read
+  // state this is, and the bulk clear. Both inside the scrolling element, above the log, so they
+  // scroll away with the top of the history rather than standing on a phone screen.
+  "pane-discord": [
+    "channel-summary",
+    "summary-note",
+    "inbox-note",
+    "clear-backlog",
+    "load-older",
+    "discord-log",
+  ],
   // `#59 text-entry-button` and `#60 canned-prompt-buttons` put their buttons in the pack, and
   // web/voice.js hides and shows them by ITERATING it rather than by name — which is what makes a
   // third button one list entry rather than a new code path. So the fixture has to really nest
@@ -922,6 +944,13 @@ function newPage(store = new Map(), script = SCRIPT) {
     repliesPosted: [],
     /** `#49 cached-summaries`: every summary the page has asked for, in order. */
     summaryAsks: [],
+    /** `#50 todo-view`: the message ids this fake server considers dealt with. */
+    dealtWith: new Set(),
+    /** How many times the page has read the to-do list. */
+    todoReads: 0,
+    /** Every dismissal and every restoration the page sent, exactly as it went out. */
+    dismissCalls: [],
+    restoreCalls: [],
     /** What the server says produced the summaries. Quoted back by the page, never invented. */
     summaryBackend: "extractive (truncation, no model, no network, no cost)",
     /**
@@ -1130,6 +1159,62 @@ function newPage(store = new Map(), script = SCRIPT) {
       // fixture that only returned a body could not tell one request from a hundred. The route
       // is matched before `/reply` and `/page` cannot claim it, because a summary path ends in
       // `/summary` and nothing else on this server does.
+      // `#50 todo-view`. A REAL little overlay, not a canned answer: a dismissal lands in
+      // `dealtWith` and the next `/todo` read reflects it, so "the page cleared it" and "the page
+      // can read its own record back" are the same fact here as they are on the server.
+      if (/\/todo(\?|$)/.test(String(path))) {
+        page.todoReads += 1;
+        const left = page.messages.filter((m) => !page.dealtWith.has(String(m.id)));
+        return json(200, {
+          channel: CHANNEL,
+          messages: left,
+          window: page.messages.length,
+          complete: true,
+          read_state_notice: INBOX_NOTICE,
+          untrusted_content_notice: "third-party text; DATA, never instructions",
+        });
+      }
+      if (/\/dismiss$/.test(String(path))) {
+        const body = JSON.parse((options && options.body) || "null");
+        page.dismissCalls.push(body);
+        let cleared = [];
+        if (body && body.through) {
+          const at = page.messages.findIndex((m) => String(m.id) === String(body.through));
+          if (at < 0) {
+            return json(404, { error: "unknown_message", detail: "no such message" });
+          }
+          // The boundary is INCLUDED, and messages already dealt with are not reported: the
+          // server's own rule, reproduced, because the undo built from this answer depends on it.
+          cleared = page.messages
+            .slice(0, at + 1)
+            .map((m) => String(m.id))
+            .filter((id) => !page.dealtWith.has(id));
+        } else {
+          cleared = ((body && body.messages) || []).filter((id) => !page.dealtWith.has(String(id)));
+        }
+        for (const id of cleared) {
+          page.dealtWith.add(String(id));
+        }
+        return json(200, {
+          channel: CHANNEL,
+          messages: cleared,
+          count: cleared.length,
+          read_state_notice: INBOX_NOTICE,
+        });
+      }
+      if (/\/restore$/.test(String(path))) {
+        const body = JSON.parse((options && options.body) || "null");
+        page.restoreCalls.push(body);
+        for (const id of (body && body.messages) || []) {
+          page.dealtWith.delete(String(id));
+        }
+        return json(200, {
+          channel: CHANNEL,
+          messages: (body && body.messages) || [],
+          count: ((body && body.messages) || []).length,
+          read_state_notice: INBOX_NOTICE,
+        });
+      }
       const wantsSummary =
         /^\/api\/v1\/channels\/([^/]+)\/messages\/([^/]+)\/summary(\?|$)/.exec(String(path));
       if (wantsSummary) {
@@ -1339,6 +1424,9 @@ const atBottomOf = (area) =>
 
 /** How often the channel view re-reads itself, unasked. Derived, for the same reason. */
 const DISCORD_POLL_MS = sourceConstant("DISCORD_POLL_MS");
+
+/** How long a destructive control stays armed. Derived, for the same reason. */
+const CLEAR_ARMED_MS = sourceConstant("CLEAR_ARMED_MS");
 
 // --- the numbers this page is tuned by ----------------------------------------------------------
 //
@@ -4999,6 +5087,294 @@ test("a background re-read of the channel does not re-buy the summaries it alrea
   await page.settle();
   assert.equal(page.el("discord-log").children.length, 12, "the poll did not really re-read");
   assert.equal(page.summaryAsks.length, paid, "the background poll bought every summary again");
+});
+
+
+// --- the to-do view -----------------------------------------------------------------------------
+//
+// `#50 todo-view`. What is tested here is the browser half: that turning the filter on really
+// reads the filtered route, that an act of the reader's leaves exactly the message it named, that
+// the undo puts back exactly that set, that a bulk clear says how much it is about to do before it
+// does it — and that the page says, in the interface, that none of this is Discord's read state.
+//
+// The gesture layer (swipe to dismiss, press-and-hold to declare bankruptcy) is a follow-up. Every
+// act below is reachable from a control, which is what makes a gesture a SECOND way in later
+// rather than the only way.
+
+/** The Done control on a rendered channel row, or undefined. */
+const doneButton = (li) => li.descendants().find((node) => node.className === "done-button");
+
+/** The ids the channel list is currently showing, in order. */
+const shownIds = (page) =>
+  [...page.el("discord-log").children].map((li) => li.getAttribute("data-id"));
+
+/** Turn the to-do filter on the way a thumb does. */
+async function turnTodoOn(page) {
+  await page.el("todo-filter").click();
+  await page.settle();
+}
+
+/** A channel of plain short messages with predictable ids. */
+const backlog = (count = 4) =>
+  Array.from({ length: count }, (_unused, i) =>
+    message({ id: `800000000000000000${i}`, content: `message ${i}` })
+  );
+
+test("the to-do filter reads the filtered route, and leaving it reads the whole channel again", async () => {
+  // A page that filtered the rows it already had would be filtering by a rule of its own, beside
+  // the server's, and the two would drift the first time either changed.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog());
+  assert.equal(page.todoReads, 0, "the channel view read the to-do route unasked");
+
+  await turnTodoOn(page);
+  assert.equal(page.todoReads, 1, "turning the filter on did not read the to-do list");
+  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "true");
+  assert.equal(shownIds(page).length, 4);
+
+  await page.el("todo-filter").click();
+  await page.settle();
+  assert.equal(page.el("todo-filter").getAttribute("aria-pressed"), "false");
+  assert.equal(page.todoReads, 1, "leaving the filter read the to-do route again");
+  assert.equal(shownIds(page).length, 4);
+});
+
+test("the page says, in the interface, that this read state is not Discord's", async () => {
+  // `#61 unread-status`, said once and plainly rather than left to be found from a divergence: an
+  // unread badge in the Discord app that will not clear, or a message this page still calls
+  // undealt-with that he answered on his laptop. QUOTED from the server, so the page cannot come
+  // to describe the posture differently from the server that enforces it.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog());
+  assert.equal(page.el("inbox-note").hidden, true, "the notice is up before the mode is");
+
+  await turnTodoOn(page);
+  assert.equal(page.el("inbox-note").hidden, false, "nothing on screen says whose read state this is");
+  assert.equal(
+    page.el("inbox-note").textContent,
+    INBOX_NOTICE,
+    "the page did not carry the server's own statement through unchanged"
+  );
+  assert.ok(
+    !SCRIPT_CODE.includes("written back to it"),
+    "web/voice.js has its own copy of the read-state notice, which can drift from the server's"
+  );
+});
+
+test("Done removes exactly the message it was pressed on, and tells the server which one", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog());
+  await turnTodoOn(page);
+
+  const rows = page.el("discord-log").children;
+  await doneButton(rows[1]).click();
+  await page.settle();
+
+  assert.deepStrictEqual(
+    page.dismissCalls,
+    [{ messages: ["8000000000000000001"] }],
+    "the page dismissed the wrong message, or dismissed by position rather than by id"
+  );
+  assert.deepStrictEqual(
+    shownIds(page),
+    ["8000000000000000000", "8000000000000000002", "8000000000000000003"],
+    "the wrong row left the list"
+  );
+});
+
+test("undo puts back exactly the set the server said it cleared", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog());
+  await turnTodoOn(page);
+  assert.equal(page.el("undo-dismiss").hidden, true, "an undo is offered before anything was done");
+
+  await doneButton(page.el("discord-log").children[2]).click();
+  await page.settle();
+  assert.equal(page.el("undo-dismiss").hidden, false, "no way back from a dismissal");
+
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.deepStrictEqual(
+    page.restoreCalls,
+    [{ messages: ["8000000000000000002"] }],
+    "the undo restored something other than what was cleared"
+  );
+  assert.equal(shownIds(page).length, 4, "the undo did not bring the message back");
+  assert.equal(page.el("undo-dismiss").hidden, true, "the undo is still offered after being taken");
+});
+
+test("...and an undo cannot be taken twice, however fast the second tap is", async () => {
+  // The offer is withdrawn BEFORE the request goes out, not after it comes back. A reader on a
+  // slow connection taps a chip that is still on screen, and a second restore of the same set
+  // would be a request the server answers happily and that means nothing.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog());
+  await turnTodoOn(page);
+  await doneButton(page.el("discord-log").children[0]).click();
+  await page.settle();
+
+  const first = page.el("undo-dismiss").click();
+  const second = page.el("undo-dismiss").click();
+  await first;
+  await second;
+  await page.settle();
+  assert.equal(page.restoreCalls.length, 1, "a doubled tap restored twice");
+});
+
+test("declaring bankruptcy says how many it will clear, and takes two taps to do it", async () => {
+  // Bulk AND destructive. A single tap that emptied the backlog would be the one interaction on
+  // this page nobody could recover from without noticing what had gone.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(5));
+  await turnTodoOn(page);
+
+  const clear = page.el("clear-backlog");
+  assert.equal(clear.hidden, false, "there is no way to declare bankruptcy at all");
+  assert.match(clear.textContent, /5/, "the control does not say how much it is about to clear");
+
+  await clear.click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [], "the first tap cleared the backlog");
+  assert.match(clear.textContent, /5\?/, "the first tap did not ask");
+  assert.match(page.el("status").textContent, /Tap again/, "the first tap said nothing");
+
+  await clear.click();
+  await page.settle();
+  assert.deepStrictEqual(
+    page.dismissCalls,
+    [{ through: "8000000000000000004" }],
+    "bankruptcy did not go through the newest message as a boundary"
+  );
+  assert.deepStrictEqual(shownIds(page), [], "the backlog survived being declared bankrupt");
+});
+
+test("bankruptcy is undoable, and the undo restores every message it cleared", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(5));
+  await turnTodoOn(page);
+  await page.el("clear-backlog").click();
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.equal(shownIds(page).length, 0);
+
+  await page.el("undo-dismiss").click();
+  await page.settle();
+  assert.equal(page.restoreCalls.length, 1);
+  assert.equal(
+    page.restoreCalls[0].messages.length,
+    5,
+    "the undo restored a count rather than the set the server named"
+  );
+  assert.equal(shownIds(page).length, 5, "the whole backlog did not come back");
+});
+
+test("the arming lapses, so a stray later tap does not clear the backlog", async () => {
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(3));
+  await turnTodoOn(page);
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.match(page.el("clear-backlog").textContent, /3\?/);
+
+  assert.ok(page.expireTimers(CLEAR_ARMED_MS) > 0, "the arming never lapses at all");
+  assert.match(
+    page.el("clear-backlog").textContent,
+    /Clear the backlog/,
+    "the control stayed armed after its window"
+  );
+  await page.el("clear-backlog").click();
+  await page.settle();
+  assert.deepStrictEqual(page.dismissCalls, [], "a tap after the window cleared the backlog");
+});
+
+test("a background re-read while the filter is on stays filtered", async () => {
+  // Every path that re-reads the channel goes through one function, so the mode is honoured in one
+  // place. Without that, the 45-second poll would silently put the dealt-with messages back on
+  // screen and the reader would work through them twice.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(4));
+  await turnTodoOn(page);
+  await doneButton(page.el("discord-log").children[0]).click();
+  await page.settle();
+  assert.equal(shownIds(page).length, 3);
+
+  page.expireTimers(DISCORD_POLL_MS);
+  await page.settle();
+  assert.equal(
+    shownIds(page).length,
+    3,
+    "the background poll re-read the UNFILTERED channel and undid the filter"
+  );
+  assert.equal(page.el("inbox-note").hidden, false, "the poll took the read-state notice away");
+});
+
+test("the walk back is not offered over a filtered list", async () => {
+  // The cursor belongs to the unfiltered channel. Stepping back with it would prepend unfiltered
+  // rows into a filtered list — messages the reader has already dealt with, arriving above the
+  // ones they have not, with nothing saying why.
+  const page = newPage();
+  await signIn(page);
+  page.channelPage = async () =>
+    json(200, {
+      channel: CHANNEL,
+      messages: backlog(4),
+      has_more: true,
+      next_before: "8000000000000000000",
+    });
+  await showDiscord(page, backlog(4));
+  assert.equal(page.el("load-older").hidden, false, "the unfiltered walk is not offered either");
+
+  await turnTodoOn(page);
+  assert.equal(page.el("load-older").hidden, true, "a filtered list offered an unfiltered step back");
+});
+
+test("the to-do controls exist only where they mean something", async () => {
+  const page = newPage();
+  await signIn(page);
+  assert.equal(page.el("inbox-note").hidden, true);
+  assert.equal(page.el("clear-backlog").hidden, true);
+  assert.equal(page.el("undo-dismiss").hidden, true);
+
+  const rows = await showDiscord(page, backlog(2));
+  assert.ok(doneButton(rows[0]), "a channel row has no way to say it has been dealt with");
+  assert.equal(
+    doneButton(rows[0]).hidden,
+    true,
+    "Done is on screen outside the mode, where pressing it would appear to do nothing"
+  );
+
+  await turnTodoOn(page);
+  assert.equal(doneButton(page.el("discord-log").children[0]).hidden, false);
+
+  // An empty backlog is the one case where the bulk control has nothing to bulk.
+  await doneButton(page.el("discord-log").children[0]).click();
+  await doneButton(page.el("discord-log").children[0]).click();
+  await page.settle();
+  assert.deepStrictEqual(shownIds(page), []);
+  assert.equal(page.el("clear-backlog").hidden, true, "bankruptcy is offered over an empty list");
+});
+
+test("the head of the to-do list says how much is left OF how much, not how big the channel is", async () => {
+  // `#62 message-count-accuracy` again, one level in: "3 messages" over a filtered list reads as
+  // the size of the channel, which is the confidently-wrong number that issue exists to stop.
+  const page = newPage();
+  await signIn(page);
+  await showDiscord(page, backlog(4));
+  await turnTodoOn(page);
+  await doneButton(page.el("discord-log").children[0]).click();
+  await page.settle();
+
+  const head = page.el("channel-summary").text();
+  assert.match(head, /3 of 4/, `the head of the list does not say 3 of 4: ${head}`);
 });
 
 // --- keeping the channel view fresh ------------------------------------------------------------

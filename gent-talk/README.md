@@ -312,6 +312,7 @@ curl -s -X POST localhost:8080/mcp \
 | Conversations kept | `storage.max_conversations` | — | default `50`, oldest dropped first |
 | Turns per conversation | `storage.max_turns_per_conversation` | — | default `1000`, then `413` |
 | Cached summaries kept | `storage.max_summaries` | — | default `2000`, least recently written dropped first |
+| "Dealt with" marks kept | `storage.max_dismissals` | — | default `10000`, oldest dropped first; **not** bounded by age, see below |
 | Retention age | `storage.retain_days` | — | default `30`; `0` means no age limit, and it bounds cached summaries too |
 | Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
 | Summary width | `summaries.target_chars` | — | default `160` |
@@ -333,14 +334,24 @@ question is a fresh Discord fetch, and it stays that way. There is exactly one s
 `src/store/`, and it holds three things:
 
 * the `/voice` **conversation transcript** — what the owner said and what the agent said back;
-* **read marks** — how far the owner has been shown each channel; and
+* **read marks** — how far the owner has been shown each channel;
+* **"dealt with" marks** — which individual messages the owner has finished with, which is the
+  overlay `#50 todo-view` is built on. Two snowflakes and an instant per row, and **no message
+  text at all**; and
 * **cached summaries** — one short line per long message, filed under the policy that produced
   it. This is the one entry NOT authored by this server: with the shipped extractive backend a
   summary is literally the opening of somebody else's message, so it is a second at-rest copy of
   third-party text and is treated as one everywhere below.
 
-The first two are the owner's own record. The third is a derived cache, bounded by the same
+The first three are the owner's own record. The last is a derived cache, bounded by the same
 retention as the rest, erased by the same purge, and never filled by a read-scope token.
+
+**Every table is bounded on write, and one of them is bounded differently on purpose.** The
+"dealt with" marks have a count ceiling and **no age limit**, unlike everything else here. An age
+limit would put a message the owner cleared last month back into his to-do list because time
+passed — a lie he cannot diagnose, since nothing on the row would say why it came back — whereas
+an expired summary is merely regenerated. The count bound is enough on its own here for a reason
+it is not enough for a summary: this is the one table that holds nobody's words.
 
 ### Read state is ours, and is never synchronised with Discord
 
@@ -516,9 +527,12 @@ not, and neither reveals anything about the configuration.
 | POST | `/api/v1/conversations/{id}/turns` | **write** | record one turn |
 | GET | `/api/v1/conversations/{id}/replay` | **write** | that transcript, budgeted and fenced, for a new call — see "Resuming" |
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
+| GET | `/api/v1/channels/{id}/todo?limit=` | read | the recent window MINUS what has been dealt with |
+| POST | `/api/v1/channels/{id}/dismiss` | **write** | `{messages:[…]}` or `{through:id}` — mark as dealt with; answers the exact set it changed |
+| POST | `/api/v1/channels/{id}/restore` | **write** | `{messages:[…]}` — the undo, restoring exactly that set |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
-| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, cached summaries |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, "dealt with" marks, cached summaries |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
@@ -900,6 +914,55 @@ Two things moved out of it rather than away:
 `02-idle` is the screenshot that proves the issue is fixed: the idle phone, at rest, with nothing
 holding a strip. `08-clear-armed` is its positive control — the same page with something to say,
 saying it — because a page that had simply deleted the line would satisfy the first alone.
+
+### The messages you have not dealt with yet
+
+`#50 todo-view`. A long backlog of assistant messages is a to-do list in practice: some want a
+reply, some only want reading, and nothing on this page could tell them apart. **To do** is a
+sub-toggle of the channel view — the same list filtered, not a third tab — and it reads a
+different route rather than filtering the rows already on screen, so there is one definition of
+"dealt with" and it lives on the server.
+
+**Read/unread is OURS, and this is the screen that has to say so.** `#61 unread-status` settled it:
+Discord shares no read state with a bot, so there is no ack to send and no field to read. Marking
+something dealt with here does **not** mark it read in Discord, and reading it in the Discord app
+does **not** clear it here. The page says that on screen — quoting `store::INBOX_NOTICE` from the
+server's own answer rather than restating it, so the two cannot drift — because the alternative is
+that the owner meets the divergence first and has to guess which of the two is broken.
+
+**The store is single-tenant.** Every mark is "the owner's", with no column saying whose. Sharing
+one deployment between two operators would silently merge their inboxes; that is not a
+configuration this decision survives, and it would have to be revisited rather than worked around.
+
+Three acts, each reachable from a control:
+
+- **Done**, on the row. One message, and the answer names it, which is what makes the undo exact.
+- **Clear the backlog**, above the list. Bulk and destructive, so it says how many it is about to
+  take, takes two taps — the same armed idiom the dock's Clear control uses — and lapses back to
+  safe after a few seconds. It sends `{through: <newest id>}` and the **boundary is included**:
+  the row you gave up on is part of what you gave up on, and that is tested at the boundary.
+- **Undo**, as a chip, carrying the exact set the server said it cleared. Not "the last N", which
+  is a different set by the time it is pressed. A bulk clear that also claimed messages you had
+  dealt with *earlier* would resurrect them on undo, so the server reports only what it really
+  changed.
+
+Two consequences worth stating. The walk back is **not** offered over a filtered list: the cursor
+belongs to the unfiltered channel, and stepping back with it would prepend messages you have
+already dealt with above ones you have not. And the head of the list says "**3 of 4**" rather than
+"3 messages", for the same reason `#62 message-count-accuracy` exists — the second reads as the
+size of the channel.
+
+**What is not here yet**, said plainly rather than left to be discovered:
+
+- **The gesture layer.** `#50` asks for a swipe to dismiss and a press-and-hold to declare
+  bankruptcy. Disambiguating horizontal from vertical intent on the one list this page scrolls is
+  a change of its own; the acts land first, each reachable by a control a keyboard can also get
+  to, so a gesture becomes a second way in rather than the only way.
+- **Detecting a reply.** `#50` also wants a message to leave the list when it is answered through
+  Discord's reply affordance. That is *derived* state and it needs a reply reference on the
+  server's `Message`, which is a wire-format change touching every struct literal that builds one.
+  Until it lands, "dealt with" here is always **declared** — which is also why nothing yet has to
+  decide what happens when derived and declared disagree.
 
 ### A long message can be read as a summary of itself
 
@@ -1736,7 +1799,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the thirty-two states that look different — signed out, idle, live
+Photographs the `/voice` page in the thirty-four states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1749,10 +1812,11 @@ rather than spoken, the control bar in each of its two homes, that same bar conv
 text field, the bar packed with every button it has, a channel message that arrived because the
 SERVER pushed it rather than because the page asked, a resumed call whose reconstruction was
 only partial and says so, the channel picker on the bar with the history walked back several
-pages, the channel pulled down past the point where letting go refreshes it, and the channel with
-its collapsed rows summarised instead of clipped — at four viewports: a tall phone, a short
-phone, a small laptop window and a maximised desktop. It prints the absolute path of every image
-so an agent can open them directly.
+pages, the channel pulled down past the point where letting go refreshes it, the channel with its
+collapsed rows summarised instead of clipped, the channel filtered to what has not been dealt
+with, and the bulk clear saying how many it is about to take — at four viewports: a tall phone, a
+short phone, a small laptop window and a maximised desktop. It prints the absolute path of every
+image so an agent can open them directly.
 
 **Some states exist on one class of device and are captured only there**, and the run says so by
 name. The reading column at each end of its range is DESKTOP ONLY, because `@media (min-width:

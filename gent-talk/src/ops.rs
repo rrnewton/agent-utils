@@ -668,6 +668,186 @@ pub async fn forget_read_mark(state: &AppState, channel_id: &str) -> Result<Chan
     Ok(channel)
 }
 
+// --- the to-do view: which messages have NOT been dealt with -------------------------------------
+//
+// `#50 todo-view`. A long backlog of assistant messages is a to-do list in practice, and Discord
+// has nowhere to write down which of them you have finished with. So this server writes it down —
+// see `#61 unread-status` and the module documentation on `crate::store`: the overlay is OURS,
+// there is no sync-in and no sync-back, and every answer here says so out loud rather than letting
+// the owner find it from a divergence.
+//
+// WHAT IS NOT HERE, stated so a reader of this file does not go looking for it. `#50` also asks
+// for a message to leave the list when it is REPLIED to, detected from the reply reference Discord
+// records. That needs a field on `crate::model::Message` and a conversion in `crate::discord`, and
+// it is deliberately a separate change: it is a wire-format change touching every struct literal
+// that builds a Message, and landing it inside this one would make an overlay nobody could review
+// on its own. Until it lands, "dealt with" is DECLARED and never derived — which is also why the
+// question of which wins when the two disagree does not arise yet.
+
+/// One channel's to-do list: what has not been dealt with, and how much has.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct TodoView {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// The messages still wanting attention, oldest first.
+    pub messages: Vec<Message>,
+    /// How many messages the window held before the dealt-with ones were dropped.
+    ///
+    /// Reported so a caller can say "9 of 30 left" rather than implying the channel holds nine
+    /// messages. It is the WINDOW's size, not the channel's: see [`Window::is_whole_channel`].
+    pub window: usize,
+    /// Whether that window is the whole channel, so a caller can avoid a confident wrong total.
+    pub complete: bool,
+}
+
+/// The messages in one channel that have not been dealt with here. Read scope to ask.
+///
+/// The list is the recent window MINUS the dismissals, and nothing else: there is no server-side
+/// notion of "important" and no inference from dwell time, both of which `#50` excludes
+/// deliberately. A message leaves this list because somebody said so.
+///
+/// A store that is not configured is an ERROR here, unlike in [`summarize_message`], and the
+/// difference is not an inconsistency. There, the store is a cache and degrading to "generate
+/// every time" produces the same answer more slowly. Here it is the ANSWER: with no overlay every
+/// message is undealt-with, so a to-do list served from a missing store would silently be the
+/// plain channel wearing a name that promises filtering.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Discord`] when the fetch fails;
+/// [`OpError::Store`] when no store is configured or the read fails.
+pub async fn todo(
+    state: &AppState,
+    channel_id: &str,
+    limit: Option<u16>,
+) -> Result<TodoView, OpError> {
+    let window = messages(state, channel_id, limit).await?;
+    let complete = window.is_whole_channel();
+    let dismissed = state.store.dismissals(&window.channel.id).await?;
+    let dismissed: std::collections::HashSet<&str> =
+        dismissed.iter().map(MessageId::as_str).collect();
+    let total = window.messages.len();
+    let left = window
+        .messages
+        .into_iter()
+        .filter(|message| !dismissed.contains(message.id.as_str()))
+        .collect();
+    Ok(TodoView {
+        channel: window.channel,
+        messages: left,
+        window: total,
+        complete,
+    })
+}
+
+/// What one dismissal or one restoration did.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct InboxChange {
+    /// The channel, as configured here.
+    pub channel: ChannelInfo,
+    /// Exactly which messages changed state, oldest first.
+    ///
+    /// The list, not merely a count, and that is what makes the undo exact: a bulk clear reports
+    /// the set it cleared, and putting that set back restores precisely what went — not "the last
+    /// N", which is a different set the moment anything else has happened.
+    pub messages: Vec<MessageId>,
+}
+
+/// Mark messages as dealt with here. Write scope.
+///
+/// Every id is checked against the fetched window first, so this cannot be used to grow the store
+/// one invented snowflake at a time — the same reason [`allowed`] guards the channel. An id that
+/// is not in the window is a refusal for the WHOLE batch rather than a silent omission: a partial
+/// bulk action that reported success would leave the caller's undo describing a set that was
+/// never dismissed.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::UnknownMessage`] when an id is
+/// not in the window; [`OpError::Discord`]; [`OpError::Store`].
+pub async fn dismiss(
+    state: &AppState,
+    channel_id: &str,
+    wanted: &[MessageId],
+) -> Result<InboxChange, OpError> {
+    let window = messages(state, channel_id, None).await?;
+    let known: std::collections::HashSet<&str> =
+        window.messages.iter().map(|m| m.id.as_str()).collect();
+    if wanted.iter().any(|id| !known.contains(id.as_str())) {
+        return Err(OpError::UnknownMessage);
+    }
+    state.store.dismiss(&window.channel.id, wanted).await?;
+    Ok(InboxChange {
+        channel: window.channel,
+        messages: wanted.to_vec(),
+    })
+}
+
+/// Declare bankruptcy: mark everything in the window at or before `through` as dealt with.
+///
+/// **The boundary is INCLUDED.** "Everything before this one" is what a person means when they
+/// press on a row and give up on the backlog, and the row they pressed is part of what they are
+/// giving up on. That is a decision, not an accident, and it is tested at the boundary.
+///
+/// Answers the exact set it cleared, so the undo is exact — which is what makes a bulk,
+/// destructive action safe enough to offer at all. Messages already dealt with are not in it: they
+/// did not change, and restoring them would resurrect something the reader cleared earlier and
+/// never asked to see again.
+///
+/// # Errors
+///
+/// As [`dismiss`]. `through` must itself be in the window.
+pub async fn declare_bankruptcy(
+    state: &AppState,
+    channel_id: &str,
+    through: &MessageId,
+) -> Result<InboxChange, OpError> {
+    let window = messages(state, channel_id, None).await?;
+    let boundary = window
+        .messages
+        .iter()
+        .position(|m| &m.id == through)
+        .ok_or(OpError::UnknownMessage)?;
+    let already = state.store.dismissals(&window.channel.id).await?;
+    let already: std::collections::HashSet<&str> = already.iter().map(MessageId::as_str).collect();
+    // By POSITION in the window, which is already sorted oldest-first, rather than by comparing
+    // snowflakes here: the window is the ordering this server has, and a second ordering rule
+    // beside it is a second thing to get wrong.
+    let clearing: Vec<MessageId> = window.messages[..=boundary]
+        .iter()
+        .map(|m| m.id.clone())
+        .filter(|id| !already.contains(id.as_str()))
+        .collect();
+    state.store.dismiss(&window.channel.id, &clearing).await?;
+    Ok(InboxChange {
+        channel: window.channel,
+        messages: clearing,
+    })
+}
+
+/// Put messages back into the to-do list. Write scope.
+///
+/// The undo. Not checked against the window, on purpose and unlike [`dismiss`]: this only ever
+/// REMOVES rows, so an id that is not there costs nothing, and refusing a set because one of its
+/// messages has since scrolled out of the window would make an undo fail exactly when the reader
+/// most needs it.
+///
+/// # Errors
+///
+/// [`OpError::UnknownChannel`] outside the allowlist; [`OpError::Store`].
+pub async fn restore(
+    state: &AppState,
+    channel_id: &str,
+    wanted: &[MessageId],
+) -> Result<InboxChange, OpError> {
+    let channel = allowed(state, channel_id)?;
+    state.store.restore(&channel.id, wanted).await?;
+    Ok(InboxChange {
+        channel,
+        messages: wanted.to_vec(),
+    })
+}
+
 /// What happened when a summary was asked for.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "state", content = "summary")]
