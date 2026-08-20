@@ -192,6 +192,22 @@
           </div>
 
           <!--
+            `#68 pull-to-refresh`. What the gesture SAYS while it is happening: armed, and then in
+            flight. A refresh that is silent is indistinguishable from no refresh at all, which is
+            the complaint the issue opens with.
+
+            A SIBLING of #scroll-area for the same two reasons the chips and the width handle are:
+            the scroll area carries the fade-under-the-header mask, and this affordance appears at
+            exactly the top edge where that mask is strongest — inside, it would announce itself by
+            dissolving. Out here it is positioned against #screen-main, so it adds no grid row and
+            cannot change the height of the thing being pulled.
+
+            It ships EMPTY and hidden: every word it says belongs to a state of the gesture, and a
+            label sitting in the markup is one the page would have to remember to take away.
+          -->
+          <div id="pull-refresh" data-state="idle" aria-hidden="true" hidden></div>
+
+          <!--
             Two chips that float over the bottom corner of the list, and are absent whenever there
             is nothing for them to do.
 

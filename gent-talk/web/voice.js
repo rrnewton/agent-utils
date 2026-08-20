@@ -2646,9 +2646,134 @@ function maybeLoadOlder() {
   if (currentView !== "discord" || discordMoreAbove !== true || olderFetchInFlight) {
     return;
   }
+  // `#68 pull-to-refresh`. A pull is a request for the NEWEST, and it happens at the top of the
+  // list — the same place this fires. Taking a step back under a finger that is asking for the
+  // opposite would grow the history the reader is trying to leave, and would do it while the
+  // gesture is mid-flight. The two are the same container's two ends, so one of them has to yield,
+  // and it is this one: the older step is automatic and will fire again the moment the finger
+  // lifts, whereas the pull is something somebody deliberately did.
+  if (pulling()) {
+    return;
+  }
   if (el("scroll-area").scrollTop <= OLDER_TRIGGER_PX) {
     guardQuietly(loadOlder)();
   }
+}
+
+// --- pulling the channel down to refresh it -----------------------------------------------------
+//
+// `#68 pull-to-refresh`. The owner found the channel hours out of date and reached for the gesture
+// his thumb already makes: "especially when I swipe up on this view and it shows me something very
+// stale." `4e3d850` fixed the staleness itself — the view re-reads on entry and polls while it is
+// up — and that covers being stale AND WAITING. It gives no way to say "refresh, NOW".
+//
+// THE TWO GESTURES AT THIS END OF THE LIST ARE TOLD APART BY WHERE THE DRAG STARTS, which is the
+// design decision the issue asks for and the only one that does not make either feature worse:
+//
+//   * a drag that begins with content still above the viewport is a SCROLL. It scrolls, it reaches
+//     the top, and `maybeLoadOlder` takes the next step back — `#65 scrollback-paging`, unchanged.
+//   * a drag that begins with the list ALREADY at its top is an OVERSCROLL, because there is
+//     nothing left to scroll into. That is the pull, and `overscroll-behavior: contain` on
+//     #scroll-area is what leaves it to this page rather than letting the browser's own
+//     pull-to-refresh reload the whole application.
+//
+// Neither is a mode and neither has to be armed: the reader does the same thing they already do,
+// and the position the finger starts from is what says which of the two they meant.
+//
+// `keepPosition: false`, unlike Refresh and unlike the poll. This is a gesture made AT THE TOP of
+// the history asking for what is new, and "keep my place" there means "stay at the oldest thing
+// you have loaded", which is the opposite of the request. The button keeps its place because it
+// is pressed from wherever the reader happens to be reading.
+
+// How far past the top the finger has to travel before a release means anything.
+const PULL_ARM_PX = 64;
+
+// What the affordance says in each state of the gesture. The reader is told it is armed BEFORE
+// they let go, because a gesture that only reports itself afterwards cannot be abandoned.
+const PULL_LABELS = {
+  pull: "Pull to refresh",
+  armed: "Release to refresh",
+  busy: "Refreshing…",
+};
+
+/** The gesture on the finger right now, or null. */
+let pull = null;
+
+/** Is a pull-to-refresh gesture in progress? Read by `maybeLoadOlder`, which must stand aside. */
+const pulling = () => pull !== null;
+
+/** Show the gesture, or take the affordance away. `null` is "no gesture". */
+function renderPull(state) {
+  const element = el("pull-refresh");
+  element.hidden = state === null;
+  element.setAttribute("data-state", state === null ? "idle" : state);
+  element.textContent = state === null ? "" : PULL_LABELS[state];
+}
+
+function pullCancel() {
+  pull = null;
+  renderPull(null);
+}
+
+/** A finger landed. Decide whether this drag could be a pull at all. */
+function pullStart(event) {
+  const point = event && event.touches && event.touches[0];
+  pull = null;
+  if (!point || currentView !== "discord" || olderFetchInFlight || discordFetchInFlight) {
+    return;
+  }
+  // The whole test, and the reason the two gestures do not fight: there is nothing above to
+  // scroll into, so whatever this drag does next is an overscroll.
+  if (el("scroll-area").scrollTop > 0) {
+    return;
+  }
+  pull = { startY: point.clientY, armed: false };
+}
+
+/** The finger moved. Arm the pull, or decide this was a scroll after all. */
+function pullMove(event) {
+  const point = pull && event && event.touches && event.touches[0];
+  if (!point) {
+    return;
+  }
+  const travelled = point.clientY - pull.startY;
+  // Upward travel is a scroll INTO the list, and a scroll position that has left the top means
+  // the browser found something to scroll. Either way this was not a pull; abandoning it here is
+  // what lets the reader change their mind without lifting a finger.
+  if (travelled <= 0 || el("scroll-area").scrollTop > 0) {
+    pullCancel();
+    return;
+  }
+  pull.armed = travelled >= PULL_ARM_PX;
+  renderPull(pull.armed ? "armed" : "pull");
+}
+
+/** The finger lifted. Only an ARMED pull does anything. */
+async function pullEnd() {
+  if (!pull) {
+    return;
+  }
+  const armed = pull.armed;
+  pull = null;
+  if (!armed) {
+    renderPull(null);
+    return;
+  }
+  renderPull("busy");
+  const before = discordNewestId;
+  try {
+    // No options: a user-initiated refresh goes to the newest message. See the note above.
+    await loadDiscord();
+  } finally {
+    renderPull(null);
+  }
+  // ...and SAYS what it found. A refresh that finds nothing looks exactly like a refresh that
+  // never happened, which is the half of this the issue is most explicit about.
+  setStatus(
+    discordNewestId !== null && discordNewestId !== before
+      ? "refreshed — something new had arrived."
+      : "refreshed — nothing new since the last read."
+  );
 }
 
 /**
@@ -3771,6 +3896,17 @@ el("scroll-area").addEventListener("scroll", () => {
   // ...and the other end of the same list: arriving at the top is a request for what is above it.
   maybeLoadOlder();
 });
+// `#68 pull-to-refresh`. On #scroll-area rather than on the document, because the gesture is about
+// THIS list and because the page's other three scroll gestures already live here. Nothing calls
+// `preventDefault`: the pull only ever begins where the element has nothing left to scroll, so
+// there is no browser behaviour to suppress — `overscroll-behavior: contain` has already stopped
+// the drag becoming the browser's own page-level refresh.
+el("scroll-area").addEventListener("touchstart", pullStart);
+el("scroll-area").addEventListener("touchmove", pullMove);
+el("scroll-area").addEventListener("touchend", guardQuietly(pullEnd));
+// A cancel is the browser taking the gesture away — a phone call arriving, a system gesture
+// winning. It must not leave the affordance standing on the screen saying "release to refresh".
+el("scroll-area").addEventListener("touchcancel", pullCancel);
 
 /**
  * Like `guard`, but for things that are not a call: it reports, and it does NOT tear down a live

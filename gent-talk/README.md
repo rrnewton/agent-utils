@@ -969,6 +969,47 @@ The screenshot state `30-channel-picker-in-bar` is what settles the acceptance c
 asserts the picker is inside a 375px viewport on all four sides and did not move by so much as a
 pixel across the whole walk. Nothing without a layout engine has an opinion about that.
 
+### Pulling the channel down, and the other end of the same container
+
+The owner found the channel hours out of date: *"especially when I swipe up on this view and it
+shows me something very stale."* The staleness itself was already fixed — the view re-reads on
+entry and polls every forty-five seconds while it is up — and that covers being stale *and
+waiting*. It gives no way to say **refresh, now**. `#68 pull-to-refresh`.
+
+**The contention is the whole design question**, because pull-down-at-the-top and
+load-older-on-scroll-up are the two ends of one scrolling element. They are told apart by **where
+the drag starts**:
+
+- with content still above the viewport there is somewhere to scroll to, so the drag is a
+  **scroll** — it reaches the top, and the automatic step back fires exactly as `#65
+  scrollback-paging` intends;
+- with the list already at its top there is nothing left to scroll into, so the drag is an
+  **overscroll** — and that is the pull. `overscroll-behavior: contain` is what leaves that
+  overscroll to this page instead of letting the browser reload the whole application under it.
+
+Neither is a mode and neither has to be armed: the reader does what they already do, and where
+the finger landed says which of the two they meant. The reading is taken at `touchstart` rather
+than from where the finger is *now*, and that is load-bearing — a flick started a little below the
+top runs the list out within a frame, so judging it live would turn ordinary scrolling into a
+refresh.
+
+Two rules keep them out of each other's way while both are live: an automatic step back **stands
+aside** while a finger is pulling (it will fire again the moment the finger lifts, whereas the
+pull is something somebody deliberately did), and a step already **in flight** refuses to arm a
+pull, because its answer is about to prepend content above the viewport.
+
+**It says what it is doing, and then what it found.** *Pull to refresh* while dragging, *Release to
+refresh* once past the threshold — before the finger lifts, so the gesture can still be abandoned —
+and *Refreshing…* while the read is out. Then one line: *refreshed — something new had arrived*, or
+*refreshed — nothing new since the last read*. A refresh that finds nothing must not look like a
+refresh that never happened.
+
+**A pull goes to the newest message; the button keeps your place.** That difference is deliberate:
+a pull is made *at the top of the history* asking for what is new, and keeping your place there
+means staying at the oldest thing loaded. **Refresh** (`#refresh-discord`) is pressed from wherever
+you are reading, so it keeps you there — and it stays, because a desktop has no gesture and a
+keyboard reaches a button.
+
 ### One channel row at a time, but only where a pointer exists
 
 A long channel is a wall of blocks, and Discord picks out the row under the pointer because a mouse
@@ -1609,7 +1650,7 @@ layout facts and a fixture with no layout engine has no opinion about them.
 scripts/run.sh --screenshots
 ```
 
-Photographs the `/voice` page in the thirty states that look different — signed out, idle, live
+Photographs the `/voice` page in the thirty-one states that look different — signed out, idle, live
 call, muted, the agent's voice silenced, just after a hang-up, the end-of-call seam with its
 disclosure open, the clear control armed, settings, the Discord view, a long transcript parked
 mid-scroll, that same list with one folded answer opened among the closed ones, the moment a turn
@@ -1621,14 +1662,19 @@ channel, the earlier conversation restored from the server after a reload, a tur
 rather than spoken, the control bar in each of its two homes, that same bar converted into a
 text field, the bar packed with every button it has, a channel message that arrived because the
 SERVER pushed it rather than because the page asked, a resumed call whose reconstruction was
-only partial and says so, and the channel picker on the bar with the history walked back several
-pages — at four viewports: a tall phone, a short phone, a small laptop window and a maximised
-desktop. It prints the absolute path of every image so an agent can open them directly.
+only partial and says so, the channel picker on the bar with the history walked back several
+pages, and the channel pulled down past the point where letting go refreshes it — at four
+viewports: a tall phone, a short phone, a small laptop window and a maximised desktop. It prints
+the absolute path of every image so an agent can open them directly.
 
-The last two states are DESKTOP ONLY, and say so in the run: `@media (min-width: 900px) and
-(pointer: fine)` is what puts the reading column on the page at all, so on a phone there is no
-column, no handle, and nothing to photograph. A scene that ran there anyway and passed would be
-filed as evidence of a layout the phone does not have, which is why `Scene.profiles` exists.
+**Some states exist on one class of device and are captured only there**, and the run says so by
+name. The reading column at each end of its range is DESKTOP ONLY, because `@media (min-width:
+900px) and (pointer: fine)` is what puts a column on the page at all — on a phone there is no
+column, no handle and nothing to photograph. The armed pull-to-refresh is PHONES ONLY for the
+mirror-image reason: `has_touch` is set per profile, and a desktop context cannot have the
+gesture. A scene that ran on the wrong device and passed would be filed as evidence of an
+interface that device does not have, which is why `Scene.profiles` exists and why `--self-test`
+checks the restrictions are still on the scenes that need them.
 
 **Dark is the default, and that is not a preference.** The owner's phone is dark, and the first run
 of this harness captured nothing but light frames, because light is the browser-automation default

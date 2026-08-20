@@ -519,6 +519,37 @@ body {
   pointer-events: none;
 }
 
+/* `#68 pull-to-refresh`. What the gesture says while it is happening, at the top edge of the list
+   and over it — positioned against #screen-main exactly as #scroll-tools is, and for the same
+   reason: inside #scroll-area it would be faded by the header mask, which is strongest at precisely
+   this edge, and it would scroll away from the gesture that is producing it.
+
+   `pointer-events: none`, because it is a report and never a control. The finger that summoned it
+   is mid-drag on the list underneath, and a strip that swallowed that drag would cancel the gesture
+   it exists to describe. */
+#pull-refresh {
+  position: absolute;
+  z-index: 2;
+  top: 0.4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 0.25rem 0.75rem;
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  font-size: 0.78rem;
+  box-shadow: 0 1px 6px rgb(0 0 0 / 35%);
+  pointer-events: none;
+}
+
+/* Armed reads differently from merely being dragged, because the difference is the whole of what
+   the reader has to know before letting go. Same accent idiom the pressed Type toggle uses. */
+#pull-refresh[data-state="armed"] {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 #scroll-tools .chip {
   display: inline-flex;
   align-items: center;

@@ -1306,6 +1306,12 @@ const TUNING_BANDS = {
     "how close to the top counts as asking for more. At a viewport's worth EVERY scroll fires a " +
     "step — including one at the bottom — so a single flick walks the whole channel; at zero the " +
     "reader has to hit the top exactly"],
+  PULL_ARM_PX: [24, 200,
+    "how far past the top a finger has to travel before releasing refreshes. Below a couple of " +
+    "dozen pixels an ordinary flick at the top of the channel refreshes by accident — and it " +
+    "throws the reader to the newest message, which is the one thing they did not ask for; above " +
+    "a couple of hundred it is further than a thumb travels on a 375x667 phone, so the gesture " +
+    "cannot be completed at all"],
   DISCORD_POLL_MS: [5000, 600000,
     "the unasked re-read: often enough to be fresh, rare enough that a voice call is not sharing " +
     "its network with it"],
@@ -4609,6 +4615,311 @@ test("switching channel starts the walk again rather than stepping back from a s
     [],
     "a failed change of channel left the previous channel's count standing over an empty list"
   );
+});
+
+// --- pulling the channel down to refresh it ----------------------------------------------------
+//
+// `#68 pull-to-refresh`. The owner found the channel hours out of date and reached for the gesture
+// his thumb already makes. The staleness itself was fixed — the view re-reads on entry and polls
+// while it is up — and that covers being stale AND WAITING; this is the way to say "refresh, now".
+//
+// The whole design question is the CONTENTION, because pull-down-at-the-top and
+// load-older-on-scroll-up are the two ends of one container. The page tells them apart by where
+// the drag STARTS: with content still above the viewport it is a scroll (and reaching the top
+// takes a step back, `#65 scrollback-paging`, untouched); with the list already at its top there
+// is nothing left to scroll into, so the drag is an overscroll and that is the pull. The tests
+// below check both readings and the two ways they could be made to fight.
+
+/** How far a finger has to travel before a release refreshes. Derived, never restated. */
+const PULL_ARM_PX = sourceConstant("PULL_ARM_PX");
+
+/** A touch event carrying only what the page reads off one. */
+const touchAt = (y) => ({ touches: [{ clientY: y }] });
+
+/**
+ * One pull gesture on the channel list: land at `from`, drag `travel` pixels DOWN, and lift.
+ *
+ * `lift: false` leaves the finger on the screen, which is the only way to observe the affordance
+ * saying "armed" — a state that exists precisely so the reader can still change their mind.
+ */
+async function pullDown(page, travel, { lift = true, from = 120 } = {}) {
+  const area = page.el("scroll-area");
+  await area.dispatch("touchstart", touchAt(from));
+  await area.dispatch("touchmove", touchAt(from + travel));
+  if (lift) {
+    await area.dispatch("touchend");
+    await page.settle();
+  }
+}
+
+/** The channel view, walked back one step so there is history above the reader. */
+async function walkedBackChannel(page) {
+  pagedChannel(page, { steps: 4, size: 4, content: (i) => longMessage(`m${i}`) });
+  await showDiscord(page, []);
+  await page.el("load-older").click();
+  await page.settle();
+  assert.equal(page.el("discord-log").children.length, 8, "the walk back did not happen");
+  return page.el("scroll-area");
+}
+
+test("A PULL PAST THE TOP REFRESHES, AND SAYS WHAT IT FOUND", async () => {
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  area.scrollTop = 0;
+  const readsBefore = page.pagesServed.length;
+
+  await pullDown(page, PULL_ARM_PX);
+
+  assert.equal(page.pagesServed.length, readsBefore + 1, "the pull fetched nothing");
+  // The NEWEST page, not another step backwards: a cursor here would be the gesture reading the
+  // wrong end of the channel.
+  assert.doesNotMatch(
+    page.pagesServed[page.pagesServed.length - 1],
+    /before=/,
+    "the pull walked further BACK instead of fetching what is new"
+  );
+  // `keepPosition: false`. A pull happens at the top of the history, and keeping your place there
+  // means staying at the oldest thing loaded — the opposite of what was asked for.
+  assert.ok(atBottomOf(area), "the pull left the reader at the top instead of at the newest line");
+  assert.equal(page.el("pull-refresh").hidden, true, "the affordance stayed on the screen");
+  // A refresh that finds nothing must not be indistinguishable from a refresh that never
+  // happened, which is the complaint the issue opens with.
+  assert.match(page.el("status").textContent, /refreshed/, "the refresh said nothing at all");
+  assert.match(page.el("status").textContent, /nothing new/);
+});
+
+test("...and says so differently when something HAS arrived", async () => {
+  const page = newPage();
+  await signIn(page);
+  const all = pagedChannel(page, { steps: 3, size: 4 });
+  await showDiscord(page, []);
+  page.el("scroll-area").scrollTop = 0;
+  // The channel gains a message while the reader is looking at it, exactly as it does in life.
+  all.push(message({ id: "9995", content: "the arm64 runner came back by itself" }));
+
+  await pullDown(page, PULL_ARM_PX);
+
+  assert.match(page.el("status").textContent, /something new/, "a real arrival was not reported");
+  assert.ok(
+    page.el("discord-log").children.some((li) => li.getAttribute("data-id") === "9995"),
+    "the message the pull fetched is not on the screen"
+  );
+});
+
+test("THE AFFORDANCE ARMS BEFORE THE FINGER LIFTS, AND REPORTS THE FETCH IN FLIGHT", async () => {
+  const page = newPage();
+  await signIn(page);
+  await walkedBackChannel(page);
+  const area = page.el("scroll-area");
+  area.scrollTop = 0;
+  const affordance = page.el("pull-refresh");
+  assert.equal(affordance.hidden, true, "the affordance stands on the screen at rest");
+
+  // Short of the threshold: the gesture is recognised and says so, but a release would do nothing.
+  await area.dispatch("touchstart", touchAt(120));
+  await area.dispatch("touchmove", touchAt(120 + PULL_ARM_PX - 1));
+  assert.equal(affordance.hidden, false, "a drag past the top said nothing at all");
+  assert.equal(affordance.getAttribute("data-state"), "pull");
+  assert.match(affordance.textContent, /Pull/);
+
+  // Past it: armed, and it says so BEFORE the finger lifts — a gesture that only reports itself
+  // afterwards cannot be abandoned.
+  await area.dispatch("touchmove", touchAt(120 + PULL_ARM_PX));
+  assert.equal(affordance.getAttribute("data-state"), "armed");
+  assert.match(affordance.textContent, /Release/);
+
+  // Changing your mind takes the offer away rather than leaving it standing: dragging back up
+  // past where the finger landed abandons the gesture, and the affordance goes with it. Without
+  // this the strip stays on the screen saying "Pull to refresh" through a scroll that is now
+  // going the other way.
+  await area.dispatch("touchmove", touchAt(110));
+  assert.equal(affordance.hidden, true, "an abandoned pull left its offer on the screen");
+  assert.equal(affordance.textContent, "", "the abandoned affordance kept its wording");
+  // ...and the release then does nothing at all.
+  const readsBefore = page.pagesServed.length;
+  await area.dispatch("touchend");
+  await page.settle();
+  assert.equal(page.pagesServed.length, readsBefore, "an abandoned pull refreshed anyway");
+
+  // Now the real one, and while the fetch is in flight. The read is HELD open here rather than
+  // answered, because "there is a visible affordance while it is in flight" is a claim about the
+  // window between the release and the answer, and a fixture that answers instantly has none.
+  await area.dispatch("touchstart", touchAt(120));
+  await area.dispatch("touchmove", touchAt(120 + PULL_ARM_PX));
+  assert.equal(affordance.getAttribute("data-state"), "armed");
+
+  let answer = null;
+  page.channelPage = () => new Promise((resolve) => {
+    answer = resolve;
+  });
+  const lifted = area.dispatch("touchend");
+  await page.settle();
+  assert.equal(affordance.hidden, false, "nothing on the screen says the refresh is happening");
+  assert.equal(affordance.getAttribute("data-state"), "busy");
+  assert.match(affordance.textContent, /Refreshing/);
+
+  answer(json(200, { channel: CHANNEL, messages: page.messages }));
+  await lifted;
+  await page.settle();
+  assert.equal(affordance.hidden, true, "the affordance was left saying the refresh is in flight");
+});
+
+test("A PULL THAT DOES NOT REACH THE THRESHOLD REFRESHES NOTHING", async () => {
+  // The other edge of the same gesture. Without this, arming at zero pixels would pass every test
+  // above — and every flick at the top of the channel would throw the reader to the newest line.
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  area.scrollTop = 0;
+  const readsBefore = page.pagesServed.length;
+
+  await pullDown(page, PULL_ARM_PX - 1);
+
+  assert.equal(page.pagesServed.length, readsBefore, "a short drag refreshed the channel");
+  assert.equal(page.el("pull-refresh").hidden, true, "the affordance was left on the screen");
+  assert.equal(area.scrollTop, 0, "a short drag moved the reader");
+});
+
+test("A DRAG THAT STARTS INSIDE THE HISTORY IS A SCROLL, NOT A REFRESH", async () => {
+  // The reading that keeps `#65 scrollback-paging` working: with content still above the viewport
+  // the drag has somewhere to scroll to, so it is a scroll however far it travels.
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const parked = area.scrollTop;
+  const readsBefore = page.pagesServed.length;
+
+  await pullDown(page, PULL_ARM_PX * 3);
+
+  assert.equal(page.pagesServed.length, readsBefore, "a drag mid-history refreshed the channel");
+  assert.equal(page.el("pull-refresh").hidden, true, "a drag mid-history offered to refresh");
+  assert.equal(area.scrollTop, parked, "the reader was moved by a gesture that did nothing");
+
+  // ...and it does not BECOME a pull by arriving at the top, which is the case that decides where
+  // the reading has to be taken. A flick started a little below the top runs the list out within
+  // a frame — so the FIRST touchmove the page sees already reports a scroll position of zero. If
+  // the gesture were judged from where the finger IS rather than from where it LANDED, that
+  // ordinary flick would refresh the channel and throw the reader to the newest line for it.
+  area.scrollTop = 30;
+  await area.dispatch("touchstart", touchAt(120));
+  area.scrollTop = 0; // the flick has already run the list out, as a real one does
+  await area.dispatch("touchmove", touchAt(120 + PULL_ARM_PX * 2));
+  await area.dispatch("touchend");
+  await page.settle();
+
+  assert.equal(
+    page.pagesServed.length,
+    readsBefore,
+    "a scroll that merely REACHED the top turned itself into a refresh"
+  );
+  assert.equal(page.el("pull-refresh").hidden, true, "the affordance appeared during a scroll");
+});
+
+test("THE PULL AND THE STEP BACK ARE THE SAME CONTAINER'S TWO ENDS, AND DO NOT FIGHT", async () => {
+  // Both directions of the contention, because either one alone is satisfiable by switching the
+  // other feature off.
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  area.scrollTop = 0;
+
+  // ONE: a scroll event arriving under a finger that is pulling must not take a step BACK. The
+  // reader is asking for the newest; growing the history they are trying to leave, mid-gesture,
+  // is the fight this design exists to avoid.
+  await pullDown(page, PULL_ARM_PX, { lift: false });
+  const readsBefore = page.pagesServed.length;
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.equal(page.pagesServed.length, readsBefore, "the pull was answered with older messages");
+
+  // ...and the step back is only STOOD ASIDE, not switched off: the finger lifts, and the very
+  // next scroll at the top takes it.
+  await area.dispatch("touchcancel");
+  await area.dispatch("scroll");
+  await page.settle();
+  assert.equal(
+    page.pagesServed.length,
+    readsBefore + 1,
+    "the automatic step back never came back after a pull"
+  );
+  assert.match(page.pagesServed[page.pagesServed.length - 1], /before=/);
+
+  // TWO: the other direction. A step that is already in flight owns the top of the list, so a
+  // finger landing on it does not arm a pull — the answer to that fetch is about to prepend
+  // content above the viewport, and a refresh would throw the reader away from it.
+  let answer = null;
+  page.channelPage = (path) => {
+    page.pagesServed.push(String(path));
+    return new Promise((resolve) => {
+      answer = resolve;
+    });
+  };
+  area.scrollTop = 0;
+  await area.dispatch("scroll");
+  await page.settle();
+  const during = page.pagesServed.length;
+  assert.ok(answer, "no older step is in flight, so this half of the test proves nothing");
+
+  // The release is deliberately NOT awaited here. On a page that armed this pull it would park on
+  // a fetch nothing is ever going to answer, and a hanging test reports as a hanging suite rather
+  // than as the defect it is; the assertions below are what has to notice.
+  await pullDown(page, PULL_ARM_PX * 2, { lift: false });
+  const lifted = page.el("scroll-area").dispatch("touchend");
+  await page.settle();
+
+  assert.equal(page.pagesServed.length, during, "a pull started on top of a step already in flight");
+  assert.equal(page.el("pull-refresh").hidden, true, "the affordance armed during a step back");
+  answer(json(200, { channel: CHANNEL, messages: [], has_more: false, next_before: null }));
+  await lifted;
+  await page.settle();
+});
+
+test("the gesture does not take the button away, because a desktop has no gesture", async () => {
+  // `#55 voice-desktop-app`. The two are deliberately DIFFERENT, and the difference is the whole
+  // reason both exist: Refresh is pressed from wherever you are reading and keeps your place; the
+  // pull is made at the top and asks for what is new. Asserted as a contrast in one page, because
+  // separately each is satisfied by the other's behaviour.
+  assert.ok(PAGE_IDS.has("refresh-discord"), "the desktop and keyboard path is gone");
+  const page = newPage();
+  await signIn(page);
+  const area = await walkedBackChannel(page);
+  assert.equal(page.el("refresh-discord").hidden, false, "the button is not on the channel view");
+
+  area.scrollTop = Math.round((area.scrollHeight - area.clientHeight) * 0.5);
+  const parked = area.scrollTop;
+  await page.el("refresh-discord").click();
+  await page.settle();
+  assert.equal(area.scrollTop, parked, "the button stopped keeping the reader's place");
+
+  area.scrollTop = 0;
+  await pullDown(page, PULL_ARM_PX);
+  assert.ok(atBottomOf(area), "the gesture stopped taking the reader to the newest message");
+});
+
+test("the pull affordance is a sibling of the scroll area, not a passenger inside it", () => {
+  // Same argument as the chips and the width handle: #scroll-area carries the fade-under-the-header
+  // mask, and this thing appears at exactly the edge where that mask is strongest — inside, it
+  // would announce itself by dissolving, and it would scroll away from the gesture producing it.
+  assert.equal(
+    markupHolds("scroll-area", "pull-refresh"),
+    false,
+    "the affordance is inside the scrolling element, where the header mask fades it out"
+  );
+  assert.equal(PAGE_ELEMENTS.get("pull-refresh").hidden, true, "it ships standing on the screen");
+  assert.equal(PAGE_ELEMENTS.get("pull-refresh").text, "", "it ships carrying a state's wording");
+  const rule = cssBlock("#pull-refresh");
+  assert.match(rule, /position:\s*absolute/, "it takes a row of the page instead of floating");
+  // A report, never a control: the finger that summoned it is mid-drag on the list underneath.
+  assert.match(rule, /pointer-events:\s*none/, "the affordance can swallow the gesture under it");
+  assert.match(
+    cssBlock('#pull-refresh[data-state="armed"]'),
+    /var\(--accent\)/,
+    "armed looks exactly like not-yet-armed, so there is nothing to release on"
+  );
+  // The gesture depends on the browser NOT taking the overscroll for its own page refresh.
+  assert.match(cssBlock("#scroll-area"), /overscroll-behavior:\s*contain/);
 });
 
 // --- one channel row at a time --------------------------------------------------------------

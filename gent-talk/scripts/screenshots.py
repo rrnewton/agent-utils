@@ -1474,6 +1474,60 @@ def _act_channel_picker_reachable(driver: Driver) -> None:
     )
 
 
+# `#68 pull-to-refresh`. A real gesture, built from real `Touch` and `TouchEvent` objects and
+# dispatched at the element -- not a synthetic object shaped like one. That is the point of doing it
+# here rather than in the page suite: the fixture hands the page whatever a test invents, so only a
+# browser can say the handlers read what a browser really sends.
+#
+# The finger is deliberately NEVER LIFTED. The state worth a picture is the armed one, because it is
+# the state that exists so the reader can still change their mind, and it is the only frame in which
+# the page is asking for a decision.
+PULL_GESTURE = """
+(() => {
+  const area = document.getElementById('scroll-area');
+  const box = area.getBoundingClientRect();
+  const x = Math.round(box.left + box.width / 2);
+  const start = Math.round(box.top + 40);
+  const at = (type, y) => {
+    const touch = new Touch({
+      identifier: 1, target: area,
+      clientX: x, clientY: y, pageX: x, pageY: y, screenX: x, screenY: y,
+    });
+    return new TouchEvent(type, {
+      touches: [touch], targetTouches: [touch], changedTouches: [touch],
+      bubbles: true, cancelable: true,
+    });
+  };
+  area.dispatchEvent(at('touchstart', start));
+  area.dispatchEvent(at('touchmove', start + 30));
+  area.dispatchEvent(at('touchmove', start + 140));
+  return document.getElementById('pull-refresh').getAttribute('data-state');
+})()
+"""
+
+
+def _act_pull_armed(driver: Driver) -> None:
+    """`#68 pull-to-refresh`: the finger is down, past the threshold, and the page says so.
+
+    Walked all the way back FIRST, and that is not decoration. A pull begins only where the list has
+    nothing left to scroll into, and arriving at the top of a channel that still has history above
+    it starts an automatic step back -- which the page refuses to arm a pull on top of, deliberately
+    (`#65 scrollback-paging` and this gesture are the two ends of one container). Reaching the
+    beginning first removes the race rather than sleeping through it.
+    """
+    _act_whole_channel(driver)
+    driver.js("(() => { document.getElementById('scroll-area').scrollTop = 0; })()")
+    driver.settle(300)
+    state = driver.js(PULL_GESTURE)
+    if state != "armed":
+        raise Unreachable(
+            "31-pull-to-refresh-armed",
+            "a pull past the threshold arms, and the page says 'Release to refresh'",
+            f"the affordance reported {state!r}",
+        )
+    driver.settle(250)
+
+
 def _act_reply_view(driver: Driver) -> None:
     _act_whole_channel(driver)
     # Park in the middle of the channel, and record it. The round trip below is then a MEASURED
@@ -2640,6 +2694,44 @@ SCENES: tuple[Scene, ...] = (
             ),
         ),
     ),
+    Scene(
+        name="31-pull-to-refresh-armed",
+        what="the channel pulled down past the threshold: the finger is still on it, and it says "
+        "what letting go will do",
+        act=_act_pull_armed,
+        # PHONES ONLY, and for the same reason `20-discord-hover` is desktops only: this gesture
+        # exists on a touch screen and nowhere else. `has_touch` is set per profile, so a capture
+        # on a desktop context would be photographing an interaction that device cannot have.
+        profiles=PHONE_PROFILES,
+        expect=(
+            ("the Discord pane is up", "window.__visible('pane-discord')"),
+            (
+                "the list really is at its top, which is the only place the pull begins",
+                "document.getElementById('scroll-area').scrollTop === 0",
+            ),
+            (
+                # THE claim. Not "an element is visible": the state is what the reader is being
+                # asked to decide, and a page that showed the same strip whatever the finger had
+                # done would satisfy any weaker check.
+                "the gesture is ARMED, so letting go now would refresh",
+                "document.getElementById('pull-refresh').getAttribute('data-state') === 'armed'",
+            ),
+            (
+                "and it says so in words, before the finger lifts",
+                "/Release/.test(window.__text('pull-refresh') || '')",
+            ),
+            (
+                # The geometry, which is the half no fixture can see: the affordance is over the
+                # list, inside the frame, and clear of the dock it must not hide behind.
+                "the affordance is on screen, clear of the dock, and not clipped by the frame",
+                "(() => { const r = document.getElementById('pull-refresh')"
+                ".getBoundingClientRect(); "
+                "const dock = document.getElementById('dock').getBoundingClientRect(); "
+                "return r.width > 40 && r.top >= 0 && r.left >= 0 && "
+                "r.right <= window.innerWidth && r.bottom <= dock.top; })()",
+            ),
+        ),
+    ),
 )
 
 
@@ -2956,7 +3048,7 @@ def check_state_controls() -> list[str]:
     """The scene table itself: an unreached state must fail by name, and none may be unguarded."""
     problems: list[str] = []
 
-    if len(SCENES) < 30:
+    if len(SCENES) < 31:
         problems.append(
             f"the scene table has only {len(SCENES)} states. The interface rework added three that "
             "are where the interesting defects now live -- the armed clear control, the seam with "
@@ -2988,7 +3080,10 @@ def check_state_controls() -> list[str]:
             "the channel picker on the bar with the history walked back several pages, because "
             "'this control cannot be reached' is a measurement on a real 375px screen -- whether "
             "the picker is inside the viewport, whole, at a scroll position the reader can be in "
-            "-- and nothing without a layout engine can answer it."
+            "-- and nothing without a layout engine can answer it. `#68 pull-to-refresh` added "
+            "the armed pull, which is the one state in this whole table built from real Touch and "
+            "TouchEvent objects: the page fixture hands the page whatever a test invents, so only "
+            "a browser can say the handlers read what a browser really sends."
         )
     names = [scene.name for scene in SCENES]
     if len(set(names)) != len(names):
@@ -3008,6 +3103,10 @@ def check_state_controls() -> list[str]:
         # hover state, so without this the scene would run on both iPhone profiles and CERTIFY a
         # sticky hover on the device the rule exists to protect from one.
         "20-discord-hover": DESKTOP_PROFILES,
+        # `#68 pull-to-refresh`. The mirror image: `has_touch` is set per profile, so on a desktop
+        # context this scene would photograph an interaction that device cannot have -- and the
+        # gesture is the whole content of the picture.
+        "31-pull-to-refresh-armed": PHONE_PROFILES,
     }
     for name, wanted_profiles in restricted.items():
         scene = next((s for s in SCENES if s.name == name), None)
@@ -3125,6 +3224,11 @@ def check_state_controls() -> list[str]:
         # scene pinned to `window.__visible('discord-channel')` would have been green throughout
         # the whole time the owner could not reach it.
         "30-channel-picker-in-bar": ("window.innerWidth", "__pickerMoved", "__pickerInScroll"),
+        # `#68 pull-to-refresh`. Pinned to the armed STATE and to its wording, not to the strip
+        # being on screen: a page that showed the same affordance whatever the finger had done
+        # would satisfy "it is visible", and what the reader has to be told is what letting go
+        # will do.
+        "31-pull-to-refresh-armed": ("'armed'", "Release", "dock.top"),
     }
     for name, needles in required.items():
         required_scene = next((s for s in SCENES if s.name == name), None)
