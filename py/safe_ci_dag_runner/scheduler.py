@@ -112,6 +112,35 @@ def _warn(message: str) -> None:
     print(f"[scheduler] ⚠ {message}", file=sys.stderr)
 
 
+#: cgroup ``cpu.stat`` counters worth keeping, mapped to journal keys that name their unit.
+_CPU_JOURNAL_COUNTERS = (
+    ("usage_usec", "cpu_usage_usec"),
+    ("nr_throttled", "cpu_nr_throttled"),
+    ("throttled_usec", "cpu_throttled_usec"),
+)
+
+
+def _cpu_journal_fields(stats: Mapping[str, int] | None) -> list[tuple[str, str]]:
+    """Final cgroup CPU counters for the durable step journal, with units in the key names.
+
+    These are the readings already taken BEFORE ``cleanup()`` removes the step's cgroup, so they
+    cost nothing extra and are the last CPU figures that will ever exist for the step.  They
+    belong in the journal for the same reason the terminal record exists at all: a hard kill
+    destroys the end-of-run profile flush, and then the journal is the only thing left that can
+    say what the step consumed against the budget it was given.
+
+    A missing input map, or a kernel that does not publish one of these counters, stays ABSENT.
+    It must not become a measured zero — that is the same substitution the CPU guard used to make.
+    """
+    if stats is None:
+        return []
+    return [
+        (journal_key, str(stats[source]))
+        for source, journal_key in _CPU_JOURNAL_COUNTERS
+        if source in stats
+    ]
+
+
 def _cpu_seconds_from_stats(stats: Mapping[str, int]) -> float | None:
     """Consumed user+system CPU-seconds from a step's cgroup ``cpu.stat``, else ``None``.
 
@@ -1137,20 +1166,26 @@ class Runner:
 
         if self.evidence is not None:
             counts = sink.counts()
-            self.evidence.record(
-                "step_end",
-                [
-                    ("step", step.tag),
-                    ("ok", str(ok).lower()),
-                    ("aborted", str(outcome.aborted).lower()),
-                    ("timed_out", str(timed_out).lower()),
-                    ("cpu_timed_out", str(cpu_timed_out).lower()),
-                    ("elapsed_s", f"{elapsed:.3f}"),
-                    ("tests_started", str(counts.started)),
-                    ("tests_completed", str(counts.completed)),
-                    ("culprit_test", culprit.test if culprit and culprit.test else ""),
-                ],
-            )
+            fields = [
+                ("step", step.tag),
+                ("ok", str(ok).lower()),
+                ("aborted", str(outcome.aborted).lower()),
+                ("timed_out", str(timed_out).lower()),
+                ("cpu_timed_out", str(cpu_timed_out).lower()),
+                ("wall_elapsed_s", f"{elapsed:.3f}"),
+                ("tests_started", str(counts.started)),
+                ("tests_completed", str(counts.completed)),
+                ("culprit_test", culprit.test if culprit and culprit.test else ""),
+            ]
+            # The two ceilings this step ran under, each named for the quantity it bounds.
+            # Recorded only when they are live, so a disabled budget stays absent rather than
+            # reading as 0.
+            if cpu_budget > 0:
+                fields.append(("cpu_limit_s", str(cpu_budget)))
+            if step.timeout > 0:
+                fields.append(("wall_limit_s", str(step.timeout)))
+            fields.extend(_cpu_journal_fields(cpu_stats))
+            self.evidence.record("step_end", fields)
 
     def result(self) -> RunResult:
         """Assemble the typed :class:`RunResult` after :meth:`run` has returned.

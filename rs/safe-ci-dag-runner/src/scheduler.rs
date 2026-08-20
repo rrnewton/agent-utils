@@ -52,6 +52,34 @@ use crate::profile_enrich::{resolve_effective_inner_jobs, step_enrichment_column
 /// A per-step measurement row (column -> value), matching the perflog step-profile schema.
 type ProfileRow = BTreeMap<String, String>;
 
+/// Final cgroup CPU counters for the durable step journal, with their units in the key names.
+///
+/// These are the readings already taken BEFORE `cleanup()` removes the step's cgroup, so they
+/// cost nothing extra and are the last CPU figures that will ever exist for the step. They belong
+/// in the journal for the same reason the terminal record exists at all: a hard kill destroys the
+/// end-of-run profile flush, and then the journal is the only thing left that can say what the
+/// step consumed against the budget it was given.
+///
+/// A missing input map, or a kernel that does not publish one of these counters, stays ABSENT. It
+/// must not become a measured zero — that is the same substitution the CPU guard used to make.
+fn cpu_journal_fields(cpu_stats: Option<&BTreeMap<String, i64>>) -> Vec<(&'static str, String)> {
+    let Some(cpu_stats) = cpu_stats else {
+        return Vec::new();
+    };
+    [
+        ("usage_usec", "cpu_usage_usec"),
+        ("nr_throttled", "cpu_nr_throttled"),
+        ("throttled_usec", "cpu_throttled_usec"),
+    ]
+    .into_iter()
+    .filter_map(|(source, journal_key)| {
+        cpu_stats
+            .get(source)
+            .map(|value| (journal_key, value.to_string()))
+    })
+    .collect()
+}
+
 /// Consumed user+system CPU-seconds from a step's cgroup `cpu.stat`, or `None` when the counter
 /// is ABSENT.
 ///
@@ -2011,26 +2039,33 @@ fn run_step(ctx: StepCtx) {
     // was this run doing" without needing the end-of-run profile rows that a hard kill destroys.
     if let Some(e) = &evidence {
         let counts = sink.counts();
-        e.record(
-            "step_end",
-            &[
-                ("step", tag.clone()),
-                ("ok", ok.to_string()),
-                ("aborted", was_aborted.to_string()),
-                ("timed_out", timed_out.to_string()),
-                ("cpu_timed_out", cpu_timed_out.to_string()),
-                ("elapsed_s", format!("{elapsed:.3}")),
-                ("tests_started", counts.started.to_string()),
-                ("tests_completed", counts.completed.to_string()),
-                (
-                    "culprit_test",
-                    culprit
-                        .as_ref()
-                        .and_then(|c| c.test.clone())
-                        .unwrap_or_default(),
-                ),
-            ],
-        );
+        let mut fields = vec![
+            ("step", tag.clone()),
+            ("ok", ok.to_string()),
+            ("aborted", was_aborted.to_string()),
+            ("timed_out", timed_out.to_string()),
+            ("cpu_timed_out", cpu_timed_out.to_string()),
+            ("wall_elapsed_s", format!("{elapsed:.3}")),
+            ("tests_started", counts.started.to_string()),
+            ("tests_completed", counts.completed.to_string()),
+            (
+                "culprit_test",
+                culprit
+                    .as_ref()
+                    .and_then(|c| c.test.clone())
+                    .unwrap_or_default(),
+            ),
+        ];
+        // The two ceilings this step ran under, each named for the quantity it bounds. Recorded
+        // only when they are live, so a disabled budget stays absent instead of reading as 0.
+        if cpu_budget > 0 {
+            fields.push(("cpu_limit_s", cpu_budget.to_string()));
+        }
+        if step.timeout > 0 {
+            fields.push(("wall_limit_s", step.timeout.to_string()));
+        }
+        fields.extend(cpu_journal_fields(cpu_stats.as_ref()));
+        e.record("step_end", &fields);
     }
 }
 
@@ -3199,6 +3234,40 @@ mod tests {
                 "the unlabelled elapsed_s must not come back:\n{record}"
             );
         }
+    }
+
+    /// The terminal step record must carry what the step actually consumed.
+    ///
+    /// `step_end` exists so the journal alone can answer "what was this run doing" without the
+    /// end-of-run profile rows, which a hard kill destroys. A counter the kernel does not publish
+    /// stays ABSENT rather than becoming a measured zero.
+    #[test]
+    fn cpu_journal_fields_name_their_units_and_never_invent_a_zero() {
+        let full = BTreeMap::from([
+            ("usage_usec".to_string(), 259_926_893i64),
+            ("nr_throttled".to_string(), 994),
+            ("throttled_usec".to_string(), 431_942_000),
+            ("user_usec".to_string(), 1),
+        ]);
+        assert_eq!(
+            cpu_journal_fields(Some(&full)),
+            vec![
+                ("cpu_usage_usec", "259926893".to_string()),
+                ("cpu_nr_throttled", "994".to_string()),
+                ("cpu_throttled_usec", "431942000".to_string()),
+            ]
+        );
+
+        // A kernel that publishes only some counters contributes only those. Inventing the rest
+        // as 0 would put a measurement in the record that was never measured.
+        let partial = BTreeMap::from([("usage_usec".to_string(), 7i64)]);
+        assert_eq!(
+            cpu_journal_fields(Some(&partial)),
+            vec![("cpu_usage_usec", "7".to_string())]
+        );
+
+        // Unboxed there is nothing to read at all.
+        assert!(cpu_journal_fields(None).is_empty());
     }
 
     /// An ABSENT CPU counter is not a measured ZERO.

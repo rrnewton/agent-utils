@@ -140,6 +140,22 @@ fn a_cpu_breach_journals_the_cpu_seconds_it_compared_not_the_wall_clock() {
         "measured_s ({measured}) must be the CPU reading, not the wall clock ({wall}); four \
          concurrent burners consume CPU faster than wall time elapses:\n{record}"
     );
+
+    // The TERMINAL record must be able to stand alone: a hard kill destroys the end-of-run
+    // profile flush, and then this is the only thing left that can say what the step consumed
+    // against the budget it was given.
+    let end = journal
+        .lines()
+        .find(|line| line.contains(r#""event":"step_end""#))
+        .unwrap_or_else(|| panic!("no step_end record in the journal:\n{journal}"))
+        .to_string();
+    assert_eq!(json_number(&end, "cpu_limit_s"), 2.0, "{end}");
+    assert_eq!(json_number(&end, "wall_limit_s"), 60.0, "{end}");
+    assert!(
+        json_number(&end, "cpu_usage_usec") >= 2_000_000.0,
+        "the journalled cgroup CPU total must cover the budget the step just blew:\n{end}"
+    );
+    assert!(json_number(&end, "wall_elapsed_s") > 0.0, "{end}");
 }
 
 /// Pull one `"key":"<number>"` out of a flat JSONL record without taking a JSON dependency on a
