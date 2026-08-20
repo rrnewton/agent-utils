@@ -1557,7 +1557,39 @@ test("every raw message shows its author and its message id", async () => {
   assert.match(text, /rrnewton/);
   assert.match(text, /999888777666555444/, "the message id is what makes this view worth having");
   assert.match(text, /2026-08-19 04:31/);
-  assert.match(page.el("status").textContent, /1 message\(s\) from lead team/);
+  // `#62 message-count-accuracy`, carried across from web/app.js. The fixture sends no `complete`,
+  // which is exactly the ordinary case: the fetch window is not a channel total, so no digit.
+  assert.match(page.el("status").textContent, /lead team — the most recent messages/);
+  assert.doesNotMatch(page.el("status").textContent, /\(s\)/, "the placeholder plural came back");
+});
+
+test("the channel view counts only when the count is the CHANNEL'S, and pluralizes", async () => {
+  const page = newPage();
+  await signIn(page);
+  page.messages = [message({ id: "1" }), message({ id: "2" })];
+  page.channelMessages = async () =>
+    json(200, { channel: CHANNEL, messages: page.messages, complete: true });
+
+  await page.el("view-switch").click();
+  await page.settle();
+  assert.match(page.el("status").textContent, /^2 messages from lead team$/);
+
+  page.messages = [message({ id: "1" })];
+  await page.el("refresh-discord").click();
+  await page.settle();
+  assert.match(page.el("status").textContent, /^1 message from lead team$/, "singular, not '1 messages'");
+});
+
+test("the channel view speaks the operator's clock, not UTC", async () => {
+  const page = newPage();
+  await signIn(page);
+  // `#52 operator-timezone`: the server converts once and hands back a finished string. The page
+  // must prefer it, or the phone and the voice agent disagree about when something was said.
+  const lines = await showDiscord(page, [
+    message({ timestamp: "2026-08-19T04:31:00.000Z", spoken_time: "2026-08-18 21:31 PDT" }),
+  ]);
+  assert.match(lines[0].text(), /2026-08-18 21:31 PDT/);
+  assert.doesNotMatch(lines[0].text(), /04:31/, "the page rendered the raw UTC stamp instead");
 });
 
 test("a bot author is labelled as one", async () => {

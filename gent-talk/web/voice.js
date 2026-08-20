@@ -1096,9 +1096,12 @@ function discordNode(message) {
   // An author name is channel data too, and a display name can be anything at all.
   author.textContent = message.author_is_bot ? `${message.author} (bot)` : String(message.author);
   const stamp = document.createElement("span");
-  stamp.textContent = String(message.timestamp || "")
-    .replace("T", " ")
-    .slice(0, 16);
+  // `#52 operator-timezone`. The server converts once, into the operator's configured zone, and
+  // hands back a string that is already correct — so prefer it. The ISO slice is the fallback for
+  // a server too old to send `spoken_time`, and it is UTC-as-Discord-reported-it. This page and
+  // web/app.js must not disagree about what time a message was posted.
+  stamp.textContent =
+    message.spoken_time || String(message.timestamp || "").replace("T", " ").slice(0, 16);
   const id = document.createElement("span");
   id.className = "msg-id";
   id.textContent = `id ${message.id}`;
@@ -1108,6 +1111,27 @@ function discordNode(message) {
   renderMarkdownInto(body, message.content);
   li.append(meta, body);
   return li;
+}
+
+// `#62 message-count-accuracy`, carried across from web/app.js where it was fixed first.
+//
+// The length of what the server returned is the FETCH WINDOW, not a channel total. Discord gives a
+// bot no message count for a guild text channel, so the number is the channel's own only when the
+// server reports `complete` — the fetch came back short, meaning there is nothing older. Otherwise
+// no digit is shown at all: a confidently wrong count is worse than no count, and this one was
+// wrong in the direction that makes the bridge look like it is losing messages.
+//
+// `!== true` rather than `=== false`, so a server too old to send the field is treated as unknown.
+// It takes the label so every branch reads as a whole sentence. Appending " from <channel>" to a
+// summary that already ends in a clause produced "older ones are not loaded from lead team".
+function channelSummary(count, complete, label) {
+  if (complete !== true) {
+    return `${label} — the most recent messages; older ones are not loaded`;
+  }
+  if (count === 0) {
+    return `no messages in ${label}`;
+  }
+  return `${count} message${count === 1 ? "" : "s"} from ${label}`;
 }
 
 /**
@@ -1148,7 +1172,7 @@ async function loadDiscord(options) {
     for (const message of payload.messages) {
       list.append(discordNode(message));
     }
-    setStatus(`${payload.messages.length} message(s) from ${payload.channel.label}`);
+    setStatus(channelSummary(payload.messages.length, payload.complete, payload.channel.label));
     if (keepPosition && !wasAtNewest) {
       area.scrollTop = previousTop;
     } else {

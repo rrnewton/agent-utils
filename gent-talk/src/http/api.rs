@@ -604,7 +604,31 @@ pub async fn style_css() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::APP_JS;
+    use super::{APP_JS, VOICE_JS};
+
+    #[test]
+    fn the_voice_page_pluralizes_and_prefers_the_operators_own_clock() {
+        // Both defects were fixed in web/app.js first and never carried across, and this guard
+        // only covered app.js — so the page the owner actually uses kept printing "message(s)"
+        // and UTC while the suite stayed green. Guarding one of two assets that render the same
+        // two fields is not a guard; it is a coin flip about which file someone edits next.
+        assert!(
+            !VOICE_JS.contains("(s)"),
+            "web/voice.js still renders a parenthesised plural"
+        );
+        assert!(
+            VOICE_JS.contains("function channelSummary("),
+            "the count helper is what keeps the fetch window from being read as a channel total"
+        );
+        assert!(
+            VOICE_JS.contains("complete !== true"),
+            "a server too old to send `complete` must be treated as unknown, not as complete"
+        );
+        assert!(
+            VOICE_JS.contains("message.spoken_time ||"),
+            "the channel view must prefer the zone-converted time the server already computed"
+        );
+    }
 
     #[test]
     fn the_phone_app_pluralizes_and_never_prints_the_placeholder_form() {
