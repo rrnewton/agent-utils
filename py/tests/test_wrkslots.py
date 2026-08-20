@@ -1524,3 +1524,139 @@ def test_completed_finish_recovery_requires_exact_archive_entry(
     assert "differs from the finish journal" in refused.stderr
     assert journal_path.is_file()
     assert not (project / "worktrees" / "slot01").exists()
+
+
+def _repair(
+    project: Path, *extra: str, machine: str = "testhost"
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable, str(WRKSLOTS), "--machine", machine, "init", str(project),
+            "--worktrees-dir", "worktrees", "--liveness-command", "liveness.py",
+            "--repair", *extra,
+        ],
+        text=True, capture_output=True, check=False,
+    )
+
+
+def test_configuration_from_an_older_build_is_dead_until_repaired(tmp_path: Path) -> None:
+    """A config missing a field this build requires must not be a one-way door.
+
+    Before the repair path existed this state was terminal: every command
+    refused for the missing field, and `init` refused to touch the file because
+    it "already has different configuration". Nothing could read it and nothing
+    could fix it.
+    """
+    project, _repository, _remote = make_project(tmp_path)
+    config_path = project / ".wrkslots.yml"
+    stale = json.loads(config_path.read_text(encoding="utf-8"))
+    del stale["liveness_command"]
+    stale["schema"] = 1
+    config_path.write_text(json.dumps(stale, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    wedged = command(project, "status", "--all-machines")
+    assert wedged.returncode == 3
+    assert "missing liveness_command" in wedged.stderr
+    assert "init --repair" in wedged.stderr
+
+    repaired = _repair(project)
+    assert repaired.returncode == 0, repaired.stderr
+    assert "added liveness_command" in repaired.stdout
+    assert "schema 1 -> 2" in repaired.stdout
+
+    healthy = command(project, "status", "--all-machines")
+    assert healthy.returncode == 0, healthy.stderr
+    current = json.loads(config_path.read_text(encoding="utf-8"))
+    assert current["schema"] == wrkslots.SCHEMA
+    assert current["liveness_command"] == "liveness.py"
+    # Repair must not have disturbed anything else.
+    assert current["machine"] == stale["machine"]
+    assert current["worktrees_dir"] == stale["worktrees_dir"]
+    assert current["heartbeat_ttl_seconds"] == stale["heartbeat_ttl_seconds"]
+
+
+def test_repair_refuses_to_relocate_live_state_and_lists_every_conflict(
+    tmp_path: Path,
+) -> None:
+    """Repair adds missing fields; it must never redirect the tool elsewhere."""
+    project, _repository, _remote = make_project(tmp_path)
+    config_path = project / ".wrkslots.yml"
+    stale = json.loads(config_path.read_text(encoding="utf-8"))
+    before = dict(stale)
+    stale["worktrees_dir"] = "somewhere-else"
+    stale["default_remote"] = "upstream"
+    config_path.write_text(json.dumps(stale, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    refused = _repair(project)
+
+    assert refused.returncode == 3
+    assert "worktrees_dir" in refused.stderr
+    # Every conflict at once, not one per run.
+    assert "default_remote" in refused.stderr
+    unchanged = json.loads(config_path.read_text(encoding="utf-8"))
+    assert unchanged["worktrees_dir"] == "somewhere-else"
+    assert unchanged["default_remote"] == "upstream"
+    assert before["worktrees_dir"] != unchanged["worktrees_dir"]
+
+
+def test_active_slot_cap_refuses_the_allocation_that_would_breach_it(
+    tmp_path: Path,
+) -> None:
+    """A cap that only appears in a report is not a cap."""
+    project, repository, _remote = make_project(tmp_path)
+    assert _repair(project, "--max-active-slots", "1").returncode == 0
+
+    first = create(project, slot="slot01", agent="codex-1", branch="codex/one")
+    assert first.returncode == 0, first.stderr
+
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+
+    assert second.returncode == 3
+    assert "max_active_slots=1" in second.stderr
+    assert "slot01" in second.stderr
+    # The refused allocation left nothing behind.
+    assert [
+        row["slot"] for row in active_slots(project) if isinstance(row, dict)
+    ] == ["slot01"]
+    assert not (project / "worktrees" / "slot02").exists()
+    assert git(repository, "worktree", "list").stdout.count("slot02") == 0
+
+
+def test_absent_cap_means_uncapped_and_init_stays_idempotent(tmp_path: Path) -> None:
+    """Absent must keep meaning "no cap", or every pre-existing config changes."""
+    project, _repository, _remote = make_project(tmp_path)
+    config = json.loads((project / ".wrkslots.yml").read_text(encoding="utf-8"))
+    assert "max_active_slots" not in config
+
+    assert create(project, slot="slot01", agent="codex-1", branch="codex/one").returncode == 0
+    second = create(project, slot="slot02", agent="codex-2", branch="codex/two")
+    assert second.returncode == 0, second.stderr
+
+
+def test_doctor_reports_every_disagreement_at_once_and_status_still_refuses(
+    tmp_path: Path,
+) -> None:
+    """Diagnosis must show the shape of the drift; status keeps its refusal."""
+    project, repository, _remote = make_project(tmp_path)
+    assert create(project).returncode == 0
+    git(repository, "worktree", "remove", "--force", str(checkout(project)))
+    (project / "worktrees" / "slot01").rmdir()
+    (project / "worktrees" / "orphan-a").mkdir()
+    (project / "worktrees" / "orphan-b").mkdir()
+
+    # The pre-existing contract is unchanged: status refuses, naming one thing.
+    refused = command(project, "status", "--all-machines")
+    assert refused.returncode == 3
+
+    report = command(project, "doctor", "--all-machines", "--format", "json")
+    assert report.returncode == 0, report.stderr
+    findings = json.loads(report.stdout)["findings"]
+    kinds = [item["kind"] for item in findings]
+    assert "row-without-directory" in kinds
+    orphans = sorted(
+        item["slot"] for item in findings if item["kind"] == "directory-without-row"
+    )
+    assert orphans == ["orphan-a", "orphan-b"], findings
+    # Diagnosis authorizes nothing and changes nothing.
+    assert (project / "worktrees" / "orphan-a").is_dir()
+    assert len(active_slots(project)) == 1

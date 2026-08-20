@@ -19,13 +19,20 @@ import subprocess
 import sys
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence, Set as AbstractSet
 from pathlib import Path
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 SCHEMA = 2
 CONFIG_NAME = ".wrkslots.yml"
+# Configuration keys that may be absent. Absent is a meaning, not a default to
+# be materialised: no `max_active_slots` key means allocation is uncapped.
+OPTIONAL_CONFIG_KEYS = frozenset({"max_active_slots"})
+# Fields `init --repair` may overwrite when the caller names a different value.
+# Everything else is refused, because a configuration says where live state
+# already is and rewriting that relocates rather than repairs.
+_CONFIG_REPAIR_UPDATABLE = frozenset({"schema", "max_active_slots"})
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 REMOTE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -49,6 +56,7 @@ class Config:
     default_landed_ref: str
     heartbeat_ttl_seconds: int
     liveness_command: Path
+    max_active_slots: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -208,7 +216,10 @@ def _as_int(value: object, label: str, *, minimum: int = 0) -> int:
 
 
 def _exact_keys(
-    value: Mapping[str, object], required: set[str], optional: set[str], label: str
+    value: Mapping[str, object],
+    required: AbstractSet[str],
+    optional: AbstractSet[str],
+    label: str,
 ) -> None:
     keys = set(value)
     missing = sorted(required - keys)
@@ -283,8 +294,9 @@ def _config_payload(
     default_landed_ref: str,
     heartbeat_ttl_seconds: int,
     liveness_command: str,
+    max_active_slots: int | None = None,
 ) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema": SCHEMA,
         "worktrees_dir": worktrees_dir,
         "machine": machine,
@@ -293,6 +305,66 @@ def _config_payload(
         "heartbeat_ttl_seconds": heartbeat_ttl_seconds,
         "liveness_command": liveness_command,
     }
+    # Absent means "no cap", so an unset cap must not appear in the payload at
+    # all; writing an explicit null would make init non-idempotent against every
+    # configuration written before the field existed.
+    if max_active_slots is not None:
+        payload["max_active_slots"] = max_active_slots
+    return payload
+
+
+def _repaired_config(
+    existing: dict[str, object], payload: dict[str, object]
+) -> tuple[dict[str, object], list[str]]:
+    """Bring a configuration written by an older build up to this schema.
+
+    Repair is deliberately narrow. It ADDS fields this build requires and that
+    the file does not have, and it bumps ``schema``. It never rewrites a field
+    that is present with a different value, because a configuration is a
+    description of where live state already is: silently changing
+    ``worktrees_dir`` or ``machine`` would not fix a stale file, it would point
+    the tool at a different registry and orphan every slot recorded in the old
+    one. Every conflicting field is refused, and all of them are listed at once,
+    so a repair can never be a disguised relocation and one fix per run is not
+    the operator's only option.
+
+    Returns the repaired mapping and a human-readable list of what changed, so
+    the operator sees the migration rather than trusting it.
+    """
+    repaired = dict(existing)
+    changes: list[str] = []
+    conflicts: list[str] = []
+    for key, want in payload.items():
+        if key not in repaired:
+            repaired[key] = want
+            changes.append(f"added {key}={want!r}")
+            continue
+        have = repaired[key]
+        if have == want:
+            continue
+        if key in _CONFIG_REPAIR_UPDATABLE:
+            # `schema` is what repair exists to advance. `max_active_slots` is a
+            # policy knob, not a pointer to state: changing it re-tunes future
+            # allocation and cannot orphan a slot that already exists. Both are
+            # still reported, so an update is never silent.
+            repaired[key] = want
+            changes.append(f"{key} {have!r} -> {want!r}")
+            continue
+        conflicts.append(f"{key}: file has {have!r}, command line says {want!r}")
+    unknown = sorted(set(repaired) - set(payload) - OPTIONAL_CONFIG_KEYS)
+    if unknown:
+        conflicts.append(
+            "unknown field(s) this build does not understand: " + ", ".join(unknown)
+        )
+    if conflicts:
+        raise Refusal(
+            "cannot repair configuration without changing a field that already "
+            "has a value; resolve these by hand and rerun:\n  "
+            + "\n  ".join(conflicts)
+        )
+    if not changes:
+        changes.append("no field needed repair")
+    return repaired, changes
 
 
 def _discover_root(explicit: str | None) -> Path:
@@ -322,9 +394,24 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         "heartbeat_ttl_seconds",
         "liveness_command",
     }
-    _exact_keys(raw, required, set(), "configuration")
+    try:
+        _exact_keys(raw, required, OPTIONAL_CONFIG_KEYS, "configuration")
+    except StateError as exc:
+        # A configuration written by an older build is missing fields this build
+        # requires. Without a repair path every command, including read-only
+        # status, is dead with no way back; say where the way back is.
+        raise StateError(
+            f"{exc} in {path}. Migrate it with `wrkslots init --repair` "
+            f"(it refuses to change any field that already has a conflicting "
+            f"value)."
+        ) from exc
     if _as_int(raw["schema"], "configuration.schema") != SCHEMA:
-        raise StateError(f"unsupported configuration schema in {path}")
+        raise StateError(
+            f"unsupported configuration schema in {path}: found "
+            f"{raw['schema']!r}, this build speaks {SCHEMA}. Migrate it with "
+            f"`wrkslots init --repair` (it refuses to change any field that "
+            f"already has a conflicting value)."
+        )
     machine = machine_override or os.environ.get("WRKSLOTS_MACHINE")
     if machine is None:
         machine = _as_str(raw["machine"], "configuration.machine")
@@ -359,6 +446,7 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
         raise StateError(
             f"configured liveness command is missing, not runnable, or unsafe: {liveness_command}"
         )
+    cap = raw.get("max_active_slots")
     return Config(
         root=root,
         config_path=path,
@@ -372,6 +460,11 @@ def _load_config(explicit_root: str | None, machine_override: str | None) -> Con
             minimum=1,
         ),
         liveness_command=liveness_command,
+        max_active_slots=(
+            None
+            if cap is None
+            else _as_int(cap, "configuration.max_active_slots", minimum=0)
+        ),
     )
 
 
@@ -2210,6 +2303,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         landed_ref,
         args.heartbeat_ttl_seconds,
         liveness_relative,
+        args.max_active_slots,
     )
     config_path = root / CONFIG_NAME
     with _locked_config(config_path, args.wait_lock):
@@ -2217,10 +2311,19 @@ def _cmd_init(args: argparse.Namespace) -> int:
         if config_path.exists() or config_path.is_symlink():
             existing = _as_mapping(_read_json(config_path, "configuration"), "configuration")
             if dict(existing) != payload:
-                raise Refusal(
-                    f"{config_path} already has different configuration; "
-                    "do not move live state by rerunning init"
-                )
+                if not args.repair:
+                    raise Refusal(
+                        f"{config_path} already has different configuration; "
+                        "do not move live state by rerunning init. If this "
+                        "configuration was written by an older build and no "
+                        "longer loads, migrate it with `init --repair`."
+                    )
+                repaired, changes = _repaired_config(dict(existing), payload)
+                _atomic_write_json(config_path, repaired)
+                for line in changes:
+                    print(f"REPAIRED {config_path}: {line}")
+            elif args.repair:
+                print(f"UNCHANGED {config_path}: already current")
         else:
             _atomic_write_json(config_path, payload)
     if worktrees.exists() and (not worktrees.is_dir() or worktrees.is_symlink()):
@@ -2235,6 +2338,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         default_landed_ref=landed_ref,
         heartbeat_ttl_seconds=args.heartbeat_ttl_seconds,
         liveness_command=liveness_command,
+        max_active_slots=args.max_active_slots,
     )
     with _mutation_locks(config, args.wait_lock):
         _recover_partial_updates(config, True)
@@ -2347,6 +2451,33 @@ def _create_plan(config: Config, args: argparse.Namespace, vcs: GitVcs) -> tuple
     return tuple(sorted(planned, key=lambda item: item.name))
 
 
+def _assert_active_slot_cap(config: Config, states: Sequence[ActiveState]) -> None:
+    """Refuse a new allocation once this machine is at its configured cap.
+
+    The cap counts rows in this machine's shard, which is the same population
+    the allocation is about to join. It is enforced here, on the allocation
+    path, rather than reported after the fact: a cap that only appears in a
+    report is not a cap, and a breach discovered later cannot un-allocate the
+    slot that caused it.
+    """
+    cap = config.max_active_slots
+    if cap is None:
+        return
+    active = [
+        record
+        for state in states
+        if state.machine == config.machine
+        for record in state.slots
+    ]
+    if len(active) < cap:
+        return
+    raise Refusal(
+        f"machine {config.machine} already holds {len(active)} active slot(s) "
+        f"against max_active_slots={cap}; finish or remove a slot before "
+        f"allocating another. Active: {', '.join(sorted(r.slot for r in active))}"
+    )
+
+
 def _assert_agent_and_slot_free(config: Config, slot: str, agent: str) -> None:
     states = _load_all_active(config)
     for state in states:
@@ -2357,6 +2488,7 @@ def _assert_agent_and_slot_free(config: Config, slot: str, agent: str) -> None:
                 raise Refusal(
                     f"agent {agent!r} already owns slot {record.slot!r} on {state.machine}"
                 )
+    _assert_active_slot_cap(config, states)
     for archive in _load_all_archives(config):
         for archived_record in archive.records:
             if archived_record.get("slot") == slot:
@@ -2889,6 +3021,162 @@ def _status_record(record: ActiveRecord) -> dict[str, object]:
     value["heartbeat_age_seconds"] = int(age)
     value["heartbeat_expired"] = expired
     return value
+
+
+def _slot_findings(config: Config, states: Sequence[ActiveState]) -> list[dict[str, object]]:
+    """Every registry/storage disagreement, as data rather than as a refusal.
+
+    ``status`` deliberately refuses on the first disagreement, because a caller
+    that is about to act must not act on a model known to be wrong. That
+    refusal is the right contract for status and is left exactly as it was.
+    But it names one problem and hides the rest, so an operator repairing a
+    registry that has drifted learns about the drift one run at a time, and
+    cannot see the shape of it at all.
+
+    This collects the same conditions without raising and without authorizing
+    anything. It is diagnosis only: nothing here is a precondition for removal,
+    and no caller may treat a clean result as permission.
+    """
+    findings: list[dict[str, object]] = []
+
+    def note(kind: str, slot: str | None, machine: str | None, detail: str) -> None:
+        findings.append(
+            {"kind": kind, "slot": slot, "machine": machine, "detail": detail}
+        )
+
+    expected: set[str] = set()
+    for state in states:
+        for record in state.slots:
+            expected.add(record.slot)
+            slot_path = config.worktrees / record.slot
+            if not slot_path.is_dir() or slot_path.is_symlink():
+                note(
+                    "row-without-directory",
+                    record.slot,
+                    state.machine,
+                    f"active row but no slot directory at {slot_path}",
+                )
+                continue
+            try:
+                actual = {entry.name for entry in slot_path.iterdir()}
+            except OSError as exc:
+                note(
+                    "slot-unreadable", record.slot, state.machine,
+                    f"cannot inspect {slot_path}: {exc}",
+                )
+                continue
+            want = {checkout.name for checkout in record.checkouts}
+            for name in sorted(want - actual):
+                note(
+                    "missing-checkout", record.slot, state.machine,
+                    f"record names checkout {name!r} but it is not in the slot",
+                )
+            for name in sorted(actual - want):
+                note(
+                    "unexpected-entry", record.slot, state.machine,
+                    f"slot holds {name!r}, which its record does not name",
+                )
+            process_state, process_detail = _process_state(record.owner)
+            if process_state == "dead":
+                note(
+                    "dead-owner", record.slot, state.machine,
+                    f"recorded owner is not running ({process_detail}); the slot "
+                    "is held by a row whose owner has exited",
+                )
+
+    try:
+        on_disk = {
+            entry.name
+            for entry in config.worktrees.iterdir()
+            if entry.is_dir() and not entry.is_symlink()
+        }
+    except OSError as exc:
+        note("worktrees-unreadable", None, None, f"cannot enumerate {config.worktrees}: {exc}")
+        on_disk = set()
+    for name in sorted(on_disk - expected):
+        note(
+            "directory-without-row", name, None,
+            f"{config.worktrees / name} exists but no active row claims it",
+        )
+
+    for path in _outstanding_journals(config):
+        note("unfinished-journal", None, None, f"recovery required: {path.name}")
+
+    # `status` refuses outright on a partial atomic update. Diagnosis reports
+    # it instead, because an operator looking at a wedged registry needs to see
+    # the interrupted write alongside everything else, not in place of it.
+    leftovers = sorted(config.worktrees.glob("ACTIVE.*.json.tmp.*"))
+    leftovers += sorted(config.worktrees.glob("ARCHIVED.*.json.tmp.*"))
+    leftovers += sorted(config.worktrees.glob("ACTIVE.*.journal.tmp.*"))
+    for path in leftovers:
+        note(
+            "partial-atomic-update", None, None,
+            f"interrupted write left {path.name}; preserve it and run "
+            "'wrkslots recover'",
+        )
+
+    cap = config.max_active_slots
+    mine = [r for s in states if s.machine == config.machine for r in s.slots]
+    if cap is not None and len(mine) > cap:
+        note(
+            "cap-breach", None, config.machine,
+            f"{len(mine)} active slot(s) against max_active_slots={cap} "
+            f"(excess {len(mine) - cap})",
+        )
+    return findings
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    config = _load_config(args.project_root, args.machine)
+    with _locked(
+        config.worktrees / "ACTIVE", exclusive=False, wait_seconds=args.wait_lock
+    ):
+        all_states, _archives = _validate_global_state(config)
+        states = (
+            all_states
+            if args.all_machines
+            else [state for state in all_states if state.machine == config.machine]
+        )
+        findings = _slot_findings(config, states)
+        rows = [
+            _status_record(record) for state in states for record in state.slots
+        ]
+    cap = config.max_active_slots
+    if args.format == "json":
+        print(
+            json.dumps(
+                {
+                    "schema": SCHEMA,
+                    "project_root": str(config.root),
+                    "worktrees_dir": str(config.worktrees),
+                    "machines": [state.machine for state in states],
+                    "active": rows,
+                    "max_active_slots": cap,
+                    "findings": findings,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+    else:
+        print(
+            f"project={config.root} worktrees={config.worktrees} "
+            f"active={len(rows)} cap={'none' if cap is None else cap} "
+            f"findings={len(findings)}"
+        )
+        counts: dict[str, int] = {}
+        for item in findings:
+            kind = str(item["kind"])
+            counts[kind] = counts.get(kind, 0) + 1
+        for kind in sorted(counts):
+            print(f"  {counts[kind]:4d}  {kind}")
+        for item in findings:
+            where = item["slot"] or "-"
+            print(f"{item['kind']}: {where}: {item['detail']}")
+    # Diagnosis never authorizes anything, so it does not fail the caller for
+    # finding problems; a non-zero exit here would push callers toward `|| true`
+    # and lose the real refusals too.
+    return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -3806,6 +4094,20 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
         required=True,
         help="executable path relative to the project root; rc 0 dead, 1 alive, 2 unverifiable",
     )
+    init.add_argument(
+        "--max-active-slots",
+        type=int,
+        default=None,
+        help="refuse create/register beyond this many active slots on this machine "
+        "(default: uncapped)",
+    )
+    init.add_argument(
+        "--repair",
+        action="store_true",
+        help="migrate a configuration written by an older build: add missing "
+        "fields and bump the schema, refusing any field that already has a "
+        "conflicting value",
+    )
     init.set_defaults(handler=_cmd_init)
 
     status = subparsers.add_parser(
@@ -3817,6 +4119,18 @@ Exit status: 0 success, 2 command-line usage, 3 fail-closed refusal.
     status.add_argument("--slot", help="show one slot")
     status.add_argument("--format", choices=("human", "json"), default="human")
     status.set_defaults(handler=_cmd_status)
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        description=(
+            "read-only: list every registry/storage disagreement at once "
+            "instead of refusing at the first; authorizes nothing"
+        ),
+        help="list every registry/storage disagreement at once (read-only)",
+    )
+    doctor.add_argument("--all-machines", action="store_true", help="read every ACTIVE shard")
+    doctor.add_argument("--format", choices=("human", "json"), default="human")
+    doctor.set_defaults(handler=_cmd_doctor)
 
     create = subparsers.add_parser(
         "create",
@@ -3960,6 +4274,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--heartbeat-ttl-seconds must be positive")
         if args.project_root is not None:
             parser.error("init uses its DIRECTORY argument, not --project-root")
+        if args.max_active_slots is not None and args.max_active_slots < 0:
+            parser.error("--max-active-slots must be non-negative")
     handler = getattr(args, "handler", None)
     if handler is None:
         parser.print_help()

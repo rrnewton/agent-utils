@@ -11,11 +11,19 @@ removal for a lifecycle command.
 
 Initialize from the project root with the registered liveness command. Its exit status is part of
 the removal boundary: rc 0 means verified dead, rc 1 means alive, and rc 2 means unverifiable.
+`--max-active-slots N` caps how many active slots this machine may hold; the cap is enforced when
+an allocation is requested, and omitting it means uncapped.
 
 ```sh
 agent-utils/py/wrkslots.py init \
-  --liveness-command ci-hub/health/agent_liveness_probe.py
+  --liveness-command ci-hub/health/agent_liveness_probe.py \
+  --max-active-slots 12
 ```
+
+A configuration written by an older build, missing a field this one requires, makes every command
+refuse. `init --repair` migrates it: it adds missing fields, bumps the schema, prints each change,
+and refuses every field that already holds a conflicting value rather than repointing the tool at a
+different registry.
 
 Create one fresh slot for one agent. Repeat `--repo`, `--remote-url`, and `--branch` for multiple
 repositories. The remote URL is trusted provisioning input; it is not learned from mutable Git
@@ -32,6 +40,11 @@ worktrees/wrkslots create slot01 \
 Use `status --all-machines` for read-only inspection. A row without its directory, a directory
 without its row, duplicate cross-shard ownership, corrupt state, or an unfinished journal refuses.
 Heartbeat age and TTL expiry are diagnosis only and never authorize removal.
+
+Use `doctor` when repairing a registry that has drifted: it lists every disagreement at once, in
+human or `--format json`, instead of refusing at the first. It is diagnosis only — it authorizes
+nothing, is never a precondition for removal, and always exits 0, so `status`'s refusals remain the
+gate.
 
 While the owner is alive, `finish` proves clean Git state, trusted remote identity, exact containing
 remote refs, landed ancestry, and path identity. It records validation, limitations, exact commits,
