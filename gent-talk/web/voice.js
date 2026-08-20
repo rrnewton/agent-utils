@@ -796,15 +796,32 @@ function canSendText() {
 // the same sentence twice a minute later still sees both.
 const TYPED_ECHO_WINDOW_MS = 10000;
 
-let lastTyped = { text: "", at: 0 };
+// A LIST, not one slot. Two typed turns inside the window used to leave the first duplicable: the
+// second overwrote it, so the vendor's echo of the first matched nothing and was rendered a second
+// time AND recorded to the server twice. Tapping Sumry and then Blockers is two sends in a second,
+// so this is the ordinary case rather than a corner.
+let recentTyped = [];
+
+function noteTypedTurn(said) {
+  const now = Date.now();
+  recentTyped = recentTyped.filter((t) => now - t.at < TYPED_ECHO_WINDOW_MS);
+  recentTyped.push({ text: said, at: now });
+}
 
 /** Would this arriving transcript be the echo of something just typed? */
 function isEchoOfTyped(said) {
-  return (
-    lastTyped.text !== "" &&
-    said.trim() === lastTyped.text &&
-    Date.now() - lastTyped.at < TYPED_ECHO_WINDOW_MS
+  const now = Date.now();
+  const want = said.trim();
+  // Consume the match: an echo answers for exactly one send, so saying the same sentence twice on
+  // purpose still shows twice.
+  const i = recentTyped.findIndex(
+    (t) => t.text === want && now - t.at < TYPED_ECHO_WINDOW_MS
   );
+  if (i === -1) {
+    return false;
+  }
+  recentTyped.splice(i, 1);
+  return true;
 }
 
 /**
@@ -814,7 +831,13 @@ function isEchoOfTyped(said) {
  * against, and with no call open there is nothing for the text to reach — so it says which control
  * would fix that, and it does not throw away what was typed.
  */
-function sendUserMessage(text) {
+/**
+ * @param {{fromComposer?: boolean}} [options] Clearing the field is only correct when the field is
+ *   where the text came from. A canned prompt that wiped a half-written message would destroy work
+ *   the page explicitly promises to keep, and it is one tap away from the composer at all times.
+ */
+function sendUserMessage(text, options) {
+  const fromComposer = Boolean(options && options.fromComposer);
   const said = String(text === null || text === undefined ? "" : text).trim();
   if (said === "") {
     return false;
@@ -827,9 +850,11 @@ function sendUserMessage(text) {
   // turn that only appears if the vendor chooses to reflect it is a turn that can silently vanish.
   line("you", said);
   recordTurn("you", said);
-  lastTyped = { text: said, at: Date.now() };
-  el("compose-text").value = "";
-  el("compose-text").focus();
+  noteTypedTurn(said);
+  if (fromComposer) {
+    el("compose-text").value = "";
+    el("compose-text").focus();
+  }
   setStatus("Sent.");
   return true;
 }
@@ -888,7 +913,7 @@ function setTextMode(on) {
 
 /** The Send button and the Enter key, which must not be two different opinions about sending. */
 function sendTyped() {
-  return sendUserMessage(el("compose-text").value);
+  return sendUserMessage(el("compose-text").value, { fromComposer: true });
 }
 
 // --- the canned prompts -------------------------------------------------------------------------
@@ -2002,7 +2027,7 @@ function teardown() {
   // window, which would leave the agent up to thirty seconds of unexplained silence. And a typed
   // turn from the dead conversation cannot suppress a transcript in the new one.
   lastActivityAt = 0;
-  lastTyped = { text: "", at: 0 };
+  recentTyped = [];
   renderControls();
 }
 

@@ -5932,3 +5932,59 @@ test("the settings screen states which control erases the record and which does 
   assert.match(settings, /not encrypted/, "an unencrypted record has to say so where it is offered");
   assert.match(settings, /id="forget-conversations"/);
 });
+
+// --- the send path serves two callers, and they are not the same caller -------------------------
+
+test("A CANNED PROMPT DOES NOT DESTROY WHAT YOU WERE HALF-WAY THROUGH TYPING", async () => {
+  const page = newPage();
+  await startTalking(page);
+  await page.el("text-entry").click();
+  page.el("compose-text").value = "half a thought I have not finished";
+
+  await page.el("canned-summary").click();
+
+  assert.equal(
+    page.el("compose-text").value,
+    "half a thought I have not finished",
+    "tapping a canned prompt cleared the composer — the page promises to keep a draft"
+  );
+  const lines = page.el("transcript").children;
+  assert.match(lines[lines.length - 1].text(), /Summarize the recent messages/);
+});
+
+test("and the composer's OWN send still clears it, because that text did come from there", async () => {
+  const page = newPage();
+  await startTalking(page);
+  await page.el("text-entry").click();
+  page.el("compose-text").value = "did the retry-budget branch land";
+  await page.el("send-text").click();
+  assert.equal(page.el("compose-text").value, "", "the composer kept the message it just sent");
+});
+
+test("TWO typed turns in a row are BOTH protected from the vendor echoing them back", async () => {
+  const page = newPage();
+  const socket = await startTalking(page);
+  await page.el("text-entry").click();
+
+  for (const said of ["first question", "second question"]) {
+    page.el("compose-text").value = said;
+    await page.el("send-text").click();
+  }
+  const afterSends = page.el("transcript").children.length;
+
+  // The vendor reflects them back, oldest first. Neither may render twice.
+  for (const said of ["first question", "second question"]) {
+    socket.onmessage({
+      data: JSON.stringify({
+        type: "user_transcript",
+        user_transcription_event: { user_transcript: said },
+      }),
+    });
+  }
+
+  assert.equal(
+    page.el("transcript").children.length,
+    afterSends,
+    "an echoed typed turn was rendered a second time — the de-dupe remembered only the newest"
+  );
+});
