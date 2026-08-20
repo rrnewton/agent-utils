@@ -54,6 +54,7 @@ from safe_ci_dag_runner.io import (
     dag_to_yaml,
 )
 from safe_ci_dag_runner.model import (
+    DAG_CONFIG_FIELDS,
     DEFAULT_JOBS_FLAG,
     DEFAULT_STEP_TIMEOUT,
     DagConfig,
@@ -63,6 +64,7 @@ from safe_ci_dag_runner.model import (
     WriteDomainGuarantee,
     WriteDomainPolicy,
     command_with_inner_jobs,
+    dag_config_carry_diff,
     effective_jobs_flag,
     preferred_inner_jobs,
     render_jobs_flag,
@@ -146,6 +148,8 @@ __all__ = [
     "step_classification",
     "preferred_inner_jobs",
     "step_failure_reason",
+    "DAG_CONFIG_FIELDS",
+    "dag_config_carry_diff",
     "undeclared_resource_demands",
     "write_domain_violations",
     "render_jobs_flag",

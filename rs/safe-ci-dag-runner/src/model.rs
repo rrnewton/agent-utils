@@ -564,6 +564,203 @@ impl DagConfig {
     pub fn by_tag(&self) -> BTreeMap<String, &Step> {
         self.steps.iter().map(|s| (s.tag(), s)).collect()
     }
+
+    /// This configuration's POLICY carried forward onto a different step list.
+    ///
+    /// The safe replacement for `DagConfig { steps, ..Default::default() }`, which is how the
+    /// dropped-field bug is written every time: `..Default::default()` reverts every field the
+    /// literal does not name, and the reverted fields appear in no diff, no warning and no
+    /// failure. Take a lane's steps and call this on the config they came from, and the caps,
+    /// timeouts and memory policy travel with them by construction.
+    #[must_use]
+    pub fn with_steps(&self, steps: Vec<Step>) -> DagConfig {
+        let mut out = self.clone();
+        out.steps = steps;
+        out
+    }
+}
+
+/// Every top-level `DagConfig` field, in declaration order — the checklist `carry_diff` walks.
+///
+/// Written down so a reader can see the whole surface at once; the compiler holds it honest,
+/// because [`dag_config_carry_diff`] destructures `DagConfig` exhaustively (no `..`) and a new
+/// field therefore fails to build until it is given a comparison here too.
+pub const DAG_CONFIG_FIELDS: [&str; 14] = [
+    "steps",
+    "description",
+    "resource_caps",
+    "mem_cap_factor",
+    "mem_cap_floor_bytes",
+    "outer_mem_safety_factor",
+    "default_step_timeout",
+    "default_jobs_flag",
+    "default_step_mem_cap_bytes",
+    "default_step_cpu_count",
+    "default_step_cpu_timeout",
+    "cpu_timeout_multiplier",
+    "cpu_timeout_platform",
+    "write_domain_policy",
+];
+
+/// Every top-level field whose value DIFFERS between two configurations, named with both values.
+///
+/// A CARRY ASSERTION. A consumer that loads a DAG file, keeps its steps and rebuilds the config
+/// silently substitutes a default for every field it did not name — a 600 s wall budget becomes
+/// 1800 s, an 8 GiB floor becomes whatever the constant says, and NOTHING reports it. A cap that
+/// silently becomes a default is indistinguishable from a cap someone chose, so the only way to
+/// know a config survived a round trip is to compare it, field by field, against the one it came
+/// from: `assert!(dag_config_carry_diff(&loaded, &rebuilt).is_empty())`.
+///
+/// Deliberately NOT a derived `PartialEq`. The comparison destructures both sides exhaustively,
+/// so adding a field to `DagConfig` is a COMPILE ERROR here until its comparison is written —
+/// which is exactly this bug's shape, a new field quietly defaulting at a call site nobody
+/// revisited. A derived `PartialEq` would start silently covering new fields and then, the first
+/// time one was `f64::NAN` or intentionally excluded, silently stop being an assertion at all.
+///
+/// `steps` are compared by tag sequence, not deeply: this answers "did the POLICY survive", and a
+/// consumer that rebuilds a config is by construction keeping the same steps.
+pub fn dag_config_carry_diff(from: &DagConfig, to: &DagConfig) -> Vec<String> {
+    // Exhaustive destructuring, NO `..`: this is the compile-time half of the guarantee.
+    let DagConfig {
+        steps: from_steps,
+        description: from_description,
+        resource_caps: from_resource_caps,
+        mem_cap_factor: from_mem_cap_factor,
+        mem_cap_floor_bytes: from_mem_cap_floor_bytes,
+        outer_mem_safety_factor: from_outer_mem_safety_factor,
+        default_step_timeout: from_default_step_timeout,
+        default_jobs_flag: from_default_jobs_flag,
+        default_step_mem_cap_bytes: from_default_step_mem_cap_bytes,
+        default_step_cpu_count: from_default_step_cpu_count,
+        default_step_cpu_timeout: from_default_step_cpu_timeout,
+        cpu_timeout_multiplier: from_cpu_timeout_multiplier,
+        cpu_timeout_platform: from_cpu_timeout_platform,
+        write_domain_policy: from_write_domain_policy,
+    } = from;
+    let DagConfig {
+        steps: to_steps,
+        description: to_description,
+        resource_caps: to_resource_caps,
+        mem_cap_factor: to_mem_cap_factor,
+        mem_cap_floor_bytes: to_mem_cap_floor_bytes,
+        outer_mem_safety_factor: to_outer_mem_safety_factor,
+        default_step_timeout: to_default_step_timeout,
+        default_jobs_flag: to_default_jobs_flag,
+        default_step_mem_cap_bytes: to_default_step_mem_cap_bytes,
+        default_step_cpu_count: to_default_step_cpu_count,
+        default_step_cpu_timeout: to_default_step_cpu_timeout,
+        cpu_timeout_multiplier: to_cpu_timeout_multiplier,
+        cpu_timeout_platform: to_cpu_timeout_platform,
+        write_domain_policy: to_write_domain_policy,
+    } = to;
+
+    let mut out: Vec<String> = Vec::new();
+    let mut note = |field: &str, a: String, b: String| {
+        if a != b {
+            out.push(format!("{field}: {a} -> {b}"));
+        }
+    };
+    let tags = |steps: &[Step]| steps.iter().map(Step::tag).collect::<Vec<_>>().join(",");
+    note("steps", tags(from_steps), tags(to_steps));
+    note(
+        "description",
+        from_description.clone(),
+        to_description.clone(),
+    );
+    note(
+        "resource_caps",
+        render_caps(from_resource_caps),
+        render_caps(to_resource_caps),
+    );
+    // Rendered, not compared as f64: NaN != NaN would report an unchanged field as dropped, and
+    // a report that fires on a config nobody touched is a report nobody reads.
+    note(
+        "mem_cap_factor",
+        from_mem_cap_factor.to_string(),
+        to_mem_cap_factor.to_string(),
+    );
+    note(
+        "mem_cap_floor_bytes",
+        from_mem_cap_floor_bytes.to_string(),
+        to_mem_cap_floor_bytes.to_string(),
+    );
+    note(
+        "outer_mem_safety_factor",
+        from_outer_mem_safety_factor.to_string(),
+        to_outer_mem_safety_factor.to_string(),
+    );
+    note(
+        "default_step_timeout",
+        from_default_step_timeout.to_string(),
+        to_default_step_timeout.to_string(),
+    );
+    note(
+        "default_jobs_flag",
+        from_default_jobs_flag.clone(),
+        to_default_jobs_flag.clone(),
+    );
+    note(
+        "default_step_mem_cap_bytes",
+        render_opt_int(*from_default_step_mem_cap_bytes),
+        render_opt_int(*to_default_step_mem_cap_bytes),
+    );
+    note(
+        "default_step_cpu_count",
+        render_opt_int(*from_default_step_cpu_count),
+        render_opt_int(*to_default_step_cpu_count),
+    );
+    note(
+        "default_step_cpu_timeout",
+        from_default_step_cpu_timeout.to_string(),
+        to_default_step_cpu_timeout.to_string(),
+    );
+    note(
+        "cpu_timeout_multiplier",
+        from_cpu_timeout_multiplier.to_string(),
+        to_cpu_timeout_multiplier.to_string(),
+    );
+    note(
+        "cpu_timeout_platform",
+        from_cpu_timeout_platform.clone(),
+        to_cpu_timeout_platform.clone(),
+    );
+    note(
+        "write_domain_policy",
+        render_policy(from_write_domain_policy),
+        render_policy(to_write_domain_policy),
+    );
+    out
+}
+
+fn render_caps(caps: &BTreeMap<String, i64>) -> String {
+    let body = caps
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// `None` renders as `<absent>`, never as `0`: ABSENT IS NOT ZERO here either, and a disabled
+/// default cap and a cap of zero are opposite instructions.
+fn render_opt_int(value: Option<i64>) -> String {
+    match value {
+        Some(v) => v.to_string(),
+        None => "<absent>".to_string(),
+    }
+}
+
+fn render_policy(policy: &WriteDomainPolicy) -> String {
+    let domains = policy
+        .allowed_domains
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "require_explicit={} allowed=[{}]",
+        policy.require_explicit, domains
+    )
 }
 
 /// Steps demanding a named resource that `resource_caps` never declares.
@@ -1209,5 +1406,155 @@ mod cpu_timeout_multiplier_tests {
         assert!(resolve_cpu_timeout_multiplier(Some(0.0)).is_err());
         assert!(resolve_cpu_timeout_multiplier(Some(-1.0)).is_err());
         assert_eq!(resolve_cpu_timeout_multiplier(Some(1.5)).unwrap().0, 1.5);
+    }
+}
+
+/// The CARRY ASSERTION: a rebuilt `DagConfig` must be provably the same configuration.
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+
+    fn step() -> Step {
+        Step {
+            group: "g".into(),
+            job: "j".into(),
+            desc: "d".into(),
+            description: String::new(),
+            cmd: "true".into(),
+            deps: vec![],
+            env: BTreeMap::new(),
+            hint: ResourceHint::default(),
+            networkonly: false,
+            engine_only: false,
+            timeout: DEFAULT_STEP_TIMEOUT,
+            cpu_timeout: 0,
+            jobs_flag: None,
+            skip_reason: None,
+            write_domains: None,
+            write_domain_guarantee: None,
+        }
+    }
+
+    /// A config with every top-level field DELIBERATELY off its default, so a dropped field
+    /// cannot coincide with the default it was replaced by. `mem_cap_factor` 1.25 and
+    /// `outer_mem_safety_factor` 1.0 were harmless in the live bug only by that coincidence.
+    fn configured() -> DagConfig {
+        let mut caps = BTreeMap::new();
+        caps.insert("hermit_guest".to_string(), 1);
+        caps.insert("manifest_guest".to_string(), 4);
+        let policy = WriteDomainPolicy {
+            require_explicit: true,
+            allowed_domains: BTreeSet::from(["shared-cargo-target".to_string()]),
+        };
+        DagConfig {
+            steps: vec![Step {
+                write_domains: Some(vec!["shared-cargo-target".to_string()]),
+                ..step()
+            }],
+            description: "a real lane".to_string(),
+            resource_caps: caps,
+            mem_cap_factor: 1.5,
+            mem_cap_floor_bytes: 4 * 1024i64.pow(3),
+            outer_mem_safety_factor: 1.2,
+            default_step_timeout: 600,
+            default_jobs_flag: "--jobs {n}".to_string(),
+            default_step_mem_cap_bytes: None,
+            default_step_cpu_count: Some(4),
+            default_step_cpu_timeout: 120,
+            cpu_timeout_multiplier: 2.0,
+            cpu_timeout_platform: "github-hosted".to_string(),
+            write_domain_policy: policy,
+        }
+    }
+
+    #[test]
+    fn carry_diff_is_empty_for_a_config_compared_with_itself() {
+        let cfg = configured();
+        assert_eq!(dag_config_carry_diff(&cfg, &cfg), Vec::<String>::new());
+        assert_eq!(
+            dag_config_carry_diff(&DagConfig::default(), &DagConfig::default()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn carry_diff_names_every_field_a_default_rebuild_drops() {
+        let cfg = configured();
+        // The exact footgun from the field: keep the steps, revert everything else.
+        let rebuilt = DagConfig {
+            steps: cfg.steps.clone(),
+            ..Default::default()
+        };
+        let diff = dag_config_carry_diff(&cfg, &rebuilt);
+        let named: Vec<&str> = diff
+            .iter()
+            .map(|line| line.split(':').next().unwrap())
+            .collect();
+        // Every field EXCEPT `steps` -- which is the one the literal named, and the only one
+        // that survived. 13 of 14.
+        let expected: Vec<&str> = DAG_CONFIG_FIELDS
+            .iter()
+            .copied()
+            .filter(|f| *f != "steps")
+            .collect();
+        assert_eq!(named, expected, "carry diff: {diff:?}");
+        // The loudest one in the live incident, spelled out: 600 s became 1800 s.
+        assert!(
+            diff.contains(&"default_step_timeout: 600 -> 1800".to_string()),
+            "{diff:?}"
+        );
+    }
+
+    #[test]
+    fn with_steps_carries_every_field_the_default_rebuild_drops() {
+        let cfg = configured();
+        let carried = cfg.with_steps(cfg.steps.clone());
+        assert_eq!(dag_config_carry_diff(&cfg, &carried), Vec::<String>::new());
+        // And it really does replace the steps, so it is usable where the footgun was written.
+        let fewer = cfg.with_steps(Vec::new());
+        assert_eq!(dag_config_carry_diff(&cfg, &fewer), vec!["steps: g.j -> "]);
+    }
+
+    #[test]
+    fn an_absent_default_cap_is_reported_as_absent_not_as_zero() {
+        let absent = DagConfig {
+            default_step_mem_cap_bytes: None,
+            ..Default::default()
+        };
+        let zero = DagConfig {
+            default_step_mem_cap_bytes: Some(0),
+            ..Default::default()
+        };
+        // ABSENT IS NOT ZERO: "disable the cap" and "cap at 0" are opposite instructions, so the
+        // report must not collapse them into the same line.
+        assert_eq!(
+            dag_config_carry_diff(&absent, &zero),
+            vec!["default_step_mem_cap_bytes: <absent> -> 0"]
+        );
+    }
+
+    #[test]
+    fn a_nan_factor_is_not_reported_as_a_dropped_field() {
+        // NaN != NaN, so a naive float comparison would report an untouched config as changed --
+        // an assertion that fires on a config nobody rebuilt is one nobody keeps.
+        let nan = DagConfig {
+            mem_cap_factor: f64::NAN,
+            ..Default::default()
+        };
+        assert_eq!(dag_config_carry_diff(&nan, &nan), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_field_checklist_matches_the_comparison() {
+        // DAG_CONFIG_FIELDS is prose until something checks it. The compiler already forces a new
+        // DagConfig field into `dag_config_carry_diff` (exhaustive destructuring, no `..`); this
+        // pins the count so the written-down list cannot drift away from what is compared.
+        let cfg = configured();
+        let diff = dag_config_carry_diff(&cfg, &DagConfig::default());
+        assert_eq!(
+            diff.len(),
+            DAG_CONFIG_FIELDS.len(),
+            "every field differs between a fully-configured DAG and the defaults: {diff:?}"
+        );
     }
 }

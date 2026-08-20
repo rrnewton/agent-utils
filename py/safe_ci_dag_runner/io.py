@@ -401,6 +401,41 @@ def dag_from_yaml(text: str) -> DagConfig:
     return _dag_from_obj(raw)
 
 
+#: :class:`DagConfig` fields that the DOCUMENT FORMAT deliberately does not carry.
+#:
+#: Writing one of these at the top level of a DAG file today has no effect whatsoever: the parser
+#: never looks at the key, the field takes its dataclass default, and nothing says so.  That is
+#: the dropped-field bug from the reader's side — a configured cap silently replaced by a default,
+#: with no report — so the loader REFUSES the key by name instead of ignoring it.
+#:
+#: Genuinely unknown keys stay tolerated: a key nobody has ever implemented cannot masquerade as a
+#: setting that took effect, whereas one that names a real field reads exactly like one that did.
+#: ``known_failures`` is listed although only this edition has the field, so both editions refuse
+#: the same set of keys byte for byte.
+UNCARRIED_CONFIG_KEYS: tuple[str, ...] = (
+    "default_step_mem_cap_bytes",
+    "default_step_cpu_count",
+    "default_step_cpu_timeout",
+    "cpu_timeout_multiplier",
+    "cpu_timeout_platform",
+    "known_failures",
+)
+
+
+def _refuse_uncarried_config_keys(doc: Mapping[str, object]) -> None:
+    """Raise when the document sets a real config field the format cannot carry."""
+    present = [key for key in UNCARRIED_CONFIG_KEYS if key in doc]
+    if not present:
+        return
+    raise DagJsonError(
+        f"<root>: {len(present)} top-level key(s) name a DagConfig field the DAG document "
+        "format does not carry, so the value would be SILENTLY replaced by a default: "
+        + ", ".join(present)
+        + ". Set these on the DagConfig at the call site (they are caller/platform policy, not "
+        "properties of the graph), or remove them."
+    )
+
+
 def _dag_from_obj(raw: object) -> DagConfig:
     """Build a :class:`DagConfig` from an already-parsed JSON/YAML object.
 
@@ -408,6 +443,7 @@ def _dag_from_obj(raw: object) -> DagConfig:
     two syntaxes cannot drift in how they construct the model.
     """
     doc = _as_obj(raw, "<root>")
+    _refuse_uncarried_config_keys(doc)
     # The document-level default_step_timeout is the per-step default for any step that omits
     # its own `timeout` (falling back to the module constant only when the document omits it
     # too). Parse it BEFORE the step loop so it can be threaded in as each step's default.

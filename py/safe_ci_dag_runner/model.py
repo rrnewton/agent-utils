@@ -10,7 +10,8 @@ import math
 import os
 import signal
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from dataclasses import fields as dataclass_fields
 from enum import Enum
 
 DEFAULT_STEP_TIMEOUT = 1800
@@ -440,6 +441,146 @@ class DagConfig:
     def by_tag(self) -> dict[str, Step]:
         """Index configured steps by their stable tags."""
         return {step.tag: step for step in self.steps}
+
+    def with_steps(self, steps: Sequence[Step]) -> DagConfig:
+        """This configuration's POLICY carried forward onto a different step list.
+
+        The safe replacement for ``DagConfig(steps=steps)``, which is how the dropped-field bug
+        is written every time: every field the call does not name reverts to its default, and the
+        reverted fields appear in no diff, no warning and no failure.  Take a lane's steps and
+        call this on the config they came from, and the caps, timeouts and memory policy travel
+        with them by construction.
+        """
+        return replace(self, steps=tuple(steps))
+
+
+#: Every top-level :class:`DagConfig` field, in declaration order — the checklist
+#: :func:`dag_config_carry_diff` walks.  :func:`_check_dag_config_fields` asserts this list is
+#: exactly the dataclass's own field set, so a NEW field cannot join ``DagConfig`` without being
+#: given a comparison here: that is the Python stand-in for the Rust edition's exhaustive
+#: destructuring, which makes the same omission a compile error.
+DAG_CONFIG_FIELDS: tuple[str, ...] = (
+    "steps",
+    "description",
+    "resource_caps",
+    "mem_cap_factor",
+    "mem_cap_floor_bytes",
+    "outer_mem_safety_factor",
+    "default_step_timeout",
+    "default_jobs_flag",
+    "default_step_mem_cap_bytes",
+    "default_step_cpu_count",
+    "default_step_cpu_timeout",
+    "known_failures",
+    "cpu_timeout_multiplier",
+    "cpu_timeout_platform",
+    "write_domain_policy",
+)
+
+
+def _check_dag_config_fields() -> list[str]:
+    """Field names present on :class:`DagConfig` but absent from :data:`DAG_CONFIG_FIELDS`, or
+    the reverse — empty when the written-down checklist is exactly the dataclass."""
+    declared = {f.name for f in dataclass_fields(DagConfig)}
+    listed = set(DAG_CONFIG_FIELDS)
+    return sorted((declared - listed) | (listed - declared))
+
+
+def _render_caps(caps: Mapping[str, int]) -> str:
+    return "{" + ",".join(f"{k}={v}" for k, v in sorted(caps.items())) + "}"
+
+
+def _render_opt_int(value: int | None) -> str:
+    """``None`` renders as ``<absent>``, never as ``0``: ABSENT IS NOT ZERO here either, and a
+    disabled default cap and a cap of zero are opposite instructions."""
+    return "<absent>" if value is None else str(value)
+
+
+def _render_policy(policy: WriteDomainPolicy) -> str:
+    domains = ",".join(sorted(policy.allowed_domains))
+    return f"require_explicit={policy.require_explicit} allowed=[{domains}]"
+
+
+def dag_config_carry_diff(frm: DagConfig, to: DagConfig) -> list[str]:
+    """Every top-level field whose value DIFFERS between two configurations, named with both
+    values.
+
+    A CARRY ASSERTION.  A consumer that loads a DAG file, keeps its steps and rebuilds the config
+    silently substitutes a default for every field it did not name — a 600 s wall budget becomes
+    1800 s, an 8 GiB floor becomes whatever the constant says, and NOTHING reports it.  A cap that
+    silently becomes a default is indistinguishable from a cap someone chose, so the only way to
+    know a config survived a round trip is to compare it, field by field, against the one it came
+    from::
+
+        assert dag_config_carry_diff(loaded, rebuilt) == []
+
+    Deliberately NOT dataclass equality.  The comparison enumerates fields one at a time against
+    :data:`DAG_CONFIG_FIELDS`, and :func:`_check_dag_config_fields` refuses a ``DagConfig`` field
+    that is not on that list — so adding a field forces a decision here, which is exactly this
+    bug's shape: a new field quietly defaulting at a call site nobody revisited.  Plain ``==``
+    would start silently covering new fields and then, the first time one held ``float('nan')``,
+    silently stop being an assertion at all.
+
+    ``steps`` are compared by tag sequence, not deeply: this answers "did the POLICY survive", and
+    a consumer that rebuilds a config is by construction keeping the same steps.
+    """
+    unaccounted = _check_dag_config_fields()
+    if unaccounted:
+        raise AssertionError(
+            "DAG_CONFIG_FIELDS is out of step with DagConfig for "
+            + ", ".join(unaccounted)
+            + "; give each field a comparison in dag_config_carry_diff before listing it"
+        )
+    rendered: tuple[tuple[str, object, object], ...] = (
+        ("steps", tuple(s.tag for s in frm.steps), tuple(s.tag for s in to.steps)),
+        ("description", frm.description, to.description),
+        ("resource_caps", _render_caps(frm.resource_caps), _render_caps(to.resource_caps)),
+        # Rendered, not compared as floats: NaN != NaN would report an unchanged field as
+        # dropped, and a report that fires on a config nobody touched is a report nobody reads.
+        ("mem_cap_factor", repr(frm.mem_cap_factor), repr(to.mem_cap_factor)),
+        ("mem_cap_floor_bytes", frm.mem_cap_floor_bytes, to.mem_cap_floor_bytes),
+        (
+            "outer_mem_safety_factor",
+            repr(frm.outer_mem_safety_factor),
+            repr(to.outer_mem_safety_factor),
+        ),
+        ("default_step_timeout", frm.default_step_timeout, to.default_step_timeout),
+        ("default_jobs_flag", frm.default_jobs_flag, to.default_jobs_flag),
+        (
+            "default_step_mem_cap_bytes",
+            _render_opt_int(frm.default_step_mem_cap_bytes),
+            _render_opt_int(to.default_step_mem_cap_bytes),
+        ),
+        (
+            "default_step_cpu_count",
+            _render_opt_int(frm.default_step_cpu_count),
+            _render_opt_int(to.default_step_cpu_count),
+        ),
+        ("default_step_cpu_timeout", frm.default_step_cpu_timeout, to.default_step_cpu_timeout),
+        ("known_failures", tuple(sorted(frm.known_failures)), tuple(sorted(to.known_failures))),
+        ("cpu_timeout_multiplier", repr(frm.cpu_timeout_multiplier), repr(to.cpu_timeout_multiplier)),
+        ("cpu_timeout_platform", frm.cpu_timeout_platform, to.cpu_timeout_platform),
+        (
+            "write_domain_policy",
+            _render_policy(frm.write_domain_policy),
+            _render_policy(to.write_domain_policy),
+        ),
+    )
+    if tuple(name for name, _, _ in rendered) != DAG_CONFIG_FIELDS:
+        raise AssertionError(
+            "dag_config_carry_diff compares fields in a different order/set than "
+            "DAG_CONFIG_FIELDS declares"
+        )
+    return [
+        f"{name}: {_flat(a)} -> {_flat(b)}" for name, a, b in rendered if a != b
+    ]
+
+
+def _flat(value: object) -> str:
+    """Render one side of a carry difference on a single line."""
+    if isinstance(value, tuple):
+        return ",".join(str(v) for v in value)
+    return str(value)
 
 
 def undeclared_resource_demands(cfg: DagConfig) -> list[str]:

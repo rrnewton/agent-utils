@@ -340,11 +340,55 @@ pub fn dag_from_yaml(text: &str) -> Result<DagConfig, DagJsonError> {
     dag_from_value(&raw)
 }
 
+/// `DagConfig` fields that the DOCUMENT FORMAT deliberately does not carry.
+///
+/// Writing one of these at the top level of a DAG file today has no effect whatsoever: the
+/// parser never looks at the key, the field takes its `DagConfig` default, and nothing says so.
+/// That is the dropped-field bug from the reader's side — a configured cap silently replaced by
+/// a default, with no report — so the loader REFUSES the key by name instead of ignoring it.
+///
+/// Genuinely unknown keys stay tolerated: a key nobody has ever implemented cannot masquerade as
+/// a setting that took effect, whereas one that names a real field reads exactly like one that
+/// did. `known_failures` is listed although this crate has no such field, because the key set is
+/// a shared contract: both language editions of the runner must refuse the same keys byte for
+/// byte, and a document is not more portable for being accepted by only one of them.
+const UNCARRIED_CONFIG_KEYS: [&str; 6] = [
+    "default_step_mem_cap_bytes",
+    "default_step_cpu_count",
+    "default_step_cpu_timeout",
+    "cpu_timeout_multiplier",
+    "cpu_timeout_platform",
+    "known_failures",
+];
+
+/// `Some(refusal)` when the document sets a real config field the format cannot carry.
+fn uncarried_config_key(doc: &serde_json::Map<String, Value>) -> Option<String> {
+    let present: Vec<&str> = UNCARRIED_CONFIG_KEYS
+        .iter()
+        .copied()
+        .filter(|key| doc.contains_key(*key))
+        .collect();
+    if present.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<root>: {} top-level key(s) name a DagConfig field the DAG document format does not \
+         carry, so the value would be SILENTLY replaced by a default: {}. Set these on the \
+         DagConfig at the call site (they are caller/platform policy, not properties of the \
+         graph), or remove them.",
+        present.len(),
+        present.join(", ")
+    ))
+}
+
 /// Construct a [`DagConfig`] from an already-parsed JSON/YAML value tree — the shared strict
 /// narrowing behind both [`dag_from_json`] and [`dag_from_yaml`], so the two syntaxes cannot
 /// drift in how they build the model.
 pub fn dag_from_value(raw: &Value) -> Result<DagConfig, DagJsonError> {
     let doc = as_obj(raw, "<root>")?;
+    if let Some(refusal) = uncarried_config_key(doc) {
+        return Err(err(refusal));
+    }
     let default_step_timeout = opt_int(doc, "default_step_timeout", DEFAULT_STEP_TIMEOUT)?;
     let policy = write_domain_policy(doc.get("write_domain_policy"))?;
     let steps_raw = match doc.get("steps") {
@@ -1139,5 +1183,70 @@ steps:
         // for real config data (small, few-decimal floats). This test PINS the current behavior so
         // the residual is visible and any future change is caught.
         assert_eq!(json_float(-887777373534812.2), "-887777373534812.3");
+    }
+
+    // ---------------------------------------------- uncarried top-level config keys (#21)
+
+    #[test]
+    fn a_top_level_key_the_format_cannot_carry_is_refused_by_name() {
+        for key in UNCARRIED_CONFIG_KEYS {
+            let doc = format!(r#"{{"{key}": 5, "steps": []}}"#);
+            let error = dag_from_json(&doc)
+                .expect_err(&format!("'{key}' silently reverted to a default"))
+                .0;
+            assert!(error.contains(key), "refusal must name the key: {error}");
+            assert!(
+                error.contains("SILENTLY replaced by a default"),
+                "refusal must say what would otherwise happen: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_counts_and_names_every_offending_key_at_once() {
+        let doc = r#"{"default_step_cpu_timeout": 5, "cpu_timeout_multiplier": 2.0, "steps": []}"#;
+        let error = dag_from_json(doc).unwrap_err().0;
+        assert!(error.contains("2 top-level key(s)"), "{error}");
+        assert!(
+            error.contains("default_step_cpu_timeout, cpu_timeout_multiplier"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_key_naming_no_config_field_at_all_is_still_tolerated() {
+        // Forward compatibility: a key nobody has ever implemented cannot masquerade as a setting
+        // that took effect, so it is NOT the dropped-field bug and stays accepted.
+        let cfg = dag_from_json(r#"{"future_thing": 5, "steps": []}"#)
+            .expect("an unimplemented key is not a dropped field");
+        assert!(cfg.steps.is_empty());
+    }
+
+    #[test]
+    fn every_key_the_serializer_emits_survives_a_round_trip() {
+        // The carry assertion applied to this crate's OWN loader/serializer pair: whatever
+        // dag_to_json writes, dag_from_json must read back to the same configuration, or the
+        // format itself is silently substituting defaults.
+        let doc = r#"{
+            "description": "a real lane",
+            "resource_caps": {"hermit_guest": 1, "manifest_guest": 4},
+            "mem_cap_factor": 1.5,
+            "mem_cap_floor_bytes": 4294967296,
+            "outer_mem_safety_factor": 1.2,
+            "default_step_timeout": 600,
+            "default_jobs_flag": "--jobs {n}",
+            "write_domain_policy": {"require_explicit": true, "allowed_domains": ["shared"]},
+            "steps": [{"group": "g", "job": "j", "cmd": "true", "write_domains": []}]
+        }"#;
+        let cfg = dag_from_json(doc).unwrap();
+        let again = dag_from_json(&dag_to_json(&cfg)).unwrap();
+        assert_eq!(
+            crate::model::dag_config_carry_diff(&cfg, &again),
+            Vec::<String>::new()
+        );
+        // and the values really were non-default, so an all-defaults round trip cannot pass by
+        // accident.
+        assert_eq!(cfg.default_step_timeout, 600);
+        assert_eq!(cfg.resource_caps.len(), 2);
     }
 }

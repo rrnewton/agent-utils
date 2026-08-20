@@ -62,10 +62,11 @@ pub use io::{
     dag_from_json, dag_from_value, dag_from_yaml, dag_to_json, dag_to_yaml, DagJsonError,
 };
 pub use model::{
-    command_with_inner_jobs, effective_jobs_flag, preferred_inner_jobs, render_jobs_flag,
-    step_classification, step_failure_reason, undeclared_resource_demands, write_domain_violations,
-    DagConfig, ResourceHint, RunResult, Step, StepClass, StepOutcome, WriteDomainGuarantee,
-    WriteDomainPolicy, DEFAULT_JOBS_FLAG, DEFAULT_STEP_TIMEOUT,
+    command_with_inner_jobs, dag_config_carry_diff, effective_jobs_flag, preferred_inner_jobs,
+    render_jobs_flag, step_classification, step_failure_reason, undeclared_resource_demands,
+    write_domain_violations, DagConfig, ResourceHint, RunResult, Step, StepClass, StepOutcome,
+    WriteDomainGuarantee, WriteDomainPolicy, DAG_CONFIG_FIELDS, DEFAULT_JOBS_FLAG,
+    DEFAULT_STEP_TIMEOUT,
 };
 pub use perflog::{append_step_profiles, PerfWindow};
 pub use profile_enrich::{
