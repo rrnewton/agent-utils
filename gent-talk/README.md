@@ -671,7 +671,17 @@ From the related-work review, and recorded in `src/mcp/mod.rs` so it does not ha
   based: the agent configuration carries the read token.
 * There are **three approval modes**, and the useful one is **per-tool approval**, which maps onto
   the rule this project wants: **reading is automatic, posting asks first.**
-* **Barge-in and `skip_turn` are native**, so pause/resume needs no button.
+* **Barge-in and `skip_turn` are native**, but neither one is pause. Barge-in interrupts the
+  agent while it is *speaking*; `skip_turn` is the agent choosing to hold. In both cases the
+  socket stays open and the microphone keeps streaming. There is no vendor pause primitive: the
+  only transport-level action is closing the conversation. **Pause is ours** — muting stops
+  uploading audio while keeping the socket and the agent's context (`web/voice.js`), and Sound off
+  silences the agent's voice while its replies keep arriving as text.
+  Two things follow, and both are the owner's observation rather than ours: **billing continues
+  while muted** (a conversation is billed for being open, though the vendor discounts silent
+  periods), and **the agent will start asking whether you are still there**, because a
+  client-side mute is invisible to it — from the vendor's side, muted and "went quiet" are the
+  same thing.
 * Caveats: MCP is unavailable on Zero Retention Mode **and HIPAA-enabled** workspaces — which
   would block this integration outright — channel text transits ElevenLabs, and conversation
   costs roughly $0.01/minute.

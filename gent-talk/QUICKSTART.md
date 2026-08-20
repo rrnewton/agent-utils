@@ -359,7 +359,9 @@ Open the agent in ElevenLabs and start a conversation. Ask, roughly in this orde
    If it posts without asking, stop, and fix the approval setting in step 5 — or switch the agent
    to the read token, which removes the capability rather than gating it.
 
-Barge-in is native, so you can interrupt it mid-sentence without a button.
+Barge-in is native, so you can interrupt it mid-sentence without a button. That is not the
+same as pausing: mute is what pauses, it is this page's own doing, and the agent cannot see
+it — expect it to ask whether you are still there during a long mute.
 
 Conversation costs roughly $0.01/minute on ElevenLabs, and everything the read tools return —
 your channel text — transits ElevenLabs and whatever model is behind it. That is inherent to

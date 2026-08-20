@@ -258,6 +258,19 @@ So the pause/resume requirement is met conversationally on every candidate. What
 available on the telephony path is **hold-to-talk**, which needs a screen and a finger. That is worth
 weighing against the fact that hold-to-talk is also the requirement least compatible with driving.
 
+> **Correction, 2026-08-19, from running it.** The paragraph above was written from vendor
+> documentation and it overstates its case. Barge-in and `skip_turn` are real, but neither is
+> pause: barge-in interrupts the agent *while it speaks*, `skip_turn` is the agent electing to
+> hold, and in both the socket stays open and the microphone keeps streaming. There is no vendor
+> pause primitive; the only transport-level action is hanging up. What actually pauses is this
+> project's own client-side mute, which stops the upload and keeps the context.
+>
+> Two consequences the documentation does not mention and the owner hit in use: **billing
+> continues while muted**, since a conversation is billed for being open — the vendor discounts
+> silent periods but does not stop the meter — and **the agent starts asking whether you are still
+> there**, because a client-side mute is invisible to it. From the vendor's side, "muted" and
+> "went quiet" are indistinguishable, so our own pause is what provokes the prompting.
+
 ## What is genuinely unmet in open source
 
 Stating this precisely, since it is the fallback justification for building:
