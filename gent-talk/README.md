@@ -310,7 +310,8 @@ curl -s -X POST localhost:8080/mcp \
 | Storage path | `storage.path` | `GENT_TALK_STORAGE_PATH` | absolute; unset means **no durable state** |
 | Conversations kept | `storage.max_conversations` | — | default `50`, oldest dropped first |
 | Turns per conversation | `storage.max_turns_per_conversation` | — | default `1000`, then `413` |
-| Retention age | `storage.retain_days` | — | default `30`; `0` means no age limit |
+| Cached summaries kept | `storage.max_summaries` | — | default `2000`, least recently written dropped first |
+| Retention age | `storage.retain_days` | — | default `30`; `0` means no age limit, and it bounds cached summaries too |
 | Summary threshold | `summaries.threshold_chars` | — | below this nothing is summarised, default `400` |
 | Summary width | `summaries.target_chars` | — | default `160` |
 | Summary context | `summaries.context_messages` | — | preceding messages shown as context, default `3` |
@@ -323,12 +324,19 @@ an error, not a shrug — a typo'd section name should not silently disable a se
 
 ## Durable state
 
-Almost nothing in this server is remembered. Channel content is never cached: every question is a
-fresh Discord fetch, and it stays that way. There is exactly one store, `src/store/`, and it holds
-only what **this server itself authored**:
+Almost nothing in this server is remembered. A channel is never cached as a channel: every
+question is a fresh Discord fetch, and it stays that way. There is exactly one store,
+`src/store/`, and it holds three things:
 
-* the `/voice` **conversation transcript** — what the owner said and what the agent said back; and
-* **read marks** — how far the owner has been shown each channel.
+* the `/voice` **conversation transcript** — what the owner said and what the agent said back;
+* **read marks** — how far the owner has been shown each channel; and
+* **cached summaries** — one short line per long message, filed under the policy that produced
+  it. This is the one entry NOT authored by this server: with the shipped extractive backend a
+  summary is literally the opening of somebody else's message, so it is a second at-rest copy of
+  third-party text and is treated as one everywhere below.
+
+The first two are the owner's own record. The third is a derived cache, bounded by the same
+retention as the rest, erased by the same purge, and never filled by a read-scope token.
 
 ### Read state is ours, and is never synchronised with Discord
 
@@ -358,19 +366,31 @@ is worse than state that was never promised.
 
 ### What is kept, for how long
 
-Retention is enforced **on every append**, not by a sweeper that might never run: at most
+Retention is enforced **on every write**, not by a sweeper that might never run: at most
 `max_conversations` conversations (least recently active dropped first), at most
 `max_turns_per_conversation` turns in one of them (further turns are refused, not silently
-dropped), and nothing older than `retain_days` days since its last turn. The defaults are 50, 1000
-and 30.
+dropped), at most `max_summaries` cached summaries (least recently written dropped first), and
+nothing older than `retain_days` days — since its last turn for a conversation, since it was made
+for a summary. The defaults are 50, 1000, 2000 and 30.
+
+The age bound is the only thing that collects an **orphan**: a cached summary whose message was
+edited or deleted upstream is unreachable by key, is filed under the current policy version, and
+nothing will ever announce that it went. The startup sweep cannot help — it deletes by policy
+version, and an orphan is under the live one.
 
 ### How an operator purges it
 
-Three ways, all of which are complete:
+Three ways, all of which erase everything — transcripts, read marks and cached summaries alike:
 
-1. delete the file (`rm ~/.local/share/gent-talk/gent-talk.sqlite3`) — with the server stopped;
-2. delete the mounted directory, which is also what `scripts/run.sh --status` prints; or
-3. `storage.path` unset, which turns the whole feature off.
+1. `DELETE /api/v1/storage` with the **write** token, on a running server. This is the only
+   complete erase over HTTP: `DELETE /api/v1/conversations` clears transcripts and deliberately
+   leaves the read marks alone, because the two are different records;
+2. delete the file (`rm ~/.local/share/gent-talk/gent-talk.sqlite3`) — with the server stopped; or
+3. delete the mounted directory, which is also what `scripts/run.sh --status` prints.
+
+Unsetting `storage.path` is **not** one of them. It turns the feature off for the next run and
+leaves every byte already written exactly where it is — which is the opposite of a purge, and is
+worth saying because it looks like one.
 
 ### Security posture — this is new, and it is a change
 
@@ -407,9 +427,19 @@ diagnosed by someone with a shell. It is FNV-1a and is **not** a security hash: 
 configuration change, and nothing more.
 
 A summariser is a model being fed channel text, so the request goes through `src/untrusted.rs`
-exactly as the MCP path does — the instruction outside the fence, the message inside it. Being
-short is not an exemption. A cached summary is a second at-rest copy of other people's text under
-the same file, with the same `0600`, and it goes with the rest on a purge.
+exactly as the MCP path does — the instruction outside the fence, the message inside it. That is
+structural rather than a convention: `SummaryRequest` holds the built prompt in a private field
+and the only constructor builds it through `untrusted::fenced`, so a backend cannot be handed
+channel text that was never framed, and a test reads back what the summariser was actually given
+rather than rebuilding it. The shipped extractive backend uses neither the prompt nor the context
+— it talks to no model, so there is nothing to fence it against — and both ride along for the
+backend that replaces it. Being short is not an exemption.
+
+A cached summary is a second at-rest copy of other people's text under the same file, with the
+same `0600`. It is bounded by the same retention, it goes with the rest on a purge, and it is
+never written by a read-scope caller: `/summary` answers a read token and serves it from the
+cache, but only a write-scope caller's answer is filed. The read token is the one pasted into the
+voice agent, and a durable write reachable from it is what the two-token split exists to prevent.
 
 ### Migrations
 
@@ -482,6 +512,7 @@ not, and neither reveals anything about the configuration.
 | GET | `/api/v1/inbox` | read | how far this server thinks each channel has been read |
 | POST | `/api/v1/channels/{id}/read` | **write** | move this server's read mark forward |
 | DELETE | `/api/v1/channels/{id}/read` | **write** | drop this server's read mark |
+| DELETE | `/api/v1/storage` | **write** | erase EVERYTHING durable: transcripts, read marks, cached summaries |
 | POST | `/mcp` | read, or **write** per tool | MCP over Streamable HTTP — see below |
 | GET/DELETE | `/mcp` | none | `405`; this endpoint is stateless and has nothing to push |
 
@@ -491,6 +522,13 @@ and more sensitive thing than a digest of a channel he already allowlisted — a
 only thing that uses them, already holds the write token. The read token gets `403`, and a test
 asserts it. **None of them is an MCP tool**, and a test holds that line too: text a tool can
 return is text that enters a model's context.
+
+**No read-scope credential writes anything durable.** That is the wider rule the line above is one
+case of: every durable write — a turn, a read mark, a cached summary — needs the write scope.
+`/summary` is the interesting one, because it is readable at read scope and yet has something to
+file: a read token is served from the cache when there is a hit and its answer is never written
+back. `/inbox` is the single durable READ a read token may make, because how far the owner has
+read is the thing the voice agent has to be able to say out loud.
 
 **`/api/v1/inbox` carries `read_state_notice` on every answer**, including the mutating ones,
 saying that this read state is gent-talk's own and is synchronised with Discord in neither
@@ -1297,8 +1335,12 @@ Beyond the security list above:
 * Summarization is extractive truncation, not a model. It shortens; it does not comprehend. The
   `Summarizer` trait, the policy-versioned cache and the `/summary` route are in place and
   tested; **no model backend is wired to them yet**, so `summaries.model` is recorded in the
-  cache key and otherwise unused, and no page requests a summary.
-* No caching: every question is a fresh Discord fetch, and Discord's rate limits are not handled.
+  cache key and otherwise unused, and **no page requests a summary**. `#49 cached-summaries` is
+  therefore the server half of that issue and not the whole of it: the seam, the key, the
+  invalidation, the bounds and the sweep are done; the thing a person would see is not.
+* No caching of channel content: every question is a fresh Discord fetch, and Discord's rate
+  limits are not handled. The summary cache is the one exception and it is a cache of DERIVED
+  text, bounded and purgeable — see "Durable state".
 * No `Retry-After` handling; a 429 from Discord surfaces as HTTP 502.
 * The web app has no service worker and no offline mode.
 * **The MCP endpoint has never been driven by a real ElevenLabs agent.** It is tested against the

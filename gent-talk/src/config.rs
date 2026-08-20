@@ -330,6 +330,7 @@ struct FileStorage {
     path: Option<String>,
     max_conversations: Option<u16>,
     max_turns_per_conversation: Option<u16>,
+    max_summaries: Option<u32>,
     retain_days: Option<u16>,
 }
 
@@ -592,6 +593,9 @@ fn storage_config(from_env: Option<&str>, file: FileStorage) -> Result<StorageCo
         max_turns_per_conversation: file
             .max_turns_per_conversation
             .unwrap_or(crate::store::DEFAULT_MAX_TURNS_PER_CONVERSATION),
+        max_summaries: file
+            .max_summaries
+            .unwrap_or(crate::store::DEFAULT_MAX_SUMMARIES),
         retain_days: file
             .retain_days
             .unwrap_or(crate::store::DEFAULT_RETAIN_DAYS),
@@ -607,6 +611,13 @@ fn storage_config(from_env: Option<&str>, file: FileStorage) -> Result<StorageCo
         return Err(ConfigError::Invalid {
             field: "storage.max_turns_per_conversation".to_owned(),
             detail: "must be at least 1, or no turn can ever be recorded".to_owned(),
+        });
+    }
+    if retention.max_summaries == 0 {
+        return Err(ConfigError::Invalid {
+            field: "storage.max_summaries".to_owned(),
+            detail: "must be at least 1; zero would delete every cached summary as it was written"
+                .to_owned(),
         });
     }
     Ok(StorageConfig { path, retention })
@@ -998,11 +1009,15 @@ writable = true
     fn retention_bounds_are_configurable_and_must_be_usable() {
         let text = format!(
             "{FULL}\n[storage]\npath = \"/data/s.sqlite3\"\nmax_conversations = 3\n\
-             max_turns_per_conversation = 7\nretain_days = 0\n"
+             max_turns_per_conversation = 7\nmax_summaries = 11\nretain_days = 0\n"
         );
         let cfg = Config::from_toml_and_env(&text, &env(&[])).expect("valid config");
         assert_eq!(cfg.storage.retention.max_conversations, 3);
         assert_eq!(cfg.storage.retention.max_turns_per_conversation, 7);
+        assert_eq!(
+            cfg.storage.retention.max_summaries, 11,
+            "the summary cache is bounded too, and the bound has to be settable"
+        );
         assert_eq!(
             cfg.storage.retention.retain_days, 0,
             "zero days must mean no age limit, not immediate deletion"
@@ -1019,6 +1034,13 @@ writable = true
         let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
         assert!(
             matches!(&err, ConfigError::Invalid { field, .. } if field == "storage.max_turns_per_conversation"),
+            "unexpected error: {err}"
+        );
+
+        let text = format!("{FULL}\n[storage]\nmax_summaries = 0\n");
+        let err = Config::from_toml_and_env(&text, &env(&[])).expect_err("must refuse");
+        assert!(
+            matches!(&err, ConfigError::Invalid { field, .. } if field == "storage.max_summaries"),
             "unexpected error: {err}"
         );
     }

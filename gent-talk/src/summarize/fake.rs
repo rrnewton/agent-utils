@@ -20,6 +20,10 @@ pub struct RecordedRequest {
     pub context: usize,
     /// The width it was asked for.
     pub target_chars: usize,
+    /// EXACTLY what a model backend would have sent — [`super::SummaryRequest::prompt`], captured
+    /// rather than rebuilt. A test that constructs the prompt itself proves only that the test
+    /// can build a fence; this proves the summariser was handed one.
+    pub prompt: String,
 }
 
 /// A summariser that answers with a fixed shape and remembers being asked.
@@ -80,6 +84,7 @@ impl Summarizer for FakeSummarizer {
             target: request.target.content.clone(),
             context: request.context.len(),
             target_chars: request.target_chars,
+            prompt: request.prompt().to_owned(),
         });
         // Deliberately NOT the message text: a fake that echoed its input would let a caller that
         // returned the raw message pass as one that summarised it.

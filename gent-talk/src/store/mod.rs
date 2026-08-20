@@ -45,7 +45,8 @@
 //!
 //! * the database file is `0600` and its directory `0700`;
 //! * retention is bounded by [`Retention`] — a conversation count, a per-conversation turn count,
-//!   and an age in days — enforced on every append, not by a sweeper that might not run;
+//!   a cached-summary count, and an age in days that applies to both — enforced on every write,
+//!   not by a sweeper that might not run;
 //! * [`StateStore::purge_everything`] erases all of it, and an operator who does not trust that
 //!   can delete the single file the store lives in.
 
@@ -244,8 +245,13 @@ pub struct ReadMark {
 ///   unreachable at once, and a startup sweep collects the directories they were in.
 /// * `channel` and `message` — which message it is about.
 /// * `content_hash` — the message TEXT. An upstream edit changes this and nothing else, so it
-///   invalidates one entry rather than the whole cache. An upstream DELETE simply orphans the
-///   entry, which is what the sweep is for.
+///   invalidates one entry rather than the whole cache.
+///
+/// An upstream EDIT or DELETE orphans the old entry: it is unreachable by key and nothing
+/// upstream will ever tell this server it went. The startup sweep cannot collect those — it
+/// deletes by *policy version*, and an orphan is under the current version — so what collects
+/// them is [`Retention`], enforced on every write of a summary: an age limit, and a ceiling on
+/// how many entries exist at all.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SummaryKey {
     /// The channel the message is in.
@@ -260,17 +266,30 @@ pub struct SummaryKey {
 
 /// Bounds on how much the store keeps.
 ///
-/// Unbounded retention is the failure this exists to prevent: a transcript store that grows
-/// forever is both a disk problem and a privacy problem, and the second one is worse. Every
-/// bound is enforced on append rather than by a background sweep, so a server that is only ever
-/// started and stopped still honours them.
+/// Unbounded retention is the failure this exists to prevent: a store that grows forever is both
+/// a disk problem and a privacy problem, and the second one is worse. Every bound is enforced on
+/// append rather than by a background sweep, so a server that is only ever started and stopped
+/// still honours them.
+///
+/// **Every table the store has is bounded here**, not only the transcript. A cached summary is a
+/// second at-rest copy of somebody else's message, and it is the ONE row a caller can cause to be
+/// written without ever appending a turn — an unbounded summary table would have been the whole
+/// privacy argument, quietly undone by the cache added to serve it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Retention {
     /// How many conversations to keep. The oldest are dropped first. At least 1.
     pub max_conversations: u16,
     /// How many turns one conversation may hold before further appends are refused. At least 1.
     pub max_turns_per_conversation: u16,
-    /// How many days a conversation survives after its last turn. `0` means no age limit.
+    /// How many cached summaries to keep. The least recently written are dropped first. At
+    /// least 1.
+    pub max_summaries: u32,
+    /// How many days a record survives: a conversation after its last turn, a cached summary
+    /// after it was made. `0` means no age limit.
+    ///
+    /// For summaries this is also the ONLY thing that collects an orphan — an entry whose
+    /// upstream message was deleted or edited away is unreachable by key and cannot be noticed
+    /// any other way, because nothing tells this server that a message went.
     pub retain_days: u16,
 }
 
@@ -279,6 +298,7 @@ impl Default for Retention {
         Self {
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
             max_turns_per_conversation: DEFAULT_MAX_TURNS_PER_CONVERSATION,
+            max_summaries: DEFAULT_MAX_SUMMARIES,
             retain_days: DEFAULT_RETAIN_DAYS,
         }
     }
@@ -288,6 +308,12 @@ impl Default for Retention {
 pub const DEFAULT_MAX_CONVERSATIONS: u16 = 50;
 /// Default number of turns one conversation may hold.
 pub const DEFAULT_MAX_TURNS_PER_CONVERSATION: u16 = 1_000;
+/// Default number of cached summaries kept.
+///
+/// Two thousand entries of a couple of hundred characters is a file measured in megabytes, which
+/// is small enough not to matter and large enough that a real day's reading never evicts anything
+/// it would have reused.
+pub const DEFAULT_MAX_SUMMARIES: u32 = 2_000;
 /// Default age limit, in days.
 pub const DEFAULT_RETAIN_DAYS: u16 = 30;
 
@@ -437,6 +463,11 @@ pub trait StateStore: Send + Sync {
 
     /// File a summary under its key, replacing any entry already there.
     ///
+    /// Bounded by [`Retention`] on the way in, exactly as [`StateStore::append_turn`] is: writing
+    /// one entry may evict the oldest, and evicts anything past the age limit. That is what keeps
+    /// an orphaned entry — one whose message was edited or deleted upstream — from living
+    /// forever. See [`SummaryKey`].
+    ///
     /// # Errors
     ///
     /// [`StoreError::Unavailable`] when no store is configured; [`StoreError::Backend`] on a
@@ -447,7 +478,9 @@ pub trait StateStore: Send + Sync {
     /// many went.
     ///
     /// Run at startup. Without it a changed policy leaves the old entries on disk forever:
-    /// unreachable, invisible, and still a copy of other people's text at rest.
+    /// unreachable, invisible, and still a copy of other people's text at rest. It collects
+    /// nothing else — an entry under the CURRENT policy is never touched here, however stale it
+    /// has become, which is [`Retention`]'s job.
     ///
     /// # Errors
     ///

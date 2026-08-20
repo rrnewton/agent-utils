@@ -702,6 +702,19 @@ function newPage(store = new Map(), script = SCRIPT) {
     storeCalls: [],
     /** Set to a status to make the whole store answer that way — a 503 is the unconfigured one. */
     storeStatus: null,
+    /**
+     * Hold every turn POST open instead of answering it at once.
+     *
+     * Without this the fixture answers in call order and appends synchronously, which makes
+     * "the turns are stored in the order they were spoken" a property of the FIXTURE: it would
+     * hold identically for a page that fires every POST in parallel and lets the network decide.
+     * A real network does not answer in call order. With `holdTurnPosts` set, each POST parks a
+     * resolver in `pendingTurnPosts` and the test decides who answers first — which is the only
+     * way to tell a page that queues from a page that hopes.
+     */
+    holdTurnPosts: false,
+    /** Resolvers for the turn POSTs currently in flight, in the order they were issued. */
+    pendingTurnPosts: [],
 
     setFetch(fn) {
       page.mint = fn;
@@ -905,6 +918,11 @@ function newPage(store = new Map(), script = SCRIPT) {
         const [, id, turns] = conversation;
         if (turns) {
           const body = JSON.parse(options.body);
+          if (page.holdTurnPosts) {
+            await new Promise((resolve) => page.pendingTurnPosts.push(resolve));
+          }
+          // Appended when the request is ANSWERED, not when it is issued — the server assigns
+          // `seq` on arrival, so the order that ends up stored is the order things landed in.
           const held = page.storedTurns.get(id) || [];
           held.push({ speaker: body.speaker, text: body.text, at_ms: 1_700_000_000_000 });
           page.storedTurns.set(id, held);
@@ -4859,6 +4877,45 @@ test("EVERY TURN IS RECORDED ON THE SERVER, EXACTLY ONCE, BOTH SPEAKERS", async 
   );
 });
 
+test("THE STORED ORDER IS THE ORDER THINGS WERE SAID, EVEN WHEN THE NETWORK ANSWERS BACKWARDS", async () => {
+  // The failure this is about is permanent and silent. The server stamps `seq` and `at_ms` when a
+  // turn ARRIVES, so two POSTs issued milliseconds apart that complete out of order are stored
+  // swapped — and the restored transcript then shows the answer above the question, with server
+  // timestamps that agree. Nothing on screen and nothing in the record says they were inverted.
+  //
+  // So the fixture is made hostile: every POST is held open and the test decides who answers
+  // first, newest first. A page that fires and forgets has both requests in flight at once and
+  // loses; a page that queues has only ever issued one.
+  const page = newPage();
+  await startTalkingNamed(page);
+  page.holdTurnPosts = true;
+
+  youSay(page, "what happened overnight");
+  assistantSays(page, "the mac runner stalled");
+  await page.settle();
+
+  assert.equal(
+    page.pendingTurnPosts.length,
+    1,
+    "both turns were POSTed at once, so their stored order is whatever the network decides"
+  );
+
+  // Answer them in the most hostile order available at each step: the newest in flight first.
+  for (let guard = 0; guard < 8 && page.pendingTurnPosts.length > 0; guard += 1) {
+    page.pendingTurnPosts.pop()();
+    await page.settle();
+  }
+
+  assert.deepEqual(
+    (page.storedTurns.get("conv_from_vendor") || []).map((t) => [t.speaker, t.text]),
+    [
+      ["you", "what happened overnight"],
+      ["agent", "the mac runner stalled"],
+    ],
+    "the record has the answer before the question, and the server's own timestamps now agree"
+  );
+});
+
 test("a reload puts the stored conversation back, with its OWN timestamps", async () => {
   // The whole point. And the specific lie to avoid: stamping a two-hour-old sentence with the
   // clock of the moment it was restored.
@@ -4893,6 +4950,93 @@ test("a reload puts the stored conversation back, with its OWN timestamps", asyn
     at(lines[1]),
     "two turns a minute apart must not share one timestamp"
   );
+});
+
+test("a restored NOTE is labelled as one, and is not put in the assistant's mouth", async () => {
+  // The server stores three speakers and the API accepts all three. A page that renders anything
+  // that is not "you" as the assistant makes the page's own remarks — a hang-up, an error it kept
+  // — read as things the voice said, which is the single attribution this screen is careful about
+  // everywhere else.
+  const page = newPage();
+  const earlier = 1_700_000_000_000;
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "you", text: "what happened overnight", at_ms: earlier },
+    { speaker: "note", text: "the call ended — the connection dropped", at_ms: earlier + 1_000 },
+    { speaker: "agent", text: "the mac runner stalled", at_ms: earlier + 2_000 },
+  ]);
+
+  await signIn(page);
+  await page.settle();
+
+  const lines = page.el("transcript").children.filter((li) => li.className !== "seam");
+  const who = (li) => li.descendants().find((n) => n.className === "who").textContent;
+  assert.deepEqual(
+    lines.map(who),
+    ["you", "note", "assistant"],
+    "a stored note came back as somebody's speech"
+  );
+});
+
+test("signing in twice does not restore the same conversation twice", async () => {
+  // `signIn()` runs on every token save, and restoring is not idempotent: it APPENDS. Saving a
+  // token a second time used to draw the whole conversation again underneath itself, with a
+  // second "earlier conversation" rule between the two copies and nothing saying they were the
+  // same lines.
+  const page = newPage();
+  page.storedTurns.set("conv_earlier", [
+    { speaker: "you", text: "what happened overnight", at_ms: 1_700_000_000_000 },
+  ]);
+
+  await signIn(page);
+  await page.settle();
+  const after_one = page.el("transcript").children.length;
+
+  page.el("api-token").value = "write-token-aaaaaaaaaaaaaaaa";
+  await page.el("save-token").click();
+  await page.settle();
+  await page.settle();
+
+  assert.equal(
+    page.el("transcript").children.length,
+    after_one,
+    `the stored conversation was appended a second time: ${page.renderedText()}`
+  );
+  assert.equal(
+    page.el("transcript").children.filter((li) => li.className === "seam").length,
+    1,
+    "a second 'earlier conversation' seam was drawn for the same conversation"
+  );
+});
+
+test("a vendor id that would have to be mangled to be legal becomes a LOCAL id instead", async () => {
+  // Stripping illegal bytes makes two different vendor ids collapse onto one stored conversation
+  // — `a/b` and `ab` are the same key once the slash is gone — and the two calls then interleave
+  // in one transcript with nothing saying so.
+  const page = newPage();
+  await startTalkingNamed(page, "call/one");
+  youSay(page, "first call");
+  await page.settle();
+
+  const second = newPage();
+  await startTalkingNamed(second, "callone");
+  youSay(second, "second call");
+  await second.settle();
+
+  const idOf = (p) =>
+    /conversations\/([^/]+)\/turns/.exec(p.storeCalls.find((c) => c.startsWith("POST")))[1];
+  assert.match(idOf(page), /^local-/, "a mangled vendor id was used as the key anyway");
+  assert.notEqual(
+    idOf(page),
+    idOf(second),
+    "two different calls were recorded into one stored conversation"
+  );
+  // The control: an id the server already accepts is passed through untouched, or every
+  // conversation would be unmatchable against the vendor's own record of the same call.
+  const clean = newPage();
+  await startTalkingNamed(clean, "conv_from_vendor");
+  youSay(clean, "hello");
+  await clean.settle();
+  assert.equal(idOf(clean), "conv_from_vendor");
 });
 
 test("CLEAR EMPTIES THE SCREEN AND ERASES NOTHING; FORGET ERASES AND LEAVES THE SCREEN", async () => {

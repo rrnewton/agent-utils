@@ -31,9 +31,11 @@ impl Summarizer for ExtractiveSummarizer {
     }
 
     async fn summarize(&self, request: &SummaryRequest<'_>) -> Result<String, SummaryError> {
-        // The context is deliberately unused: truncation cannot make use of it, and pretending
-        // otherwise by concatenating neighbours would produce a summary of the wrong message.
-        // A model backend is what the context is there for.
+        // The context and `SummaryRequest::prompt` are deliberately unused. Truncation cannot use
+        // the context, and pretending otherwise by concatenating neighbours would produce a
+        // summary of the wrong message; the prompt is for a backend that talks to a model, and
+        // this one talks to nothing — no model sees this text, so there is nothing to fence it
+        // against. Both exist on the request for the backend that replaces this one.
         Ok(crate::summary::condense(
             &request.target.content,
             request.target_chars,

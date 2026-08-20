@@ -138,6 +138,7 @@ async fn every_api_route_refuses_an_unauthenticated_caller() {
             "/api/v1/conversations/abc/turns".to_owned(),
             Some(serde_json::json!({"speaker": "you", "text": "hello"})),
         ),
+        ("DELETE", "/api/v1/storage".to_owned(), None),
         ("GET", "/api/v1/inbox".to_owned(), None),
         (
             "POST",
@@ -1085,6 +1086,184 @@ async fn the_read_token_cannot_reach_a_transcript_or_move_a_mark() {
     // decision rather than about the token being broken.
     let (status, payload) = call(&harness, "GET", "/api/v1/inbox", Some(READ_TOKEN), None).await;
     assert_eq!(status, StatusCode::OK, "{payload}");
+}
+
+#[tokio::test]
+async fn the_read_token_cannot_leave_a_row_in_the_store_through_the_summary_route() {
+    // `/summary` is READABLE at read scope, so this is not about a 403: it is about what the
+    // answer LEAVES BEHIND. The read token is the one pasted into the ElevenLabs agent, and a
+    // durable write reachable from it is exactly what the two-token split exists to prevent.
+    // Driven through the real router, because the property is about the credential on the wire.
+    let (harness, store) = store_harness();
+    let channel = ChannelId(READ_CHANNEL.to_owned());
+    harness.discord.seed(
+        &channel,
+        "codex-integ",
+        &"the mac runner went offline mid-deploy and nothing reported. ".repeat(12),
+    );
+    let (status, listing) = call(
+        &harness,
+        "GET",
+        &format!("/api/v1/channels/{READ_CHANNEL}/messages"),
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    let id = listing["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .and_then(|m| m["id"].as_str())
+        .expect("a seeded message")
+        .to_owned();
+    let uri = format!("/api/v1/channels/{READ_CHANNEL}/messages/{id}/summary");
+
+    for attempt in 1..=2 {
+        let (status, payload) = call(&harness, "GET", &uri, Some(READ_TOKEN), None).await;
+        assert_eq!(status, StatusCode::OK, "{payload}");
+        assert_eq!(
+            payload["state"], "generated",
+            "ask {attempt} with the READ token was served from a cache that only a read token \
+             could have filled: {payload}"
+        );
+    }
+    assert_eq!(
+        store.cached_summaries(),
+        0,
+        "a read-scope request wrote a row into the owner's store"
+    );
+
+    // THE CONTROL. The same request with the WRITE token does file it — so the assertion above
+    // is about the scope, not about a route that can never cache anything.
+    let (status, payload) = call(&harness, "GET", &uri, Some(WRITE_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["state"], "generated", "{payload}");
+    assert_eq!(
+        store.cached_summaries(),
+        1,
+        "the write token did not fill the cache either, so nothing here is being tested"
+    );
+
+    // And the read token is still SERVED from what the write token filed: it may spend the cache,
+    // it may not fill it.
+    let (status, payload) = call(&harness, "GET", &uri, Some(READ_TOKEN), None).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["state"], "cached",
+        "the read token must still be served from an entry someone else filed: {payload}"
+    );
+    assert_eq!(store.cached_summaries(), 1);
+}
+
+#[tokio::test]
+async fn the_purge_route_erases_all_three_records_and_leaves_the_store_usable() {
+    use gent_talk::store::StateStore as _;
+
+    // The operator's erase. `DELETE /api/v1/conversations` deliberately clears only transcripts,
+    // so without this route there is no way to erase the read marks or the cached summaries
+    // short of deleting the file — and `purge_everything` was trait surface with no caller at
+    // all, which is a claim in a document rather than a capability.
+    let (harness, store) = store_harness();
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        "/api/v1/conversations/conv_01/turns",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"speaker": "you", "text": "what happened overnight?"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        &format!("/api/v1/channels/{WRITE_CHANNEL}/read"),
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"message_id": "1000000000000000200"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    store
+        .cache_summary(
+            &gent_talk::store::SummaryKey {
+                channel: ChannelId(WRITE_CHANNEL.to_owned()),
+                message: gent_talk::model::MessageId("1000000000000000200".to_owned()),
+                content_hash: 1,
+                version: "current".to_owned(),
+            },
+            "somebody else's message, shortened",
+        )
+        .await
+        .expect("cache");
+
+    // A read token must not be able to erase the owner's record.
+    let (status, payload) = call(
+        &harness,
+        "DELETE",
+        "/api/v1/storage",
+        Some(READ_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{payload}");
+    assert_eq!(store.purges(), 0, "the refused call purged anyway");
+
+    let (status, payload) = call(
+        &harness,
+        "DELETE",
+        "/api/v1/storage",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(
+        payload["purged"],
+        serde_json::json!(["conversations", "read_marks", "summaries"]),
+        "the answer has to name what it erased: {payload}"
+    );
+
+    // All three, checked separately: a purge that took the transcripts and left the copy of
+    // other people's text behind is the one that matters and the one a single check would miss.
+    let (status, payload) = call(
+        &harness,
+        "GET",
+        "/api/v1/conversations",
+        Some(WRITE_TOKEN),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert!(
+        payload["conversations"]
+            .as_array()
+            .is_some_and(Vec::is_empty),
+        "the transcripts survived the purge: {payload}"
+    );
+    assert!(
+        store.read_marks().await.expect("marks").is_empty(),
+        "the read marks survived the purge"
+    );
+    assert_eq!(
+        store.cached_summaries(),
+        0,
+        "the cached summaries survived the purge, and those are third parties' text"
+    );
+
+    // And the store is still open: a purge that broke the server would be a restart, not an
+    // erase.
+    let (status, payload) = call(
+        &harness,
+        "POST",
+        "/api/v1/conversations/conv_02/turns",
+        Some(WRITE_TOKEN),
+        Some(serde_json::json!({"speaker": "you", "text": "still working"})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the purge left the store unusable: {payload}"
+    );
 }
 
 #[tokio::test]

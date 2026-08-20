@@ -226,6 +226,33 @@ fn restrict_file(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Delete whatever retention no longer allows of the SUMMARY cache, inside a transaction.
+///
+/// Two bounds, and they collect different failures. The age limit is the only thing that ever
+/// removes an ORPHAN — an entry whose message was edited or deleted upstream, which is
+/// unreachable by key and which nothing will ever announce. The count limit is the ceiling: it
+/// holds even against a caller that asks for a summary of a different message every second.
+fn prune_summaries(
+    transaction: &rusqlite::Transaction<'_>,
+    retention: Retention,
+) -> Result<(), StoreError> {
+    if retention.retain_days > 0 {
+        let cutoff = now_ms() - i64::from(retention.retain_days) * 86_400_000;
+        transaction
+            .execute("DELETE FROM summaries WHERE made_at_ms < ?1", [cutoff])
+            .map_err(backend)?;
+    }
+    transaction
+        .execute(
+            "DELETE FROM summaries WHERE rowid NOT IN (
+                 SELECT rowid FROM summaries ORDER BY made_at_ms DESC, rowid DESC LIMIT ?1
+             )",
+            [i64::from(retention.max_summaries)],
+        )
+        .map_err(backend)?;
+    Ok(())
+}
+
 /// Delete whatever retention no longer allows, inside the caller's transaction.
 fn prune(transaction: &rusqlite::Transaction<'_>, retention: Retention) -> Result<(), StoreError> {
     if retention.retain_days > 0 {
@@ -542,8 +569,10 @@ impl StateStore for SqliteStore {
     async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError> {
         let key = key.clone();
         let summary = summary.to_owned();
+        let retention = self.retention;
         self.with_connection(move |connection| {
-            connection
+            let transaction = connection.transaction().map_err(backend)?;
+            transaction
                 .execute(
                     "INSERT INTO summaries
                         (version, channel_id, message_id, content_hash, summary, made_at_ms)
@@ -559,8 +588,11 @@ impl StateStore for SqliteStore {
                         now_ms()
                     ],
                 )
-                .map(|_| ())
-                .map_err(backend)
+                .map_err(backend)?;
+            // In the same transaction as the insert, for the same reason the transcript prunes
+            // there: a bound applied "soon afterwards" is a bound a crash can skip.
+            prune_summaries(&transaction, retention)?;
+            transaction.commit().map_err(backend)
         })
         .await
     }
@@ -1042,6 +1074,150 @@ mod tests {
                 .expect("sweep"),
             0,
             "a second sweep must find nothing left to do"
+        );
+    }
+
+    /// Count the rows the summary cache is actually holding.
+    ///
+    /// Straight SQL rather than a trait method, because what is under test is the TABLE — an
+    /// entry the key can no longer reach still occupies a row, and a count that went through
+    /// `cached_summary` could not see one.
+    fn summary_rows(store: &SqliteStore) -> i64 {
+        let guard = store
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        guard
+            .query_row("SELECT COUNT(*) FROM summaries", [], |row| row.get(0))
+            .expect("count")
+    }
+
+    fn summary_key(message: &str, content_hash: u64) -> SummaryKey {
+        SummaryKey {
+            channel: ChannelId("1111111111".to_owned()),
+            message: MessageId(message.to_owned()),
+            content_hash,
+            version: "current".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_summary_cache_is_bounded_by_count_and_evicts_the_oldest_first() {
+        // Without this the table is the one thing in the store with no bound at all: every edit
+        // of a message adds a row and orphans the last one, and nothing ever collects it.
+        let dir = TempDir::new("sqlite-summary-count");
+        let store = store(
+            &dir,
+            Retention {
+                max_summaries: 3,
+                retain_days: 0,
+                ..Retention::default()
+            },
+        );
+        for n in 0..5_u64 {
+            store
+                .cache_summary(
+                    &summary_key(&format!("100000000000000000{n}"), n),
+                    &format!("summary {n}"),
+                )
+                .await
+                .expect("cache");
+            // The bound is on made_at_ms, which comes from the clock; without a gap the five
+            // writes can share a millisecond and the eviction order would be decided by the
+            // rowid tie-break alone.
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            summary_rows(&store),
+            3,
+            "the summary table grew past its ceiling"
+        );
+        for n in 0..2_u64 {
+            assert_eq!(
+                store
+                    .cached_summary(&summary_key(&format!("100000000000000000{n}"), n))
+                    .await
+                    .expect("read"),
+                None,
+                "entry {n} is the oldest and must have been evicted first"
+            );
+        }
+        for n in 2..5_u64 {
+            assert_eq!(
+                store
+                    .cached_summary(&summary_key(&format!("100000000000000000{n}"), n))
+                    .await
+                    .expect("read")
+                    .as_deref(),
+                Some(format!("summary {n}").as_str()),
+                "the newest entries must be the ones kept"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_summary_is_collected_by_the_age_limit_the_sweep_cannot_reach() {
+        // The exact shape of the leak: a message is EDITED upstream, so the entry under the old
+        // content hash is unreachable by key and stays under the CURRENT policy version — which
+        // is the one thing `forget_summaries_except` will never delete. The age bound is what
+        // collects it, and this test is the only thing that says so.
+        let dir = TempDir::new("sqlite-summary-orphan");
+        let store = store(
+            &dir,
+            Retention {
+                retain_days: 1,
+                ..Retention::default()
+            },
+        );
+        let key = summary_key("1000000000000000200", 0xdead_beef);
+        store
+            .cache_summary(&key, "the runner stalled overnight")
+            .await
+            .expect("cache");
+        // Age it two days, which is what the passage of time would do.
+        {
+            let guard = store
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard
+                .execute(
+                    "UPDATE summaries SET made_at_ms = ?1",
+                    [now_ms() - 2 * 86_400_000],
+                )
+                .expect("age the row");
+        }
+        assert_eq!(summary_rows(&store), 1, "the row to be collected is there");
+        assert_eq!(
+            store
+                .forget_summaries_except("current")
+                .await
+                .expect("sweep"),
+            0,
+            "the startup sweep must NOT be what collects this; it deletes by policy version, and \
+             an orphan is under the current one"
+        );
+        assert_eq!(summary_rows(&store), 1);
+
+        // The edited message's summary is written under a new content hash — and that write is
+        // what collects the orphan.
+        store
+            .cache_summary(&summary_key("1000000000000000200", 0x0bad_c0de), "reverted")
+            .await
+            .expect("cache");
+        assert_eq!(
+            summary_rows(&store),
+            1,
+            "the entry for the message's old text outlived the age limit"
+        );
+        assert_eq!(
+            store
+                .cached_summary(&summary_key("1000000000000000200", 0x0bad_c0de))
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("reverted"),
+            "the age limit took the live entry too"
         );
     }
 

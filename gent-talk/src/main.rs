@@ -226,6 +226,7 @@ async fn main() -> anyhow::Result<()> {
                 path = %path.display(),
                 max_conversations = retention.max_conversations,
                 max_turns_per_conversation = retention.max_turns_per_conversation,
+                max_summaries = retention.max_summaries,
                 retain_days = retention.retain_days,
                 "durable state is ON. Conversation transcripts and read marks are written to \
                  this file at 0600 and survive a restart. Read marks are THIS SERVER'S OWN: \
@@ -327,7 +328,16 @@ async fn main() -> anyhow::Result<()> {
             swept,
             "deleted cached summaries produced under an older policy"
         ),
-        Err(error) => tracing::debug!(%error, "no summary cache to sweep"),
+        // Not configured is not a failure: there is no cache, so there is nothing to sweep. A
+        // store that IS configured and could not be swept is a real fault and has to be visible
+        // at the default RUST_LOG=info, because what it leaves behind is other people's text at
+        // rest under a policy that no longer applies.
+        Err(gent_talk::store::StoreError::Unavailable(_)) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "the summary cache could NOT be swept; entries produced under an older policy are \
+             still on disk"
+        ),
     }
 
     let bind = config.bind;

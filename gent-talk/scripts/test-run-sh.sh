@@ -22,6 +22,10 @@ SENTINEL_EL_KEY="SENTINEL-ELEVENLABS-KEY-51ab7e30"
 
 TEST_IMAGE_NAME="gent-talk-selftest"
 TEST_IMAGE_TAG="t0"
+# A second throwaway image, built FROM scratch around a static binary, used to prove that the
+# durable-state mount is writable by the container's user. Separate from the one above because it
+# must run as uid 10001 and carry nothing else.
+PROBE_IMAGE="gent-talk-selftest-writeprobe:t0"
 TEST_PORT=18099
 # A tag and port that no test ever creates anything under, for the "nothing is there" checks.
 ABSENT_TAG="no-such-tag"
@@ -59,6 +63,7 @@ cleanup() {
     fi
     "$ENGINE" rm -f "$TEST_CONTAINER_NAME" >/dev/null 2>&1 || true
     "$ENGINE" rmi "${TEST_IMAGE_NAME}:${TEST_IMAGE_TAG}" >/dev/null 2>&1 || true
+    "$ENGINE" rmi "$PROBE_IMAGE" >/dev/null 2>&1 || true
     if [ -f "$SELFTEST_UNIT_PATH" ]; then
         systemctl --user stop "$SELFTEST_UNIT" >/dev/null 2>&1 || true
         rm -f "$SELFTEST_UNIT_PATH"
@@ -297,6 +302,97 @@ ok "the launch is detached, named, restart-policied, and does not use --rm"
 grep -q -- '-v .*:/var/lib/gent-talk:Z' <<< "$runline" \
     || fail "run command does not bind-mount durable state, so a rebuild would discard it: $runline"
 ok "durable state is bind-mounted from the host, so a rebuild does not discard it"
+
+# --- 8d. the mount is writable BY THE CONTAINER'S USER, and the launcher checks it ------------
+#
+# The mount existing is not the property that matters; the server being able to WRITE to it is.
+# The image runs as uid 10001, and under rootless podman a host directory owned by the invoking
+# user and mode 0700 appears inside the container as root:root drwx------ — so uid 10001 is
+# denied, the server refuses to start because it cannot open its SQLite file, and --restart turns
+# that into a crash loop. This is the check that would have caught it.
+DATA_PROBE_DIR="$TMPDIR_TEST/data"
+mkdir -p -m 700 "$DATA_PROBE_DIR"
+MOUNT_CONFIG="$TMPDIR_TEST/mount.env"
+write_config "$MOUNT_CONFIG"
+echo "GENT_TALK_DATA_DIR=$DATA_PROBE_DIR" >> "$MOUNT_CONFIG"
+mountout="$(run_sh --config "$MOUNT_CONFIG" --dry-run --no-tunnel)"
+mountline="$(grep '(dry run).*run -d' <<< "$mountout")"
+grep -q -- "-v ${DATA_PROBE_DIR}:/var/lib/gent-talk:Z" <<< "$mountline" \
+    || fail "GENT_TALK_DATA_DIR is not the directory that gets mounted: $mountline"
+grep -qi 'writable by the container' <<< "$mountout" \
+    || fail "the launcher does not preflight the mount at all, so a store it cannot open is \
+discovered inside the container: $mountout"
+ok "the launcher mounts GENT_TALK_DATA_DIR and says it will check the container can write there"
+
+if ! command -v "$ENGINE" >/dev/null 2>&1; then
+    echo "SKIP $ENGINE is not installed; the mount-writability check needs it" >&2
+else
+    ROOTLESS_HOST="$("$ENGINE" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+    if [ "$ROOTLESS_HOST" = "true" ]; then
+        # THE FUNCTIONAL CHECK FIRST, deliberately. Asserting that a flag appears in a command
+        # line only proves the string is there; what has to be true is that a container running
+        # as uid 10001 can WRITE to this mount, and only running one says so. It uses the very
+        # arguments run.sh printed, and it is built FROM scratch around a static binary compiled
+        # here — no registry, no network, no base image on the host.
+        PROBE_CTX="$TMPDIR_TEST/probe-image"
+        mkdir -p "$PROBE_CTX"
+        cat > "$PROBE_CTX/probe.c" <<'PROBEC'
+#include <fcntl.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    int fd = open(argv[1], O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (fd < 0) return 1;
+    close(fd);
+    return 0;
+}
+PROBEC
+        if ! command -v cc >/dev/null 2>&1 \
+            || ! cc -static -O0 -o "$PROBE_CTX/probe" "$PROBE_CTX/probe.c" 2>/dev/null; then
+            echo "SKIP no static C compiler; cannot build the offline write-probe image" >&2
+        else
+            printf 'FROM scratch\nCOPY probe /probe\nUSER 10001:10001\nENTRYPOINT ["/probe"]\n' \
+                > "$PROBE_CTX/Containerfile"
+            "$ENGINE" build --pull=never -t "$PROBE_IMAGE" "$PROBE_CTX" >/dev/null 2>&1 \
+                || fail "could not build the throwaway write-probe image"
+
+            mount_arg="$(grep -o -- '-v [^ ]*' <<< "$mountline" | head -1 | cut -d' ' -f2)"
+            userns_arg="$(grep -o -- '--userns=[^ ]*' <<< "$mountline" | head -1)"
+            [ -n "$mount_arg" ] || fail "could not read the mount argument back out of: $mountline"
+
+            "$ENGINE" run --rm -v "$mount_arg" "$userns_arg" "$PROBE_IMAGE" \
+                /var/lib/gent-talk/written-by-the-container >/dev/null 2>&1 \
+                || fail "uid 10001 CANNOT write to the mount run.sh builds: the server would fail \
+to open its store and crash-loop under --restart. args: -v $mount_arg $userns_arg"
+            [ -f "$DATA_PROBE_DIR/written-by-the-container" ] \
+                || fail "the container reported success but nothing landed in $DATA_PROBE_DIR"
+            ok "a container running as uid 10001 really can write to the mount run.sh builds"
+
+            # THE CONTROL. Without the remapping the same write is REFUSED on this host — which is
+            # what makes the check above about the flag rather than about a permissive host.
+            if "$ENGINE" run --rm -v "$mount_arg" "$PROBE_IMAGE" \
+                    /var/lib/gent-talk/control >/dev/null 2>&1; then
+                fail "the control PASSED: this host allows uid 10001 to write to the bare mount, \
+so the check above certifies nothing"
+            fi
+            ok "and without that mapping the identical write is refused, so the flag is load-bearing"
+
+            # Said in the command line too, by name, so the reason the write above worked is
+            # recorded where a reader of the launch output can see it.
+            grep -q -- '--userns=keep-id:uid=10001,gid=10001' <<< "$mountline" \
+                || fail "the write worked, but not because of the mapping this asserts: $mountline"
+            ok "under a rootless engine the launch maps the container's server user onto this user"
+
+            # Removed HERE, not only in cleanup(): the detection checks further down pick an
+            # arbitrary local image to build their throwaway one from, and a FROM-scratch image
+            # with no shell in it is not a usable base. Leaving it around made an unrelated check
+            # fail for a reason that was not there.
+            "$ENGINE" rmi "$PROBE_IMAGE" >/dev/null 2>&1 || true
+        fi
+    else
+        echo "SKIP engine is not rootless; the userns remapping check does not apply" >&2
+    fi
+fi
 
 # --status must say where that directory is, or an operator cannot find it to back it up or
 # purge it.
@@ -636,7 +732,11 @@ ok "the screenshot harness refuses an unknown state name"
 # --- 10. already-running detection, by image and by port -------------------------------------
 if command -v "$ENGINE" >/dev/null 2>&1; then
     BASE_IMAGE="$("$ENGINE" images --format '{{.Repository}}:{{.Tag}}' | grep -E '^docker.io/library/debian:' | head -1 || true)"
-    [ -n "$BASE_IMAGE" ] || BASE_IMAGE="$("$ENGINE" images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | head -1 || true)"
+    # This suite's OWN throwaway images are excluded from the fallback: the write-probe one is
+    # FROM scratch and has no shell, so building the detection image on top of it produces a
+    # container that exits at once and is then, correctly, not detected as running — an unrelated
+    # check failing for a reason that is not in it.
+    [ -n "$BASE_IMAGE" ] || BASE_IMAGE="$("$ENGINE" images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | grep -v 'gent-talk-selftest' | head -1 || true)"
     if [ -z "$BASE_IMAGE" ]; then
         echo "SKIP no local image to tag for the detection test" >&2
     else

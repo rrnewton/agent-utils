@@ -9,8 +9,9 @@
 //!
 //! * a conversation that was never written answers [`StoreError::NotFound`], and so does
 //!   forgetting one twice;
-//! * the same [`Retention`] bounds apply, including the per-conversation turn ceiling and the
-//!   [`super::MAX_TURN_CHARS`] limit on one turn;
+//! * the same [`Retention`] bounds apply, including the per-conversation turn ceiling, the
+//!   [`super::MAX_TURN_CHARS`] limit on one turn, and the count and age bounds on the cached
+//!   summaries;
 //! * a read mark refuses an id it cannot order, and never moves backwards;
 //! * [`FakeStore::fail_next`] makes the very next operation fail, so a caller's error path can be
 //!   exercised instead of assumed.
@@ -30,11 +31,26 @@ use super::{
 };
 use crate::model::{ChannelId, MessageId};
 
+/// One cached summary as the fake holds it.
+///
+/// `made_at_ms` and `seq` are not decoration: the real store bounds this table by age and by
+/// count, and a fake that kept only the text could not reproduce either — which is exactly how a
+/// fake stops being able to say no.
+#[derive(Clone, Debug)]
+struct FakeSummary {
+    text: String,
+    made_at_ms: i64,
+    /// Insertion order, standing in for SQLite's `rowid`: it breaks a tie between two entries
+    /// made in the same millisecond, and it survives an overwrite, as a rowid does.
+    seq: u64,
+}
+
 #[derive(Debug, Default)]
 struct State {
     conversations: BTreeMap<String, Vec<Turn>>,
     marks: BTreeMap<String, (MessageId, u64, i64)>,
-    summaries: BTreeMap<(String, String, String, String), String>,
+    summaries: BTreeMap<(String, String, String, String), FakeSummary>,
+    next_summary_seq: u64,
     fail_next: Option<String>,
     appended: usize,
     purges: usize,
@@ -86,6 +102,16 @@ impl FakeStore {
     #[must_use]
     pub fn purges(&self) -> usize {
         self.lock().purges
+    }
+
+    /// How many cached summaries are held right now.
+    ///
+    /// A count rather than the entries themselves: what tests need to know is whether a caller
+    /// caused a durable write, and "how many rows are there" is the question that answers it
+    /// without a test having to reconstruct the four-part key.
+    #[must_use]
+    pub fn cached_summaries(&self) -> usize {
+        self.lock().summaries.len()
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -288,13 +314,54 @@ impl StateStore for FakeStore {
     async fn cached_summary(&self, key: &SummaryKey) -> Result<Option<String>, StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
-        Ok(state.summaries.get(&fake_key(key)).cloned())
+        Ok(state
+            .summaries
+            .get(&fake_key(key))
+            .map(|entry| entry.text.clone()))
     }
 
     async fn cache_summary(&self, key: &SummaryKey, summary: &str) -> Result<(), StoreError> {
         let mut state = self.lock();
         armed(&mut state)?;
-        state.summaries.insert(fake_key(key), summary.to_owned());
+        let slot = fake_key(key);
+        let seq = match state.summaries.get(&slot) {
+            // An overwrite keeps its place in the queue, as it keeps its rowid in SQLite.
+            Some(existing) => existing.seq,
+            None => {
+                let next = state.next_summary_seq;
+                state.next_summary_seq += 1;
+                next
+            }
+        };
+        state.summaries.insert(
+            slot,
+            FakeSummary {
+                text: summary.to_owned(),
+                made_at_ms: now_ms(),
+                seq,
+            },
+        );
+
+        // The same two bounds the SQLite store applies, in the same order. See
+        // `super::sqlite::prune_summaries` for why the age one is the only thing that ever
+        // collects an orphan.
+        if self.retention.retain_days > 0 {
+            let cutoff = now_ms() - i64::from(self.retention.retain_days) * 86_400_000;
+            state.summaries.retain(|_, held| held.made_at_ms >= cutoff);
+        }
+        while state.summaries.len() > self.retention.max_summaries as usize {
+            let oldest = state
+                .summaries
+                .iter()
+                .min_by_key(|(_, held)| (held.made_at_ms, held.seq))
+                .map(|(slot, _)| slot.clone());
+            match oldest {
+                Some(slot) => {
+                    state.summaries.remove(&slot);
+                }
+                None => break,
+            }
+        }
         Ok(())
     }
 
@@ -362,6 +429,7 @@ mod tests {
             max_conversations: 2,
             max_turns_per_conversation: 2,
             retain_days: 0,
+            ..Retention::default()
         });
         for (n, at) in [("a", 1_000), ("b", 2_000), ("c", 3_000)] {
             store
@@ -416,6 +484,48 @@ mod tests {
                 .expect_err("must refuse")
                 .code(),
             "bad_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_fake_bounds_the_summary_cache_exactly_as_the_real_store_does() {
+        // Parity, and it is load-bearing: every test of the summary path runs against this store,
+        // so a fake with an unbounded cache would let an unbounded cache ship.
+        let store = FakeStore::with_retention(Retention {
+            max_summaries: 2,
+            retain_days: 0,
+            ..Retention::default()
+        });
+        let key = |n: u64| SummaryKey {
+            channel: ChannelId("1111111111".to_owned()),
+            message: MessageId(format!("100000000000000000{n}")),
+            content_hash: n,
+            version: "current".to_owned(),
+        };
+        for n in 0..3_u64 {
+            store
+                .cache_summary(&key(n), &format!("summary {n}"))
+                .await
+                .expect("cache");
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            store.cached_summaries(),
+            2,
+            "the fake's summary cache grew past the ceiling the real one enforces"
+        );
+        assert_eq!(
+            store.cached_summary(&key(0)).await.expect("read"),
+            None,
+            "the oldest entry must be the one evicted"
+        );
+        assert_eq!(
+            store
+                .cached_summary(&key(2))
+                .await
+                .expect("read")
+                .as_deref(),
+            Some("summary 2")
         );
     }
 }

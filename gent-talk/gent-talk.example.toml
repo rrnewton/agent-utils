@@ -90,8 +90,11 @@ writable = false
 # api_base = "https://api.elevenlabs.io/v1"
 
 [storage]
-# Durable state: the /voice conversation transcript, and how far the owner has read in each
-# channel. Everything else this server does is stateless — channel content is never cached.
+# Durable state: the /voice conversation transcript, how far the owner has read in each channel,
+# and the cached summaries below. Everything else this server does is stateless — a channel is
+# never cached as a channel. A cached SUMMARY is: with the shipped extractive backend it is the
+# opening of somebody else's message, so it is a second at-rest copy of third-party text and is
+# bounded and purged as one.
 #
 # UNSET MEANS OFF, and off is honest: the routes that need a store answer 503
 # storage_not_configured rather than keeping state in memory that evaporates on restart.
@@ -106,10 +109,16 @@ writable = false
 # Environment: GENT_TALK_STORAGE_PATH
 # path = "/var/lib/gent-talk/gent-talk.sqlite3"
 
-# Retention. Enforced on every append, not by a sweeper that might not run.
+# Retention. Enforced on every write, not by a sweeper that might not run. EVERY table is
+# bounded: an unbounded one is both a disk problem and a privacy problem, and the second is worse.
 # max_conversations = 50            # oldest dropped first; at least 1
 # max_turns_per_conversation = 1000 # further turns are refused with 413; at least 1
-# retain_days = 30                  # 0 means no age limit
+# max_summaries = 2000              # least recently written dropped first; at least 1
+# retain_days = 30                  # 0 means no age limit. Applies to conversations (since the
+#                                   # last turn) AND to cached summaries (since they were made) —
+#                                   # for a summary it is the only thing that collects an entry
+#                                   # whose message was edited or deleted upstream, because such
+#                                   # an entry is unreachable by key and nothing announces it.
 
 [summaries]
 # How a long channel message is turned into one short line. EVERY setting here is folded into the
@@ -124,8 +133,10 @@ writable = false
 # target_chars = 160
 # context_messages = 3        # how many preceding messages ride along as context
 #
-# The model to ask. Unset means the shipped extractive backend: truncation, no model, no network,
-# no cost. The server says which one it is using at startup, and every summary answer carries the
-# backend name, so a page can never imply a model summary it did not get.
+# The model to ask. NOTE: no model-backed summariser is wired up yet, so today this setting does
+# exactly one thing — it is folded into the cache key, so setting it invalidates every summary
+# produced without it. Unset means the shipped extractive backend: truncation, no model, no
+# network, no cost. The server says which one it is using at startup, and every summary answer
+# carries the backend name, so a page can never imply a model summary it did not get.
 # Environment: GENT_TALK_SUMMARY_MODEL
 # model = "..."

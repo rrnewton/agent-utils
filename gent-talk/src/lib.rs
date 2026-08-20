@@ -7,10 +7,14 @@
 //!
 //! # What is kept
 //!
-//! Almost nothing. Channel content is never cached: every question is a fresh Discord fetch.
-//! [`store`] is the single exception, and it holds only what this server itself authored — the
-//! `/voice` transcript, and how far the owner has read. Read state in particular is OURS: Discord
-//! shares none with a bot, so nothing here is synchronised with it in either direction.
+//! Almost nothing. A channel is never cached as a channel: every question is a fresh Discord
+//! fetch. [`store`] is the single exception, and it holds three things — the `/voice` transcript,
+//! how far the owner has read, and one short cached SUMMARY per long message. The first two are
+//! what this server itself authored; the third is derived from somebody else's message and with
+//! the shipped extractive backend it is literally the opening of one, so it is treated as a
+//! second at-rest copy of third-party text: bounded by the same retention, erased by the same
+//! purge, and never written on behalf of a read-scope token. Read state in particular is OURS:
+//! Discord shares none with a bot, so nothing here is synchronised with it in either direction.
 //!
 //! # Untrusted input
 //!

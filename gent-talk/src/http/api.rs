@@ -874,6 +874,31 @@ pub async fn forget_conversations(
     )))
 }
 
+/// `DELETE /api/v1/storage` — erase EVERYTHING this server holds.
+///
+/// The operator's erase, and the only complete one there is over HTTP.
+/// `DELETE /api/v1/conversations` clears transcripts and deliberately leaves the read marks
+/// alone, because the two are different records and a control that quietly does more than it
+/// says is the failure this project is written against. This route says it does all of it: the
+/// transcripts, this server's read marks, and the cached summaries — which are the one thing on
+/// disk written by third parties.
+///
+/// Write scope, obviously. It exists because [`crate::store::StateStore::purge_everything`] was
+/// otherwise trait surface with three implementations and no caller: an erase nobody can invoke
+/// is not an erase, it is a claim in a document.
+pub async fn purge_storage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require(&headers, &state, Scope::Write)?;
+    state.store.purge_everything().await?;
+    Ok(no_store(Json(serde_json::json!({
+        "purged": ["conversations", "read_marks", "summaries"],
+        "detail": "every durable record this server holds has been erased; the store is still \
+                   open and usable",
+    }))))
+}
+
 /// This server's own inbox state.
 #[derive(Debug, Serialize)]
 pub struct InboxResponse {
@@ -983,9 +1008,11 @@ pub async fn message_summary(
     Path((channel_id, message_id)): Path<(String, String)>,
     Query(query): Query<LimitQuery>,
 ) -> Result<Json<MessageSummaryResponse>, ApiError> {
-    require(&headers, &state, Scope::Read)?;
+    // The granted scope, not the required one: a read token may be served FROM the cache but
+    // never writes to it. See `ops::summarize_message`.
+    let caller = require(&headers, &state, Scope::Read)?;
     let (channel, outcome) =
-        ops::summarize_message(&state, &channel_id, &message_id, query.limit).await?;
+        ops::summarize_message(&state, caller, &channel_id, &message_id, query.limit).await?;
     Ok(Json(MessageSummaryResponse {
         channel,
         message_id,

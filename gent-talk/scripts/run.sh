@@ -7,14 +7,22 @@
 #   2. Loads configuration and verifies every REQUIRED variable is actually set, by name.
 #   3. Optionally (off by default) makes sure the cloudflared tunnel unit is running.
 #   4. Rebuilds the image.
-#   5. Removes a leftover STOPPED container, then runs the new one detached, with a host
-#      directory bind-mounted for durable state.
+#   5. Removes a leftover STOPPED container, proves the host directory for durable state is
+#      writable by the container's own user, then runs the new one detached with it mounted.
 #
-# DURABLE STATE. The server keeps the /voice transcript and its own read marks in a SQLite file.
-# That file must live OUTSIDE the container: this script replaces the container on every launch,
-# so anything written into the image's writable layer is destroyed by the next deploy, silently.
-# GENT_TALK_DATA_DIR (default: ${XDG_DATA_HOME:-$HOME/.local/share}/gent-talk) is created 0700
-# and mounted at /var/lib/gent-talk. --status reports it. Deleting that directory is the purge.
+# DURABLE STATE. The server keeps the /voice transcript, its own read marks and its summary cache
+# in a SQLite file. That file must live OUTSIDE the container: this script replaces the container
+# on every launch, so anything written into the image's writable layer is destroyed by the next
+# deploy, silently. GENT_TALK_DATA_DIR (default: ${XDG_DATA_HOME:-$HOME/.local/share}/gent-talk)
+# is created 0700 and mounted at /var/lib/gent-talk. --status reports it. Deleting that directory
+# is the purge.
+#
+# The mount also has to be WRITABLE BY THE CONTAINER'S USER, which is not automatic and is not
+# what a bind mount gives you: the image runs as uid 10001, and under rootless podman a directory
+# owned by the invoking user appears inside the container as root's. Step 5 therefore maps the
+# container's server user back onto this one (--userns=keep-id) and then PROVES the mount is
+# writable, with the real image, before launching anything. The server refuses to start when it
+# cannot open its store, so without that check a bad mount is a crash loop discovered from logs.
 #
 # Usage:
 #   scripts/run.sh [--shutdown] [--restart] [--logs] [--follow] [--status] [--tunnel-status]
@@ -1093,10 +1101,59 @@ Set GENT_TALK_DATA_DIR to somewhere this user can write."
     chmod 700 -- "$DATA_DIR" || die "cannot restrict the state directory: $DATA_DIR"
 fi
 
-run_args=(run -d --name "$CONTAINER_NAME" --restart "$RESTART_POLICY" -p "${HOST_ADDR}:${HOST_PORT}:8080")
+# THE MOUNT ARGUMENTS, kept in one array because the write PROBE below has to use exactly the
+# ones the launch uses. A probe that tested a different mount would certify nothing.
+#
 # :Z relabels for SELinux, which is what makes the mount readable to a rootless container on a
 # host that enforces it. Without it the server starts and every storage call fails with EACCES.
-run_args+=(-v "${DATA_DIR}:${CONTAINER_DATA_DIR}:Z")
+#
+# --userns=keep-id is the other half, and it is the one whose absence broke this outright. Under
+# ROOTLESS podman the invoking user is uid 0 inside the container's user namespace, and every
+# other uid maps into the subuid range — so $DATA_DIR, owned by this user and mode 0700, appears
+# inside as root:root drwx------ and the image's `gent` (uid 10001) cannot write to it. The server
+# opens its SQLite file at startup and exits when it cannot, and the container is launched with a
+# restart policy, so the whole deployment is a crash loop. `keep-id:uid=...,gid=...` maps the
+# container's server user back onto this host user, which is what makes the owner's own directory
+# writable by it. It is rootless-only: rootful podman and docker reject it, and there uid 10001
+# in the container IS uid 10001 on the host, so the directory has to be owned accordingly — the
+# probe below is what says so, by name, instead of leaving it to be discovered from a crash loop.
+CONTAINER_UID=10001
+CONTAINER_GID=10001
+mount_args=(-v "${DATA_DIR}:${CONTAINER_DATA_DIR}:Z")
+ROOTLESS="$("$ENGINE" info --format '{{.Host.Security.Rootless}}' 2>/dev/null || true)"
+if [ "$ROOTLESS" = "true" ]; then
+    mount_args+=("--userns=keep-id:uid=${CONTAINER_UID},gid=${CONTAINER_GID}")
+fi
+
+# The preflight. This script exists to make a bad start fail HERE rather than five minutes later
+# inside a container, and "the store cannot be opened" is the one failure that takes the whole
+# server down. So it is checked with the real image, the real mount arguments and the real
+# container user, before anything is launched.
+step "Checking $DATA_DIR is writable by the container's user (uid $CONTAINER_UID)"
+if [ "$DRY_RUN" = 1 ]; then
+    note "(dry run) would write a probe file to $CONTAINER_DATA_DIR as uid $CONTAINER_UID"
+elif ! PROBE_OUTPUT="$("$ENGINE" run --rm "${mount_args[@]}" --entrypoint /bin/sh "$IMAGE_REF" \
+        -c "probe=\"${CONTAINER_DATA_DIR}/.write-probe.\$\$\"; : > \"\$probe\" && rm -f \"\$probe\"" \
+        2>&1)"; then
+    # The engine's own words are reproduced, because "the mount is not writable" and "this image
+    # has no /bin/sh to run the probe with" fail identically here and are fixed differently.
+    die "the durable-state mount is NOT writable by the container's user (uid $CONTAINER_UID).
+  host directory: $DATA_DIR
+  mounted at:     $CONTAINER_DATA_DIR
+  engine:         $ENGINE (rootless=${ROOTLESS:-unknown})
+  $ENGINE said:   ${PROBE_OUTPUT:-(nothing)}
+The server opens its SQLite file at startup and REFUSES to start when it cannot, and this
+container is launched with --restart $RESTART_POLICY, so launching now would produce a crash
+loop rather than a server.
+Rootless podman: this needs --userns=keep-id, which this script adds automatically; if you are
+seeing this anyway the engine rejected it — check '$ENGINE info'.
+Rootful podman or docker: uid $CONTAINER_UID inside the container is uid $CONTAINER_UID on the
+host, so either chown the directory to it (sudo chown $CONTAINER_UID:$CONTAINER_GID '$DATA_DIR')
+or point GENT_TALK_DATA_DIR at a directory that user can write."
+fi
+
+run_args=(run -d --name "$CONTAINER_NAME" --restart "$RESTART_POLICY" -p "${HOST_ADDR}:${HOST_PORT}:8080")
+run_args+=("${mount_args[@]}")
 for var in "${REQUIRED_VARS[@]}" "${OPTIONAL_VARS[@]}"; do
     [ -n "${!var:-}" ] || continue
     export "${var?}"

@@ -663,15 +663,23 @@ impl SummaryOutcome {
 }
 
 /// One message, summarised — from the cache when the policy and the text are unchanged. Read
-/// scope.
+/// scope to ASK; write scope to leave anything behind.
 ///
 /// The ORDER here is load-bearing and is the whole of the issue's first requirement: the
 /// threshold is checked BEFORE the cache and before the summariser, so a short message costs
 /// neither a lookup nor a call. Then the cache, then the summariser, then the write.
 ///
+/// `caller` is the scope the credential actually carries, and it decides ONE thing: whether the
+/// generated summary is filed. A read-scope token may SPEND the cache and may never FILL it. The
+/// read token is the one pasted into a hosted voice agent, and a durable write reachable from the
+/// least-trusted credential is precisely what the two-token split exists to prevent — see
+/// [`crate::http`] for the rule stated once. A read-scope caller therefore gets the same answer,
+/// generated every time, exactly as it would with no store configured at all.
+///
 /// The summariser is a model being fed channel text, so the request is built through
-/// [`crate::untrusted`] exactly as the MCP path is. A summary is not exempt from the boundary for
-/// being short.
+/// [`crate::summarize::SummaryRequest::new`], which frames it with [`crate::untrusted`] — the
+/// fence is part of constructing the request rather than something this function could forget. A
+/// summary is not exempt from the boundary for being short.
 ///
 /// # Errors
 ///
@@ -681,6 +689,7 @@ impl SummaryOutcome {
 /// error here — see below.
 pub async fn summarize_message(
     state: &AppState,
+    caller: crate::auth::Scope,
     channel_id: &str,
     message_id: &str,
     limit: Option<u16>,
@@ -714,35 +723,20 @@ pub async fn summarize_message(
 
     let start = position.saturating_sub(state.config.summaries.context_messages);
     let context = &window.messages[start..position];
-    let request = crate::summarize::SummaryRequest {
-        target,
-        context,
-        target_chars: state.config.summaries.target_chars,
-    };
+    let request =
+        crate::summarize::SummaryRequest::new(target, context, state.config.summaries.target_chars);
     let generated = state.summarizer.summarize(&request).await?;
-    if let Err(error) = state.store.cache_summary(&key, &generated).await {
-        tracing::warn!(%error, "summary could not be cached; it will be generated again");
+    if caller >= crate::auth::Scope::Write {
+        if let Err(error) = state.store.cache_summary(&key, &generated).await {
+            tracing::warn!(%error, "summary could not be cached; it will be generated again");
+        }
+    } else {
+        tracing::debug!(
+            "a read-scope caller asked for a summary; it was generated and NOT filed, because a \
+             read token may spend the cache and never fill it"
+        );
     }
     Ok((window.channel, SummaryOutcome::Generated(generated)))
-}
-
-/// What a summariser is actually shown.
-///
-/// Separated from [`summarize_message`] so it is testable on its own, and so there is exactly one
-/// place where channel text is framed for a model on this path. The preamble sits OUTSIDE the
-/// fence; everything written by another party sits inside it.
-#[must_use]
-pub fn summary_prompt(request: &crate::summarize::SummaryRequest<'_>) -> String {
-    let mut out = String::from(crate::summarize::PROMPT);
-    out.push_str("\n\n");
-    if !request.context.is_empty() {
-        out.push_str("Earlier in the same channel, for context only:\n");
-        out.push_str(&crate::untrusted::render_for_model(request.context));
-        out.push_str("\n\n");
-    }
-    out.push_str("The message to summarise:\n");
-    out.push_str(&crate::untrusted::fenced(&request.target.content));
-    out
 }
 
 #[cfg(test)]

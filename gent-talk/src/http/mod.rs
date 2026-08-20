@@ -8,9 +8,16 @@
 //! * Everything under `/api/` requires a bearer token, and the write scope is required for
 //!   anything that reaches Discord with a message — and for minting a signed conversation URL,
 //!   which is a credential for talking to an agent that can itself post.
-//! * The write scope is ALSO required for everything that touches durable state, reads included.
-//!   A stored transcript is the owner's own speech, and moving a read mark changes what another
-//!   device will be shown. Neither is a read of a channel he already allowlisted.
+//! * **No read-scope credential ever writes anything durable.** The read token is the one pasted
+//!   into a hosted voice agent, so it is the least trusted thing that holds a credential here;
+//!   every durable write — appending a turn, moving a read mark, filing a cached summary —
+//!   requires the write scope. `/summary` is readable at read scope and is served from the cache
+//!   when there is a hit, but a read-scope caller's generated summary is NOT filed; see
+//!   [`crate::ops::summarize_message`].
+//! * The write scope is ALSO required to READ a transcript. A stored transcript is the owner's
+//!   own speech plus whatever channel text was read aloud to him, which is not a read of a
+//!   channel he already allowlisted. The one durable read a read-scope token may make is
+//!   `/inbox`, because how far HE has read is what the agent has to be able to say out loud.
 //! * Every request — routed or not, authorized or not — leaves exactly ONE line in the access
 //!   log at INFO. See [`crate::access`] for why that is load-bearing rather than nice to have.
 //! * `/mcp` is the Streamable HTTP MCP endpoint. It requires a bearer token too, and answers a
@@ -69,6 +76,9 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/conversations/{conversation_id}/turns",
             post(api::append_turn),
         )
+        // The operator's erase, and the only COMPLETE one over HTTP: the conversation routes
+        // clear transcripts and say so, this one clears everything the store holds.
+        .route("/api/v1/storage", axum::routing::delete(api::purge_storage))
         .route("/api/v1/inbox", get(api::inbox))
         .route(
             "/api/v1/channels/{channel_id}/read",

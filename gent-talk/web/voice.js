@@ -796,14 +796,23 @@ async function api(path, options) {
 // Both sentences are on the Settings screen next to the button, because a control that quietly
 // does more than the screen says is the failure this whole page is written against.
 
-/** Ids the server will accept: letters, digits, '-' and '_', at most 64 characters. */
+/**
+ * Ids the server will accept: letters, digits, '-' and '_', at most 64 characters.
+ *
+ * A vendor id that already fits is used as it is, so the stored conversation can be matched up
+ * with the vendor's own record of the same call. Anything else gets a LOCAL id rather than a
+ * cleaned-up version of itself: stripping the illegal bytes out is what makes `a/b` and `ab` the
+ * same conversation, and two different calls writing into one transcript is a worse failure than
+ * an id that does not match the vendor's.
+ */
 function conversationIdFrom(vendorId) {
-  const cleaned = String(vendorId || "").replace(/[^A-Za-z0-9_-]/g, "");
-  if (cleaned.length > 0) {
-    return cleaned.slice(0, 64);
+  const raw = String(vendorId || "");
+  if (raw.length > 0 && raw.length <= 64 && /^[A-Za-z0-9_-]+$/.test(raw)) {
+    return raw;
   }
-  // A call the vendor never named still happened. Local, unguessable enough for a filename, and
-  // deliberately not a credential: it is only a key in this owner's own store.
+  // A call the vendor never named — or named in a way this server will not accept — still
+  // happened. Local, unguessable enough for a filename, and deliberately not a credential: it is
+  // only a key in this owner's own store.
   return `local-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
@@ -819,21 +828,44 @@ function setStorageState(text) {
  *
  * Deliberately not awaited by its callers and deliberately silent on the call screen: the owner
  * is in a car. The FIRST failure disables recording and is reported once, in Settings.
+ *
+ * ONE AT A TIME, IN THE ORDER THEY WERE SAID. Every turn joins `recordQueue` and the next POST is
+ * not issued until the previous one has answered. Firing them off in parallel looks harmless and
+ * is not: the SERVER stamps `seq` and `at_ms` at arrival, so two requests milliseconds apart that
+ * complete out of order — different connections, one retransmit, any ordinary jitter — are stored
+ * in the order they LANDED. That inversion is then permanent and invisible: the restored
+ * transcript shows the answer above the question, with server timestamps that agree with it, and
+ * nothing anywhere records that they were swapped.
+ *
+ * The cost is that recording lags a fast exchange by one round trip. Nothing on the screen waits
+ * for it, so the owner cannot tell.
  */
+let recordQueue = Promise.resolve();
+
 function recordTurn(who, text) {
   if (recordingBroken || !session.conversationId || !text) {
     return;
   }
   const speaker = who === "you" ? "you" : "agent";
-  api(`/api/v1/conversations/${session.conversationId}/turns`, {
-    method: "POST",
-    body: { speaker, text },
-  }).catch((error) => {
-    recordingBroken = true;
-    setStorageState(
-      `Not recording: ${error.message}. What is already stored is untouched; the lines on ` +
-        `screen are only on screen.`
-    );
+  // Captured now: by the time this turn reaches the front of the queue the session may have moved
+  // on, and a turn belongs to the conversation it was spoken in.
+  const conversationId = session.conversationId;
+  recordQueue = recordQueue.then(() => {
+    // Checked here rather than only at call time: a turn queued before the store failed must not
+    // be posted after it, or one dead store costs one request per turn for the rest of the call.
+    if (recordingBroken) {
+      return undefined;
+    }
+    return api(`/api/v1/conversations/${conversationId}/turns`, {
+      method: "POST",
+      body: { speaker, text },
+    }).catch((error) => {
+      recordingBroken = true;
+      setStorageState(
+        `Not recording: ${error.message}. What is already stored is untouched; the lines on ` +
+          `screen are only on screen.`
+      );
+    });
   });
 }
 
@@ -843,8 +875,19 @@ function recordTurn(who, text) {
  * A failure here is NOT an error panel. The page works perfectly well without a store — that is
  * what it did until this landed — and a server with no `storage.path` answers 503 by design, so
  * treating that as a fault would put a red banner on a correctly configured deployment.
+ *
+ * ONCE PER PAGE, and the flag is why. `signIn()` runs again whenever a token is saved, so pasting
+ * a second token — or the same one twice — used to append the same conversation underneath
+ * itself, with a second "earlier conversation" rule between the copies. Nothing about the screen
+ * said the duplicate was a duplicate.
  */
+let restoredStoredConversation = false;
+
 async function loadStoredConversation() {
+  if (restoredStoredConversation) {
+    return;
+  }
+  restoredStoredConversation = true;
   let listing = null;
   try {
     listing = await api("/api/v1/conversations");
@@ -865,7 +908,15 @@ async function loadStoredConversation() {
     return;
   }
   for (const turn of (restored && restored.turns) || []) {
-    line(turn.speaker === "you" ? "you" : "assistant", turn.text, turn.at_ms);
+    // THREE stored speakers, not two. A `note` is something the PAGE recorded — a hang-up, an
+    // error it wanted kept — and the server accepts and stores it as its own speaker. Folding it
+    // into "assistant" would put words in the assistant's mouth that it never said, which is the
+    // one attribution this screen is careful about everywhere else. It comes back labelled as
+    // what it is. (A line rather than a seam on purpose: a seam's explanation is held to a word
+    // budget, and a stored note is text of whatever length it was written with.)
+    const who =
+      turn.speaker === "you" ? "you" : turn.speaker === "note" ? "note" : "assistant";
+    line(who, turn.text, turn.at_ms);
   }
   if (((restored && restored.turns) || []).length > 0) {
     transcriptSeam(
