@@ -1,5 +1,11 @@
 # Orc authorship provenance
 
+> **Provenance.** This is a dated investigation record, kept as written. It was produced
+> against a private downstream workspace, so names of repositories, hosts and services
+> outside this one appear below and cannot be resolved from here. They are left in place
+> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
+> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+
 ## Finding
 
 An Orc `role=user` block is not necessarily owner-authored. Orc preserves useful

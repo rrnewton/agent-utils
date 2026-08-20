@@ -1,5 +1,11 @@
 # Work-output artifacts and site identity
 
+> **Provenance.** This is a dated investigation record, kept as written. It was produced
+> against a private downstream workspace, so names of repositories, hosts and services
+> outside this one appear below and cannot be resolved from here. They are left in place
+> deliberately: rewriting a record to look tidier destroys the evidence it exists to be.
+> Nothing here describes `agent-utils` itself. See `#67 standalone-repo`.
+
 ## Decision
 
 Treat work outputs as a provider-neutral, evidence-backed catalog produced during
